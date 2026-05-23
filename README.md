@@ -13,9 +13,9 @@ This is a Cargo workspace containing three sub-crates:
 
 | Crate | Purpose |
 |---|---|
-| [`xc-numerics`](crates/xc-numerics) | High-precision numerical primitives: GL quadrature (f64 + HP with disk cache), LU factorization, inverse iteration, root-finding, prime sieve. |
+| [`xc-numerics`](crates/xc-numerics) | High-precision numerical primitives: GL quadrature (f64 + HP with disk cache), LU factorization, inverse iteration, root-finding, prime sieve, HP symmetric eigendecomposition, HP formatting / comparison helpers. |
 | [`xc-zeta`](crates/xc-zeta) | Riemann zeta function utilities: reference zero loading (HP strings, f64, rug::Float), path-parameterized. |
-| [`xc-spectral`](crates/xc-spectral) | Spectral methods: CCM Weil-form construction (f64 + HP), prolate-wave operators, Mellin transforms, Yakaboylu W-positivity framework, Dirichlet L-function extensions. |
+| [`xc-spectral`](crates/xc-spectral) | Spectral methods: CCM Weil-form construction (f64 + HP), prolate-wave operators (f64 + HP), Mellin transforms (f64 + HP), Yakaboylu W-positivity framework (f64 + HP), Dirichlet L-function extensions. |
 
 ### Module inventory
 
@@ -23,18 +23,20 @@ This is a Cargo workspace containing three sub-crates:
 - `quadrature` — Gauss-Legendre at f64 (configurable N-point) and HP (with disk cache)
 - `root_finding` — f64 bisection with configurable tolerance and max iterations
 - `primes` — Sieve of Eratosthenes, prime counting function π(x)
-- `linalg` (HP-gated) — LU factorization with partial pivoting, LU solve, inverse iteration (with optional forced-even projection), ℓ² normalization, Rayleigh quotient
+- `linalg` (HP-gated) — LU factorization with partial pivoting, LU solve, inverse iteration (with optional forced-even projection), ℓ² normalization, Rayleigh quotient. Inner reductions and matvec parallelized.
+- `fmt` (HP-gated) — `display_hp` (decimal scientific notation at any sig-digit count, no f64 underflow), `sign_of` (HP sign without f64), `matching_digits` and `relative_difference` (HP comparison helpers). Use these wherever you'd otherwise call `to_f64()` for display or comparison.
+- `eigen` (HP-gated) — HP symmetric eigendecomposition: `tridiag_eigenvalues_hp` (symmetric tridiagonal QR with implicit Wilkinson shifts), `tridiag_eigenvector_for_value_hp` and `dense_symmetric_eigenvector_for_value_hp` (shifted inverse iteration), `householder_tridiag_hp` (dense → tridiagonal reduction with parallel reductions, matvec, symmetric update, and Q accumulation), `dense_symmetric_eigenvalues_hp` (full pipeline). Truly dynamic in working precision (verified at HP-1000 against PARI/GP 2000-digit reference; matches to ≥500 digits across 9 reference matrices including Hilbert and Wilkinson W11).
 
 **xc-zeta:**
 - `zeros` — Load reference zeros as HP strings, f64, or `rug::Float`; path-parameterized for flexibility
 
 **xc-spectral:**
-- `ccm` — CCM construction: `CcmParams`, `CcmResult`, `prime_powers_up_to`, `run_f64`, `solve_spectrum`
-- `ccm::hp` (HP-gated) — `HighPrecConfig`, `HighPrecResult`, `run`, `save_xi_json`, `load_xi_json`, `measure_evenness`, full Weil-form matrix assembly at arbitrary precision
-- `prolate` — Prolate-wave operator PW_λ, eigenfunction identification (h₀, h₄), ℰ map, comparison against ξ_λ
-- `mellin` — Truncated completed eta function Λ_λ(s), ξ-weighted Mellin G(s), parallelized critical-line zero scanner, HP variants
-- `yakaboylu` — Yakaboylu's Hilbert-Pólya framework: V̂_R matrix elements, W-positivity tests, synthetic off-line zero detection
-- `lfunction` — Dirichlet L-function character specs (χ₃, χ₄, χ₅, χ₇), twisted prime-power enumeration
+- `ccm` — CCM construction: `CcmParams`, `CcmResult`, `prime_powers_up_to`, `run_f64`, `solve_spectrum_f64`
+- `ccm::hp` (HP-gated) — `HighPrecConfig`, `HighPrecResult`, `run`, `save_xi_json`, `load_xi_json`, `measure_evenness`, full Weil-form matrix assembly at arbitrary precision. Symmetrize loop, Newton-per-seed loop, and evenness reduction are all parallelized.
+- `prolate` — Prolate-wave operator PW_λ. f64 prototype (`build_pw_matrix_f64`, `compute_k_lambda_f64`, `compare_xi_to_k_lambda_f64`) and HP submodule `prolate::hp` (`build_pw_matrix`, `compute_k_lambda`, `compare_xi_to_k_lambda`) using the HP eigensolver from `xc-numerics::eigen`. HP u-grid evaluation parallelized.
+- `mellin` — Truncated completed eta function `Λ_λ(s)`, ξ-weighted Mellin `G(s)`, parallelized critical-line zero scanner. Full f64 (`*_f64`) and HP (`*_hp`) parity: `omega_f64` / `omega_hp`, `truncated_lambda_f64` / `truncated_lambda_hp`, `xi_weighted_mellin_f64` / `xi_weighted_mellin_hp`, `scan_critical_line_zeros_f64` / `scan_critical_line_zeros_hp`. The HP scan also runs in parallel.
+- `yakaboylu` — Yakaboylu's Hilbert-Pólya framework. f64 prototype (`v_r_matrix_element_f64`, `build_w_matrix_f64`, `test_w_positivity_f64`, `WPositivityResultF64`) and HP submodule `yakaboylu::hp` (`build_w_matrix`, `test_w_positivity`, `HpWPositivityResult`) using `dense_symmetric_eigenvalues_hp`. HP outer-row matrix build is parallelized.
+- `lfunction` — Dirichlet L-function character specs (χ₃, χ₄, χ₅, χ₇), twisted prime-power enumeration. `chi_at` and `chi_at_prime_power` return exact `i8` values (precision-agnostic) alongside the `_f64` variants.
 
 ## Tests
 
@@ -48,10 +50,60 @@ cargo test --workspace
 
 # Full HP tier (Linux/WSL/macOS — requires libgmp-dev libmpfr-dev libmpc-dev):
 cargo test --workspace --features hp
-# 60 tests pass, 0 ignored
+# 111 tests pass, 0 ignored
 ```
 
-## Using from another crate
+### HP eigensolver verification (3 layers)
+
+The HP symmetric eigensolver in `xc-numerics::eigen` is verified at three
+independent levels:
+
+1. **Closed-form structured matrices** (Strang's tridiagonal, Hilbert,
+   rotated diagonal, clustered eigenvalues, Wilkinson W21) — closed-form
+   eigenvalues at HP-256 and HP-1000.
+2. **PARI/GP cross-check** — `tests/eigen_reference.rs` loads
+   `tests/fixtures/eigen_reference.json` (9 reference matrices generated
+   by PARI at 2000-digit precision via `polrootsreal(charpoly(M))`) and
+   verifies every eigenvalue matches our HP-1000 result to ≥500 decimal
+   digits.
+3. **Property-based** — random symmetric matrices (deterministically
+   seeded HP LCG, no f64) verified to satisfy trace, determinant,
+   eigenequation, normalization, orthogonality, and decomposition
+   properties.
+
+To regenerate the PARI fixture (only needed if the test cases change):
+
+```bash
+sudo apt install pari-gp  # if not already installed
+cd crates/xc-numerics/tests/fixtures
+gp -q generate_eigen_reference.gp > eigen_reference.json
+```
+
+The committed `eigen_reference.json` is 448 KB; the test passes vacuously
+on machines without PARI but verifies fully wherever the JSON is present.
+
+## Performance
+
+The HP code paths are parallelized with [rayon](https://github.com/rayon-rs/rayon)
+throughout. Parallelization is unconditional — there are no `if n >
+threshold` guards. Small-n tests pay a small constant overhead, but
+production workloads scale across all available cores.
+
+| Layer | Parallelized hot spots |
+|---|---|
+| `xc-numerics::eigen` | Householder reduction: ‖x‖ and ‖v‖² reductions, matvec `p = β·A·v`, symmetric rank-2 update `A ← A − v·qᵀ − q·vᵀ`, vᵀp reduction, Q accumulation `Q ← Q · H`. |
+| `xc-numerics::linalg` | `normalize_l2` (parallel sum-of-squares + per-element divide), `rayleigh_quotient` (parallel row evaluation + final reduction), `inverse_iteration` initial guess and forced-even projection. |
+| `xc-spectral::ccm::hp` | `run` and `measure_evenness` symmetrize loops (parallel pair compute, sequential write to avoid mirror-cell aliasing), Newton-per-seed loop in `run` (~50 independent refinements), combined `diff_sq + norm_sq` reduction in `measure_evenness`. |
+| `xc-spectral::yakaboylu::hp` | `build_w_matrix` outer-row loop. |
+| `xc-spectral::prolate::hp` | `compute_k_lambda` u-grid evaluation, `compare_xi_to_k_lambda` ξ-value reconstruction and dot reductions. |
+| `xc-spectral::mellin` | Critical-line scan grid evaluation in both `scan_critical_line_zeros_f64` and `scan_critical_line_zeros_hp`. |
+
+The toolkit ships HP-everywhere by policy. f64 fast paths exist where
+explicitly requested (suffixed `_f64`); they remain useful for
+quick-iteration smoke tests but cannot reach the precisions needed for
+publication-grade convergence claims.
+
+
 
 In your `Cargo.toml`:
 
@@ -80,10 +132,72 @@ System dependencies for HP tier:
 sudo apt install build-essential m4 libgmp-dev libmpfr-dev libmpc-dev
 ```
 
+## HP / f64 boundary policy
+
+The toolkit follows a strict rule: **HP everywhere unless f64 is
+explicitly requested**. f64 underflows below ~10⁻³⁰⁸, which is
+routinely violated by HP values our papers produce (e.g. eigenvalues
+of magnitude 10⁻¹⁰⁰⁰ at λ²=1000).
+
+### Naming convention
+
+Every public function that operates at f64 precision has `_f64` in its
+name. There is no ambiguity at the call site: if you don't see `_f64`,
+the function is HP (or precision-agnostic).
+
+| Pattern | Examples |
+|---|---|
+| `_f64` suffix → f64-only | `gauss_legendre_64pt_f64`, `bisect_f64`, `omega_f64`, `truncated_lambda_f64`, `xi_weighted_mellin_f64`, `scan_critical_line_zeros_f64`, `solve_spectrum_f64`, `chi_at_f64`, `chi_at_prime_power_f64`, `build_w_matrix_f64`, `smallest_eigenvalue_f64`, `compute_k_lambda_f64`, `compare_xi_to_k_lambda_f64`, `run_f64`, `build_tau_f64`, `v_r_matrix_element_f64`, `build_pw_matrix_f64`, `first_n_f64`, `to_f64_result`, `bisect_zero_f64`, `legendre_p_deriv_f64`, `gl_nodes_weights_f64`, `parity_of_f64`, `count_nodes_f64`, `interp_grid_f64`, `build_pw_dense_f64` |
+| `_hp` suffix → HP | `omega_hp`, `truncated_lambda_hp`, `xi_weighted_mellin_hp`, `scan_critical_line_zeros_hp`, `tridiag_eigenvalues_hp`, `householder_tridiag_hp`, `dense_symmetric_eigenvalues_hp`, `dense_symmetric_eigenvector_for_value_hp`, `tridiag_eigenvector_for_value_hp` |
+| no suffix → HP-default | `ccm::hp::run`, `ccm::hp::measure_evenness`, `inverse_iteration`, `lu_factor`, `lu_solve`, `normalize_l2`, `rayleigh_quotient`, `display_hp`, `sign_of`, `matching_digits`, `relative_difference`, `chi_at` (returns exact `i8`), `chi_at_prime_power` (returns exact `i8`), `gauss_legendre_nodes` (in the `hp` submodule) |
+
+### Allowed f64 in HP code
+
+f64 is permitted in HP-claiming code only at:
+
+- **Documented f64 boundary fields** in result structs (e.g. `CcmResult`,
+  `LoadedXi.xi_f64`, `LoadedXi.weil_min_eigenvalue` — paired with `xi_hp`
+  and `weil_min_eigenvalue_hp` for HP consumers).
+- **`to_f64_result()`** — explicit lossy conversion.
+- **Wall-clock metadata** (`elapsed_seconds: f64`).
+- **CLI input parameters** (e.g. `CcmParams::from_lambda(lambda: f64, ...)`).
+  These are user inputs at f64 precision by contract; the precomputed
+  `lambda_sq_int: u64` field is what HP code paths actually consume.
+- **Digit-to-bit conversion** (`bits = digits * DIGITS_TO_BITS_FACTOR`)
+  where the output is an integer (`u32`) — no precision loss.
+
+### Forbidden in HP code
+
+- `to_f64()` on an HP value used in display, comparison, or computation
+  that could underflow. Use `xc_numerics::fmt::display_hp` (formatting),
+  `sign_of` (sign inspection), `matching_digits` or `relative_difference`
+  (HP-native comparison) instead.
+- f64 arithmetic on HP-derived values where the result is consumed
+  by HP code (no `(hp_value.to_f64() / divisor).round() as i32` etc.).
+- f64 thresholds compared against HP `Float` values without explicit
+  HP construction (build the threshold once as `Float::with_val(prec,
+  Float::parse("1e-10").unwrap())`).
+
+Full guideline (private):
+[`xcelerator-research/research/methods/HP_F64_GUIDELINES.md`](https://github.com/TeamXcelerator/xcelerator-research).
+
 ## Version History
 
 | Version | Changes |
 |---|---|
+| `v0.4.0` | **HP-everywhere unless explicitly requested + comprehensive rayon parallelization.** |
+| | • **Naming:** every public f64 function has `_f64` in its name; every HP function is unsuffixed (default) or `_hp`-suffixed where a parallel f64 version exists. No silent f64 leaks in HP code paths. |
+| | • **`xc-numerics::eigen`** — new HP symmetric eigendecomposition (Householder + tridiagonal QR with Wilkinson shifts + shifted inverse iteration). Verified across 3 layers: closed-form structured matrices (Strang, Hilbert, Wilkinson W21), PARI/GP cross-check at 2000 digits (committed JSON fixture, 9 reference matrices), property-based tests with deterministic random matrices (trace, determinant, eigenequation, normalization, orthogonality, decomposition reconstruction). |
+| | • **`xc-numerics::fmt`** — new module with HP-only formatting (`display_hp`) and comparison helpers (`sign_of`, `matching_digits`, `relative_difference`) that operate without an f64 round-trip. |
+| | • **`xc-spectral::prolate::hp`** and **`yakaboylu::hp`** submodules promote both pipelines to pure HP using the new HP eigensolver. |
+| | • **`xc-spectral::mellin`** gains full HP parity: `omega_hp`, `truncated_lambda_hp`, `xi_weighted_mellin_hp`, `scan_critical_line_zeros_hp` with parallel scan grid. |
+| | • **Rayon parallelization** across the HP hot path (Householder, linalg primitives, ccm::hp symmetrize/Newton/evenness, yakaboylu W-matrix, prolate u-grid, mellin scan). Unconditional — no small-n guards. |
+| | • **`prime_powers_up_to`** now returns `(k, p, j)` triples (was `(k, log_p_f64)`); HP code paths read `p` directly and compute `log p` in HP. |
+| | • **`CcmParams`** gains a precomputed `lambda_sq_int: u64` field; HP code paths consume that integer instead of recomputing from f64. |
+| | • **`LFunctionSpec::chi_at`** and **`chi_at_prime_power`** — new exact `i8`-returning variants alongside the `_f64` ones; usable in HP code without an f64 cast. |
+| | • **Inverse-iteration seed vector** built entirely in HP. Internal `fl(prec, v: f64)` helpers replaced with integer literals and `Float::parse` for non-integer constants. |
+| | • **`LoadedXi.weil_min_eigenvalue_hp`** field added (paired with the existing f64 view). |
+| | • Test counts: 47 (f64-only) / 111 (full HP). |
 | `v0.3.0` | Add `ccm::hp::measure_evenness()` for eigenvector symmetry measurement. 60 tests on Vast. |
 | `v0.2.0` | **Breaking:** `ccm::hp::run()` now takes `&[Float]` seeds instead of `&[f64]`. Eliminates f64 truncation in Newton seeding that caused divergence at high eigenvalue index (k > ~100). |
 | `v0.1.0` | Initial release. CCM construction, prolate, Mellin, Yakaboylu, L-functions, HP numerics. 58 tests pass. |

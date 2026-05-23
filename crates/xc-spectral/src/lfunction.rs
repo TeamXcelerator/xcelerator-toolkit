@@ -144,23 +144,40 @@ impl LFunctionSpec {
         ]
     }
 
+    /// Evaluate χ(n) returning the exact integer value `{-1, 0, +1}`.
+    /// This is the precision-agnostic primitive — call it from HP code
+    /// paths and convert the integer result to whatever working type
+    /// you need (`Float::with_val(prec, spec.chi_at(n))`).
+    #[inline]
+    pub fn chi_at(&self, n: u64) -> i8 {
+        let idx = (n % self.modulus) as usize;
+        self.chi[idx]
+    }
+
     /// Evaluate χ(n). For Stage 1, returns -1/0/1 as f64.
     #[inline]
-    pub fn chi_at(&self, n: u64) -> f64 {
-        let idx = (n % self.modulus) as usize;
-        self.chi[idx] as f64
+    pub fn chi_at_f64(&self, n: u64) -> f64 {
+        self.chi_at(n) as f64
+    }
+
+    /// Compute χ(p^j) = χ(p)^j as an exact integer in `{-1, 0, +1}`.
+    #[inline]
+    pub fn chi_at_prime_power(&self, p: u64, j: u32) -> i8 {
+        let chi_p = self.chi_at(p);
+        if chi_p == 0 {
+            0
+        } else if j % 2 == 0 {
+            // χ(p) ∈ {-1, +1} squared is +1.
+            1
+        } else {
+            chi_p
+        }
     }
 
     /// Compute χ(p^j) = χ(p)^j. Returns 0 if χ(p) = 0.
     #[inline]
-    pub fn chi_at_prime_power(&self, p: u64, j: u32) -> f64 {
-        let chi_p = self.chi_at(p);
-        if chi_p == 0.0 {
-            0.0
-        } else {
-            // For real characters χ(p) ∈ {-1, +1}, so χ(p)^j is also ±1.
-            chi_p.powi(j as i32)
-        }
+    pub fn chi_at_prime_power_f64(&self, p: u64, j: u32) -> f64 {
+        self.chi_at_prime_power(p, j) as f64
     }
 
     /// True iff χ takes only real values (Stage 1 supports only these).
@@ -180,53 +197,15 @@ impl LFunctionSpec {
 }
 
 /// Enumerate prime powers `n = p^j` with `1 < n ≤ bound`, returning
-/// `(n, log p, χ(p)^j)` for use in the L-function-twisted Weil form.
+/// `(n, p, j)` triples — the same shape as `ccm::prime_powers_up_to`,
+/// but produced from the same sieve.
 ///
-/// This is the L-function generalization of `prime_powers_up_to`.
-pub fn prime_powers_up_to_chi(bound: u64, spec: &LFunctionSpec) -> Vec<(u64, f64, f64)> {
-    if bound < 2 {
-        return Vec::new();
-    }
-    let n = bound as usize;
-    let mut sieve = vec![true; n + 1];
-    sieve[0] = false;
-    if n >= 1 {
-        sieve[1] = false;
-    }
-    let mut p = 2usize;
-    while p * p <= n {
-        if sieve[p] {
-            let mut q = p * p;
-            while q <= n {
-                sieve[q] = false;
-                q += p;
-            }
-        }
-        p += 1;
-    }
-    let mut out = Vec::new();
-    for p in 2..=n {
-        if !sieve[p] {
-            continue;
-        }
-        let log_p = (p as f64).ln();
-        let mut k: u64 = p as u64;
-        let mut j: u32 = 1;
-        while k <= bound {
-            let chi_pj = spec.chi_at_prime_power(p as u64, j);
-            // Only include prime powers that contribute non-zero — but
-            // we keep them in for now to preserve indexing matching with
-            // the zeta case. Callers can skip χ=0 entries.
-            out.push((k, log_p, chi_pj));
-            if k > bound / (p as u64) {
-                break;
-            }
-            k *= p as u64;
-            j += 1;
-        }
-    }
-    out.sort_unstable_by_key(|&(n, _, _)| n);
-    out
+/// This is the L-function generalization of `prime_powers_up_to`. To get
+/// the χ(p)^j weighting at any precision, call `spec.chi_at_prime_power_f64(p, j)`
+/// after the fact (it returns f64 values in {-1, 0, 1} which are exact
+/// at any precision).
+pub fn prime_powers_up_to_chi(bound: u64, _spec: &LFunctionSpec) -> Vec<(u64, u64, u32)> {
+    crate::ccm::prime_powers_up_to(bound)
 }
 
 #[cfg(test)]
@@ -237,21 +216,21 @@ mod tests {
     fn zeta_is_trivial() {
         let z = LFunctionSpec::riemann_zeta();
         assert!(z.is_trivial());
-        assert_eq!(z.chi_at(0), 1.0);
-        assert_eq!(z.chi_at(2), 1.0);
-        assert_eq!(z.chi_at(100), 1.0);
-        assert_eq!(z.chi_at_prime_power(2, 5), 1.0);
+        assert_eq!(z.chi_at_f64(0), 1.0);
+        assert_eq!(z.chi_at_f64(2), 1.0);
+        assert_eq!(z.chi_at_f64(100), 1.0);
+        assert_eq!(z.chi_at_prime_power_f64(2, 5), 1.0);
     }
 
     #[test]
     fn chi_3_values() {
         let c = LFunctionSpec::chi_3();
-        assert_eq!(c.chi_at(0), 0.0); // gcd(0, 3) > 1
-        assert_eq!(c.chi_at(1), 1.0);
-        assert_eq!(c.chi_at(2), -1.0);
-        assert_eq!(c.chi_at(3), 0.0);
-        assert_eq!(c.chi_at(4), 1.0); // 4 mod 3 = 1
-        assert_eq!(c.chi_at(5), -1.0); // 5 mod 3 = 2
+        assert_eq!(c.chi_at_f64(0), 0.0); // gcd(0, 3) > 1
+        assert_eq!(c.chi_at_f64(1), 1.0);
+        assert_eq!(c.chi_at_f64(2), -1.0);
+        assert_eq!(c.chi_at_f64(3), 0.0);
+        assert_eq!(c.chi_at_f64(4), 1.0); // 4 mod 3 = 1
+        assert_eq!(c.chi_at_f64(5), -1.0); // 5 mod 3 = 2
         assert!(!c.is_trivial());
         assert!(c.is_real());
     }
@@ -260,15 +239,15 @@ mod tests {
     fn chi_3_prime_powers() {
         let c = LFunctionSpec::chi_3();
         // p=2 gives χ(2)=-1, so χ(2^j) = (-1)^j
-        assert_eq!(c.chi_at_prime_power(2, 1), -1.0);
-        assert_eq!(c.chi_at_prime_power(2, 2), 1.0);
-        assert_eq!(c.chi_at_prime_power(2, 3), -1.0);
+        assert_eq!(c.chi_at_prime_power_f64(2, 1), -1.0);
+        assert_eq!(c.chi_at_prime_power_f64(2, 2), 1.0);
+        assert_eq!(c.chi_at_prime_power_f64(2, 3), -1.0);
         // p=3 gives χ(3)=0, so all powers are 0
-        assert_eq!(c.chi_at_prime_power(3, 1), 0.0);
-        assert_eq!(c.chi_at_prime_power(3, 2), 0.0);
+        assert_eq!(c.chi_at_prime_power_f64(3, 1), 0.0);
+        assert_eq!(c.chi_at_prime_power_f64(3, 2), 0.0);
         // p=5 gives χ(5)=χ(2)=-1
-        assert_eq!(c.chi_at_prime_power(5, 1), -1.0);
-        assert_eq!(c.chi_at_prime_power(5, 2), 1.0);
+        assert_eq!(c.chi_at_prime_power_f64(5, 1), -1.0);
+        assert_eq!(c.chi_at_prime_power_f64(5, 2), 1.0);
     }
 
     #[test]
@@ -277,28 +256,33 @@ mod tests {
         let pp = prime_powers_up_to_chi(13, &zeta);
         let ks: Vec<u64> = pp.iter().map(|&(k, _, _)| k).collect();
         assert_eq!(ks, vec![2, 3, 4, 5, 7, 8, 9, 11, 13]);
-        // For zeta, all chi values should be 1.
-        assert!(pp.iter().all(|&(_, _, c)| c == 1.0));
+        // For zeta, χ(p)^j is always 1; verify via spec.
+        for &(_, p, j) in &pp {
+            assert_eq!(zeta.chi_at_prime_power_f64(p, j), 1.0);
+        }
     }
 
     #[test]
     fn enumerate_prime_powers_chi_3() {
         let c = LFunctionSpec::chi_3();
         let pp = prime_powers_up_to_chi(13, &c);
-        // Same prime powers as before; chi values differ.
-        let pairs: Vec<(u64, f64)> = pp.iter().map(|&(k, _, x)| (k, x)).collect();
+        // Each (p, j) yields a chi value via spec.chi_at_prime_power_f64.
         // χ(2) = -1 ⇒ χ(2)=-1, χ(4)=1, χ(8)=-1
         // χ(3) = 0 ⇒ χ(3)=0, χ(9)=0
         // χ(5) = -1, χ(7) = 1, χ(11) = -1, χ(13) = 1
-        assert_eq!(pairs[0], (2, -1.0));
-        assert_eq!(pairs[1], (3, 0.0));
-        assert_eq!(pairs[2], (4, 1.0));
-        assert_eq!(pairs[3], (5, -1.0));
-        assert_eq!(pairs[4], (7, 1.0));
-        assert_eq!(pairs[5], (8, -1.0));
-        assert_eq!(pairs[6], (9, 0.0));
-        assert_eq!(pairs[7], (11, -1.0));
-        assert_eq!(pairs[8], (13, 1.0));
+        let mut seen: Vec<(u64, f64)> = pp.iter()
+            .map(|&(k, p, j)| (k, c.chi_at_prime_power_f64(p, j)))
+            .collect();
+        seen.sort_by_key(|&(k, _)| k);
+        assert_eq!(seen[0], (2, -1.0));
+        assert_eq!(seen[1], (3, 0.0));
+        assert_eq!(seen[2], (4, 1.0));
+        assert_eq!(seen[3], (5, -1.0));
+        assert_eq!(seen[4], (7, 1.0));
+        assert_eq!(seen[5], (8, -1.0));
+        assert_eq!(seen[6], (9, 0.0));
+        assert_eq!(seen[7], (11, -1.0));
+        assert_eq!(seen[8], (13, 1.0));
     }
 
     #[test]
@@ -312,10 +296,10 @@ mod tests {
     #[test]
     fn chi_4_values() {
         let c = LFunctionSpec::chi_4();
-        assert_eq!(c.chi_at(0), 0.0);
-        assert_eq!(c.chi_at(1), 1.0);
-        assert_eq!(c.chi_at(2), 0.0);
-        assert_eq!(c.chi_at(3), -1.0);
+        assert_eq!(c.chi_at_f64(0), 0.0);
+        assert_eq!(c.chi_at_f64(1), 1.0);
+        assert_eq!(c.chi_at_f64(2), 0.0);
+        assert_eq!(c.chi_at_f64(3), -1.0);
         assert!(!c.is_even()); // odd parity
         assert!(c.is_real());
     }
@@ -323,24 +307,24 @@ mod tests {
     #[test]
     fn chi_5_real_values() {
         let c = LFunctionSpec::chi_5_real();
-        assert_eq!(c.chi_at(0), 0.0);
-        assert_eq!(c.chi_at(1), 1.0);
-        assert_eq!(c.chi_at(2), -1.0);
-        assert_eq!(c.chi_at(3), -1.0);
-        assert_eq!(c.chi_at(4), 1.0);
+        assert_eq!(c.chi_at_f64(0), 0.0);
+        assert_eq!(c.chi_at_f64(1), 1.0);
+        assert_eq!(c.chi_at_f64(2), -1.0);
+        assert_eq!(c.chi_at_f64(3), -1.0);
+        assert_eq!(c.chi_at_f64(4), 1.0);
         assert!(c.is_even()); // even parity
     }
 
     #[test]
     fn chi_7_values() {
         let c = LFunctionSpec::chi_7();
-        assert_eq!(c.chi_at(0), 0.0);
-        assert_eq!(c.chi_at(1), 1.0);
-        assert_eq!(c.chi_at(2), 1.0);
-        assert_eq!(c.chi_at(3), -1.0);
-        assert_eq!(c.chi_at(4), 1.0);
-        assert_eq!(c.chi_at(5), -1.0);
-        assert_eq!(c.chi_at(6), -1.0);
+        assert_eq!(c.chi_at_f64(0), 0.0);
+        assert_eq!(c.chi_at_f64(1), 1.0);
+        assert_eq!(c.chi_at_f64(2), 1.0);
+        assert_eq!(c.chi_at_f64(3), -1.0);
+        assert_eq!(c.chi_at_f64(4), 1.0);
+        assert_eq!(c.chi_at_f64(5), -1.0);
+        assert_eq!(c.chi_at_f64(6), -1.0);
         assert!(!c.is_even()); // odd
     }
 

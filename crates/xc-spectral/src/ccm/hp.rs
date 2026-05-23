@@ -42,8 +42,11 @@ pub const MAX_QUAD_POINTS: usize = 4000;
 /// Multiplier: quad_points = digits * QUAD_POINTS_PER_DIGIT (clamped to [MIN, MAX]).
 pub const QUAD_POINTS_PER_DIGIT: usize = 3;
 
-/// HP singularity guard for rho_hp(x) near x = 0.
-pub const HP_SINGULARITY_GUARD: f64 = 1e-30;
+/// HP singularity guard for `rho_hp(x)` near `x = 0`. Below this magnitude
+/// we use the Taylor-series branch instead of `1 / (2 sinh(x/2))` directly.
+/// Stored as a string literal so it is parsed as an HP `Float` at the
+/// caller's working precision (no f64 round-trip).
+pub const HP_SINGULARITY_GUARD_STR: &str = "1e-30";
 
 impl HighPrecConfig {
     pub fn for_decimal_digits(digits: u32) -> Self {
@@ -99,12 +102,22 @@ impl HighPrecResult {
 }
 
 /// A ξ_λ vector loaded from disk.
+///
+/// Both HP and f64 views are provided. HP code paths should use
+/// `xi_hp` and `weil_min_eigenvalue_hp`; the f64 fields exist for
+/// f64-tier consumers and are explicitly lossy boundaries.
 pub struct LoadedXi {
     pub lambda_squared: f64,
     pub n_modes: usize,
     pub precision_bits: u32,
+    /// HP-precision smallest Weil eigenvalue. Use this in HP paths.
+    pub weil_min_eigenvalue_hp: Float,
+    /// Lossy f64 view of `weil_min_eigenvalue_hp`. May underflow f64
+    /// at large λ; HP callers should ignore this field.
     pub weil_min_eigenvalue: f64,
+    /// Lossy f64 view of `xi_hp`. Renormalized by ‖ξ‖_∞ for f64 safety.
     pub xi_f64: Vec<f64>,
+    /// HP-precision eigenvector. Use this in HP paths.
     pub xi_hp: Vec<Float>,
 }
 
@@ -145,12 +158,18 @@ pub fn load_xi_json(path: &std::path::Path) -> Result<LoadedXi> {
     } else {
         xi_hp.iter().map(|f| { let mut t = f.clone(); t /= &xi_linf_hp; t.to_f64() }).collect()
     };
-    Ok(LoadedXi { lambda_squared, n_modes, precision_bits,
-        weil_min_eigenvalue: weil_min_hp.to_f64(), xi_f64, xi_hp })
+    Ok(LoadedXi {
+        lambda_squared,
+        n_modes,
+        precision_bits,
+        weil_min_eigenvalue: weil_min_hp.to_f64(),
+        weil_min_eigenvalue_hp: weil_min_hp,
+        xi_f64,
+        xi_hp,
+    })
 }
 
 // -- Helpers
-#[inline] fn fl(prec: u32, v: f64) -> Float { Float::with_val(prec, v) }
 #[inline] fn fl_i(prec: u32, v: i64) -> Float { Float::with_val(prec, v) }
 #[inline] fn pi(prec: u32) -> Float { Float::with_val(prec, rug::float::Constant::Pi) }
 #[inline] fn euler(prec: u32) -> Float { Float::with_val(prec, rug::float::Constant::Euler) }
@@ -169,15 +188,22 @@ pub fn run(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> Re
     let l = Float::with_val(prec, params.lambda_squared).ln();
     let mut tau = build_tau_hp(params, &l, cfg)?;
 
-    // Force exact symmetry.
-    for i in 0..dim {
-        for j in (i + 1)..dim {
-            let mut sum = tau[i * dim + j].clone();
-            sum += &tau[j * dim + i];
-            sum /= 2u32;
-            tau[i * dim + j] = sum.clone();
-            tau[j * dim + i] = sum;
-        }
+    // Force exact symmetry. Compute averaged upper-triangle values in
+    // parallel, then write back sequentially (each pair writes two
+    // distinct mirror cells, so the write-phase is sequential to avoid
+    // aliasing).
+    let pairs: Vec<(usize, usize)> = (0..dim)
+        .flat_map(|i| ((i + 1)..dim).map(move |j| (i, j)))
+        .collect();
+    let symmetrized: Vec<(usize, usize, Float)> = pairs.par_iter().map(|&(i, j)| {
+        let mut sum = tau[i * dim + j].clone();
+        sum += &tau[j * dim + i];
+        sum /= 2u32;
+        (i, j, sum)
+    }).collect();
+    for (i, j, sum) in symmetrized {
+        tau[i * dim + j] = sum.clone();
+        tau[j * dim + i] = sum;
     }
 
     // Find smallest eigenpair by inverse iteration (forced even).
@@ -190,15 +216,18 @@ pub fn run(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> Re
     let xi = normalize_eigenvector(&xi_raw, &l, prec);
 
     // Find eigenvalues as zeros of R(z), seeded from HP reference zeros.
+    // Each Newton refinement is independent across seeds — parallelize.
     let n_eigs = cfg.n_eigenvalues.min(zero_seeds.len());
-    let mut eigenvalues_pos = Vec::with_capacity(n_eigs);
-    for seed in zero_seeds.iter().take(n_eigs) {
-        let seed_hp = Float::with_val(prec, seed);
-        match newton_xi_hat_zero(&xi, params.n_modes, &l, &seed_hp, prec, cfg.newton_steps) {
-            Some(z) => eigenvalues_pos.push(z),
-            None => eigenvalues_pos.push(seed_hp),
-        }
-    }
+    let eigenvalues_pos: Vec<Float> = zero_seeds[..n_eigs]
+        .par_iter()
+        .map(|seed| {
+            let seed_hp = Float::with_val(prec, seed);
+            match newton_xi_hat_zero(&xi, params.n_modes, &l, &seed_hp, prec, cfg.newton_steps) {
+                Some(z) => z,
+                None => seed_hp,
+            }
+        })
+        .collect();
 
     Ok(HighPrecResult {
         eigenvalues_pos,
@@ -228,15 +257,19 @@ pub fn measure_evenness(params: &CcmParams, cfg: &HighPrecConfig) -> Result<Even
     let l = Float::with_val(prec, params.lambda_squared).ln();
     let mut tau = build_tau_hp(params, &l, cfg)?;
 
-    // Force exact symmetry of the matrix.
-    for i in 0..dim {
-        for j in (i + 1)..dim {
-            let mut sum = tau[i * dim + j].clone();
-            sum += &tau[j * dim + i];
-            sum /= 2u32;
-            tau[i * dim + j] = sum.clone();
-            tau[j * dim + i] = sum;
-        }
+    // Force exact symmetry of the matrix (parallel compute, sequential write).
+    let pairs: Vec<(usize, usize)> = (0..dim)
+        .flat_map(|i| ((i + 1)..dim).map(move |j| (i, j)))
+        .collect();
+    let symmetrized: Vec<(usize, usize, Float)> = pairs.par_iter().map(|&(i, j)| {
+        let mut sum = tau[i * dim + j].clone();
+        sum += &tau[j * dim + i];
+        sum /= 2u32;
+        (i, j, sum)
+    }).collect();
+    for (i, j, sum) in symmetrized {
+        tau[i * dim + j] = sum.clone();
+        tau[j * dim + i] = sum;
     }
 
     // Natural (unforced) smallest eigenpair.
@@ -249,15 +282,23 @@ pub fn measure_evenness(params: &CcmParams, cfg: &HighPrecConfig) -> Result<Even
 
     // Evenness deviation: ‖ξ - γξ‖ / ‖ξ‖ where γ is index reflection.
     // γξ_i = ξ_{dim-1-i}. Deviation = ‖ξ - γξ‖₂ / ‖ξ‖₂.
-    let mut diff_sq = fl(prec, 0.0);
-    let mut norm_sq = fl(prec, 0.0);
-    for i in 0..dim {
-        let reflected = dim - 1 - i;
-        let mut d = xi_natural[i].clone();
-        d -= &xi_natural[reflected];
-        diff_sq += d.square();
-        norm_sq += xi_natural[i].clone().square();
-    }
+    // Both reductions are parallelized over i.
+    let zero = || Float::with_val(prec, 0);
+    let (diff_sq, norm_sq) = (0..dim).into_par_iter()
+        .map(|i| {
+            let reflected = dim - 1 - i;
+            let mut d = xi_natural[i].clone();
+            d -= &xi_natural[reflected];
+            let d_sq = d.square();
+            let n_sq = xi_natural[i].clone().square();
+            (d_sq, n_sq)
+        })
+        .reduce(|| (zero(), zero()),
+                |(mut a_d, mut a_n), (b_d, b_n)| {
+                    a_d += &b_d;
+                    a_n += &b_n;
+                    (a_d, a_n)
+                });
     let mut deviation = diff_sq.sqrt();
     let norm = norm_sq.sqrt();
     if !norm.is_zero() {
@@ -289,7 +330,7 @@ fn build_tau_hp(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<V
     let prec = cfg.precision_bits;
     let n_max = params.n_modes;
     let dim = params.matrix_size();
-    let lambda_sq_int = (params.lambda_squared + super::LAMBDA_SQ_ROUNDING_EPS).floor() as u64;
+    let lambda_sq_int = params.lambda_sq_int;
 
     let pi_v = pi(prec);
     let mut two_pi = pi_v.clone(); two_pi *= 2u32;
@@ -332,10 +373,11 @@ fn build_tau_hp(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<V
     eprintln!("[HP] α, β, γ done. Assembling {}×{} matrix...", dim, dim);
 
     let prime_powers = prime_powers_up_to(lambda_sq_int);
-    let pp_data: Vec<(Float, Float, Float)> = prime_powers.iter().map(|&(k, _log_p_f64)| {
+    // Pure HP path: compute log_p in HP from the exposed prime, do not
+    // recover j from log ratios. j is provided directly by the sieve.
+    let pp_data: Vec<(Float, Float, Float)> = prime_powers.iter().map(|&(k, _p, _j)| {
         let log_k = Float::with_val(prec, k).ln();
-        let j_approx = (log_k.to_f64() / _log_p_f64).round() as u32;
-        let mut log_p = log_k.clone(); log_p /= j_approx;
+        let log_p = Float::with_val(prec, _p).ln();
         let sqrt_k = Float::with_val(prec, k).sqrt();
         (log_k, log_p, sqrt_k)
     }).collect();
@@ -369,13 +411,13 @@ fn build_tau_hp(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<V
 
         let two_pi_n_over_l = { let mut v = two_pi.clone(); v *= &nf; v /= l; v };
         let two_pi_m_over_l = { let mut v = two_pi.clone(); v *= &mf; v /= l; v };
-        let mut wp = fl(prec, 0.0);
+        let mut wp = Float::with_val(prec, 0);
         for (log_k, log_p, sqrt_k) in &pp_data {
             let q = if n == m {
                 let mut ph = two_pi_n_over_l.clone(); ph *= log_k;
                 let c = ph.cos();
                 let mut t = log_k.clone(); t /= l;
-                let mut f = fl(prec, 1.0); f -= &t; f *= 2u32; f *= &c; f
+                let mut f = Float::with_val(prec, 1); f -= &t; f *= 2u32; f *= &c; f
             } else {
                 let mut sm = two_pi_m_over_l.clone(); sm *= log_k; let sm_s = sm.sin();
                 let mut sn = two_pi_n_over_l.clone(); sn *= log_k; let sn_s = sn.sin();
@@ -389,7 +431,7 @@ fn build_tau_hp(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<V
         let mut t = w02; t -= &wr; t -= &wp; t
     }).collect();
 
-    let mut tau = vec![fl(prec, 0.0); dim * dim];
+    let mut tau = vec![Float::with_val(prec, 0); dim * dim];
     for (i, &(n, m)) in cells.iter().enumerate() {
         tau[params.idx(n) * dim + params.idx(m)] = computed[i].clone();
     }
@@ -398,12 +440,12 @@ fn build_tau_hp(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<V
 
 fn signed_alpha(table: &[Float], n: i64, prec: u32) -> Float {
     let k = n.unsigned_abs() as usize;
-    if k >= table.len() { return fl(prec, 0.0); }
+    if k >= table.len() { return Float::with_val(prec, 0); }
     if n < 0 { let mut v = table[k].clone(); v = -v; v } else { table[k].clone() }
 }
 
 fn compute_alpha_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Float]) -> Float {
-    if n == 0 { return fl(prec, 0.0); }
+    if n == 0 { return Float::with_val(prec, 0); }
     let pi_v = pi(prec);
     let mut freq = pi_v.clone(); freq *= 2u32; freq *= fl_i(prec, n); freq /= l;
     let f = |x: &Float| -> Float {
@@ -451,9 +493,9 @@ fn compute_gamma_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Flo
 }
 
 fn rho_hp(x: &Float, prec: u32) -> Float {
-    let tiny = fl(prec, HP_SINGULARITY_GUARD);
+    let tiny = Float::with_val(prec, Float::parse(HP_SINGULARITY_GUARD_STR).unwrap());
     if x.cmp_abs(&tiny).map(|o| o.is_lt()).unwrap_or(false) {
-        let mut v = x.clone().recip(); v /= 2u32; v += fl(prec, 0.25); v
+        let mut v = x.clone().recip(); v /= 2u32; v += { let mut q = Float::with_val(prec, 1); q /= 4u32; q }; v
     } else {
         let mut hx = x.clone(); hx /= 2u32;
         let e = hx.exp();
@@ -466,7 +508,7 @@ fn quad_eval<F>(nodes: &[Float], weights: &[Float], l: &Float, f: F) -> Float
 where F: Fn(&Float) -> Float {
     let prec = l.prec();
     let mut half_l = l.clone(); half_l /= 2u32;
-    let mut acc = fl(prec, 0.0);
+    let mut acc = Float::with_val(prec, 0);
     for (n, w) in nodes.iter().zip(weights) {
         let mut x = n.clone(); x += 1u32; x *= &half_l;
         let mut term = w.clone(); term *= &f(&x);
@@ -476,7 +518,7 @@ where F: Fn(&Float) -> Float {
 }
 
 fn normalize_eigenvector(xi: &[Float], l: &Float, prec: u32) -> Vec<Float> {
-    let mut sum = fl(prec, 0.0);
+    let mut sum = Float::with_val(prec, 0);
     for v in xi { sum += v; }
     let mut target = l.clone().sqrt();
     target /= &sum;
@@ -492,10 +534,10 @@ fn newton_xi_hat_zero(
 ) -> Option<Float> {
     let two_pi_over_l = { let mut v = pi(prec); v *= 2u32; v /= l; v };
     let mut z = seed.clone();
-    let tol = fl(prec, 2.0).pow(-((prec as i32) - 16));
+    let tol = Float::with_val(prec, 2).pow(-((prec as i32) - 16));
     for _ in 0..n_steps {
-        let mut r = fl(prec, 0.0);
-        let mut r_prime = fl(prec, 0.0);
+        let mut r = Float::with_val(prec, 0);
+        let mut r_prime = Float::with_val(prec, 0);
         for j in -(n_max as i64)..=(n_max as i64) {
             let idx = (j + n_max as i64) as usize;
             let mut pole = two_pi_over_l.clone(); pole *= fl_i(prec, j);
@@ -586,16 +628,26 @@ mod tests {
         assert_eq!(result.eigenvalues_pos.len(), 5);
 
         // First eigenvalue should match 14.13... to at least 10 digits.
-        let first = result.eigenvalues_pos[0].to_f64();
-        assert!((first - 14.134725).abs() < 1e-5,
-            "first eigenvalue {} should be near 14.13", first);
+        // Compare in HP — no f64 round-trip.
+        let prec = result.precision_bits;
+        let target = Float::with_val(prec,
+            Float::parse("14.134725141734693790457251983").unwrap());
+        let mut diff = result.eigenvalues_pos[0].clone();
+        diff -= &target;
+        let abs_diff = diff.abs();
+        let tol = Float::with_val(prec, Float::parse("1e-5").unwrap());
+        assert!(abs_diff < tol,
+            "first eigenvalue {} should be near 14.13",
+            xc_numerics::fmt::display_hp(&result.eigenvalues_pos[0], 10));
 
-        // ε_N should be small (tiny Weil eigenvalue at λ²=13).
-        let eps = result.weil_min_eigenvalue.to_f64();
-        assert!(eps.abs() < 1e-20,
-            "ε_N = {} should be tiny at λ²=13, N=10", eps);
+        // ε_N should be small (tiny Weil eigenvalue at λ²=13). Compare HP.
+        let eps_tol = Float::with_val(prec, Float::parse("1e-20").unwrap());
+        let abs_eps = result.weil_min_eigenvalue.clone().abs();
+        assert!(abs_eps < eps_tol,
+            "ε_N = {} should be tiny at λ²=13, N=10",
+            xc_numerics::fmt::display_hp(&result.weil_min_eigenvalue, 6));
 
-        // Elapsed time should be positive.
+        // Elapsed time should be positive (f64 metadata is fine here).
         assert!(result.elapsed_seconds > 0.0);
     }
 
@@ -605,15 +657,36 @@ mod tests {
         let params = CcmParams::from_lambda(3.605551275463989, 10);
         let cfg = HighPrecConfig::for_decimal_digits(64);
         let result = measure_evenness(&params, &cfg).unwrap();
-        let dev = result.evenness_deviation.to_f64();
+
+        let prec = result.evenness_deviation.prec();
+
         // At λ²=13, the natural eigenvector should be essentially even.
-        assert!(dev < 1e-10,
-            "evenness deviation at λ²=13 should be tiny, got {:.4e}", dev);
+        // Compare in HP (deviation could be 1e-30 or smaller — tighter than f64).
+        let dev_tol = Float::with_val(prec, Float::parse("1e-10").unwrap());
+        assert!(result.evenness_deviation < dev_tol,
+            "evenness deviation at λ²=13 should be tiny, got {}",
+            xc_numerics::fmt::display_hp(&result.evenness_deviation, 6));
+
         // Both eigenvalues should be the same (since natural IS even).
-        let nat = result.natural_eigenvalue.to_f64();
-        let forced = result.forced_eigenvalue.to_f64();
-        let rel_diff = ((nat - forced) / forced.abs()).abs();
-        assert!(rel_diff < 1e-10,
-            "natural and forced eigenvalues should match, rel diff = {:.4e}", rel_diff);
+        // Use HP relative_difference helper — no f64 fallback even at tiny ε.
+        if let Some(rel_diff) = xc_numerics::fmt::relative_difference(
+            &result.natural_eigenvalue, &result.forced_eigenvalue
+        ) {
+            let rel_tol = Float::with_val(prec, Float::parse("1e-10").unwrap());
+            assert!(rel_diff < rel_tol,
+                "natural and forced eigenvalues should match, rel diff = {}",
+                xc_numerics::fmt::display_hp(&rel_diff, 6));
+        } else {
+            // forced is exactly zero — the only acceptable case is when
+            // natural is also zero.
+            assert!(result.natural_eigenvalue.is_zero(),
+                "forced is zero but natural is not — eigenvalues differ");
+        }
+
+        // Sanity check signs match (both should be positive at λ²=13).
+        use xc_numerics::fmt::sign_of;
+        assert_eq!(sign_of(&result.natural_eigenvalue),
+                   sign_of(&result.forced_eigenvalue),
+                   "natural and forced eigenvalue signs must agree at λ²=13");
     }
 }

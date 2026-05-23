@@ -8,14 +8,14 @@
 //! reused across runs at the same `(n_pts, precision_bits)`.
 
 /// 64-point Gauss-Legendre quadrature on [a, b] at f64 precision.
-/// For a configurable number of points, use `gauss_legendre_n`.
-pub fn gauss_legendre_64<F: Fn(f64) -> f64>(f: F, a: f64, b: f64) -> f64 {
-    gauss_legendre_n(f, a, b, 64)
+/// For a configurable number of points, use `gauss_legendre_npt_f64`.
+pub fn gauss_legendre_64pt_f64<F: Fn(f64) -> f64>(f: F, a: f64, b: f64) -> f64 {
+    gauss_legendre_npt_f64(f, a, b, 64)
 }
 
 /// N-point Gauss-Legendre quadrature on [a, b] at f64 precision.
-pub fn gauss_legendre_n<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, n: usize) -> f64 {
-    let (nodes, weights) = gl_nodes_weights(n);
+pub fn gauss_legendre_npt_f64<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, n: usize) -> f64 {
+    let (nodes, weights) = gl_nodes_weights_f64(n);
     let mid = 0.5 * (a + b);
     let half = 0.5 * (b - a);
     let mut sum = 0.0_f64;
@@ -26,7 +26,7 @@ pub fn gauss_legendre_n<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, n: usize) -> f6
     sum * half
 }
 
-fn gl_nodes_weights(n: usize) -> (Vec<f64>, Vec<f64>) {
+fn gl_nodes_weights_f64(n: usize) -> (Vec<f64>, Vec<f64>) {
     let mut nodes = vec![0.0_f64; n];
     let mut weights = vec![0.0_f64; n];
     for k in 0..n {
@@ -63,7 +63,6 @@ fn legendre_p_deriv_f64(n: usize, x: f64) -> (f64, f64) {
 mod hp {
     use rug::{ops::Pow, Float};
 
-    #[inline] fn fl(prec: u32, v: f64) -> Float { Float::with_val(prec, v) }
     #[inline] fn fl_i(prec: u32, v: i64) -> Float { Float::with_val(prec, v) }
     #[inline] fn pi(prec: u32) -> Float { Float::with_val(prec, rug::float::Constant::Pi) }
 
@@ -111,7 +110,7 @@ mod hp {
 
     fn gauss_legendre_compute(n: usize, prec: u32) -> (Vec<Float>, Vec<Float>) {
         let pi_v = pi(prec);
-        let one = fl(prec, 1.0);
+        let one = Float::with_val(prec, 1);
         let mut nodes = Vec::with_capacity(n);
         let mut weights = Vec::with_capacity(n);
         let four_n_plus_two = fl_i(prec, (4 * n + 2) as i64);
@@ -120,7 +119,7 @@ mod hp {
             phi *= fl_i(prec, (4 * k - 1) as i64);
             phi /= &four_n_plus_two;
             let mut x = phi.cos();
-            let eps_threshold = fl(prec, 2.0).pow(-((prec as i32) - 8));
+            let eps_threshold = Float::with_val(prec, 2).pow(-((prec as i32) - 8));
             for _ in 0..50 {
                 let (pn, pn_prime) = legendre_p_and_deriv(n, &x, prec);
                 let mut dx = pn; dx /= &pn_prime;
@@ -130,7 +129,7 @@ mod hp {
             let (_pn, pn_prime) = legendre_p_and_deriv(n, &x, prec);
             let one_minus_x2 = { let mut v = one.clone(); v -= x.clone().square(); v };
             let mut den = one_minus_x2; den *= &pn_prime.square();
-            let mut w = fl(prec, 2.0); w /= &den;
+            let mut w = Float::with_val(prec, 2); w /= &den;
             nodes.push(x);
             weights.push(w);
         }
@@ -142,9 +141,9 @@ mod hp {
     }
 
     fn legendre_p_and_deriv(n: usize, x: &Float, prec: u32) -> (Float, Float) {
-        let one = fl(prec, 1.0);
-        if n == 0 { return (one, fl(prec, 0.0)); }
-        let mut p0 = fl(prec, 1.0);
+        let one = Float::with_val(prec, 1);
+        if n == 0 { return (one, Float::with_val(prec, 0)); }
+        let mut p0 = Float::with_val(prec, 1);
         let mut p1 = x.clone();
         if n == 1 { return (p1, one); }
         for k in 1..n {
@@ -173,7 +172,7 @@ mod tests {
     /// GL-64 should integrate x² on [0, 1] exactly (polynomial degree < 2*64).
     #[test]
     fn gl64_integrates_x_squared() {
-        let result = gauss_legendre_64(|x| x * x, 0.0, 1.0);
+        let result = gauss_legendre_64pt_f64(|x| x * x, 0.0, 1.0);
         let expected = 1.0 / 3.0;
         let rel_err = (result - expected).abs() / expected;
         assert!(rel_err < 1e-14, "GL-64 x² integral: got {}, expected {}, rel err {:.2e}", result, expected, rel_err);
@@ -182,7 +181,7 @@ mod tests {
     /// GL-64 should integrate sin(x) on [0, π] to high accuracy.
     #[test]
     fn gl64_integrates_sin() {
-        let result = gauss_legendre_64(|x| x.sin(), 0.0, std::f64::consts::PI);
+        let result = gauss_legendre_64pt_f64(|x| x.sin(), 0.0, std::f64::consts::PI);
         let expected = 2.0;
         let rel_err = (result - expected).abs() / expected;
         assert!(rel_err < 1e-13, "GL-64 sin integral: got {}, expected {}, rel err {:.2e}", result, expected, rel_err);
@@ -191,7 +190,7 @@ mod tests {
     /// GL-64 should integrate exp(-x²) on [-5, 5] ≈ √π.
     #[test]
     fn gl64_integrates_gaussian() {
-        let result = gauss_legendre_64(|x| (-x * x).exp(), -5.0, 5.0);
+        let result = gauss_legendre_64pt_f64(|x| (-x * x).exp(), -5.0, 5.0);
         let expected = std::f64::consts::PI.sqrt();
         let rel_err = (result - expected).abs() / expected;
         assert!(rel_err < 1e-10, "GL-64 Gaussian integral: got {}, expected {}, rel err {:.2e}", result, expected, rel_err);
