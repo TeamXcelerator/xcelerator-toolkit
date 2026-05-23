@@ -1,0 +1,22 @@
+[package]
+name = "xc-numerics"
+description = "High-precision numerical primitives: linear algebra, Newton iteration, Gauss-Legendre quadrature."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# High-precision tier via rug (MPFR/GMP).
+# Build: cargo build --release --features hp
+# Requires: sudo apt install build-essential m4 libgmp-dev libmpfr-dev libmpc-dev
+hp = ["dep:rug", "dep:serde_json"]
+
+[dependencies]
+anyhow = { workspace = true }
+rayon = { workspace = true }
+rug = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }

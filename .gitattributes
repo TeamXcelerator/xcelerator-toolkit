@@ -1,0 +1,4 @@
+# Treat reference data as binary so SHA-256 hashes are stable across
+# platforms (no autocrlf line-ending conversion on Windows checkouts).
+data/*.json -text
+*.pdf binary

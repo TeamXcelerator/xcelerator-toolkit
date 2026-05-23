@@ -1,0 +1,19 @@
+# Build artifacts
+target/
+*.exe
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cached GL nodes (regeneratable)
+~/.cache/ccm_gl/
+
+# Editor swap
+*.swp
+*~

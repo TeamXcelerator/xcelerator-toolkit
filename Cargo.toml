@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xc-numerics",
+    "crates/xc-zeta",
+    "crates/xc-spectral",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Ronnie Andrews, Jr. <5178942+TeamXceleratorDev@users.noreply.github.com>"]
+license-file = "../../LICENSE"
+publish = false
+repository = "https://github.com/TeamXcelerator/xcelerator-toolkit"
+
+[workspace.dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+nalgebra = "0.33"
+rayon = "1.10"
+rug = { version = "1.27", default-features = false, features = ["float"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

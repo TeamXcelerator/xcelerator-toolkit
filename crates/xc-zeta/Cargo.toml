@@ -1,0 +1,19 @@
+[package]
+name = "xc-zeta"
+description = "Riemann zeta function utilities: reference zero loading, generation, comparison helpers."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+hp = ["dep:rug"]
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rug = { workspace = true, optional = true }

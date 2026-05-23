@@ -1,0 +1,23 @@
+[package]
+name = "xc-spectral"
+description = "Spectral methods for analytic number theory: CCM Weil-form construction, prolate-wave operators, Mellin transforms, Hermite expansions."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+hp = ["dep:rug", "xc-numerics/hp", "xc-zeta/hp"]
+
+[dependencies]
+anyhow = { workspace = true }
+nalgebra = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rug = { workspace = true, optional = true }
+xc-numerics = { path = "../xc-numerics" }
+xc-zeta = { path = "../xc-zeta" }
