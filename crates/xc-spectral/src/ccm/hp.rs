@@ -156,7 +156,12 @@ pub fn load_xi_json(path: &std::path::Path) -> Result<LoadedXi> {
 #[inline] fn euler(prec: u32) -> Float { Float::with_val(prec, rug::float::Constant::Euler) }
 
 /// Top-level entry. Build matrix, find eigenvector, solve spectrum.
-pub fn run(params: &CcmParams, cfg: &HighPrecConfig, zeros_f64: &[f64]) -> Result<HighPrecResult> {
+///
+/// `zero_seeds` are the reference Riemann zero imaginary parts used as
+/// Newton seeds. They should be at full working precision (decimal strings
+/// parsed to `Float`) — NOT f64-truncated. Using f64 seeds causes Newton
+/// divergence at high eigenvalue index.
+pub fn run(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> Result<HighPrecResult> {
     let start = Instant::now();
     let prec = cfg.precision_bits;
     let dim = params.matrix_size();
@@ -184,13 +189,14 @@ pub fn run(params: &CcmParams, cfg: &HighPrecConfig, zeros_f64: &[f64]) -> Resul
     // Normalize: Σ ξ_j = √L.
     let xi = normalize_eigenvector(&xi_raw, &l, prec);
 
-    // Find eigenvalues as zeros of R(z).
-    let n_eigs = cfg.n_eigenvalues.min(zeros_f64.len());
+    // Find eigenvalues as zeros of R(z), seeded from HP reference zeros.
+    let n_eigs = cfg.n_eigenvalues.min(zero_seeds.len());
     let mut eigenvalues_pos = Vec::with_capacity(n_eigs);
-    for &z_seed in zeros_f64.iter().take(n_eigs) {
-        match newton_xi_hat_zero(&xi, params.n_modes, &l, &fl(prec, z_seed), prec, cfg.newton_steps) {
+    for seed in zero_seeds.iter().take(n_eigs) {
+        let seed_hp = Float::with_val(prec, seed);
+        match newton_xi_hat_zero(&xi, params.n_modes, &l, &seed_hp, prec, cfg.newton_steps) {
             Some(z) => eigenvalues_pos.push(z),
-            None => eigenvalues_pos.push(fl(prec, z_seed)),
+            None => eigenvalues_pos.push(seed_hp),
         }
     }
 
@@ -478,5 +484,46 @@ mod tests {
         let cfg = HighPrecConfig::for_decimal_digits(10);
         // 10 * 3 = 30, clamped to min 600
         assert_eq!(cfg.quad_points, MIN_QUAD_POINTS);
+    }
+
+    /// hp::run() at small N should produce eigenvalues near Riemann zeros.
+    /// Uses λ²=13, N=10 (21×21 matrix) at 64-digit precision — fast enough
+    /// for a unit test (~1-2 seconds).
+    #[test]
+    fn run_small_n_produces_eigenvalues() {
+        let params = CcmParams::from_lambda(3.605551275463989, 10);
+        let mut cfg = HighPrecConfig::for_decimal_digits(64);
+        cfg.n_eigenvalues = 5;
+
+        // HP seeds: first 5 Riemann zeros at full precision.
+        let prec = cfg.precision_bits;
+        let seed_strs = [
+            "14.134725141734693790457251983562470270784257115699243175685567460149",
+            "21.022039638771554992628479593896902777334340524902781754629520403587",
+            "25.010857580145688763213790992562821818659549672557996672496542006745",
+            "30.424876125859513210311897530584091320181560023715440180962146036993",
+            "32.935061587739189690662368964074903488812715603517039009280003440784",
+        ];
+        let zero_seeds: Vec<Float> = seed_strs.iter()
+            .map(|s| Float::with_val(prec, Float::parse(s).unwrap()))
+            .collect();
+
+        let result = run(&params, &cfg, &zero_seeds).unwrap();
+
+        // Should produce 5 eigenvalues.
+        assert_eq!(result.eigenvalues_pos.len(), 5);
+
+        // First eigenvalue should match 14.13... to at least 10 digits.
+        let first = result.eigenvalues_pos[0].to_f64();
+        assert!((first - 14.134725).abs() < 1e-5,
+            "first eigenvalue {} should be near 14.13", first);
+
+        // ε_N should be small (tiny Weil eigenvalue at λ²=13).
+        let eps = result.weil_min_eigenvalue.to_f64();
+        assert!(eps.abs() < 1e-20,
+            "ε_N = {} should be tiny at λ²=13, N=10", eps);
+
+        // Elapsed time should be positive.
+        assert!(result.elapsed_seconds > 0.0);
     }
 }

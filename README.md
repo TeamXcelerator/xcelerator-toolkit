@@ -48,7 +48,7 @@ cargo test --workspace
 
 # Full HP tier (Linux/WSL/macOS — requires libgmp-dev libmpfr-dev libmpc-dev):
 cargo test --workspace --features hp
-# 56 tests pass, 0 ignored
+# 59 tests pass, 0 ignored
 ```
 
 ## Using from another crate
@@ -79,6 +79,13 @@ System dependencies for HP tier:
 ```bash
 sudo apt install build-essential m4 libgmp-dev libmpfr-dev libmpc-dev
 ```
+
+## Version History
+
+| Version | Changes |
+|---|---|
+| `v0.2.0` | **Breaking:** `ccm::hp::run()` now takes `&[Float]` seeds instead of `&[f64]`. Eliminates f64 truncation in Newton seeding that caused divergence at high eigenvalue index (k > ~100). |
+| `v0.1.0` | Initial release. CCM construction, prolate, Mellin, Yakaboylu, L-functions, HP numerics. 58 tests pass. |
 
 ## Used by
 
