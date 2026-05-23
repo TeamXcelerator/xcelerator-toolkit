@@ -209,6 +209,78 @@ pub fn run(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> Re
     })
 }
 
+/// Measure the natural evenness of the smallest eigenvector before
+/// forced symmetrization.
+///
+/// Returns `(evenness_deviation, natural_eigenvalue, forced_eigenvalue)` where:
+/// - `evenness_deviation` = ‖ξ - γξ‖ / ‖ξ‖ (0 = perfectly even, >0 = asymmetric)
+/// - `natural_eigenvalue` = smallest eigenvalue without forcing
+/// - `forced_eigenvalue` = smallest *even* eigenvalue (with forcing)
+///
+/// At small λ, the natural eigenvector is essentially even (deviation ~10⁻¹⁵⁰).
+/// At large λ (λ²≥1000), the natural eigenvector may be odd or mixed-symmetry,
+/// with deviation O(1). This is a structural property of the construction,
+/// not a precision artifact (verified at HP-1000).
+pub fn measure_evenness(params: &CcmParams, cfg: &HighPrecConfig) -> Result<EvennessResult> {
+    let prec = cfg.precision_bits;
+    let dim = params.matrix_size();
+
+    let l = Float::with_val(prec, params.lambda_squared).ln();
+    let mut tau = build_tau_hp(params, &l, cfg)?;
+
+    // Force exact symmetry of the matrix.
+    for i in 0..dim {
+        for j in (i + 1)..dim {
+            let mut sum = tau[i * dim + j].clone();
+            sum += &tau[j * dim + i];
+            sum /= 2u32;
+            tau[i * dim + j] = sum.clone();
+            tau[j * dim + i] = sum;
+        }
+    }
+
+    // Natural (unforced) smallest eigenpair.
+    let (natural_eval, xi_natural) = xc_numerics::linalg::inverse_iteration(
+        &tau, dim, prec, cfg.inverse_iter_steps, false)?;
+
+    // Forced-even smallest eigenpair.
+    let (forced_eval, _xi_forced) = xc_numerics::linalg::inverse_iteration(
+        &tau, dim, prec, cfg.inverse_iter_steps, true)?;
+
+    // Evenness deviation: ‖ξ - γξ‖ / ‖ξ‖ where γ is index reflection.
+    // γξ_i = ξ_{dim-1-i}. Deviation = ‖ξ - γξ‖₂ / ‖ξ‖₂.
+    let mut diff_sq = fl(prec, 0.0);
+    let mut norm_sq = fl(prec, 0.0);
+    for i in 0..dim {
+        let reflected = dim - 1 - i;
+        let mut d = xi_natural[i].clone();
+        d -= &xi_natural[reflected];
+        diff_sq += d.square();
+        norm_sq += xi_natural[i].clone().square();
+    }
+    let mut deviation = diff_sq.sqrt();
+    let norm = norm_sq.sqrt();
+    if !norm.is_zero() {
+        deviation /= &norm;
+    }
+
+    Ok(EvennessResult {
+        evenness_deviation: deviation,
+        natural_eigenvalue: natural_eval,
+        forced_eigenvalue: forced_eval,
+    })
+}
+
+/// Result of the evenness measurement.
+pub struct EvennessResult {
+    /// ‖ξ - γξ‖ / ‖ξ‖. Zero means perfectly even.
+    pub evenness_deviation: Float,
+    /// Smallest eigenvalue without forced-even projection.
+    pub natural_eigenvalue: Float,
+    /// Smallest eigenvalue with forced-even projection.
+    pub forced_eigenvalue: Float,
+}
+
 // ===========================================================================
 // Matrix construction
 // ===========================================================================
@@ -525,5 +597,23 @@ mod tests {
 
         // Elapsed time should be positive.
         assert!(result.elapsed_seconds > 0.0);
+    }
+
+    /// measure_evenness at λ²=13, N=10 should show near-perfect evenness.
+    #[test]
+    fn measure_evenness_small_lambda_is_even() {
+        let params = CcmParams::from_lambda(3.605551275463989, 10);
+        let cfg = HighPrecConfig::for_decimal_digits(64);
+        let result = measure_evenness(&params, &cfg).unwrap();
+        let dev = result.evenness_deviation.to_f64();
+        // At λ²=13, the natural eigenvector should be essentially even.
+        assert!(dev < 1e-10,
+            "evenness deviation at λ²=13 should be tiny, got {:.4e}", dev);
+        // Both eigenvalues should be the same (since natural IS even).
+        let nat = result.natural_eigenvalue.to_f64();
+        let forced = result.forced_eigenvalue.to_f64();
+        let rel_diff = ((nat - forced) / forced.abs()).abs();
+        assert!(rel_diff < 1e-10,
+            "natural and forced eigenvalues should match, rel diff = {:.4e}", rel_diff);
     }
 }

@@ -30,7 +30,7 @@ This is a Cargo workspace containing three sub-crates:
 
 **xc-spectral:**
 - `ccm` — CCM construction: `CcmParams`, `CcmResult`, `prime_powers_up_to`, `run_f64`, `solve_spectrum`
-- `ccm::hp` (HP-gated) — `HighPrecConfig`, `HighPrecResult`, `run`, `save_xi_json`, `load_xi_json`, full Weil-form matrix assembly at arbitrary precision
+- `ccm::hp` (HP-gated) — `HighPrecConfig`, `HighPrecResult`, `run`, `save_xi_json`, `load_xi_json`, `measure_evenness`, full Weil-form matrix assembly at arbitrary precision
 - `prolate` — Prolate-wave operator PW_λ, eigenfunction identification (h₀, h₄), ℰ map, comparison against ξ_λ
 - `mellin` — Truncated completed eta function Λ_λ(s), ξ-weighted Mellin G(s), parallelized critical-line zero scanner, HP variants
 - `yakaboylu` — Yakaboylu's Hilbert-Pólya framework: V̂_R matrix elements, W-positivity tests, synthetic off-line zero detection
@@ -48,7 +48,7 @@ cargo test --workspace
 
 # Full HP tier (Linux/WSL/macOS — requires libgmp-dev libmpfr-dev libmpc-dev):
 cargo test --workspace --features hp
-# 59 tests pass, 0 ignored
+# 60 tests pass, 0 ignored
 ```
 
 ## Using from another crate
@@ -84,6 +84,7 @@ sudo apt install build-essential m4 libgmp-dev libmpfr-dev libmpc-dev
 
 | Version | Changes |
 |---|---|
+| `v0.3.0` | Add `ccm::hp::measure_evenness()` for eigenvector symmetry measurement. 60 tests on Vast. |
 | `v0.2.0` | **Breaking:** `ccm::hp::run()` now takes `&[Float]` seeds instead of `&[f64]`. Eliminates f64 truncation in Newton seeding that caused divergence at high eigenvalue index (k > ~100). |
 | `v0.1.0` | Initial release. CCM construction, prolate, Mellin, Yakaboylu, L-functions, HP numerics. 58 tests pass. |
 
