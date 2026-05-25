@@ -44,6 +44,11 @@ pub struct CcmParams {
 }
 
 impl CcmParams {
+    /// Construct from λ (not λ²) and the mode cutoff N.
+    ///
+    /// `lambda_squared` is computed as `lambda * lambda` at f64;
+    /// `lambda_sq_int` is `⌊λ² + ε⌋` (integer-floor with a small
+    /// rounding epsilon so √13² rounds to 13, not 12).
     pub fn from_lambda(lambda: f64, n_modes: usize) -> Self {
         let lambda_squared = lambda * lambda;
         // Precompute prime-cutoff integer once at construction (CLI
@@ -56,21 +61,32 @@ impl CcmParams {
         Self { lambda_squared, lambda_sq_int, n_modes }
     }
 
+    /// Recover λ from `lambda_squared` (f64).
     pub fn lambda(&self) -> f64 { self.lambda_squared.sqrt() }
+    /// `L = ln(λ²) = 2 ln λ` at f64. Used as the V_n basis half-period.
     pub fn log_length(&self) -> f64 { self.lambda_squared.ln() }
+    /// Matrix dimension `2N+1`.
     pub fn matrix_size(&self) -> usize { 2 * self.n_modes + 1 }
 
+    /// Map a centered basis index `n ∈ [-N, N]` to the row/column
+    /// position in the row-major matrix (`n = 0` → position `N`).
     pub fn idx(&self, n: i64) -> usize {
         (n + self.n_modes as i64) as usize
     }
 }
 
-/// Result of a single CCM run.
+/// Result of a single CCM run at f64 precision.
 #[derive(Debug, Clone)]
 pub struct CcmResult {
+    /// Newton-refined positive eigenvalues at f64 precision, in the
+    /// order returned by Newton (paired with the Riemann-zero seeds).
     pub eigenvalues_pos: Vec<f64>,
+    /// Smallest Weil-form eigenvalue (the spectral gap quantity ε_N).
     pub weil_min_eigenvalue: f64,
+    /// Smallest-eigenvalue eigenvector of the Weil form, ℓ²-normalized,
+    /// in the V_n basis order.
     pub xi: Vec<f64>,
+    /// Wall-clock seconds for the entire f64 run.
     pub elapsed_seconds: f64,
 }
 

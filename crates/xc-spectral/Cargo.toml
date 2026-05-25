@@ -10,7 +10,7 @@ repository.workspace = true
 
 [features]
 default = []
-hp = ["dep:rug", "xc-numerics/hp", "xc-zeta/hp"]
+hp = ["dep:rug", "dep:zip", "xc-numerics/hp", "xc-zeta/hp"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -19,5 +19,6 @@ rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rug = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
 xc-numerics = { path = "../xc-numerics" }
 xc-zeta = { path = "../xc-zeta" }

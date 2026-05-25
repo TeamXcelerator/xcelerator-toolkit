@@ -57,12 +57,17 @@ pub fn display_hp_short(x: &Float) -> String {
 /// underflow in f64 (e.g. 10^-1000) are treated as their actual sign.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Sign {
+    /// Strictly less than zero.
     Negative,
+    /// Exactly zero (MPFR's `is_zero()`).
     Zero,
+    /// Strictly greater than zero.
     Positive,
 }
 
 impl Sign {
+    /// Lowercase English label: `"negative"`, `"zero"`, or `"positive"`.
+    /// Used for diagnostic logging.
     pub fn as_str(self) -> &'static str {
         match self {
             Sign::Negative => "negative",

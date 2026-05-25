@@ -20,20 +20,20 @@ This is a Cargo workspace containing three sub-crates:
 ### Module inventory
 
 **xc-numerics:**
-- `quadrature` — Gauss-Legendre at f64 (configurable N-point) and HP. The HP path caches nodes/weights to `<cwd>/data/gl_cache/` and supports both uncompressed JSON and zip-compressed JSON fixtures (auto-decompressed on first read). Per-cwd layout means each paper repo / reproduction script gets its own independent cache, and pre-computed cache fixtures can be checked into a repo to skip the cold-start cost of Newton iteration.
-- `root_finding` — f64 bisection with configurable tolerance and max iterations
-- `primes` — Sieve of Eratosthenes, prime counting function π(x)
-- `linalg` (HP-gated) — LU factorization with partial pivoting, LU solve, inverse iteration (with optional forced-even projection), ℓ² normalization, Rayleigh quotient. Inner reductions and matvec parallelized.
+- `quadrature` — Gauss-Legendre at f64 (configurable N-point) and HP. The HP path caches nodes/weights to `<cwd>/data/gl_cache/` and supports both uncompressed JSON and zip-compressed JSON fixtures (auto-decompressed on first read). Per-cwd layout means each paper repo / reproduction script gets its own independent cache, and pre-computed cache fixtures can be checked into a repo to skip the cold-start cost of Newton iteration. Cache hits are structurally validated (Σw = 2, Σx·w = 0, antisymmetric nodes); corrupt or wrong-precision files are skipped with a stderr warning. Public audit API: `verify_gl_cache_dir`.
+- `root_finding` — f64 bisection with configurable tolerance and max iterations. Endpoint-zero handled correctly (returns the zero endpoint, no walk-away).
+- `primes` — Sieve of Eratosthenes, prime counting function π(x).
+- `linalg` (HP-gated) — Dense LU factorization with partial pivoting, LU solve, banded tridiagonal LU (Thomas with partial pivoting; O(n) factor and solve), inverse iteration (with optional forced-even projection; rustdoc documents both convergence floors), ℓ² normalization, Rayleigh quotient. Inner reductions and matvec parallelized.
 - `fmt` (HP-gated) — `display_hp` (decimal scientific notation at any sig-digit count, no f64 underflow), `sign_of` (HP sign without f64), `matching_digits` and `relative_difference` (HP comparison helpers). Use these wherever you'd otherwise call `to_f64()` for display or comparison.
-- `eigen` (HP-gated) — HP symmetric eigendecomposition: `tridiag_eigenvalues_hp` (symmetric tridiagonal QR with implicit Wilkinson shifts), `tridiag_eigenvector_for_value_hp` and `dense_symmetric_eigenvector_for_value_hp` (shifted inverse iteration), `householder_tridiag_hp` (dense → tridiagonal reduction with parallel reductions, matvec, symmetric update, and Q accumulation), `dense_symmetric_eigenvalues_hp` (full pipeline). Truly dynamic in working precision (verified at HP-1000 against PARI/GP 2000-digit reference; matches to ≥500 digits across 9 reference matrices including Hilbert and Wilkinson W11).
+- `eigen` (HP-gated) — HP symmetric eigendecomposition: `tridiag_eigenvalues_hp` (symmetric tridiagonal QR with implicit Wilkinson shifts; allocation-optimized inner loop), `tridiag_eigenvector_for_value_hp` (shifted inverse iteration with `TridiagEigvecOptions { max_steps, early_termination, solver: Banded | Dense }`), `dense_symmetric_eigenvector_for_value_hp` (shifted inverse iteration on dense input), `householder_tridiag_hp` (dense → tridiagonal reduction with parallel reductions, matvec, symmetric update, and Q accumulation), `dense_symmetric_eigenvalues_hp` (full pipeline). Truly dynamic in working precision (verified at HP-1000 against PARI/GP 2000-digit reference for both dense and tridiagonal cases; matches to ≥500 digits across 9 reference matrices including Hilbert and Wilkinson W11).
 
 **xc-zeta:**
-- `zeros` — Load reference zeros as HP strings, f64, or `rug::Float`; path-parameterized for flexibility
+- `zeros` — Load reference zeros as HP strings, f64, or `rug::Float`; path-parameterized for flexibility.
 
 **xc-spectral:**
-- `ccm` — CCM construction: `CcmParams`, `CcmResult`, `prime_powers_up_to`, `run_f64`, `solve_spectrum_f64`
-- `ccm::hp` (HP-gated) — `HighPrecConfig`, `HighPrecResult`, `run`, `save_xi_json`, `load_xi_json`, `measure_evenness`, full Weil-form matrix assembly at arbitrary precision. Symmetrize loop, Newton-per-seed loop, and evenness reduction are all parallelized.
-- `prolate` — Prolate-wave operator PW_λ. f64 prototype (`build_pw_matrix_f64`, `compute_k_lambda_f64`, `compare_xi_to_k_lambda_f64`) and HP submodule `prolate::hp` (`build_pw_matrix`, `compute_k_lambda`, `compare_xi_to_k_lambda`) using the HP eigensolver from `xc-numerics::eigen`. HP u-grid evaluation parallelized.
+- `ccm` — CCM construction: `CcmParams`, `CcmResult`, `prime_powers_up_to`, `run_f64`, `solve_spectrum_f64`.
+- `ccm::hp` (HP-gated) — `HighPrecConfig`, `HighPrecResult`, `run`, `save_xi_json`, `load_xi_json`, `measure_evenness`, full Weil-form matrix assembly at arbitrary precision. The τ-matrix construction is cached automatically to `<cwd>/data/tau_cache/` (uncompressed JSON, single zip, or byte-split `.partXX` for files exceeding GitHub's 100 MB limit). Symmetrize loop, Newton-per-seed loop, and evenness reduction are all parallelized. Public audit API: `verify_tau_cache_dir`.
+- `prolate` — Prolate-wave operator PW_λ. f64 prototype (`build_pw_matrix_f64`, `compute_k_lambda_f64`, `compare_xi_to_k_lambda_f64`) and HP submodule `prolate::hp` (`build_pw_matrix`, `compute_k_lambda`, `compare_xi_to_k_lambda`) using the HP eigensolver from `xc-numerics::eigen`. The eigenvalue spectrum from `tridiag_eigenvalues_hp` (the dominant cost in `compute_k_lambda` at HP-1000) is cached to `<cwd>/data/prolate_eigvals_cache/`. HP u-grid evaluation parallelized. Public audit API: `verify_prolate_eigvals_cache_dir`.
 - `mellin` — Truncated completed eta function `Λ_λ(s)`, ξ-weighted Mellin `G(s)`, parallelized critical-line zero scanner. Full f64 (`*_f64`) and HP (`*_hp`) parity: `omega_f64` / `omega_hp`, `truncated_lambda_f64` / `truncated_lambda_hp`, `xi_weighted_mellin_f64` / `xi_weighted_mellin_hp`, `scan_critical_line_zeros_f64` / `scan_critical_line_zeros_hp`. The HP scan also runs in parallel.
 - `yakaboylu` — Yakaboylu's Hilbert-Pólya framework. f64 prototype (`v_r_matrix_element_f64`, `build_w_matrix_f64`, `test_w_positivity_f64`, `WPositivityResultF64`) and HP submodule `yakaboylu::hp` (`build_w_matrix`, `test_w_positivity`, `HpWPositivityResult`) using `dense_symmetric_eigenvalues_hp`. HP outer-row matrix build is parallelized.
 - `lfunction` — Dirichlet L-function character specs (χ₃, χ₄, χ₅, χ₇), twisted prime-power enumeration. `chi_at` and `chi_at_prime_power` return exact `i8` values (precision-agnostic) alongside the `_f64` variants.
@@ -46,11 +46,11 @@ public APIs have unit tests.
 ```bash
 # f64-only (Windows/Linux/macOS — no system dependencies):
 cargo test --workspace
-# 47 tests pass, 0 ignored
+# 54 tests pass, 0 ignored
 
 # Full HP tier (Linux/WSL/macOS — requires libgmp-dev libmpfr-dev libmpc-dev):
 cargo test --workspace --features hp
-# 111 tests pass, 0 ignored
+# 166 tests pass, 0 ignored
 ```
 
 ### HP eigensolver verification (3 layers)
@@ -185,33 +185,20 @@ Full guideline (private):
 
 | Version | Changes |
 |---|---|
-| `v0.5.0` | **Tridiagonal LU + banded shifted inverse iteration.** Architectural change: HP eigenvector recovery on tridiagonal matrices no longer densifies. |
-| | • **`xc-numerics::linalg::tridiag_lu_factor_hp`** — Thomas algorithm with partial pivoting at HP. Stores L (sub-diagonal multipliers) and U (main + super + super-super diagonals to capture pivot fill-in) as four short vectors of length ~n, plus a row permutation. O(n) factor cost vs dense LU's O(n³). |
-| | • **`xc-numerics::linalg::tridiag_lu_solve_hp`** — Forward + back substitution against the banded factored form. O(n) solve cost vs dense O(n²). |
-| | • **`xc-numerics::eigen::tridiag_eigenvector_for_value_hp_banded`** — drop-in alternative to `tridiag_eigenvector_for_value_hp_with_options` that uses the banded LU instead of densifying T - λI + εI. At HP-1000 with N=8001 the per-eigenvector wall-time drops from hours to seconds and resident memory from ~26 GB to a few KB. |
-| | • **`xc-spectral::prolate::hp::compute_k_lambda`** opts into the banded variant. Numerical output is unchanged (banded LU produces an eigenvector that satisfies T·v = λv to working precision, same as dense LU); the change is purely architectural. |
-| | • **Heavy testing** to mirror the HP eigensolver's three-layer validation: banded vs dense LU equivalence on Strang's tridiagonal n=10 (HP-256), Wilkinson W11 + shift (HP-512), property test on a deterministic-random asymmetric tridiagonal n=50, partial-pivoting test on a zero-diagonal first row, HP-1000 production residual check (n=20, ‖T·v - λv‖_∞ < 10⁻⁹⁰⁰). |
-| | • The dense variant `tridiag_eigenvector_for_value_hp_with_options` remains in the public API for backward compatibility and cross-validation purposes. |
-| `v0.4.3` | **Better progress timing + opt-in early termination on inverse iteration.** |
-| | • **`xc-numerics::eigen::tridiag_eigenvector_for_value_hp_with_options`** — new explicit-options entry point with an `early_termination: bool` flag. The original `tridiag_eigenvector_for_value_hp` function is unchanged in behaviour (delegates to `_with_options(..., false)`); existing callers get bit-identical numerics. |
-| | • **Convergence test** when `early_termination=true`: tracks `|⟨v_k, v_{k-1}⟩|` (cheap O(n) per step) and breaks the inverse-iteration loop as soon as the change drops below the working-precision threshold. For well-conditioned, well-separated eigenvalues this typically cuts step count from 200 to 20-50, a 4-10× speedup on the iteration phase. |
-| | • **`xc-spectral::prolate::hp::compute_k_lambda`** opts into early termination — prolate eigenvalues are widely separated at small k, so the iteration converges quickly. The published numerical output of `prolate-compare` is unchanged (the iteration still runs to convergence; it just stops as soon as it gets there). |
-| | • **Improved progress timing.** The previous v0.4.2 prints only timed the inverse-iteration loop, missing the dense-matrix build (~6.6 GB at N=4001, ~26 GB at N=8001) and the LU factor (the actual O(N³) cost). v0.4.3 wraps the entire `tridiag_eigenvector_for_value_hp` body in a phase timer and prints `[HP eigvec] dense matrix built in Xs` and `[HP eigvec] LU factor done in Xs` separately. Each per-step progress line now also reports both the iter-only and total-phase elapsed times. |
-| | • Backward compatible: numerical output identical to v0.4.2 in all configurations; new HP cache tests still pass; the opt-in flag means callers that don't pass it get the conservative full-`max_steps` behaviour. |
-| `v0.4.2` | **Progress visibility for long-running HP iterations.** |
-| | • **`xc-numerics::eigen::tridiag_eigenvector_for_value_hp`** — adds an `eprintln!` every 25 inverse-iteration steps reporting `(step, max_steps, N, elapsed_seconds)`. Lets users distinguish "still iterating" from "wedged" on multi-hour runs at large N. No behavior change to the numerical output; pure observability. |
-| | • **`xc-numerics::linalg::inverse_iteration`** — same per-iteration progress line every 25 steps; also prints a final line on convergence. |
-| | • **`xc-spectral::prolate::hp::compute_k_lambda`** — bracket prints around each phase: tridiagonal build, full eigenvalue compute (tridiag QR), eigenvector search loop with per-iteration line, k_λ sampling. Each phase reports its own elapsed time. |
-| | • **`xc-spectral::prolate::hp::compare_xi_to_k_lambda`** — bracket prints with elapsed time. |
-| | • Triggered by 2026-05-25 Paper B Claim 1 retest cycle: a `prolate-compare` run sat silent for ~12 hours under multi-process contention with no visible signal whether it was making progress. The new prints would have made the wedge state visible within minutes. |
-| | • Backward compatible: numerical output identical to v0.4.1; tests unchanged. New `eprintln!` lines are stderr only (don't disturb stdout result parsing). |
-| `v0.4.1` | **GL cache: per-cwd layout + zip-compressed cache support.** |
-| | • **`xc-numerics::quadrature`** — HP GL cache directory moved from `~/.cache/ccm_gl/` to `<cwd>/data/gl_cache/`. Per-cwd makes parallel runs across multiple servers and concurrent processes safer (no shared mutable state in `$HOME`), and lets paper repositories ship pre-computed cache fixtures alongside their reproduction scripts. |
-| | • **Zip-compressed cache files** — the toolkit now also reads `prec{prec}_npts{n}.json.zip` (zip archive containing a single entry of the same name without `.zip`). Lookup priority: uncompressed `.json` first, then `.json.zip` (auto-decompressed on first read; the decompressed copy is also written next to the `.zip` so future reads hit the fast path), then compute fresh. |
-| | • Compresses HP-1000 GL caches by ~3-4× in practice; lets paper repositories check in pre-warmed cache fixtures without bloating `git clone`. |
-| | • Backward compatible: existing callers of `gauss_legendre_nodes(n, prec)` get the same return type and the same caching semantics, just from a different directory. |
-| | • New `zip` (v2.2, deflate-only) workspace dependency, gated by the `hp` feature. |
-| | • New unit tests in `quadrature::hp_cache_tests`: lookup priority, zip fallback with auto-decompress, fresh-compute round-trip, integration sanity. All gated `#[cfg(all(test, feature = "hp"))]`. |
+| `v0.6.0` | **Cache infrastructure, HEAVY testing, perf, API consolidation, rustdoc pass.** Squashed release of v0.5.1 through v0.5.13. Public API breaking vs v0.5.0 (eigenvector recovery consolidates three entry points into one). |
+| | • **API consolidation:** `tridiag_eigenvector_for_value_hp` is the single entry point. Takes `TridiagEigvecOptions { max_steps, early_termination, solver: TridiagSolver::{Banded, Dense} }`. Banded LU is the default; dense is retained for cross-validation. The v0.4.x/v0.5.0 wrappers are removed. |
+| | • **HEAVY testing audit:** three-layer validation (closed-form + cross-check + property) on every core numeric — dense LU, banded LU, tridiag QR (PARI/GP cross-check at 2000 digits, JSON fixture committed), Householder, inverse iteration, root finding (`bisect_f64` endpoint-sign bug fixed), GL quadrature, vector ops, HP cache fixtures. |
+| | • **Cache infrastructure:** three disk caches share the same shape (structural validation on load, “preserve but discard” on corruption, public `verify_*_cache_dir` audit API): `<cwd>/data/gl_cache/` (Gauss-Legendre nodes/weights), `<cwd>/data/prolate_eigvals_cache/` (`compute_k_lambda` eigenvalues), `<cwd>/data/tau_cache/` (τ-matrix; custom byte-split `.json.zip.partXX` for compressed payloads exceeding GitHub’s 100 MB hard limit). |
+| | • **Cache wall-time impact:** Paper A and Paper B re-runs at the same `(λ², N, prec)`: first run unchanged (cache miss → compute → save); subsequent runs skip τ-matrix construction and the prolate tridiag QR entirely. λ²=100 N=4001 HP-1000 prolate eigenvalues drop from ~27 minutes to ~5 seconds on a hit. |
+| | • **Performance:** `tridiag_eigenvalues_hp` allocation reduction — 20 scratch Floats hoisted out of the QR sweep, ~14 fewer MPFR allocs per Givens step (~10¹⁰ fewer at HP-1000 N=8001). `CwdGuard` mutex poison recovery so a single panicking test doesn’t cascade. |
+| | • **Documentation:** module-level rustdoc on every crate; field-level docs on every public struct, variant docs on every public enum, function docs on every public fn. |
+| | • **Test counts:** f64 16 + 37 + 1 = 54 tests pass on Windows MSVC; HP 166 tests pass on Linux. |
+| `v0.5.0` | **Tridiagonal LU + banded shifted inverse iteration.** Squashed release of v0.4.1 through v0.5.0. Memory-efficient eigenvector recovery for HP-scale tridiagonal systems. |
+| | • **`xc-numerics::linalg::tridiag_lu_factor_hp` / `tridiag_lu_solve_hp`** — Thomas algorithm with partial pivoting at HP. O(n) factor and O(n) per-step solve vs the dense path’s O(n³)/O(n²). |
+| | • **`eigen::tridiag_eigenvector_for_value_hp`** is now banded by default; the dense path is retained for cross-validation. Resident memory at HP-1000 N=8001 drops from ~26 GB (dense) to a few KB (banded). |
+| | • **Opt-in early termination** on inverse iteration via the `|⟨v_k, v_{k-1}⟩|` convergence proxy (cheap O(n) per step). For well-conditioned, well-separated eigenvalues this typically cuts step count from 200 to 20-50. |
+| | • **Progress visibility** — long-running HP iterations print elapsed-time progress every 25 steps so reviewers can distinguish “still iterating” from “wedged” on multi-hour runs. |
+| | • **GL cache** moved from `~/.cache/ccm_gl/` to `<cwd>/data/gl_cache/` (per-cwd, parallel-run safe) and supports zip-compressed cache files. |
 | `v0.4.0` | **HP-everywhere unless explicitly requested + comprehensive rayon parallelization.** |
 | | • **Naming:** every public f64 function has `_f64` in its name; every HP function is unsuffixed (default) or `_hp`-suffixed where a parallel f64 version exists. No silent f64 leaks in HP code paths. |
 | | • **`xc-numerics::eigen`** — new HP symmetric eigendecomposition (Householder + tridiagonal QR with Wilkinson shifts + shifted inverse iteration). Verified across 3 layers: closed-form structured matrices (Strang, Hilbert, Wilkinson W21), PARI/GP cross-check at 2000 digits (committed JSON fixture, 9 reference matrices), property-based tests with deterministic random matrices (trace, determinant, eigenequation, normalization, orthogonality, decomposition reconstruction). |
@@ -231,8 +218,8 @@ Full guideline (private):
 
 ## Used by
 
-- [`ccm-reproduction-and-convergence`](https://github.com/TeamXcelerator/ccm-reproduction-and-convergence) — Paper A: independent reproduction of CCM zeta spectral triple at 460 matching digits.
-- [`ccm-convergence-rate-falsifications`](https://github.com/TeamXcelerator/ccm-convergence-rate-falsifications) — Paper B: empirical falsification of CCM Lemma 7.2 and Śliwiński Conjecture 4.1.
+- [`ccm-reproduction-and-convergence`](https://github.com/TeamXcelerator/ccm-reproduction-and-convergence) — Paper A: independent reproduction of CCM zeta spectral triple, with eigenvalue match to 460 digits at HP-1000 against a 2000-digit PARI/GP reference.
+- [`ccm-convergence-rate-falsifications`](https://github.com/TeamXcelerator/ccm-convergence-rate-falsifications) — Paper B: empirical convergence-rate study at HP-1000 (CCM Lemma 7.2 falsified; Śliwiński Conjecture 4.1 unsupported; CCM 10⁵⁵× more accurate than naive Mellin truncation).
 
 ## License
 

@@ -10,6 +10,13 @@
 
 /// Bisect `f` on `[a, b]` assuming a sign change in the interval.
 /// Returns the root or `None` if no sign change is detected.
+///
+/// If `f(a)` or `f(b)` evaluates to a value with magnitude below `tol`,
+/// that endpoint is returned directly — including the exact-zero case.
+/// Past iterations track the sign at the left endpoint via a cached
+/// boolean so the inner loop never multiplies function values (avoids
+/// over-/underflow when `f` returns very large or very small magnitudes,
+/// which is common at HP boundaries even after `to_f64`).
 pub fn bisect_f64<F: Fn(f64) -> f64>(
     f: &F,
     mut a: f64,
@@ -19,12 +26,35 @@ pub fn bisect_f64<F: Fn(f64) -> f64>(
 ) -> Option<f64> {
     let fa = f(a);
     let fb = f(b);
-    if fa * fb > 0.0 { return None; }
+
+    // Endpoint hits: either exactly zero or within tol → return that
+    // endpoint as the root. Subsumes the |f(a) * f(b)| == 0 case so we
+    // don't depend on float sign-of-zero behavior in the bracket check.
+    if fa.abs() < tol { return Some(a); }
+    if fb.abs() < tol { return Some(b); }
+
+    // No sign change → no root we can guarantee. Use signum to avoid
+    // over-/underflow in fa * fb when either side has extreme magnitude.
+    if fa.signum() == fb.signum() { return None; }
+
+    // Track the sign at the left endpoint instead of recomputing f(a)
+    // each iteration. Equivalent to the textbook formulation, but
+    // immune to multiplication over-/underflow on extreme inputs.
+    let mut fa_sign = fa.signum();
+
     for _ in 0..max_iter {
         let m = 0.5 * (a + b);
         let fm = f(m);
         if (b - a).abs() < tol || fm.abs() < tol { return Some(m); }
-        if fm * f(a) < 0.0 { b = m; } else { a = m; }
+
+        if fm.signum() != fa_sign {
+            // Sign change in [a, m] → root is there; shrink b.
+            b = m;
+        } else {
+            // Sign change in [m, b] → root is there; shrink a, update sign.
+            a = m;
+            fa_sign = fm.signum();
+        }
     }
     Some(0.5 * (a + b))
 }
@@ -57,5 +87,81 @@ mod tests {
     fn bisect_no_sign_change() {
         let result = bisect_f64(&|x| x * x + 1.0, -1.0, 1.0, 1e-15, 200);
         assert!(result.is_none());
+    }
+
+    /// Bisect should honor the tolerance `tol`: if the function evaluates
+    /// to a value smaller than `tol` at the midpoint, return that midpoint.
+    /// Conversely, the returned root should be within `tol` of the true root
+    /// (or have a residual below `tol`).
+    #[test]
+    fn bisect_tolerance_honored() {
+        // A loose tolerance (1e-3) on a function with a wide bracket
+        // should produce a root within ~tol of the true value (√2).
+        let tol = 1e-3;
+        let root = bisect_f64(&|x| x * x - 2.0, 1.0, 2.0, tol, 200).unwrap();
+        let expected = std::f64::consts::SQRT_2;
+        // Either |root - expected| < tol, or |f(root)| < tol — bisection
+        // can return on either condition.
+        let root_err = (root - expected).abs();
+        let resid = (root * root - 2.0).abs();
+        assert!(root_err < tol || resid < tol,
+            "bisect_f64 with tol={}: root={}, expected={}, |root-expected|={}, |f(root)|={}",
+            tol, root, expected, root_err, resid);
+
+        // A tighter tolerance (1e-12) should produce a root within ~tol.
+        let tol_tight = 1e-12;
+        let root2 = bisect_f64(&|x| x * x - 2.0, 1.0, 2.0, tol_tight, 200).unwrap();
+        let root2_err = (root2 - expected).abs();
+        let resid2 = (root2 * root2 - 2.0).abs();
+        assert!(root2_err < tol_tight * 10.0 || resid2 < tol_tight,
+            "bisect_f64 with tol={}: |root-expected|={}, |f(root)|={}",
+            tol_tight, root2_err, resid2);
+    }
+
+    /// Bisect should respect `max_iter`: with a tiny iteration cap on a
+    /// problem requiring many bisections, the returned approximation
+    /// is the midpoint of the final bracket — which is `(a + b) / 2`
+    /// after `max_iter` halvings of the original interval.
+    #[test]
+    fn bisect_max_iter_honored() {
+        // Original bracket [1, 2] has width 1. After k bisections the
+        // bracket has width 2^-k. With max_iter = 3 the final bracket
+        // is 1/8 = 0.125 wide; the midpoint is within 1/16 = 0.0625 of
+        // the true root.
+        let tol = 0.0;  // disable tolerance-based exit so max_iter actually bites
+        let root = bisect_f64(&|x| x * x - 2.0, 1.0, 2.0, tol, 3).unwrap();
+        let expected = std::f64::consts::SQRT_2;
+        let err = (root - expected).abs();
+        // After 3 bisections, error ≤ 2^-4 = 0.0625.
+        assert!(err < 0.07, "bisect with max_iter=3: err {} should be < 0.07", err);
+        // But should not have converged to true precision.
+        assert!(err > 1e-6, "bisect with max_iter=3 unexpectedly converged: err {}", err);
+    }
+
+    /// Narrow bracket: bisect on [√2 - 1e-3, √2 + 1e-3] should converge
+    /// to √2 in a handful of iterations.
+    #[test]
+    fn bisect_narrow_bracket() {
+        let expected = std::f64::consts::SQRT_2;
+        let a = expected - 1e-3;
+        let b = expected + 1e-3;
+        let root = bisect_f64(&|x| x * x - 2.0, a, b, 1e-15, 200).unwrap();
+        let err = (root - expected).abs();
+        assert!(err < 1e-14, "narrow-bracket bisect: err {:.2e} should be < 1e-14", err);
+    }
+
+    /// Edge case: function value exactly zero at one endpoint. Bisect
+    /// detects this via fa * fb == 0 (which is not > 0), so a root is
+    /// returned. With f(x) = x at bracket [0, 1], the midpoint heads
+    /// toward 0; the test verifies the returned root has small |f(x)|.
+    #[test]
+    fn bisect_zero_at_endpoint() {
+        let result = bisect_f64(&|x| x, 0.0, 1.0, 1e-15, 200);
+        assert!(result.is_some(),
+            "bisect_f64 should accept zero-at-endpoint as a sign change");
+        let root = result.unwrap();
+        let resid = root.abs();
+        assert!(resid < 1e-14,
+            "bisect with f(0)=0: residual {} should be tiny", resid);
     }
 }

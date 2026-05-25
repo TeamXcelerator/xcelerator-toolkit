@@ -81,6 +81,10 @@ pub struct ProlateConfig {
 }
 
 impl ProlateConfig {
+    /// Construct a config with default `n_sample = 256` and
+    /// `precision_bits = 53` (f64). `n_grid` is rounded up to the
+    /// next odd integer so `x = 0` lands on a grid point and the
+    /// even/odd parity classification is exact.
     pub fn new(lambda: f64, n_grid: usize) -> Self {
         // Make n_grid odd so x=0 is a grid point (clean even-symmetry).
         let n = if n_grid % 2 == 0 { n_grid + 1 } else { n_grid };
@@ -91,6 +95,7 @@ impl ProlateConfig {
             precision_bits: 53, // f64 default
         }
     }
+    /// Override the comparison-grid size.
     pub fn with_n_sample(mut self, n_sample: usize) -> Self {
         self.n_sample = n_sample;
         self
@@ -629,7 +634,10 @@ pub mod hp {
     use anyhow::Result;
     use rayon::prelude::*;
     use rug::Float;
-    use xc_numerics::eigen::{tridiag_eigenvalues_hp, tridiag_eigenvector_for_value_hp_banded};
+    use xc_numerics::eigen::{
+        tridiag_eigenvalues_hp, tridiag_eigenvector_for_value_hp,
+        TridiagEigvecOptions,
+    };
 
     /// HP-build of the FD prolate-wave tridiagonal data.
     ///
@@ -735,11 +743,20 @@ pub mod hp {
     /// Indeterminate otherwise. All HP arithmetic.
     #[derive(Debug, PartialEq, Eq, Clone, Copy)]
     pub enum HpParity {
+        /// `v(x) ≈ v(-x)` to working precision.
         Even,
+        /// `v(x) ≈ -v(-x)` to working precision.
         Odd,
+        /// Neither even nor odd (mixed-parity or below the zero
+        /// threshold).
         Indeterminate,
     }
 
+    /// Classify the parity of HP vector `v` under the index reflection
+    /// `i ↔ n-1-i` (which corresponds to `x ↔ -x` on the symmetric FD
+    /// grid). Returns `HpParity::Indeterminate` when the vector's
+    /// total mass is below the zero threshold or both even/odd
+    /// deviations exceed the classification tolerance.
     pub fn parity_of(v: &[Float], prec: u32) -> HpParity {
         let n = v.len();
         if n == 0 {
@@ -892,6 +909,428 @@ pub mod hp {
         result
     }
 
+    // ===========================================================================
+    // Prolate eigenvalue cache
+    // ===========================================================================
+    //
+    // The dominant cost in `compute_k_lambda` at HP-1000 is the full
+    // tridiagonal QR on PW_λ — at N=8001 prec=3338 this is ~30 minutes
+    // of wall-time. The output is just the eigenvalue vector (a few MB
+    // serialized at HP-1000). It's deterministic in `(λ², n_grid, prec)`
+    // and reusable across runs at the same configuration.
+    //
+    // Cache layout (mirrors xc-numerics::quadrature::hp gl_cache):
+    //   <cwd>/data/prolate_eigvals_cache/lambda_sq{LSQ}_ngrid{N}_prec{P}.json[.zip]
+    //
+    // Lookup priority:
+    //   1. Uncompressed `.json`
+    //   2. `.json.zip` (auto-decompressed on first read; the
+    //      decompressed `.json` is written next to the .zip for future
+    //      fast reads)
+    //   3. Compute fresh; write to (1).
+    //
+    // Cache key is `λ²_int = round(λ²)` — only used when the round-trip
+    // is exact (i.e. λ² is an integer like 13, 100, 1000 in our paper
+    // configs). Non-integer λ² silently bypasses the cache.
+
+    /// Tolerance for structural identity checks on a loaded prolate
+    /// eigenvalue cache file. Mirror of `quadrature::hp` cache check
+    /// tolerance.
+    fn prolate_cache_tol(prec: u32) -> Float {
+        use rug::ops::Pow;
+        Float::with_val(prec, 2).pow(-((prec as i32) - 8))
+    }
+
+    /// Verify a loaded eigenvalue vector satisfies the prolate-spectrum
+    /// structural identities:
+    ///
+    ///   1. Count = `n_grid` (after rounding to odd if the caller's
+    ///      n_grid was even).
+    ///   2. Ascending order: `e[k] ≤ e[k+1]` for all `k`.
+    ///   3. The smallest eigenvalue ≈ 2π·λ² (the asymptotic prediction
+    ///      for the prolate operator's ground state). At our scales the
+    ///      relative deviation is ≲ 1% — far above any cache-corruption
+    ///      noise.
+    ///
+    /// Returns `None` if all identities hold; `Some(reason)` otherwise.
+    fn prolate_cache_structural_check(
+        evals: &[Float],
+        n_expected: usize,
+        lambda_sq: u64,
+        prec: u32,
+    ) -> Option<String> {
+        if evals.len() != n_expected {
+            return Some(format!(
+                "eigenvalue count {} != expected {}", evals.len(), n_expected
+            ));
+        }
+
+        // Ascending order check.
+        for k in 0..(evals.len().saturating_sub(1)) {
+            if evals[k] > evals[k + 1] {
+                return Some(format!(
+                    "not ascending at index {}: e[{}] > e[{}]",
+                    k, k, k + 1
+                ));
+            }
+        }
+
+        // Ground state ≈ 2π·λ². Tolerance is loose: 5% relative,
+        // since the FD discretization itself contributes ~0.1-1%
+        // deviation from the continuum value.
+        let pi_v = Float::with_val(prec, rug::float::Constant::Pi);
+        let mut expected_e0 = pi_v.clone();
+        expected_e0 *= 2u32;
+        expected_e0 *= Float::with_val(prec, lambda_sq);
+        let mut diff = evals[0].clone();
+        diff -= &expected_e0;
+        let abs_diff = diff.abs();
+        let mut tol_rel = expected_e0.clone().abs();
+        tol_rel *= 5u32;
+        tol_rel /= 100u32;  // 5% of expected
+        if !abs_diff.cmp_abs(&tol_rel).map(|o| o.is_lt()).unwrap_or(false) {
+            return Some(format!(
+                "ground state {} deviates from 2πλ² ≈ {} by {} (5% tol)",
+                evals[0], expected_e0, abs_diff
+            ));
+        }
+
+        // Per-element finiteness/precision sanity (cheap belt-and-
+        // suspenders against hot-tip values like NaN slipping through
+        // the JSON parser).
+        let tol = prolate_cache_tol(prec);
+        for (k, e) in evals.iter().enumerate() {
+            if e.is_nan() {
+                return Some(format!("eigenvalue {} is NaN", k));
+            }
+            if e.is_infinite() {
+                return Some(format!("eigenvalue {} is infinite", k));
+            }
+            // Suppress unused warning — tol is passed for parity with
+            // future identity checks; not currently used.
+            let _ = &tol;
+        }
+
+        None
+    }
+
+    /// Round-trip check: for the cache key to be valid, `λ²` must
+    /// round to an exact non-negative integer to within working
+    /// precision tolerance. Returns `None` if the value isn't an
+    /// integer (or is negative); the cache layer treats this as
+    /// "cache disabled for this caller" and falls through to compute.
+    fn lambda_sq_int_for_key(lambda_sq: &Float) -> Option<u64> {
+        if lambda_sq.is_sign_negative() || lambda_sq.is_zero() {
+            return None;
+        }
+        // round(λ²) and compare back.
+        let rounded = lambda_sq.clone().round();
+        let mut diff = lambda_sq.clone();
+        diff -= &rounded;
+        let abs_diff = diff.abs();
+        // Generous tolerance: 1e-10. λ² in our paper configs is
+        // exactly integer (13, 100, 1000); this rounds at f64 → HP
+        // round-trip noise (~1e-15 at most).
+        let tol = Float::with_val(lambda_sq.prec(), rug::Float::parse("1e-10").unwrap());
+        if !abs_diff.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false) {
+            return None;
+        }
+        // Convert rounded HP → u64. to_integer().to_u64() handles this.
+        rounded.to_integer().and_then(|i| i.to_u64())
+    }
+
+    fn prolate_cache_dir() -> Option<std::path::PathBuf> {
+        let cwd = std::env::current_dir().ok()?;
+        let dir = cwd.join("data").join("prolate_eigvals_cache");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    }
+
+    fn prolate_cache_filename(lambda_sq: u64, n_grid: usize, prec: u32) -> String {
+        format!("lambda_sq{}_ngrid{}_prec{}.json", lambda_sq, n_grid, prec)
+    }
+
+    fn prolate_cache_path(lambda_sq: u64, n_grid: usize, prec: u32) -> Option<std::path::PathBuf> {
+        prolate_cache_dir().map(|d| d.join(prolate_cache_filename(lambda_sq, n_grid, prec)))
+    }
+
+    fn prolate_cache_zip_path(lambda_sq: u64, n_grid: usize, prec: u32) -> Option<std::path::PathBuf> {
+        prolate_cache_dir().map(|d| {
+            let f = prolate_cache_filename(lambda_sq, n_grid, prec);
+            d.join(format!("{}.zip", f))
+        })
+    }
+
+    /// Parse a prolate eigenvalue cache JSON: a single JSON array of
+    /// decimal strings, length `n_expected`, each parseable at the
+    /// requested precision. Returns `None` on any structural mismatch.
+    fn parse_prolate_cache_json(data: &str, n_expected: usize, prec: u32) -> Option<Vec<Float>> {
+        let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
+        let arr = parsed.as_array()?;
+        if arr.len() != n_expected { return None; }
+        let mut evals = Vec::with_capacity(n_expected);
+        for s in arr {
+            evals.push(Float::with_val(prec, Float::parse(s.as_str()?).ok()?));
+        }
+        Some(evals)
+    }
+
+    fn warn_prolate_cache_skip(path: &std::path::Path, reason: &str) {
+        eprintln!(
+            "[prolate_cache] WARNING: skipping {} ({}); recomputing",
+            path.display(), reason
+        );
+    }
+
+    fn load_prolate_eigvals_from_zip(
+        zip_path: &std::path::Path,
+        json_filename: &str,
+        n_expected: usize,
+        prec: u32,
+    ) -> Option<(Vec<Float>, String)> {
+        use std::io::Read;
+        let file = std::fs::File::open(zip_path).ok()?;
+        let mut archive = zip::ZipArchive::new(file).ok()?;
+        let mut entry = archive.by_name(json_filename).ok()?;
+        let mut data = String::new();
+        entry.read_to_string(&mut data).ok()?;
+        let parsed = parse_prolate_cache_json(&data, n_expected, prec)?;
+        Some((parsed, data))
+    }
+
+    /// Try to load prolate eigenvalues from disk cache for `(λ², n_grid, prec)`.
+    /// Returns `None` if cache miss, parse failure, or structural
+    /// validation failure (with diagnostic warning to stderr in the
+    /// failure cases).
+    fn load_prolate_eigvals_cache(
+        lambda_sq: u64, n_grid: usize, prec: u32,
+    ) -> Option<Vec<Float>> {
+        // Path 1: uncompressed JSON.
+        if let Some(path) = prolate_cache_path(lambda_sq, n_grid, prec) {
+            if path.exists() {
+                match std::fs::read_to_string(&path) {
+                    Ok(data) => match parse_prolate_cache_json(&data, n_grid, prec) {
+                        Some(evals) => {
+                            if let Some(reason) = prolate_cache_structural_check(
+                                &evals, n_grid, lambda_sq, prec,
+                            ) {
+                                warn_prolate_cache_skip(&path, &reason);
+                            } else {
+                                return Some(evals);
+                            }
+                        }
+                        None => {
+                            warn_prolate_cache_skip(&path, "JSON shape mismatch or unparseable");
+                        }
+                    },
+                    Err(e) => {
+                        warn_prolate_cache_skip(&path, &format!("read failed: {}", e));
+                    }
+                }
+            }
+        }
+
+        // Path 2: zip-compressed JSON.
+        if let Some(zip_path) = prolate_cache_zip_path(lambda_sq, n_grid, prec) {
+            if zip_path.exists() {
+                let json_filename = prolate_cache_filename(lambda_sq, n_grid, prec);
+                match load_prolate_eigvals_from_zip(&zip_path, &json_filename, n_grid, prec) {
+                    Some((evals, json_string)) => {
+                        if let Some(reason) = prolate_cache_structural_check(
+                            &evals, n_grid, lambda_sq, prec,
+                        ) {
+                            warn_prolate_cache_skip(&zip_path, &reason);
+                        } else {
+                            // Write the decompressed copy.
+                            if let Some(json_path) =
+                                prolate_cache_path(lambda_sq, n_grid, prec)
+                            {
+                                let _ = std::fs::write(&json_path, &json_string);
+                            }
+                            return Some(evals);
+                        }
+                    }
+                    None => {
+                        warn_prolate_cache_skip(
+                            &zip_path,
+                            "zip open / decompress / shape parse failed",
+                        );
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn save_prolate_eigvals_cache(
+        lambda_sq: u64, n_grid: usize, prec: u32, evals: &[Float],
+    ) {
+        if let Some(path) = prolate_cache_path(lambda_sq, n_grid, prec) {
+            let strs: Vec<String> = evals.iter().map(|f| f.to_string()).collect();
+            let json = serde_json::Value::Array(
+                strs.into_iter().map(serde_json::Value::String).collect()
+            );
+            if let Ok(s) = serde_json::to_string(&json) {
+                let _ = std::fs::write(path, s);
+            }
+        }
+    }
+
+    /// Per-file outcome from `verify_prolate_eigvals_cache_dir`.
+    ///
+    /// Each variant carries the file path and (when parseable from the
+    /// filename) the cache key tuple `(lambda_sq, n_grid, prec)`.
+    /// `Skipped` is emitted for files whose name doesn't match the
+    /// expected `lambda_sq{L}_ngrid{N}_prec{P}.json[.zip]` pattern.
+    #[derive(Debug, Clone)]
+    pub enum ProlateCacheFileStatus {
+        /// File parsed and passed all structural identity checks.
+        Ok { path: std::path::PathBuf, n_grid: usize, prec: u32, lambda_sq: u64 },
+        /// File skipped because its name didn't match the expected
+        /// `lambda_sq{L}_ngrid{N}_prec{P}.json[.zip]` pattern.
+        Skipped { path: std::path::PathBuf, reason: String },
+        /// Filename matched but the file failed to load (parse JSON,
+        /// decompress zip, etc.).
+        LoadFailed { path: std::path::PathBuf, n_grid: usize, prec: u32, lambda_sq: u64, reason: String },
+        /// File loaded but the eigenvalue vector failed at least one
+        /// of the prolate-spectrum structural identities (count, sort
+        /// order, ground-state magnitude ≈ 2π·λ², per-element
+        /// finiteness).
+        StructurallyInvalid { path: std::path::PathBuf, n_grid: usize, prec: u32, lambda_sq: u64, reason: String },
+    }
+
+    /// Aggregate report from `verify_prolate_eigvals_cache_dir`.
+    #[derive(Debug, Clone)]
+    pub struct ProlateCacheVerifyReport {
+        /// Directory that was scanned.
+        pub directory: std::path::PathBuf,
+        /// One status entry per file in `directory`.
+        pub statuses: Vec<ProlateCacheFileStatus>,
+    }
+
+    impl ProlateCacheVerifyReport {
+        /// Count of files that passed all checks.
+        pub fn ok_count(&self) -> usize {
+            self.statuses.iter().filter(|s| matches!(s, ProlateCacheFileStatus::Ok { .. })).count()
+        }
+        /// Count of files that failed at least one check (load or
+        /// structural). Skipped files are not counted as failures.
+        pub fn failure_count(&self) -> usize {
+            self.statuses.iter().filter(|s| matches!(s,
+                ProlateCacheFileStatus::LoadFailed { .. }
+                | ProlateCacheFileStatus::StructurallyInvalid { .. }
+            )).count()
+        }
+        /// All failure entries (load + structural), for callers that
+        /// want to print only the bad files.
+        pub fn failures(&self) -> impl Iterator<Item = &ProlateCacheFileStatus> {
+            self.statuses.iter().filter(|s| matches!(s,
+                ProlateCacheFileStatus::LoadFailed { .. }
+                | ProlateCacheFileStatus::StructurallyInvalid { .. }
+            ))
+        }
+    }
+
+    fn parse_prolate_cache_filename(name: &str) -> Option<(u64, usize, u32)> {
+        // `lambda_sq{LSQ}_ngrid{N}_prec{P}.json[.zip]`
+        let stem = name
+            .strip_suffix(".json.zip")
+            .or_else(|| name.strip_suffix(".json"))?;
+        let after_lsq = stem.strip_prefix("lambda_sq")?;
+        let mut parts = after_lsq.splitn(2, "_ngrid");
+        let lsq_str = parts.next()?;
+        let rest = parts.next()?;
+        let mut parts2 = rest.splitn(2, "_prec");
+        let n_str = parts2.next()?;
+        let prec_str = parts2.next()?;
+        let lambda_sq: u64 = lsq_str.parse().ok()?;
+        let n_grid: usize = n_str.parse().ok()?;
+        let prec: u32 = prec_str.parse().ok()?;
+        Some((lambda_sq, n_grid, prec))
+    }
+
+    /// Walk the prolate eigenvalue cache directory and structurally
+    /// verify every `lambda_sq{L}_ngrid{N}_prec{P}.json[.zip]` file.
+    /// Returns a per-file status report; does not mutate any files.
+    pub fn verify_prolate_eigvals_cache_dir(
+        dir: &std::path::Path,
+    ) -> std::io::Result<ProlateCacheVerifyReport> {
+        let mut statuses: Vec<ProlateCacheFileStatus> = Vec::new();
+
+        if !dir.exists() {
+            return Ok(ProlateCacheVerifyReport {
+                directory: dir.to_path_buf(),
+                statuses,
+            });
+        }
+
+        let entries = std::fs::read_dir(dir)?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() { continue; }
+            let name = match path.file_name().and_then(|s| s.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            let (lambda_sq, n_grid, prec) = match parse_prolate_cache_filename(name) {
+                Some(t) => t,
+                None => {
+                    statuses.push(ProlateCacheFileStatus::Skipped {
+                        path: path.clone(),
+                        reason: format!(
+                            "filename '{}' not in expected lambda_sq{{L}}_ngrid{{N}}_prec{{P}}.json[.zip] form",
+                            name
+                        ),
+                    });
+                    continue;
+                }
+            };
+
+            let parsed: Option<Vec<Float>> = if name.ends_with(".json.zip") {
+                let json_filename = prolate_cache_filename(lambda_sq, n_grid, prec);
+                load_prolate_eigvals_from_zip(&path, &json_filename, n_grid, prec)
+                    .map(|(p, _)| p)
+            } else {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|data| parse_prolate_cache_json(&data, n_grid, prec))
+            };
+
+            let evals = match parsed {
+                Some(e) => e,
+                None => {
+                    statuses.push(ProlateCacheFileStatus::LoadFailed {
+                        path: path.clone(),
+                        lambda_sq, n_grid, prec,
+                        reason: "parse / decompress failed".to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            match prolate_cache_structural_check(&evals, n_grid, lambda_sq, prec) {
+                None => {
+                    statuses.push(ProlateCacheFileStatus::Ok {
+                        path, lambda_sq, n_grid, prec
+                    });
+                }
+                Some(reason) => {
+                    statuses.push(ProlateCacheFileStatus::StructurallyInvalid {
+                        path, lambda_sq, n_grid, prec, reason
+                    });
+                }
+            }
+        }
+
+        Ok(ProlateCacheVerifyReport {
+            directory: dir.to_path_buf(),
+            statuses,
+        })
+    }
+
     /// HP result of `compute_k_lambda`. Stores the sample grid and k_λ
     /// values in HP.
     #[derive(Debug, Clone)]
@@ -959,12 +1398,41 @@ pub mod hp {
         let n_plus_1 = Float::with_val(prec, (n + 1) as u32);
         h /= &n_plus_1;
 
-        // Get all eigenvalues sorted ascending.
-        eprintln!("[HP prolate] computing all {} eigenvalues of PW_λ via tridiag QR...", n);
-        let eig_start = std::time::Instant::now();
-        let eigenvalues = tridiag_eigenvalues_hp(&diag, &off_diag, prec)?;
-        eprintln!("[HP prolate] {} eigenvalues computed in {:.1}s",
-            eigenvalues.len(), eig_start.elapsed().as_secs_f64());
+        // Get all eigenvalues sorted ascending. Try the prolate
+        // eigenvalue cache first: at HP-1000 with N=8001 the
+        // tridiagonal QR is ~30 minutes; if we've computed this exact
+        // (λ², n_grid, prec) before, the cache turns that into a
+        // ~5-second JSON read. Cache key derives from λ²_int — only
+        // active when λ² is integer-valued (our paper configs are
+        // 13/100/1000); non-integer λ² silently bypasses the cache.
+        let mut lambda_sq_for_key = lambda.clone();
+        lambda_sq_for_key *= lambda;
+        let cache_key = lambda_sq_int_for_key(&lambda_sq_for_key);
+
+        let eigenvalues: Vec<Float> = if let Some(lambda_sq_int) = cache_key {
+            if let Some(cached) = load_prolate_eigvals_cache(lambda_sq_int, n, prec) {
+                eprintln!(
+                    "[HP prolate] loaded {} cached eigenvalues for λ²={}, N={}, prec={} bits",
+                    cached.len(), lambda_sq_int, n, prec
+                );
+                cached
+            } else {
+                eprintln!("[HP prolate] computing all {} eigenvalues of PW_λ via tridiag QR...", n);
+                let eig_start = std::time::Instant::now();
+                let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec)?;
+                eprintln!("[HP prolate] {} eigenvalues computed in {:.1}s",
+                    evals.len(), eig_start.elapsed().as_secs_f64());
+                save_prolate_eigvals_cache(lambda_sq_int, n, prec, &evals);
+                evals
+            }
+        } else {
+            eprintln!("[HP prolate] computing all {} eigenvalues of PW_λ via tridiag QR (cache disabled: λ² not integer)...", n);
+            let eig_start = std::time::Instant::now();
+            let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec)?;
+            eprintln!("[HP prolate] {} eigenvalues computed in {:.1}s",
+                evals.len(), eig_start.elapsed().as_secs_f64());
+            evals
+        };
         if eigenvalues.len() != n {
             anyhow::bail!("eigensolver returned {} eigenvalues, expected {}",
                 eigenvalues.len(), n);
@@ -984,23 +1452,23 @@ pub mod hp {
             let lambda_k = &eigenvalues[k];
             eprintln!("[HP prolate] eigenvector {}/{} (eigenvalue {})...",
                 k + 1, n_try, xc_numerics::fmt::display_hp(lambda_k, 8));
-            // Opt into early termination: prolate eigenvectors are
-            // well-conditioned (the spectrum is widely-spaced and
-            // non-degenerate at small k) so the iteration typically
-            // converges in 20-50 steps. Capping at 200 with no
-            // convergence check was wasting hours per run at HP-1000.
-            // Convergence threshold is the same one `inverse_iteration`
-            // in linalg.rs uses (working-precision tight); a
-            // convergence-detected break produces a vector that
-            // satisfies the eigenequation to working precision.
+            // Opt into the production defaults: banded LU (O(n) factor
+            // and O(n) per-step solve via tridiag_lu_factor_hp + Thomas
+            // forward/back substitution), early termination on the
+            // |⟨v_k, v_{k-1}⟩| convergence proxy, 200-step ceiling.
             //
-            // Banded variant: uses tridiagonal LU (Thomas with partial
-            // pivoting) instead of densifying T - λI + εI to N×N. At
-            // HP-1000 with N=8001 this drops the per-eigenvector
-            // wall-time from hours to seconds and the memory footprint
-            // from ~26 GB to a few KB.
-            let v = match tridiag_eigenvector_for_value_hp_banded(
-                &diag, &off_diag, lambda_k, prec, 200, true,
+            // Prolate eigenvectors are well-conditioned (the spectrum
+            // is widely-spaced and non-degenerate at small k) so the
+            // iteration typically converges in 20-50 steps. Capping at
+            // 200 with no convergence check was wasting hours per run
+            // at HP-1000.
+            //
+            // Banded LU drops the per-eigenvector wall-time from hours
+            // to seconds at HP-1000 with N=8001, and the memory
+            // footprint from ~26 GB to a few KB, vs the dense LU
+            // alternative.
+            let v = match tridiag_eigenvector_for_value_hp(
+                &diag, &off_diag, lambda_k, prec, TridiagEigvecOptions::default(),
             ) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -1168,10 +1636,15 @@ pub mod hp {
     /// HP comparison result. All fields HP except `linf_index` (a usize).
     #[derive(Debug, Clone)]
     pub struct HpComparisonResult {
+        /// Best fit scalar `c` such that `c·k_λ ≈ ξ_λ` on the sampling grid (HP).
         pub optimal_scalar: Float,
+        /// L∞ norm of the residual `ξ_λ − c·k_λ` on the grid (HP).
         pub linf_error: Float,
+        /// Discrete ℓ² norm of the residual (no quadrature weights), HP.
         pub l2_error: Float,
+        /// L∞ norm of `ξ_λ` on the grid, used for relative-error reporting (HP).
         pub xi_linf: Float,
+        /// Index of the maximum residual on the sampling grid.
         pub linf_index: usize,
     }
 
@@ -1429,6 +1902,209 @@ pub mod hp {
             let zero = Float::with_val(prec, 0);
             assert!(cmp.xi_linf > zero,
                 "xi_linf should be positive, got {}", display_hp(&cmp.xi_linf, 6));
+        }
+
+        // ---------------------------------------------------------------
+        // Prolate eigenvalue cache — pure-function and verify_dir tests
+        // ---------------------------------------------------------------
+
+        /// `lambda_sq_int_for_key` accepts integer-valued λ² (within
+        /// 1e-10 tolerance) and rejects non-integer values.
+        #[test]
+        fn cache_key_accepts_integer_lambda_sq() {
+            let prec = 256;
+            // Integer-valued λ² → Some(L)
+            assert_eq!(lambda_sq_int_for_key(&hp(prec, "13")), Some(13));
+            assert_eq!(lambda_sq_int_for_key(&hp(prec, "100")), Some(100));
+            assert_eq!(lambda_sq_int_for_key(&hp(prec, "1000")), Some(1000));
+            // Tiny f64 round-trip noise should still parse — but we're
+            // building these from exact strings so they're already tight.
+            assert_eq!(lambda_sq_int_for_key(&hp(prec, "13.0")), Some(13));
+            // Non-integer rejected.
+            assert_eq!(lambda_sq_int_for_key(&hp(prec, "13.5")), None);
+            assert_eq!(lambda_sq_int_for_key(&hp(prec, "100.001")), None);
+            // Negative or zero rejected.
+            assert_eq!(lambda_sq_int_for_key(&hp(prec, "0")), None);
+            let mut neg = hp(prec, "13"); neg = -neg;
+            assert_eq!(lambda_sq_int_for_key(&neg), None);
+        }
+
+        /// `parse_prolate_cache_filename` parses well-formed names and
+        /// rejects others.
+        #[test]
+        fn cache_filename_parser_extracts_tuple() {
+            assert_eq!(
+                parse_prolate_cache_filename("lambda_sq13_ngrid4001_prec3338.json"),
+                Some((13, 4001, 3338))
+            );
+            assert_eq!(
+                parse_prolate_cache_filename("lambda_sq1000_ngrid8001_prec3338.json.zip"),
+                Some((1000, 8001, 3338))
+            );
+            // Wrong shape → None.
+            assert_eq!(parse_prolate_cache_filename("foo.json"), None);
+            assert_eq!(parse_prolate_cache_filename("lambda_sq13.json"), None);
+            assert_eq!(
+                parse_prolate_cache_filename("lambda_sq_ngrid_prec.json"),
+                None
+            );
+        }
+
+        /// `prolate_cache_structural_check` accepts a real prolate
+        /// spectrum and rejects perturbed versions.
+        #[test]
+        fn cache_structural_check_accepts_real_prolate_spectrum() {
+            let prec = 256;
+            let lambda = hp(prec, "5");
+            let lambda_sq: u64 = 25;
+            let n = 401;
+            let (diag, off_diag) = build_pw_matrix(&lambda, n, prec);
+            let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
+            // Real spectrum must pass.
+            assert!(prolate_cache_structural_check(&evals, n, lambda_sq, prec).is_none(),
+                "real prolate spectrum should pass structural check");
+
+            // Wrong count → reject.
+            let mut short = evals.clone();
+            short.pop();
+            assert!(prolate_cache_structural_check(&short, n, lambda_sq, prec).is_some(),
+                "wrong count should be rejected");
+
+            // Out-of-order → reject.
+            let mut shuffled = evals.clone();
+            shuffled.swap(0, 5);
+            assert!(prolate_cache_structural_check(&shuffled, n, lambda_sq, prec).is_some(),
+                "non-ascending order should be rejected");
+
+            // Wrong ground state magnitude → reject. Replace e_0 with
+            // a value 50% off from 2π·25.
+            let mut off_e0 = evals.clone();
+            off_e0[0] = hp(prec, "50");  // way below 2π·25 ≈ 157
+            assert!(prolate_cache_structural_check(&off_e0, n, lambda_sq, prec).is_some(),
+                "ground-state magnitude check should reject 50 vs 2π·25 ≈ 157");
+
+            // NaN entry → reject.
+            let mut with_nan = evals.clone();
+            with_nan[10] = Float::with_val(prec, f64::NAN);
+            assert!(prolate_cache_structural_check(&with_nan, n, lambda_sq, prec).is_some(),
+                "NaN entry should be rejected");
+        }
+
+        /// `verify_prolate_eigvals_cache_dir` on a non-existent directory
+        /// returns an empty report, not an error.
+        #[test]
+        fn verify_dir_handles_missing_directory() {
+            let temp_root = std::env::temp_dir()
+                .join(format!("xc_spectral_prolate_cache_test_missing_{}",
+                              std::process::id()));
+            let nonexistent = temp_root.join("does_not_exist");
+            let report = verify_prolate_eigvals_cache_dir(&nonexistent).unwrap();
+            assert_eq!(report.statuses.len(), 0);
+            assert_eq!(report.ok_count(), 0);
+            assert_eq!(report.failure_count(), 0);
+        }
+
+        /// `verify_prolate_eigvals_cache_dir` classifies files by kind:
+        /// Ok, Skipped (unrecognized name), LoadFailed (malformed JSON),
+        /// StructurallyInvalid (parses but fails identity check).
+        #[test]
+        fn verify_dir_classifies_files() {
+            let prec = 256;
+            let lambda = hp(prec, "5");
+            let lambda_sq: u64 = 25;
+            let n_grid: usize = 401;
+
+            // Compute a real spectrum once.
+            let (diag, off_diag) = build_pw_matrix(&lambda, n_grid, prec);
+            let real_evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
+
+            // Build an isolated temp dir.
+            let temp_dir = std::env::temp_dir()
+                .join(format!("xc_spectral_prolate_cache_test_classify_{}_{}",
+                              std::process::id(),
+                              std::time::SystemTime::now()
+                                  .duration_since(std::time::UNIX_EPOCH)
+                                  .map(|d| d.as_nanos()).unwrap_or(0)));
+            std::fs::create_dir_all(&temp_dir).unwrap();
+
+            // 1. Valid file: serialize the real spectrum.
+            let valid_name = prolate_cache_filename(lambda_sq, n_grid, prec);
+            let valid_path = temp_dir.join(&valid_name);
+            let strs: Vec<String> = real_evals.iter().map(|f| f.to_string()).collect();
+            let valid_json = serde_json::Value::Array(
+                strs.into_iter().map(serde_json::Value::String).collect()
+            );
+            std::fs::write(&valid_path, serde_json::to_string(&valid_json).unwrap()).unwrap();
+
+            // 2. Structurally-invalid file: reverse the spectrum so it's
+            //    not ascending.
+            let mut bad_evals = real_evals.clone();
+            bad_evals.reverse();
+            let bad_name = prolate_cache_filename(lambda_sq + 1, n_grid, prec);
+            let bad_path = temp_dir.join(&bad_name);
+            let bad_strs: Vec<String> = bad_evals.iter().map(|f| f.to_string()).collect();
+            let bad_json = serde_json::Value::Array(
+                bad_strs.into_iter().map(serde_json::Value::String).collect()
+            );
+            std::fs::write(&bad_path, serde_json::to_string(&bad_json).unwrap()).unwrap();
+
+            // 3. Skipped file: unrecognized name.
+            let skipped_path = temp_dir.join("not_a_prolate_cache.txt");
+            std::fs::write(&skipped_path, "irrelevant").unwrap();
+
+            // 4. LoadFailed: matching name pattern, malformed JSON.
+            let malformed_name = prolate_cache_filename(lambda_sq + 2, n_grid, prec);
+            let malformed_path = temp_dir.join(&malformed_name);
+            std::fs::write(&malformed_path, "{").unwrap();
+
+            let report = verify_prolate_eigvals_cache_dir(&temp_dir).unwrap();
+            assert_eq!(report.statuses.len(), 4,
+                "expected 4 statuses, got {}", report.statuses.len());
+
+            let mut saw_ok = false;
+            let mut saw_invalid = false;
+            let mut saw_skipped = false;
+            let mut saw_loadfail = false;
+            for s in &report.statuses {
+                match s {
+                    ProlateCacheFileStatus::Ok { path, lambda_sq: l, n_grid: ng, prec: p } => {
+                        assert_eq!(path, &valid_path);
+                        assert_eq!(*l, lambda_sq);
+                        assert_eq!(*ng, n_grid);
+                        assert_eq!(*p, prec);
+                        saw_ok = true;
+                    }
+                    ProlateCacheFileStatus::StructurallyInvalid { path, .. } => {
+                        assert_eq!(path, &bad_path);
+                        saw_invalid = true;
+                    }
+                    ProlateCacheFileStatus::Skipped { path, .. } => {
+                        assert_eq!(path, &skipped_path);
+                        saw_skipped = true;
+                    }
+                    ProlateCacheFileStatus::LoadFailed { path, .. } => {
+                        assert_eq!(path, &malformed_path);
+                        saw_loadfail = true;
+                    }
+                }
+            }
+            assert!(saw_ok, "missing Ok");
+            assert!(saw_invalid, "missing StructurallyInvalid");
+            assert!(saw_skipped, "missing Skipped");
+            assert!(saw_loadfail, "missing LoadFailed");
+
+            assert_eq!(report.ok_count(), 1);
+            assert_eq!(report.failure_count(), 2,
+                "LoadFailed + StructurallyInvalid both count; expected 2");
+
+            // Files preserved (verify is read-only).
+            assert!(valid_path.exists());
+            assert!(bad_path.exists());
+            assert!(skipped_path.exists());
+            assert!(malformed_path.exists());
+
+            // Cleanup.
+            let _ = std::fs::remove_dir_all(&temp_dir);
         }
     }
 }

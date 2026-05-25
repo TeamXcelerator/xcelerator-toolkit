@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "xc-numerics"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "rayon",
@@ -505,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "xc-spectral"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "nalgebra",
@@ -515,11 +515,12 @@ dependencies = [
  "serde_json",
  "xc-numerics",
  "xc-zeta",
+ "zip",
 ]
 
 [[package]]
 name = "xc-zeta"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "rug",

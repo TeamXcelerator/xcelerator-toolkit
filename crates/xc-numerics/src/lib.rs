@@ -7,9 +7,13 @@
 //!
 //! - **`quadrature`**: Gauss-Legendre nodes/weights at f64 and HP, with
 //!   a disk cache for HP nodes (parameter-independent across runs).
-//! - **`linalg`**: HP linear algebra — LU factorization with partial
-//!   pivoting, LU solve, inverse iteration for smallest eigenpair,
-//!   ℓ² normalization, Rayleigh quotient.
+//! - **`linalg`**: HP linear algebra — dense LU factorization with
+//!   partial pivoting (`lu_factor` / `lu_solve`), banded tridiagonal
+//!   LU via Thomas with partial pivoting (`tridiag_lu_factor_hp` /
+//!   `tridiag_lu_solve_hp`; O(n) factor and solve), inverse iteration
+//!   for smallest eigenpair (with optional forced-even projection
+//!   and dual convergence-floor docs), ℓ² normalization, Rayleigh
+//!   quotient.
 //! - **`root_finding`**: bisection and Newton refinement helpers.
 //! - **`fmt`**: HP-only display/comparison helpers (no f64 fallbacks).
 //!   Use these wherever you would otherwise call `to_f64()` on a

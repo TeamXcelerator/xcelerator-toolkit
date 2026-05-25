@@ -20,14 +20,39 @@ use rug::{ops::Pow, Float};
 /// no f64 round-trip occurs.
 #[inline] fn hp_zero(prec: u32) -> Float { Float::with_val(prec, 0) }
 
-/// LU factorization with partial pivoting. The matrix `a` is stored row-major
-/// with `dim` rows and columns. Returns the factored representation suitable
-/// for `lu_solve`.
+// ===========================================================================
+// Dense LU factorization with partial pivoting
+// ===========================================================================
+
+/// Output of `lu_factor`. Stores the in-place LU representation plus the
+/// row permutation produced by partial pivoting.
+///
+/// The `lu` matrix is row-major with strictly lower-triangle entries
+/// holding the L multipliers (unit diagonal of L is implied) and the
+/// upper triangle holding U. The `perm` permutation records the row
+/// swaps so that `P · A = L · U`.
 pub struct LuFactors {
+    /// Combined LU storage, row-major, length `dim²`. The strict lower
+    /// triangle holds L (with implicit unit diagonal); the upper
+    /// triangle (including the diagonal) holds U.
     pub lu: Vec<Float>,
+    /// Row permutation. `perm[i]` is the original row index that ended
+    /// up at position `i` after partial pivoting.
     pub perm: Vec<usize>,
 }
 
+/// LU factorization of a dense `dim × dim` matrix with partial pivoting,
+/// in-place, at HP precision.
+///
+/// Input `a` is row-major (length `dim²`). Returns `LuFactors` suitable
+/// for solving `A · x = b` via [`lu_solve`]. Returns an error if the
+/// matrix is exactly singular (a zero pivot is encountered after
+/// pivoting).
+///
+/// The Schur-complement update is parallelized across rows via rayon.
+/// Cost is O(dim³) HP arithmetic ops; for the load-bearing toolkit
+/// callers (`inverse_iteration`) the LU factor is computed once and
+/// reused per step.
 pub fn lu_factor(a: &[Float], dim: usize) -> Result<LuFactors> {
     let mut lu: Vec<Float> = a.to_vec();
     let mut perm: Vec<usize> = (0..dim).collect();
@@ -405,6 +430,28 @@ pub fn rayleigh_quotient(a: &[Float], dim: usize, xi: &[Float], prec: u32) -> Fl
 /// natural smallest eigenvalue.
 ///
 /// Returns `(eigenvalue, eigenvector)`. The eigenvector is ℓ²-normalized.
+///
+/// # Convergence floors
+///
+/// The eigenvector residual `‖A·v - μ·v‖` is governed by *two* floors,
+/// whichever is larger:
+///
+/// 1. **Rate floor**: `(λ_min / λ_next_smallest)^max_steps`. Active when
+///    the iteration runs to `max_steps` without converging. Tight when
+///    the smallest eigenvalue is well-separated from the next-smallest.
+/// 2. **Rayleigh sqrt-floor**: When the iteration's
+///    Rayleigh-quotient stability test triggers early termination
+///    (eigenvalue change `|Δμ/μ| < 2^-(prec-32)`), the eigenvector
+///    residual is bounded by `√(2^-(prec-32))` ≈ `10^-(0.15·prec)`.
+///    This follows from Rayleigh's quadratic convergence: when the
+///    eigenvalue is good to ε, the eigenvector is good to √ε.
+///
+/// At HP-256 the Rayleigh sqrt-floor is ~10⁻³³; at HP-1000 it's ~10⁻⁴⁹⁸.
+/// To reach working-precision residual regardless of which floor is
+/// active, callers should use a *shifted* inverse iteration. For
+/// tridiagonal inputs see [`crate::eigen::tridiag_eigenvector_for_value_hp`]
+/// (which factorizes `T - λI + ε·I` once and runs the iteration on
+/// the deflated system, reaching ~10⁻⁹⁰⁰ at HP-1000 in tens of steps).
 pub fn inverse_iteration(
     a: &[Float],
     dim: usize,
@@ -659,6 +706,206 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // normalize_l2 / rayleigh_quotient — HEAVY tests
+    // -----------------------------------------------------------------------
+
+    /// `normalize_l2` on a zero-length vector should be a no-op (no panic,
+    /// no allocation). The function early-returns when `v` is empty.
+    #[test]
+    fn normalize_l2_empty_vector_is_noop() {
+        let mut v: Vec<Float> = Vec::new();
+        normalize_l2(&mut v);
+        assert!(v.is_empty(), "empty vector should remain empty");
+    }
+
+    /// `normalize_l2` on a single-nonzero-element vector produces a unit
+    /// vector (just sign-preserved): [3] → [1], [-7] → [-1].
+    #[test]
+    fn normalize_l2_single_element_preserves_sign() {
+        let prec = 128;
+        let mut v_pos = vec![hp(prec, "3")];
+        normalize_l2(&mut v_pos);
+        let one = hp(prec, "1");
+        let mut diff = v_pos[0].clone(); diff -= &one;
+        let abs_diff = diff.abs();
+        assert!(abs_diff < hp(prec, "1e-30"),
+            "[3] normalized should be [1]; got [{}]",
+            display_hp(&v_pos[0], 6));
+
+        let mut v_neg = vec![hp(prec, "-7")];
+        normalize_l2(&mut v_neg);
+        let neg_one = {
+            let mut t = hp(prec, "1");
+            t = -t;
+            t
+        };
+        let mut diff = v_neg[0].clone(); diff -= &neg_one;
+        let abs_diff = diff.abs();
+        assert!(abs_diff < hp(prec, "1e-30"),
+            "[-7] normalized should be [-1]; got [{}]",
+            display_hp(&v_neg[0], 6));
+    }
+
+    /// Property: after `normalize_l2`, the L² norm of the result is
+    /// always 1, regardless of the input vector's magnitude or length.
+    /// Tests across a sweep of sizes and seeded "random" signs.
+    #[test]
+    fn property_normalize_l2_produces_unit_norm() {
+        let prec = 256;
+        let sizes = [3usize, 7, 16, 50];
+
+        for &n in &sizes {
+            for seed in 0..3 {
+                // Deterministic-random vector with values in {-3, -1, 1, 3, 5}.
+                let pattern = [-3i32, -1, 1, 3, 5];
+                let mut v: Vec<Float> = (0..n).map(|i| {
+                    let val = pattern[(i + seed) % pattern.len()];
+                    hp(prec, &val.to_string())
+                }).collect();
+
+                normalize_l2(&mut v);
+
+                // Check ‖v‖² = 1.
+                let mut norm_sq = hp(prec, "0");
+                for vi in &v {
+                    let mut t = vi.clone();
+                    t *= vi;
+                    norm_sq += &t;
+                }
+                let mut diff = norm_sq.clone(); diff -= 1u32;
+                let abs_diff = diff.abs();
+                let tol = hp(prec, "1e-50");
+                assert!(abs_diff < tol,
+                    "n={}, seed={}: ‖v‖² should be 1, got {}",
+                    n, seed, display_hp(&norm_sq, 6));
+            }
+        }
+    }
+
+    /// HP-1000 round-trip: build a vector at HP-1000, normalize, and
+    /// verify ‖v‖² = 1 to working precision.
+    #[test]
+    fn normalize_l2_at_hp_1000() {
+        let prec = 3338;
+        let n = 100;
+        let mut v: Vec<Float> = (0..n).map(|i| {
+            // Linear ramp [1, 2, ..., 100] in HP.
+            hp(prec, &(i + 1).to_string())
+        }).collect();
+        normalize_l2(&mut v);
+
+        let mut norm_sq = hp(prec, "0");
+        for vi in &v {
+            let mut t = vi.clone();
+            t *= vi;
+            norm_sq += &t;
+        }
+        let mut diff = norm_sq.clone(); diff -= 1u32;
+        let abs_diff = diff.abs();
+        // At HP-1000 working precision, the normalize operation should
+        // achieve ‖v‖² = 1 to ~working-precision floor.
+        let tol = hp(prec, "1e-900");
+        assert!(abs_diff < tol,
+            "HP-1000 normalize_l2: ‖v‖² should be 1, got {} (diff {})",
+            display_hp(&norm_sq, 8), display_hp(&abs_diff, 6));
+    }
+
+    /// `rayleigh_quotient` on a known eigenvector returns the
+    /// corresponding eigenvalue. Test on Strang n=3 with the smallest
+    /// eigenvector recovered via inverse iteration.
+    #[test]
+    fn rayleigh_quotient_returns_eigenvalue_for_eigenvector() {
+        let prec = 256;
+        let n = 3;
+        // Strang's tridiagonal n=3 as a dense matrix.
+        let mut a = vec![hp_zero(prec); n * n];
+        for i in 0..n {
+            a[i * n + i] = hp(prec, "2");
+            if i > 0 { a[i * n + (i - 1)] = hp(prec, "-1"); }
+            if i + 1 < n { a[i * n + (i + 1)] = hp(prec, "-1"); }
+        }
+        // Recover smallest eigenvector via inverse iteration.
+        let (mu, v) = inverse_iteration(&a, n, prec, 200, false).unwrap();
+        // Now compute Rayleigh quotient and compare to mu.
+        let rq = rayleigh_quotient(&a, n, &v, prec);
+        let mut diff = rq.clone(); diff -= &mu;
+        let abs_diff = diff.abs();
+        // RQ matches the iteration's μ to working precision (it's the
+        // same computation modulo allocation).
+        let tol = hp(prec, "1e-50");
+        assert!(abs_diff < tol,
+            "RQ on smallest eigenvector should match μ; RQ={}, μ={}, diff={}",
+            display_hp(&rq, 8), display_hp(&mu, 8), display_hp(&abs_diff, 6));
+    }
+
+    /// Property: Rayleigh quotient is bounded above by the largest
+    /// eigenvalue and below by the smallest, for any unit vector.
+    /// We test by building diag(1, 2, 3, 4, 5) and confirming
+    /// that the RQ for several unit vectors lies in [1, 5].
+    #[test]
+    fn property_rayleigh_quotient_bounded_by_spectrum() {
+        let prec = 256;
+        let n = 5;
+        // Diagonal matrix with eigenvalues 1, 2, 3, 4, 5.
+        let mut a = vec![hp_zero(prec); n * n];
+        for i in 0..n {
+            a[i * n + i] = hp(prec, &(i + 1).to_string());
+        }
+
+        // Test on a sweep of unit vectors. For diag(λ_1, ..., λ_n),
+        // RQ = Σ λ_i x_i² / Σ x_i², which is a convex combination of
+        // eigenvalues bounded by min/max λ.
+        let lower = hp(prec, "1");
+        let upper = hp(prec, "5");
+        let tol = hp(prec, "1e-30");
+
+        // 5 deterministic unit vectors via seeded patterns.
+        for seed in 0..5 {
+            let mut v: Vec<Float> = (0..n).map(|i| {
+                let val = (((i + seed) * 13) % 11 + 1) as i32;
+                hp(prec, &val.to_string())
+            }).collect();
+            normalize_l2(&mut v);
+            let rq = rayleigh_quotient(&a, n, &v, prec);
+
+            // RQ must be ≥ 1 - tol and ≤ 5 + tol.
+            let mut below = lower.clone(); below -= &tol;
+            let mut above = upper.clone(); above += &tol;
+            assert!(rq >= below,
+                "seed={}: RQ {} should be ≥ smallest eigenvalue 1",
+                seed, display_hp(&rq, 6));
+            assert!(rq <= above,
+                "seed={}: RQ {} should be ≤ largest eigenvalue 5",
+                seed, display_hp(&rq, 6));
+        }
+    }
+
+    /// HP-1000 RQ test: on Strang n=10 with smallest eigenvector,
+    /// Rayleigh quotient matches the known closed-form smallest
+    /// eigenvalue λ_1 = 2 - 2cos(π/11) to working-precision floor.
+    #[test]
+    fn rayleigh_quotient_at_hp_1000() {
+        let prec = 3338;
+        let n = 10;
+        let a = strang_dense(prec, n);
+        // Use inverse_iteration to get the smallest eigenpair.
+        let (mu, v) = inverse_iteration(&a, n, prec, 200, false).unwrap();
+        let rq = rayleigh_quotient(&a, n, &v, prec);
+        let mut diff = rq.clone(); diff -= &mu;
+        let abs_diff = diff.abs();
+        // RQ and μ should match very tightly. The Rayleigh-sqrt
+        // convergence floor at HP-1000 (~10⁻⁴⁹⁸) governs how close v is
+        // to the true eigenvector; the difference between RQ(v) and
+        // μ from inverse iteration is bounded by roughly the
+        // *square* of that floor (RQ has quadratic accuracy in the
+        // eigenvector error). 1e-100 leaves comfortable headroom.
+        let tol = hp(prec, "1e-100");
+        assert!(abs_diff < tol,
+            "HP-1000 RQ vs μ: |RQ - μ| = {} should be < 1e-100",
+            display_hp(&abs_diff, 6));
+    }
+
+    // -----------------------------------------------------------------------
     // Tridiagonal LU tests
     // -----------------------------------------------------------------------
     //
@@ -717,7 +964,12 @@ mod tests {
         for i in 0..4 {
             let mut diff = mx[i].clone(); diff -= &b[i];
             let abs_diff = diff.abs();
-            let tol = hp(prec, "1e-200");
+            // HP-256 working precision is ~77 decimal digits. After one
+            // LU factor + one solve over a 4×4 matrix, accumulated ULP
+            // error is ~10^-70. The test tolerance must respect this:
+            // 10^-60 leaves plenty of headroom while still catching any
+            // real algorithmic error (which would be much larger).
+            let tol = hp(prec, "1e-60");
             assert!(abs_diff < tol,
                 "M·x[{}] - b[{}] = {} should be ≈ 0", i, i, display_hp(&abs_diff, 4));
         }
@@ -762,7 +1014,9 @@ mod tests {
         for i in 0..3 {
             let mut diff = mx[i].clone(); diff -= &b[i];
             let abs_diff = diff.abs();
-            let tol = hp(prec, "1e-200");
+            // HP-256 ≈ 77 decimal digits. Pivoted 3×3 LU residual is at
+            // worst ~10^-70 from ULP accumulation; 10^-60 leaves headroom.
+            let tol = hp(prec, "1e-60");
             assert!(abs_diff < tol,
                 "with pivoting, M·x[{}] - b[{}] = {}", i, i, display_hp(&abs_diff, 4));
         }
@@ -922,7 +1176,12 @@ mod tests {
             if i < n - 1 { let mut t = upper[i].clone(); t *= &x[i + 1]; s += &t; }
             let mut diff = s.clone(); diff -= &b[i];
             let abs_diff = diff.abs();
-            let tol = hp(prec, "1e-200");
+            // HP-256 ≈ 77 decimal digits. At n=50 with asymmetric off-
+            // diagonals and partial pivoting, accumulated ULP error is
+            // ~10^-70; 10^-50 is comfortable headroom while still
+            // catching any algorithmic bug (which would manifest as
+            // O(1) error, not 10^-50).
+            let tol = hp(prec, "1e-50");
             assert!(abs_diff < tol,
                 "M·x[{}] - b[{}] = {}", i, i, display_hp(&abs_diff, 4));
         }
@@ -961,6 +1220,361 @@ mod tests {
             assert!(abs_diff < tol,
                 "HP-1000 M·x[{}] - b[{}] = {}", i, i, display_hp(&abs_diff, 4));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Dense LU — HEAVY tests
+    // -----------------------------------------------------------------------
+    //
+    // Closed-form structured matrices + property test + HP-1000 residual,
+    // mirroring the depth of the banded LU and HP eigensolver test suites.
+
+    /// Build Strang's tridiagonal `n x n` (diag=2, off=-1) as a *dense*
+    /// row-major matrix. Used as a canonical structured input for the
+    /// dense LU tests below.
+    fn strang_dense(prec: u32, n: usize) -> Vec<Float> {
+        let mut m = vec![hp_zero(prec); n * n];
+        for i in 0..n {
+            m[i * n + i] = hp(prec, "2");
+            if i > 0 { m[i * n + (i - 1)] = hp(prec, "-1"); }
+            if i + 1 < n { m[i * n + (i + 1)] = hp(prec, "-1"); }
+        }
+        m
+    }
+
+    /// Build Wilkinson W11 + shift as a dense matrix for LU testing.
+    /// W11 has diag = [5,4,3,2,1,0,1,2,3,4,5], off = all 1's. We add a
+    /// shift of -7 to the diagonal so the matrix is well-conditioned
+    /// (the largest eigenvalue ≈ 10.75; shifting by -7 keeps all
+    /// eigenvalues bounded away from zero).
+    fn wilkinson_w11_shifted(prec: u32) -> Vec<Float> {
+        let n = 11;
+        let raw = ["5", "4", "3", "2", "1", "0", "1", "2", "3", "4", "5"];
+        let mut m = vec![hp_zero(prec); n * n];
+        for i in 0..n {
+            let mut d = hp(prec, raw[i]);
+            d -= 7u32;
+            m[i * n + i] = d;
+            if i > 0 { m[i * n + (i - 1)] = hp(prec, "1"); }
+            if i + 1 < n { m[i * n + (i + 1)] = hp(prec, "1"); }
+        }
+        m
+    }
+
+    /// Closed-form: dense LU of Strang n=10 should solve M·x = e_5
+    /// (middle unit vector) and the recovered x should satisfy M·x = b
+    /// to working precision.
+    #[test]
+    fn lu_factor_solves_strang_n10() {
+        let prec = 256;
+        let n = 10;
+        let m = strang_dense(prec, n);
+
+        let factors = lu_factor(&m, n).unwrap();
+
+        // Solve M·x = e_{n/2}.
+        let mut b = vec![hp_zero(prec); n];
+        b[n / 2] = hp(prec, "1");
+        let x = lu_solve(&factors, &b, n, prec);
+        assert_eq!(x.len(), n);
+
+        // Verify M·x = b.
+        for i in 0..n {
+            let mut s = hp_zero(prec);
+            for j in 0..n {
+                let mut t = m[i * n + j].clone();
+                t *= &x[j];
+                s += &t;
+            }
+            let mut diff = s.clone(); diff -= &b[i];
+            let abs_diff = diff.abs();
+            // HP-256 ≈ 77 decimal digits. Dense LU on Strang n=10 with
+            // partial pivoting accumulates ~10^-70 ULP; 1e-50 leaves
+            // headroom while still catching algorithmic regressions.
+            let tol = hp(prec, "1e-50");
+            assert!(abs_diff < tol,
+                "Strang n=10 dense LU: M·x[{}] - b[{}] = {}",
+                i, i, display_hp(&abs_diff, 4));
+        }
+    }
+
+    /// Closed-form: dense LU on Wilkinson W11 + shift handles partial
+    /// pivoting on a near-symmetric input where some pivots will be
+    /// small (e.g. the row whose original diagonal was 0 - 7 = -7,
+    /// which is fine, but the elimination sequence still exercises the
+    /// pivoting logic).
+    #[test]
+    fn lu_factor_solves_wilkinson_w11_shifted() {
+        let prec = 512; // a bit higher to expose any cancellation
+        let n = 11;
+        let m = wilkinson_w11_shifted(prec);
+
+        let factors = lu_factor(&m, n).unwrap();
+
+        // Solve for b = e_0 (first canonical basis vector).
+        let mut b = vec![hp_zero(prec); n];
+        b[0] = hp(prec, "1");
+        let x = lu_solve(&factors, &b, n, prec);
+
+        // M·x = b verification.
+        for i in 0..n {
+            let mut s = hp_zero(prec);
+            for j in 0..n {
+                let mut t = m[i * n + j].clone();
+                t *= &x[j];
+                s += &t;
+            }
+            let mut diff = s.clone(); diff -= &b[i];
+            let abs_diff = diff.abs();
+            // HP-512 ≈ 154 decimal digits. Dense LU residual at this size
+            // accumulates ~10^-140 ULP; 1e-100 is comfortable headroom.
+            let tol = hp(prec, "1e-100");
+            assert!(abs_diff < tol,
+                "Wilkinson W11+shift LU: M·x[{}] - b[{}] = {}",
+                i, i, display_hp(&abs_diff, 4));
+        }
+    }
+
+    /// Property: solve M·x = b on deterministic-random symmetric
+    /// matrices across a sweep of sizes and seeds. Verify M·x reproduces
+    /// b to working precision.
+    ///
+    /// Uses small integer-valued entries from a deterministic LCG so HP
+    /// arithmetic is exact in the construction step — the only rounding
+    /// happens during LU factor + solve, which is the thing we want to
+    /// measure.
+    #[test]
+    fn lu_property_solve_matches_b() {
+        let prec = 256;
+        let sizes = [3usize, 5, 8];
+        let seeds_per_size = 3;
+
+        for &n in &sizes {
+            for seed in 0..seeds_per_size {
+                // Deterministic-random symmetric matrix with entries in
+                // a small integer range. We use a simple construction:
+                // diagonal = (n + i mod 3 + 1) (always positive,
+                // diagonally dominant), off-diagonal = ±1 alternating.
+                let mut a = vec![hp_zero(prec); n * n];
+                for i in 0..n {
+                    a[i * n + i] = hp(prec, &format!("{}", n + (i % 3) + 1));
+                    for j in (i + 1)..n {
+                        let val = if (i + j + seed as usize) % 2 == 0 { 1 } else { -1 };
+                        a[i * n + j] = hp(prec, &val.to_string());
+                        a[j * n + i] = hp(prec, &val.to_string());
+                    }
+                }
+
+                let factors = lu_factor(&a, n).unwrap();
+
+                // Build a non-trivial b.
+                let b: Vec<Float> = (0..n).map(|i| {
+                    hp(prec, &format!("{}", 1 + (i % 7)))
+                }).collect();
+
+                let x = lu_solve(&factors, &b, n, prec);
+                assert_eq!(x.len(), n);
+
+                // M·x = b check.
+                for i in 0..n {
+                    let mut s = hp_zero(prec);
+                    for j in 0..n {
+                        let mut t = a[i * n + j].clone();
+                        t *= &x[j];
+                        s += &t;
+                    }
+                    let mut diff = s.clone(); diff -= &b[i];
+                    let abs_diff = diff.abs();
+                    let tol = hp(prec, "1e-50");
+                    assert!(abs_diff < tol,
+                        "n={}, seed={}: M·x[{}] - b[{}] = {}",
+                        n, seed, i, i, display_hp(&abs_diff, 4));
+                }
+            }
+        }
+    }
+
+    /// HP-1000 residual: dense LU on Strang n=20 at 3338-bit precision.
+    /// Production scenario for the dense path; expect the residual to
+    /// land near working-precision floor.
+    #[test]
+    fn lu_at_hp_1000() {
+        let prec = 3338;
+        let n = 20;
+        let m = strang_dense(prec, n);
+
+        let factors = lu_factor(&m, n).unwrap();
+
+        let mut b = vec![hp_zero(prec); n];
+        b[n / 2] = hp(prec, "1");
+        let x = lu_solve(&factors, &b, n, prec);
+
+        for i in 0..n {
+            let mut s = hp_zero(prec);
+            for j in 0..n {
+                let mut t = m[i * n + j].clone();
+                t *= &x[j];
+                s += &t;
+            }
+            let mut diff = s.clone(); diff -= &b[i];
+            let abs_diff = diff.abs();
+            // At HP-1000 dense LU at n=20 should reach ~10^-900 residual.
+            let tol = hp(prec, "1e-900");
+            assert!(abs_diff < tol,
+                "HP-1000 Strang n=20 LU: M·x[{}] - b[{}] = {}",
+                i, i, display_hp(&abs_diff, 4));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // inverse_iteration — HEAVY tests
+    // -----------------------------------------------------------------------
+
+    /// Property: `inverse_iteration` recovers the smallest eigenvalue of
+    /// a deterministic-random *strongly* diagonally dominant matrix, and
+    /// the returned eigenvector satisfies A·v ≈ λ·v.
+    ///
+    /// `inverse_iteration` is governed by *two* convergence floors that
+    /// limit the achievable eigenvector residual:
+    ///
+    /// 1. **Rate floor**: `(λ_min / λ_next)^max_steps`. Active when the
+    ///    iteration runs to `max_steps` without triggering early
+    ///    termination. Tighter when the smallest eigenvalue is much
+    ///    smaller than the next-smallest.
+    /// 2. **Rayleigh sqrt-floor**: When the iteration's
+    ///    Rayleigh-quotient stability test triggers early termination
+    ///    (eigenvalue change `|Δμ/μ| < 2^-(prec-32)`), the eigenvector
+    ///    residual is bounded by the *square root* of that threshold
+    ///    (Rayleigh's quadratic convergence). At HP-256 this floor is
+    ///    `√(2^-224)` ≈ `10^-33`; at HP-1000 it's ≈ `10^-498`.
+    ///
+    /// We use a strongly diagonally dominant matrix (diag grows as
+    /// 1, 11, 21, ...; convergence ratio ~0.09) so the iteration
+    /// converges *fast* and triggers early termination — meaning floor
+    /// (2) applies. Tolerance set to `1e-25` (8 orders of headroom
+    /// above the ~10⁻³³ floor; tightens enough to catch any
+    /// algorithmic regression).
+    ///
+    /// Callers needing tighter residual than this floor should use
+    /// the shifted variant in
+    /// [`crate::eigen::tridiag_eigenvector_for_value_hp`], which
+    /// reaches working precision (~10⁻⁹⁰⁰ at HP-1000).
+    #[test]
+    fn property_inverse_iteration_recovers_eigenpair() {
+        let prec = 256;
+        let sizes = [3usize, 5, 8];
+        let seeds_per_size = 3;
+
+        for &n in &sizes {
+            for seed in 0..seeds_per_size {
+                // Strongly diagonally dominant: diag[i] = 1 + 10*i. Off-
+                // diagonals: small ±1 perturbations. This keeps the
+                // smallest eigenvalue near 1 while the next-smallest is
+                // near 10, giving an inverse-iteration convergence ratio
+                // of ~0.1 — fast enough that early termination triggers
+                // early (typically tens of steps).
+                let mut a = vec![hp_zero(prec); n * n];
+                for i in 0..n {
+                    let diag_val = 1 + 10 * (i as i32);
+                    a[i * n + i] = hp(prec, &diag_val.to_string());
+                    for j in (i + 1)..n {
+                        let val = if (i + j + seed as usize) % 3 == 0 { 1 }
+                                  else if (i + j + seed as usize) % 3 == 1 { -1 }
+                                  else { 0 };
+                        a[i * n + j] = hp(prec, &val.to_string());
+                        a[j * n + i] = hp(prec, &val.to_string());
+                    }
+                }
+
+                let (mu, v) = inverse_iteration(&a, n, prec, 200, false).unwrap();
+                assert_eq!(v.len(), n);
+
+                // A·v - μ·v residual.
+                let mut max_resid = hp_zero(prec);
+                for i in 0..n {
+                    let mut av_i = hp_zero(prec);
+                    for j in 0..n {
+                        let mut t = a[i * n + j].clone();
+                        t *= &v[j];
+                        av_i += &t;
+                    }
+                    let mut mu_v_i = mu.clone();
+                    mu_v_i *= &v[i];
+                    let mut diff = av_i; diff -= &mu_v_i;
+                    let abs_diff = diff.abs();
+                    if abs_diff > max_resid {
+                        max_resid = abs_diff;
+                    }
+                }
+
+                // 1e-25 sits 8 orders above the Rayleigh-sqrt floor at
+                // HP-256 (~10^-33). An algorithmic regression would
+                // produce O(1) error, far above this bound.
+                let tol = hp(prec, "1e-25");
+                assert!(max_resid < tol,
+                    "n={}, seed={}: ‖A·v - μ·v‖_∞ = {} should be < 1e-25",
+                    n, seed, display_hp(&max_resid, 4));
+
+                // Eigenvector unit-normalized.
+                let mut norm_sq = hp_zero(prec);
+                for vi in &v {
+                    let mut t = vi.clone();
+                    t *= vi;
+                    norm_sq += &t;
+                }
+                let mut nd = norm_sq.clone(); nd -= 1u32;
+                let abs_nd = nd.abs();
+                let norm_tol = hp(prec, "1e-50");
+                assert!(abs_nd < norm_tol,
+                    "n={}, seed={}: ‖v‖² should be 1, got {}",
+                    n, seed, display_hp(&norm_sq, 6));
+            }
+        }
+    }
+
+    /// HP-1000 inverse-iteration scenario: Strang n=20, recover the
+    /// smallest eigenpair and verify the residual lands at the
+    /// algorithm's convergence-rate floor (not working precision).
+    ///
+    /// Strang's eigenvalue gap is `λ_1/λ_2 ≈ 1/4`, so unshifted inverse
+    /// iteration has convergence ratio ~0.25 per step. After 200 steps
+    /// the residual lands at `0.25^200 ≈ 10⁻¹²⁰` — that's the algorithm
+    /// floor for this matrix, not the HP-1000 working-precision floor
+    /// (~10⁻⁹⁰⁰). To reach working precision we'd need a shifted
+    /// inverse iteration (which `tridiag_eigenvector_for_value_hp`
+    /// does and which lands at ~10⁻⁹⁰⁰ as the eigenvector test there
+    /// confirms). Tolerance set to 10⁻¹⁰⁰ — comfortably above the
+    /// expected algorithm floor and well below any algorithmic
+    /// regression.
+    #[test]
+    fn inverse_iteration_at_hp_1000() {
+        let prec = 3338;
+        let n = 20;
+        let a = strang_dense(prec, n);
+
+        let (mu, v) = inverse_iteration(&a, n, prec, 200, false).unwrap();
+        assert_eq!(v.len(), n);
+
+        let mut max_resid = hp_zero(prec);
+        for i in 0..n {
+            let mut av_i = hp_zero(prec);
+            for j in 0..n {
+                let mut t = a[i * n + j].clone();
+                t *= &v[j];
+                av_i += &t;
+            }
+            let mut mu_v_i = mu.clone();
+            mu_v_i *= &v[i];
+            let mut diff = av_i; diff -= &mu_v_i;
+            let abs_diff = diff.abs();
+            if abs_diff > max_resid {
+                max_resid = abs_diff;
+            }
+        }
+        let tol = hp(prec, "1e-100");
+        assert!(max_resid < tol,
+            "HP-1000 Strang n=20 inverse_iteration: ‖A·v - μ·v‖_∞ = {} should be < 1e-100",
+            display_hp(&max_resid, 6));
     }
 }
 

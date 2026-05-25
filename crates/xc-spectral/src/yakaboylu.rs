@@ -162,13 +162,31 @@ pub fn test_w_positivity_f64(
 }
 
 #[derive(Debug, Clone)]
+/// Result of a W-positivity test at f64 precision.
+///
+/// Returned by `test_w_positivity_f64`. The HP analogue is
+/// `hp::HpWPositivityResult`. f64 precision is adequate for sanity
+/// checks at small `n_zeros`; for production tests at larger N use
+/// the HP path to avoid f64-induced spurious indefiniteness.
 pub struct WPositivityResultF64 {
+    /// Number of zeros used to build the W matrix (matrix size N×N).
     pub n_zeros: usize,
+    /// Regularization parameter ε used in the V̂_R matrix element.
     pub epsilon_f64: f64,
+    /// Smallest eigenvalue of W. Should be > 0 for true zeros on the
+    /// critical line; negative values suggest off-line zeros or
+    /// numerical noise.
     pub smallest_eigenvalue_f64: f64,
+    /// Largest eigenvalue of W.
     pub largest_eigenvalue_f64: f64,
+    /// Spectral condition number `largest / |smallest|`. Returned as
+    /// `f64::INFINITY` if `|smallest| < 1e-300`.
     pub condition_number_f64: f64,
+    /// `true` if `smallest > -1e-10` (positivity within numerical
+    /// tolerance). The threshold is intentionally loose at f64 to
+    /// distinguish numerical noise from a real positivity violation.
     pub positive_definite: bool,
+    /// All eigenvalues of W, sorted ascending.
     pub all_eigenvalues_f64: Vec<f64>,
 }
 
@@ -469,12 +487,19 @@ pub mod hp {
     /// and `positive_definite`.
     #[derive(Debug, Clone)]
     pub struct HpWPositivityResult {
+        /// Number of zeros used to build the W matrix (matrix size N×N).
         pub n_zeros: usize,
+        /// Regularization parameter ε at HP precision.
         pub epsilon: Float,
+        /// Smallest eigenvalue of W at HP precision.
         pub smallest_eigenvalue: Float,
+        /// Largest eigenvalue of W at HP precision.
         pub largest_eigenvalue: Float,
+        /// Spectral condition number `largest / |smallest|` at HP precision.
         pub condition_number: Float,
+        /// `true` if W is positive-definite within HP-tight tolerance.
         pub positive_definite: bool,
+        /// All eigenvalues of W at HP precision, sorted ascending.
         pub all_eigenvalues: Vec<Float>,
     }
 
