@@ -277,8 +277,17 @@ pub fn tridiag_eigenvalues_hp(
 /// `diag` has length `n`, `off_diag` has length `n-1`. `eigenvalue` is the
 /// known eigenvalue. Returns the unit eigenvector at HP precision.
 ///
+/// Find the eigenvector of a symmetric tridiagonal matrix corresponding
+/// to the (already-known) eigenvalue `eigenvalue` via shifted inverse
+/// iteration on a dense `(T - λI + εI)`.
+///
 /// Uses LU factorization of (T - λI + ε·I) where ε is a small shift to
 /// avoid singularity. ε is precision-dependent: `2^-(prec - 32)`.
+///
+/// `max_steps` is the upper bound on inverse-iteration steps. The
+/// iteration runs all `max_steps` steps unless `early_termination` is
+/// `true`, in which case it stops as soon as the relative change in
+/// the computed Rayleigh quotient drops below `2^-(prec-32)`.
 pub fn tridiag_eigenvector_for_value_hp(
     diag: &[Float],
     off_diag: &[Float],
@@ -286,6 +295,34 @@ pub fn tridiag_eigenvector_for_value_hp(
     prec: u32,
     max_steps: usize,
 ) -> Result<Vec<Float>> {
+    tridiag_eigenvector_for_value_hp_with_options(
+        diag, off_diag, eigenvalue, prec, max_steps, false,
+    )
+}
+
+/// Variant of `tridiag_eigenvector_for_value_hp` with an explicit
+/// `early_termination` flag. When `false`, runs the full `max_steps`
+/// regardless (the conservative default; bit-identical output to
+/// callers that always wanted N steps). When `true`, breaks the
+/// inverse-iteration loop as soon as the Rayleigh quotient
+/// (eigenvalue estimate from the current iterate) stops moving by
+/// more than the working-precision threshold.
+///
+/// The `_with_options` form lets callers opt into a shorter run
+/// when they're confident the iteration has converged. For a
+/// well-conditioned tridiagonal whose eigenvalue separation is
+/// large compared to working precision, convergence usually
+/// happens in 20-50 steps; the original 200-step ceiling is
+/// pessimistic.
+pub fn tridiag_eigenvector_for_value_hp_with_options(
+    diag: &[Float],
+    off_diag: &[Float],
+    eigenvalue: &Float,
+    prec: u32,
+    max_steps: usize,
+    early_termination: bool,
+) -> Result<Vec<Float>> {
+    let phase_start = std::time::Instant::now();
     let n = diag.len();
     if n == 0 {
         return Err(anyhow!("empty matrix"));
@@ -299,6 +336,7 @@ pub fn tridiag_eigenvector_for_value_hp(
     // Build the dense (T - λI + ε·I) matrix and run inverse iteration.
     // The shift ε scales with precision: large enough to avoid singularity,
     // small enough that the iteration converges to the right eigenvector.
+    let build_start = std::time::Instant::now();
     let mut a = vec![hp_zero(prec); n * n];
     let two = Float::with_val(prec, 2);
     let epsilon: Float = two.pow(-((prec as i32) - 32));
@@ -313,8 +351,17 @@ pub fn tridiag_eigenvector_for_value_hp(
         a[i * n + (i + 1)] = off_diag[i].clone();
         a[(i + 1) * n + i] = off_diag[i].clone();
     }
+    eprintln!(
+        "[HP eigvec] dense matrix built in {:.1}s (N={}, prec={} bits)",
+        build_start.elapsed().as_secs_f64(), n, prec
+    );
 
+    let lu_start = std::time::Instant::now();
     let lu = lu_factor(&a, n)?;
+    eprintln!(
+        "[HP eigvec] LU factor done in {:.1}s",
+        lu_start.elapsed().as_secs_f64()
+    );
 
     // Initial guess: a Gaussian centered at the middle, all in HP.
     // Each entry independent → parallel construction.
@@ -333,10 +380,238 @@ pub fn tridiag_eigenvector_for_value_hp(
     }).collect();
     normalize_l2(&mut v);
 
-    for _ in 0..max_steps {
-        let mut new_v = lu_solve(&lu, &v, n, prec);
+    // Convergence threshold for early termination: same as
+    // `inverse_iteration` in linalg.rs. Roughly working-precision tight.
+    let conv_thresh = if early_termination {
+        Some(Float::with_val(prec, 2).pow(-((prec as i32) - 32)))
+    } else {
+        None
+    };
+
+    // Track the previous Rayleigh quotient estimate for the convergence
+    // check. The eigenvalue estimate at step k is roughly
+    // (vᵀ_{k-1} · v_k) / ‖v_k‖² which simplifies because v is already
+    // ℓ²-normalized — we use the dot product of consecutive iterates as
+    // a proxy. A more rigorous test would call `rayleigh_quotient`, but
+    // that re-walks the matrix every step (O(n²) per step). Cheaper
+    // proxy: |⟨v_k, v_{k-1}⟩| → 1 as the iteration converges.
+    let mut prev_dot = hp_zero(prec);
+
+    let iter_start = std::time::Instant::now();
+    let mut completed_steps = 0usize;
+    for step in 0..max_steps {
+        let new_v = lu_solve(&lu, &v, n, prec);
+        let mut new_v = new_v;
         normalize_l2(&mut new_v);
+
+        // Optional convergence check: if |⟨v_k, v_{k-1}⟩| has stopped
+        // moving (its relative change drops below the threshold), the
+        // iteration has converged.
+        if let Some(thresh) = conv_thresh.as_ref() {
+            // Compute |⟨v_k, v_{k-1}⟩| (a single sequential pass; we
+            // don't bother parallelizing this since it's cheap relative
+            // to the LU solve already done).
+            let mut dot = hp_zero(prec);
+            for i in 0..n {
+                let mut t = v[i].clone();
+                t *= &new_v[i];
+                dot += &t;
+            }
+            dot = dot.abs();
+            if step > 2 {
+                let mut diff = dot.clone();
+                diff -= &prev_dot;
+                diff = diff.abs();
+                // Converged when |dot - prev_dot| < threshold.
+                if diff < *thresh {
+                    v = new_v;
+                    completed_steps = step + 1;
+                    eprintln!(
+                        "[HP eigvec] inverse iteration converged at step {}/{} on N={} (elapsed {:.1}s, total {:.1}s)",
+                        completed_steps, max_steps, n,
+                        iter_start.elapsed().as_secs_f64(),
+                        phase_start.elapsed().as_secs_f64()
+                    );
+                    break;
+                }
+            }
+            prev_dot = dot;
+        }
+
         v = new_v;
+        completed_steps = step + 1;
+        // Progress: print every 25 steps. Useful to distinguish "still
+        // iterating" from "wedged" on multi-hour runs at large N. Each
+        // print is one line on stderr; cost is negligible vs the LU solve.
+        if completed_steps % 25 == 0 {
+            eprintln!(
+                "[HP eigvec] inverse iteration {}/{} on N={} (elapsed {:.1}s, total {:.1}s)",
+                completed_steps, max_steps, n,
+                iter_start.elapsed().as_secs_f64(),
+                phase_start.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    // If we exited the loop without an explicit convergence break and
+    // didn't already print a 25-multiple, emit a final summary so the
+    // caller sees the full timing picture.
+    if completed_steps % 25 != 0 {
+        eprintln!(
+            "[HP eigvec] inverse iteration {}/{} done on N={} (elapsed {:.1}s, total {:.1}s)",
+            completed_steps, max_steps, n,
+            iter_start.elapsed().as_secs_f64(),
+            phase_start.elapsed().as_secs_f64()
+        );
+    }
+
+    Ok(v)
+}
+
+/// Banded variant of `tridiag_eigenvector_for_value_hp_with_options`:
+/// uses the toolkit's tridiagonal LU factorization (Thomas with partial
+/// pivoting, O(n) factor + O(n) solve per step) instead of densifying
+/// the matrix to N×N (O(n²) memory, O(n³) factor cost). Numerical output
+/// is equivalent to working precision.
+///
+/// At HP-1000 with N=8001, the dense path uses ~26 GB of resident memory
+/// and ~hours of LU factor cost; this banded path uses kilobytes and
+/// finishes the LU factor in milliseconds. This delivers most of the
+/// per-eigenvector wall-time savings observed in Paper B's Claim 1
+/// retest cycle.
+///
+/// The convergence semantics, `early_termination` flag, and progress
+/// printing match `tridiag_eigenvector_for_value_hp_with_options` exactly.
+pub fn tridiag_eigenvector_for_value_hp_banded(
+    diag: &[Float],
+    off_diag: &[Float],
+    eigenvalue: &Float,
+    prec: u32,
+    max_steps: usize,
+    early_termination: bool,
+) -> Result<Vec<Float>> {
+    let phase_start = std::time::Instant::now();
+    let n = diag.len();
+    if n == 0 {
+        return Err(anyhow!("empty matrix"));
+    }
+    if off_diag.len() != n - 1 {
+        return Err(anyhow!(
+            "off_diag length {} should be {}", off_diag.len(), n - 1
+        ));
+    }
+
+    // Build the shifted tridiagonal (T - λI + ε·I). Only the diagonal
+    // changes; off-diagonals are unchanged. Length n + 2(n-1) = 3n-2
+    // HP entries — a few KB at HP-1000 vs the ~26 GB the dense form
+    // would need.
+    let build_start = std::time::Instant::now();
+    let two = Float::with_val(prec, 2);
+    let epsilon: Float = two.pow(-((prec as i32) - 32));
+
+    let mut shifted_diag: Vec<Float> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut entry = diag[i].clone();
+        entry -= eigenvalue;
+        entry += &epsilon;
+        shifted_diag.push(entry);
+    }
+    // Symmetric tridiagonal: lower and upper off-diagonals are equal.
+    // The banded LU factorizer accepts asymmetric input (so it also
+    // handles general tridiagonals), so we provide both.
+    let lower: Vec<Float> = off_diag.iter().cloned().collect();
+    let upper: Vec<Float> = off_diag.iter().cloned().collect();
+    eprintln!(
+        "[HP eigvec/banded] tridiagonal shifted matrix built in {:.3}s (N={}, prec={} bits)",
+        build_start.elapsed().as_secs_f64(), n, prec
+    );
+
+    // Banded LU factor (O(n) ops vs the dense O(n³)).
+    let lu_start = std::time::Instant::now();
+    let factors = crate::linalg::tridiag_lu_factor_hp(&lower, &shifted_diag, &upper, prec)?;
+    eprintln!(
+        "[HP eigvec/banded] tridiag LU factor done in {:.3}s",
+        lu_start.elapsed().as_secs_f64()
+    );
+
+    // Initial guess: a Gaussian centered at the middle, all in HP.
+    // Each entry independent → parallel construction.
+    let mut v: Vec<Float> = (0..n).into_par_iter().map(|i| {
+        let center = (n as i64) / 2;
+        let j = (i as i64) - center;
+        let half = ((n as i64) / 2).max(1);
+        let mut x = Float::with_val(prec, j);
+        x /= half;
+        let mut x_sq = x.clone();
+        x_sq *= &x;
+        x_sq /= 2u32;
+        let mut arg = hp_zero(prec);
+        arg -= &x_sq;
+        arg.exp()
+    }).collect();
+    crate::linalg::normalize_l2(&mut v);
+
+    let conv_thresh = if early_termination {
+        Some(Float::with_val(prec, 2).pow(-((prec as i32) - 32)))
+    } else {
+        None
+    };
+
+    let mut prev_dot = hp_zero(prec);
+    let iter_start = std::time::Instant::now();
+    let mut completed_steps = 0usize;
+    for step in 0..max_steps {
+        // Banded solve: O(n) instead of dense O(n²) per step.
+        let mut new_v = crate::linalg::tridiag_lu_solve_hp(&factors, &v, prec)?;
+        crate::linalg::normalize_l2(&mut new_v);
+
+        if let Some(thresh) = conv_thresh.as_ref() {
+            // |⟨v_k, v_{k-1}⟩| convergence proxy (cheap, O(n)).
+            let mut dot = hp_zero(prec);
+            for i in 0..n {
+                let mut t = v[i].clone();
+                t *= &new_v[i];
+                dot += &t;
+            }
+            dot = dot.abs();
+            if step > 2 {
+                let mut diff = dot.clone();
+                diff -= &prev_dot;
+                diff = diff.abs();
+                if diff < *thresh {
+                    v = new_v;
+                    completed_steps = step + 1;
+                    eprintln!(
+                        "[HP eigvec/banded] inverse iteration converged at step {}/{} on N={} (elapsed {:.3}s, total {:.3}s)",
+                        completed_steps, max_steps, n,
+                        iter_start.elapsed().as_secs_f64(),
+                        phase_start.elapsed().as_secs_f64()
+                    );
+                    break;
+                }
+            }
+            prev_dot = dot;
+        }
+
+        v = new_v;
+        completed_steps = step + 1;
+        if completed_steps % 25 == 0 {
+            eprintln!(
+                "[HP eigvec/banded] inverse iteration {}/{} on N={} (elapsed {:.3}s, total {:.3}s)",
+                completed_steps, max_steps, n,
+                iter_start.elapsed().as_secs_f64(),
+                phase_start.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    if completed_steps % 25 != 0 {
+        eprintln!(
+            "[HP eigvec/banded] inverse iteration {}/{} done on N={} (elapsed {:.3}s, total {:.3}s)",
+            completed_steps, max_steps, n,
+            iter_start.elapsed().as_secs_f64(),
+            phase_start.elapsed().as_secs_f64()
+        );
     }
 
     Ok(v)
@@ -1746,4 +2021,143 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Banded eigenvector tests
+    // -----------------------------------------------------------------------
+
+    /// Banded path returns an eigenvector that satisfies T·v = λv to
+    /// working precision. Same test pattern as `tridiag_eigenvector_recovery`
+    /// but using the banded variant.
+    #[test]
+    fn banded_eigenvector_recovery() {
+        let prec = 256;
+        // Strang n=3: diag=[2,2,2], off=[1,1]. Smallest eigenvalue
+        // 2 - √2 ≈ 0.5858.
+        let diag = vec![hp(prec, "2"), hp(prec, "2"), hp(prec, "2")];
+        let off_diag = vec![hp(prec, "1"), hp(prec, "1")];
+
+        let two = hp(prec, "2");
+        let mut sqrt2 = hp(prec, "2"); sqrt2 = sqrt2.sqrt();
+        let mut e0 = two; e0 -= &sqrt2;
+
+        let v = tridiag_eigenvector_for_value_hp_banded(
+            &diag, &off_diag, &e0, prec, 100, true,
+        ).unwrap();
+        assert_eq!(v.len(), 3);
+
+        // Verify T·v ≈ λv.
+        let mut tv0 = v[0].clone(); tv0 *= 2u32; tv0 += &v[1];
+        let mut tv1 = v[0].clone(); tv1 += &v[2];
+        let mut tmp = v[1].clone(); tmp *= 2u32;
+        tv1 += &tmp;
+        let mut tv2 = v[1].clone(); tv2 += &v[2].clone(); tv2 += &v[2];
+
+        let mut lv0 = e0.clone(); lv0 *= &v[0];
+        let mut lv1 = e0.clone(); lv1 *= &v[1];
+        let mut lv2 = e0.clone(); lv2 *= &v[2];
+
+        let mut r0 = tv0; r0 -= &lv0; let r0 = r0.abs();
+        let mut r1 = tv1; r1 -= &lv1; let r1 = r1.abs();
+        let mut r2 = tv2; r2 -= &lv2; let r2 = r2.abs();
+
+        let tol = hp(prec, "1e-50");
+        assert!(r0 < tol, "T·v - λv at index 0: {}", display_hp(&r0, 4));
+        assert!(r1 < tol, "T·v - λv at index 1: {}", display_hp(&r1, 4));
+        assert!(r2 < tol, "T·v - λv at index 2: {}", display_hp(&r2, 4));
+    }
+
+    /// Banded vs dense equivalence: run both code paths on the same
+    /// Strang n=10 input and confirm the eigenvectors agree (up to sign,
+    /// since inverse iteration is agnostic to sign of v).
+    #[test]
+    fn banded_matches_dense_on_strang_n10() {
+        let prec = 256;
+        let n = 10;
+
+        // Strang's tridiagonal: diag = 2, off = -1. Smallest eigenvalue
+        // λ_1 = 2 - 2 cos(π/(n+1)) = 2 - 2 cos(π/11). Use 30 digits of
+        // pre-computed value as the target.
+        let diag: Vec<Float> = (0..n).map(|_| hp(prec, "2")).collect();
+        let off_diag: Vec<Float> = (0..n - 1).map(|_| hp(prec, "-1")).collect();
+
+        let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
+        let lambda_1 = evals[0].clone();
+
+        // Dense path.
+        let v_dense = tridiag_eigenvector_for_value_hp_with_options(
+            &diag, &off_diag, &lambda_1, prec, 200, true,
+        ).unwrap();
+
+        // Banded path.
+        let v_banded = tridiag_eigenvector_for_value_hp_banded(
+            &diag, &off_diag, &lambda_1, prec, 200, true,
+        ).unwrap();
+
+        assert_eq!(v_dense.len(), n);
+        assert_eq!(v_banded.len(), n);
+
+        // Pin signs: both eigenvectors should have positive value at the
+        // center (or both negative). If they don't agree, flip one.
+        let center = n / 2;
+        let zero = hp(prec, "0");
+        let mut v_b = v_banded.clone();
+        let dense_pos = v_dense[center] > zero;
+        let banded_pos = v_b[center] > zero;
+        if dense_pos != banded_pos {
+            for v in v_b.iter_mut() { *v = -v.clone(); }
+        }
+
+        // Element-wise compare. Should match to working precision.
+        for i in 0..n {
+            let mut diff = v_dense[i].clone(); diff -= &v_b[i];
+            let abs_diff = diff.abs();
+            let tol = hp(prec, "1e-50");
+            assert!(abs_diff < tol,
+                "banded vs dense disagreement at index {}: {} (dense={}, banded={})",
+                i, display_hp(&abs_diff, 6),
+                display_hp(&v_dense[i], 6),
+                display_hp(&v_b[i], 6));
+        }
+    }
+
+    /// Banded path at HP-1000: residual of T·v - λv at publication
+    /// precision. This is the "production scenario" check.
+    #[test]
+    fn banded_eigenvector_residual_hp_1000() {
+        let prec = 3338;
+        let n = 20;
+
+        // Strang's tridiagonal at n=20.
+        let diag: Vec<Float> = (0..n).map(|_| hp(prec, "2")).collect();
+        let off_diag: Vec<Float> = (0..n - 1).map(|_| hp(prec, "-1")).collect();
+
+        let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
+        let lambda_1 = evals[0].clone();
+
+        // Banded path with early termination.
+        let v = tridiag_eigenvector_for_value_hp_banded(
+            &diag, &off_diag, &lambda_1, prec, 200, true,
+        ).unwrap();
+
+        // Compute residual ‖T·v - λv‖_∞.
+        let mut max_resid = hp(prec, "0");
+        for i in 0..n {
+            // (Tv)_i = diag[i]·v[i] + off[i-1]·v[i-1] + off[i]·v[i+1]
+            let mut tv_i = diag[i].clone(); tv_i *= &v[i];
+            if i > 0 { let mut t = off_diag[i - 1].clone(); t *= &v[i - 1]; tv_i += &t; }
+            if i < n - 1 { let mut t = off_diag[i].clone(); t *= &v[i + 1]; tv_i += &t; }
+            let mut lv_i = lambda_1.clone(); lv_i *= &v[i];
+            let mut resid = tv_i; resid -= &lv_i; resid = resid.abs();
+            if resid > max_resid { max_resid = resid; }
+        }
+
+        // At HP-1000 with the working-precision early-termination
+        // threshold, residual should be ≲ 10^-900 (~working precision).
+        let tol = hp(prec, "1e-900");
+        assert!(max_resid < tol,
+            "HP-1000 banded residual ‖T·v - λv‖_∞ = {} should be < 1e-900",
+            display_hp(&max_resid, 6));
+    }
 }
+

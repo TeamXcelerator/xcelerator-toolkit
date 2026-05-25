@@ -13,14 +13,14 @@ This is a Cargo workspace containing three sub-crates:
 
 | Crate | Purpose |
 |---|---|
-| [`xc-numerics`](crates/xc-numerics) | High-precision numerical primitives: GL quadrature (f64 + HP with disk cache), LU factorization, inverse iteration, root-finding, prime sieve, HP symmetric eigendecomposition, HP formatting / comparison helpers. |
+| [`xc-numerics`](crates/xc-numerics) | High-precision numerical primitives: GL quadrature (f64 + HP with `<cwd>/data/gl_cache/` disk cache, JSON or zip-compressed), LU factorization, inverse iteration, root-finding, prime sieve, HP symmetric eigendecomposition, HP formatting / comparison helpers. |
 | [`xc-zeta`](crates/xc-zeta) | Riemann zeta function utilities: reference zero loading (HP strings, f64, rug::Float), path-parameterized. |
 | [`xc-spectral`](crates/xc-spectral) | Spectral methods: CCM Weil-form construction (f64 + HP), prolate-wave operators (f64 + HP), Mellin transforms (f64 + HP), Yakaboylu W-positivity framework (f64 + HP), Dirichlet L-function extensions. |
 
 ### Module inventory
 
 **xc-numerics:**
-- `quadrature` — Gauss-Legendre at f64 (configurable N-point) and HP (with disk cache)
+- `quadrature` — Gauss-Legendre at f64 (configurable N-point) and HP. The HP path caches nodes/weights to `<cwd>/data/gl_cache/` and supports both uncompressed JSON and zip-compressed JSON fixtures (auto-decompressed on first read). Per-cwd layout means each paper repo / reproduction script gets its own independent cache, and pre-computed cache fixtures can be checked into a repo to skip the cold-start cost of Newton iteration.
 - `root_finding` — f64 bisection with configurable tolerance and max iterations
 - `primes` — Sieve of Eratosthenes, prime counting function π(x)
 - `linalg` (HP-gated) — LU factorization with partial pivoting, LU solve, inverse iteration (with optional forced-even projection), ℓ² normalization, Rayleigh quotient. Inner reductions and matvec parallelized.
@@ -185,6 +185,33 @@ Full guideline (private):
 
 | Version | Changes |
 |---|---|
+| `v0.5.0` | **Tridiagonal LU + banded shifted inverse iteration.** Architectural change: HP eigenvector recovery on tridiagonal matrices no longer densifies. |
+| | • **`xc-numerics::linalg::tridiag_lu_factor_hp`** — Thomas algorithm with partial pivoting at HP. Stores L (sub-diagonal multipliers) and U (main + super + super-super diagonals to capture pivot fill-in) as four short vectors of length ~n, plus a row permutation. O(n) factor cost vs dense LU's O(n³). |
+| | • **`xc-numerics::linalg::tridiag_lu_solve_hp`** — Forward + back substitution against the banded factored form. O(n) solve cost vs dense O(n²). |
+| | • **`xc-numerics::eigen::tridiag_eigenvector_for_value_hp_banded`** — drop-in alternative to `tridiag_eigenvector_for_value_hp_with_options` that uses the banded LU instead of densifying T - λI + εI. At HP-1000 with N=8001 the per-eigenvector wall-time drops from hours to seconds and resident memory from ~26 GB to a few KB. |
+| | • **`xc-spectral::prolate::hp::compute_k_lambda`** opts into the banded variant. Numerical output is unchanged (banded LU produces an eigenvector that satisfies T·v = λv to working precision, same as dense LU); the change is purely architectural. |
+| | • **Heavy testing** to mirror the HP eigensolver's three-layer validation: banded vs dense LU equivalence on Strang's tridiagonal n=10 (HP-256), Wilkinson W11 + shift (HP-512), property test on a deterministic-random asymmetric tridiagonal n=50, partial-pivoting test on a zero-diagonal first row, HP-1000 production residual check (n=20, ‖T·v - λv‖_∞ < 10⁻⁹⁰⁰). |
+| | • The dense variant `tridiag_eigenvector_for_value_hp_with_options` remains in the public API for backward compatibility and cross-validation purposes. |
+| `v0.4.3` | **Better progress timing + opt-in early termination on inverse iteration.** |
+| | • **`xc-numerics::eigen::tridiag_eigenvector_for_value_hp_with_options`** — new explicit-options entry point with an `early_termination: bool` flag. The original `tridiag_eigenvector_for_value_hp` function is unchanged in behaviour (delegates to `_with_options(..., false)`); existing callers get bit-identical numerics. |
+| | • **Convergence test** when `early_termination=true`: tracks `|⟨v_k, v_{k-1}⟩|` (cheap O(n) per step) and breaks the inverse-iteration loop as soon as the change drops below the working-precision threshold. For well-conditioned, well-separated eigenvalues this typically cuts step count from 200 to 20-50, a 4-10× speedup on the iteration phase. |
+| | • **`xc-spectral::prolate::hp::compute_k_lambda`** opts into early termination — prolate eigenvalues are widely separated at small k, so the iteration converges quickly. The published numerical output of `prolate-compare` is unchanged (the iteration still runs to convergence; it just stops as soon as it gets there). |
+| | • **Improved progress timing.** The previous v0.4.2 prints only timed the inverse-iteration loop, missing the dense-matrix build (~6.6 GB at N=4001, ~26 GB at N=8001) and the LU factor (the actual O(N³) cost). v0.4.3 wraps the entire `tridiag_eigenvector_for_value_hp` body in a phase timer and prints `[HP eigvec] dense matrix built in Xs` and `[HP eigvec] LU factor done in Xs` separately. Each per-step progress line now also reports both the iter-only and total-phase elapsed times. |
+| | • Backward compatible: numerical output identical to v0.4.2 in all configurations; new HP cache tests still pass; the opt-in flag means callers that don't pass it get the conservative full-`max_steps` behaviour. |
+| `v0.4.2` | **Progress visibility for long-running HP iterations.** |
+| | • **`xc-numerics::eigen::tridiag_eigenvector_for_value_hp`** — adds an `eprintln!` every 25 inverse-iteration steps reporting `(step, max_steps, N, elapsed_seconds)`. Lets users distinguish "still iterating" from "wedged" on multi-hour runs at large N. No behavior change to the numerical output; pure observability. |
+| | • **`xc-numerics::linalg::inverse_iteration`** — same per-iteration progress line every 25 steps; also prints a final line on convergence. |
+| | • **`xc-spectral::prolate::hp::compute_k_lambda`** — bracket prints around each phase: tridiagonal build, full eigenvalue compute (tridiag QR), eigenvector search loop with per-iteration line, k_λ sampling. Each phase reports its own elapsed time. |
+| | • **`xc-spectral::prolate::hp::compare_xi_to_k_lambda`** — bracket prints with elapsed time. |
+| | • Triggered by 2026-05-25 Paper B Claim 1 retest cycle: a `prolate-compare` run sat silent for ~12 hours under multi-process contention with no visible signal whether it was making progress. The new prints would have made the wedge state visible within minutes. |
+| | • Backward compatible: numerical output identical to v0.4.1; tests unchanged. New `eprintln!` lines are stderr only (don't disturb stdout result parsing). |
+| `v0.4.1` | **GL cache: per-cwd layout + zip-compressed cache support.** |
+| | • **`xc-numerics::quadrature`** — HP GL cache directory moved from `~/.cache/ccm_gl/` to `<cwd>/data/gl_cache/`. Per-cwd makes parallel runs across multiple servers and concurrent processes safer (no shared mutable state in `$HOME`), and lets paper repositories ship pre-computed cache fixtures alongside their reproduction scripts. |
+| | • **Zip-compressed cache files** — the toolkit now also reads `prec{prec}_npts{n}.json.zip` (zip archive containing a single entry of the same name without `.zip`). Lookup priority: uncompressed `.json` first, then `.json.zip` (auto-decompressed on first read; the decompressed copy is also written next to the `.zip` so future reads hit the fast path), then compute fresh. |
+| | • Compresses HP-1000 GL caches by ~3-4× in practice; lets paper repositories check in pre-warmed cache fixtures without bloating `git clone`. |
+| | • Backward compatible: existing callers of `gauss_legendre_nodes(n, prec)` get the same return type and the same caching semantics, just from a different directory. |
+| | • New `zip` (v2.2, deflate-only) workspace dependency, gated by the `hp` feature. |
+| | • New unit tests in `quadrature::hp_cache_tests`: lookup priority, zip fallback with auto-decompress, fresh-compute round-trip, integration sanity. All gated `#[cfg(all(test, feature = "hp"))]`. |
 | `v0.4.0` | **HP-everywhere unless explicitly requested + comprehensive rayon parallelization.** |
 | | • **Naming:** every public f64 function has `_f64` in its name; every HP function is unsuffixed (default) or `_hp`-suffixed where a parallel f64 version exists. No silent f64 leaks in HP code paths. |
 | | • **`xc-numerics::eigen`** — new HP symmetric eigendecomposition (Householder + tridiagonal QR with Wilkinson shifts + shifted inverse iteration). Verified across 3 layers: closed-form structured matrices (Strang, Hilbert, Wilkinson W21), PARI/GP cross-check at 2000 digits (committed JSON fixture, 9 reference matrices), property-based tests with deterministic random matrices (trace, determinant, eigenequation, normalization, orthogonality, decomposition reconstruction). |

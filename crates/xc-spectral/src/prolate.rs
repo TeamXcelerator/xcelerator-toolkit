@@ -629,7 +629,7 @@ pub mod hp {
     use anyhow::Result;
     use rayon::prelude::*;
     use rug::Float;
-    use xc_numerics::eigen::{tridiag_eigenvalues_hp, tridiag_eigenvector_for_value_hp};
+    use xc_numerics::eigen::{tridiag_eigenvalues_hp, tridiag_eigenvector_for_value_hp_banded};
 
     /// HP-build of the FD prolate-wave tridiagonal data.
     ///
@@ -940,8 +940,18 @@ pub mod hp {
             anyhow::bail!("n_grid too small (got {}); need at least 16 to find h_4", n);
         }
 
+        eprintln!("[HP prolate] computing k_λ at λ²={:.6}, N={}, n_sample={}, prec={} bits",
+            {
+                let mut sq = lambda.clone();
+                sq *= lambda;
+                sq.to_f64()
+            }, n, n_sample, prec);
+
         // Build the tridiagonal in HP.
+        eprintln!("[HP prolate] building tridiagonal PW_λ on N={} grid...", n);
+        let pw_start = std::time::Instant::now();
         let (diag, off_diag) = build_pw_matrix(lambda, n, prec);
+        eprintln!("[HP prolate] PW_λ built in {:.1}s", pw_start.elapsed().as_secs_f64());
 
         // Compute h = 2λ / (N+1) for later use (continuous-L² scaling, integration).
         let mut h = lambda.clone();
@@ -950,7 +960,11 @@ pub mod hp {
         h /= &n_plus_1;
 
         // Get all eigenvalues sorted ascending.
+        eprintln!("[HP prolate] computing all {} eigenvalues of PW_λ via tridiag QR...", n);
+        let eig_start = std::time::Instant::now();
         let eigenvalues = tridiag_eigenvalues_hp(&diag, &off_diag, prec)?;
+        eprintln!("[HP prolate] {} eigenvalues computed in {:.1}s",
+            eigenvalues.len(), eig_start.elapsed().as_secs_f64());
         if eigenvalues.len() != n {
             anyhow::bail!("eigensolver returned {} eigenvalues, expected {}",
                 eigenvalues.len(), n);
@@ -959,6 +973,8 @@ pub mod hp {
         // Search the lowest-lying eigenfunctions for h_0 and h_4.
         // Limit search depth: prolate h_4 is the third even eigenfunction.
         let n_try = super::PROLATE_SEARCH_DEPTH.min(n);
+        eprintln!("[HP prolate] searching for h_0 (even, 0 nodes) and h_4 (even, 4 nodes) in first {} eigenvectors...", n_try);
+        let search_start = std::time::Instant::now();
         let mut h0_idx: Option<usize> = None;
         let mut h4_idx: Option<usize> = None;
         let mut h0_vec: Option<Vec<Float>> = None;
@@ -966,7 +982,26 @@ pub mod hp {
 
         for k in 0..n_try {
             let lambda_k = &eigenvalues[k];
-            let v = match tridiag_eigenvector_for_value_hp(&diag, &off_diag, lambda_k, prec, 200) {
+            eprintln!("[HP prolate] eigenvector {}/{} (eigenvalue {})...",
+                k + 1, n_try, xc_numerics::fmt::display_hp(lambda_k, 8));
+            // Opt into early termination: prolate eigenvectors are
+            // well-conditioned (the spectrum is widely-spaced and
+            // non-degenerate at small k) so the iteration typically
+            // converges in 20-50 steps. Capping at 200 with no
+            // convergence check was wasting hours per run at HP-1000.
+            // Convergence threshold is the same one `inverse_iteration`
+            // in linalg.rs uses (working-precision tight); a
+            // convergence-detected break produces a vector that
+            // satisfies the eigenequation to working precision.
+            //
+            // Banded variant: uses tridiagonal LU (Thomas with partial
+            // pivoting) instead of densifying T - λI + εI to N×N. At
+            // HP-1000 with N=8001 this drops the per-eigenvector
+            // wall-time from hours to seconds and the memory footprint
+            // from ~26 GB to a few KB.
+            let v = match tridiag_eigenvector_for_value_hp_banded(
+                &diag, &off_diag, lambda_k, prec, 200, true,
+            ) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -980,10 +1015,12 @@ pub mod hp {
             let nodes = count_nodes(&v, prec);
             match nodes {
                 0 if h0_idx.is_none() => {
+                    eprintln!("[HP prolate] found h_0 at index {}", k);
                     h0_idx = Some(k);
                     h0_vec = Some(v);
                 }
                 4 if h4_idx.is_none() => {
+                    eprintln!("[HP prolate] found h_4 at index {}", k);
                     h4_idx = Some(k);
                     h4_vec = Some(v);
                 }
@@ -993,6 +1030,8 @@ pub mod hp {
                 break;
             }
         }
+        eprintln!("[HP prolate] eigenvector search done in {:.1}s",
+            search_start.elapsed().as_secs_f64());
         let h0_idx = h0_idx.ok_or_else(|| {
             anyhow::anyhow!("could not find h_{{0,λ}} (even, 0 nodes) in first {} eigenfunctions", n_try)
         })?;
@@ -1086,6 +1125,8 @@ pub mod hp {
 
         // Evaluate k_λ(u) = √u · Σ_{n=1}^{⌊λ/u⌋} h_λ(n·u).
         // Each grid point u is independent → parallelize via par_iter.
+        eprintln!("[HP prolate] sampling k_λ on {} log-spaced grid points...", n_sample);
+        let sample_start = std::time::Instant::now();
         let k_values: Vec<Float> = u_grid.par_iter().map(|u| {
             let mut ratio = lambda.clone();
             ratio /= u;
@@ -1109,6 +1150,8 @@ pub mod hp {
             result *= &s;
             result
         }).collect();
+        eprintln!("[HP prolate] k_λ sampling done in {:.1}s; total compute_k_lambda elapsed {:.1}s",
+            sample_start.elapsed().as_secs_f64(), start.elapsed().as_secs_f64());
 
         Ok(HpProlateResult {
             k_values,
@@ -1154,6 +1197,10 @@ pub mod hp {
         if u_grid.is_empty() {
             anyhow::bail!("empty grid");
         }
+
+        let cmp_start = std::time::Instant::now();
+        eprintln!("[HP prolate] comparing ξ_λ to c·k_λ on {} grid points (N={} modes)...",
+            u_grid.len(), n_modes);
 
         // L = ln(λ²) = 2 ln λ; inv_sqrt_l = 1/√L.
         let mut lambda_sq = lambda.clone();
@@ -1250,6 +1297,8 @@ pub mod hp {
             }
         }
 
+        eprintln!("[HP prolate] compare done in {:.1}s",
+            cmp_start.elapsed().as_secs_f64());
         Ok(HpComparisonResult {
             optimal_scalar: c,
             linf_error,
