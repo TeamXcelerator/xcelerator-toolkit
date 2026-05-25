@@ -326,11 +326,44 @@ mod hp {
     }
 
     fn save_gl_cache(n: usize, prec: u32, nodes: &[Float], weights: &[Float]) {
+        // Always write the uncompressed .json first — it's the fast
+        // next-read path. Then also write a deflated .json.zip
+        // alongside for distribution (smaller commits, fewer git
+        // bytes). Mirrors the tau_cache pattern. The toolkit's read
+        // path already prefers .json over .json.zip on subsequent
+        // reads, so the .zip is purely a distribution artifact.
         if let Some(path) = gl_cache_path(n, prec) {
             let ns: Vec<String> = nodes.iter().map(|f| f.to_string()).collect();
             let ws: Vec<String> = weights.iter().map(|f| f.to_string()).collect();
             let json = serde_json::json!([ns, ws]);
-            if let Ok(s) = serde_json::to_string(&json) { let _ = std::fs::write(path, s); }
+            let json_str = match serde_json::to_string(&json) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            if std::fs::write(&path, &json_str).is_err() { return; }
+
+            // Compress to .json.zip alongside. Failure on the zip
+            // write is non-fatal (the .json above is the canonical
+            // cache; the .zip is opportunistic).
+            use std::io::Write;
+            let entry_name = format!("prec{}_npts{}.json", prec, n);
+            let zip_filename = format!("{}.zip", entry_name);
+            let zip_path = match path.parent() {
+                Some(p) => p.join(&zip_filename),
+                None => return,
+            };
+            let mut buf: Vec<u8> = Vec::with_capacity(json_str.len() / 2);
+            {
+                let cursor = std::io::Cursor::new(&mut buf);
+                let mut writer = zip::ZipWriter::new(cursor);
+                let opts: zip::write::SimpleFileOptions =
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated);
+                if writer.start_file(&entry_name, opts).is_err() { return; }
+                if writer.write_all(json_str.as_bytes()).is_err() { return; }
+                if writer.finish().is_err() { return; }
+            }
+            let _ = std::fs::write(&zip_path, &buf);
         }
     }
 
@@ -970,6 +1003,59 @@ mod hp_cache_tests {
         }
         for (a, b) in weights.iter().zip(weights2.iter()) {
             assert_eq!(a.to_string(), b.to_string(), "weight round-trip");
+        }
+    }
+
+    /// v0.7.0 contract: fresh compute writes both `.json` AND
+    /// `.json.zip` alongside. The `.json` is the canonical fast-read
+    /// path; the `.zip` is a distribution artifact for paper repos
+    /// to commit.
+    #[test]
+    fn cache_fresh_compute_writes_json_and_zip() {
+        let temp = fresh_temp_dir("compute_writes_both");
+        let _guard = CwdGuard::enter(&temp);
+
+        let n = 8;
+        let prec: u32 = 128;
+
+        let json_path = temp.join("data").join("gl_cache")
+            .join(format!("prec{}_npts{}.json", prec, n));
+        let zip_path = temp.join("data").join("gl_cache")
+            .join(format!("prec{}_npts{}.json.zip", prec, n));
+        assert!(!json_path.exists(), ".json should not exist before compute");
+        assert!(!zip_path.exists(), ".json.zip should not exist before compute");
+
+        // Trigger fresh compute.
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec);
+        assert_well_formed(n, prec, &nodes, &weights);
+
+        // Both files must exist after compute.
+        assert!(json_path.exists(),
+            "fresh compute should write {} (canonical fast-read path)",
+            json_path.display());
+        assert!(zip_path.exists(),
+            "fresh compute should write {} (distribution artifact)",
+            zip_path.display());
+
+        // Sanity: the .zip must be smaller than the .json (compression
+        // ratio > 1) and must round-trip back to the same data when
+        // loaded via the existing zip-read path.
+        let json_size = std::fs::metadata(&json_path).unwrap().len();
+        let zip_size = std::fs::metadata(&zip_path).unwrap().len();
+        assert!(zip_size < json_size,
+            ".json.zip ({} bytes) should be smaller than .json ({} bytes)",
+            zip_size, json_size);
+
+        // Round-trip via the zip path: delete the .json so the loader
+        // falls through to the .zip, then verify nodes/weights match.
+        std::fs::remove_file(&json_path).unwrap();
+        let (nodes2, weights2) = hp::gauss_legendre_nodes(n, prec);
+        assert_eq!(nodes.len(), nodes2.len());
+        for (a, b) in nodes.iter().zip(nodes2.iter()) {
+            assert_eq!(a.to_string(), b.to_string(), "node round-trip via zip");
+        }
+        for (a, b) in weights.iter().zip(weights2.iter()) {
+            assert_eq!(a.to_string(), b.to_string(), "weight round-trip via zip");
         }
     }
 

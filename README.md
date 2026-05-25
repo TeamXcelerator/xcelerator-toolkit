@@ -185,6 +185,11 @@ Full guideline (private):
 
 | Version | Changes |
 |---|---|
+| `v0.7.0` | **GL cache also writes `.json.zip` alongside `.json`.** Mirrors the τ-cache "always write both" pattern. No public API change; no behavior change for existing readers (the `.json` is still the fast next-read path; the new `.zip` is for distribution / git checkin). |
+| | • `save_gl_cache` now writes both `.json` (canonical fast-read) and `.json.zip` (distribution artifact) on every fresh compute. Mirrors `tau_cache::save`. |
+| | • Lets paper repositories check in compressed GL cache fixtures alongside the τ-cache fixtures using a single uniform pattern (`data/*_cache/*.json.zip`). The decompressed `.json` files are gitignored on the consumer side; fresh clones get full cache benefit on first read by auto-decompressing the committed `.zip`. |
+| | • New test `cache_fresh_compute_writes_json_and_zip` (HP-gated) verifies both files appear on fresh compute, that the zip is smaller than the json, and that round-trip through the zip-only path returns bit-identical nodes/weights. |
+| | • Test counts: f64 16 + 37 + 1 = 54 pass on Windows MSVC (unchanged; the new test is HP-gated). HP path: 167 expected on Linux (was 166; +1 new test). |
 | `v0.6.0` | **Cache infrastructure, HEAVY testing, perf, API consolidation, rustdoc pass.** Squashed release of v0.5.1 through v0.5.13. Public API breaking vs v0.5.0 (eigenvector recovery consolidates three entry points into one). |
 | | • **API consolidation:** `tridiag_eigenvector_for_value_hp` is the single entry point. Takes `TridiagEigvecOptions { max_steps, early_termination, solver: TridiagSolver::{Banded, Dense} }`. Banded LU is the default; dense is retained for cross-validation. The v0.4.x/v0.5.0 wrappers are removed. |
 | | • **HEAVY testing audit:** three-layer validation (closed-form + cross-check + property) on every core numeric — dense LU, banded LU, tridiag QR (PARI/GP cross-check at 2000 digits, JSON fixture committed), Householder, inverse iteration, root finding (`bisect_f64` endpoint-sign bug fixed), GL quadrature, vector ops, HP cache fixtures. |
