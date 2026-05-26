@@ -223,8 +223,8 @@ Full guideline (private):
 
 ## Used by
 
-- [`ccm-reproduction-and-convergence`](https://github.com/TeamXcelerator/ccm-reproduction-and-convergence) — Paper A: independent reproduction of CCM zeta spectral triple, with eigenvalue match to 460 digits at HP-1000 against a 2000-digit PARI/GP reference.
-- [`ccm-convergence-rate-falsifications`](https://github.com/TeamXcelerator/ccm-convergence-rate-falsifications) — Paper B: empirical convergence-rate study at HP-1000 (CCM Lemma 7.2 falsified; Śliwiński Conjecture 4.1 unsupported; CCM 10⁵⁵× more accurate than naive Mellin truncation).
+- [`ccm-reproduction-and-convergence`](https://github.com/TeamXcelerator/ccm-reproduction-and-convergence) — Paper A: independent reproduction of CCM zeta spectral triple, with eigenvalue match to 999 digits at HP-1000 (λ²=1000, N=800) against a 2000-digit PARI/GP reference.
+- [`ccm-convergence-rate-falsifications`](https://github.com/TeamXcelerator/ccm-convergence-rate-falsifications) — Paper B: empirical convergence-rate study at HP-1000 (CCM Lemma 7.2 falsified — rel×λ² grows by ~1.116×10⁶ across λ²∈[13,1000]; Śliwiński Conjecture 4.1 unsupported across κ∈[50,500]; CCM is 10⁹⁹⁹× more accurate than naive Mellin truncation at λ²=1000).
 
 ## License
 
