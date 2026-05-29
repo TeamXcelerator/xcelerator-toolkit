@@ -5,7 +5,8 @@
 //!
 //! - **`lu_factor` / `lu_solve`**: LU factorization with partial pivoting,
 //!   followed by forward/back substitution. Parallelized via rayon over
-//!   the Schur-complement update.
+//!   the Schur-complement update (factor) and the inner triangular-solve
+//!   reductions (solve; see `lu_solve_with` for the serial/parallel knob).
 //! - **`inverse_iteration`**: Smallest-eigenpair finder via inverse
 //!   iteration with the LU factorization cached for O(n²) per step.
 //!   Optional even-symmetry projection at each step (for forced-even
@@ -91,21 +92,92 @@ pub fn lu_factor(a: &[Float], dim: usize) -> Result<LuFactors> {
     Ok(LuFactors { lu, perm })
 }
 
+/// Below this row length, the inner triangular-solve reduction runs
+/// serially. Rayon's task-dispatch overhead exceeds the benefit of
+/// parallelizing a handful of HP multiply-subtracts; the crossover is
+/// dominated by per-task overhead vs. per-op HP cost. Tuned
+/// conservatively — HP ops at working precision (hundreds to thousands
+/// of digits) are expensive enough that a row of ~32 already amortizes
+/// the dispatch, but we leave headroom.
+const PAR_SOLVE_MIN_ROW: usize = 32;
+
 /// Solve `A·x = b` given the LU factorization of `A` from `lu_factor`.
+///
+/// Parallelizes the inner reduction of each triangular-solve row across
+/// rayon when the row is long enough to amortize task overhead (see
+/// [`lu_solve_with`] and `PAR_SOLVE_MIN_ROW`). This is the default for
+/// all toolkit callers (notably `inverse_iteration`, where `lu_solve`
+/// is the per-step hot path at large dimension).
 pub fn lu_solve(factors: &LuFactors, b: &[Float], dim: usize, prec: u32) -> Vec<Float> {
+    lu_solve_with(factors, b, dim, prec, true)
+}
+
+/// Solve `A·x = b` given the LU factorization of `A` from `lu_factor`,
+/// with explicit control over whether the inner triangular-solve
+/// reductions are parallelized via rayon.
+///
+/// The outer loops (over rows) are inherently sequential: in forward
+/// substitution row `i` depends on `y[0..i]`, and in back substitution
+/// row `i` depends on `x[i+1..dim]`. Only the inner sum
+/// `Σ_j lu[i,j] · {y,x}[j]` is parallelizable. For each row that inner
+/// sum is a reduction over up to `dim` HP multiply-subtracts; at large
+/// `dim` and high precision this dominates `inverse_iteration`'s
+/// per-step cost, and parallelizing it across cores gives a real
+/// end-to-end speedup.
+///
+/// * `parallel = true` (the [`lu_solve`] default): parallelize the inner
+///   reduction for rows longer than `PAR_SOLVE_MIN_ROW`; short rows stay
+///   serial to avoid rayon dispatch overhead exceeding the work.
+/// * `parallel = false`: fully serial. Useful for tiny matrices,
+///   deterministic single-threaded benchmarking, or callers that are
+///   already saturating all cores at a higher level.
+///
+/// The result is identical to working precision either way. HP reduction
+/// order can differ between the serial and parallel paths, but the
+/// difference is below the working-precision floor (the eigenvalue and
+/// eigenvector reference tests confirm this tolerance).
+pub fn lu_solve_with(
+    factors: &LuFactors,
+    b: &[Float],
+    dim: usize,
+    prec: u32,
+    parallel: bool,
+) -> Vec<Float> {
     let lu = &factors.lu;
     let perm = &factors.perm;
     let pb: Vec<Float> = (0..dim).map(|i| b[perm[i]].clone()).collect();
+
+    // Forward substitution: solve L·y = P·b. L has implicit unit diagonal.
     let mut y = vec![hp_zero(prec); dim];
     for i in 0..dim {
-        let mut s = pb[i].clone();
-        for j in 0..i { let mut t = lu[i * dim + j].clone(); t *= &y[j]; s -= &t; }
+        let row_len = i; // number of terms in the inner sum
+        let s = if parallel && row_len >= PAR_SOLVE_MIN_ROW {
+            let sum = (0..i).into_par_iter().map(|j| {
+                let mut t = lu[i * dim + j].clone(); t *= &y[j]; t
+            }).reduce(|| hp_zero(prec), |mut a, b| { a += &b; a });
+            let mut s = pb[i].clone(); s -= &sum; s
+        } else {
+            let mut s = pb[i].clone();
+            for j in 0..i { let mut t = lu[i * dim + j].clone(); t *= &y[j]; s -= &t; }
+            s
+        };
         y[i] = s;
     }
+
+    // Back substitution: solve U·x = y. U has explicit diagonal.
     let mut x = vec![hp_zero(prec); dim];
     for i in (0..dim).rev() {
-        let mut s = y[i].clone();
-        for j in (i + 1)..dim { let mut t = lu[i * dim + j].clone(); t *= &x[j]; s -= &t; }
+        let row_len = dim - 1 - i; // number of terms in the inner sum
+        let mut s = if parallel && row_len >= PAR_SOLVE_MIN_ROW {
+            let sum = ((i + 1)..dim).into_par_iter().map(|j| {
+                let mut t = lu[i * dim + j].clone(); t *= &x[j]; t
+            }).reduce(|| hp_zero(prec), |mut a, b| { a += &b; a });
+            let mut s = y[i].clone(); s -= &sum; s
+        } else {
+            let mut s = y[i].clone();
+            for j in (i + 1)..dim { let mut t = lu[i * dim + j].clone(); t *= &x[j]; s -= &t; }
+            s
+        };
         s /= &lu[i * dim + i];
         x[i] = s;
     }
@@ -1295,6 +1367,45 @@ mod tests {
             assert!(abs_diff < tol,
                 "Strang n=10 dense LU: M·x[{}] - b[{}] = {}",
                 i, i, display_hp(&abs_diff, 4));
+        }
+    }
+
+    /// Equivalence: `lu_solve_with(parallel=true)` and
+    /// `lu_solve_with(parallel=false)` must produce the same solution to
+    /// working precision. Uses n=80 so rows beyond `PAR_SOLVE_MIN_ROW`
+    /// (32) exercise the parallel inner-reduction branch, while early
+    /// rows exercise the serial fallback within the same solve.
+    #[test]
+    fn lu_solve_serial_parallel_equivalence() {
+        let prec = 256;
+        let n = 80;
+        let m = strang_dense(prec, n);
+        let factors = lu_factor(&m, n).unwrap();
+
+        // A non-trivial right-hand side: b[i] = (i mod 7) + 1, exact in HP.
+        let b: Vec<Float> = (0..n).map(|i| hp(prec, &format!("{}", (i % 7) + 1))).collect();
+
+        let x_par = lu_solve_with(&factors, &b, n, prec, true);
+        let x_ser = lu_solve_with(&factors, &b, n, prec, false);
+
+        // The two paths differ only in HP reduction order; the gap must
+        // be below the working-precision floor. HP-256 ≈ 77 digits;
+        // require agreement to 1e-60.
+        let tol = hp(prec, "1e-60");
+        for i in 0..n {
+            let mut diff = x_par[i].clone(); diff -= &x_ser[i];
+            let abs_diff = diff.abs();
+            assert!(abs_diff < tol,
+                "serial/parallel lu_solve disagree at x[{}]: |Δ| = {}",
+                i, display_hp(&abs_diff, 4));
+        }
+
+        // And the default `lu_solve` must match the explicit parallel call.
+        let x_default = lu_solve(&factors, &b, n, prec);
+        for i in 0..n {
+            let mut diff = x_default[i].clone(); diff -= &x_par[i];
+            assert!(diff.abs() < tol,
+                "lu_solve default disagrees with lu_solve_with(parallel=true) at x[{}]", i);
         }
     }
 
