@@ -14,6 +14,12 @@ Thumbs.db
 # Cached GL nodes (regeneratable)
 ~/.cache/ccm_gl/
 
+# Per-cwd disk caches written by tests / runs (regeneratable).
+# The toolkit writes these to <cwd>/data/*_cache/ — see README.
+**/data/gl_cache/
+**/data/tau_cache/
+**/data/prolate_eigvals_cache/
+
 # Editor swap
 *.swp
 *~

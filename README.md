@@ -23,7 +23,7 @@ This is a Cargo workspace containing three sub-crates:
 - `quadrature` — Gauss-Legendre at f64 (configurable N-point) and HP. The HP path caches nodes/weights to `<cwd>/data/gl_cache/` and supports both uncompressed JSON and zip-compressed JSON fixtures (auto-decompressed on first read). Per-cwd layout means each paper repo / reproduction script gets its own independent cache, and pre-computed cache fixtures can be checked into a repo to skip the cold-start cost of Newton iteration. Cache hits are structurally validated (Σw = 2, Σx·w = 0, antisymmetric nodes); corrupt or wrong-precision files are skipped with a stderr warning. Public audit API: `verify_gl_cache_dir`.
 - `root_finding` — f64 bisection with configurable tolerance and max iterations. Endpoint-zero handled correctly (returns the zero endpoint, no walk-away).
 - `primes` — Sieve of Eratosthenes, prime counting function π(x).
-- `linalg` (HP-gated) — Dense LU factorization with partial pivoting, LU solve, banded tridiagonal LU (Thomas with partial pivoting; O(n) factor and solve), inverse iteration (with optional forced-even projection; rustdoc documents both convergence floors), ℓ² normalization, Rayleigh quotient. Inner reductions and matvec parallelized.
+- `linalg` (HP-gated) — Dense LU factorization with partial pivoting, LU solve, banded tridiagonal LU (Thomas with partial pivoting; O(n) factor and solve), inverse iteration (with optional forced-even projection; rustdoc documents both convergence floors), ℓ² normalization, Rayleigh quotient. Inner reductions and matvec parallelized. `lu_solve` parallelizes its inner triangular-solve reductions by default; `lu_solve_with(..., parallel)` exposes a serial/parallel toggle for tiny matrices or deterministic single-threaded benchmarking.
 - `fmt` (HP-gated) — `display_hp` (decimal scientific notation at any sig-digit count, no f64 underflow), `sign_of` (HP sign without f64), `matching_digits` and `relative_difference` (HP comparison helpers). Use these wherever you'd otherwise call `to_f64()` for display or comparison.
 - `eigen` (HP-gated) — HP symmetric eigendecomposition: `tridiag_eigenvalues_hp` (symmetric tridiagonal QR with implicit Wilkinson shifts; allocation-optimized inner loop), `tridiag_eigenvector_for_value_hp` (shifted inverse iteration with `TridiagEigvecOptions { max_steps, early_termination, solver: Banded | Dense }`), `dense_symmetric_eigenvector_for_value_hp` (shifted inverse iteration on dense input), `householder_tridiag_hp` (dense → tridiagonal reduction with parallel reductions, matvec, symmetric update, and Q accumulation), `dense_symmetric_eigenvalues_hp` (full pipeline). Truly dynamic in working precision (verified at HP-1000 against PARI/GP 2000-digit reference for both dense and tridiagonal cases; matches to ≥500 digits across 9 reference matrices including Hilbert and Wilkinson W11).
 
@@ -50,7 +50,7 @@ cargo test --workspace
 
 # Full HP tier (Linux/WSL/macOS — requires libgmp-dev libmpfr-dev libmpc-dev):
 cargo test --workspace --features hp
-# 166 tests pass, 0 ignored
+# 168 tests pass, 2 ignored
 ```
 
 ### HP eigensolver verification (3 layers)
@@ -85,14 +85,17 @@ on machines without PARI but verifies fully wherever the JSON is present.
 ## Performance
 
 The HP code paths are parallelized with [rayon](https://github.com/rayon-rs/rayon)
-throughout. Parallelization is unconditional — there are no `if n >
-threshold` guards. Small-n tests pay a small constant overhead, but
+throughout. Most parallelization is unconditional — there are no `if n >
+threshold` guards — with one exception: `lu_solve` runs its inner
+triangular-solve reduction serially for short rows (below a small fixed
+threshold) where rayon's dispatch overhead would exceed the work, and in
+parallel for longer rows. Small-n tests pay a small constant overhead, but
 production workloads scale across all available cores.
 
 | Layer | Parallelized hot spots |
 |---|---|
 | `xc-numerics::eigen` | Householder reduction: ‖x‖ and ‖v‖² reductions, matvec `p = β·A·v`, symmetric rank-2 update `A ← A − v·qᵀ − q·vᵀ`, vᵀp reduction, Q accumulation `Q ← Q · H`. |
-| `xc-numerics::linalg` | `normalize_l2` (parallel sum-of-squares + per-element divide), `rayleigh_quotient` (parallel row evaluation + final reduction), `inverse_iteration` initial guess and forced-even projection. |
+| `xc-numerics::linalg` | `lu_factor` Schur-complement update; `lu_solve` inner forward/back-substitution reductions (per-row, length-thresholded); `normalize_l2` (parallel sum-of-squares + per-element divide), `rayleigh_quotient` (parallel row evaluation + final reduction), `inverse_iteration` initial guess and forced-even projection. |
 | `xc-spectral::ccm::hp` | `run` and `measure_evenness` symmetrize loops (parallel pair compute, sequential write to avoid mirror-cell aliasing), Newton-per-seed loop in `run` (~50 independent refinements), combined `diff_sq + norm_sq` reduction in `measure_evenness`. |
 | `xc-spectral::yakaboylu::hp` | `build_w_matrix` outer-row loop. |
 | `xc-spectral::prolate::hp` | `compute_k_lambda` u-grid evaluation, `compare_xi_to_k_lambda` ξ-value reconstruction and dot reductions. |
@@ -185,6 +188,12 @@ Full guideline (private):
 
 | Version | Changes |
 |---|---|
+| `v0.8.0` | **`lu_solve` parallelizes its inner triangular-solve reductions (behavior change).** The forward/back-substitution inner sums are now split across rayon for rows longer than a small fixed threshold; the result is identical to working precision but the computation is multi-threaded and the HP reduction order is no longer deterministic. This is the per-step hot path in `inverse_iteration`, where it was the one remaining serial bottleneck at large dimension — every other HP hot path was already parallel, so on a many-core box the entire inverse-iteration phase previously ran on a single core. |
+| | • **New `lu_solve_with(factors, b, dim, prec, parallel: bool)`.** `lu_solve` now delegates to it with `parallel = true` (the default for all callers, including `inverse_iteration`). Pass `parallel = false` for tiny matrices, deterministic single-threaded benchmarking, or callers already saturating cores at a higher level. |
+| | • **Outer row loops remain sequential** — forward substitution row `i` depends on `y[0..i]` and back substitution on `x[i+1..]`; only the inner reduction `Σ_j lu[i,j]·{y,x}[j]` is parallelized. Short rows (below `PAR_SOLVE_MIN_ROW = 32`) stay serial to avoid rayon dispatch overhead exceeding the work. |
+| | • **New test `lu_solve_serial_parallel_equivalence`** (HP-gated): on an n=80 Strang system (rows on both sides of the threshold) the serial and parallel paths, and the `lu_solve` default vs explicit `lu_solve_with(parallel=true)`, agree to 1e-60 at HP-256. |
+| | • **Motivation:** cutting per-config wall-clock for the convergence-knob (Paper C) Vast runs, where large-`N` configs at high precision spend most of their time in `inverse_iteration`'s `lu_solve`. See `xcelerator-research/research/ccm/KNOB_SCALING_FORMULA.md`. |
+| | • Test counts: f64 16 + 37 + 1 = 54 pass on Windows MSVC (unchanged; the new test is HP-gated). HP path: 168 pass, 2 ignored (was 167 + new equivalence test). |
 | `v0.7.0` | **GL cache also writes `.json.zip` alongside `.json`.** Mirrors the τ-cache "always write both" pattern. No public API change; no behavior change for existing readers (the `.json` is still the fast next-read path; the new `.zip` is for distribution / git checkin). |
 | | • `save_gl_cache` now writes both `.json` (canonical fast-read) and `.json.zip` (distribution artifact) on every fresh compute. Mirrors `tau_cache::save`. |
 | | • Lets paper repositories check in compressed GL cache fixtures alongside the τ-cache fixtures using a single uniform pattern (`data/*_cache/*.json.zip`). The decompressed `.json` files are gitignored on the consumer side; fresh clones get full cache benefit on first read by auto-decompressing the committed `.zip`. |
