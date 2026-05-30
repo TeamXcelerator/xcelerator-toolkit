@@ -264,14 +264,48 @@ pub fn run(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> Re
         tau[j * dim + i] = sum;
     }
 
-    // Find smallest eigenpair by inverse iteration (forced even).
-    eprintln!("[HP] LU factoring {}×{} matrix (one-time cost)...", dim, dim);
-    let (eps_n, xi_raw) = xc_numerics::linalg::inverse_iteration(
-        &tau, dim, prec, cfg.inverse_iter_steps, true)?;
-    eprintln!("[HP] LU factorization done.");
-
-    // Normalize: Σ ξ_j = √L.
-    let xi = normalize_eigenvector(&xi_raw, &l, prec);
+    // Smallest eigenpair (ξ, ε_N).
+    //
+    // After-τ cache check: if a cached Weil eigenvector exists for this
+    // (λ², N, prec) AND it validates against the in-hand τ via the
+    // eigen-residual ‖τξ − μξ‖, skip the costly LU factorization
+    // entirely. A missing or residual-failing entry falls through to a
+    // fresh inverse-iteration compute, which is then cached. The check
+    // sits *after* `build_tau_hp` precisely so τ is available for the
+    // residual validation (the strongest integrity test for ξ).
+    let lambda_sq = params.lambda_sq_int;
+    let n_modes_key = params.n_modes;
+    let mut cached_pair: Option<(Float, Vec<Float>)> = None;
+    if let Some(c) = weil_eigvec_cache::load(lambda_sq, n_modes_key, prec, cfg.cache_mode) {
+        if weil_eigvec_cache::residual_ok(&tau, dim, &c.xi, &c.eps_n, prec) {
+            eprintln!(
+                "[HP] loaded cached Weil eigenvector for λ²={}, N={}, prec={} bits \
+                 (skipping LU; τ-residual validated)",
+                lambda_sq, n_modes_key, prec
+            );
+            cached_pair = Some((c.eps_n, c.xi));
+        } else {
+            eprintln!(
+                "[HP] WARNING: cached Weil eigenvector for λ²={}, N={}, prec={} failed \
+                 τ-residual validation; recomputing",
+                lambda_sq, n_modes_key, prec
+            );
+        }
+    }
+    let (eps_n, xi) = match cached_pair {
+        Some(pair) => pair,
+        None => {
+            // Find smallest eigenpair by inverse iteration (forced even).
+            eprintln!("[HP] LU factoring {}×{} matrix (one-time cost)...", dim, dim);
+            let (eps_n, xi_raw) = xc_numerics::linalg::inverse_iteration(
+                &tau, dim, prec, cfg.inverse_iter_steps, true)?;
+            eprintln!("[HP] LU factorization done.");
+            // Normalize: Σ ξ_j = √L.
+            let xi = normalize_eigenvector(&xi_raw, &l, prec);
+            weil_eigvec_cache::save(lambda_sq, n_modes_key, prec, &eps_n, &xi, cfg.cache_mode);
+            (eps_n, xi)
+        }
+    };
 
     // Find eigenvalues as zeros of R(z), seeded from HP reference zeros.
     // Each Newton refinement is independent across seeds — parallelize.
@@ -1460,10 +1494,442 @@ pub use tau_cache::{
     TauCacheVerifyReport, TauCacheFileStatus,
 };
 
+// ===========================================================================
+// Weil-eigenvector (ξ) disk cache
+// ===========================================================================
+
+mod weil_eigvec_cache {
+    //! Disk cache for the smallest-eigenvalue eigenvector ξ of the Weil
+    //! quadratic form (the vector produced by `inverse_iteration` inside
+    //! [`super::run`], ℓ²-normalized so Σξ = √L). Distinct from the
+    //! prolate eigenvalue cache (`prolate_eigvals_cache`, different
+    //! operator *and* quantity) and the τ-matrix cache (`tau_cache`,
+    //! different quantity).
+    //!
+    //! Cache layout under `<cwd>/data/weil_eigvec_cache/`:
+    //!   - `weil_eigvec_lambda_sq{L}_nmodes{N}_prec{P}.json` (uncompressed,
+    //!     fast path)
+    //!   - `weil_eigvec_lambda_sq{L}_nmodes{N}_prec{P}.json.zip`
+    //!     (single-zip companion for distribution)
+    //!
+    //! Unlike `tau_cache`, ξ is small (2N+1 entries, ≲ 2 MB even at
+    //! HP-1000/N=800), so there is no byte-split `.partXX` tier — single
+    //! zip only, exactly like the GL-node cache.
+    //!
+    //! Schema mirrors [`super::HighPrecResult::save_xi_json`]
+    //! (`schema_version: 1`): a JSON object carrying ξ as decimal strings
+    //! plus `weil_min_eigenvalue` (ε_N) and the `(λ², N, prec)` metadata.
+    //!
+    //! Validation on load is two-tier:
+    //!   1. *Structural* (here, no τ needed): length = 2N+1, finite
+    //!      entries, metadata match. Cheap O(N).
+    //!   2. *Residual* (at the [`super::run`] call site, where τ is in
+    //!      hand): ‖τξ − ε_N·ξ‖ below the working-precision floor. This is
+    //!      the strongest integrity test and is why the cache check sits
+    //!      *after* the τ build.
+
+    use rug::{ops::Pow, Float};
+    use std::io::{Read, Write};
+
+    use xc_numerics::quadrature::CacheMode;
+
+    /// Base raw URL of the public consolidated Weil-eigenvector cache
+    /// repository. Files live at
+    /// `{REMOTE_BASE}/weil_eigvec_cache/prec{P}/lambda_sq{L}/nmodes{B}-{B+999}/weil_eigvec_lambda_sq{L}_nmodes{N}_prec{P}.json.zip`
+    /// where `B = (N / 1000) * 1000`.
+    const REMOTE_BASE: &str =
+        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-weil-eigvec-cache/main";
+
+    /// A ξ entry loaded from the cache: the eigenvector plus its
+    /// eigenvalue ε_N, both at the requested working precision.
+    pub(super) struct CachedXi {
+        pub eps_n: Float,
+        pub xi: Vec<Float>,
+    }
+
+    fn cache_dir() -> Option<std::path::PathBuf> {
+        let cwd = std::env::current_dir().ok()?;
+        let dir = cwd.join("data").join("weil_eigvec_cache");
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    }
+
+    pub(super) fn cache_filename(lambda_sq: u64, n_modes: usize, prec: u32) -> String {
+        format!("weil_eigvec_lambda_sq{}_nmodes{}_prec{}.json", lambda_sq, n_modes, prec)
+    }
+
+    fn json_path(lambda_sq: u64, n_modes: usize, prec: u32) -> Option<std::path::PathBuf> {
+        cache_dir().map(|d| d.join(cache_filename(lambda_sq, n_modes, prec)))
+    }
+
+    fn zip_path(lambda_sq: u64, n_modes: usize, prec: u32) -> Option<std::path::PathBuf> {
+        cache_dir().map(|d| {
+            let f = cache_filename(lambda_sq, n_modes, prec);
+            d.join(format!("{}.zip", f))
+        })
+    }
+
+    /// Parse the cache JSON object into `(eps_n, xi)`. Returns `None` on
+    /// any structural mismatch: wrong xi length, metadata disagreement,
+    /// unparseable HP strings, or a non-finite entry.
+    pub(super) fn parse_json(
+        data: &str, lambda_sq: u64, n_modes: usize, prec: u32,
+    ) -> Option<CachedXi> {
+        let v: serde_json::Value = serde_json::from_str(data).ok()?;
+
+        // Metadata must match the requested key (guards against a
+        // filename/content mismatch or a stale collision).
+        if v.get("n_modes").and_then(|x| x.as_u64())? as usize != n_modes { return None; }
+        if v.get("precision_bits").and_then(|x| x.as_u64())? as u32 != prec { return None; }
+        // λ² stored as a number; the paper configs are exact integers.
+        let l_meta = v.get("lambda_squared").and_then(|x| x.as_f64())?;
+        if (l_meta - lambda_sq as f64).abs() > 0.5 { return None; }
+
+        let eps_str = v.get("weil_min_eigenvalue").and_then(|x| x.as_str())?;
+        let eps_n = Float::with_val(prec, Float::parse(eps_str).ok()?);
+        if eps_n.is_nan() || eps_n.is_infinite() { return None; }
+
+        let arr = v.get("xi").and_then(|x| x.as_array())?;
+        if arr.len() != 2 * n_modes + 1 { return None; }
+        let mut xi = Vec::with_capacity(arr.len());
+        for s in arr {
+            let f = Float::with_val(prec, Float::parse(s.as_str()?).ok()?);
+            if f.is_nan() || f.is_infinite() { return None; }
+            xi.push(f);
+        }
+        Some(CachedXi { eps_n, xi })
+    }
+
+    /// Eigen-residual check: is `(xi, eps_n)` a genuine eigenpair of the
+    /// in-hand τ matrix? Returns `true` when `‖τξ − ε_N·ξ‖_∞ / ‖ξ‖_∞`
+    /// sits below the working-precision floor. This is the strong
+    /// integrity test that catches a structurally-valid-but-wrong ξ
+    /// (e.g. a different eigenvector, or one from a subtly different τ).
+    pub(super) fn residual_ok(
+        tau: &[Float], dim: usize, xi: &[Float], eps_n: &Float, prec: u32,
+    ) -> bool {
+        if xi.len() != dim || tau.len() != dim * dim { return false; }
+
+        // ‖ξ‖_∞ for the relative bound. A zero vector can never be a
+        // valid eigenvector.
+        let mut xi_linf = Float::with_val(prec, 0);
+        for v in xi {
+            let a = v.clone().abs();
+            if a > xi_linf { xi_linf = a; }
+        }
+        if xi_linf.is_zero() { return false; }
+
+        // max_i | (τξ)_i − ε_N ξ_i |, rows computed in parallel then a
+        // deterministic max-fold. The inner row sum is sequential (it is
+        // the same fixed index order every run).
+        use rayon::prelude::*;
+        let resid_inf = (0..dim).into_par_iter().map(|i| {
+            let mut row = Float::with_val(prec, 0);
+            for j in 0..dim {
+                let mut t = tau[i * dim + j].clone();
+                t *= &xi[j];
+                row += &t;
+            }
+            let mut e = eps_n.clone();
+            e *= &xi[i];
+            row -= &e;
+            row.abs()
+        }).reduce(|| Float::with_val(prec, 0), |a, b| if a > b { a } else { b });
+
+        // Relative residual vs floor. Use a generous floor: the eigenpair
+        // is accurate to ~working precision, but the residual accumulates
+        // O(N) HP roundings in the matrix-vector product. 2^-(prec-32)
+        // leaves 32 bits (~10 digits) of headroom — far below the O(1)
+        // residual a wrong ξ would produce, yet safely above the genuine
+        // floor.
+        let mut rel = resid_inf;
+        rel /= &xi_linf;
+        let floor = Float::with_val(prec, 2).pow(-((prec as i32) - 32));
+        rel.cmp_abs(&floor).map(|o| o.is_lt()).unwrap_or(false)
+    }
+
+    /// Deterministic remote URL for the `(λ², N, prec)` fixture in the
+    /// public xcelerator-weil-eigvec-cache repo (precision-first → λ² →
+    /// nmodes-thousand-bucket layout, mirroring tau/GL).
+    fn remote_zip_url(lambda_sq: u64, n_modes: usize, prec: u32) -> String {
+        let bucket = (n_modes / 1000) * 1000;
+        format!(
+            "{base}/weil_eigvec_cache/prec{p}/lambda_sq{l}/nmodes{b}-{bend}/{stem}.zip",
+            base = REMOTE_BASE, p = prec, l = lambda_sq,
+            b = bucket, bend = bucket + 999,
+            stem = cache_filename(lambda_sq, n_modes, prec)
+        )
+    }
+
+    /// Test-only accessor for `remote_zip_url`.
+    #[cfg(test)]
+    pub(super) fn remote_zip_url_for_test(
+        lambda_sq: u64, n_modes: usize, prec: u32,
+    ) -> String {
+        remote_zip_url(lambda_sq, n_modes, prec)
+    }
+
+    fn warn_skip(path: &std::path::Path, reason: &str) {
+        eprintln!(
+            "[weil_eigvec_cache] WARNING: skipping {} ({}); recomputing",
+            path.display(), reason
+        );
+    }
+
+    /// Read a single zip and return the parsed entry plus the raw inner
+    /// JSON (so the caller can write the decompressed copy without
+    /// re-serializing).
+    fn read_single_zip(
+        zip_path: &std::path::Path,
+        lambda_sq: u64, n_modes: usize, prec: u32,
+    ) -> Option<(CachedXi, String)> {
+        let file = std::fs::File::open(zip_path).ok()?;
+        let mut archive = zip::ZipArchive::new(file).ok()?;
+        let entry_name = cache_filename(lambda_sq, n_modes, prec);
+        let mut entry = archive.by_name(&entry_name).ok()?;
+        let mut data = String::new();
+        entry.read_to_string(&mut data).ok()?;
+        let parsed = parse_json(&data, lambda_sq, n_modes, prec)?;
+        Some((parsed, data))
+    }
+
+    pub(super) fn load(
+        lambda_sq: u64, n_modes: usize, prec: u32, mode: CacheMode,
+    ) -> Option<CachedXi> {
+        if mode == CacheMode::Off { return None; }
+
+        // Tier 1 (all non-Off modes): uncompressed JSON. Fast read.
+        if let Some(path) = json_path(lambda_sq, n_modes, prec) {
+            if path.exists() {
+                match std::fs::read_to_string(&path) {
+                    Ok(data) => match parse_json(&data, lambda_sq, n_modes, prec) {
+                        Some(c) => return Some(c),
+                        None => warn_skip(&path, "JSON shape / metadata mismatch or unparseable"),
+                    },
+                    Err(e) => warn_skip(&path, &format!("read failed: {}", e)),
+                }
+            }
+        }
+
+        // JsonOnly stops after the uncompressed tier.
+        if mode == CacheMode::JsonOnly { return None; }
+
+        // Tier 2 (JsonZip, DynamicFetch): local single zip.
+        if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec) {
+            return Some(c);
+        }
+
+        // JsonZip stops after the local tiers.
+        if mode == CacheMode::JsonZip { return None; }
+
+        // Tier 3 (DynamicFetch only): remote fetch (single zip; no parts,
+        // ξ is small). On success the zip lands locally and we re-run the
+        // local-zip loader so the decompressed .json is written.
+        if fetch_remote_zip(lambda_sq, n_modes, prec) {
+            if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec) {
+                return Some(c);
+            }
+        }
+
+        None
+    }
+
+    /// Load from a local single zip (tier 2). On success writes the
+    /// decompressed `.json` alongside and returns the parsed entry.
+    fn try_load_local_zip(lambda_sq: u64, n_modes: usize, prec: u32) -> Option<CachedXi> {
+        let zp = zip_path(lambda_sq, n_modes, prec)?;
+        if !zp.exists() { return None; }
+        match read_single_zip(&zp, lambda_sq, n_modes, prec) {
+            Some((parsed, json_string)) => {
+                if let Some(jp) = json_path(lambda_sq, n_modes, prec) {
+                    let _ = std::fs::write(&jp, &json_string);
+                }
+                Some(parsed)
+            }
+            None => {
+                warn_skip(&zp, "zip open / decompress / shape parse failed");
+                None
+            }
+        }
+    }
+
+    /// Outcome of a single `curl` download attempt (mirrors the GL/τ
+    /// fetch classification).
+    enum CurlOutcome { Ok, HttpError, Transient }
+
+    fn curl_attempt(url: &str, dest: &std::path::Path) -> CurlOutcome {
+        let tmp = dest.with_extension("zip.partial");
+        let _ = std::fs::remove_file(&tmp);
+        let output = std::process::Command::new("curl")
+            .arg("--silent").arg("--show-error").arg("--location")
+            .arg("--retry").arg("3").arg("--retry-delay").arg("1")
+            .arg("--write-out").arg("%{http_code}")
+            .arg("-o").arg(&tmp).arg(url)
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                let code: u32 = String::from_utf8_lossy(&out.stdout)
+                    .trim().parse().unwrap_or(0);
+                match code {
+                    200..=299 => match std::fs::rename(&tmp, dest) {
+                        Ok(()) => CurlOutcome::Ok,
+                        Err(_) => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
+                    },
+                    404 => { let _ = std::fs::remove_file(&tmp); CurlOutcome::HttpError }
+                    _ => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
+                }
+            }
+            _ => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
+        }
+    }
+
+    /// Download the `(λ², N, prec)` `.json.zip` from the public cache
+    /// repo. Returns `true` if a file was written. Robust to
+    /// `raw.githubusercontent.com` rate-limiting: only a 404 is a
+    /// definitive miss; 429/5xx/no-response retry with backoff.
+    fn fetch_remote_zip(lambda_sq: u64, n_modes: usize, prec: u32) -> bool {
+        let dest = match zip_path(lambda_sq, n_modes, prec) {
+            Some(p) => p,
+            None => return false,
+        };
+        let url = remote_zip_url(lambda_sq, n_modes, prec);
+
+        const MAX_TRIES: usize = 5;
+        for attempt in 0..MAX_TRIES {
+            match curl_attempt(&url, &dest) {
+                CurlOutcome::Ok => {
+                    eprintln!(
+                        "[weil_eigvec_cache] fetched {} from remote cache",
+                        dest.file_name().and_then(|s| s.to_str()).unwrap_or("(file)")
+                    );
+                    return true;
+                }
+                CurlOutcome::HttpError => return false, // 404 — definitive miss.
+                CurlOutcome::Transient => {
+                    if attempt + 1 < MAX_TRIES {
+                        let secs = 2 * (attempt as u64 + 1);
+                        std::thread::sleep(std::time::Duration::from_secs(secs));
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Serialize `(eps_n, xi)` to the schema-versioned JSON object.
+    fn serialize_to_json(
+        lambda_sq: u64, n_modes: usize, prec: u32, eps_n: &Float, xi: &[Float],
+    ) -> Vec<u8> {
+        let xi_strings: Vec<String> = xi.iter().map(|f| f.to_string()).collect();
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "lambda_squared": lambda_sq,
+            "n_modes": n_modes,
+            "precision_bits": prec,
+            "weil_min_eigenvalue": eps_n.to_string(),
+            "xi": xi_strings,
+        });
+        serde_json::to_vec(&payload).unwrap_or_default()
+    }
+
+    fn compress_to_zip(json_bytes: &[u8], entry_name: &str) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::with_capacity(json_bytes.len() / 2);
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            if writer.start_file(entry_name, opts).is_err() { return Vec::new(); }
+            if writer.write_all(json_bytes).is_err() { return Vec::new(); }
+            if writer.finish().is_err() { return Vec::new(); }
+        }
+        buf
+    }
+
+    fn cleanup_previous(lambda_sq: u64, n_modes: usize, prec: u32) {
+        if let Some(p) = json_path(lambda_sq, n_modes, prec) {
+            if p.exists() { let _ = std::fs::remove_file(&p); }
+        }
+        if let Some(p) = zip_path(lambda_sq, n_modes, prec) {
+            if p.exists() { let _ = std::fs::remove_file(&p); }
+        }
+    }
+
+    pub(super) fn save(
+        lambda_sq: u64, n_modes: usize, prec: u32,
+        eps_n: &Float, xi: &[Float], mode: CacheMode,
+    ) {
+        if mode == CacheMode::Off { return; }
+
+        let json_bytes = serialize_to_json(lambda_sq, n_modes, prec, eps_n, xi);
+        if json_bytes.is_empty() { return; }
+
+        cleanup_previous(lambda_sq, n_modes, prec);
+
+        // Always write the uncompressed JSON first (fast-read path).
+        if let Some(jp) = json_path(lambda_sq, n_modes, prec) {
+            let _ = std::fs::write(&jp, &json_bytes);
+        }
+
+        // JsonOnly writes only the uncompressed .json; no zip companion.
+        if mode == CacheMode::JsonOnly { return; }
+
+        // JsonZip / DynamicFetch: also write a compressed copy for
+        // distribution. ξ is small, so this is always a single zip (no
+        // byte-split tier — unlike τ).
+        let entry_name = cache_filename(lambda_sq, n_modes, prec);
+        let zip_bytes = compress_to_zip(&json_bytes, &entry_name);
+        if zip_bytes.is_empty() { return; }
+        if let Some(zp) = zip_path(lambda_sq, n_modes, prec) {
+            if let Err(e) = std::fs::write(&zp, &zip_bytes) {
+                eprintln!(
+                    "[weil_eigvec_cache] WARNING: could not write {}: {}",
+                    zp.display(), e
+                );
+            }
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serialize all cwd-mutating cache tests in this module. Cargo runs
+    /// tests in parallel by default; cwd is per-process (not per-thread),
+    /// so two cache tests racing on `set_current_dir` would corrupt each
+    /// other (one test deleting the temp dir another captured as its
+    /// "original"). The mutex enforces sequential access. Mirrors the GL
+    /// cache tests in `xc-numerics::quadrature`.
+    static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Guard that restores the original cwd on drop, so a panic inside a
+    /// test doesn't leave the runner in a temp dir (which would break
+    /// subsequent unrelated tests). Holds the CWD_LOCK for the guard's
+    /// lifetime to serialize cwd mutation.
+    struct CwdGuard {
+        original: std::path::PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl CwdGuard {
+        fn enter(temp: &std::path::Path) -> Self {
+            // Recover from poison: a previously-panicking test poisons the
+            // lock, but subsequent tests can still safely acquire it (the
+            // global cwd state isn't corrupted by a panic — the prior
+            // guard's Drop ran on unwind and restored cwd).
+            let lock = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let original = std::env::current_dir().expect("no cwd");
+            std::env::set_current_dir(temp).expect("set_current_dir to temp");
+            CwdGuard { original, _lock: lock }
+        }
+    }
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
 
     /// HighPrecConfig::for_decimal_digits should produce expected values.
     #[test]
@@ -1797,6 +2263,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    /// Negative: a structurally-invalid τ `.json` on disk (parseable but
+    /// asymmetric) must be skipped by `tau_cache::load` (returns `None`,
+    /// treated as a miss → caller recomputes). The bad file is preserved.
+    /// Mirrors the GL cache's structurally-invalid-json test; brings the
+    /// τ load path to parity (previously only the verify-dir audit and
+    /// the unit-level structural_check were tested, not the load path).
+    #[test]
+    fn tau_load_skips_structurally_invalid_json() {
+        use super::tau_cache::{load, cache_filename};
+        use xc_numerics::quadrature::CacheMode;
+        let prec = 128;
+        let lambda_sq = 13u64;
+        let n_modes = 3usize;
+        let dim = 2 * n_modes + 1; // 7
+
+        let temp = std::env::temp_dir().join(format!(
+            "xc_tau_invalid_json_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos()).unwrap_or(0)));
+        std::fs::create_dir_all(&temp).unwrap();
+        let _guard = CwdGuard::enter(&temp);
+
+        let dir = temp.join("data").join("tau_cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(cache_filename(lambda_sq, n_modes, prec));
+
+        // Build a correctly-shaped matrix, then break symmetry at one
+        // off-diagonal pair so structural_check rejects it.
+        let mut m = vec![Float::with_val(prec, 0); dim * dim];
+        for i in 0..dim {
+            for j in i..dim {
+                let val = Float::with_val(prec, (i + j + 1) as f64);
+                m[i * dim + j] = val.clone();
+                m[j * dim + i] = val;
+            }
+        }
+        m[0 * dim + 1] = Float::with_val(prec, 99); // τ[1,0] unchanged → asymmetric
+        let strs: Vec<String> = m.iter().map(|f| f.to_string()).collect();
+        let json = serde_json::Value::Array(
+            strs.into_iter().map(serde_json::Value::String).collect());
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        // load must skip the asymmetric matrix (None).
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly).is_none(),
+            "structurally-invalid (asymmetric) τ .json must be skipped");
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip).is_none(),
+            "structurally-invalid τ .json must be skipped (no zip either)");
+
+        // Bad file preserved on disk.
+        assert!(path.exists(),
+            "structurally-invalid τ file should be preserved for inspection");
+
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// Negative: a truncated/corrupt τ `.json.zip` must be detected and
+    /// skipped without panic (`load` returns `None`). The corrupt file is
+    /// preserved. Mirrors the GL cache's `cache_handles_corrupt_zip_gracefully`.
+    #[test]
+    fn tau_load_handles_corrupt_zip_gracefully() {
+        use super::tau_cache::load;
+        use xc_numerics::quadrature::CacheMode;
+        let prec = 64;
+        let lambda_sq = 49u64;
+        let n_modes = 3usize;
+
+        let temp = std::env::temp_dir().join(format!(
+            "xc_tau_corrupt_zip_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos()).unwrap_or(0)));
+        std::fs::create_dir_all(&temp).unwrap();
+        let _guard = CwdGuard::enter(&temp);
+
+        let dir = temp.join("data").join("tau_cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Garbage bytes named as the single-zip for this config; no
+        // local .json, so JsonZip falls through to the zip, fails to
+        // open it, and returns None without panicking.
+        let zip_path = dir.join(format!(
+            "lambda_sq{}_nmodes{}_prec{}.json.zip",
+            lambda_sq, n_modes, prec));
+        std::fs::write(&zip_path, b"not a zip file at all -- random bytes").unwrap();
+
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip).is_none(),
+            "corrupt τ .json.zip must be skipped, not loaded");
+
+        assert!(zip_path.exists(),
+            "corrupt τ zip should be preserved for inspection");
+
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
     /// The remote τ URL is deterministically derived from
     /// `(λ², N, prec)` using the public xcelerator-tau-cache repo's
     /// precision-first → λ² → nmodes-thousand-bucket layout.
@@ -1872,5 +2434,301 @@ mod tests {
         let dim = params.matrix_size();
         assert_eq!(tau.len(), dim * dim,
             "fetched τ length {} != (2N+1)² = {}", tau.len(), dim * dim);
+    }
+
+    // -----------------------------------------------------------------
+    // weil_eigvec_cache tests
+    // -----------------------------------------------------------------
+
+    /// A fresh temp dir + cwd guard so cache reads/writes land in a
+    /// throwaway location and never touch the real `data/` tree.
+    fn weil_temp_cwd(tag: &str) -> std::path::PathBuf {
+        let temp = std::env::temp_dir().join(format!(
+            "xc_weil_eigvec_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos()).unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&temp).unwrap();
+        temp
+    }
+
+    /// The remote ξ URL is deterministically derived from `(λ², N, prec)`
+    /// using the public repo's precision-first → λ² → nmodes-thousand-
+    /// bucket layout (mirrors tau/GL), with the `weil_eigvec_` filename
+    /// prefix.
+    #[test]
+    fn weil_eigvec_remote_url_uses_bucketed_layout() {
+        // λ²=1000, N=800, prec=3338 → bucket 0-999.
+        let url = super::weil_eigvec_cache::remote_zip_url_for_test(1000, 800, 3338);
+        assert_eq!(
+            url,
+            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-weil-eigvec-cache/main/weil_eigvec_cache/prec3338/lambda_sq1000/nmodes0-999/weil_eigvec_lambda_sq1000_nmodes800_prec3338.json.zip"
+        );
+
+        // λ²=400, N=1500, prec=4999 → bucket 1000-1999.
+        let url2 = super::weil_eigvec_cache::remote_zip_url_for_test(400, 1500, 4999);
+        assert_eq!(
+            url2,
+            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-weil-eigvec-cache/main/weil_eigvec_cache/prec4999/lambda_sq400/nmodes1000-1999/weil_eigvec_lambda_sq400_nmodes1500_prec4999.json.zip"
+        );
+    }
+
+    /// `parse_json` accepts a well-formed entry and rejects metadata
+    /// mismatches, wrong xi length, and non-finite values.
+    #[test]
+    fn weil_eigvec_parse_json_validates() {
+        use super::weil_eigvec_cache::parse_json;
+        let prec = 128;
+        let lambda_sq = 13u64;
+        let n_modes = 3usize;
+        let dim = 2 * n_modes + 1; // 7
+
+        let xi: Vec<Float> = (0..dim).map(|i| Float::with_val(prec, (i + 1) as f64)).collect();
+        let xi_strs: Vec<String> = xi.iter().map(|f| f.to_string()).collect();
+        let good = serde_json::json!({
+            "schema_version": 1,
+            "lambda_squared": lambda_sq,
+            "n_modes": n_modes,
+            "precision_bits": prec,
+            "weil_min_eigenvalue": "1.5e-40",
+            "xi": xi_strs,
+        }).to_string();
+        let parsed = parse_json(&good, lambda_sq, n_modes, prec)
+            .expect("well-formed entry should parse");
+        assert_eq!(parsed.xi.len(), dim);
+
+        // Wrong n_modes metadata → reject.
+        assert!(parse_json(&good, lambda_sq, n_modes + 1, prec).is_none(),
+            "n_modes mismatch should be rejected");
+        // Wrong precision metadata → reject.
+        assert!(parse_json(&good, lambda_sq, n_modes, prec + 1).is_none(),
+            "precision mismatch should be rejected");
+        // Wrong λ² metadata → reject.
+        assert!(parse_json(&good, lambda_sq + 5, n_modes, prec).is_none(),
+            "lambda_sq mismatch should be rejected");
+
+        // Wrong xi length → reject.
+        let mut short_strs = xi_strs.clone();
+        short_strs.pop();
+        let short = serde_json::json!({
+            "schema_version": 1, "lambda_squared": lambda_sq, "n_modes": n_modes,
+            "precision_bits": prec, "weil_min_eigenvalue": "1.5e-40", "xi": short_strs,
+        }).to_string();
+        assert!(parse_json(&short, lambda_sq, n_modes, prec).is_none(),
+            "wrong xi length should be rejected");
+    }
+
+    /// `residual_ok` accepts a genuine eigenpair of τ and rejects a
+    /// perturbed (wrong) eigenvector — the strong integrity test the
+    /// after-τ cache check relies on.
+    #[test]
+    fn weil_eigvec_residual_check_discriminates() {
+        use super::weil_eigvec_cache::residual_ok;
+        let prec = 256;
+        let n = 5;
+        // Diagonal matrix: eigenpairs are (λ_i, e_i). Smallest is λ=1 at e_0.
+        let mut a = vec![Float::with_val(prec, 0); n * n];
+        let diag = ["1", "2", "3", "4", "5"];
+        for (i, d) in diag.iter().enumerate() {
+            a[i * n + i] = Float::with_val(prec, Float::parse(d).unwrap());
+        }
+        // True smallest eigenpair.
+        let eps = Float::with_val(prec, 1);
+        let mut xi = vec![Float::with_val(prec, 0); n];
+        xi[0] = Float::with_val(prec, 1);
+        assert!(residual_ok(&a, n, &xi, &eps, prec),
+            "genuine eigenpair should pass the residual check");
+
+        // Wrong eigenvector (points along e_1, whose eigenvalue is 2,
+        // not 1) → residual is O(1) → reject.
+        let mut wrong = vec![Float::with_val(prec, 0); n];
+        wrong[1] = Float::with_val(prec, 1);
+        assert!(!residual_ok(&a, n, &wrong, &eps, prec),
+            "wrong eigenvector should fail the residual check");
+
+        // Zero vector → reject.
+        let zero = vec![Float::with_val(prec, 0); n];
+        assert!(!residual_ok(&a, n, &zero, &eps, prec),
+            "zero vector should fail the residual check");
+    }
+
+    /// Round-trip: `save` then `load` returns a byte-identical ξ and ε_N
+    /// at every CacheMode tier. Also checks that `CacheMode::Off` writes
+    /// nothing.
+    #[test]
+    fn weil_eigvec_save_load_round_trip() {
+        use super::weil_eigvec_cache::{save, load};
+        use xc_numerics::quadrature::CacheMode;
+        let prec = 128;
+        let lambda_sq = 49u64;
+        let n_modes = 4usize;
+        let dim = 2 * n_modes + 1; // 9
+
+        let temp = weil_temp_cwd("round_trip");
+        let _guard = CwdGuard::enter(&temp);
+
+        let eps = Float::with_val(prec, Float::parse("3.25e-12").unwrap());
+        let xi: Vec<Float> = (0..dim)
+            .map(|i| Float::with_val(prec, Float::parse(
+                &format!("0.{}1", i + 1)).unwrap()))
+            .collect();
+
+        // Off: writes nothing, reads nothing.
+        save(lambda_sq, n_modes, prec, &eps, &xi, CacheMode::Off);
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::Off).is_none(),
+            "Off should never read");
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly).is_none(),
+            "Off save should have written nothing");
+
+        // JsonZip: writes .json + .json.zip; reads back identical.
+        save(lambda_sq, n_modes, prec, &eps, &xi, CacheMode::JsonZip);
+        let got = load(lambda_sq, n_modes, prec, CacheMode::JsonZip)
+            .expect("JsonZip round-trip should load");
+        assert_eq!(got.xi.len(), dim);
+        for (a, b) in xi.iter().zip(got.xi.iter()) {
+            assert_eq!(a.to_string(), b.to_string(), "xi entry must round-trip exactly");
+        }
+        assert_eq!(eps.to_string(), got.eps_n.to_string(),
+            "eps_n must round-trip exactly");
+
+        // Remove the .json so the next read must use the .zip tier.
+        let jp = temp.join("data").join("weil_eigvec_cache")
+            .join(super::weil_eigvec_cache::cache_filename(lambda_sq, n_modes, prec));
+        std::fs::remove_file(&jp).unwrap();
+        let from_zip = load(lambda_sq, n_modes, prec, CacheMode::JsonZip)
+            .expect("zip-tier load should succeed after .json removed");
+        for (a, b) in xi.iter().zip(from_zip.xi.iter()) {
+            assert_eq!(a.to_string(), b.to_string(), "zip-tier xi must match");
+        }
+
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// Negative: a structurally-invalid ξ `.json` (parseable JSON but
+    /// wrong xi length / mismatched metadata) must be skipped by `load`
+    /// (returns `None`, treated as a miss → caller recomputes). The bad
+    /// file is preserved on disk for inspection. Mirrors the GL cache's
+    /// `cache_discards_structurally_invalid_json_and_recomputes`.
+    #[test]
+    fn weil_eigvec_load_skips_structurally_invalid_json() {
+        use super::weil_eigvec_cache::{load, cache_filename};
+        use xc_numerics::quadrature::CacheMode;
+        let prec = 128;
+        let lambda_sq = 13u64;
+        let n_modes = 4usize; // expects 2N+1 = 9 entries
+
+        let temp = weil_temp_cwd("invalid_json");
+        let _guard = CwdGuard::enter(&temp);
+
+        let dir = temp.join("data").join("weil_eigvec_cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(cache_filename(lambda_sq, n_modes, prec));
+
+        // Shape-parseable JSON, but xi has the WRONG length (3 ≠ 9)
+        // and otherwise-valid metadata. parse_json must reject it.
+        let bad = serde_json::json!({
+            "schema_version": 1,
+            "lambda_squared": lambda_sq,
+            "n_modes": n_modes,
+            "precision_bits": prec,
+            "weil_min_eigenvalue": "1.0e-20",
+            "xi": ["1.0", "2.0", "3.0"],
+        }).to_string();
+        std::fs::write(&path, &bad).unwrap();
+
+        // load must skip (None) — never returns a malformed entry.
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly).is_none(),
+            "structurally-invalid .json must be skipped");
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip).is_none(),
+            "structurally-invalid .json must be skipped (zip tier has nothing either)");
+
+        // The bad file is preserved on disk (load does not delete it;
+        // only a recompute+save would overwrite it).
+        assert!(path.exists(),
+            "structurally-invalid file should be preserved for inspection");
+
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// Negative: a truncated/corrupt ξ `.json.zip` must be detected and
+    /// skipped without panic (`load` returns `None`). The corrupt file is
+    /// preserved. Mirrors the GL cache's `cache_handles_corrupt_zip_gracefully`.
+    #[test]
+    fn weil_eigvec_load_handles_corrupt_zip_gracefully() {
+        use super::weil_eigvec_cache::load;
+        use xc_numerics::quadrature::CacheMode;
+        let prec = 64;
+        let lambda_sq = 49u64;
+        let n_modes = 3usize;
+
+        let temp = weil_temp_cwd("corrupt_zip");
+        let _guard = CwdGuard::enter(&temp);
+
+        let dir = temp.join("data").join("weil_eigvec_cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Random bytes that are NOT a valid zip. No local .json present,
+        // so JsonZip must fall through to the (garbage) zip, fail to
+        // open it, and return None — without panicking.
+        let zip_path = dir.join(format!(
+            "weil_eigvec_lambda_sq{}_nmodes{}_prec{}.json.zip",
+            lambda_sq, n_modes, prec
+        ));
+        std::fs::write(&zip_path, b"not a zip file at all -- random bytes").unwrap();
+
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip).is_none(),
+            "corrupt .json.zip must be skipped, not loaded");
+
+        // Corrupt file preserved on disk.
+        assert!(zip_path.exists(),
+            "corrupt zip should be preserved for inspection");
+
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// Live end-to-end remote ξ-fetch test against the PUBLIC
+    /// `xcelerator-weil-eigvec-cache` repo. `#[ignore]`d so it never runs
+    /// in the default suite (needs network + `curl` + a populated repo).
+    /// Run explicitly with:
+    ///
+    /// ```text
+    /// cargo test -p xc-spectral --features hp -- --ignored weil_eigvec_remote_fetch_live
+    /// ```
+    #[test]
+    #[ignore = "live network: hits the public xcelerator-weil-eigvec-cache repo; run with --ignored"]
+    fn weil_eigvec_remote_fetch_live_downloads_and_validates() {
+        use xc_numerics::quadrature::CacheMode;
+        let temp = weil_temp_cwd("remote_live");
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp).unwrap();
+
+        let result = (|| {
+            // A config that exists in the public repo (the seed fixture
+            // generated by examples/gen_weil_eigvec_fixture: λ²=13, N=10,
+            // HP-64 → prec 229 bits).
+            let lambda_sq = 13u64;
+            let n_modes = 10usize;
+            let prec = 229u32;
+            assert!(super::weil_eigvec_cache::load(
+                lambda_sq, n_modes, prec, CacheMode::JsonZip
+            ).is_none(), "no local cache should exist before fetch");
+
+            super::weil_eigvec_cache::load(
+                lambda_sq, n_modes, prec, CacheMode::DynamicFetch,
+            ).map(|c| (c.xi.len(), 2 * n_modes + 1))
+        })();
+
+        std::env::set_current_dir(&original).unwrap();
+        let _ = std::fs::remove_dir_all(&temp);
+
+        let (got_len, expected_len) = result
+            .expect("remote fetch should have returned a ξ entry");
+        assert_eq!(got_len, expected_len,
+            "fetched ξ length {} != 2N+1 = {}", got_len, expected_len);
     }
 }

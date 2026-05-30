@@ -19,6 +19,7 @@ Thumbs.db
 **/data/gl_cache/
 **/data/tau_cache/
 **/data/prolate_eigvals_cache/
+**/data/weil_eigvec_cache/
 
 # Editor swap
 *.swp

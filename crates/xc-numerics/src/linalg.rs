@@ -152,9 +152,16 @@ pub fn lu_solve_with(
     for i in 0..dim {
         let row_len = i; // number of terms in the inner sum
         let s = if parallel && row_len >= PAR_SOLVE_MIN_ROW {
-            let sum = (0..i).into_par_iter().map(|j| {
+            // Parallel multiplies, then a fixed index-order fold. HP
+            // addition is non-associative, so we must NOT use rayon's
+            // `.reduce()` (its combine order is runtime-dependent). The
+            // sequential fold over the collected terms makes the result
+            // bit-identical run-to-run — required for xi cacheability.
+            let terms: Vec<Float> = (0..i).into_par_iter().map(|j| {
                 let mut t = lu[i * dim + j].clone(); t *= &y[j]; t
-            }).reduce(|| hp_zero(prec), |mut a, b| { a += &b; a });
+            }).collect();
+            let mut sum = hp_zero(prec);
+            for t in &terms { sum += t; }
             let mut s = pb[i].clone(); s -= &sum; s
         } else {
             let mut s = pb[i].clone();
@@ -169,9 +176,13 @@ pub fn lu_solve_with(
     for i in (0..dim).rev() {
         let row_len = dim - 1 - i; // number of terms in the inner sum
         let mut s = if parallel && row_len >= PAR_SOLVE_MIN_ROW {
-            let sum = ((i + 1)..dim).into_par_iter().map(|j| {
+            // Parallel multiplies, then a fixed index-order fold (see the
+            // forward-substitution note above): deterministic HP sum.
+            let terms: Vec<Float> = ((i + 1)..dim).into_par_iter().map(|j| {
                 let mut t = lu[i * dim + j].clone(); t *= &x[j]; t
-            }).reduce(|| hp_zero(prec), |mut a, b| { a += &b; a });
+            }).collect();
+            let mut sum = hp_zero(prec);
+            for t in &terms { sum += t; }
             let mut s = y[i].clone(); s -= &sum; s
         } else {
             let mut s = y[i].clone();
@@ -471,25 +482,40 @@ pub fn tridiag_lu_solve_hp(
 pub fn normalize_l2(v: &mut [Float]) {
     if v.is_empty() { return; }
     let prec = v[0].prec();
-    let norm_sq: Float = v.par_iter()
+    // Parallel squares, then a fixed index-order fold. HP addition is
+    // non-associative, so rayon's `.reduce()` (runtime-dependent combine
+    // order) would make ‖v‖ — and hence the normalized v — drift in the
+    // low bits run-to-run. The sequential fold keeps it bit-identical.
+    let squares: Vec<Float> = v.par_iter()
         .map(|vk| {
             let mut t = vk.clone();
             t *= vk;
             t
         })
-        .reduce(|| hp_zero(prec), |mut a, b| { a += &b; a });
+        .collect();
+    let mut norm_sq = hp_zero(prec);
+    for t in &squares { norm_sq += t; }
     let norm = norm_sq.sqrt();
     v.par_iter_mut().for_each(|vk| { *vk /= &norm; });
 }
 
 /// Rayleigh quotient `xᵀ A x` for a symmetric matrix `a` (row-major).
-/// Parallelized over rows. Final reduction also parallel.
+/// Per-row contributions are computed in parallel, then summed in a
+/// fixed index order. The final fold is sequential (not rayon
+/// `.reduce()`) because HP addition is non-associative: a runtime-
+/// ordered reduction would let the low bits of the returned μ drift
+/// run-to-run, which can flip the inverse-iteration convergence test
+/// and change the iteration count. A deterministic μ keeps xi
+/// reproducible.
 pub fn rayleigh_quotient(a: &[Float], dim: usize, xi: &[Float], prec: u32) -> Float {
-    (0..dim).into_par_iter().map(|i| {
+    let contribs: Vec<Float> = (0..dim).into_par_iter().map(|i| {
         let mut row_sum = hp_zero(prec);
         for j in 0..dim { let mut t = a[i * dim + j].clone(); t *= &xi[j]; row_sum += &t; }
         let mut contrib = row_sum; contrib *= &xi[i]; contrib
-    }).reduce(|| hp_zero(prec), |mut a, b| { a += &b; a })
+    }).collect();
+    let mut total = hp_zero(prec);
+    for c in &contribs { total += c; }
+    total
 }
 
 /// Inverse iteration to find the smallest-eigenpair of a symmetric
