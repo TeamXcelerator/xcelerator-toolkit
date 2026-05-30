@@ -668,7 +668,7 @@ mod hp {
     /// Use this from a CLI wrapper to audit a cache directory before
     /// a long HP run, e.g.:
     ///
-    /// ```ignore
+    /// ```text
     /// let report = verify_gl_cache_dir(std::path::Path::new("data/gl_cache"))?;
     /// for failure in report.failures() { eprintln!("{:?}", failure); }
     /// if report.failure_count() > 0 { std::process::exit(1); }

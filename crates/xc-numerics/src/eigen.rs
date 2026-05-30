@@ -358,7 +358,7 @@ impl Default for TridiagEigvecOptions {
 /// cross-validate against the dense LU path should set
 /// `solver=TridiagSolver::Dense`.
 ///
-/// ```ignore
+/// ```text
 /// // Default (banded + early termination):
 /// let v = tridiag_eigenvector_for_value_hp(
 ///     &diag, &off_diag, &lambda, prec, TridiagEigvecOptions::default(),
