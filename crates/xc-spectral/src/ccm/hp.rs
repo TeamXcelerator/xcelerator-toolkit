@@ -38,6 +38,10 @@ pub struct HighPrecConfig {
     /// Number of positive eigenvalues to compute. Newton refinement
     /// runs over the first `n_eigenvalues` reference Riemann zeros.
     pub n_eigenvalues: usize,
+    /// Cache strategy for the GL-node and τ-matrix disk caches. See
+    /// [`xc_numerics::quadrature::CacheMode`]. Default `DynamicFetch`
+    /// (local `.json` → local zip → remote fetch → compute).
+    pub cache_mode: xc_numerics::quadrature::CacheMode,
 }
 
 /// Conversion factor: decimal digits to binary bits.
@@ -80,6 +84,7 @@ impl HighPrecConfig {
                 .max(MIN_QUAD_POINTS)
                 .min(MAX_QUAD_POINTS),
             n_eigenvalues: 50,
+            cache_mode: xc_numerics::quadrature::CacheMode::default(),
         }
     }
 }
@@ -407,7 +412,7 @@ fn build_tau_hp(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<V
     let lambda_sq = params.lambda_sq_int;
     let n_modes = params.n_modes;
 
-    if let Some(cached) = tau_cache::load(lambda_sq, n_modes, prec) {
+    if let Some(cached) = tau_cache::load(lambda_sq, n_modes, prec, cfg.cache_mode) {
         eprintln!(
             "[HP] loaded cached τ-matrix for λ²={}, N={}, prec={} bits ({}×{} = {} entries)",
             lambda_sq, n_modes, prec,
@@ -417,7 +422,7 @@ fn build_tau_hp(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<V
     }
 
     let tau = build_tau_hp_compute(params, l, cfg)?;
-    tau_cache::save(lambda_sq, n_modes, prec, &tau);
+    tau_cache::save(lambda_sq, n_modes, prec, &tau, cfg.cache_mode);
     Ok(tau)
 }
 
@@ -445,7 +450,7 @@ fn build_tau_hp_compute(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> 
     eprintln!("[HP] Precomputing {} unique GL node tables...", unique_pts.len());
     let gl_cache: HashMap<usize, (Vec<Float>, Vec<Float>)> = unique_pts
         .par_iter()
-        .map(|&npts| (npts, xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, xc_numerics::quadrature::CacheMode::default())))
+        .map(|&npts| (npts, xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode)))
         .collect();
     eprintln!("[HP] GL tables cached. Computing integrals...");
 
@@ -834,8 +839,16 @@ mod tau_cache {
         read_single_zip(&concatenated, json_filename, n_modes, prec)
     }
 
-    pub(super) fn load(lambda_sq: u64, n_modes: usize, prec: u32) -> Option<Vec<Float>> {
-        // Path 1: uncompressed JSON. Fast read.
+    pub(super) fn load(
+        lambda_sq: u64,
+        n_modes: usize,
+        prec: u32,
+        mode: xc_numerics::quadrature::CacheMode,
+    ) -> Option<Vec<Float>> {
+        use xc_numerics::quadrature::CacheMode;
+        if mode == CacheMode::Off { return None; }
+
+        // Tier 1 (all non-Off modes): uncompressed JSON. Fast read.
         if let Some(path) = json_path(lambda_sq, n_modes, prec) {
             if path.exists() {
                 match std::fs::read_to_string(&path) {
@@ -854,9 +867,40 @@ mod tau_cache {
             }
         }
 
+        // JsonOnly stops after the uncompressed tier.
+        if mode == CacheMode::JsonOnly { return None; }
+
+        // Tier 2 (JsonZip, DynamicFetch): local zip — single first, then
+        // multi-part. Both write the decompressed .json on success.
+        if let Some(tau) = try_load_local_zip(lambda_sq, n_modes, prec) {
+            return Some(tau);
+        }
+
+        // JsonZip stops after the local tiers.
+        if mode == CacheMode::JsonZip { return None; }
+
+        // Tier 3 (DynamicFetch only): remote fetch from the public
+        // consolidated τ-cache repo. Probe the single zip first, then the
+        // byte-split parts. On success the file(s) land in the local
+        // cache dir; we then re-run the local-zip loader so the
+        // decompressed .json is written and the same validation applies.
+        if fetch_remote(lambda_sq, n_modes, prec) {
+            if let Some(tau) = try_load_local_zip(lambda_sq, n_modes, prec) {
+                return Some(tau);
+            }
+        }
+
+        None
+    }
+
+    /// Attempt to load a config from a local single zip, then local
+    /// multi-part parts (tier 2). On success writes the decompressed
+    /// `.json` alongside and returns the matrix. Returns `None` if no
+    /// local zip/parts exist or they fail validation.
+    fn try_load_local_zip(lambda_sq: u64, n_modes: usize, prec: u32) -> Option<Vec<Float>> {
         let json_filename = cache_filename(lambda_sq, n_modes, prec);
 
-        // Path 2: single zip.
+        // Single zip first.
         if let Some(zp) = zip_path(lambda_sq, n_modes, prec) {
             if zp.exists() {
                 match std::fs::read(&zp) {
@@ -878,9 +922,8 @@ mod tau_cache {
             }
         }
 
-        // Path 3: multi-part split zip.
+        // Multi-part split zip.
         if let Some(parts) = part_paths(lambda_sq, n_modes, prec) {
-            // Combined-path label for diagnostic warnings.
             let first_part_path = parts.first().cloned().unwrap_or_default();
             match read_split_zip_parts(&parts, &json_filename, n_modes, prec) {
                 Some((tau, data)) => {
@@ -901,6 +944,99 @@ mod tau_cache {
         }
 
         None
+    }
+
+    /// Base raw URL of the public consolidated τ-cache repository.
+    const REMOTE_BASE: &str =
+        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache/main";
+
+    /// Remote directory (and filename stem) for a config, using the
+    /// repo's precision-first → λ² → nmodes-thousand-bucket layout.
+    /// Returns `(dir_url, filename)` where `filename` is the canonical
+    /// `lambda_sq{L}_nmodes{N}_prec{P}.json.zip` stem.
+    fn remote_dir_and_stem(lambda_sq: u64, n_modes: usize, prec: u32) -> (String, String) {
+        let bucket = (n_modes / 1000) * 1000;
+        let dir = format!(
+            "{base}/tau_cache/prec{p}/lambda_sq{l}/nmodes{b}-{bend}",
+            base = REMOTE_BASE, p = prec, l = lambda_sq, b = bucket, bend = bucket + 999
+        );
+        let stem = format!("{}.zip", cache_filename(lambda_sq, n_modes, prec));
+        (dir, stem)
+    }
+
+    /// Test-only accessor for `remote_dir_and_stem` (the function is
+    /// private; this lets the test module assert URL formatting without
+    /// widening the API).
+    #[cfg(test)]
+    pub(super) fn remote_dir_and_stem_for_test(
+        lambda_sq: u64, n_modes: usize, prec: u32,
+    ) -> (String, String) {
+        remote_dir_and_stem(lambda_sq, n_modes, prec)
+    }
+
+    /// `curl -fsSL` a single URL to `dest`. Returns true on success
+    /// (HTTP 2xx, file written). Downloads to a `.partial` temp and
+    /// renames on success so a failed download never leaves a truncated
+    /// file. Graceful on missing curl / network error / HTTP >= 400.
+    fn curl_to(url: &str, dest: &std::path::Path) -> bool {
+        let tmp = dest.with_extension("downloading");
+        let status = std::process::Command::new("curl")
+            .arg("-fsSL").arg("-o").arg(&tmp).arg(url)
+            .status();
+        match status {
+            Ok(s) if s.success() => match std::fs::rename(&tmp, dest) {
+                Ok(()) => true,
+                Err(_) => { let _ = std::fs::remove_file(&tmp); false }
+            },
+            _ => { let _ = std::fs::remove_file(&tmp); false }
+        }
+    }
+
+    /// Download a config from the public τ-cache repo into the local
+    /// cache dir. Probes the **single zip first**; if that 404s, probes
+    /// the byte-split parts `.part00`, `.part01`, … until a part 404s.
+    /// Returns true if a complete config was downloaded locally (either
+    /// the single zip, or at least one part with all subsequent parts
+    /// present up to the first gap).
+    ///
+    /// Mirrors the local read order (single → parts) so the subsequent
+    /// `try_load_local_zip` finds and validates whatever was fetched.
+    fn fetch_remote(lambda_sq: u64, n_modes: usize, prec: u32) -> bool {
+        let dir = match cache_dir() { Some(d) => d, None => return false };
+        let (remote_dir, stem) = remote_dir_and_stem(lambda_sq, n_modes, prec);
+
+        // Probe 1: single zip.
+        let single_url = format!("{}/{}", remote_dir, stem);
+        let single_dest = dir.join(&stem);
+        if curl_to(&single_url, &single_dest) {
+            eprintln!("[tau_cache] fetched {} from remote cache", stem);
+            return true;
+        }
+
+        // Probe 2: byte-split parts. Download .part00, .part01, … in
+        // sequence; stop at the first part that 404s. Require at least
+        // part00 to succeed. The toolkit's local part loader then
+        // concatenates them lexicographically.
+        let mut idx = 0usize;
+        let mut got_any = false;
+        loop {
+            let part_name = format!("{}.part{:02}", stem, idx);
+            let part_url = format!("{}/{}", remote_dir, part_name);
+            let part_dest = dir.join(&part_name);
+            if curl_to(&part_url, &part_dest) {
+                got_any = true;
+                idx += 1;
+                // Safety cap: a config should never exceed a few dozen
+                // 90 MB parts. Stop runaway probing.
+                if idx > 256 { break; }
+            } else {
+                break;
+            }
+        }
+        if got_any {
+            eprintln!("[tau_cache] fetched {} ({} parts) from remote cache", stem, idx);
+        }
+        got_any
     }
 
     /// Serialize `tau` to JSON (decimal strings) and return the
@@ -944,7 +1080,17 @@ mod tau_cache {
         }
     }
 
-    pub(super) fn save(lambda_sq: u64, n_modes: usize, prec: u32, tau: &[Float]) {
+    pub(super) fn save(
+        lambda_sq: u64,
+        n_modes: usize,
+        prec: u32,
+        tau: &[Float],
+        mode: xc_numerics::quadrature::CacheMode,
+    ) {
+        use xc_numerics::quadrature::CacheMode;
+        // Off writes nothing.
+        if mode == CacheMode::Off { return; }
+
         // Always write the uncompressed JSON first (it's the fast-read
         // path; subsequent loads bypass zip entirely).
         let json_bytes = serialize_to_json(tau);
@@ -956,8 +1102,12 @@ mod tau_cache {
             let _ = std::fs::write(&jp, &json_bytes);
         }
 
-        // Also write a compressed copy for distribution. Decide
-        // single-zip vs multi-part split based on compressed size.
+        // JsonOnly writes only the uncompressed .json; no zip companion.
+        if mode == CacheMode::JsonOnly { return; }
+
+        // JsonZip / DynamicFetch: also write a compressed copy for
+        // distribution. Decide single-zip vs multi-part split based on
+        // compressed size.
         let entry_name = cache_filename(lambda_sq, n_modes, prec);
         let zip_bytes = compress_to_zip(&json_bytes, &entry_name);
         if zip_bytes.is_empty() { return; }
@@ -1271,6 +1421,8 @@ mod tests {
         let params = CcmParams::from_lambda(3.605551275463989, 10);
         let mut cfg = HighPrecConfig::for_decimal_digits(64);
         cfg.n_eigenvalues = 5;
+        // Hermetic: no cache read/write, no network. Pure compute.
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
 
         // HP seeds: first 5 Riemann zeros at full precision.
         let prec = cfg.precision_bits;
@@ -1318,7 +1470,9 @@ mod tests {
     #[test]
     fn measure_evenness_small_lambda_is_even() {
         let params = CcmParams::from_lambda(3.605551275463989, 10);
-        let cfg = HighPrecConfig::for_decimal_digits(64);
+        let mut cfg = HighPrecConfig::for_decimal_digits(64);
+        // Hermetic: no cache read/write, no network. Pure compute.
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
         let result = measure_evenness(&params, &cfg).unwrap();
 
         let prec = result.evenness_deviation.prec();
@@ -1550,5 +1704,82 @@ mod tests {
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// The remote τ URL is deterministically derived from
+    /// `(λ², N, prec)` using the public xcelerator-tau-cache repo's
+    /// precision-first → λ² → nmodes-thousand-bucket layout.
+    #[test]
+    fn tau_remote_url_uses_bucketed_layout() {
+        // λ²=1000, N=800, prec=3338 → bucket 0-999.
+        let (dir, stem) = super::tau_cache::remote_dir_and_stem_for_test(1000, 800, 3338);
+        assert_eq!(
+            dir,
+            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache/main/tau_cache/prec3338/lambda_sq1000/nmodes0-999"
+        );
+        assert_eq!(stem, "lambda_sq1000_nmodes800_prec3338.json.zip");
+
+        // λ²=400, N=1500, prec=4999 → bucket 1000-1999.
+        let (dir2, stem2) = super::tau_cache::remote_dir_and_stem_for_test(400, 1500, 4999);
+        assert_eq!(
+            dir2,
+            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache/main/tau_cache/prec4999/lambda_sq400/nmodes1000-1999"
+        );
+        assert_eq!(stem2, "lambda_sq400_nmodes1500_prec4999.json.zip");
+    }
+
+    /// Live end-to-end remote τ-fetch test against the PUBLIC
+    /// `xcelerator-tau-cache` repo. `#[ignore]`d so it never runs in the
+    /// default suite (needs network + `curl` + the public repo).
+    /// Run explicitly with:
+    ///
+    /// ```text
+    /// cargo test -p xc-spectral --features hp -- --ignored tau_remote_fetch_live
+    /// ```
+    ///
+    /// Uses (λ²=1000, N=800, prec=3338) — a known byte-split config in
+    /// the repo (Paper A headline; >90 MB → multiple .partXX). In a
+    /// fresh temp cwd with NO local cache, `build_tau_hp` under
+    /// DynamicFetch must miss local tiers, hit the remote tier, probe
+    /// the single zip (404) then download all `.partXX`, concatenate +
+    /// decompress + validate, and return a (2·800+1)² matrix.
+    #[test]
+    #[ignore = "live network: hits the public xcelerator-tau-cache repo; run with --ignored"]
+    fn tau_remote_fetch_live_downloads_and_validates() {
+        // Isolate cwd so the cache writes land in a throwaway dir.
+        let temp = std::env::temp_dir()
+            .join(format!("xc_tau_remote_live_{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&temp).unwrap();
+
+        // Run the fetch inside a closure so we always restore cwd.
+        let result = (|| {
+            let lambda_sq = 1000u64;
+            let n_modes = 800usize;
+            let prec = 3338u32;
+            let params = CcmParams::from_lambda((lambda_sq as f64).sqrt(), n_modes);
+            // Sanity: no local cache present.
+            assert!(super::tau_cache::load(
+                lambda_sq, n_modes, prec,
+                xc_numerics::quadrature::CacheMode::JsonZip
+            ).is_none(), "no local cache should exist before fetch");
+
+            // DynamicFetch: should pull from the remote repo.
+            let tau = super::tau_cache::load(
+                lambda_sq, n_modes, prec,
+                xc_numerics::quadrature::CacheMode::DynamicFetch,
+            );
+            (tau, params)
+        })();
+
+        std::env::set_current_dir(&original).unwrap();
+        let _ = std::fs::remove_dir_all(&temp);
+
+        let (tau, params) = result;
+        let tau = tau.expect("remote fetch should have returned a τ-matrix");
+        let dim = params.matrix_size();
+        assert_eq!(tau.len(), dim * dim,
+            "fetched τ length {} != (2N+1)² = {}", tau.len(), dim * dim);
     }
 }
