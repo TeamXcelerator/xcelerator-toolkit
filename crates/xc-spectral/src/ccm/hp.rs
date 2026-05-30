@@ -445,7 +445,7 @@ fn build_tau_hp_compute(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> 
     eprintln!("[HP] Precomputing {} unique GL node tables...", unique_pts.len());
     let gl_cache: HashMap<usize, (Vec<Float>, Vec<Float>)> = unique_pts
         .par_iter()
-        .map(|&npts| (npts, xc_numerics::quadrature::gauss_legendre_nodes(npts, prec)))
+        .map(|&npts| (npts, xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, xc_numerics::quadrature::CacheMode::default())))
         .collect();
     eprintln!("[HP] GL tables cached. Computing integrals...");
 

@@ -490,7 +490,7 @@ pub fn xi_weighted_mellin_hp(
 
     // GL nodes and weights on [-1, 1] at HP.
     // Use the cached version from highprec if available, otherwise compute.
-    let (nodes, weights) = xc_numerics::quadrature::gauss_legendre_nodes(n_quad, prec);
+    let (nodes, weights) = xc_numerics::quadrature::gauss_legendre_nodes(n_quad, prec, xc_numerics::quadrature::CacheMode::default());
 
     // Map GL nodes from [-1, 1] to [λ⁻¹, λ].
     let a = {
@@ -596,7 +596,7 @@ pub fn truncated_lambda_hp(
     let prec = lambda.prec();
     let one = Float::with_val(prec, 1);
 
-    let (nodes, weights) = xc_numerics::quadrature::gauss_legendre_nodes(n_quad, prec);
+    let (nodes, weights) = xc_numerics::quadrature::gauss_legendre_nodes(n_quad, prec, xc_numerics::quadrature::CacheMode::default());
 
     let a = { let mut v = lambda.clone(); v = v.recip(); v };
     let b = lambda.clone();

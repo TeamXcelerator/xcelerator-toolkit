@@ -20,7 +20,7 @@ This is a Cargo workspace containing three sub-crates:
 ### Module inventory
 
 **xc-numerics:**
-- `quadrature` — Gauss-Legendre at f64 (configurable N-point) and HP. The HP path caches nodes/weights to `<cwd>/data/gl_cache/` and supports both uncompressed JSON and zip-compressed JSON fixtures (auto-decompressed on first read). Per-cwd layout means each paper repo / reproduction script gets its own independent cache, and pre-computed cache fixtures can be checked into a repo to skip the cold-start cost of Newton iteration. Cache hits are structurally validated (Σw = 2, Σx·w = 0, antisymmetric nodes); corrupt or wrong-precision files are skipped with a stderr warning. Public audit API: `verify_gl_cache_dir`.
+- `quadrature` — Gauss-Legendre at f64 (configurable N-point) and HP. The HP path caches nodes/weights to `<cwd>/data/gl_cache/` and supports both uncompressed JSON and zip-compressed JSON fixtures (auto-decompressed on first read). A [`CacheMode`] parameter on `gauss_legendre_nodes(n, prec, mode)` selects the lookup strategy: `Off` (always compute), `JsonOnly` (local `.json` only), `JsonZip` (local `.json` then `.json.zip`), or `DynamicFetch` (default — local, then a remote download of the specific fixture from the public [`xcelerator-gl-cache`](https://github.com/TeamXcelerator/xcelerator-gl-cache) repo via `curl`, then compute). Remote fetch fires only on local cache miss and falls through to compute if `curl`/network/the fixture is unavailable. Per-cwd layout means each paper repo / reproduction script gets its own independent cache, and pre-computed cache fixtures can be checked into a repo to skip the cold-start cost of Newton iteration. Cache hits are structurally validated (Σw = 2, Σx·w = 0, antisymmetric nodes); corrupt or wrong-precision files are skipped with a stderr warning. Public audit API: `verify_gl_cache_dir`.
 - `root_finding` — f64 bisection with configurable tolerance and max iterations. Endpoint-zero handled correctly (returns the zero endpoint, no walk-away).
 - `primes` — Sieve of Eratosthenes, prime counting function π(x).
 - `linalg` (HP-gated) — Dense LU factorization with partial pivoting, LU solve, banded tridiagonal LU (Thomas with partial pivoting; O(n) factor and solve), inverse iteration (with optional forced-even projection; rustdoc documents both convergence floors), ℓ² normalization, Rayleigh quotient. Inner reductions and matvec parallelized. `lu_solve` parallelizes its inner triangular-solve reductions by default; `lu_solve_with(..., parallel)` exposes a serial/parallel toggle for tiny matrices or deterministic single-threaded benchmarking.
@@ -50,7 +50,9 @@ cargo test --workspace
 
 # Full HP tier (Linux/WSL/macOS — requires libgmp-dev libmpfr-dev libmpc-dev):
 cargo test --workspace --features hp
-# 168 tests pass, 2 ignored
+# 171 tests pass, 2 ignored (PARI-fixture heavy tests);
+# plus 1 ignored live-network test (remote_fetch_live) — run it with:
+#   cargo test -p xc-numerics --features hp -- --ignored remote_fetch_live
 ```
 
 ### HP eigensolver verification (3 layers)
@@ -188,6 +190,14 @@ Full guideline (private):
 
 | Version | Changes |
 |---|---|
+| `v0.9.0` | **GL cache gains a `CacheMode` and remote-fetch tier.** `gauss_legendre_nodes` now takes a `CacheMode` argument (signature change): `Off` / `JsonOnly` / `JsonZip` / `DynamicFetch` (default). DynamicFetch adds a new last-resort tier that downloads the specific `(n, prec)` fixture from the public consolidated cache repo [`xcelerator-gl-cache`](https://github.com/TeamXcelerator/xcelerator-gl-cache) via `curl`, before falling back to a fresh Newton compute. |
+| | • **Lookup order (DynamicFetch):** local `.json` → local `.json.zip` (decompress + write `.json`) → **remote `.json.zip`** (download to local cache, then decompress + write `.json`) → compute. Remote fires only on a local miss; missing `curl`, network failure, or a 404 (un-cached config) falls through to compute. Downloads go to a `.partial` temp path and are renamed on success so a failed download never leaves a truncated file. |
+| | • **Remote URL is deterministic** from `(n, prec)` using the cache repo's precision-first, npts-thousand-bucketed layout: `gl_cache/prec{P}/npts{B}-{B+999}/prec{P}_npts{N}.json.zip` with `B = (N/1000)*1000`. |
+| | • **`CacheMode::Off`** computes always and never reads/writes disk or network — useful for hermetic reproductions. **`JsonZip`** reproduces the exact pre-v0.9.0 behavior. |
+| | • Call sites updated: `mellin` (×2) and `ccm::hp` τ-build (×1) pass `CacheMode::default()`. |
+| | • **New tests:** `cache_mode_off_never_touches_disk`, `cache_mode_json_only_ignores_zip`, `remote_url_uses_bucketed_layout`, and an `#[ignore]`-gated live end-to-end fetch `remote_fetch_live_downloads_and_validates` (run with `cargo test -p xc-numerics --features hp -- --ignored`). The 10 pre-existing GL-cache tests now pin `JsonZip` mode. |
+| | • **Motivation:** lets fresh cloud (Vast) runs pull only the specific GL fixtures they need from the public cache repo on demand — no giant clone, no recompute — while keeping the lean transfer-repo workflow. See `xcelerator-research/research/ccm/PERFORMANCE.md`. |
+| | • Test counts: f64 16 + 37 + 1 = 54 pass on Windows MSVC (unchanged). HP: 171 pass, 2 ignored (PARI heavy) + 1 ignored live-network test. |
 | `v0.8.0` | **`lu_solve` parallelizes its inner triangular-solve reductions (behavior change).** The forward/back-substitution inner sums are now split across rayon for rows longer than a small fixed threshold; the result is identical to working precision but the computation is multi-threaded and the HP reduction order is no longer deterministic. This is the per-step hot path in `inverse_iteration`, where it was the one remaining serial bottleneck at large dimension — every other HP hot path was already parallel, so on a many-core box the entire inverse-iteration phase previously ran on a single core. |
 | | • **New `lu_solve_with(factors, b, dim, prec, parallel: bool)`.** `lu_solve` now delegates to it with `parallel = true` (the default for all callers, including `inverse_iteration`). Pass `parallel = false` for tiny matrices, deterministic single-threaded benchmarking, or callers already saturating cores at a higher level. |
 | | • **Outer row loops remain sequential** — forward substitution row `i` depends on `y[0..i]` and back substitution on `x[i+1..]`; only the inner reduction `Σ_j lu[i,j]·{y,x}[j]` is parallelized. Short rows (below `PAR_SOLVE_MIN_ROW = 32`) stay serial to avoid rayon dispatch overhead exceeding the work. |

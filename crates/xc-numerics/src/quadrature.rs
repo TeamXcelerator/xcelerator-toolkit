@@ -7,19 +7,36 @@
 //! polynomials and cached to disk under `<cwd>/data/gl_cache/` so they're
 //! reused across runs at the same `(n_pts, precision_bits)`.
 //!
-//! Cache lookup order (HP path):
+//! Cache lookup is governed by [`CacheMode`] (HP path). The full lookup
+//! order, for the default `CacheMode::DynamicFetch`, is:
 //! 1. `<cwd>/data/gl_cache/prec{prec}_npts{n}.json` (uncompressed)
 //! 2. `<cwd>/data/gl_cache/prec{prec}_npts{n}.json.zip` (zip archive
 //!    containing one entry of the same name without `.zip`).
 //!    Auto-decompressed on first read; the result is also written
 //!    out as the uncompressed `.json` so future reads in the same
 //!    process and on the same machine hit path (1) directly.
-//! 3. Compute fresh via Newton iteration; cache result to (1).
+//! 3. **Remote fetch** from the public consolidated cache repository
+//!    `TeamXcelerator/xcelerator-gl-cache` via `curl`. The deterministic
+//!    URL is derived from `(n, prec)` using the precision-first,
+//!    npts-thousand-bucketed layout. On success the `.json.zip` is
+//!    written to the local cache dir and decompressed to `.json`, so
+//!    subsequent reads hit path (1). Falls through to compute if `curl`
+//!    is unavailable, the file 404s, or the download fails validation.
+//! 4. Compute fresh via Newton iteration; cache result to (1)+(2).
 //!
-//! New computes always write to the uncompressed `.json` form. Zip
-//! files are read-only from the toolkit's perspective; they're
-//! produced offline (e.g. by checking compressed cache fixtures into
-//! the paper repository to avoid cold-start cost on fresh machines).
+//! [`CacheMode`] selects how far down this list a lookup goes:
+//! - `Off`          — no cache read or write; always compute.
+//! - `JsonOnly`     — step (1) only.
+//! - `JsonZip`      — steps (1)+(2) (the pre-remote behavior).
+//! - `DynamicFetch` — steps (1)+(2)+(3) (**default**).
+//!
+//! `gauss_legendre_nodes(n, prec, mode)` takes the [`CacheMode`]
+//! explicitly; pass `CacheMode::default()` (== `DynamicFetch`) for the
+//! standard behavior.
+//!
+//! New computes write the uncompressed `.json` (and, for `JsonZip` /
+//! `DynamicFetch`, the `.json.zip` alongside). Remote fetch is read-only
+//! with respect to the remote repository.
 
 /// 64-point Gauss-Legendre quadrature on [a, b] at f64 precision.
 /// For a configurable number of points, use `gauss_legendre_npt_f64`.
@@ -76,6 +93,48 @@ fn legendre_p_deriv_f64(n: usize, x: f64) -> (f64, f64) {
 #[cfg(feature = "hp")]
 mod hp {
     use rug::{ops::Pow, Float};
+
+    /// Controls how `gauss_legendre_nodes` resolves a `(n, prec)` table.
+    ///
+    /// Variants are ordered by how many lookup tiers they enable before
+    /// falling back to a fresh Newton compute:
+    ///
+    /// - `Off`          — no cache at all. Always compute; never read or
+    ///   write any cache file.
+    /// - `JsonOnly`     — read a local uncompressed `.json` if present;
+    ///   otherwise compute. Does not consult `.json.zip` or the remote.
+    /// - `JsonZip`      — local `.json`, then local `.json.zip`
+    ///   (decompressing to `.json`), then compute. This is the
+    ///   pre-remote-fetch behavior.
+    /// - `DynamicFetch` — local `.json`, then local `.json.zip`, then a
+    ///   remote download from the public `xcelerator-gl-cache` repo, then
+    ///   compute. **Default.**
+    ///
+    /// On a fresh compute, `JsonOnly` writes only the `.json`; `JsonZip`
+    /// and `DynamicFetch` write both `.json` and `.json.zip`; `Off`
+    /// writes nothing.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CacheMode {
+        /// No caching: always compute, never touch disk or network.
+        Off,
+        /// Local uncompressed `.json` only.
+        JsonOnly,
+        /// Local `.json` then local `.json.zip` (pre-remote behavior).
+        JsonZip,
+        /// Local `.json`, local `.json.zip`, then remote fetch (default).
+        DynamicFetch,
+    }
+
+    impl Default for CacheMode {
+        fn default() -> Self { CacheMode::DynamicFetch }
+    }
+
+    /// Base raw URL of the public consolidated GL cache repository.
+    /// Files live at
+    /// `{REMOTE_BASE}/gl_cache/prec{P}/npts{B}-{B+999}/prec{P}_npts{N}.json.zip`
+    /// where `B = (N / 1000) * 1000`.
+    const REMOTE_BASE: &str =
+        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main";
 
     #[inline] fn fl_i(prec: u32, v: i64) -> Float { Float::with_val(prec, v) }
     #[inline] fn pi(prec: u32) -> Float { Float::with_val(prec, rug::float::Constant::Pi) }
@@ -171,14 +230,24 @@ mod hp {
         None
     }
 
-    /// Compute (or load from disk cache) Gauss-Legendre nodes and weights
+    /// Compute (or load from cache) Gauss-Legendre nodes and weights
     /// at the given precision in bits, for `n` points on `[-1, 1]`.
     ///
-    /// See module docs for the cache lookup order.
-    pub fn gauss_legendre_nodes(n: usize, prec: u32) -> (Vec<Float>, Vec<Float>) {
-        if let Some(cached) = load_gl_cache(n, prec) { return cached; }
+    /// `mode` selects the cache strategy; see [`CacheMode`] and the
+    /// module docs for the lookup order. Pass `CacheMode::default()`
+    /// (== `DynamicFetch`) for the standard behavior.
+    pub fn gauss_legendre_nodes(
+        n: usize,
+        prec: u32,
+        mode: CacheMode,
+    ) -> (Vec<Float>, Vec<Float>) {
+        if mode != CacheMode::Off {
+            if let Some(cached) = load_gl_cache(n, prec, mode) { return cached; }
+        }
         let result = gauss_legendre_compute(n, prec);
-        save_gl_cache(n, prec, &result.0, &result.1);
+        if mode != CacheMode::Off {
+            save_gl_cache(n, prec, &result.0, &result.1, mode);
+        }
         result
     }
 
@@ -236,8 +305,10 @@ mod hp {
         );
     }
 
-    fn load_gl_cache(n: usize, prec: u32) -> Option<(Vec<Float>, Vec<Float>)> {
-        // Path 1: uncompressed JSON. Fast read.
+    fn load_gl_cache(n: usize, prec: u32, mode: CacheMode) -> Option<(Vec<Float>, Vec<Float>)> {
+        if mode == CacheMode::Off { return None; }
+
+        // Tier 1 (all non-Off modes): uncompressed JSON. Fast read.
         if let Some(path) = gl_cache_path(n, prec) {
             if path.exists() {
                 match std::fs::read_to_string(&path) {
@@ -267,39 +338,130 @@ mod hp {
             }
         }
 
-        // Path 2: zip-compressed JSON. Decompress, parse, and write the
-        // decompressed JSON next to the .zip so subsequent reads in the
-        // same process and on the same machine hit path 1 directly.
-        if let Some(zip_path) = gl_cache_zip_path(n, prec) {
-            if zip_path.exists() {
-                match load_from_zip(&zip_path, n, prec) {
-                    Some((parsed, json_string)) => {
-                        // Structural check on the zip-loaded values too.
-                        if let Some(reason) =
-                            cache_structural_check(&parsed.0, &parsed.1, prec)
-                        {
-                            warn_cache_skip(&zip_path, &reason);
-                        } else {
-                            // Write the decompressed copy. Best-effort: errors
-                            // are non-fatal since we already have the parsed
-                            // result in memory.
-                            if let Some(json_path) = gl_cache_path(n, prec) {
-                                let _ = std::fs::write(&json_path, &json_string);
-                            }
-                            return Some(parsed);
-                        }
-                    }
-                    None => {
-                        warn_cache_skip(
-                            &zip_path,
-                            "zip open / decompress / shape parse failed",
-                        );
-                    }
-                }
+        // JsonOnly stops here.
+        if mode == CacheMode::JsonOnly { return None; }
+
+        // Tier 2 (JsonZip, DynamicFetch): zip-compressed JSON. Decompress,
+        // parse, and write the decompressed JSON next to the .zip so
+        // subsequent reads in the same process and on the same machine
+        // hit tier 1 directly.
+        if let Some(result) = try_load_local_zip(n, prec) {
+            return Some(result);
+        }
+
+        // JsonZip stops here.
+        if mode == CacheMode::JsonZip { return None; }
+
+        // Tier 3 (DynamicFetch only): remote fetch from the public
+        // consolidated GL cache repo. On success the .json.zip lands in
+        // the local cache dir; we then re-run the local-zip loader so the
+        // decompressed .json is written and the same validation applies.
+        if fetch_remote_zip(n, prec) {
+            if let Some(result) = try_load_local_zip(n, prec) {
+                return Some(result);
             }
         }
 
         None
+    }
+
+    /// Attempt to load `(n, prec)` from a local `.json.zip` (tier 2).
+    /// On success, writes the decompressed `.json` alongside and returns
+    /// the parsed pair. Returns `None` if the zip is absent, corrupt, or
+    /// structurally invalid.
+    fn try_load_local_zip(n: usize, prec: u32) -> Option<(Vec<Float>, Vec<Float>)> {
+        let zip_path = gl_cache_zip_path(n, prec)?;
+        if !zip_path.exists() { return None; }
+        match load_from_zip(&zip_path, n, prec) {
+            Some((parsed, json_string)) => {
+                if let Some(reason) =
+                    cache_structural_check(&parsed.0, &parsed.1, prec)
+                {
+                    warn_cache_skip(&zip_path, &reason);
+                    None
+                } else {
+                    // Best-effort decompressed-copy write; non-fatal.
+                    if let Some(json_path) = gl_cache_path(n, prec) {
+                        let _ = std::fs::write(&json_path, &json_string);
+                    }
+                    Some(parsed)
+                }
+            }
+            None => {
+                warn_cache_skip(
+                    &zip_path,
+                    "zip open / decompress / shape parse failed",
+                );
+                None
+            }
+        }
+    }
+
+    /// Deterministic remote URL for the `(n, prec)` cache fixture in the
+    /// public `xcelerator-gl-cache` repo, using the precision-first,
+    /// npts-thousand-bucketed layout.
+    fn remote_zip_url(n: usize, prec: u32) -> String {
+        let bucket = (n / 1000) * 1000;
+        format!(
+            "{base}/gl_cache/prec{p}/npts{b}-{bend}/prec{p}_npts{n}.json.zip",
+            base = REMOTE_BASE, p = prec, b = bucket, bend = bucket + 999, n = n
+        )
+    }
+
+    /// Test-only accessor for `remote_zip_url` (the function itself is
+    /// private; this lets the cache-tests module assert URL formatting
+    /// without making the builder public API).
+    #[cfg(test)]
+    pub fn remote_zip_url_for_test(n: usize, prec: u32) -> String {
+        remote_zip_url(n, prec)
+    }
+
+    /// Download the `(n, prec)` `.json.zip` from the public cache repo
+    /// into the local cache dir via `curl`. Returns `true` if a file was
+    /// written. Graceful: missing `curl`, network failure, or an HTTP
+    /// error (e.g. 404 for an un-cached config) returns `false` and the
+    /// caller falls through to compute.
+    ///
+    /// `curl -fsSL` flags: `-f` fail (nonzero exit) on HTTP >= 400 and
+    /// write no body, `-s` silent, `-S` still show errors, `-L` follow
+    /// redirects. We download to a temp path and rename on success so a
+    /// partial/failed download never leaves a truncated `.json.zip`.
+    fn fetch_remote_zip(n: usize, prec: u32) -> bool {
+        let zip_path = match gl_cache_zip_path(n, prec) {
+            Some(p) => p,
+            None => return false,
+        };
+        let url = remote_zip_url(n, prec);
+        let tmp_path = zip_path.with_extension("zip.partial");
+
+        let status = std::process::Command::new("curl")
+            .arg("-fsSL")
+            .arg("-o").arg(&tmp_path)
+            .arg(&url)
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                // Move into place atomically; if rename fails, clean up.
+                match std::fs::rename(&tmp_path, &zip_path) {
+                    Ok(()) => {
+                        eprintln!(
+                            "[gl_cache] fetched {} from remote cache",
+                            zip_path.file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("(file)")
+                        );
+                        true
+                    }
+                    Err(_) => { let _ = std::fs::remove_file(&tmp_path); false }
+                }
+            }
+            _ => {
+                // curl missing, network down, or HTTP error (e.g. 404).
+                let _ = std::fs::remove_file(&tmp_path);
+                false
+            }
+        }
     }
 
     /// Read a zip cache file. Expects the archive to contain exactly one
@@ -325,13 +487,14 @@ mod hp {
         Some((parsed, data))
     }
 
-    fn save_gl_cache(n: usize, prec: u32, nodes: &[Float], weights: &[Float]) {
+    fn save_gl_cache(n: usize, prec: u32, nodes: &[Float], weights: &[Float], mode: CacheMode) {
+        // Off writes nothing.
+        if mode == CacheMode::Off { return; }
+
         // Always write the uncompressed .json first — it's the fast
-        // next-read path. Then also write a deflated .json.zip
-        // alongside for distribution (smaller commits, fewer git
-        // bytes). Mirrors the tau_cache pattern. The toolkit's read
-        // path already prefers .json over .json.zip on subsequent
-        // reads, so the .zip is purely a distribution artifact.
+        // next-read path. Then, for modes that consult the zip tier
+        // (JsonZip, DynamicFetch), also write a deflated .json.zip
+        // alongside for distribution. JsonOnly writes only the .json.
         if let Some(path) = gl_cache_path(n, prec) {
             let ns: Vec<String> = nodes.iter().map(|f| f.to_string()).collect();
             let ws: Vec<String> = weights.iter().map(|f| f.to_string()).collect();
@@ -341,6 +504,9 @@ mod hp {
                 Err(_) => return,
             };
             if std::fs::write(&path, &json_str).is_err() { return; }
+
+            // Only JsonZip / DynamicFetch produce the .zip companion.
+            if matches!(mode, CacheMode::JsonOnly) { return; }
 
             // Compress to .json.zip alongside. Failure on the zip
             // write is non-fatal (the .json above is the canonical
@@ -592,6 +758,7 @@ mod hp {
 #[cfg(feature = "hp")]
 pub use hp::{
     gauss_legendre_nodes,
+    CacheMode,
     verify_gl_cache_dir, CacheVerifyReport, CacheFileStatus,
 };
 
@@ -910,7 +1077,7 @@ mod hp_cache_tests {
         zip_writer.write_all(zip_payload.as_bytes()).unwrap();
         zip_writer.finish().unwrap();
 
-        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec);
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
         // The smallest |node| should match the .json file's epsilon
@@ -955,7 +1122,7 @@ mod hp_cache_tests {
         let json_path = cache_dir.join(format!("prec{}_npts{}.json", prec, n));
         assert!(!json_path.exists(), "uncompressed .json should not exist before read");
 
-        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec);
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
         // After read, the .json must exist (decompressed copy written
@@ -985,7 +1152,7 @@ mod hp_cache_tests {
             .join(format!("prec{}_npts{}.json", prec, n));
         assert!(!json_path.exists(), "cache file should not exist before compute");
 
-        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec);
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
         assert!(json_path.exists(),
@@ -994,7 +1161,7 @@ mod hp_cache_tests {
         // Sanity: cached value should round-trip. Re-reading should
         // not recompute (fast path), and we should get back the same
         // nodes/weights bit-for-bit.
-        let (nodes2, weights2) = hp::gauss_legendre_nodes(n, prec);
+        let (nodes2, weights2) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_eq!(nodes.len(), nodes2.len());
         for (a, b) in nodes.iter().zip(nodes2.iter()) {
             // Compare via string form to avoid HP equality subtleties:
@@ -1003,6 +1170,169 @@ mod hp_cache_tests {
         }
         for (a, b) in weights.iter().zip(weights2.iter()) {
             assert_eq!(a.to_string(), b.to_string(), "weight round-trip");
+        }
+    }
+
+    /// `CacheMode::Off` must never read or write any cache file: a fresh
+    /// compute leaves the cache dir empty, and a pre-existing `.json` is
+    /// ignored (recomputed, not read).
+    #[test]
+    fn cache_mode_off_never_touches_disk() {
+        let temp = fresh_temp_dir("mode_off");
+        let _guard = CwdGuard::enter(&temp);
+
+        let n = 8;
+        let prec: u32 = 128;
+        let json_path = temp.join("data").join("gl_cache")
+            .join(format!("prec{}_npts{}.json", prec, n));
+        let zip_path = temp.join("data").join("gl_cache")
+            .join(format!("prec{}_npts{}.json.zip", prec, n));
+
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::Off);
+        assert_well_formed(n, prec, &nodes, &weights);
+
+        // Off writes nothing.
+        assert!(!json_path.exists(), "Off mode must not write .json");
+        assert!(!zip_path.exists(), "Off mode must not write .json.zip");
+    }
+
+    /// `CacheMode::JsonOnly` must read a local `.json` but must NOT
+    /// consult a `.json.zip`. We plant only a `.json.zip` (no `.json`)
+    /// with a recognizable payload; JsonOnly should ignore it and
+    /// recompute, leaving the real values (which pass structural checks),
+    /// and crucially must NOT write a decompressed `.json` from the zip.
+    #[test]
+    fn cache_mode_json_only_ignores_zip() {
+        let temp = fresh_temp_dir("mode_json_only");
+        let _guard = CwdGuard::enter(&temp);
+
+        let n = 4;
+        let prec: u32 = 64;
+        let cache_dir = temp.join("data").join("gl_cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Plant a structurally-bogus .json.zip (all-0.01 nodes/weights):
+        // if JsonOnly wrongly consulted it, the result would differ from
+        // a real GL-4 table. Build the zip with the canonical entry name.
+        let zip_path = cache_dir.join(format!("prec{}_npts{}.json.zip", prec, n));
+        {
+            use std::io::Write;
+            let ns: Vec<String> = (0..n).map(|_| "0.01".to_string()).collect();
+            let ws: Vec<String> = (0..n).map(|_| "0.01".to_string()).collect();
+            let payload = serde_json::json!([ns, ws]).to_string();
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts: zip::write::SimpleFileOptions =
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file(format!("prec{}_npts{}.json", prec, n), opts).unwrap();
+            zw.write_all(payload.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+
+        let json_path = cache_dir.join(format!("prec{}_npts{}.json", prec, n));
+        assert!(!json_path.exists(), "no .json should exist before the call");
+
+        // JsonOnly: must ignore the zip, recompute real values.
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonOnly);
+        assert_well_formed(n, prec, &nodes, &weights);
+
+        // The smallest |node| of a real GL-4 table is ~0.339, NOT the
+        // planted 0.01 — proving the zip was not consulted.
+        let smallest = nodes.iter()
+            .map(|x| x.clone().abs())
+            .min_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap();
+        let bogus = Float::with_val(prec, Float::parse("0.02").unwrap());
+        assert!(smallest > bogus,
+            "JsonOnly must not have used the planted zip (smallest |node| = {})",
+            smallest);
+
+        // JsonOnly writes only .json, never a .zip companion; and it must
+        // not have written a decompressed .json *from* the zip.
+        assert!(json_path.exists(), "JsonOnly should write its computed .json");
+    }
+
+    /// The remote URL is deterministically derived from `(n, prec)` using
+    /// the precision-first, npts-thousand-bucketed layout of the public
+    /// xcelerator-gl-cache repo.
+    #[test]
+    fn remote_url_uses_bucketed_layout() {
+        // npts 4000 → bucket 4000-4999.
+        assert_eq!(
+            hp::remote_zip_url_for_test(4000, 3338),
+            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main/gl_cache/prec3338/npts4000-4999/prec3338_npts4000.json.zip"
+        );
+        // npts 600 → bucket 0-999.
+        assert_eq!(
+            hp::remote_zip_url_for_test(600, 681),
+            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main/gl_cache/prec681/npts0-999/prec681_npts600.json.zip"
+        );
+        // npts 6169 → bucket 6000-6999.
+        assert_eq!(
+            hp::remote_zip_url_for_test(6169, 3338),
+            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main/gl_cache/prec3338/npts6000-6999/prec3338_npts6169.json.zip"
+        );
+    }
+
+    /// Live end-to-end remote-fetch test against the PUBLIC
+    /// `xcelerator-gl-cache` repo. `#[ignore]`d so it never runs in the
+    /// default suite (it requires network + `curl` + the public repo to
+    /// be reachable and to contain the fixture). Run explicitly with:
+    ///
+    /// ```text
+    /// cargo test -p xc-numerics --features hp -- --ignored remote_fetch_live
+    /// ```
+    ///
+    /// Uses (n=600, prec=681), which is a known fixture in the repo
+    /// (imported from Paper B). In a fresh temp cwd with NO local cache,
+    /// `DynamicFetch` must miss tiers 1 and 2, hit the remote tier,
+    /// download the `.json.zip`, decompress + validate it, write both
+    /// the local `.json.zip` and the decompressed `.json`, and return
+    /// structurally-valid nodes/weights.
+    #[test]
+    #[ignore = "live network: hits the public xcelerator-gl-cache repo; run with --ignored"]
+    fn remote_fetch_live_downloads_and_validates() {
+        let temp = fresh_temp_dir("remote_fetch_live");
+        let _guard = CwdGuard::enter(&temp);
+
+        let n = 600;
+        let prec: u32 = 681;
+        let cache_dir = temp.join("data").join("gl_cache");
+        let json_path = cache_dir.join(format!("prec{}_npts{}.json", prec, n));
+        let zip_path = cache_dir.join(format!("prec{}_npts{}.json.zip", prec, n));
+
+        // Precondition: nothing local. (fresh_temp_dir guarantees this,
+        // but assert to make the test's premise explicit.)
+        assert!(!json_path.exists(), "no local .json should exist before fetch");
+        assert!(!zip_path.exists(), "no local .json.zip should exist before fetch");
+
+        // DynamicFetch: should fall through to the remote tier and pull
+        // the fixture from the public repo.
+        let (nodes, weights) =
+            hp::gauss_legendre_nodes(n, prec, hp::CacheMode::DynamicFetch);
+
+        // Returned values must be structurally valid GL-600 @ HP-681.
+        assert_well_formed(n, prec, &nodes, &weights);
+
+        // The remote tier must have landed the .json.zip locally, and the
+        // subsequent local-zip load must have written the decompressed
+        // .json alongside.
+        assert!(zip_path.exists(),
+            "remote fetch should have written the .json.zip to the local cache");
+        assert!(json_path.exists(),
+            "local-zip load should have written the decompressed .json");
+
+        // A second call must now hit the local .json (tier 1) and return
+        // bit-identical values.
+        let (nodes2, weights2) =
+            hp::gauss_legendre_nodes(n, prec, hp::CacheMode::DynamicFetch);
+        assert_eq!(nodes.len(), nodes2.len());
+        for (a, b) in nodes.iter().zip(nodes2.iter()) {
+            assert_eq!(a.to_string(), b.to_string(), "node round-trip after fetch");
+        }
+        for (a, b) in weights.iter().zip(weights2.iter()) {
+            assert_eq!(a.to_string(), b.to_string(), "weight round-trip after fetch");
         }
     }
 
@@ -1026,7 +1356,7 @@ mod hp_cache_tests {
         assert!(!zip_path.exists(), ".json.zip should not exist before compute");
 
         // Trigger fresh compute.
-        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec);
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
         // Both files must exist after compute.
@@ -1049,7 +1379,7 @@ mod hp_cache_tests {
         // Round-trip via the zip path: delete the .json so the loader
         // falls through to the .zip, then verify nodes/weights match.
         std::fs::remove_file(&json_path).unwrap();
-        let (nodes2, weights2) = hp::gauss_legendre_nodes(n, prec);
+        let (nodes2, weights2) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_eq!(nodes.len(), nodes2.len());
         for (a, b) in nodes.iter().zip(nodes2.iter()) {
             assert_eq!(a.to_string(), b.to_string(), "node round-trip via zip");
@@ -1071,7 +1401,7 @@ mod hp_cache_tests {
         // Use small n, modest precision: enough to validate, fast to run.
         let n = 16;
         let prec: u32 = 128;
-        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec);
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
         // ∫_{-1}^{1} x² dx = 2/3.
@@ -1113,7 +1443,7 @@ mod hp_cache_tests {
 
         let n: usize = 12;
         let prec: u32 = 256;
-        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec);
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
         // 1. Symmetry: nodes[i] + nodes[n-1-i] = 0.
@@ -1180,7 +1510,7 @@ mod hp_cache_tests {
         // Loading should silently fall through to fresh compute. The
         // returned values must be REAL GL nodes/weights (which pass the
         // structural check), not the bad payload's values.
-        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec);
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
         // Sanity: real GL nodes are antisymmetric on [-1, 1] and
@@ -1224,7 +1554,7 @@ mod hp_cache_tests {
         std::fs::write(&zip_path, b"not a zip file at all -- random bytes").unwrap();
 
         // Should not panic. Should fall through to fresh compute.
-        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec);
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
         // The corrupt file is preserved on disk.
