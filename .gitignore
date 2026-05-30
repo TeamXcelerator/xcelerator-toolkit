@@ -11,9 +11,6 @@ target/
 .DS_Store
 Thumbs.db
 
-# Cached GL nodes (regeneratable)
-~/.cache/ccm_gl/
-
 # Per-cwd disk caches written by tests / runs (regeneratable).
 # The toolkit writes these to <cwd>/data/*_cache/ — see README.
 # We keep the cache directories in the repo (via a tracked .gitkeep in
