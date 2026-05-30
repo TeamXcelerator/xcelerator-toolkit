@@ -974,30 +974,94 @@ mod tau_cache {
         remote_dir_and_stem(lambda_sq, n_modes, prec)
     }
 
-    /// `curl -fsSL` a single URL to `dest`. Returns true on success
-    /// (HTTP 2xx, file written). Downloads to a `.partial` temp and
-    /// renames on success so a failed download never leaves a truncated
-    /// file. Graceful on missing curl / network error / HTTP >= 400.
-    fn curl_to(url: &str, dest: &std::path::Path) -> bool {
+    /// Outcome of a single `curl` download attempt, classified by the
+    /// actual HTTP status code.
+    enum CurlOutcome {
+        /// HTTP 2xx, file written and renamed into place.
+        Ok,
+        /// HTTP 404 specifically — the file does not exist. For part
+        /// probing this is the genuine end-of-parts marker.
+        HttpError,
+        /// Anything else: 429 (rate limit), 5xx, no response, curl
+        /// missing, network/DNS/timeout, write error. Must be retried;
+        /// must NOT be treated as end-of-parts (would silently truncate).
+        Transient,
+    }
+
+    /// `curl` a single URL to `dest`, capturing the actual HTTP status
+    /// code so we can distinguish a genuine 404 (end-of-parts) from a
+    /// transient 429/5xx (rate-limit / server hiccup — must retry, NOT
+    /// stop). raw.githubusercontent.com rate-limits bursts of requests,
+    /// so a multi-part fetch will hit 429 if we go too fast; treating
+    /// that as end-of-parts would silently truncate the download.
+    ///
+    /// Uses `--write-out %{http_code}` (not `--fail`) so curl still
+    /// writes the body decision to us via the printed code. We only
+    /// keep the file on a 2xx. Downloads to a temp path and renames on
+    /// success so a failed download never leaves a truncated file.
+    fn curl_attempt(url: &str, dest: &std::path::Path) -> CurlOutcome {
         let tmp = dest.with_extension("downloading");
-        let status = std::process::Command::new("curl")
-            .arg("-fsSL").arg("-o").arg(&tmp).arg(url)
-            .status();
-        match status {
-            Ok(s) if s.success() => match std::fs::rename(&tmp, dest) {
-                Ok(()) => true,
-                Err(_) => { let _ = std::fs::remove_file(&tmp); false }
-            },
-            _ => { let _ = std::fs::remove_file(&tmp); false }
+        let _ = std::fs::remove_file(&tmp);
+        let output = std::process::Command::new("curl")
+            .arg("--silent").arg("--show-error").arg("--location")
+            .arg("--retry").arg("3").arg("--retry-delay").arg("1")
+            .arg("--write-out").arg("%{http_code}")
+            .arg("-o").arg(&tmp).arg(url)
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                let code: u32 = String::from_utf8_lossy(&out.stdout)
+                    .trim().parse().unwrap_or(0);
+                match code {
+                    200..=299 => match std::fs::rename(&tmp, dest) {
+                        Ok(()) => CurlOutcome::Ok,
+                        Err(_) => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
+                    },
+                    404 => { let _ = std::fs::remove_file(&tmp); CurlOutcome::HttpError }
+                    // 429 (rate limit), 5xx, redirects-gone-wrong, 0
+                    // (no response): all transient — retry, don't stop.
+                    _ => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
+                }
+            }
+            // curl itself failed to run / network-level error / missing curl.
+            _ => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
         }
+    }
+
+    /// Download a single URL with retries on transient failure
+    /// (including HTTP 429 rate-limiting). Returns the final outcome
+    /// (`Ok`, `HttpError` for a genuine 404, or `Transient` if all
+    /// retries were exhausted). Uses a longer backoff than curl's own
+    /// `--retry` because GitHub's rate-limit window is seconds-scale.
+    fn curl_with_retries(url: &str, dest: &std::path::Path) -> CurlOutcome {
+        const MAX_TRIES: usize = 5;
+        for attempt in 0..MAX_TRIES {
+            match curl_attempt(url, dest) {
+                CurlOutcome::Ok => return CurlOutcome::Ok,
+                CurlOutcome::HttpError => return CurlOutcome::HttpError, // 404: definitive
+                CurlOutcome::Transient => {
+                    if attempt + 1 < MAX_TRIES {
+                        // Backoff grows: 2s, 4s, 6s, 8s — rides out a
+                        // GitHub rate-limit window.
+                        let secs = 2 * (attempt as u64 + 1);
+                        std::thread::sleep(std::time::Duration::from_secs(secs));
+                    }
+                }
+            }
+        }
+        CurlOutcome::Transient
     }
 
     /// Download a config from the public τ-cache repo into the local
     /// cache dir. Probes the **single zip first**; if that 404s, probes
-    /// the byte-split parts `.part00`, `.part01`, … until a part 404s.
-    /// Returns true if a complete config was downloaded locally (either
-    /// the single zip, or at least one part with all subsequent parts
-    /// present up to the first gap).
+    /// the byte-split parts `.part00`, `.part01`, … and stops only when
+    /// a part returns an HTTP error (404 = genuine end-of-parts).
+    ///
+    /// A *transient* failure on any part (after retries) aborts the whole
+    /// fetch and returns `false` — we must never silently truncate a
+    /// multi-part config, because concatenating a partial set produces a
+    /// corrupt zip. On abort, any downloaded parts are removed so a stale
+    /// partial set can't be mistaken for a complete one on a later load.
     ///
     /// Mirrors the local read order (single → parts) so the subsequent
     /// `try_load_local_zip` finds and validates whatever was fetched.
@@ -1008,35 +1072,62 @@ mod tau_cache {
         // Probe 1: single zip.
         let single_url = format!("{}/{}", remote_dir, stem);
         let single_dest = dir.join(&stem);
-        if curl_to(&single_url, &single_dest) {
-            eprintln!("[tau_cache] fetched {} from remote cache", stem);
-            return true;
+        match curl_with_retries(&single_url, &single_dest) {
+            CurlOutcome::Ok => {
+                eprintln!("[tau_cache] fetched {} from remote cache", stem);
+                return true;
+            }
+            CurlOutcome::Transient => {
+                // Network trouble even for the single-zip probe; give up
+                // (caller falls through to compute).
+                return false;
+            }
+            // HttpError (404): no single zip — this config is byte-split.
+            CurlOutcome::HttpError => {}
         }
 
-        // Probe 2: byte-split parts. Download .part00, .part01, … in
-        // sequence; stop at the first part that 404s. Require at least
-        // part00 to succeed. The toolkit's local part loader then
-        // concatenates them lexicographically.
+        // Probe 2: byte-split parts. Download .part00, .part01, … until
+        // an HTTP error (404) marks the genuine end. A transient failure
+        // aborts and cleans up — never a silent truncation.
+        let mut downloaded: Vec<std::path::PathBuf> = Vec::new();
         let mut idx = 0usize;
-        let mut got_any = false;
         loop {
             let part_name = format!("{}.part{:02}", stem, idx);
             let part_url = format!("{}/{}", remote_dir, part_name);
             let part_dest = dir.join(&part_name);
-            if curl_to(&part_url, &part_dest) {
-                got_any = true;
-                idx += 1;
-                // Safety cap: a config should never exceed a few dozen
-                // 90 MB parts. Stop runaway probing.
-                if idx > 256 { break; }
-            } else {
-                break;
+            match curl_with_retries(&part_url, &part_dest) {
+                CurlOutcome::Ok => {
+                    downloaded.push(part_dest);
+                    idx += 1;
+                    if idx > 256 { break; } // safety cap
+                    // Brief inter-part pause to stay under
+                    // raw.githubusercontent.com's burst rate limit
+                    // (datacenter IPs trip 429 on rapid sequential
+                    // requests). Cheap insurance vs. a retry storm.
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                }
+                CurlOutcome::HttpError => break, // genuine end-of-parts
+                CurlOutcome::Transient => {
+                    // Could not retrieve a part that may well exist.
+                    // Abort: remove everything downloaded so a partial
+                    // set is never concatenated into a corrupt zip.
+                    eprintln!(
+                        "[tau_cache] WARNING: transient failure fetching {} after retries; \
+                         aborting remote fetch and recomputing",
+                        part_name
+                    );
+                    for p in &downloaded { let _ = std::fs::remove_file(p); }
+                    return false;
+                }
             }
         }
-        if got_any {
+
+        if !downloaded.is_empty() {
             eprintln!("[tau_cache] fetched {} ({} parts) from remote cache", stem, idx);
+            true
+        } else {
+            false
         }
-        got_any
     }
 
     /// Serialize `tau` to JSON (decimal strings) and return the
