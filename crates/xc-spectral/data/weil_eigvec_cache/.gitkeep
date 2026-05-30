@@ -1,0 +1,10 @@
+# CCM Weil-form smallest-eigenvector (ξ) disk cache.
+#
+# The toolkit writes ξ fixtures here as `<cwd>/data/weil_eigvec_cache/`
+# when a run computes (or remote-fetches) a Weil eigenvector. The
+# generated `.json` / `.json.zip` files are gitignored (see
+# /.gitignore); this `.gitkeep` keeps the directory structure in the
+# repo so the layout is self-documenting and present on a fresh clone.
+#
+# Public consolidated fixtures live at:
+#   https://github.com/TeamXcelerator/xcelerator-weil-eigvec-cache

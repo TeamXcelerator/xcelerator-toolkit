@@ -1903,7 +1903,13 @@ mod tests {
     /// other (one test deleting the temp dir another captured as its
     /// "original"). The mutex enforces sequential access. Mirrors the GL
     /// cache tests in `xc-numerics::quadrature`.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
+    ///
+    /// This aliases the crate-level [`crate::TEST_CWD_LOCK`] so the
+    /// `ccm::hp` and `prolate::hp` cache tests — which share one
+    /// process-global cwd within the same test binary — serialize
+    /// against *each other*, not just within their own module.
+    #[allow(dead_code)]
+    static CWD_LOCK: &Mutex<()> = &crate::TEST_CWD_LOCK;
 
     /// Guard that restores the original cwd on drop, so a panic inside a
     /// test doesn't leave the runner in a temp dir (which would break
@@ -2153,7 +2159,7 @@ mod tests {
     /// an empty report.
     #[test]
     fn tau_cache_verify_missing_dir() {
-        let nonexistent = std::env::temp_dir()
+        let nonexistent = crate::test_tmp_root()
             .join(format!("xc_spectral_tau_cache_test_missing_{}",
                           std::process::id()));
         let report = super::tau_cache::verify_tau_cache_dir(&nonexistent).unwrap();
@@ -2174,13 +2180,7 @@ mod tests {
         let dim = 2 * n_modes + 1; // 7
         let lambda_sq: u64 = 13;
 
-        let temp_dir = std::env::temp_dir()
-            .join(format!("xc_spectral_tau_cache_test_classify_{}_{}",
-                          std::process::id(),
-                          std::time::SystemTime::now()
-                              .duration_since(std::time::UNIX_EPOCH)
-                              .map(|d| d.as_nanos()).unwrap_or(0)));
-        std::fs::create_dir_all(&temp_dir).unwrap();
+        let temp_dir = crate::fresh_test_dir("tau_cache_classify");
 
         // 1. Valid: build a symmetric matrix and serialize.
         let mut sym = vec![Float::with_val(prec, 0); dim * dim];
@@ -2278,12 +2278,7 @@ mod tests {
         let n_modes = 3usize;
         let dim = 2 * n_modes + 1; // 7
 
-        let temp = std::env::temp_dir().join(format!(
-            "xc_tau_invalid_json_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos()).unwrap_or(0)));
-        std::fs::create_dir_all(&temp).unwrap();
+        let temp = crate::fresh_test_dir("tau_invalid_json");
         let _guard = CwdGuard::enter(&temp);
 
         let dir = temp.join("data").join("tau_cache");
@@ -2331,12 +2326,7 @@ mod tests {
         let lambda_sq = 49u64;
         let n_modes = 3usize;
 
-        let temp = std::env::temp_dir().join(format!(
-            "xc_tau_corrupt_zip_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos()).unwrap_or(0)));
-        std::fs::create_dir_all(&temp).unwrap();
+        let temp = crate::fresh_test_dir("tau_corrupt_zip");
         let _guard = CwdGuard::enter(&temp);
 
         let dir = temp.join("data").join("tau_cache");
@@ -2402,9 +2392,7 @@ mod tests {
         // Isolate cwd so the cache writes land in a throwaway dir.
         // CwdGuard serializes against other cwd-mutating tests (cwd is
         // process-global) and restores the original cwd on drop.
-        let temp = std::env::temp_dir()
-            .join(format!("xc_tau_remote_live_{}", std::process::id()));
-        std::fs::create_dir_all(&temp).unwrap();
+        let temp = crate::fresh_test_dir("tau_remote_live");
         let _guard = CwdGuard::enter(&temp);
 
         let lambda_sq = 1000u64;
@@ -2438,17 +2426,10 @@ mod tests {
 
     /// A fresh temp dir + cwd guard so cache reads/writes land in a
     /// throwaway location and never touch the real `data/` tree.
+    /// Scratch lives under `target/test-tmp/` (removed by `cargo clean`),
+    /// not the OS temp dir.
     fn weil_temp_cwd(tag: &str) -> std::path::PathBuf {
-        let temp = std::env::temp_dir().join(format!(
-            "xc_weil_eigvec_{}_{}_{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos()).unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&temp).unwrap();
-        temp
+        crate::fresh_test_dir(&format!("weil_eigvec_{}", tag))
     }
 
     /// The remote ξ URL is deterministically derived from `(λ², N, prec)`

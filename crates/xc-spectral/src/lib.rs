@@ -31,3 +31,40 @@ pub mod prolate;
 pub mod mellin;
 pub mod yakaboylu;
 pub mod lfunction;
+
+/// Crate-wide lock serializing all cwd-mutating cache tests.
+///
+/// Cargo runs tests in parallel within a single test binary, and the
+/// current working directory is process-global (not per-thread). The
+/// `ccm::hp` and `prolate::hp` cache tests both `set_current_dir` into
+/// a throwaway temp dir to isolate their `<cwd>/data/*_cache/` writes;
+/// if they used separate mutexes they would race each other (one test
+/// deleting the temp dir another captured as its "original"). A single
+/// crate-level lock guarantees mutual exclusion across both modules.
+#[cfg(test)]
+pub(crate) static TEST_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Root for throwaway test directories, under the workspace `target/`
+/// dir (not the OS temp dir). Keeping test scratch inside `target/`
+/// means it is contained in the repo's build area and removed by
+/// `cargo clean`, rather than scattering directories in `/tmp` or
+/// `%TEMP%`. Resolved from `CARGO_MANIFEST_DIR` at compile time, so it
+/// is correct regardless of the process's runtime cwd.
+#[cfg(test)]
+pub(crate) fn test_tmp_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..").join("..").join("target").join("test-tmp")
+}
+
+/// Make a fresh, unique throwaway directory under [`test_tmp_root`].
+/// The `tag` plus a process-id + nanosecond suffix avoids clashes when
+/// tests run in parallel or are re-run rapidly.
+#[cfg(test)]
+pub(crate) fn fresh_test_dir(tag: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos()).unwrap_or(0);
+    let dir = test_tmp_root().join(format!("{}_{}_{}", tag, std::process::id(), nanos));
+    std::fs::create_dir_all(&dir).expect("create test tmp dir");
+    dir
+}

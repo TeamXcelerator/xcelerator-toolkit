@@ -932,18 +932,25 @@ mod hp_cache_tests {
         }
     }
 
-    /// Make a fresh, unique temp directory under the OS temp.
+    /// Make a fresh, unique throwaway directory under the workspace
+    /// `target/test-tmp/` dir (not the OS temp dir). Keeping test scratch
+    /// inside `target/` means it is contained in the repo's build area
+    /// and removed by `cargo clean`, rather than scattering directories
+    /// in `/tmp` or `%TEMP%`. The path is resolved from
+    /// `CARGO_MANIFEST_DIR` at compile time, so it is correct regardless
+    /// of the process's runtime cwd. A tag plus a process-id +
+    /// nanosecond suffix avoids clashes when tests run in parallel or
+    /// are re-run rapidly.
     fn fresh_temp_dir(tag: &str) -> std::path::PathBuf {
-        // Use a tag plus a process+nanosecond suffix to avoid clashes
-        // when tests are re-run rapidly.
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let pid = std::process::id();
-        let dir = std::env::temp_dir()
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..").join("..").join("target").join("test-tmp")
             .join(format!("xc_numerics_gl_cache_test_{}_{}_{}", tag, pid, nanos));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::create_dir_all(&dir).expect("create test tmp dir");
         dir
     }
 

@@ -638,6 +638,14 @@ pub mod hp {
         tridiag_eigenvalues_hp, tridiag_eigenvector_for_value_hp,
         TridiagEigvecOptions,
     };
+    use xc_numerics::quadrature::CacheMode;
+
+    /// Base raw URL of the public consolidated prolate-eigenvalue cache
+    /// repository. Files live at
+    /// `{REMOTE_BASE}/prolate_eigvals_cache/prec{P}/lambda_sq{L}/ngrid{B}-{B+999}/lambda_sq{L}_ngrid{N}_prec{P}.json.zip`
+    /// where `B = (N / 1000) * 1000`.
+    const PROLATE_REMOTE_BASE: &str =
+        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-prolate-eigvals-cache/main";
 
     /// HP-build of the FD prolate-wave tridiagonal data.
     ///
@@ -922,12 +930,15 @@ pub mod hp {
     // Cache layout (mirrors xc-numerics::quadrature::hp gl_cache):
     //   <cwd>/data/prolate_eigvals_cache/lambda_sq{LSQ}_ngrid{N}_prec{P}.json[.zip]
     //
-    // Lookup priority:
-    //   1. Uncompressed `.json`
-    //   2. `.json.zip` (auto-decompressed on first read; the
-    //      decompressed `.json` is written next to the .zip for future
-    //      fast reads)
-    //   3. Compute fresh; write to (1).
+    // Lookup priority (governed by CacheMode, default DynamicFetch):
+    //   1. Uncompressed `.json` (all non-Off modes)
+    //   2. Local `.json.zip` (JsonZip, DynamicFetch; auto-decompressed
+    //      on first read; the decompressed `.json` is written next to
+    //      the .zip for future fast reads)
+    //   3. Remote `.json.zip` from the public consolidated repo
+    //      (DynamicFetch only; single zip, no byte-split — the
+    //      eigenvalue vector is small)
+    //   4. Compute fresh; write to (1)+(2) per the mode.
     //
     // Cache key is `λ²_int = round(λ²)` — only used when the round-trip
     // is exact (i.e. λ² is an integer like 13, 100, 1000 in our paper
@@ -1098,14 +1109,21 @@ pub mod hp {
         Some((parsed, data))
     }
 
-    /// Try to load prolate eigenvalues from disk cache for `(λ², n_grid, prec)`.
-    /// Returns `None` if cache miss, parse failure, or structural
+    /// Try to load prolate eigenvalues from cache for `(λ², n_grid, prec)`.
+    /// Returns `None` on cache miss, parse failure, or structural
     /// validation failure (with diagnostic warning to stderr in the
-    /// failure cases).
+    /// failure cases). The lookup depth is governed by `mode`:
+    ///   - `Off`          — never read (returns `None` immediately).
+    ///   - `JsonOnly`     — local `.json` only.
+    ///   - `JsonZip`      — local `.json` then local `.json.zip`.
+    ///   - `DynamicFetch` — the above, then a remote fetch from the
+    ///                      public consolidated repo.
     fn load_prolate_eigvals_cache(
-        lambda_sq: u64, n_grid: usize, prec: u32,
+        lambda_sq: u64, n_grid: usize, prec: u32, mode: CacheMode,
     ) -> Option<Vec<Float>> {
-        // Path 1: uncompressed JSON.
+        if mode == CacheMode::Off { return None; }
+
+        // Tier 1 (all non-Off modes): uncompressed JSON. Fast read.
         if let Some(path) = prolate_cache_path(lambda_sq, n_grid, prec) {
             if path.exists() {
                 match std::fs::read_to_string(&path) {
@@ -1130,50 +1148,198 @@ pub mod hp {
             }
         }
 
-        // Path 2: zip-compressed JSON.
-        if let Some(zip_path) = prolate_cache_zip_path(lambda_sq, n_grid, prec) {
-            if zip_path.exists() {
-                let json_filename = prolate_cache_filename(lambda_sq, n_grid, prec);
-                match load_prolate_eigvals_from_zip(&zip_path, &json_filename, n_grid, prec) {
-                    Some((evals, json_string)) => {
-                        if let Some(reason) = prolate_cache_structural_check(
-                            &evals, n_grid, lambda_sq, prec,
-                        ) {
-                            warn_prolate_cache_skip(&zip_path, &reason);
-                        } else {
-                            // Write the decompressed copy.
-                            if let Some(json_path) =
-                                prolate_cache_path(lambda_sq, n_grid, prec)
-                            {
-                                let _ = std::fs::write(&json_path, &json_string);
-                            }
-                            return Some(evals);
-                        }
-                    }
-                    None => {
-                        warn_prolate_cache_skip(
-                            &zip_path,
-                            "zip open / decompress / shape parse failed",
-                        );
-                    }
-                }
+        // JsonOnly stops after the uncompressed tier.
+        if mode == CacheMode::JsonOnly { return None; }
+
+        // Tier 2 (JsonZip, DynamicFetch): local zip.
+        if let Some(evals) = try_load_local_prolate_zip(lambda_sq, n_grid, prec) {
+            return Some(evals);
+        }
+
+        // JsonZip stops after the local tiers.
+        if mode == CacheMode::JsonZip { return None; }
+
+        // Tier 3 (DynamicFetch only): remote fetch from the public
+        // consolidated prolate-eigvals cache repo. On success the
+        // `.json.zip` lands locally and we re-run the local-zip loader so
+        // the decompressed `.json` is written and the same validation
+        // applies.
+        if fetch_remote_prolate_zip(lambda_sq, n_grid, prec) {
+            if let Some(evals) = try_load_local_prolate_zip(lambda_sq, n_grid, prec) {
+                return Some(evals);
             }
         }
 
         None
     }
 
-    fn save_prolate_eigvals_cache(
-        lambda_sq: u64, n_grid: usize, prec: u32, evals: &[Float],
-    ) {
-        if let Some(path) = prolate_cache_path(lambda_sq, n_grid, prec) {
-            let strs: Vec<String> = evals.iter().map(|f| f.to_string()).collect();
-            let json = serde_json::Value::Array(
-                strs.into_iter().map(serde_json::Value::String).collect()
-            );
-            if let Ok(s) = serde_json::to_string(&json) {
-                let _ = std::fs::write(path, s);
+    /// Load from a local `.json.zip` (tier 2). On success writes the
+    /// decompressed `.json` alongside and returns the validated
+    /// eigenvalues. Returns `None` if the zip is absent, corrupt, or
+    /// structurally invalid.
+    fn try_load_local_prolate_zip(
+        lambda_sq: u64, n_grid: usize, prec: u32,
+    ) -> Option<Vec<Float>> {
+        let zip_path = prolate_cache_zip_path(lambda_sq, n_grid, prec)?;
+        if !zip_path.exists() { return None; }
+        let json_filename = prolate_cache_filename(lambda_sq, n_grid, prec);
+        match load_prolate_eigvals_from_zip(&zip_path, &json_filename, n_grid, prec) {
+            Some((evals, json_string)) => {
+                if let Some(reason) = prolate_cache_structural_check(
+                    &evals, n_grid, lambda_sq, prec,
+                ) {
+                    warn_prolate_cache_skip(&zip_path, &reason);
+                    None
+                } else {
+                    if let Some(json_path) = prolate_cache_path(lambda_sq, n_grid, prec) {
+                        let _ = std::fs::write(&json_path, &json_string);
+                    }
+                    Some(evals)
+                }
             }
+            None => {
+                warn_prolate_cache_skip(
+                    &zip_path, "zip open / decompress / shape parse failed",
+                );
+                None
+            }
+        }
+    }
+
+    /// Deterministic remote URL for the `(λ², n_grid, prec)` fixture in
+    /// the public xcelerator-prolate-eigvals-cache repo (precision-first
+    /// → λ² → ngrid-thousand-bucket layout, mirroring tau/weil-eigvec).
+    fn prolate_remote_zip_url(lambda_sq: u64, n_grid: usize, prec: u32) -> String {
+        let bucket = (n_grid / 1000) * 1000;
+        format!(
+            "{base}/prolate_eigvals_cache/prec{p}/lambda_sq{l}/ngrid{b}-{bend}/{stem}.zip",
+            base = PROLATE_REMOTE_BASE, p = prec, l = lambda_sq,
+            b = bucket, bend = bucket + 999,
+            stem = prolate_cache_filename(lambda_sq, n_grid, prec)
+        )
+    }
+
+    /// Test-only accessor for `prolate_remote_zip_url`.
+    #[cfg(test)]
+    pub(super) fn prolate_remote_zip_url_for_test(
+        lambda_sq: u64, n_grid: usize, prec: u32,
+    ) -> String {
+        prolate_remote_zip_url(lambda_sq, n_grid, prec)
+    }
+
+    /// Outcome of a single `curl` download attempt, classified by the
+    /// actual HTTP status (mirrors the GL/τ/ξ fetch logic).
+    enum ProlateCurlOutcome { Ok, HttpError, Transient }
+
+    fn prolate_curl_attempt(url: &str, dest: &std::path::Path) -> ProlateCurlOutcome {
+        let tmp = dest.with_extension("zip.partial");
+        let _ = std::fs::remove_file(&tmp);
+        let output = std::process::Command::new("curl")
+            .arg("--silent").arg("--show-error").arg("--location")
+            .arg("--retry").arg("3").arg("--retry-delay").arg("1")
+            .arg("--write-out").arg("%{http_code}")
+            .arg("-o").arg(&tmp).arg(url)
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                let code: u32 = String::from_utf8_lossy(&out.stdout)
+                    .trim().parse().unwrap_or(0);
+                match code {
+                    200..=299 => match std::fs::rename(&tmp, dest) {
+                        Ok(()) => ProlateCurlOutcome::Ok,
+                        Err(_) => { let _ = std::fs::remove_file(&tmp); ProlateCurlOutcome::Transient }
+                    },
+                    404 => { let _ = std::fs::remove_file(&tmp); ProlateCurlOutcome::HttpError }
+                    _ => { let _ = std::fs::remove_file(&tmp); ProlateCurlOutcome::Transient }
+                }
+            }
+            _ => { let _ = std::fs::remove_file(&tmp); ProlateCurlOutcome::Transient }
+        }
+    }
+
+    /// Download the `(λ², n_grid, prec)` `.json.zip` from the public
+    /// cache repo into the local cache dir. Returns `true` if a file was
+    /// written. Robust to `raw.githubusercontent.com` rate-limiting:
+    /// only a 404 is a definitive miss; 429/5xx/no-response retry with
+    /// backoff. Single zip only (no `.partXX` — the spectrum is small).
+    fn fetch_remote_prolate_zip(lambda_sq: u64, n_grid: usize, prec: u32) -> bool {
+        let dest = match prolate_cache_zip_path(lambda_sq, n_grid, prec) {
+            Some(p) => p,
+            None => return false,
+        };
+        let url = prolate_remote_zip_url(lambda_sq, n_grid, prec);
+
+        const MAX_TRIES: usize = 5;
+        for attempt in 0..MAX_TRIES {
+            match prolate_curl_attempt(&url, &dest) {
+                ProlateCurlOutcome::Ok => {
+                    eprintln!(
+                        "[prolate_cache] fetched {} from remote cache",
+                        dest.file_name().and_then(|s| s.to_str()).unwrap_or("(file)")
+                    );
+                    return true;
+                }
+                ProlateCurlOutcome::HttpError => return false, // 404 — definitive miss.
+                ProlateCurlOutcome::Transient => {
+                    if attempt + 1 < MAX_TRIES {
+                        let secs = 2 * (attempt as u64 + 1);
+                        std::thread::sleep(std::time::Duration::from_secs(secs));
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn save_prolate_eigvals_cache(
+        lambda_sq: u64, n_grid: usize, prec: u32, evals: &[Float], mode: CacheMode,
+    ) {
+        // Off writes nothing.
+        if mode == CacheMode::Off { return; }
+
+        let strs: Vec<String> = evals.iter().map(|f| f.to_string()).collect();
+        let json = serde_json::Value::Array(
+            strs.into_iter().map(serde_json::Value::String).collect()
+        );
+        let json_str = match serde_json::to_string(&json) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        // Always write the uncompressed `.json` first (fast next-read path).
+        let json_path = match prolate_cache_path(lambda_sq, n_grid, prec) {
+            Some(p) => p,
+            None => return,
+        };
+        if std::fs::write(&json_path, &json_str).is_err() { return; }
+
+        // JsonOnly writes only the `.json`; no zip companion.
+        if mode == CacheMode::JsonOnly { return; }
+
+        // JsonZip / DynamicFetch: also write a single `.json.zip` for
+        // distribution. The spectrum is small, so this is always a single
+        // zip (no byte-split tier — unlike τ).
+        let entry_name = prolate_cache_filename(lambda_sq, n_grid, prec);
+        let zip_path = match prolate_cache_zip_path(lambda_sq, n_grid, prec) {
+            Some(p) => p,
+            None => return,
+        };
+        let mut buf: Vec<u8> = Vec::with_capacity(json_str.len() / 2);
+        {
+            use std::io::Write;
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            if writer.start_file(&entry_name, opts).is_err() { return; }
+            if writer.write_all(json_str.as_bytes()).is_err() { return; }
+            if writer.finish().is_err() { return; }
+        }
+        if let Err(e) = std::fs::write(&zip_path, &buf) {
+            eprintln!(
+                "[prolate_cache] WARNING: could not write {}: {}",
+                zip_path.display(), e
+            );
         }
     }
 
@@ -1365,11 +1531,19 @@ pub mod hp {
     ///
     /// `n_grid` is the number of FD interior points (forced odd).
     /// `n_sample` is the number of comparison-grid points.
+    ///
+    /// `mode` selects the prolate-eigenvalue cache strategy (see
+    /// [`xc_numerics::quadrature::CacheMode`]): `Off` always recomputes
+    /// the spectrum, `JsonOnly`/`JsonZip` consult the local cache,
+    /// `DynamicFetch` (the recommended default) also pulls a missing
+    /// spectrum from the public `xcelerator-prolate-eigvals-cache` repo.
+    /// Pass `CacheMode::default()` for the standard behavior.
     pub fn compute_k_lambda(
         lambda: &Float,
         n_grid: usize,
         n_sample: usize,
         prec: u32,
+        mode: CacheMode,
     ) -> Result<HpProlateResult> {
         let start = std::time::Instant::now();
 
@@ -1410,7 +1584,7 @@ pub mod hp {
         let cache_key = lambda_sq_int_for_key(&lambda_sq_for_key);
 
         let eigenvalues: Vec<Float> = if let Some(lambda_sq_int) = cache_key {
-            if let Some(cached) = load_prolate_eigvals_cache(lambda_sq_int, n, prec) {
+            if let Some(cached) = load_prolate_eigvals_cache(lambda_sq_int, n, prec, mode) {
                 eprintln!(
                     "[HP prolate] loaded {} cached eigenvalues for λ²={}, N={}, prec={} bits",
                     cached.len(), lambda_sq_int, n, prec
@@ -1422,7 +1596,7 @@ pub mod hp {
                 let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec)?;
                 eprintln!("[HP prolate] {} eigenvalues computed in {:.1}s",
                     evals.len(), eig_start.elapsed().as_secs_f64());
-                save_prolate_eigvals_cache(lambda_sq_int, n, prec, &evals);
+                save_prolate_eigvals_cache(lambda_sq_int, n, prec, &evals, mode);
                 evals
             }
         } else {
@@ -1851,7 +2025,7 @@ pub mod hp {
         fn compute_k_lambda_runs_hp() {
             let prec = 256;
             let lambda = hp(prec, "5");
-            let res = compute_k_lambda(&lambda, 401, 64, prec).unwrap();
+            let res = compute_k_lambda(&lambda, 401, 64, prec, CacheMode::Off).unwrap();
             assert_eq!(res.u_grid.len(), 64);
             assert_eq!(res.k_values.len(), 64);
 
@@ -1881,7 +2055,7 @@ pub mod hp {
         fn compare_runs_end_to_end_hp() {
             let prec = 256;
             let lambda = hp(prec, "5");
-            let res = compute_k_lambda(&lambda, 401, 64, prec).unwrap();
+            let res = compute_k_lambda(&lambda, 401, 64, prec, CacheMode::Off).unwrap();
 
             // Build synthetic ξ: only ξ_0 nonzero, equal to √L.
             let n_modes = 20;
@@ -1994,7 +2168,7 @@ pub mod hp {
         /// returns an empty report, not an error.
         #[test]
         fn verify_dir_handles_missing_directory() {
-            let temp_root = std::env::temp_dir()
+            let temp_root = crate::test_tmp_root()
                 .join(format!("xc_spectral_prolate_cache_test_missing_{}",
                               std::process::id()));
             let nonexistent = temp_root.join("does_not_exist");
@@ -2018,14 +2192,8 @@ pub mod hp {
             let (diag, off_diag) = build_pw_matrix(&lambda, n_grid, prec);
             let real_evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
 
-            // Build an isolated temp dir.
-            let temp_dir = std::env::temp_dir()
-                .join(format!("xc_spectral_prolate_cache_test_classify_{}_{}",
-                              std::process::id(),
-                              std::time::SystemTime::now()
-                                  .duration_since(std::time::UNIX_EPOCH)
-                                  .map(|d| d.as_nanos()).unwrap_or(0)));
-            std::fs::create_dir_all(&temp_dir).unwrap();
+            // Build an isolated temp dir under target/test-tmp.
+            let temp_dir = crate::fresh_test_dir("prolate_cache_classify");
 
             // 1. Valid file: serialize the real spectrum.
             let valid_name = prolate_cache_filename(lambda_sq, n_grid, prec);
@@ -2105,6 +2273,206 @@ pub mod hp {
 
             // Cleanup.
             let _ = std::fs::remove_dir_all(&temp_dir);
+        }
+
+        // -------------------------------------------------------------
+        // CacheMode / remote-fetch tests
+        // -------------------------------------------------------------
+
+        use std::sync::Mutex;
+
+        /// Serialize cwd-mutating cache tests (cwd is process-global).
+        /// Aliases the crate-level [`crate::TEST_CWD_LOCK`] so these
+        /// tests serialize against the `ccm::hp` cache tests too (both
+        /// run in the same xc-spectral test binary and share one
+        /// process-global cwd). Mirrors the GL / ccm::hp guards.
+        #[allow(dead_code)]
+        static PROLATE_CWD_LOCK: &Mutex<()> = &crate::TEST_CWD_LOCK;
+
+        struct ProlateCwdGuard {
+            original: std::path::PathBuf,
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+        impl ProlateCwdGuard {
+            fn enter(temp: &std::path::Path) -> Self {
+                let lock = PROLATE_CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                let original = std::env::current_dir().expect("no cwd");
+                std::env::set_current_dir(temp).expect("set_current_dir to temp");
+                ProlateCwdGuard { original, _lock: lock }
+            }
+        }
+        impl Drop for ProlateCwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.original);
+            }
+        }
+
+        fn prolate_temp_cwd(tag: &str) -> std::path::PathBuf {
+            crate::fresh_test_dir(&format!("prolate_{}", tag))
+        }
+
+        /// The remote prolate URL is deterministically derived from
+        /// `(λ², ngrid, prec)` using the public repo's precision-first →
+        /// λ² → ngrid-thousand-bucket layout.
+        #[test]
+        fn prolate_remote_url_uses_bucketed_layout() {
+            // λ²=100, ngrid=4001, prec=3338 → bucket 4000-4999.
+            let url = prolate_remote_zip_url_for_test(100, 4001, 3338);
+            assert_eq!(
+                url,
+                "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-prolate-eigvals-cache/main/prolate_eigvals_cache/prec3338/lambda_sq100/ngrid4000-4999/lambda_sq100_ngrid4001_prec3338.json.zip"
+            );
+
+            // λ²=1000, ngrid=8001, prec=3338 → bucket 8000-8999.
+            let url2 = prolate_remote_zip_url_for_test(1000, 8001, 3338);
+            assert_eq!(
+                url2,
+                "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-prolate-eigvals-cache/main/prolate_eigvals_cache/prec3338/lambda_sq1000/ngrid8000-8999/lambda_sq1000_ngrid8001_prec3338.json.zip"
+            );
+        }
+
+        /// `save` then `load` round-trips eigenvalues at every CacheMode
+        /// tier, and `CacheMode::Off` writes nothing.
+        #[test]
+        fn prolate_cache_save_load_round_trip() {
+            let prec = 256;
+            let lambda_sq = 25u64;
+            let n_grid = 401usize;
+
+            let temp = prolate_temp_cwd("round_trip");
+            let _guard = ProlateCwdGuard::enter(&temp);
+
+            // Build a real, validation-passing spectrum.
+            let lambda = hp(prec, "5");
+            let (diag, off_diag) = build_pw_matrix(&lambda, n_grid, prec);
+            let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
+
+            // Off: writes nothing, reads nothing.
+            save_prolate_eigvals_cache(lambda_sq, n_grid, prec, &evals, CacheMode::Off);
+            assert!(load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::Off).is_none(),
+                "Off should never read");
+            assert!(load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::JsonOnly).is_none(),
+                "Off save should have written nothing");
+
+            // JsonZip: writes .json + .json.zip; reads back identical.
+            save_prolate_eigvals_cache(lambda_sq, n_grid, prec, &evals, CacheMode::JsonZip);
+            let got = load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::JsonZip)
+                .expect("JsonZip round-trip should load");
+            assert_eq!(got.len(), evals.len());
+            for (a, b) in evals.iter().zip(got.iter()) {
+                assert_eq!(a.to_string(), b.to_string(), "eigenvalue must round-trip exactly");
+            }
+
+            // Remove the .json so the next read must use the .zip tier.
+            let jp = temp.join("data").join("prolate_eigvals_cache")
+                .join(prolate_cache_filename(lambda_sq, n_grid, prec));
+            std::fs::remove_file(&jp).unwrap();
+            let from_zip = load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::JsonZip)
+                .expect("zip-tier load should succeed after .json removed");
+            for (a, b) in evals.iter().zip(from_zip.iter()) {
+                assert_eq!(a.to_string(), b.to_string(), "zip-tier eigenvalue must match");
+            }
+
+            drop(_guard);
+            let _ = std::fs::remove_dir_all(&temp);
+        }
+
+        /// Negative: a structurally-invalid `.json` (descending order)
+        /// must be skipped by `load` (returns None → recompute). Bad file
+        /// preserved.
+        #[test]
+        fn prolate_load_skips_structurally_invalid_json() {
+            let prec = 256;
+            let lambda_sq = 25u64;
+            let n_grid = 401usize;
+
+            let temp = prolate_temp_cwd("invalid_json");
+            let _guard = ProlateCwdGuard::enter(&temp);
+
+            // Real spectrum reversed → not ascending → fails the check.
+            let lambda = hp(prec, "5");
+            let (diag, off_diag) = build_pw_matrix(&lambda, n_grid, prec);
+            let mut bad = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
+            bad.reverse();
+
+            let dir = temp.join("data").join("prolate_eigvals_cache");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(prolate_cache_filename(lambda_sq, n_grid, prec));
+            let strs: Vec<String> = bad.iter().map(|f| f.to_string()).collect();
+            let json = serde_json::Value::Array(
+                strs.into_iter().map(serde_json::Value::String).collect());
+            std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+            assert!(load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::JsonOnly).is_none(),
+                "descending (non-ascending) spectrum must be skipped");
+            assert!(path.exists(),
+                "structurally-invalid file should be preserved for inspection");
+
+            drop(_guard);
+            let _ = std::fs::remove_dir_all(&temp);
+        }
+
+        /// Negative: a corrupt `.json.zip` must be detected and skipped
+        /// without panic (`load` returns None). Corrupt file preserved.
+        #[test]
+        fn prolate_load_handles_corrupt_zip_gracefully() {
+            let prec = 64;
+            let lambda_sq = 25u64;
+            let n_grid = 401usize;
+
+            let temp = prolate_temp_cwd("corrupt_zip");
+            let _guard = ProlateCwdGuard::enter(&temp);
+
+            let dir = temp.join("data").join("prolate_eigvals_cache");
+            std::fs::create_dir_all(&dir).unwrap();
+            // Garbage bytes named as the zip; no local .json, so JsonZip
+            // falls through to the zip, fails to open it, returns None.
+            let zip_path = dir.join(format!(
+                "lambda_sq{}_ngrid{}_prec{}.json.zip", lambda_sq, n_grid, prec));
+            std::fs::write(&zip_path, b"not a zip file at all -- random bytes").unwrap();
+
+            assert!(load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::JsonZip).is_none(),
+                "corrupt .json.zip must be skipped, not loaded");
+            assert!(zip_path.exists(),
+                "corrupt zip should be preserved for inspection");
+
+            drop(_guard);
+            let _ = std::fs::remove_dir_all(&temp);
+        }
+
+        /// Live end-to-end remote prolate-fetch test against the PUBLIC
+        /// `xcelerator-prolate-eigvals-cache` repo. `#[ignore]`d so it
+        /// never runs in the default suite (needs network + curl + a
+        /// populated repo). Run with:
+        ///
+        /// ```text
+        /// cargo test -p xc-spectral --features hp -- --ignored prolate_remote_fetch_live
+        /// ```
+        #[test]
+        #[ignore = "live network: hits the public xcelerator-prolate-eigvals-cache repo; run with --ignored"]
+        fn prolate_remote_fetch_live_downloads_and_validates() {
+            // A config that exists in the public repo (the seed fixture
+            // generated by examples/gen_prolate_eigvals_fixture: λ²=25,
+            // n_grid=401, HP-64 → prec 229 bits).
+            let lambda_sq = 25u64;
+            let n_grid = 401usize;
+            let prec = 229u32;
+
+            let temp = prolate_temp_cwd("remote_live");
+            let _guard = ProlateCwdGuard::enter(&temp);
+
+            assert!(load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::JsonZip).is_none(),
+                "no local cache should exist before fetch");
+
+            let fetched = load_prolate_eigvals_cache(
+                lambda_sq, n_grid, prec, CacheMode::DynamicFetch);
+
+            let evals = fetched.expect("remote fetch should have returned a spectrum");
+            assert_eq!(evals.len(), n_grid,
+                "fetched spectrum length {} != ngrid {}", evals.len(), n_grid);
+
+            drop(_guard);
+            let _ = std::fs::remove_dir_all(&temp);
         }
     }
 }

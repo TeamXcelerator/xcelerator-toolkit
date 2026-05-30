@@ -69,7 +69,12 @@ mod tests {
     /// Create a temp file with 3 zeros and verify loading works.
     #[test]
     fn load_zeros_from_file() {
-        let dir = std::env::temp_dir().join("xc_zeta_test");
+        // Scratch under target/test-tmp (removed by cargo clean), not
+        // the OS temp dir. Resolved from CARGO_MANIFEST_DIR so it is
+        // correct regardless of the process's runtime cwd.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..").join("..").join("target").join("test-tmp")
+            .join(format!("xc_zeta_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("test_zeros.json");
         let mut f = std::fs::File::create(&path).unwrap();
