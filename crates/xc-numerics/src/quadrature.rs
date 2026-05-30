@@ -20,8 +20,10 @@
 //!    URL is derived from `(n, prec)` using the precision-first,
 //!    npts-thousand-bucketed layout. On success the `.json.zip` is
 //!    written to the local cache dir and decompressed to `.json`, so
-//!    subsequent reads hit path (1). Falls through to compute if `curl`
-//!    is unavailable, the file 404s, or the download fails validation.
+//!    subsequent reads hit path (1). The fetch is HTTP-status-aware:
+//!    only a 404 is a definitive miss; 429 (rate limit) / 5xx / network
+//!    failures are retried with backoff. Falls through to compute if
+//!    `curl` is unavailable, the file 404s, or retries are exhausted.
 //! 4. Compute fresh via Newton iteration; cache result to (1)+(2).
 //!
 //! [`CacheMode`] selects how far down this list a lookup goes:
@@ -417,50 +419,88 @@ mod hp {
     }
 
     /// Download the `(n, prec)` `.json.zip` from the public cache repo
+    /// Download the `(n, prec)` `.json.zip` from the public cache repo
     /// into the local cache dir via `curl`. Returns `true` if a file was
-    /// written. Graceful: missing `curl`, network failure, or an HTTP
-    /// error (e.g. 404 for an un-cached config) returns `false` and the
+    /// written. Graceful: missing `curl`, a genuine 404 (un-cached
+    /// config), or repeated transient failure returns `false` and the
     /// caller falls through to compute.
     ///
-    /// `curl -fsSL` flags: `-f` fail (nonzero exit) on HTTP >= 400 and
-    /// write no body, `-s` silent, `-S` still show errors, `-L` follow
-    /// redirects. We download to a temp path and rename on success so a
-    /// partial/failed download never leaves a truncated `.json.zip`.
+    /// Robust to `raw.githubusercontent.com` rate-limiting: it captures
+    /// the real HTTP status code (`--write-out %{http_code}`) and retries
+    /// with backoff on 429/5xx/no-response. Only a 404 is treated as a
+    /// definitive miss (no retry). Downloads to a temp path and renames
+    /// on success so a partial/failed download never leaves a truncated
+    /// `.json.zip`.
     fn fetch_remote_zip(n: usize, prec: u32) -> bool {
         let zip_path = match gl_cache_zip_path(n, prec) {
             Some(p) => p,
             None => return false,
         };
         let url = remote_zip_url(n, prec);
-        let tmp_path = zip_path.with_extension("zip.partial");
 
-        let status = std::process::Command::new("curl")
-            .arg("-fsSL")
-            .arg("-o").arg(&tmp_path)
-            .arg(&url)
-            .status();
-
-        match status {
-            Ok(s) if s.success() => {
-                // Move into place atomically; if rename fails, clean up.
-                match std::fs::rename(&tmp_path, &zip_path) {
-                    Ok(()) => {
-                        eprintln!(
-                            "[gl_cache] fetched {} from remote cache",
-                            zip_path.file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("(file)")
-                        );
-                        true
+        const MAX_TRIES: usize = 5;
+        for attempt in 0..MAX_TRIES {
+            match curl_attempt_gl(&url, &zip_path) {
+                CurlOutcome::Ok => {
+                    eprintln!(
+                        "[gl_cache] fetched {} from remote cache",
+                        zip_path.file_name().and_then(|s| s.to_str()).unwrap_or("(file)")
+                    );
+                    return true;
+                }
+                // 404: this config isn't cached remotely. Definitive miss.
+                CurlOutcome::HttpError => return false,
+                // 429 / 5xx / network: retry with growing backoff.
+                CurlOutcome::Transient => {
+                    if attempt + 1 < MAX_TRIES {
+                        let secs = 2 * (attempt as u64 + 1);
+                        std::thread::sleep(std::time::Duration::from_secs(secs));
                     }
-                    Err(_) => { let _ = std::fs::remove_file(&tmp_path); false }
                 }
             }
-            _ => {
-                // curl missing, network down, or HTTP error (e.g. 404).
-                let _ = std::fs::remove_file(&tmp_path);
-                false
+        }
+        false
+    }
+
+    /// Outcome of a single GL `curl` download attempt, classified by the
+    /// actual HTTP status code (mirrors the τ-cache fetch logic).
+    enum CurlOutcome {
+        /// HTTP 2xx, file written and renamed into place.
+        Ok,
+        /// HTTP 404 — the fixture isn't in the remote repo. Definitive.
+        HttpError,
+        /// 429 (rate limit), 5xx, no response, missing curl, network /
+        /// write error. Retryable; never a definitive miss.
+        Transient,
+    }
+
+    /// `curl` one URL to `dest`, capturing the HTTP status so 404
+    /// (definitive) is distinguished from 429/5xx (transient). Writes to
+    /// a temp path and renames on a 2xx so a failed download never leaves
+    /// a truncated file.
+    fn curl_attempt_gl(url: &str, dest: &std::path::Path) -> CurlOutcome {
+        let tmp = dest.with_extension("zip.partial");
+        let _ = std::fs::remove_file(&tmp);
+        let output = std::process::Command::new("curl")
+            .arg("--silent").arg("--show-error").arg("--location")
+            .arg("--retry").arg("3").arg("--retry-delay").arg("1")
+            .arg("--write-out").arg("%{http_code}")
+            .arg("-o").arg(&tmp).arg(url)
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                let code: u32 = String::from_utf8_lossy(&out.stdout)
+                    .trim().parse().unwrap_or(0);
+                match code {
+                    200..=299 => match std::fs::rename(&tmp, dest) {
+                        Ok(()) => CurlOutcome::Ok,
+                        Err(_) => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
+                    },
+                    404 => { let _ = std::fs::remove_file(&tmp); CurlOutcome::HttpError }
+                    _ => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
+                }
             }
+            _ => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
         }
     }
 
