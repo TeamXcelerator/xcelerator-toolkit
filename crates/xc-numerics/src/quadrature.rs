@@ -442,10 +442,8 @@ mod hp {
         for attempt in 0..MAX_TRIES {
             match curl_attempt_gl(&url, &zip_path) {
                 CurlOutcome::Ok => {
-                    eprintln!(
-                        "[gl_cache] fetched {} from remote cache",
-                        zip_path.file_name().and_then(|s| s.to_str()).unwrap_or("(file)")
-                    );
+                    // Routine cache hit — silent. Only corruption /
+                    // recompute paths warn (see warn_cache_skip).
                     return true;
                 }
                 // 404: this config isn't cached remotely. Definitive miss.

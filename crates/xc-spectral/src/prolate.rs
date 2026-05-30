@@ -1273,10 +1273,7 @@ pub mod hp {
         for attempt in 0..MAX_TRIES {
             match prolate_curl_attempt(&url, &dest) {
                 ProlateCurlOutcome::Ok => {
-                    eprintln!(
-                        "[prolate_cache] fetched {} from remote cache",
-                        dest.file_name().and_then(|s| s.to_str()).unwrap_or("(file)")
-                    );
+                    // Routine cache hit — silent.
                     return true;
                 }
                 ProlateCurlOutcome::HttpError => return false, // 404 — definitive miss.

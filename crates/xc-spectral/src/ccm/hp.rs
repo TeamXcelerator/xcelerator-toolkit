@@ -1108,7 +1108,7 @@ mod tau_cache {
         let single_dest = dir.join(&stem);
         match curl_with_retries(&single_url, &single_dest) {
             CurlOutcome::Ok => {
-                eprintln!("[tau_cache] fetched {} from remote cache", stem);
+                // Routine cache hit — silent.
                 return true;
             }
             CurlOutcome::Transient => {
@@ -1157,7 +1157,7 @@ mod tau_cache {
         }
 
         if !downloaded.is_empty() {
-            eprintln!("[tau_cache] fetched {} ({} parts) from remote cache", stem, idx);
+            // Routine multi-part cache hit — silent.
             true
         } else {
             false
@@ -1798,10 +1798,7 @@ mod weil_eigvec_cache {
         for attempt in 0..MAX_TRIES {
             match curl_attempt(&url, &dest) {
                 CurlOutcome::Ok => {
-                    eprintln!(
-                        "[weil_eigvec_cache] fetched {} from remote cache",
-                        dest.file_name().and_then(|s| s.to_str()).unwrap_or("(file)")
-                    );
+                    // Routine cache hit — silent.
                     return true;
                 }
                 CurlOutcome::HttpError => return false, // 404 — definitive miss.
