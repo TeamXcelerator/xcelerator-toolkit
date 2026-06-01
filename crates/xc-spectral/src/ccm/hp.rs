@@ -42,6 +42,11 @@ pub struct HighPrecConfig {
     /// [`xc_numerics::quadrature::CacheMode`]. Default `DynamicFetch`
     /// (local `.json` → local zip → remote fetch → compute).
     pub cache_mode: xc_numerics::quadrature::CacheMode,
+    /// Whether to project onto the even subspace at each inverse-iteration
+    /// step. Default `true` (forced-even, the standard CCM path). Set to
+    /// `false` to test whether the natural (unprojected) smallest
+    /// eigenvector is even without forcing.
+    pub force_even: bool,
 }
 
 /// Conversion factor: decimal digits to binary bits.
@@ -85,6 +90,7 @@ impl HighPrecConfig {
                 .min(MAX_QUAD_POINTS),
             n_eigenvalues: 50,
             cache_mode: xc_numerics::quadrature::CacheMode::default(),
+            force_even: true,
         }
     }
 }
@@ -295,10 +301,10 @@ pub fn run(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> Re
     let (eps_n, xi) = match cached_pair {
         Some(pair) => pair,
         None => {
-            // Find smallest eigenpair by inverse iteration (forced even).
+            // Find smallest eigenpair by inverse iteration.
             eprintln!("[HP] LU factoring {}×{} matrix (one-time cost)...", dim, dim);
             let (eps_n, xi_raw) = xc_numerics::linalg::inverse_iteration(
-                &tau, dim, prec, cfg.inverse_iter_steps, true)?;
+                &tau, dim, prec, cfg.inverse_iter_steps, cfg.force_even)?;
             eprintln!("[HP] LU factorization done.");
             // Normalize: Σ ξ_j = √L.
             let xi = normalize_eigenvector(&xi_raw, &l, prec);
