@@ -1951,6 +1951,7 @@ mod tests {
         assert_eq!(cfg.inverse_iter_steps, 200);
         assert_eq!(cfg.newton_steps, 20);
         assert_eq!(cfg.n_eigenvalues, 50);
+        assert!(cfg.force_even, "force_even should default to true");
     }
 
     /// HighPrecConfig::for_decimal_digits at 500 digits.
@@ -1961,6 +1962,17 @@ mod tests {
         assert_eq!(cfg.precision_bits, 1677);
         // 500 * 3 = 1500, clamped to [600, 4000] → 1500
         assert_eq!(cfg.quad_points, 1500);
+    }
+
+    /// force_even defaults to true and is settable.
+    #[test]
+    fn config_force_even_default_and_override() {
+        let cfg = HighPrecConfig::for_decimal_digits(200);
+        assert!(cfg.force_even, "force_even should default to true");
+
+        let mut cfg2 = HighPrecConfig::for_decimal_digits(200);
+        cfg2.force_even = false;
+        assert!(!cfg2.force_even, "force_even should be settable to false");
     }
 
     /// HighPrecConfig quad_points should clamp to MAX_QUAD_POINTS.
