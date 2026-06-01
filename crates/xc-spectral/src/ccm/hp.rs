@@ -282,7 +282,7 @@ pub fn run(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> Re
     let lambda_sq = params.lambda_sq_int;
     let n_modes_key = params.n_modes;
     let mut cached_pair: Option<(Float, Vec<Float>)> = None;
-    if let Some(c) = weil_eigvec_cache::load(lambda_sq, n_modes_key, prec, cfg.cache_mode) {
+    if let Some(c) = weil_eigvec_cache::load(lambda_sq, n_modes_key, prec, cfg.cache_mode, cfg.force_even) {
         if weil_eigvec_cache::residual_ok(&tau, dim, &c.xi, &c.eps_n, prec) {
             eprintln!(
                 "[HP] loaded cached Weil eigenvector for λ²={}, N={}, prec={} bits \
@@ -308,7 +308,7 @@ pub fn run(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> Re
             eprintln!("[HP] LU factorization done.");
             // Normalize: Σ ξ_j = √L.
             let xi = normalize_eigenvector(&xi_raw, &l, prec);
-            weil_eigvec_cache::save(lambda_sq, n_modes_key, prec, &eps_n, &xi, cfg.cache_mode);
+            weil_eigvec_cache::save(lambda_sq, n_modes_key, prec, &eps_n, &xi, cfg.cache_mode, cfg.force_even);
             (eps_n, xi)
         }
     };
@@ -1560,17 +1560,22 @@ mod weil_eigvec_cache {
         Some(dir)
     }
 
-    pub(super) fn cache_filename(lambda_sq: u64, n_modes: usize, prec: u32) -> String {
-        format!("weil_eigvec_lambda_sq{}_nmodes{}_prec{}.json", lambda_sq, n_modes, prec)
+    pub(super) fn cache_filename(lambda_sq: u64, n_modes: usize, prec: u32, force_even: bool) -> String {
+        // Forced-even (the default CCM path) keeps the historical name with
+        // NO suffix, so every pre-existing public fixture stays valid. The
+        // natural (unprojected) variant gets a `_natural` marker so the two
+        // never collide in the cache.
+        let variant = if force_even { "" } else { "_natural" };
+        format!("weil_eigvec_lambda_sq{}_nmodes{}_prec{}{}.json", lambda_sq, n_modes, prec, variant)
     }
 
-    fn json_path(lambda_sq: u64, n_modes: usize, prec: u32) -> Option<std::path::PathBuf> {
-        cache_dir().map(|d| d.join(cache_filename(lambda_sq, n_modes, prec)))
+    fn json_path(lambda_sq: u64, n_modes: usize, prec: u32, force_even: bool) -> Option<std::path::PathBuf> {
+        cache_dir().map(|d| d.join(cache_filename(lambda_sq, n_modes, prec, force_even)))
     }
 
-    fn zip_path(lambda_sq: u64, n_modes: usize, prec: u32) -> Option<std::path::PathBuf> {
+    fn zip_path(lambda_sq: u64, n_modes: usize, prec: u32, force_even: bool) -> Option<std::path::PathBuf> {
         cache_dir().map(|d| {
-            let f = cache_filename(lambda_sq, n_modes, prec);
+            let f = cache_filename(lambda_sq, n_modes, prec, force_even);
             d.join(format!("{}.zip", f))
         })
     }
@@ -1657,13 +1662,13 @@ mod weil_eigvec_cache {
     /// Deterministic remote URL for the `(λ², N, prec)` fixture in the
     /// public xcelerator-weil-eigvec-cache repo (precision-first → λ² →
     /// nmodes-thousand-bucket layout, mirroring tau/GL).
-    fn remote_zip_url(lambda_sq: u64, n_modes: usize, prec: u32) -> String {
+    fn remote_zip_url(lambda_sq: u64, n_modes: usize, prec: u32, force_even: bool) -> String {
         let bucket = (n_modes / 1000) * 1000;
         format!(
             "{base}/weil_eigvec_cache/prec{p}/lambda_sq{l}/nmodes{b}-{bend}/{stem}.zip",
             base = REMOTE_BASE, p = prec, l = lambda_sq,
             b = bucket, bend = bucket + 999,
-            stem = cache_filename(lambda_sq, n_modes, prec)
+            stem = cache_filename(lambda_sq, n_modes, prec, force_even)
         )
     }
 
@@ -1672,7 +1677,7 @@ mod weil_eigvec_cache {
     pub(super) fn remote_zip_url_for_test(
         lambda_sq: u64, n_modes: usize, prec: u32,
     ) -> String {
-        remote_zip_url(lambda_sq, n_modes, prec)
+        remote_zip_url(lambda_sq, n_modes, prec, true)
     }
 
     fn warn_skip(path: &std::path::Path, reason: &str) {
@@ -1687,11 +1692,11 @@ mod weil_eigvec_cache {
     /// re-serializing).
     fn read_single_zip(
         zip_path: &std::path::Path,
-        lambda_sq: u64, n_modes: usize, prec: u32,
+        lambda_sq: u64, n_modes: usize, prec: u32, force_even: bool,
     ) -> Option<(CachedXi, String)> {
         let file = std::fs::File::open(zip_path).ok()?;
         let mut archive = zip::ZipArchive::new(file).ok()?;
-        let entry_name = cache_filename(lambda_sq, n_modes, prec);
+        let entry_name = cache_filename(lambda_sq, n_modes, prec, force_even);
         let mut entry = archive.by_name(&entry_name).ok()?;
         let mut data = String::new();
         entry.read_to_string(&mut data).ok()?;
@@ -1700,12 +1705,12 @@ mod weil_eigvec_cache {
     }
 
     pub(super) fn load(
-        lambda_sq: u64, n_modes: usize, prec: u32, mode: CacheMode,
+        lambda_sq: u64, n_modes: usize, prec: u32, mode: CacheMode, force_even: bool,
     ) -> Option<CachedXi> {
         if mode == CacheMode::Off { return None; }
 
         // Tier 1 (all non-Off modes): uncompressed JSON. Fast read.
-        if let Some(path) = json_path(lambda_sq, n_modes, prec) {
+        if let Some(path) = json_path(lambda_sq, n_modes, prec, force_even) {
             if path.exists() {
                 match std::fs::read_to_string(&path) {
                     Ok(data) => match parse_json(&data, lambda_sq, n_modes, prec) {
@@ -1721,7 +1726,7 @@ mod weil_eigvec_cache {
         if mode == CacheMode::JsonOnly { return None; }
 
         // Tier 2 (JsonZip, DynamicFetch): local single zip.
-        if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec) {
+        if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec, force_even) {
             return Some(c);
         }
 
@@ -1731,8 +1736,8 @@ mod weil_eigvec_cache {
         // Tier 3 (DynamicFetch only): remote fetch (single zip; no parts,
         // ξ is small). On success the zip lands locally and we re-run the
         // local-zip loader so the decompressed .json is written.
-        if fetch_remote_zip(lambda_sq, n_modes, prec) {
-            if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec) {
+        if fetch_remote_zip(lambda_sq, n_modes, prec, force_even) {
+            if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec, force_even) {
                 return Some(c);
             }
         }
@@ -1742,12 +1747,12 @@ mod weil_eigvec_cache {
 
     /// Load from a local single zip (tier 2). On success writes the
     /// decompressed `.json` alongside and returns the parsed entry.
-    fn try_load_local_zip(lambda_sq: u64, n_modes: usize, prec: u32) -> Option<CachedXi> {
-        let zp = zip_path(lambda_sq, n_modes, prec)?;
+    fn try_load_local_zip(lambda_sq: u64, n_modes: usize, prec: u32, force_even: bool) -> Option<CachedXi> {
+        let zp = zip_path(lambda_sq, n_modes, prec, force_even)?;
         if !zp.exists() { return None; }
-        match read_single_zip(&zp, lambda_sq, n_modes, prec) {
+        match read_single_zip(&zp, lambda_sq, n_modes, prec, force_even) {
             Some((parsed, json_string)) => {
-                if let Some(jp) = json_path(lambda_sq, n_modes, prec) {
+                if let Some(jp) = json_path(lambda_sq, n_modes, prec, force_even) {
                     let _ = std::fs::write(&jp, &json_string);
                 }
                 Some(parsed)
@@ -1793,12 +1798,12 @@ mod weil_eigvec_cache {
     /// repo. Returns `true` if a file was written. Robust to
     /// `raw.githubusercontent.com` rate-limiting: only a 404 is a
     /// definitive miss; 429/5xx/no-response retry with backoff.
-    fn fetch_remote_zip(lambda_sq: u64, n_modes: usize, prec: u32) -> bool {
-        let dest = match zip_path(lambda_sq, n_modes, prec) {
+    fn fetch_remote_zip(lambda_sq: u64, n_modes: usize, prec: u32, force_even: bool) -> bool {
+        let dest = match zip_path(lambda_sq, n_modes, prec, force_even) {
             Some(p) => p,
             None => return false,
         };
-        let url = remote_zip_url(lambda_sq, n_modes, prec);
+        let url = remote_zip_url(lambda_sq, n_modes, prec, force_even);
 
         const MAX_TRIES: usize = 5;
         for attempt in 0..MAX_TRIES {
@@ -1849,28 +1854,28 @@ mod weil_eigvec_cache {
         buf
     }
 
-    fn cleanup_previous(lambda_sq: u64, n_modes: usize, prec: u32) {
-        if let Some(p) = json_path(lambda_sq, n_modes, prec) {
+    fn cleanup_previous(lambda_sq: u64, n_modes: usize, prec: u32, force_even: bool) {
+        if let Some(p) = json_path(lambda_sq, n_modes, prec, force_even) {
             if p.exists() { let _ = std::fs::remove_file(&p); }
         }
-        if let Some(p) = zip_path(lambda_sq, n_modes, prec) {
+        if let Some(p) = zip_path(lambda_sq, n_modes, prec, force_even) {
             if p.exists() { let _ = std::fs::remove_file(&p); }
         }
     }
 
     pub(super) fn save(
         lambda_sq: u64, n_modes: usize, prec: u32,
-        eps_n: &Float, xi: &[Float], mode: CacheMode,
+        eps_n: &Float, xi: &[Float], mode: CacheMode, force_even: bool,
     ) {
         if mode == CacheMode::Off { return; }
 
         let json_bytes = serialize_to_json(lambda_sq, n_modes, prec, eps_n, xi);
         if json_bytes.is_empty() { return; }
 
-        cleanup_previous(lambda_sq, n_modes, prec);
+        cleanup_previous(lambda_sq, n_modes, prec, force_even);
 
         // Always write the uncompressed JSON first (fast-read path).
-        if let Some(jp) = json_path(lambda_sq, n_modes, prec) {
+        if let Some(jp) = json_path(lambda_sq, n_modes, prec, force_even) {
             let _ = std::fs::write(&jp, &json_bytes);
         }
 
@@ -1880,10 +1885,10 @@ mod weil_eigvec_cache {
         // JsonZip / DynamicFetch: also write a compressed copy for
         // distribution. ξ is small, so this is always a single zip (no
         // byte-split tier — unlike τ).
-        let entry_name = cache_filename(lambda_sq, n_modes, prec);
+        let entry_name = cache_filename(lambda_sq, n_modes, prec, force_even);
         let zip_bytes = compress_to_zip(&json_bytes, &entry_name);
         if zip_bytes.is_empty() { return; }
-        if let Some(zp) = zip_path(lambda_sq, n_modes, prec) {
+        if let Some(zp) = zip_path(lambda_sq, n_modes, prec, force_even) {
             if let Err(e) = std::fs::write(&zp, &zip_bytes) {
                 eprintln!(
                     "[weil_eigvec_cache] WARNING: could not write {}: {}",
@@ -1973,6 +1978,22 @@ mod tests {
         let mut cfg2 = HighPrecConfig::for_decimal_digits(200);
         cfg2.force_even = false;
         assert!(!cfg2.force_even, "force_even should be settable to false");
+    }
+
+    /// Weil-eigenvector cache filename keying: the forced-even variant
+    /// keeps the historical (suffix-free) name so all pre-existing public
+    /// fixtures stay valid; the natural variant gets a `_natural` marker
+    /// so the two never collide.
+    #[test]
+    fn weil_eigvec_cache_filename_keys_on_force_even() {
+        use super::weil_eigvec_cache::cache_filename;
+        let forced = cache_filename(1000, 800, 6660, true);
+        let natural = cache_filename(1000, 800, 6660, false);
+        // Forced-even is the historical name (backward compatible).
+        assert_eq!(forced, "weil_eigvec_lambda_sq1000_nmodes800_prec6660.json");
+        // Natural is distinct.
+        assert_eq!(natural, "weil_eigvec_lambda_sq1000_nmodes800_prec6660_natural.json");
+        assert_ne!(forced, natural);
     }
 
     /// HighPrecConfig quad_points should clamp to MAX_QUAD_POINTS.
@@ -2569,15 +2590,15 @@ mod tests {
             .collect();
 
         // Off: writes nothing, reads nothing.
-        save(lambda_sq, n_modes, prec, &eps, &xi, CacheMode::Off);
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::Off).is_none(),
+        save(lambda_sq, n_modes, prec, &eps, &xi, CacheMode::Off, true);
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::Off, true).is_none(),
             "Off should never read");
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly).is_none(),
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly, true).is_none(),
             "Off save should have written nothing");
 
         // JsonZip: writes .json + .json.zip; reads back identical.
-        save(lambda_sq, n_modes, prec, &eps, &xi, CacheMode::JsonZip);
-        let got = load(lambda_sq, n_modes, prec, CacheMode::JsonZip)
+        save(lambda_sq, n_modes, prec, &eps, &xi, CacheMode::JsonZip, true);
+        let got = load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true)
             .expect("JsonZip round-trip should load");
         assert_eq!(got.xi.len(), dim);
         for (a, b) in xi.iter().zip(got.xi.iter()) {
@@ -2588,9 +2609,9 @@ mod tests {
 
         // Remove the .json so the next read must use the .zip tier.
         let jp = temp.join("data").join("weil_eigvec_cache")
-            .join(super::weil_eigvec_cache::cache_filename(lambda_sq, n_modes, prec));
+            .join(super::weil_eigvec_cache::cache_filename(lambda_sq, n_modes, prec, true));
         std::fs::remove_file(&jp).unwrap();
-        let from_zip = load(lambda_sq, n_modes, prec, CacheMode::JsonZip)
+        let from_zip = load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true)
             .expect("zip-tier load should succeed after .json removed");
         for (a, b) in xi.iter().zip(from_zip.xi.iter()) {
             assert_eq!(a.to_string(), b.to_string(), "zip-tier xi must match");
@@ -2618,7 +2639,7 @@ mod tests {
 
         let dir = temp.join("data").join("weil_eigvec_cache");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(cache_filename(lambda_sq, n_modes, prec));
+        let path = dir.join(cache_filename(lambda_sq, n_modes, prec, true));
 
         // Shape-parseable JSON, but xi has the WRONG length (3 ≠ 9)
         // and otherwise-valid metadata. parse_json must reject it.
@@ -2633,9 +2654,9 @@ mod tests {
         std::fs::write(&path, &bad).unwrap();
 
         // load must skip (None) — never returns a malformed entry.
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly).is_none(),
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly, true).is_none(),
             "structurally-invalid .json must be skipped");
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip).is_none(),
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true).is_none(),
             "structurally-invalid .json must be skipped (zip tier has nothing either)");
 
         // The bad file is preserved on disk (load does not delete it;
@@ -2672,7 +2693,7 @@ mod tests {
         ));
         std::fs::write(&zip_path, b"not a zip file at all -- random bytes").unwrap();
 
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip).is_none(),
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true).is_none(),
             "corrupt .json.zip must be skipped, not loaded");
 
         // Corrupt file preserved on disk.
@@ -2707,11 +2728,11 @@ mod tests {
         let n_modes = 10usize;
         let prec = 229u32;
         assert!(super::weil_eigvec_cache::load(
-            lambda_sq, n_modes, prec, CacheMode::JsonZip
+            lambda_sq, n_modes, prec, CacheMode::JsonZip, true
         ).is_none(), "no local cache should exist before fetch");
 
         let fetched = super::weil_eigvec_cache::load(
-            lambda_sq, n_modes, prec, CacheMode::DynamicFetch,
+            lambda_sq, n_modes, prec, CacheMode::DynamicFetch, true,
         ).map(|c| (c.xi.len(), 2 * n_modes + 1));
 
         let (got_len, expected_len) = fetched
