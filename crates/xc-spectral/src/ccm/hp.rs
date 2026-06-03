@@ -249,7 +249,7 @@ pub fn run(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> Re
     let prec = cfg.precision_bits;
     let dim = params.matrix_size();
 
-    let l = Float::with_val(prec, params.lambda_squared).ln();
+    let l = log_lambda_sq_hp(params, prec);
     let mut tau = build_tau_hp(params, &l, cfg)?;
 
     // Force exact symmetry. Compute averaged upper-triangle values in
@@ -352,7 +352,7 @@ pub fn measure_evenness(params: &CcmParams, cfg: &HighPrecConfig) -> Result<Even
     let prec = cfg.precision_bits;
     let dim = params.matrix_size();
 
-    let l = Float::with_val(prec, params.lambda_squared).ln();
+    let l = log_lambda_sq_hp(params, prec);
     let mut tau = build_tau_hp(params, &l, cfg)?;
 
     // Force exact symmetry of the matrix (parallel compute, sequential write).
@@ -664,6 +664,30 @@ fn normalize_eigenvector(xi: &[Float], l: &Float, prec: u32) -> Vec<Float> {
     target /= &sum;
     xi.iter().map(|v| { let mut x = v.clone(); x *= &target; x }).collect()
 }
+
+/// Basis half-period `L = ln(λ²) = 2 ln λ` at full working precision.
+///
+/// CRITICAL: the integral λ² (the paper configs: 13, 100, 1000, …) must
+/// enter the HP construction via the EXACT integer `lambda_sq_int`, not
+/// the f64 `lambda_squared`. The f64 field can carry round-off when λ is
+/// formed as an integer square root (e.g. `13.0_f64.sqrt()² =
+/// 12.999999999999998`); promoting that truncated f64 to HP would make
+/// `L`, the V_n pole spacing `2π/L`, and therefore every eigenvalue
+/// accurate only to ~15 digits regardless of working precision
+/// (DEFECT-001). When `lambda_squared` is an exact integer we use
+/// `lambda_sq_int` so `L = ln(N)` is computed at full HP. Only genuinely
+/// non-integer λ² (not used by the paper configs) falls back to the f64.
+fn log_lambda_sq_hp(params: &CcmParams, prec: u32) -> Float {
+    let lsq_f = params.lambda_squared;
+    if (lsq_f - lsq_f.round()).abs() < 1e-9 {
+        // Integral λ²: use the exact integer for a full-precision L.
+        Float::with_val(prec, params.lambda_sq_int).ln()
+    } else {
+        // Non-integer λ² (not a paper config): preserve prior behavior.
+        Float::with_val(prec, lsq_f).ln()
+    }
+}
+
 
 // ===========================================================================
 // Newton refinement of R(z) zeros
