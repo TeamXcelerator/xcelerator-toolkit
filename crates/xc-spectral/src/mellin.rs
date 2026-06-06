@@ -462,13 +462,20 @@ pub fn omega_hp(t: &rug::Float) -> rug::Float {
 
 /// HP version of the ξ_λ-weighted Mellin transform.
 /// All arithmetic at `prec` bits. Returns (Re, Im) of G(s).
+///
+/// `gl_nodes` and `gl_weights` are pre-fetched GL nodes/weights for
+/// `n_quad` points at `prec` bits. Callers must fetch these once before
+/// any parallel section — passing them in prevents a cache-write race
+/// when many rayon threads would otherwise call `gauss_legendre_nodes`
+/// concurrently on a cache miss.
 #[cfg(feature = "hp")]
 pub fn xi_weighted_mellin_hp(
     s_re: &rug::Float, s_im: &rug::Float,
     lambda: &rug::Float,
     xi_hp: &[rug::Float],
     n_modes: usize,
-    n_quad: usize,
+    gl_nodes: &[rug::Float],
+    gl_weights: &[rug::Float],
 ) -> (rug::Float, rug::Float) {
     use rug::Float;
     use rug::ops::Pow;
@@ -488,9 +495,9 @@ pub fn xi_weighted_mellin_hp(
         let mut v = l.clone().sqrt(); v = v.recip(); v
     };
 
-    // GL nodes and weights on [-1, 1] at HP.
-    // Use the cached version from highprec if available, otherwise compute.
-    let (nodes, weights) = xc_numerics::quadrature::gauss_legendre_nodes(n_quad, prec, xc_numerics::quadrature::CacheMode::default());
+    let n_quad = gl_nodes.len();
+    let nodes = gl_nodes;
+    let weights = gl_weights;
 
     // Map GL nodes from [-1, 1] to [λ⁻¹, λ].
     let a = {
@@ -584,11 +591,18 @@ pub fn xi_weighted_mellin_hp(
 }
 
 /// HP version of the truncated Λ_λ (unweighted, for comparison).
+///
+/// `gl_nodes` and `gl_weights` are pre-fetched GL nodes/weights for
+/// `n_quad` points at `prec` bits. Callers must fetch these once before
+/// any parallel section — passing them in prevents a cache-write race
+/// when many rayon threads would otherwise call `gauss_legendre_nodes`
+/// concurrently on a cache miss.
 #[cfg(feature = "hp")]
 pub fn truncated_lambda_hp(
     s_re: &rug::Float, s_im: &rug::Float,
     lambda: &rug::Float,
-    n_quad: usize,
+    gl_nodes: &[rug::Float],
+    gl_weights: &[rug::Float],
 ) -> (rug::Float, rug::Float) {
     use rug::Float;
     use rug::ops::Pow;
@@ -596,7 +610,9 @@ pub fn truncated_lambda_hp(
     let prec = lambda.prec();
     let one = Float::with_val(prec, 1);
 
-    let (nodes, weights) = xc_numerics::quadrature::gauss_legendre_nodes(n_quad, prec, xc_numerics::quadrature::CacheMode::default());
+    let n_quad = gl_nodes.len();
+    let nodes = gl_nodes;
+    let weights = gl_weights;
 
     let a = { let mut v = lambda.clone(); v = v.recip(); v };
     let b = lambda.clone();
@@ -802,7 +818,9 @@ mod hp_tests {
         let s_re = Float::with_val(prec, 2);
         let s_im = Float::with_val(prec, 0);
         let lambda = Float::with_val(prec, 50);
-        let (re, im) = truncated_lambda_hp(&s_re, &s_im, &lambda, 200);
+        let (nodes, weights) = xc_numerics::quadrature::gauss_legendre_nodes(
+            200, prec, xc_numerics::quadrature::CacheMode::default());
+        let (re, im) = truncated_lambda_hp(&s_re, &s_im, &lambda, &nodes, &weights);
         let mut expected = Float::with_val(prec, rug::float::Constant::Pi);
         expected.square_mut();
         expected /= 6u32;
@@ -839,8 +857,11 @@ mod hp_tests {
         let s_re = { let mut v = Float::with_val(prec, 1); v /= 2u32; v };
         let s_im = Float::with_val(prec, 14);
 
-        let (g_re, g_im) = xi_weighted_mellin_hp(&s_re, &s_im, &lambda, &xi, n_modes, 100);
-        let (l_re, l_im) = truncated_lambda_hp(&s_re, &s_im, &lambda, 100);
+        let n_quad = 100;
+        let (gl_nodes, gl_weights) = xc_numerics::quadrature::gauss_legendre_nodes(
+            n_quad, prec, xc_numerics::quadrature::CacheMode::default());
+        let (g_re, g_im) = xi_weighted_mellin_hp(&s_re, &s_im, &lambda, &xi, n_modes, &gl_nodes, &gl_weights);
+        let (l_re, l_im) = truncated_lambda_hp(&s_re, &s_im, &lambda, &gl_nodes, &gl_weights);
 
         // With flat ξ, G(s) = Λ_λ(s).
         let mut re_diff = g_re.clone();
@@ -865,7 +886,11 @@ mod hp_tests {
         let t_max = Float::with_val(prec, 20);
 
         let zeros = scan_critical_line_zeros_hp(
-            &|sigma_hp, t_hp| truncated_lambda_hp(sigma_hp, t_hp, &lambda, 200),
+            &|sigma_hp, t_hp| {
+                let (nodes, weights) = xc_numerics::quadrature::gauss_legendre_nodes(
+                    200, prec, xc_numerics::quadrature::CacheMode::default());
+                truncated_lambda_hp(sigma_hp, t_hp, &lambda, &nodes, &weights)
+            },
             &t_min, &t_max, 200, 30,
         );
 
