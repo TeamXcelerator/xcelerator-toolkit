@@ -310,43 +310,14 @@ mod hp {
     fn load_gl_cache(n: usize, prec: u32, mode: CacheMode) -> Option<(Vec<Float>, Vec<Float>)> {
         if mode == CacheMode::Off { return None; }
 
-        // Tier 1 (all non-Off modes): uncompressed JSON. Fast read.
-        if let Some(path) = gl_cache_path(n, prec) {
-            if path.exists() {
-                match std::fs::read_to_string(&path) {
-                    Ok(data) => match parse_gl_json(&data, n, prec) {
-                        Some((nodes, weights)) => {
-                            // Structural identity check on the loaded
-                            // values. A wrong-precision file or a value-
-                            // corrupted file can pass `parse_gl_json`
-                            // (which only checks shape), but it won't
-                            // pass the GL structural identities.
-                            if let Some(reason) =
-                                cache_structural_check(&nodes, &weights, prec)
-                            {
-                                warn_cache_skip(&path, &reason);
-                            } else {
-                                return Some((nodes, weights));
-                            }
-                        }
-                        None => {
-                            warn_cache_skip(&path, "JSON shape mismatch or unparseable");
-                        }
-                    },
-                    Err(e) => {
-                        warn_cache_skip(&path, &format!("read failed: {}", e));
-                    }
-                }
-            }
-        }
-
-        // JsonOnly stops here.
+        // Caches are stored as .json.zip only — we read straight from the
+        // zip (decompress in memory) and never write a decompressed .json.
+        // This keeps local disk usage ~2x smaller so more configs stay
+        // cached during sweeps. JsonOnly is now a no-op for reads (kept
+        // for API compatibility) since no uncompressed .json is written.
         if mode == CacheMode::JsonOnly { return None; }
 
-        // Tier 2 (JsonZip, DynamicFetch): zip-compressed JSON. Decompress,
-        // parse, and write the decompressed JSON next to the .zip so
-        // subsequent reads in the same process and on the same machine
-        // hit tier 1 directly.
+        // Tier 1 (JsonZip, DynamicFetch): local zip — decompress in memory.
         if let Some(result) = try_load_local_zip(n, prec) {
             return Some(result);
         }
@@ -354,10 +325,9 @@ mod hp {
         // JsonZip stops here.
         if mode == CacheMode::JsonZip { return None; }
 
-        // Tier 3 (DynamicFetch only): remote fetch from the public
+        // Tier 2 (DynamicFetch only): remote fetch from the public
         // consolidated GL cache repo. On success the .json.zip lands in
-        // the local cache dir; we then re-run the local-zip loader so the
-        // decompressed .json is written and the same validation applies.
+        // the local cache dir; we then re-run the local-zip loader.
         if fetch_remote_zip(n, prec) {
             if let Some(result) = try_load_local_zip(n, prec) {
                 return Some(result);
@@ -367,25 +337,20 @@ mod hp {
         None
     }
 
-    /// Attempt to load `(n, prec)` from a local `.json.zip` (tier 2).
-    /// On success, writes the decompressed `.json` alongside and returns
-    /// the parsed pair. Returns `None` if the zip is absent, corrupt, or
-    /// structurally invalid.
+    /// Attempt to load `(n, prec)` from a local `.json.zip`.
+    /// Decompresses in memory; does NOT write a decompressed `.json`.
+    /// Returns `None` if the zip is absent, corrupt, or structurally invalid.
     fn try_load_local_zip(n: usize, prec: u32) -> Option<(Vec<Float>, Vec<Float>)> {
         let zip_path = gl_cache_zip_path(n, prec)?;
         if !zip_path.exists() { return None; }
         match load_from_zip(&zip_path, n, prec) {
-            Some((parsed, json_string)) => {
+            Some((parsed, _json_string)) => {
                 if let Some(reason) =
                     cache_structural_check(&parsed.0, &parsed.1, prec)
                 {
                     warn_cache_skip(&zip_path, &reason);
                     None
                 } else {
-                    // Best-effort decompressed-copy write; non-fatal.
-                    if let Some(json_path) = gl_cache_path(n, prec) {
-                        let _ = std::fs::write(&json_path, &json_string);
-                    }
                     Some(parsed)
                 }
             }
@@ -526,13 +491,14 @@ mod hp {
     }
 
     fn save_gl_cache(n: usize, prec: u32, nodes: &[Float], weights: &[Float], mode: CacheMode) {
-        // Off writes nothing.
-        if mode == CacheMode::Off { return; }
+        // Off writes nothing. JsonOnly also writes nothing now: the cache
+        // is zip-only (we never persist a decompressed .json), so the
+        // only meaningful write modes are JsonZip / DynamicFetch.
+        if matches!(mode, CacheMode::Off | CacheMode::JsonOnly) { return; }
 
-        // Always write the uncompressed .json first — it's the fast
-        // next-read path. Then, for modes that consult the zip tier
-        // (JsonZip, DynamicFetch), also write a deflated .json.zip
-        // alongside for distribution. JsonOnly writes only the .json.
+        // Serialize to JSON in memory, then write ONLY the deflated
+        // .json.zip. No uncompressed .json is written — readers
+        // decompress from the zip on demand. This halves local disk use.
         if let Some(path) = gl_cache_path(n, prec) {
             let ns: Vec<String> = nodes.iter().map(|f| f.to_string()).collect();
             let ws: Vec<String> = weights.iter().map(|f| f.to_string()).collect();
@@ -541,14 +507,7 @@ mod hp {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            if std::fs::write(&path, &json_str).is_err() { return; }
 
-            // Only JsonZip / DynamicFetch produce the .zip companion.
-            if matches!(mode, CacheMode::JsonOnly) { return; }
-
-            // Compress to .json.zip alongside. Failure on the zip
-            // write is non-fatal (the .json above is the canonical
-            // cache; the .zip is opportunistic).
             use std::io::Write;
             let entry_name = format!("prec{}_npts{}.json", prec, n);
             let zip_filename = format!("{}.zip", entry_name);
@@ -1086,16 +1045,13 @@ mod hp_cache_tests {
         }
     }
 
-    /// Lookup priority test: when both `.json` and `.json.zip` exist
-    /// for the same `(n, prec)`, the toolkit must prefer the
-    /// uncompressed `.json` (the fast path).
-    ///
-    /// Both fixtures are structurally-valid (so neither is rejected by
-    /// the cache structural validator); they differ only in their
-    /// "epsilon" pin so we can tell which one was loaded.
+    /// Zip-only contract: the `.json.zip` is the sole source of truth.
+    /// Even if a stale uncompressed `.json` is present, it is ignored —
+    /// the toolkit reads only the zip. (Tier-1 `.json` reads were
+    /// removed when the cache became zip-only to halve disk usage.)
     #[test]
-    fn cache_prefers_uncompressed_json_over_zip() {
-        let temp = fresh_temp_dir("prefers_json");
+    fn cache_reads_zip_ignoring_stale_json() {
+        let temp = fresh_temp_dir("zip_is_truth");
         let _guard = CwdGuard::enter(&temp);
 
         let n = 4;
@@ -1103,13 +1059,14 @@ mod hp_cache_tests {
         let cache_dir = temp.join("data").join("gl_cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
 
-        // .json fixture: epsilon = 0.01 (so smallest |node| ≈ 0.01).
+        // Stale .json fixture: epsilon = 0.01 (smallest |node| ≈ 0.01).
+        // This must be IGNORED under the zip-only contract.
         let json_payload = synthetic_valid_gl_json(n, 0.01);
         let json_path = cache_dir.join(format!("prec{}_npts{}.json", prec, n));
         std::fs::write(&json_path, &json_payload).unwrap();
 
-        // .zip fixture: epsilon = 0.5 (so smallest |node| ≈ 0.5).
-        // The .zip should be ignored because the .json wins.
+        // .zip fixture: epsilon = 0.5 (smallest |node| ≈ 0.5).
+        // This is the source of truth and must win.
         let zip_path = cache_dir.join(format!("prec{}_npts{}.json.zip", prec, n));
         let zip_file = std::fs::File::create(&zip_path).unwrap();
         let mut zip_writer = zip::ZipWriter::new(zip_file);
@@ -1125,23 +1082,23 @@ mod hp_cache_tests {
         let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
-        // The smallest |node| should match the .json file's epsilon
-        // (~0.01), not the .zip's (~0.5).
+        // The smallest |node| should match the .ZIP's epsilon (~0.5),
+        // proving the zip was read and the stale .json was ignored.
         let mut smallest_abs = f64::INFINITY;
         for x in &nodes {
             let a = x.clone().abs().to_f64();
             if a < smallest_abs { smallest_abs = a; }
         }
-        assert!(smallest_abs < 0.05,
-            "expected smallest |node| ~0.01 from .json fixture, got {}",
+        assert!(smallest_abs > 0.3,
+            "expected smallest |node| ~0.5 from .zip fixture (zip-only contract), got {}",
             smallest_abs);
     }
 
     /// Zip fallback test: when only `.json.zip` exists, the toolkit
-    /// must read it, decompress, and also write the decompressed
-    /// `.json` next to it for future reads.
+    /// must read it and decompress in-memory, WITHOUT writing a
+    /// decompressed `.json` next to it (zip-only contract).
     #[test]
-    fn cache_reads_zip_and_writes_decompressed_json() {
+    fn cache_reads_zip_without_writing_decompressed_json() {
         let temp = fresh_temp_dir("zip_fallback");
         let _guard = CwdGuard::enter(&temp);
 
@@ -1170,19 +1127,15 @@ mod hp_cache_tests {
         let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
-        // After read, the .json must exist (decompressed copy written
-        // for future fast reads).
-        assert!(json_path.exists(),
-            "uncompressed .json should be written next to .zip after first read");
-        // And its contents should be the original payload.
-        let written = std::fs::read_to_string(&json_path).unwrap();
-        assert_eq!(written, payload,
-            "decompressed copy must match original zipped payload");
+        // Zip-only contract: reading from the .json.zip must NOT write a
+        // decompressed .json — the zip is read in-memory each time.
+        assert!(!json_path.exists(),
+            "zip-only: no decompressed .json should be written after read");
     }
 
     /// Compute-and-cache test: when neither `.json` nor `.json.zip`
     /// exists, the toolkit must compute fresh and write the result
-    /// to the uncompressed `.json` path.
+    /// to the `.json.zip` path (zip-only — no uncompressed `.json`).
     #[test]
     fn cache_computes_fresh_and_writes_json() {
         let temp = fresh_temp_dir("compute_fresh");
@@ -1195,13 +1148,19 @@ mod hp_cache_tests {
 
         let json_path = temp.join("data").join("gl_cache")
             .join(format!("prec{}_npts{}.json", prec, n));
+        let zip_path = temp.join("data").join("gl_cache")
+            .join(format!("prec{}_npts{}.json.zip", prec, n));
         assert!(!json_path.exists(), "cache file should not exist before compute");
+        assert!(!zip_path.exists(), "cache zip should not exist before compute");
 
         let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
-        assert!(json_path.exists(),
-            "fresh compute should write to <cwd>/data/gl_cache/...");
+        // Zip-only: fresh compute writes the .json.zip, never the .json.
+        assert!(zip_path.exists(),
+            "fresh compute should write the .json.zip to <cwd>/data/gl_cache/...");
+        assert!(!json_path.exists(),
+            "zip-only: fresh compute must not write an uncompressed .json");
 
         // Sanity: cached value should round-trip. Re-reading should
         // not recompute (fast path), and we should get back the same
@@ -1293,9 +1252,10 @@ mod hp_cache_tests {
             "JsonOnly must not have used the planted zip (smallest |node| = {})",
             smallest);
 
-        // JsonOnly writes only .json, never a .zip companion; and it must
-        // not have written a decompressed .json *from* the zip.
-        assert!(json_path.exists(), "JsonOnly should write its computed .json");
+        // Zip-only contract: JsonOnly is now a read/write no-op. It must
+        // not consult the zip and must not write any .json.
+        assert!(!json_path.exists(),
+            "zip-only: JsonOnly must not write a decompressed .json");
     }
 
     /// The remote URL is deterministically derived from `(n, prec)` using
@@ -1360,16 +1320,15 @@ mod hp_cache_tests {
         // Returned values must be structurally valid GL-600 @ HP-681.
         assert_well_formed(n, prec, &nodes, &weights);
 
-        // The remote tier must have landed the .json.zip locally, and the
-        // subsequent local-zip load must have written the decompressed
-        // .json alongside.
+        // The remote tier must have landed the .json.zip locally. Zip-only
+        // contract: no decompressed .json is written.
         assert!(zip_path.exists(),
             "remote fetch should have written the .json.zip to the local cache");
-        assert!(json_path.exists(),
-            "local-zip load should have written the decompressed .json");
+        assert!(!json_path.exists(),
+            "zip-only: local-zip load must not write a decompressed .json");
 
-        // A second call must now hit the local .json (tier 1) and return
-        // bit-identical values.
+        // A second call must now hit the local .json.zip (tier 1) and
+        // return bit-identical values.
         let (nodes2, weights2) =
             hp::gauss_legendre_nodes(n, prec, hp::CacheMode::DynamicFetch);
         assert_eq!(nodes.len(), nodes2.len());
@@ -1381,13 +1340,11 @@ mod hp_cache_tests {
         }
     }
 
-    /// v0.7.0 contract: fresh compute writes both `.json` AND
-    /// `.json.zip` alongside. The `.json` is the canonical fast-read
-    /// path; the `.zip` is a distribution artifact for paper repos
-    /// to commit.
+    /// Zip-only contract: fresh compute writes ONLY the `.json.zip`
+    /// (no uncompressed `.json`). Readers decompress in-memory on demand.
     #[test]
-    fn cache_fresh_compute_writes_json_and_zip() {
-        let temp = fresh_temp_dir("compute_writes_both");
+    fn cache_fresh_compute_writes_zip_only() {
+        let temp = fresh_temp_dir("compute_writes_zip_only");
         let _guard = CwdGuard::enter(&temp);
 
         let n = 8;
@@ -1404,26 +1361,15 @@ mod hp_cache_tests {
         let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
-        // Both files must exist after compute.
-        assert!(json_path.exists(),
-            "fresh compute should write {} (canonical fast-read path)",
-            json_path.display());
+        // Only the .zip must exist after compute.
         assert!(zip_path.exists(),
-            "fresh compute should write {} (distribution artifact)",
+            "fresh compute should write {} (the zip-only cache)",
             zip_path.display());
+        assert!(!json_path.exists(),
+            "zip-only: fresh compute must not write an uncompressed .json");
 
-        // Sanity: the .zip must be smaller than the .json (compression
-        // ratio > 1) and must round-trip back to the same data when
-        // loaded via the existing zip-read path.
-        let json_size = std::fs::metadata(&json_path).unwrap().len();
-        let zip_size = std::fs::metadata(&zip_path).unwrap().len();
-        assert!(zip_size < json_size,
-            ".json.zip ({} bytes) should be smaller than .json ({} bytes)",
-            zip_size, json_size);
-
-        // Round-trip via the zip path: delete the .json so the loader
-        // falls through to the .zip, then verify nodes/weights match.
-        std::fs::remove_file(&json_path).unwrap();
+        // Round-trip: a second read goes through the zip again (no .json
+        // exists) and must yield bit-identical nodes/weights.
         let (nodes2, weights2) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_eq!(nodes.len(), nodes2.len());
         for (a, b) in nodes.iter().zip(nodes2.iter()) {
@@ -1530,7 +1476,7 @@ mod hp_cache_tests {
             "Σ x_i w_i should be 0; got {}", abs_moment);
     }
 
-    /// A structurally-invalid `.json` (shape OK, but values violate
+    /// A structurally-invalid `.json.zip` (shape OK, but values violate
     /// Σ w_i = 2 and antisymmetry) must be discarded by the
     /// structural validator, falling through to fresh compute.
     /// The bad file is preserved on disk (not deleted).
@@ -1547,10 +1493,20 @@ mod hp_cache_tests {
         // The legacy fake_gl_json produces shape-valid but
         // structurally-invalid data (nodes = [0.0000000000, ...],
         // weights = [0.0000000006, ...]; sum of weights ≠ 2,
-        // nodes not antisymmetric).
+        // nodes not antisymmetric). Plant it inside a .json.zip (the
+        // only tier that's read now).
         let bad_payload = fake_gl_json(n);
-        let json_path = cache_dir.join(format!("prec{}_npts{}.json", prec, n));
-        std::fs::write(&json_path, &bad_payload).unwrap();
+        let zip_path = cache_dir.join(format!("prec{}_npts{}.json.zip", prec, n));
+        {
+            use std::io::Write;
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file(format!("prec{}_npts{}.json", prec, n), opts).unwrap();
+            zw.write_all(bad_payload.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
 
         // Loading should silently fall through to fresh compute. The
         // returned values must be REAL GL nodes/weights (which pass the
@@ -1568,17 +1524,20 @@ mod hp_cache_tests {
         assert!(abs_wdiff.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false),
             "fresh compute should produce Σw=2; got Σw={}", wsum);
 
-        // The bad file is preserved (not deleted).
-        assert!(json_path.exists(),
-            "structurally-invalid file should be preserved on disk for the user to inspect");
-
-        // After load, the toolkit also wrote the freshly-computed
-        // result over the bad file at the canonical .json path
-        // (because save_gl_cache always writes after fresh compute).
-        // Reading the .json now should give the *real* GL data.
-        let now_on_disk = std::fs::read_to_string(&json_path).unwrap();
-        assert_ne!(now_on_disk, bad_payload,
-            "fresh compute should have overwritten the bad payload with valid GL data");
+        // After fresh compute, save_gl_cache overwrites the bad .json.zip
+        // with valid GL data (cleanup-then-write). Reading the zip now
+        // must give real GL data that passes structural checks.
+        assert!(zip_path.exists(), "the .json.zip should still exist after recompute");
+        let (nodes2, _w2) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
+        let mut antisym_ok = true;
+        for (a, b) in nodes2.iter().zip(nodes2.iter().rev()) {
+            let mut s = a.clone(); s += b;
+            if s.clone().abs() > Float::with_val(prec, rug::Float::parse("1e-30").unwrap()) {
+                antisym_ok = false; break;
+            }
+        }
+        assert!(antisym_ok,
+            "after recompute the cached zip should hold valid antisymmetric GL nodes");
     }
 
     /// A truncated/corrupt `.json.zip` must be detected and skipped

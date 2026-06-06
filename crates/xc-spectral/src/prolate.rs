@@ -1123,35 +1123,12 @@ pub mod hp {
     ) -> Option<Vec<Float>> {
         if mode == CacheMode::Off { return None; }
 
-        // Tier 1 (all non-Off modes): uncompressed JSON. Fast read.
-        if let Some(path) = prolate_cache_path(lambda_sq, n_grid, prec) {
-            if path.exists() {
-                match std::fs::read_to_string(&path) {
-                    Ok(data) => match parse_prolate_cache_json(&data, n_grid, prec) {
-                        Some(evals) => {
-                            if let Some(reason) = prolate_cache_structural_check(
-                                &evals, n_grid, lambda_sq, prec,
-                            ) {
-                                warn_prolate_cache_skip(&path, &reason);
-                            } else {
-                                return Some(evals);
-                            }
-                        }
-                        None => {
-                            warn_prolate_cache_skip(&path, "JSON shape mismatch or unparseable");
-                        }
-                    },
-                    Err(e) => {
-                        warn_prolate_cache_skip(&path, &format!("read failed: {}", e));
-                    }
-                }
-            }
-        }
-
-        // JsonOnly stops after the uncompressed tier.
+        // Caches are zip-only: read straight from the .json.zip
+        // (decompress in memory), never write a decompressed .json.
+        // JsonOnly is now a read no-op (kept for API compatibility).
         if mode == CacheMode::JsonOnly { return None; }
 
-        // Tier 2 (JsonZip, DynamicFetch): local zip.
+        // Tier 1 (JsonZip, DynamicFetch): local zip — in memory.
         if let Some(evals) = try_load_local_prolate_zip(lambda_sq, n_grid, prec) {
             return Some(evals);
         }
@@ -1159,11 +1136,9 @@ pub mod hp {
         // JsonZip stops after the local tiers.
         if mode == CacheMode::JsonZip { return None; }
 
-        // Tier 3 (DynamicFetch only): remote fetch from the public
+        // Tier 2 (DynamicFetch only): remote fetch from the public
         // consolidated prolate-eigvals cache repo. On success the
-        // `.json.zip` lands locally and we re-run the local-zip loader so
-        // the decompressed `.json` is written and the same validation
-        // applies.
+        // `.json.zip` lands locally and we re-run the local-zip loader.
         if fetch_remote_prolate_zip(lambda_sq, n_grid, prec) {
             if let Some(evals) = try_load_local_prolate_zip(lambda_sq, n_grid, prec) {
                 return Some(evals);
@@ -1173,10 +1148,9 @@ pub mod hp {
         None
     }
 
-    /// Load from a local `.json.zip` (tier 2). On success writes the
-    /// decompressed `.json` alongside and returns the validated
-    /// eigenvalues. Returns `None` if the zip is absent, corrupt, or
-    /// structurally invalid.
+    /// Load from a local `.json.zip`. Decompresses in memory; does NOT
+    /// write a decompressed `.json`. Returns the validated eigenvalues,
+    /// or `None` if the zip is absent, corrupt, or structurally invalid.
     fn try_load_local_prolate_zip(
         lambda_sq: u64, n_grid: usize, prec: u32,
     ) -> Option<Vec<Float>> {
@@ -1184,16 +1158,13 @@ pub mod hp {
         if !zip_path.exists() { return None; }
         let json_filename = prolate_cache_filename(lambda_sq, n_grid, prec);
         match load_prolate_eigvals_from_zip(&zip_path, &json_filename, n_grid, prec) {
-            Some((evals, json_string)) => {
+            Some((evals, _json_string)) => {
                 if let Some(reason) = prolate_cache_structural_check(
                     &evals, n_grid, lambda_sq, prec,
                 ) {
                     warn_prolate_cache_skip(&zip_path, &reason);
                     None
                 } else {
-                    if let Some(json_path) = prolate_cache_path(lambda_sq, n_grid, prec) {
-                        let _ = std::fs::write(&json_path, &json_string);
-                    }
                     Some(evals)
                 }
             }
@@ -1291,8 +1262,8 @@ pub mod hp {
     fn save_prolate_eigvals_cache(
         lambda_sq: u64, n_grid: usize, prec: u32, evals: &[Float], mode: CacheMode,
     ) {
-        // Off writes nothing.
-        if mode == CacheMode::Off { return; }
+        // Off and JsonOnly write nothing: the cache is zip-only.
+        if matches!(mode, CacheMode::Off | CacheMode::JsonOnly) { return; }
 
         let strs: Vec<String> = evals.iter().map(|f| f.to_string()).collect();
         let json = serde_json::Value::Array(
@@ -1303,19 +1274,9 @@ pub mod hp {
             Err(_) => return,
         };
 
-        // Always write the uncompressed `.json` first (fast next-read path).
-        let json_path = match prolate_cache_path(lambda_sq, n_grid, prec) {
-            Some(p) => p,
-            None => return,
-        };
-        if std::fs::write(&json_path, &json_str).is_err() { return; }
-
-        // JsonOnly writes only the `.json`; no zip companion.
-        if mode == CacheMode::JsonOnly { return; }
-
-        // JsonZip / DynamicFetch: also write a single `.json.zip` for
-        // distribution. The spectrum is small, so this is always a single
-        // zip (no byte-split tier — unlike τ).
+        // Write ONLY a single `.json.zip`. Readers decompress on demand —
+        // no uncompressed `.json` is persisted. The spectrum is small, so
+        // this is always a single zip (no byte-split tier — unlike τ).
         let entry_name = prolate_cache_filename(lambda_sq, n_grid, prec);
         let zip_path = match prolate_cache_zip_path(lambda_sq, n_grid, prec) {
             Some(p) => p,
@@ -2348,27 +2309,28 @@ pub mod hp {
             save_prolate_eigvals_cache(lambda_sq, n_grid, prec, &evals, CacheMode::Off);
             assert!(load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::Off).is_none(),
                 "Off should never read");
-            assert!(load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::JsonOnly).is_none(),
+            assert!(load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::JsonZip).is_none(),
                 "Off save should have written nothing");
 
-            // JsonZip: writes .json + .json.zip; reads back identical.
+            // JsonZip: writes ONLY the .json.zip (zip-only contract);
+            // reads back identical by decompressing in memory.
             save_prolate_eigvals_cache(lambda_sq, n_grid, prec, &evals, CacheMode::JsonZip);
+
+            // No uncompressed .json should be written.
+            let jp = temp.join("data").join("prolate_eigvals_cache")
+                .join(prolate_cache_filename(lambda_sq, n_grid, prec));
+            assert!(!jp.exists(), "zip-only: save must not write an uncompressed .json");
+
             let got = load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::JsonZip)
-                .expect("JsonZip round-trip should load");
+                .expect("JsonZip round-trip should load from the zip");
             assert_eq!(got.len(), evals.len());
             for (a, b) in evals.iter().zip(got.iter()) {
                 assert_eq!(a.to_string(), b.to_string(), "eigenvalue must round-trip exactly");
             }
 
-            // Remove the .json so the next read must use the .zip tier.
-            let jp = temp.join("data").join("prolate_eigvals_cache")
-                .join(prolate_cache_filename(lambda_sq, n_grid, prec));
-            std::fs::remove_file(&jp).unwrap();
-            let from_zip = load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::JsonZip)
-                .expect("zip-tier load should succeed after .json removed");
-            for (a, b) in evals.iter().zip(from_zip.iter()) {
-                assert_eq!(a.to_string(), b.to_string(), "zip-tier eigenvalue must match");
-            }
+            // JsonOnly is now a read no-op (no uncompressed .json exists).
+            assert!(load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::JsonOnly).is_none(),
+                "zip-only: JsonOnly must not read the zip");
 
             drop(_guard);
             let _ = std::fs::remove_dir_all(&temp);
@@ -2394,16 +2356,29 @@ pub mod hp {
 
             let dir = temp.join("data").join("prolate_eigvals_cache");
             std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join(prolate_cache_filename(lambda_sq, n_grid, prec));
+            let entry_name = prolate_cache_filename(lambda_sq, n_grid, prec);
+            let zip_path = dir.join(format!("{}.zip", entry_name));
             let strs: Vec<String> = bad.iter().map(|f| f.to_string()).collect();
             let json = serde_json::Value::Array(
                 strs.into_iter().map(serde_json::Value::String).collect());
-            std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+            let json_str = serde_json::to_string(&json).unwrap();
 
-            assert!(load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::JsonOnly).is_none(),
-                "descending (non-ascending) spectrum must be skipped");
-            assert!(path.exists(),
-                "structurally-invalid file should be preserved for inspection");
+            // Plant the bad spectrum inside a .json.zip (only tier read now).
+            {
+                use std::io::Write;
+                let f = std::fs::File::create(&zip_path).unwrap();
+                let mut zw = zip::ZipWriter::new(f);
+                let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated);
+                zw.start_file(&entry_name, opts).unwrap();
+                zw.write_all(json_str.as_bytes()).unwrap();
+                zw.finish().unwrap();
+            }
+
+            assert!(load_prolate_eigvals_cache(lambda_sq, n_grid, prec, CacheMode::JsonZip).is_none(),
+                "descending (non-ascending) spectrum in the zip must be skipped");
+            assert!(zip_path.exists(),
+                "structurally-invalid zip should be preserved for inspection");
 
             drop(_guard);
             let _ = std::fs::remove_dir_all(&temp);

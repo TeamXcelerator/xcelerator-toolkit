@@ -912,30 +912,14 @@ mod tau_cache {
         use xc_numerics::quadrature::CacheMode;
         if mode == CacheMode::Off { return None; }
 
-        // Tier 1 (all non-Off modes): uncompressed JSON. Fast read.
-        if let Some(path) = json_path(lambda_sq, n_modes, prec) {
-            if path.exists() {
-                match std::fs::read_to_string(&path) {
-                    Ok(data) => match parse_json(&data, n_modes, prec) {
-                        Some(tau) => {
-                            if let Some(reason) = structural_check(&tau, n_modes, prec) {
-                                warn_skip(&path, &reason);
-                            } else {
-                                return Some(tau);
-                            }
-                        }
-                        None => warn_skip(&path, "JSON shape mismatch or unparseable"),
-                    },
-                    Err(e) => warn_skip(&path, &format!("read failed: {}", e)),
-                }
-            }
-        }
-
-        // JsonOnly stops after the uncompressed tier.
+        // Caches are zip-only: we read straight from the .json.zip
+        // (decompress in memory) and never write a decompressed .json.
+        // Keeps local disk usage ~2x smaller. JsonOnly is now a read
+        // no-op (kept for API compatibility) since no .json is written.
         if mode == CacheMode::JsonOnly { return None; }
 
-        // Tier 2 (JsonZip, DynamicFetch): local zip — single first, then
-        // multi-part. Both write the decompressed .json on success.
+        // Tier 1 (JsonZip, DynamicFetch): local zip — single first, then
+        // multi-part. Decompressed in memory; no .json written.
         if let Some(tau) = try_load_local_zip(lambda_sq, n_modes, prec) {
             return Some(tau);
         }
@@ -943,11 +927,10 @@ mod tau_cache {
         // JsonZip stops after the local tiers.
         if mode == CacheMode::JsonZip { return None; }
 
-        // Tier 3 (DynamicFetch only): remote fetch from the public
+        // Tier 2 (DynamicFetch only): remote fetch from the public
         // consolidated τ-cache repo. Probe the single zip first, then the
         // byte-split parts. On success the file(s) land in the local
-        // cache dir; we then re-run the local-zip loader so the
-        // decompressed .json is written and the same validation applies.
+        // cache dir; we then re-run the local-zip loader.
         if fetch_remote(lambda_sq, n_modes, prec) {
             if let Some(tau) = try_load_local_zip(lambda_sq, n_modes, prec) {
                 return Some(tau);
@@ -958,9 +941,9 @@ mod tau_cache {
     }
 
     /// Attempt to load a config from a local single zip, then local
-    /// multi-part parts (tier 2). On success writes the decompressed
-    /// `.json` alongside and returns the matrix. Returns `None` if no
-    /// local zip/parts exist or they fail validation.
+    /// multi-part parts. Decompresses in memory; does NOT write a
+    /// decompressed `.json`. Returns `None` if no local zip/parts exist
+    /// or they fail validation.
     fn try_load_local_zip(lambda_sq: u64, n_modes: usize, prec: u32) -> Option<Vec<Float>> {
         let json_filename = cache_filename(lambda_sq, n_modes, prec);
 
@@ -969,13 +952,10 @@ mod tau_cache {
             if zp.exists() {
                 match std::fs::read(&zp) {
                     Ok(bytes) => match read_single_zip(&bytes, &json_filename, n_modes, prec) {
-                        Some((tau, data)) => {
+                        Some((tau, _data)) => {
                             if let Some(reason) = structural_check(&tau, n_modes, prec) {
                                 warn_skip(&zp, &reason);
                             } else {
-                                if let Some(jp) = json_path(lambda_sq, n_modes, prec) {
-                                    let _ = std::fs::write(&jp, &data);
-                                }
                                 return Some(tau);
                             }
                         }
@@ -990,13 +970,10 @@ mod tau_cache {
         if let Some(parts) = part_paths(lambda_sq, n_modes, prec) {
             let first_part_path = parts.first().cloned().unwrap_or_default();
             match read_split_zip_parts(&parts, &json_filename, n_modes, prec) {
-                Some((tau, data)) => {
+                Some((tau, _data)) => {
                     if let Some(reason) = structural_check(&tau, n_modes, prec) {
                         warn_skip(&first_part_path, &format!("{} (split parts)", reason));
                     } else {
-                        if let Some(jp) = json_path(lambda_sq, n_modes, prec) {
-                            let _ = std::fs::write(&jp, &data);
-                        }
                         return Some(tau);
                     }
                 }
@@ -1243,26 +1220,20 @@ mod tau_cache {
         mode: xc_numerics::quadrature::CacheMode,
     ) {
         use xc_numerics::quadrature::CacheMode;
-        // Off writes nothing.
-        if mode == CacheMode::Off { return; }
+        // Off and JsonOnly write nothing: the cache is zip-only (we never
+        // persist a decompressed .json), so only JsonZip / DynamicFetch
+        // produce output.
+        if matches!(mode, CacheMode::Off | CacheMode::JsonOnly) { return; }
 
-        // Always write the uncompressed JSON first (it's the fast-read
-        // path; subsequent loads bypass zip entirely).
+        // Serialize to JSON in memory.
         let json_bytes = serialize_to_json(tau);
         if json_bytes.is_empty() { return; }
 
         cleanup_previous(lambda_sq, n_modes, prec);
 
-        if let Some(jp) = json_path(lambda_sq, n_modes, prec) {
-            let _ = std::fs::write(&jp, &json_bytes);
-        }
-
-        // JsonOnly writes only the uncompressed .json; no zip companion.
-        if mode == CacheMode::JsonOnly { return; }
-
-        // JsonZip / DynamicFetch: also write a compressed copy for
-        // distribution. Decide single-zip vs multi-part split based on
-        // compressed size.
+        // Write ONLY the compressed copy. Readers decompress from the zip
+        // on demand — no uncompressed .json is persisted. Decide single-zip
+        // vs multi-part split based on compressed size.
         let entry_name = cache_filename(lambda_sq, n_modes, prec);
         let zip_bytes = compress_to_zip(&json_bytes, &entry_name);
         if zip_bytes.is_empty() { return; }
@@ -1733,23 +1704,12 @@ mod weil_eigvec_cache {
     ) -> Option<CachedXi> {
         if mode == CacheMode::Off { return None; }
 
-        // Tier 1 (all non-Off modes): uncompressed JSON. Fast read.
-        if let Some(path) = json_path(lambda_sq, n_modes, prec, force_even) {
-            if path.exists() {
-                match std::fs::read_to_string(&path) {
-                    Ok(data) => match parse_json(&data, lambda_sq, n_modes, prec) {
-                        Some(c) => return Some(c),
-                        None => warn_skip(&path, "JSON shape / metadata mismatch or unparseable"),
-                    },
-                    Err(e) => warn_skip(&path, &format!("read failed: {}", e)),
-                }
-            }
-        }
-
-        // JsonOnly stops after the uncompressed tier.
+        // Caches are zip-only: read straight from the .json.zip
+        // (decompress in memory), never write a decompressed .json.
+        // JsonOnly is now a read no-op (kept for API compatibility).
         if mode == CacheMode::JsonOnly { return None; }
 
-        // Tier 2 (JsonZip, DynamicFetch): local single zip.
+        // Tier 1 (JsonZip, DynamicFetch): local single zip — in memory.
         if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec, force_even) {
             return Some(c);
         }
@@ -1757,9 +1717,9 @@ mod weil_eigvec_cache {
         // JsonZip stops after the local tiers.
         if mode == CacheMode::JsonZip { return None; }
 
-        // Tier 3 (DynamicFetch only): remote fetch (single zip; no parts,
+        // Tier 2 (DynamicFetch only): remote fetch (single zip; no parts,
         // ξ is small). On success the zip lands locally and we re-run the
-        // local-zip loader so the decompressed .json is written.
+        // local-zip loader.
         if fetch_remote_zip(lambda_sq, n_modes, prec, force_even) {
             if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec, force_even) {
                 return Some(c);
@@ -1769,18 +1729,13 @@ mod weil_eigvec_cache {
         None
     }
 
-    /// Load from a local single zip (tier 2). On success writes the
-    /// decompressed `.json` alongside and returns the parsed entry.
+    /// Load from a local single zip. Decompresses in memory; does NOT
+    /// write a decompressed `.json`. Returns the parsed entry or None.
     fn try_load_local_zip(lambda_sq: u64, n_modes: usize, prec: u32, force_even: bool) -> Option<CachedXi> {
         let zp = zip_path(lambda_sq, n_modes, prec, force_even)?;
         if !zp.exists() { return None; }
         match read_single_zip(&zp, lambda_sq, n_modes, prec, force_even) {
-            Some((parsed, json_string)) => {
-                if let Some(jp) = json_path(lambda_sq, n_modes, prec, force_even) {
-                    let _ = std::fs::write(&jp, &json_string);
-                }
-                Some(parsed)
-            }
+            Some((parsed, _json_string)) => Some(parsed),
             None => {
                 warn_skip(&zp, "zip open / decompress / shape parse failed");
                 None
@@ -1891,24 +1846,17 @@ mod weil_eigvec_cache {
         lambda_sq: u64, n_modes: usize, prec: u32,
         eps_n: &Float, xi: &[Float], mode: CacheMode, force_even: bool,
     ) {
-        if mode == CacheMode::Off { return; }
+        // Off and JsonOnly write nothing: the cache is zip-only.
+        if matches!(mode, CacheMode::Off | CacheMode::JsonOnly) { return; }
 
         let json_bytes = serialize_to_json(lambda_sq, n_modes, prec, eps_n, xi);
         if json_bytes.is_empty() { return; }
 
         cleanup_previous(lambda_sq, n_modes, prec, force_even);
 
-        // Always write the uncompressed JSON first (fast-read path).
-        if let Some(jp) = json_path(lambda_sq, n_modes, prec, force_even) {
-            let _ = std::fs::write(&jp, &json_bytes);
-        }
-
-        // JsonOnly writes only the uncompressed .json; no zip companion.
-        if mode == CacheMode::JsonOnly { return; }
-
-        // JsonZip / DynamicFetch: also write a compressed copy for
-        // distribution. ξ is small, so this is always a single zip (no
-        // byte-split tier — unlike τ).
+        // Write ONLY the compressed copy. Readers decompress from the zip
+        // on demand — no uncompressed .json is persisted. ξ is small, so
+        // this is always a single zip (no byte-split tier — unlike τ).
         let entry_name = cache_filename(lambda_sq, n_modes, prec, force_even);
         let zip_bytes = compress_to_zip(&json_bytes, &entry_name);
         if zip_bytes.is_empty() { return; }
@@ -2343,7 +2291,8 @@ mod tests {
 
         let dir = temp.join("data").join("tau_cache");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(cache_filename(lambda_sq, n_modes, prec));
+        let entry_name = cache_filename(lambda_sq, n_modes, prec);
+        let zip_path = dir.join(format!("{}.zip", entry_name));
 
         // Build a correctly-shaped matrix, then break symmetry at one
         // off-diagonal pair so structural_check rejects it.
@@ -2359,17 +2308,30 @@ mod tests {
         let strs: Vec<String> = m.iter().map(|f| f.to_string()).collect();
         let json = serde_json::Value::Array(
             strs.into_iter().map(serde_json::Value::String).collect());
-        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let json_str = serde_json::to_string(&json).unwrap();
 
-        // load must skip the asymmetric matrix (None).
+        // Plant the bad matrix inside a .json.zip (the only tier read now).
+        {
+            use std::io::Write;
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file(&entry_name, opts).unwrap();
+            zw.write_all(json_str.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
+
+        // load must skip the asymmetric matrix (None). JsonOnly is a
+        // read no-op; JsonZip reads the zip, runs structural_check, rejects.
         assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly).is_none(),
-            "structurally-invalid (asymmetric) τ .json must be skipped");
+            "JsonOnly is a read no-op under the zip-only contract");
         assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip).is_none(),
-            "structurally-invalid τ .json must be skipped (no zip either)");
+            "structurally-invalid (asymmetric) τ matrix in the zip must be skipped");
 
         // Bad file preserved on disk.
-        assert!(path.exists(),
-            "structurally-invalid τ file should be preserved for inspection");
+        assert!(zip_path.exists(),
+            "structurally-invalid τ zip should be preserved for inspection");
 
         drop(_guard);
         let _ = std::fs::remove_dir_all(&temp);
@@ -2617,13 +2579,20 @@ mod tests {
         save(lambda_sq, n_modes, prec, &eps, &xi, CacheMode::Off, true);
         assert!(load(lambda_sq, n_modes, prec, CacheMode::Off, true).is_none(),
             "Off should never read");
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly, true).is_none(),
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true).is_none(),
             "Off save should have written nothing");
 
-        // JsonZip: writes .json + .json.zip; reads back identical.
+        // JsonZip: writes ONLY the .json.zip (zip-only contract); reads
+        // back identical by decompressing in memory.
         save(lambda_sq, n_modes, prec, &eps, &xi, CacheMode::JsonZip, true);
+
+        // No uncompressed .json should be written.
+        let jp = temp.join("data").join("weil_eigvec_cache")
+            .join(super::weil_eigvec_cache::cache_filename(lambda_sq, n_modes, prec, true));
+        assert!(!jp.exists(), "zip-only: save must not write an uncompressed .json");
+
         let got = load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true)
-            .expect("JsonZip round-trip should load");
+            .expect("JsonZip round-trip should load from the zip");
         assert_eq!(got.xi.len(), dim);
         for (a, b) in xi.iter().zip(got.xi.iter()) {
             assert_eq!(a.to_string(), b.to_string(), "xi entry must round-trip exactly");
@@ -2631,25 +2600,18 @@ mod tests {
         assert_eq!(eps.to_string(), got.eps_n.to_string(),
             "eps_n must round-trip exactly");
 
-        // Remove the .json so the next read must use the .zip tier.
-        let jp = temp.join("data").join("weil_eigvec_cache")
-            .join(super::weil_eigvec_cache::cache_filename(lambda_sq, n_modes, prec, true));
-        std::fs::remove_file(&jp).unwrap();
-        let from_zip = load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true)
-            .expect("zip-tier load should succeed after .json removed");
-        for (a, b) in xi.iter().zip(from_zip.xi.iter()) {
-            assert_eq!(a.to_string(), b.to_string(), "zip-tier xi must match");
-        }
+        // JsonOnly is now a read no-op (no uncompressed .json exists).
+        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly, true).is_none(),
+            "zip-only: JsonOnly must not read the zip");
 
         drop(_guard);
         let _ = std::fs::remove_dir_all(&temp);
     }
 
-    /// Negative: a structurally-invalid ξ `.json` (parseable JSON but
-    /// wrong xi length / mismatched metadata) must be skipped by `load`
-    /// (returns `None`, treated as a miss → caller recomputes). The bad
-    /// file is preserved on disk for inspection. Mirrors the GL cache's
-    /// `cache_discards_structurally_invalid_json_and_recomputes`.
+    /// Negative: a structurally-invalid ξ entry (parseable JSON but
+    /// wrong xi length / mismatched metadata) inside a `.json.zip` must
+    /// be skipped by `load` (returns `None`, treated as a miss → caller
+    /// recomputes). The bad file is preserved on disk for inspection.
     #[test]
     fn weil_eigvec_load_skips_structurally_invalid_json() {
         use super::weil_eigvec_cache::{load, cache_filename};
@@ -2663,7 +2625,8 @@ mod tests {
 
         let dir = temp.join("data").join("weil_eigvec_cache");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(cache_filename(lambda_sq, n_modes, prec, true));
+        let entry_name = cache_filename(lambda_sq, n_modes, prec, true);
+        let zip_path = dir.join(format!("{}.zip", entry_name));
 
         // Shape-parseable JSON, but xi has the WRONG length (3 ≠ 9)
         // and otherwise-valid metadata. parse_json must reject it.
@@ -2675,18 +2638,28 @@ mod tests {
             "weil_min_eigenvalue": "1.0e-20",
             "xi": ["1.0", "2.0", "3.0"],
         }).to_string();
-        std::fs::write(&path, &bad).unwrap();
+
+        // Plant the bad entry inside a .json.zip (the only tier read now).
+        {
+            use std::io::Write;
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file(&entry_name, opts).unwrap();
+            zw.write_all(bad.as_bytes()).unwrap();
+            zw.finish().unwrap();
+        }
 
         // load must skip (None) — never returns a malformed entry.
         assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly, true).is_none(),
-            "structurally-invalid .json must be skipped");
+            "JsonOnly is a read no-op under the zip-only contract");
         assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true).is_none(),
-            "structurally-invalid .json must be skipped (zip tier has nothing either)");
+            "structurally-invalid ξ entry in the zip must be skipped");
 
-        // The bad file is preserved on disk (load does not delete it;
-        // only a recompute+save would overwrite it).
-        assert!(path.exists(),
-            "structurally-invalid file should be preserved for inspection");
+        // The bad file is preserved on disk (load does not delete it).
+        assert!(zip_path.exists(),
+            "structurally-invalid zip should be preserved for inspection");
 
         drop(_guard);
         let _ = std::fs::remove_dir_all(&temp);
