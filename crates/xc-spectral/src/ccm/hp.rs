@@ -987,19 +987,28 @@ mod tau_cache {
         None
     }
 
-    /// Base raw URL of the public consolidated τ-cache repository.
-    const REMOTE_BASE: &str =
-        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache/main";
+    /// Base raw URLs of the public τ-cache repositories, in probe order.
+    ///
+    /// The toolkit checks each repo in sequence during a remote fetch and
+    /// stops at the first hit. Repo-1 is checked first (it holds all
+    /// fixtures generated before the split); repo-2 holds all fixtures
+    /// generated after the split. Adding a third repo in the future is a
+    /// one-line change here.
+    const REMOTE_BASES: &[&str] = &[
+        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache/main",
+        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache-2/main",
+    ];
 
-    /// Remote directory (and filename stem) for a config, using the
-    /// repo's precision-first → λ² → nmodes-thousand-bucket layout.
-    /// Returns `(dir_url, filename)` where `filename` is the canonical
-    /// `lambda_sq{L}_nmodes{N}_prec{P}.json.zip` stem.
-    fn remote_dir_and_stem(lambda_sq: u64, n_modes: usize, prec: u32) -> (String, String) {
+    /// Remote directory URL (and filename stem) for a config in a
+    /// specific base repo, using the precision-first → λ² →
+    /// nmodes-thousand-bucket layout.
+    /// Returns `(dir_url, stem)` where `stem` is the canonical
+    /// `lambda_sq{L}_nmodes{N}_prec{P}.json.zip` filename.
+    fn remote_dir_and_stem(base: &str, lambda_sq: u64, n_modes: usize, prec: u32) -> (String, String) {
         let bucket = (n_modes / 1000) * 1000;
         let dir = format!(
             "{base}/tau_cache/prec{p}/lambda_sq{l}/nmodes{b}-{bend}",
-            base = REMOTE_BASE, p = prec, l = lambda_sq, b = bucket, bend = bucket + 999
+            base = base, p = prec, l = lambda_sq, b = bucket, bend = bucket + 999
         );
         let stem = format!("{}.zip", cache_filename(lambda_sq, n_modes, prec));
         (dir, stem)
@@ -1007,12 +1016,14 @@ mod tau_cache {
 
     /// Test-only accessor for `remote_dir_and_stem` (the function is
     /// private; this lets the test module assert URL formatting without
-    /// widening the API).
+    /// widening the API). Returns results for all configured bases.
     #[cfg(test)]
     pub(super) fn remote_dir_and_stem_for_test(
         lambda_sq: u64, n_modes: usize, prec: u32,
-    ) -> (String, String) {
-        remote_dir_and_stem(lambda_sq, n_modes, prec)
+    ) -> Vec<(String, String)> {
+        REMOTE_BASES.iter()
+            .map(|base| remote_dir_and_stem(base, lambda_sq, n_modes, prec))
+            .collect()
     }
 
     /// Outcome of a single `curl` download attempt, classified by the
@@ -1093,82 +1104,97 @@ mod tau_cache {
         CurlOutcome::Transient
     }
 
-    /// Download a config from the public τ-cache repo into the local
-    /// cache dir. Probes the **single zip first**; if that 404s, probes
-    /// the byte-split parts `.part00`, `.part01`, … and stops only when
-    /// a part returns an HTTP error (404 = genuine end-of-parts).
+    /// Download a config from the public τ-cache repos into the local
+    /// cache dir. Iterates over `REMOTE_BASES` in order, trying each
+    /// repo until one contains the file.
+    ///
+    /// Within each repo, probes the **single zip first**; if that 404s,
+    /// probes the byte-split parts `.part00`, `.part01`, … and stops only
+    /// when a part returns an HTTP error (404 = genuine end-of-parts).
     ///
     /// A *transient* failure on any part (after retries) aborts the whole
-    /// fetch and returns `false` — we must never silently truncate a
-    /// multi-part config, because concatenating a partial set produces a
-    /// corrupt zip. On abort, any downloaded parts are removed so a stale
-    /// partial set can't be mistaken for a complete one on a later load.
+    /// fetch for that repo and tries the next repo — we must never
+    /// silently truncate a multi-part config. On abort, any downloaded
+    /// parts are removed so a stale partial set can't be mistaken for a
+    /// complete one on a later load.
     ///
     /// Mirrors the local read order (single → parts) so the subsequent
     /// `try_load_local_zip` finds and validates whatever was fetched.
     fn fetch_remote(lambda_sq: u64, n_modes: usize, prec: u32) -> bool {
         let dir = match cache_dir() { Some(d) => d, None => return false };
-        let (remote_dir, stem) = remote_dir_and_stem(lambda_sq, n_modes, prec);
 
-        // Probe 1: single zip.
-        let single_url = format!("{}/{}", remote_dir, stem);
-        let single_dest = dir.join(&stem);
-        match curl_with_retries(&single_url, &single_dest) {
-            CurlOutcome::Ok => {
-                // Routine cache hit — silent.
+        for base in REMOTE_BASES {
+            let (remote_dir, stem) = remote_dir_and_stem(base, lambda_sq, n_modes, prec);
+
+            // Probe 1: single zip.
+            let single_url = format!("{}/{}", remote_dir, stem);
+            let single_dest = dir.join(&stem);
+            match curl_with_retries(&single_url, &single_dest) {
+                CurlOutcome::Ok => {
+                    // Routine cache hit — silent.
+                    return true;
+                }
+                CurlOutcome::Transient => {
+                    // Network trouble on this repo's single-zip probe;
+                    // skip to the next repo.
+                    continue;
+                }
+                // HttpError (404): no single zip in this repo — may be
+                // byte-split, or not present here at all.
+                CurlOutcome::HttpError => {}
+            }
+
+            // Probe 2: byte-split parts. Download .part00, .part01, … until
+            // an HTTP error (404) marks the genuine end. A transient failure
+            // aborts this repo and tries the next — never a silent truncation.
+            let mut downloaded: Vec<std::path::PathBuf> = Vec::new();
+            let mut idx = 0usize;
+            let mut transient_abort = false;
+            loop {
+                let part_name = format!("{}.part{:02}", stem, idx);
+                let part_url = format!("{}/{}", remote_dir, part_name);
+                let part_dest = dir.join(&part_name);
+                match curl_with_retries(&part_url, &part_dest) {
+                    CurlOutcome::Ok => {
+                        downloaded.push(part_dest);
+                        idx += 1;
+                        if idx > 256 { break; } // safety cap
+                        // Brief inter-part pause to stay under
+                        // raw.githubusercontent.com's burst rate limit
+                        // (datacenter IPs trip 429 on rapid sequential
+                        // requests). Cheap insurance vs. a retry storm.
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                    CurlOutcome::HttpError => break, // genuine end-of-parts (or file not in this repo)
+                    CurlOutcome::Transient => {
+                        // Could not retrieve a part that may well exist.
+                        // Abort: remove everything downloaded so a partial
+                        // set is never concatenated into a corrupt zip.
+                        eprintln!(
+                            "[tau_cache] WARNING: transient failure fetching {} after retries; \
+                             trying next repo",
+                            part_name
+                        );
+                        for p in &downloaded { let _ = std::fs::remove_file(p); }
+                        transient_abort = true;
+                        break;
+                    }
+                }
+            }
+
+            if transient_abort {
+                continue; // try next repo
+            }
+
+            if !downloaded.is_empty() {
+                // Routine multi-part cache hit — silent.
                 return true;
             }
-            CurlOutcome::Transient => {
-                // Network trouble even for the single-zip probe; give up
-                // (caller falls through to compute).
-                return false;
-            }
-            // HttpError (404): no single zip — this config is byte-split.
-            CurlOutcome::HttpError => {}
+
+            // No single zip and no parts in this repo — try the next one.
         }
 
-        // Probe 2: byte-split parts. Download .part00, .part01, … until
-        // an HTTP error (404) marks the genuine end. A transient failure
-        // aborts and cleans up — never a silent truncation.
-        let mut downloaded: Vec<std::path::PathBuf> = Vec::new();
-        let mut idx = 0usize;
-        loop {
-            let part_name = format!("{}.part{:02}", stem, idx);
-            let part_url = format!("{}/{}", remote_dir, part_name);
-            let part_dest = dir.join(&part_name);
-            match curl_with_retries(&part_url, &part_dest) {
-                CurlOutcome::Ok => {
-                    downloaded.push(part_dest);
-                    idx += 1;
-                    if idx > 256 { break; } // safety cap
-                    // Brief inter-part pause to stay under
-                    // raw.githubusercontent.com's burst rate limit
-                    // (datacenter IPs trip 429 on rapid sequential
-                    // requests). Cheap insurance vs. a retry storm.
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                }
-                CurlOutcome::HttpError => break, // genuine end-of-parts
-                CurlOutcome::Transient => {
-                    // Could not retrieve a part that may well exist.
-                    // Abort: remove everything downloaded so a partial
-                    // set is never concatenated into a corrupt zip.
-                    eprintln!(
-                        "[tau_cache] WARNING: transient failure fetching {} after retries; \
-                         aborting remote fetch and recomputing",
-                        part_name
-                    );
-                    for p in &downloaded { let _ = std::fs::remove_file(p); }
-                    return false;
-                }
-            }
-        }
-
-        if !downloaded.is_empty() {
-            // Routine multi-part cache hit — silent.
-            true
-        } else {
-            false
-        }
+        false
     }
 
     /// Serialize `tau` to JSON (decimal strings) and return the
@@ -2374,23 +2400,36 @@ mod tests {
     /// The remote τ URL is deterministically derived from
     /// `(λ², N, prec)` using the public xcelerator-tau-cache repo's
     /// precision-first → λ² → nmodes-thousand-bucket layout.
+    /// Checks that all configured bases produce correctly bucketed URLs.
     #[test]
     fn tau_remote_url_uses_bucketed_layout() {
         // λ²=1000, N=800, prec=3338 → bucket 0-999.
-        let (dir, stem) = super::tau_cache::remote_dir_and_stem_for_test(1000, 800, 3338);
+        let results = super::tau_cache::remote_dir_and_stem_for_test(1000, 800, 3338);
+        assert_eq!(results.len(), 2, "expected 2 remote bases");
         assert_eq!(
-            dir,
+            results[0].0,
             "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache/main/tau_cache/prec3338/lambda_sq1000/nmodes0-999"
         );
-        assert_eq!(stem, "lambda_sq1000_nmodes800_prec3338.json.zip");
+        assert_eq!(results[0].1, "lambda_sq1000_nmodes800_prec3338.json.zip");
+        assert_eq!(
+            results[1].0,
+            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache-2/main/tau_cache/prec3338/lambda_sq1000/nmodes0-999"
+        );
+        assert_eq!(results[1].1, "lambda_sq1000_nmodes800_prec3338.json.zip");
 
         // λ²=400, N=1500, prec=4999 → bucket 1000-1999.
-        let (dir2, stem2) = super::tau_cache::remote_dir_and_stem_for_test(400, 1500, 4999);
+        let results2 = super::tau_cache::remote_dir_and_stem_for_test(400, 1500, 4999);
+        assert_eq!(results2.len(), 2, "expected 2 remote bases");
         assert_eq!(
-            dir2,
+            results2[0].0,
             "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache/main/tau_cache/prec4999/lambda_sq400/nmodes1000-1999"
         );
-        assert_eq!(stem2, "lambda_sq400_nmodes1500_prec4999.json.zip");
+        assert_eq!(results2[0].1, "lambda_sq400_nmodes1500_prec4999.json.zip");
+        assert_eq!(
+            results2[1].0,
+            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache-2/main/tau_cache/prec4999/lambda_sq400/nmodes1000-1999"
+        );
+        assert_eq!(results2[1].1, "lambda_sq400_nmodes1500_prec4999.json.zip");
     }
 
     /// Live end-to-end remote τ-fetch test against the PUBLIC

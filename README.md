@@ -189,6 +189,10 @@ Full guideline (private):
 
 ## Version History
 
+- **v0.9.2** — τ-cache remote fetch now checks two repos (`xcelerator-tau-cache` then `xcelerator-tau-cache-2`) to support cache overflow beyond the first repo's storage limit. Adding further overflow repos is a one-line change to `REMOTE_BASES`.
+
+- **v0.9.1** — Zip-only cache: τ, GL, and Weil caches read directly from `.json.zip` in memory; no decompressed `.json` is written to disk, halving local cache storage overhead.
+
 - **v0.9.0** — DynamicFetch cache tier (GL, τ, and Weil eigenvector caches fetch from public repos on demand). Weil eigenvector (ξ) cache with bit-reproducible determinism. `force_even` field on `HighPrecConfig` (natural-eigenvector testing). Cache keys on `force_even` (forced/natural ξ stored separately).
 
 - **v0.8.0** — Parallel `lu_solve` (inner triangular-solve reductions via rayon). Eliminates the last single-core bottleneck in inverse iteration at large N.
