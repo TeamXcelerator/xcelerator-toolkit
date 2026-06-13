@@ -53,7 +53,7 @@ pub fn truncated_lambda_f64(
     let mid = 0.5 * (a + b);
     let half = 0.5 * (b - a);
 
-    let (nodes, weights) = gauss_legendre_f64(n_quad);
+    let (nodes, weights) = xc_numerics::quadrature::gl_nodes_weights_f64(n_quad);
 
     let mut sum_re = 0.0_f64;
     let mut sum_im = 0.0_f64;
@@ -99,7 +99,7 @@ pub fn xi_weighted_mellin_f64(
     let mid = 0.5 * (a + b);
     let half = 0.5 * (b - a);
 
-    let (nodes, weights) = gauss_legendre_f64(n_quad);
+    let (nodes, weights) = xc_numerics::quadrature::gl_nodes_weights_f64(n_quad);
 
     let xi_0 = xi[n_modes];
     let xi_pos: Vec<f64> = (1..=n_modes).map(|n| xi[n_modes + n]).collect();
@@ -198,40 +198,10 @@ where
     0.5 * (a + b)
 }
 
-/// Simple Gauss-Legendre nodes and weights at f64 for moderate n.
-/// Uses the standard Newton iteration on Legendre polynomials.
-fn gauss_legendre_f64(n: usize) -> (Vec<f64>, Vec<f64>) {
-    let mut nodes = vec![0.0_f64; n];
-    let mut weights = vec![0.0_f64; n];
-    for k in 0..n {
-        // Initial guess
-        let mut x = ((4 * k + 3) as f64 * std::f64::consts::PI / (4 * n + 2) as f64).cos();
-        // Newton on P_n(x)
-        for _ in 0..20 {
-            let (pn, pn_prime) = legendre_p_deriv_f64(n, x);
-            x -= pn / pn_prime;
-        }
-        let (_, pn_prime) = legendre_p_deriv_f64(n, x);
-        nodes[k] = x;
-        weights[k] = 2.0 / ((1.0 - x * x) * pn_prime * pn_prime);
-    }
-    (nodes, weights)
-}
-
-fn legendre_p_deriv_f64(n: usize, x: f64) -> (f64, f64) {
-    if n == 0 { return (1.0, 0.0); }
-    let mut p0 = 1.0_f64;
-    let mut p1 = x;
-    for k in 1..n {
-        let p_next = ((2 * k + 1) as f64 * x * p1 - k as f64 * p0) / (k + 1) as f64;
-        p0 = p1;
-        p1 = p_next;
-    }
-    let deriv = n as f64 * (x * p1 - p0) / (x * x - 1.0);
-    (p1, deriv)
-}
-
+// Reference Riemann-zero literals below are quoted at published precision
+// (more digits than f64 holds); the excess is harmless on parse.
 #[cfg(test)]
+#[allow(clippy::excessive_precision)]
 mod tests {
     use super::*;
 
@@ -297,7 +267,7 @@ mod tests {
         for (i, &rz) in riemann_zeros.iter().enumerate() {
             let closest = zeros.iter()
                 .map(|&z| (z, (z - rz).abs()))
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((z, diff)) = closest {
                 eprintln!("{:>5} {:>15.6} {:>15.6} {:>12.4e}", i + 1, z, rz, diff);
             } else {
@@ -314,7 +284,7 @@ mod tests {
     #[test]
     fn truncated_lambda_zeros_vs_riemann_at_lambda_10() {
         let lambda = 10.0;
-        let riemann_zeros = vec![
+        let riemann_zeros = [
             14.134725141734695, 21.022039638771556, 25.010857580145687,
             30.424876125859512, 32.935061587739189,
         ];
@@ -327,7 +297,7 @@ mod tests {
         for (i, &rz) in riemann_zeros.iter().enumerate() {
             let closest = zeros.iter()
                 .map(|&z| (z, (z - rz).abs()))
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((z, diff)) = closest {
                 eprintln!("{:>5} {:>15.6} {:>15.6} {:>12.4e}", i + 1, z, rz, diff);
             } else {
@@ -354,11 +324,12 @@ mod tests {
     #[test]
     fn xi_weighted_mellin_zeros_at_lambda_sqrt13() {
         // Run CCM at f64 to get ξ_λ.
-        let lambda = 13.0_f64.sqrt();
         let n_modes = 120;
-        let params = crate::ccm::CcmParams::from_lambda(lambda, n_modes);
+        let params = crate::ccm::CcmParams::from_lambda_sq_integer(13, n_modes);
         let result = crate::ccm::run_f64(&params).unwrap();
         let xi = &result.xi;
+        // λ = √13 as f64 — only used as the Mellin integral parameter.
+        let lambda = 13.0_f64.sqrt();
 
         let riemann_zeros = vec![
             14.134725141734695, 21.022039638771556, 25.010857580145687,
@@ -378,7 +349,7 @@ mod tests {
         for (i, &rz) in riemann_zeros.iter().enumerate() {
             let closest = zeros.iter()
                 .map(|&z| (z, (z - rz).abs()))
-                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((z, diff)) = closest {
                 eprintln!("{:>5} {:>15.6} {:>15.6} {:>12.4e}", i + 1, z, rz, diff);
             } else {
@@ -897,7 +868,7 @@ mod hp_tests {
         let target = Float::with_val(prec, Float::parse("14.134725141734693790457251983").unwrap());
         let closest = zeros.iter()
             .map(|z| { let mut d = z.clone(); d -= &target; d.abs() })
-            .min_by(|a, b| a.partial_cmp(b).unwrap());
+            .min_by(|a, b| a.total_cmp(b));
         let closest = closest.expect("should find at least one zero");
         let tol = { let mut v = Float::with_val(prec, 1); v /= 2u32; v };
         assert!(closest < tol,

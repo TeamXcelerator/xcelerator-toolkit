@@ -259,14 +259,14 @@ mod tests {
         // Expect ~77 (e.g. "7.7e1" or "77.06" → "7.7e1").
         // Allow a generous range — the exact value depends on integer
         // arithmetic in matching_digits.
-        let m_f64 = (prec as f64) * 0.30103;
+        let m_f64 = (prec as f64) * std::f64::consts::LOG10_2;
         let m_int = m_f64 as u64;
         assert!(s.starts_with(&format!("{}", m_int)) ||
                 s.starts_with(&format!("{}", m_int - 1)) ||
                 s.starts_with(&format!("{}", m_int + 1)) ||
-                s.starts_with(&format!("7.7")) ||
-                s.starts_with(&format!("7.6")) ||
-                s.starts_with(&format!("7.8")),
+                s.starts_with(&"7.7".to_string()) ||
+                s.starts_with(&"7.6".to_string()) ||
+                s.starts_with(&"7.8".to_string()),
             "expected matching digits near {} (= prec/3.322), got '{}'", m_int, s);
     }
 

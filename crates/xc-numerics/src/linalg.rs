@@ -557,28 +557,48 @@ pub fn inverse_iteration(
     max_steps: usize,
     force_even: bool,
 ) -> Result<(Float, Vec<Float>)> {
+    inverse_iteration_from(a, dim, prec, max_steps, force_even, None)
+}
+
+/// Inverse iteration with an optional warm-start vector.
+/// When `start` is `Some(v)`, uses `v` as the initial guess instead of
+/// the Gaussian. When `None`, falls back to the Gaussian initial guess.
+/// Warm-start from a nearby-precision cached ξ
+/// dramatically reduces iteration count for P-sweep campaigns.
+pub fn inverse_iteration_from(
+    a: &[Float],
+    dim: usize,
+    prec: u32,
+    max_steps: usize,
+    force_even: bool,
+    start: Option<Vec<Float>>,
+) -> Result<(Float, Vec<Float>)> {
     let lu = lu_factor(a, dim)?;
 
-    // Initial guess: a Gaussian-shaped vector centered at the middle index,
-    // computed entirely in HP arithmetic. Each entry is independent so we
-    // parallelize via into_par_iter.
-    let mut xi: Vec<Float> = (0..dim).into_par_iter().map(|i| {
-        let center = (dim as i64) / 2;
-        let j = (i as i64) - center;
-        let half = ((dim as i64) / 2).max(1);
-        // x = j / (dim/2)
-        let mut x = Float::with_val(prec, j);
-        x /= half;
-        // x_sq = x²
-        let mut x_sq = x.clone();
-        x_sq *= &x;
-        // arg = -x² / 2 ⇒ build as 0 - x²/2
-        x_sq /= 2u32;
-        let mut arg = Float::with_val(prec, 0);
-        arg -= &x_sq;
-        // g = exp(arg)
-        arg.exp()
-    }).collect();
+    // Initial guess: warm-start from provided vector, or fall back to
+    // Gaussian centered at the middle index.
+    let mut xi: Vec<Float> = if let Some(warm) = start {
+        // Re-precision the warm-start vector (it may be at a different prec)
+        warm.into_iter().map(|v| {
+            let s = v.to_string();
+            Float::with_val(prec, Float::parse(&s).unwrap_or_else(|_| Float::parse("0").unwrap()))
+        }).collect()
+    } else {
+        // Gaussian initial guess
+        (0..dim).into_par_iter().map(|i| {
+            let center = (dim as i64) / 2;
+            let j = (i as i64) - center;
+            let half = ((dim as i64) / 2).max(1);
+            let mut x = Float::with_val(prec, j);
+            x /= half;
+            let mut x_sq = x.clone();
+            x_sq *= &x;
+            x_sq /= 2u32;
+            let mut arg = Float::with_val(prec, 0);
+            arg -= &x_sq;
+            arg.exp()
+        }).collect()
+    };
     normalize_l2(&mut xi);
 
     let mut mu = hp_zero(prec);
@@ -589,12 +609,40 @@ pub fn inverse_iteration(
         let mut v = lu_solve(&lu, &xi, dim, prec);
         normalize_l2(&mut v);
         if force_even {
-            // Forced-even projection: ξ_i ← (v_i + v_{n-1-i}) / 2.
-            // Independent per i → parallelize.
-            let xi_sym: Vec<Float> = (0..dim).into_par_iter().map(|i| {
-                let mut s = v[i].clone(); s += &v[dim - 1 - i]; s /= 2u32; s
-            }).collect();
-            xi = xi_sym;
+            // Auto-detect natural symmetry, only project
+            // when the vector is drifting odd. This avoids the overhead of
+            // projecting an already-even vector, and logs when odd drift
+            // is detected (debug mode only).
+            //
+            // Symmetry deviation: max_i |v[i] - v[dim-1-i]| / max_i |v[i]|
+            // ≈ 0 → even (no projection needed)
+            // ≈ 2 → odd (projection needed; log warning in debug)
+            let linf: Float = v.iter().map(|x| x.clone().abs())
+                .fold(hp_zero(prec), |a, b| if b > a { b } else { a });
+            let odd_dev: Float = if linf.is_zero() {
+                hp_zero(prec)
+            } else {
+                let max_asym = (0..dim).map(|i| {
+                    let mut d = v[i].clone(); d -= &v[dim - 1 - i]; d.abs()
+                }).fold(hp_zero(prec), |a, b| if b > a { b } else { a });
+                let mut rel = max_asym; rel /= &linf; rel
+            };
+            // Threshold: projection needed if deviation > 0.5 (halfway between
+            // even=0 and odd=2). Below threshold the vector is already even
+            // enough — skip projection to save cost.
+            let needs_projection = odd_dev.to_f64() > 0.5;
+            if needs_projection {
+                crate::hp_debug!(
+                    "[HP invit] step {}: natural vector is odd (deviation={:.3}), applying even projection",
+                    step + 1, odd_dev.to_f64()
+                );
+                let xi_sym: Vec<Float> = (0..dim).into_par_iter().map(|i| {
+                    let mut s = v[i].clone(); s += &v[dim - 1 - i]; s /= 2u32; s
+                }).collect();
+                xi = xi_sym;
+            } else {
+                xi = v;
+            }
         } else {
             xi = v;
         }
@@ -610,7 +658,7 @@ pub fn inverse_iteration(
                 diff.clone().abs() < Float::with_val(prec, 2).pow(-((prec as i32) - 32))
             };
             if converged {
-                eprintln!(
+                crate::hp_debug!(
                     "[HP invit] inverse iteration converged at step {}/{} on N={} (elapsed {:.1}s)",
                     step + 1, max_steps, dim, iter_start.elapsed().as_secs_f64()
                 );
@@ -621,17 +669,123 @@ pub fn inverse_iteration(
         // Progress: print every 25 steps. Useful to distinguish "still
         // iterating" from "wedged" on multi-hour runs at large N.
         if (step + 1) % 25 == 0 {
-            eprintln!(
+            crate::hp_debug!(
                 "[HP invit] inverse iteration {}/{} on N={} (elapsed {:.1}s)",
                 step + 1, max_steps, dim, iter_start.elapsed().as_secs_f64()
             );
         }
     }
+
+    // ── Part 2: Shifted inverse iteration refinement ─────────────────────
+    // The Rayleigh-quotient convergence above gives μ at full precision but
+    // ξ only at √(tol) ≈ half-precision. One step of shifted inverse
+    // iteration at μ yields a full-precision eigenvector.
+    //
+    // Solves (A − μ·I)·v = ξ_old, then normalizes. The shift makes the
+    // target eigenvalue appear near-zero, so one solve gives full-precision
+    // convergence regardless of eigenvalue gaps.
+    let shifted_a: Vec<Float> = (0..dim * dim).into_par_iter().map(|idx| {
+        let i = idx / dim;
+        let j = idx % dim;
+        let mut val = a[idx].clone();
+        if i == j {
+            val -= &mu;
+        }
+        val
+    }).collect();
+
+    match lu_factor(&shifted_a, dim) {
+        Ok(shifted_lu) => {
+            let mut xi_refined = lu_solve(&shifted_lu, &xi, dim, prec);
+            normalize_l2(&mut xi_refined);
+            if force_even {
+                let xi_sym: Vec<Float> = (0..dim).into_par_iter().map(|i| {
+                    let mut s = xi_refined[i].clone();
+                    s += &xi_refined[dim - 1 - i];
+                    s /= 2u32;
+                    s
+                }).collect();
+                xi_refined = xi_sym;
+                normalize_l2(&mut xi_refined);
+            }
+
+            // ── Part 3: Confidence check ─────────────────────────────────
+            // Recompute Rayleigh quotient on refined vector. If it differs
+            // significantly from μ, the refinement picked up a different
+            // eigenvalue (near-degeneracy cross-over). In that case, keep
+            // the original (unrefined) ξ which was at least pointing in the
+            // right direction.
+            let mu_refined = rayleigh_quotient(a, dim, &xi_refined, prec);
+            let mut check_diff = mu_refined.clone();
+            check_diff -= &mu;
+            let check_ratio = if !mu.is_zero() {
+                let mut r = check_diff.abs();
+                r /= &mu.clone().abs();
+                r
+            } else {
+                check_diff.abs()
+            };
+            // Accept refinement only if eigenvalue didn't jump (< 1% relative change)
+            let accept_tol = Float::with_val(prec, 0.01f64);
+            if check_ratio < accept_tol {
+                xi = xi_refined;
+                mu = mu_refined;
+                crate::hp_debug!(
+                    "[HP invit] shifted refinement accepted (delta_mu/mu < 1%)",
+                );
+            } else {
+                crate::hp_debug!(
+                    "[HP invit] shifted refinement REJECTED: eigenvalue jumped (delta/mu = {}), keeping original ξ",
+                    check_ratio.to_f64()
+                );
+            }
+        }
+        Err(_) => {
+            // Shifted matrix is singular (exact eigenvalue hit) — skip
+            // refinement. The unrefined ξ from inverse iteration is used.
+            crate::hp_debug!(
+                "[HP invit] shifted matrix singular at μ — skipping refinement (eigvec at sqrt-precision)",
+            );
+        }
+    }
+
+    // ── Part 1 residual check (diagnostic, not a loop — just verification) ──
+    // Compute ||A·ξ − μ·ξ||∞ for logging. This lets us track eigenvector
+    // quality across runs and detect regressions.
+    let residual_norm: Float = {
+        let residuals: Vec<Float> = (0..dim).into_par_iter().map(|i| {
+            let mut av_i = hp_zero(prec);
+            for j in 0..dim {
+                let mut t = a[i * dim + j].clone();
+                t *= &xi[j];
+                av_i += &t;
+            }
+            let mut mu_v_i = mu.clone();
+            mu_v_i *= &xi[i];
+            av_i -= &mu_v_i;
+            av_i.abs()
+        }).collect();
+        let mut max_r = hp_zero(prec);
+        for r in &residuals {
+            if *r > max_r { max_r = r.clone(); }
+        }
+        max_r
+    };
+    crate::hp_debug!(
+        "[HP invit] final residual ||Av-μv||_∞ = {} (prec={} bits, dim={})",
+        residual_norm.to_f64(), prec, dim
+    );
+
     Ok((mu, xi))
 }
 
 
+// Matrix fixtures below use the row-major index convention `a[i * dim + j]`
+// uniformly, including the `i = 0` / `j = 0` rows where `0 * dim` and `+ 0`
+// are kept for visual alignment with their neighbors. Allow the resulting
+// erasing_op / identity_op lints in this test-only module.
 #[cfg(test)]
+#[allow(clippy::erasing_op, clippy::identity_op)]
 mod tests {
     use super::*;
     use rug::Float;
@@ -722,6 +876,142 @@ mod tests {
         let mut norm_sq = hp(prec, "0");
         for vi in &v { norm_sq += vi.clone().square(); }
         assert_hp_close(&norm_sq, &hp(prec, "1"), 10, "‖v‖²");
+    }
+
+    /// Near-degenerate eigenvalues: tests that shifted refinement resolves
+    /// the correct eigenvector even when two eigenvalues are moderately close.
+    /// Matrix: diag(1.0, 1.1, 2.0, 3.0) — gap = 0.1 (10%). The unshifted
+    /// inverse iteration converges slowly (ratio 1/1.1 = 0.91 per step),
+    /// but shifted refinement at μ≈1.0 should give a clean eigenvector.
+    #[test]
+    fn inverse_iteration_near_degenerate_eigenvalues() {
+        let prec = 256;
+        let dim = 4;
+        let mut a = vec![hp(prec, "0"); dim * dim];
+        a[0 * dim + 0] = hp(prec, "1.0");
+        a[1 * dim + 1] = hp(prec, "1.1");
+        a[2 * dim + 2] = hp(prec, "2.0");
+        a[3 * dim + 3] = hp(prec, "3.0");
+        let (mu, v) = inverse_iteration(&a, dim, prec, 200, false).unwrap();
+        // Must converge to 1.0, not 1.1
+        assert_hp_close(&mu, &hp(prec, "1"), 3, "near-degenerate smallest eigenvalue");
+        // Eigenvector should be concentrated on index 0 (the 1.0 eigenspace)
+        let v0_sq = v[0].clone().square();
+        let threshold = hp(prec, "0.99");
+        assert!(v0_sq > threshold,
+            "eigenvector should be concentrated on index 0 for eigenvalue 1.0, got |v[0]|²={}",
+            v0_sq.to_f64());
+    }
+
+    /// VERY near-degenerate (gap = 0.01): verifies the shifted refinement
+    /// step helps separate eigenvalues that are close but resolvable.
+    #[test]
+    fn inverse_iteration_extremely_close_eigenvalues() {
+        let prec = 512;
+        let dim = 4;
+        let mut a = vec![hp(prec, "0"); dim * dim];
+        a[0 * dim + 0] = hp(prec, "1.0");
+        a[1 * dim + 1] = hp(prec, "1.01"); // gap = 0.01
+        a[2 * dim + 2] = hp(prec, "5.0");
+        a[3 * dim + 3] = hp(prec, "10.0");
+        let (mu, v) = inverse_iteration(&a, dim, prec, 200, false).unwrap();
+        // Eigenvalue must be 1.0 (not 1.01).
+        let mut diff = mu.clone();
+        diff -= &hp(prec, "1.0");
+        let abs_diff = diff.abs();
+        let tol = hp(prec, "0.005"); // must be closer to 1.0 than to 1.01
+        assert!(abs_diff < tol,
+            "close eigenvalues: μ should be 1.0, diff = {}",
+            abs_diff.to_f64());
+        // Eigenvector should be concentrated on index 0
+        let v0_sq = v[0].clone().square();
+        let threshold = hp(prec, "0.99");
+        assert!(v0_sq > threshold,
+            "eigvec should point at index 0 for eigenvalue 1.0, got |v[0]|²={}",
+            v0_sq.to_f64());
+    }
+
+    /// Residual quality check: after refinement, the residual ||Av−μv||
+    /// should be near working precision, not the sqrt-floor.
+    /// Uses a non-trivial symmetric matrix where the sqrt-floor would be
+    /// visible without refinement.
+    #[test]
+    fn inverse_iteration_residual_below_sqrt_floor() {
+        let prec = 256; // sqrt-floor at ~10^-33, working precision ~10^-66
+        let dim = 6;
+        // Tridiagonal 2,-1 (Strang matrix): eigenvalues are
+        // 2 - 2*cos(k*π/(n+1)) for k=1..n. Smallest ~ 2*(1-cos(π/7)) ≈ 0.198.
+        let mut a = vec![hp(prec, "0"); dim * dim];
+        for i in 0..dim {
+            a[i * dim + i] = hp(prec, "2");
+            if i > 0 { a[i * dim + (i - 1)] = hp(prec, "-1"); }
+            if i + 1 < dim { a[i * dim + (i + 1)] = hp(prec, "-1"); }
+        }
+        let (mu, v) = inverse_iteration(&a, dim, prec, 200, false).unwrap();
+        // Compute residual ||Av - μv||∞
+        let mut max_resid = hp(prec, "0");
+        for i in 0..dim {
+            let mut av_i = hp(prec, "0");
+            for j in 0..dim {
+                let mut t = a[i * dim + j].clone();
+                t *= &v[j];
+                av_i += &t;
+            }
+            let mut mu_v_i = mu.clone();
+            mu_v_i *= &v[i];
+            av_i -= &mu_v_i;
+            let abs_r = av_i.abs();
+            if abs_r > max_resid { max_resid = abs_r; }
+        }
+        // With refinement, residual should be much better than the sqrt-floor.
+        // sqrt-floor at prec=256 is ~10^-33. Full precision would be ~10^-66.
+        // Accept if residual < 10^-50 (significantly below sqrt-floor but
+        // allowing some numerical noise).
+        let tol = hp(prec, "1e-50");
+        assert!(max_resid < tol,
+            "residual after refinement should be below sqrt-floor; got ||Av-μv||∞ = {} (expect < 1e-50)",
+            max_resid.to_f64());
+    }
+
+    /// Warm-start test: inverse_iteration_from with a warm-start converges to
+    /// the same eigenpair as cold-start with the Gaussian guess.
+    #[test]
+    fn inverse_iteration_warm_start_matches_cold() {
+        let prec = 256;
+        let dim = 6;
+        // Strang tridiagonal n=6
+        let mut a = vec![hp(prec, "0"); dim * dim];
+        for i in 0..dim {
+            a[i * dim + i] = hp(prec, "2");
+            if i > 0 { a[i * dim + (i-1)] = hp(prec, "-1"); }
+            if i+1 < dim { a[i * dim + (i+1)] = hp(prec, "-1"); }
+        }
+        // Cold start
+        let (mu_cold, xi_cold) = inverse_iteration(&a, dim, prec, 200, false).unwrap();
+        // Warm start from the cold result (simulates a nearby-precision cache hit)
+        let warm = xi_cold.clone();
+        let (mu_warm, xi_warm) = inverse_iteration_from(&a, dim, prec, 200, false, Some(warm)).unwrap();
+
+        // Eigenvalues must match to working precision
+        let mut diff = mu_cold.clone(); diff -= &mu_warm;
+        let abs_diff = diff.abs();
+        let tol = hp(prec, "1e-50");
+        assert!(abs_diff < tol,
+            "warm-start eigenvalue should match cold-start; diff={}",
+            abs_diff.to_f64());
+
+        // Eigenvectors must match (up to sign)
+        let dot: Float = xi_cold.iter().zip(xi_warm.iter())
+            .map(|(a,b)| { let mut t=a.clone(); t*=b; t })
+            .fold(hp(prec,"0"), |mut s,t| { s+=&t; s });
+        // |dot| should be ≈ 1 (unit vectors)
+        let dot_abs = dot.abs();
+        let mut diff2 = dot_abs.clone(); diff2 -= hp(prec, "1");
+        let diff2_abs = diff2.abs();
+        let sign_tol = hp(prec, "1e-40");
+        assert!(diff2_abs < sign_tol,
+            "warm-start eigenvector should match cold-start (up to sign); |dot|-1={}",
+            diff2_abs.to_f64());
     }
 
     /// normalize_l2 should produce a unit vector.
@@ -1496,7 +1786,7 @@ mod tests {
                 for i in 0..n {
                     a[i * n + i] = hp(prec, &format!("{}", n + (i % 3) + 1));
                     for j in (i + 1)..n {
-                        let val = if (i + j + seed as usize) % 2 == 0 { 1 } else { -1 };
+                        let val = if (i + j + seed as usize).is_multiple_of(2) { 1 } else { -1 };
                         a[i * n + j] = hp(prec, &val.to_string());
                         a[j * n + i] = hp(prec, &val.to_string());
                     }
@@ -1615,7 +1905,7 @@ mod tests {
                     let diag_val = 1 + 10 * (i as i32);
                     a[i * n + i] = hp(prec, &diag_val.to_string());
                     for j in (i + 1)..n {
-                        let val = if (i + j + seed as usize) % 3 == 0 { 1 }
+                        let val = if (i + j + seed as usize).is_multiple_of(3) { 1 }
                                   else if (i + j + seed as usize) % 3 == 1 { -1 }
                                   else { 0 };
                         a[i * n + j] = hp(prec, &val.to_string());
@@ -1712,6 +2002,117 @@ mod tests {
         assert!(max_resid < tol,
             "HP-1000 Strang n=20 inverse_iteration: ‖A·v - μ·v‖_∞ = {} should be < 1e-100",
             display_hp(&max_resid, 6));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Boundary-condition tests
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `lu_factor` on a 1×1 matrix: trivial LU, solve must recover the
+    /// unique solution.
+    #[test]
+    fn lu_factor_1x1() {
+        let prec = 64;
+        // [5] * x = [20] → x = 4
+        let a = vec![hp(prec, "5")];
+        let b = vec![hp(prec, "20")];
+        let factors = lu_factor(&a, 1).expect("1×1 LU should not fail");
+        let x = lu_solve(&factors, &b, 1, prec);
+        assert_eq!(x.len(), 1);
+        let mut diff = x[0].clone(); diff -= hp(prec, "4"); let d = diff.abs();
+        assert!(d < hp(prec, "1e-15"), "1×1 solve: |x[0] - 4| = {} should be 0", d);
+    }
+
+    /// `lu_factor` on a 1×1 singular (zero) matrix should return an error.
+    #[test]
+    fn lu_factor_1x1_singular() {
+        let prec = 64;
+        let a = vec![hp(prec, "0")];
+        assert!(lu_factor(&a, 1).is_err(), "1×1 zero matrix should be singular");
+    }
+
+    /// `tridiag_lu_factor_hp` on a 1×1 tridiagonal: no off-diagonals.
+    #[test]
+    fn tridiag_lu_1x1() {
+        let prec = 64;
+        let diag = vec![hp(prec, "7")];
+        let lower: Vec<Float> = Vec::new();
+        let upper: Vec<Float> = Vec::new();
+        let factors = tridiag_lu_factor_hp(&lower, &diag, &upper, prec)
+            .expect("1×1 tridiag LU should not fail");
+        let b = vec![hp(prec, "14")];
+        let x = tridiag_lu_solve_hp(&factors, &b, prec)
+            .expect("1×1 tridiag solve should not fail");
+        assert_eq!(x.len(), 1);
+        let mut diff = x[0].clone(); diff -= hp(prec, "2"); let d = diff.abs();
+        assert!(d < hp(prec, "1e-15"), "1×1 tridiag solve: |x[0] - 2| = {} should be 0", d);
+    }
+
+    /// `normalize_l2` on a vector of all-zeros: the norm is 0 so the
+    /// function divides by zero. Confirm it does not panic (the output is
+    /// NaN or Inf — not our contract to define, but no panic is the key).
+    #[test]
+    fn normalize_l2_all_zeros_no_panic() {
+        let prec = 64;
+        let mut v = vec![hp(prec, "0"), hp(prec, "0"), hp(prec, "0")];
+        // Should not panic regardless of the NaN/Inf result.
+        normalize_l2(&mut v);
+        // Output is at least finite in the sense that v was mutated or is NaN/Inf:
+        // we just confirm no panic occurred.
+    }
+
+    /// `inverse_iteration` on a 1×1 matrix: the only eigenvalue is the
+    /// single diagonal entry, and the eigenvector is [1].
+    #[test]
+    fn inverse_iteration_1x1() {
+        let prec = 128;
+        let a = vec![hp(prec, "3.14159")];
+        let (mu, v) = inverse_iteration(&a, 1, prec, 50, false)
+            .expect("1×1 inverse_iteration should succeed");
+        assert_eq!(v.len(), 1);
+        // The only eigenvalue is 3.14159.
+        let mut diff = mu.clone(); diff -= hp(prec, "3.14159"); let d = diff.abs();
+        assert!(d < hp(prec, "1e-14"), "1×1 eigenvalue: got {}, expected 3.14159", d);
+        // Eigenvector of a 1×1 is [±1]; ℓ² norm should be 1.
+        let mut v0_sq = v[0].clone(); v0_sq.square_mut();
+        let mut norm_diff = v0_sq; norm_diff -= hp(prec, "1");
+        let nd = norm_diff.abs();
+        assert!(nd < hp(prec, "1e-15"), "1×1 eigenvector should have ℓ²-norm 1");
+    }
+
+    /// `tridiag_lu_factor_hp` with mismatched slice lengths should return
+    /// an error, not panic.
+    #[test]
+    fn tridiag_lu_length_mismatch_returns_error() {
+        let prec = 64;
+        // n=3 matrix but wrong off-diagonal lengths.
+        let diag = vec![hp(prec, "1"), hp(prec, "2"), hp(prec, "3")];
+        let bad_lower = vec![hp(prec, "0.5")]; // should be length 2
+        let upper = vec![hp(prec, "0.5"), hp(prec, "0.5")];
+        assert!(tridiag_lu_factor_hp(&bad_lower, &diag, &upper, prec).is_err(),
+            "mismatched lower length should return Err");
+    }
+
+    /// `lu_solve` result is the inverse of `lu_factor` — round-trip on a
+    /// 2×2 identity matrix should give the identity.
+    #[test]
+    fn lu_factor_solve_identity_2x2() {
+        let prec = 64;
+        let dim = 2;
+        let mut a = vec![hp(prec, "0"); dim * dim];
+        a[0] = hp(prec, "1"); // [0,0]
+        a[dim + 1] = hp(prec, "1"); // [1,1]
+
+        let factors = lu_factor(&a, dim).expect("identity LU");
+        // Solve A·x = e_0 = [1, 0]
+        let b = vec![hp(prec, "1"), hp(prec, "0")];
+        let x = lu_solve(&factors, &b, dim, prec);
+        assert_eq!(x.len(), 2);
+        let mut d0 = x[0].clone(); d0 -= hp(prec, "1"); let d0 = d0.abs();
+        let mut d1 = x[1].clone(); d1 -= hp(prec, "0"); let d1 = d1.abs();
+        let tol = hp(prec, "1e-15");
+        assert!(d0 < tol, "I·x = e_0: x[0] should be 1 (got diff {})", d0);
+        assert!(d1 < tol, "I·x = e_0: x[1] should be 0 (got diff {})", d1);
     }
 }
 

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.®)
+// All rights reserved. See LICENSE in the repository root.
+
 //! L-function specifications for the generalized CCM construction.
 //!
 //! This module extends the CCM construction (originally defined for the
@@ -166,7 +169,7 @@ impl LFunctionSpec {
         let chi_p = self.chi_at(p);
         if chi_p == 0 {
             0
-        } else if j % 2 == 0 {
+        } else if j.is_multiple_of(2) {
             // χ(p) ∈ {-1, +1} squared is +1.
             1
         } else {
@@ -197,13 +200,16 @@ impl LFunctionSpec {
 }
 
 /// Enumerate prime powers `n = p^j` with `1 < n ≤ bound`, returning
-/// `(n, p, j)` triples — the same shape as `ccm::prime_powers_up_to`,
-/// but produced from the same sieve.
+/// `(n, p, j)` triples — the same shape as `ccm::prime_powers_up_to`.
 ///
-/// This is the L-function generalization of `prime_powers_up_to`. To get
-/// the χ(p)^j weighting at any precision, call `spec.chi_at_prime_power_f64(p, j)`
-/// after the fact (it returns f64 values in {-1, 0, 1} which are exact
-/// at any precision).
+/// **The `spec` parameter is intentionally unused.** This function enumerates
+/// ALL prime powers up to `bound` regardless of the character — the χ weighting
+/// is applied by the caller *after* enumeration. To get χ(p)^j at any
+/// precision, call `spec.chi_at_prime_power(p, j)` on the returned triples.
+///
+/// This design keeps the enumerator precision-agnostic: the same `(n, p, j)`
+/// triples work for both f64 (`chi_at_prime_power_f64`) and HP
+/// (`Float::with_val(prec, spec.chi_at_prime_power(p, j))`).
 pub fn prime_powers_up_to_chi(bound: u64, _spec: &LFunctionSpec) -> Vec<(u64, u64, u32)> {
     crate::ccm::prime_powers_up_to(bound)
 }

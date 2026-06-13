@@ -164,4 +164,30 @@ mod tests {
         assert!(resid < 1e-14,
             "bisect with f(0)=0: residual {} should be tiny", resid);
     }
+
+    /// Edge case: max_iter = 0. The loop body never executes so bisect
+    /// falls through to the final `Some(0.5*(a+b))` return. The result
+    /// is the midpoint of the bracket — not converged, but not panicked.
+    #[test]
+    fn bisect_max_iter_zero_returns_midpoint() {
+        // f(x) = x² - 2, bracket [1, 2]. max_iter=0 → no iterations.
+        // Note: endpoints are checked BEFORE the loop, so if either
+        // endpoint happens to be near zero it would return early.
+        // Use tol=0 to disable that path; then result must be midpoint 1.5.
+        let result = bisect_f64(&|x| x * x - 2.0, 1.0, 2.0, 0.0, 0);
+        assert!(result.is_some(), "max_iter=0 should return Some (midpoint)");
+        let root = result.unwrap();
+        assert!((root - 1.5).abs() < 1e-15,
+            "max_iter=0 should return midpoint 1.5, got {}", root);
+    }
+
+    /// Edge case: a == b (degenerate bracket). f(a) == f(b) so there's
+    /// no sign change; bisect returns None.
+    #[test]
+    fn bisect_degenerate_bracket_a_eq_b() {
+        let result = bisect_f64(&|x| x * x - 2.0, 1.5, 1.5, 1e-15, 200);
+        // f(1.5) = 0.25 ≠ 0 and same sign on both sides → None.
+        assert!(result.is_none(),
+            "degenerate bracket a==b with no root at endpoint should return None");
+    }
 }

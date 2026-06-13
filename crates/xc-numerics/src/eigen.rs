@@ -88,8 +88,8 @@ pub fn tridiag_eigenvalues_hp(
 
     // Working copies; algorithm mutates these in place.
     // Pad e with one trailing zero so e[m] is always valid for m up to n-1.
-    let mut d: Vec<Float> = diag.iter().cloned().collect();
-    let mut e: Vec<Float> = off_diag.iter().cloned().collect();
+    let mut d: Vec<Float> = diag.to_vec();
+    let mut e: Vec<Float> = off_diag.to_vec();
     e.push(hp_zero(prec));  // sentinel; index n-1 is always 0
 
     let tol = qr_tolerance(prec);
@@ -424,14 +424,14 @@ pub fn tridiag_eigenvector_for_value_hp(
                 a[i * n + (i + 1)] = off_diag[i].clone();
                 a[(i + 1) * n + i] = off_diag[i].clone();
             }
-            eprintln!(
+            crate::hp_debug!(
                 "{} dense matrix built in {:.1}s (N={}, prec={} bits)",
                 log_tag, build_start.elapsed().as_secs_f64(), n, prec
             );
 
             let lu_start = std::time::Instant::now();
             let lu = lu_factor(&a, n)?;
-            eprintln!(
+            crate::hp_debug!(
                 "{} LU factor done in {:.1}s",
                 log_tag, lu_start.elapsed().as_secs_f64()
             );
@@ -443,8 +443,8 @@ pub fn tridiag_eigenvector_for_value_hp(
             // vs the ~26 GB the dense form would need at N=8001.
             let build_start = std::time::Instant::now();
             let mut shifted_diag: Vec<Float> = Vec::with_capacity(n);
-            for i in 0..n {
-                let mut entry = diag[i].clone();
+            for d in diag.iter() {
+                let mut entry = d.clone();
                 entry -= eigenvalue;
                 entry += &epsilon;
                 shifted_diag.push(entry);
@@ -452,9 +452,9 @@ pub fn tridiag_eigenvector_for_value_hp(
             // Symmetric tridiagonal: lower and upper off-diagonals are
             // equal. The banded LU factorizer accepts asymmetric input,
             // so we pass both copies.
-            let lower: Vec<Float> = off_diag.iter().cloned().collect();
-            let upper: Vec<Float> = off_diag.iter().cloned().collect();
-            eprintln!(
+            let lower: Vec<Float> = off_diag.to_vec();
+            let upper: Vec<Float> = off_diag.to_vec();
+            crate::hp_debug!(
                 "{} tridiagonal shifted matrix built in {:.3}s (N={}, prec={} bits)",
                 log_tag, build_start.elapsed().as_secs_f64(), n, prec
             );
@@ -463,7 +463,7 @@ pub fn tridiag_eigenvector_for_value_hp(
             let factors = crate::linalg::tridiag_lu_factor_hp(
                 &lower, &shifted_diag, &upper, prec,
             )?;
-            eprintln!(
+            crate::hp_debug!(
                 "{} tridiag LU factor done in {:.3}s",
                 log_tag, lu_start.elapsed().as_secs_f64()
             );
@@ -527,7 +527,7 @@ pub fn tridiag_eigenvector_for_value_hp(
                 if diff < *thresh {
                     v = new_v;
                     completed_steps = step + 1;
-                    eprintln!(
+                    crate::hp_debug!(
                         "{} inverse iteration converged at step {}/{} on N={} (elapsed {:.3}s, total {:.3}s)",
                         log_tag, completed_steps, opts.max_steps, n,
                         iter_start.elapsed().as_secs_f64(),
@@ -541,8 +541,8 @@ pub fn tridiag_eigenvector_for_value_hp(
 
         v = new_v;
         completed_steps = step + 1;
-        if completed_steps % 25 == 0 {
-            eprintln!(
+        if completed_steps.is_multiple_of(25) {
+            crate::hp_debug!(
                 "{} inverse iteration {}/{} on N={} (elapsed {:.3}s, total {:.3}s)",
                 log_tag, completed_steps, opts.max_steps, n,
                 iter_start.elapsed().as_secs_f64(),
@@ -551,8 +551,8 @@ pub fn tridiag_eigenvector_for_value_hp(
         }
     }
 
-    if completed_steps % 25 != 0 {
-        eprintln!(
+    if !completed_steps.is_multiple_of(25) {
+        crate::hp_debug!(
             "{} inverse iteration {}/{} done on N={} (elapsed {:.3}s, total {:.3}s)",
             log_tag, completed_steps, opts.max_steps, n,
             iter_start.elapsed().as_secs_f64(),
@@ -582,7 +582,7 @@ pub fn householder_tridiag_hp(
     if a.len() != n * n {
         return Err(anyhow!("matrix length {} != n² = {}", a.len(), n * n));
     }
-    let mut h: Vec<Float> = a.iter().cloned().collect();
+    let mut h: Vec<Float> = a.to_vec();
 
     // Q starts as identity; we apply each Householder reflection from the
     // right as we go, accumulating into Q. (Equivalently, store Householder
@@ -743,10 +743,10 @@ pub fn householder_tridiag_hp(
             }
             row
         }).collect();
-        for i in 0..m {
-            for j in 0..m {
+        for (i, row) in row_deltas.iter().enumerate() {
+            for (j, delta) in row.iter().enumerate() {
                 let cell = (k + 1 + i) * n + (k + 1 + j);
-                h[cell] -= &row_deltas[i][j];
+                h[cell] -= delta;
             }
         }
 
@@ -846,7 +846,7 @@ pub fn dense_symmetric_eigenvector_for_value_hp(
     let epsilon: Float = two.pow(-((prec as i32) - 32));
 
     // Build (A - λI + εI).
-    let mut shifted: Vec<Float> = a.iter().cloned().collect();
+    let mut shifted: Vec<Float> = a.to_vec();
     for i in 0..n {
         shifted[i * n + i] -= eigenvalue;
         shifted[i * n + i] += &epsilon;
@@ -883,7 +883,12 @@ pub fn dense_symmetric_eigenvector_for_value_hp(
 // Tests
 // ===========================================================================
 
+// Verification loops below iterate matrix/vector indices directly
+// (`m[i * n + j]`, paired `vecs[i][k] · vecs[j][k]`), where the index
+// arithmetic is the natural expression. Allow needless_range_loop in
+// this test-only module.
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
     use crate::fmt::{display_hp, matching_digits};
@@ -2382,6 +2387,121 @@ mod tests {
                 "solver {:?}: HP-1000 residual ‖T·v - λv‖_∞ = {} should be < 1e-900",
                 solver, display_hp(&max_resid, 6));
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Boundary-condition tests for tridiag and Householder
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `tridiag_eigenvalues_hp` on a 1×1 matrix: single eigenvalue equals
+    /// the single diagonal entry.
+    #[test]
+    fn tridiag_eigenvalues_1x1() {
+        let prec = 128;
+        let diag = vec![hp(prec, "7.5")];
+        let off_diag: Vec<Float> = Vec::new();
+        let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
+        assert_eq!(evals.len(), 1);
+        let mut diff = evals[0].clone(); diff -= hp(prec, "7.5"); let d = diff.abs();
+        assert!(d < hp(prec, "1e-50"),
+            "1×1 tridiag eigenvalue should be 7.5; got diff {}", d);
+    }
+
+    /// `tridiag_eigenvalues_hp` on a 2×2 symmetric tridiagonal: eigenvalues
+    /// d ± off for T = [[d, off],[off, d]] are exactly d + |off| and d - |off|.
+    #[test]
+    fn tridiag_eigenvalues_2x2() {
+        let prec = 128;
+        // T = [[3, 1], [1, 3]] → eigenvalues 2, 4.
+        let diag = vec![hp(prec, "3"), hp(prec, "3")];
+        let off_diag = vec![hp(prec, "1")];
+        let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
+        assert_eq!(evals.len(), 2);
+        // Should be ascending: [2, 4].
+        let mut d0 = evals[0].clone(); d0 -= hp(prec, "2"); let d0 = d0.abs();
+        let mut d1 = evals[1].clone(); d1 -= hp(prec, "4"); let d1 = d1.abs();
+        let tol = hp(prec, "1e-50");
+        assert!(d0 < tol, "2×2 eval[0] should be 2; diff = {}", d0);
+        assert!(d1 < tol, "2×2 eval[1] should be 4; diff = {}", d1);
+    }
+
+    /// `tridiag_eigenvalues_hp` with zero off-diagonal: reduces to sorting the
+    /// diagonal. Results should equal the diagonal in ascending order.
+    #[test]
+    fn tridiag_eigenvalues_zero_off_diagonal() {
+        let prec = 128;
+        let diag = vec![hp(prec, "5"), hp(prec, "1"), hp(prec, "3")];
+        let off_diag = vec![hp(prec, "0"), hp(prec, "0")];
+        let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
+        assert_eq!(evals.len(), 3);
+        let tol = hp(prec, "1e-50");
+        let mut d0 = evals[0].clone(); d0 -= hp(prec, "1"); let d0 = d0.abs();
+        let mut d1 = evals[1].clone(); d1 -= hp(prec, "3"); let d1 = d1.abs();
+        let mut d2 = evals[2].clone(); d2 -= hp(prec, "5"); let d2 = d2.abs();
+        assert!(d0 < tol, "zero off-diag evals[0] should be 1; diff={}", d0);
+        assert!(d1 < tol, "zero off-diag evals[1] should be 3; diff={}", d1);
+        assert!(d2 < tol, "zero off-diag evals[2] should be 5; diff={}", d2);
+    }
+
+    /// `tridiag_eigenvalues_hp` with off_diag wrong length should return Err.
+    #[test]
+    fn tridiag_eigenvalues_wrong_off_diag_length_errors() {
+        let prec = 64;
+        let diag = vec![hp(prec, "1"), hp(prec, "2"), hp(prec, "3")];
+        let bad_off = vec![hp(prec, "0.5")]; // should be length 2
+        assert!(tridiag_eigenvalues_hp(&diag, &bad_off, prec).is_err(),
+            "wrong off-diag length should return Err");
+    }
+
+    /// `householder_tridiag_hp` on a 1×1 matrix: no-op (no reflections
+    /// needed). The single diagonal is returned unchanged.
+    #[test]
+    fn householder_tridiag_1x1() {
+        let prec = 128;
+        let a = vec![hp(prec, "42")];
+        let (diag, off_diag, q) = householder_tridiag_hp(&a, 1, prec).unwrap();
+        assert_eq!(diag.len(), 1);
+        assert!(off_diag.is_empty());
+        assert_eq!(q.len(), 1);
+        let mut d = diag[0].clone(); d -= hp(prec, "42"); let d = d.abs();
+        assert!(d < hp(prec, "1e-50"), "1×1 householder diag should be 42; diff={}", d);
+    }
+
+    /// `householder_tridiag_hp` on a 2×2 symmetric matrix: one Householder
+    /// step is trivial (only the off-diagonal is set). The eigenvalues of the
+    /// returned tridiagonal should match the original matrix.
+    #[test]
+    fn householder_tridiag_2x2_preserves_eigenvalues() {
+        let prec = 128;
+        // A = [[2, 3], [3, 5]]; eigenvalues = (7 ± √37) / 2 ≈ 0.459 and 6.541.
+        let a = vec![hp(prec, "2"), hp(prec, "3"), hp(prec, "3"), hp(prec, "5")];
+        let (diag, off_diag, _q) = householder_tridiag_hp(&a, 2, prec).unwrap();
+        // The Householder output IS already tridiagonal for 2×2; get eigenvalues.
+        let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
+        assert_eq!(evals.len(), 2);
+        // Trace = 7 and determinant = 10 - 9 = 1, so eigenvalues satisfy
+        // λ₁ + λ₂ = 7, λ₁ * λ₂ = 1.
+        // Tolerance is a few ULPs at prec=128 bits (~38 decimal digits).
+        let tol = hp(prec, "1e-35");
+        let mut sum = evals[0].clone(); sum += &evals[1];
+        let mut trace_diff = sum; trace_diff -= hp(prec, "7"); let trace_diff = trace_diff.abs();
+        assert!(trace_diff < tol,
+            "2×2 eigenvalue sum (trace) should be 7; diff = {}", trace_diff);
+        let mut prod = evals[0].clone(); prod *= &evals[1];
+        let mut det_diff = prod; det_diff -= hp(prec, "1"); let det_diff = det_diff.abs();
+        assert!(det_diff < tol,
+            "2×2 eigenvalue product (det) should be 1; diff = {}", det_diff);
+    }
+
+    /// `dense_symmetric_eigenvalues_hp` on a 1×1 matrix: single eigenvalue.
+    #[test]
+    fn dense_eigenvalues_1x1() {
+        let prec = 128;
+        let a = vec![hp(prec, "99")];
+        let evals = dense_symmetric_eigenvalues_hp(&a, 1, prec).unwrap();
+        assert_eq!(evals.len(), 1);
+        let mut d = evals[0].clone(); d -= hp(prec, "99"); let d = d.abs();
+        assert!(d < hp(prec, "1e-50"), "1×1 dense eigenvalue should be 99; diff={}", d);
     }
 }
 

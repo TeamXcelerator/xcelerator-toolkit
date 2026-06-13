@@ -32,6 +32,22 @@ pub mod mellin;
 pub mod yakaboylu;
 pub mod lfunction;
 
+/// Debug logging macro — only prints when `XCELERATOR_DEBUG=1` is set.
+///
+/// Use this instead of bare `eprintln!` for diagnostic/progress messages.
+/// In production runs (no env var), the check is a single
+/// `std::env::var` call that short-circuits and costs essentially nothing.
+///
+/// Usage: `hp_debug!("message {}", value);`
+#[macro_export]
+macro_rules! hp_debug {
+    ($($arg:tt)*) => {
+        if std::env::var("XCELERATOR_DEBUG").as_deref() == Ok("1") {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 /// Crate-wide lock serializing all cwd-mutating cache tests.
 ///
 /// Cargo runs tests in parallel within a single test binary, and the
@@ -41,7 +57,10 @@ pub mod lfunction;
 /// if they used separate mutexes they would race each other (one test
 /// deleting the temp dir another captured as its "original"). A single
 /// crate-level lock guarantees mutual exclusion across both modules.
-#[cfg(test)]
+///
+/// Gated on the `hp` feature: the only consumers are the HP-gated
+/// cache tests, so without `hp` this would be unused.
+#[cfg(all(test, feature = "hp"))]
 pub(crate) static TEST_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Root for throwaway test directories, under the workspace `target/`
@@ -50,7 +69,9 @@ pub(crate) static TEST_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// `cargo clean`, rather than scattering directories in `/tmp` or
 /// `%TEMP%`. Resolved from `CARGO_MANIFEST_DIR` at compile time, so it
 /// is correct regardless of the process's runtime cwd.
-#[cfg(test)]
+///
+/// Gated on the `hp` feature: only the HP-gated cache tests use it.
+#[cfg(all(test, feature = "hp"))]
 pub(crate) fn test_tmp_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..").join("..").join("target").join("test-tmp")
@@ -59,7 +80,9 @@ pub(crate) fn test_tmp_root() -> std::path::PathBuf {
 /// Make a fresh, unique throwaway directory under [`test_tmp_root`].
 /// The `tag` plus a process-id + nanosecond suffix avoids clashes when
 /// tests run in parallel or are re-run rapidly.
-#[cfg(test)]
+///
+/// Gated on the `hp` feature: only the HP-gated cache tests use it.
+#[cfg(all(test, feature = "hp"))]
 pub(crate) fn fresh_test_dir(tag: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

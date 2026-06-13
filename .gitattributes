@@ -2,3 +2,13 @@
 # platforms (no autocrlf line-ending conversion on Windows checkouts).
 data/*.json -text
 *.pdf binary
+
+# Shell scripts must be checked out with LF line endings, even on Windows,
+# so they execute correctly on Linux (Vast) without "bad interpreter" errors.
+*.sh text eol=lf
+
+# Rust / TOML / Markdown / lock files — let git auto-handle.
+*.rs text
+*.toml text
+*.md text
+*.lock text

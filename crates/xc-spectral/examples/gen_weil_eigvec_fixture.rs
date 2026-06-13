@@ -29,7 +29,7 @@ fn main() {
     let n_modes: usize = args[2].parse().expect("n_modes must be a usize");
     let digits: u32 = args[3].parse().expect("digits must be a u32");
 
-    let params = CcmParams::from_lambda((lambda_sq as f64).sqrt(), n_modes);
+    let params = CcmParams::from_lambda_sq_integer(lambda_sq, n_modes);
     let mut cfg = HighPrecConfig::for_decimal_digits(digits);
     // Local-only cache: write .json + .json.zip, never touch the network.
     cfg.cache_mode = CacheMode::JsonZip;

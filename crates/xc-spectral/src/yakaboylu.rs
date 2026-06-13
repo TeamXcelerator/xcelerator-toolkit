@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.®)
+// All rights reserved. See LICENSE in the repository root.
+
 //! Yakaboylu's Riemann operator framework — high-precision verification.
 //!
 //! Implements the matrix-element computations and W-positivity tests from
@@ -146,7 +149,7 @@ pub fn test_w_positivity_f64(
     let m = DMatrix::from_row_slice(n, n, &w);
     let eig = SymmetricEigen::new(m);
     let mut evals: Vec<f64> = eig.eigenvalues.iter().copied().collect();
-    evals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    evals.sort_by(|a, b| a.total_cmp(b));
     let largest = evals.last().copied().unwrap_or(0.0);
     let cond = if smallest.abs() > 1e-300 { largest / smallest.abs() } else { f64::INFINITY };
 
@@ -239,7 +242,10 @@ pub fn v_r_matrix_element_hp(
     (result_re, result_im)
 }
 
+// Reference Riemann-zero literals below are quoted at published precision
+// (more digits than f64 holds); the excess is harmless on parse.
 #[cfg(test)]
+#[allow(clippy::excessive_precision)]
 mod tests {
     use super::*;
 
@@ -310,7 +316,7 @@ mod tests {
         }
         // Off-diagonal should be ε² / (γ-γ')² which is small.
         // E.g. (0,1): eps² / (21.02-14.13)² ≈ 1e-6 / 47 ≈ 2e-8
-        let off_01 = w[0 * 5 + 1];
+        let off_01 = w[1]; // row 0, col 1 in row-major 5×5
         assert!(off_01.abs() < 1e-7, "off-diagonal too large: {}", off_01);
     }
 
@@ -622,7 +628,7 @@ pub mod hp {
             // Off-diagonal (0, 1) should be ε² / (γ_2 - γ_1)².
             // γ_2 - γ_1 ≈ 6.887, (γ_2 - γ_1)² ≈ 47.4, ε² = 1e-6.
             // Predicted ≈ 1e-6 / 47.4 ≈ 2.1e-8.
-            let off_01 = w[0 * 5 + 1].clone().abs();
+            let off_01 = w[1].clone().abs(); // row 0, col 1 in row-major 5×5
             let upper = hp(prec, "1e-7");
             assert!(off_01 < upper,
                 "off-diagonal should be small, got {}", display_hp(&off_01, 6));

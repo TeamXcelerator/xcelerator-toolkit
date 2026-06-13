@@ -22,49 +22,132 @@ use std::time::Instant;
 #[cfg(feature = "hp")]
 pub mod hp;
 
-/// Parameters for a single CCM run. The `lambda_squared` field is f64
-/// (the user's CLI input — an explicit f64 boundary). `lambda_sq_int`
-/// is precomputed at construction so HP code paths can use it as `u64`
-/// without doing any f64 arithmetic on `lambda_squared`.
+/// How λ² is represented and processed.
+///
+/// Both `value_u64` and `value_f64` are always populated. The
+/// `is_integer` flag controls which path the HP computation takes:
+///
+/// - `is_integer = true`: uses `value_u64` for exact HP promotion
+///   (`Float::with_val(prec, value_u64)`) — full working precision,
+///   no representation error. This is the correct path for the paper
+///   configs (13, 100, 1000, etc.).
+///
+/// - `is_integer = false`: uses `value_f64` formatted to 17
+///   significant figures and parsed into HP via string conversion.
+///   Gives ~17 digits of accuracy on L = ln(λ²). Used for
+///   convergence-formula research (dense sweeps in the low-λ² region).
+///
+/// Having both values always available allows optimizations: the u64
+/// is always used for prime sieving (`prime_powers_up_to(value_u64)`),
+/// the f64 is always used for display and f64-tier computation, and
+/// the bool selects the HP promotion path.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LambdaSq {
+    /// Integer form: `⌊λ²⌋`. Used for prime cutoff, cache keys in
+    /// integer mode, and exact HP promotion when `is_integer = true`.
+    pub value_u64: u64,
+    /// Float form: the full-precision f64 λ² value. Used for display,
+    /// f64-tier computation, cache keys in fractional mode, and HP
+    /// promotion when `is_integer = false`.
+    pub value_f64: f64,
+    /// `true` = integer mode (HP uses `value_u64`).
+    /// `false` = fractional mode (HP uses `value_f64`).
+    pub is_integer: bool,
+}
+
+impl LambdaSq {
+    /// Construct in integer mode from a u64 value.
+    pub fn integer(v: u64) -> Self {
+        Self { value_u64: v, value_f64: v as f64, is_integer: true }
+    }
+
+    /// Construct in fractional mode from an f64 value.
+    pub fn fractional(v: f64) -> Self {
+        Self { value_u64: v.floor() as u64, value_f64: v, is_integer: false }
+    }
+
+    /// Construct in fractional mode but with an explicit u64 override
+    /// (for testing: e.g. λ²=15.0 fractional with value_u64=15).
+    pub fn fractional_with_int(value_f64: f64, value_u64: u64) -> Self {
+        Self { value_u64, value_f64, is_integer: false }
+    }
+
+    /// Mode string for JSON metadata: `"integer"` or `"fractional"`.
+    pub fn mode_str(&self) -> &'static str {
+        if self.is_integer { "integer" } else { "fractional" }
+    }
+
+    /// Canonical string for cache filenames.
+    /// Integer: `"13"`, Fractional: `"12p5"` (dot replaced with `p`,
+    /// trailing zeros stripped).
+    pub fn filename_str(&self) -> String {
+        if self.is_integer {
+            format!("{}", self.value_u64)
+        } else {
+            let s = format!("{}", self.value_f64);
+            if s.contains('.') {
+                let trimmed = s.trim_end_matches('0');
+                let trimmed = if trimmed.ends_with('.') {
+                    format!("{}0", trimmed)
+                } else {
+                    trimmed.to_string()
+                };
+                trimmed.replace('.', "p")
+            } else {
+                format!("{}p0", s)
+            }
+        }
+    }
+
+    /// Parse a filename fragment back into a `LambdaSq`.
+    /// `"13"` → integer(13), `"12p5"` → fractional(12.5).
+    pub fn from_filename_str(s: &str) -> Option<Self> {
+        if s.contains('p') {
+            let f_str = s.replace('p', ".");
+            let v: f64 = f_str.parse().ok()?;
+            Some(LambdaSq::fractional(v))
+        } else {
+            let v: u64 = s.parse().ok()?;
+            Some(LambdaSq::integer(v))
+        }
+    }
+}
+
+/// Parameters for a single CCM run.
 #[derive(Debug, Clone)]
 pub struct CcmParams {
-    /// `λ²` as f64 — this is the user's CLI input parameter (explicit
-    /// f64 boundary). HP code paths should NOT do f64 arithmetic on
-    /// this field; use `lambda_sq_int` for the prime cutoff or promote
-    /// to HP via `Float::with_val(prec, lambda_squared)` for other uses.
-    pub lambda_squared: f64,
-
-    /// `⌊λ² + ε⌋` precomputed as `u64` at construction. The prime
-    /// cutoff for the Weil-form sum. HP code paths read this directly
-    /// without any f64 arithmetic.
-    pub lambda_sq_int: u64,
+    /// `λ²` — either exact integer or fractional f64.
+    pub lambda_sq: LambdaSq,
 
     /// Mode cutoff N. Matrix dimension is `2N+1`.
     pub n_modes: usize,
 }
 
 impl CcmParams {
-    /// Construct from λ (not λ²) and the mode cutoff N.
-    ///
-    /// `lambda_squared` is computed as `lambda * lambda` at f64;
-    /// `lambda_sq_int` is `⌊λ² + ε⌋` (integer-floor with a small
-    /// rounding epsilon so √13² rounds to 13, not 12).
-    pub fn from_lambda(lambda: f64, n_modes: usize) -> Self {
-        let lambda_squared = lambda * lambda;
-        // Precompute prime-cutoff integer once at construction (CLI
-        // input boundary). The +EPS handles f64 imprecision when λ is
-        // an exact integer-square-root: e.g. sqrt(13)² evaluates to
-        // 12.999999985... at f64, which would floor to 12. After this
-        // point, HP code uses `lambda_sq_int` as a u64 — no f64
-        // arithmetic in HP paths.
-        let lambda_sq_int = (lambda_squared + LAMBDA_SQ_ROUNDING_EPS).floor() as u64;
-        Self { lambda_squared, lambda_sq_int, n_modes }
+    /// Construct with an explicit integer λ² value. This is the
+    /// primary constructor — pass λ² directly (e.g. 13, 100, 1000).
+    pub fn from_lambda_sq_integer(lambda_sq: u64, n_modes: usize) -> Self {
+        Self {
+            lambda_sq: LambdaSq::integer(lambda_sq),
+            n_modes,
+        }
     }
 
-    /// Recover λ from `lambda_squared` (f64).
-    pub fn lambda(&self) -> f64 { self.lambda_squared.sqrt() }
-    /// `L = ln(λ²) = 2 ln λ` at f64. Used as the V_n basis half-period.
-    pub fn log_length(&self) -> f64 { self.lambda_squared.ln() }
+    /// Construct with an explicit fractional λ² value (e.g. 12.5, 2.7).
+    /// Uses the float path for HP promotion (~17 digits of accuracy on L).
+    pub fn from_lambda_sq_fractional(lambda_sq: f64, n_modes: usize) -> Self {
+        Self {
+            lambda_sq: LambdaSq::fractional(lambda_sq),
+            n_modes,
+        }
+    }
+
+    /// The f64 value of λ² (for display, f64-tier computation).
+    pub fn lambda_squared(&self) -> f64 { self.lambda_sq.value_f64 }
+    /// The integer floor of λ² — the prime cutoff for the Weil-form sum.
+    pub fn lambda_sq_int(&self) -> u64 { self.lambda_sq.value_u64 }
+    /// `L = ln(λ²) = 2 ln λ` at f64.
+    pub fn log_length(&self) -> f64 { self.lambda_sq.value_f64.ln() }
     /// Matrix dimension `2N+1`.
     pub fn matrix_size(&self) -> usize { 2 * self.n_modes + 1 }
 
@@ -112,8 +195,8 @@ pub fn prime_powers_up_to(bound: u64) -> Vec<(u64, u64, u32)> {
         p += 1;
     }
     let mut out = Vec::new();
-    for p in 2..=n {
-        if !sieve[p] { continue; }
+    for (p, &is_prime) in sieve.iter().enumerate().skip(2) {
+        if !is_prime { continue; }
         let mut q: u64 = p as u64;
         let mut j: u32 = 1;
         while q <= bound {
@@ -128,17 +211,15 @@ pub fn prime_powers_up_to(bound: u64) -> Vec<(u64, u64, u32)> {
 }
 
 /// Euler-Mascheroni constant γ ≈ 0.5772. Used in the archimedean
-/// (gamma-factor) contribution W_R of the Weil quadratic form.
+/// (gamma-factor) contribution W_R of the Weil quadratic form. Quoted
+/// at full precision for documentation; f64 rounds to its nearest value.
+#[allow(clippy::excessive_precision)]
 pub const EULER_GAMMA: f64 = 0.5772156649015328606;
 
 /// Numerical zero threshold for eigenvector sum normalization.
 /// If |Σ ξ_j| < this value, the eigenvector is considered degenerate
 /// and normalization is skipped with an error.
 pub const EIGENVECTOR_SUM_THRESHOLD: f64 = 1e-14;
-
-/// Epsilon for rounding λ² to the nearest integer for prime-power sieve.
-/// Prevents floating-point truncation errors (e.g., 12.9999999 → 12).
-pub const LAMBDA_SQ_ROUNDING_EPS: f64 = 1e-9;
 
 /// Singularity guard for the W_R integrand near x = 0.
 /// When |x| < this value, the integrand uses its Taylor expansion
@@ -159,11 +240,11 @@ pub fn run_f64(params: &CcmParams) -> Result<CcmResult> {
     let n = params.n_modes;
     let l = params.log_length();
 
-    let tau = build_tau_f64(params, l, params.lambda_sq_int)?;
+    let tau = build_tau_f64(params, l, params.lambda_sq_int())?;
 
     let eig = SymmetricEigen::new(tau);
     let (eps_n, idx_min) = eig.eigenvalues.iter().enumerate()
-        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .min_by(|a, b| a.1.total_cmp(b.1))
         .map(|(i, &v)| (v, i))
         .ok_or_else(|| anyhow!("empty spectrum"))?;
     let xi_raw: Vec<f64> = eig.eigenvectors.column(idx_min).iter().copied().collect();
@@ -277,8 +358,8 @@ pub fn solve_spectrum_f64(xi: &[f64], n_max: usize, l: f64, tol: f64, max_iter: 
     let f = |t: f64| -> f64 {
         let mut acc = xi_pos[0];
         let mut sum = 0.0_f64;
-        for j in 1..=n_max {
-            sum += xi_pos[j] / (t - (j as f64).powi(2));
+        for (j, &xij) in xi_pos.iter().enumerate().skip(1) {
+            sum += xij / (t - (j as f64).powi(2));
         }
         acc += 2.0 * t * sum;
         acc
@@ -299,7 +380,10 @@ pub fn solve_spectrum_f64(xi: &[f64], n_max: usize, l: f64, tol: f64, max_iter: 
 }
 
 
+// Reference Riemann-zero literals below are quoted at published precision
+// (more digits than f64 holds); the excess is harmless on parse.
 #[cfg(test)]
+#[allow(clippy::excessive_precision)]
 mod tests {
     use super::*;
 
@@ -332,8 +416,8 @@ mod tests {
     /// CcmParams basic properties.
     #[test]
     fn ccm_params_basic() {
-        let p = CcmParams::from_lambda(3.605551275463989, 120);
-        assert!((p.lambda_squared - 13.0).abs() < 1e-6);
+        let p = CcmParams::from_lambda_sq_integer(13, 120);
+        assert!((p.lambda_squared() - 13.0).abs() < 1e-12);
         assert_eq!(p.matrix_size(), 241);
         assert_eq!(p.idx(0), 120);
         assert_eq!(p.idx(-120), 0);
@@ -346,7 +430,7 @@ mod tests {
     /// rather than Riemann zeros (those need the HP path).
     #[test]
     fn run_f64_produces_spectrum() {
-        let params = CcmParams::from_lambda(3.605551275463989, 120);
+        let params = CcmParams::from_lambda_sq_integer(13, 120);
         let result = run_f64(&params).unwrap();
         assert!(!result.eigenvalues_pos.is_empty(),
             "should produce at least one eigenvalue");
@@ -355,7 +439,7 @@ mod tests {
             "ε_N = {} should be tiny", result.weil_min_eigenvalue);
         // ξ should be normalized (Σ ξ_j = √L).
         let sum_xi: f64 = result.xi.iter().sum();
-        let l = (3.605551275463989_f64 * 3.605551275463989).ln();
+        let l = 13.0_f64.ln();
         let expected_sum = l.sqrt();
         assert!((sum_xi - expected_sum).abs() < 1e-3,
             "Σ ξ_j = {} should be √L = {}", sum_xi, expected_sum);
@@ -407,8 +491,8 @@ mod tests {
     /// CcmParams accessor methods.
     #[test]
     fn ccm_params_accessors() {
-        let p = CcmParams::from_lambda(10.0, 50);
-        assert!((p.lambda() - 10.0).abs() < 1e-10);
+        let p = CcmParams::from_lambda_sq_integer(100, 50);
+        assert!((p.lambda_squared() - 100.0).abs() < 1e-12);
         assert!((p.log_length() - 100.0_f64.ln()).abs() < 1e-10);
     }
 
@@ -420,5 +504,43 @@ mod tests {
         let pp2 = prime_powers_up_to(2);
         assert_eq!(pp2.len(), 1);
         assert_eq!(pp2[0].0, 2);
+    }
+
+    /// prime_powers_up_to output should be sorted ascending by k.
+    #[test]
+    fn prime_powers_output_is_sorted() {
+        let pp = prime_powers_up_to(50);
+        for w in pp.windows(2) {
+            assert!(w[0].0 < w[1].0, "prime_powers_up_to should be sorted; {} >= {}", w[0].0, w[1].0);
+        }
+    }
+
+    /// prime_powers_up_to: every (k, p, j) triple satisfies k = p^j exactly.
+    #[test]
+    fn prime_powers_triple_invariant() {
+        for &(k, p, j) in &prime_powers_up_to(100) {
+            let expected: u64 = (0..j).fold(1, |acc, _| acc * p);
+            assert_eq!(k, expected, "triple ({}, {}, {}): k ≠ p^j", k, p, j);
+        }
+    }
+
+    /// CcmParams::from_lambda_sq_integer(0) should not panic.
+    /// lambda_sq_int will be 0 and prime_powers_up_to(0) returns empty.
+    #[test]
+    fn ccm_params_lambda_zero() {
+        let p = CcmParams::from_lambda_sq_integer(0, 10);
+        assert_eq!(p.lambda_sq_int(), 0);
+        assert!(prime_powers_up_to(p.lambda_sq_int()).is_empty());
+    }
+
+    /// solve_spectrum_f64 with n_max=0 (degenerate ξ = [ξ_0]) should
+    /// return an empty root list without panicking — there are no poles in
+    /// R(t) and the bisection loop has no intervals to search.
+    #[test]
+    fn solve_spectrum_n_max_zero() {
+        let l = 13.0_f64.ln();
+        let xi = vec![1.0_f64]; // only ξ_0
+        let roots = solve_spectrum_f64(&xi, 0, l, DEFAULT_BISECT_TOL, DEFAULT_BISECT_MAX_ITER).unwrap();
+        assert!(roots.is_empty(), "n_max=0 should produce no roots");
     }
 }

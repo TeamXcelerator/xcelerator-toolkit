@@ -60,7 +60,7 @@ fn main() {
         xc_numerics::fmt::display_hp(&res.eigenvalue_0, 8)
     );
     // n_grid is forced odd inside compute_k_lambda; report the actual N.
-    let n_actual = if n_grid % 2 == 0 { n_grid + 1 } else { n_grid };
+    let n_actual = if n_grid.is_multiple_of(2) { n_grid + 1 } else { n_grid };
     eprintln!(
         "[gen] fixture written under ./data/prolate_eigvals_cache/ \
          (lambda_sq{}_ngrid{}_prec{}.json[.zip])",

@@ -29,6 +29,17 @@ pub mod quadrature;
 pub mod root_finding;
 pub mod primes;
 
+/// Debug logging macro — only prints when `XCELERATOR_DEBUG=1` is set.
+/// Same contract as `xc_spectral::hp_debug!` — use for diagnostics only.
+#[macro_export]
+macro_rules! hp_debug {
+    ($($arg:tt)*) => {
+        if std::env::var("XCELERATOR_DEBUG").as_deref() == Ok("1") {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 #[cfg(feature = "hp")]
 pub mod linalg;
 

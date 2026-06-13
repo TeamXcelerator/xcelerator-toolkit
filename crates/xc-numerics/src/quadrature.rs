@@ -59,7 +59,13 @@ pub fn gauss_legendre_npt_f64<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, n: usize)
     sum * half
 }
 
-fn gl_nodes_weights_f64(n: usize) -> (Vec<f64>, Vec<f64>) {
+/// Compute n-point Gauss-Legendre nodes and weights on `[-1, 1]` at f64.
+///
+/// The nodes are sorted in ascending order. Callers that need to set up
+/// a variable-integrand integral (e.g. a complex-valued integrand with
+/// multiple accumulator sums) can call this directly rather than using
+/// [`gauss_legendre_npt_f64`], which takes a single closure.
+pub fn gl_nodes_weights_f64(n: usize) -> (Vec<f64>, Vec<f64>) {
     let mut nodes = vec![0.0_f64; n];
     let mut weights = vec![0.0_f64; n];
     for k in 0..n {
@@ -96,6 +102,10 @@ fn legendre_p_deriv_f64(n: usize, x: f64) -> (f64, f64) {
 mod hp {
     use rug::{ops::Pow, Float};
 
+    /// A Gauss-Legendre quadrature table: `(nodes, weights)`, each vector
+    /// of length `n` on `[-1, 1]`.
+    type GlTable = (Vec<Float>, Vec<Float>);
+
     /// Controls how `gauss_legendre_nodes` resolves a `(n, prec)` table.
     ///
     /// Variants are ordered by how many lookup tiers they enable before
@@ -116,6 +126,7 @@ mod hp {
     /// and `DynamicFetch` write both `.json` and `.json.zip`; `Off`
     /// writes nothing.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Default)]
     pub enum CacheMode {
         /// No caching: always compute, never touch disk or network.
         Off,
@@ -124,12 +135,11 @@ mod hp {
         /// Local `.json` then local `.json.zip` (pre-remote behavior).
         JsonZip,
         /// Local `.json`, local `.json.zip`, then remote fetch (default).
+        #[default]
         DynamicFetch,
     }
 
-    impl Default for CacheMode {
-        fn default() -> Self { CacheMode::DynamicFetch }
-    }
+    
 
     /// Base raw URL of the public consolidated GL cache repository.
     /// Files live at
@@ -137,6 +147,16 @@ mod hp {
     /// where `B = (N / 1000) * 1000`.
     const REMOTE_BASE: &str =
         "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main";
+
+    /// Toolkit version string embedded in every GL cache file written by
+    /// this build. Matches `[workspace.package].version` in `Cargo.toml`.
+    const TOOLKIT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+    /// Minimum toolkit version required to use a GL cache file. Files
+    /// produced by an older toolkit are treated as cache misses and
+    /// recomputed. Update this constant when a change to the GL
+    /// computation changes the stored values.
+    const CACHE_MIN_TOOLKIT_VERSION: &str = "0.10.0";
 
     #[inline] fn fl_i(prec: u32, v: i64) -> Float { Float::with_val(prec, v) }
     #[inline] fn pi(prec: u32) -> Float { Float::with_val(prec, rug::float::Constant::Pi) }
@@ -274,15 +294,22 @@ mod hp {
         gl_cache_dir().map(|d| d.join(format!("prec{}_npts{}.json.zip", prec, n)))
     }
 
-    /// Parse a 2-element JSON array of decimal strings into HP node and
-    /// weight vectors. Returns `None` on any structural mismatch
-    /// (precision tag missing, length mismatch, malformed numbers).
+    /// Parse the GL cache JSON into HP node and weight vectors.
+    /// Expects schema_version 1 envelope format. Returns `None` on any
+    /// structural mismatch or incompatible `min_compatible_version`.
     fn parse_gl_json(data: &str, n: usize, prec: u32) -> Option<(Vec<Float>, Vec<Float>)> {
         let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
-        let arr = parsed.as_array()?;
-        if arr.len() != 2 { return None; }
-        let nodes_arr = arr[0].as_array()?;
-        let weights_arr = arr[1].as_array()?;
+        let obj = parsed.as_object()?;
+
+        if let Some(min_ver) = obj.get("min_compatible_version").and_then(|v| v.as_str()) {
+            if version_is_older(CACHE_MIN_TOOLKIT_VERSION, min_ver) {
+                return None;
+            }
+        }
+
+        let nodes_arr = obj.get("nodes")?.as_array()?;
+        let weights_arr = obj.get("weights")?.as_array()?;
+
         if nodes_arr.len() != n || weights_arr.len() != n { return None; }
         let mut nodes = Vec::with_capacity(n);
         let mut weights = Vec::with_capacity(n);
@@ -293,6 +320,20 @@ mod hp {
             weights.push(Float::with_val(prec, Float::parse(s.as_str()?).ok()?));
         }
         Some((nodes, weights))
+    }
+
+    /// Returns `true` if `a` is strictly older than `b` using simple
+    /// major.minor.patch comparison (no semver pre-release handling
+    /// needed — toolkit versions are always plain `X.Y.Z`).
+    fn version_is_older(a: &str, b: &str) -> bool {
+        let parse = |s: &str| -> (u64, u64, u64) {
+            let mut parts = s.splitn(3, '.');
+            let major = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            let minor = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            let patch = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            (major, minor, patch)
+        };
+        parse(a) < parse(b)
     }
 
     /// Print a diagnostic warning to stderr when a cache file exists
@@ -381,6 +422,15 @@ mod hp {
     #[cfg(test)]
     pub fn remote_zip_url_for_test(n: usize, prec: u32) -> String {
         remote_zip_url(n, prec)
+    }
+
+    /// Test-only accessor for `parse_gl_json` (lets version-rejection
+    /// tests call the parser directly without touching disk).
+    #[cfg(test)]
+    pub fn parse_gl_json_for_test(
+        data: &str, n: usize, prec: u32,
+    ) -> Option<(Vec<Float>, Vec<Float>)> {
+        parse_gl_json(data, n, prec)
     }
 
     /// Download the `(n, prec)` `.json.zip` from the public cache repo
@@ -478,7 +528,7 @@ mod hp {
         zip_path: &std::path::Path,
         n: usize,
         prec: u32,
-    ) -> Option<((Vec<Float>, Vec<Float>), String)> {
+    ) -> Option<(GlTable, String)> {
         use std::io::Read;
         let file = std::fs::File::open(zip_path).ok()?;
         let mut archive = zip::ZipArchive::new(file).ok()?;
@@ -496,13 +546,21 @@ mod hp {
         // only meaningful write modes are JsonZip / DynamicFetch.
         if matches!(mode, CacheMode::Off | CacheMode::JsonOnly) { return; }
 
-        // Serialize to JSON in memory, then write ONLY the deflated
-        // .json.zip. No uncompressed .json is written — readers
+        // Serialize to the versioned JSON envelope, then write ONLY the
+        // deflated .json.zip. No uncompressed .json is written — readers
         // decompress from the zip on demand. This halves local disk use.
         if let Some(path) = gl_cache_path(n, prec) {
             let ns: Vec<String> = nodes.iter().map(|f| f.to_string()).collect();
             let ws: Vec<String> = weights.iter().map(|f| f.to_string()).collect();
-            let json = serde_json::json!([ns, ws]);
+            let json = serde_json::json!({
+                "schema_version": 1,
+                "toolkit_version": TOOLKIT_VERSION,
+                "min_compatible_version": CACHE_MIN_TOOLKIT_VERSION,
+                "n_pts": n,
+                "precision_bits": prec,
+                "nodes": ns,
+                "weights": ws,
+            });
             let json_str = match serde_json::to_string(&json) {
                 Ok(s) => s,
                 Err(_) => return,
@@ -649,9 +707,9 @@ mod hp {
             .or_else(|| name.strip_suffix(".json"))?;
         // stem now: "prec{P}_npts{N}"
         let after_prec = stem.strip_prefix("prec")?;
-        let mut parts = after_prec.splitn(2, "_npts");
-        let prec_str = parts.next()?;
-        let n_str = parts.next()?;
+        let (prec_str, n_str) = after_prec.split_once("_npts")?;
+        
+        
         let prec: u32 = prec_str.parse().ok()?;
         let n: usize = n_str.parse().ok()?;
         Some((n, prec))
@@ -1018,15 +1076,20 @@ mod hp_cache_tests {
         serde_json::json!([nodes, weights]).to_string()
     }
 
-    /// Old fake-data generator. Retained for tests that specifically
-    /// want a *structurally-invalid* payload to exercise the rejection
-    /// path; the cache-priority and zip-fallback tests no longer use
-    /// it because the structural validator now rejects it.
-    #[allow(dead_code)]
-    fn fake_gl_json(n: usize) -> String {
-        let nodes: Vec<String> = (0..n).map(|i| format!("0.{:010}", i)).collect();
-        let weights: Vec<String> = (0..n).map(|i| format!("0.{:010}", n + i)).collect();
-        serde_json::json!([nodes, weights]).to_string()
+    /// Produce a valid-envelope JSON but with structurally-invalid
+    /// nodes/weights (all zeros — Σw ≠ 2, nodes not antisymmetric).
+    /// The parser accepts the envelope; the structural check rejects it.
+    fn structurally_invalid_gl_json(n: usize, prec: u32) -> String {
+        let zeros: Vec<String> = (0..n).map(|_| "0".to_string()).collect();
+        serde_json::json!({
+            "schema_version": 1,
+            "toolkit_version": "0.10.0",
+            "min_compatible_version": "0.10.0",
+            "n_pts": n,
+            "precision_bits": prec,
+            "nodes": zeros.clone(),
+            "weights": zeros,
+        }).to_string()
     }
 
     /// Round-trip helper: compute or load nodes/weights, then verify
@@ -1256,6 +1319,34 @@ mod hp_cache_tests {
         // not consult the zip and must not write any .json.
         assert!(!json_path.exists(),
             "zip-only: JsonOnly must not write a decompressed .json");
+    }
+
+    /// A GL cache file with a `min_compatible_version` newer than the
+    /// current `CACHE_MIN_TOOLKIT_VERSION` must be rejected (returns
+    /// `None` from the parser so the caller falls through to recompute).
+    /// This simulates loading a file written by a future toolkit version
+    /// that introduced breaking changes to the GL format.
+    #[test]
+    fn gl_cache_rejects_newer_min_compatible_version() {
+        let n = 4;
+        let prec: u32 = 64;
+        // Build a well-formed envelope but stamp a far-future
+        // min_compatible_version that exceeds our CACHE_MIN_TOOLKIT_VERSION.
+        let ns: Vec<String> = (0..n).map(|i| format!("{}", i)).collect();
+        let ws: Vec<String> = (0..n).map(|i| format!("{}", i)).collect();
+        let payload = serde_json::json!({
+            "toolkit_version": "99.0.0",
+            "min_compatible_version": "99.0.0",
+            "n_pts": n,
+            "precision_bits": prec,
+            "nodes": ns,
+            "weights": ws,
+        }).to_string();
+        // parse_gl_json must return None because 99.0.0 > CACHE_MIN_TOOLKIT_VERSION.
+        assert!(
+            hp::parse_gl_json_for_test(&payload, n, prec).is_none(),
+            "parser should reject a cache file requiring min_compatible_version=99.0.0"
+        );
     }
 
     /// The remote URL is deterministically derived from `(n, prec)` using
@@ -1490,12 +1581,11 @@ mod hp_cache_tests {
         let cache_dir = temp.join("data").join("gl_cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
 
-        // The legacy fake_gl_json produces shape-valid but
-        // structurally-invalid data (nodes = [0.0000000000, ...],
-        // weights = [0.0000000006, ...]; sum of weights ≠ 2,
-        // nodes not antisymmetric). Plant it inside a .json.zip (the
-        // only tier that's read now).
-        let bad_payload = fake_gl_json(n);
+        // Plant a structurally-invalid envelope (all-zero nodes/weights:
+        // Σw ≠ 2, nodes not antisymmetric) inside a .json.zip. The parser
+        // accepts the envelope; the structural check rejects it, so the
+        // loader falls through to fresh compute.
+        let bad_payload = structurally_invalid_gl_json(n, prec);
         let zip_path = cache_dir.join(format!("prec{}_npts{}.json.zip", prec, n));
         {
             use std::io::Write;
@@ -1578,14 +1668,39 @@ mod hp_cache_tests {
         let cache_dir = temp.join("data").join("gl_cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
 
-        // 1. Valid file (synthetic-but-structurally-valid).
+        // 1. Valid file: well-formed envelope + structurally valid values.
+        // Use real GL-4 nodes/weights from a fresh compute so structural
+        // checks pass.
+        let (real_nodes, real_weights) = hp::gauss_legendre_nodes(4, 64, hp::CacheMode::Off);
+        let ns: Vec<String> = real_nodes.iter().map(|f| f.to_string()).collect();
+        let ws: Vec<String> = real_weights.iter().map(|f| f.to_string()).collect();
+        let valid_json = serde_json::json!({
+            "schema_version": 1,
+            "toolkit_version": "0.10.0",
+            "min_compatible_version": "0.10.0",
+            "n_pts": 4_usize,
+            "precision_bits": 64_u32,
+            "nodes": ns,
+            "weights": ws,
+        }).to_string();
         let valid_path = cache_dir.join("prec64_npts4.json");
-        std::fs::write(&valid_path, synthetic_valid_gl_json(4, 0.1)).unwrap();
+        std::fs::write(&valid_path, valid_json).unwrap();
 
-        // 2. Structurally-invalid file (legacy fake_gl_json shape-valid,
-        //    structurally bogus).
+        // 2. Structurally-invalid file: valid envelope but nodes/weights
+        //    are all zeros → fails Σw=2 identity.
+        let bad_ns: Vec<String> = (0..5).map(|_| "0".to_string()).collect();
+        let bad_ws: Vec<String> = (0..5).map(|_| "0".to_string()).collect();
+        let bad_json = serde_json::json!({
+            "schema_version": 1,
+            "toolkit_version": "0.10.0",
+            "min_compatible_version": "0.10.0",
+            "n_pts": 5_usize,
+            "precision_bits": 64_u32,
+            "nodes": bad_ns,
+            "weights": bad_ws,
+        }).to_string();
         let bad_path = cache_dir.join("prec64_npts5.json");
-        std::fs::write(&bad_path, fake_gl_json(5)).unwrap();
+        std::fs::write(&bad_path, bad_json).unwrap();
 
         // 3. Unrecognized filename — should be reported as Skipped.
         let skipped_path = cache_dir.join("not_a_cache_file.txt");
