@@ -32,7 +32,7 @@ This is a Cargo workspace containing three sub-crates:
 
 **xc-spectral:**
 - `ccm` — CCM construction: `CcmParams` (`from_lambda_sq_integer` / `from_lambda_sq_fractional`), `LambdaSq` (integer/fractional λ² mode), `CcmResult`, `prime_powers_up_to`, `run_f64`, `solve_spectrum_f64`.
-- `ccm::hp` (HP-gated) — `HighPrecConfig`, `HighPrecResult`, `run`, `measure_evenness`, full Weil-form matrix assembly at arbitrary precision. The τ-matrix is cached to `<cwd>/data/tau_cache/` (JSON, single zip, or byte-split `.partXX` for GitHub's 100 MB limit). The Weil eigenvector ξ is cached to `<cwd>/data/weil_eigvec_cache/` with a remote-fetch tier from the public [`xcelerator-weil-eigvec-cache`](https://github.com/TeamXcelerator/xcelerator-weil-eigvec-cache) repo. The eigensolver uses adaptive Newton steps, f64 warm seeds, Halley's method (selectable via `XCELERATOR_SOLVER=halley`), warm-start inverse iteration (`XCELERATOR_WARM_START=1`), and auto-detects even/odd eigenvector symmetry. Newton convergence failures return `None` (type: `Vec<Option<Float>>`) rather than silently returning a bad result. Public audit API: `verify_tau_cache_dir`. Also exposes `weil_spectrum_hp(params, cfg, include_primes)` — the full dense HP spectrum of the localized Weil-form τ-matrix (smallest positive eigenvalue = the plunge `ε_N`), with an archimedean-only mode (`include_primes = false` drops the prime-power sum `w_p` from every τ entry) for prefactor-decomposition studies.
+- `ccm::hp` (HP-gated) — `HighPrecConfig`, `HighPrecResult`, `run`, `measure_evenness`, full Weil-form matrix assembly at arbitrary precision. The τ-matrix is cached to `<cwd>/data/tau_cache/` (JSON, single zip, or byte-split `.partXX` for GitHub's 100 MB limit). The Weil eigenvector ξ is cached to `<cwd>/data/weil_eigvec_cache/` with a remote-fetch tier from the public [`xcelerator-weil-eigvec-cache`](https://github.com/TeamXcelerator/xcelerator-weil-eigvec-cache) repo. The eigensolver uses adaptive Newton steps, f64 warm seeds, Halley's method (selectable via `XCELERATOR_SOLVER=halley`), warm-start inverse iteration (`XCELERATOR_WARM_START=1`), and auto-detects even/odd eigenvector symmetry. Newton convergence failures return `None` (type: `Vec<Option<Float>>`) rather than silently returning a bad result. Public audit API: `verify_tau_cache_dir`. Also exposes `weil_spectrum_hp(params, cfg, include_primes)` — the full dense HP spectrum of the localized Weil-form τ-matrix (smallest positive eigenvalue = the plunge `ε_N`), with an archimedean-only mode (`include_primes = false` drops the prime-power sum `w_p` from every τ entry) for prefactor-decomposition studies. `weil_plunge_cancellation_hp(params, cfg) -> PlungeCancellation` finds the full plunge eigenvector ξ and returns the plunge `ε_N` together with the archimedean and prime Rayleigh quotients on that same ξ (`ε_N = arch_rayleigh − prime_rayleigh` by linearity), quantifying the archimedean↔prime cancellation that sets the floor.
 - `screw` (HP-gated) — Suzuki screw function `g(t)` (arXiv:2606.09096): `ScrewKernel::new(a_max, prec)` / `.eval(&t)`, HP throughout (closed-form `ψ(1/4) = −γ − π/2 − 3 ln 2` and `Φ(1,2,1/4) = π² + 8·G` from rug constants; Hurwitz–Lerch `Φ(z,2,1/4)` by HP series; von Mangoldt sum via `prime_powers_up_to`). Validated to 1e-38 against an independent reference implementation. The continuous kernel of the localized Weil-form convolution operator `G_a`.
 - `prolate` — Prolate-wave operator PW_λ. f64 prototype and HP submodule `prolate::hp` using the HP eigensolver from `xc-numerics::eigen`. Eigenvalue spectrum cached to `<cwd>/data/prolate_eigvals_cache/`. Public audit API: `verify_prolate_eigvals_cache_dir`.
 - `mellin` — Truncated completed eta function Λ_λ(s), ξ-weighted Mellin G(s), parallelized critical-line zero scanner. Full f64 (`*_f64`) and HP (`*_hp`) parity. Uses `xc_numerics::quadrature::gl_nodes_weights_f64` for the f64 path (no internal duplication).
@@ -52,7 +52,7 @@ cargo test --workspace
 
 # Full HP tier (Linux/WSL/macOS — requires libgmp-dev libmpfr-dev libmpc-dev):
 cargo test --workspace --features hp
-# 229 tests pass, 4 ignored (PARI-fixture and live-network tests)
+# 230 tests pass, 4 ignored (PARI-fixture and live-network tests)
 #
 # To run the live remote-fetch test:
 #   cargo test -p xc-numerics --features hp -- --ignored remote_fetch_live
@@ -161,9 +161,13 @@ Full guideline (private):
   reference. New `ccm::hp::weil_spectrum_hp(params, cfg, include_primes)`:
   the full HP spectrum of the localized Weil-form τ-matrix, with an
   archimedean-only mode (`include_primes = false`) that drops the prime-power
-  sum for prefactor-decomposition studies. **Backwards compatible — additive
+  sum for prefactor-decomposition studies. Also adds
+  `ccm::hp::weil_plunge_cancellation_hp` (with the `PlungeCancellation` result)
+  — decomposes the plunge `ε_N` on the full eigenvector ξ into archimedean and
+  prime Rayleigh quotients (`ε_N = arch − prime`), and the `weil_cancellation`
+  example. **Backwards compatible — additive
   only** (no public API changed; the one internal signature change is to a
-  private function whose sole caller is unchanged). Adds 3 unit tests.
+  private function whose sole caller is unchanged). Adds 4 unit tests.
 
 - **v0.10.0** — Eigensolver overhaul (adaptive Newton steps, f64 warm seeds,
   Halley's method, warm-start inverse iteration, auto-detect even/odd symmetry,

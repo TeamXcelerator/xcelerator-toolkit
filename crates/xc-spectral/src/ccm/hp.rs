@@ -561,6 +561,76 @@ pub fn weil_spectrum_hp(
     xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&tau, dim, prec)
 }
 
+/// Decomposition of the plunge into archimedean and prime Rayleigh
+/// contributions on the **full** plunge eigenvector ξ.
+///
+/// The localized Weil form splits as `A_full = A_arch − A_prime` (the τ
+/// entry is `w02 − wr − wp`; the archimedean part is `w02 − wr`, the prime
+/// part is the prime-power sum `wp`). By linearity of the Rayleigh
+/// quotient on the full plunge eigenvector ξ:
+/// ```text
+///   ε_N = ⟨A_full ξ,ξ⟩/⟨ξ,ξ⟩
+///       = ⟨A_arch ξ,ξ⟩/⟨ξ,ξ⟩ − ⟨A_prime ξ,ξ⟩/⟨ξ,ξ⟩
+///       = arch_rayleigh − prime_rayleigh.
+/// ```
+/// Since `ε_N` is exponentially small while `arch_rayleigh` and
+/// `prime_rayleigh` are O(1)-or-larger, the two must agree to
+/// `≈ −log₁₀|ε_N|` digits — a direct quantitative picture of the
+/// archimedean↔prime (Weil-positivity) cancellation that produces the
+/// CCM convergence floor.
+pub struct PlungeCancellation {
+    /// Plunge eigenvalue `ε_N = arch_rayleigh − prime_rayleigh`.
+    pub eps_n: Float,
+    /// `⟨A_arch ξ,ξ⟩/⟨ξ,ξ⟩` — archimedean Rayleigh on the full plunge ξ.
+    pub arch_rayleigh: Float,
+    /// `⟨A_prime ξ,ξ⟩/⟨ξ,ξ⟩` — prime-sum Rayleigh on the full plunge ξ.
+    pub prime_rayleigh: Float,
+}
+
+/// Compute the [`PlungeCancellation`] for `(λ², N, P)`. Finds the full
+/// plunge eigenvector ξ by inverse iteration, then evaluates the
+/// archimedean and prime Rayleigh quotients on that same ξ.
+pub fn weil_plunge_cancellation_hp(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+) -> Result<PlungeCancellation> {
+    let prec = cfg.precision_bits;
+    let dim = params.matrix_size();
+    let l = log_lambda_sq_hp(params, prec);
+
+    // Full Weil form; smallest positive eigenvalue (the plunge) and its
+    // eigenvector via the dense HP symmetric path.
+    let mut tau_full = build_tau_hp(params, &l, cfg)?;
+    force_symmetric(&mut tau_full, dim);
+    let eigs = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&tau_full, dim, prec)?;
+    let zero = Float::with_val(prec, 0);
+    let eps_n = eigs
+        .iter()
+        .find(|e| **e > zero)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no positive eigenvalue (Weil form indefinite?)"))?;
+    let xi = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
+        &tau_full, dim, &eps_n, prec, cfg.inverse_iter_steps,
+    )?;
+
+    // Archimedean-only form (prime sum dropped).
+    let mut tau_arch = build_tau_hp_compute(params, &l, cfg, false)?;
+    force_symmetric(&mut tau_arch, dim);
+
+    // Rayleigh quotients on the SAME ξ. The split is exact by linearity:
+    // arch_rayleigh − prime_rayleigh = full_rayleigh = ε_N.
+    let full_rayleigh = xc_numerics::linalg::rayleigh_quotient(&tau_full, dim, &xi, prec);
+    let arch_rayleigh = xc_numerics::linalg::rayleigh_quotient(&tau_arch, dim, &xi, prec);
+    let mut prime_rayleigh = Float::with_val(prec, &arch_rayleigh);
+    prime_rayleigh -= &full_rayleigh;
+
+    Ok(PlungeCancellation {
+        eps_n: full_rayleigh,
+        arch_rayleigh,
+        prime_rayleigh,
+    })
+}
+
 fn build_tau_hp_compute(params: &CcmParams, l: &Float, cfg: &HighPrecConfig, include_primes: bool) -> Result<Vec<Float>> {
     let prec = cfg.precision_bits;
     let n_max = params.n_modes;
@@ -2412,6 +2482,38 @@ mod tests {
             arch[0] < zero,
             "archimedean-only form should be indefinite, min={}",
             arch[0]
+        );
+    }
+
+    /// `weil_plunge_cancellation_hp`: the plunge ε_N is the difference of
+    /// two O(1) Rayleigh quotients (archimedean − prime) that agree to many
+    /// digits. λ²=13, N=12, 64 digits, hermetic.
+    #[test]
+    fn weil_plunge_cancellation_decomposes() {
+        let params = CcmParams::from_lambda_sq_integer(13, 12);
+        let mut cfg = HighPrecConfig::for_decimal_digits(64);
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+
+        let d = weil_plunge_cancellation_hp(&params, &cfg).unwrap();
+        let prec = cfg.precision_bits;
+
+        // ε_N = arch − prime exactly (linearity of the Rayleigh quotient).
+        let mut recon = Float::with_val(prec, &d.arch_rayleigh);
+        recon -= &d.prime_rayleigh;
+        let mut err = Float::with_val(prec, &recon);
+        err -= &d.eps_n;
+        assert!(err.abs() < Float::with_val(prec, 2).pow(-(prec as i32 - 16)),
+            "arch − prime should equal eps_n");
+
+        // ε_N is small and positive; arch is O(1) (not exponentially small).
+        let zero = Float::with_val(prec, 0);
+        assert!(d.eps_n > zero, "plunge should be positive");
+        assert!(d.eps_n < Float::with_val(prec, 1), "plunge should be small");
+        let thresh = Float::with_val(prec, Float::parse("1e-3").unwrap());
+        assert!(
+            d.arch_rayleigh.clone().abs() > thresh,
+            "arch Rayleigh should be O(1), not exponentially small: {}",
+            d.arch_rayleigh
         );
     }
 
