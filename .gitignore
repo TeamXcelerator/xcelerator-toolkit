@@ -6,6 +6,7 @@ target/
 # IDE
 .vscode/
 .idea/
+.kiro/
 
 # OS
 .DS_Store

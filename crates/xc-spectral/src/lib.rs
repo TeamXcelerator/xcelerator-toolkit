@@ -31,6 +31,8 @@ pub mod prolate;
 pub mod mellin;
 pub mod yakaboylu;
 pub mod lfunction;
+#[cfg(feature = "hp")]
+pub mod screw;
 
 /// Debug logging macro — only prints when `XCELERATOR_DEBUG=1` is set.
 ///

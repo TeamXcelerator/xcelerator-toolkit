@@ -514,12 +514,54 @@ fn build_tau_hp(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<V
         return Ok(cached);
     }
 
-    let tau = build_tau_hp_compute(params, l, cfg)?;
+    let tau = build_tau_hp_compute(params, l, cfg, true)?;
     tau_cache::save(lambda_sq, n_modes, prec, &tau, cfg.cache_mode);
     Ok(tau)
 }
 
-fn build_tau_hp_compute(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<Vec<Float>> {
+/// Eigenvalues of the localized Weil-form (`τ`) matrix. The smallest
+/// positive eigenvalue is the plunge `ε_N`, whose `−log₁₀|ε_N|` is the CCM
+/// prime-content floor `D_Primes(λ²)` (up to the small ε_N↔matching-digit
+/// offset).
+///
+/// `include_primes`:
+/// - `true`  → the full Weil form (archimedean + prime sum). This is the
+///   same `ε_N` returned by [`run`] / cached in `weil_eigvec_cache`.
+/// - `false` → the **archimedean-only** form (prime sum `w_p` dropped from
+///   every `τ` entry). Used to test the prefactor decomposition: do the
+///   archimedean-only and full plunges share the same prefactor power
+///   (the prime sum shifting only the additive constant)?
+///
+/// Returns the **full Weil-form spectrum** (all eigenvalues of `τ`, sorted
+/// ascending). The smallest positive eigenvalue is the plunge `ε_N`; the
+/// overall minimum reveals whether the form is positive (Weil positivity)
+/// or O(1)-indefinite (relevant for the archimedean-only mode, where the
+/// prime sum that enforces positivity is absent).
+///
+/// Uses the dense HP symmetric eigensolver (all eigenvalues) rather than
+/// inverse iteration, since the archimedean-only spectrum bottom may be
+/// negative — `inverse_iteration` finds the smallest-*magnitude* eigenvalue,
+/// not the spectrum minimum, so it would be the wrong tool there. The
+/// archimedean-only path bypasses the τ disk cache (keyed only on
+/// `(λ², N, prec)`, which would collide with the full matrix).
+pub fn weil_spectrum_hp(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    include_primes: bool,
+) -> Result<Vec<Float>> {
+    let prec = cfg.precision_bits;
+    let dim = params.matrix_size();
+    let l = log_lambda_sq_hp(params, prec);
+    let mut tau = if include_primes {
+        build_tau_hp(params, &l, cfg)?
+    } else {
+        build_tau_hp_compute(params, &l, cfg, false)?
+    };
+    force_symmetric(&mut tau, dim);
+    xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&tau, dim, prec)
+}
+
+fn build_tau_hp_compute(params: &CcmParams, l: &Float, cfg: &HighPrecConfig, include_primes: bool) -> Result<Vec<Float>> {
     let prec = cfg.precision_bits;
     let n_max = params.n_modes;
     let dim = params.matrix_size();
@@ -606,6 +648,7 @@ fn build_tau_hp_compute(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> 
         let two_pi_n_over_l = { let mut v = two_pi.clone(); v *= &nf; v /= l; v };
         let two_pi_m_over_l = { let mut v = two_pi.clone(); v *= &mf; v /= l; v };
         let mut wp = Float::with_val(prec, 0);
+        if include_primes {
         for (log_k, log_p, sqrt_k) in &pp_data {
             let q = if n == m {
                 let mut ph = two_pi_n_over_l.clone(); ph *= log_k;
@@ -621,6 +664,7 @@ fn build_tau_hp_compute(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> 
             };
             let mut term = q; term *= log_p; term /= sqrt_k;
             wp += &term;
+        }
         }
         let mut t = w02; t -= &wr; t -= &wp; t
     }).collect();
@@ -2340,6 +2384,35 @@ mod tests {
         // Natural is distinct.
         assert_eq!(natural, "weil_eigvec_lambda_sq1000_nmodes800_prec6660_natural.json");
         assert_ne!(forced, natural);
+    }
+
+    /// `weil_spectrum_hp`: the FULL Weil form is positive (smallest
+    /// eigenvalue > 0 — Weil positivity / the plunge), while the
+    /// ARCHIMEDEAN-ONLY form (prime sum `w_p` dropped) is indefinite
+    /// (negative minimum — the prime sum that enforces positivity is
+    /// absent). λ²=13, N=12, 64 digits, hermetic (no cache / no network).
+    #[test]
+    fn weil_spectrum_full_positive_arch_indefinite() {
+        let params = CcmParams::from_lambda_sq_integer(13, 12);
+        let mut cfg = HighPrecConfig::for_decimal_digits(64);
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+
+        let full = weil_spectrum_hp(&params, &cfg, true).unwrap();
+        let arch = weil_spectrum_hp(&params, &cfg, false).unwrap();
+
+        let zero = Float::with_val(cfg.precision_bits, 0);
+        // FULL: smallest eigenvalue is positive (Weil positivity).
+        assert!(
+            full[0] > zero,
+            "full Weil form should be positive definite, min={}",
+            full[0]
+        );
+        // ARCH-only: minimum is negative (indefinite without the prime sum).
+        assert!(
+            arch[0] < zero,
+            "archimedean-only form should be indefinite, min={}",
+            arch[0]
+        );
     }
 
     /// HighPrecConfig quad_points should clamp to MAX_QUAD_POINTS.
