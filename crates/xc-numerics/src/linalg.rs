@@ -1577,8 +1577,8 @@ mod tests {
 
     /// HP-1000 precision-scaling test: factorize a Strang's tridiagonal
     /// at the publication precision, solve a system, verify residual.
-    /// This is the "production scenario" test — same precision Paper B
-    /// runs at.
+    /// This is the "production scenario" test — the same precision the
+    /// HP-1000 research runs use.
     #[test]
     fn tridiag_lu_at_hp_1000() {
         let prec = 3338; // HP-1000d

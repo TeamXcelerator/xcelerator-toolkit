@@ -32,7 +32,7 @@ This is a Cargo workspace containing three sub-crates:
 
 **xc-spectral:**
 - `ccm` — CCM construction: `CcmParams` (`from_lambda_sq_integer` / `from_lambda_sq_fractional`), `LambdaSq` (integer/fractional λ² mode), `CcmResult`, `prime_powers_up_to`, `run_f64`, `solve_spectrum_f64`.
-- `ccm::hp` (HP-gated) — `HighPrecConfig`, `HighPrecResult`, `run`, `measure_evenness`, full Weil-form matrix assembly at arbitrary precision. The τ-matrix is cached to `<cwd>/data/tau_cache/` (JSON, single zip, or byte-split `.partXX` for GitHub's 100 MB limit). The Weil eigenvector ξ is cached to `<cwd>/data/weil_eigvec_cache/` with a remote-fetch tier from the public [`xcelerator-weil-eigvec-cache`](https://github.com/TeamXcelerator/xcelerator-weil-eigvec-cache) repo. The eigensolver uses adaptive Newton steps, f64 warm seeds, Halley's method (selectable via `XCELERATOR_SOLVER=halley`), warm-start inverse iteration (`XCELERATOR_WARM_START=1`), and auto-detects even/odd eigenvector symmetry. Newton convergence failures return `None` (type: `Vec<Option<Float>>`) rather than silently returning a bad result. Public audit API: `verify_tau_cache_dir`. Also exposes `weil_spectrum_hp(params, cfg, include_primes)` — the full dense HP spectrum of the localized Weil-form τ-matrix (smallest positive eigenvalue = the plunge `ε_N`), with an archimedean-only mode (`include_primes = false` drops the prime-power sum `w_p` from every τ entry) for prefactor-decomposition studies. `weil_plunge_cancellation_hp(params, cfg) -> PlungeCancellation` finds the full plunge eigenvector ξ and returns the plunge `ε_N` together with the archimedean and prime Rayleigh quotients on that same ξ (`ε_N = arch_rayleigh − prime_rayleigh` by linearity), quantifying the archimedean↔prime cancellation that sets the floor.
+- `ccm::hp` (HP-gated) — `HighPrecConfig`, `HighPrecResult`, `run`, `measure_evenness`, full Weil-form matrix assembly at arbitrary precision. The τ-matrix is cached to `<cwd>/data/tau_cache/` (JSON, single zip, or byte-split `.partXX` for GitHub's 100 MB limit). The Weil eigenvector ξ is cached to `<cwd>/data/weil_eigvec_cache/` with a remote-fetch tier from the public [`xcelerator-weil-eigvec-cache`](https://github.com/TeamXcelerator/xcelerator-weil-eigvec-cache) repo. The eigensolver uses adaptive Newton steps, f64 warm seeds, Halley's method (selectable via `XCELERATOR_SOLVER=halley`), warm-start inverse iteration (`XCELERATOR_WARM_START=1`), and auto-detects even/odd eigenvector symmetry. Newton convergence failures return `None` (type: `Vec<Option<Float>>`) rather than silently returning a bad result. Public audit API: `verify_tau_cache_dir`. Also exposes `weil_spectrum_hp(params, cfg, include_primes)` — the full dense HP spectrum of the localized Weil-form τ-matrix (smallest positive eigenvalue = the plunge `ε_N`), with an archimedean-only mode (`include_primes = false` drops the prime-power sum `w_p` from every τ entry) for prefactor-decomposition studies. `weil_plunge_cancellation_hp(params, cfg) -> PlungeCancellation` finds the full plunge eigenvector ξ and returns the plunge `ε_N` together with the archimedean and prime Rayleigh quotients on that same ξ (`ε_N = arch_rayleigh − prime_rayleigh` by linearity), quantifying the archimedean↔prime cancellation that sets the floor. `weil_spectrum_sonin_hp(params, cfg, omega, n_drop)` (with `SoninRestriction`) and `band_concentration_matrix_hp(params, cfg, omega)` add the time-frequency (Slepian/prolate) band-concentration operator in the same `V_n` basis (eigenvalues `χ∈(0,1)`): the latter exposes the band-concentrated vs Sonin-like (anti-band) split, and the former deflates the top `n_drop` band-concentrated modes to return the archimedean Weil spectrum on the Sonin subspace (where archimedean positivity holds, Connes Thm 7.1).
 - `screw` (HP-gated) — Suzuki screw function `g(t)` (arXiv:2606.09096): `ScrewKernel::new(a_max, prec)` / `.eval(&t)`, HP throughout (closed-form `ψ(1/4) = −γ − π/2 − 3 ln 2` and `Φ(1,2,1/4) = π² + 8·G` from rug constants; Hurwitz–Lerch `Φ(z,2,1/4)` by HP series; von Mangoldt sum via `prime_powers_up_to`). Validated to 1e-38 against an independent reference implementation. The continuous kernel of the localized Weil-form convolution operator `G_a`.
 - `prolate` — Prolate-wave operator PW_λ. f64 prototype and HP submodule `prolate::hp` using the HP eigensolver from `xc-numerics::eigen`. Eigenvalue spectrum cached to `<cwd>/data/prolate_eigvals_cache/`. Public audit API: `verify_prolate_eigvals_cache_dir`.
 - `mellin` — Truncated completed eta function Λ_λ(s), ξ-weighted Mellin G(s), parallelized critical-line zero scanner. Full f64 (`*_f64`) and HP (`*_hp`) parity. Uses `xc_numerics::quadrature::gl_nodes_weights_f64` for the f64 path (no internal duplication).
@@ -150,11 +150,20 @@ the function is HP (or precision-agnostic).
 | `_hp` suffix → HP | `omega_hp`, `truncated_lambda_hp`, `xi_weighted_mellin_hp`, `scan_critical_line_zeros_hp`, `tridiag_eigenvalues_hp`, `householder_tridiag_hp`, `dense_symmetric_eigenvalues_hp`, `tridiag_eigenvector_for_value_hp` |
 | no suffix → HP-default | `ccm::hp::run`, `inverse_iteration`, `lu_factor`, `lu_solve`, `normalize_l2`, `rayleigh_quotient`, `display_hp`, `matching_digits`, `chi_at`, `gauss_legendre_nodes` |
 
-Full guideline (private):
-[`xcelerator-research/research/methods/HP_F64_GUIDELINES.md`](https://github.com/TeamXcelerator/xcelerator-research).
-
 
 ## Version History
+
+- **v0.11.1** — New `ccm::hp::band_concentration_matrix_hp(params, cfg, omega)`:
+  the time-frequency (Slepian/prolate) band-concentration operator in the
+  localized Weil-form `V_n` basis, with eigenvalues `χ ∈ (0,1)` separating the
+  band-concentrated (prolate) subspace from the Sonin-like (anti-band) subspace.
+  New `ccm::hp::weil_spectrum_sonin_hp(params, cfg, omega, n_drop)` (with the
+  `SoninRestriction` result): deflates the top `n_drop` band-concentrated modes
+  and returns the archimedean Weil spectrum on the Sonin subspace (where
+  archimedean positivity holds, Connes Thm 7.1). Adds the `weil_sonin` example.
+  **Backwards compatible — additive only** (no public API changed). Adds 2 unit
+  tests. Also scrubs internal shorthand from a few code comments (no behavior
+  change).
 
 - **v0.11.0** — New `xc-spectral::screw` module: the Suzuki screw function
   `g(t)` (arXiv:2606.09096) in HP, validated to 1e-38 against an independent

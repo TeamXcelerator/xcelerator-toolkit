@@ -19,7 +19,7 @@ use super::{prime_powers_up_to, CcmParams, CcmResult};
 ///
 /// All fields are public so callers can override individual components
 /// after a `for_decimal_digits` construction. The default values are
-/// tuned for the Paper A / Paper B HP-1000 retest workload; tweak with
+/// tuned for the HP-1000 retest workload; tweak with
 /// caution.
 #[derive(Debug, Clone)]
 pub struct HighPrecConfig {
@@ -629,6 +629,186 @@ pub fn weil_plunge_cancellation_hp(
         arch_rayleigh,
         prime_rayleigh,
     })
+}
+
+/// `sinc(t) = sin(t)/t`, with `sinc(0) = 1`, at working precision `prec`.
+fn sinc_hp(t: &Float, prec: u32) -> Float {
+    let tiny = Float::with_val(prec, Float::parse("1e-40").unwrap());
+    if t.cmp_abs(&tiny).map(|o| o.is_lt()).unwrap_or(false) {
+        Float::with_val(prec, 1)
+    } else {
+        let mut s = t.clone().sin();
+        s /= t;
+        s
+    }
+}
+
+/// Time-frequency (prolate) band-concentration matrix `C` in the same
+/// `V_n` trigonometric basis as the localized Weil form, for a frequency
+/// band `(−Ω, Ω)` (`omega` = Ω).
+///
+/// With `φ_n(x) = e^{2π i n x / L}/√L` on the log-interval `(−a, a)`
+/// (`a = ½ ln λ²`, `L = 2a`) and `ω_n = 2π n / L`, the entry is the
+/// time-then-band-limiting (Slepian concentration) operator
+/// `C[n,m] = (a/π) ∫_{−Ω}^{Ω} sinc(a(ω_n−ξ)) sinc(a(ω_m−ξ)) dξ`,
+/// computed by HP Gauss–Legendre quadrature on the band.
+///
+/// Its eigenvalues `χ ∈ (0,1)` are the band-concentration ratios: `χ ≈ 1`
+/// modes are band-concentrated (the prolate/PSWF subspace), `χ ≈ 0` modes
+/// span the Sonin-like (anti-band) subspace. The number of `χ ≈ 1` modes
+/// is the Shannon number `≈ 2aΩ/π`. Symmetric, row-major, dimension `2N+1`,
+/// in the `params.idx` ordering (so it matches `weil_spectrum_hp`).
+pub fn band_concentration_matrix_hp(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    omega: &Float,
+) -> Result<Vec<Float>> {
+    let prec = cfg.precision_bits;
+    let n_max = params.n_modes as i64;
+    let dim = params.matrix_size();
+    let l = log_lambda_sq_hp(params, prec);
+    let mut a = l.clone();
+    a /= 2u32;
+    let pi_v = pi(prec);
+    let npts = cfg.quad_points.max(8 * params.n_modes + 64);
+    let (nodes, weights) =
+        xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode);
+
+    // ω_n = 2π n / L, indexed by position params.idx(n) = n + N.
+    let omega_n: Vec<Float> = (-n_max..=n_max)
+        .map(|n| {
+            let mut w = pi_v.clone();
+            w *= 2u32;
+            w *= fl_i(prec, n);
+            w /= &l;
+            w
+        })
+        .collect();
+
+    // prefactor (a/π)·Ω folded into the quadrature weight.
+    let mut aon = a.clone();
+    aon /= &pi_v;
+    aon *= omega;
+
+    let mut c = vec![Float::with_val(prec, 0); dim * dim];
+    for (q, node) in nodes.iter().enumerate() {
+        let mut xi = node.clone(); // GL node on [-1,1]
+        xi *= omega; // ξ_q = Ω·node ∈ (−Ω, Ω)
+        let svec: Vec<Float> = omega_n
+            .iter()
+            .map(|wn| {
+                let mut arg = wn.clone();
+                arg -= &xi;
+                arg *= &a;
+                sinc_hp(&arg, prec)
+            })
+            .collect();
+        let mut wq = weights[q].clone();
+        wq *= &aon;
+        for i in 0..dim {
+            let mut wi = svec[i].clone();
+            wi *= &wq;
+            for j in i..dim {
+                let mut term = wi.clone();
+                term *= &svec[j];
+                c[i * dim + j] += &term;
+            }
+        }
+    }
+    for i in 0..dim {
+        for j in (i + 1)..dim {
+            let v = c[i * dim + j].clone();
+            c[j * dim + i] = v;
+        }
+    }
+    Ok(c)
+}
+
+/// Result of restricting the archimedean Weil form to the Sonin-like
+/// (anti-band) subspace via band-concentration deflation.
+pub struct SoninRestriction {
+    /// Band-concentration eigenvalues `χ ∈ (0,1)`, ascending. The count
+    /// of `χ ≈ 1` is the Shannon number; the `χ ≈ 0` tail is the Sonin
+    /// subspace.
+    pub chi: Vec<Float>,
+    /// Spectrum of the archimedean Weil form after deflating the top
+    /// `n_dropped` band-concentrated modes (those land near `+σ`). The
+    /// smallest entry is the archimedean Rayleigh minimum on the
+    /// band-complement (Sonin-like) subspace — positive iff archimedean
+    /// positivity holds there (Connes Thm 7.1).
+    pub spectrum: Vec<Float>,
+    /// Number of band-concentrated modes deflated out.
+    pub n_dropped: usize,
+}
+
+/// Archimedean Weil-form spectrum restricted to the Sonin-like (anti-band)
+/// subspace. The full-space archimedean form is O(1)-indefinite; this
+/// deflates the top `n_drop` band-concentration eigenvectors (band
+/// `(−Ω, Ω)`, `omega = Ω`) by a positive shift `σ`, leaving the
+/// archimedean form on the band-complement. Returns the deflated spectrum;
+/// its minimum is the archimedean Rayleigh minimum on that subspace.
+///
+/// Method: build [`band_concentration_matrix_hp`], take its top `n_drop`
+/// eigenvectors `v_k` (largest `χ`), and form `Ã = A_arch + σ Σ_k v_k v_kᵀ`
+/// with `σ` a Gershgorin bound on `‖A_arch‖` (so deflated modes leave the
+/// spectrum bottom). `A_arch` is the prime-free Weil matrix
+/// (`build_tau_hp_compute(.., include_primes=false)`).
+pub fn weil_spectrum_sonin_hp(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    omega: &Float,
+    n_drop: usize,
+) -> Result<SoninRestriction> {
+    let prec = cfg.precision_bits;
+    let dim = params.matrix_size();
+    let l = log_lambda_sq_hp(params, prec);
+
+    let cmat = band_concentration_matrix_hp(params, cfg, omega)?;
+    let chi = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&cmat, dim, prec)?;
+
+    let n_drop = n_drop.min(dim);
+    let mut deflate: Vec<Vec<Float>> = Vec::with_capacity(n_drop);
+    for k in 0..n_drop {
+        let chi_k = &chi[dim - 1 - k]; // largest χ first
+        let mut v = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
+            &cmat, dim, chi_k, prec, cfg.inverse_iter_steps,
+        )?;
+        xc_numerics::linalg::normalize_l2(&mut v);
+        deflate.push(v);
+    }
+
+    let mut a_arch = build_tau_hp_compute(params, &l, cfg, false)?;
+    force_symmetric(&mut a_arch, dim);
+
+    // σ = 10 · (Gershgorin bound on |spectrum|) + 1.
+    let mut sigma = Float::with_val(prec, 0);
+    for i in 0..dim {
+        let mut row = Float::with_val(prec, 0);
+        for j in 0..dim {
+            row += a_arch[i * dim + j].clone().abs();
+        }
+        if row > sigma {
+            sigma = row;
+        }
+    }
+    sigma *= 10u32;
+    sigma += 1u32;
+
+    for v in &deflate {
+        for i in 0..dim {
+            let mut svi = v[i].clone();
+            svi *= &sigma;
+            for j in 0..dim {
+                let mut term = svi.clone();
+                term *= &v[j];
+                a_arch[i * dim + j] += &term;
+            }
+        }
+    }
+    force_symmetric(&mut a_arch, dim);
+    let spectrum = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&a_arch, dim, prec)?;
+
+    Ok(SoninRestriction { chi, spectrum, n_dropped: n_drop })
 }
 
 fn build_tau_hp_compute(params: &CcmParams, l: &Float, cfg: &HighPrecConfig, include_primes: bool) -> Result<Vec<Float>> {
@@ -2418,6 +2598,62 @@ mod tests {
         assert!(cfg.force_even, "force_even should default to true");
     }
 
+    /// Band-concentration matrix is symmetric, has a [0,1] spectrum, and
+    /// exhibits a concentrated/Sonin split (some χ≈1, some χ≈0).
+    #[test]
+    fn band_concentration_spectrum_in_unit_interval() {
+        let params = CcmParams::from_lambda_sq_integer(5, 8);
+        let mut cfg = HighPrecConfig::for_decimal_digits(30);
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let prec = cfg.precision_bits;
+        let dim = params.matrix_size();
+        let omega = Float::with_val(prec, 15);
+        let c = band_concentration_matrix_hp(&params, &cfg, &omega).unwrap();
+        for i in 0..dim {
+            for j in 0..dim {
+                let d = (c[i * dim + j].to_f64() - c[j * dim + i].to_f64()).abs();
+                assert!(d < 1e-25, "C not symmetric at ({i},{j}): {d}");
+            }
+            let cii = c[i * dim + i].to_f64();
+            assert!(cii > -1e-9 && cii < 1.0 + 1e-6, "diag {cii} out of [0,1]");
+        }
+        let chi = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&c, dim, prec).unwrap();
+        let chi_f: Vec<f64> = chi.iter().map(|x| x.to_f64()).collect();
+        for &x in &chi_f {
+            assert!(x > -1e-6 && x < 1.0 + 1e-6, "chi {x} out of [0,1]");
+        }
+        assert!(chi_f.iter().any(|&x| x > 0.9), "expected a concentrated (χ≈1) mode");
+        assert!(chi_f.iter().any(|&x| x < 0.1), "expected a Sonin-like (χ≈0) mode");
+    }
+
+    /// Sonin restriction deflates exactly `n_drop` band-concentrated modes:
+    /// they cluster near the shift σ (≈ max eigenvalue), well separated
+    /// from the rest, and the result shape is consistent.
+    #[test]
+    fn weil_sonin_deflates_band_modes() {
+        let params = CcmParams::from_lambda_sq_integer(5, 8);
+        let mut cfg = HighPrecConfig::for_decimal_digits(30);
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let prec = cfg.precision_bits;
+        let dim = params.matrix_size();
+        let omega = Float::with_val(prec, 15);
+        let n_drop = 5usize;
+        let res = weil_spectrum_sonin_hp(&params, &cfg, &omega, n_drop).unwrap();
+        assert_eq!(res.chi.len(), dim);
+        assert_eq!(res.spectrum.len(), dim);
+        assert_eq!(res.n_dropped, n_drop);
+        for w in res.chi.windows(2) {
+            assert!(w[0].to_f64() <= w[1].to_f64() + 1e-12, "χ not ascending");
+        }
+        // The n_drop deflated modes cluster near σ (the max); everything
+        // else sits below σ/2 — so exactly n_drop eigenvalues exceed σ/2.
+        let s: Vec<f64> = res.spectrum.iter().map(|x| x.to_f64()).collect();
+        let max_v = *s.last().unwrap();
+        assert!(max_v > 10.0, "deflation shift σ should be large, got {max_v}");
+        let big = s.iter().filter(|&&e| e > max_v / 2.0).count();
+        assert_eq!(big, n_drop, "expected {n_drop} deflated modes near σ, got {big}");
+    }
+
     /// HighPrecConfig::for_decimal_digits at 500 digits.
     #[test]
     fn config_for_500_digits() {
@@ -3147,7 +3383,7 @@ mod tests {
     /// ```
     ///
     /// Uses (λ²=1000, N=800, prec=3338) — a known byte-split config in
-    /// the repo (Paper A headline; >90 MB → multiple .partXX). In a
+    /// the repo (a headline HP-1000 config; >90 MB → multiple .partXX). In a
     /// fresh temp cwd with NO local cache, `build_tau_hp` under
     /// DynamicFetch must miss local tiers, hit the remote tier, probe
     /// the single zip (404) then download all `.partXX`, concatenate +

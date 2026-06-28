@@ -1381,7 +1381,7 @@ mod hp_cache_tests {
     /// ```
     ///
     /// Uses (n=600, prec=681), which is a known fixture in the repo
-    /// (imported from Paper B). In a fresh temp cwd with NO local cache,
+    /// (a standard HP-1000 fixture). In a fresh temp cwd with NO local cache,
     /// `DynamicFetch` must miss tiers 1 and 2, hit the remote tier,
     /// download the `.json.zip`, decompress + validate it, write both
     /// the local `.json.zip` and the decompressed `.json`, and return
