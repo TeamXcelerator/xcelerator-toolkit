@@ -48,3 +48,6 @@ pub mod fmt;
 
 #[cfg(feature = "hp")]
 pub mod eigen;
+
+#[cfg(feature = "hp")]
+pub mod hp_runtime;

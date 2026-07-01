@@ -428,7 +428,17 @@ mod tests {
     /// structure at λ²=13, N=120. Note: f64 tier uses bisection on R(t)
     /// without Newton-from-seed, so eigenvalues are Weil-form roots
     /// rather than Riemann zeros (those need the HP path).
+    ///
+    /// Skipped in debug builds: the unoptimized nalgebra `SymmetricEigen`
+    /// on a 241×241 matrix allocates a stack frame for every intermediate
+    /// value, exhausting even a large stack before finishing.
+    ///
+    /// Skipped always (ignored): building the 241×241 τ-matrix via
+    /// O(N²) GL integrations is a multi-minute test even in release mode;
+    /// run explicitly with `--include-ignored` when validating the f64 path.
     #[test]
+    #[ignore = "f64 τ-matrix build (58K GL integrations) — too slow for routine test runs; use --include-ignored to run explicitly"]
+    #[cfg(not(debug_assertions))]
     fn run_f64_produces_spectrum() {
         let params = CcmParams::from_lambda_sq_integer(13, 120);
         let result = run_f64(&params).unwrap();

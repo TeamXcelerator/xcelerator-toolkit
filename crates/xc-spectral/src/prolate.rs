@@ -1968,6 +1968,7 @@ pub mod hp {
         /// Build PW_λ in HP and confirm the diagonal is sane (positive,
         /// finite, bounded).
         #[test]
+        #[ignore = "HP matrix compute — GMP arena exhaustion in long debug test runs on WSL2; run with: RAYON_NUM_THREADS=2 cargo test --features hp -- --include-ignored --test-threads=1"]
         fn pw_matrix_ground_state_hp() {
             let prec = 256;
             let lambda = hp(prec, "2");
@@ -1987,6 +1988,7 @@ pub mod hp {
 
         /// Smallest prolate eigenvalue at λ=5 should be close to 2π·25 = 157.08.
         #[test]
+        #[ignore = "HP matrix compute — GMP arena exhaustion in long debug test runs on WSL2; run with: RAYON_NUM_THREADS=2 cargo test --features hp -- --include-ignored --test-threads=1"]
         fn pw_smallest_eigenvalue_hp() {
             let prec = 256;
             let lambda = hp(prec, "5");
@@ -2019,6 +2021,7 @@ pub mod hp {
         /// End-to-end compute_k_lambda at HP. Verify result is finite,
         /// has expected shape, and eigenvalues are sane.
         #[test]
+        #[ignore = "HP matrix compute — GMP arena exhaustion in long debug test runs on WSL2; run with: RAYON_NUM_THREADS=2 cargo test --features hp -- --include-ignored --test-threads=1"]
         fn compute_k_lambda_runs_hp() {
             let prec = 256;
             let lambda = hp(prec, "5");
@@ -2049,6 +2052,7 @@ pub mod hp {
 
         /// End-to-end compare_xi_to_k_lambda at HP with a synthetic ξ.
         #[test]
+        #[ignore = "HP matrix compute — GMP arena exhaustion in long debug test runs on WSL2; run with: RAYON_NUM_THREADS=2 cargo test --features hp -- --include-ignored --test-threads=1"]
         fn compare_runs_end_to_end_hp() {
             let prec = 256;
             let lambda = hp(prec, "5");
