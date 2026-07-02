@@ -1,18 +1,27 @@
-// Minimal single-config repro + fix-recipe harness for the WSL2 HP abort
-// (research: TOOLKIT_DEFECTS DEFECT-00x). Fresh compute (CacheMode::Off).
+// Regression-check / diagnostic harness for the WSL2 HP abort fixed in
+// v0.11.2/v0.11.3 (see xc_numerics::hp_runtime module docs for the full
+// writeup of what was confirmed and why). Fresh compute (CacheMode::Off)
+// so the LU / inverse-iteration path is always exercised.
+//
+// With no env vars, this exercises the toolkit's built-in WSL2 handling
+// (xc_numerics::hp_runtime::run_hp) exactly as the production ccm::hp::run
+// entry point does — i.e. it should just pass on WSL2 with no configuration:
+//
+//   cargo run --release --features hp --example wsl_abort_repro
+//
+// The POOL_*/OUTER_STACK_MB knobs below bypass the toolkit's own WSL
+// handling and build an ad hoc pool/thread instead — useful for
+// re-diagnosing a *new* WSL2 issue (varying worker count / stack size by
+// hand) without touching hp_runtime.rs itself:
 //
 //   LSQ=20 NM=140 DIG=210 POOL_THREADS=4 POOL_STACK_MB=512 \
 //     ./target/release/examples/wsl_abort_repro
 //
 // Env knobs:
 //   LSQ, NM, DIG         : config (default 5 / 40 / 90)
-//   POOL_THREADS         : rayon worker count (0/unset = rayon default)
-//   POOL_STACK_MB        : rayon worker stack in MiB (0/unset = std default)
+//   POOL_THREADS         : ad hoc rayon worker count (0/unset = skip, use hp_runtime)
+//   POOL_STACK_MB        : ad hoc rayon worker stack in MiB (0/unset = std default)
 //   OUTER_STACK_MB       : big-stack std::thread wrapping the whole run (0 = none)
-//
-// When POOL_* or OUTER_STACK_MB are set, the CCM run executes inside a
-// configured rayon pool and/or a large-stack std::thread so BOTH the pool
-// workers and the participating caller have adequate stack.
 
 #[cfg(feature = "hp")]
 fn run_config() {

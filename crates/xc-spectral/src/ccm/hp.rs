@@ -880,10 +880,17 @@ fn build_tau_hp_compute(params: &CcmParams, l: &Float, cfg: &HighPrecConfig, inc
     };
     eprintln!("[HP] Precomputing {} unique GL node tables (npts up to {}, prec={} bits)...",
         unique_pts.len(), unique_pts.last().copied().unwrap_or(0), prec);
-    let gl_cache: HashMap<usize, (Vec<Float>, Vec<Float>)> = unique_pts
-        .par_iter()
-        .map(|&npts| (npts, xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode)))
-        .collect();
+    // xc_numerics::hp_runtime::map_gl_precompute: parallel on Vast/native
+    // Linux (unchanged); sequential on WSL2, where sustained concurrent
+    // GMP allocation across many back-to-back GL computes triggers a
+    // non-deterministic glibc abort (confirmed independent of rayon —
+    // reproduces with plain std::thread too). GL tables are cached to
+    // disk after first compute, so this only costs time on a cold cache.
+    let gl_pairs: Vec<(usize, (Vec<Float>, Vec<Float>))> = xc_numerics::hp_runtime::map_gl_precompute(
+        &unique_pts,
+        |&npts| (npts, xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode)),
+    );
+    let gl_cache: HashMap<usize, (Vec<Float>, Vec<Float>)> = gl_pairs.into_iter().collect();
     eprintln!("[HP] GL tables ready. Computing α_L, β_L, γ_L integrals...");
 
     let indices: Vec<usize> = (0..=n_max).collect();

@@ -151,9 +151,10 @@ where
     F: Fn(f64, f64) -> (f64, f64) + Sync,
 {
     use rayon::prelude::*;
-    // On WSL2, cap the global rayon pool before the parallel scan so we
-    // don't exhaust the GMP arena / thread limit even in pure-f64 code.
-    xc_numerics::hp_runtime::init_global_pool_for_wsl();
+    // On WSL2, ensure the global rayon pool is capped to a small worker
+    // count before the parallel scan fires (see xc_numerics::hp_runtime
+    // module docs). No-op on Vast / native Linux.
+    xc_numerics::hp_runtime::init_hp_pool();
     let dt = (t_max - t_min) / (n_scan as f64);
 
     // Parallel scan: evaluate Re(eval_fn(0.5, t_i)) at each grid point.

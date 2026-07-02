@@ -52,8 +52,9 @@ cargo test --workspace
 
 # Full HP tier (Linux/WSL/macOS — requires libgmp-dev libmpfr-dev libmpc-dev):
 cargo test --workspace --features hp --release -- --test-threads=1
-# ~213 tests pass, ~23 ignored (HP compute, slow Mellin scans, live-network);
-# test-threads=1 required on WSL2 (GMP arena limit)
+# ~211 tests pass, 23 ignored (HP compute, slow Mellin scans, live-network).
+# --test-threads=1 and --release are needed on WSL2 (see "Running under
+# WSL2" below); on Vast / native Linux the defaults work fine too.
 #
 # To run everything including the heavy HP compute tests:
 #   RAYON_NUM_THREADS=2 cargo test --features hp --release -- --test-threads=1 --include-ignored
@@ -132,6 +133,50 @@ System dependencies for HP tier:
 sudo apt install build-essential m4 libgmp-dev libmpfr-dev libmpc-dev
 ```
 
+## Running under WSL2 — known limitations
+
+The HP (GMP/MPFR) tier runs correctly under WSL2, but with two differences
+from native Linux (Vast, bare-metal, CI) that are worth knowing about
+before you file a bug:
+
+**1. Reduced HP parallelism (automatic, no configuration needed).**
+On WSL2, rayon's default thread pool (sized to all logical cores) reliably
+aborts the process (`exit 1`, no panic, no backtrace — a glibc-level
+`abort()`, confirmed independent of rayon; the same failure reproduces with
+plain `std::thread`) during dense HP linear algebra at matrix dimension
+≳240. The toolkit detects WSL2 (`xc_numerics::hp_runtime::is_wsl`) and
+automatically caps HP parallelism to a small worker count (`nproc/8`,
+clamped to 2–4) instead. **This happens transparently — no environment
+variables or code changes are required.** It means HP compute is slower
+per-core-available on WSL2 than on an equivalently-sized native Linux box,
+but it is correct and will not crash.
+- Override with `XC_HP_THREADS=N` if you want to experiment with a higher
+  worker count on your machine (the safe threshold was only bracketed
+  between 8 and 16 combined pool threads on one 32-core test machine, not
+  precisely determined, and may differ on other WSL2 configurations).
+- **Vast and native Linux are completely unaffected** — every WSL2-specific
+  code path is gated behind `is_wsl()` and is a zero-cost no-op elsewhere.
+
+**2. Slow cold-cache Gauss-Legendre precompute at large configurations.**
+Computing GL node/weight tables at high point counts and precision (e.g.
+npts≈1200, prec≈1000 bits — roughly λ²≳25 in the CCM construction) takes
+several minutes on WSL2 when the local/remote GL cache doesn't already have
+the fixture. This is genuinely slow compute, not a defect — it is one-time
+per `(npts, precision_bits)` pair and is cached to disk (`<cwd>/data/gl_cache/`)
+afterward, and on WSL2 it additionally runs single-threaded (see the
+`map_gl_precompute` note in `xc_numerics::hp_runtime`) to keep total HP
+thread activity low. **If a run at a large λ² appears to hang on WSL2, it is
+very likely still computing — check CPU usage (`ps aux`) before assuming a
+crash.** Populating the local GL cache from the public
+[`xcelerator-gl-cache`](https://github.com/TeamXcelerator/xcelerator-gl-cache)
+repo ahead of time avoids the wait entirely.
+
+**Practical guidance:** WSL2 is suitable for local development, small-to-
+moderate configurations, and running the test suite. For large sweeps,
+high-precision campaigns, or anything where wall-clock time matters, use
+Vast or another native Linux machine — the toolkit's parallelism is
+unrestricted there.
+
 ## HP / f64 boundary policy
 
 The toolkit follows a strict rule: **HP everywhere unless f64 is
@@ -154,21 +199,33 @@ the function is HP (or precision-agnostic).
 
 ## Version History
 
-- **v0.11.2** — WSL2 HP reliability fix. Adds `xc-numerics::hp_runtime`:
-  a WSL2-aware execution context that detects `/proc/version` and, on WSL2 only,
-  routes all HP entry points through a single shared rayon pool (2 workers,
-  256 MB per-worker stack) and a 256 MB `spawn_scoped` outer thread. Fixes the
-  hard-abort (exit 1, no panic) that occurred on WSL2 when 32 default rayon
-  workers exhausted the GMP arena/mmap limit during dense LU and GL-node
-  Newton compute. All five public HP entry points in `ccm::hp` and
-  `scan_critical_line_zeros_hp` in `mellin` are wrapped with `run_hp(||…)`.
-  On Vast / native Linux the wrapper is a zero-overhead passthrough — full
-  parallelism and behavior unchanged. Also marks slow/intensive HP compute
-  tests `#[ignore]` with explicit run instructions (`RAYON_NUM_THREADS=2
-  cargo test --features hp --release -- --include-ignored --test-threads=1`)
-  so the default test run (`cargo test --features hp`) completes cleanly in
-  ~60 s on WSL2 without process crashes. **Backwards compatible — no public
-  API changed; all callers of `run`, `weil_spectrum_hp`, etc. are unaffected.**
+- **v0.11.3** — WSL2 HP reliability fix, corrected design (supersedes the
+  v0.11.2 approach below). `xc-numerics::hp_runtime` now uses exactly one
+  capped global rayon pool plus one dedicated pool reused via
+  `pool.install` (not two independently-configured pools, which testing
+  showed made the abort *more* likely by doubling the combined
+  concurrently-active-thread count). Worker count auto-detected as
+  `nproc/8` (clamped to 2–4) rather than a fixed value; overridable via
+  `XC_HP_THREADS`. Adds `map_gl_precompute` (parallel on non-WSL, serial on
+  WSL2) as additional headroom under the WSL2 thread budget for GL table
+  precompute. See the new README section "Running under WSL2 — known
+  limitations" and the extensive module docs in `hp_runtime.rs` for the
+  full empirical writeup (confirmed: not rayon-specific; confirmed: not
+  stack-size or `MALLOC_ARENA_MAX` sensitive; confirmed: thread-count
+  sensitive; confirmed: GL compute at large configurations is slow on
+  WSL2, not unstable — an earlier working theory to the contrary was a
+  false positive from short-timeout polling of a genuinely multi-minute
+  computation). **Backwards compatible — no public API changed.**
+
+- **v0.11.2** — WSL2 HP reliability fix (initial version; see v0.11.3 for
+  the corrected design). Added `xc-numerics::hp_runtime`, a WSL2-aware
+  execution context wrapping all `ccm::hp` public entry points and
+  `scan_critical_line_zeros_hp` in `mellin` with `run_hp(||…)`. On Vast /
+  native Linux the wrapper is a zero-overhead passthrough — full
+  parallelism and behavior unchanged. Also marked slow/intensive HP
+  compute tests `#[ignore]` with explicit run instructions so the default
+  test run completes cleanly on WSL2 without process crashes.
+  **Backwards compatible — no public API changed.**
 
 - **v0.11.1** — New `ccm::hp::band_concentration_matrix_hp(params, cfg, omega)`:
   the time-frequency (Slepian/prolate) band-concentration operator in the
