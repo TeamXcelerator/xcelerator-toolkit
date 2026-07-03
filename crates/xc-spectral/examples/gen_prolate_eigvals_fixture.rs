@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.®)
+// All rights reserved. See LICENSE in the repository root.
+
 // Generate a genuine prolate-eigenvalue cache fixture by running the
 // real HP prolate pipeline (`compute_k_lambda`). The eigenvalue
 // spectrum comes straight out of `tridiag_eigenvalues_hp` and is saved

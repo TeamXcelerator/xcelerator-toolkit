@@ -49,5 +49,11 @@ pub mod fmt;
 #[cfg(feature = "hp")]
 pub mod eigen;
 
-#[cfg(feature = "hp")]
+// Not gated behind `hp`: this module uses only std and rayon (both
+// available in the f64-only tier), and its purpose — capping rayon
+// parallelism on WSL2 to avoid a glibc-level abort — applies equally to
+// f64-only rayon callers (e.g. mellin::scan_critical_line_zeros_f64).
+// Gating it behind `hp` would break the default (`cargo build --workspace
+// --release`, no `--features hp`) build, since that f64 scanner calls
+// `hp_runtime::init_hp_pool()` unconditionally.
 pub mod hp_runtime;

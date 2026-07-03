@@ -133,49 +133,37 @@ System dependencies for HP tier:
 sudo apt install build-essential m4 libgmp-dev libmpfr-dev libmpc-dev
 ```
 
-## Running under WSL2 — known limitations
+## Running under WSL2
 
-The HP (GMP/MPFR) tier runs correctly under WSL2, but with two differences
-from native Linux (Vast, bare-metal, CI) that are worth knowing about
-before you file a bug:
+The HP (GMP/MPFR) tier runs at full, uncapped parallelism under WSL2 —
+identical to Vast, bare-metal Linux, or CI. No configuration is needed.
 
-**1. Reduced HP parallelism (automatic, no configuration needed).**
-On WSL2, rayon's default thread pool (sized to all logical cores) reliably
-aborts the process (`exit 1`, no panic, no backtrace — a glibc-level
-`abort()`, confirmed independent of rayon; the same failure reproduces with
-plain `std::thread`) during dense HP linear algebra at matrix dimension
-≳240. The toolkit detects WSL2 (`xc_numerics::hp_runtime::is_wsl`) and
-automatically caps HP parallelism to a small worker count (`nproc/8`,
-clamped to 2–4) instead. **This happens transparently — no environment
-variables or code changes are required.** It means HP compute is slower
-per-core-available on WSL2 than on an equivalently-sized native Linux box,
-but it is correct and will not crash.
-- Override with `XC_HP_THREADS=N` if you want to experiment with a higher
-  worker count on your machine (the safe threshold was only bracketed
-  between 8 and 16 combined pool threads on one 32-core test machine, not
-  precisely determined, and may differ on other WSL2 configurations).
-- **Vast and native Linux are completely unaffected** — every WSL2-specific
-  code path is gated behind `is_wsl()` and is a zero-cost no-op elsewhere.
+**History / optional safe mode.** Earlier toolkit versions (v0.11.2–v0.11.4)
+auto-detected WSL2 and unconditionally capped HP parallelism to a small
+worker count, because testing at the time found that rayon's default
+thread pool (sized to all logical cores) could abort the process (`exit 1`,
+no panic, no backtrace — a glibc-level `abort()`) during dense HP linear
+algebra at matrix dimension ≳240 on one 32-core WSL2 test machine.
+Retesting on 2026-07-02 found the abort no longer reproduces — 8/8 runs
+clean at full uncapped parallelism, including both the exact originally
+aborting configuration and a substantially harder one — with no WSL update
+or other environment change in between. Given that, capping by default was
+no longer justified.
 
-**2. Slow cold-cache Gauss-Legendre precompute at large configurations.**
-Computing GL node/weight tables at high point counts and precision (e.g.
-npts≈1200, prec≈1000 bits — roughly λ²≳25 in the CCM construction) takes
-several minutes on WSL2 when the local/remote GL cache doesn't already have
-the fixture. This is genuinely slow compute, not a defect — it is one-time
-per `(npts, precision_bits)` pair and is cached to disk (`<cwd>/data/gl_cache/`)
-afterward, and on WSL2 it additionally runs single-threaded (see the
-`map_gl_precompute` note in `xc_numerics::hp_runtime`) to keep total HP
-thread activity low. **If a run at a large λ² appears to hang on WSL2, it is
-very likely still computing — check CPU usage (`ps aux`) before assuming a
-crash.** Populating the local GL cache from the public
-[`xcelerator-gl-cache`](https://github.com/TeamXcelerator/xcelerator-gl-cache)
-repo ahead of time avoids the wait entirely.
+If you ever hit HP-compute instability on WSL2 (or any platform), set
+`XC_HP_SAFE_MODE=1` to opt into the old capped-pool / sequential-GL
+execution context:
+- Caps HP parallelism to `nproc/8` workers (clamped to 2–4). Override with
+  `XC_HP_THREADS=N`.
+- Runs Gauss-Legendre node/weight precompute sequentially instead of in
+  parallel (GL tables are cached to disk after first compute, so this only
+  costs time on a cold cache).
+- Runs HP entry points inside a large-stack scoped thread. Override the
+  stack size with `XC_HP_STACK_MB=N` (default 256).
 
-**Practical guidance:** WSL2 is suitable for local development, small-to-
-moderate configurations, and running the test suite. For large sweeps,
-high-precision campaigns, or anything where wall-clock time matters, use
-Vast or another native Linux machine — the toolkit's parallelism is
-unrestricted there.
+See `xc_numerics::hp_runtime` module docs for the full history and design
+of safe mode. If you do need it, please let us know (open an issue) so we
+can track whether the original instability has resurfaced.
 
 ## HP / f64 boundary policy
 
@@ -198,6 +186,55 @@ the function is HP (or precision-agnostic).
 
 
 ## Version History
+
+- **v0.11.4** — Two changes, bundled since v0.11.3's release was never
+  published:
+
+  **1. Fix: default f64-only build** (`cargo build --workspace --release`,
+  no `--features hp`) failed to compile with `E0433: cannot find
+  hp_runtime in xc_numerics`. The f64 critical-line scanner
+  (`scan_critical_line_zeros_f64` in `mellin.rs`, not hp-gated) calls
+  `xc_numerics::hp_runtime::init_hp_pool()`, but `hp_runtime` itself was
+  gated behind `#[cfg(feature = "hp")]` in `xc-numerics/src/lib.rs`, so
+  the module didn't exist in f64-only builds. Fix: `hp_runtime` is no
+  longer feature-gated — the module only depends on `std` and `rayon`
+  (both available unconditionally), so it compiles in both tiers. This
+  restores the README's own first quick-start command.
+
+  Reported by Akiva Groskin, who traced the failure to the `hp_runtime`
+  feature gate and confirmed the fix (ungating the module) on macOS.
+  Independently reproduced and verified on WSL2 before applying.
+
+  **2. WSL2 default flipped to full uncapped parallelism**, identical to
+  Vast/native Linux. `xc-numerics::hp_runtime` no longer auto-detects
+  WSL2 (`is_wsl()` removed) — the capped-pool / sequential-GL execution
+  context introduced in v0.11.2 is now an opt-in (`XC_HP_SAFE_MODE=1`)
+  rather than the unconditional WSL2 default.
+
+  Basis: the abort that motivated the v0.11.2 cap was retested on
+  2026-07-02 on the same 32-core WSL2 machine that originally exhibited
+  it, with no WSL update and no other environment change in between.
+  8/8 runs completed cleanly at full uncapped parallelism (rayon's
+  default global pool, parallel GL precompute) — 2 runs at the exact
+  originally-aborting configuration (λ²=20, N=140, dim 281) and 6 runs
+  at a substantially harder one (λ²=30, N=230, dim 461). Unconditionally
+  capping WSL2 parallelism is no longer justified given this: it imposed
+  a real performance cost (2–4 workers instead of all cores) for a
+  failure mode that no longer reproduces.
+
+  The original investigation's findings (thread-count sensitivity, not
+  rayon-specific, not stack/arena-size sensitive) and the capped
+  execution context itself are preserved as `XC_HP_SAFE_MODE=1`, in case
+  the abort was environment-specific in a way that resurfaces on a
+  different machine or WSL2 build. See `xc_numerics::hp_runtime` module
+  docs for the full history and design.
+
+  **Minor public API change**: `hp_runtime::is_wsl()` is removed
+  (replaced by `hp_runtime::safe_mode()`, which checks `XC_HP_SAFE_MODE`
+  instead of platform detection). No other function in this crate or
+  any other called `is_wsl()` directly, so this has no effect on any
+  existing caller. `init_hp_pool`, `run_hp`, and `map_gl_precompute`
+  keep their signatures unchanged.
 
 - **v0.11.3** — WSL2 HP reliability fix, corrected design (supersedes the
   v0.11.2 approach below). `xc-numerics::hp_runtime` now uses exactly one
@@ -308,6 +345,7 @@ the function is HP (or precision-agnostic).
 ## Used by
 
 - [`ccm-reproduction-and-convergence`](https://github.com/TeamXcelerator/ccm-reproduction-and-convergence) — Independent reproduction of the CCM zeta spectral triple, with eigenvalue match to 999 digits.
+- [`ccm-convergence-rate`](https://github.com/TeamXcelerator/ccm-convergence-rate) — A quantitative convergence law for the CCM zeta spectral triple's basis-size, precision, and prime-cutoff dependence, with defined rigor tiers for each component.
 - [`ccm-convergence-rate-falsifications`](https://github.com/TeamXcelerator/ccm-convergence-rate-falsifications) — Empirical convergence-rate study and falsification of proposed convergence-rate predictions.
 
 ## License

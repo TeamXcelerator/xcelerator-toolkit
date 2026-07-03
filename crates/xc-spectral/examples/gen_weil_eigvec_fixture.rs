@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.®)
+// All rights reserved. See LICENSE in the repository root.
+
 // Generate a genuine Weil-eigenvector (ξ) cache fixture by running the
 // real HP CCM pipeline. Because the eigenvector comes straight out of
 // `inverse_iteration`, the saved file is guaranteed to pass the

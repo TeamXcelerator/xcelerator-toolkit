@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "xc-numerics"
-version = "0.11.3"
+version = "0.11.4"
 dependencies = [
  "anyhow",
  "rayon",
@@ -505,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "xc-spectral"
-version = "0.11.3"
+version = "0.11.4"
 dependencies = [
  "anyhow",
  "nalgebra",
@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "xc-zeta"
-version = "0.11.3"
+version = "0.11.4"
 dependencies = [
  "anyhow",
  "rug",

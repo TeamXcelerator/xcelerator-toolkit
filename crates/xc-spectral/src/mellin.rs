@@ -151,9 +151,9 @@ where
     F: Fn(f64, f64) -> (f64, f64) + Sync,
 {
     use rayon::prelude::*;
-    // On WSL2, ensure the global rayon pool is capped to a small worker
-    // count before the parallel scan fires (see xc_numerics::hp_runtime
-    // module docs). No-op on Vast / native Linux.
+    // No-op by default (full parallelism everywhere). If XC_HP_SAFE_MODE=1
+    // is set, caps the global rayon pool to a small worker count before the
+    // parallel scan fires — see xc_numerics::hp_runtime module docs.
     xc_numerics::hp_runtime::init_hp_pool();
     let dt = (t_max - t_min) / (n_scan as f64);
 
@@ -696,8 +696,9 @@ pub fn scan_critical_line_zeros_hp<F>(
 where
     F: Fn(&rug::Float, &rug::Float) -> (rug::Float, rug::Float) + Sync,
 {
-    // On WSL2, route through the safe execution context (capped rayon pool
-    // + large-stack outer thread) to avoid the GMP-arena / stack abort.
+    // Zero-overhead pass-through by default (full parallelism everywhere).
+    // If XC_HP_SAFE_MODE=1 is set, routes through the capped rayon pool +
+    // large-stack outer thread instead — see xc_numerics::hp_runtime docs.
     xc_numerics::hp_runtime::run_hp(|| {
         scan_critical_line_zeros_hp_inner(eval_fn, t_min, t_max, n_scan, bisect_iter)
     })

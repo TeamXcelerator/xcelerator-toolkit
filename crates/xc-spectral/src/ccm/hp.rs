@@ -266,14 +266,13 @@ fn force_symmetric(matrix: &mut [Float], dim: usize) {
 /// divergence at high eigenvalue index.
 /// High-precision CCM run.
 ///
-/// On WSL2 the call is automatically routed through
-/// [`xc_numerics::hp_runtime::run_hp`]: a large-stack scoped thread plus
-/// a local rayon pool with a modest worker count and per-worker stack size.
-/// This avoids the GMP-arena / participating-caller stack aborts that occur
-/// with the default 32-worker 8 MB-stack pool under WSL2.
-///
-/// On Vast / native Linux / CI: `run_hp` is a zero-overhead pass-through —
-/// no thread spawn, no pool creation, full parallelism unchanged.
+/// The call is routed through [`xc_numerics::hp_runtime::run_hp`], which by
+/// default is a zero-overhead pass-through (no thread spawn, no pool
+/// creation, full parallelism, identical on every platform including
+/// WSL2). Set `XC_HP_SAFE_MODE=1` to opt into a capped-pool / large-stack
+/// execution context instead — see the `hp_runtime` module docs for when
+/// that might be needed and the history of why it used to be the default
+/// on WSL2.
 pub fn run(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> Result<HighPrecResult> {
     xc_numerics::hp_runtime::run_hp(|| run_inner(params, cfg, zero_seeds))
 }

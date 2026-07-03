@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.®)
+// All rights reserved. See LICENSE in the repository root.
+
 // Local WSL fix proof + conv(λ²) = D_eig − D_match measurement.
 //
 // For each (λ², N, P) config below, runs the full HP CCM pipeline via

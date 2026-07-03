@@ -1,18 +1,27 @@
-// Regression-check / diagnostic harness for the WSL2 HP abort fixed in
-// v0.11.2/v0.11.3 (see xc_numerics::hp_runtime module docs for the full
-// writeup of what was confirmed and why). Fresh compute (CacheMode::Off)
-// so the LU / inverse-iteration path is always exercised.
+// Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.®)
+// All rights reserved. See LICENSE in the repository root.
+
+// Regression-check / diagnostic harness for the WSL2 HP abort investigated
+// in v0.11.2-v0.11.4 (see xc_numerics::hp_runtime module docs for the full
+// writeup, including the 2026-07-02 finding that the abort no longer
+// reproduces and the default was changed to full uncapped parallelism
+// everywhere). Fresh compute (CacheMode::Off) so the LU / inverse-iteration
+// path is always exercised.
 //
-// With no env vars, this exercises the toolkit's built-in WSL2 handling
-// (xc_numerics::hp_runtime::run_hp) exactly as the production ccm::hp::run
-// entry point does — i.e. it should just pass on WSL2 with no configuration:
+// With no env vars, this exercises the toolkit's default behavior
+// (xc_numerics::hp_runtime::run_hp with XC_HP_SAFE_MODE unset) exactly as
+// the production ccm::hp::run entry point does — i.e. full parallelism,
+// zero-overhead pass-through, identical on WSL2 and native Linux:
 //
 //   cargo run --release --features hp --example wsl_abort_repro
 //
-// The POOL_*/OUTER_STACK_MB knobs below bypass the toolkit's own WSL
-// handling and build an ad hoc pool/thread instead — useful for
-// re-diagnosing a *new* WSL2 issue (varying worker count / stack size by
-// hand) without touching hp_runtime.rs itself:
+// Set XC_HP_SAFE_MODE=1 to instead exercise the opt-in capped-pool /
+// large-stack execution context (see hp_runtime module docs).
+//
+// The POOL_*/OUTER_STACK_MB knobs below bypass hp_runtime entirely and
+// build an ad hoc pool/thread instead — useful for re-diagnosing a *new*
+// abort (varying worker count / stack size by hand) without touching
+// hp_runtime.rs itself:
 //
 //   LSQ=20 NM=140 DIG=210 POOL_THREADS=4 POOL_STACK_MB=512 \
 //     ./target/release/examples/wsl_abort_repro

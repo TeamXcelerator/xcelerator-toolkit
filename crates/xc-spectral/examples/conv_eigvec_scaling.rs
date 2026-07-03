@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.®)
+// All rights reserved. See LICENSE in the repository root.
+
 // Measurement for the `conv` eigenvalue->zero conversion derivation
 // (research/convergence/CONV_CONVERSION_DERIVATION.md §8.5).
 //
