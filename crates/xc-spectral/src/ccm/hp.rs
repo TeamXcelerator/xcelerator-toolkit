@@ -1291,11 +1291,23 @@ mod tau_cache {
     /// by this build. Matches `[workspace.package].version` in `Cargo.toml`.
     const TOOLKIT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+    #[cfg(test)]
+    pub(super) fn toolkit_version_for_test() -> &'static str {
+        TOOLKIT_VERSION
+    }
+
     /// Minimum toolkit version required to use a tau cache file. Files
     /// produced by an older toolkit are treated as cache misses and
     /// recomputed. Update this constant when a change to the tau
     /// computation changes the stored values.
-    const CACHE_MIN_TOOLKIT_VERSION: &str = "0.10.0";
+    const CACHE_MIN_TOOLKIT_VERSION: &str = "0.12.0";
+
+    fn effective_min_version() -> String {
+        std::env::var("XC_TAU_CACHE_MIN_VER")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| CACHE_MIN_TOOLKIT_VERSION.to_string())
+    }
 
     /// Tolerance for the symmetry identity check on cache load.
     /// At precision `prec` bits this is `2^-(prec - 8)` — same
@@ -1347,17 +1359,16 @@ mod tau_cache {
 
     /// Parse the cache JSON for the tau matrix.
     /// Expects schema_version 1 envelope format. Returns `None` on any
-    /// structural mismatch or incompatible `min_compatible_version`.
+    /// structural mismatch or a stale `toolkit_version`.
     fn parse_json(data: &str, n_modes: usize, prec: u32) -> Option<Vec<Float>> {
         let dim = 2 * n_modes + 1;
         let n_expected = dim * dim;
         let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
         let obj = parsed.as_object()?;
 
-        if let Some(min_ver) = obj.get("min_compatible_version").and_then(|v| v.as_str()) {
-            if version_is_older(CACHE_MIN_TOOLKIT_VERSION, min_ver) {
-                return None;
-            }
+        let file_ver = obj.get("toolkit_version").and_then(|v| v.as_str())?;
+        if version_is_older(file_ver, &effective_min_version()) {
+            return None;
         }
 
         let arr = obj.get("matrix")?.as_array()?;
@@ -1550,14 +1561,22 @@ mod tau_cache {
     /// Base raw URLs of the public τ-cache repositories, in probe order.
     ///
     /// The toolkit checks each repo in sequence during a remote fetch and
-    /// stops at the first hit. Repo-1 is checked first (it holds all
-    /// fixtures generated before the split); repo-2 holds all fixtures
-    /// generated after the split. Adding a third repo in the future is a
-    /// one-line change here.
+    /// stops at the first hit. Currently a single repo; adding another
+    /// in the future is a one-line change here.
     const REMOTE_BASES: &[&str] = &[
         "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache/main",
-        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache-2/main",
     ];
+
+    fn active_bases() -> Vec<String> {
+        match std::env::var("XC_TAU_CACHE_BASES") {
+            Ok(v) if !v.trim().is_empty() => v
+                .split(',')
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            _ => REMOTE_BASES.iter().map(|s| s.to_string()).collect(),
+        }
+    }
 
     /// Remote directory URL (and filename stem) for a config in a
     /// specific base repo, using the precision-first → λ² →
@@ -1623,9 +1642,15 @@ mod tau_cache {
     fn curl_attempt(url: &str, dest: &std::path::Path) -> CurlOutcome {
         let tmp = dest.with_extension("downloading");
         let _ = std::fs::remove_file(&tmp);
-        let output = std::process::Command::new("curl")
-            .arg("--silent").arg("--show-error").arg("--location")
-            .arg("--retry").arg("3").arg("--retry-delay").arg("1")
+        let mut cmd = std::process::Command::new("curl");
+        cmd.arg("--silent").arg("--show-error").arg("--location")
+            .arg("--retry").arg("3").arg("--retry-delay").arg("1");
+        if let Ok(tok) = std::env::var("XC_CACHE_AUTH") {
+            if !tok.trim().is_empty() {
+                cmd.arg("-H").arg(format!("Authorization: token {}", tok.trim()));
+            }
+        }
+        let output = cmd
             .arg("--write-out").arg("%{http_code}")
             .arg("-o").arg(&tmp).arg(url)
             .output();
@@ -1692,8 +1717,8 @@ mod tau_cache {
     fn fetch_remote(lambda_sq: LambdaSq, n_modes: usize, prec: u32) -> bool {
         let dir = match cache_dir() { Some(d) => d, None => return false };
 
-        for base in REMOTE_BASES {
-            let (remote_dir, stem) = remote_dir_and_stem(base, lambda_sq, n_modes, prec);
+        for base in active_bases() {
+            let (remote_dir, stem) = remote_dir_and_stem(&base, lambda_sq, n_modes, prec);
 
             // Probe 1: single zip.
             let single_url = format!("{}/{}", remote_dir, stem);
@@ -1773,7 +1798,6 @@ mod tau_cache {
         let payload = serde_json::json!({
             "schema_version": 1,
             "toolkit_version": TOOLKIT_VERSION,
-            "min_compatible_version": CACHE_MIN_TOOLKIT_VERSION,
             "lambda_sq": lambda_sq.value_f64,
             "lambda_sq_mode": lambda_sq.mode_str(),
             "n_modes": n_modes,
@@ -2138,22 +2162,50 @@ mod weil_eigvec_cache {
 
     use super::super::LambdaSq;
 
-    /// Base raw URL of the public consolidated Weil-eigenvector cache
-    /// repository. Files live at
-    /// `{REMOTE_BASE}/weil_eigvec_cache/prec{P}/lambda_sq{L}/nmodes{B}-{B+999}/weil_eigvec_lambda_sq{L}_nmodes{N}_prec{P}.json.zip`
+    /// Base raw URLs of the public consolidated Weil-eigenvector cache
+    /// repositories, in probe order. Files live at
+    /// `{base}/weil_eigvec_cache/prec{P}/lambda_sq{L}/nmodes{B}-{B+999}/weil_eigvec_lambda_sq{L}_nmodes{N}_prec{P}.json.zip`
     /// where `B = (N / 1000) * 1000`.
-    const REMOTE_BASE: &str =
-        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-weil-eigvec-cache/main";
+    ///
+    /// An array (mirroring `super::tau_cache::REMOTE_BASES`) so a
+    /// second/overflow weil-eigvec cache repo can be added with a
+    /// one-line change here.
+    const REMOTE_BASES: &[&str] = &[
+        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-weil-eigvec-cache/main",
+    ];
+
+    fn active_bases() -> Vec<String> {
+        match std::env::var("XC_WEIL_CACHE_BASES") {
+            Ok(v) if !v.trim().is_empty() => v
+                .split(',')
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            _ => REMOTE_BASES.iter().map(|s| s.to_string()).collect(),
+        }
+    }
 
     /// Toolkit version string embedded in every weil eigvec cache file
     /// written by this build.
     const TOOLKIT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+    #[cfg(test)]
+    pub(super) fn toolkit_version_for_test() -> &'static str {
+        TOOLKIT_VERSION
+    }
+
     /// Minimum toolkit version required to use a weil eigvec cache file.
     /// Files produced by an older toolkit are treated as cache misses.
     /// Update this constant when a change to the eigenvector computation
     /// changes the stored values.
-    const CACHE_MIN_TOOLKIT_VERSION: &str = "0.10.0";
+    const CACHE_MIN_TOOLKIT_VERSION: &str = "0.12.0";
+
+    fn effective_min_version() -> String {
+        std::env::var("XC_WEIL_CACHE_MIN_VER")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| CACHE_MIN_TOOLKIT_VERSION.to_string())
+    }
 
     /// Current schema version for the weil eigvec JSON envelope.
     const SCHEMA_VERSION: u32 = 1;
@@ -2263,17 +2315,16 @@ mod weil_eigvec_cache {
 
     /// Parse the cache JSON object into `(eps_n, xi)`.
     /// Expects schema_version 1 envelope format. Returns `None` on any
-    /// structural mismatch or incompatible `min_compatible_version`.
+    /// structural mismatch or a stale `toolkit_version`.
     pub(super) fn parse_json(
         data: &str, lambda_sq: LambdaSq, n_modes: usize, prec: u32,
     ) -> Option<CachedXi> {
         let v: serde_json::Value = serde_json::from_str(data).ok()?;
         let obj = v.as_object()?;
 
-        if let Some(min_ver) = obj.get("min_compatible_version").and_then(|x| x.as_str()) {
-            if version_is_older(CACHE_MIN_TOOLKIT_VERSION, min_ver) {
-                return None;
-            }
+        let file_ver = obj.get("toolkit_version").and_then(|x| x.as_str())?;
+        if version_is_older(file_ver, &effective_min_version()) {
+            return None;
         }
 
         if obj.get("n_modes").and_then(|x| x.as_u64())? as usize != n_modes { return None; }
@@ -2356,25 +2407,28 @@ mod weil_eigvec_cache {
         rel.cmp_abs(&floor).map(|o| o.is_lt()).unwrap_or(false)
     }
 
-    /// Deterministic remote URL for the `(λ², N, prec)` fixture in the
-    /// public xcelerator-weil-eigvec-cache repo (precision-first → λ² →
-    /// nmodes-thousand-bucket layout, mirroring tau/GL).
-    fn remote_zip_url(lambda_sq: LambdaSq, n_modes: usize, prec: u32, force_even: bool) -> String {
+    /// Deterministic remote URL for the `(λ², N, prec)` fixture in a
+    /// specific base repo (precision-first → λ² → nmodes-thousand-bucket
+    /// layout, mirroring tau/GL).
+    fn remote_zip_url(base: &str, lambda_sq: LambdaSq, n_modes: usize, prec: u32, force_even: bool) -> String {
         let bucket = (n_modes / 1000) * 1000;
         format!(
             "{base}/weil_eigvec_cache/prec{p}/lambda_sq{l}/nmodes{b}-{bend}/{stem}.zip",
-            base = REMOTE_BASE, p = prec, l = lambda_sq.filename_str(),
+            base = base, p = prec, l = lambda_sq.filename_str(),
             b = bucket, bend = bucket + 999,
             stem = cache_filename(lambda_sq, n_modes, prec, force_even)
         )
     }
 
-    /// Test-only accessor for `remote_zip_url`.
+    /// Test-only accessor for `remote_zip_url`. Returns results for all
+    /// configured bases, in probe order.
     #[cfg(test)]
     pub(super) fn remote_zip_url_for_test(
         lambda_sq: LambdaSq, n_modes: usize, prec: u32,
-    ) -> String {
-        remote_zip_url(lambda_sq, n_modes, prec, true)
+    ) -> Vec<String> {
+        REMOTE_BASES.iter()
+            .map(|base| remote_zip_url(base, lambda_sq, n_modes, prec, true))
+            .collect()
     }
 
     /// Test-only accessor for `parse_json` (lets version-rejection tests
@@ -2461,9 +2515,15 @@ mod weil_eigvec_cache {
     fn curl_attempt(url: &str, dest: &std::path::Path) -> CurlOutcome {
         let tmp = dest.with_extension("zip.partial");
         let _ = std::fs::remove_file(&tmp);
-        let output = std::process::Command::new("curl")
-            .arg("--silent").arg("--show-error").arg("--location")
-            .arg("--retry").arg("3").arg("--retry-delay").arg("1")
+        let mut cmd = std::process::Command::new("curl");
+        cmd.arg("--silent").arg("--show-error").arg("--location")
+            .arg("--retry").arg("3").arg("--retry-delay").arg("1");
+        if let Ok(tok) = std::env::var("XC_CACHE_AUTH") {
+            if !tok.trim().is_empty() {
+                cmd.arg("-H").arg(format!("Authorization: token {}", tok.trim()));
+            }
+        }
+        let output = cmd
             .arg("--write-out").arg("%{http_code}")
             .arg("-o").arg(&tmp).arg(url)
             .output();
@@ -2493,20 +2553,26 @@ mod weil_eigvec_cache {
             Some(p) => p,
             None => return false,
         };
-        let url = remote_zip_url(lambda_sq, n_modes, prec, force_even);
 
-        const MAX_TRIES: usize = 5;
-        for attempt in 0..MAX_TRIES {
-            match curl_attempt(&url, &dest) {
-                CurlOutcome::Ok => {
-                    // Routine cache hit — silent.
-                    return true;
-                }
-                CurlOutcome::HttpError => return false, // 404 — definitive miss.
-                CurlOutcome::Transient => {
-                    if attempt + 1 < MAX_TRIES {
-                        let secs = 2 * (attempt as u64 + 1);
-                        std::thread::sleep(std::time::Duration::from_secs(secs));
+        // Iterate over REMOTE_BASES in order, trying each repo until one
+        // has the file. Mirrors the τ-cache multi-repo probe logic.
+        for base in active_bases() {
+            let url = remote_zip_url(&base, lambda_sq, n_modes, prec, force_even);
+
+            const MAX_TRIES: usize = 5;
+            for attempt in 0..MAX_TRIES {
+                match curl_attempt(&url, &dest) {
+                    CurlOutcome::Ok => {
+                        // Routine cache hit — silent.
+                        return true;
+                    }
+                    // 404: not in this repo — try the next one.
+                    CurlOutcome::HttpError => break,
+                    CurlOutcome::Transient => {
+                        if attempt + 1 < MAX_TRIES {
+                            let secs = 2 * (attempt as u64 + 1);
+                            std::thread::sleep(std::time::Duration::from_secs(secs));
+                        }
                     }
                 }
             }
@@ -2522,7 +2588,6 @@ mod weil_eigvec_cache {
         let payload = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
             "toolkit_version": TOOLKIT_VERSION,
-            "min_compatible_version": CACHE_MIN_TOOLKIT_VERSION,
             "lambda_sq": lambda_sq.value_f64,
             "lambda_sq_mode": lambda_sq.mode_str(),
             "n_modes": n_modes,
@@ -3142,18 +3207,18 @@ mod tests {
             "NaN entry should be rejected");
     }
 
-    /// `tau_cache::parse_json_for_test` rejects a JSON envelope where
-    /// `min_compatible_version` is newer than `CACHE_MIN_TOOLKIT_VERSION`.
+    /// `tau_cache::parse_json_for_test` rejects a JSON envelope whose
+    /// `toolkit_version` is older than `CACHE_MIN_TOOLKIT_VERSION` — a
+    /// stale file written by an older toolkit build.
     #[test]
-    fn tau_cache_rejects_newer_min_compatible_version() {
+    fn tau_cache_rejects_stale_toolkit_version() {
         let n_modes: usize = 1;
         let prec: u32 = 64;
-        // Build a well-formed envelope stamped with a far-future minimum.
+        // Build a well-formed envelope stamped with a far-past version.
         let dim = 2 * n_modes + 1;
         let strs: Vec<String> = (0..dim * dim).map(|i| format!("{}", i)).collect();
         let payload = serde_json::json!({
-            "toolkit_version": "99.0.0",
-            "min_compatible_version": "99.0.0",
+            "toolkit_version": "0.0.1",
             "lambda_sq": 13_u64,
             "n_modes": n_modes,
             "precision_bits": prec,
@@ -3161,7 +3226,7 @@ mod tests {
         }).to_string();
         assert!(
             super::tau_cache::parse_json_for_test(&payload, n_modes, prec).is_none(),
-            "tau parser should reject min_compatible_version=99.0.0"
+            "tau parser should reject a stale toolkit_version=0.0.1"
         );
     }
 
@@ -3207,8 +3272,7 @@ mod tests {
         let strs: Vec<String> = sym.iter().map(|f| f.to_string()).collect();
         let valid_json = serde_json::json!({
             "schema_version": 1,
-            "toolkit_version": "0.10.0",
-            "min_compatible_version": "0.10.0",
+            "toolkit_version": super::tau_cache::toolkit_version_for_test(),
             "lambda_sq": lambda_sq.value_f64,
             "n_modes": n_modes,
             "precision_bits": prec,
@@ -3227,8 +3291,7 @@ mod tests {
         let bad_strs: Vec<String> = asym.iter().map(|f| f.to_string()).collect();
         let bad_json = serde_json::json!({
             "schema_version": 1,
-            "toolkit_version": "0.10.0",
-            "min_compatible_version": "0.10.0",
+            "toolkit_version": super::tau_cache::toolkit_version_for_test(),
             "lambda_sq": lsq_bad.value_f64,
             "n_modes": n_modes,
             "precision_bits": prec,
@@ -3326,8 +3389,7 @@ mod tests {
         let strs: Vec<String> = m.iter().map(|f| f.to_string()).collect();
         let json = serde_json::json!({
             "schema_version": 1,
-            "toolkit_version": "0.10.0",
-            "min_compatible_version": "0.10.0",
+            "toolkit_version": super::tau_cache::toolkit_version_for_test(),
             "lambda_sq": lambda_sq.value_f64,
             "n_modes": n_modes,
             "precision_bits": prec,
@@ -3406,31 +3468,21 @@ mod tests {
         use super::super::LambdaSq;
         // λ²=1000, N=800, prec=3338 → bucket 0-999.
         let results = super::tau_cache::remote_dir_and_stem_for_test(LambdaSq::integer(1000), 800, 3338);
-        assert_eq!(results.len(), 2, "expected 2 remote bases");
+        assert_eq!(results.len(), 1, "expected 1 remote base");
         assert_eq!(
             results[0].0,
             "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache/main/tau_cache/prec3338/lambda_sq1000/nmodes0-999"
         );
         assert_eq!(results[0].1, "lambda_sq1000_nmodes800_prec3338.json.zip");
-        assert_eq!(
-            results[1].0,
-            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache-2/main/tau_cache/prec3338/lambda_sq1000/nmodes0-999"
-        );
-        assert_eq!(results[1].1, "lambda_sq1000_nmodes800_prec3338.json.zip");
 
         // λ²=400, N=1500, prec=4999 → bucket 1000-1999.
         let results2 = super::tau_cache::remote_dir_and_stem_for_test(LambdaSq::integer(400), 1500, 4999);
-        assert_eq!(results2.len(), 2, "expected 2 remote bases");
+        assert_eq!(results2.len(), 1, "expected 1 remote base");
         assert_eq!(
             results2[0].0,
             "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache/main/tau_cache/prec4999/lambda_sq400/nmodes1000-1999"
         );
         assert_eq!(results2[0].1, "lambda_sq400_nmodes1500_prec4999.json.zip");
-        assert_eq!(
-            results2[1].0,
-            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache-2/main/tau_cache/prec4999/lambda_sq400/nmodes1000-1999"
-        );
-        assert_eq!(results2[1].1, "lambda_sq400_nmodes1500_prec4999.json.zip");
     }
 
     /// Live end-to-end remote τ-fetch test against the PUBLIC
@@ -3502,17 +3554,17 @@ mod tests {
     fn weil_eigvec_remote_url_uses_bucketed_layout() {
         use super::super::LambdaSq;
         // λ²=1000, N=800, prec=3338 → bucket 0-999.
-        let url = super::weil_eigvec_cache::remote_zip_url_for_test(LambdaSq::integer(1000), 800, 3338);
+        let urls = super::weil_eigvec_cache::remote_zip_url_for_test(LambdaSq::integer(1000), 800, 3338);
         assert_eq!(
-            url,
-            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-weil-eigvec-cache/main/weil_eigvec_cache/prec3338/lambda_sq1000/nmodes0-999/weil_eigvec_lambda_sq1000_nmodes800_prec3338.json.zip"
+            urls,
+            vec!["https://raw.githubusercontent.com/TeamXcelerator/xcelerator-weil-eigvec-cache/main/weil_eigvec_cache/prec3338/lambda_sq1000/nmodes0-999/weil_eigvec_lambda_sq1000_nmodes800_prec3338.json.zip"]
         );
 
         // λ²=400, N=1500, prec=4999 → bucket 1000-1999.
-        let url2 = super::weil_eigvec_cache::remote_zip_url_for_test(LambdaSq::integer(400), 1500, 4999);
+        let urls2 = super::weil_eigvec_cache::remote_zip_url_for_test(LambdaSq::integer(400), 1500, 4999);
         assert_eq!(
-            url2,
-            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-weil-eigvec-cache/main/weil_eigvec_cache/prec4999/lambda_sq400/nmodes1000-1999/weil_eigvec_lambda_sq400_nmodes1500_prec4999.json.zip"
+            urls2,
+            vec!["https://raw.githubusercontent.com/TeamXcelerator/xcelerator-weil-eigvec-cache/main/weil_eigvec_cache/prec4999/lambda_sq400/nmodes1000-1999/weil_eigvec_lambda_sq400_nmodes1500_prec4999.json.zip"]
         );
     }
 
@@ -3531,6 +3583,7 @@ mod tests {
         let xi_strs: Vec<String> = xi.iter().map(|f| f.to_string()).collect();
         let good = serde_json::json!({
             "schema_version": 1,
+            "toolkit_version": super::weil_eigvec_cache::toolkit_version_for_test(),
             "lambda_sq": lambda_sq.value_f64,
             "n_modes": n_modes,
             "precision_bits": prec,
@@ -3555,7 +3608,8 @@ mod tests {
         let mut short_strs = xi_strs.clone();
         short_strs.pop();
         let short = serde_json::json!({
-            "schema_version": 1, "lambda_sq": lambda_sq.value_f64, "n_modes": n_modes,
+            "schema_version": 1, "toolkit_version": super::weil_eigvec_cache::toolkit_version_for_test(),
+            "lambda_sq": lambda_sq.value_f64, "n_modes": n_modes,
             "precision_bits": prec, "weil_min_eigenvalue": "1.5e-40", "xi": short_strs,
         }).to_string();
         assert!(parse_json(&short, lambda_sq, n_modes, prec).is_none(),
@@ -3563,9 +3617,10 @@ mod tests {
     }
 
     /// `weil_eigvec_cache::parse_json_for_test` rejects a JSON envelope
-    /// where `min_compatible_version` is newer than `CACHE_MIN_TOOLKIT_VERSION`.
+    /// whose `toolkit_version` is older than `CACHE_MIN_TOOLKIT_VERSION`
+    /// — a stale file written by an older toolkit build.
     #[test]
-    fn weil_eigvec_rejects_newer_min_compatible_version() {
+    fn weil_eigvec_rejects_stale_toolkit_version() {
         use super::super::LambdaSq;
         let prec: u32 = 128;
         let lambda_sq = LambdaSq::integer(13);
@@ -3574,8 +3629,7 @@ mod tests {
         let xi_strs: Vec<String> = (0..dim).map(|i| format!("0.{}", i + 1)).collect();
         let payload = serde_json::json!({
             "schema_version": 1,
-            "toolkit_version": "99.0.0",
-            "min_compatible_version": "99.0.0",
+            "toolkit_version": "0.0.1",
             "lambda_sq": lambda_sq.value_f64,
             "n_modes": n_modes,
             "precision_bits": prec,
@@ -3586,7 +3640,7 @@ mod tests {
             super::weil_eigvec_cache::parse_json_for_test(
                 &payload, lambda_sq, n_modes, prec
             ).is_none(),
-            "weil eigvec parser should reject min_compatible_version=99.0.0"
+            "weil eigvec parser should reject a stale toolkit_version=0.0.1"
         );
     }
 
@@ -3704,6 +3758,7 @@ mod tests {
         // and otherwise-valid metadata. parse_json must reject it.
         let bad = serde_json::json!({
             "schema_version": 1,
+            "toolkit_version": super::weil_eigvec_cache::toolkit_version_for_test(),
             "lambda_sq": lambda_sq.value_f64,
             "n_modes": n_modes,
             "precision_bits": prec,

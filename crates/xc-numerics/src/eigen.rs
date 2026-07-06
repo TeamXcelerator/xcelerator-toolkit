@@ -42,6 +42,21 @@ fn qr_tolerance(prec: u32) -> Float {
     two.pow(exponent)
 }
 
+/// Maximum QR sweep iterations allowed per deflating eigenvalue before
+/// `tridiag_eigenvalues_hp` gives up with an error. Default 100.
+///
+/// Some inputs (observed: large-N tridiagonal matrices at certain λ²
+/// configurations) converge correctly but slowly, needing more than 100
+/// sweeps per eigenvalue. Override via `XC_HP_QR_MAX_ITER=<n>` rather than
+/// editing this default, so the 100 ceiling stays the norm and callers who
+/// hit slow-but-real convergence can raise it without a code change.
+fn qr_max_iter() -> usize {
+    std::env::var("XC_HP_QR_MAX_ITER")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100)
+}
+
 /// HP zero at the given precision (integer literal — no f64).
 #[inline]
 fn hp_zero(prec: u32) -> Float {
@@ -93,7 +108,7 @@ pub fn tridiag_eigenvalues_hp(
     e.push(hp_zero(prec));  // sentinel; index n-1 is always 0
 
     let tol = qr_tolerance(prec);
-    let max_iter = 100;
+    let max_iter = qr_max_iter();
 
     // Scratch Floats hoisted out of all loops. Each is allocated once at
     // function start and reused via `assign` / in-place ops, avoiding

@@ -141,22 +141,50 @@ mod hp {
 
     
 
-    /// Base raw URL of the public consolidated GL cache repository.
-    /// Files live at
-    /// `{REMOTE_BASE}/gl_cache/prec{P}/npts{B}-{B+999}/prec{P}_npts{N}.json.zip`
+    /// Base raw URLs of the public consolidated GL cache repositories, in
+    /// probe order. Files live at
+    /// `{base}/gl_cache/prec{P}/npts{B}-{B+999}/prec{P}_npts{N}.json.zip`
     /// where `B = (N / 1000) * 1000`.
-    const REMOTE_BASE: &str =
-        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main";
+    ///
+    /// An array (mirroring `xc_spectral::ccm::hp::tau_cache::REMOTE_BASES`)
+    /// so a second/overflow GL cache repo can be added with a one-line
+    /// change here, the same pattern already used for the τ cache.
+    const REMOTE_BASES: &[&str] = &[
+        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main",
+    ];
+
+    fn active_bases() -> Vec<String> {
+        match std::env::var("XC_GL_CACHE_BASES") {
+            Ok(v) if !v.trim().is_empty() => v
+                .split(',')
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            _ => REMOTE_BASES.iter().map(|s| s.to_string()).collect(),
+        }
+    }
 
     /// Toolkit version string embedded in every GL cache file written by
     /// this build. Matches `[workspace.package].version` in `Cargo.toml`.
     const TOOLKIT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+    #[cfg(test)]
+    pub fn toolkit_version_for_test() -> &'static str {
+        TOOLKIT_VERSION
+    }
+
     /// Minimum toolkit version required to use a GL cache file. Files
     /// produced by an older toolkit are treated as cache misses and
     /// recomputed. Update this constant when a change to the GL
     /// computation changes the stored values.
-    const CACHE_MIN_TOOLKIT_VERSION: &str = "0.10.0";
+    const CACHE_MIN_TOOLKIT_VERSION: &str = "0.12.0";
+
+    fn effective_min_version() -> String {
+        std::env::var("XC_GL_CACHE_MIN_VER")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| CACHE_MIN_TOOLKIT_VERSION.to_string())
+    }
 
     #[inline] fn fl_i(prec: u32, v: i64) -> Float { Float::with_val(prec, v) }
     #[inline] fn pi(prec: u32) -> Float { Float::with_val(prec, rug::float::Constant::Pi) }
@@ -296,15 +324,14 @@ mod hp {
 
     /// Parse the GL cache JSON into HP node and weight vectors.
     /// Expects schema_version 1 envelope format. Returns `None` on any
-    /// structural mismatch or incompatible `min_compatible_version`.
+    /// structural mismatch or a stale `toolkit_version`.
     fn parse_gl_json(data: &str, n: usize, prec: u32) -> Option<(Vec<Float>, Vec<Float>)> {
         let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
         let obj = parsed.as_object()?;
 
-        if let Some(min_ver) = obj.get("min_compatible_version").and_then(|v| v.as_str()) {
-            if version_is_older(CACHE_MIN_TOOLKIT_VERSION, min_ver) {
-                return None;
-            }
+        let file_ver = obj.get("toolkit_version").and_then(|v| v.as_str())?;
+        if version_is_older(file_ver, &effective_min_version()) {
+            return None;
         }
 
         let nodes_arr = obj.get("nodes")?.as_array()?;
@@ -405,23 +432,24 @@ mod hp {
         }
     }
 
-    /// Deterministic remote URL for the `(n, prec)` cache fixture in the
-    /// public `xcelerator-gl-cache` repo, using the precision-first,
-    /// npts-thousand-bucketed layout.
-    fn remote_zip_url(n: usize, prec: u32) -> String {
+    /// Deterministic remote URL for the `(n, prec)` cache fixture in a
+    /// specific base repo, using the precision-first, npts-thousand-
+    /// bucketed layout.
+    fn remote_zip_url(base: &str, n: usize, prec: u32) -> String {
         let bucket = (n / 1000) * 1000;
         format!(
             "{base}/gl_cache/prec{p}/npts{b}-{bend}/prec{p}_npts{n}.json.zip",
-            base = REMOTE_BASE, p = prec, b = bucket, bend = bucket + 999, n = n
+            base = base, p = prec, b = bucket, bend = bucket + 999, n = n
         )
     }
 
     /// Test-only accessor for `remote_zip_url` (the function itself is
     /// private; this lets the cache-tests module assert URL formatting
-    /// without making the builder public API).
+    /// without making the builder public API). Returns results for all
+    /// configured bases, in probe order.
     #[cfg(test)]
-    pub fn remote_zip_url_for_test(n: usize, prec: u32) -> String {
-        remote_zip_url(n, prec)
+    pub fn remote_zip_url_for_test(n: usize, prec: u32) -> Vec<String> {
+        REMOTE_BASES.iter().map(|base| remote_zip_url(base, n, prec)).collect()
     }
 
     /// Test-only accessor for `parse_gl_json` (lets version-rejection
@@ -451,23 +479,29 @@ mod hp {
             Some(p) => p,
             None => return false,
         };
-        let url = remote_zip_url(n, prec);
 
-        const MAX_TRIES: usize = 5;
-        for attempt in 0..MAX_TRIES {
-            match curl_attempt_gl(&url, &zip_path) {
-                CurlOutcome::Ok => {
-                    // Routine cache hit — silent. Only corruption /
-                    // recompute paths warn (see warn_cache_skip).
-                    return true;
-                }
-                // 404: this config isn't cached remotely. Definitive miss.
-                CurlOutcome::HttpError => return false,
-                // 429 / 5xx / network: retry with growing backoff.
-                CurlOutcome::Transient => {
-                    if attempt + 1 < MAX_TRIES {
-                        let secs = 2 * (attempt as u64 + 1);
-                        std::thread::sleep(std::time::Duration::from_secs(secs));
+        // Iterate over REMOTE_BASES in order, trying each repo until one
+        // has the file. Mirrors the τ-cache multi-repo probe logic.
+        for base in active_bases() {
+            let url = remote_zip_url(&base, n, prec);
+
+            const MAX_TRIES: usize = 5;
+            for attempt in 0..MAX_TRIES {
+                match curl_attempt_gl(&url, &zip_path) {
+                    CurlOutcome::Ok => {
+                        // Routine cache hit — silent. Only corruption /
+                        // recompute paths warn (see warn_cache_skip).
+                        return true;
+                    }
+                    // 404: this config isn't cached in this repo. Break
+                    // out of the retry loop and try the next repo.
+                    CurlOutcome::HttpError => break,
+                    // 429 / 5xx / network: retry with growing backoff.
+                    CurlOutcome::Transient => {
+                        if attempt + 1 < MAX_TRIES {
+                            let secs = 2 * (attempt as u64 + 1);
+                            std::thread::sleep(std::time::Duration::from_secs(secs));
+                        }
                     }
                 }
             }
@@ -494,9 +528,15 @@ mod hp {
     fn curl_attempt_gl(url: &str, dest: &std::path::Path) -> CurlOutcome {
         let tmp = dest.with_extension("zip.partial");
         let _ = std::fs::remove_file(&tmp);
-        let output = std::process::Command::new("curl")
-            .arg("--silent").arg("--show-error").arg("--location")
-            .arg("--retry").arg("3").arg("--retry-delay").arg("1")
+        let mut cmd = std::process::Command::new("curl");
+        cmd.arg("--silent").arg("--show-error").arg("--location")
+            .arg("--retry").arg("3").arg("--retry-delay").arg("1");
+        if let Ok(tok) = std::env::var("XC_CACHE_AUTH") {
+            if !tok.trim().is_empty() {
+                cmd.arg("-H").arg(format!("Authorization: token {}", tok.trim()));
+            }
+        }
+        let output = cmd
             .arg("--write-out").arg("%{http_code}")
             .arg("-o").arg(&tmp).arg(url)
             .output();
@@ -555,7 +595,6 @@ mod hp {
             let json = serde_json::json!({
                 "schema_version": 1,
                 "toolkit_version": TOOLKIT_VERSION,
-                "min_compatible_version": CACHE_MIN_TOOLKIT_VERSION,
                 "n_pts": n,
                 "precision_bits": prec,
                 "nodes": ns,
@@ -1083,8 +1122,7 @@ mod hp_cache_tests {
         let zeros: Vec<String> = (0..n).map(|_| "0".to_string()).collect();
         serde_json::json!({
             "schema_version": 1,
-            "toolkit_version": "0.10.0",
-            "min_compatible_version": "0.10.0",
+            "toolkit_version": hp::toolkit_version_for_test(),
             "n_pts": n,
             "precision_bits": prec,
             "nodes": zeros.clone(),
@@ -1321,31 +1359,29 @@ mod hp_cache_tests {
             "zip-only: JsonOnly must not write a decompressed .json");
     }
 
-    /// A GL cache file with a `min_compatible_version` newer than the
-    /// current `CACHE_MIN_TOOLKIT_VERSION` must be rejected (returns
-    /// `None` from the parser so the caller falls through to recompute).
-    /// This simulates loading a file written by a future toolkit version
-    /// that introduced breaking changes to the GL format.
+    /// A GL cache file whose `toolkit_version` is older than the current
+    /// `CACHE_MIN_TOOLKIT_VERSION` must be rejected (returns `None` from
+    /// the parser so the caller falls through to recompute). This
+    /// simulates loading a stale file written by an older toolkit build
+    /// whose output is no longer trusted.
     #[test]
-    fn gl_cache_rejects_newer_min_compatible_version() {
+    fn gl_cache_rejects_stale_toolkit_version() {
         let n = 4;
         let prec: u32 = 64;
-        // Build a well-formed envelope but stamp a far-future
-        // min_compatible_version that exceeds our CACHE_MIN_TOOLKIT_VERSION.
+        // Build a well-formed envelope but stamp a far-past toolkit_version.
         let ns: Vec<String> = (0..n).map(|i| format!("{}", i)).collect();
         let ws: Vec<String> = (0..n).map(|i| format!("{}", i)).collect();
         let payload = serde_json::json!({
-            "toolkit_version": "99.0.0",
-            "min_compatible_version": "99.0.0",
+            "toolkit_version": "0.0.1",
             "n_pts": n,
             "precision_bits": prec,
             "nodes": ns,
             "weights": ws,
         }).to_string();
-        // parse_gl_json must return None because 99.0.0 > CACHE_MIN_TOOLKIT_VERSION.
+        // parse_gl_json must return None because 0.0.1 < CACHE_MIN_TOOLKIT_VERSION.
         assert!(
             hp::parse_gl_json_for_test(&payload, n, prec).is_none(),
-            "parser should reject a cache file requiring min_compatible_version=99.0.0"
+            "parser should reject a stale cache file with toolkit_version=0.0.1"
         );
     }
 
@@ -1357,17 +1393,17 @@ mod hp_cache_tests {
         // npts 4000 → bucket 4000-4999.
         assert_eq!(
             hp::remote_zip_url_for_test(4000, 3338),
-            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main/gl_cache/prec3338/npts4000-4999/prec3338_npts4000.json.zip"
+            vec!["https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main/gl_cache/prec3338/npts4000-4999/prec3338_npts4000.json.zip"]
         );
         // npts 600 → bucket 0-999.
         assert_eq!(
             hp::remote_zip_url_for_test(600, 681),
-            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main/gl_cache/prec681/npts0-999/prec681_npts600.json.zip"
+            vec!["https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main/gl_cache/prec681/npts0-999/prec681_npts600.json.zip"]
         );
         // npts 6169 → bucket 6000-6999.
         assert_eq!(
             hp::remote_zip_url_for_test(6169, 3338),
-            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main/gl_cache/prec3338/npts6000-6999/prec3338_npts6169.json.zip"
+            vec!["https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main/gl_cache/prec3338/npts6000-6999/prec3338_npts6169.json.zip"]
         );
     }
 
@@ -1676,8 +1712,7 @@ mod hp_cache_tests {
         let ws: Vec<String> = real_weights.iter().map(|f| f.to_string()).collect();
         let valid_json = serde_json::json!({
             "schema_version": 1,
-            "toolkit_version": "0.10.0",
-            "min_compatible_version": "0.10.0",
+            "toolkit_version": hp::toolkit_version_for_test(),
             "n_pts": 4_usize,
             "precision_bits": 64_u32,
             "nodes": ns,
@@ -1692,8 +1727,7 @@ mod hp_cache_tests {
         let bad_ws: Vec<String> = (0..5).map(|_| "0".to_string()).collect();
         let bad_json = serde_json::json!({
             "schema_version": 1,
-            "toolkit_version": "0.10.0",
-            "min_compatible_version": "0.10.0",
+            "toolkit_version": hp::toolkit_version_for_test(),
             "n_pts": 5_usize,
             "precision_bits": 64_u32,
             "nodes": bad_ns,

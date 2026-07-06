@@ -7,6 +7,77 @@
 **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)  
 **Contact:** randrewsmath@gmail.com
 
+---
+
+## Key Features
+
+- **HP-everywhere by policy** — GMP/MPFR (`rug`) arithmetic throughout;
+  f64 fast paths exist only where explicitly requested and are always
+  named with an `_f64` suffix, so there is no ambiguity at the call site.
+
+- **CCM Weil-form construction** — full Connes–Consani–Moscovici zeta
+  spectral triple assembly (f64 + HP), including the Weil-form
+  eigensolver, plunge-cancellation decomposition, and Sonin/band-concentration
+  restriction.
+
+- **Disk-cached HP fixtures** — Gauss-Legendre quadrature, τ-matrices,
+  Weil eigenvectors, and prolate eigenvalues are cached locally and can
+  fetch from public cache repos on demand, so expensive HP compute is a
+  one-time cost.
+
+- **Parallel throughout, bit-reproducible** — rayon-based parallelization
+  across every HP hot spot, with a fixed reduction order so results are
+  bit-identical run-to-run despite the non-associativity of HP addition.
+
+- **Verified eigensolver** — HP symmetric eigendecomposition cross-checked
+  against PARI/GP at 2000-digit precision, closed-form structured
+  matrices, and property-based random testing.
+
+- **Full parallelism on WSL2** — no capped thread pools or platform
+  workarounds needed; an opt-in safe mode exists as a fallback if HP
+  instability is ever encountered.
+
+- **Additional spectral tooling** — prolate-wave operators, Mellin
+  transforms, the Yakaboylu Hilbert–Pólya framework, the Suzuki screw
+  function, and Dirichlet L-function extensions, all with f64/HP parity.
+
+---
+
+## Reporting issues & feature requests
+
+Found a bug, hit a limitation, or have an idea for a new capability? Please
+reach out directly rather than forking the repository or starting an
+independent project:
+
+- Open an issue: https://github.com/TeamXcelerator/xcelerator-toolkit/issues
+- Or email: randrewsmath@gmail.com
+
+This keeps fixes and improvements consolidated in one place, so everyone who
+depends on the toolkit benefits from them. The license (see below) does not
+permit modification or redistribution — the intended path for any change,
+however small, is to report it here so it can be reviewed and fixed or added
+upstream.
+
+## Citing this work
+
+If you use the Xcelerator Toolkit in your research, please cite it:
+
+```bibtex
+@software{AndrewsXceleratorToolkit2026,
+  author = {Andrews, Ronnie, Jr.},
+  title  = {Xcelerator Toolkit: High-Precision Numerical Libraries for
+            Analytic Number Theory and Spectral Methods},
+  year   = {2026},
+  url    = {https://github.com/TeamXcelerator/xcelerator-toolkit}
+}
+```
+
+A note in the methods section such as *"computations were performed using
+the Xcelerator Toolkit (github.com/TeamXcelerator/xcelerator-toolkit)"* is
+equally welcome. Thank you.
+
+---
+
 ## Crates
 
 This is a Cargo workspace containing three sub-crates:
@@ -184,110 +255,59 @@ the function is HP (or precision-agnostic).
 | `_hp` suffix → HP | `omega_hp`, `truncated_lambda_hp`, `xi_weighted_mellin_hp`, `scan_critical_line_zeros_hp`, `tridiag_eigenvalues_hp`, `householder_tridiag_hp`, `dense_symmetric_eigenvalues_hp`, `tridiag_eigenvector_for_value_hp` |
 | no suffix → HP-default | `ccm::hp::run`, `inverse_iteration`, `lu_factor`, `lu_solve`, `normalize_l2`, `rayleigh_quotient`, `display_hp`, `matching_digits`, `chi_at`, `gauss_legendre_nodes` |
 
+## Used by
+
+- [`ccm-reproduction-and-convergence`](https://github.com/TeamXcelerator/ccm-reproduction-and-convergence) — Independent reproduction of the CCM zeta spectral triple, with eigenvalue match to 999 digits.
+- [`ccm-convergence-rate`](https://github.com/TeamXcelerator/ccm-convergence-rate) — A quantitative convergence law for the CCM zeta spectral triple's basis-size, precision, and prime-cutoff dependence, with defined rigor tiers for each component.
+- [`ccm-convergence-rate-falsifications`](https://github.com/TeamXcelerator/ccm-convergence-rate-falsifications) — Empirical convergence-rate study and falsification of proposed convergence-rate predictions.
+
+---
 
 ## Version History
 
-- **v0.11.4** — Two changes, bundled since v0.11.3's release was never
-  published:
+- **v0.12.0** — Fix: cache staleness check read the wrong field in the
+  wrong direction, so it never actually rejected cache files (GL, τ,
+  Weil eigvec, prolate) written by an older toolkit build. Now compares
+  the file's own `toolkit_version` against the toolkit's minimum-
+  compatible-version floor and rejects anything older. Floors raised to
+  `0.12.0` on all 4 caches. Behavior change: cache files below `0.12.0`
+  (local or public) are now treated as stale and recomputed/re-fetched.
 
-  **1. Fix: default f64-only build** (`cargo build --workspace --release`,
-  no `--features hp`) failed to compile with `E0433: cannot find
-  hp_runtime in xc_numerics`. The f64 critical-line scanner
-  (`scan_critical_line_zeros_f64` in `mellin.rs`, not hp-gated) calls
-  `xc_numerics::hp_runtime::init_hp_pool()`, but `hp_runtime` itself was
-  gated behind `#[cfg(feature = "hp")]` in `xc-numerics/src/lib.rs`, so
-  the module didn't exist in f64-only builds. Fix: `hp_runtime` is no
-  longer feature-gated — the module only depends on `std` and `rayon`
-  (both available unconditionally), so it compiles in both tiers. This
-  restores the README's own first quick-start command.
+- **v0.11.4** — Two fixes: (1) default f64-only build
+  (`cargo build --workspace --release`, no `--features hp`) failed to
+  compile (`E0433`) because the f64 critical-line scanner called
+  `hp_runtime` unconditionally while the module was hp-gated;
+  `hp_runtime` is no longer feature-gated. Reported by Akiva Groskin.
+  (2) WSL2 no longer auto-caps HP parallelism — full uncapped
+  parallelism is now the default (matching Vast/native Linux); the
+  abort that motivated the v0.11.2 cap no longer reproduces. Opt-in
+  fallback: `XC_HP_SAFE_MODE=1`. Minor API change:
+  `hp_runtime::is_wsl()` removed (use `safe_mode()`).
 
-  Reported by Akiva Groskin, who traced the failure to the `hp_runtime`
-  feature gate and confirmed the fix (ungating the module) on macOS.
-  Independently reproduced and verified on WSL2 before applying.
+- **v0.11.3** — WSL2 HP reliability fix, corrected design (supersedes
+  v0.11.2): one capped global rayon pool plus one dedicated pool via
+  `pool.install`, not two independent pools. Worker count auto-detected
+  (`nproc/8`, clamped 2–4), overridable via `XC_HP_THREADS`. Adds
+  `map_gl_precompute`. Backwards compatible — no public API changed.
 
-  **2. WSL2 default flipped to full uncapped parallelism**, identical to
-  Vast/native Linux. `xc-numerics::hp_runtime` no longer auto-detects
-  WSL2 (`is_wsl()` removed) — the capped-pool / sequential-GL execution
-  context introduced in v0.11.2 is now an opt-in (`XC_HP_SAFE_MODE=1`)
-  rather than the unconditional WSL2 default.
+- **v0.11.2** — WSL2 HP reliability fix (initial version; see v0.11.3
+  for the corrected design). Added `xc-numerics::hp_runtime`, a
+  WSL2-aware wrapper around `ccm::hp` and `scan_critical_line_zeros_hp`
+  (zero-overhead passthrough elsewhere). Slow/intensive HP tests marked
+  `#[ignore]`. Backwards compatible — no public API changed.
 
-  Basis: the abort that motivated the v0.11.2 cap was retested on
-  2026-07-02 on the same 32-core WSL2 machine that originally exhibited
-  it, with no WSL update and no other environment change in between.
-  8/8 runs completed cleanly at full uncapped parallelism (rayon's
-  default global pool, parallel GL precompute) — 2 runs at the exact
-  originally-aborting configuration (λ²=20, N=140, dim 281) and 6 runs
-  at a substantially harder one (λ²=30, N=230, dim 461). Unconditionally
-  capping WSL2 parallelism is no longer justified given this: it imposed
-  a real performance cost (2–4 workers instead of all cores) for a
-  failure mode that no longer reproduces.
+- **v0.11.1** — New `ccm::hp::band_concentration_matrix_hp` (Slepian/
+  prolate band-concentration operator, eigenvalues `χ ∈ (0,1)`) and
+  `weil_spectrum_sonin_hp` (`SoninRestriction`: archimedean spectrum on
+  the Sonin subspace). Adds the `weil_sonin` example. Backwards
+  compatible — additive only.
 
-  The original investigation's findings (thread-count sensitivity, not
-  rayon-specific, not stack/arena-size sensitive) and the capped
-  execution context itself are preserved as `XC_HP_SAFE_MODE=1`, in case
-  the abort was environment-specific in a way that resurfaces on a
-  different machine or WSL2 build. See `xc_numerics::hp_runtime` module
-  docs for the full history and design.
-
-  **Minor public API change**: `hp_runtime::is_wsl()` is removed
-  (replaced by `hp_runtime::safe_mode()`, which checks `XC_HP_SAFE_MODE`
-  instead of platform detection). No other function in this crate or
-  any other called `is_wsl()` directly, so this has no effect on any
-  existing caller. `init_hp_pool`, `run_hp`, and `map_gl_precompute`
-  keep their signatures unchanged.
-
-- **v0.11.3** — WSL2 HP reliability fix, corrected design (supersedes the
-  v0.11.2 approach below). `xc-numerics::hp_runtime` now uses exactly one
-  capped global rayon pool plus one dedicated pool reused via
-  `pool.install` (not two independently-configured pools, which testing
-  showed made the abort *more* likely by doubling the combined
-  concurrently-active-thread count). Worker count auto-detected as
-  `nproc/8` (clamped to 2–4) rather than a fixed value; overridable via
-  `XC_HP_THREADS`. Adds `map_gl_precompute` (parallel on non-WSL, serial on
-  WSL2) as additional headroom under the WSL2 thread budget for GL table
-  precompute. See the new README section "Running under WSL2 — known
-  limitations" and the extensive module docs in `hp_runtime.rs` for the
-  full empirical writeup (confirmed: not rayon-specific; confirmed: not
-  stack-size or `MALLOC_ARENA_MAX` sensitive; confirmed: thread-count
-  sensitive; confirmed: GL compute at large configurations is slow on
-  WSL2, not unstable — an earlier working theory to the contrary was a
-  false positive from short-timeout polling of a genuinely multi-minute
-  computation). **Backwards compatible — no public API changed.**
-
-- **v0.11.2** — WSL2 HP reliability fix (initial version; see v0.11.3 for
-  the corrected design). Added `xc-numerics::hp_runtime`, a WSL2-aware
-  execution context wrapping all `ccm::hp` public entry points and
-  `scan_critical_line_zeros_hp` in `mellin` with `run_hp(||…)`. On Vast /
-  native Linux the wrapper is a zero-overhead passthrough — full
-  parallelism and behavior unchanged. Also marked slow/intensive HP
-  compute tests `#[ignore]` with explicit run instructions so the default
-  test run completes cleanly on WSL2 without process crashes.
-  **Backwards compatible — no public API changed.**
-
-- **v0.11.1** — New `ccm::hp::band_concentration_matrix_hp(params, cfg, omega)`:
-  the time-frequency (Slepian/prolate) band-concentration operator in the
-  localized Weil-form `V_n` basis, with eigenvalues `χ ∈ (0,1)` separating the
-  band-concentrated (prolate) subspace from the Sonin-like (anti-band) subspace.
-  New `ccm::hp::weil_spectrum_sonin_hp(params, cfg, omega, n_drop)` (with the
-  `SoninRestriction` result): deflates the top `n_drop` band-concentrated modes
-  and returns the archimedean Weil spectrum on the Sonin subspace (where
-  archimedean positivity holds, Connes Thm 7.1). Adds the `weil_sonin` example.
-  **Backwards compatible — additive only** (no public API changed). Adds 2 unit
-  tests. Also scrubs internal shorthand from a few code comments (no behavior
-  change).
-
-- **v0.11.0** — New `xc-spectral::screw` module: the Suzuki screw function
-  `g(t)` (arXiv:2606.09096) in HP, validated to 1e-38 against an independent
-  reference. New `ccm::hp::weil_spectrum_hp(params, cfg, include_primes)`:
-  the full HP spectrum of the localized Weil-form τ-matrix, with an
-  archimedean-only mode (`include_primes = false`) that drops the prime-power
-  sum for prefactor-decomposition studies. Also adds
-  `ccm::hp::weil_plunge_cancellation_hp` (with the `PlungeCancellation` result)
-  — decomposes the plunge `ε_N` on the full eigenvector ξ into archimedean and
-  prime Rayleigh quotients (`ε_N = arch − prime`), and the `weil_cancellation`
-  example. **Backwards compatible — additive
-  only** (no public API changed; the one internal signature change is to a
-  private function whose sole caller is unchanged). Adds 4 unit tests.
+- **v0.11.0** — New `xc-spectral::screw` module (Suzuki screw function,
+  HP, validated to 1e-38). New `ccm::hp::weil_spectrum_hp`
+  (archimedean-only mode via `include_primes`) and
+  `weil_plunge_cancellation_hp` (`PlungeCancellation`: decomposes `ε_N`
+  into archimedean/prime Rayleigh quotients). Adds the
+  `weil_cancellation` example. Backwards compatible — additive only.
 
 - **v0.10.0** — Eigensolver overhaul (adaptive Newton steps, f64 warm seeds,
   Halley's method, warm-start inverse iteration, auto-detect even/odd symmetry,
@@ -302,8 +322,8 @@ the function is HP (or precision-agnostic).
   `save_xi_json`, `load_xi_json`, `LoadedXi` removed (dead API).
   226 tests, 0 failures.
 
-- **v0.9.2** — τ-cache remote fetch checks two repos (`xcelerator-tau-cache`
-  then `xcelerator-tau-cache-2`) to support cache overflow.
+- **v0.9.2** — τ-cache remote fetch checks a list of configured public
+  repos in order, stopping at the first hit.
 
 - **v0.9.1** — Zip-only cache: τ, GL, and Weil caches read directly from
   `.json.zip` in memory; no decompressed `.json` written to disk, halving
@@ -341,12 +361,6 @@ the function is HP (or precision-agnostic).
 
 - **v0.1.0** — Initial release. CCM construction, prolate, Mellin,
   Yakaboylu, L-functions, HP numerics.
-
-## Used by
-
-- [`ccm-reproduction-and-convergence`](https://github.com/TeamXcelerator/ccm-reproduction-and-convergence) — Independent reproduction of the CCM zeta spectral triple, with eigenvalue match to 999 digits.
-- [`ccm-convergence-rate`](https://github.com/TeamXcelerator/ccm-convergence-rate) — A quantitative convergence law for the CCM zeta spectral triple's basis-size, precision, and prime-cutoff dependence, with defined rigor tiers for each component.
-- [`ccm-convergence-rate-falsifications`](https://github.com/TeamXcelerator/ccm-convergence-rate-falsifications) — Empirical convergence-rate study and falsification of proposed convergence-rate predictions.
 
 ## License
 

@@ -640,20 +640,48 @@ pub mod hp {
 
     use super::super::ccm::LambdaSq;
 
-    /// Base raw URL of the public consolidated prolate-eigenvalue cache
-    /// repository. Files live at
-    /// `{REMOTE_BASE}/prolate_eigvals_cache/prec{P}/lambda_sq{L}/ngrid{B}-{B+999}/lambda_sq{L}_ngrid{N}_prec{P}.json.zip`
+    /// Base raw URLs of the public consolidated prolate-eigenvalue cache
+    /// repositories, in probe order. Files live at
+    /// `{base}/prolate_eigvals_cache/prec{P}/lambda_sq{L}/ngrid{B}-{B+999}/lambda_sq{L}_ngrid{N}_prec{P}.json.zip`
     /// where `B = (N / 1000) * 1000`.
-    const PROLATE_REMOTE_BASE: &str =
-        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-prolate-eigvals-cache/main";
+    ///
+    /// An array (mirroring `xc_spectral::ccm::hp::tau_cache::REMOTE_BASES`)
+    /// so a second/overflow prolate cache repo can be added with a
+    /// one-line change here.
+    const PROLATE_REMOTE_BASES: &[&str] = &[
+        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-prolate-eigvals-cache/main",
+    ];
+
+    fn prolate_active_bases() -> Vec<String> {
+        match std::env::var("XC_PROLATE_CACHE_BASES") {
+            Ok(v) if !v.trim().is_empty() => v
+                .split(',')
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            _ => PROLATE_REMOTE_BASES.iter().map(|s| s.to_string()).collect(),
+        }
+    }
 
     /// Toolkit version string embedded in every prolate eigvals cache file
     /// written by this build.
     const PROLATE_TOOLKIT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+    #[cfg(test)]
+    pub(super) fn prolate_toolkit_version_for_test() -> &'static str {
+        PROLATE_TOOLKIT_VERSION
+    }
+
     /// Minimum toolkit version required to use a prolate eigvals cache file.
     /// Files produced by an older toolkit are treated as cache misses.
-    const PROLATE_CACHE_MIN_TOOLKIT_VERSION: &str = "0.10.0";
+    const PROLATE_CACHE_MIN_TOOLKIT_VERSION: &str = "0.12.0";
+
+    fn prolate_effective_min_version() -> String {
+        std::env::var("XC_PROLATE_CACHE_MIN_VER")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| PROLATE_CACHE_MIN_TOOLKIT_VERSION.to_string())
+    }
 
     /// HP-build of the FD prolate-wave tridiagonal data.
     ///
@@ -1078,15 +1106,14 @@ pub mod hp {
 
     /// Parse a prolate eigenvalue cache JSON.
     /// Expects schema_version 1 envelope format. Returns `None` on any
-    /// structural mismatch or incompatible `min_compatible_version`.
+    /// structural mismatch or a stale `toolkit_version`.
     fn parse_prolate_cache_json(data: &str, n_expected: usize, prec: u32) -> Option<Vec<Float>> {
         let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
         let obj = parsed.as_object()?;
 
-        if let Some(min_ver) = obj.get("min_compatible_version").and_then(|v| v.as_str()) {
-            if prolate_version_is_older(PROLATE_CACHE_MIN_TOOLKIT_VERSION, min_ver) {
-                return None;
-            }
+        let file_ver = obj.get("toolkit_version").and_then(|v| v.as_str())?;
+        if prolate_version_is_older(file_ver, &prolate_effective_min_version()) {
+            return None;
         }
 
         let arr = obj.get("eigenvalues")?.as_array()?;
@@ -1201,25 +1228,28 @@ pub mod hp {
         }
     }
 
-    /// Deterministic remote URL for the `(λ², n_grid, prec)` fixture in
-    /// the public xcelerator-prolate-eigvals-cache repo (precision-first
-    /// → λ² → ngrid-thousand-bucket layout, mirroring tau/weil-eigvec).
-    fn prolate_remote_zip_url(lambda_sq: LambdaSq, n_grid: usize, prec: u32) -> String {
+    /// Deterministic remote URL for the `(λ², n_grid, prec)` fixture in a
+    /// specific base repo (precision-first → λ² → ngrid-thousand-bucket
+    /// layout, mirroring tau/weil-eigvec).
+    fn prolate_remote_zip_url(base: &str, lambda_sq: LambdaSq, n_grid: usize, prec: u32) -> String {
         let bucket = (n_grid / 1000) * 1000;
         format!(
             "{base}/prolate_eigvals_cache/prec{p}/lambda_sq{l}/ngrid{b}-{bend}/{stem}.zip",
-            base = PROLATE_REMOTE_BASE, p = prec, l = lambda_sq.filename_str(),
+            base = base, p = prec, l = lambda_sq.filename_str(),
             b = bucket, bend = bucket + 999,
             stem = prolate_cache_filename(lambda_sq, n_grid, prec)
         )
     }
 
-    /// Test-only accessor for `prolate_remote_zip_url`.
+    /// Test-only accessor for `prolate_remote_zip_url`. Returns results
+    /// for all configured bases, in probe order.
     #[cfg(test)]
     pub(super) fn prolate_remote_zip_url_for_test(
         lambda_sq: LambdaSq, n_grid: usize, prec: u32,
-    ) -> String {
-        prolate_remote_zip_url(lambda_sq, n_grid, prec)
+    ) -> Vec<String> {
+        PROLATE_REMOTE_BASES.iter()
+            .map(|base| prolate_remote_zip_url(base, lambda_sq, n_grid, prec))
+            .collect()
     }
 
     /// Test-only accessor for `parse_prolate_cache_json` (lets
@@ -1237,9 +1267,15 @@ pub mod hp {
     fn prolate_curl_attempt(url: &str, dest: &std::path::Path) -> ProlateCurlOutcome {
         let tmp = dest.with_extension("zip.partial");
         let _ = std::fs::remove_file(&tmp);
-        let output = std::process::Command::new("curl")
-            .arg("--silent").arg("--show-error").arg("--location")
-            .arg("--retry").arg("3").arg("--retry-delay").arg("1")
+        let mut cmd = std::process::Command::new("curl");
+        cmd.arg("--silent").arg("--show-error").arg("--location")
+            .arg("--retry").arg("3").arg("--retry-delay").arg("1");
+        if let Ok(tok) = std::env::var("XC_CACHE_AUTH") {
+            if !tok.trim().is_empty() {
+                cmd.arg("-H").arg(format!("Authorization: token {}", tok.trim()));
+            }
+        }
+        let output = cmd
             .arg("--write-out").arg("%{http_code}")
             .arg("-o").arg(&tmp).arg(url)
             .output();
@@ -1270,20 +1306,26 @@ pub mod hp {
             Some(p) => p,
             None => return false,
         };
-        let url = prolate_remote_zip_url(lambda_sq, n_grid, prec);
 
-        const MAX_TRIES: usize = 5;
-        for attempt in 0..MAX_TRIES {
-            match prolate_curl_attempt(&url, &dest) {
-                ProlateCurlOutcome::Ok => {
-                    // Routine cache hit — silent.
-                    return true;
-                }
-                ProlateCurlOutcome::HttpError => return false, // 404 — definitive miss.
-                ProlateCurlOutcome::Transient => {
-                    if attempt + 1 < MAX_TRIES {
-                        let secs = 2 * (attempt as u64 + 1);
-                        std::thread::sleep(std::time::Duration::from_secs(secs));
+        // Iterate over PROLATE_REMOTE_BASES in order, trying each repo
+        // until one has the file. Mirrors the τ-cache multi-repo probe.
+        for base in prolate_active_bases() {
+            let url = prolate_remote_zip_url(&base, lambda_sq, n_grid, prec);
+
+            const MAX_TRIES: usize = 5;
+            for attempt in 0..MAX_TRIES {
+                match prolate_curl_attempt(&url, &dest) {
+                    ProlateCurlOutcome::Ok => {
+                        // Routine cache hit — silent.
+                        return true;
+                    }
+                    // 404: not in this repo — try the next one.
+                    ProlateCurlOutcome::HttpError => break,
+                    ProlateCurlOutcome::Transient => {
+                        if attempt + 1 < MAX_TRIES {
+                            let secs = 2 * (attempt as u64 + 1);
+                            std::thread::sleep(std::time::Duration::from_secs(secs));
+                        }
                     }
                 }
             }
@@ -1302,7 +1344,6 @@ pub mod hp {
         let json = serde_json::json!({
             "schema_version": 1,
             "toolkit_version": PROLATE_TOOLKIT_VERSION,
-            "min_compatible_version": PROLATE_CACHE_MIN_TOOLKIT_VERSION,
             "lambda_sq": lambda_sq.value_f64,
             "lambda_sq_mode": lambda_sq.mode_str(),
             "n_grid": n_grid,
@@ -2202,8 +2243,7 @@ pub mod hp {
             let strs: Vec<String> = real_evals.iter().map(|f| f.to_string()).collect();
             let valid_json = serde_json::json!({
                 "schema_version": 1,
-                "toolkit_version": "0.10.0",
-                "min_compatible_version": "0.10.0",
+                "toolkit_version": prolate_toolkit_version_for_test(),
                 "lambda_sq": lambda_sq.value_f64,
                 "n_grid": n_grid,
                 "precision_bits": prec,
@@ -2221,8 +2261,7 @@ pub mod hp {
             let bad_strs: Vec<String> = bad_evals.iter().map(|f| f.to_string()).collect();
             let bad_json = serde_json::json!({
                 "schema_version": 1,
-                "toolkit_version": "0.10.0",
-                "min_compatible_version": "0.10.0",
+                "toolkit_version": prolate_toolkit_version_for_test(),
                 "lambda_sq": lsq_bad.value_f64,
                 "n_grid": n_grid,
                 "precision_bits": prec,
@@ -2325,17 +2364,16 @@ pub mod hp {
             crate::fresh_test_dir(&format!("prolate_{}", tag))
         }
 
-        /// `parse_prolate_cache_json_for_test` rejects an envelope where
-        /// `min_compatible_version` is newer than
-        /// `PROLATE_CACHE_MIN_TOOLKIT_VERSION`.
+        /// `parse_prolate_cache_json_for_test` rejects an envelope whose
+        /// `toolkit_version` is older than `PROLATE_CACHE_MIN_TOOLKIT_VERSION`
+        /// — a stale file written by an older toolkit build.
         #[test]
-        fn prolate_cache_rejects_newer_min_compatible_version() {
+        fn prolate_cache_rejects_stale_toolkit_version() {
             let n_grid = 5usize;
             let prec: u32 = 64;
             let strs: Vec<String> = (0..n_grid).map(|i| format!("{}", i + 1)).collect();
             let payload = serde_json::json!({
-                "toolkit_version": "99.0.0",
-                "min_compatible_version": "99.0.0",
+                "toolkit_version": "0.0.1",
                 "lambda_sq": 25_u64,
                 "n_grid": n_grid,
                 "precision_bits": prec,
@@ -2343,7 +2381,7 @@ pub mod hp {
             }).to_string();
             assert!(
                 parse_prolate_cache_json_for_test(&payload, n_grid, prec).is_none(),
-                "prolate parser should reject min_compatible_version=99.0.0"
+                "prolate parser should reject a stale toolkit_version=0.0.1"
             );
         }
 
@@ -2353,17 +2391,17 @@ pub mod hp {
         #[test]
         fn prolate_remote_url_uses_bucketed_layout() {
             // λ²=100, ngrid=4001, prec=3338 → bucket 4000-4999.
-            let url = prolate_remote_zip_url_for_test(LambdaSq::integer(100), 4001, 3338);
+            let urls = prolate_remote_zip_url_for_test(LambdaSq::integer(100), 4001, 3338);
             assert_eq!(
-                url,
-                "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-prolate-eigvals-cache/main/prolate_eigvals_cache/prec3338/lambda_sq100/ngrid4000-4999/lambda_sq100_ngrid4001_prec3338.json.zip"
+                urls,
+                vec!["https://raw.githubusercontent.com/TeamXcelerator/xcelerator-prolate-eigvals-cache/main/prolate_eigvals_cache/prec3338/lambda_sq100/ngrid4000-4999/lambda_sq100_ngrid4001_prec3338.json.zip"]
             );
 
             // λ²=1000, ngrid=8001, prec=3338 → bucket 8000-8999.
-            let url2 = prolate_remote_zip_url_for_test(LambdaSq::integer(1000), 8001, 3338);
+            let urls2 = prolate_remote_zip_url_for_test(LambdaSq::integer(1000), 8001, 3338);
             assert_eq!(
-                url2,
-                "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-prolate-eigvals-cache/main/prolate_eigvals_cache/prec3338/lambda_sq1000/ngrid8000-8999/lambda_sq1000_ngrid8001_prec3338.json.zip"
+                urls2,
+                vec!["https://raw.githubusercontent.com/TeamXcelerator/xcelerator-prolate-eigvals-cache/main/prolate_eigvals_cache/prec3338/lambda_sq1000/ngrid8000-8999/lambda_sq1000_ngrid8001_prec3338.json.zip"]
             );
         }
 
