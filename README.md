@@ -265,13 +265,23 @@ the function is HP (or precision-agnostic).
 
 ## Version History
 
+- **v0.12.1** — Fix: cache writes (GL, τ, Weil eigvec, prolate) silently
+  failed for any config whose serialized JSON exceeded ~4 GiB — the
+  `zip` crate defaults to classic (non-Zip64) headers, which abort the
+  write past that size with no error surfaced to the caller. Affected
+  configs (e.g. τ at HP-1500/2000 for N in the 700-1000+ range)
+  recomputed from scratch on every run instead of caching. Fixed by
+  setting `large_file(true)` on all cache zip writers. `save()` now
+  also warns to stderr if zip compression ever fails, instead of
+  silently no-oping.
+
 - **v0.12.0** — Fix: cache staleness check read the wrong field in the
-  wrong direction, so it never actually rejected cache files (GL, τ,
-  Weil eigvec, prolate) written by an older toolkit build. Now compares
-  the file's own `toolkit_version` against the toolkit's minimum-
-  compatible-version floor and rejects anything older. Floors raised to
-  `0.12.0` on all 4 caches. Behavior change: cache files below `0.12.0`
-  (local or public) are now treated as stale and recomputed/re-fetched.
+  wrong direction, so it never actually rejected cache files written by
+  an older toolkit build. Now compares the file's own `toolkit_version`
+  against the toolkit's minimum-compatible-version floor and rejects
+  anything older. Floors raised to `0.12.0` on all 4 caches. Behavior
+  change: cache files below `0.12.0` (local or public) are now treated
+  as stale and recomputed/re-fetched.
 
 - **v0.11.4** — Two fixes: (1) default f64-only build
   (`cargo build --workspace --release`, no `--features hp`) failed to

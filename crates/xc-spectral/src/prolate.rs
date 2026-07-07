@@ -1363,13 +1363,21 @@ pub mod hp {
             Some(p) => p,
             None => return,
         };
+        // large_file(true): the `zip` crate defaults to classic
+        // (non-Zip64) headers, which silently abort the write once
+        // either the uncompressed or compressed size crosses 4 GiB
+        // (see xc_spectral::ccm::hp::tau_cache::compress_to_zip for the
+        // full writeup of this failure mode). The eigenvalue spectrum
+        // is small in practice, but this keeps the write path uniform
+        // and safe regardless of grid size.
         let mut buf: Vec<u8> = Vec::with_capacity(json_str.len() / 2);
         {
             use std::io::Write;
             let cursor = std::io::Cursor::new(&mut buf);
             let mut writer = zip::ZipWriter::new(cursor);
             let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
+                .compression_method(zip::CompressionMethod::Deflated)
+                .large_file(true);
             if writer.start_file(&entry_name, opts).is_err() { return; }
             if writer.write_all(json_str.as_bytes()).is_err() { return; }
             if writer.finish().is_err() { return; }

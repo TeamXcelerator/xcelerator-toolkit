@@ -1809,13 +1809,26 @@ mod tau_cache {
 
     /// Compress `json_bytes` to a deflated zip in-memory; the inner
     /// entry is named `entry_name`. Returns the resulting zip bytes.
+    ///
+    /// `large_file(true)` is required: the `zip` crate defaults to
+    /// classic (non-Zip64) headers, which silently abort the write once
+    /// either the uncompressed or compressed size crosses 4 GiB. τ-matrix
+    /// JSON at HP-1500/HP-2000 for N in the 700-1000 range routinely
+    /// exceeds that (e.g. λ²=1000, N=890 at HP-2000 is ~6.5 GB
+    /// uncompressed), so without this flag `compress_to_zip` returns an
+    /// empty `Vec` and the caller (`save`) treats that as "nothing to
+    /// cache" with no error surfaced — every write for such a config
+    /// silently no-ops forever. Setting `large_file` unconditionally
+    /// costs 20 bytes of Zip64 header overhead per entry, negligible
+    /// even for the smallest cached files.
     fn compress_to_zip(json_bytes: &[u8], entry_name: &str) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(json_bytes.len() / 2);
         {
             let cursor = std::io::Cursor::new(&mut buf);
             let mut writer = zip::ZipWriter::new(cursor);
             let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
+                .compression_method(zip::CompressionMethod::Deflated)
+                .large_file(true);
             if writer.start_file(entry_name, opts).is_err() { return Vec::new(); }
             if writer.write_all(json_bytes).is_err() { return Vec::new(); }
             if writer.finish().is_err() { return Vec::new(); }
@@ -1862,7 +1875,15 @@ mod tau_cache {
         // vs multi-part split based on compressed size.
         let entry_name = cache_filename(lambda_sq, n_modes, prec);
         let zip_bytes = compress_to_zip(&json_bytes, &entry_name);
-        if zip_bytes.is_empty() { return; }
+        if zip_bytes.is_empty() {
+            eprintln!(
+                "[tau_cache] WARNING: zip compression failed for λ²={}, N={}, prec={} \
+                 ({} bytes uncompressed) — this config will NOT be cached and will \
+                 recompute from scratch on every run",
+                lambda_sq.value_f64, n_modes, prec, json_bytes.len()
+            );
+            return;
+        }
 
         if zip_bytes.len() <= PART_BYTE_LIMIT {
             // Single-zip path: under the per-part cap, write one file.
@@ -2598,13 +2619,16 @@ mod weil_eigvec_cache {
         serde_json::to_vec(&payload).unwrap_or_default()
     }
 
+    /// See `tau_cache::compress_to_zip` for why `large_file(true)` is
+    /// required (silent 4 GiB write-abort otherwise).
     fn compress_to_zip(json_bytes: &[u8], entry_name: &str) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::with_capacity(json_bytes.len() / 2);
         {
             let cursor = std::io::Cursor::new(&mut buf);
             let mut writer = zip::ZipWriter::new(cursor);
             let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
+                .compression_method(zip::CompressionMethod::Deflated)
+                .large_file(true);
             if writer.start_file(entry_name, opts).is_err() { return Vec::new(); }
             if writer.write_all(json_bytes).is_err() { return Vec::new(); }
             if writer.finish().is_err() { return Vec::new(); }
@@ -2638,7 +2662,15 @@ mod weil_eigvec_cache {
         // this is always a single zip (no byte-split tier — unlike τ).
         let entry_name = cache_filename(lambda_sq, n_modes, prec, force_even);
         let zip_bytes = compress_to_zip(&json_bytes, &entry_name);
-        if zip_bytes.is_empty() { return; }
+        if zip_bytes.is_empty() {
+            eprintln!(
+                "[weil_eigvec_cache] WARNING: zip compression failed for λ²={}, N={}, \
+                 prec={} ({} bytes uncompressed) — this config will NOT be cached and \
+                 will recompute from scratch on every run",
+                lambda_sq.value_f64, n_modes, prec, json_bytes.len()
+            );
+            return;
+        }
         if let Some(zp) = zip_path(lambda_sq, n_modes, prec, force_even) {
             if let Err(e) = std::fs::write(&zp, &zip_bytes) {
                 crate::hp_debug!(
