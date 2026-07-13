@@ -258,6 +258,24 @@ fn force_symmetric(matrix: &mut [Float], dim: usize) {
     }
 }
 
+/// Quadratic form `vᵀ M v` for a dense row-major matrix `m` (`dim`×`dim`)
+/// and vector `v`, in full HP. Used for Rayleigh quotients on recovered
+/// eigenvectors.
+fn quad_form(m: &[Float], v: &[Float], dim: usize, prec: u32) -> Float {
+    let mut total = Float::with_val(prec, 0);
+    for i in 0..dim {
+        let mut row = Float::with_val(prec, 0);
+        for j in 0..dim {
+            let mut t = m[i * dim + j].clone();
+            t *= &v[j];
+            row += &t;
+        }
+        row *= &v[i];
+        total += &row;
+    }
+    total
+}
+
 /// Top-level entry. Build matrix, find eigenvector, solve spectrum.
 ///
 /// `zero_seeds` are the reference Riemann zero imaginary parts used as
@@ -657,6 +675,148 @@ fn weil_plunge_cancellation_hp_inner(
         arch_rayleigh,
         prime_rayleigh,
     })
+}
+
+/// Archimedean-only plunge eigenvector: the ground eigenvector of the
+/// localized Weil form with the prime-power sum `w_p` dropped
+/// (`include_primes = false`). Returns `(eigenvalue, prime_rayleigh, ψ)`:
+/// the even-ground-state eigenvalue; the prime Rayleigh quotient
+/// `ρ_p = ⟨A_prime ψ, ψ⟩ / ‖ψ‖²` (with `A_prime = τ_full − τ_arch` the
+/// prime-power part of the Weil form) measured on that eigenvector; and the
+/// coefficients ψ ordered `j = −N..+N` (the `params.idx` order, position
+/// `0` = mode `−N`), matching the full-form ξ layout.
+///
+/// This builds τ with `build_tau_hp_compute(.., include_primes = false)`
+/// (the same archimedean-only matrix its `tau_arch` and
+/// `weil_spectrum_hp_inner`'s `false` branch use) and recovers the
+/// eigenvector via the same dense HP path as [`weil_plunge_cancellation_hp`].
+/// The archimedean-only form is O(1)-indefinite; unlike the full form, its
+/// smallest **positive** eigenvalue is ODD, so this selects the smallest
+/// positive eigenvalue whose eigenvector is **even** (ξ(j) = ξ(−j)) — the
+/// even ground state — then projects that eigenvector onto the even subspace
+/// (ψ_j ← ½(ψ_j + ψ_{−j})), renormalizes, and guards `even_dev < 1e-40`, so
+/// the returned vector is a pure even mode even under near-degeneracy.
+pub fn weil_arch_eigvec_hp(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+) -> Result<(Float, Float, Vec<Float>)> {
+    xc_numerics::hp_runtime::run_hp(|| weil_arch_eigvec_hp_inner(params, cfg))
+}
+
+fn weil_arch_eigvec_hp_inner(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+) -> Result<(Float, Float, Vec<Float>)> {
+    let prec = cfg.precision_bits;
+    let dim = params.matrix_size();
+    let l = log_lambda_sq_hp(params, prec);
+
+    // Archimedean-only τ (prime sum dropped), symmetrized — identical to the
+    // `tau_arch` built inside `weil_plunge_cancellation_hp_inner`.
+    let mut tau_arch = build_tau_hp_compute(params, &l, cfg, false)?;
+    force_symmetric(&mut tau_arch, dim);
+
+    // Even ground state: the smallest POSITIVE eigenvalue whose eigenvector
+    // is even (ξ(j) = ξ(−j)). The archimedean-only form is O(1)-indefinite
+    // and its lowest positive mode is ODD, so we walk positive eigenvalues in
+    // ascending order, recover each eigenvector, and take the first even one
+    // (L1 reflection test: even ⇒ ‖ξ − γξ‖₁ < ‖ξ + γξ‖₁).
+    let eigs = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&tau_arch, dim, prec)?;
+    let zero = Float::with_val(prec, 0);
+    let mut found: Option<(Float, Vec<Float>)> = None;
+    for e in eigs.iter().filter(|e| **e > zero).take(64) {
+        let xi = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
+            &tau_arch, dim, e, prec, cfg.inverse_iter_steps,
+        )?;
+        let mut refl_diff = Float::with_val(prec, 0);
+        let mut refl_sum = Float::with_val(prec, 0);
+        for i in 0..dim {
+            let mut d = xi[i].clone();
+            d -= &xi[dim - 1 - i];
+            refl_diff += d.abs();
+            let mut s = xi[i].clone();
+            s += &xi[dim - 1 - i];
+            refl_sum += s.abs();
+        }
+        if refl_diff < refl_sum {
+            found = Some((e.clone(), xi));
+            break;
+        }
+    }
+    let (eps, xi_raw) = found.ok_or_else(|| {
+        anyhow::anyhow!("no positive even eigenvector in the first 64 positive archimedean eigenvalues")
+    })?;
+
+    // Project onto the even subspace ψ_i = ½(ξ_i + ξ_{dim−1−i}) and
+    // renormalize. This guards against a near-degenerate solver landing on an
+    // even/odd mix: the written vector is then a pure even mode.
+    let mut psi: Vec<Float> = (0..dim)
+        .map(|i| {
+            let mut s = xi_raw[i].clone();
+            s += &xi_raw[dim - 1 - i];
+            s /= 2u32;
+            s
+        })
+        .collect();
+    let mut norm_sq = Float::with_val(prec, 0);
+    for v in &psi {
+        norm_sq += v.clone().square();
+    }
+    let norm = norm_sq.sqrt();
+    if norm.is_zero() {
+        return Err(anyhow::anyhow!(
+            "even projection of the selected eigenvector is zero (selection landed on a non-even mode)"
+        ));
+    }
+    for v in psi.iter_mut() {
+        *v /= &norm;
+    }
+
+    // Parity guard: even_dev = ‖ψ − γψ‖₂ / ‖ψ‖₂ (same convention as
+    // `measure_evenness`). After exact symmetrization this is 0; the guard
+    // catches a pathological reflection/index error.
+    let zerof = || Float::with_val(prec, 0);
+    let (diff_sq, nrm_sq) = (0..dim)
+        .map(|i| {
+            let mut d = psi[i].clone();
+            d -= &psi[dim - 1 - i];
+            (d.square(), psi[i].clone().square())
+        })
+        .fold((zerof(), zerof()), |(mut ad, mut an), (bd, bn)| {
+            ad += &bd;
+            an += &bn;
+            (ad, an)
+        });
+    let mut even_dev = diff_sq.sqrt();
+    let nrm = nrm_sq.sqrt();
+    if !nrm.is_zero() {
+        even_dev /= &nrm;
+    }
+    let guard = Float::with_val(prec, 1e-40);
+    if even_dev >= guard {
+        return Err(anyhow::anyhow!(
+            "even-subspace parity guard failed: even_dev = {:.3e} >= 1e-40",
+            even_dev.to_f64()
+        ));
+    }
+
+    // Prime Rayleigh quotient on the even archimedean-only vector:
+    // ρ_p = ⟨A_prime ψ, ψ⟩ / ‖ψ‖², with A_prime = τ_full − τ_arch the
+    // prime-power part of the Weil form. This is the ρ_p of the floor-bound
+    // sign hypothesis, measured on the actual trial vector.
+    let mut tau_full = build_tau_hp_compute(params, &l, cfg, true)?;
+    force_symmetric(&mut tau_full, dim);
+    let mut rho_p = quad_form(&tau_full, &psi, dim, prec);
+    rho_p -= &quad_form(&tau_arch, &psi, dim, prec);
+    let mut denom = Float::with_val(prec, 0);
+    for v in &psi {
+        denom += v.clone().square();
+    }
+    if !denom.is_zero() {
+        rho_p /= &denom;
+    }
+
+    Ok((eps, rho_p, psi))
 }
 
 /// `sinc(t) = sin(t)/t`, with `sinc(0) = 1`, at working precision `prec`.
