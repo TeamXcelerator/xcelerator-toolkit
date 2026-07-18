@@ -6,7 +6,9 @@
 /// Sieve of Eratosthenes up to `bound` (inclusive). Returns a sorted
 /// vector of all primes ≤ bound.
 pub fn sieve_primes(bound: u64) -> Vec<u64> {
-    if bound < 2 { return Vec::new(); }
+    if bound < 2 {
+        return Vec::new();
+    }
     let n = bound as usize;
     let mut is_prime = vec![true; n + 1];
     is_prime[0] = false;
@@ -15,7 +17,10 @@ pub fn sieve_primes(bound: u64) -> Vec<u64> {
     while p * p <= n {
         if is_prime[p] {
             let mut q = p * p;
-            while q <= n { is_prime[q] = false; q += p; }
+            while q <= n {
+                is_prime[q] = false;
+                q += p;
+            }
         }
         p += 1;
     }
@@ -82,7 +87,13 @@ mod tests {
         // divisible by any earlier prime.
         for &p in &primes {
             for &q in primes.iter().take_while(|&&q| q * q <= p) {
-                assert_ne!(p % q, 0, "{} is divisible by {} but was returned as prime", p, q);
+                assert_ne!(
+                    p % q,
+                    0,
+                    "{} is divisible by {} but was returned as prime",
+                    p,
+                    q
+                );
             }
         }
     }

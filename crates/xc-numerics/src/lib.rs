@@ -25,16 +25,27 @@
 //!
 //! The HP tier is gated behind the `hp` feature.
 
+pub mod primes;
 pub mod quadrature;
 pub mod root_finding;
-pub mod primes;
 
-/// Debug logging macro — only prints when `XCELERATOR_DEBUG=1` is set.
-/// Same contract as `xc_spectral::hp_debug!` — use for diagnostics only.
+/// Debug logging macro controlled by [`set_hp_debug_logging`].
+static HP_DEBUG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Explicitly enables or disables diagnostic HP progress logging.
+pub fn set_hp_debug_logging(enabled: bool) {
+    HP_DEBUG_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[doc(hidden)]
+pub fn hp_debug_enabled() -> bool {
+    HP_DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[macro_export]
 macro_rules! hp_debug {
     ($($arg:tt)*) => {
-        if std::env::var("XCELERATOR_DEBUG").as_deref() == Ok("1") {
+        if $crate::hp_debug_enabled() {
             eprintln!($($arg)*);
         }
     };
@@ -49,11 +60,16 @@ pub mod fmt;
 #[cfg(feature = "hp")]
 pub mod eigen;
 
-// Not gated behind `hp`: this module uses only std and rayon (both
-// available in the f64-only tier), and its purpose — capping rayon
-// parallelism on WSL2 to avoid a glibc-level abort — applies equally to
-// f64-only rayon callers (e.g. mellin::scan_critical_line_zeros_f64).
-// Gating it behind `hp` would break the default (`cargo build --workspace
-// --release`, no `--features hp`) build, since that f64 scanner calls
-// `hp_runtime::init_hp_pool()` unconditionally.
+#[cfg(feature = "hp")]
+pub mod interval;
+
+#[cfg(feature = "hp")]
+pub mod mpfr_interval;
+
+#[cfg(feature = "hp")]
+pub mod reduction;
+
+// Not gated behind `hp`: resolved scheduling policy and its tests remain
+// available to f64-only planners, while no process environment or platform
+// detection can silently alter execution.
 pub mod hp_runtime;

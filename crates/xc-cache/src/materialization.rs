@@ -1,0 +1,672 @@
+//! End-to-end selective remote retrieval and decoded payload verification.
+
+use crate::protocol::normalized_relative_path;
+use crate::{
+    reconstruct_transport_package, verify_canonical_payload_zip64, CacheError, ContentDigest,
+    DeterministicPackageReport, PartFetchReport, RemoteGitStore, RemoteShardReader,
+    ResolvedRemoteArtifact, VerifiedPackageReport,
+};
+use serde::Serialize;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use xc_core::{CancellationToken, ResourcePolicy};
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RemoteArtifactMaterializationReport {
+    pub schema_version: u32,
+    pub artifact_family: String,
+    pub semantic_digest: ContentDigest,
+    pub manifest_digest: ContentDigest,
+    pub canonical_payload_digest: ContentDigest,
+    pub transport_digest: ContentDigest,
+    pub repository: String,
+    pub revision: String,
+    pub package_path: PathBuf,
+    pub projected_new_local_bytes: u64,
+    pub reused_verified_package: bool,
+    pub part_fetch: Option<PartFetchReport>,
+    pub package: DeterministicPackageReport,
+    pub verification: VerifiedPackageReport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RemoteArtifactClosureMaterializationReport {
+    pub schema_version: u32,
+    pub root_semantic_digest: ContentDigest,
+    pub root_manifest_digest: ContentDigest,
+    pub dependency_count: usize,
+    pub dependency_closure_fully_validated: bool,
+    pub artifacts_dependency_first: Vec<RemoteArtifactMaterializationReport>,
+}
+
+pub fn materialize_resolved_remote_artifact_closure(
+    remote: &dyn RemoteGitStore,
+    root: &ResolvedRemoteArtifact,
+    parts_root: &Path,
+    dependency_packages_root: &Path,
+    root_package_path: &Path,
+    resources: &ResourcePolicy,
+    cancellation: &CancellationToken,
+) -> Result<RemoteArtifactClosureMaterializationReport, CacheError> {
+    if dependency_packages_root.as_os_str().is_empty() {
+        return Err(CacheError::InvalidManifest(
+            "full closure materialization requires a dependency package root".to_owned(),
+        ));
+    }
+    let mut ordered = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut active = BTreeSet::new();
+    collect_dependency_first(root, &mut seen, &mut active, &mut ordered)?;
+    let root_manifest_digest = root.manifest.digest()?;
+    let mut reports = Vec::with_capacity(ordered.len());
+    for artifact in ordered {
+        cancellation
+            .check()
+            .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+        let manifest_digest = artifact.manifest.digest()?;
+        let package_path = if artifact.semantic_digest == root.semantic_digest
+            && manifest_digest == root_manifest_digest
+        {
+            root_package_path.to_owned()
+        } else {
+            dependency_packages_root
+                .join(&artifact.semantic_digest.0)
+                .join(format!("{}.zip", manifest_digest.0))
+        };
+        if let Some(parent) = package_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        reports.push(materialize_resolved_remote_artifact(
+            remote,
+            artifact,
+            parts_root,
+            &package_path,
+            resources,
+            cancellation,
+        )?);
+    }
+    Ok(RemoteArtifactClosureMaterializationReport {
+        schema_version: 1,
+        root_semantic_digest: root.semantic_digest.clone(),
+        root_manifest_digest,
+        dependency_count: reports.len().saturating_sub(1),
+        dependency_closure_fully_validated: true,
+        artifacts_dependency_first: reports,
+    })
+}
+
+fn collect_dependency_first<'a>(
+    artifact: &'a ResolvedRemoteArtifact,
+    seen: &mut BTreeSet<(ContentDigest, ContentDigest)>,
+    active: &mut BTreeSet<(ContentDigest, ContentDigest)>,
+    ordered: &mut Vec<&'a ResolvedRemoteArtifact>,
+) -> Result<(), CacheError> {
+    let identity = (
+        artifact.semantic_digest.clone(),
+        artifact.manifest.digest()?,
+    );
+    if seen.contains(&identity) {
+        return Ok(());
+    }
+    if !active.insert(identity.clone()) {
+        return Err(CacheError::InvalidManifest(
+            "resolved dependency materialization graph contains a cycle".to_owned(),
+        ));
+    }
+    if artifact.manifest.canonical_payload.dependencies.len() != artifact.dependencies.len() {
+        return Err(CacheError::InvalidManifest(format!(
+            "resolved dependency count does not match the canonical manifest for {}",
+            artifact.semantic_digest.0
+        )));
+    }
+    for declared in &artifact.manifest.canonical_payload.dependencies {
+        let mut matching = artifact.dependencies.iter().filter(|dependency| {
+            dependency.family == declared.artifact_family
+                && dependency.semantic_digest == declared.semantic_digest
+                && dependency.manifest.payload_digest == declared.payload_digest
+                && dependency.manifest.digest().ok().as_ref() == Some(&declared.manifest_digest)
+        });
+        if matching.next().is_none() || matching.next().is_some() {
+            return Err(CacheError::InvalidManifest(format!(
+                "resolved dependency graph does not exactly match declared dependency {}/{}",
+                declared.artifact_family, declared.semantic_digest.0
+            )));
+        }
+    }
+    for dependency in &artifact.dependencies {
+        collect_dependency_first(dependency, seen, active, ordered)?;
+    }
+    active.remove(&identity);
+    seen.insert(identity);
+    ordered.push(artifact);
+    Ok(())
+}
+
+/// Materialize one already-resolved artifact without cloning its shard.
+///
+/// Verified parts are retained under `parts_root` for resumable reuse. The
+/// reconstructed package becomes visible only after its transport identity is
+/// complete, and a newly reconstructed package is removed if decoded logical
+/// payload validation fails.
+pub fn materialize_resolved_remote_artifact(
+    remote: &dyn RemoteGitStore,
+    artifact: &ResolvedRemoteArtifact,
+    parts_root: &Path,
+    package_path: &Path,
+    resources: &ResourcePolicy,
+    cancellation: &CancellationToken,
+) -> Result<RemoteArtifactMaterializationReport, CacheError> {
+    cancellation
+        .check()
+        .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+    artifact.manifest.validate()?;
+    artifact.encoding.validate()?;
+    artifact.receipt.validate()?;
+    if parts_root.as_os_str().is_empty() || package_path.as_os_str().is_empty() {
+        return Err(CacheError::InvalidManifest(
+            "remote materialization requires explicit part-store and package paths".to_owned(),
+        ));
+    }
+    let manifest_digest = artifact.manifest.digest()?;
+    let transport_digest = artifact.encoding.digest()?;
+    if manifest_digest != artifact.index.manifest_digest
+        || artifact.manifest.artifact_family != artifact.family
+        || artifact.manifest.semantic_digest != artifact.semantic_digest
+        || artifact.manifest.payload_digest != artifact.index.canonical_payload_digest
+        || artifact.encoding.canonical_payload_digest != artifact.manifest.payload_digest
+        || !artifact
+            .manifest
+            .transport_digests
+            .contains(&transport_digest)
+        || artifact.receipt.manifest_digest != manifest_digest
+        || artifact.receipt.transport_digest != transport_digest
+        || artifact.receipt.canonical_payload_digest != artifact.manifest.payload_digest
+    {
+        return Err(CacheError::InvalidManifest(
+            "resolved artifact identities are inconsistent before materialization".to_owned(),
+        ));
+    }
+
+    let package_exists = package_path.exists();
+    let projected_new_local_bytes = if package_exists {
+        0
+    } else {
+        projected_new_local_bytes(
+            &artifact.encoding,
+            parts_root,
+            artifact.encoding.package_size_bytes,
+        )?
+    };
+    if resources
+        .maximum_permanent_disk_bytes
+        .is_some_and(|maximum| projected_new_local_bytes > maximum)
+    {
+        return Err(CacheError::ResourceLimit(format!(
+            "remote materialization projects {projected_new_local_bytes} new local bytes above the permanent-disk budget"
+        )));
+    }
+
+    if package_exists {
+        let verification = verify_canonical_payload_zip64(
+            &artifact.manifest.canonical_payload,
+            &artifact.encoding,
+            package_path,
+            cancellation,
+        )?;
+        return report(
+            artifact,
+            projected_new_local_bytes,
+            true,
+            None,
+            DeterministicPackageReport {
+                canonical_payload_digest: verification.canonical_payload_digest.clone(),
+                encoder_profile: artifact.encoding.encoder_profile.clone(),
+                package_size_bytes: verification.package_size_bytes,
+                package_digest: verification.package_digest.clone(),
+                package_path: package_path.to_owned(),
+            },
+            verification,
+        );
+    }
+
+    fs::create_dir_all(parts_root)?;
+    let reader = RemoteShardReader::new(remote, 1)?;
+    let part_fetch = reader.fetch_transport_parts(
+        &artifact.repository,
+        &artifact.revision,
+        &artifact.encoding,
+        parts_root,
+        resources,
+        cancellation,
+    )?;
+    let package = reconstruct_transport_package(
+        &artifact.encoding,
+        parts_root,
+        package_path,
+        resources,
+        cancellation,
+    )?;
+    let verification = match verify_canonical_payload_zip64(
+        &artifact.manifest.canonical_payload,
+        &artifact.encoding,
+        package_path,
+        cancellation,
+    ) {
+        Ok(verification) => verification,
+        Err(error) => {
+            let _ = fs::remove_file(package_path);
+            return Err(error);
+        }
+    };
+    report(
+        artifact,
+        projected_new_local_bytes,
+        false,
+        Some(part_fetch),
+        package,
+        verification,
+    )
+}
+
+fn report(
+    artifact: &ResolvedRemoteArtifact,
+    projected_new_local_bytes: u64,
+    reused_verified_package: bool,
+    part_fetch: Option<PartFetchReport>,
+    package: DeterministicPackageReport,
+    verification: VerifiedPackageReport,
+) -> Result<RemoteArtifactMaterializationReport, CacheError> {
+    let manifest_digest = artifact.manifest.digest()?;
+    let transport_digest = artifact.encoding.digest()?;
+    let package_path = package.package_path.clone();
+    Ok(RemoteArtifactMaterializationReport {
+        schema_version: 1,
+        artifact_family: artifact.family.clone(),
+        semantic_digest: artifact.semantic_digest.clone(),
+        manifest_digest,
+        canonical_payload_digest: artifact.manifest.payload_digest.clone(),
+        transport_digest,
+        repository: artifact.repository.clone(),
+        revision: artifact.revision.clone(),
+        package_path,
+        projected_new_local_bytes,
+        reused_verified_package,
+        part_fetch,
+        package,
+        verification,
+    })
+}
+
+fn projected_new_local_bytes(
+    encoding: &crate::TransportEncodingRecord,
+    parts_root: &Path,
+    package_bytes: u64,
+) -> Result<u64, CacheError> {
+    let mut projected = package_bytes;
+    for part in &encoding.ordered_parts {
+        if !normalized_relative_path(&part.repository_path) {
+            return Err(CacheError::InvalidManifest(format!(
+                "transport part path {:?} is unsafe",
+                part.repository_path
+            )));
+        }
+        let path = part
+            .repository_path
+            .split('/')
+            .fold(parts_root.to_owned(), |path, component| {
+                path.join(component)
+            });
+        if !path.exists() {
+            projected = projected.checked_add(part.size_bytes).ok_or_else(|| {
+                CacheError::ResourceLimit(
+                    "projected remote materialization size exceeds u64".to_owned(),
+                )
+            })?;
+        }
+    }
+    Ok(projected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        package_canonical_payload_zip64, stream_split_encoded, ArtifactAssuranceState,
+        ArtifactDisposition, CacheVisibility, CanonicalArtifactManifest, CanonicalPayloadEnvelope,
+        CompareAndSwapResult, LogicalPayloadItem, PayloadFileSource, PublicationDestination,
+        PublicationReceipt, RemoteCommitRequest, RemoteReadReport, SemanticKeyEnvelope,
+        ShardIndexEntry, ToolkitVersion, TransportPart, TransportPolicy,
+        DETERMINISTIC_ZIP64_PROFILE_V1,
+    };
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use xc_core::{AssuranceLevel, PublicationAuthorityMode};
+
+    struct MemoryRemote {
+        revision: String,
+        paths: BTreeMap<String, Vec<u8>>,
+        reads: AtomicUsize,
+    }
+
+    impl RemoteGitStore for MemoryRemote {
+        fn read_ref(&self, _repository: &str, _branch: &str) -> Result<String, CacheError> {
+            Ok(self.revision.clone())
+        }
+
+        fn immutable_path_digest(
+            &self,
+            _repository: &str,
+            _revision: &str,
+            path: &str,
+        ) -> Result<Option<ContentDigest>, CacheError> {
+            Ok(self
+                .paths
+                .get(path)
+                .map(|bytes| ContentDigest::sha256(bytes)))
+        }
+
+        fn read_committed_path(
+            &self,
+            _repository: &str,
+            revision: &str,
+            path: &str,
+            maximum_bytes: u64,
+            cancellation: &CancellationToken,
+            writer: &mut dyn Write,
+        ) -> Result<RemoteReadReport, CacheError> {
+            cancellation
+                .check()
+                .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+            if revision != self.revision {
+                return Err(CacheError::NotFound(revision.to_owned()));
+            }
+            let bytes = self
+                .paths
+                .get(path)
+                .ok_or_else(|| CacheError::NotFound(path.to_owned()))?;
+            if bytes.len() as u64 > maximum_bytes {
+                return Err(CacheError::ResourceLimit(path.to_owned()));
+            }
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            writer.write_all(bytes)?;
+            Ok(RemoteReadReport {
+                repository_path: path.to_owned(),
+                revision: revision.to_owned(),
+                size_bytes: bytes.len() as u64,
+                content_digest: ContentDigest::sha256(bytes),
+            })
+        }
+
+        fn compare_and_swap_commit(
+            &self,
+            _request: &RemoteCommitRequest,
+        ) -> Result<CompareAndSwapResult, CacheError> {
+            Err(CacheError::ReadOnlyLayer("memory-remote".to_owned()))
+        }
+
+        fn verify_committed_part(
+            &self,
+            _repository: &str,
+            _revision: &str,
+            _part: &TransportPart,
+        ) -> Result<(), CacheError> {
+            Ok(())
+        }
+    }
+
+    fn temporary_root() -> PathBuf {
+        std::env::temp_dir().join(format!("xc-cache-materialization-{}", std::process::id()))
+    }
+
+    #[test]
+    fn selective_materialization_reuses_parts_and_verified_package() {
+        let root = temporary_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source_path = root.join("source.bin");
+        let logical_bytes = b"canonical decoded payload";
+        fs::write(&source_path, logical_bytes).unwrap();
+        let canonical_payload = CanonicalPayloadEnvelope {
+            schema_version: 1,
+            scalar_backend: "opaque".to_owned(),
+            precision_bits: None,
+            scalar_representation: "bytes".to_owned(),
+            dimensions: vec![logical_bytes.len() as u64],
+            endianness: "not-applicable".to_owned(),
+            special_value_encoding: "not-applicable".to_owned(),
+            ordered_items: vec![LogicalPayloadItem {
+                normalized_path: "value.bin".to_owned(),
+                content_digest: ContentDigest::sha256(logical_bytes),
+                size_bytes: logical_bytes.len() as u64,
+            }],
+            dependencies: Vec::new(),
+        };
+        let payload_digest = canonical_payload.digest().unwrap();
+        let encoded_path = root.join("encoded.zip");
+        package_canonical_payload_zip64(
+            &canonical_payload,
+            &[PayloadFileSource {
+                normalized_path: "value.bin".to_owned(),
+                source_path,
+            }],
+            &encoded_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let encoded = fs::read(encoded_path).unwrap();
+        let mut remote_paths = BTreeMap::new();
+        let encoding = stream_split_encoded(
+            &mut encoded.as_slice(),
+            payload_digest.clone(),
+            DETERMINISTIC_ZIP64_PROFILE_V1,
+            &TransportPolicy {
+                maximum_file_bytes_exclusive: 1_000,
+                split_part_bytes: 32,
+                maximum_batch_payload_bytes: 1_000,
+                maximum_pending_batches: 1,
+            },
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+            |part, bytes| {
+                remote_paths.insert(part.repository_path.clone(), bytes.to_vec());
+                Ok(())
+            },
+        )
+        .unwrap();
+        let transport_digest = encoding.digest().unwrap();
+        let semantic_key = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "materialization_fixture".to_owned(),
+            mathematical_semantics_version: "fixture-v1".to_owned(),
+            resolved_mathematical_parameters: json!({"case": 1}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        let semantic_digest = semantic_key.digest().unwrap();
+        let manifest = CanonicalArtifactManifest {
+            schema_version: 1,
+            artifact_family: "fixture".to_owned(),
+            semantic_key,
+            semantic_digest: semantic_digest.clone(),
+            canonical_payload,
+            payload_digest: payload_digest.clone(),
+            transport_digests: vec![transport_digest.clone()],
+            resolved_mathematical_configuration_digest: ContentDigest::sha256(b"config"),
+            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            maximum_reader_version: None,
+            requested_assurance: AssuranceLevel::Computed,
+            claim_scope: "materialization fixture".to_owned(),
+            assumptions: Vec::new(),
+        };
+        let manifest_digest = manifest.digest().unwrap();
+        let transaction_id = ContentDigest::sha256(b"transaction").0;
+        let index = ShardIndexEntry {
+            semantic_digest: semantic_digest.clone(),
+            canonical_payload_digest: payload_digest.clone(),
+            manifest_digest: manifest_digest.clone(),
+            achieved_assurance: ArtifactAssuranceState::Computed,
+            disposition: ArtifactDisposition::Active,
+            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            transport_digests: vec![transport_digest.clone()],
+            publication_transaction_id: transaction_id.clone(),
+        };
+        let receipt = PublicationReceipt {
+            schema_version: 1,
+            transaction_id: transaction_id.clone(),
+            idempotency_key: ContentDigest(transaction_id),
+            destination: PublicationDestination::Public,
+            principal: "fixture".to_owned(),
+            authorized_repository: "team/shard".to_owned(),
+            repository_permission_evidence_digest: ContentDigest::sha256(b"permission"),
+            shard_id: "fixture-001".to_owned(),
+            branch: "main".to_owned(),
+            semantic_digest: semantic_digest.clone(),
+            canonical_payload_digest: payload_digest,
+            manifest_digest: manifest_digest.clone(),
+            transport_digest: transport_digest.clone(),
+            policy_digest: ContentDigest::sha256(b"policy"),
+            policy_id: "fixture-owner-policy".to_owned(),
+            authority_mode: PublicationAuthorityMode::OwnerDirect,
+            validation_evidence_digests: vec![ContentDigest::sha256(b"validation")],
+            contributor_authorization_digest: None,
+            reviewer_approvals: Vec::new(),
+            payload_commit_ids: vec!["payload-commit".to_owned()],
+            payload_batch_record_commit_ids: Vec::new(),
+            payload_batch_record_digests: BTreeMap::new(),
+            metadata_commit_id: "metadata-commit".to_owned(),
+            metadata_file_digests: BTreeMap::from([(
+                "manifests/fixture.json".to_owned(),
+                manifest_digest,
+            )]),
+            discoverability_subject_digests: BTreeMap::from([(
+                "indexes/fixture/00.json".to_owned(),
+                ContentDigest::sha256(b"index"),
+            )]),
+            remote_verification_results: vec![crate::RemoteCommitVerificationResult {
+                phase: "immutable_metadata".to_owned(),
+                sequence: 0,
+                commit_id: "metadata-commit".to_owned(),
+                verified: true,
+                content_digests: vec![transport_digest],
+            }],
+            verified_at_unix_seconds: 1,
+        };
+        let source = RemoteReadReport {
+            repository_path: "fixture.json".to_owned(),
+            revision: "a".repeat(40),
+            size_bytes: 1,
+            content_digest: ContentDigest::sha256(b"fixture"),
+        };
+        let artifact = ResolvedRemoteArtifact {
+            family: "fixture".to_owned(),
+            semantic_digest,
+            overlay: "public".to_owned(),
+            visibility: CacheVisibility::Public,
+            shard_id: "fixture-001".to_owned(),
+            authorized_repository: "team/shard".to_owned(),
+            repository: "team/shard".to_owned(),
+            revision: source.revision.clone(),
+            index,
+            manifest,
+            encoding,
+            receipt,
+            index_source: source.clone(),
+            manifest_source: source.clone(),
+            encoding_source: source.clone(),
+            receipt_source: source,
+            dependencies: Vec::new(),
+        };
+        let remote = MemoryRemote {
+            revision: artifact.revision.clone(),
+            paths: remote_paths,
+            reads: AtomicUsize::new(0),
+        };
+        let parts_root = root.join("parts");
+        let package_path = root.join("materialized.zip");
+        let first = materialize_resolved_remote_artifact(
+            &remote,
+            &artifact,
+            &parts_root,
+            &package_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(!first.reused_verified_package);
+        assert_eq!(
+            first.part_fetch.unwrap().downloaded_sequences.len(),
+            artifact.encoding.ordered_parts.len()
+        );
+        let reads = remote.reads.load(Ordering::Relaxed);
+        let second = materialize_resolved_remote_artifact(
+            &remote,
+            &artifact,
+            &parts_root,
+            &package_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(second.reused_verified_package);
+        assert!(second.part_fetch.is_none());
+        assert_eq!(remote.reads.load(Ordering::Relaxed), reads);
+        assert_eq!(
+            second.verification.logical_size_bytes,
+            logical_bytes.len() as u64
+        );
+
+        let mut dependency = artifact.clone();
+        dependency
+            .manifest
+            .semantic_key
+            .resolved_mathematical_parameters = json!({"case": "dependency"});
+        dependency.semantic_digest = dependency.manifest.semantic_key.digest().unwrap();
+        dependency.manifest.semantic_digest = dependency.semantic_digest.clone();
+        dependency.dependencies.clear();
+        let dependency_identity = crate::PayloadDependencyIdentity {
+            artifact_family: dependency.family.clone(),
+            semantic_digest: dependency.semantic_digest.clone(),
+            manifest_digest: dependency.manifest.digest().unwrap(),
+            payload_digest: dependency.manifest.payload_digest.clone(),
+        };
+        let mut root_artifact = artifact.clone();
+        root_artifact.manifest.canonical_payload.dependencies = vec![dependency_identity];
+        root_artifact.manifest.payload_digest =
+            root_artifact.manifest.canonical_payload.digest().unwrap();
+        root_artifact.dependencies = vec![dependency];
+        let mut ordered = Vec::new();
+        collect_dependency_first(
+            &root_artifact,
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut ordered,
+        )
+        .unwrap();
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(
+            ordered[0].semantic_digest,
+            root_artifact.dependencies[0].semantic_digest
+        );
+        assert_eq!(ordered[1].semantic_digest, root_artifact.semantic_digest);
+
+        root_artifact.dependencies[0].family = "substituted-family".to_owned();
+        let error = collect_dependency_first(
+            &root_artifact,
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::InvalidManifest(_)));
+        let _ = fs::remove_dir_all(root);
+    }
+}

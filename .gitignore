@@ -7,26 +7,26 @@ target/
 .vscode/
 .idea/
 .kiro/
+/.agents/
+/.github/
+/scripts/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Per-cwd disk caches written by tests / runs (regeneratable).
-# The toolkit writes these to <cwd>/data/*_cache/ — see README.
-# We keep the cache directories in the repo (via a tracked .gitkeep in
-# each) so the layout is self-documenting, but ignore the generated
-# fixtures themselves (.json / .json.zip / byte-split .partXX).
-**/data/gl_cache/**
-**/data/tau_cache/**
-**/data/prolate_eigvals_cache/**
-**/data/weil_eigvec_cache/**
-# ...except the .gitkeep placeholders that preserve the directories.
-!**/data/gl_cache/.gitkeep
-!**/data/tau_cache/.gitkeep
-!**/data/prolate_eigvals_cache/.gitkeep
-!**/data/weil_eigvec_cache/.gitkeep
+# Local WSL validation environment (large, machine-specific).
+.wsl-bootstrap/
+.wsl-dist/
+
+# Per-working-directory datasets and regeneratable disk caches.
+/data/
+**/data/*_cache/
 
 # Editor swap
 *.swp
 *~
+
+# Python tooling
+__pycache__/
+*.py[cod]

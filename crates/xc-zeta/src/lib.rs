@@ -6,8 +6,8 @@
 //! - **`zeros`**: Loaders for the canonical reference zero file.
 //!   Provides HP-string, f64-truncated, and `rug::Float` views.
 //!
-//! The reference data file is generated reproducibly via PARI/GP
-//! (`scripts/generate_zeros.sh` in the repository root) and is
-//! cross-validated against universally-tabulated first-10 zeros.
+//! The bundled reference data was computed with rigorous Arb interval
+//! arithmetic. Its leading 1,000 digits were independently cross-checked
+//! against a standard published tabulation.
 
 pub mod zeros;

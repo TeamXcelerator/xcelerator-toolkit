@@ -25,11 +25,10 @@
 //! shifted inverse iteration. This keeps the whole pipeline feasible
 //! at HP-1000 for n in the thousands.
 
-#![cfg(feature = "hp")]
-
 use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use rug::{ops::Pow, Assign, Float};
+use xc_core::EigenpairDiagnostics;
 
 use crate::linalg::{lu_factor, lu_solve, normalize_l2};
 
@@ -47,14 +46,20 @@ fn qr_tolerance(prec: u32) -> Float {
 ///
 /// Some inputs (observed: large-N tridiagonal matrices at certain λ²
 /// configurations) converge correctly but slowly, needing more than 100
-/// sweeps per eigenvalue. Override via `XC_HP_QR_MAX_ITER=<n>` rather than
-/// editing this default, so the 100 ceiling stays the norm and callers who
-/// hit slow-but-real convergence can raise it without a code change.
-fn qr_max_iter() -> usize {
-    std::env::var("XC_HP_QR_MAX_ITER")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(100)
+/// sweeps per eigenvalue. Callers with slow-but-real convergence can pass a
+/// larger typed limit to `tridiag_eigenvalues_hp_with_options`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TridiagQrOptions {
+    /// Maximum QR sweeps allowed per deflating eigenvalue.
+    pub max_iterations_per_eigenvalue: usize,
+}
+
+impl Default for TridiagQrOptions {
+    fn default() -> Self {
+        Self {
+            max_iterations_per_eigenvalue: 100,
+        }
+    }
 }
 
 /// HP zero at the given precision (integer literal — no f64).
@@ -85,11 +90,25 @@ fn hp_one(prec: u32) -> Float {
 /// (the `tqli` routine) and Golub & Van Loan §8.3. Wilkinson shift,
 /// QR sweep iterates from `m-1` down to `l`, deflates eigenvalues
 /// from the top-left of the active region.
-pub fn tridiag_eigenvalues_hp(
+pub fn tridiag_eigenvalues_hp(diag: &[Float], off_diag: &[Float], prec: u32) -> Result<Vec<Float>> {
+    tridiag_eigenvalues_hp_with_options(diag, off_diag, prec, TridiagQrOptions::default())
+}
+
+/// Eigenvalues of a symmetric tridiagonal matrix using explicit QR controls.
+///
+/// This is the provenance-friendly entry point for unusually slow but valid
+/// matrices that require a sweep budget above the deterministic default.
+pub fn tridiag_eigenvalues_hp_with_options(
     diag: &[Float],
     off_diag: &[Float],
     prec: u32,
+    options: TridiagQrOptions,
 ) -> Result<Vec<Float>> {
+    if options.max_iterations_per_eigenvalue == 0 {
+        return Err(anyhow!(
+            "max_iterations_per_eigenvalue must be greater than zero"
+        ));
+    }
     let n = diag.len();
     if n == 0 {
         return Ok(Vec::new());
@@ -97,18 +116,18 @@ pub fn tridiag_eigenvalues_hp(
     if off_diag.len() != n - 1 {
         return Err(anyhow!(
             "off_diag length {} should be {} (= diag length - 1)",
-            off_diag.len(), n - 1
+            off_diag.len(),
+            n - 1
         ));
     }
-
     // Working copies; algorithm mutates these in place.
     // Pad e with one trailing zero so e[m] is always valid for m up to n-1.
     let mut d: Vec<Float> = diag.to_vec();
     let mut e: Vec<Float> = off_diag.to_vec();
-    e.push(hp_zero(prec));  // sentinel; index n-1 is always 0
+    e.push(hp_zero(prec)); // sentinel; index n-1 is always 0
 
     let tol = qr_tolerance(prec);
-    let max_iter = qr_max_iter();
+    let max_iter = options.max_iterations_per_eigenvalue;
 
     // Scratch Floats hoisted out of all loops. Each is allocated once at
     // function start and reused via `assign` / in-place ops, avoiding
@@ -175,7 +194,8 @@ pub fn tridiag_eigenvalues_hp(
             if iter_count > max_iter {
                 return Err(anyhow!(
                     "tridiag QR failed to converge for eigenvalue at l={} after {} iterations",
-                    l, max_iter
+                    l,
+                    max_iter
                 ));
             }
 
@@ -304,6 +324,518 @@ pub fn tridiag_eigenvalues_hp(
     Ok(d)
 }
 
+/// One exact-index enclosure produced by HP Sturm bisection. The endpoint
+/// counts satisfy `lower_count <= index < upper_count`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HpTridiagonalEigenvalueEnclosure {
+    pub index: usize,
+    pub lower: Float,
+    pub upper: Float,
+    pub lower_count: usize,
+    pub upper_count: usize,
+    pub iterations: usize,
+}
+
+/// Selected tridiagonal values together with route-level work telemetry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HpSelectedTridiagonalSpectrum {
+    pub precision_bits: u32,
+    pub first_index: usize,
+    pub last_index: usize,
+    pub sturm_evaluations: usize,
+    pub enclosures: Vec<HpTridiagonalEigenvalueEnclosure>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HpSelectedTridiagonalEigenpair {
+    pub enclosure: HpTridiagonalEigenvalueEnclosure,
+    pub eigenvalue: Float,
+    pub eigenvector: Vec<Float>,
+    pub residual_norm: Float,
+    pub diagnostics: EigenpairDiagnostics<Float>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HpTridiagonalEigenvalueCluster {
+    pub first_index: usize,
+    pub last_index: usize,
+    pub lower: Float,
+    pub upper: Float,
+    pub requested_indices: Vec<usize>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum HpSelectedTridiagonalItem {
+    SimpleEigenpair(Box<HpSelectedTridiagonalEigenpair>),
+    Cluster(HpTridiagonalEigenvalueCluster),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HpSelectedTridiagonalEigenpairs {
+    pub spectrum: HpSelectedTridiagonalSpectrum,
+    pub vector_recoveries: usize,
+    pub inverse_iteration_runs: usize,
+    pub items: Vec<HpSelectedTridiagonalItem>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HpSelectedTridiagonalEigenpairOptions {
+    pub first_index: usize,
+    pub last_index: usize,
+    pub absolute_tolerance: Float,
+    pub maximum_bisection_iterations: usize,
+    pub eigenvector_options: TridiagEigvecOptions,
+    pub precision_bits: u32,
+}
+
+fn validate_hp_tridiagonal(diag: &[Float], off_diag: &[Float], prec: u32) -> Result<()> {
+    if diag.is_empty() || off_diag.len() + 1 != diag.len() {
+        return Err(anyhow!(
+            "HP tridiagonal problem requires off_diag.len() + 1 == diag.len() > 0"
+        ));
+    }
+    if prec <= 32 {
+        return Err(anyhow!("HP tridiagonal precision must exceed 32 bits"));
+    }
+    if diag.iter().chain(off_diag).any(|value| !value.is_finite()) {
+        return Err(anyhow!("HP tridiagonal entries must be finite"));
+    }
+    Ok(())
+}
+
+fn sturm_sign_changes_for_block_hp(
+    diag: &[Float],
+    off_diag: &[Float],
+    threshold: &Float,
+    start: usize,
+    end: usize,
+    prec: u32,
+) -> usize {
+    let mut previous_nonzero_sign = 1i8;
+    let mut changes = 0usize;
+    let mut record_sign = |value: &Float| {
+        if value.is_zero() {
+            return;
+        }
+        let sign = if value.is_sign_negative() { -1 } else { 1 };
+        if sign != previous_nonzero_sign {
+            changes += 1;
+        }
+        previous_nonzero_sign = sign;
+    };
+
+    let mut previous_polynomial = hp_one(prec);
+    let mut current_polynomial = Float::with_val(prec, &diag[start]);
+    current_polynomial -= threshold;
+    record_sign(&current_polynomial);
+    for index in start + 1..end {
+        let mut next_polynomial = Float::with_val(prec, &diag[index]);
+        next_polynomial -= threshold;
+        next_polynomial *= &current_polynomial;
+        let mut coupling = Float::with_val(prec, &off_diag[index - 1]);
+        coupling *= Float::with_val(prec, &off_diag[index - 1]);
+        coupling *= &previous_polynomial;
+        next_polynomial -= coupling;
+        record_sign(&next_polynomial);
+        previous_polynomial = current_polynomial;
+        current_polynomial = next_polynomial;
+    }
+    changes
+}
+
+fn tridiag_sturm_count_below_hp_unchecked(
+    diag: &[Float],
+    off_diag: &[Float],
+    threshold: &Float,
+    prec: u32,
+) -> usize {
+    let mut count = 0usize;
+    let mut block_start = 0usize;
+    for boundary in 1..=diag.len() {
+        if boundary == diag.len() || off_diag[boundary - 1].is_zero() {
+            count += sturm_sign_changes_for_block_hp(
+                diag,
+                off_diag,
+                threshold,
+                block_start,
+                boundary,
+                prec,
+            );
+            block_start = boundary;
+        }
+    }
+    count
+}
+
+/// Count eigenvalues strictly below an HP threshold through the characteristic
+/// polynomial Sturm sequence. Exact zero couplings split independent blocks,
+/// so diagonal and reducible tridiagonal matrices retain strict semantics even
+/// when the threshold equals an eigenvalue.
+pub fn tridiag_sturm_count_below_hp(
+    diag: &[Float],
+    off_diag: &[Float],
+    threshold: &Float,
+    prec: u32,
+) -> Result<usize> {
+    validate_hp_tridiagonal(diag, off_diag, prec)?;
+    if !threshold.is_finite() {
+        return Err(anyhow!("HP Sturm threshold must be finite"));
+    }
+    Ok(tridiag_sturm_count_below_hp_unchecked(
+        diag, off_diag, threshold, prec,
+    ))
+}
+
+fn tridiag_gershgorin_bounds_hp(diag: &[Float], off_diag: &[Float], prec: u32) -> (Float, Float) {
+    let mut lower = Float::with_val(prec, &diag[0]);
+    let mut upper = lower.clone();
+    for index in 0..diag.len() {
+        let mut radius = hp_zero(prec);
+        if index > 0 {
+            radius += Float::with_val(prec, &off_diag[index - 1]).abs();
+        }
+        if index + 1 < diag.len() {
+            radius += Float::with_val(prec, &off_diag[index]).abs();
+        }
+        let mut row_lower = Float::with_val(prec, &diag[index]);
+        row_lower -= &radius;
+        let mut row_upper = Float::with_val(prec, &diag[index]);
+        row_upper += &radius;
+        if row_lower < lower {
+            lower = row_lower;
+        }
+        if row_upper > upper {
+            upper = row_upper;
+        }
+    }
+    let mut scale = lower.clone().abs();
+    let upper_abs = upper.clone().abs();
+    if upper_abs > scale {
+        scale = upper_abs;
+    }
+    if scale < 1 {
+        scale.assign(1);
+    }
+    let mut padding = Float::with_val(prec, 2).pow(-((prec / 2) as i32));
+    padding *= scale;
+    lower -= &padding;
+    upper += padding;
+    (lower, upper)
+}
+
+/// Compute only the inclusive algebraic index range `[first_index,last_index]`
+/// of a symmetric tridiagonal matrix. This is an HP computed route: endpoint
+/// counts and precision-stagnation checks are retained, but rigorous claims
+/// still require interval counts from `xc-certify`.
+pub fn tridiag_selected_eigenvalues_hp(
+    diag: &[Float],
+    off_diag: &[Float],
+    first_index: usize,
+    last_index: usize,
+    absolute_tolerance: &Float,
+    maximum_iterations: usize,
+    prec: u32,
+) -> Result<HpSelectedTridiagonalSpectrum> {
+    validate_hp_tridiagonal(diag, off_diag, prec)?;
+    if first_index > last_index || last_index >= diag.len() {
+        return Err(anyhow!(
+            "selected HP tridiagonal range must satisfy first <= last < dimension"
+        ));
+    }
+    if !absolute_tolerance.is_finite() || absolute_tolerance <= &hp_zero(prec) {
+        return Err(anyhow!(
+            "selected HP tridiagonal tolerance must be finite and positive"
+        ));
+    }
+    if maximum_iterations == 0 {
+        return Err(anyhow!(
+            "selected HP tridiagonal maximum_iterations must be positive"
+        ));
+    }
+    let tolerance = Float::with_val(prec, absolute_tolerance);
+    let (global_lower, global_upper) = tridiag_gershgorin_bounds_hp(diag, off_diag, prec);
+    let global_lower_count =
+        tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &global_lower, prec);
+    let global_upper_count =
+        tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &global_upper, prec);
+    if global_lower_count != 0 || global_upper_count != diag.len() {
+        return Err(anyhow!(
+            "HP Gershgorin bracket failed count reconciliation: [{global_lower_count}, {global_upper_count}] for dimension {}",
+            diag.len()
+        ));
+    }
+
+    let mut sturm_evaluations = 2usize;
+    let mut enclosures = Vec::with_capacity(last_index - first_index + 1);
+    for index in first_index..=last_index {
+        let mut lower = global_lower.clone();
+        let mut upper = global_upper.clone();
+        let mut lower_count = global_lower_count;
+        let mut upper_count = global_upper_count;
+        let mut iterations = 0usize;
+        loop {
+            let mut width = upper.clone();
+            width -= &lower;
+            if width <= tolerance {
+                break;
+            }
+            if iterations == maximum_iterations {
+                return Err(anyhow!(
+                    "HP Sturm bisection did not enclose eigenvalue {index} within the requested tolerance after {maximum_iterations} iterations"
+                ));
+            }
+            let mut midpoint = lower.clone();
+            midpoint += &upper;
+            midpoint /= 2u32;
+            if midpoint == lower || midpoint == upper {
+                return Err(anyhow!(
+                    "HP Sturm bisection stagnated at {prec} bits for eigenvalue {index}; precision escalation is required"
+                ));
+            }
+            let midpoint_count =
+                tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &midpoint, prec);
+            sturm_evaluations += 1;
+            if midpoint_count <= index {
+                lower = midpoint;
+                lower_count = midpoint_count;
+            } else {
+                upper = midpoint;
+                upper_count = midpoint_count;
+            }
+            iterations += 1;
+        }
+        if lower_count > index || upper_count <= index {
+            return Err(anyhow!(
+                "HP Sturm endpoint counts do not enclose eigenvalue {index}: [{lower_count}, {upper_count}]"
+            ));
+        }
+        enclosures.push(HpTridiagonalEigenvalueEnclosure {
+            index,
+            lower,
+            upper,
+            lower_count,
+            upper_count,
+            iterations,
+        });
+    }
+    Ok(HpSelectedTridiagonalSpectrum {
+        precision_bits: prec,
+        first_index,
+        last_index,
+        sturm_evaluations,
+        enclosures,
+    })
+}
+
+fn tridiag_rayleigh_and_residual_hp(
+    diag: &[Float],
+    off_diag: &[Float],
+    vector: &[Float],
+    matrix_scale: &Float,
+    prec: u32,
+) -> (Float, EigenpairDiagnostics<Float>) {
+    let mut numerator = hp_zero(prec);
+    let mut denominator = hp_zero(prec);
+    for index in 0..diag.len() {
+        let mut square = Float::with_val(prec, &vector[index]);
+        square *= &vector[index];
+        denominator += &square;
+        square *= &diag[index];
+        numerator += square;
+        if index + 1 < diag.len() {
+            let mut cross = Float::with_val(prec, &vector[index]);
+            cross *= &vector[index + 1];
+            cross *= &off_diag[index];
+            cross *= 2u32;
+            numerator += cross;
+        }
+    }
+    let mut eigenvalue = numerator;
+    eigenvalue /= &denominator;
+
+    let mut residual_squared = hp_zero(prec);
+    let mut action_squared = hp_zero(prec);
+    for index in 0..diag.len() {
+        let mut action = Float::with_val(prec, &diag[index]);
+        action *= &vector[index];
+        if index > 0 {
+            let mut term = Float::with_val(prec, &off_diag[index - 1]);
+            term *= &vector[index - 1];
+            action += term;
+        }
+        if index + 1 < diag.len() {
+            let mut term = Float::with_val(prec, &off_diag[index]);
+            term *= &vector[index + 1];
+            action += term;
+        }
+        let mut action_square = action.clone();
+        action_square *= &action;
+        action_squared += action_square;
+        let mut expected = eigenvalue.clone();
+        expected *= &vector[index];
+        action -= expected;
+        action *= action.clone();
+        residual_squared += action;
+    }
+    let absolute_residual = residual_squared.sqrt();
+    let vector_norm = denominator.clone().sqrt();
+    let action_norm = action_squared.sqrt();
+    let mut eigenvalue_scale = eigenvalue.clone().abs();
+    eigenvalue_scale *= &vector_norm;
+    let mut relative_denominator = action_norm;
+    relative_denominator += &eigenvalue_scale;
+    let mut relative_residual = absolute_residual.clone();
+    if !relative_denominator.is_zero() {
+        relative_residual /= relative_denominator;
+    }
+    let mut backward_denominator = Float::with_val(prec, matrix_scale);
+    backward_denominator *= &vector_norm;
+    backward_denominator += eigenvalue_scale;
+    let mut scaled_backward_error = absolute_residual.clone();
+    if !backward_denominator.is_zero() {
+        scaled_backward_error /= backward_denominator;
+    }
+    let mut orthogonality_error = denominator;
+    orthogonality_error -= 1u32;
+    orthogonality_error.abs_mut();
+    (
+        eigenvalue,
+        EigenpairDiagnostics {
+            absolute_residual,
+            relative_residual,
+            scaled_backward_error,
+            orthogonality_error,
+        },
+    )
+}
+
+/// Recover HP eigenvectors only for selected values whose endpoint counts
+/// establish a one-dimensional eigenspace. Multiplicities are coalesced into
+/// cluster records and never assigned arbitrary individual vectors.
+pub fn tridiag_selected_eigenpairs_hp(
+    diag: &[Float],
+    off_diag: &[Float],
+    options: &HpSelectedTridiagonalEigenpairOptions,
+) -> Result<HpSelectedTridiagonalEigenpairs> {
+    let prec = options.precision_bits;
+    let eigenvector_options = options.eigenvector_options;
+    if eigenvector_options.max_steps == 0 {
+        return Err(anyhow!(
+            "selected HP eigenvector recovery requires a positive step limit"
+        ));
+    }
+    let spectrum = tridiag_selected_eigenvalues_hp(
+        diag,
+        off_diag,
+        options.first_index,
+        options.last_index,
+        &options.absolute_tolerance,
+        options.maximum_bisection_iterations,
+        prec,
+    )?;
+    let mut items = Vec::with_capacity(spectrum.enclosures.len());
+    let mut vector_recoveries = 0usize;
+    let mut inverse_iteration_runs = 0usize;
+    let (matrix_lower, matrix_upper) = tridiag_gershgorin_bounds_hp(diag, off_diag, prec);
+    let mut matrix_scale = matrix_lower.abs();
+    let upper_scale = matrix_upper.abs();
+    if upper_scale > matrix_scale {
+        matrix_scale = upper_scale;
+    }
+    if matrix_scale < 1 {
+        matrix_scale.assign(1);
+    }
+    let mut residual_target = Float::with_val(prec, 2).pow(-((prec / 2) as i32));
+    residual_target *= &matrix_scale;
+    for enclosure in &spectrum.enclosures {
+        let cluster_dimension = enclosure
+            .upper_count
+            .checked_sub(enclosure.lower_count)
+            .ok_or_else(|| anyhow!("selected HP endpoint count decreased"))?;
+        if cluster_dimension != 1 {
+            let cluster_first = enclosure.lower_count;
+            let cluster_last = enclosure.upper_count.saturating_sub(1);
+            if let Some(HpSelectedTridiagonalItem::Cluster(existing)) = items.last_mut() {
+                if existing.first_index == cluster_first && existing.last_index == cluster_last {
+                    existing.requested_indices.push(enclosure.index);
+                    if enclosure.lower < existing.lower {
+                        existing.lower = enclosure.lower.clone();
+                    }
+                    if enclosure.upper > existing.upper {
+                        existing.upper = enclosure.upper.clone();
+                    }
+                    continue;
+                }
+            }
+            items.push(HpSelectedTridiagonalItem::Cluster(
+                HpTridiagonalEigenvalueCluster {
+                    first_index: cluster_first,
+                    last_index: cluster_last,
+                    lower: enclosure.lower.clone(),
+                    upper: enclosure.upper.clone(),
+                    requested_indices: vec![enclosure.index],
+                    reason: "endpoint Sturm counts do not establish a one-dimensional eigenspace"
+                        .to_owned(),
+                },
+            ));
+            continue;
+        }
+
+        let mut shift = enclosure.lower.clone();
+        shift += &enclosure.upper;
+        shift /= 2u32;
+        let mut eigenvector =
+            tridiag_eigenvector_for_value_hp(diag, off_diag, &shift, prec, eigenvector_options)?;
+        inverse_iteration_runs += 1;
+        let (mut eigenvalue, mut diagnostics) =
+            tridiag_rayleigh_and_residual_hp(diag, off_diag, &eigenvector, &matrix_scale, prec);
+        if diagnostics.absolute_residual > residual_target && eigenvector_options.early_termination
+        {
+            let retry_options = TridiagEigvecOptions {
+                early_termination: false,
+                ..eigenvector_options
+            };
+            eigenvector =
+                tridiag_eigenvector_for_value_hp(diag, off_diag, &eigenvalue, prec, retry_options)?;
+            inverse_iteration_runs += 1;
+            (eigenvalue, diagnostics) =
+                tridiag_rayleigh_and_residual_hp(diag, off_diag, &eigenvector, &matrix_scale, prec);
+        }
+        if diagnostics.absolute_residual > residual_target {
+            return Err(anyhow!(
+                "HP inverse iteration did not meet the residual target for selected index {}: residual={}, target={}",
+                enclosure.index,
+                diagnostics.absolute_residual,
+                residual_target
+            ));
+        }
+        if eigenvalue < enclosure.lower || eigenvalue > enclosure.upper {
+            return Err(anyhow!(
+                "HP inverse-iteration Rayleigh value escaped the selected enclosure for index {}",
+                enclosure.index
+            ));
+        }
+        vector_recoveries += 1;
+        let residual_norm = diagnostics.absolute_residual.clone();
+        items.push(HpSelectedTridiagonalItem::SimpleEigenpair(Box::new(
+            HpSelectedTridiagonalEigenpair {
+                enclosure: enclosure.clone(),
+                eigenvalue,
+                eigenvector,
+                residual_norm,
+                diagnostics,
+            },
+        )));
+    }
+    Ok(HpSelectedTridiagonalEigenpairs {
+        spectrum,
+        vector_recoveries,
+        inverse_iteration_runs,
+        items,
+    })
+}
+
 // ===========================================================================
 // Eigenvector for a specific eigenvalue (shifted inverse iteration)
 // ===========================================================================
@@ -389,6 +921,9 @@ impl Default for TridiagEigvecOptions {
 ///     },
 /// )?;
 /// ```
+// Keep the remainder checks below for the Rust 1.85 MSRV;
+// `usize::is_multiple_of` is newer than the supported compiler.
+#[allow(unknown_lints, clippy::manual_is_multiple_of)]
 pub fn tridiag_eigenvector_for_value_hp(
     diag: &[Float],
     off_diag: &[Float],
@@ -403,7 +938,9 @@ pub fn tridiag_eigenvector_for_value_hp(
     }
     if off_diag.len() != n - 1 {
         return Err(anyhow!(
-            "off_diag length {} should be {}", off_diag.len(), n - 1
+            "off_diag length {} should be {}",
+            off_diag.len(),
+            n - 1
         ));
     }
 
@@ -441,14 +978,18 @@ pub fn tridiag_eigenvector_for_value_hp(
             }
             crate::hp_debug!(
                 "{} dense matrix built in {:.1}s (N={}, prec={} bits)",
-                log_tag, build_start.elapsed().as_secs_f64(), n, prec
+                log_tag,
+                build_start.elapsed().as_secs_f64(),
+                n,
+                prec
             );
 
             let lu_start = std::time::Instant::now();
             let lu = lu_factor(&a, n)?;
             crate::hp_debug!(
                 "{} LU factor done in {:.1}s",
-                log_tag, lu_start.elapsed().as_secs_f64()
+                log_tag,
+                lu_start.elapsed().as_secs_f64()
             );
             Factored::Dense(lu)
         }
@@ -471,16 +1012,18 @@ pub fn tridiag_eigenvector_for_value_hp(
             let upper: Vec<Float> = off_diag.to_vec();
             crate::hp_debug!(
                 "{} tridiagonal shifted matrix built in {:.3}s (N={}, prec={} bits)",
-                log_tag, build_start.elapsed().as_secs_f64(), n, prec
+                log_tag,
+                build_start.elapsed().as_secs_f64(),
+                n,
+                prec
             );
 
             let lu_start = std::time::Instant::now();
-            let factors = crate::linalg::tridiag_lu_factor_hp(
-                &lower, &shifted_diag, &upper, prec,
-            )?;
+            let factors = crate::linalg::tridiag_lu_factor_hp(&lower, &shifted_diag, &upper, prec)?;
             crate::hp_debug!(
                 "{} tridiag LU factor done in {:.3}s",
-                log_tag, lu_start.elapsed().as_secs_f64()
+                log_tag,
+                lu_start.elapsed().as_secs_f64()
             );
             Factored::Banded(factors)
         }
@@ -488,19 +1031,22 @@ pub fn tridiag_eigenvector_for_value_hp(
 
     // Initial guess: a Gaussian centered at the middle, all in HP.
     // Each entry independent → parallel construction.
-    let mut v: Vec<Float> = (0..n).into_par_iter().map(|i| {
-        let center = (n as i64) / 2;
-        let j = (i as i64) - center;
-        let half = ((n as i64) / 2).max(1);
-        let mut x = Float::with_val(prec, j);
-        x /= half;
-        let mut x_sq = x.clone();
-        x_sq *= &x;
-        x_sq /= 2u32;
-        let mut arg = hp_zero(prec);
-        arg -= &x_sq;
-        arg.exp()
-    }).collect();
+    let mut v: Vec<Float> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let center = (n as i64) / 2;
+            let j = (i as i64) - center;
+            let half = ((n as i64) / 2).max(1);
+            let mut x = Float::with_val(prec, j);
+            x /= half;
+            let mut x_sq = x.clone();
+            x_sq *= &x;
+            x_sq /= 2u32;
+            let mut arg = hp_zero(prec);
+            arg -= &x_sq;
+            arg.exp()
+        })
+        .collect();
     normalize_l2(&mut v);
 
     let conv_thresh = if opts.early_termination {
@@ -521,9 +1067,7 @@ pub fn tridiag_eigenvector_for_value_hp(
         // Solve (T - λI + ε·I) y = v_k. Banded is O(n); dense is O(n²).
         let mut new_v = match &factored {
             Factored::Dense(lu) => lu_solve(lu, &v, n, prec),
-            Factored::Banded(factors) => {
-                crate::linalg::tridiag_lu_solve_hp(factors, &v, prec)?
-            }
+            Factored::Banded(factors) => crate::linalg::tridiag_lu_solve_hp(factors, &v, prec)?,
         };
         normalize_l2(&mut new_v);
 
@@ -556,20 +1100,26 @@ pub fn tridiag_eigenvector_for_value_hp(
 
         v = new_v;
         completed_steps = step + 1;
-        if completed_steps.is_multiple_of(25) {
+        if completed_steps % 25 == 0 {
             crate::hp_debug!(
                 "{} inverse iteration {}/{} on N={} (elapsed {:.3}s, total {:.3}s)",
-                log_tag, completed_steps, opts.max_steps, n,
+                log_tag,
+                completed_steps,
+                opts.max_steps,
+                n,
                 iter_start.elapsed().as_secs_f64(),
                 phase_start.elapsed().as_secs_f64()
             );
         }
     }
 
-    if !completed_steps.is_multiple_of(25) {
+    if completed_steps % 25 != 0 {
         crate::hp_debug!(
             "{} inverse iteration {}/{} done on N={} (elapsed {:.3}s, total {:.3}s)",
-            log_tag, completed_steps, opts.max_steps, n,
+            log_tag,
+            completed_steps,
+            opts.max_steps,
+            n,
             iter_start.elapsed().as_secs_f64(),
             phase_start.elapsed().as_secs_f64()
         );
@@ -616,13 +1166,15 @@ pub fn householder_tridiag_hp(
         let x: Vec<Float> = (0..m).map(|i| h[(k + 1 + i) * n + k].clone()).collect();
 
         // ‖x‖ via parallel reduction.
-        let alpha_sq: Float = x.par_iter()
+        let alpha_terms: Vec<Float> = x
+            .par_iter()
             .map(|xi| {
                 let mut t = xi.clone();
                 t *= xi;
                 t
             })
-            .reduce(|| hp_zero(prec), |mut a, b| { a += &b; a });
+            .collect();
+        let alpha_sq = crate::reduction::deterministic_pairwise_sum_hp(&alpha_terms, prec);
         let alpha = alpha_sq.sqrt();
 
         // If subdiagonal is already zero, skip.
@@ -656,13 +1208,15 @@ pub fn householder_tridiag_hp(
         v[0] = v0;
 
         // ‖v‖² via parallel reduction.
-        let v_norm_sq: Float = v.par_iter()
+        let v_norm_terms: Vec<Float> = v
+            .par_iter()
             .map(|vi| {
                 let mut t = vi.clone();
                 t *= vi;
                 t
             })
-            .reduce(|| hp_zero(prec), |mut a, b| { a += &b; a });
+            .collect();
+        let v_norm_sq = crate::reduction::deterministic_pairwise_sum_hp(&v_norm_terms, prec);
         if v_norm_sq.is_zero() {
             continue;
         }
@@ -684,18 +1238,21 @@ pub fn householder_tridiag_hp(
         // Compute p = (2/‖v‖²) · h_sub · v.
         // h_sub is the bottom-right (n-k-1)×(n-k-1) block at h[k+1+i, k+1+j].
         // Each row of p is independent → parallelize over i with rayon.
-        let p: Vec<Float> = (0..m).into_par_iter().map(|i| {
-            let mut acc = hp_zero(prec);
-            for j in 0..m {
-                let mut t = h[(k + 1 + i) * n + (k + 1 + j)].clone();
-                t *= &v[j];
-                acc += &t;
-            }
-            // p[i] = (2/‖v‖²) · acc
-            acc *= 2u32;
-            acc /= &v_norm_sq;
-            acc
-        }).collect();
+        let p: Vec<Float> = (0..m)
+            .into_par_iter()
+            .map(|i| {
+                let mut acc = hp_zero(prec);
+                for j in 0..m {
+                    let mut t = h[(k + 1 + i) * n + (k + 1 + j)].clone();
+                    t *= &v[j];
+                    acc += &t;
+                }
+                // p[i] = (2/‖v‖²) · acc
+                acc *= 2u32;
+                acc /= &v_norm_sq;
+                acc
+            })
+            .collect();
 
         // β = (vᵀ p) / 2  (note: p already has the 2/‖v‖² factor)
         // Wait — let me redo. Standard Householder symmetric update:
@@ -715,13 +1272,15 @@ pub fn householder_tridiag_hp(
         // I'll trust the textbook form and verify with tests.
 
         // vᵀ p — parallel reduce.
-        let vt_p: Float = (0..m).into_par_iter()
+        let vt_p_terms: Vec<Float> = (0..m)
+            .into_par_iter()
             .map(|i| {
                 let mut t = v[i].clone();
                 t *= &p[i];
                 t
             })
-            .reduce(|| hp_zero(prec), |mut a, b| { a += &b; a });
+            .collect();
+        let vt_p = crate::reduction::deterministic_pairwise_sum_hp(&vt_p_terms, prec);
 
         // K = (vᵀ p) / ‖v‖² — projection coefficient of p onto v.
         // Since p = β·A·v with β = 2/‖v‖², we have vᵀp = β·vᵀAv, so
@@ -733,31 +1292,36 @@ pub fn householder_tridiag_hp(
         let mut big_k = vt_p;
         big_k /= &v_norm_sq;
 
-        let q_vec: Vec<Float> = (0..m).map(|i| {
-            let mut qi = p[i].clone();
-            let mut bk = big_k.clone();
-            bk *= &v[i];
-            qi -= &bk;
-            qi
-        }).collect();
+        let q_vec: Vec<Float> = (0..m)
+            .map(|i| {
+                let mut qi = p[i].clone();
+                let mut bk = big_k.clone();
+                bk *= &v[i];
+                qi -= &bk;
+                qi
+            })
+            .collect();
 
         // h_sub ← h_sub - v·qᵀ - q·vᵀ
         // Each row update i is independent of other rows, so compute the
         // per-row delta vectors in parallel, then apply them to h. We
         // collect into a Vec<Vec<Float>> to avoid the borrowing dance of
         // mutating disjoint slices of h within rayon's borrow rules.
-        let row_deltas: Vec<Vec<Float>> = (0..m).into_par_iter().map(|i| {
-            let mut row = Vec::with_capacity(m);
-            for j in 0..m {
-                let mut delta = v[i].clone();
-                delta *= &q_vec[j];
-                let mut delta2 = q_vec[i].clone();
-                delta2 *= &v[j];
-                delta += &delta2;
-                row.push(delta);
-            }
-            row
-        }).collect();
+        let row_deltas: Vec<Vec<Float>> = (0..m)
+            .into_par_iter()
+            .map(|i| {
+                let mut row = Vec::with_capacity(m);
+                for j in 0..m {
+                    let mut delta = v[i].clone();
+                    delta *= &q_vec[j];
+                    let mut delta2 = q_vec[i].clone();
+                    delta2 *= &v[j];
+                    delta += &delta2;
+                    row.push(delta);
+                }
+                row
+            })
+            .collect();
         for (i, row) in row_deltas.iter().enumerate() {
             for (j, delta) in row.iter().enumerate() {
                 let cell = (k + 1 + i) * n + (k + 1 + j);
@@ -831,16 +1395,185 @@ pub fn householder_tridiag_hp(
 // Top-level: dense symmetric eigendecomposition
 // ===========================================================================
 
+/// Diagnostics from the independent cyclic Jacobi eigensolver.
+#[derive(Clone, Debug)]
+pub struct JacobiEigenvaluesHp {
+    pub eigenvalues: Vec<Float>,
+    pub sweeps: usize,
+    pub rotations: usize,
+    pub maximum_off_diagonal: Float,
+}
+
+/// Independent HP eigenvalue route for a dense real symmetric matrix.
+///
+/// This cyclic Jacobi implementation acts directly on the dense matrix and
+/// shares neither Householder reduction nor tridiagonal QR with
+/// [`dense_symmetric_eigenvalues_hp`]. All rotations, stopping tests, and
+/// sorting remain in `rug::Float`; there is no f64 seed or conversion.
+/// `max_sweeps` is an explicit resource bound and zero is rejected.
+pub fn dense_symmetric_eigenvalues_jacobi_hp(
+    input: &[Float],
+    n: usize,
+    prec: u32,
+    max_sweeps: usize,
+) -> Result<JacobiEigenvaluesHp> {
+    if n == 0 || input.len() != n * n {
+        return Err(anyhow!(
+            "Jacobi eigensolver requires a nonempty n-by-n matrix"
+        ));
+    }
+    if prec <= 32 || max_sweeps == 0 {
+        return Err(anyhow!(
+            "Jacobi eigensolver requires precision above 32 bits and at least one sweep"
+        ));
+    }
+    if input.iter().any(|value| !value.is_finite()) {
+        return Err(anyhow!("Jacobi eigensolver matrix entries must be finite"));
+    }
+    for row in 0..n {
+        for column in 0..row {
+            if input[row * n + column] != input[column * n + row] {
+                return Err(anyhow!(
+                    "Jacobi eigensolver requires exact symmetric storage at ({row}, {column})"
+                ));
+            }
+        }
+    }
+
+    let mut matrix: Vec<Float> = input
+        .iter()
+        .map(|value| Float::with_val(prec, value))
+        .collect();
+    let mut scale = Float::with_val(prec, 1);
+    for value in &matrix {
+        let magnitude = value.clone().abs();
+        if magnitude > scale {
+            scale = magnitude;
+        }
+    }
+    let mut tolerance = Float::with_val(prec, 2);
+    tolerance = tolerance.pow(-((prec as i32) - 16));
+    tolerance *= &scale;
+    let zero = Float::with_val(prec, 0);
+    let one = Float::with_val(prec, 1);
+    let mut rotations = 0usize;
+
+    for sweep in 0..max_sweeps {
+        let before = maximum_off_diagonal_hp(&matrix, n, prec);
+        if before <= tolerance {
+            let mut eigenvalues: Vec<Float> = (0..n)
+                .map(|index| matrix[index * n + index].clone())
+                .collect();
+            eigenvalues.sort_by(|left, right| left.partial_cmp(right).unwrap());
+            return Ok(JacobiEigenvaluesHp {
+                eigenvalues,
+                sweeps: sweep,
+                rotations,
+                maximum_off_diagonal: before,
+            });
+        }
+        for p in 0..n - 1 {
+            for q in p + 1..n {
+                let apq = matrix[p * n + q].clone();
+                if apq.clone().abs() <= tolerance {
+                    continue;
+                }
+                let app = matrix[p * n + p].clone();
+                let aqq = matrix[q * n + q].clone();
+                let mut tau = aqq.clone();
+                tau -= &app;
+                let mut two_apq = apq.clone();
+                two_apq *= 2u32;
+                tau /= two_apq;
+
+                let mut root = tau.clone();
+                root *= &tau;
+                root += &one;
+                root = root.sqrt();
+                let mut denominator = tau.clone().abs();
+                denominator += root;
+                let mut tangent = one.clone();
+                tangent /= denominator;
+                if tau < zero {
+                    tangent = -tangent;
+                }
+                let mut cosine = tangent.clone();
+                cosine *= &tangent;
+                cosine += &one;
+                cosine = cosine.sqrt();
+                cosine.recip_mut();
+                let mut sine = tangent.clone();
+                sine *= &cosine;
+
+                for k in 0..n {
+                    if k == p || k == q {
+                        continue;
+                    }
+                    let akp = matrix[k * n + p].clone();
+                    let akq = matrix[k * n + q].clone();
+                    let mut new_kp = cosine.clone();
+                    new_kp *= &akp;
+                    let mut term = sine.clone();
+                    term *= &akq;
+                    new_kp -= term;
+                    let mut new_kq = sine.clone();
+                    new_kq *= akp;
+                    let mut term = cosine.clone();
+                    term *= akq;
+                    new_kq += term;
+                    matrix[k * n + p].assign(&new_kp);
+                    matrix[p * n + k].assign(new_kp);
+                    matrix[k * n + q].assign(&new_kq);
+                    matrix[q * n + k].assign(new_kq);
+                }
+                let mut diagonal_change = tangent;
+                diagonal_change *= &apq;
+                matrix[p * n + p].assign(app - &diagonal_change);
+                matrix[q * n + q].assign(aqq + &diagonal_change);
+                matrix[p * n + q].assign(&zero);
+                matrix[q * n + p].assign(&zero);
+                rotations += 1;
+            }
+        }
+        let after = maximum_off_diagonal_hp(&matrix, n, prec);
+        if after <= tolerance {
+            let mut eigenvalues: Vec<Float> = (0..n)
+                .map(|index| matrix[index * n + index].clone())
+                .collect();
+            eigenvalues.sort_by(|left, right| left.partial_cmp(right).unwrap());
+            return Ok(JacobiEigenvaluesHp {
+                eigenvalues,
+                sweeps: sweep + 1,
+                rotations,
+                maximum_off_diagonal: after,
+            });
+        }
+    }
+    let maximum = maximum_off_diagonal_hp(&matrix, n, prec);
+    Err(anyhow!(
+        "cyclic Jacobi failed to converge after {max_sweeps} sweeps; maximum off-diagonal is {maximum}"
+    ))
+}
+
+fn maximum_off_diagonal_hp(matrix: &[Float], n: usize, prec: u32) -> Float {
+    let mut maximum = Float::with_val(prec, 0);
+    for row in 0..n {
+        for column in 0..row {
+            let magnitude = matrix[row * n + column].clone().abs();
+            if magnitude > maximum {
+                maximum = magnitude;
+            }
+        }
+    }
+    maximum
+}
+
 /// Eigenvalues (only) of a dense symmetric matrix at HP precision.
 ///
 /// Pipeline: Householder tridiagonalization → tridiagonal QR.
 /// Returns eigenvalues sorted ascending. Eigenvectors are not computed
 /// to save memory at HP scale.
-pub fn dense_symmetric_eigenvalues_hp(
-    a: &[Float],
-    n: usize,
-    prec: u32,
-) -> Result<Vec<Float>> {
+pub fn dense_symmetric_eigenvalues_hp(a: &[Float], n: usize, prec: u32) -> Result<Vec<Float>> {
     let (diag, off_diag, _q) = householder_tridiag_hp(a, n, prec)?;
     tridiag_eigenvalues_hp(&diag, &off_diag, prec)
 }
@@ -870,19 +1603,22 @@ pub fn dense_symmetric_eigenvector_for_value_hp(
     let lu = lu_factor(&shifted, n)?;
 
     // Initial guess: Gaussian-shaped, all in HP. Parallel construction.
-    let mut v: Vec<Float> = (0..n).into_par_iter().map(|i| {
-        let center = (n as i64) / 2;
-        let j = (i as i64) - center;
-        let half = ((n as i64) / 2).max(1);
-        let mut x = Float::with_val(prec, j);
-        x /= half;
-        let mut x_sq = x.clone();
-        x_sq *= &x;
-        x_sq /= 2u32;
-        let mut arg = hp_zero(prec);
-        arg -= &x_sq;
-        arg.exp()
-    }).collect();
+    let mut v: Vec<Float> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let center = (n as i64) / 2;
+            let j = (i as i64) - center;
+            let half = ((n as i64) / 2).max(1);
+            let mut x = Float::with_val(prec, j);
+            x /= half;
+            let mut x_sq = x.clone();
+            x_sq *= &x;
+            x_sq /= 2u32;
+            let mut arg = hp_zero(prec);
+            arg -= &x_sq;
+            arg.exp()
+        })
+        .collect();
     normalize_l2(&mut v);
 
     for _ in 0..max_steps {
@@ -926,12 +1662,128 @@ mod tests {
         let three = hp(prec, "3");
         // |evals[i] - expected[i]| should be ~0 in HP.
         let tol = hp(prec, "1e-50");
-        let mut d0 = evals[0].clone(); d0 -= &one; let abs0 = d0.abs();
-        let mut d1 = evals[1].clone(); d1 -= &two; let abs1 = d1.abs();
-        let mut d2 = evals[2].clone(); d2 -= &three; let abs2 = d2.abs();
-        assert!(abs0 < tol && abs1 < tol && abs2 < tol,
+        let mut d0 = evals[0].clone();
+        d0 -= &one;
+        let abs0 = d0.abs();
+        let mut d1 = evals[1].clone();
+        d1 -= &two;
+        let abs1 = d1.abs();
+        let mut d2 = evals[2].clone();
+        d2 -= &three;
+        let abs2 = d2.abs();
+        assert!(
+            abs0 < tol && abs1 < tol && abs2 < tol,
             "got {}, {}, {}",
-            display_hp(&evals[0], 6), display_hp(&evals[1], 6), display_hp(&evals[2], 6));
+            display_hp(&evals[0], 6),
+            display_hp(&evals[1], 6),
+            display_hp(&evals[2], 6)
+        );
+    }
+
+    #[test]
+    fn hp_sturm_count_preserves_strict_semantics_across_reducible_blocks() {
+        let prec = 256;
+        let diag = vec![hp(prec, "1"), hp(prec, "0"), hp(prec, "1")];
+        let off_diag = vec![hp(prec, "0"), hp(prec, "0")];
+        assert_eq!(
+            tridiag_sturm_count_below_hp(&diag, &off_diag, &hp(prec, "1"), prec).unwrap(),
+            1
+        );
+        assert_eq!(
+            tridiag_sturm_count_below_hp(&diag, &off_diag, &hp(prec, "2"), prec).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn hp_selected_sturm_values_enclose_full_qr_reference() {
+        let prec = 256;
+        let dimension = 10usize;
+        let diag = vec![hp(prec, "2"); dimension];
+        let off_diag = vec![hp(prec, "-1"); dimension - 1];
+        let full = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
+        let tolerance = hp(prec, "1e-40");
+        let selected =
+            tridiag_selected_eigenvalues_hp(&diag, &off_diag, 2, 5, &tolerance, 200, prec).unwrap();
+        assert_eq!(selected.enclosures.len(), 4);
+        assert_eq!(selected.first_index, 2);
+        assert_eq!(selected.last_index, 5);
+        assert!(selected.sturm_evaluations > 2);
+        for enclosure in &selected.enclosures {
+            assert!(enclosure.lower <= full[enclosure.index]);
+            assert!(enclosure.upper >= full[enclosure.index]);
+            let mut width = enclosure.upper.clone();
+            width -= &enclosure.lower;
+            assert!(width <= tolerance);
+            assert!(enclosure.lower_count <= enclosure.index);
+            assert!(enclosure.upper_count > enclosure.index);
+        }
+    }
+
+    #[test]
+    fn hp_selected_eigenpairs_recover_simple_vectors_and_coalesce_multiplicity() {
+        let prec = 256;
+        let diagonal = vec![hp(prec, "2"); 8];
+        let off_diagonal = vec![hp(prec, "-1"); 7];
+        let simple = tridiag_selected_eigenpairs_hp(
+            &diagonal,
+            &off_diagonal,
+            &HpSelectedTridiagonalEigenpairOptions {
+                first_index: 1,
+                last_index: 2,
+                absolute_tolerance: hp(prec, "1e-30"),
+                maximum_bisection_iterations: 200,
+                eigenvector_options: TridiagEigvecOptions::default(),
+                precision_bits: prec,
+            },
+        )
+        .unwrap();
+        assert_eq!(simple.vector_recoveries, 2);
+        assert!(
+            simple.items.iter().all(|item| matches!(
+                item,
+                HpSelectedTridiagonalItem::SimpleEigenpair(pair)
+                    if pair.residual_norm < hp(prec, "1e-40")
+                        && pair.diagnostics.absolute_residual == pair.residual_norm
+                        && pair.diagnostics.relative_residual < hp(prec, "1e-40")
+                        && pair.diagnostics.scaled_backward_error < hp(prec, "1e-40")
+                        && pair.diagnostics.orthogonality_error < hp(prec, "1e-40")
+            )),
+            "selected eigenpair residuals were not HP-small: {:?}",
+            simple
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    HpSelectedTridiagonalItem::SimpleEigenpair(pair) => {
+                        Some(pair.residual_norm.clone())
+                    }
+                    HpSelectedTridiagonalItem::Cluster(_) => None,
+                })
+                .collect::<Vec<_>>()
+        );
+
+        let repeated_diagonal = vec![hp(prec, "1"), hp(prec, "1"), hp(prec, "3")];
+        let zero_off_diagonal = vec![hp(prec, "0"), hp(prec, "0")];
+        let clustered = tridiag_selected_eigenpairs_hp(
+            &repeated_diagonal,
+            &zero_off_diagonal,
+            &HpSelectedTridiagonalEigenpairOptions {
+                first_index: 0,
+                last_index: 1,
+                absolute_tolerance: hp(prec, "1e-30"),
+                maximum_bisection_iterations: 200,
+                eigenvector_options: TridiagEigvecOptions::default(),
+                precision_bits: prec,
+            },
+        )
+        .unwrap();
+        assert_eq!(clustered.vector_recoveries, 0);
+        assert_eq!(clustered.items.len(), 1);
+        let HpSelectedTridiagonalItem::Cluster(cluster) = &clustered.items[0] else {
+            panic!("repeated eigenvalue was assigned an individual vector");
+        };
+        assert_eq!((cluster.first_index, cluster.last_index), (0, 1));
+        assert_eq!(cluster.requested_indices, vec![0, 1]);
     }
 
     /// 2×2 symmetric tridiagonal: diag=[2,2], off=[1].
@@ -946,11 +1798,18 @@ mod tests {
         let one = hp(prec, "1");
         let three = hp(prec, "3");
         let tol = hp(prec, "1e-50");
-        let mut d0 = evals[0].clone(); d0 -= &one; let abs0 = d0.abs();
-        let mut d1 = evals[1].clone(); d1 -= &three; let abs1 = d1.abs();
-        assert!(abs0 < tol && abs1 < tol,
+        let mut d0 = evals[0].clone();
+        d0 -= &one;
+        let abs0 = d0.abs();
+        let mut d1 = evals[1].clone();
+        d1 -= &three;
+        let abs1 = d1.abs();
+        assert!(
+            abs0 < tol && abs1 < tol,
             "expected (1, 3), got ({}, {})",
-            display_hp(&evals[0], 6), display_hp(&evals[1], 6));
+            display_hp(&evals[0], 6),
+            display_hp(&evals[1], 6)
+        );
     }
 
     /// 3×3 symmetric tridiagonal with known eigenvalues.
@@ -970,16 +1829,25 @@ mod tests {
         assert_eq!(evals.len(), 3);
 
         let two = hp(prec, "2");
-        let mut sqrt2 = hp(prec, "2"); sqrt2 = sqrt2.sqrt();
-        let mut e0 = two.clone(); e0 -= &sqrt2;     // 2 - √2
-        let e1 = two.clone();                          // 2
-        let mut e2 = two.clone(); e2 += &sqrt2;     // 2 + √2
+        let mut sqrt2 = hp(prec, "2");
+        sqrt2 = sqrt2.sqrt();
+        let mut e0 = two.clone();
+        e0 -= &sqrt2; // 2 - √2
+        let e1 = two.clone(); // 2
+        let mut e2 = two.clone();
+        e2 += &sqrt2; // 2 + √2
 
         let tol = hp(prec, "1e-100");
 
-        let mut d0 = evals[0].clone(); d0 -= &e0; let abs0 = d0.abs();
-        let mut d1 = evals[1].clone(); d1 -= &e1; let abs1 = d1.abs();
-        let mut d2 = evals[2].clone(); d2 -= &e2; let abs2 = d2.abs();
+        let mut d0 = evals[0].clone();
+        d0 -= &e0;
+        let abs0 = d0.abs();
+        let mut d1 = evals[1].clone();
+        d1 -= &e1;
+        let abs1 = d1.abs();
+        let mut d2 = evals[2].clone();
+        d2 -= &e2;
+        let abs2 = d2.abs();
 
         assert!(abs0 < tol, "eigval[0] off by {}", display_hp(&abs0, 4));
         assert!(abs1 < tol, "eigval[1] off by {}", display_hp(&abs1, 4));
@@ -990,16 +1858,19 @@ mod tests {
     /// Use the same 3×3 matrix at higher precision.
     #[test]
     fn tridiag_eigenvalues_hp_1000() {
-        let prec = 3338;  // ≈ 1000 decimal digits
+        let prec = 3338; // ≈ 1000 decimal digits
         let diag = vec![hp(prec, "2"), hp(prec, "2"), hp(prec, "2")];
         let off_diag = vec![hp(prec, "1"), hp(prec, "1")];
         let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
 
         let two = hp(prec, "2");
-        let mut sqrt2 = hp(prec, "2"); sqrt2 = sqrt2.sqrt();
-        let mut e0 = two.clone(); e0 -= &sqrt2;
+        let mut sqrt2 = hp(prec, "2");
+        sqrt2 = sqrt2.sqrt();
+        let mut e0 = two.clone();
+        e0 -= &sqrt2;
         let e1 = two.clone();
-        let mut e2 = two; e2 += &sqrt2;
+        let mut e2 = two;
+        e2 += &sqrt2;
 
         // Should match to ~prec/3.322 ≈ 1000 decimal digits.
         let m0 = matching_digits(&evals[0], &e0);
@@ -1008,12 +1879,21 @@ mod tests {
 
         // Expect ≥500 digits of agreement (well below working precision).
         let min_digits = Float::with_val(prec, 500);
-        assert!(m0 > min_digits || m0.is_infinite(),
-            "eigval[0] matches only {} digits", display_hp(&m0, 4));
-        assert!(m1 > min_digits || m1.is_infinite(),
-            "eigval[1] matches only {} digits", display_hp(&m1, 4));
-        assert!(m2 > min_digits || m2.is_infinite(),
-            "eigval[2] matches only {} digits", display_hp(&m2, 4));
+        assert!(
+            m0 > min_digits || m0.is_infinite(),
+            "eigval[0] matches only {} digits",
+            display_hp(&m0, 4)
+        );
+        assert!(
+            m1 > min_digits || m1.is_infinite(),
+            "eigval[1] matches only {} digits",
+            display_hp(&m1, 4)
+        );
+        assert!(
+            m2 > min_digits || m2.is_infinite(),
+            "eigval[2] matches only {} digits",
+            display_hp(&m2, 4)
+        );
     }
 
     /// Eigenvector recovery via shifted inverse iteration.
@@ -1030,8 +1910,10 @@ mod tests {
         let off_diag = vec![hp(prec, "1"), hp(prec, "1")];
 
         let two = hp(prec, "2");
-        let mut sqrt2 = hp(prec, "2"); sqrt2 = sqrt2.sqrt();
-        let mut e0 = two; e0 -= &sqrt2;
+        let mut sqrt2 = hp(prec, "2");
+        sqrt2 = sqrt2.sqrt();
+        let mut e0 = two;
+        e0 -= &sqrt2;
 
         for solver in [TridiagSolver::Banded, TridiagSolver::Dense] {
             let opts = TridiagEigvecOptions {
@@ -1039,34 +1921,59 @@ mod tests {
                 early_termination: true,
                 solver,
             };
-            let v = tridiag_eigenvector_for_value_hp(
-                &diag, &off_diag, &e0, prec, opts,
-            ).unwrap();
+            let v = tridiag_eigenvector_for_value_hp(&diag, &off_diag, &e0, prec, opts).unwrap();
             assert_eq!(v.len(), 3, "solver {:?}: wrong length", solver);
 
             // Verify T·v ≈ λ·v.
             // T·v = (2v[0] + v[1], v[0] + 2v[1] + v[2], v[1] + 2v[2])
-            let mut tv0 = v[0].clone(); tv0 *= 2u32; tv0 += &v[1];
-            let mut tv1 = v[0].clone(); tv1 += &v[2];
-            let mut tmp = v[1].clone(); tmp *= 2u32;
+            let mut tv0 = v[0].clone();
+            tv0 *= 2u32;
+            tv0 += &v[1];
+            let mut tv1 = v[0].clone();
+            tv1 += &v[2];
+            let mut tmp = v[1].clone();
+            tmp *= 2u32;
             tv1 += &tmp;
-            let mut tv2 = v[1].clone(); tv2 += &v[2].clone(); tv2 += &v[2];
+            let mut tv2 = v[1].clone();
+            tv2 += &v[2].clone();
+            tv2 += &v[2];
 
-            let mut lv0 = e0.clone(); lv0 *= &v[0];
-            let mut lv1 = e0.clone(); lv1 *= &v[1];
-            let mut lv2 = e0.clone(); lv2 *= &v[2];
+            let mut lv0 = e0.clone();
+            lv0 *= &v[0];
+            let mut lv1 = e0.clone();
+            lv1 *= &v[1];
+            let mut lv2 = e0.clone();
+            lv2 *= &v[2];
 
-            let mut r0 = tv0; r0 -= &lv0; let r0 = r0.abs();
-            let mut r1 = tv1; r1 -= &lv1; let r1 = r1.abs();
-            let mut r2 = tv2; r2 -= &lv2; let r2 = r2.abs();
+            let mut r0 = tv0;
+            r0 -= &lv0;
+            let r0 = r0.abs();
+            let mut r1 = tv1;
+            r1 -= &lv1;
+            let r1 = r1.abs();
+            let mut r2 = tv2;
+            r2 -= &lv2;
+            let r2 = r2.abs();
 
             let tol = hp(prec, "1e-50");
-            assert!(r0 < tol, "solver {:?}: T·v - λv at index 0: {}",
-                solver, display_hp(&r0, 4));
-            assert!(r1 < tol, "solver {:?}: T·v - λv at index 1: {}",
-                solver, display_hp(&r1, 4));
-            assert!(r2 < tol, "solver {:?}: T·v - λv at index 2: {}",
-                solver, display_hp(&r2, 4));
+            assert!(
+                r0 < tol,
+                "solver {:?}: T·v - λv at index 0: {}",
+                solver,
+                display_hp(&r0, 4)
+            );
+            assert!(
+                r1 < tol,
+                "solver {:?}: T·v - λv at index 1: {}",
+                solver,
+                display_hp(&r1, 4)
+            );
+            assert!(
+                r2 < tol,
+                "solver {:?}: T·v - λv at index 2: {}",
+                solver,
+                display_hp(&r2, 4)
+            );
         }
     }
 
@@ -1078,10 +1985,7 @@ mod tests {
         let n = 4;
         // Build a random-ish symmetric matrix.
         let raw = [
-            "4", "1", "2", "0",
-            "1", "3", "1", "1",
-            "2", "1", "5", "2",
-            "0", "1", "2", "6",
+            "4", "1", "2", "0", "1", "3", "1", "1", "2", "1", "5", "2", "0", "1", "2", "6",
         ];
         let a: Vec<Float> = raw.iter().map(|s| hp(prec, s)).collect();
 
@@ -1090,21 +1994,29 @@ mod tests {
 
         // Sanity: eigenvalues should be sorted ascending.
         for i in 0..(n - 1) {
-            assert!(evals_dense[i] <= evals_dense[i + 1],
+            assert!(
+                evals_dense[i] <= evals_dense[i + 1],
                 "eigenvalues not sorted: [{}, {}]",
                 display_hp(&evals_dense[i], 6),
-                display_hp(&evals_dense[i + 1], 6));
+                display_hp(&evals_dense[i + 1], 6)
+            );
         }
 
         // Sum of eigenvalues = trace = 4 + 3 + 5 + 6 = 18.
         let mut sum = hp(prec, "0");
-        for v in &evals_dense { sum += v; }
+        for v in &evals_dense {
+            sum += v;
+        }
         let expected_trace = hp(prec, "18");
         let tol = hp(prec, "1e-50");
-        let mut diff = sum.clone(); diff -= &expected_trace; let abs_diff = diff.abs();
-        assert!(abs_diff < tol,
+        let mut diff = sum.clone();
+        diff -= &expected_trace;
+        let abs_diff = diff.abs();
+        assert!(
+            abs_diff < tol,
             "sum of eigenvalues should be trace = 18, got {}",
-            display_hp(&sum, 6));
+            display_hp(&sum, 6)
+        );
     }
 
     /// Householder reduction produces an orthogonal Q: QᵀQ = I.
@@ -1118,11 +2030,8 @@ mod tests {
         let n = 5;
         // Random-ish symmetric input.
         let raw = [
-            "4", "1", "2", "0", "1",
-            "1", "3", "1", "1", "0",
-            "2", "1", "5", "2", "1",
-            "0", "1", "2", "6", "3",
-            "1", "0", "1", "3", "7",
+            "4", "1", "2", "0", "1", "1", "3", "1", "1", "0", "2", "1", "5", "2", "1", "0", "1",
+            "2", "6", "3", "1", "0", "1", "3", "7",
         ];
         let a: Vec<Float> = raw.iter().map(|s| hp(prec, s)).collect();
 
@@ -1140,12 +2049,18 @@ mod tests {
                     sum += &t;
                 }
                 let expected = if i == j { hp(prec, "1") } else { hp(prec, "0") };
-                let mut diff = sum.clone(); diff -= &expected;
+                let mut diff = sum.clone();
+                diff -= &expected;
                 let abs_diff = diff.abs();
-                assert!(abs_diff < tol,
+                assert!(
+                    abs_diff < tol,
                     "(QᵀQ)[{},{}] should be {} (Kronecker δ); got {}, diff {}",
-                    i, j, if i == j { 1 } else { 0 },
-                    display_hp(&sum, 6), display_hp(&abs_diff, 4));
+                    i,
+                    j,
+                    if i == j { 1 } else { 0 },
+                    display_hp(&sum, 6),
+                    display_hp(&abs_diff, 4)
+                );
             }
         }
     }
@@ -1161,8 +2076,12 @@ mod tests {
         let mut a = vec![hp(prec, "0"); n * n];
         for i in 0..n {
             a[i * n + i] = hp(prec, "2");
-            if i > 0 { a[i * n + (i - 1)] = hp(prec, "-1"); }
-            if i + 1 < n { a[i * n + (i + 1)] = hp(prec, "-1"); }
+            if i > 0 {
+                a[i * n + (i - 1)] = hp(prec, "-1");
+            }
+            if i + 1 < n {
+                a[i * n + (i + 1)] = hp(prec, "-1");
+            }
         }
 
         let (diag, off_diag, q) = householder_tridiag_hp(&a, n, prec).unwrap();
@@ -1174,22 +2093,31 @@ mod tests {
         let neg_one = hp(prec, "-1");
         let tol = hp(prec, "1e-50");
         for i in 0..n {
-            let mut diff = diag[i].clone(); diff -= &two;
+            let mut diff = diag[i].clone();
+            diff -= &two;
             let abs_diff = diff.abs();
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "tridiag diag[{}] should be 2; got {}",
-                i, display_hp(&diag[i], 6));
+                i,
+                display_hp(&diag[i], 6)
+            );
         }
         // Each off-diagonal should be |−1| (sign of the new off-diag is
         // determined by the Householder sign convention; we accept ±1).
         for i in 0..(n - 1) {
-            let mut diff_neg = off_diag[i].clone(); diff_neg -= &neg_one;
-            let mut diff_pos = off_diag[i].clone(); diff_pos -= 1u32;
+            let mut diff_neg = off_diag[i].clone();
+            diff_neg -= &neg_one;
+            let mut diff_pos = off_diag[i].clone();
+            diff_pos -= 1u32;
             let abs_neg = diff_neg.abs();
             let abs_pos = diff_pos.abs();
-            assert!(abs_neg < tol || abs_pos < tol,
+            assert!(
+                abs_neg < tol || abs_pos < tol,
                 "tridiag off_diag[{}] should be ±1; got {}",
-                i, display_hp(&off_diag[i], 6));
+                i,
+                display_hp(&off_diag[i], 6)
+            );
         }
 
         // Q is orthogonal even on a tridiag input.
@@ -1202,11 +2130,16 @@ mod tests {
                     sum += &t;
                 }
                 let expected = if i == j { hp(prec, "1") } else { hp(prec, "0") };
-                let mut diff = sum.clone(); diff -= &expected;
+                let mut diff = sum.clone();
+                diff -= &expected;
                 let abs_diff = diff.abs();
-                assert!(abs_diff < tol,
+                assert!(
+                    abs_diff < tol,
                     "Q on already-tridiag input still orthogonal: (QᵀQ)[{},{}] should be δ; got {}",
-                    i, j, display_hp(&sum, 6));
+                    i,
+                    j,
+                    display_hp(&sum, 6)
+                );
             }
         }
     }
@@ -1218,9 +2151,15 @@ mod tests {
         let n = 3;
         // Diagonal matrix diag(1, 2, 3). Eigenvalue 2 has eigenvector (0, 1, 0).
         let a: Vec<Float> = vec![
-            hp(prec, "1"), hp(prec, "0"), hp(prec, "0"),
-            hp(prec, "0"), hp(prec, "2"), hp(prec, "0"),
-            hp(prec, "0"), hp(prec, "0"), hp(prec, "3"),
+            hp(prec, "1"),
+            hp(prec, "0"),
+            hp(prec, "0"),
+            hp(prec, "0"),
+            hp(prec, "2"),
+            hp(prec, "0"),
+            hp(prec, "0"),
+            hp(prec, "0"),
+            hp(prec, "3"),
         ];
 
         let lambda = hp(prec, "2");
@@ -1235,11 +2174,24 @@ mod tests {
         let one = hp(prec, "1");
         let close_to_one_tol = hp(prec, "1e-30");
 
-        assert!(abs_v0 < small, "|v[0]| should be tiny, got {}", display_hp(&abs_v0, 6));
-        assert!(abs_v2 < small, "|v[2]| should be tiny, got {}", display_hp(&abs_v2, 6));
-        let mut v1_diff = abs_v1; v1_diff -= &one; let v1_diff_abs = v1_diff.abs();
-        assert!(v1_diff_abs < close_to_one_tol,
-            "|v[1]| should be 1, got {}", display_hp(&v[1], 6));
+        assert!(
+            abs_v0 < small,
+            "|v[0]| should be tiny, got {}",
+            display_hp(&abs_v0, 6)
+        );
+        assert!(
+            abs_v2 < small,
+            "|v[2]| should be tiny, got {}",
+            display_hp(&abs_v2, 6)
+        );
+        let mut v1_diff = abs_v1;
+        v1_diff -= &one;
+        let v1_diff_abs = v1_diff.abs();
+        assert!(
+            v1_diff_abs < close_to_one_tol,
+            "|v[1]| should be 1, got {}",
+            display_hp(&v[1], 6)
+        );
     }
 
     // ===========================================================================
@@ -1264,15 +2216,17 @@ mod tests {
         // Expected eigenvalues: λ_k = 4 sin²(kπ/(2(n+1))).
         let pi_v = Float::with_val(prec, rug::float::Constant::Pi);
         let two_n_plus_1 = Float::with_val(prec, 2 * (n as u32 + 1));
-        let expected: Vec<Float> = (1..=n).map(|k| {
-            let mut arg = Float::with_val(prec, k as u32);
-            arg *= &pi_v;
-            arg /= &two_n_plus_1;
-            let mut s = arg.sin();
-            s *= s.clone();
-            s *= 4u32;
-            s
-        }).collect();
+        let expected: Vec<Float> = (1..=n)
+            .map(|k| {
+                let mut arg = Float::with_val(prec, k as u32);
+                arg *= &pi_v;
+                arg /= &two_n_plus_1;
+                let mut s = arg.sin();
+                s *= s.clone();
+                s *= 4u32;
+                s
+            })
+            .collect();
         // Sort ascending (already ascending by k since sin is monotone on [0, π/2]).
         (diag, off_diag, expected)
     }
@@ -1291,10 +2245,14 @@ mod tests {
             let mut diff = computed.clone();
             diff -= expected;
             let abs_diff = diff.abs();
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "eigenvalue {} off by {} (expected {}, got {})",
-                i, display_hp(&abs_diff, 4),
-                display_hp(expected, 6), display_hp(computed, 6));
+                i,
+                display_hp(&abs_diff, 4),
+                display_hp(expected, 6),
+                display_hp(computed, 6)
+            );
         }
     }
 
@@ -1312,8 +2270,12 @@ mod tests {
             let mut diff = computed.clone();
             diff -= expected;
             let abs_diff = diff.abs();
-            assert!(abs_diff < tol,
-                "n=50 eigenvalue {} off by {}", i, display_hp(&abs_diff, 4));
+            assert!(
+                abs_diff < tol,
+                "n=50 eigenvalue {} off by {}",
+                i,
+                display_hp(&abs_diff, 4)
+            );
         }
     }
 
@@ -1330,8 +2292,13 @@ mod tests {
         let min_digits = Float::with_val(prec, 500);
         for (i, (computed, expected)) in evals.iter().zip(expected.iter()).enumerate() {
             let m = matching_digits(computed, expected);
-            assert!(m > min_digits || m.is_infinite(),
-                "n={}, k={}: only {} matching digits", n, i, display_hp(&m, 4));
+            assert!(
+                m > min_digits || m.is_infinite(),
+                "n={}, k={}: only {} matching digits",
+                n,
+                i,
+                display_hp(&m, 4)
+            );
         }
     }
 
@@ -1373,7 +2340,9 @@ mod tests {
         // = 1/1 + 1/3 + 1/5 + 1/7 = 1 + 0.3333... + 0.2 + 0.142857...
         //   = 1.6761904761...
         let mut sum = Float::with_val(prec, 0);
-        for v in &evals { sum += v; }
+        for v in &evals {
+            sum += v;
+        }
         let mut expected_trace = Float::with_val(prec, 0);
         for k in 0..n {
             let mut term = Float::with_val(prec, 1);
@@ -1382,33 +2351,45 @@ mod tests {
             expected_trace += &term;
         }
         let tol = hp(prec, "1e-50");
-        let mut diff = sum.clone(); diff -= &expected_trace;
+        let mut diff = sum.clone();
+        diff -= &expected_trace;
         let abs_diff = diff.abs();
-        assert!(abs_diff < tol,
+        assert!(
+            abs_diff < tol,
             "Hilbert trace mismatch: sum {} vs trace {}, delta {}",
-            display_hp(&sum, 6), display_hp(&expected_trace, 6),
-            display_hp(&abs_diff, 4));
+            display_hp(&sum, 6),
+            display_hp(&expected_trace, 6),
+            display_hp(&abs_diff, 4)
+        );
 
         // Eigenvalues should all be positive (Hilbert is SPD).
         let zero = Float::with_val(prec, 0);
         for (i, v) in evals.iter().enumerate() {
-            assert!(*v > zero, "Hilbert eigenvalue {} should be positive, got {}",
-                i, display_hp(v, 6));
+            assert!(
+                *v > zero,
+                "Hilbert eigenvalue {} should be positive, got {}",
+                i,
+                display_hp(v, 6)
+            );
         }
 
         // Smallest eigenvalue should be very small (Hilbert is ill-conditioned).
         // For n=4, the smallest eigenvalue is ~10^-4.
         let small_threshold = hp(prec, "1e-3");
-        assert!(evals[0] < small_threshold,
+        assert!(
+            evals[0] < small_threshold,
             "smallest eigenvalue should be < 1e-3 (Hilbert ill-conditioning), got {}",
-            display_hp(&evals[0], 6));
+            display_hp(&evals[0], 6)
+        );
 
         // Largest eigenvalue should be ~1.5 for n=4.
         let large_lo = hp(prec, "1.0");
         let large_hi = hp(prec, "2.0");
-        assert!(evals[n - 1] > large_lo && evals[n - 1] < large_hi,
+        assert!(
+            evals[n - 1] > large_lo && evals[n - 1] < large_hi,
             "largest eigenvalue should be in [1, 2], got {}",
-            display_hp(&evals[n - 1], 6));
+            display_hp(&evals[n - 1], 6)
+        );
     }
 
     /// Random rotation of a known diagonal matrix. Constructs A = G^T D G
@@ -1448,11 +2429,31 @@ mod tests {
         // Givens rotation angles: π/3, π/4, π/5, π/7 (irrational, distinct).
         // Apply rotations on (0,1), (1,2), (2,3), (3,4), (0,4) — covers all pairs.
         let rotations: Vec<(usize, usize, Float)> = vec![
-            (0, 1, { let mut t = pi_v.clone(); t /= 3u32; t }),
-            (1, 2, { let mut t = pi_v.clone(); t /= 4u32; t }),
-            (2, 3, { let mut t = pi_v.clone(); t /= 5u32; t }),
-            (3, 4, { let mut t = pi_v.clone(); t /= 7u32; t }),
-            (0, 4, { let mut t = pi_v.clone(); t /= 11u32; t }),
+            (0, 1, {
+                let mut t = pi_v.clone();
+                t /= 3u32;
+                t
+            }),
+            (1, 2, {
+                let mut t = pi_v.clone();
+                t /= 4u32;
+                t
+            }),
+            (2, 3, {
+                let mut t = pi_v.clone();
+                t /= 5u32;
+                t
+            }),
+            (3, 4, {
+                let mut t = pi_v.clone();
+                t /= 7u32;
+                t
+            }),
+            (0, 4, {
+                let mut t = pi_v.clone();
+                t /= 11u32;
+                t
+            }),
         ];
 
         for (i, j, theta) in &rotations {
@@ -1462,11 +2463,16 @@ mod tests {
             let mut new_a = a.clone();
             // Apply G from the right: A ← A G. Updates columns i and j.
             for r in 0..n {
-                let mut new_ri = c.clone(); new_ri *= &a[r * n + *i];
-                let mut t = s.clone(); t *= &a[r * n + *j];
+                let mut new_ri = c.clone();
+                new_ri *= &a[r * n + *i];
+                let mut t = s.clone();
+                t *= &a[r * n + *j];
                 new_ri += &t;
-                let mut new_rj = s.clone(); new_rj = -new_rj; new_rj *= &a[r * n + *i];
-                let mut t = c.clone(); t *= &a[r * n + *j];
+                let mut new_rj = s.clone();
+                new_rj = -new_rj;
+                new_rj *= &a[r * n + *i];
+                let mut t = c.clone();
+                t *= &a[r * n + *j];
                 new_rj += &t;
                 new_a[r * n + *i] = new_ri;
                 new_a[r * n + *j] = new_rj;
@@ -1475,11 +2481,16 @@ mod tests {
             // Apply G^T from the left: A ← G^T A. Updates rows i and j.
             let mut new_a = a.clone();
             for col in 0..n {
-                let mut new_ic = c.clone(); new_ic *= &a[*i * n + col];
-                let mut t = s.clone(); t *= &a[*j * n + col];
+                let mut new_ic = c.clone();
+                new_ic *= &a[*i * n + col];
+                let mut t = s.clone();
+                t *= &a[*j * n + col];
                 new_ic += &t;
-                let mut new_jc = s.clone(); new_jc = -new_jc; new_jc *= &a[*i * n + col];
-                let mut t = c.clone(); t *= &a[*j * n + col];
+                let mut new_jc = s.clone();
+                new_jc = -new_jc;
+                new_jc *= &a[*i * n + col];
+                let mut t = c.clone();
+                t *= &a[*j * n + col];
                 new_jc += &t;
                 new_a[*i * n + col] = new_ic;
                 new_a[*j * n + col] = new_jc;
@@ -1496,10 +2507,14 @@ mod tests {
             let mut diff = computed.clone();
             diff -= expected;
             let abs_diff = diff.abs();
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "rotated_diagonal eigenvalue {} off by {} (expected {}, got {})",
-                i, display_hp(&abs_diff, 4),
-                display_hp(expected, 6), display_hp(computed, 6));
+                i,
+                display_hp(&abs_diff, 4),
+                display_hp(expected, 6),
+                display_hp(computed, 6)
+            );
         }
     }
 
@@ -1513,14 +2528,16 @@ mod tests {
         let n = 4;
 
         // Eigenvalues separated by 10^-100 each.
-        let chosen: Vec<Float> = (0..n).map(|k| {
-            let mut v = Float::with_val(prec, 1);
-            let mut delta = Float::with_val(prec, k as u32);
-            let scale = hp(prec, "1e-100");
-            delta *= &scale;
-            v += &delta;
-            v
-        }).collect();
+        let chosen: Vec<Float> = (0..n)
+            .map(|k| {
+                let mut v = Float::with_val(prec, 1);
+                let mut delta = Float::with_val(prec, k as u32);
+                let scale = hp(prec, "1e-100");
+                delta *= &scale;
+                v += &delta;
+                v
+            })
+            .collect();
 
         // Build A = G^T D G with one Givens rotation on (0, 2).
         let mut a = vec![Float::with_val(prec, 0); n * n];
@@ -1529,7 +2546,11 @@ mod tests {
         }
 
         let pi_v = Float::with_val(prec, rug::float::Constant::Pi);
-        let theta = { let mut t = pi_v.clone(); t /= 6u32; t };
+        let theta = {
+            let mut t = pi_v.clone();
+            t /= 6u32;
+            t
+        };
         let c = theta.clone().cos();
         let s = theta.clone().sin();
         let (i, j) = (0usize, 2usize);
@@ -1537,11 +2558,16 @@ mod tests {
         // G^T A G via two passes (right then left).
         let mut new_a = a.clone();
         for r in 0..n {
-            let mut new_ri = c.clone(); new_ri *= &a[r * n + i];
-            let mut t = s.clone(); t *= &a[r * n + j];
+            let mut new_ri = c.clone();
+            new_ri *= &a[r * n + i];
+            let mut t = s.clone();
+            t *= &a[r * n + j];
             new_ri += &t;
-            let mut new_rj = s.clone(); new_rj = -new_rj; new_rj *= &a[r * n + i];
-            let mut t = c.clone(); t *= &a[r * n + j];
+            let mut new_rj = s.clone();
+            new_rj = -new_rj;
+            new_rj *= &a[r * n + i];
+            let mut t = c.clone();
+            t *= &a[r * n + j];
             new_rj += &t;
             new_a[r * n + i] = new_ri;
             new_a[r * n + j] = new_rj;
@@ -1549,11 +2575,16 @@ mod tests {
         a = new_a;
         let mut new_a = a.clone();
         for col in 0..n {
-            let mut new_ic = c.clone(); new_ic *= &a[i * n + col];
-            let mut t = s.clone(); t *= &a[j * n + col];
+            let mut new_ic = c.clone();
+            new_ic *= &a[i * n + col];
+            let mut t = s.clone();
+            t *= &a[j * n + col];
             new_ic += &t;
-            let mut new_jc = s.clone(); new_jc = -new_jc; new_jc *= &a[i * n + col];
-            let mut t = c.clone(); t *= &a[j * n + col];
+            let mut new_jc = s.clone();
+            new_jc = -new_jc;
+            new_jc *= &a[i * n + col];
+            let mut t = c.clone();
+            t *= &a[j * n + col];
             new_jc += &t;
             new_a[i * n + col] = new_ic;
             new_a[j * n + col] = new_jc;
@@ -1570,9 +2601,12 @@ mod tests {
             let mut diff = computed.clone();
             diff -= expected;
             let abs_diff = diff.abs();
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "clustered eigenvalue {} off by {}",
-                i, display_hp(&abs_diff, 4));
+                i,
+                display_hp(&abs_diff, 4)
+            );
         }
     }
 
@@ -1587,11 +2621,13 @@ mod tests {
         let prec = 256;
         let n = 21;
         // diag: 10, 9, 8, ..., 1, 0, 1, ..., 9, 10
-        let diag: Vec<Float> = (0..n).map(|i| {
-            let mid = (n / 2) as i64; // 10 for n=21
-            let val = (mid - i as i64).abs();
-            Float::with_val(prec, val as u32)
-        }).collect();
+        let diag: Vec<Float> = (0..n)
+            .map(|i| {
+                let mid = (n / 2) as i64; // 10 for n=21
+                let val = (mid - i as i64).abs();
+                Float::with_val(prec, val as u32)
+            })
+            .collect();
         let off_diag: Vec<Float> = vec![Float::with_val(prec, 1); n - 1];
 
         let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
@@ -1603,21 +2639,29 @@ mod tests {
         let lo = hp(prec, "10.74");
         let hi = hp(prec, "10.75");
         let largest = &evals[n - 1];
-        assert!(*largest > lo && *largest < hi,
+        assert!(
+            *largest > lo && *largest < hi,
             "Wilkinson W21 largest eigenvalue should be ≈10.7462, got {}",
-            display_hp(largest, 8));
+            display_hp(largest, 8)
+        );
 
         // Also verify trace = sum of |i - mid| for i = 0..n.
         // = 2 * (1 + 2 + ... + 10) = 2 * 55 = 110.
         let mut sum = Float::with_val(prec, 0);
-        for v in &evals { sum += v; }
+        for v in &evals {
+            sum += v;
+        }
         let expected_trace = Float::with_val(prec, 110u32);
         let tol = hp(prec, "1e-50");
-        let mut diff = sum.clone(); diff -= &expected_trace;
+        let mut diff = sum.clone();
+        diff -= &expected_trace;
         let abs_diff = diff.abs();
-        assert!(abs_diff < tol,
+        assert!(
+            abs_diff < tol,
             "W21 trace mismatch: sum {} vs 110, delta {}",
-            display_hp(&sum, 6), display_hp(&abs_diff, 4));
+            display_hp(&sum, 6),
+            display_hp(&abs_diff, 4)
+        );
     }
 
     /// Verify A·v = λ·v for an eigenvector recovered via shifted inverse iteration.
@@ -1640,9 +2684,8 @@ mod tests {
                 early_termination: true,
                 solver,
             };
-            let v = tridiag_eigenvector_for_value_hp(
-                &diag, &off_diag, &lambda, prec, opts,
-            ).unwrap();
+            let v =
+                tridiag_eigenvector_for_value_hp(&diag, &off_diag, &lambda, prec, opts).unwrap();
 
             // Compute T·v and verify it equals λ·v at HP precision.
             // T·v at index i = diag[i]·v[i] + off[i-1]·v[i-1] + off[i]·v[i+1]
@@ -1664,11 +2707,14 @@ mod tests {
             }
 
             // λ·v
-            let lv: Vec<Float> = v.iter().map(|vi| {
-                let mut t = lambda.clone();
-                t *= vi;
-                t
-            }).collect();
+            let lv: Vec<Float> = v
+                .iter()
+                .map(|vi| {
+                    let mut t = lambda.clone();
+                    t *= vi;
+                    t
+                })
+                .collect();
 
             // Residual ‖T·v - λ·v‖_∞ should be tiny.
             let mut max_residual = Float::with_val(prec, 0);
@@ -1681,9 +2727,12 @@ mod tests {
                 }
             }
             let tol = hp(prec, "1e-50");
-            assert!(max_residual < tol,
+            assert!(
+                max_residual < tol,
                 "solver {:?}: ‖T·v - λv‖_∞ = {} should be < 1e-50",
-                solver, display_hp(&max_residual, 4));
+                solver,
+                display_hp(&max_residual, 4)
+            );
 
             // Eigenvector should be unit-normalized.
             let mut norm_sq = Float::with_val(prec, 0);
@@ -1696,9 +2745,12 @@ mod tests {
             norm_diff -= 1u32;
             let abs_norm_diff = norm_diff.abs();
             let norm_tol = hp(prec, "1e-50");
-            assert!(abs_norm_diff < norm_tol,
+            assert!(
+                abs_norm_diff < norm_tol,
                 "solver {:?}: ‖v‖² should be 1, got {}",
-                solver, display_hp(&norm_sq, 6));
+                solver,
+                display_hp(&norm_sq, 6)
+            );
         }
     }
 
@@ -1750,10 +2802,14 @@ mod tests {
             let abs_diff = diff.abs();
             // Tolerance scales with the small magnitude.
             let tol = hp(prec, "1e-550");
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "below-floor eigenvalue {} off by {} (expected {}, got {})",
-                k, display_hp(&abs_diff, 4),
-                display_hp(&expected, 6), display_hp(&evals[k - 1], 6));
+                k,
+                display_hp(&abs_diff, 4),
+                display_hp(&expected, 6),
+                display_hp(&evals[k - 1], 6)
+            );
         }
     }
 
@@ -1778,7 +2834,9 @@ mod tests {
         // LCG constants (Numerical Recipes 64-bit values).
         let a: u64 = 6364136223846793005;
         let c: u64 = 1442695040888963407;
-        let mut state: u64 = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+        let mut state: u64 = seed
+            .wrapping_mul(2862933555777941757)
+            .wrapping_add(3037000493);
 
         let mut next_uniform = || -> Float {
             state = state.wrapping_mul(a).wrapping_add(c);
@@ -1831,17 +2889,23 @@ mod tests {
 
                 // Sum
                 let mut sum = Float::with_val(prec, 0);
-                for v in &evals { sum += v; }
+                for v in &evals {
+                    sum += v;
+                }
 
                 let mut diff = sum.clone();
                 diff -= &trace;
                 let abs_diff = diff.abs();
                 let tol = hp(prec, "1e-50");
-                assert!(abs_diff < tol,
+                assert!(
+                    abs_diff < tol,
                     "n={}, seed={}: trace {} vs sum {} differ by {}",
-                    n, seed,
-                    display_hp(&trace, 6), display_hp(&sum, 6),
-                    display_hp(&abs_diff, 4));
+                    n,
+                    seed,
+                    display_hp(&trace, 6),
+                    display_hp(&sum, 6),
+                    display_hp(&abs_diff, 4)
+                );
             }
         }
     }
@@ -1884,7 +2948,9 @@ mod tests {
 
                 // Product of eigenvalues
                 let mut product = Float::with_val(prec, 1);
-                for v in &evals { product *= v; }
+                for v in &evals {
+                    product *= v;
+                }
 
                 let mut diff = product.clone();
                 diff -= &det;
@@ -1899,11 +2965,15 @@ mod tests {
                     }
                     t
                 };
-                assert!(abs_diff < tol_relative,
+                assert!(
+                    abs_diff < tol_relative,
                     "n={}, seed={}: det {} vs product {} differ by {}",
-                    n, seed,
-                    display_hp(&det, 6), display_hp(&product, 6),
-                    display_hp(&abs_diff, 4));
+                    n,
+                    seed,
+                    display_hp(&det, 6),
+                    display_hp(&product, 6),
+                    display_hp(&abs_diff, 4)
+                );
             }
         }
     }
@@ -1922,9 +2992,8 @@ mod tests {
                 let evals = dense_symmetric_eigenvalues_hp(&a, n, prec).unwrap();
 
                 for (k, lambda) in evals.iter().enumerate() {
-                    let v = match dense_symmetric_eigenvector_for_value_hp(
-                        &a, n, lambda, prec, 200
-                    ) {
+                    let v = match dense_symmetric_eigenvector_for_value_hp(&a, n, lambda, prec, 200)
+                    {
                         Ok(v) => v,
                         Err(_) => continue, // shifted singular system — rare
                     };
@@ -1942,11 +3011,14 @@ mod tests {
                     }
 
                     // Compute λ·v.
-                    let lv: Vec<Float> = v.iter().map(|vi| {
-                        let mut t = lambda.clone();
-                        t *= vi;
-                        t
-                    }).collect();
+                    let lv: Vec<Float> = v
+                        .iter()
+                        .map(|vi| {
+                            let mut t = lambda.clone();
+                            t *= vi;
+                            t
+                        })
+                        .collect();
 
                     // Residual ‖A·v - λ·v‖_∞.
                     let mut max_residual = Float::with_val(prec, 0);
@@ -1960,9 +3032,14 @@ mod tests {
                     }
 
                     let tol = hp(prec, "1e-40");
-                    assert!(max_residual < tol,
+                    assert!(
+                        max_residual < tol,
                         "n={}, seed={}, k={}: ‖A·v - λv‖_∞ = {} should be < 1e-40",
-                        n, seed, k, display_hp(&max_residual, 4));
+                        n,
+                        seed,
+                        k,
+                        display_hp(&max_residual, 4)
+                    );
                 }
             }
         }
@@ -1982,9 +3059,8 @@ mod tests {
                 let evals = dense_symmetric_eigenvalues_hp(&a, n, prec).unwrap();
 
                 for lambda in &evals {
-                    let v = match dense_symmetric_eigenvector_for_value_hp(
-                        &a, n, lambda, prec, 200
-                    ) {
+                    let v = match dense_symmetric_eigenvector_for_value_hp(&a, n, lambda, prec, 200)
+                    {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
@@ -1999,9 +3075,13 @@ mod tests {
                     diff -= 1u32;
                     let abs_diff = diff.abs();
                     let tol = hp(prec, "1e-50");
-                    assert!(abs_diff < tol,
+                    assert!(
+                        abs_diff < tol,
                         "n={}, seed={}: ‖v‖² = {} should be 1",
-                        n, seed, display_hp(&norm_sq, 6));
+                        n,
+                        seed,
+                        display_hp(&norm_sq, 6)
+                    );
                 }
             }
         }
@@ -2023,9 +3103,8 @@ mod tests {
                 // Recover all eigenvectors.
                 let mut vecs: Vec<Vec<Float>> = Vec::with_capacity(n);
                 for lambda in &evals {
-                    let v = match dense_symmetric_eigenvector_for_value_hp(
-                        &a, n, lambda, prec, 200
-                    ) {
+                    let v = match dense_symmetric_eigenvector_for_value_hp(&a, n, lambda, prec, 200)
+                    {
                         Ok(v) => v,
                         Err(_) => return, // skip whole test on failure
                     };
@@ -2080,14 +3159,17 @@ mod tests {
                 let mut vecs: Vec<Vec<Float>> = Vec::with_capacity(n);
                 let mut all_recovered = true;
                 for lambda in &evals {
-                    match dense_symmetric_eigenvector_for_value_hp(
-                        &a, n, lambda, prec, 200
-                    ) {
+                    match dense_symmetric_eigenvector_for_value_hp(&a, n, lambda, prec, 200) {
                         Ok(v) => vecs.push(v),
-                        Err(_) => { all_recovered = false; break; }
+                        Err(_) => {
+                            all_recovered = false;
+                            break;
+                        }
                     }
                 }
-                if !all_recovered { continue; }
+                if !all_recovered {
+                    continue;
+                }
 
                 // Reconstruct A_reconstructed[i][j] = Σ_k λ_k v_k[i] v_k[j].
                 let mut a_reconstructed = vec![Float::with_val(prec, 0); n * n];
@@ -2116,9 +3198,13 @@ mod tests {
                 }
 
                 let tol = hp(prec, "1e-30");
-                assert!(max_diff < tol,
+                assert!(
+                    max_diff < tol,
                     "n={}, seed={}: ‖A - Σ λ v vᵀ‖_∞ = {} should be < 1e-30",
-                    n, seed, display_hp(&max_diff, 4));
+                    n,
+                    seed,
+                    display_hp(&max_diff, 4)
+                );
             }
         }
     }
@@ -2167,11 +3253,13 @@ mod tests {
         // dominant. This avoids near-degenerate eigenvalues that would
         // require many extra QR iterations (and tighten our tolerance
         // budget unnecessarily).
-        let off_diag: Vec<Float> = (0..n.saturating_sub(1)).map(|_| {
-            let mut v = next_uniform();
-            v /= 2u32;
-            v
-        }).collect();
+        let off_diag: Vec<Float> = (0..n.saturating_sub(1))
+            .map(|_| {
+                let mut v = next_uniform();
+                v /= 2u32;
+                v
+            })
+            .collect();
         (diag, off_diag)
     }
 
@@ -2189,16 +3277,24 @@ mod tests {
                 let (diag, off_diag) = lcg_random_tridiag(prec, n, seed as u64 + 1000);
                 let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
 
-                assert_eq!(evals.len(), n,
+                assert_eq!(
+                    evals.len(),
+                    n,
                     "n={}, seed={}: expected {} eigenvalues, got {}",
-                    n, seed, n, evals.len());
+                    n,
+                    seed,
+                    n,
+                    evals.len()
+                );
 
                 // Ascending check: e[k] ≤ e[k+1] for all k.
                 for k in 0..(n - 1) {
                     assert!(
                         evals[k] <= evals[k + 1],
                         "n={}, seed={}: eigenvalues not ascending at index {}: {} > {}",
-                        n, seed, k,
+                        n,
+                        seed,
+                        k,
                         display_hp(&evals[k], 6),
                         display_hp(&evals[k + 1], 6)
                     );
@@ -2236,9 +3332,13 @@ mod tests {
                 diff -= &trace;
                 let abs_diff = diff.abs();
                 let tol = hp(prec, "1e-50");
-                assert!(abs_diff < tol,
+                assert!(
+                    abs_diff < tol,
                     "n={}, seed={}: |Σλ - trace| = {} should be < 1e-50",
-                    n, seed, display_hp(&abs_diff, 4));
+                    n,
+                    seed,
+                    display_hp(&abs_diff, 4)
+                );
             }
         }
     }
@@ -2260,9 +3360,13 @@ mod tests {
                 diff -= &expected[k];
                 let abs_diff = diff.abs();
                 let tol = hp(prec, "1e-50");
-                assert!(abs_diff < tol,
+                assert!(
+                    abs_diff < tol,
                     "Strang n={}, eigenvalue {}: |computed - expected| = {} > 1e-50",
-                    n, k, display_hp(&abs_diff, 6));
+                    n,
+                    k,
+                    display_hp(&abs_diff, 6)
+                );
             }
         }
     }
@@ -2288,9 +3392,14 @@ mod tests {
                 diff -= &expected;
                 let abs_diff = diff.abs();
                 let tol = hp(prec, "1e-100");
-                assert!(abs_diff < tol,
+                assert!(
+                    abs_diff < tol,
                     "n={}, eigenvalue {}: expected {}, got {}",
-                    n, k, k + 1, display_hp(&evals[k], 6));
+                    n,
+                    k,
+                    k + 1,
+                    display_hp(&evals[k], 6)
+                );
             }
         }
     }
@@ -2322,15 +3431,29 @@ mod tests {
 
         // Dense path.
         let v_dense = tridiag_eigenvector_for_value_hp(
-            &diag, &off_diag, &lambda_1, prec,
-            TridiagEigvecOptions { solver: TridiagSolver::Dense, ..common },
-        ).unwrap();
+            &diag,
+            &off_diag,
+            &lambda_1,
+            prec,
+            TridiagEigvecOptions {
+                solver: TridiagSolver::Dense,
+                ..common
+            },
+        )
+        .unwrap();
 
         // Banded path.
         let v_banded = tridiag_eigenvector_for_value_hp(
-            &diag, &off_diag, &lambda_1, prec,
-            TridiagEigvecOptions { solver: TridiagSolver::Banded, ..common },
-        ).unwrap();
+            &diag,
+            &off_diag,
+            &lambda_1,
+            prec,
+            TridiagEigvecOptions {
+                solver: TridiagSolver::Banded,
+                ..common
+            },
+        )
+        .unwrap();
 
         assert_eq!(v_dense.len(), n);
         assert_eq!(v_banded.len(), n);
@@ -2343,19 +3466,25 @@ mod tests {
         let dense_pos = v_dense[center] > zero;
         let banded_pos = v_b[center] > zero;
         if dense_pos != banded_pos {
-            for v in v_b.iter_mut() { *v = -v.clone(); }
+            for v in v_b.iter_mut() {
+                *v = -v.clone();
+            }
         }
 
         // Element-wise compare. Should match to working precision.
         for i in 0..n {
-            let mut diff = v_dense[i].clone(); diff -= &v_b[i];
+            let mut diff = v_dense[i].clone();
+            diff -= &v_b[i];
             let abs_diff = diff.abs();
             let tol = hp(prec, "1e-50");
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "banded vs dense disagreement at index {}: {} (dense={}, banded={})",
-                i, display_hp(&abs_diff, 6),
+                i,
+                display_hp(&abs_diff, 6),
                 display_hp(&v_dense[i], 6),
-                display_hp(&v_b[i], 6));
+                display_hp(&v_b[i], 6)
+            );
         }
     }
 
@@ -2376,31 +3505,52 @@ mod tests {
 
         for solver in [TridiagSolver::Banded, TridiagSolver::Dense] {
             let v = tridiag_eigenvector_for_value_hp(
-                &diag, &off_diag, &lambda_1, prec,
+                &diag,
+                &off_diag,
+                &lambda_1,
+                prec,
                 TridiagEigvecOptions {
                     max_steps: 200,
                     early_termination: true,
                     solver,
                 },
-            ).unwrap();
+            )
+            .unwrap();
 
             // Compute residual ‖T·v - λv‖_∞.
             let mut max_resid = hp(prec, "0");
             for i in 0..n {
-                let mut tv_i = diag[i].clone(); tv_i *= &v[i];
-                if i > 0 { let mut t = off_diag[i - 1].clone(); t *= &v[i - 1]; tv_i += &t; }
-                if i < n - 1 { let mut t = off_diag[i].clone(); t *= &v[i + 1]; tv_i += &t; }
-                let mut lv_i = lambda_1.clone(); lv_i *= &v[i];
-                let mut resid = tv_i; resid -= &lv_i; resid = resid.abs();
-                if resid > max_resid { max_resid = resid; }
+                let mut tv_i = diag[i].clone();
+                tv_i *= &v[i];
+                if i > 0 {
+                    let mut t = off_diag[i - 1].clone();
+                    t *= &v[i - 1];
+                    tv_i += &t;
+                }
+                if i < n - 1 {
+                    let mut t = off_diag[i].clone();
+                    t *= &v[i + 1];
+                    tv_i += &t;
+                }
+                let mut lv_i = lambda_1.clone();
+                lv_i *= &v[i];
+                let mut resid = tv_i;
+                resid -= &lv_i;
+                resid = resid.abs();
+                if resid > max_resid {
+                    max_resid = resid;
+                }
             }
 
             // At HP-1000 with the working-precision early-termination
             // threshold, residual should be ≲ 10^-900 (~working precision).
             let tol = hp(prec, "1e-900");
-            assert!(max_resid < tol,
+            assert!(
+                max_resid < tol,
                 "solver {:?}: HP-1000 residual ‖T·v - λv‖_∞ = {} should be < 1e-900",
-                solver, display_hp(&max_resid, 6));
+                solver,
+                display_hp(&max_resid, 6)
+            );
         }
     }
 
@@ -2417,9 +3567,14 @@ mod tests {
         let off_diag: Vec<Float> = Vec::new();
         let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
         assert_eq!(evals.len(), 1);
-        let mut diff = evals[0].clone(); diff -= hp(prec, "7.5"); let d = diff.abs();
-        assert!(d < hp(prec, "1e-50"),
-            "1×1 tridiag eigenvalue should be 7.5; got diff {}", d);
+        let mut diff = evals[0].clone();
+        diff -= hp(prec, "7.5");
+        let d = diff.abs();
+        assert!(
+            d < hp(prec, "1e-50"),
+            "1×1 tridiag eigenvalue should be 7.5; got diff {}",
+            d
+        );
     }
 
     /// `tridiag_eigenvalues_hp` on a 2×2 symmetric tridiagonal: eigenvalues
@@ -2433,8 +3588,12 @@ mod tests {
         let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
         assert_eq!(evals.len(), 2);
         // Should be ascending: [2, 4].
-        let mut d0 = evals[0].clone(); d0 -= hp(prec, "2"); let d0 = d0.abs();
-        let mut d1 = evals[1].clone(); d1 -= hp(prec, "4"); let d1 = d1.abs();
+        let mut d0 = evals[0].clone();
+        d0 -= hp(prec, "2");
+        let d0 = d0.abs();
+        let mut d1 = evals[1].clone();
+        d1 -= hp(prec, "4");
+        let d1 = d1.abs();
         let tol = hp(prec, "1e-50");
         assert!(d0 < tol, "2×2 eval[0] should be 2; diff = {}", d0);
         assert!(d1 < tol, "2×2 eval[1] should be 4; diff = {}", d1);
@@ -2450,9 +3609,15 @@ mod tests {
         let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
         assert_eq!(evals.len(), 3);
         let tol = hp(prec, "1e-50");
-        let mut d0 = evals[0].clone(); d0 -= hp(prec, "1"); let d0 = d0.abs();
-        let mut d1 = evals[1].clone(); d1 -= hp(prec, "3"); let d1 = d1.abs();
-        let mut d2 = evals[2].clone(); d2 -= hp(prec, "5"); let d2 = d2.abs();
+        let mut d0 = evals[0].clone();
+        d0 -= hp(prec, "1");
+        let d0 = d0.abs();
+        let mut d1 = evals[1].clone();
+        d1 -= hp(prec, "3");
+        let d1 = d1.abs();
+        let mut d2 = evals[2].clone();
+        d2 -= hp(prec, "5");
+        let d2 = d2.abs();
         assert!(d0 < tol, "zero off-diag evals[0] should be 1; diff={}", d0);
         assert!(d1 < tol, "zero off-diag evals[1] should be 3; diff={}", d1);
         assert!(d2 < tol, "zero off-diag evals[2] should be 5; diff={}", d2);
@@ -2464,8 +3629,10 @@ mod tests {
         let prec = 64;
         let diag = vec![hp(prec, "1"), hp(prec, "2"), hp(prec, "3")];
         let bad_off = vec![hp(prec, "0.5")]; // should be length 2
-        assert!(tridiag_eigenvalues_hp(&diag, &bad_off, prec).is_err(),
-            "wrong off-diag length should return Err");
+        assert!(
+            tridiag_eigenvalues_hp(&diag, &bad_off, prec).is_err(),
+            "wrong off-diag length should return Err"
+        );
     }
 
     /// `householder_tridiag_hp` on a 1×1 matrix: no-op (no reflections
@@ -2478,8 +3645,14 @@ mod tests {
         assert_eq!(diag.len(), 1);
         assert!(off_diag.is_empty());
         assert_eq!(q.len(), 1);
-        let mut d = diag[0].clone(); d -= hp(prec, "42"); let d = d.abs();
-        assert!(d < hp(prec, "1e-50"), "1×1 householder diag should be 42; diff={}", d);
+        let mut d = diag[0].clone();
+        d -= hp(prec, "42");
+        let d = d.abs();
+        assert!(
+            d < hp(prec, "1e-50"),
+            "1×1 householder diag should be 42; diff={}",
+            d
+        );
     }
 
     /// `householder_tridiag_hp` on a 2×2 symmetric matrix: one Householder
@@ -2498,14 +3671,26 @@ mod tests {
         // λ₁ + λ₂ = 7, λ₁ * λ₂ = 1.
         // Tolerance is a few ULPs at prec=128 bits (~38 decimal digits).
         let tol = hp(prec, "1e-35");
-        let mut sum = evals[0].clone(); sum += &evals[1];
-        let mut trace_diff = sum; trace_diff -= hp(prec, "7"); let trace_diff = trace_diff.abs();
-        assert!(trace_diff < tol,
-            "2×2 eigenvalue sum (trace) should be 7; diff = {}", trace_diff);
-        let mut prod = evals[0].clone(); prod *= &evals[1];
-        let mut det_diff = prod; det_diff -= hp(prec, "1"); let det_diff = det_diff.abs();
-        assert!(det_diff < tol,
-            "2×2 eigenvalue product (det) should be 1; diff = {}", det_diff);
+        let mut sum = evals[0].clone();
+        sum += &evals[1];
+        let mut trace_diff = sum;
+        trace_diff -= hp(prec, "7");
+        let trace_diff = trace_diff.abs();
+        assert!(
+            trace_diff < tol,
+            "2×2 eigenvalue sum (trace) should be 7; diff = {}",
+            trace_diff
+        );
+        let mut prod = evals[0].clone();
+        prod *= &evals[1];
+        let mut det_diff = prod;
+        det_diff -= hp(prec, "1");
+        let det_diff = det_diff.abs();
+        assert!(
+            det_diff < tol,
+            "2×2 eigenvalue product (det) should be 1; diff = {}",
+            det_diff
+        );
     }
 
     /// `dense_symmetric_eigenvalues_hp` on a 1×1 matrix: single eigenvalue.
@@ -2515,8 +3700,77 @@ mod tests {
         let a = vec![hp(prec, "99")];
         let evals = dense_symmetric_eigenvalues_hp(&a, 1, prec).unwrap();
         assert_eq!(evals.len(), 1);
-        let mut d = evals[0].clone(); d -= hp(prec, "99"); let d = d.abs();
-        assert!(d < hp(prec, "1e-50"), "1×1 dense eigenvalue should be 99; diff={}", d);
+        let mut d = evals[0].clone();
+        d -= hp(prec, "99");
+        let d = d.abs();
+        assert!(
+            d < hp(prec, "1e-50"),
+            "1×1 dense eigenvalue should be 99; diff={}",
+            d
+        );
+    }
+
+    #[test]
+    fn independent_jacobi_matches_closed_form_and_qr() {
+        let prec = 256;
+        let matrix = vec![
+            hp(prec, "2"),
+            hp(prec, "1"),
+            hp(prec, "0"),
+            hp(prec, "1"),
+            hp(prec, "2"),
+            hp(prec, "1"),
+            hp(prec, "0"),
+            hp(prec, "1"),
+            hp(prec, "2"),
+        ];
+        let jacobi = dense_symmetric_eigenvalues_jacobi_hp(&matrix, 3, prec, 30).unwrap();
+        let qr = dense_symmetric_eigenvalues_hp(&matrix, 3, prec).unwrap();
+        assert!(jacobi.sweeps > 0);
+        assert!(jacobi.rotations > 0);
+        let tolerance = hp(prec, "1e-60");
+        for (left, right) in jacobi.eigenvalues.iter().zip(&qr) {
+            let mut difference = left.clone();
+            difference -= right;
+            assert!(difference.abs() < tolerance);
+        }
+        let mut middle = jacobi.eigenvalues[1].clone();
+        middle -= 2;
+        assert!(middle.abs() < tolerance);
+    }
+
+    #[test]
+    fn independent_jacobi_resolves_cluster_and_repeats_at_higher_precision() {
+        let solve = |prec| {
+            let delta = hp(prec, "1e-30");
+            let mut one_plus = hp(prec, "1");
+            one_plus += &delta;
+            let matrix = vec![
+                hp(prec, "1"),
+                hp(prec, "1e-35"),
+                hp(prec, "0"),
+                hp(prec, "1e-35"),
+                one_plus,
+                hp(prec, "0"),
+                hp(prec, "0"),
+                hp(prec, "0"),
+                hp(prec, "3"),
+            ];
+            dense_symmetric_eigenvalues_jacobi_hp(&matrix, 3, prec, 30)
+                .unwrap()
+                .eigenvalues
+        };
+        let low = solve(192);
+        let high = solve(320);
+        let tolerance = hp(320, "1e-50");
+        for (left, right) in low.iter().zip(&high) {
+            let mut difference = Float::with_val(320, left);
+            difference -= right;
+            assert!(difference.abs() < tolerance);
+        }
+        let mut gap = high[1].clone();
+        gap -= &high[0];
+        assert!(gap > hp(320, "9e-31"));
+        assert!(gap < hp(320, "2e-30"));
     }
 }
-

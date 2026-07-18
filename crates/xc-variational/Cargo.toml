@@ -1,0 +1,26 @@
+[package]
+name = "xc-variational"
+description = "Exact and high-precision variational problems, including the Maynard-Tao M_k finite-degree engine."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+hp = ["dep:rug", "dep:xc-solver", "xc-certify/hp", "xc-solver/hp-reference"]
+
+[dependencies]
+serde = { workspace = true }
+sha2 = { workspace = true }
+rug = { workspace = true, optional = true }
+xc-core = { workspace = true }
+xc-certify = { workspace = true }
+xc-operator = { workspace = true }
+xc-solver = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

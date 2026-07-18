@@ -1,0 +1,25 @@
+[package]
+name = "xc-solver"
+description = "Multi-solver framework with explicit targets, diagnostics, cross-checks, and deterministic f64 reference solvers."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+hp-reference = ["dep:rug", "dep:xc-numerics", "xc-numerics/hp", "xc-operator/hp"]
+
+[dependencies]
+nalgebra = { workspace = true }
+serde = { workspace = true }
+rug = { workspace = true, optional = true }
+xc-core = { workspace = true }
+xc-operator = { workspace = true }
+xc-numerics = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

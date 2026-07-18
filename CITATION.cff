@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use the Xcelerator Toolkit in research, please cite this software."
+title: "Xcelerator Toolkit: High-Precision Numerical Libraries for Analytic Number Theory and Spectral Methods"
+type: software
+authors:
+  - family-names: Andrews
+    given-names: Ronnie
+    name-suffix: Jr.
+    orcid: "https://orcid.org/0009-0003-9724-3104"
+repository-code: "https://github.com/TeamXcelerator/xcelerator-toolkit"
+url: "https://github.com/TeamXcelerator/xcelerator-toolkit"
+version: "0.13.0"
+date-released: "2026-07-14"
+license: other
+keywords:
+  - high-precision arithmetic
+  - Riemann Hypothesis
+  - spectral methods
+  - certified numerics
+  - Maynard-Tao sieve

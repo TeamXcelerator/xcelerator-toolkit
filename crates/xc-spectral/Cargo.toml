@@ -3,6 +3,7 @@ name = "xc-spectral"
 description = "Spectral methods for analytic number theory: CCM Weil-form construction, prolate-wave operators, Mellin transforms, Hermite expansions."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license-file.workspace = true
 publish.workspace = true
@@ -10,7 +11,8 @@ repository.workspace = true
 
 [features]
 default = []
-hp = ["dep:rug", "dep:zip", "xc-numerics/hp", "xc-zeta/hp"]
+hp = ["dep:rug", "dep:zip", "dep:xc-operator", "dep:xc-solver", "xc-numerics/hp", "xc-zeta/hp", "xc-certify/hp", "xc-root/hp", "xc-solver/hp-reference"]
+arb = ["hp"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -20,5 +22,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rug = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
-xc-numerics = { path = "../xc-numerics" }
-xc-zeta = { path = "../xc-zeta" }
+xc-numerics = { workspace = true }
+xc-zeta = { workspace = true }
+xc-core = { workspace = true }
+xc-certify = { workspace = true }
+xc-root = { workspace = true }
+xc-cache = { workspace = true }
+xc-operator = { workspace = true, optional = true, features = ["hp"] }
+xc-solver = { workspace = true, optional = true }
+
+[build-dependencies]
+cc = "1.2"
+
+[[example]]
+name = "ccm_first_fifty_production"
+required-features = ["arb"]

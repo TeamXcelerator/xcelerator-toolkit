@@ -23,12 +23,10 @@
 //! exponentially small eigenvalue requires HP-*exact* matrix entries, which
 //! kernel quadrature cannot deliver (its `~1/n²` error swamps `λ_a ~ 10^{−500}`
 //! and breaks positivity). The plunge is computed by the HP-exact Galerkin
-//! Weil form in [`crate::ccm::hp::weil_min_eigenvalue_hp`] (the same operator,
+//! Weil form in [`crate::ccm::hp::weil_spectrum_hp`] (the same operator,
 //! `A_a` = Friedrichs extension of the localized Weil form, Suzuki Thm 1.1),
 //! which additionally supports an archimedean-only mode (prime sum off) for
 //! the prefactor decomposition test.
-
-#![cfg(feature = "hp")]
 
 use rug::float::Constant;
 use rug::ops::Pow;
@@ -93,7 +91,12 @@ impl ScrewKernel {
             .map(|(pk, p, _k)| (pk, Float::with_val(prec, p).ln()))
             .collect();
 
-        ScrewKernel { prec, dig_coef, phi1, vm }
+        ScrewKernel {
+            prec,
+            dig_coef,
+            phi1,
+            vm,
+        }
     }
 
     /// Hurwitz–Lerch `Φ(z,2,1/4) = Σ_{k≥0} z^k/(k+1/4)²` for `0 ≤ z < 1`,

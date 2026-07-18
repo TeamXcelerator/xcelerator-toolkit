@@ -8,12 +8,358 @@
 //! - Find smallest eigenpair by inverse iteration (from xc-numerics).
 //! - Solve spectrum equation by Newton's method.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use rayon::prelude::*;
 use rug::{ops::Pow, Float};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Instant;
+use xc_cache::{
+    resolve_or_compute_json_artifact_with_dependencies, ArtifactAssuranceAttestation,
+    ArtifactCacheContext, ArtifactExecutionCacheRequest, ArtifactManifest,
+    ArtifactProductionAssessment, CacheError, CacheQuality, DependencyRef, SemanticKeyEnvelope,
+    ToolkitVersion,
+};
 
 use super::{prime_powers_up_to, CcmParams, CcmResult};
+
+enum CcmCacheRoute<'a> {
+    Standalone,
+    Fabric(&'a ArtifactCacheContext<'a>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableTauMatrix {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    entries: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableArchimedeanIntegrals {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    alpha: Vec<String>,
+    beta: Vec<String>,
+    gamma: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortablePrimeComponent {
+    schema_version: u32,
+    lambda_squared: String,
+    prime_cutoff: u64,
+    n_modes: usize,
+    precision_bits: u32,
+    prime_content: Vec<PrimePowerContent>,
+    entries: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableEvenSectorMatrix {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    dimension: usize,
+    entries: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableLuFactorization {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    subspace: String,
+    dimension: usize,
+    lu: Vec<String>,
+    permutation: Vec<usize>,
+}
+
+struct ComputedArchimedeanIntegrals {
+    alpha: Vec<Float>,
+    beta: Vec<Float>,
+    gamma: Vec<Float>,
+}
+
+struct ComputedCcmMatrixComponents {
+    pole: Vec<Float>,
+    archimedean: Vec<Float>,
+    prime: Vec<Float>,
+}
+
+fn assemble_tau_components(components: &ComputedCcmMatrixComponents, prec: u32) -> Vec<Float> {
+    components
+        .pole
+        .iter()
+        .zip(&components.archimedean)
+        .zip(&components.prime)
+        .map(|((pole, archimedean), prime)| {
+            let mut value = Float::with_val(prec, pole);
+            value -= archimedean;
+            value -= prime;
+            value
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableWeilEigenpair {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    force_even: bool,
+    eigenvalue: String,
+    eigenvector: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableSecularSource {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    force_even: bool,
+    eigenpair_content_digest: String,
+    normalization: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "value")]
+enum PortableRootOutcome {
+    Converged(String),
+    Approximate(String),
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableRootRange {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    force_even: bool,
+    first_root_index: usize,
+    seeds: Vec<String>,
+    outcomes: Vec<PortableRootOutcome>,
+    solver: String,
+    solver_steps: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableEvennessEvidence {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    evenness_deviation: String,
+    natural_eigenvalue: String,
+    forced_eigenvalue: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableRunEvidence {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    force_even: bool,
+    root_count: usize,
+    weil_min_eigenvalue: String,
+    converged_roots: usize,
+    approximate_roots: usize,
+    failed_roots: usize,
+}
+
+fn lambda_squared_cache_identity(params: &CcmParams) -> String {
+    if params.lambda_sq.is_integer {
+        params.lambda_sq.value_u64.to_string()
+    } else {
+        format!("{:.17e}", params.lambda_sq.value_f64)
+    }
+}
+
+/// Exact lambda-squared input for arbitrary-precision CCM assembly.
+///
+/// The decimal literal is retained verbatim for provenance. `prime_cutoff`
+/// must be its exact integer floor, so the analytic length and the discrete
+/// prime content cannot silently be derived from different rounded values.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ExactLambdaSquaredHp {
+    pub decimal: xc_core::DecimalLiteral,
+    pub prime_cutoff: u64,
+    pub mode: LambdaSquaredMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LambdaSquaredMode {
+    Integer,
+    Fractional,
+}
+
+impl ExactLambdaSquaredHp {
+    pub fn new(decimal: xc_core::DecimalLiteral, prime_cutoff: u64) -> Result<Self> {
+        let floor = xc_core::DecimalLiteral::new(prime_cutoff.to_string())?;
+        let ordering = decimal.cmp_numeric(&floor)?;
+        if ordering.is_lt() {
+            bail!("lambda-squared is below its declared prime-content floor");
+        }
+        let mode = if ordering.is_eq() {
+            LambdaSquaredMode::Integer
+        } else {
+            let next = prime_cutoff.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!("fractional lambda-squared exceeds the supported u64 prime floor")
+            })?;
+            let ceiling = xc_core::DecimalLiteral::new(next.to_string())?;
+            if !decimal.cmp_numeric(&ceiling)?.is_lt() {
+                bail!("lambda-squared is not below the next integer after its prime-content floor");
+            }
+            LambdaSquaredMode::Fractional
+        };
+        Ok(Self {
+            decimal,
+            prime_cutoff,
+            mode,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PrimePowerContent {
+    pub power: u64,
+    pub prime: u64,
+    pub exponent: u32,
+}
+
+/// Provenance retained with an exact arbitrary-precision CCM assembly.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CcmHpAssemblyEvidence {
+    pub lambda_squared: ExactLambdaSquaredHp,
+    pub n_modes: usize,
+    pub precision_bits: u32,
+    pub prime_content: Vec<PrimePowerContent>,
+}
+
+pub struct ExactCcmWeilFormHp {
+    pub matrix: Vec<Float>,
+    pub evidence: CcmHpAssemblyEvidence,
+}
+
+/// Construct the localized Weil form without passing lambda-squared through
+/// binary64. Integer and fractional inputs use the same exact decimal route;
+/// MPFR performs the sole rounding at the requested working precision.
+pub fn localized_weil_form_exact_hp(
+    lambda_squared: ExactLambdaSquaredHp,
+    n_modes: usize,
+    cfg: &HighPrecConfig,
+    include_primes: bool,
+) -> Result<ExactCcmWeilFormHp> {
+    xc_numerics::hp_runtime::run_hp(|| {
+        let parsed = Float::parse(lambda_squared.decimal.as_str()).map_err(|error| {
+            anyhow::anyhow!("failed to parse exact lambda-squared literal for MPFR: {error}")
+        })?;
+        let value = Float::with_val(cfg.precision_bits, parsed);
+        if value <= 0 {
+            bail!("lambda-squared must be positive");
+        }
+        let l = value.ln();
+        let mut matrix = build_tau_hp_compute_exact(
+            n_modes,
+            lambda_squared.prime_cutoff,
+            &l,
+            cfg,
+            include_primes,
+        )?;
+        force_symmetric(&mut matrix, 2 * n_modes + 1);
+        let prime_content = if include_primes {
+            prime_powers_up_to(lambda_squared.prime_cutoff)
+                .into_iter()
+                .map(|(power, prime, exponent)| PrimePowerContent {
+                    power,
+                    prime,
+                    exponent,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(ExactCcmWeilFormHp {
+            evidence: CcmHpAssemblyEvidence {
+                lambda_squared,
+                n_modes,
+                precision_bits: cfg.precision_bits,
+                prime_content,
+            },
+            matrix,
+        })
+    })
+}
+
+/// CCM adapter from finite Weil low-mode requests to the common capability
+/// planner. Solver internals remain free of CCM parameters and semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CcmLowModeSolverRequest {
+    pub matrix_dimension: usize,
+    pub requested_modes: usize,
+    pub assurance: xc_core::AssuranceLevel,
+    pub precision: xc_core::PrecisionPolicy,
+    pub matrix_materialized: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CcmLowModeSolverPlanner;
+
+impl xc_solver::DomainSolverPlanner for CcmLowModeSolverPlanner {
+    type Request = CcmLowModeSolverRequest;
+
+    fn domain_id(&self) -> &'static str {
+        "ccm_weil_low_modes"
+    }
+
+    fn solver_input(
+        &self,
+        request: &Self::Request,
+    ) -> Result<xc_solver::SolverPlannerInput, xc_solver::SolverError> {
+        Ok(xc_solver::SolverPlannerInput {
+            structure: if request.matrix_materialized {
+                xc_operator::MatrixStructure::Dense
+            } else {
+                xc_operator::MatrixStructure::MatrixFree
+            },
+            dimension: request.matrix_dimension,
+            target: xc_core::EigenTarget::SmallestMagnitude,
+            requested_eigenpairs: request.requested_modes,
+            assurance: request.assurance,
+            precision: request.precision,
+            matrix_materialized: request.matrix_materialized,
+            generalized: false,
+        })
+    }
+
+    fn planning_rationale(&self, request: &Self::Request) -> Vec<String> {
+        vec![format!(
+            "CCM requests {} low-magnitude Weil modes together so guard-space ambiguity is visible",
+            request.requested_modes
+        )]
+    }
+}
 
 /// Configuration for the high-precision tier.
 ///
@@ -36,8 +382,11 @@ pub struct HighPrecConfig {
     /// (`|dz| < tol`) or stagnation detection (construction ceiling reached).
     /// This cap is a safety net only — it prevents infinite loops on
     /// pathological/wandering seeds and is never reached on real configs.
-    /// Default 200. Override via env: `XCELERATOR_SOLVER_STEPS=<n>`.
+    /// The deterministic default is at least 200; callers may override it
+    /// explicitly on this configuration value.
     pub solver_steps: usize,
+    /// Root-finding method used to refine Riemann-zero seeds.
+    pub root_solver: RootSolver,
     /// Number of Gauss–Legendre quadrature points used in the integral
     /// computation of α_L, β_L, γ_L. Clamped to `[MIN_QUAD_POINTS,
     /// MAX_QUAD_POINTS]` regardless of input.
@@ -46,8 +395,9 @@ pub struct HighPrecConfig {
     /// runs over the first `n_eigenvalues` reference Riemann zeros.
     pub n_eigenvalues: usize,
     /// Cache strategy for the GL-node and τ-matrix disk caches. See
-    /// [`xc_numerics::quadrature::CacheMode`]. Default `DynamicFetch`
-    /// (local `.json` → local zip → remote fetch → compute).
+    /// [`xc_numerics::quadrature::CacheMode`]. The default standalone mode
+    /// uses local compressed caches; managed remote resolution uses `run_via_cache`.
+    /// (local compressed cache → compute).
     pub cache_mode: xc_numerics::quadrature::CacheMode,
     /// Whether to project onto the even subspace at each inverse-iteration
     /// step. Default `true` (forced-even, the standard CCM path). Set to
@@ -60,14 +410,33 @@ pub struct HighPrecConfig {
     /// is used as the starting vector for inverse iteration instead of the
     /// Gaussian initial guess. Dramatically reduces iteration count for
     /// P-sweep campaigns. Default `true`.
-    /// Override via env: `XCELERATOR_WARM_START=0` disables.
     pub warm_start: bool,
     /// Precision tolerance in bits for warm-start cache lookup.
     /// A cached ξ at prec' is accepted as a warm start if
     /// |prec' - target_prec| ≤ warm_start_tolerance_bits.
     /// Default 500 bits (~150 decimal digits) — spans a full HP-level step.
-    /// Override via env: `XCELERATOR_WARM_START_TOL=<bits>` (e.g. `=200`).
     pub warm_start_tolerance_bits: u32,
+}
+
+/// Root-finding method for the CCM high-precision Riemann-zero refinement.
+///
+/// Keeping this choice in [`HighPrecConfig`] makes it reviewable, testable,
+/// and eligible for inclusion in resolved configuration provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootSolver {
+    /// Cubic convergence using three passes over the poles per step.
+    Halley,
+    /// Quadratic convergence using two passes over the poles per step.
+    Newton,
+}
+
+impl RootSolver {
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Halley => "Halley",
+            Self::Newton => "Newton",
+        }
+    }
 }
 
 /// Conversion factor: decimal digits to binary bits.
@@ -107,20 +476,14 @@ impl HighPrecConfig {
         // ceiling). The cap only fires for pathological/wandering seeds and
         // prevents an infinite loop. Default 200 steps is never reached on
         // any real (λ², N, P) config; it is purely a safety net.
-        // Override via env: XCELERATOR_SOLVER_STEPS=<n> for testing.
-        let solver_steps = {
-            let p = digits as f64;
-            let k = (p / 10.0).log2().ceil() as usize;
-            let default_cap = k.max(200);
-            std::env::var("XCELERATOR_SOLVER_STEPS")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(default_cap)
-        };
+        let p = digits as f64;
+        let k = (p / 10.0).log2().ceil() as usize;
+        let solver_steps = k.max(200);
         Self {
             precision_bits: bits,
             inverse_iter_steps: 200,
             solver_steps,
+            root_solver: RootSolver::Halley,
             quad_points: ((digits as usize) * QUAD_POINTS_PER_DIGIT)
                 .clamp(MIN_QUAD_POINTS, MAX_QUAD_POINTS),
             n_eigenvalues: 50,
@@ -130,14 +493,9 @@ impl HighPrecConfig {
             // precision as the starting vector for inverse iteration
             // instead of the Gaussian guess. Falls back to the Gaussian
             // when no nearby cache entry exists (cold cache).
-            // Override via XCELERATOR_WARM_START=0 to disable.
-            warm_start: std::env::var("XCELERATOR_WARM_START").as_deref() != Ok("0"),
-            // Tolerance in bits for warm-start lookup, default 500
-            // Override via XCELERATOR_WARM_START_TOL=<bits>
-            warm_start_tolerance_bits: std::env::var("XCELERATOR_WARM_START_TOL")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-                .unwrap_or(500),
+            warm_start: true,
+            // Tolerance in bits for warm-start lookup, default 500.
+            warm_start_tolerance_bits: 500,
         }
     }
 }
@@ -209,30 +567,367 @@ pub struct HighPrecResult {
     pub precision_bits: u32,
 }
 
+/// Lossless persisted form of one CCM eigenvalue outcome.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "value")]
+pub enum PortableEigenvalueResult {
+    Converged(xc_numerics::fmt::PortableHpFloat),
+    Approximate(xc_numerics::fmt::PortableHpFloat),
+    Failed,
+}
+
+/// Portable CCM result payload for use inside [`xc_core::ResearchResult`].
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableHighPrecResult {
+    pub eigenvalues_pos: Vec<PortableEigenvalueResult>,
+    pub weil_min_eigenvalue: xc_numerics::fmt::PortableHpFloat,
+    pub xi: Vec<xc_numerics::fmt::PortableHpFloat>,
+    pub elapsed_seconds: f64,
+    pub precision_bits: u32,
+}
+
+impl PortableHighPrecResult {
+    pub fn from_runtime(result: &HighPrecResult) -> Result<Self> {
+        let eigenvalues_pos = result
+            .eigenvalues_pos
+            .iter()
+            .map(|value| match value {
+                EigenvalueResult::Converged(value) => {
+                    xc_numerics::fmt::PortableHpFloat::from_float(value)
+                        .map(PortableEigenvalueResult::Converged)
+                }
+                EigenvalueResult::Approximate(value) => {
+                    xc_numerics::fmt::PortableHpFloat::from_float(value)
+                        .map(PortableEigenvalueResult::Approximate)
+                }
+                EigenvalueResult::Failed => Ok(PortableEigenvalueResult::Failed),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(Self {
+            eigenvalues_pos,
+            weil_min_eigenvalue: xc_numerics::fmt::PortableHpFloat::from_float(
+                &result.weil_min_eigenvalue,
+            )?,
+            xi: result
+                .xi
+                .iter()
+                .map(xc_numerics::fmt::PortableHpFloat::from_float)
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            elapsed_seconds: result.elapsed_seconds,
+            precision_bits: result.precision_bits,
+        })
+    }
+
+    pub fn to_runtime(&self) -> Result<HighPrecResult> {
+        let eigenvalues_pos = self
+            .eigenvalues_pos
+            .iter()
+            .map(|value| match value {
+                PortableEigenvalueResult::Converged(value) => {
+                    value.to_float().map(EigenvalueResult::Converged)
+                }
+                PortableEigenvalueResult::Approximate(value) => {
+                    value.to_float().map(EigenvalueResult::Approximate)
+                }
+                PortableEigenvalueResult::Failed => Ok(EigenvalueResult::Failed),
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(HighPrecResult {
+            eigenvalues_pos,
+            weil_min_eigenvalue: self.weil_min_eigenvalue.to_float()?,
+            xi: self
+                .xi
+                .iter()
+                .map(xc_numerics::fmt::PortableHpFloat::to_float)
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            elapsed_seconds: self.elapsed_seconds,
+            precision_bits: self.precision_bits,
+        })
+    }
+}
+
 impl HighPrecResult {
+    // HP_F64_REPORT_BOUNDARY_BEGIN: explicit lossy CLI/plot projection only.
     /// Lossy conversion to the f64-tier `CcmResult`. Eigenvalues, ξ
     /// entries, and ε_N collapse to f64; the f64 underflow boundary at
     /// ~10⁻³⁰⁸ silently maps to zero. Use only for f64-tier consumers
     /// (CLI summaries, plot generation); never for downstream HP work.
     pub fn to_f64_result(&self) -> CcmResult {
         CcmResult {
-            eigenvalues_pos: self.eigenvalues_pos.iter().map(|r| match r {
-                EigenvalueResult::Converged(f) => f.to_f64(),
-                EigenvalueResult::Approximate(f) => f.to_f64(),
-                EigenvalueResult::Failed => f64::NAN, // degenerate — NaN signals garbage
-            }).collect(),
+            eigenvalues_pos: self
+                .eigenvalues_pos
+                .iter()
+                .map(|r| match r {
+                    EigenvalueResult::Converged(f) => f.to_f64(),
+                    EigenvalueResult::Approximate(f) => f.to_f64(),
+                    EigenvalueResult::Failed => f64::NAN, // degenerate — NaN signals garbage
+                })
+                .collect(),
             weil_min_eigenvalue: self.weil_min_eigenvalue.to_f64(),
             xi: self.xi.iter().map(|f| f.to_f64()).collect(),
             elapsed_seconds: self.elapsed_seconds,
         }
     }
+    // HP_F64_REPORT_BOUNDARY_END
+}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CcmParity {
+    Even,
+    Odd,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CcmStateCriterion {
+    AlgebraicGround,
+    SmallestPositive,
+    NearestZero,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CcmStateTarget {
+    AlgebraicGround,
+    SmallestPositive,
+    NearestZero,
+    ParityRestricted {
+        parity: CcmParity,
+        criterion: CcmStateCriterion,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct CcmStateCandidateHp {
+    pub algebraic_index: usize,
+    pub eigenvalue: Float,
+    pub eigenvector: Vec<Float>,
+    pub parity: CcmParity,
+}
+
+#[derive(Clone, Debug)]
+pub struct SelectedCcmStateHp {
+    pub requested_target: CcmStateTarget,
+    pub algebraic_index: usize,
+    pub eigenvalue: Float,
+    pub eigenvector: Vec<Float>,
+    pub parity: CcmParity,
+}
+
+pub fn select_ccm_state_hp(
+    target: CcmStateTarget,
+    candidates: &[CcmStateCandidateHp],
+) -> Result<SelectedCcmStateHp> {
+    if candidates.is_empty()
+        || candidates.iter().any(|candidate| {
+            candidate.eigenvector.is_empty()
+                || !candidate.eigenvalue.is_finite()
+                || candidate.eigenvector.iter().any(|value| !value.is_finite())
+        })
+    {
+        anyhow::bail!("CCM state selection requires finite nonempty eigenpairs");
+    }
+    let (parity, criterion) = match target {
+        CcmStateTarget::AlgebraicGround => (None, CcmStateCriterion::AlgebraicGround),
+        CcmStateTarget::SmallestPositive => (None, CcmStateCriterion::SmallestPositive),
+        CcmStateTarget::NearestZero => (None, CcmStateCriterion::NearestZero),
+        CcmStateTarget::ParityRestricted { parity, criterion } => (Some(parity), criterion),
+    };
+    let eligible = candidates
+        .iter()
+        .filter(|candidate| parity.is_none_or(|required| candidate.parity == required))
+        .filter(|candidate| {
+            criterion != CcmStateCriterion::SmallestPositive || candidate.eigenvalue > 0
+        })
+        .collect::<Vec<_>>();
+    if eligible.is_empty() {
+        anyhow::bail!("requested CCM state target has no eligible candidate");
+    }
+    let score = |candidate: &CcmStateCandidateHp| match criterion {
+        CcmStateCriterion::AlgebraicGround | CcmStateCriterion::SmallestPositive => {
+            candidate.eigenvalue.clone()
+        }
+        CcmStateCriterion::NearestZero => candidate.eigenvalue.clone().abs(),
+    };
+    let mut selected = eligible[0];
+    let mut selected_score = score(selected);
+    for candidate in eligible.iter().skip(1) {
+        let candidate_score = score(candidate);
+        if candidate_score < selected_score {
+            selected = candidate;
+            selected_score = candidate_score;
+        } else if candidate_score == selected_score {
+            anyhow::bail!("requested CCM state target is ambiguous at the selected boundary");
+        }
+    }
+    Ok(SelectedCcmStateHp {
+        requested_target: target,
+        algebraic_index: selected.algebraic_index,
+        eigenvalue: selected.eigenvalue.clone(),
+        eigenvector: selected.eigenvector.clone(),
+        parity: selected.parity,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CcmFormComponentKind {
+    Archimedean,
+    Prime,
+    Pole,
+    Other,
+}
+
+#[derive(Clone, Debug)]
+pub struct CcmFormComponentMatrixHp {
+    pub kind: CcmFormComponentKind,
+    /// Signed coefficient in the total-form convention, normally +1 or -1.
+    pub signed_coefficient: i32,
+    pub matrix_row_major: Vec<Float>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CcmFormComponentValueHp {
+    pub kind: CcmFormComponentKind,
+    pub signed_coefficient: i32,
+    pub rayleigh_value: Float,
+    pub signed_contribution: Float,
+}
+
+#[derive(Clone, Debug)]
+pub struct CcmFormDecompositionHp {
+    pub total_value: Float,
+    pub reconstructed_total: Float,
+    pub cancellation_residual: Float,
+    pub components: Vec<CcmFormComponentValueHp>,
+}
+
+pub fn evaluate_ccm_form_components_hp(
+    total_matrix_row_major: &[Float],
+    components: &[CcmFormComponentMatrixHp],
+    vector: &[Float],
+    precision_bits: u32,
+) -> Result<CcmFormDecompositionHp> {
+    let dimension = vector.len();
+    if precision_bits < 64
+        || dimension == 0
+        || total_matrix_row_major.len() != dimension.saturating_mul(dimension)
+        || vector.iter().any(|value| !value.is_finite())
+    {
+        anyhow::bail!("invalid CCM form-decomposition dimensions or precision");
+    }
+    let required = [
+        CcmFormComponentKind::Archimedean,
+        CcmFormComponentKind::Prime,
+        CcmFormComponentKind::Pole,
+        CcmFormComponentKind::Other,
+    ];
+    for kind in required {
+        if components
+            .iter()
+            .filter(|component| component.kind == kind)
+            .count()
+            != 1
+        {
+            anyhow::bail!("CCM form decomposition requires each named component exactly once");
+        }
+    }
+    if components.iter().any(|component| {
+        component.signed_coefficient == 0
+            || component.matrix_row_major.len() != dimension.saturating_mul(dimension)
+            || component
+                .matrix_row_major
+                .iter()
+                .any(|value| !value.is_finite())
+    }) {
+        anyhow::bail!("CCM form components require finite square matrices and nonzero signs");
+    }
+
+    let rayleigh = |matrix: &[Float]| -> Result<Float> {
+        let mut applied = vec![Float::with_val(precision_bits, 0); dimension];
+        for row in 0..dimension {
+            let terms = (0..dimension)
+                .map(|column| {
+                    let mut term =
+                        Float::with_val(precision_bits, &matrix[row * dimension + column]);
+                    term *= &vector[column];
+                    term
+                })
+                .collect::<Vec<_>>();
+            applied[row] =
+                xc_numerics::reduction::deterministic_pairwise_sum_hp(&terms, precision_bits);
+        }
+        let numerator_terms = vector
+            .iter()
+            .zip(&applied)
+            .map(|(left, right)| {
+                let mut term = Float::with_val(precision_bits, left);
+                term *= right;
+                term
+            })
+            .collect::<Vec<_>>();
+        let denominator_terms = vector
+            .iter()
+            .map(|value| {
+                let mut term = Float::with_val(precision_bits, value);
+                term *= value;
+                term
+            })
+            .collect::<Vec<_>>();
+        let numerator =
+            xc_numerics::reduction::deterministic_pairwise_sum_hp(&numerator_terms, precision_bits);
+        let denominator = xc_numerics::reduction::deterministic_pairwise_sum_hp(
+            &denominator_terms,
+            precision_bits,
+        );
+        if denominator <= 0 {
+            anyhow::bail!("CCM form-decomposition vector has nonpositive norm");
+        }
+        Ok(Float::with_val(precision_bits, numerator / denominator))
+    };
+
+    let total_value = rayleigh(total_matrix_row_major)?;
+    let mut values = Vec::with_capacity(components.len());
+    for component in components {
+        let rayleigh_value = rayleigh(&component.matrix_row_major)?;
+        let mut signed_contribution = Float::with_val(precision_bits, &rayleigh_value);
+        signed_contribution *= component.signed_coefficient;
+        values.push(CcmFormComponentValueHp {
+            kind: component.kind,
+            signed_coefficient: component.signed_coefficient,
+            rayleigh_value,
+            signed_contribution,
+        });
+    }
+    let reconstructed_total = xc_numerics::reduction::deterministic_pairwise_sum_hp(
+        &values
+            .iter()
+            .map(|value| value.signed_contribution.clone())
+            .collect::<Vec<_>>(),
+        precision_bits,
+    );
+    let mut cancellation_residual = Float::with_val(precision_bits, &total_value);
+    cancellation_residual -= &reconstructed_total;
+    cancellation_residual.abs_mut();
+    Ok(CcmFormDecompositionHp {
+        total_value,
+        reconstructed_total,
+        cancellation_residual,
+        components: values,
+    })
 }
 
 // -- Helpers
-#[inline] fn fl_i(prec: u32, v: i64) -> Float { Float::with_val(prec, v) }
-#[inline] fn pi(prec: u32) -> Float { Float::with_val(prec, rug::float::Constant::Pi) }
-#[inline] fn euler(prec: u32) -> Float { Float::with_val(prec, rug::float::Constant::Euler) }
+#[inline]
+fn fl_i(prec: u32, v: i64) -> Float {
+    Float::with_val(prec, v)
+}
+#[inline]
+fn pi(prec: u32) -> Float {
+    Float::with_val(prec, rug::float::Constant::Pi)
+}
+#[inline]
+fn euler(prec: u32) -> Float {
+    Float::with_val(prec, rug::float::Constant::Euler)
+}
 
 /// Force exact symmetry on a `dim × dim` row-major HP matrix in-place.
 ///
@@ -246,34 +941,1462 @@ fn force_symmetric(matrix: &mut [Float], dim: usize) {
     let pairs: Vec<(usize, usize)> = (0..dim)
         .flat_map(|i| ((i + 1)..dim).map(move |j| (i, j)))
         .collect();
-    let symmetrized: Vec<(usize, usize, Float)> = pairs.par_iter().map(|&(i, j)| {
-        let mut sum = matrix[i * dim + j].clone();
-        sum += &matrix[j * dim + i];
-        sum /= 2u32;
-        (i, j, sum)
-    }).collect();
+    let symmetrized: Vec<(usize, usize, Float)> = pairs
+        .par_iter()
+        .map(|&(i, j)| {
+            let mut sum = matrix[i * dim + j].clone();
+            sum += &matrix[j * dim + i];
+            sum /= 2u32;
+            (i, j, sum)
+        })
+        .collect();
     for (i, j, sum) in symmetrized {
         matrix[i * dim + j] = sum.clone();
         matrix[j * dim + i] = sum;
     }
 }
 
-/// Quadratic form `vᵀ M v` for a dense row-major matrix `m` (`dim`×`dim`)
-/// and vector `v`, in full HP. Used for Rayleigh quotients on recovered
-/// eigenvectors.
-fn quad_form(m: &[Float], v: &[Float], dim: usize, prec: u32) -> Float {
-    let mut total = Float::with_val(prec, 0);
-    for i in 0..dim {
-        let mut row = Float::with_val(prec, 0);
-        for j in 0..dim {
-            let mut t = m[i * dim + j].clone();
-            t *= &v[j];
-            row += &t;
-        }
-        row *= &v[i];
-        total += &row;
+fn decode_tau_artifact(
+    artifact: &PortableTauMatrix,
+    params: &CcmParams,
+    prec: u32,
+) -> std::result::Result<Vec<Float>, CacheError> {
+    let identity = lambda_squared_cache_identity(params);
+    let expected = params.matrix_size() * params.matrix_size();
+    if artifact.schema_version != 2
+        || artifact.lambda_squared != identity
+        || artifact.n_modes != params.n_modes
+        || artifact.precision_bits != prec
+        || artifact.entries.len() != expected
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM tau payload does not match its semantic identity".to_owned(),
+        ));
     }
-    total
+    let mut tau = Vec::with_capacity(expected);
+    for entry in &artifact.entries {
+        let parsed = Float::parse(entry).map_err(|error| {
+            CacheError::InvalidManifest(format!(
+                "CCM tau payload contains an invalid HP scalar: {error}"
+            ))
+        })?;
+        tau.push(Float::with_val(prec, parsed));
+    }
+    if let Some(reason) = tau_cache::structural_check(&tau, params.n_modes, prec) {
+        return Err(CacheError::InvalidManifest(format!(
+            "CCM tau payload failed structural validation: {reason}"
+        )));
+    }
+    Ok(tau)
+}
+
+#[cfg(feature = "arb")]
+fn certify_tau_from_retained_computation(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    tau: &[Float],
+    manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<ArtifactProductionAssessment> {
+    let certification = super::cutoff_free::CutoffFreeConfig::new(
+        params.lambda_sq_int(),
+        params.n_modes,
+        cfg.precision_bits,
+    );
+    let (interval_matrix, certificate) = super::cutoff_free::certify_portable(&certification)?;
+    if interval_matrix.tau.len() != tau.len() {
+        bail!("cutoff-free certification matrix dimension differs from retained tau matrix");
+    }
+    let mut error_enclosures = Vec::with_capacity(tau.len());
+    for (index, (point, enclosure)) in tau.iter().zip(&interval_matrix.tau).enumerate() {
+        let exact_point = point.to_rational().ok_or_else(|| {
+            anyhow::anyhow!("retained tau entry {index} cannot be represented exactly")
+        })?;
+        let error_lower = enclosure.lower().clone() - &exact_point;
+        let error_upper = enclosure.upper().clone() - &exact_point;
+        error_enclosures.push(serde_json::json!({
+            "index": index,
+            "point": {
+                "numerator": exact_point.numer().to_string(),
+                "denominator": exact_point.denom().to_string()
+            },
+            "true_minus_point": {
+                "lower": {
+                    "numerator": error_lower.numer().to_string(),
+                    "denominator": error_lower.denom().to_string()
+                },
+                "upper": {
+                    "numerator": error_upper.numer().to_string(),
+                    "denominator": error_upper.denom().to_string()
+                }
+            }
+        }));
+    }
+    let replay = xc_certify::exact::verify_portable_interval_inertia_certificate(&certificate);
+    if !replay.valid {
+        bail!(
+            "portable tau interval certificate failed independent replay: {}",
+            replay.errors.join("; ")
+        );
+    }
+    let sink = cache.production_sink.ok_or_else(|| {
+        anyhow::anyhow!("certified assurance requires the toolkit evidence store")
+    })?;
+    let certificate_bytes = serde_json::to_vec_pretty(&certificate)?;
+    let certificate_digest = sink
+        .record_evidence("portable-interval-certificate", &certificate_bytes)
+        .map_err(anyhow::Error::from)?;
+    let containment_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "artifact_key": manifest.key,
+        "artifact_content_digest": manifest.content_digest,
+        "certificate_id": certificate.certificate_id,
+        "interval_matrix_digest": certificate.matrix_digest,
+        "verified_entry_count": tau.len(),
+        "claim": "each exact retained MPFR value has the listed rigorous true-minus-point error enclosure",
+        "error_enclosures": error_enclosures
+    }))?;
+    let containment_digest = sink
+        .record_evidence("interval-containment-report", &containment_bytes)
+        .map_err(anyhow::Error::from)?;
+    let mut evidence_digests = vec![certificate_digest, containment_digest];
+    evidence_digests.sort();
+    let achieved_assurance = match cache.requested_assurance {
+        xc_core::AssuranceLevel::Computed => xc_cache::ArtifactAssuranceState::Computed,
+        xc_core::AssuranceLevel::CrossChecked => xc_cache::ArtifactAssuranceState::CrossChecked,
+        xc_core::AssuranceLevel::Certified => xc_cache::ArtifactAssuranceState::Certified,
+    };
+    Ok(ArtifactProductionAssessment {
+        achieved_assurance,
+        evidence_digests,
+    })
+}
+
+#[cfg(not(feature = "arb"))]
+fn certify_tau_from_retained_computation(
+    _params: &CcmParams,
+    _cfg: &HighPrecConfig,
+    _tau: &[Float],
+    _manifest: &ArtifactManifest,
+    _cache: &ArtifactCacheContext<'_>,
+) -> Result<ArtifactProductionAssessment> {
+    bail!("cross-checked or certified CCM assurance requires the xc-spectral arb feature")
+}
+
+fn parse_hp_vector(
+    values: &[String],
+    precision_bits: u32,
+) -> std::result::Result<Vec<Float>, CacheError> {
+    values
+        .iter()
+        .map(|value| {
+            Float::parse(value)
+                .map(|parsed| Float::with_val(precision_bits, parsed))
+                .map_err(|error| {
+                    CacheError::InvalidManifest(format!(
+                        "CCM component contains an invalid HP scalar: {error}"
+                    ))
+                })
+                .and_then(|parsed| {
+                    if parsed.is_finite() {
+                        Ok(parsed)
+                    } else {
+                        Err(CacheError::InvalidManifest(
+                            "CCM component contains a non-finite HP scalar".to_owned(),
+                        ))
+                    }
+                })
+        })
+        .collect()
+}
+
+fn canonical_dependency_refs(manifests: Vec<ArtifactManifest>) -> Vec<DependencyRef> {
+    let mut dependencies: Vec<DependencyRef> = manifests
+        .into_iter()
+        .map(|manifest| DependencyRef {
+            key: manifest.key,
+            content_digest: manifest.content_digest,
+            required_quality: CacheQuality::Validated,
+        })
+        .collect();
+    dependencies.sort_by(|left, right| {
+        (
+            left.key.kind.as_str(),
+            left.key.logical_key.as_str(),
+            left.key.parameters_digest.0.as_str(),
+            left.content_digest.0.as_str(),
+        )
+            .cmp(&(
+                right.key.kind.as_str(),
+                right.key.logical_key.as_str(),
+                right.key.parameters_digest.0.as_str(),
+                right.content_digest.0.as_str(),
+            ))
+    });
+    dependencies
+}
+
+fn decode_archimedean_integrals(
+    artifact: &PortableArchimedeanIntegrals,
+    params: &CcmParams,
+    precision_bits: u32,
+) -> std::result::Result<ComputedArchimedeanIntegrals, CacheError> {
+    let expected = params.n_modes + 1;
+    if artifact.schema_version != 1
+        || artifact.lambda_squared != lambda_squared_cache_identity(params)
+        || artifact.n_modes != params.n_modes
+        || artifact.precision_bits != precision_bits
+        || artifact.alpha.len() != expected
+        || artifact.beta.len() != expected
+        || artifact.gamma.len() != expected
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM archimedean-integral payload does not match its semantic identity".to_owned(),
+        ));
+    }
+    Ok(ComputedArchimedeanIntegrals {
+        alpha: parse_hp_vector(&artifact.alpha, precision_bits)?,
+        beta: parse_hp_vector(&artifact.beta, precision_bits)?,
+        gamma: parse_hp_vector(&artifact.gamma, precision_bits)?,
+    })
+}
+
+fn decode_prime_component(
+    artifact: &PortablePrimeComponent,
+    params: &CcmParams,
+    precision_bits: u32,
+) -> std::result::Result<Vec<Float>, CacheError> {
+    let expected_content: Vec<PrimePowerContent> = prime_powers_up_to(params.lambda_sq_int())
+        .into_iter()
+        .map(|(power, prime, exponent)| PrimePowerContent {
+            power,
+            prime,
+            exponent,
+        })
+        .collect();
+    let expected_entries = params.matrix_size() * params.matrix_size();
+    if artifact.schema_version != 1
+        || artifact.lambda_squared != lambda_squared_cache_identity(params)
+        || artifact.prime_cutoff != params.lambda_sq_int()
+        || artifact.n_modes != params.n_modes
+        || artifact.precision_bits != precision_bits
+        || artifact.prime_content != expected_content
+        || artifact.entries.len() != expected_entries
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM prime-component payload does not match its semantic identity".to_owned(),
+        ));
+    }
+    let matrix = parse_hp_vector(&artifact.entries, precision_bits)?;
+    let dim = params.matrix_size();
+    for row in 0..dim {
+        for column in (row + 1)..dim {
+            if matrix[row * dim + column] != matrix[column * dim + row] {
+                return Err(CacheError::InvalidManifest(
+                    "CCM prime-component payload is not exactly symmetric".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(matrix)
+}
+
+fn resolve_archimedean_integrals_via_cache(
+    params: &CcmParams,
+    l: &Float,
+    cfg: &HighPrecConfig,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(ComputedArchimedeanIntegrals, ArtifactManifest)> {
+    let precision_bits = cfg.precision_bits;
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_archimedean_integrals".to_owned(),
+        mathematical_semantics_version: "ccm-archimedean-integrals-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": precision_bits,
+            "quadrature_points": cfg.quad_points,
+            "scalar_backend": "rug_mpfr"
+        }),
+        normalization: Some("alpha_beta_gamma_nonnegative_modes".to_owned()),
+        target: Some("localized_archimedean_form_primitives".to_owned()),
+        subspace: None,
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: Some("adaptive_gauss_legendre_by_mode".to_owned()),
+    };
+    let logical_key = format!(
+        "ccm/archimedean-integrals/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        precision_bits
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.archimedean_integrals.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "archimedean_integrals".to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            let (integrals, manifests) =
+                compute_archimedean_integrals_tracked(params.n_modes, l, cfg, Some(cache))
+                    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            let dependencies = manifests
+                .into_iter()
+                .map(|manifest| DependencyRef {
+                    key: manifest.key,
+                    content_digest: manifest.content_digest,
+                    required_quality: CacheQuality::Validated,
+                })
+                .collect();
+            Ok((
+                PortableArchimedeanIntegrals {
+                    schema_version: 1,
+                    lambda_squared: lambda_squared_cache_identity(params),
+                    n_modes: params.n_modes,
+                    precision_bits,
+                    alpha: integrals.alpha.iter().map(Float::to_string).collect(),
+                    beta: integrals.beta.iter().map(Float::to_string).collect(),
+                    gamma: integrals.gamma.iter().map(Float::to_string).collect(),
+                },
+                dependencies,
+            ))
+        },
+        |artifact| decode_archimedean_integrals(artifact, params, precision_bits).map(|_| ()),
+    )?;
+    let manifest = resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("archimedean-integral execution returned no manifest"))?;
+    Ok((
+        decode_archimedean_integrals(&resolved.value, params, precision_bits)?,
+        manifest,
+    ))
+}
+
+fn resolve_prime_component_via_cache(
+    params: &CcmParams,
+    l: &Float,
+    cfg: &HighPrecConfig,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(Vec<Float>, ArtifactManifest)> {
+    let precision_bits = cfg.precision_bits;
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_prime_component".to_owned(),
+        mathematical_semantics_version: "ccm-prime-component-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "prime_cutoff": params.lambda_sq_int(),
+            "n_modes": params.n_modes,
+            "precision_bits": precision_bits,
+            "scalar_backend": "rug_mpfr"
+        }),
+        normalization: Some("symmetric_row_major_unsigned_prime_sum".to_owned()),
+        target: Some("localized_prime_power_component".to_owned()),
+        subspace: None,
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: None,
+    };
+    let logical_key = format!(
+        "ccm/prime-component/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        precision_bits
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.prime_component.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "prime_component".to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            let mut entries = compute_prime_component_matrix(
+                params.n_modes,
+                params.lambda_sq_int(),
+                l,
+                precision_bits,
+            );
+            force_symmetric(&mut entries, params.matrix_size());
+            Ok((
+                PortablePrimeComponent {
+                    schema_version: 1,
+                    lambda_squared: lambda_squared_cache_identity(params),
+                    prime_cutoff: params.lambda_sq_int(),
+                    n_modes: params.n_modes,
+                    precision_bits,
+                    prime_content: prime_powers_up_to(params.lambda_sq_int())
+                        .into_iter()
+                        .map(|(power, prime, exponent)| PrimePowerContent {
+                            power,
+                            prime,
+                            exponent,
+                        })
+                        .collect(),
+                    entries: entries.iter().map(Float::to_string).collect(),
+                },
+                Vec::new(),
+            ))
+        },
+        |artifact| decode_prime_component(artifact, params, precision_bits).map(|_| ()),
+    )?;
+    let manifest = resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("prime-component execution returned no manifest"))?;
+    Ok((
+        decode_prime_component(&resolved.value, params, precision_bits)?,
+        manifest,
+    ))
+}
+
+fn build_tau_hp_via_cache(
+    params: &CcmParams,
+    l: &Float,
+    cfg: &HighPrecConfig,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(Vec<Float>, ArtifactManifest)> {
+    let prec = cfg.precision_bits;
+    let lambda_identity = lambda_squared_cache_identity(params);
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_tau_matrix".to_owned(),
+        mathematical_semantics_version: "ccm-weil-form-v0.13.0-v2".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_identity,
+            "prime_cutoff": params.lambda_sq.value_u64,
+            "n_modes": params.n_modes,
+            "precision_bits": prec,
+            "scalar_backend": "rug_mpfr",
+            "include_primes": true
+        }),
+        normalization: Some("symmetric_row_major".to_owned()),
+        target: Some("localized_weil_form".to_owned()),
+        subspace: None,
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: None,
+    };
+    let logical_key = format!(
+        "ccm/tau/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        prec
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.tau.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "tau_matrix".to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            let (integrals, archimedean_manifest) =
+                resolve_archimedean_integrals_via_cache(params, l, cfg, cache)
+                    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            let (prime, prime_manifest) = resolve_prime_component_via_cache(params, l, cfg, cache)
+                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            let (pole, archimedean) =
+                assemble_pole_and_archimedean_components(params.n_modes, l, prec, &integrals);
+            let components = ComputedCcmMatrixComponents {
+                pole,
+                archimedean,
+                prime,
+            };
+            let dependencies =
+                canonical_dependency_refs(vec![archimedean_manifest, prime_manifest]);
+            let tau = assemble_tau_components(&components, prec);
+            Ok((
+                PortableTauMatrix {
+                    schema_version: 2,
+                    lambda_squared: lambda_squared_cache_identity(params),
+                    n_modes: params.n_modes,
+                    precision_bits: prec,
+                    entries: tau.iter().map(Float::to_string).collect(),
+                },
+                dependencies,
+            ))
+        },
+        |artifact| decode_tau_artifact(artifact, params, prec).map(|_| ()),
+    )?;
+    let manifest = resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("typed tau execution returned no artifact manifest"))?;
+    let tau = decode_tau_artifact(&resolved.value, params, prec)?;
+    if cache.requested_assurance != xc_core::AssuranceLevel::Computed {
+        let required_assurance = match cache.requested_assurance {
+            xc_core::AssuranceLevel::Computed => unreachable!(),
+            xc_core::AssuranceLevel::CrossChecked => xc_cache::ArtifactAssuranceState::CrossChecked,
+            xc_core::AssuranceLevel::Certified => xc_cache::ArtifactAssuranceState::Certified,
+        };
+        if let Some(sink) = cache.production_sink {
+            sink.record_assurance_requirement(xc_cache::ArtifactAssuranceRequirement {
+                schema_version: 1,
+                artifact_key: manifest.key.clone(),
+                content_digest: manifest.content_digest.clone(),
+                required_assurance,
+            })
+            .map_err(anyhow::Error::from)?;
+        }
+        let retained_assurance = cache
+            .production_sink
+            .map(|sink| {
+                sink.retained_assurance(&manifest.key, &manifest.content_digest)
+                    .map_err(anyhow::Error::from)
+            })
+            .transpose()?
+            .flatten()
+            .filter(|assessment| assessment.achieved_assurance >= required_assurance);
+        if retained_assurance.is_some() {
+            return Ok((tau, manifest));
+        }
+        match certify_tau_from_retained_computation(params, cfg, &tau, &manifest, cache) {
+            Ok(assessment) => {
+                if let Some(sink) = cache.production_sink {
+                    sink.record_assurance(ArtifactAssuranceAttestation {
+                        schema_version: 1,
+                        artifact_key: manifest.key.clone(),
+                        content_digest: manifest.content_digest.clone(),
+                        achieved_assurance: assessment.achieved_assurance,
+                        evidence_digests: assessment.evidence_digests,
+                    })
+                    .map_err(anyhow::Error::from)?;
+                }
+            }
+            Err(error)
+                if cache.certification_failure_policy
+                    == xc_cache::CertificationFailurePolicy::RetainComputedSkipPublication =>
+            {
+                eprintln!(
+                    "[HP] certification failed; retained computed tau and disabled its publication: {error}"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok((tau, manifest))
+}
+
+fn decode_weil_eigenpair(
+    artifact: &PortableWeilEigenpair,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    tau: &[Float],
+) -> std::result::Result<(Float, Vec<Float>), CacheError> {
+    let prec = cfg.precision_bits;
+    if artifact.schema_version != 1
+        || artifact.lambda_squared != lambda_squared_cache_identity(params)
+        || artifact.n_modes != params.n_modes
+        || artifact.precision_bits != prec
+        || artifact.force_even != cfg.force_even
+        || artifact.eigenvector.len() != params.matrix_size()
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM Weil eigenpair payload does not match its semantic identity".to_owned(),
+        ));
+    }
+    let parse = |value: &str| {
+        Float::parse(value)
+            .map(|parsed| Float::with_val(prec, parsed))
+            .map_err(|error| {
+                CacheError::InvalidManifest(format!(
+                    "CCM Weil eigenpair contains an invalid HP scalar: {error}"
+                ))
+            })
+    };
+    let eps_n = parse(&artifact.eigenvalue)?;
+    let xi: Vec<Float> = artifact
+        .eigenvector
+        .iter()
+        .map(|entry| parse(entry))
+        .collect::<std::result::Result<_, _>>()?;
+    if !weil_eigvec_cache::residual_ok(tau, params.matrix_size(), &xi, &eps_n, prec) {
+        return Err(CacheError::InvalidManifest(
+            "CCM Weil eigenpair failed its tau residual validation".to_owned(),
+        ));
+    }
+    Ok((eps_n, xi))
+}
+
+fn build_even_sector_matrix(tau: &[Float], n_modes: usize, prec: u32) -> Vec<Float> {
+    let full_dim = 2 * n_modes + 1;
+    let even_dim = n_modes + 1;
+    let center = n_modes;
+    let sqrt_two = Float::with_val(prec, 2).sqrt();
+    let mut sector = vec![Float::with_val(prec, 0); even_dim * even_dim];
+    sector[0] = tau[center * full_dim + center].clone();
+    for k in 1..=n_modes {
+        let minus_k = center - k;
+        let plus_k = center + k;
+        let mut row_value = tau[center * full_dim + minus_k].clone();
+        row_value += &tau[center * full_dim + plus_k];
+        row_value /= &sqrt_two;
+        sector[k] = row_value.clone();
+        sector[k * even_dim] = row_value;
+        for j in 1..=n_modes {
+            let minus_j = center - j;
+            let plus_j = center + j;
+            let mut value = tau[minus_k * full_dim + minus_j].clone();
+            value += &tau[minus_k * full_dim + plus_j];
+            value += &tau[plus_k * full_dim + minus_j];
+            value += &tau[plus_k * full_dim + plus_j];
+            value /= 2u32;
+            sector[k * even_dim + j] = value;
+        }
+    }
+    force_symmetric(&mut sector, even_dim);
+    sector
+}
+
+fn expand_even_sector_vector(vector: &[Float], n_modes: usize, prec: u32) -> Vec<Float> {
+    let mut expanded = vec![Float::with_val(prec, 0); 2 * n_modes + 1];
+    expanded[n_modes] = vector[0].clone();
+    let sqrt_two = Float::with_val(prec, 2).sqrt();
+    for k in 1..=n_modes {
+        let mut value = vector[k].clone();
+        value /= &sqrt_two;
+        expanded[n_modes - k] = value.clone();
+        expanded[n_modes + k] = value;
+    }
+    expanded
+}
+
+fn resolve_even_sector_matrix_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    tau: &[Float],
+    tau_manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(Vec<Float>, ArtifactManifest)> {
+    let dimension = params.n_modes + 1;
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_even_sector_matrix".to_owned(),
+        mathematical_semantics_version: "ccm-even-sector-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": cfg.precision_bits,
+            "tau_content_digest": tau_manifest.content_digest.0
+        }),
+        normalization: Some("orthonormal_reflection_even_basis_row_major".to_owned()),
+        target: Some("even_sector_weil_form".to_owned()),
+        subspace: Some("even".to_owned()),
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: None,
+    };
+    let logical_key = format!(
+        "ccm/even-sector/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        cfg.precision_bits
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.even_sector.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "even_sector_matrix".to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            let sector = build_even_sector_matrix(tau, params.n_modes, cfg.precision_bits);
+            Ok((
+                PortableEvenSectorMatrix {
+                    schema_version: 1,
+                    lambda_squared: lambda_squared_cache_identity(params),
+                    n_modes: params.n_modes,
+                    precision_bits: cfg.precision_bits,
+                    dimension,
+                    entries: sector.iter().map(Float::to_string).collect(),
+                },
+                vec![DependencyRef {
+                    key: tau_manifest.key.clone(),
+                    content_digest: tau_manifest.content_digest.clone(),
+                    required_quality: CacheQuality::Validated,
+                }],
+            ))
+        },
+        |artifact| {
+            if artifact.schema_version != 1
+                || artifact.lambda_squared != lambda_squared_cache_identity(params)
+                || artifact.n_modes != params.n_modes
+                || artifact.precision_bits != cfg.precision_bits
+                || artifact.dimension != dimension
+                || artifact.entries.len() != dimension * dimension
+            {
+                return Err(CacheError::InvalidManifest(
+                    "CCM even-sector matrix does not match its semantic identity".to_owned(),
+                ));
+            }
+            let decoded = parse_hp_vector(&artifact.entries, cfg.precision_bits)?;
+            let expected = build_even_sector_matrix(tau, params.n_modes, cfg.precision_bits);
+            if decoded != expected {
+                return Err(CacheError::InvalidManifest(
+                    "CCM even-sector matrix is inconsistent with its full tau dependency"
+                        .to_owned(),
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    let manifest = resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("even-sector execution returned no manifest"))?;
+    Ok((
+        parse_hp_vector(&resolved.value.entries, cfg.precision_bits)?,
+        manifest,
+    ))
+}
+
+fn factorization_residual_ok(
+    matrix: &[Float],
+    factors: &xc_numerics::linalg::LuFactors,
+    dimension: usize,
+    precision_bits: u32,
+) -> bool {
+    if matrix.len() != dimension * dimension
+        || factors.lu.len() != dimension * dimension
+        || factors.perm.len() != dimension
+    {
+        return false;
+    }
+    let rhs: Vec<Float> = (0..dimension)
+        .map(|index| Float::with_val(precision_bits, index + 1))
+        .collect();
+    let solution = xc_numerics::linalg::lu_solve(factors, &rhs, dimension, precision_bits);
+    let mut maximum = Float::with_val(precision_bits, 0);
+    for row in 0..dimension {
+        let mut value = Float::with_val(precision_bits, 0);
+        for column in 0..dimension {
+            let mut term = matrix[row * dimension + column].clone();
+            term *= &solution[column];
+            value += term;
+        }
+        value -= &rhs[row];
+        let residual = value.abs();
+        if residual > maximum {
+            maximum = residual;
+        }
+    }
+    maximum < Float::with_val(precision_bits, 2).pow(-((precision_bits / 4) as i32))
+}
+
+fn resolve_factorization_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    matrix: &[Float],
+    matrix_manifest: &ArtifactManifest,
+    subspace: &str,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(xc_numerics::linalg::LuFactors, ArtifactManifest)> {
+    let dimension = if subspace == "even" {
+        params.n_modes + 1
+    } else {
+        params.matrix_size()
+    };
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_factorization".to_owned(),
+        mathematical_semantics_version: "ccm-dense-lu-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": cfg.precision_bits,
+            "subspace": subspace,
+            "matrix_content_digest": matrix_manifest.content_digest.0,
+            "pivoting": "partial"
+        }),
+        normalization: Some("combined_lu_row_major_with_permutation".to_owned()),
+        target: Some("inverse_iteration_linear_solve".to_owned()),
+        subspace: Some(subspace.to_owned()),
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: Some("dense_lu_partial_pivoting".to_owned()),
+    };
+    let logical_key = format!(
+        "ccm/factorization/{}/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        cfg.precision_bits,
+        subspace
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.factorization.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "factorization".to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            let factors = xc_numerics::linalg::lu_factor(matrix, dimension)
+                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            Ok((
+                PortableLuFactorization {
+                    schema_version: 1,
+                    lambda_squared: lambda_squared_cache_identity(params),
+                    n_modes: params.n_modes,
+                    precision_bits: cfg.precision_bits,
+                    subspace: subspace.to_owned(),
+                    dimension,
+                    lu: factors.lu.iter().map(Float::to_string).collect(),
+                    permutation: factors.perm,
+                },
+                vec![DependencyRef {
+                    key: matrix_manifest.key.clone(),
+                    content_digest: matrix_manifest.content_digest.clone(),
+                    required_quality: CacheQuality::Validated,
+                }],
+            ))
+        },
+        |artifact| {
+            if artifact.schema_version != 1
+                || artifact.lambda_squared != lambda_squared_cache_identity(params)
+                || artifact.n_modes != params.n_modes
+                || artifact.precision_bits != cfg.precision_bits
+                || artifact.subspace != subspace
+                || artifact.dimension != dimension
+                || artifact.lu.len() != dimension * dimension
+                || artifact.permutation.len() != dimension
+            {
+                return Err(CacheError::InvalidManifest(
+                    "CCM factorization does not match its semantic identity".to_owned(),
+                ));
+            }
+            let factors = xc_numerics::linalg::LuFactors {
+                lu: parse_hp_vector(&artifact.lu, cfg.precision_bits)?,
+                perm: artifact.permutation.clone(),
+            };
+            if factorization_residual_ok(matrix, &factors, dimension, cfg.precision_bits) {
+                Ok(())
+            } else {
+                Err(CacheError::InvalidManifest(
+                    "CCM factorization failed its deterministic solve residual".to_owned(),
+                ))
+            }
+        },
+    )?;
+    let manifest = resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("factorization execution returned no manifest"))?;
+    Ok((
+        xc_numerics::linalg::LuFactors {
+            lu: parse_hp_vector(&resolved.value.lu, cfg.precision_bits)?,
+            perm: resolved.value.permutation,
+        },
+        manifest,
+    ))
+}
+
+fn weil_eigenpair_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    tau: &[Float],
+    tau_manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(Float, Vec<Float>, ArtifactManifest)> {
+    let prec = cfg.precision_bits;
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_weil_eigenpair".to_owned(),
+        mathematical_semantics_version: "ccm-smallest-weil-eigenpair-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": prec,
+            "scalar_backend": "rug_mpfr",
+            "force_even": cfg.force_even,
+            "normalization": "sum_xi_equals_sqrt_log_lambda_squared"
+        }),
+        normalization: Some("sum_xi_equals_sqrt_log_lambda_squared".to_owned()),
+        target: Some("smallest_weil_form_eigenpair".to_owned()),
+        subspace: cfg.force_even.then(|| "even".to_owned()),
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: None,
+    };
+    let logical_key = format!(
+        "ccm/weil-eigenpair/{}/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        prec,
+        if cfg.force_even { "even" } else { "natural" }
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.weil_eigenpair.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "weil_eigenpair".to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            let (eps_n, xi, factor_manifest) = if cfg.force_even {
+                let (sector, sector_manifest) =
+                    resolve_even_sector_matrix_via_cache(params, cfg, tau, tau_manifest, cache)
+                        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                let (factors, factor_manifest) = resolve_factorization_via_cache(
+                    params,
+                    cfg,
+                    &sector,
+                    &sector_manifest,
+                    "even",
+                    cache,
+                )
+                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                let (eps_n, sector_vector) = xc_numerics::linalg::inverse_iteration_from_factors(
+                    &sector,
+                    &factors,
+                    params.n_modes + 1,
+                    prec,
+                    cfg.inverse_iter_steps,
+                    false,
+                    None,
+                )
+                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                let expanded = expand_even_sector_vector(&sector_vector, params.n_modes, prec);
+                (
+                    eps_n,
+                    normalize_eigenvector(&expanded, l, prec),
+                    factor_manifest,
+                )
+            } else {
+                let (factors, factor_manifest) =
+                    resolve_factorization_via_cache(params, cfg, tau, tau_manifest, "full", cache)
+                        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                let (eps_n, xi_raw) = xc_numerics::linalg::inverse_iteration_from_factors(
+                    tau,
+                    &factors,
+                    params.matrix_size(),
+                    prec,
+                    cfg.inverse_iter_steps,
+                    false,
+                    None,
+                )
+                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                (
+                    eps_n,
+                    normalize_eigenvector(&xi_raw, l, prec),
+                    factor_manifest,
+                )
+            };
+            Ok((
+                PortableWeilEigenpair {
+                    schema_version: 1,
+                    lambda_squared: lambda_squared_cache_identity(params),
+                    n_modes: params.n_modes,
+                    precision_bits: prec,
+                    force_even: cfg.force_even,
+                    eigenvalue: eps_n.to_string(),
+                    eigenvector: xi.iter().map(Float::to_string).collect(),
+                },
+                vec![DependencyRef {
+                    key: factor_manifest.key,
+                    content_digest: factor_manifest.content_digest,
+                    required_quality: CacheQuality::Validated,
+                }],
+            ))
+        },
+        |artifact| decode_weil_eigenpair(artifact, params, cfg, tau).map(|_| ()),
+    )?;
+    let manifest = resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("Weil eigenpair execution returned no manifest"))?;
+    let (eigenvalue, eigenvector) = decode_weil_eigenpair(&resolved.value, params, cfg, tau)?;
+    Ok((eigenvalue, eigenvector, manifest))
+}
+
+fn resolve_secular_source_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    eigenpair_manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<ArtifactManifest> {
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_secular_source".to_owned(),
+        mathematical_semantics_version: "ccm-secular-source-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": cfg.precision_bits,
+            "force_even": cfg.force_even,
+            "eigenpair_content_digest": eigenpair_manifest.content_digest.0
+        }),
+        normalization: Some("sum_xi_equals_sqrt_log_lambda_squared".to_owned()),
+        target: Some("ccm_secular_function".to_owned()),
+        subspace: cfg.force_even.then(|| "even".to_owned()),
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: Some("xi_hat_exponential_sum".to_owned()),
+    };
+    let logical_key = format!(
+        "ccm/secular-source/{}/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        cfg.precision_bits,
+        if cfg.force_even { "even" } else { "natural" }
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.secular_source.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "secular_source".to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let expected_digest = eigenpair_manifest.content_digest.0.clone();
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            Ok((
+                PortableSecularSource {
+                    schema_version: 1,
+                    lambda_squared: lambda_squared_cache_identity(params),
+                    n_modes: params.n_modes,
+                    precision_bits: cfg.precision_bits,
+                    force_even: cfg.force_even,
+                    eigenpair_content_digest: expected_digest.clone(),
+                    normalization: "sum_xi_equals_sqrt_log_lambda_squared".to_owned(),
+                },
+                vec![DependencyRef {
+                    key: eigenpair_manifest.key.clone(),
+                    content_digest: eigenpair_manifest.content_digest.clone(),
+                    required_quality: CacheQuality::Validated,
+                }],
+            ))
+        },
+        |artifact| {
+            if artifact.schema_version != 1
+                || artifact.lambda_squared != lambda_squared_cache_identity(params)
+                || artifact.n_modes != params.n_modes
+                || artifact.precision_bits != cfg.precision_bits
+                || artifact.force_even != cfg.force_even
+                || artifact.eigenpair_content_digest != expected_digest
+                || artifact.normalization != "sum_xi_equals_sqrt_log_lambda_squared"
+            {
+                Err(CacheError::InvalidManifest(
+                    "CCM secular-source payload does not match its semantic identity".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
+        },
+    )?;
+    resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("secular-source execution returned no manifest"))
+}
+
+fn compute_root_range(
+    xi: &[Float],
+    params: &CcmParams,
+    l: &Float,
+    cfg: &HighPrecConfig,
+    seeds: &[Float],
+) -> Vec<EigenvalueResult> {
+    seeds
+        .iter()
+        .map(|seed| {
+            solve_r_zero(
+                xi,
+                params.n_modes,
+                l,
+                seed,
+                cfg.precision_bits,
+                cfg.solver_steps,
+                cfg.root_solver,
+            )
+        })
+        .collect()
+}
+
+fn decode_root_range(
+    artifact: &PortableRootRange,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    seeds: &[Float],
+) -> std::result::Result<Vec<EigenvalueResult>, CacheError> {
+    let expected_seeds: Vec<String> = seeds.iter().map(Float::to_string).collect();
+    if artifact.schema_version != 1
+        || artifact.lambda_squared != lambda_squared_cache_identity(params)
+        || artifact.n_modes != params.n_modes
+        || artifact.precision_bits != cfg.precision_bits
+        || artifact.force_even != cfg.force_even
+        || artifact.first_root_index != 1
+        || artifact.seeds != expected_seeds
+        || artifact.outcomes.len() != seeds.len()
+        || artifact.solver != cfg.root_solver.display_name().to_ascii_lowercase()
+        || artifact.solver_steps != cfg.solver_steps
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM root-range payload does not match its semantic identity".to_owned(),
+        ));
+    }
+    let decoded: Vec<EigenvalueResult> = artifact
+        .outcomes
+        .iter()
+        .map(|outcome| match outcome {
+            PortableRootOutcome::Converged(value) => {
+                parse_hp_vector(std::slice::from_ref(value), cfg.precision_bits)
+                    .map(|parsed| EigenvalueResult::Converged(parsed[0].clone()))
+            }
+            PortableRootOutcome::Approximate(value) => {
+                parse_hp_vector(std::slice::from_ref(value), cfg.precision_bits)
+                    .map(|parsed| EigenvalueResult::Approximate(parsed[0].clone()))
+            }
+            PortableRootOutcome::Failed => Ok(EigenvalueResult::Failed),
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    let mut previous: Option<&Float> = None;
+    for outcome in &decoded {
+        let value = match outcome {
+            EigenvalueResult::Converged(value) | EigenvalueResult::Approximate(value) => value,
+            EigenvalueResult::Failed => continue,
+        };
+        if value <= &Float::with_val(cfg.precision_bits, 0)
+            || previous.is_some_and(|prior| value <= prior)
+        {
+            return Err(CacheError::InvalidManifest(
+                "CCM root-range payload is not a strictly increasing positive sequence".to_owned(),
+            ));
+        }
+        previous = Some(value);
+    }
+    Ok(decoded)
+}
+
+fn resolve_root_range_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    xi: &[Float],
+    seeds: &[Float],
+    secular_manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(Vec<EigenvalueResult>, ArtifactManifest)> {
+    let seed_strings: Vec<String> = seeds.iter().map(Float::to_string).collect();
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_root_refinement".to_owned(),
+        mathematical_semantics_version: "ccm-root-range-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": cfg.precision_bits,
+            "force_even": cfg.force_even,
+            "first_root_index": 1,
+            "root_count": seeds.len(),
+            "seeds": seed_strings,
+            "solver": cfg.root_solver.display_name().to_ascii_lowercase(),
+            "solver_steps": cfg.solver_steps
+        }),
+        normalization: None,
+        target: Some("positive_ccm_spectral_roots".to_owned()),
+        subspace: cfg.force_even.then(|| "even".to_owned()),
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: Some(cfg.root_solver.display_name().to_ascii_lowercase()),
+    };
+    let logical_key = format!(
+        "ccm/root-range/{}/{}/{}/{}/1-{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        cfg.precision_bits,
+        if cfg.force_even { "even" } else { "natural" },
+        seeds.len()
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.root_range.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "root_range".to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            let outcomes = compute_root_range(xi, params, l, cfg, seeds)
+                .into_iter()
+                .map(|outcome| match outcome {
+                    EigenvalueResult::Converged(value) => {
+                        PortableRootOutcome::Converged(value.to_string())
+                    }
+                    EigenvalueResult::Approximate(value) => {
+                        PortableRootOutcome::Approximate(value.to_string())
+                    }
+                    EigenvalueResult::Failed => PortableRootOutcome::Failed,
+                })
+                .collect();
+            Ok((
+                PortableRootRange {
+                    schema_version: 1,
+                    lambda_squared: lambda_squared_cache_identity(params),
+                    n_modes: params.n_modes,
+                    precision_bits: cfg.precision_bits,
+                    force_even: cfg.force_even,
+                    first_root_index: 1,
+                    seeds: seeds.iter().map(Float::to_string).collect(),
+                    outcomes,
+                    solver: cfg.root_solver.display_name().to_ascii_lowercase(),
+                    solver_steps: cfg.solver_steps,
+                },
+                vec![DependencyRef {
+                    key: secular_manifest.key.clone(),
+                    content_digest: secular_manifest.content_digest.clone(),
+                    required_quality: CacheQuality::Validated,
+                }],
+            ))
+        },
+        |artifact| decode_root_range(artifact, params, cfg, seeds).map(|_| ()),
+    )?;
+    let manifest = resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("root-range execution returned no manifest"))?;
+    Ok((
+        decode_root_range(&resolved.value, params, cfg, seeds)?,
+        manifest,
+    ))
+}
+
+fn record_run_evidence_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    eps_n: &Float,
+    roots: &[EigenvalueResult],
+    eigenpair_manifest: &ArtifactManifest,
+    root_manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<ArtifactManifest> {
+    let counts = roots
+        .iter()
+        .fold((0usize, 0usize, 0usize), |mut counts, root| {
+            match root {
+                EigenvalueResult::Converged(_) => counts.0 += 1,
+                EigenvalueResult::Approximate(_) => counts.1 += 1,
+                EigenvalueResult::Failed => counts.2 += 1,
+            }
+            counts
+        });
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_convergence_diagnostics".to_owned(),
+        mathematical_semantics_version: "ccm-run-evidence-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": cfg.precision_bits,
+            "force_even": cfg.force_even,
+            "root_count": roots.len(),
+            "eigenpair_content_digest": eigenpair_manifest.content_digest.0,
+            "root_range_content_digest": root_manifest.content_digest.0
+        }),
+        normalization: None,
+        target: Some("ccm_configuration_run_summary".to_owned()),
+        subspace: cfg.force_even.then(|| "even".to_owned()),
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: None,
+    };
+    let logical_key = format!(
+        "ccm/run-evidence/{}/{}/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        cfg.precision_bits,
+        if cfg.force_even { "even" } else { "natural" },
+        roots.len()
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.run_evidence.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "run_evidence".to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            Ok((
+                PortableRunEvidence {
+                    schema_version: 1,
+                    lambda_squared: lambda_squared_cache_identity(params),
+                    n_modes: params.n_modes,
+                    precision_bits: cfg.precision_bits,
+                    force_even: cfg.force_even,
+                    root_count: roots.len(),
+                    weil_min_eigenvalue: eps_n.to_string(),
+                    converged_roots: counts.0,
+                    approximate_roots: counts.1,
+                    failed_roots: counts.2,
+                },
+                canonical_dependency_refs(vec![eigenpair_manifest.clone(), root_manifest.clone()]),
+            ))
+        },
+        |artifact| {
+            if artifact.schema_version != 1
+                || artifact.lambda_squared != lambda_squared_cache_identity(params)
+                || artifact.n_modes != params.n_modes
+                || artifact.precision_bits != cfg.precision_bits
+                || artifact.force_even != cfg.force_even
+                || artifact.root_count != roots.len()
+                || artifact.weil_min_eigenvalue != eps_n.to_string()
+                || artifact.converged_roots != counts.0
+                || artifact.approximate_roots != counts.1
+                || artifact.failed_roots != counts.2
+            {
+                return Err(CacheError::InvalidManifest(
+                    "CCM run evidence does not match its semantic identity".to_owned(),
+                ));
+            }
+            parse_hp_vector(
+                std::slice::from_ref(&artifact.weil_min_eigenvalue),
+                cfg.precision_bits,
+            )
+            .map(|_| ())
+        },
+    )?;
+    resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("run-evidence execution returned no manifest"))
 }
 
 /// Top-level entry. Build matrix, find eigenvector, solve spectrum.
@@ -284,24 +2407,94 @@ fn quad_form(m: &[Float], v: &[Float], dim: usize, prec: u32) -> Float {
 /// divergence at high eigenvalue index.
 /// High-precision CCM run.
 ///
-/// The call is routed through [`xc_numerics::hp_runtime::run_hp`], which by
-/// default is a zero-overhead pass-through (no thread spawn, no pool
-/// creation, full parallelism, identical on every platform including
-/// WSL2). Set `XC_HP_SAFE_MODE=1` to opt into a capped-pool / large-stack
-/// execution context instead — see the `hp_runtime` module docs for when
-/// that might be needed and the history of why it used to be the default
-/// on WSL2.
-pub fn run(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> Result<HighPrecResult> {
-    xc_numerics::hp_runtime::run_hp(|| run_inner(params, cfg, zero_seeds))
+/// The call is routed through [`xc_numerics::hp_runtime::run_hp`], whose
+/// default is a direct full-parallel call. Safe-capped execution is selected
+/// only through `run_hp_with_policy`, and the same explicit policy is recorded
+/// in provenance; no environment variable changes this route.
+pub fn run(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    zero_seeds: &[Float],
+) -> Result<HighPrecResult> {
+    let managed =
+        xc_cache::ManagedArtifactCacheSession::from_environment().map_err(anyhow::Error::from)?;
+    if let Some(managed) = &managed {
+        #[cfg(not(feature = "arb"))]
+        if managed.requested_assurance() != xc_core::AssuranceLevel::Computed {
+            bail!(
+                "requested {:?} assurance requires an xc-spectral build with the arb feature",
+                managed.requested_assurance()
+            );
+        }
+        let cache = managed.context();
+        let result = xc_numerics::hp_runtime::run_hp(|| {
+            run_inner(params, cfg, zero_seeds, CcmCacheRoute::Fabric(&cache))
+        })?;
+        managed
+            .finalize_publication_inventory()
+            .map_err(anyhow::Error::from)?;
+        Ok(result)
+    } else {
+        xc_numerics::hp_runtime::run_hp(|| {
+            run_inner(params, cfg, zero_seeds, CcmCacheRoute::Standalone)
+        })
+    }
 }
 
-fn run_inner(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> Result<HighPrecResult> {
+/// Runs the HP CCM pipeline through the common cache fabric.
+///
+/// # Mathematical semantics
+/// Builds the localized Weil form, obtains its selected smallest eigenpair,
+/// and refines the positive spectrum from the supplied Riemann-zero seeds.
+///
+/// # Precision
+/// All numerical construction and validation uses the precision in `cfg`.
+/// Typed cache payloads store decimal representations of the MPFR values.
+///
+/// # Failure states
+/// Matrix construction, inverse iteration, cache policy, cache corruption,
+/// required-reuse misses, and unavailable write overlays return errors.
+///
+/// # Assurance and validity
+/// A reused tau matrix passes structural symmetry checks. A reused eigenpair
+/// must additionally pass its full tau residual at working precision.
+///
+/// # Cache effects
+/// Lookup and persistence are governed only by `cache`; neither artifact path
+/// performs direct GitHub access or invokes a network subprocess.
+///
+/// # Example
+/// Supply an [`ArtifactCacheContext`] containing the desired ordered overlays
+/// and an explicit prefer-reuse, require-reuse, or disabled policy.
+pub fn run_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    zero_seeds: &[Float],
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<HighPrecResult> {
+    xc_numerics::hp_runtime::run_hp(|| {
+        run_inner(params, cfg, zero_seeds, CcmCacheRoute::Fabric(cache))
+    })
+}
+
+fn run_inner(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    zero_seeds: &[Float],
+    cache_route: CcmCacheRoute<'_>,
+) -> Result<HighPrecResult> {
     let start = Instant::now();
     let prec = cfg.precision_bits;
     let dim = params.matrix_size();
 
     let l = log_lambda_sq_hp(params, prec);
-    let mut tau = build_tau_hp(params, &l, cfg)?;
+    let (mut tau, tau_manifest) = match &cache_route {
+        CcmCacheRoute::Standalone => (build_tau_hp(params, &l, cfg)?, None),
+        CcmCacheRoute::Fabric(cache) => {
+            let (tau, manifest) = build_tau_hp_via_cache(params, &l, cfg, cache)?;
+            (tau, Some(manifest))
+        }
+    };
 
     // Force exact symmetry of the τ-matrix (parallel compute, sequential write).
     force_symmetric(&mut tau, dim);
@@ -316,57 +2509,100 @@ fn run_inner(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> 
     // sits *after* `build_tau_hp` precisely so τ is available for the
     // residual validation (the strongest integrity test for ξ).
     //
-    let lambda_sq = params.lambda_sq;
-    let n_modes_key = params.n_modes;
-    let mut cached_pair: Option<(Float, Vec<Float>)> = None;
-    if let Some(c) = weil_eigvec_cache::load(lambda_sq, n_modes_key, prec, cfg.cache_mode, cfg.force_even) {
-        if weil_eigvec_cache::residual_ok(&tau, dim, &c.xi, &c.eps_n, prec) {
-            eprintln!(
+    let (eps_n, xi, eigenpair_manifest) = if let CcmCacheRoute::Fabric(cache) = &cache_route {
+        let (eps_n, xi, manifest) = weil_eigenpair_via_cache(
+            params,
+            cfg,
+            &l,
+            &tau,
+            tau_manifest
+                .as_ref()
+                .expect("fabric tau route retains its exact manifest"),
+            cache,
+        )?;
+        (eps_n, xi, Some(manifest))
+    } else {
+        let lambda_sq = params.lambda_sq;
+        let n_modes_key = params.n_modes;
+        let mut cached_pair: Option<(Float, Vec<Float>)> = None;
+        if let Some(c) =
+            weil_eigvec_cache::load(lambda_sq, n_modes_key, prec, cfg.cache_mode, cfg.force_even)
+        {
+            if weil_eigvec_cache::residual_ok(&tau, dim, &c.xi, &c.eps_n, prec) {
+                eprintln!(
                 "[HP] loaded cached Weil eigenvector for λ²={}, N={}, prec={} bits (τ-residual validated)",
                 lambda_sq.value_f64, n_modes_key, prec
             );
-            cached_pair = Some((c.eps_n, c.xi));
-        } else {
-            crate::hp_debug!(
-                "[HP] WARNING: cached Weil eigenvector for λ²={}, N={}, prec={} failed \
+                cached_pair = Some((c.eps_n, c.xi));
+            } else {
+                crate::hp_debug!(
+                    "[HP] WARNING: cached Weil eigenvector for λ²={}, N={}, prec={} failed \
                  τ-residual validation; recomputing",
-                lambda_sq.value_f64, n_modes_key, prec
-            );
+                    lambda_sq.value_f64,
+                    n_modes_key,
+                    prec
+                );
+            }
         }
-    }
-    let (eps_n, xi) = match cached_pair {
-        Some(pair) => pair,
-        None => {
-            // Warm-start from nearby-precision cache if enabled.
-            // Scan for a cached ξ at a nearby precision to use as the
-            // starting vector for inverse iteration instead of the Gaussian.
-            let warm_xi: Option<Vec<Float>> = if cfg.warm_start {
-                weil_eigvec_cache::find_warm_start(
-                    lambda_sq, n_modes_key, prec,
-                    cfg.warm_start_tolerance_bits,
-                    cfg.force_even,
-                )
-            } else {
-                None
-            };
+        let pair = match cached_pair {
+            Some(pair) => pair,
+            None => {
+                // Warm-start from nearby-precision cache if enabled.
+                // Scan for a cached ξ at a nearby precision to use as the
+                // starting vector for inverse iteration instead of the Gaussian.
+                let warm_xi: Option<Vec<Float>> = if cfg.warm_start {
+                    weil_eigvec_cache::find_warm_start(
+                        lambda_sq,
+                        n_modes_key,
+                        prec,
+                        cfg.warm_start_tolerance_bits,
+                        cfg.force_even,
+                    )
+                } else {
+                    None
+                };
 
-            // Find smallest eigenpair by inverse iteration.
-            eprintln!("[HP] LU factoring {}×{} matrix (one-time cost)...", dim, dim);
-            let (eps_n, xi_raw) = if let Some(warm) = warm_xi {
-                crate::hp_debug!("[HP] starting inverse iteration from warm-start vector");
-                xc_numerics::linalg::inverse_iteration_from(
-                    &tau, dim, prec, cfg.inverse_iter_steps, cfg.force_even, Some(warm))?
-            } else {
-                xc_numerics::linalg::inverse_iteration(
-                    &tau, dim, prec, cfg.inverse_iter_steps, cfg.force_even)?
-            };
-            crate::hp_debug!("[HP] LU factorization done.");
-            // Normalize: Σ ξ_j = √L.
-            let xi = normalize_eigenvector(&xi_raw, &l, prec);
-            eprintln!("[HP] Eigenvector computed. Solving spectrum...");
-            weil_eigvec_cache::save(lambda_sq, n_modes_key, prec, &eps_n, &xi, cfg.cache_mode, cfg.force_even);
-            (eps_n, xi)
-        }
+                // Find smallest eigenpair by inverse iteration.
+                eprintln!(
+                    "[HP] LU factoring {}×{} matrix (one-time cost)...",
+                    dim, dim
+                );
+                let (eps_n, xi_raw) = if let Some(warm) = warm_xi {
+                    crate::hp_debug!("[HP] starting inverse iteration from warm-start vector");
+                    xc_numerics::linalg::inverse_iteration_from(
+                        &tau,
+                        dim,
+                        prec,
+                        cfg.inverse_iter_steps,
+                        cfg.force_even,
+                        Some(warm),
+                    )?
+                } else {
+                    xc_numerics::linalg::inverse_iteration(
+                        &tau,
+                        dim,
+                        prec,
+                        cfg.inverse_iter_steps,
+                        cfg.force_even,
+                    )?
+                };
+                crate::hp_debug!("[HP] LU factorization done.");
+                // Normalize: Σ ξ_j = √L.
+                let xi = normalize_eigenvector(&xi_raw, &l, prec);
+                eprintln!("[HP] Eigenvector computed. Solving spectrum...");
+                weil_eigvec_cache::save(
+                    lambda_sq,
+                    n_modes_key,
+                    prec,
+                    &eps_n,
+                    &xi,
+                    cfg.cache_mode,
+                    cfg.force_even,
+                );
+                (eps_n, xi)
+            }
+        };
+        (pair.0, pair.1, None)
     };
 
     // Find eigenvalues as zeros of R(z), seeded from HP reference zeros.
@@ -380,24 +2616,77 @@ fn run_inner(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> 
     // Riemann zero indices — using f64 seeds causes cross-overs and
     // completely wrong eigenvalues in the wrong slots. Riemann zero seeds
     // are robust across all (λ², N) configurations.
-    let hp_seeds: Vec<Float> = zero_seeds[..n_eigs].iter()
+    let hp_seeds: Vec<Float> = zero_seeds[..n_eigs]
+        .iter()
         .map(|s| Float::with_val(prec, s))
         .collect();
-    crate::hp_debug!("[HP] using {} reference Riemann zeros as HP {} seeds (N={})",
-        hp_seeds.len(), active_solver_name(), params.n_modes);
+    crate::hp_debug!(
+        "[HP] using {} reference Riemann zeros as HP {} seeds (N={})",
+        hp_seeds.len(),
+        cfg.root_solver.display_name(),
+        params.n_modes
+    );
 
-    let eigenvalues_pos: Vec<EigenvalueResult> = hp_seeds.iter()
-        .map(|seed| {
-            let result = solve_r_zero(&xi, params.n_modes, &l, seed, prec, cfg.solver_steps);
-            if matches!(result, EigenvalueResult::Failed) {
-                crate::hp_debug!(
-                    "[HP] WARNING: {} hit degenerate denominator for seed {} — skipping",
-                    active_solver_name(), seed.to_f64()
-                );
-            }
-            result
-        })
-        .collect();
+    let (eigenvalues_pos, root_manifest): (Vec<EigenvalueResult>, Option<ArtifactManifest>) =
+        if let CcmCacheRoute::Fabric(cache) = &cache_route {
+            let secular_manifest = resolve_secular_source_via_cache(
+                params,
+                cfg,
+                eigenpair_manifest
+                    .as_ref()
+                    .expect("fabric eigenpair route retains its exact manifest"),
+                cache,
+            )?;
+            let (roots, manifest) = resolve_root_range_via_cache(
+                params,
+                cfg,
+                &l,
+                &xi,
+                &hp_seeds,
+                &secular_manifest,
+                cache,
+            )?;
+            (roots, Some(manifest))
+        } else {
+            let roots = hp_seeds
+                .iter()
+                .map(|seed| {
+                    let result = solve_r_zero(
+                        &xi,
+                        params.n_modes,
+                        &l,
+                        seed,
+                        prec,
+                        cfg.solver_steps,
+                        cfg.root_solver,
+                    );
+                    if matches!(result, EigenvalueResult::Failed) {
+                        crate::hp_debug!(
+                            "[HP] WARNING: {} hit degenerate denominator for seed {} — skipping",
+                            cfg.root_solver.display_name(),
+                            xc_numerics::fmt::display_hp(seed, 10)
+                        );
+                    }
+                    result
+                })
+                .collect();
+            (roots, None)
+        };
+    if let CcmCacheRoute::Fabric(cache) = &cache_route {
+        record_run_evidence_via_cache(
+            params,
+            cfg,
+            &eps_n,
+            &eigenvalues_pos,
+            eigenpair_manifest
+                .as_ref()
+                .expect("fabric eigenpair route retains its exact manifest"),
+            root_manifest
+                .as_ref()
+                .expect("fabric root route retains its exact manifest"),
+            cache,
+        )?;
+    }
     // After all solves, verify each computed eigenvalue is closest
     // to its assigned seed (detect cross-overs). Log warnings for any
     // mismatches but don't reorder — ordering is by seed, not by value.
@@ -406,13 +2695,23 @@ fn run_inner(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> 
             Some(z) => z,
             None => continue,
         };
-        if k >= hp_seeds.len() { break; }
+        if k >= hp_seeds.len() {
+            break;
+        }
         let ref_k = hp_seeds[k].clone();
-        let mut dist_k = ev.clone(); dist_k -= &ref_k; let dist_k = dist_k.abs();
+        let mut dist_k = ev.clone();
+        dist_k -= &ref_k;
+        let dist_k = dist_k.abs();
         for (j, ref_j_seed) in hp_seeds.iter().enumerate() {
-            if j == k { continue; }
-            if j >= hp_seeds.len() { break; }
-            let mut dist_j = ev.clone(); dist_j -= ref_j_seed; let dist_j = dist_j.abs();
+            if j == k {
+                continue;
+            }
+            if j >= hp_seeds.len() {
+                break;
+            }
+            let mut dist_j = ev.clone();
+            dist_j -= ref_j_seed;
+            let dist_j = dist_j.abs();
             if dist_j < dist_k {
                 crate::hp_debug!(
                     "[HP] WARNING: eigenvalue {} is closer to seed {} than its own seed {} — possible cross-over",
@@ -445,28 +2744,206 @@ fn run_inner(params: &CcmParams, cfg: &HighPrecConfig, zero_seeds: &[Float]) -> 
 /// with deviation O(1). This is a structural property of the construction,
 /// not a precision artifact (verified at HP-1000).
 pub fn measure_evenness(params: &CcmParams, cfg: &HighPrecConfig) -> Result<EvennessResult> {
+    let managed =
+        xc_cache::ManagedArtifactCacheSession::from_environment().map_err(anyhow::Error::from)?;
+    if let Some(managed) = &managed {
+        let cache = managed.context();
+        let result =
+            xc_numerics::hp_runtime::run_hp(|| measure_evenness_via_cache(params, cfg, &cache))?;
+        managed
+            .finalize_publication_inventory()
+            .map_err(anyhow::Error::from)?;
+        Ok(result)
+    } else {
+        let l = log_lambda_sq_hp(params, cfg.precision_bits);
+        let tau = build_tau_hp(params, &l, cfg)?;
+        measure_evenness_from_tau(params, cfg, tau)
+    }
+}
+
+fn evenness_from_natural_state(
+    params: &CcmParams,
+    precision_bits: u32,
+    natural_eval: Float,
+    xi_natural: &[Float],
+    forced_eval: Float,
+) -> EvennessResult {
+    let dim = params.matrix_size();
+    let squared_terms: Vec<(Float, Float)> = (0..dim)
+        .into_par_iter()
+        .map(|index| {
+            let reflected = dim - 1 - index;
+            let mut difference = xi_natural[index].clone();
+            difference -= &xi_natural[reflected];
+            (difference.square(), xi_natural[index].clone().square())
+        })
+        .collect();
+    let differences: Vec<Float> = squared_terms
+        .iter()
+        .map(|(difference, _)| difference.clone())
+        .collect();
+    let norms: Vec<Float> = squared_terms.into_iter().map(|(_, norm)| norm).collect();
+    let mut deviation =
+        xc_numerics::reduction::deterministic_pairwise_sum_hp(&differences, precision_bits).sqrt();
+    let norm = xc_numerics::reduction::deterministic_pairwise_sum_hp(&norms, precision_bits).sqrt();
+    if !norm.is_zero() {
+        deviation /= norm;
+    }
+    EvennessResult {
+        evenness_deviation: deviation,
+        natural_eigenvalue: natural_eval,
+        forced_eigenvalue: forced_eval,
+    }
+}
+
+fn measure_evenness_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<EvennessResult> {
+    let l = log_lambda_sq_hp(params, cfg.precision_bits);
+    let (mut tau, tau_manifest) = build_tau_hp_via_cache(params, &l, cfg, cache)?;
+    force_symmetric(&mut tau, params.matrix_size());
+
+    let mut natural_cfg = cfg.clone();
+    natural_cfg.force_even = false;
+    let (natural_eval, natural_xi, natural_manifest) =
+        weil_eigenpair_via_cache(params, &natural_cfg, &l, &tau, &tau_manifest, cache)?;
+    let mut forced_cfg = cfg.clone();
+    forced_cfg.force_even = true;
+    let (forced_eval, _forced_xi, forced_manifest) =
+        weil_eigenpair_via_cache(params, &forced_cfg, &l, &tau, &tau_manifest, cache)?;
+    let calculated = evenness_from_natural_state(
+        params,
+        cfg.precision_bits,
+        natural_eval,
+        &natural_xi,
+        forced_eval,
+    );
+
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_validation_record".to_owned(),
+        mathematical_semantics_version: "ccm-evenness-evidence-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": cfg.precision_bits,
+            "natural_eigenpair": natural_manifest.content_digest.0,
+            "forced_eigenpair": forced_manifest.content_digest.0
+        }),
+        normalization: Some("l2_reflection_deviation".to_owned()),
+        target: Some("natural_evenness".to_owned()),
+        subspace: None,
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: None,
+    };
+    let logical_key = format!(
+        "ccm/evenness/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        cfg.precision_bits
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.evenness.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "evenness_evidence".to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            Ok((
+                PortableEvennessEvidence {
+                    schema_version: 1,
+                    lambda_squared: lambda_squared_cache_identity(params),
+                    n_modes: params.n_modes,
+                    precision_bits: cfg.precision_bits,
+                    evenness_deviation: calculated.evenness_deviation.to_string(),
+                    natural_eigenvalue: calculated.natural_eigenvalue.to_string(),
+                    forced_eigenvalue: calculated.forced_eigenvalue.to_string(),
+                },
+                canonical_dependency_refs(vec![natural_manifest, forced_manifest]),
+            ))
+        },
+        |artifact| {
+            if artifact.schema_version != 1
+                || artifact.lambda_squared != lambda_squared_cache_identity(params)
+                || artifact.n_modes != params.n_modes
+                || artifact.precision_bits != cfg.precision_bits
+                || artifact.evenness_deviation != calculated.evenness_deviation.to_string()
+                || artifact.natural_eigenvalue != calculated.natural_eigenvalue.to_string()
+                || artifact.forced_eigenvalue != calculated.forced_eigenvalue.to_string()
+            {
+                return Err(CacheError::InvalidManifest(
+                    "CCM evenness evidence does not match its semantic identity".to_owned(),
+                ));
+            }
+            parse_hp_vector(
+                &[
+                    artifact.evenness_deviation.clone(),
+                    artifact.natural_eigenvalue.clone(),
+                    artifact.forced_eigenvalue.clone(),
+                ],
+                cfg.precision_bits,
+            )
+            .map(|_| ())
+        },
+    )?;
+    let values = parse_hp_vector(
+        &[
+            resolved.value.evenness_deviation,
+            resolved.value.natural_eigenvalue,
+            resolved.value.forced_eigenvalue,
+        ],
+        cfg.precision_bits,
+    )?;
+    Ok(EvennessResult {
+        evenness_deviation: values[0].clone(),
+        natural_eigenvalue: values[1].clone(),
+        forced_eigenvalue: values[2].clone(),
+    })
+}
+
+fn measure_evenness_from_tau(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    mut tau: Vec<Float>,
+) -> Result<EvennessResult> {
     let prec = cfg.precision_bits;
     let dim = params.matrix_size();
-
-    let l = log_lambda_sq_hp(params, prec);
-    let mut tau = build_tau_hp(params, &l, cfg)?;
 
     // Force exact symmetry of the τ-matrix (parallel compute, sequential write).
     force_symmetric(&mut tau, dim);
 
     // Natural (unforced) smallest eigenpair.
-    let (natural_eval, xi_natural) = xc_numerics::linalg::inverse_iteration(
-        &tau, dim, prec, cfg.inverse_iter_steps, false)?;
+    let (natural_eval, xi_natural) =
+        xc_numerics::linalg::inverse_iteration(&tau, dim, prec, cfg.inverse_iter_steps, false)?;
 
     // Forced-even smallest eigenpair.
-    let (forced_eval, _xi_forced) = xc_numerics::linalg::inverse_iteration(
-        &tau, dim, prec, cfg.inverse_iter_steps, true)?;
+    let (forced_eval, _xi_forced) =
+        xc_numerics::linalg::inverse_iteration(&tau, dim, prec, cfg.inverse_iter_steps, true)?;
 
     // Evenness deviation: ‖ξ - γξ‖ / ‖ξ‖ where γ is index reflection.
     // γξ_i = ξ_{dim-1-i}. Deviation = ‖ξ - γξ‖₂ / ‖ξ‖₂.
     // Both reductions are parallelized over i.
-    let zero = || Float::with_val(prec, 0);
-    let (diff_sq, norm_sq) = (0..dim).into_par_iter()
+    let squared_terms: Vec<(Float, Float)> = (0..dim)
+        .into_par_iter()
         .map(|i| {
             let reflected = dim - 1 - i;
             let mut d = xi_natural[i].clone();
@@ -475,12 +2952,14 @@ pub fn measure_evenness(params: &CcmParams, cfg: &HighPrecConfig) -> Result<Even
             let n_sq = xi_natural[i].clone().square();
             (d_sq, n_sq)
         })
-        .reduce(|| (zero(), zero()),
-                |(mut a_d, mut a_n), (b_d, b_n)| {
-                    a_d += &b_d;
-                    a_n += &b_n;
-                    (a_d, a_n)
-                });
+        .collect();
+    let diff_terms: Vec<Float> = squared_terms
+        .iter()
+        .map(|(difference, _)| difference.clone())
+        .collect();
+    let norm_terms: Vec<Float> = squared_terms.into_iter().map(|(_, norm)| norm).collect();
+    let diff_sq = xc_numerics::reduction::deterministic_pairwise_sum_hp(&diff_terms, prec);
+    let norm_sq = xc_numerics::reduction::deterministic_pairwise_sum_hp(&norm_terms, prec);
     let mut deviation = diff_sq.sqrt();
     let norm = norm_sq.sqrt();
     if !norm.is_zero() {
@@ -513,7 +2992,7 @@ pub struct EvennessResult {
 ///
 /// At HP-1000 the τ-matrix construction is O(N²) HP integral
 /// evaluations + O(N³) LU-equivalent work in inverse iteration; for the
-/// load-bearing paper configs (λ²=13/100/1000 at N=120/500/800) this is
+/// representative large configurations (λ²=13/100/1000 at N=120/500/800) this is
 /// minutes-to-hours of wall-time. The output is fully determined by
 /// `(λ²_int, n_modes, prec)`, so it can be cached on disk and reused
 /// across runs.
@@ -539,8 +3018,12 @@ fn build_tau_hp(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<V
     if let Some(cached) = tau_cache::load(lambda_sq, n_modes, prec, cfg.cache_mode) {
         eprintln!(
             "[HP] loaded cached τ-matrix for λ²={}, N={}, prec={} bits ({}×{} = {} entries)",
-            lambda_sq.value_f64, n_modes, prec,
-            params.matrix_size(), params.matrix_size(), cached.len()
+            lambda_sq.value_f64,
+            n_modes,
+            prec,
+            params.matrix_size(),
+            params.matrix_size(),
+            cached.len()
         );
         return Ok(cached);
     }
@@ -583,6 +3066,34 @@ pub fn weil_spectrum_hp(
     xc_numerics::hp_runtime::run_hp(|| weil_spectrum_hp_inner(params, cfg, include_primes))
 }
 
+/// Assemble the dense HP Weil-form matrix for independent solver and
+/// certificate routes. The returned storage is exactly symmetric row-major
+/// data at `cfg.precision_bits`; `include_primes=false` selects the
+/// archimedean-only form and bypasses the full-form cache.
+pub fn weil_matrix_hp(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    include_primes: bool,
+) -> Result<Vec<Float>> {
+    xc_numerics::hp_runtime::run_hp(|| weil_matrix_hp_inner(params, cfg, include_primes))
+}
+
+fn weil_matrix_hp_inner(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    include_primes: bool,
+) -> Result<Vec<Float>> {
+    let dim = params.matrix_size();
+    let l = log_lambda_sq_hp(params, cfg.precision_bits);
+    let mut tau = if include_primes {
+        build_tau_hp(params, &l, cfg)?
+    } else {
+        build_tau_hp_compute(params, &l, cfg, false)?
+    };
+    force_symmetric(&mut tau, dim);
+    Ok(tau)
+}
+
 fn weil_spectrum_hp_inner(
     params: &CcmParams,
     cfg: &HighPrecConfig,
@@ -590,13 +3101,7 @@ fn weil_spectrum_hp_inner(
 ) -> Result<Vec<Float>> {
     let prec = cfg.precision_bits;
     let dim = params.matrix_size();
-    let l = log_lambda_sq_hp(params, prec);
-    let mut tau = if include_primes {
-        build_tau_hp(params, &l, cfg)?
-    } else {
-        build_tau_hp_compute(params, &l, cfg, false)?
-    };
-    force_symmetric(&mut tau, dim);
+    let tau = weil_matrix_hp_inner(params, cfg, include_primes)?;
     xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&tau, dim, prec)
 }
 
@@ -656,7 +3161,11 @@ fn weil_plunge_cancellation_hp_inner(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("no positive eigenvalue (Weil form indefinite?)"))?;
     let xi = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
-        &tau_full, dim, &eps_n, prec, cfg.inverse_iter_steps,
+        &tau_full,
+        dim,
+        &eps_n,
+        prec,
+        cfg.inverse_iter_steps,
     )?;
 
     // Archimedean-only form (prime sum dropped).
@@ -675,148 +3184,6 @@ fn weil_plunge_cancellation_hp_inner(
         arch_rayleigh,
         prime_rayleigh,
     })
-}
-
-/// Archimedean-only plunge eigenvector: the ground eigenvector of the
-/// localized Weil form with the prime-power sum `w_p` dropped
-/// (`include_primes = false`). Returns `(eigenvalue, prime_rayleigh, ψ)`:
-/// the even-ground-state eigenvalue; the prime Rayleigh quotient
-/// `ρ_p = ⟨A_prime ψ, ψ⟩ / ‖ψ‖²` (with `A_prime = τ_full − τ_arch` the
-/// prime-power part of the Weil form) measured on that eigenvector; and the
-/// coefficients ψ ordered `j = −N..+N` (the `params.idx` order, position
-/// `0` = mode `−N`), matching the full-form ξ layout.
-///
-/// This builds τ with `build_tau_hp_compute(.., include_primes = false)`
-/// (the same archimedean-only matrix its `tau_arch` and
-/// `weil_spectrum_hp_inner`'s `false` branch use) and recovers the
-/// eigenvector via the same dense HP path as [`weil_plunge_cancellation_hp`].
-/// The archimedean-only form is O(1)-indefinite; unlike the full form, its
-/// smallest **positive** eigenvalue is ODD, so this selects the smallest
-/// positive eigenvalue whose eigenvector is **even** (ξ(j) = ξ(−j)) — the
-/// even ground state — then projects that eigenvector onto the even subspace
-/// (ψ_j ← ½(ψ_j + ψ_{−j})), renormalizes, and guards `even_dev < 1e-40`, so
-/// the returned vector is a pure even mode even under near-degeneracy.
-pub fn weil_arch_eigvec_hp(
-    params: &CcmParams,
-    cfg: &HighPrecConfig,
-) -> Result<(Float, Float, Vec<Float>)> {
-    xc_numerics::hp_runtime::run_hp(|| weil_arch_eigvec_hp_inner(params, cfg))
-}
-
-fn weil_arch_eigvec_hp_inner(
-    params: &CcmParams,
-    cfg: &HighPrecConfig,
-) -> Result<(Float, Float, Vec<Float>)> {
-    let prec = cfg.precision_bits;
-    let dim = params.matrix_size();
-    let l = log_lambda_sq_hp(params, prec);
-
-    // Archimedean-only τ (prime sum dropped), symmetrized — identical to the
-    // `tau_arch` built inside `weil_plunge_cancellation_hp_inner`.
-    let mut tau_arch = build_tau_hp_compute(params, &l, cfg, false)?;
-    force_symmetric(&mut tau_arch, dim);
-
-    // Even ground state: the smallest POSITIVE eigenvalue whose eigenvector
-    // is even (ξ(j) = ξ(−j)). The archimedean-only form is O(1)-indefinite
-    // and its lowest positive mode is ODD, so we walk positive eigenvalues in
-    // ascending order, recover each eigenvector, and take the first even one
-    // (L1 reflection test: even ⇒ ‖ξ − γξ‖₁ < ‖ξ + γξ‖₁).
-    let eigs = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&tau_arch, dim, prec)?;
-    let zero = Float::with_val(prec, 0);
-    let mut found: Option<(Float, Vec<Float>)> = None;
-    for e in eigs.iter().filter(|e| **e > zero).take(64) {
-        let xi = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
-            &tau_arch, dim, e, prec, cfg.inverse_iter_steps,
-        )?;
-        let mut refl_diff = Float::with_val(prec, 0);
-        let mut refl_sum = Float::with_val(prec, 0);
-        for i in 0..dim {
-            let mut d = xi[i].clone();
-            d -= &xi[dim - 1 - i];
-            refl_diff += d.abs();
-            let mut s = xi[i].clone();
-            s += &xi[dim - 1 - i];
-            refl_sum += s.abs();
-        }
-        if refl_diff < refl_sum {
-            found = Some((e.clone(), xi));
-            break;
-        }
-    }
-    let (eps, xi_raw) = found.ok_or_else(|| {
-        anyhow::anyhow!("no positive even eigenvector in the first 64 positive archimedean eigenvalues")
-    })?;
-
-    // Project onto the even subspace ψ_i = ½(ξ_i + ξ_{dim−1−i}) and
-    // renormalize. This guards against a near-degenerate solver landing on an
-    // even/odd mix: the written vector is then a pure even mode.
-    let mut psi: Vec<Float> = (0..dim)
-        .map(|i| {
-            let mut s = xi_raw[i].clone();
-            s += &xi_raw[dim - 1 - i];
-            s /= 2u32;
-            s
-        })
-        .collect();
-    let mut norm_sq = Float::with_val(prec, 0);
-    for v in &psi {
-        norm_sq += v.clone().square();
-    }
-    let norm = norm_sq.sqrt();
-    if norm.is_zero() {
-        return Err(anyhow::anyhow!(
-            "even projection of the selected eigenvector is zero (selection landed on a non-even mode)"
-        ));
-    }
-    for v in psi.iter_mut() {
-        *v /= &norm;
-    }
-
-    // Parity guard: even_dev = ‖ψ − γψ‖₂ / ‖ψ‖₂ (same convention as
-    // `measure_evenness`). After exact symmetrization this is 0; the guard
-    // catches a pathological reflection/index error.
-    let zerof = || Float::with_val(prec, 0);
-    let (diff_sq, nrm_sq) = (0..dim)
-        .map(|i| {
-            let mut d = psi[i].clone();
-            d -= &psi[dim - 1 - i];
-            (d.square(), psi[i].clone().square())
-        })
-        .fold((zerof(), zerof()), |(mut ad, mut an), (bd, bn)| {
-            ad += &bd;
-            an += &bn;
-            (ad, an)
-        });
-    let mut even_dev = diff_sq.sqrt();
-    let nrm = nrm_sq.sqrt();
-    if !nrm.is_zero() {
-        even_dev /= &nrm;
-    }
-    let guard = Float::with_val(prec, 1e-40);
-    if even_dev >= guard {
-        return Err(anyhow::anyhow!(
-            "even-subspace parity guard failed: even_dev = {:.3e} >= 1e-40",
-            even_dev.to_f64()
-        ));
-    }
-
-    // Prime Rayleigh quotient on the even archimedean-only vector:
-    // ρ_p = ⟨A_prime ψ, ψ⟩ / ‖ψ‖², with A_prime = τ_full − τ_arch the
-    // prime-power part of the Weil form. This is the ρ_p of the floor-bound
-    // sign hypothesis, measured on the actual trial vector.
-    let mut tau_full = build_tau_hp_compute(params, &l, cfg, true)?;
-    force_symmetric(&mut tau_full, dim);
-    let mut rho_p = quad_form(&tau_full, &psi, dim, prec);
-    rho_p -= &quad_form(&tau_arch, &psi, dim, prec);
-    let mut denom = Float::with_val(prec, 0);
-    for v in &psi {
-        denom += v.clone().square();
-    }
-    if !denom.is_zero() {
-        rho_p /= &denom;
-    }
-
-    Ok((eps, rho_p, psi))
 }
 
 /// `sinc(t) = sin(t)/t`, with `sinc(0) = 1`, at working precision `prec`.
@@ -945,7 +3312,7 @@ pub struct SoninRestriction {
 /// its minimum is the archimedean Rayleigh minimum on that subspace.
 ///
 /// Method: build [`band_concentration_matrix_hp`], take its top `n_drop`
-/// eigenvectors `v_k` (largest `χ`), and form `Ã = A_arch + σ Σ_k v_k v_kᵀ`
+/// eigenvectors `v_k` (largest `χ`), and form `A_deflated = A_arch + σ Σ_k v_k v_kᵀ`
 /// with `σ` a Gershgorin bound on `‖A_arch‖` (so deflated modes leave the
 /// spectrum bottom). `A_arch` is the prime-free Weil matrix
 /// (`build_tau_hp_compute(.., include_primes=false)`).
@@ -976,7 +3343,11 @@ fn weil_spectrum_sonin_hp_inner(
     for k in 0..n_drop {
         let chi_k = &chi[dim - 1 - k]; // largest χ first
         let mut v = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
-            &cmat, dim, chi_k, prec, cfg.inverse_iter_steps,
+            &cmat,
+            dim,
+            chi_k,
+            prec,
+            cfg.inverse_iter_steps,
         )?;
         xc_numerics::linalg::normalize_l2(&mut v);
         deflate.push(v);
@@ -1013,216 +3384,689 @@ fn weil_spectrum_sonin_hp_inner(
     force_symmetric(&mut a_arch, dim);
     let spectrum = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&a_arch, dim, prec)?;
 
-    Ok(SoninRestriction { chi, spectrum, n_dropped: n_drop })
+    Ok(SoninRestriction {
+        chi,
+        spectrum,
+        n_dropped: n_drop,
+    })
 }
 
-fn build_tau_hp_compute(params: &CcmParams, l: &Float, cfg: &HighPrecConfig, include_primes: bool) -> Result<Vec<Float>> {
+fn build_tau_hp_compute(
+    params: &CcmParams,
+    l: &Float,
+    cfg: &HighPrecConfig,
+    include_primes: bool,
+) -> Result<Vec<Float>> {
+    build_tau_hp_compute_exact(
+        params.n_modes,
+        params.lambda_sq_int(),
+        l,
+        cfg,
+        include_primes,
+    )
+}
+
+fn build_tau_hp_compute_exact(
+    n_modes: usize,
+    lambda_sq_int: u64,
+    l: &Float,
+    cfg: &HighPrecConfig,
+    include_primes: bool,
+) -> Result<Vec<Float>> {
+    let (components, _) =
+        build_tau_components_exact_tracked(n_modes, lambda_sq_int, l, cfg, include_primes, None)?;
+    Ok(assemble_tau_components(&components, cfg.precision_bits))
+}
+
+fn compute_archimedean_integrals_tracked(
+    n_modes: usize,
+    l: &Float,
+    cfg: &HighPrecConfig,
+    fabric_cache: Option<&ArtifactCacheContext<'_>>,
+) -> Result<(ComputedArchimedeanIntegrals, Vec<ArtifactManifest>)> {
     let prec = cfg.precision_bits;
-    let n_max = params.n_modes;
-    let dim = params.matrix_size();
-    let lambda_sq_int = params.lambda_sq_int();
+    let base_pts = cfg.quad_points;
+    let prec_extra = (prec / 2) as usize;
+    crate::hp_debug!(
+        "[HP] Computing alpha_L, beta_L, gamma_L for n=0..{} (base quad={})",
+        n_modes,
+        base_pts
+    );
+
+    use std::collections::HashMap;
+    let pts_for_n: Vec<usize> = (0..=n_modes)
+        .map(|n| base_pts.max(3 * n + prec_extra))
+        .collect();
+    let unique_pts: Vec<usize> = {
+        let mut values = pts_for_n.clone();
+        values.sort_unstable();
+        values.dedup();
+        values
+    };
+    eprintln!(
+        "[HP] Precomputing {} unique GL node tables (npts up to {}, prec={} bits)...",
+        unique_pts.len(),
+        unique_pts.last().copied().unwrap_or(0),
+        prec
+    );
+    type GlTable = (Vec<Float>, Vec<Float>);
+    let (gl_cache, quadrature_manifests): (HashMap<usize, GlTable>, Vec<ArtifactManifest>) =
+        if let Some(cache) = fabric_cache {
+            let resolved = xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
+                let request = ArtifactCacheContext {
+                    resolver: cache.resolver,
+                    acceptance: cache.acceptance,
+                    ordered_overlays: cache.ordered_overlays.clone(),
+                    mode: cache.mode,
+                    write_on_miss: cache.write_on_miss,
+                    write_visibility: cache.write_visibility,
+                    requested_assurance: cache.requested_assurance,
+                    certification_failure_policy: cache.certification_failure_policy,
+                    production_sink: cache.production_sink,
+                };
+                xc_numerics::quadrature::gauss_legendre_nodes_via_cache(npts, prec, request)
+                    .map(|rule| (npts, (rule.nodes, rule.weights), rule.artifact_manifest))
+            });
+            let mut tables = HashMap::new();
+            let mut manifests = Vec::new();
+            for result in resolved {
+                let (npts, table, manifest) = result.map_err(anyhow::Error::from)?;
+                tables.insert(npts, table);
+                manifests.push(manifest);
+            }
+            manifests.sort_by(|left, right| left.key.logical_key.cmp(&right.key.logical_key));
+            (tables, manifests)
+        } else {
+            let pairs: Vec<(usize, GlTable)> =
+                xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
+                    (
+                        npts,
+                        xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode),
+                    )
+                });
+            (pairs.into_iter().collect(), Vec::new())
+        };
+    eprintln!("[HP] GL tables ready. Computing alpha_L, beta_L, gamma_L integrals...");
+
+    let indices: Vec<usize> = (0..=n_modes).collect();
+    let alpha = indices
+        .par_iter()
+        .map(|&n| {
+            let (nodes, weights) = gl_cache.get(&pts_for_n[n]).unwrap();
+            compute_alpha_l(n as i64, l, prec, nodes, weights)
+        })
+        .collect();
+    let beta = indices
+        .par_iter()
+        .map(|&n| {
+            let (nodes, weights) = gl_cache.get(&pts_for_n[n]).unwrap();
+            compute_beta_l(n as i64, l, prec, nodes, weights)
+        })
+        .collect();
+    let gamma = indices
+        .par_iter()
+        .map(|&n| {
+            let (nodes, weights) = gl_cache.get(&pts_for_n[n]).unwrap();
+            compute_gamma_l(n as i64, l, prec, nodes, weights)
+        })
+        .collect();
+    Ok((
+        ComputedArchimedeanIntegrals { alpha, beta, gamma },
+        quadrature_manifests,
+    ))
+}
+
+fn assemble_pole_and_archimedean_components(
+    n_modes: usize,
+    l: &Float,
+    prec: u32,
+    integrals: &ComputedArchimedeanIntegrals,
+) -> (Vec<Float>, Vec<Float>) {
+    let dim = 2 * n_modes + 1;
+    let pi_v = pi(prec);
+    let mut sixteen_pi2 = pi_v.square();
+    sixteen_pi2 *= 16u32;
+    let l_sq = l.clone().square();
+    let sinh2_l_over_4 = {
+        let mut value = l.clone();
+        value /= 4u32;
+        value.sinh().square()
+    };
+    let cells: Vec<(i64, i64)> = (-(n_modes as i64)..=(n_modes as i64))
+        .flat_map(|n| (-(n_modes as i64)..=(n_modes as i64)).map(move |m| (n, m)))
+        .collect();
+    let values: Vec<(Float, Float)> = cells
+        .par_iter()
+        .map(|&(n, m)| {
+            let nf = fl_i(prec, n);
+            let mf = fl_i(prec, m);
+            let pole = {
+                let mut mn = sixteen_pi2.clone();
+                mn *= &mf;
+                mn *= &nf;
+                let mut numerator = l_sq.clone();
+                numerator -= &mn;
+                let mut left = sixteen_pi2.clone();
+                left *= &mf;
+                left *= &mf;
+                left += &l_sq;
+                let mut right = sixteen_pi2.clone();
+                right *= &nf;
+                right *= &nf;
+                right += &l_sq;
+                left *= right;
+                let mut value = sinh2_l_over_4.clone();
+                value *= 32u32;
+                value *= l;
+                value *= numerator;
+                value /= left;
+                value
+            };
+            let archimedean = if n == m {
+                let index = n.unsigned_abs() as usize;
+                let mut value = integrals.gamma[index].clone();
+                value -= &integrals.beta[index];
+                value *= 2u32;
+                value
+            } else {
+                let mut value = signed_alpha(&integrals.alpha, m, prec);
+                value -= signed_alpha(&integrals.alpha, n, prec);
+                value /= fl_i(prec, n - m);
+                value
+            };
+            (pole, archimedean)
+        })
+        .collect();
+    let mut pole = vec![Float::with_val(prec, 0); dim * dim];
+    let mut archimedean = vec![Float::with_val(prec, 0); dim * dim];
+    for (index, &(n, m)) in cells.iter().enumerate() {
+        let row = (n + n_modes as i64) as usize;
+        let column = (m + n_modes as i64) as usize;
+        pole[row * dim + column] = values[index].0.clone();
+        archimedean[row * dim + column] = values[index].1.clone();
+    }
+    (pole, archimedean)
+}
+
+fn compute_prime_component_matrix(
+    n_modes: usize,
+    prime_cutoff: u64,
+    l: &Float,
+    prec: u32,
+) -> Vec<Float> {
+    let dim = 2 * n_modes + 1;
+    let pi_v = pi(prec);
+    let mut two_pi = pi_v.clone();
+    two_pi *= 2u32;
+    let prime_data: Vec<(Float, Float, Float)> = prime_powers_up_to(prime_cutoff)
+        .into_iter()
+        .map(|(power, prime, _)| {
+            (
+                Float::with_val(prec, power).ln(),
+                Float::with_val(prec, prime).ln(),
+                Float::with_val(prec, power).sqrt(),
+            )
+        })
+        .collect();
+    let cells: Vec<(i64, i64)> = (-(n_modes as i64)..=(n_modes as i64))
+        .flat_map(|n| (-(n_modes as i64)..=(n_modes as i64)).map(move |m| (n, m)))
+        .collect();
+    let values: Vec<Float> = cells
+        .par_iter()
+        .map(|&(n, m)| {
+            let mut omega_n = two_pi.clone();
+            omega_n *= fl_i(prec, n);
+            omega_n /= l;
+            let mut omega_m = two_pi.clone();
+            omega_m *= fl_i(prec, m);
+            omega_m /= l;
+            let mut sum = Float::with_val(prec, 0);
+            for (log_power, log_prime, sqrt_power) in &prime_data {
+                let kernel = if n == m {
+                    let mut phase = omega_n.clone();
+                    phase *= log_power;
+                    let mut factor = Float::with_val(prec, 1);
+                    let mut ratio = log_power.clone();
+                    ratio /= l;
+                    factor -= ratio;
+                    factor *= 2u32;
+                    factor *= phase.cos();
+                    factor
+                } else {
+                    let mut phase_m = omega_m.clone();
+                    phase_m *= log_power;
+                    let mut phase_n = omega_n.clone();
+                    phase_n *= log_power;
+                    let mut difference = phase_m.sin();
+                    difference -= phase_n.sin();
+                    let mut denominator = pi_v.clone();
+                    denominator *= fl_i(prec, n - m);
+                    difference /= denominator;
+                    difference
+                };
+                let mut term = kernel;
+                term *= log_prime;
+                term /= sqrt_power;
+                sum += term;
+            }
+            sum
+        })
+        .collect();
+    let mut matrix = vec![Float::with_val(prec, 0); dim * dim];
+    for (index, &(n, m)) in cells.iter().enumerate() {
+        let row = (n + n_modes as i64) as usize;
+        let column = (m + n_modes as i64) as usize;
+        matrix[row * dim + column] = values[index].clone();
+    }
+    matrix
+}
+
+fn build_tau_components_exact_tracked(
+    n_modes: usize,
+    lambda_sq_int: u64,
+    l: &Float,
+    cfg: &HighPrecConfig,
+    include_primes: bool,
+    fabric_cache: Option<&ArtifactCacheContext<'_>>,
+) -> Result<(ComputedCcmMatrixComponents, Vec<ArtifactManifest>)> {
+    let prec = cfg.precision_bits;
+    let n_max = n_modes;
+    let dim = 2 * n_modes + 1;
 
     let pi_v = pi(prec);
-    let mut two_pi = pi_v.clone(); two_pi *= 2u32;
-    let mut sixteen_pi2 = pi_v.clone().square(); sixteen_pi2 *= 16u32;
+    let mut two_pi = pi_v.clone();
+    two_pi *= 2u32;
+    let mut sixteen_pi2 = pi_v.clone().square();
+    sixteen_pi2 *= 16u32;
     let l_sq = l.clone().square();
-    let sinh2_l_over_4 = { let mut v = l.clone(); v /= 4u32; v.sinh().square() };
+    let sinh2_l_over_4 = {
+        let mut v = l.clone();
+        v /= 4u32;
+        v.sinh().square()
+    };
 
     let base_pts = cfg.quad_points;
     let prec_extra = (cfg.precision_bits / 2) as usize;
-    crate::hp_debug!("[HP] Computing α_L, β_L, γ_L for n=0..{} (base quad={})", n_max, base_pts);
+    crate::hp_debug!(
+        "[HP] Computing α_L, β_L, γ_L for n=0..{} (base quad={})",
+        n_max,
+        base_pts
+    );
 
     use std::collections::HashMap;
-    let pts_for_n: Vec<usize> = (0..=n_max).map(|n| base_pts.max(3 * n + prec_extra)).collect();
+    let pts_for_n: Vec<usize> = (0..=n_max)
+        .map(|n| base_pts.max(3 * n + prec_extra))
+        .collect();
     let unique_pts: Vec<usize> = {
-        let mut v = pts_for_n.clone(); v.sort_unstable(); v.dedup(); v
+        let mut v = pts_for_n.clone();
+        v.sort_unstable();
+        v.dedup();
+        v
     };
-    eprintln!("[HP] Precomputing {} unique GL node tables (npts up to {}, prec={} bits)...",
-        unique_pts.len(), unique_pts.last().copied().unwrap_or(0), prec);
+    eprintln!(
+        "[HP] Precomputing {} unique GL node tables (npts up to {}, prec={} bits)...",
+        unique_pts.len(),
+        unique_pts.last().copied().unwrap_or(0),
+        prec
+    );
     // xc_numerics::hp_runtime::map_gl_precompute: parallel on Vast/native
     // Linux (unchanged); sequential on WSL2, where sustained concurrent
     // GMP allocation across many back-to-back GL computes triggers a
     // non-deterministic glibc abort (confirmed independent of rayon —
     // reproduces with plain std::thread too). GL tables are cached to
     // disk after first compute, so this only costs time on a cold cache.
-    let gl_pairs: Vec<(usize, (Vec<Float>, Vec<Float>))> = xc_numerics::hp_runtime::map_gl_precompute(
-        &unique_pts,
-        |&npts| (npts, xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode)),
-    );
-    let gl_cache: HashMap<usize, (Vec<Float>, Vec<Float>)> = gl_pairs.into_iter().collect();
+    type GlTable = (Vec<Float>, Vec<Float>);
+    let (gl_cache, quadrature_manifests): (HashMap<usize, GlTable>, Vec<ArtifactManifest>) =
+        if let Some(cache) = fabric_cache {
+            let resolved = xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
+                let request = ArtifactCacheContext {
+                    resolver: cache.resolver,
+                    acceptance: cache.acceptance,
+                    ordered_overlays: cache.ordered_overlays.clone(),
+                    mode: cache.mode,
+                    write_on_miss: cache.write_on_miss,
+                    write_visibility: cache.write_visibility,
+                    requested_assurance: cache.requested_assurance,
+                    certification_failure_policy: cache.certification_failure_policy,
+                    production_sink: cache.production_sink,
+                };
+                xc_numerics::quadrature::gauss_legendre_nodes_via_cache(npts, prec, request)
+                    .map(|rule| (npts, (rule.nodes, rule.weights), rule.artifact_manifest))
+            });
+            let mut tables = HashMap::new();
+            let mut manifests = Vec::new();
+            for result in resolved {
+                let (npts, table, manifest) = result.map_err(anyhow::Error::from)?;
+                tables.insert(npts, table);
+                manifests.push(manifest);
+            }
+            manifests.sort_by(|left, right| left.key.logical_key.cmp(&right.key.logical_key));
+            (tables, manifests)
+        } else {
+            let gl_pairs: Vec<(usize, GlTable)> =
+                xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
+                    (
+                        npts,
+                        xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode),
+                    )
+                });
+            (gl_pairs.into_iter().collect(), Vec::new())
+        };
     eprintln!("[HP] GL tables ready. Computing α_L, β_L, γ_L integrals...");
 
     let indices: Vec<usize> = (0..=n_max).collect();
-    let alpha_l: Vec<Float> = indices.par_iter().map(|&n| {
-        let pts = pts_for_n[n];
-        let (nodes, weights) = gl_cache.get(&pts).unwrap();
-        compute_alpha_l(n as i64, l, prec, nodes, weights)
-    }).collect();
-    let beta_l: Vec<Float> = indices.par_iter().map(|&n| {
-        let pts = pts_for_n[n];
-        let (nodes, weights) = gl_cache.get(&pts).unwrap();
-        compute_beta_l(n as i64, l, prec, nodes, weights)
-    }).collect();
-    let gamma_l: Vec<Float> = indices.par_iter().map(|&n| {
-        let pts = pts_for_n[n];
-        let (nodes, weights) = gl_cache.get(&pts).unwrap();
-        compute_gamma_l(n as i64, l, prec, nodes, weights)
-    }).collect();
-    eprintln!("[HP] Integrals done. Assembling {}×{} τ-matrix...", dim, dim);
+    let alpha_l: Vec<Float> = indices
+        .par_iter()
+        .map(|&n| {
+            let pts = pts_for_n[n];
+            let (nodes, weights) = gl_cache.get(&pts).unwrap();
+            compute_alpha_l(n as i64, l, prec, nodes, weights)
+        })
+        .collect();
+    let beta_l: Vec<Float> = indices
+        .par_iter()
+        .map(|&n| {
+            let pts = pts_for_n[n];
+            let (nodes, weights) = gl_cache.get(&pts).unwrap();
+            compute_beta_l(n as i64, l, prec, nodes, weights)
+        })
+        .collect();
+    let gamma_l: Vec<Float> = indices
+        .par_iter()
+        .map(|&n| {
+            let pts = pts_for_n[n];
+            let (nodes, weights) = gl_cache.get(&pts).unwrap();
+            compute_gamma_l(n as i64, l, prec, nodes, weights)
+        })
+        .collect();
+    eprintln!(
+        "[HP] Integrals done. Assembling {}×{} τ-matrix...",
+        dim, dim
+    );
 
     let prime_powers = prime_powers_up_to(lambda_sq_int);
     // Pure HP path: compute log_p in HP from the exposed prime, do not
     // recover j from log ratios. j is provided directly by the sieve.
-    let pp_data: Vec<(Float, Float, Float)> = prime_powers.iter().map(|&(k, _p, _j)| {
-        let log_k = Float::with_val(prec, k).ln();
-        let log_p = Float::with_val(prec, _p).ln();
-        let sqrt_k = Float::with_val(prec, k).sqrt();
-        (log_k, log_p, sqrt_k)
-    }).collect();
+    let pp_data: Vec<(Float, Float, Float)> = prime_powers
+        .iter()
+        .map(|&(k, _p, _j)| {
+            let log_k = Float::with_val(prec, k).ln();
+            let log_p = Float::with_val(prec, _p).ln();
+            let sqrt_k = Float::with_val(prec, k).sqrt();
+            (log_k, log_p, sqrt_k)
+        })
+        .collect();
 
     let cells: Vec<(i64, i64)> = (-(n_max as i64)..=(n_max as i64))
         .flat_map(|n| (-(n_max as i64)..=(n_max as i64)).map(move |m| (n, m)))
         .collect();
 
-    let computed: Vec<Float> = cells.par_iter().map(|&(n, m)| {
-        let nf = fl_i(prec, n);
-        let mf = fl_i(prec, m);
+    let computed: Vec<(Float, Float, Float)> = cells
+        .par_iter()
+        .map(|&(n, m)| {
+            let nf = fl_i(prec, n);
+            let mf = fl_i(prec, m);
 
-        let w02 = {
-            let mut mn = sixteen_pi2.clone(); mn *= &mf; mn *= &nf;
-            let mut num = l_sq.clone(); num -= &mn;
-            let mut a = sixteen_pi2.clone(); a *= &mf; a *= &mf; a += &l_sq;
-            let mut b = sixteen_pi2.clone(); b *= &nf; b *= &nf; b += &l_sq;
-            let mut den = a; den *= &b;
-            let mut v = sinh2_l_over_4.clone(); v *= 32u32; v *= l; v *= &num; v /= &den;
-            v
-        };
-
-        let wr = if n == m {
-            let k = n.unsigned_abs() as usize;
-            let mut v = gamma_l[k].clone(); v -= &beta_l[k]; v *= 2u32; v
-        } else {
-            let an = signed_alpha(&alpha_l, n, prec);
-            let am = signed_alpha(&alpha_l, m, prec);
-            let mut v = am; v -= &an; v /= fl_i(prec, n - m); v
-        };
-
-        let two_pi_n_over_l = { let mut v = two_pi.clone(); v *= &nf; v /= l; v };
-        let two_pi_m_over_l = { let mut v = two_pi.clone(); v *= &mf; v /= l; v };
-        let mut wp = Float::with_val(prec, 0);
-        if include_primes {
-        for (log_k, log_p, sqrt_k) in &pp_data {
-            let q = if n == m {
-                let mut ph = two_pi_n_over_l.clone(); ph *= log_k;
-                let c = ph.cos();
-                let mut t = log_k.clone(); t /= l;
-                let mut f = Float::with_val(prec, 1); f -= &t; f *= 2u32; f *= &c; f
-            } else {
-                let mut sm = two_pi_m_over_l.clone(); sm *= log_k; let sm_s = sm.sin();
-                let mut sn = two_pi_n_over_l.clone(); sn *= log_k; let sn_s = sn.sin();
-                let mut d = sm_s; d -= &sn_s;
-                let mut dn = pi_v.clone(); dn *= fl_i(prec, n - m);
-                d /= &dn; d
+            let w02 = {
+                let mut mn = sixteen_pi2.clone();
+                mn *= &mf;
+                mn *= &nf;
+                let mut num = l_sq.clone();
+                num -= &mn;
+                let mut a = sixteen_pi2.clone();
+                a *= &mf;
+                a *= &mf;
+                a += &l_sq;
+                let mut b = sixteen_pi2.clone();
+                b *= &nf;
+                b *= &nf;
+                b += &l_sq;
+                let mut den = a;
+                den *= &b;
+                let mut v = sinh2_l_over_4.clone();
+                v *= 32u32;
+                v *= l;
+                v *= &num;
+                v /= &den;
+                v
             };
-            let mut term = q; term *= log_p; term /= sqrt_k;
-            wp += &term;
-        }
-        }
-        let mut t = w02; t -= &wr; t -= &wp; t
-    }).collect();
 
-    let mut tau = vec![Float::with_val(prec, 0); dim * dim];
+            let wr = if n == m {
+                let k = n.unsigned_abs() as usize;
+                let mut v = gamma_l[k].clone();
+                v -= &beta_l[k];
+                v *= 2u32;
+                v
+            } else {
+                let an = signed_alpha(&alpha_l, n, prec);
+                let am = signed_alpha(&alpha_l, m, prec);
+                let mut v = am;
+                v -= &an;
+                v /= fl_i(prec, n - m);
+                v
+            };
+
+            let two_pi_n_over_l = {
+                let mut v = two_pi.clone();
+                v *= &nf;
+                v /= l;
+                v
+            };
+            let two_pi_m_over_l = {
+                let mut v = two_pi.clone();
+                v *= &mf;
+                v /= l;
+                v
+            };
+            let mut wp = Float::with_val(prec, 0);
+            if include_primes {
+                for (log_k, log_p, sqrt_k) in &pp_data {
+                    let q = if n == m {
+                        let mut ph = two_pi_n_over_l.clone();
+                        ph *= log_k;
+                        let c = ph.cos();
+                        let mut t = log_k.clone();
+                        t /= l;
+                        let mut f = Float::with_val(prec, 1);
+                        f -= &t;
+                        f *= 2u32;
+                        f *= &c;
+                        f
+                    } else {
+                        let mut sm = two_pi_m_over_l.clone();
+                        sm *= log_k;
+                        let sm_s = sm.sin();
+                        let mut sn = two_pi_n_over_l.clone();
+                        sn *= log_k;
+                        let sn_s = sn.sin();
+                        let mut d = sm_s;
+                        d -= &sn_s;
+                        let mut dn = pi_v.clone();
+                        dn *= fl_i(prec, n - m);
+                        d /= &dn;
+                        d
+                    };
+                    let mut term = q;
+                    term *= log_p;
+                    term /= sqrt_k;
+                    wp += &term;
+                }
+            }
+            (w02, wr, wp)
+        })
+        .collect();
+
+    let mut pole = vec![Float::with_val(prec, 0); dim * dim];
+    let mut archimedean = vec![Float::with_val(prec, 0); dim * dim];
+    let mut prime = vec![Float::with_val(prec, 0); dim * dim];
     for (i, &(n, m)) in cells.iter().enumerate() {
-        tau[params.idx(n) * dim + params.idx(m)] = computed[i].clone();
+        let row = (n + n_modes as i64) as usize;
+        let column = (m + n_modes as i64) as usize;
+        pole[row * dim + column] = computed[i].0.clone();
+        archimedean[row * dim + column] = computed[i].1.clone();
+        prime[row * dim + column] = computed[i].2.clone();
     }
-    Ok(tau)
+    Ok((
+        ComputedCcmMatrixComponents {
+            pole,
+            archimedean,
+            prime,
+        },
+        quadrature_manifests,
+    ))
 }
 
 fn signed_alpha(table: &[Float], n: i64, prec: u32) -> Float {
     let k = n.unsigned_abs() as usize;
-    if k >= table.len() { return Float::with_val(prec, 0); }
-    if n < 0 { let mut v = table[k].clone(); v = -v; v } else { table[k].clone() }
+    if k >= table.len() {
+        return Float::with_val(prec, 0);
+    }
+    if n < 0 {
+        let mut v = table[k].clone();
+        v = -v;
+        v
+    } else {
+        table[k].clone()
+    }
 }
 
 fn compute_alpha_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Float]) -> Float {
-    if n == 0 { return Float::with_val(prec, 0); }
+    if n == 0 {
+        return Float::with_val(prec, 0);
+    }
     let pi_v = pi(prec);
-    let mut freq = pi_v.clone(); freq *= 2u32; freq *= fl_i(prec, n); freq /= l;
+    let mut freq = pi_v.clone();
+    freq *= 2u32;
+    freq *= fl_i(prec, n);
+    freq /= l;
     let f = |x: &Float| -> Float {
-        let mut ph = freq.clone(); ph *= x;
-        let mut r = ph.sin(); r *= &rho_hp(x, prec); r
+        let mut ph = freq.clone();
+        ph *= x;
+        let mut r = ph.sin();
+        r *= &rho_hp(x, prec);
+        r
     };
     let mut v = quad_eval(nodes, weights, l, f);
-    v /= &pi_v; v
+    v /= &pi_v;
+    v
 }
 
 fn compute_beta_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Float]) -> Float {
     let pi_v = pi(prec);
-    let mut freq = pi_v.clone(); freq *= 2u32; freq *= fl_i(prec, n); freq /= l;
+    let mut freq = pi_v.clone();
+    freq *= 2u32;
+    freq *= fl_i(prec, n);
+    freq /= l;
     let f = |x: &Float| -> Float {
-        let mut ph = freq.clone(); ph *= x;
+        let mut ph = freq.clone();
+        ph *= x;
         let c = ph.cos();
-        let mut r = x.clone(); r *= &c; r *= &rho_hp(x, prec); r
+        let mut r = x.clone();
+        r *= &c;
+        r *= &rho_hp(x, prec);
+        r
     };
     let mut v = quad_eval(nodes, weights, l, f);
-    v /= l; v
+    v /= l;
+    v
 }
 
 fn compute_gamma_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Float]) -> Float {
     let pi_v = pi(prec);
-    let mut freq = pi_v.clone(); freq *= 2u32; freq *= fl_i(prec, n); freq /= l;
+    let mut freq = pi_v.clone();
+    freq *= 2u32;
+    freq *= fl_i(prec, n);
+    freq /= l;
     let f = |x: &Float| -> Float {
-        let mut ph = freq.clone(); ph *= x;
+        let mut ph = freq.clone();
+        ph *= x;
         let c = ph.cos();
-        let mut neg_half = x.clone(); neg_half /= -2i32;
+        let mut neg_half = x.clone();
+        neg_half /= -2i32;
         let e = neg_half.exp();
-        let mut diff = c; diff -= &e;
-        diff *= &rho_hp(x, prec); diff
+        let mut diff = c;
+        diff -= &e;
+        diff *= &rho_hp(x, prec);
+        diff
     };
     let mut v = quad_eval(nodes, weights, l, f);
     let kappa_half = {
         let exp_l = l.clone().exp();
-        let mut num = exp_l.clone(); num -= 1u32;
-        let mut den = exp_l; den += 1u32;
-        let mut ratio = num; ratio /= &den;
-        let mut four_pi = pi_v; four_pi *= 4u32;
+        let mut num = exp_l.clone();
+        num -= 1u32;
+        let mut den = exp_l;
+        den += 1u32;
+        let mut ratio = num;
+        ratio /= &den;
+        let mut four_pi = pi_v;
+        four_pi *= 4u32;
         ratio *= &four_pi;
-        let mut k = ratio.ln(); k += euler(prec); k /= 2u32; k
+        let mut k = ratio.ln();
+        k += euler(prec);
+        k /= 2u32;
+        k
     };
-    v += &kappa_half; v
+    v += &kappa_half;
+    v
 }
 
 fn rho_hp(x: &Float, prec: u32) -> Float {
     let tiny = Float::with_val(prec, Float::parse(HP_SINGULARITY_GUARD_STR).unwrap());
     if x.cmp_abs(&tiny).map(|o| o.is_lt()).unwrap_or(false) {
-        let mut v = x.clone().recip(); v /= 2u32; v += { let mut q = Float::with_val(prec, 1); q /= 4u32; q }; v
+        let mut v = x.clone().recip();
+        v /= 2u32;
+        v += {
+            let mut q = Float::with_val(prec, 1);
+            q /= 4u32;
+            q
+        };
+        v
     } else {
-        let mut hx = x.clone(); hx /= 2u32;
+        let mut hx = x.clone();
+        hx /= 2u32;
         let e = hx.exp();
-        let mut d = x.clone().sinh(); d *= 2u32;
-        let mut r = e; r /= &d; r
+        let mut d = x.clone().sinh();
+        d *= 2u32;
+        let mut r = e;
+        r /= &d;
+        r
     }
 }
 
 fn quad_eval<F>(nodes: &[Float], weights: &[Float], l: &Float, f: F) -> Float
-where F: Fn(&Float) -> Float {
+where
+    F: Fn(&Float) -> Float,
+{
     let prec = l.prec();
-    let mut half_l = l.clone(); half_l /= 2u32;
+    let mut half_l = l.clone();
+    half_l /= 2u32;
     let mut acc = Float::with_val(prec, 0);
     for (n, w) in nodes.iter().zip(weights) {
-        let mut x = n.clone(); x += 1u32; x *= &half_l;
-        let mut term = w.clone(); term *= &f(&x);
+        let mut x = n.clone();
+        x += 1u32;
+        x *= &half_l;
+        let mut term = w.clone();
+        term *= &f(&x);
         acc += &term;
     }
-    acc *= &half_l; acc
+    acc *= &half_l;
+    acc
 }
 
 fn normalize_eigenvector(xi: &[Float], l: &Float, prec: u32) -> Vec<Float> {
     let mut sum = Float::with_val(prec, 0);
-    for v in xi { sum += v; }
+    for v in xi {
+        sum += v;
+    }
     let mut target = l.clone().sqrt();
     target /= &sum;
-    xi.iter().map(|v| { let mut x = v.clone(); x *= &target; x }).collect()
+    xi.iter()
+        .map(|v| {
+            let mut x = v.clone();
+            x *= &target;
+            x
+        })
+        .collect()
 }
 
 /// Basis half-period `L = ln(λ²) = 2 ln λ` at full working precision.
@@ -1245,33 +4089,30 @@ fn log_lambda_sq_hp(params: &CcmParams, prec: u32) -> Float {
     }
 }
 
-
 // ===========================================================================
 // Newton refinement of R(z) zeros
 // ===========================================================================
 
-/// Returns the name of the active solver based on `XCELERATOR_SOLVER`.
-fn active_solver_name() -> &'static str {
-    match std::env::var("XCELERATOR_SOLVER").as_deref() {
-        Ok("newton") => "Newton",
-        _ => "Halley",
-    }
-}
-
 /// Root-finding method for R(z) zeros.
 ///
-/// Selected via the `XCELERATOR_SOLVER` environment variable:
+/// Selected explicitly through [`HighPrecConfig::root_solver`]:
 ///   - `"halley"` (default): cubic convergence, 3 passes per step, ~33%
 ///     fewer steps than Newton. Requires seeds reasonably close to the
 ///     true eigenvalue — satisfied in practice by the f64 warm seeds.
 ///   - `"newton"`: quadratic convergence, 2 passes per step. Use if Halley
 ///     exhibits convergence issues on a specific config.
 fn solve_r_zero(
-    xi: &[Float], n_max: usize, l: &Float, seed: &Float, prec: u32, n_steps: usize,
+    xi: &[Float],
+    n_max: usize,
+    l: &Float,
+    seed: &Float,
+    prec: u32,
+    n_steps: usize,
+    method: RootSolver,
 ) -> EigenvalueResult {
-    match std::env::var("XCELERATOR_SOLVER").as_deref() {
-        Ok("newton") => newton_xi_hat_zero(xi, n_max, l, seed, prec, n_steps),
-        _            => halley_xi_hat_zero(xi, n_max, l, seed, prec, n_steps),
+    match method {
+        RootSolver::Newton => newton_xi_hat_zero(xi, n_max, l, seed, prec, n_steps),
+        RootSolver::Halley => halley_xi_hat_zero(xi, n_max, l, seed, prec, n_steps),
     }
 }
 
@@ -1288,9 +4129,19 @@ fn solve_r_zero(
 ///   convergence or stagnation (best approximation found).
 /// - `Failed` only if R'(z) = 0 (degenerate denominator — garbage).
 fn newton_xi_hat_zero(
-    xi: &[Float], n_max: usize, l: &Float, seed: &Float, prec: u32, n_steps: usize,
+    xi: &[Float],
+    n_max: usize,
+    l: &Float,
+    seed: &Float,
+    prec: u32,
+    n_steps: usize,
 ) -> EigenvalueResult {
-    let two_pi_over_l = { let mut v = pi(prec); v *= 2u32; v /= l; v };
+    let two_pi_over_l = {
+        let mut v = pi(prec);
+        v *= 2u32;
+        v /= l;
+        v
+    };
     let mut z = seed.clone();
     let tol = Float::with_val(prec, 2).pow(-((prec as i32) - 16));
     // Stagnation floor: if |dz| stops shrinking while already below f64
@@ -1302,16 +4153,24 @@ fn newton_xi_hat_zero(
         let mut r_prime = Float::with_val(prec, 0);
         for j in -(n_max as i64)..=(n_max as i64) {
             let idx = (j + n_max as i64) as usize;
-            let mut pole = two_pi_over_l.clone(); pole *= fl_i(prec, j);
-            let mut den = z.clone(); den -= &pole;
-            let mut term = xi[idx].clone(); term /= &den;
+            let mut pole = two_pi_over_l.clone();
+            pole *= fl_i(prec, j);
+            let mut den = z.clone();
+            den -= &pole;
+            let mut term = xi[idx].clone();
+            term /= &den;
             r += &term;
-            let mut den_sq = den.clone(); den_sq.square_mut();
-            let mut dterm = xi[idx].clone(); dterm /= &den_sq;
+            let mut den_sq = den.clone();
+            den_sq.square_mut();
+            let mut dterm = xi[idx].clone();
+            dterm /= &den_sq;
             r_prime -= &dterm;
         }
-        if r_prime.is_zero() { return EigenvalueResult::Failed; }
-        let mut dz = r; dz /= &r_prime;
+        if r_prime.is_zero() {
+            return EigenvalueResult::Failed;
+        }
+        let mut dz = r;
+        dz /= &r_prime;
         z -= &dz;
         let abs_dz = dz.abs();
         // Converged to full HP precision.
@@ -1320,7 +4179,12 @@ fn newton_xi_hat_zero(
         }
         // Stagnated: step stopped shrinking while already below f64 floor.
         // The construction's accuracy ceiling has been reached.
-        if abs_dz >= prev_dz && prev_dz.cmp_abs(&stagnation_tol).map(|o| o.is_lt()).unwrap_or(false) {
+        if abs_dz >= prev_dz
+            && prev_dz
+                .cmp_abs(&stagnation_tol)
+                .map(|o| o.is_lt())
+                .unwrap_or(false)
+        {
             return EigenvalueResult::Converged(z);
         }
         prev_dz = abs_dz;
@@ -1328,7 +4192,7 @@ fn newton_xi_hat_zero(
     // Step limit exhausted — return best approximation, not a hard failure.
     crate::hp_debug!(
         "[HP] WARNING: Newton failed to converge for seed {} — returning Approximate",
-        seed.to_f64()
+        xc_numerics::fmt::display_hp(seed, 10)
     );
     EigenvalueResult::Approximate(z)
 }
@@ -1347,9 +4211,19 @@ fn newton_xi_hat_zero(
 ///   convergence or stagnation (best approximation found).
 /// - `Failed` only if the Halley denominator is zero (degenerate).
 fn halley_xi_hat_zero(
-    xi: &[Float], n_max: usize, l: &Float, seed: &Float, prec: u32, n_steps: usize,
+    xi: &[Float],
+    n_max: usize,
+    l: &Float,
+    seed: &Float,
+    prec: u32,
+    n_steps: usize,
 ) -> EigenvalueResult {
-    let two_pi_over_l = { let mut v = pi(prec); v *= 2u32; v /= l; v };
+    let two_pi_over_l = {
+        let mut v = pi(prec);
+        v *= 2u32;
+        v /= l;
+        v
+    };
     let mut z = seed.clone();
     let tol = Float::with_val(prec, 2).pow(-((prec as i32) - 16));
     // Stagnation floor: if |dz| stops shrinking while already below f64
@@ -1357,23 +4231,30 @@ fn halley_xi_hat_zero(
     let stagnation_tol = Float::with_val(prec, 2).pow(-53);
     let mut prev_dz = Float::with_val(prec, f64::INFINITY);
     for _ in 0..n_steps {
-        let mut r        = Float::with_val(prec, 0);
-        let mut r_prime  = Float::with_val(prec, 0);
+        let mut r = Float::with_val(prec, 0);
+        let mut r_prime = Float::with_val(prec, 0);
         let mut r_dprime = Float::with_val(prec, 0);
         for j in -(n_max as i64)..=(n_max as i64) {
             let idx = (j + n_max as i64) as usize;
-            let mut pole = two_pi_over_l.clone(); pole *= fl_i(prec, j);
-            let mut den = z.clone(); den -= &pole;
+            let mut pole = two_pi_over_l.clone();
+            pole *= fl_i(prec, j);
+            let mut den = z.clone();
+            den -= &pole;
 
-            let mut term = xi[idx].clone(); term /= &den;
+            let mut term = xi[idx].clone();
+            term /= &den;
             r += &term;
 
-            let mut den2 = den.clone(); den2.square_mut();
-            let mut dt = xi[idx].clone(); dt /= &den2;
+            let mut den2 = den.clone();
+            den2.square_mut();
+            let mut dt = xi[idx].clone();
+            dt /= &den2;
             r_prime -= &dt;
 
-            let mut den3 = den2.clone(); den3 *= &den;
-            let mut ddt = xi[idx].clone(); ddt /= &den3;
+            let mut den3 = den2.clone();
+            den3 *= &den;
+            let mut ddt = xi[idx].clone();
+            ddt /= &den3;
             ddt *= 2u32;
             r_dprime += &ddt;
         }
@@ -1381,12 +4262,18 @@ fn halley_xi_hat_zero(
         let mut denom = r_prime.clone();
         denom.square_mut();
         denom *= 2u32;
-        let mut rr2 = r.clone(); rr2 *= &r_dprime;
+        let mut rr2 = r.clone();
+        rr2 *= &r_dprime;
         denom -= &rr2;
 
-        if denom.is_zero() { return EigenvalueResult::Failed; }
+        if denom.is_zero() {
+            return EigenvalueResult::Failed;
+        }
 
-        let mut dz = r.clone(); dz *= &r_prime; dz *= 2u32; dz /= &denom;
+        let mut dz = r.clone();
+        dz *= &r_prime;
+        dz *= 2u32;
+        dz /= &denom;
         z -= &dz;
         let abs_dz = dz.abs();
         // Converged to full HP precision.
@@ -1395,7 +4282,12 @@ fn halley_xi_hat_zero(
         }
         // Stagnated: step stopped shrinking while already below f64 floor.
         // The construction's accuracy ceiling has been reached.
-        if abs_dz >= prev_dz && prev_dz.cmp_abs(&stagnation_tol).map(|o| o.is_lt()).unwrap_or(false) {
+        if abs_dz >= prev_dz
+            && prev_dz
+                .cmp_abs(&stagnation_tol)
+                .map(|o| o.is_lt())
+                .unwrap_or(false)
+        {
             return EigenvalueResult::Converged(z);
         }
         prev_dz = abs_dz;
@@ -1403,11 +4295,10 @@ fn halley_xi_hat_zero(
     // Step limit exhausted — return best approximation, not a hard failure.
     crate::hp_debug!(
         "[HP] WARNING: Halley failed to converge for seed {} — returning Approximate",
-        seed.to_f64()
+        xc_numerics::fmt::display_hp(seed, 10)
     );
     EigenvalueResult::Approximate(z)
 }
-
 
 // ===========================================================================
 // τ-matrix disk cache
@@ -1460,13 +4351,11 @@ mod tau_cache {
     /// produced by an older toolkit are treated as cache misses and
     /// recomputed. Update this constant when a change to the tau
     /// computation changes the stored values.
-    const CACHE_MIN_TOOLKIT_VERSION: &str = "0.12.0";
-
     fn effective_min_version() -> String {
-        std::env::var("XC_TAU_CACHE_MIN_VER")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| CACHE_MIN_TOOLKIT_VERSION.to_string())
+        xc_cache::artifact_compatibility_policy("ccm-matrices", "ccm_tau_matrix")
+            .expect("CCM matrix compatibility policy")
+            .minimum_producer_version
+            .to_string()
     }
 
     /// Tolerance for the symmetry identity check on cache load.
@@ -1484,7 +4373,12 @@ mod tau_cache {
     }
 
     pub(super) fn cache_filename(lambda_sq: LambdaSq, n_modes: usize, prec: u32) -> String {
-        format!("lambda_sq{}_nmodes{}_prec{}.json", lambda_sq.filename_str(), n_modes, prec)
+        format!(
+            "lambda_sq{}_nmodes{}_prec{}.json",
+            lambda_sq.filename_str(),
+            n_modes,
+            prec
+        )
     }
 
     fn json_path(lambda_sq: LambdaSq, n_modes: usize, prec: u32) -> Option<std::path::PathBuf> {
@@ -1500,19 +4394,30 @@ mod tau_cache {
 
     /// Glob the .partXX files for a given config in lexicographic
     /// order. Returns `None` if no parts exist.
-    fn part_paths(lambda_sq: LambdaSq, n_modes: usize, prec: u32) -> Option<Vec<std::path::PathBuf>> {
+    fn part_paths(
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
+    ) -> Option<Vec<std::path::PathBuf>> {
         let dir = cache_dir()?;
         let stem = cache_filename(lambda_sq, n_modes, prec);
         let prefix = format!("{}.zip.part", stem);
-        let mut parts: Vec<std::path::PathBuf> = std::fs::read_dir(&dir).ok()?
+        let mut parts: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .ok()?
             .filter_map(|entry| {
                 let entry = entry.ok()?;
                 let name = entry.file_name();
                 let s = name.to_str()?;
-                if s.starts_with(&prefix) { Some(entry.path()) } else { None }
+                if s.starts_with(&prefix) {
+                    Some(entry.path())
+                } else {
+                    None
+                }
             })
             .collect();
-        if parts.is_empty() { return None; }
+        if parts.is_empty() {
+            return None;
+        }
         parts.sort();
         Some(parts)
     }
@@ -1532,7 +4437,9 @@ mod tau_cache {
         }
 
         let arr = obj.get("matrix")?.as_array()?;
-        if arr.len() != n_expected { return None; }
+        if arr.len() != n_expected {
+            return None;
+        }
         let mut out = Vec::with_capacity(n_expected);
         for s in arr {
             out.push(Float::with_val(prec, Float::parse(s.as_str()?).ok()?));
@@ -1555,14 +4462,14 @@ mod tau_cache {
     /// Verify the loaded matrix satisfies the structural identities:
     /// length matches `(2N+1)²`, no NaN/Inf entries, and symmetry
     /// `τ[i,j] = τ[j,i]` to working precision.
-    pub(super) fn structural_check(
-        tau: &[Float], n_modes: usize, prec: u32,
-    ) -> Option<String> {
+    pub(super) fn structural_check(tau: &[Float], n_modes: usize, prec: u32) -> Option<String> {
         let dim = 2 * n_modes + 1;
         if tau.len() != dim * dim {
             return Some(format!(
                 "matrix length {} != expected {}², = {}",
-                tau.len(), dim, dim * dim
+                tau.len(),
+                dim,
+                dim * dim
             ));
         }
         for (k, v) in tau.iter().enumerate() {
@@ -1594,7 +4501,8 @@ mod tau_cache {
     fn warn_skip(path: &std::path::Path, reason: &str) {
         crate::hp_debug!(
             "[tau_cache] WARNING: skipping {} ({}); recomputing",
-            path.display(), reason
+            path.display(),
+            reason
         );
     }
 
@@ -1627,8 +4535,7 @@ mod tau_cache {
         let mut concatenated: Vec<u8> = Vec::new();
         for p in parts {
             let mut bytes = Vec::new();
-            std::fs::File::open(p).ok()?
-                .read_to_end(&mut bytes).ok()?;
+            std::fs::File::open(p).ok()?.read_to_end(&mut bytes).ok()?;
             concatenated.extend_from_slice(&bytes);
         }
         read_single_zip(&concatenated, json_filename, n_modes, prec)
@@ -1641,31 +4548,22 @@ mod tau_cache {
         mode: xc_numerics::quadrature::CacheMode,
     ) -> Option<Vec<Float>> {
         use xc_numerics::quadrature::CacheMode;
-        if mode == CacheMode::Off { return None; }
+        if mode == CacheMode::Off {
+            return None;
+        }
 
         // Caches are zip-only: we read straight from the .json.zip
         // (decompress in memory) and never write a decompressed .json.
         // Keeps local disk usage ~2x smaller. JsonOnly is now a read
-        // no-op (kept for API compatibility) since no .json is written.
-        if mode == CacheMode::JsonOnly { return None; }
+        // no-op because current cache files are zip-only.
+        if mode == CacheMode::JsonOnly {
+            return None;
+        }
 
-        // Tier 1 (JsonZip, DynamicFetch): local zip — single first, then
+        // Local zip — single first, then
         // multi-part. Decompressed in memory; no .json written.
         if let Some(tau) = try_load_local_zip(lambda_sq, n_modes, prec) {
             return Some(tau);
-        }
-
-        // JsonZip stops after the local tiers.
-        if mode == CacheMode::JsonZip { return None; }
-
-        // Tier 2 (DynamicFetch only): remote fetch from the public
-        // consolidated τ-cache repo. Probe the single zip first, then the
-        // byte-split parts. On success the file(s) land in the local
-        // cache dir; we then re-run the local-zip loader.
-        if fetch_remote(lambda_sq, n_modes, prec) {
-            if let Some(tau) = try_load_local_zip(lambda_sq, n_modes, prec) {
-                return Some(tau);
-            }
         }
 
         None
@@ -1718,237 +4616,10 @@ mod tau_cache {
         None
     }
 
-    /// Base raw URLs of the public τ-cache repositories, in probe order.
-    ///
-    /// The toolkit checks each repo in sequence during a remote fetch and
-    /// stops at the first hit. Currently a single repo; adding another
-    /// in the future is a one-line change here.
-    const REMOTE_BASES: &[&str] = &[
-        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache/main",
-    ];
-
-    fn active_bases() -> Vec<String> {
-        match std::env::var("XC_TAU_CACHE_BASES") {
-            Ok(v) if !v.trim().is_empty() => v
-                .split(',')
-                .map(|s| s.trim().trim_end_matches('/').to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
-            _ => REMOTE_BASES.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    /// Remote directory URL (and filename stem) for a config in a
-    /// specific base repo, using the precision-first → λ² →
-    /// nmodes-thousand-bucket layout.
-    /// Returns `(dir_url, stem)` where `stem` is the canonical
-    /// `lambda_sq{L}_nmodes{N}_prec{P}.json.zip` filename.
-    fn remote_dir_and_stem(base: &str, lambda_sq: LambdaSq, n_modes: usize, prec: u32) -> (String, String) {
-        let bucket = (n_modes / 1000) * 1000;
-        let dir = format!(
-            "{base}/tau_cache/prec{p}/lambda_sq{l}/nmodes{b}-{bend}",
-            base = base, p = prec, l = lambda_sq.filename_str(), b = bucket, bend = bucket + 999
-        );
-        let stem = format!("{}.zip", cache_filename(lambda_sq, n_modes, prec));
-        (dir, stem)
-    }
-
-    /// Test-only accessor for `remote_dir_and_stem` (the function is
-    /// private; this lets the test module assert URL formatting without
-    /// widening the API). Returns results for all configured bases.
+    /// Test-only accessor for the current schema parser.
     #[cfg(test)]
-    pub(super) fn remote_dir_and_stem_for_test(
-        lambda_sq: LambdaSq, n_modes: usize, prec: u32,
-    ) -> Vec<(String, String)> {
-        REMOTE_BASES.iter()
-            .map(|base| remote_dir_and_stem(base, lambda_sq, n_modes, prec))
-            .collect()
-    }
-
-    /// Test-only accessor for `parse_json` (lets version-rejection tests
-    /// call the parser directly without touching disk).
-    #[cfg(test)]
-    pub(super) fn parse_json_for_test(
-        data: &str, n_modes: usize, prec: u32,
-    ) -> Option<Vec<Float>> {
+    pub(super) fn parse_json_for_test(data: &str, n_modes: usize, prec: u32) -> Option<Vec<Float>> {
         parse_json(data, n_modes, prec)
-    }
-
-    /// Outcome of a single `curl` download attempt, classified by the
-    /// actual HTTP status code.
-    enum CurlOutcome {
-        /// HTTP 2xx, file written and renamed into place.
-        Ok,
-        /// HTTP 404 specifically — the file does not exist. For part
-        /// probing this is the genuine end-of-parts marker.
-        HttpError,
-        /// Anything else: 429 (rate limit), 5xx, no response, curl
-        /// missing, network/DNS/timeout, write error. Must be retried;
-        /// must NOT be treated as end-of-parts (would silently truncate).
-        Transient,
-    }
-
-    /// `curl` a single URL to `dest`, capturing the actual HTTP status
-    /// code so we can distinguish a genuine 404 (end-of-parts) from a
-    /// transient 429/5xx (rate-limit / server hiccup — must retry, NOT
-    /// stop). raw.githubusercontent.com rate-limits bursts of requests,
-    /// so a multi-part fetch will hit 429 if we go too fast; treating
-    /// that as end-of-parts would silently truncate the download.
-    ///
-    /// Uses `--write-out %{http_code}` (not `--fail`) so curl still
-    /// writes the body decision to us via the printed code. We only
-    /// keep the file on a 2xx. Downloads to a temp path and renames on
-    /// success so a failed download never leaves a truncated file.
-    fn curl_attempt(url: &str, dest: &std::path::Path) -> CurlOutcome {
-        let tmp = dest.with_extension("downloading");
-        let _ = std::fs::remove_file(&tmp);
-        let mut cmd = std::process::Command::new("curl");
-        cmd.arg("--silent").arg("--show-error").arg("--location")
-            .arg("--retry").arg("3").arg("--retry-delay").arg("1");
-        if let Ok(tok) = std::env::var("XC_CACHE_AUTH") {
-            if !tok.trim().is_empty() {
-                cmd.arg("-H").arg(format!("Authorization: token {}", tok.trim()));
-            }
-        }
-        let output = cmd
-            .arg("--write-out").arg("%{http_code}")
-            .arg("-o").arg(&tmp).arg(url)
-            .output();
-        match output {
-            Ok(out) if out.status.success() => {
-                let code: u32 = String::from_utf8_lossy(&out.stdout)
-                    .trim().parse().unwrap_or(0);
-                match code {
-                    200..=299 => match std::fs::rename(&tmp, dest) {
-                        Ok(()) => CurlOutcome::Ok,
-                        Err(_) => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
-                    },
-                    404 => { let _ = std::fs::remove_file(&tmp); CurlOutcome::HttpError }
-                    // 429 (rate limit), 5xx, redirects-gone-wrong, 0
-                    // (no response): all transient — retry, don't stop.
-                    _ => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
-                }
-            }
-            // curl itself failed to run / network-level error / missing curl.
-            _ => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
-        }
-    }
-
-    /// Download a single URL with retries on transient failure
-    /// (including HTTP 429 rate-limiting). Returns the final outcome
-    /// (`Ok`, `HttpError` for a genuine 404, or `Transient` if all
-    /// retries were exhausted). Uses a longer backoff than curl's own
-    /// `--retry` because GitHub's rate-limit window is seconds-scale.
-    fn curl_with_retries(url: &str, dest: &std::path::Path) -> CurlOutcome {
-        const MAX_TRIES: usize = 5;
-        for attempt in 0..MAX_TRIES {
-            match curl_attempt(url, dest) {
-                CurlOutcome::Ok => return CurlOutcome::Ok,
-                CurlOutcome::HttpError => return CurlOutcome::HttpError, // 404: definitive
-                CurlOutcome::Transient => {
-                    if attempt + 1 < MAX_TRIES {
-                        // Backoff grows: 2s, 4s, 6s, 8s — rides out a
-                        // GitHub rate-limit window.
-                        let secs = 2 * (attempt as u64 + 1);
-                        std::thread::sleep(std::time::Duration::from_secs(secs));
-                    }
-                }
-            }
-        }
-        CurlOutcome::Transient
-    }
-
-    /// Download a config from the public τ-cache repos into the local
-    /// cache dir. Iterates over `REMOTE_BASES` in order, trying each
-    /// repo until one contains the file.
-    ///
-    /// Within each repo, probes the **single zip first**; if that 404s,
-    /// probes the byte-split parts `.part00`, `.part01`, … and stops only
-    /// when a part returns an HTTP error (404 = genuine end-of-parts).
-    ///
-    /// A *transient* failure on any part (after retries) aborts the whole
-    /// fetch for that repo and tries the next repo — we must never
-    /// silently truncate a multi-part config. On abort, any downloaded
-    /// parts are removed so a stale partial set can't be mistaken for a
-    /// complete one on a later load.
-    ///
-    /// Mirrors the local read order (single → parts) so the subsequent
-    /// `try_load_local_zip` finds and validates whatever was fetched.
-    fn fetch_remote(lambda_sq: LambdaSq, n_modes: usize, prec: u32) -> bool {
-        let dir = match cache_dir() { Some(d) => d, None => return false };
-
-        for base in active_bases() {
-            let (remote_dir, stem) = remote_dir_and_stem(&base, lambda_sq, n_modes, prec);
-
-            // Probe 1: single zip.
-            let single_url = format!("{}/{}", remote_dir, stem);
-            let single_dest = dir.join(&stem);
-            match curl_with_retries(&single_url, &single_dest) {
-                CurlOutcome::Ok => {
-                    // Routine cache hit — silent.
-                    return true;
-                }
-                CurlOutcome::Transient => {
-                    // Network trouble on this repo's single-zip probe;
-                    // skip to the next repo.
-                    continue;
-                }
-                // HttpError (404): no single zip in this repo — may be
-                // byte-split, or not present here at all.
-                CurlOutcome::HttpError => {}
-            }
-
-            // Probe 2: byte-split parts. Download .part00, .part01, … until
-            // an HTTP error (404) marks the genuine end. A transient failure
-            // aborts this repo and tries the next — never a silent truncation.
-            let mut downloaded: Vec<std::path::PathBuf> = Vec::new();
-            let mut idx = 0usize;
-            let mut transient_abort = false;
-            loop {
-                let part_name = format!("{}.part{:02}", stem, idx);
-                let part_url = format!("{}/{}", remote_dir, part_name);
-                let part_dest = dir.join(&part_name);
-                match curl_with_retries(&part_url, &part_dest) {
-                    CurlOutcome::Ok => {
-                        downloaded.push(part_dest);
-                        idx += 1;
-                        if idx > 256 { break; } // safety cap
-                        // Brief inter-part pause to stay under
-                        // raw.githubusercontent.com's burst rate limit
-                        // (datacenter IPs trip 429 on rapid sequential
-                        // requests). Cheap insurance vs. a retry storm.
-                        std::thread::sleep(std::time::Duration::from_millis(300));
-                    }
-                    CurlOutcome::HttpError => break, // genuine end-of-parts (or file not in this repo)
-                    CurlOutcome::Transient => {
-                        // Could not retrieve a part that may well exist.
-                        // Abort: remove everything downloaded so a partial
-                        // set is never concatenated into a corrupt zip.
-                        crate::hp_debug!(
-                            "[tau_cache] WARNING: transient failure fetching {} after retries; \
-                             trying next repo",
-                            part_name
-                        );
-                        for p in &downloaded { let _ = std::fs::remove_file(p); }
-                        transient_abort = true;
-                        break;
-                    }
-                }
-            }
-
-            if transient_abort {
-                continue; // try next repo
-            }
-
-            if !downloaded.is_empty() {
-                // Routine multi-part cache hit — silent.
-                return true;
-            }
-
-            // No single zip and no parts in this repo — try the next one.
-        }
-
-        false
     }
 
     /// Serialize `tau` to the versioned JSON envelope and return the
@@ -1989,9 +4660,15 @@ mod tau_cache {
             let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
                 .large_file(true);
-            if writer.start_file(entry_name, opts).is_err() { return Vec::new(); }
-            if writer.write_all(json_bytes).is_err() { return Vec::new(); }
-            if writer.finish().is_err() { return Vec::new(); }
+            if writer.start_file(entry_name, opts).is_err() {
+                return Vec::new();
+            }
+            if writer.write_all(json_bytes).is_err() {
+                return Vec::new();
+            }
+            if writer.finish().is_err() {
+                return Vec::new();
+            }
         }
         buf
     }
@@ -2001,13 +4678,19 @@ mod tau_cache {
     /// from a previous run that wrote a different shape.
     fn cleanup_previous(lambda_sq: LambdaSq, n_modes: usize, prec: u32) {
         if let Some(p) = json_path(lambda_sq, n_modes, prec) {
-            if p.exists() { let _ = std::fs::remove_file(&p); }
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
         }
         if let Some(p) = zip_path(lambda_sq, n_modes, prec) {
-            if p.exists() { let _ = std::fs::remove_file(&p); }
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
         }
         if let Some(parts) = part_paths(lambda_sq, n_modes, prec) {
-            for p in parts { let _ = std::fs::remove_file(&p); }
+            for p in parts {
+                let _ = std::fs::remove_file(&p);
+            }
         }
     }
 
@@ -2020,13 +4703,17 @@ mod tau_cache {
     ) {
         use xc_numerics::quadrature::CacheMode;
         // Off and JsonOnly write nothing: the cache is zip-only (we never
-        // persist a decompressed .json), so only JsonZip / DynamicFetch
+        // persist a decompressed .json), so only JsonZip
         // produce output.
-        if matches!(mode, CacheMode::Off | CacheMode::JsonOnly) { return; }
+        if matches!(mode, CacheMode::Off | CacheMode::JsonOnly) {
+            return;
+        }
 
         // Serialize to JSON in memory.
         let json_bytes = serialize_to_json(tau, lambda_sq, n_modes, prec);
-        if json_bytes.is_empty() { return; }
+        if json_bytes.is_empty() {
+            return;
+        }
 
         cleanup_previous(lambda_sq, n_modes, prec);
 
@@ -2040,7 +4727,10 @@ mod tau_cache {
                 "[tau_cache] WARNING: zip compression failed for λ²={}, N={}, prec={} \
                  ({} bytes uncompressed) — this config will NOT be cached and will \
                  recompute from scratch on every run",
-                lambda_sq.value_f64, n_modes, prec, json_bytes.len()
+                lambda_sq.value_f64,
+                n_modes,
+                prec,
+                json_bytes.len()
             );
             return;
         }
@@ -2051,7 +4741,8 @@ mod tau_cache {
                 if let Err(e) = std::fs::write(&zp, &zip_bytes) {
                     crate::hp_debug!(
                         "[tau_cache] WARNING: could not write {}: {}",
-                        zp.display(), e
+                        zp.display(),
+                        e
                     );
                 }
             }
@@ -2061,7 +4752,10 @@ mod tau_cache {
             // concatenation, so naming uses zero-padded indices to
             // keep the order correct.
             let n_parts = zip_bytes.len().div_ceil(PART_BYTE_LIMIT);
-            let dir = match cache_dir() { Some(d) => d, None => return };
+            let dir = match cache_dir() {
+                Some(d) => d,
+                None => return,
+            };
             for i in 0..n_parts {
                 let start = i * PART_BYTE_LIMIT;
                 let end = ((i + 1) * PART_BYTE_LIMIT).min(zip_bytes.len());
@@ -2069,7 +4763,8 @@ mod tau_cache {
                 if let Err(e) = std::fs::write(&part_path, &zip_bytes[start..end]) {
                     crate::hp_debug!(
                         "[tau_cache] WARNING: could not write {}: {}",
-                        part_path.display(), e
+                        part_path.display(),
+                        e
                     );
                     return;
                 }
@@ -2092,17 +4787,37 @@ mod tau_cache {
     #[derive(Debug, Clone)]
     pub enum TauCacheFileStatus {
         /// File parsed and passed all structural identity checks.
-        Ok { path: std::path::PathBuf, lambda_sq: LambdaSq, n_modes: usize, prec: u32 },
+        Ok {
+            path: std::path::PathBuf,
+            lambda_sq: LambdaSq,
+            n_modes: usize,
+            prec: u32,
+        },
         /// File was skipped. Either the filename didn't match the
         /// expected pattern, or it's a `.partXX` chunk handled as part
         /// of an assembled multi-part archive.
-        Skipped { path: std::path::PathBuf, reason: String },
+        Skipped {
+            path: std::path::PathBuf,
+            reason: String,
+        },
         /// Filename matched but the file failed to load (decompress,
         /// concatenate, parse JSON, etc.).
-        LoadFailed { path: std::path::PathBuf, lambda_sq: LambdaSq, n_modes: usize, prec: u32, reason: String },
+        LoadFailed {
+            path: std::path::PathBuf,
+            lambda_sq: LambdaSq,
+            n_modes: usize,
+            prec: u32,
+            reason: String,
+        },
         /// File loaded but failed at least one structural identity
         /// check on the τ matrix it contains.
-        StructurallyInvalid { path: std::path::PathBuf, lambda_sq: LambdaSq, n_modes: usize, prec: u32, reason: String },
+        StructurallyInvalid {
+            path: std::path::PathBuf,
+            lambda_sq: LambdaSq,
+            n_modes: usize,
+            prec: u32,
+            reason: String,
+        },
     }
 
     /// Aggregate report from `verify_tau_cache_dir`.
@@ -2118,25 +4833,35 @@ mod tau_cache {
     impl TauCacheVerifyReport {
         /// Count of files that passed all checks.
         pub fn ok_count(&self) -> usize {
-            self.statuses.iter()
+            self.statuses
+                .iter()
                 .filter(|s| matches!(s, TauCacheFileStatus::Ok { .. }))
                 .count()
         }
         /// Count of files that failed at least one check (load or
         /// structural). Skipped files are not counted as failures.
         pub fn failure_count(&self) -> usize {
-            self.statuses.iter().filter(|s| matches!(s,
-                TauCacheFileStatus::LoadFailed { .. }
-                | TauCacheFileStatus::StructurallyInvalid { .. }
-            )).count()
+            self.statuses
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s,
+                        TauCacheFileStatus::LoadFailed { .. }
+                            | TauCacheFileStatus::StructurallyInvalid { .. }
+                    )
+                })
+                .count()
         }
         /// All failure entries (load + structural), for callers that
         /// want to print only the bad files.
         pub fn failures(&self) -> impl Iterator<Item = &TauCacheFileStatus> {
-            self.statuses.iter().filter(|s| matches!(s,
-                TauCacheFileStatus::LoadFailed { .. }
-                | TauCacheFileStatus::StructurallyInvalid { .. }
-            ))
+            self.statuses.iter().filter(|s| {
+                matches!(
+                    s,
+                    TauCacheFileStatus::LoadFailed { .. }
+                        | TauCacheFileStatus::StructurallyInvalid { .. }
+                )
+            })
         }
     }
 
@@ -2157,11 +4882,9 @@ mod tau_cache {
         };
         let after_lsq = stem.strip_prefix("lambda_sq")?;
         let (lsq_str, rest) = after_lsq.split_once("_nmodes")?;
-        
-        
+
         let (n_str, prec_str) = rest.split_once("_prec")?;
-        
-        
+
         Some((
             LambdaSq::from_filename_str(lsq_str)?,
             n_str.parse().ok()?,
@@ -2183,16 +4906,18 @@ mod tau_cache {
         Some(&name[..pos])
     }
 
-    pub(super) enum FileKind { Json, Zip, Part }
+    pub(super) enum FileKind {
+        Json,
+        Zip,
+        Part,
+    }
 
     /// Walk the τ-cache directory and structurally verify every file.
     /// Multi-part archives are verified as a set: if any `.partXX`
     /// files are present for a config, the verifier reads them all,
     /// concatenates, decompresses, and validates the result. Files
     /// not in the expected pattern are reported as `Skipped`.
-    pub fn verify_tau_cache_dir(
-        dir: &std::path::Path,
-    ) -> std::io::Result<TauCacheVerifyReport> {
+    pub fn verify_tau_cache_dir(dir: &std::path::Path) -> std::io::Result<TauCacheVerifyReport> {
         let mut statuses: Vec<TauCacheFileStatus> = Vec::new();
 
         if !dir.exists() {
@@ -2206,13 +4931,16 @@ mod tau_cache {
         // Multi-part archives (kind=Part) are deduplicated: we verify
         // the whole set once per config rather than per-file.
         // Key is (filename_str, n_modes, prec) for uniqueness; value is LambdaSq.
-        let mut configs_with_parts: std::collections::BTreeMap<(String, usize, u32), LambdaSq> = std::collections::BTreeMap::new();
+        let mut configs_with_parts: std::collections::BTreeMap<(String, usize, u32), LambdaSq> =
+            std::collections::BTreeMap::new();
         let mut singletons: Vec<(std::path::PathBuf, LambdaSq, usize, u32, FileKind)> = Vec::new();
 
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if !path.is_file() { continue; }
+            if !path.is_file() {
+                continue;
+            }
             let name = match path.file_name().and_then(|s| s.to_str()) {
                 Some(n) => n.to_string(),
                 None => continue,
@@ -2241,7 +4969,8 @@ mod tau_cache {
         // Verify singletons.
         for (path, lsq, n_modes, prec, kind) in singletons {
             let parsed: Option<Vec<Float>> = match kind {
-                FileKind::Json => std::fs::read_to_string(&path).ok()
+                FileKind::Json => std::fs::read_to_string(&path)
+                    .ok()
                     .and_then(|d| parse_json(&d, n_modes, prec)),
                 FileKind::Zip => std::fs::read(&path).ok().and_then(|bytes| {
                     let entry_name = cache_filename(lsq, n_modes, prec);
@@ -2252,14 +4981,24 @@ mod tau_cache {
             match parsed {
                 Some(tau) => match structural_check(&tau, n_modes, prec) {
                     None => statuses.push(TauCacheFileStatus::Ok {
-                        path, lambda_sq: lsq, n_modes, prec,
+                        path,
+                        lambda_sq: lsq,
+                        n_modes,
+                        prec,
                     }),
                     Some(reason) => statuses.push(TauCacheFileStatus::StructurallyInvalid {
-                        path, lambda_sq: lsq, n_modes, prec, reason,
+                        path,
+                        lambda_sq: lsq,
+                        n_modes,
+                        prec,
+                        reason,
                     }),
                 },
                 None => statuses.push(TauCacheFileStatus::LoadFailed {
-                    path, lambda_sq: lsq, n_modes, prec,
+                    path,
+                    lambda_sq: lsq,
+                    n_modes,
+                    prec,
                     reason: "parse / decompress failed".to_string(),
                 }),
             }
@@ -2276,15 +5015,28 @@ mod tau_cache {
             match read_split_zip_parts(&parts, &entry_name, n_modes, prec) {
                 Some((tau, _data)) => match structural_check(&tau, n_modes, prec) {
                     None => statuses.push(TauCacheFileStatus::Ok {
-                        path: representative, lambda_sq: lsq, n_modes, prec,
+                        path: representative,
+                        lambda_sq: lsq,
+                        n_modes,
+                        prec,
                     }),
                     Some(reason) => statuses.push(TauCacheFileStatus::StructurallyInvalid {
-                        path: representative, lambda_sq: lsq, n_modes, prec, reason,
+                        path: representative,
+                        lambda_sq: lsq,
+                        n_modes,
+                        prec,
+                        reason,
                     }),
                 },
                 None => statuses.push(TauCacheFileStatus::LoadFailed {
-                    path: representative, lambda_sq: lsq, n_modes, prec,
-                    reason: format!("split archive ({} parts) failed to assemble / decompress", parts.len()),
+                    path: representative,
+                    lambda_sq: lsq,
+                    n_modes,
+                    prec,
+                    reason: format!(
+                        "split archive ({} parts) failed to assemble / decompress",
+                        parts.len()
+                    ),
                 }),
             }
         }
@@ -2297,10 +5049,7 @@ mod tau_cache {
 }
 
 #[cfg(feature = "hp")]
-pub use tau_cache::{
-    verify_tau_cache_dir,
-    TauCacheVerifyReport, TauCacheFileStatus,
-};
+pub use tau_cache::{verify_tau_cache_dir, TauCacheFileStatus, TauCacheVerifyReport};
 
 // ===========================================================================
 // Weil-eigenvector (ξ) disk cache
@@ -2343,29 +5092,6 @@ mod weil_eigvec_cache {
 
     use super::super::LambdaSq;
 
-    /// Base raw URLs of the public consolidated Weil-eigenvector cache
-    /// repositories, in probe order. Files live at
-    /// `{base}/weil_eigvec_cache/prec{P}/lambda_sq{L}/nmodes{B}-{B+999}/weil_eigvec_lambda_sq{L}_nmodes{N}_prec{P}.json.zip`
-    /// where `B = (N / 1000) * 1000`.
-    ///
-    /// An array (mirroring `super::tau_cache::REMOTE_BASES`) so a
-    /// second/overflow weil-eigvec cache repo can be added with a
-    /// one-line change here.
-    const REMOTE_BASES: &[&str] = &[
-        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-weil-eigvec-cache/main",
-    ];
-
-    fn active_bases() -> Vec<String> {
-        match std::env::var("XC_WEIL_CACHE_BASES") {
-            Ok(v) if !v.trim().is_empty() => v
-                .split(',')
-                .map(|s| s.trim().trim_end_matches('/').to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
-            _ => REMOTE_BASES.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
     /// Toolkit version string embedded in every weil eigvec cache file
     /// written by this build.
     const TOOLKIT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -2379,13 +5105,11 @@ mod weil_eigvec_cache {
     /// Files produced by an older toolkit are treated as cache misses.
     /// Update this constant when a change to the eigenvector computation
     /// changes the stored values.
-    const CACHE_MIN_TOOLKIT_VERSION: &str = "0.12.0";
-
     fn effective_min_version() -> String {
-        std::env::var("XC_WEIL_CACHE_MIN_VER")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| CACHE_MIN_TOOLKIT_VERSION.to_string())
+        xc_cache::artifact_compatibility_policy("weil-states", "ccm_weil_eigenpair")
+            .expect("Weil-state compatibility policy")
+            .minimum_producer_version
+            .to_string()
     }
 
     /// Current schema version for the weil eigvec JSON envelope.
@@ -2426,7 +5150,11 @@ mod weil_eigvec_cache {
     ) -> Option<Vec<Float>> {
         let dir = cache_dir()?;
         let variant = if force_even { "" } else { "_natural" };
-        let prefix = format!("weil_eigvec_lambda_sq{}_nmodes{}_prec", lambda_sq.filename_str(), n_modes);
+        let prefix = format!(
+            "weil_eigvec_lambda_sq{}_nmodes{}_prec",
+            lambda_sq.filename_str(),
+            n_modes
+        );
         let suffix = format!("{}.json.zip", variant);
 
         let mut best_prec: Option<u32> = None;
@@ -2443,7 +5171,9 @@ mod weil_eigvec_cache {
             // Parse the prec value from the filename
             let mid = &name_str[prefix.len()..name_str.len() - suffix.len()];
             if let Ok(p) = mid.parse::<u32>() {
-                if p == target_prec { continue; } // exact match handled elsewhere
+                if p == target_prec {
+                    continue;
+                } // exact match handled elsewhere
                 let diff = target_prec.abs_diff(p);
                 if diff <= tolerance_bits && diff < best_diff {
                     best_diff = diff;
@@ -2455,39 +5185,73 @@ mod weil_eigvec_cache {
         let nearby_prec = best_prec?;
 
         // Load the nearby cache entry (at its original precision)
-        let cached = load(lambda_sq, n_modes, nearby_prec, CacheMode::JsonZip, force_even)?;
+        let cached = load(
+            lambda_sq,
+            n_modes,
+            nearby_prec,
+            CacheMode::JsonZip,
+            force_even,
+        )?;
 
         // Promote ξ to target precision by re-parsing each entry.
         // This is exact: we're just increasing the mantissa bits, no rounding.
-        let xi_promoted: Vec<Float> = cached.xi.iter()
+        let xi_promoted: Vec<Float> = cached
+            .xi
+            .iter()
             .map(|v| {
                 let s = v.to_string();
-                Float::with_val(target_prec, Float::parse(&s).unwrap_or_else(|_| Float::parse("0").unwrap()))
+                Float::with_val(
+                    target_prec,
+                    Float::parse(&s).unwrap_or_else(|_| Float::parse("0").unwrap()),
+                )
             })
             .collect();
 
         crate::hp_debug!(
             "[HP] warm-start from nearby cache prec={} (target={}, diff={} bits)",
-            nearby_prec, target_prec, best_diff
+            nearby_prec,
+            target_prec,
+            best_diff
         );
 
         Some(xi_promoted)
     }
 
-    pub(super) fn cache_filename(lambda_sq: LambdaSq, n_modes: usize, prec: u32, force_even: bool) -> String {
+    pub(super) fn cache_filename(
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
+        force_even: bool,
+    ) -> String {
         // Forced-even (the default CCM path) keeps the historical name with
         // NO suffix, so every pre-existing public fixture stays valid. The
         // natural (unprojected) variant gets a `_natural` marker so the two
         // never collide in the cache.
         let variant = if force_even { "" } else { "_natural" };
-        format!("weil_eigvec_lambda_sq{}_nmodes{}_prec{}{}.json", lambda_sq.filename_str(), n_modes, prec, variant)
+        format!(
+            "weil_eigvec_lambda_sq{}_nmodes{}_prec{}{}.json",
+            lambda_sq.filename_str(),
+            n_modes,
+            prec,
+            variant
+        )
     }
 
-    fn json_path(lambda_sq: LambdaSq, n_modes: usize, prec: u32, force_even: bool) -> Option<std::path::PathBuf> {
+    fn json_path(
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
+        force_even: bool,
+    ) -> Option<std::path::PathBuf> {
         cache_dir().map(|d| d.join(cache_filename(lambda_sq, n_modes, prec, force_even)))
     }
 
-    fn zip_path(lambda_sq: LambdaSq, n_modes: usize, prec: u32, force_even: bool) -> Option<std::path::PathBuf> {
+    fn zip_path(
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
+        force_even: bool,
+    ) -> Option<std::path::PathBuf> {
         cache_dir().map(|d| {
             let f = cache_filename(lambda_sq, n_modes, prec, force_even);
             d.join(format!("{}.zip", f))
@@ -2498,7 +5262,10 @@ mod weil_eigvec_cache {
     /// Expects schema_version 1 envelope format. Returns `None` on any
     /// structural mismatch or a stale `toolkit_version`.
     pub(super) fn parse_json(
-        data: &str, lambda_sq: LambdaSq, n_modes: usize, prec: u32,
+        data: &str,
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
     ) -> Option<CachedXi> {
         let v: serde_json::Value = serde_json::from_str(data).ok()?;
         let obj = v.as_object()?;
@@ -2508,21 +5275,33 @@ mod weil_eigvec_cache {
             return None;
         }
 
-        if obj.get("n_modes").and_then(|x| x.as_u64())? as usize != n_modes { return None; }
-        if obj.get("precision_bits").and_then(|x| x.as_u64())? as u32 != prec { return None; }
+        if obj.get("n_modes").and_then(|x| x.as_u64())? as usize != n_modes {
+            return None;
+        }
+        if obj.get("precision_bits").and_then(|x| x.as_u64())? as u32 != prec {
+            return None;
+        }
         let l_meta = obj.get("lambda_sq").and_then(|x| x.as_f64())?;
-        if (l_meta - lambda_sq.value_f64).abs() > 0.5 { return None; }
+        if (l_meta - lambda_sq.value_f64).abs() > 0.5 {
+            return None;
+        }
 
         let eps_str = obj.get("weil_min_eigenvalue").and_then(|x| x.as_str())?;
         let eps_n = Float::with_val(prec, Float::parse(eps_str).ok()?);
-        if eps_n.is_nan() || eps_n.is_infinite() { return None; }
+        if eps_n.is_nan() || eps_n.is_infinite() {
+            return None;
+        }
 
         let arr = obj.get("xi").and_then(|x| x.as_array())?;
-        if arr.len() != 2 * n_modes + 1 { return None; }
+        if arr.len() != 2 * n_modes + 1 {
+            return None;
+        }
         let mut xi = Vec::with_capacity(arr.len());
         for s in arr {
             let f = Float::with_val(prec, Float::parse(s.as_str()?).ok()?);
-            if f.is_nan() || f.is_infinite() { return None; }
+            if f.is_nan() || f.is_infinite() {
+                return None;
+            }
             xi.push(f);
         }
         Some(CachedXi { eps_n, xi })
@@ -2546,35 +5325,54 @@ mod weil_eigvec_cache {
     /// integrity test that catches a structurally-valid-but-wrong ξ
     /// (e.g. a different eigenvector, or one from a subtly different τ).
     pub(super) fn residual_ok(
-        tau: &[Float], dim: usize, xi: &[Float], eps_n: &Float, prec: u32,
+        tau: &[Float],
+        dim: usize,
+        xi: &[Float],
+        eps_n: &Float,
+        prec: u32,
     ) -> bool {
-        if xi.len() != dim || tau.len() != dim * dim { return false; }
+        if xi.len() != dim || tau.len() != dim * dim {
+            return false;
+        }
 
         // ‖ξ‖_∞ for the relative bound. A zero vector can never be a
         // valid eigenvector.
         let mut xi_linf = Float::with_val(prec, 0);
         for v in xi {
             let a = v.clone().abs();
-            if a > xi_linf { xi_linf = a; }
+            if a > xi_linf {
+                xi_linf = a;
+            }
         }
-        if xi_linf.is_zero() { return false; }
+        if xi_linf.is_zero() {
+            return false;
+        }
 
         // max_i | (τξ)_i − ε_N ξ_i |, rows computed in parallel then a
         // deterministic max-fold. The inner row sum is sequential (it is
         // the same fixed index order every run).
         use rayon::prelude::*;
-        let resid_inf = (0..dim).into_par_iter().map(|i| {
-            let mut row = Float::with_val(prec, 0);
-            for j in 0..dim {
-                let mut t = tau[i * dim + j].clone();
-                t *= &xi[j];
-                row += &t;
+        let residuals: Vec<Float> = (0..dim)
+            .into_par_iter()
+            .map(|i| {
+                let mut row = Float::with_val(prec, 0);
+                for j in 0..dim {
+                    let mut t = tau[i * dim + j].clone();
+                    t *= &xi[j];
+                    row += &t;
+                }
+                let mut e = eps_n.clone();
+                e *= &xi[i];
+                row -= &e;
+                row.abs()
+            })
+            .collect();
+        let mut resid_inf = Float::with_val(prec, 0);
+        for residual in residuals {
+            if residual > resid_inf {
+                resid_inf = residual;
             }
-            let mut e = eps_n.clone();
-            e *= &xi[i];
-            row -= &e;
-            row.abs()
-        }).reduce(|| Float::with_val(prec, 0), |a, b| if a > b { a } else { b });
+        }
 
         // Relative residual vs floor. Use a generous floor: the eigenpair
         // is accurate to ~working precision, but the residual accumulates
@@ -2588,35 +5386,14 @@ mod weil_eigvec_cache {
         rel.cmp_abs(&floor).map(|o| o.is_lt()).unwrap_or(false)
     }
 
-    /// Deterministic remote URL for the `(λ², N, prec)` fixture in a
-    /// specific base repo (precision-first → λ² → nmodes-thousand-bucket
-    /// layout, mirroring tau/GL).
-    fn remote_zip_url(base: &str, lambda_sq: LambdaSq, n_modes: usize, prec: u32, force_even: bool) -> String {
-        let bucket = (n_modes / 1000) * 1000;
-        format!(
-            "{base}/weil_eigvec_cache/prec{p}/lambda_sq{l}/nmodes{b}-{bend}/{stem}.zip",
-            base = base, p = prec, l = lambda_sq.filename_str(),
-            b = bucket, bend = bucket + 999,
-            stem = cache_filename(lambda_sq, n_modes, prec, force_even)
-        )
-    }
-
-    /// Test-only accessor for `remote_zip_url`. Returns results for all
-    /// configured bases, in probe order.
-    #[cfg(test)]
-    pub(super) fn remote_zip_url_for_test(
-        lambda_sq: LambdaSq, n_modes: usize, prec: u32,
-    ) -> Vec<String> {
-        REMOTE_BASES.iter()
-            .map(|base| remote_zip_url(base, lambda_sq, n_modes, prec, true))
-            .collect()
-    }
-
     /// Test-only accessor for `parse_json` (lets version-rejection tests
     /// call the parser directly without touching disk).
     #[cfg(test)]
     pub(super) fn parse_json_for_test(
-        data: &str, lambda_sq: LambdaSq, n_modes: usize, prec: u32,
+        data: &str,
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
     ) -> Option<CachedXi> {
         parse_json(data, lambda_sq, n_modes, prec)
     }
@@ -2624,7 +5401,8 @@ mod weil_eigvec_cache {
     fn warn_skip(path: &std::path::Path, reason: &str) {
         crate::hp_debug!(
             "[weil_eigvec_cache] WARNING: skipping {} ({}); recomputing",
-            path.display(), reason
+            path.display(),
+            reason
         );
     }
 
@@ -2633,7 +5411,10 @@ mod weil_eigvec_cache {
     /// re-serializing).
     fn read_single_zip(
         zip_path: &std::path::Path,
-        lambda_sq: LambdaSq, n_modes: usize, prec: u32, force_even: bool,
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
+        force_even: bool,
     ) -> Option<(CachedXi, String)> {
         let file = std::fs::File::open(zip_path).ok()?;
         let mut archive = zip::ZipArchive::new(file).ok()?;
@@ -2646,30 +5427,26 @@ mod weil_eigvec_cache {
     }
 
     pub(super) fn load(
-        lambda_sq: LambdaSq, n_modes: usize, prec: u32, mode: CacheMode, force_even: bool,
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
+        mode: CacheMode,
+        force_even: bool,
     ) -> Option<CachedXi> {
-        if mode == CacheMode::Off { return None; }
+        if mode == CacheMode::Off {
+            return None;
+        }
 
         // Caches are zip-only: read straight from the .json.zip
         // (decompress in memory), never write a decompressed .json.
-        // JsonOnly is now a read no-op (kept for API compatibility).
-        if mode == CacheMode::JsonOnly { return None; }
-
-        // Tier 1 (JsonZip, DynamicFetch): local single zip — in memory.
-        if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec, force_even) {
-            return Some(c);
+        // JsonOnly is a read no-op because current cache files are zip-only.
+        if mode == CacheMode::JsonOnly {
+            return None;
         }
 
-        // JsonZip stops after the local tiers.
-        if mode == CacheMode::JsonZip { return None; }
-
-        // Tier 2 (DynamicFetch only): remote fetch (single zip; no parts,
-        // ξ is small). On success the zip lands locally and we re-run the
-        // local-zip loader.
-        if fetch_remote_zip(lambda_sq, n_modes, prec, force_even) {
-            if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec, force_even) {
-                return Some(c);
-            }
+        // Local single zip — in memory.
+        if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec, force_even) {
+            return Some(c);
         }
 
         None
@@ -2677,9 +5454,16 @@ mod weil_eigvec_cache {
 
     /// Load from a local single zip. Decompresses in memory; does NOT
     /// write a decompressed `.json`. Returns the parsed entry or None.
-    fn try_load_local_zip(lambda_sq: LambdaSq, n_modes: usize, prec: u32, force_even: bool) -> Option<CachedXi> {
+    fn try_load_local_zip(
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
+        force_even: bool,
+    ) -> Option<CachedXi> {
         let zp = zip_path(lambda_sq, n_modes, prec, force_even)?;
-        if !zp.exists() { return None; }
+        if !zp.exists() {
+            return None;
+        }
         match read_single_zip(&zp, lambda_sq, n_modes, prec, force_even) {
             Some((parsed, _json_string)) => Some(parsed),
             None => {
@@ -2689,81 +5473,13 @@ mod weil_eigvec_cache {
         }
     }
 
-    /// Outcome of a single `curl` download attempt (mirrors the GL/τ
-    /// fetch classification).
-    enum CurlOutcome { Ok, HttpError, Transient }
-
-    fn curl_attempt(url: &str, dest: &std::path::Path) -> CurlOutcome {
-        let tmp = dest.with_extension("zip.partial");
-        let _ = std::fs::remove_file(&tmp);
-        let mut cmd = std::process::Command::new("curl");
-        cmd.arg("--silent").arg("--show-error").arg("--location")
-            .arg("--retry").arg("3").arg("--retry-delay").arg("1");
-        if let Ok(tok) = std::env::var("XC_CACHE_AUTH") {
-            if !tok.trim().is_empty() {
-                cmd.arg("-H").arg(format!("Authorization: token {}", tok.trim()));
-            }
-        }
-        let output = cmd
-            .arg("--write-out").arg("%{http_code}")
-            .arg("-o").arg(&tmp).arg(url)
-            .output();
-        match output {
-            Ok(out) if out.status.success() => {
-                let code: u32 = String::from_utf8_lossy(&out.stdout)
-                    .trim().parse().unwrap_or(0);
-                match code {
-                    200..=299 => match std::fs::rename(&tmp, dest) {
-                        Ok(()) => CurlOutcome::Ok,
-                        Err(_) => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
-                    },
-                    404 => { let _ = std::fs::remove_file(&tmp); CurlOutcome::HttpError }
-                    _ => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
-                }
-            }
-            _ => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
-        }
-    }
-
-    /// Download the `(λ², N, prec)` `.json.zip` from the public cache
-    /// repo. Returns `true` if a file was written. Robust to
-    /// `raw.githubusercontent.com` rate-limiting: only a 404 is a
-    /// definitive miss; 429/5xx/no-response retry with backoff.
-    fn fetch_remote_zip(lambda_sq: LambdaSq, n_modes: usize, prec: u32, force_even: bool) -> bool {
-        let dest = match zip_path(lambda_sq, n_modes, prec, force_even) {
-            Some(p) => p,
-            None => return false,
-        };
-
-        // Iterate over REMOTE_BASES in order, trying each repo until one
-        // has the file. Mirrors the τ-cache multi-repo probe logic.
-        for base in active_bases() {
-            let url = remote_zip_url(&base, lambda_sq, n_modes, prec, force_even);
-
-            const MAX_TRIES: usize = 5;
-            for attempt in 0..MAX_TRIES {
-                match curl_attempt(&url, &dest) {
-                    CurlOutcome::Ok => {
-                        // Routine cache hit — silent.
-                        return true;
-                    }
-                    // 404: not in this repo — try the next one.
-                    CurlOutcome::HttpError => break,
-                    CurlOutcome::Transient => {
-                        if attempt + 1 < MAX_TRIES {
-                            let secs = 2 * (attempt as u64 + 1);
-                            std::thread::sleep(std::time::Duration::from_secs(secs));
-                        }
-                    }
-                }
-            }
-        }
-        false
-    }
-
     /// Serialize `(eps_n, xi)` to the versioned schema-v1 JSON object.
     fn serialize_to_json(
-        lambda_sq: LambdaSq, n_modes: usize, prec: u32, eps_n: &Float, xi: &[Float],
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
+        eps_n: &Float,
+        xi: &[Float],
     ) -> Vec<u8> {
         let xi_strings: Vec<String> = xi.iter().map(|f| f.to_string()).collect();
         let payload = serde_json::json!({
@@ -2789,31 +5505,50 @@ mod weil_eigvec_cache {
             let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
                 .large_file(true);
-            if writer.start_file(entry_name, opts).is_err() { return Vec::new(); }
-            if writer.write_all(json_bytes).is_err() { return Vec::new(); }
-            if writer.finish().is_err() { return Vec::new(); }
+            if writer.start_file(entry_name, opts).is_err() {
+                return Vec::new();
+            }
+            if writer.write_all(json_bytes).is_err() {
+                return Vec::new();
+            }
+            if writer.finish().is_err() {
+                return Vec::new();
+            }
         }
         buf
     }
 
     fn cleanup_previous(lambda_sq: LambdaSq, n_modes: usize, prec: u32, force_even: bool) {
         if let Some(p) = json_path(lambda_sq, n_modes, prec, force_even) {
-            if p.exists() { let _ = std::fs::remove_file(&p); }
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
         }
         if let Some(p) = zip_path(lambda_sq, n_modes, prec, force_even) {
-            if p.exists() { let _ = std::fs::remove_file(&p); }
+            if p.exists() {
+                let _ = std::fs::remove_file(&p);
+            }
         }
     }
 
     pub(super) fn save(
-        lambda_sq: LambdaSq, n_modes: usize, prec: u32,
-        eps_n: &Float, xi: &[Float], mode: CacheMode, force_even: bool,
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
+        eps_n: &Float,
+        xi: &[Float],
+        mode: CacheMode,
+        force_even: bool,
     ) {
         // Off and JsonOnly write nothing: the cache is zip-only.
-        if matches!(mode, CacheMode::Off | CacheMode::JsonOnly) { return; }
+        if matches!(mode, CacheMode::Off | CacheMode::JsonOnly) {
+            return;
+        }
 
         let json_bytes = serialize_to_json(lambda_sq, n_modes, prec, eps_n, xi);
-        if json_bytes.is_empty() { return; }
+        if json_bytes.is_empty() {
+            return;
+        }
 
         cleanup_previous(lambda_sq, n_modes, prec, force_even);
 
@@ -2827,7 +5562,10 @@ mod weil_eigvec_cache {
                 "[weil_eigvec_cache] WARNING: zip compression failed for λ²={}, N={}, \
                  prec={} ({} bytes uncompressed) — this config will NOT be cached and \
                  will recompute from scratch on every run",
-                lambda_sq.value_f64, n_modes, prec, json_bytes.len()
+                lambda_sq.value_f64,
+                n_modes,
+                prec,
+                json_bytes.len()
             );
             return;
         }
@@ -2835,13 +5573,13 @@ mod weil_eigvec_cache {
             if let Err(e) = std::fs::write(&zp, &zip_bytes) {
                 crate::hp_debug!(
                     "[weil_eigvec_cache] WARNING: could not write {}: {}",
-                    zp.display(), e
+                    zp.display(),
+                    e
                 );
             }
         }
     }
 }
-
 
 // Matrix fixtures below use the row-major index convention `m[i * dim + j]`
 // uniformly, including `i = 0` rows where `0 * dim` is kept for alignment
@@ -2851,6 +5589,401 @@ mod weil_eigvec_cache {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn tau_matrix_round_trips_through_common_cache_fabric() {
+        use xc_cache::{
+            ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
+            FilesystemCacheStore,
+        };
+
+        let root =
+            std::env::temp_dir().join(format!("xc-spectral-ccm-tau-fabric-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "workstation",
+                &root,
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let context = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["workstation".to_owned()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy:
+                xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let params = CcmParams::from_lambda_sq_integer(5, 2);
+        let cfg = HighPrecConfig::for_decimal_digits(40);
+        let l = log_lambda_sq_hp(&params, cfg.precision_bits);
+        let first = build_tau_hp_via_cache(&params, &l, &cfg, &context).unwrap();
+        let second = build_tau_hp_via_cache(&params, &l, &cfg, &context).unwrap();
+        assert_eq!(first, second);
+        assert!(!first.1.dependencies.is_empty());
+        assert!(first
+            .1
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.key.kind == "ccm_archimedean_integrals"));
+        assert!(first
+            .1
+            .dependencies
+            .iter()
+            .any(|dependency| dependency.key.kind == "ccm_prime_component"));
+        let seeds = vec![Float::with_val(cfg.precision_bits, 14)];
+        let first_run = run_via_cache(&params, &cfg, &seeds, &context).unwrap();
+        let second_run = run_via_cache(&params, &cfg, &seeds, &context).unwrap();
+        assert_eq!(
+            first_run.weil_min_eigenvalue,
+            second_run.weil_min_eigenvalue
+        );
+        assert_eq!(first_run.xi, second_run.xi);
+        assert_eq!(first_run.eigenvalues_pos.len(), 1);
+        let first_evenness = measure_evenness_via_cache(&params, &cfg, &context).unwrap();
+        let second_evenness = measure_evenness_via_cache(&params, &cfg, &context).unwrap();
+        assert_eq!(
+            first_evenness.evenness_deviation,
+            second_evenness.evenness_deviation
+        );
+        assert_eq!(
+            first_evenness.natural_eigenvalue,
+            second_evenness.natural_eigenvalue
+        );
+        assert_eq!(
+            first_evenness.forced_eigenvalue,
+            second_evenness.forced_eigenvalue
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn even_sector_projection_preserves_even_quadratic_form() {
+        let precision_bits = 256;
+        let n_modes = 2;
+        let dim = 2 * n_modes + 1;
+        let mut tau = vec![Float::with_val(precision_bits, 0); dim * dim];
+        for row in 0..dim {
+            for column in row..dim {
+                let value = Float::with_val(precision_bits, (row + 2) * (column + 3));
+                tau[row * dim + column] = value.clone();
+                tau[column * dim + row] = value;
+            }
+        }
+        let sector = build_even_sector_matrix(&tau, n_modes, precision_bits);
+        let y = vec![
+            Float::with_val(precision_bits, 1),
+            Float::with_val(precision_bits, 2),
+            Float::with_val(precision_bits, -3),
+        ];
+        let x = expand_even_sector_vector(&y, n_modes, precision_bits);
+        let full = xc_numerics::linalg::rayleigh_quotient(&tau, dim, &x, precision_bits);
+        let reduced =
+            xc_numerics::linalg::rayleigh_quotient(&sector, n_modes + 1, &y, precision_bits);
+        let mut difference = full;
+        difference -= reduced;
+        assert!(difference.abs() < Float::with_val(precision_bits, 2).pow(-240));
+    }
+
+    #[cfg(feature = "arb")]
+    #[test]
+    fn retained_tau_is_interval_certified_and_promoted_without_recomputation() {
+        use xc_cache::{
+            ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
+            CanonicalStagingProductionSink, FilesystemCacheStore, TransportPolicy,
+        };
+        use xc_core::{CancellationToken, ResourcePolicy};
+
+        let root = std::env::temp_dir().join(format!(
+            "xc-spectral-ccm-certified-retained-tau-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "workstation",
+                root.join("cache"),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let sink = CanonicalStagingProductionSink::new(
+            root.join("staging"),
+            TransportPolicy::default(),
+            ResourcePolicy::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let context = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["workstation".to_owned()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Certified,
+            certification_failure_policy:
+                xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: Some(&sink),
+        };
+        let params = CcmParams::from_lambda_sq_integer(5, 2);
+        let cfg = HighPrecConfig::for_decimal_digits(40);
+        let l = log_lambda_sq_hp(&params, cfg.precision_bits);
+        let first = build_tau_hp_via_cache(&params, &l, &cfg, &context).unwrap();
+        let reused = build_tau_hp_via_cache(&params, &l, &cfg, &context).unwrap();
+        assert_eq!(first, reused);
+        let tau_draft = sink
+            .drafts()
+            .unwrap()
+            .into_iter()
+            .find(|draft| draft.family == "ccm-matrices")
+            .unwrap();
+        assert_eq!(
+            tau_draft.achieved_assurance,
+            xc_cache::ArtifactAssuranceState::Certified
+        );
+        assert_eq!(
+            tau_draft.required_assurance,
+            Some(xc_cache::ArtifactAssuranceState::Certified)
+        );
+        assert_eq!(tau_draft.assurance_evidence_digests.len(), 2);
+        assert_eq!(sink.drafts().unwrap().len(), 2);
+        let inventory = xc_cache::build_managed_publication_inventory(
+            &sink.drafts().unwrap(),
+            xc_core::PublicationTarget::Both,
+            "TeamXcelerator",
+            xc_cache::ManagedRunProfile::Author,
+            xc_core::AssuranceLevel::Certified,
+            xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            true,
+        )
+        .unwrap();
+        assert!(inventory.ready_for_remote_execution);
+        assert_eq!(inventory.entries.len(), 4);
+        assert!(inventory
+            .entries
+            .iter()
+            .all(|entry| entry.assurance_eligible));
+        assert_eq!(
+            inventory
+                .entries
+                .iter()
+                .filter(|entry| entry.required_assurance.is_some())
+                .count(),
+            2
+        );
+        assert!(root.join("staging/evidence").is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_ccm_hp_result_round_trips_values_status_and_precision() {
+        let precision_bits = 512;
+        let runtime = HighPrecResult {
+            eigenvalues_pos: vec![
+                EigenvalueResult::Converged(Float::with_val(
+                    precision_bits,
+                    Float::parse("14.134725141734693790457251983562").unwrap(),
+                )),
+                EigenvalueResult::Approximate(Float::with_val(
+                    768,
+                    Float::parse("21.022039638771554992628479593896").unwrap(),
+                )),
+                EigenvalueResult::Failed,
+            ],
+            weil_min_eigenvalue: Float::with_val(precision_bits, Float::parse("1e-120").unwrap()),
+            xi: vec![
+                Float::with_val(384, Float::parse("-0.125").unwrap()),
+                Float::with_val(640, Float::parse("0.75").unwrap()),
+            ],
+            elapsed_seconds: 1.25,
+            precision_bits,
+        };
+        let portable = PortableHighPrecResult::from_runtime(&runtime).unwrap();
+        let saved = xc_core::ResearchResult::computed(
+            portable,
+            xc_core::SolverProvenance::current_package("rug_mpfr"),
+        );
+        let encoded = serde_json::to_vec(&saved).unwrap();
+        let decoded: xc_core::ResearchResult<PortableHighPrecResult> =
+            serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, saved);
+        let reconstructed = decoded.value.unwrap().to_runtime().unwrap();
+        assert_eq!(reconstructed.precision_bits, runtime.precision_bits);
+        assert_eq!(
+            reconstructed.weil_min_eigenvalue,
+            runtime.weil_min_eigenvalue
+        );
+        assert_eq!(reconstructed.xi, runtime.xi);
+        for (actual, expected) in reconstructed
+            .eigenvalues_pos
+            .iter()
+            .zip(&runtime.eigenvalues_pos)
+        {
+            match (actual, expected) {
+                (EigenvalueResult::Converged(actual), EigenvalueResult::Converged(expected))
+                | (
+                    EigenvalueResult::Approximate(actual),
+                    EigenvalueResult::Approximate(expected),
+                ) => {
+                    assert_eq!(actual, expected);
+                    assert_eq!(actual.prec(), expected.prec());
+                }
+                (EigenvalueResult::Failed, EigenvalueResult::Failed) => {}
+                _ => panic!("saved CCM eigenvalue status changed"),
+            }
+        }
+    }
+
+    #[test]
+    fn exact_fractional_lambda_squared_drives_hp_assembly_and_evidence() {
+        let integer =
+            ExactLambdaSquaredHp::new(xc_core::DecimalLiteral::new("13").unwrap(), 13).unwrap();
+        assert_eq!(integer.mode, LambdaSquaredMode::Integer);
+
+        let fractional = ExactLambdaSquaredHp::new(
+            xc_core::DecimalLiteral::new("13.0000000000000000000000000000000000001").unwrap(),
+            13,
+        )
+        .unwrap();
+        assert_eq!(fractional.mode, LambdaSquaredMode::Fractional);
+        assert!(
+            ExactLambdaSquaredHp::new(xc_core::DecimalLiteral::new("14.1").unwrap(), 13).is_err()
+        );
+
+        let mut cfg = HighPrecConfig::for_decimal_digits(50);
+        cfg.quad_points = 96;
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let exact = localized_weil_form_exact_hp(fractional, 0, &cfg, true).unwrap();
+        assert_eq!(exact.matrix.len(), 1);
+        assert_eq!(exact.evidence.n_modes, 0);
+        assert_eq!(exact.evidence.precision_bits, cfg.precision_bits);
+        assert_eq!(exact.evidence.lambda_squared.prime_cutoff, 13);
+        assert_eq!(exact.evidence.prime_content.len(), 9);
+        assert_eq!(exact.evidence.prime_content.last().unwrap().power, 13);
+    }
+
+    #[test]
+    fn ccm_domain_planner_selects_guarded_hp_low_mode_route() {
+        let request = CcmLowModeSolverRequest {
+            matrix_dimension: 5,
+            requested_modes: 2,
+            assurance: xc_core::AssuranceLevel::Computed,
+            precision: xc_core::PrecisionPolicy::fixed(192),
+            matrix_materialized: true,
+        };
+        let plan =
+            xc_solver::DomainSolverPlanner::plan(&CcmLowModeSolverPlanner, &request).unwrap();
+        assert_eq!(plan.domain_id, "ccm_weil_low_modes");
+        assert_eq!(plan.input.target, xc_core::EigenTarget::SmallestMagnitude);
+        assert!(!plan.input.generalized);
+        assert_eq!(
+            plan.solver_plan.primary,
+            xc_solver::SolverRoute::HpBlockShiftInvert
+        );
+    }
+
+    #[test]
+    fn ccm_state_targets_are_distinct_and_retained_in_results() {
+        let precision = 192;
+        let candidate = |index, value, parity| CcmStateCandidateHp {
+            algebraic_index: index,
+            eigenvalue: Float::with_val(precision, value),
+            eigenvector: vec![Float::with_val(precision, 1)],
+            parity,
+        };
+        let candidates = vec![
+            candidate(0, -4, CcmParity::Even),
+            candidate(1, -1, CcmParity::Odd),
+            candidate(2, 2, CcmParity::Even),
+            candidate(3, 3, CcmParity::Odd),
+        ];
+        let ground = select_ccm_state_hp(CcmStateTarget::AlgebraicGround, &candidates).unwrap();
+        let positive = select_ccm_state_hp(CcmStateTarget::SmallestPositive, &candidates).unwrap();
+        let nearest = select_ccm_state_hp(CcmStateTarget::NearestZero, &candidates).unwrap();
+        let odd_positive = select_ccm_state_hp(
+            CcmStateTarget::ParityRestricted {
+                parity: CcmParity::Odd,
+                criterion: CcmStateCriterion::SmallestPositive,
+            },
+            &candidates,
+        )
+        .unwrap();
+        assert_eq!(ground.algebraic_index, 0);
+        assert_eq!(positive.algebraic_index, 2);
+        assert_eq!(nearest.algebraic_index, 1);
+        assert_eq!(odd_positive.algebraic_index, 3);
+        assert_eq!(odd_positive.parity, CcmParity::Odd);
+        assert!(matches!(
+            odd_positive.requested_target,
+            CcmStateTarget::ParityRestricted { .. }
+        ));
+    }
+
+    #[test]
+    fn ccm_form_components_reconstruct_total_on_the_same_vector() {
+        let precision = 192;
+        let diagonal = |left, right| {
+            vec![
+                Float::with_val(precision, left),
+                Float::with_val(precision, 0),
+                Float::with_val(precision, 0),
+                Float::with_val(precision, right),
+            ]
+        };
+        let components = vec![
+            CcmFormComponentMatrixHp {
+                kind: CcmFormComponentKind::Archimedean,
+                signed_coefficient: 1,
+                matrix_row_major: diagonal(10, 14),
+            },
+            CcmFormComponentMatrixHp {
+                kind: CcmFormComponentKind::Prime,
+                signed_coefficient: -1,
+                matrix_row_major: diagonal(2, 4),
+            },
+            CcmFormComponentMatrixHp {
+                kind: CcmFormComponentKind::Pole,
+                signed_coefficient: 1,
+                matrix_row_major: diagonal(1, 1),
+            },
+            CcmFormComponentMatrixHp {
+                kind: CcmFormComponentKind::Other,
+                signed_coefficient: 1,
+                matrix_row_major: diagonal(1, 3),
+            },
+        ];
+        let total = diagonal(10, 14);
+        let vector = vec![Float::with_val(precision, 1), Float::with_val(precision, 2)];
+        let report =
+            evaluate_ccm_form_components_hp(&total, &components, &vector, precision).unwrap();
+        assert_eq!(report.components.len(), 4);
+        assert!(report.cancellation_residual < Float::with_val(precision, 1e-50));
+    }
 
     /// Serialize all cwd-mutating cache tests in this module. Cargo runs
     /// tests in parallel by default; cwd is per-process (not per-thread),
@@ -2883,7 +6016,10 @@ mod tests {
             let lock = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let original = std::env::current_dir().expect("no cwd");
             std::env::set_current_dir(temp).expect("set_current_dir to temp");
-            CwdGuard { original, _lock: lock }
+            CwdGuard {
+                original,
+                _lock: lock,
+            }
         }
     }
     impl Drop for CwdGuard {
@@ -2905,6 +6041,121 @@ mod tests {
         assert_eq!(cfg.solver_steps, 200);
         assert_eq!(cfg.n_eigenvalues, 50);
         assert!(cfg.force_even, "force_even should default to true");
+    }
+
+    #[test]
+    fn dense_ccm_has_two_independent_hp_routes_and_precision_repeat() {
+        let params = CcmParams::from_lambda_sq_integer(5, 2);
+        let solve = |digits| {
+            let mut cfg = HighPrecConfig::for_decimal_digits(digits);
+            cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+            let matrix = weil_matrix_hp(&params, &cfg, true).unwrap();
+            let dimension = params.matrix_size();
+            let qr = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(
+                &matrix,
+                dimension,
+                cfg.precision_bits,
+            )
+            .unwrap();
+            let jacobi = xc_numerics::eigen::dense_symmetric_eigenvalues_jacobi_hp(
+                &matrix,
+                dimension,
+                cfg.precision_bits,
+                80,
+            )
+            .unwrap();
+            (qr, jacobi.eigenvalues)
+        };
+        let (qr_low, jacobi_low) = solve(30);
+        let (qr_high, jacobi_high) = solve(50);
+        let high_precision = qr_high[0].prec();
+        let route_tolerance = Float::with_val(high_precision, Float::parse("1e-35").unwrap());
+        for (qr, jacobi) in qr_high.iter().zip(&jacobi_high) {
+            let mut difference = qr.clone();
+            difference -= jacobi;
+            assert!(difference.abs() < route_tolerance);
+        }
+        let repeat_tolerance = Float::with_val(high_precision, Float::parse("1e-25").unwrap());
+        for (low, high) in qr_low.iter().zip(&qr_high) {
+            let mut difference = Float::with_val(high_precision, low);
+            difference -= high;
+            assert!(difference.abs() < repeat_tolerance);
+        }
+        for (low, high) in jacobi_low.iter().zip(&jacobi_high) {
+            let mut difference = Float::with_val(high_precision, low);
+            difference -= high;
+            assert!(difference.abs() < repeat_tolerance);
+        }
+    }
+
+    #[test]
+    fn ccm_low_modes_are_requested_as_one_guarded_hp_block() {
+        use xc_core::{DecimalLiteral, EigenTarget};
+        use xc_operator::DenseSymmetricHp;
+        use xc_solver::{
+            BlockShiftInvertConfigHp, BlockShiftInvertSolverHp, DenseShiftInvertFactorizationHp,
+        };
+
+        let params = CcmParams::from_lambda_sq_integer(5, 2);
+        let mut cfg = HighPrecConfig::for_decimal_digits(30);
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let matrix = weil_matrix_hp(&params, &cfg, true).unwrap();
+        let dimension = params.matrix_size();
+        let full_reference = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(
+            &matrix,
+            dimension,
+            cfg.precision_bits,
+        )
+        .unwrap();
+        let operator = DenseSymmetricHp::new(
+            "ccm-weil-low-block",
+            dimension,
+            matrix.clone(),
+            cfg.precision_bits,
+            &Float::with_val(cfg.precision_bits, 0),
+        )
+        .unwrap();
+        let factorization = DenseShiftInvertFactorizationHp::factor(
+            "ccm-weil-zero-shift",
+            dimension,
+            &matrix,
+            DecimalLiteral::new("0").unwrap(),
+            cfg.precision_bits,
+        )
+        .unwrap();
+        let report = BlockShiftInvertSolverHp
+            .solve(
+                &operator,
+                &factorization,
+                &BlockShiftInvertConfigHp {
+                    target: EigenTarget::SmallestMagnitude,
+                    precision_bits: cfg.precision_bits,
+                    requested_eigenpairs: 2,
+                    guard_eigenpairs: 1,
+                    absolute_residual_tolerance: DecimalLiteral::new("1e-20").unwrap(),
+                    scaled_backward_error_tolerance: DecimalLiteral::new("1e-20").unwrap(),
+                    ritz_value_stability_tolerance: DecimalLiteral::new("1e-20").unwrap(),
+                    boundary_cluster_tolerance: DecimalLiteral::new("1e-25").unwrap(),
+                    maximum_iterations: 60,
+                    minimum_iterations: 2,
+                    maximum_projected_sweeps: 100,
+                },
+            )
+            .unwrap();
+        assert_eq!(report.requested_eigenpairs, 2);
+        assert!(report.boundary_cluster.is_none());
+        assert!(report.retained_eigenpairs.len() >= 2);
+        let tolerance = Float::with_val(cfg.precision_bits, Float::parse("1e-18").unwrap());
+        for (selected, reference) in report
+            .retained_eigenpairs
+            .iter()
+            .take(2)
+            .zip(full_reference.iter().take(2))
+        {
+            let mut difference = selected.eigenvalue.clone();
+            difference -= reference;
+            assert!(difference.abs() < tolerance);
+        }
     }
 
     /// Band-concentration matrix is symmetric, has a [0,1] spectrum, and
@@ -2932,8 +6183,14 @@ mod tests {
         for &x in &chi_f {
             assert!(x > -1e-6 && x < 1.0 + 1e-6, "chi {x} out of [0,1]");
         }
-        assert!(chi_f.iter().any(|&x| x > 0.9), "expected a concentrated (χ≈1) mode");
-        assert!(chi_f.iter().any(|&x| x < 0.1), "expected a Sonin-like (χ≈0) mode");
+        assert!(
+            chi_f.iter().any(|&x| x > 0.9),
+            "expected a concentrated (χ≈1) mode"
+        );
+        assert!(
+            chi_f.iter().any(|&x| x < 0.1),
+            "expected a Sonin-like (χ≈0) mode"
+        );
     }
 
     /// Sonin restriction deflates exactly `n_drop` band-concentrated modes:
@@ -2960,9 +6217,15 @@ mod tests {
         // else sits below σ/2 — so exactly n_drop eigenvalues exceed σ/2.
         let s: Vec<f64> = res.spectrum.iter().map(|x| x.to_f64()).collect();
         let max_v = *s.last().unwrap();
-        assert!(max_v > 10.0, "deflation shift σ should be large, got {max_v}");
+        assert!(
+            max_v > 10.0,
+            "deflation shift σ should be large, got {max_v}"
+        );
         let big = s.iter().filter(|&&e| e > max_v / 2.0).count();
-        assert_eq!(big, n_drop, "expected {n_drop} deflated modes near σ, got {big}");
+        assert_eq!(
+            big, n_drop,
+            "expected {n_drop} deflated modes near σ, got {big}"
+        );
     }
 
     /// HighPrecConfig::for_decimal_digits at 500 digits.
@@ -2992,14 +6255,17 @@ mod tests {
     /// so the two never collide.
     #[test]
     fn weil_eigvec_cache_filename_keys_on_force_even() {
-        use super::weil_eigvec_cache::cache_filename;
         use super::super::LambdaSq;
+        use super::weil_eigvec_cache::cache_filename;
         let forced = cache_filename(LambdaSq::integer(1000), 800, 6660, true);
         let natural = cache_filename(LambdaSq::integer(1000), 800, 6660, false);
-        // Forced-even is the historical name (backward compatible).
+        // Forced-even identifies the even-subspace representation.
         assert_eq!(forced, "weil_eigvec_lambda_sq1000_nmodes800_prec6660.json");
         // Natural is distinct.
-        assert_eq!(natural, "weil_eigvec_lambda_sq1000_nmodes800_prec6660_natural.json");
+        assert_eq!(
+            natural,
+            "weil_eigvec_lambda_sq1000_nmodes800_prec6660_natural.json"
+        );
         assert_ne!(forced, natural);
     }
 
@@ -3051,8 +6317,10 @@ mod tests {
         recon -= &d.prime_rayleigh;
         let mut err = Float::with_val(prec, &recon);
         err -= &d.eps_n;
-        assert!(err.abs() < Float::with_val(prec, 2).pow(-(prec as i32 - 16)),
-            "arch − prime should equal eps_n");
+        assert!(
+            err.abs() < Float::with_val(prec, 2).pow(-(prec as i32 - 16)),
+            "arch − prime should equal eps_n"
+        );
 
         // ε_N is small and positive; arch is O(1) (not exponentially small).
         let zero = Float::with_val(prec, 0);
@@ -3103,7 +6371,8 @@ mod tests {
             "30.424876125859513210311897530584091320181560023715440180962146036993",
             "32.935061587739189690662368964074903488812715603517039009280003440784",
         ];
-        let zero_seeds: Vec<Float> = seed_strs.iter()
+        let zero_seeds: Vec<Float> = seed_strs
+            .iter()
             .map(|s| Float::with_val(prec, Float::parse(s).unwrap()))
             .collect();
 
@@ -3111,30 +6380,39 @@ mod tests {
 
         // At N=10, the f64 solver finds however many eigenvalues exist
         // in the standard brackets. Just verify we got at least 1.
-        assert!(!result.eigenvalues_pos.is_empty(),
-            "should produce at least one eigenvalue");
+        assert!(
+            !result.eigenvalues_pos.is_empty(),
+            "should produce at least one eigenvalue"
+        );
 
         // First eigenvalue should match 14.13... to at least 10 digits.
         // Compare in HP — no f64 round-trip.
         let prec = result.precision_bits;
-        let target = Float::with_val(prec,
-            Float::parse("14.134725141734693790457251983").unwrap());
-        let ev0 = result.eigenvalues_pos[0].value()
+        let target = Float::with_val(
+            prec,
+            Float::parse("14.134725141734693790457251983").unwrap(),
+        );
+        let ev0 = result.eigenvalues_pos[0]
+            .value()
             .expect("Newton should converge for zero_1 at λ²=13, N=10, P=64");
         let mut diff = ev0.clone();
         diff -= &target;
         let abs_diff = diff.abs();
         let tol = Float::with_val(prec, Float::parse("1e-5").unwrap());
-        assert!(abs_diff < tol,
+        assert!(
+            abs_diff < tol,
             "first eigenvalue {} should be near 14.13",
-            xc_numerics::fmt::display_hp(ev0, 10));
+            xc_numerics::fmt::display_hp(ev0, 10)
+        );
 
         // ε_N should be small (tiny Weil eigenvalue at λ²=13). Compare HP.
         let eps_tol = Float::with_val(prec, Float::parse("1e-20").unwrap());
         let abs_eps = result.weil_min_eigenvalue.clone().abs();
-        assert!(abs_eps < eps_tol,
+        assert!(
+            abs_eps < eps_tol,
             "ε_N = {} should be tiny at λ²=13, N=10",
-            xc_numerics::fmt::display_hp(&result.weil_min_eigenvalue, 6));
+            xc_numerics::fmt::display_hp(&result.weil_min_eigenvalue, 6)
+        );
 
         // Elapsed time should be positive (f64 metadata is fine here).
         assert!(result.elapsed_seconds > 0.0);
@@ -3156,8 +6434,10 @@ mod tests {
         // trivially (dz=0 < tol on first step). Either way, not a silent
         // fallback to seed.
         // Actually: with all-zero xi, r=0 and r_prime=0 → Failed (division guard).
-        assert!(!result.has_value(),
-            "newton should return Failed with all-zero xi (degenerate R(z)=0)");
+        assert!(
+            !result.has_value(),
+            "newton should return Failed with all-zero xi (degenerate R(z)=0)"
+        );
     }
 
     /// P3 test: log_lambda_sq_hp at non-integer (fractional) λ² should
@@ -3172,17 +6452,23 @@ mod tests {
         let ref_val = {
             let five = Float::with_val(prec, 5);
             let two = Float::with_val(prec, 2);
-            let mut ratio = five; ratio /= &two;
+            let mut ratio = five;
+            ratio /= &two;
             ratio.ln()
         };
-        let mut diff = l.clone(); diff -= &ref_val;
+        let mut diff = l.clone();
+        diff -= &ref_val;
         let abs_diff = diff.abs();
         // Should match to at least 15 significant digits (f64 input limit).
         // At prec=512 the string-parse path gives 17 sig figs.
         let tol = Float::with_val(prec, Float::parse("1e-15").unwrap());
-        assert!(abs_diff < tol,
+        assert!(
+            abs_diff < tol,
             "log_lambda_sq_hp for fractional λ²=2.5: L = {}, ref = {}, diff = {}",
-            l.to_f64(), ref_val.to_f64(), abs_diff.to_f64());
+            l.to_f64(),
+            ref_val.to_f64(),
+            abs_diff.to_f64()
+        );
     }
 
     /// R4 test: solver_steps is a high safety cap (never reached in practice;
@@ -3192,16 +6478,28 @@ mod tests {
     fn config_newton_steps_adaptive_with_precision() {
         // All precision levels: k=ceil(log2(P/10)).max(200) = 200
         let cfg60 = HighPrecConfig::for_decimal_digits(60);
-        assert_eq!(cfg60.solver_steps, 200, "HP-60 should use safety cap of 200");
+        assert_eq!(
+            cfg60.solver_steps, 200,
+            "HP-60 should use safety cap of 200"
+        );
 
         let cfg200 = HighPrecConfig::for_decimal_digits(200);
-        assert_eq!(cfg200.solver_steps, 200, "HP-200 should use safety cap of 200");
+        assert_eq!(
+            cfg200.solver_steps, 200,
+            "HP-200 should use safety cap of 200"
+        );
 
         let cfg1000 = HighPrecConfig::for_decimal_digits(1000);
-        assert_eq!(cfg1000.solver_steps, 200, "HP-1000 should use safety cap of 200");
+        assert_eq!(
+            cfg1000.solver_steps, 200,
+            "HP-1000 should use safety cap of 200"
+        );
 
         let cfg2000 = HighPrecConfig::for_decimal_digits(2000);
-        assert_eq!(cfg2000.solver_steps, 200, "HP-2000 should use safety cap of 200");
+        assert_eq!(
+            cfg2000.solver_steps, 200,
+            "HP-2000 should use safety cap of 200"
+        );
 
         // Steps must be non-decreasing with precision
         assert!(cfg200.solver_steps >= cfg60.solver_steps);
@@ -3221,33 +6519,32 @@ mod tests {
         cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
         let prec = cfg.precision_bits;
         let seed_str = "14.134725141734693790457251983562470270784257115699243175685567460149";
-        let zero_seeds: Vec<Float> = vec![
-            Float::with_val(prec, Float::parse(seed_str).unwrap())
-        ];
+        let zero_seeds: Vec<Float> = vec![Float::with_val(prec, Float::parse(seed_str).unwrap())];
 
         // Newton result
-        std::env::set_var("XCELERATOR_SOLVER", "newton");
+        cfg.root_solver = RootSolver::Newton;
         let result_n = run(&params, &cfg, &zero_seeds).unwrap();
-        let ev_newton = result_n.eigenvalues_pos[0].value()
+        let ev_newton = result_n.eigenvalues_pos[0]
+            .value()
             .expect("Newton should converge");
 
         // Halley result
-        std::env::set_var("XCELERATOR_SOLVER", "halley");
+        cfg.root_solver = RootSolver::Halley;
         let result_h = run(&params, &cfg, &zero_seeds).unwrap();
-        let ev_halley = result_h.eigenvalues_pos[0].value()
+        let ev_halley = result_h.eigenvalues_pos[0]
+            .value()
             .expect("Halley should converge");
-
-        // Reset to default
-        std::env::remove_var("XCELERATOR_SOLVER");
 
         // Both should agree to at least 50 digits
         let mut diff = ev_newton.clone();
         diff -= ev_halley;
         let abs_diff = diff.abs();
         let tol = Float::with_val(prec, Float::parse("1e-50").unwrap());
-        assert!(abs_diff < tol,
+        assert!(
+            abs_diff < tol,
             "Halley and Newton should agree to 50 digits; diff = {}",
-            abs_diff.to_f64());
+            abs_diff.to_f64()
+        );
     }
     /// Uses λ²=13, N=10 which has good eigenvalue convergence.
     /// The f64 seed path is exercised when xi is available.
@@ -3259,16 +6556,18 @@ mod tests {
         cfg.n_eigenvalues = 1;
         cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
         let prec = cfg.precision_bits;
-        let seed_strs = [
-            "14.134725141734693790457251983562470270784257115699243175685567460149",
-        ];
-        let zero_seeds: Vec<Float> = seed_strs.iter()
+        let seed_strs = ["14.134725141734693790457251983562470270784257115699243175685567460149"];
+        let zero_seeds: Vec<Float> = seed_strs
+            .iter()
             .map(|s| Float::with_val(prec, Float::parse(s).unwrap()))
             .collect();
         let result = run(&params, &cfg, &zero_seeds).unwrap();
         // Should produce 1 eigenvalue (Some or None — just check no panic)
-        assert_eq!(result.eigenvalues_pos.len(), 1,
-            "should produce 1 eigenvalue entry for n_eigenvalues=1");
+        assert_eq!(
+            result.eigenvalues_pos.len(),
+            1,
+            "should produce 1 eigenvalue entry for n_eigenvalues=1"
+        );
     }
 
     /// measure_evenness at λ²=13, N=10 should show near-perfect evenness.
@@ -3286,31 +6585,40 @@ mod tests {
         // At λ²=13, the natural eigenvector should be essentially even.
         // Compare in HP (deviation could be 1e-30 or smaller — tighter than f64).
         let dev_tol = Float::with_val(prec, Float::parse("1e-10").unwrap());
-        assert!(result.evenness_deviation < dev_tol,
+        assert!(
+            result.evenness_deviation < dev_tol,
             "evenness deviation at λ²=13 should be tiny, got {}",
-            xc_numerics::fmt::display_hp(&result.evenness_deviation, 6));
+            xc_numerics::fmt::display_hp(&result.evenness_deviation, 6)
+        );
 
         // Both eigenvalues should be the same (since natural IS even).
         // Use HP relative_difference helper — no f64 fallback even at tiny ε.
         if let Some(rel_diff) = xc_numerics::fmt::relative_difference(
-            &result.natural_eigenvalue, &result.forced_eigenvalue
+            &result.natural_eigenvalue,
+            &result.forced_eigenvalue,
         ) {
             let rel_tol = Float::with_val(prec, Float::parse("1e-10").unwrap());
-            assert!(rel_diff < rel_tol,
+            assert!(
+                rel_diff < rel_tol,
                 "natural and forced eigenvalues should match, rel diff = {}",
-                xc_numerics::fmt::display_hp(&rel_diff, 6));
+                xc_numerics::fmt::display_hp(&rel_diff, 6)
+            );
         } else {
             // forced is exactly zero — the only acceptable case is when
             // natural is also zero.
-            assert!(result.natural_eigenvalue.is_zero(),
-                "forced is zero but natural is not — eigenvalues differ");
+            assert!(
+                result.natural_eigenvalue.is_zero(),
+                "forced is zero but natural is not — eigenvalues differ"
+            );
         }
 
         // Sanity check signs match (both should be positive at λ²=13).
         use xc_numerics::fmt::sign_of;
-        assert_eq!(sign_of(&result.natural_eigenvalue),
-                   sign_of(&result.forced_eigenvalue),
-                   "natural and forced eigenvalue signs must agree at λ²=13");
+        assert_eq!(
+            sign_of(&result.natural_eigenvalue),
+            sign_of(&result.forced_eigenvalue),
+            "natural and forced eigenvalue signs must agree at λ²=13"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -3322,8 +6630,8 @@ mod tests {
     /// other patterns.
     #[test]
     fn tau_cache_filename_parser() {
-        use super::tau_cache::{parse_filename, FileKind};
         use super::super::LambdaSq;
+        use super::tau_cache::{parse_filename, FileKind};
 
         // .json
         let r = parse_filename("lambda_sq13_nmodes120_prec3338.json").unwrap();
@@ -3376,31 +6684,39 @@ mod tests {
                 sym[j * dim + i] = val;
             }
         }
-        assert!(structural_check(&sym, n_modes, prec).is_none(),
-            "symmetric matrix should pass");
+        assert!(
+            structural_check(&sym, n_modes, prec).is_none(),
+            "symmetric matrix should pass"
+        );
 
         // Wrong length.
         let mut short = sym.clone();
         short.pop();
-        assert!(structural_check(&short, n_modes, prec).is_some(),
-            "wrong length should be rejected");
+        assert!(
+            structural_check(&short, n_modes, prec).is_some(),
+            "wrong length should be rejected"
+        );
 
         // Asymmetric: perturb one off-diagonal pair so τ[i,j] ≠ τ[j,i].
         let mut asym = sym.clone();
         asym[0 * dim + 1] = Float::with_val(prec, 99);
         // τ[1,0] is still its original value → asymmetry.
-        assert!(structural_check(&asym, n_modes, prec).is_some(),
-            "asymmetric matrix should be rejected");
+        assert!(
+            structural_check(&asym, n_modes, prec).is_some(),
+            "asymmetric matrix should be rejected"
+        );
 
         // NaN entry.
         let mut with_nan = sym.clone();
         with_nan[5] = Float::with_val(prec, f64::NAN);
-        assert!(structural_check(&with_nan, n_modes, prec).is_some(),
-            "NaN entry should be rejected");
+        assert!(
+            structural_check(&with_nan, n_modes, prec).is_some(),
+            "NaN entry should be rejected"
+        );
     }
 
     /// `tau_cache::parse_json_for_test` rejects a JSON envelope whose
-    /// `toolkit_version` is older than `CACHE_MIN_TOOLKIT_VERSION` — a
+    /// `toolkit_version` is older than the CCM-matrix family producer floor — a
     /// stale file written by an older toolkit build.
     #[test]
     fn tau_cache_rejects_stale_toolkit_version() {
@@ -3415,7 +6731,8 @@ mod tests {
             "n_modes": n_modes,
             "precision_bits": prec,
             "matrix": strs,
-        }).to_string();
+        })
+        .to_string();
         assert!(
             super::tau_cache::parse_json_for_test(&payload, n_modes, prec).is_none(),
             "tau parser should reject a stale toolkit_version=0.0.1"
@@ -3426,9 +6743,10 @@ mod tests {
     /// an empty report.
     #[test]
     fn tau_cache_verify_missing_dir() {
-        let nonexistent = crate::test_tmp_root()
-            .join(format!("xc_spectral_tau_cache_test_missing_{}",
-                          std::process::id()));
+        let nonexistent = crate::test_tmp_root().join(format!(
+            "xc_spectral_tau_cache_test_missing_{}",
+            std::process::id()
+        ));
         let report = super::tau_cache::verify_tau_cache_dir(&nonexistent).unwrap();
         assert_eq!(report.statuses.len(), 0);
         assert_eq!(report.ok_count(), 0);
@@ -3440,8 +6758,8 @@ mod tests {
     /// for an unrecognized name, LoadFailed for malformed JSON.
     #[test]
     fn tau_cache_verify_classifies() {
-        use super::tau_cache::{TauCacheFileStatus, verify_tau_cache_dir, cache_filename};
         use super::super::LambdaSq;
+        use super::tau_cache::{cache_filename, verify_tau_cache_dir, TauCacheFileStatus};
 
         let prec = 128;
         let n_modes = 3;
@@ -3496,13 +6814,18 @@ mod tests {
         std::fs::write(&skipped_path, "irrelevant").unwrap();
 
         // 4. LoadFailed: matching pattern, malformed JSON.
-        let malformed_name = cache_filename(LambdaSq::integer(lambda_sq.value_u64 + 2), n_modes, prec);
+        let malformed_name =
+            cache_filename(LambdaSq::integer(lambda_sq.value_u64 + 2), n_modes, prec);
         let malformed_path = temp_dir.join(&malformed_name);
         std::fs::write(&malformed_path, "{").unwrap();
 
         let report = verify_tau_cache_dir(&temp_dir).unwrap();
-        assert_eq!(report.statuses.len(), 4,
-            "expected 4 statuses, got {}", report.statuses.len());
+        assert_eq!(
+            report.statuses.len(),
+            4,
+            "expected 4 statuses, got {}",
+            report.statuses.len()
+        );
 
         let mut saw_ok = false;
         let mut saw_invalid = false;
@@ -3510,7 +6833,12 @@ mod tests {
         let mut saw_loadfail = false;
         for s in &report.statuses {
             match s {
-                TauCacheFileStatus::Ok { path, lambda_sq: l, n_modes: n, prec: p } => {
+                TauCacheFileStatus::Ok {
+                    path,
+                    lambda_sq: l,
+                    n_modes: n,
+                    prec: p,
+                } => {
                     assert_eq!(path, &valid_path);
                     assert_eq!(*l, lambda_sq);
                     assert_eq!(*n, n_modes);
@@ -3551,9 +6879,9 @@ mod tests {
     /// the unit-level structural_check were tested, not the load path).
     #[test]
     fn tau_load_skips_structurally_invalid_json() {
-        use super::tau_cache::{load, cache_filename};
-        use xc_numerics::quadrature::CacheMode;
         use super::super::LambdaSq;
+        use super::tau_cache::{cache_filename, load};
+        use xc_numerics::quadrature::CacheMode;
         let prec = 128;
         let lambda_sq = LambdaSq::integer(13);
         let n_modes = 3usize;
@@ -3603,14 +6931,20 @@ mod tests {
 
         // load must skip the asymmetric matrix (None). JsonOnly is a
         // read no-op; JsonZip reads the zip, runs structural_check, rejects.
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly).is_none(),
-            "JsonOnly is a read no-op under the zip-only contract");
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip).is_none(),
-            "structurally-invalid (asymmetric) τ matrix in the zip must be skipped");
+        assert!(
+            load(lambda_sq, n_modes, prec, CacheMode::JsonOnly).is_none(),
+            "JsonOnly is a read no-op under the zip-only contract"
+        );
+        assert!(
+            load(lambda_sq, n_modes, prec, CacheMode::JsonZip).is_none(),
+            "structurally-invalid (asymmetric) τ matrix in the zip must be skipped"
+        );
 
         // Bad file preserved on disk.
-        assert!(zip_path.exists(),
-            "structurally-invalid τ zip should be preserved for inspection");
+        assert!(
+            zip_path.exists(),
+            "structurally-invalid τ zip should be preserved for inspection"
+        );
 
         drop(_guard);
         let _ = std::fs::remove_dir_all(&temp);
@@ -3621,9 +6955,9 @@ mod tests {
     /// preserved. Mirrors the GL cache's `cache_handles_corrupt_zip_gracefully`.
     #[test]
     fn tau_load_handles_corrupt_zip_gracefully() {
+        use super::super::LambdaSq;
         use super::tau_cache::load;
         use xc_numerics::quadrature::CacheMode;
-        use super::super::LambdaSq;
         let prec = 64;
         let lambda_sq = LambdaSq::integer(49);
         let n_modes = 3usize;
@@ -3638,89 +6972,21 @@ mod tests {
         // open it, and returns None without panicking.
         let zip_path = dir.join(format!(
             "lambda_sq{}_nmodes{}_prec{}.json.zip",
-            lambda_sq.filename_str(), n_modes, prec));
+            lambda_sq.filename_str(),
+            n_modes,
+            prec
+        ));
         std::fs::write(&zip_path, b"not a zip file at all -- random bytes").unwrap();
 
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip).is_none(),
-            "corrupt τ .json.zip must be skipped, not loaded");
-
-        assert!(zip_path.exists(),
-            "corrupt τ zip should be preserved for inspection");
-
-        drop(_guard);
-        let _ = std::fs::remove_dir_all(&temp);
-    }
-
-    /// The remote τ URL is deterministically derived from
-    /// `(λ², N, prec)` using the public xcelerator-tau-cache repo's
-    /// precision-first → λ² → nmodes-thousand-bucket layout.
-    /// Checks that all configured bases produce correctly bucketed URLs.
-    #[test]
-    fn tau_remote_url_uses_bucketed_layout() {
-        use super::super::LambdaSq;
-        // λ²=1000, N=800, prec=3338 → bucket 0-999.
-        let results = super::tau_cache::remote_dir_and_stem_for_test(LambdaSq::integer(1000), 800, 3338);
-        assert_eq!(results.len(), 1, "expected 1 remote base");
-        assert_eq!(
-            results[0].0,
-            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache/main/tau_cache/prec3338/lambda_sq1000/nmodes0-999"
-        );
-        assert_eq!(results[0].1, "lambda_sq1000_nmodes800_prec3338.json.zip");
-
-        // λ²=400, N=1500, prec=4999 → bucket 1000-1999.
-        let results2 = super::tau_cache::remote_dir_and_stem_for_test(LambdaSq::integer(400), 1500, 4999);
-        assert_eq!(results2.len(), 1, "expected 1 remote base");
-        assert_eq!(
-            results2[0].0,
-            "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-tau-cache/main/tau_cache/prec4999/lambda_sq400/nmodes1000-1999"
-        );
-        assert_eq!(results2[0].1, "lambda_sq400_nmodes1500_prec4999.json.zip");
-    }
-
-    /// Live end-to-end remote τ-fetch test against the PUBLIC
-    /// `xcelerator-tau-cache` repo. `#[ignore]`d so it never runs in the
-    /// default suite (needs network + `curl` + the public repo).
-    /// Run explicitly with:
-    ///
-    /// ```text
-    /// cargo test -p xc-spectral --features hp -- --ignored tau_remote_fetch_live
-    /// ```
-    ///
-    /// Uses (λ²=1000, N=800, prec=3338) — a known byte-split config in
-    /// the repo (a headline HP-1000 config; >90 MB → multiple .partXX). In a
-    /// fresh temp cwd with NO local cache, `build_tau_hp` under
-    /// DynamicFetch must miss local tiers, hit the remote tier, probe
-    /// the single zip (404) then download all `.partXX`, concatenate +
-    /// decompress + validate, and return a (2·800+1)² matrix.
-    #[test]
-    #[ignore = "live network: hits the public xcelerator-tau-cache repo; run with --ignored"]
-    fn tau_remote_fetch_live_downloads_and_validates() {
-        // Isolate cwd so the cache writes land in a throwaway dir.
-        // CwdGuard serializes against other cwd-mutating tests (cwd is
-        // process-global) and restores the original cwd on drop.
-        let temp = crate::fresh_test_dir("tau_remote_live");
-        let _guard = CwdGuard::enter(&temp);
-
-        let lambda_sq = super::super::LambdaSq::integer(1000);
-        let n_modes = 800usize;
-        let prec = 3338u32;
-        let params = CcmParams::from_lambda_sq_integer(lambda_sq.value_u64, n_modes);
-        // Sanity: no local cache present.
-        assert!(super::tau_cache::load(
-            lambda_sq, n_modes, prec,
-            xc_numerics::quadrature::CacheMode::JsonZip
-        ).is_none(), "no local cache should exist before fetch");
-
-        // DynamicFetch: should pull from the remote repo.
-        let tau = super::tau_cache::load(
-            lambda_sq, n_modes, prec,
-            xc_numerics::quadrature::CacheMode::DynamicFetch,
+        assert!(
+            load(lambda_sq, n_modes, prec, CacheMode::JsonZip).is_none(),
+            "corrupt τ .json.zip must be skipped, not loaded"
         );
 
-        let tau = tau.expect("remote fetch should have returned a τ-matrix");
-        let dim = params.matrix_size();
-        assert_eq!(tau.len(), dim * dim,
-            "fetched τ length {} != (2N+1)² = {}", tau.len(), dim * dim);
+        assert!(
+            zip_path.exists(),
+            "corrupt τ zip should be preserved for inspection"
+        );
 
         drop(_guard);
         let _ = std::fs::remove_dir_all(&temp);
@@ -3738,40 +7004,20 @@ mod tests {
         crate::fresh_test_dir(&format!("weil_eigvec_{}", tag))
     }
 
-    /// The remote ξ URL is deterministically derived from `(λ², N, prec)`
-    /// using the public repo's precision-first → λ² → nmodes-thousand-
-    /// bucket layout (mirrors tau/GL), with the `weil_eigvec_` filename
-    /// prefix.
-    #[test]
-    fn weil_eigvec_remote_url_uses_bucketed_layout() {
-        use super::super::LambdaSq;
-        // λ²=1000, N=800, prec=3338 → bucket 0-999.
-        let urls = super::weil_eigvec_cache::remote_zip_url_for_test(LambdaSq::integer(1000), 800, 3338);
-        assert_eq!(
-            urls,
-            vec!["https://raw.githubusercontent.com/TeamXcelerator/xcelerator-weil-eigvec-cache/main/weil_eigvec_cache/prec3338/lambda_sq1000/nmodes0-999/weil_eigvec_lambda_sq1000_nmodes800_prec3338.json.zip"]
-        );
-
-        // λ²=400, N=1500, prec=4999 → bucket 1000-1999.
-        let urls2 = super::weil_eigvec_cache::remote_zip_url_for_test(LambdaSq::integer(400), 1500, 4999);
-        assert_eq!(
-            urls2,
-            vec!["https://raw.githubusercontent.com/TeamXcelerator/xcelerator-weil-eigvec-cache/main/weil_eigvec_cache/prec4999/lambda_sq400/nmodes1000-1999/weil_eigvec_lambda_sq400_nmodes1500_prec4999.json.zip"]
-        );
-    }
-
     /// `parse_json` accepts a well-formed entry and rejects metadata
     /// mismatches, wrong xi length, and non-finite values.
     #[test]
     fn weil_eigvec_parse_json_validates() {
-        use super::weil_eigvec_cache::parse_json;
         use super::super::LambdaSq;
+        use super::weil_eigvec_cache::parse_json;
         let prec = 128;
         let lambda_sq = LambdaSq::integer(13);
         let n_modes = 3usize;
         let dim = 2 * n_modes + 1; // 7
 
-        let xi: Vec<Float> = (0..dim).map(|i| Float::with_val(prec, (i + 1) as f64)).collect();
+        let xi: Vec<Float> = (0..dim)
+            .map(|i| Float::with_val(prec, (i + 1) as f64))
+            .collect();
         let xi_strs: Vec<String> = xi.iter().map(|f| f.to_string()).collect();
         let good = serde_json::json!({
             "schema_version": 1,
@@ -3781,20 +7027,33 @@ mod tests {
             "precision_bits": prec,
             "weil_min_eigenvalue": "1.5e-40",
             "xi": xi_strs,
-        }).to_string();
-        let parsed = parse_json(&good, lambda_sq, n_modes, prec)
-            .expect("well-formed entry should parse");
+        })
+        .to_string();
+        let parsed =
+            parse_json(&good, lambda_sq, n_modes, prec).expect("well-formed entry should parse");
         assert_eq!(parsed.xi.len(), dim);
 
         // Wrong n_modes metadata → reject.
-        assert!(parse_json(&good, lambda_sq, n_modes + 1, prec).is_none(),
-            "n_modes mismatch should be rejected");
+        assert!(
+            parse_json(&good, lambda_sq, n_modes + 1, prec).is_none(),
+            "n_modes mismatch should be rejected"
+        );
         // Wrong precision metadata → reject.
-        assert!(parse_json(&good, lambda_sq, n_modes, prec + 1).is_none(),
-            "precision mismatch should be rejected");
+        assert!(
+            parse_json(&good, lambda_sq, n_modes, prec + 1).is_none(),
+            "precision mismatch should be rejected"
+        );
         // Wrong λ² metadata → reject.
-        assert!(parse_json(&good, LambdaSq::integer(lambda_sq.value_u64 + 5), n_modes, prec).is_none(),
-            "lambda_sq mismatch should be rejected");
+        assert!(
+            parse_json(
+                &good,
+                LambdaSq::integer(lambda_sq.value_u64 + 5),
+                n_modes,
+                prec
+            )
+            .is_none(),
+            "lambda_sq mismatch should be rejected"
+        );
 
         // Wrong xi length → reject.
         let mut short_strs = xi_strs.clone();
@@ -3804,12 +7063,14 @@ mod tests {
             "lambda_sq": lambda_sq.value_f64, "n_modes": n_modes,
             "precision_bits": prec, "weil_min_eigenvalue": "1.5e-40", "xi": short_strs,
         }).to_string();
-        assert!(parse_json(&short, lambda_sq, n_modes, prec).is_none(),
-            "wrong xi length should be rejected");
+        assert!(
+            parse_json(&short, lambda_sq, n_modes, prec).is_none(),
+            "wrong xi length should be rejected"
+        );
     }
 
     /// `weil_eigvec_cache::parse_json_for_test` rejects a JSON envelope
-    /// whose `toolkit_version` is older than `CACHE_MIN_TOOLKIT_VERSION`
+    /// whose `toolkit_version` is older than the Weil-state family producer floor
     /// — a stale file written by an older toolkit build.
     #[test]
     fn weil_eigvec_rejects_stale_toolkit_version() {
@@ -3827,11 +7088,11 @@ mod tests {
             "precision_bits": prec,
             "weil_min_eigenvalue": "1.23e-10",
             "xi": xi_strs,
-        }).to_string();
+        })
+        .to_string();
         assert!(
-            super::weil_eigvec_cache::parse_json_for_test(
-                &payload, lambda_sq, n_modes, prec
-            ).is_none(),
+            super::weil_eigvec_cache::parse_json_for_test(&payload, lambda_sq, n_modes, prec)
+                .is_none(),
             "weil eigvec parser should reject a stale toolkit_version=0.0.1"
         );
     }
@@ -3854,20 +7115,26 @@ mod tests {
         let eps = Float::with_val(prec, 1);
         let mut xi = vec![Float::with_val(prec, 0); n];
         xi[0] = Float::with_val(prec, 1);
-        assert!(residual_ok(&a, n, &xi, &eps, prec),
-            "genuine eigenpair should pass the residual check");
+        assert!(
+            residual_ok(&a, n, &xi, &eps, prec),
+            "genuine eigenpair should pass the residual check"
+        );
 
         // Wrong eigenvector (points along e_1, whose eigenvalue is 2,
         // not 1) → residual is O(1) → reject.
         let mut wrong = vec![Float::with_val(prec, 0); n];
         wrong[1] = Float::with_val(prec, 1);
-        assert!(!residual_ok(&a, n, &wrong, &eps, prec),
-            "wrong eigenvector should fail the residual check");
+        assert!(
+            !residual_ok(&a, n, &wrong, &eps, prec),
+            "wrong eigenvector should fail the residual check"
+        );
 
         // Zero vector → reject.
         let zero = vec![Float::with_val(prec, 0); n];
-        assert!(!residual_ok(&a, n, &zero, &eps, prec),
-            "zero vector should fail the residual check");
+        assert!(
+            !residual_ok(&a, n, &zero, &eps, prec),
+            "zero vector should fail the residual check"
+        );
     }
 
     /// Round-trip: `save` then `load` returns a byte-identical ξ and ε_N
@@ -3875,9 +7142,9 @@ mod tests {
     /// nothing.
     #[test]
     fn weil_eigvec_save_load_round_trip() {
-        use super::weil_eigvec_cache::{save, load};
-        use xc_numerics::quadrature::CacheMode;
         use super::super::LambdaSq;
+        use super::weil_eigvec_cache::{load, save};
+        use xc_numerics::quadrature::CacheMode;
         let prec = 128;
         let lambda_sq = LambdaSq::integer(49);
         let n_modes = 4usize;
@@ -3888,38 +7155,62 @@ mod tests {
 
         let eps = Float::with_val(prec, Float::parse("3.25e-12").unwrap());
         let xi: Vec<Float> = (0..dim)
-            .map(|i| Float::with_val(prec, Float::parse(
-                format!("0.{}1", i + 1)).unwrap()))
+            .map(|i| Float::with_val(prec, Float::parse(format!("0.{}1", i + 1)).unwrap()))
             .collect();
 
         // Off: writes nothing, reads nothing.
         save(lambda_sq, n_modes, prec, &eps, &xi, CacheMode::Off, true);
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::Off, true).is_none(),
-            "Off should never read");
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true).is_none(),
-            "Off save should have written nothing");
+        assert!(
+            load(lambda_sq, n_modes, prec, CacheMode::Off, true).is_none(),
+            "Off should never read"
+        );
+        assert!(
+            load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true).is_none(),
+            "Off save should have written nothing"
+        );
 
         // JsonZip: writes ONLY the .json.zip (zip-only contract); reads
         // back identical by decompressing in memory.
-        save(lambda_sq, n_modes, prec, &eps, &xi, CacheMode::JsonZip, true);
+        save(
+            lambda_sq,
+            n_modes,
+            prec,
+            &eps,
+            &xi,
+            CacheMode::JsonZip,
+            true,
+        );
 
         // No uncompressed .json should be written.
-        let jp = temp.join("data").join("weil_eigvec_cache")
-            .join(super::weil_eigvec_cache::cache_filename(lambda_sq, n_modes, prec, true));
-        assert!(!jp.exists(), "zip-only: save must not write an uncompressed .json");
+        let jp = temp.join("data").join("weil_eigvec_cache").join(
+            super::weil_eigvec_cache::cache_filename(lambda_sq, n_modes, prec, true),
+        );
+        assert!(
+            !jp.exists(),
+            "zip-only: save must not write an uncompressed .json"
+        );
 
         let got = load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true)
             .expect("JsonZip round-trip should load from the zip");
         assert_eq!(got.xi.len(), dim);
         for (a, b) in xi.iter().zip(got.xi.iter()) {
-            assert_eq!(a.to_string(), b.to_string(), "xi entry must round-trip exactly");
+            assert_eq!(
+                a.to_string(),
+                b.to_string(),
+                "xi entry must round-trip exactly"
+            );
         }
-        assert_eq!(eps.to_string(), got.eps_n.to_string(),
-            "eps_n must round-trip exactly");
+        assert_eq!(
+            eps.to_string(),
+            got.eps_n.to_string(),
+            "eps_n must round-trip exactly"
+        );
 
         // JsonOnly is now a read no-op (no uncompressed .json exists).
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly, true).is_none(),
-            "zip-only: JsonOnly must not read the zip");
+        assert!(
+            load(lambda_sq, n_modes, prec, CacheMode::JsonOnly, true).is_none(),
+            "zip-only: JsonOnly must not read the zip"
+        );
 
         drop(_guard);
         let _ = std::fs::remove_dir_all(&temp);
@@ -3931,9 +7222,9 @@ mod tests {
     /// recomputes). The bad file is preserved on disk for inspection.
     #[test]
     fn weil_eigvec_load_skips_structurally_invalid_json() {
-        use super::weil_eigvec_cache::{load, cache_filename};
-        use xc_numerics::quadrature::CacheMode;
         use super::super::LambdaSq;
+        use super::weil_eigvec_cache::{cache_filename, load};
+        use xc_numerics::quadrature::CacheMode;
         let prec = 128;
         let lambda_sq = LambdaSq::integer(13);
         let n_modes = 4usize; // expects 2N+1 = 9 entries
@@ -3956,7 +7247,8 @@ mod tests {
             "precision_bits": prec,
             "weil_min_eigenvalue": "1.0e-20",
             "xi": ["1.0", "2.0", "3.0"],
-        }).to_string();
+        })
+        .to_string();
 
         // Plant the bad entry inside a .json.zip (the only tier read now).
         {
@@ -3971,14 +7263,20 @@ mod tests {
         }
 
         // load must skip (None) — never returns a malformed entry.
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonOnly, true).is_none(),
-            "JsonOnly is a read no-op under the zip-only contract");
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true).is_none(),
-            "structurally-invalid ξ entry in the zip must be skipped");
+        assert!(
+            load(lambda_sq, n_modes, prec, CacheMode::JsonOnly, true).is_none(),
+            "JsonOnly is a read no-op under the zip-only contract"
+        );
+        assert!(
+            load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true).is_none(),
+            "structurally-invalid ξ entry in the zip must be skipped"
+        );
 
         // The bad file is preserved on disk (load does not delete it).
-        assert!(zip_path.exists(),
-            "structurally-invalid zip should be preserved for inspection");
+        assert!(
+            zip_path.exists(),
+            "structurally-invalid zip should be preserved for inspection"
+        );
 
         drop(_guard);
         let _ = std::fs::remove_dir_all(&temp);
@@ -3989,9 +7287,9 @@ mod tests {
     /// preserved. Mirrors the GL cache's `cache_handles_corrupt_zip_gracefully`.
     #[test]
     fn weil_eigvec_load_handles_corrupt_zip_gracefully() {
+        use super::super::LambdaSq;
         use super::weil_eigvec_cache::load;
         use xc_numerics::quadrature::CacheMode;
-        use super::super::LambdaSq;
         let prec = 64;
         let lambda_sq = LambdaSq::integer(49);
         let n_modes = 3usize;
@@ -4006,56 +7304,22 @@ mod tests {
         // open it, and return None — without panicking.
         let zip_path = dir.join(format!(
             "weil_eigvec_lambda_sq{}_nmodes{}_prec{}.json.zip",
-            lambda_sq.filename_str(), n_modes, prec
+            lambda_sq.filename_str(),
+            n_modes,
+            prec
         ));
         std::fs::write(&zip_path, b"not a zip file at all -- random bytes").unwrap();
 
-        assert!(load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true).is_none(),
-            "corrupt .json.zip must be skipped, not loaded");
+        assert!(
+            load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true).is_none(),
+            "corrupt .json.zip must be skipped, not loaded"
+        );
 
         // Corrupt file preserved on disk.
-        assert!(zip_path.exists(),
-            "corrupt zip should be preserved for inspection");
-
-        drop(_guard);
-        let _ = std::fs::remove_dir_all(&temp);
-    }
-
-    /// Live end-to-end remote ξ-fetch test against the PUBLIC
-    /// `xcelerator-weil-eigvec-cache` repo. `#[ignore]`d so it never runs
-    /// in the default suite (needs network + `curl` + a populated repo).
-    /// Run explicitly with:
-    ///
-    /// ```text
-    /// cargo test -p xc-spectral --features hp -- --ignored weil_eigvec_remote_fetch_live
-    /// ```
-    #[test]
-    #[ignore = "live network: hits the public xcelerator-weil-eigvec-cache repo; run with --ignored"]
-    fn weil_eigvec_remote_fetch_live_downloads_and_validates() {
-        use xc_numerics::quadrature::CacheMode;
-        // CwdGuard serializes against other cwd-mutating tests (cwd is
-        // process-global) and restores the original cwd on drop.
-        let temp = weil_temp_cwd("remote_live");
-        let _guard = CwdGuard::enter(&temp);
-
-        // A config that exists in the public repo (the seed fixture
-        // generated by examples/gen_weil_eigvec_fixture: λ²=13, N=10,
-        // HP-64 → prec 229 bits).
-        let lambda_sq = super::super::LambdaSq::integer(13);
-        let n_modes = 10usize;
-        let prec = 229u32;
-        assert!(super::weil_eigvec_cache::load(
-            lambda_sq, n_modes, prec, CacheMode::JsonZip, true
-        ).is_none(), "no local cache should exist before fetch");
-
-        let fetched = super::weil_eigvec_cache::load(
-            lambda_sq, n_modes, prec, CacheMode::DynamicFetch, true,
-        ).map(|c| (c.xi.len(), 2 * n_modes + 1));
-
-        let (got_len, expected_len) = fetched
-            .expect("remote fetch should have returned a ξ entry");
-        assert_eq!(got_len, expected_len,
-            "fetched ξ length {} != 2N+1 = {}", got_len, expected_len);
+        assert!(
+            zip_path.exists(),
+            "corrupt zip should be preserved for inspection"
+        );
 
         drop(_guard);
         let _ = std::fs::remove_dir_all(&temp);
@@ -4098,21 +7362,34 @@ mod tests {
         let tol_check = Float::with_val(prec, 2).pow(-((prec as i32) / 2));
 
         let z_newton = super::newton_xi_hat_zero(&xi, n_max, &l, &seed, prec, 100)
-            .value().expect("Newton should find a zero").clone();
-        assert!(z_newton.clone().abs() < tol_check,
-            "Newton zero should be ~0, got {}", z_newton);
+            .value()
+            .expect("Newton should find a zero")
+            .clone();
+        assert!(
+            z_newton.clone().abs() < tol_check,
+            "Newton zero should be ~0, got {}",
+            z_newton
+        );
 
         let z_halley = super::halley_xi_hat_zero(&xi, n_max, &l, &seed, prec, 100)
-            .value().expect("Halley should find a zero").clone();
-        assert!(z_halley.clone().abs() < tol_check,
-            "Halley zero should be ~0, got {}", z_halley);
+            .value()
+            .expect("Halley should find a zero")
+            .clone();
+        assert!(
+            z_halley.clone().abs() < tol_check,
+            "Halley zero should be ~0, got {}",
+            z_halley
+        );
 
         // Verify the two methods agree.
         let mut diff = z_newton.clone();
         diff -= &z_halley;
         let abs_diff = diff.abs();
-        assert!(abs_diff < tol_check,
-            "Newton and Halley zeros differ by {}", abs_diff);
+        assert!(
+            abs_diff < tol_check,
+            "Newton and Halley zeros differ by {}",
+            abs_diff
+        );
     }
 
     /// `newton_xi_hat_zero` with a pole directly on the seed (degenerate case):

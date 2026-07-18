@@ -1,0 +1,20 @@
+[package]
+name = "xc-cli"
+description = "Command-line interface for Xcelerator Toolkit research and cache workflows."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "xc"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+xc-cache = { workspace = true }
+xc-core = { workspace = true }

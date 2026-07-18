@@ -19,7 +19,16 @@ use rug::{ops::Pow, Float};
 
 /// Build an HP zero at the given precision. Uses an integer literal so
 /// no f64 round-trip occurs.
-#[inline] fn hp_zero(prec: u32) -> Float { Float::with_val(prec, 0) }
+#[inline]
+fn hp_zero(prec: u32) -> Float {
+    Float::with_val(prec, 0)
+}
+
+fn needs_even_projection(odd_deviation: &Float, prec: u32) -> bool {
+    let mut threshold = Float::with_val(prec, 1);
+    threshold /= 2u32;
+    odd_deviation > &threshold
+}
 
 // ===========================================================================
 // Dense LU factorization with partial pivoting
@@ -62,27 +71,49 @@ pub fn lu_factor(a: &[Float], dim: usize) -> Result<LuFactors> {
         let mut max_val = lu[k * dim + k].clone().abs();
         for i in (k + 1)..dim {
             let v = lu[i * dim + k].clone().abs();
-            if v > max_val { max_val = v; max_idx = i; }
+            if v > max_val {
+                max_val = v;
+                max_idx = i;
+            }
         }
         if max_idx != k {
-            for j in 0..dim { lu.swap(k * dim + j, max_idx * dim + j); }
+            for j in 0..dim {
+                lu.swap(k * dim + j, max_idx * dim + j);
+            }
             perm.swap(k, max_idx);
         }
         let pivot = lu[k * dim + k].clone();
-        if pivot.is_zero() { return Err(anyhow!("singular matrix")); }
-        let factors: Vec<Float> = ((k + 1)..dim).map(|i| {
-            let mut f = lu[i * dim + k].clone(); f /= &pivot; f
-        }).collect();
-        for (idx, i) in ((k + 1)..dim).enumerate() { lu[i * dim + k] = factors[idx].clone(); }
+        if pivot.is_zero() {
+            return Err(anyhow!("singular matrix"));
+        }
+        let factors: Vec<Float> = ((k + 1)..dim)
+            .map(|i| {
+                let mut f = lu[i * dim + k].clone();
+                f /= &pivot;
+                f
+            })
+            .collect();
+        for (idx, i) in ((k + 1)..dim).enumerate() {
+            lu[i * dim + k] = factors[idx].clone();
+        }
         let pivot_row: Vec<Float> = ((k + 1)..dim).map(|j| lu[k * dim + j].clone()).collect();
-        let updates: Vec<Vec<Float>> = factors.par_iter().enumerate().map(|(idx, factor)| {
-            let i = k + 1 + idx;
-            ((k + 1)..dim).enumerate().map(|(j_off, j)| {
-                let mut val = lu[i * dim + j].clone();
-                let mut prod = pivot_row[j_off].clone(); prod *= factor;
-                val -= &prod; val
-            }).collect()
-        }).collect();
+        let updates: Vec<Vec<Float>> = factors
+            .par_iter()
+            .enumerate()
+            .map(|(idx, factor)| {
+                let i = k + 1 + idx;
+                ((k + 1)..dim)
+                    .enumerate()
+                    .map(|(j_off, j)| {
+                        let mut val = lu[i * dim + j].clone();
+                        let mut prod = pivot_row[j_off].clone();
+                        prod *= factor;
+                        val -= &prod;
+                        val
+                    })
+                    .collect()
+            })
+            .collect();
         for (idx, i) in ((k + 1)..dim).enumerate() {
             for (j_off, j) in ((k + 1)..dim).enumerate() {
                 lu[i * dim + j] = updates[idx][j_off].clone();
@@ -155,17 +186,27 @@ pub fn lu_solve_with(
             // Parallel multiplies, then a fixed index-order fold. HP
             // addition is non-associative, so we must NOT use rayon's
             // `.reduce()` (its combine order is runtime-dependent). The
-            // sequential fold over the collected terms makes the result
+            // canonical pairwise tree over the collected terms makes the result
             // bit-identical run-to-run — required for xi cacheability.
-            let terms: Vec<Float> = (0..i).into_par_iter().map(|j| {
-                let mut t = lu[i * dim + j].clone(); t *= &y[j]; t
-            }).collect();
-            let mut sum = hp_zero(prec);
-            for t in &terms { sum += t; }
-            let mut s = pb[i].clone(); s -= &sum; s
+            let terms: Vec<Float> = (0..i)
+                .into_par_iter()
+                .map(|j| {
+                    let mut t = lu[i * dim + j].clone();
+                    t *= &y[j];
+                    t
+                })
+                .collect();
+            let sum = crate::reduction::deterministic_pairwise_sum_hp(&terms, prec);
+            let mut s = pb[i].clone();
+            s -= &sum;
+            s
         } else {
             let mut s = pb[i].clone();
-            for j in 0..i { let mut t = lu[i * dim + j].clone(); t *= &y[j]; s -= &t; }
+            for j in 0..i {
+                let mut t = lu[i * dim + j].clone();
+                t *= &y[j];
+                s -= &t;
+            }
             s
         };
         y[i] = s;
@@ -178,15 +219,25 @@ pub fn lu_solve_with(
         let mut s = if parallel && row_len >= PAR_SOLVE_MIN_ROW {
             // Parallel multiplies, then a fixed index-order fold (see the
             // forward-substitution note above): deterministic HP sum.
-            let terms: Vec<Float> = ((i + 1)..dim).into_par_iter().map(|j| {
-                let mut t = lu[i * dim + j].clone(); t *= &x[j]; t
-            }).collect();
-            let mut sum = hp_zero(prec);
-            for t in &terms { sum += t; }
-            let mut s = y[i].clone(); s -= &sum; s
+            let terms: Vec<Float> = ((i + 1)..dim)
+                .into_par_iter()
+                .map(|j| {
+                    let mut t = lu[i * dim + j].clone();
+                    t *= &x[j];
+                    t
+                })
+                .collect();
+            let sum = crate::reduction::deterministic_pairwise_sum_hp(&terms, prec);
+            let mut s = y[i].clone();
+            s -= &sum;
+            s
         } else {
             let mut s = y[i].clone();
-            for j in (i + 1)..dim { let mut t = lu[i * dim + j].clone(); t *= &x[j]; s -= &t; }
+            for j in (i + 1)..dim {
+                let mut t = lu[i * dim + j].clone();
+                t *= &x[j];
+                s -= &t;
+            }
             s
         };
         s /= &lu[i * dim + i];
@@ -274,12 +325,16 @@ pub fn tridiag_lu_factor_hp(
     }
     if lower.len() != n.saturating_sub(1) {
         return Err(anyhow!(
-            "lower length {} should be {} (n-1)", lower.len(), n - 1
+            "lower length {} should be {} (n-1)",
+            lower.len(),
+            n - 1
         ));
     }
     if upper.len() != n.saturating_sub(1) {
         return Err(anyhow!(
-            "upper length {} should be {} (n-1)", upper.len(), n - 1
+            "upper length {} should be {} (n-1)",
+            upper.len(),
+            n - 1
         ));
     }
 
@@ -343,7 +398,11 @@ pub fn tridiag_lu_factor_hp(
             let old_c_k = c[k].clone();
             let old_a_k = a[k].clone();
             let old_d_kp1 = d[k + 1].clone();
-            let old_c_kp1 = if k + 1 < n - 1 { c[k + 1].clone() } else { hp_zero(prec) };
+            let old_c_kp1 = if k + 1 < n - 1 {
+                c[k + 1].clone()
+            } else {
+                hp_zero(prec)
+            };
 
             d[k] = old_a_k;
             c[k] = old_d_kp1;
@@ -365,7 +424,8 @@ pub fn tridiag_lu_factor_hp(
         let abs_pivot = pivot.clone().abs();
         if abs_pivot.is_zero() {
             return Err(anyhow!(
-                "tridiag LU: zero pivot at row {} (matrix is singular)", k
+                "tridiag LU: zero pivot at row {} (matrix is singular)",
+                k
             ));
         }
         if abs_pivot < small_pivot_thresh {
@@ -480,42 +540,53 @@ pub fn tridiag_lu_solve_hp(
 /// In-place ℓ² normalization of an HP vector. Sum-of-squares is computed
 /// via parallel reduction; the per-element divide is parallelized too.
 pub fn normalize_l2(v: &mut [Float]) {
-    if v.is_empty() { return; }
+    if v.is_empty() {
+        return;
+    }
     let prec = v[0].prec();
-    // Parallel squares, then a fixed index-order fold. HP addition is
+    // Parallel squares, then the canonical adjacent pairwise tree. HP addition is
     // non-associative, so rayon's `.reduce()` (runtime-dependent combine
     // order) would make ‖v‖ — and hence the normalized v — drift in the
     // low bits run-to-run. The sequential fold keeps it bit-identical.
-    let squares: Vec<Float> = v.par_iter()
+    let squares: Vec<Float> = v
+        .par_iter()
         .map(|vk| {
             let mut t = vk.clone();
             t *= vk;
             t
         })
         .collect();
-    let mut norm_sq = hp_zero(prec);
-    for t in &squares { norm_sq += t; }
+    let norm_sq = crate::reduction::deterministic_pairwise_sum_hp(&squares, prec);
     let norm = norm_sq.sqrt();
-    v.par_iter_mut().for_each(|vk| { *vk /= &norm; });
+    v.par_iter_mut().for_each(|vk| {
+        *vk /= &norm;
+    });
 }
 
 /// Rayleigh quotient `xᵀ A x` for a symmetric matrix `a` (row-major).
-/// Per-row contributions are computed in parallel, then summed in a
-/// fixed index order. The final fold is sequential (not rayon
+/// Per-row contributions are computed in parallel, then summed through the
+/// canonical adjacent pairwise tree (not rayon
 /// `.reduce()`) because HP addition is non-associative: a runtime-
 /// ordered reduction would let the low bits of the returned μ drift
 /// run-to-run, which can flip the inverse-iteration convergence test
 /// and change the iteration count. A deterministic μ keeps xi
 /// reproducible.
 pub fn rayleigh_quotient(a: &[Float], dim: usize, xi: &[Float], prec: u32) -> Float {
-    let contribs: Vec<Float> = (0..dim).into_par_iter().map(|i| {
-        let mut row_sum = hp_zero(prec);
-        for j in 0..dim { let mut t = a[i * dim + j].clone(); t *= &xi[j]; row_sum += &t; }
-        let mut contrib = row_sum; contrib *= &xi[i]; contrib
-    }).collect();
-    let mut total = hp_zero(prec);
-    for c in &contribs { total += c; }
-    total
+    let contribs: Vec<Float> = (0..dim)
+        .into_par_iter()
+        .map(|i| {
+            let mut row_sum = hp_zero(prec);
+            for j in 0..dim {
+                let mut t = a[i * dim + j].clone();
+                t *= &xi[j];
+                row_sum += &t;
+            }
+            let mut contrib = row_sum;
+            contrib *= &xi[i];
+            contrib
+        })
+        .collect();
+    crate::reduction::deterministic_pairwise_sum_hp(&contribs, prec)
 }
 
 /// Inverse iteration to find the smallest-eigenpair of a symmetric
@@ -573,31 +644,86 @@ pub fn inverse_iteration_from(
     force_even: bool,
     start: Option<Vec<Float>>,
 ) -> Result<(Float, Vec<Float>)> {
-    let lu = lu_factor(a, dim)?;
+    inverse_iteration_from_optional_factors(a, dim, prec, max_steps, force_even, start, None)
+}
+
+/// Inverse iteration using a previously validated LU factorization of `a`.
+/// The retained factors avoid repeating the dominant initial O(n^3)
+/// factorization; the shifted refinement remains freshly factorized because
+/// its matrix depends on the newly computed Rayleigh quotient.
+pub fn inverse_iteration_from_factors(
+    a: &[Float],
+    factors: &LuFactors,
+    dim: usize,
+    prec: u32,
+    max_steps: usize,
+    force_even: bool,
+    start: Option<Vec<Float>>,
+) -> Result<(Float, Vec<Float>)> {
+    if factors.lu.len() != dim * dim || factors.perm.len() != dim {
+        return Err(anyhow!(
+            "LU factor dimensions do not match inverse-iteration matrix"
+        ));
+    }
+    inverse_iteration_from_optional_factors(
+        a,
+        dim,
+        prec,
+        max_steps,
+        force_even,
+        start,
+        Some(factors),
+    )
+}
+
+fn inverse_iteration_from_optional_factors(
+    a: &[Float],
+    dim: usize,
+    prec: u32,
+    max_steps: usize,
+    force_even: bool,
+    start: Option<Vec<Float>>,
+    retained_factors: Option<&LuFactors>,
+) -> Result<(Float, Vec<Float>)> {
+    let computed_factors;
+    let lu = if let Some(factors) = retained_factors {
+        factors
+    } else {
+        computed_factors = lu_factor(a, dim)?;
+        &computed_factors
+    };
 
     // Initial guess: warm-start from provided vector, or fall back to
     // Gaussian centered at the middle index.
     let mut xi: Vec<Float> = if let Some(warm) = start {
         // Re-precision the warm-start vector (it may be at a different prec)
-        warm.into_iter().map(|v| {
-            let s = v.to_string();
-            Float::with_val(prec, Float::parse(&s).unwrap_or_else(|_| Float::parse("0").unwrap()))
-        }).collect()
+        warm.into_iter()
+            .map(|v| {
+                let s = v.to_string();
+                Float::with_val(
+                    prec,
+                    Float::parse(&s).unwrap_or_else(|_| Float::parse("0").unwrap()),
+                )
+            })
+            .collect()
     } else {
         // Gaussian initial guess
-        (0..dim).into_par_iter().map(|i| {
-            let center = (dim as i64) / 2;
-            let j = (i as i64) - center;
-            let half = ((dim as i64) / 2).max(1);
-            let mut x = Float::with_val(prec, j);
-            x /= half;
-            let mut x_sq = x.clone();
-            x_sq *= &x;
-            x_sq /= 2u32;
-            let mut arg = Float::with_val(prec, 0);
-            arg -= &x_sq;
-            arg.exp()
-        }).collect()
+        (0..dim)
+            .into_par_iter()
+            .map(|i| {
+                let center = (dim as i64) / 2;
+                let j = (i as i64) - center;
+                let half = ((dim as i64) / 2).max(1);
+                let mut x = Float::with_val(prec, j);
+                x /= half;
+                let mut x_sq = x.clone();
+                x_sq *= &x;
+                x_sq /= 2u32;
+                let mut arg = Float::with_val(prec, 0);
+                arg -= &x_sq;
+                arg.exp()
+            })
+            .collect()
     };
     normalize_l2(&mut xi);
 
@@ -606,7 +732,7 @@ pub fn inverse_iteration_from(
 
     let iter_start = std::time::Instant::now();
     for step in 0..max_steps {
-        let mut v = lu_solve(&lu, &xi, dim, prec);
+        let mut v = lu_solve(lu, &xi, dim, prec);
         normalize_l2(&mut v);
         if force_even {
             // Auto-detect natural symmetry, only project
@@ -617,28 +743,43 @@ pub fn inverse_iteration_from(
             // Symmetry deviation: max_i |v[i] - v[dim-1-i]| / max_i |v[i]|
             // ≈ 0 → even (no projection needed)
             // ≈ 2 → odd (projection needed; log warning in debug)
-            let linf: Float = v.iter().map(|x| x.clone().abs())
+            let linf: Float = v
+                .iter()
+                .map(|x| x.clone().abs())
                 .fold(hp_zero(prec), |a, b| if b > a { b } else { a });
             let odd_dev: Float = if linf.is_zero() {
                 hp_zero(prec)
             } else {
-                let max_asym = (0..dim).map(|i| {
-                    let mut d = v[i].clone(); d -= &v[dim - 1 - i]; d.abs()
-                }).fold(hp_zero(prec), |a, b| if b > a { b } else { a });
-                let mut rel = max_asym; rel /= &linf; rel
+                let max_asym = (0..dim)
+                    .map(|i| {
+                        let mut d = v[i].clone();
+                        d -= &v[dim - 1 - i];
+                        d.abs()
+                    })
+                    .fold(hp_zero(prec), |a, b| if b > a { b } else { a });
+                let mut rel = max_asym;
+                rel /= &linf;
+                rel
             };
             // Threshold: projection needed if deviation > 0.5 (halfway between
             // even=0 and odd=2). Below threshold the vector is already even
             // enough — skip projection to save cost.
-            let needs_projection = odd_dev.to_f64() > 0.5;
+            let needs_projection = needs_even_projection(&odd_dev, prec);
             if needs_projection {
                 crate::hp_debug!(
-                    "[HP invit] step {}: natural vector is odd (deviation={:.3}), applying even projection",
-                    step + 1, odd_dev.to_f64()
+                    "[HP invit] step {}: natural vector is odd (deviation={}), applying even projection",
+                    step + 1,
+                    crate::fmt::display_hp(&odd_dev, 4)
                 );
-                let xi_sym: Vec<Float> = (0..dim).into_par_iter().map(|i| {
-                    let mut s = v[i].clone(); s += &v[dim - 1 - i]; s /= 2u32; s
-                }).collect();
+                let xi_sym: Vec<Float> = (0..dim)
+                    .into_par_iter()
+                    .map(|i| {
+                        let mut s = v[i].clone();
+                        s += &v[dim - 1 - i];
+                        s /= 2u32;
+                        s
+                    })
+                    .collect();
                 xi = xi_sym;
             } else {
                 xi = v;
@@ -650,9 +791,11 @@ pub fn inverse_iteration_from(
         mu = rayleigh_quotient(a, dim, &xi, prec);
 
         if step > 2 {
-            let mut diff = mu.clone(); diff -= &prev_mu;
+            let mut diff = mu.clone();
+            diff -= &prev_mu;
             let converged = if !mu.is_zero() {
-                let mut r = diff.clone().abs(); r /= &mu.clone().abs();
+                let mut r = diff.clone().abs();
+                r /= &mu.clone().abs();
                 r < Float::with_val(prec, 2).pow(-((prec as i32) - 32))
             } else {
                 diff.clone().abs() < Float::with_val(prec, 2).pow(-((prec as i32) - 32))
@@ -660,7 +803,10 @@ pub fn inverse_iteration_from(
             if converged {
                 crate::hp_debug!(
                     "[HP invit] inverse iteration converged at step {}/{} on N={} (elapsed {:.1}s)",
-                    step + 1, max_steps, dim, iter_start.elapsed().as_secs_f64()
+                    step + 1,
+                    max_steps,
+                    dim,
+                    iter_start.elapsed().as_secs_f64()
                 );
                 break;
             }
@@ -671,7 +817,10 @@ pub fn inverse_iteration_from(
         if (step + 1) % 25 == 0 {
             crate::hp_debug!(
                 "[HP invit] inverse iteration {}/{} on N={} (elapsed {:.1}s)",
-                step + 1, max_steps, dim, iter_start.elapsed().as_secs_f64()
+                step + 1,
+                max_steps,
+                dim,
+                iter_start.elapsed().as_secs_f64()
             );
         }
     }
@@ -684,27 +833,33 @@ pub fn inverse_iteration_from(
     // Solves (A − μ·I)·v = ξ_old, then normalizes. The shift makes the
     // target eigenvalue appear near-zero, so one solve gives full-precision
     // convergence regardless of eigenvalue gaps.
-    let shifted_a: Vec<Float> = (0..dim * dim).into_par_iter().map(|idx| {
-        let i = idx / dim;
-        let j = idx % dim;
-        let mut val = a[idx].clone();
-        if i == j {
-            val -= &mu;
-        }
-        val
-    }).collect();
+    let shifted_a: Vec<Float> = (0..dim * dim)
+        .into_par_iter()
+        .map(|idx| {
+            let i = idx / dim;
+            let j = idx % dim;
+            let mut val = a[idx].clone();
+            if i == j {
+                val -= &mu;
+            }
+            val
+        })
+        .collect();
 
     match lu_factor(&shifted_a, dim) {
         Ok(shifted_lu) => {
             let mut xi_refined = lu_solve(&shifted_lu, &xi, dim, prec);
             normalize_l2(&mut xi_refined);
             if force_even {
-                let xi_sym: Vec<Float> = (0..dim).into_par_iter().map(|i| {
-                    let mut s = xi_refined[i].clone();
-                    s += &xi_refined[dim - 1 - i];
-                    s /= 2u32;
-                    s
-                }).collect();
+                let xi_sym: Vec<Float> = (0..dim)
+                    .into_par_iter()
+                    .map(|i| {
+                        let mut s = xi_refined[i].clone();
+                        s += &xi_refined[dim - 1 - i];
+                        s /= 2u32;
+                        s
+                    })
+                    .collect();
                 xi_refined = xi_sym;
                 normalize_l2(&mut xi_refined);
             }
@@ -726,17 +881,16 @@ pub fn inverse_iteration_from(
                 check_diff.abs()
             };
             // Accept refinement only if eigenvalue didn't jump (< 1% relative change)
-            let accept_tol = Float::with_val(prec, 0.01f64);
+            let mut accept_tol = Float::with_val(prec, 1);
+            accept_tol /= 100u32;
             if check_ratio < accept_tol {
                 xi = xi_refined;
                 mu = mu_refined;
-                crate::hp_debug!(
-                    "[HP invit] shifted refinement accepted (delta_mu/mu < 1%)",
-                );
+                crate::hp_debug!("[HP invit] shifted refinement accepted (delta_mu/mu < 1%)",);
             } else {
                 crate::hp_debug!(
                     "[HP invit] shifted refinement REJECTED: eigenvalue jumped (delta/mu = {}), keeping original ξ",
-                    check_ratio.to_f64()
+                    crate::fmt::display_hp(&check_ratio, 8)
                 );
             }
         }
@@ -753,32 +907,38 @@ pub fn inverse_iteration_from(
     // Compute ||A·ξ − μ·ξ||∞ for logging. This lets us track eigenvector
     // quality across runs and detect regressions.
     let residual_norm: Float = {
-        let residuals: Vec<Float> = (0..dim).into_par_iter().map(|i| {
-            let mut av_i = hp_zero(prec);
-            for j in 0..dim {
-                let mut t = a[i * dim + j].clone();
-                t *= &xi[j];
-                av_i += &t;
-            }
-            let mut mu_v_i = mu.clone();
-            mu_v_i *= &xi[i];
-            av_i -= &mu_v_i;
-            av_i.abs()
-        }).collect();
+        let residuals: Vec<Float> = (0..dim)
+            .into_par_iter()
+            .map(|i| {
+                let mut av_i = hp_zero(prec);
+                for j in 0..dim {
+                    let mut t = a[i * dim + j].clone();
+                    t *= &xi[j];
+                    av_i += &t;
+                }
+                let mut mu_v_i = mu.clone();
+                mu_v_i *= &xi[i];
+                av_i -= &mu_v_i;
+                av_i.abs()
+            })
+            .collect();
         let mut max_r = hp_zero(prec);
         for r in &residuals {
-            if *r > max_r { max_r = r.clone(); }
+            if *r > max_r {
+                max_r = r.clone();
+            }
         }
         max_r
     };
     crate::hp_debug!(
         "[HP invit] final residual ||Av-μv||_∞ = {} (prec={} bits, dim={})",
-        residual_norm.to_f64(), prec, dim
+        crate::fmt::display_hp(&residual_norm, 8),
+        prec,
+        dim
     );
 
     Ok((mu, xi))
 }
-
 
 // Matrix fixtures below use the row-major index convention `a[i * dim + j]`
 // uniformly, including the `i = 0` / `j = 0` rows where `0 * dim` and `+ 0`
@@ -788,8 +948,23 @@ pub fn inverse_iteration_from(
 #[allow(clippy::erasing_op, clippy::identity_op)]
 mod tests {
     use super::*;
+    use crate::fmt::{display_hp, matching_digits, relative_difference};
     use rug::Float;
-    use crate::fmt::{display_hp, relative_difference, matching_digits};
+
+    #[test]
+    fn hp_even_projection_decision_does_not_round_through_f64() {
+        let prec = 256;
+        let mut threshold = Float::with_val(prec, 1);
+        threshold /= 2u32;
+        let epsilon = Float::with_val(prec, 2).pow(-200);
+        let mut below = threshold.clone();
+        below -= &epsilon;
+        let mut above = threshold;
+        above += epsilon;
+
+        assert!(!needs_even_projection(&below, prec));
+        assert!(needs_even_projection(&above, prec));
+    }
 
     /// Build an HP `Float` from an integer-valued seed at the given precision.
     /// Used in tests for textbook small matrices where matrix entries are
@@ -811,9 +986,13 @@ mod tests {
             let mut diff = actual.clone();
             diff -= expected;
             let abs_diff = diff.abs();
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "{}: |actual| = {} should be < 10^-{}",
-                msg, display_hp(&abs_diff, 6), tol_digits);
+                msg,
+                display_hp(&abs_diff, 6),
+                tol_digits
+            );
         } else {
             let rel = relative_difference(actual, expected).unwrap();
             assert!(rel < tol,
@@ -833,10 +1012,7 @@ mod tests {
     #[test]
     fn lu_factor_and_solve_2x2() {
         let prec = 64;
-        let a = vec![
-            hp(prec, "2"), hp(prec, "1"),
-            hp(prec, "1"), hp(prec, "3"),
-        ];
+        let a = vec![hp(prec, "2"), hp(prec, "1"), hp(prec, "1"), hp(prec, "3")];
         let b = vec![hp(prec, "4"), hp(prec, "7")];
         let lu = lu_factor(&a, 2).unwrap();
         let x = lu_solve(&lu, &b, 2, prec);
@@ -851,9 +1027,15 @@ mod tests {
     fn inverse_iteration_diagonal_3x3() {
         let prec = 128;
         let a = vec![
-            hp(prec, "1"), hp(prec, "0"), hp(prec, "0"),
-            hp(prec, "0"), hp(prec, "2"), hp(prec, "0"),
-            hp(prec, "0"), hp(prec, "0"), hp(prec, "3"),
+            hp(prec, "1"),
+            hp(prec, "0"),
+            hp(prec, "0"),
+            hp(prec, "0"),
+            hp(prec, "2"),
+            hp(prec, "0"),
+            hp(prec, "0"),
+            hp(prec, "0"),
+            hp(prec, "3"),
         ];
         let (mu, _v) = inverse_iteration(&a, 3, prec, 50, false).unwrap();
         assert_hp_close(&mu, &hp(prec, "1"), 10, "smallest eigenvalue");
@@ -874,7 +1056,9 @@ mod tests {
         assert_hp_close(&mu, &hp(prec, "0.1"), 10, "smallest eigenvalue");
         // Eigenvector should be ℓ²-normalized. Check ‖v‖² = 1 in HP.
         let mut norm_sq = hp(prec, "0");
-        for vi in &v { norm_sq += vi.clone().square(); }
+        for vi in &v {
+            norm_sq += vi.clone().square();
+        }
         assert_hp_close(&norm_sq, &hp(prec, "1"), 10, "‖v‖²");
     }
 
@@ -894,13 +1078,20 @@ mod tests {
         a[3 * dim + 3] = hp(prec, "3.0");
         let (mu, v) = inverse_iteration(&a, dim, prec, 200, false).unwrap();
         // Must converge to 1.0, not 1.1
-        assert_hp_close(&mu, &hp(prec, "1"), 3, "near-degenerate smallest eigenvalue");
+        assert_hp_close(
+            &mu,
+            &hp(prec, "1"),
+            3,
+            "near-degenerate smallest eigenvalue",
+        );
         // Eigenvector should be concentrated on index 0 (the 1.0 eigenspace)
         let v0_sq = v[0].clone().square();
         let threshold = hp(prec, "0.99");
-        assert!(v0_sq > threshold,
+        assert!(
+            v0_sq > threshold,
             "eigenvector should be concentrated on index 0 for eigenvalue 1.0, got |v[0]|²={}",
-            v0_sq.to_f64());
+            v0_sq.to_f64()
+        );
     }
 
     /// VERY near-degenerate (gap = 0.01): verifies the shifted refinement
@@ -920,15 +1111,19 @@ mod tests {
         diff -= &hp(prec, "1.0");
         let abs_diff = diff.abs();
         let tol = hp(prec, "0.005"); // must be closer to 1.0 than to 1.01
-        assert!(abs_diff < tol,
+        assert!(
+            abs_diff < tol,
             "close eigenvalues: μ should be 1.0, diff = {}",
-            abs_diff.to_f64());
+            abs_diff.to_f64()
+        );
         // Eigenvector should be concentrated on index 0
         let v0_sq = v[0].clone().square();
         let threshold = hp(prec, "0.99");
-        assert!(v0_sq > threshold,
+        assert!(
+            v0_sq > threshold,
             "eigvec should point at index 0 for eigenvalue 1.0, got |v[0]|²={}",
-            v0_sq.to_f64());
+            v0_sq.to_f64()
+        );
     }
 
     /// Residual quality check: after refinement, the residual ||Av−μv||
@@ -944,8 +1139,12 @@ mod tests {
         let mut a = vec![hp(prec, "0"); dim * dim];
         for i in 0..dim {
             a[i * dim + i] = hp(prec, "2");
-            if i > 0 { a[i * dim + (i - 1)] = hp(prec, "-1"); }
-            if i + 1 < dim { a[i * dim + (i + 1)] = hp(prec, "-1"); }
+            if i > 0 {
+                a[i * dim + (i - 1)] = hp(prec, "-1");
+            }
+            if i + 1 < dim {
+                a[i * dim + (i + 1)] = hp(prec, "-1");
+            }
         }
         let (mu, v) = inverse_iteration(&a, dim, prec, 200, false).unwrap();
         // Compute residual ||Av - μv||∞
@@ -961,7 +1160,9 @@ mod tests {
             mu_v_i *= &v[i];
             av_i -= &mu_v_i;
             let abs_r = av_i.abs();
-            if abs_r > max_resid { max_resid = abs_r; }
+            if abs_r > max_resid {
+                max_resid = abs_r;
+            }
         }
         // With refinement, residual should be much better than the sqrt-floor.
         // sqrt-floor at prec=256 is ~10^-33. Full precision would be ~10^-66.
@@ -983,35 +1184,55 @@ mod tests {
         let mut a = vec![hp(prec, "0"); dim * dim];
         for i in 0..dim {
             a[i * dim + i] = hp(prec, "2");
-            if i > 0 { a[i * dim + (i-1)] = hp(prec, "-1"); }
-            if i+1 < dim { a[i * dim + (i+1)] = hp(prec, "-1"); }
+            if i > 0 {
+                a[i * dim + (i - 1)] = hp(prec, "-1");
+            }
+            if i + 1 < dim {
+                a[i * dim + (i + 1)] = hp(prec, "-1");
+            }
         }
         // Cold start
         let (mu_cold, xi_cold) = inverse_iteration(&a, dim, prec, 200, false).unwrap();
         // Warm start from the cold result (simulates a nearby-precision cache hit)
         let warm = xi_cold.clone();
-        let (mu_warm, xi_warm) = inverse_iteration_from(&a, dim, prec, 200, false, Some(warm)).unwrap();
+        let (mu_warm, xi_warm) =
+            inverse_iteration_from(&a, dim, prec, 200, false, Some(warm)).unwrap();
 
         // Eigenvalues must match to working precision
-        let mut diff = mu_cold.clone(); diff -= &mu_warm;
+        let mut diff = mu_cold.clone();
+        diff -= &mu_warm;
         let abs_diff = diff.abs();
         let tol = hp(prec, "1e-50");
-        assert!(abs_diff < tol,
+        assert!(
+            abs_diff < tol,
             "warm-start eigenvalue should match cold-start; diff={}",
-            abs_diff.to_f64());
+            abs_diff.to_f64()
+        );
 
         // Eigenvectors must match (up to sign)
-        let dot: Float = xi_cold.iter().zip(xi_warm.iter())
-            .map(|(a,b)| { let mut t=a.clone(); t*=b; t })
-            .fold(hp(prec,"0"), |mut s,t| { s+=&t; s });
+        let dot: Float = xi_cold
+            .iter()
+            .zip(xi_warm.iter())
+            .map(|(a, b)| {
+                let mut t = a.clone();
+                t *= b;
+                t
+            })
+            .fold(hp(prec, "0"), |mut s, t| {
+                s += &t;
+                s
+            });
         // |dot| should be ≈ 1 (unit vectors)
         let dot_abs = dot.abs();
-        let mut diff2 = dot_abs.clone(); diff2 -= hp(prec, "1");
+        let mut diff2 = dot_abs.clone();
+        diff2 -= hp(prec, "1");
         let diff2_abs = diff2.abs();
         let sign_tol = hp(prec, "1e-40");
-        assert!(diff2_abs < sign_tol,
+        assert!(
+            diff2_abs < sign_tol,
             "warm-start eigenvector should match cold-start (up to sign); |dot|-1={}",
-            diff2_abs.to_f64());
+            diff2_abs.to_f64()
+        );
     }
 
     /// normalize_l2 should produce a unit vector.
@@ -1021,7 +1242,9 @@ mod tests {
         let mut v = vec![hp(prec, "3"), hp(prec, "4")];
         normalize_l2(&mut v);
         let mut norm_sq = hp(prec, "0");
-        for vi in &v { norm_sq += vi.clone().square(); }
+        for vi in &v {
+            norm_sq += vi.clone().square();
+        }
         assert_hp_close(&norm_sq, &hp(prec, "1"), 15, "‖v‖²");
         // 3/5, 4/5
         assert_hp_close(&v[0], &hp(prec, "0.6"), 15, "v[0]");
@@ -1034,9 +1257,15 @@ mod tests {
     fn rayleigh_quotient_diagonal() {
         let prec = 64;
         let a = vec![
-            hp(prec, "1"), hp(prec, "0"), hp(prec, "0"),
-            hp(prec, "0"), hp(prec, "2"), hp(prec, "0"),
-            hp(prec, "0"), hp(prec, "0"), hp(prec, "3"),
+            hp(prec, "1"),
+            hp(prec, "0"),
+            hp(prec, "0"),
+            hp(prec, "0"),
+            hp(prec, "2"),
+            hp(prec, "0"),
+            hp(prec, "0"),
+            hp(prec, "0"),
+            hp(prec, "3"),
         ];
         let x = vec![hp(prec, "1"), hp(prec, "0"), hp(prec, "0")];
         let q = rayleigh_quotient(&a, 3, &x, prec);
@@ -1048,10 +1277,7 @@ mod tests {
     fn lu_factor_singular_errors() {
         let prec = 64;
         // [[1, 2], [2, 4]] — second row is 2× first row.
-        let a = vec![
-            hp(prec, "1"), hp(prec, "2"),
-            hp(prec, "2"), hp(prec, "4"),
-        ];
+        let a = vec![hp(prec, "1"), hp(prec, "2"), hp(prec, "2"), hp(prec, "4")];
         let result = lu_factor(&a, 2);
         assert!(result.is_err(), "singular matrix should error");
     }
@@ -1086,11 +1312,18 @@ mod tests {
         // Check via HP comparison to both candidates; one must match within 1e-8.
         let one = hp(prec, "1");
         let five = hp(prec, "5");
-        let mut diff_to_1 = mu.clone(); diff_to_1 -= &one; let abs_d1 = diff_to_1.abs();
-        let mut diff_to_5 = mu.clone(); diff_to_5 -= &five; let abs_d5 = diff_to_5.abs();
+        let mut diff_to_1 = mu.clone();
+        diff_to_1 -= &one;
+        let abs_d1 = diff_to_1.abs();
+        let mut diff_to_5 = mu.clone();
+        diff_to_5 -= &five;
+        let abs_d5 = diff_to_5.abs();
         let tol = hp(prec, "1e-8");
-        assert!(abs_d1 < tol || abs_d5 < tol,
-            "forced-even smallest should be 1 or 5, got {}", display_hp(&mu, 8));
+        assert!(
+            abs_d1 < tol || abs_d5 < tol,
+            "forced-even smallest should be 1 or 5, got {}",
+            display_hp(&mu, 8)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1114,11 +1347,14 @@ mod tests {
         let mut v_pos = vec![hp(prec, "3")];
         normalize_l2(&mut v_pos);
         let one = hp(prec, "1");
-        let mut diff = v_pos[0].clone(); diff -= &one;
+        let mut diff = v_pos[0].clone();
+        diff -= &one;
         let abs_diff = diff.abs();
-        assert!(abs_diff < hp(prec, "1e-30"),
+        assert!(
+            abs_diff < hp(prec, "1e-30"),
             "[3] normalized should be [1]; got [{}]",
-            display_hp(&v_pos[0], 6));
+            display_hp(&v_pos[0], 6)
+        );
 
         let mut v_neg = vec![hp(prec, "-7")];
         normalize_l2(&mut v_neg);
@@ -1127,11 +1363,14 @@ mod tests {
             t = -t;
             t
         };
-        let mut diff = v_neg[0].clone(); diff -= &neg_one;
+        let mut diff = v_neg[0].clone();
+        diff -= &neg_one;
         let abs_diff = diff.abs();
-        assert!(abs_diff < hp(prec, "1e-30"),
+        assert!(
+            abs_diff < hp(prec, "1e-30"),
             "[-7] normalized should be [-1]; got [{}]",
-            display_hp(&v_neg[0], 6));
+            display_hp(&v_neg[0], 6)
+        );
     }
 
     /// Property: after `normalize_l2`, the L² norm of the result is
@@ -1146,10 +1385,12 @@ mod tests {
             for seed in 0..3 {
                 // Deterministic-random vector with values in {-3, -1, 1, 3, 5}.
                 let pattern = [-3i32, -1, 1, 3, 5];
-                let mut v: Vec<Float> = (0..n).map(|i| {
-                    let val = pattern[(i + seed) % pattern.len()];
-                    hp(prec, &val.to_string())
-                }).collect();
+                let mut v: Vec<Float> = (0..n)
+                    .map(|i| {
+                        let val = pattern[(i + seed) % pattern.len()];
+                        hp(prec, &val.to_string())
+                    })
+                    .collect();
 
                 normalize_l2(&mut v);
 
@@ -1160,12 +1401,17 @@ mod tests {
                     t *= vi;
                     norm_sq += &t;
                 }
-                let mut diff = norm_sq.clone(); diff -= 1u32;
+                let mut diff = norm_sq.clone();
+                diff -= 1u32;
                 let abs_diff = diff.abs();
                 let tol = hp(prec, "1e-50");
-                assert!(abs_diff < tol,
+                assert!(
+                    abs_diff < tol,
                     "n={}, seed={}: ‖v‖² should be 1, got {}",
-                    n, seed, display_hp(&norm_sq, 6));
+                    n,
+                    seed,
+                    display_hp(&norm_sq, 6)
+                );
             }
         }
     }
@@ -1176,10 +1422,12 @@ mod tests {
     fn normalize_l2_at_hp_1000() {
         let prec = 3338;
         let n = 100;
-        let mut v: Vec<Float> = (0..n).map(|i| {
-            // Linear ramp [1, 2, ..., 100] in HP.
-            hp(prec, &(i + 1).to_string())
-        }).collect();
+        let mut v: Vec<Float> = (0..n)
+            .map(|i| {
+                // Linear ramp [1, 2, ..., 100] in HP.
+                hp(prec, &(i + 1).to_string())
+            })
+            .collect();
         normalize_l2(&mut v);
 
         let mut norm_sq = hp(prec, "0");
@@ -1188,14 +1436,18 @@ mod tests {
             t *= vi;
             norm_sq += &t;
         }
-        let mut diff = norm_sq.clone(); diff -= 1u32;
+        let mut diff = norm_sq.clone();
+        diff -= 1u32;
         let abs_diff = diff.abs();
         // At HP-1000 working precision, the normalize operation should
         // achieve ‖v‖² = 1 to ~working-precision floor.
         let tol = hp(prec, "1e-900");
-        assert!(abs_diff < tol,
+        assert!(
+            abs_diff < tol,
             "HP-1000 normalize_l2: ‖v‖² should be 1, got {} (diff {})",
-            display_hp(&norm_sq, 8), display_hp(&abs_diff, 6));
+            display_hp(&norm_sq, 8),
+            display_hp(&abs_diff, 6)
+        );
     }
 
     /// `rayleigh_quotient` on a known eigenvector returns the
@@ -1209,21 +1461,30 @@ mod tests {
         let mut a = vec![hp_zero(prec); n * n];
         for i in 0..n {
             a[i * n + i] = hp(prec, "2");
-            if i > 0 { a[i * n + (i - 1)] = hp(prec, "-1"); }
-            if i + 1 < n { a[i * n + (i + 1)] = hp(prec, "-1"); }
+            if i > 0 {
+                a[i * n + (i - 1)] = hp(prec, "-1");
+            }
+            if i + 1 < n {
+                a[i * n + (i + 1)] = hp(prec, "-1");
+            }
         }
         // Recover smallest eigenvector via inverse iteration.
         let (mu, v) = inverse_iteration(&a, n, prec, 200, false).unwrap();
         // Now compute Rayleigh quotient and compare to mu.
         let rq = rayleigh_quotient(&a, n, &v, prec);
-        let mut diff = rq.clone(); diff -= &mu;
+        let mut diff = rq.clone();
+        diff -= &mu;
         let abs_diff = diff.abs();
         // RQ matches the iteration's μ to working precision (it's the
         // same computation modulo allocation).
         let tol = hp(prec, "1e-50");
-        assert!(abs_diff < tol,
+        assert!(
+            abs_diff < tol,
             "RQ on smallest eigenvector should match μ; RQ={}, μ={}, diff={}",
-            display_hp(&rq, 8), display_hp(&mu, 8), display_hp(&abs_diff, 6));
+            display_hp(&rq, 8),
+            display_hp(&mu, 8),
+            display_hp(&abs_diff, 6)
+        );
     }
 
     /// Property: Rayleigh quotient is bounded above by the largest
@@ -1249,22 +1510,32 @@ mod tests {
 
         // 5 deterministic unit vectors via seeded patterns.
         for seed in 0..5 {
-            let mut v: Vec<Float> = (0..n).map(|i| {
-                let val = (((i + seed) * 13) % 11 + 1) as i32;
-                hp(prec, &val.to_string())
-            }).collect();
+            let mut v: Vec<Float> = (0..n)
+                .map(|i| {
+                    let val = (((i + seed) * 13) % 11 + 1) as i32;
+                    hp(prec, &val.to_string())
+                })
+                .collect();
             normalize_l2(&mut v);
             let rq = rayleigh_quotient(&a, n, &v, prec);
 
             // RQ must be ≥ 1 - tol and ≤ 5 + tol.
-            let mut below = lower.clone(); below -= &tol;
-            let mut above = upper.clone(); above += &tol;
-            assert!(rq >= below,
+            let mut below = lower.clone();
+            below -= &tol;
+            let mut above = upper.clone();
+            above += &tol;
+            assert!(
+                rq >= below,
                 "seed={}: RQ {} should be ≥ smallest eigenvalue 1",
-                seed, display_hp(&rq, 6));
-            assert!(rq <= above,
+                seed,
+                display_hp(&rq, 6)
+            );
+            assert!(
+                rq <= above,
                 "seed={}: RQ {} should be ≤ largest eigenvalue 5",
-                seed, display_hp(&rq, 6));
+                seed,
+                display_hp(&rq, 6)
+            );
         }
     }
 
@@ -1279,7 +1550,8 @@ mod tests {
         // Use inverse_iteration to get the smallest eigenpair.
         let (mu, v) = inverse_iteration(&a, n, prec, 200, false).unwrap();
         let rq = rayleigh_quotient(&a, n, &v, prec);
-        let mut diff = rq.clone(); diff -= &mu;
+        let mut diff = rq.clone();
+        diff -= &mu;
         let abs_diff = diff.abs();
         // RQ and μ should match very tightly. The Rayleigh-sqrt
         // convergence floor at HP-1000 (~10⁻⁴⁹⁸) governs how close v is
@@ -1288,9 +1560,11 @@ mod tests {
         // *square* of that floor (RQ has quadratic accuracy in the
         // eigenvector error). 1e-100 leaves comfortable headroom.
         let tol = hp(prec, "1e-100");
-        assert!(abs_diff < tol,
+        assert!(
+            abs_diff < tol,
             "HP-1000 RQ vs μ: |RQ - μ| = {} should be < 1e-100",
-            display_hp(&abs_diff, 6));
+            display_hp(&abs_diff, 6)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1344,13 +1618,23 @@ mod tests {
         // M·x = b check (in HP).
         let mut mx = vec![hp_zero(prec); 4];
         for i in 0..4 {
-            let mut s = diag[i].clone(); s *= &x[i];
-            if i > 0 { let mut t = lower[i - 1].clone(); t *= &x[i - 1]; s += &t; }
-            if i < 3 { let mut t = upper[i].clone(); t *= &x[i + 1]; s += &t; }
+            let mut s = diag[i].clone();
+            s *= &x[i];
+            if i > 0 {
+                let mut t = lower[i - 1].clone();
+                t *= &x[i - 1];
+                s += &t;
+            }
+            if i < 3 {
+                let mut t = upper[i].clone();
+                t *= &x[i + 1];
+                s += &t;
+            }
             mx[i] = s;
         }
         for i in 0..4 {
-            let mut diff = mx[i].clone(); diff -= &b[i];
+            let mut diff = mx[i].clone();
+            diff -= &b[i];
             let abs_diff = diff.abs();
             // HP-256 working precision is ~77 decimal digits. After one
             // LU factor + one solve over a 4×4 matrix, accumulated ULP
@@ -1358,8 +1642,13 @@ mod tests {
             // 10^-60 leaves plenty of headroom while still catching any
             // real algorithmic error (which would be much larger).
             let tol = hp(prec, "1e-60");
-            assert!(abs_diff < tol,
-                "M·x[{}] - b[{}] = {} should be ≈ 0", i, i, display_hp(&abs_diff, 4));
+            assert!(
+                abs_diff < tol,
+                "M·x[{}] - b[{}] = {} should be ≈ 0",
+                i,
+                i,
+                display_hp(&abs_diff, 4)
+            );
         }
     }
 
@@ -1384,8 +1673,11 @@ mod tests {
 
         // Verify the factorization captured the pivoting via permutation.
         // perm[0] should not be 0 (since row 0 had to be pivoted away).
-        assert_ne!(factors.perm[0], 0,
-            "expected row 0 to be pivoted away; perm = {:?}", factors.perm);
+        assert_ne!(
+            factors.perm[0], 0,
+            "expected row 0 to be pivoted away; perm = {:?}",
+            factors.perm
+        );
 
         // Solve M·x = b for some b.
         let b = vec![hp(prec, "2"), hp(prec, "4"), hp(prec, "11")];
@@ -1394,19 +1686,34 @@ mod tests {
         // M·x check.
         let mut mx = vec![hp_zero(prec); 3];
         for i in 0..3 {
-            let mut s = diag[i].clone(); s *= &x[i];
-            if i > 0 { let mut t = lower[i - 1].clone(); t *= &x[i - 1]; s += &t; }
-            if i < 2 { let mut t = upper[i].clone(); t *= &x[i + 1]; s += &t; }
+            let mut s = diag[i].clone();
+            s *= &x[i];
+            if i > 0 {
+                let mut t = lower[i - 1].clone();
+                t *= &x[i - 1];
+                s += &t;
+            }
+            if i < 2 {
+                let mut t = upper[i].clone();
+                t *= &x[i + 1];
+                s += &t;
+            }
             mx[i] = s;
         }
         for i in 0..3 {
-            let mut diff = mx[i].clone(); diff -= &b[i];
+            let mut diff = mx[i].clone();
+            diff -= &b[i];
             let abs_diff = diff.abs();
             // HP-256 ≈ 77 decimal digits. Pivoted 3×3 LU residual is at
             // worst ~10^-70 from ULP accumulation; 10^-60 leaves headroom.
             let tol = hp(prec, "1e-60");
-            assert!(abs_diff < tol,
-                "with pivoting, M·x[{}] - b[{}] = {}", i, i, display_hp(&abs_diff, 4));
+            assert!(
+                abs_diff < tol,
+                "with pivoting, M·x[{}] - b[{}] = {}",
+                i,
+                i,
+                display_hp(&abs_diff, 4)
+            );
         }
     }
 
@@ -1428,11 +1735,15 @@ mod tests {
         // at any eigenvalue.
         let shift = hp(prec, "0.01");
         let mut shifted_diag = diag.clone();
-        for d in shifted_diag.iter_mut() { *d -= &shift; }
+        for d in shifted_diag.iter_mut() {
+            *d -= &shift;
+        }
 
         // Build dense form for cross-check.
         let mut dense = vec![hp_zero(prec); n * n];
-        for i in 0..n { dense[i * n + i] = shifted_diag[i].clone(); }
+        for i in 0..n {
+            dense[i * n + i] = shifted_diag[i].clone();
+        }
         for i in 0..n - 1 {
             dense[i * n + (i + 1)] = upper[i].clone();
             dense[(i + 1) * n + i] = lower[i].clone();
@@ -1458,15 +1769,19 @@ mod tests {
         // pivoting needed, the order is the same and the answers should
         // be bit-close).
         for i in 0..n {
-            let mut diff = x_banded[i].clone(); diff -= &x_dense[i];
+            let mut diff = x_banded[i].clone();
+            diff -= &x_dense[i];
             let abs_diff = diff.abs();
             // 50 digits of agreement is comfortable headroom at HP-256.
             let tol = hp(prec, "1e-50");
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "banded vs dense disagreement at index {}: {} (banded={}, dense={})",
-                i, display_hp(&abs_diff, 6),
+                i,
+                display_hp(&abs_diff, 6),
                 display_hp(&x_banded[i], 6),
-                display_hp(&x_dense[i], 6));
+                display_hp(&x_dense[i], 6)
+            );
         }
     }
 
@@ -1488,11 +1803,15 @@ mod tests {
 
         let shift = hp(prec, "7");
         let mut shifted_diag = diag.clone();
-        for d in shifted_diag.iter_mut() { *d -= &shift; }
+        for d in shifted_diag.iter_mut() {
+            *d -= &shift;
+        }
 
         // Dense form.
         let mut dense = vec![hp_zero(prec); n * n];
-        for i in 0..n { dense[i * n + i] = shifted_diag[i].clone(); }
+        for i in 0..n {
+            dense[i * n + i] = shifted_diag[i].clone();
+        }
         for i in 0..n - 1 {
             dense[i * n + (i + 1)] = upper[i].clone();
             dense[(i + 1) * n + i] = lower[i].clone();
@@ -1509,14 +1828,18 @@ mod tests {
         let x_dense = lu_solve(&dense_factors, &b, n, prec);
 
         for i in 0..n {
-            let mut diff = x_banded[i].clone(); diff -= &x_dense[i];
+            let mut diff = x_banded[i].clone();
+            diff -= &x_dense[i];
             let abs_diff = diff.abs();
             // The W11 case may pivot, so we relax the tolerance vs the
             // bit-close case. 100 digits of agreement is still very tight.
             let tol = hp(prec, "1e-100");
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "Wilkinson W11 banded vs dense at index {}: {}",
-                i, display_hp(&abs_diff, 6));
+                i,
+                display_hp(&abs_diff, 6)
+            );
         }
     }
 
@@ -1542,8 +1865,20 @@ mod tests {
         for i in 0..n - 1 {
             // Off-diagonals: ±1, ±2 alternating pattern (asymmetric to
             // expose pivoting paths).
-            let lv = if i % 3 == 0 { -1 } else if i % 3 == 1 { 2 } else { -2 };
-            let uv = if i % 3 == 0 { 1 } else if i % 3 == 1 { -1 } else { 2 };
+            let lv = if i % 3 == 0 {
+                -1
+            } else if i % 3 == 1 {
+                2
+            } else {
+                -2
+            };
+            let uv = if i % 3 == 0 {
+                1
+            } else if i % 3 == 1 {
+                -1
+            } else {
+                2
+            };
             lower.push(hp(prec, &format!("{}", lv)));
             upper.push(hp(prec, &format!("{}", uv)));
         }
@@ -1552,17 +1887,29 @@ mod tests {
 
         // Build a non-trivial b.
         let mut b = Vec::with_capacity(n);
-        for i in 0..n { b.push(hp(prec, &format!("{}", 1 + (i % 7)))); }
+        for i in 0..n {
+            b.push(hp(prec, &format!("{}", 1 + (i % 7))));
+        }
 
         let x = tridiag_lu_solve_hp(&factors, &b, prec).unwrap();
         assert_eq!(x.len(), n);
 
         // Verify M·x = b in HP.
         for i in 0..n {
-            let mut s = diag[i].clone(); s *= &x[i];
-            if i > 0 { let mut t = lower[i - 1].clone(); t *= &x[i - 1]; s += &t; }
-            if i < n - 1 { let mut t = upper[i].clone(); t *= &x[i + 1]; s += &t; }
-            let mut diff = s.clone(); diff -= &b[i];
+            let mut s = diag[i].clone();
+            s *= &x[i];
+            if i > 0 {
+                let mut t = lower[i - 1].clone();
+                t *= &x[i - 1];
+                s += &t;
+            }
+            if i < n - 1 {
+                let mut t = upper[i].clone();
+                t *= &x[i + 1];
+                s += &t;
+            }
+            let mut diff = s.clone();
+            diff -= &b[i];
             let abs_diff = diff.abs();
             // HP-256 ≈ 77 decimal digits. At n=50 with asymmetric off-
             // diagonals and partial pivoting, accumulated ULP error is
@@ -1570,8 +1917,13 @@ mod tests {
             // catching any algorithmic bug (which would manifest as
             // O(1) error, not 10^-50).
             let tol = hp(prec, "1e-50");
-            assert!(abs_diff < tol,
-                "M·x[{}] - b[{}] = {}", i, i, display_hp(&abs_diff, 4));
+            assert!(
+                abs_diff < tol,
+                "M·x[{}] - b[{}] = {}",
+                i,
+                i,
+                display_hp(&abs_diff, 4)
+            );
         }
     }
 
@@ -1598,15 +1950,30 @@ mod tests {
 
         // Verify M·x = b at HP-1000.
         for i in 0..n {
-            let mut s = diag[i].clone(); s *= &x[i];
-            if i > 0 { let mut t = lower[i - 1].clone(); t *= &x[i - 1]; s += &t; }
-            if i < n - 1 { let mut t = upper[i].clone(); t *= &x[i + 1]; s += &t; }
-            let mut diff = s.clone(); diff -= &b[i];
+            let mut s = diag[i].clone();
+            s *= &x[i];
+            if i > 0 {
+                let mut t = lower[i - 1].clone();
+                t *= &x[i - 1];
+                s += &t;
+            }
+            if i < n - 1 {
+                let mut t = upper[i].clone();
+                t *= &x[i + 1];
+                s += &t;
+            }
+            let mut diff = s.clone();
+            diff -= &b[i];
             let abs_diff = diff.abs();
             // At HP-1000 we should match to ~900+ digits.
             let tol = hp(prec, "1e-900");
-            assert!(abs_diff < tol,
-                "HP-1000 M·x[{}] - b[{}] = {}", i, i, display_hp(&abs_diff, 4));
+            assert!(
+                abs_diff < tol,
+                "HP-1000 M·x[{}] - b[{}] = {}",
+                i,
+                i,
+                display_hp(&abs_diff, 4)
+            );
         }
     }
 
@@ -1624,8 +1991,12 @@ mod tests {
         let mut m = vec![hp_zero(prec); n * n];
         for i in 0..n {
             m[i * n + i] = hp(prec, "2");
-            if i > 0 { m[i * n + (i - 1)] = hp(prec, "-1"); }
-            if i + 1 < n { m[i * n + (i + 1)] = hp(prec, "-1"); }
+            if i > 0 {
+                m[i * n + (i - 1)] = hp(prec, "-1");
+            }
+            if i + 1 < n {
+                m[i * n + (i + 1)] = hp(prec, "-1");
+            }
         }
         m
     }
@@ -1643,8 +2014,12 @@ mod tests {
             let mut d = hp(prec, raw[i]);
             d -= 7u32;
             m[i * n + i] = d;
-            if i > 0 { m[i * n + (i - 1)] = hp(prec, "1"); }
-            if i + 1 < n { m[i * n + (i + 1)] = hp(prec, "1"); }
+            if i > 0 {
+                m[i * n + (i - 1)] = hp(prec, "1");
+            }
+            if i + 1 < n {
+                m[i * n + (i + 1)] = hp(prec, "1");
+            }
         }
         m
     }
@@ -1674,15 +2049,20 @@ mod tests {
                 t *= &x[j];
                 s += &t;
             }
-            let mut diff = s.clone(); diff -= &b[i];
+            let mut diff = s.clone();
+            diff -= &b[i];
             let abs_diff = diff.abs();
             // HP-256 ≈ 77 decimal digits. Dense LU on Strang n=10 with
             // partial pivoting accumulates ~10^-70 ULP; 1e-50 leaves
             // headroom while still catching algorithmic regressions.
             let tol = hp(prec, "1e-50");
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "Strang n=10 dense LU: M·x[{}] - b[{}] = {}",
-                i, i, display_hp(&abs_diff, 4));
+                i,
+                i,
+                display_hp(&abs_diff, 4)
+            );
         }
     }
 
@@ -1699,7 +2079,9 @@ mod tests {
         let factors = lu_factor(&m, n).unwrap();
 
         // A non-trivial right-hand side: b[i] = (i mod 7) + 1, exact in HP.
-        let b: Vec<Float> = (0..n).map(|i| hp(prec, &format!("{}", (i % 7) + 1))).collect();
+        let b: Vec<Float> = (0..n)
+            .map(|i| hp(prec, &format!("{}", (i % 7) + 1)))
+            .collect();
 
         let x_par = lu_solve_with(&factors, &b, n, prec, true);
         let x_ser = lu_solve_with(&factors, &b, n, prec, false);
@@ -1709,19 +2091,27 @@ mod tests {
         // require agreement to 1e-60.
         let tol = hp(prec, "1e-60");
         for i in 0..n {
-            let mut diff = x_par[i].clone(); diff -= &x_ser[i];
+            let mut diff = x_par[i].clone();
+            diff -= &x_ser[i];
             let abs_diff = diff.abs();
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "serial/parallel lu_solve disagree at x[{}]: |Δ| = {}",
-                i, display_hp(&abs_diff, 4));
+                i,
+                display_hp(&abs_diff, 4)
+            );
         }
 
         // And the default `lu_solve` must match the explicit parallel call.
         let x_default = lu_solve(&factors, &b, n, prec);
         for i in 0..n {
-            let mut diff = x_default[i].clone(); diff -= &x_par[i];
-            assert!(diff.abs() < tol,
-                "lu_solve default disagrees with lu_solve_with(parallel=true) at x[{}]", i);
+            let mut diff = x_default[i].clone();
+            diff -= &x_par[i];
+            assert!(
+                diff.abs() < tol,
+                "lu_solve default disagrees with lu_solve_with(parallel=true) at x[{}]",
+                i
+            );
         }
     }
 
@@ -1751,14 +2141,19 @@ mod tests {
                 t *= &x[j];
                 s += &t;
             }
-            let mut diff = s.clone(); diff -= &b[i];
+            let mut diff = s.clone();
+            diff -= &b[i];
             let abs_diff = diff.abs();
             // HP-512 ≈ 154 decimal digits. Dense LU residual at this size
             // accumulates ~10^-140 ULP; 1e-100 is comfortable headroom.
             let tol = hp(prec, "1e-100");
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "Wilkinson W11+shift LU: M·x[{}] - b[{}] = {}",
-                i, i, display_hp(&abs_diff, 4));
+                i,
+                i,
+                display_hp(&abs_diff, 4)
+            );
         }
     }
 
@@ -1771,6 +2166,8 @@ mod tests {
     /// happens during LU factor + solve, which is the thing we want to
     /// measure.
     #[test]
+    // Keep remainder arithmetic for the Rust 1.85 MSRV.
+    #[allow(unknown_lints, clippy::manual_is_multiple_of)]
     fn lu_property_solve_matches_b() {
         let prec = 256;
         let sizes = [3usize, 5, 8];
@@ -1786,7 +2183,11 @@ mod tests {
                 for i in 0..n {
                     a[i * n + i] = hp(prec, &format!("{}", n + (i % 3) + 1));
                     for j in (i + 1)..n {
-                        let val = if (i + j + seed as usize).is_multiple_of(2) { 1 } else { -1 };
+                        let val = if (i + j + seed as usize) % 2 == 0 {
+                            1
+                        } else {
+                            -1
+                        };
                         a[i * n + j] = hp(prec, &val.to_string());
                         a[j * n + i] = hp(prec, &val.to_string());
                     }
@@ -1795,9 +2196,9 @@ mod tests {
                 let factors = lu_factor(&a, n).unwrap();
 
                 // Build a non-trivial b.
-                let b: Vec<Float> = (0..n).map(|i| {
-                    hp(prec, &format!("{}", 1 + (i % 7)))
-                }).collect();
+                let b: Vec<Float> = (0..n)
+                    .map(|i| hp(prec, &format!("{}", 1 + (i % 7))))
+                    .collect();
 
                 let x = lu_solve(&factors, &b, n, prec);
                 assert_eq!(x.len(), n);
@@ -1810,12 +2211,19 @@ mod tests {
                         t *= &x[j];
                         s += &t;
                     }
-                    let mut diff = s.clone(); diff -= &b[i];
+                    let mut diff = s.clone();
+                    diff -= &b[i];
                     let abs_diff = diff.abs();
                     let tol = hp(prec, "1e-50");
-                    assert!(abs_diff < tol,
+                    assert!(
+                        abs_diff < tol,
                         "n={}, seed={}: M·x[{}] - b[{}] = {}",
-                        n, seed, i, i, display_hp(&abs_diff, 4));
+                        n,
+                        seed,
+                        i,
+                        i,
+                        display_hp(&abs_diff, 4)
+                    );
                 }
             }
         }
@@ -1843,13 +2251,18 @@ mod tests {
                 t *= &x[j];
                 s += &t;
             }
-            let mut diff = s.clone(); diff -= &b[i];
+            let mut diff = s.clone();
+            diff -= &b[i];
             let abs_diff = diff.abs();
             // At HP-1000 dense LU at n=20 should reach ~10^-900 residual.
             let tol = hp(prec, "1e-900");
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "HP-1000 Strang n=20 LU: M·x[{}] - b[{}] = {}",
-                i, i, display_hp(&abs_diff, 4));
+                i,
+                i,
+                display_hp(&abs_diff, 4)
+            );
         }
     }
 
@@ -1887,6 +2300,8 @@ mod tests {
     /// [`crate::eigen::tridiag_eigenvector_for_value_hp`], which
     /// reaches working precision (~10⁻⁹⁰⁰ at HP-1000).
     #[test]
+    // Keep remainder arithmetic for the Rust 1.85 MSRV.
+    #[allow(unknown_lints, clippy::manual_is_multiple_of)]
     fn property_inverse_iteration_recovers_eigenpair() {
         let prec = 256;
         let sizes = [3usize, 5, 8];
@@ -1905,9 +2320,13 @@ mod tests {
                     let diag_val = 1 + 10 * (i as i32);
                     a[i * n + i] = hp(prec, &diag_val.to_string());
                     for j in (i + 1)..n {
-                        let val = if (i + j + seed as usize).is_multiple_of(3) { 1 }
-                                  else if (i + j + seed as usize) % 3 == 1 { -1 }
-                                  else { 0 };
+                        let val = if (i + j + seed as usize) % 3 == 0 {
+                            1
+                        } else if (i + j + seed as usize) % 3 == 1 {
+                            -1
+                        } else {
+                            0
+                        };
                         a[i * n + j] = hp(prec, &val.to_string());
                         a[j * n + i] = hp(prec, &val.to_string());
                     }
@@ -1927,7 +2346,8 @@ mod tests {
                     }
                     let mut mu_v_i = mu.clone();
                     mu_v_i *= &v[i];
-                    let mut diff = av_i; diff -= &mu_v_i;
+                    let mut diff = av_i;
+                    diff -= &mu_v_i;
                     let abs_diff = diff.abs();
                     if abs_diff > max_resid {
                         max_resid = abs_diff;
@@ -1938,9 +2358,13 @@ mod tests {
                 // HP-256 (~10^-33). An algorithmic regression would
                 // produce O(1) error, far above this bound.
                 let tol = hp(prec, "1e-25");
-                assert!(max_resid < tol,
+                assert!(
+                    max_resid < tol,
                     "n={}, seed={}: ‖A·v - μ·v‖_∞ = {} should be < 1e-25",
-                    n, seed, display_hp(&max_resid, 4));
+                    n,
+                    seed,
+                    display_hp(&max_resid, 4)
+                );
 
                 // Eigenvector unit-normalized.
                 let mut norm_sq = hp_zero(prec);
@@ -1949,12 +2373,17 @@ mod tests {
                     t *= vi;
                     norm_sq += &t;
                 }
-                let mut nd = norm_sq.clone(); nd -= 1u32;
+                let mut nd = norm_sq.clone();
+                nd -= 1u32;
                 let abs_nd = nd.abs();
                 let norm_tol = hp(prec, "1e-50");
-                assert!(abs_nd < norm_tol,
+                assert!(
+                    abs_nd < norm_tol,
                     "n={}, seed={}: ‖v‖² should be 1, got {}",
-                    n, seed, display_hp(&norm_sq, 6));
+                    n,
+                    seed,
+                    display_hp(&norm_sq, 6)
+                );
             }
         }
     }
@@ -1992,16 +2421,19 @@ mod tests {
             }
             let mut mu_v_i = mu.clone();
             mu_v_i *= &v[i];
-            let mut diff = av_i; diff -= &mu_v_i;
+            let mut diff = av_i;
+            diff -= &mu_v_i;
             let abs_diff = diff.abs();
             if abs_diff > max_resid {
                 max_resid = abs_diff;
             }
         }
         let tol = hp(prec, "1e-100");
-        assert!(max_resid < tol,
+        assert!(
+            max_resid < tol,
             "HP-1000 Strang n=20 inverse_iteration: ‖A·v - μ·v‖_∞ = {} should be < 1e-100",
-            display_hp(&max_resid, 6));
+            display_hp(&max_resid, 6)
+        );
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2019,8 +2451,14 @@ mod tests {
         let factors = lu_factor(&a, 1).expect("1×1 LU should not fail");
         let x = lu_solve(&factors, &b, 1, prec);
         assert_eq!(x.len(), 1);
-        let mut diff = x[0].clone(); diff -= hp(prec, "4"); let d = diff.abs();
-        assert!(d < hp(prec, "1e-15"), "1×1 solve: |x[0] - 4| = {} should be 0", d);
+        let mut diff = x[0].clone();
+        diff -= hp(prec, "4");
+        let d = diff.abs();
+        assert!(
+            d < hp(prec, "1e-15"),
+            "1×1 solve: |x[0] - 4| = {} should be 0",
+            d
+        );
     }
 
     /// `lu_factor` on a 1×1 singular (zero) matrix should return an error.
@@ -2028,7 +2466,10 @@ mod tests {
     fn lu_factor_1x1_singular() {
         let prec = 64;
         let a = vec![hp(prec, "0")];
-        assert!(lu_factor(&a, 1).is_err(), "1×1 zero matrix should be singular");
+        assert!(
+            lu_factor(&a, 1).is_err(),
+            "1×1 zero matrix should be singular"
+        );
     }
 
     /// `tridiag_lu_factor_hp` on a 1×1 tridiagonal: no off-diagonals.
@@ -2041,11 +2482,16 @@ mod tests {
         let factors = tridiag_lu_factor_hp(&lower, &diag, &upper, prec)
             .expect("1×1 tridiag LU should not fail");
         let b = vec![hp(prec, "14")];
-        let x = tridiag_lu_solve_hp(&factors, &b, prec)
-            .expect("1×1 tridiag solve should not fail");
+        let x = tridiag_lu_solve_hp(&factors, &b, prec).expect("1×1 tridiag solve should not fail");
         assert_eq!(x.len(), 1);
-        let mut diff = x[0].clone(); diff -= hp(prec, "2"); let d = diff.abs();
-        assert!(d < hp(prec, "1e-15"), "1×1 tridiag solve: |x[0] - 2| = {} should be 0", d);
+        let mut diff = x[0].clone();
+        diff -= hp(prec, "2");
+        let d = diff.abs();
+        assert!(
+            d < hp(prec, "1e-15"),
+            "1×1 tridiag solve: |x[0] - 2| = {} should be 0",
+            d
+        );
     }
 
     /// `normalize_l2` on a vector of all-zeros: the norm is 0 so the
@@ -2071,13 +2517,24 @@ mod tests {
             .expect("1×1 inverse_iteration should succeed");
         assert_eq!(v.len(), 1);
         // The only eigenvalue is 3.14159.
-        let mut diff = mu.clone(); diff -= hp(prec, "3.14159"); let d = diff.abs();
-        assert!(d < hp(prec, "1e-14"), "1×1 eigenvalue: got {}, expected 3.14159", d);
+        let mut diff = mu.clone();
+        diff -= hp(prec, "3.14159");
+        let d = diff.abs();
+        assert!(
+            d < hp(prec, "1e-14"),
+            "1×1 eigenvalue: got {}, expected 3.14159",
+            d
+        );
         // Eigenvector of a 1×1 is [±1]; ℓ² norm should be 1.
-        let mut v0_sq = v[0].clone(); v0_sq.square_mut();
-        let mut norm_diff = v0_sq; norm_diff -= hp(prec, "1");
+        let mut v0_sq = v[0].clone();
+        v0_sq.square_mut();
+        let mut norm_diff = v0_sq;
+        norm_diff -= hp(prec, "1");
         let nd = norm_diff.abs();
-        assert!(nd < hp(prec, "1e-15"), "1×1 eigenvector should have ℓ²-norm 1");
+        assert!(
+            nd < hp(prec, "1e-15"),
+            "1×1 eigenvector should have ℓ²-norm 1"
+        );
     }
 
     /// `tridiag_lu_factor_hp` with mismatched slice lengths should return
@@ -2089,8 +2546,10 @@ mod tests {
         let diag = vec![hp(prec, "1"), hp(prec, "2"), hp(prec, "3")];
         let bad_lower = vec![hp(prec, "0.5")]; // should be length 2
         let upper = vec![hp(prec, "0.5"), hp(prec, "0.5")];
-        assert!(tridiag_lu_factor_hp(&bad_lower, &diag, &upper, prec).is_err(),
-            "mismatched lower length should return Err");
+        assert!(
+            tridiag_lu_factor_hp(&bad_lower, &diag, &upper, prec).is_err(),
+            "mismatched lower length should return Err"
+        );
     }
 
     /// `lu_solve` result is the inverse of `lu_factor` — round-trip on a
@@ -2108,11 +2567,14 @@ mod tests {
         let b = vec![hp(prec, "1"), hp(prec, "0")];
         let x = lu_solve(&factors, &b, dim, prec);
         assert_eq!(x.len(), 2);
-        let mut d0 = x[0].clone(); d0 -= hp(prec, "1"); let d0 = d0.abs();
-        let mut d1 = x[1].clone(); d1 -= hp(prec, "0"); let d1 = d1.abs();
+        let mut d0 = x[0].clone();
+        d0 -= hp(prec, "1");
+        let d0 = d0.abs();
+        let mut d1 = x[1].clone();
+        d1 -= hp(prec, "0");
+        let d1 = d1.abs();
         let tol = hp(prec, "1e-15");
         assert!(d0 < tol, "I·x = e_0: x[0] should be 1 (got diff {})", d0);
         assert!(d1 < tol, "I·x = e_0: x[1] should be 0 (got diff {})", d1);
     }
 }
-

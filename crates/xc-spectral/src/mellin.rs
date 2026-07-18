@@ -23,7 +23,6 @@
 //! The question: do the zeros of Λ_λ(s) match our CCM eigenvalues?
 //! If yes, we have a direct Mellin-side bridge.
 
-
 /// ω(t) = t·e^t / (1 + e^t)² — the kernel of the completed eta function.
 /// Well-behaved for t > 0; decays exponentially for large t.
 #[inline]
@@ -42,11 +41,7 @@ pub fn omega_f64(t: f64) -> f64 {
 ///
 /// Uses Gauss-Legendre quadrature at f64.
 /// Returns (real part, imaginary part).
-pub fn truncated_lambda_f64(
-    s_re: f64, s_im: f64,
-    lambda: f64,
-    n_quad: usize,
-) -> (f64, f64) {
+pub fn truncated_lambda_f64(s_re: f64, s_im: f64, lambda: f64, n_quad: usize) -> (f64, f64) {
     // Gauss-Legendre on [λ⁻¹, λ] mapped from [-1, 1].
     let a = 1.0 / lambda;
     let b = lambda;
@@ -86,9 +81,10 @@ pub fn truncated_lambda_f64(
 ///
 /// Returns (real part, imaginary part).
 pub fn xi_weighted_mellin_f64(
-    s_re: f64, s_im: f64,
+    s_re: f64,
+    s_im: f64,
     lambda: f64,
-    xi: &[f64],  // length 2N+1, indexed j = -N..N with xi[N] = ξ_0
+    xi: &[f64], // length 2N+1, indexed j = -N..N with xi[N] = ξ_0
     n_modes: usize,
     n_quad: usize,
 ) -> (f64, f64) {
@@ -151,10 +147,9 @@ where
     F: Fn(f64, f64) -> (f64, f64) + Sync,
 {
     use rayon::prelude::*;
-    // No-op by default (full parallelism everywhere). If XC_HP_SAFE_MODE=1
-    // is set, caps the global rayon pool to a small worker count before the
+    // Full parallelism is the explicit default. Safe-capped HP workflows use
+    // hp_runtime::run_hp_with_policy; no process environment is read before the
     // parallel scan fires — see xc_numerics::hp_runtime module docs.
-    xc_numerics::hp_runtime::init_hp_pool();
     let dt = (t_max - t_min) / (n_scan as f64);
 
     // Parallel scan: evaluate Re(eval_fn(0.5, t_i)) at each grid point.
@@ -181,11 +176,7 @@ where
     zeros
 }
 
-fn bisect_zero_f64<F>(
-    eval_fn: &F,
-    mut a: f64, mut b: f64,
-    max_iter: usize,
-) -> f64
+fn bisect_zero_f64<F>(eval_fn: &F, mut a: f64, mut b: f64, max_iter: usize) -> f64
 where
     F: Fn(f64, f64) -> (f64, f64) + Sync,
 {
@@ -225,8 +216,13 @@ mod tests {
         let (re, im) = truncated_lambda_f64(2.0, 0.0, 50.0, 200);
         let expected = std::f64::consts::PI.powi(2) / 6.0;
         let rel_err = (re - expected).abs() / expected;
-        assert!(rel_err < 0.01, "Λ_50(2) = {} should be close to π²/6 = {} (rel err {})",
-            re, expected, rel_err);
+        assert!(
+            rel_err < 0.01,
+            "Λ_50(2) = {} should be close to π²/6 = {} (rel err {})",
+            re,
+            expected,
+            rel_err
+        );
         assert!(im.abs() < 1e-10);
     }
 
@@ -246,17 +242,21 @@ mod tests {
         let lambda = 50.0;
         let zeros = scan_critical_line_zeros_f64(
             &|sigma, t| truncated_lambda_f64(sigma, t, lambda, 200),
-            10.0, 20.0, 1000,
+            10.0,
+            20.0,
+            1000,
         );
         // Should find at least one zero near 14.13.
         let first_riemann = 14.134725141734695;
-        let closest = zeros.iter()
+        let closest = zeros
+            .iter()
             .map(|&z| (z - first_riemann).abs())
             .fold(f64::INFINITY, f64::min);
         assert!(
             closest < 1.0,
             "should find a zero near 14.13 (closest was {:.4} away, zeros found: {:?})",
-            closest, zeros
+            closest,
+            zeros
         );
     }
 
@@ -274,20 +274,32 @@ mod tests {
     #[cfg(not(debug_assertions))]
     fn truncated_lambda_zeros_vs_riemann_at_lambda_sqrt13() {
         let lambda = 13.0_f64.sqrt();
-        let riemann_zeros = vec![
-            14.134725141734695, 21.022039638771556, 25.010857580145687,
-            30.424876125859512, 32.935061587739189, 37.586178158825675,
-            40.918719012147500, 43.327073280915000, 48.005150881167160,
+        let riemann_zeros = [
+            14.134725141734695,
+            21.022039638771556,
+            25.010857580145687,
+            30.424876125859512,
+            32.935061587739189,
+            37.586178158825675,
+            40.918719012147500,
+            43.327073280915000,
+            48.005150881167160,
             49.773832477672300,
         ];
         let zeros = scan_critical_line_zeros_f64(
             &|sigma, t| truncated_lambda_f64(sigma, t, lambda, 300),
-            5.0, 55.0, 5000,
+            5.0,
+            55.0,
+            5000,
         );
         eprintln!("\nΛ_λ zeros on critical line (λ = √13 ≈ {:.4}):", lambda);
-        eprintln!("{:>5} {:>15} {:>15} {:>12}", "k", "Λ_λ zero", "Riemann zero", "difference");
+        eprintln!(
+            "{:>5} {:>15} {:>15} {:>12}",
+            "k", "Λ_λ zero", "Riemann zero", "difference"
+        );
         for (i, &rz) in riemann_zeros.iter().enumerate() {
-            let closest = zeros.iter()
+            let closest = zeros
+                .iter()
                 .map(|&z| (z, (z - rz).abs()))
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((z, diff)) = closest {
@@ -316,17 +328,26 @@ mod tests {
     fn truncated_lambda_zeros_vs_riemann_at_lambda_10() {
         let lambda = 10.0;
         let riemann_zeros = [
-            14.134725141734695, 21.022039638771556, 25.010857580145687,
-            30.424876125859512, 32.935061587739189,
+            14.134725141734695,
+            21.022039638771556,
+            25.010857580145687,
+            30.424876125859512,
+            32.935061587739189,
         ];
         let zeros = scan_critical_line_zeros_f64(
             &|sigma, t| truncated_lambda_f64(sigma, t, lambda, 300),
-            10.0, 40.0, 3000,
+            10.0,
+            40.0,
+            3000,
         );
         eprintln!("\nΛ_λ zeros on critical line (λ = 10):");
-        eprintln!("{:>5} {:>15} {:>15} {:>12}", "k", "Λ_λ zero", "Riemann zero", "difference");
+        eprintln!(
+            "{:>5} {:>15} {:>15} {:>12}",
+            "k", "Λ_λ zero", "Riemann zero", "difference"
+        );
         for (i, &rz) in riemann_zeros.iter().enumerate() {
-            let closest = zeros.iter()
+            let closest = zeros
+                .iter()
                 .map(|&z| (z, (z - rz).abs()))
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((z, diff)) = closest {
@@ -338,7 +359,8 @@ mod tests {
         eprintln!("Total zeros found in [10, 40]: {}", zeros.len());
         // At λ=10, should find zeros close to Riemann zeros.
         let first_riemann = 14.134725141734695;
-        let closest_to_first = zeros.iter()
+        let closest_to_first = zeros
+            .iter()
             .map(|&z| (z - first_riemann).abs())
             .fold(f64::INFINITY, f64::min);
         assert!(
@@ -369,23 +391,35 @@ mod tests {
         // λ = √13 as f64 — only used as the Mellin integral parameter.
         let lambda = 13.0_f64.sqrt();
 
-        let riemann_zeros = vec![
-            14.134725141734695, 21.022039638771556, 25.010857580145687,
-            30.424876125859512, 32.935061587739189, 37.586178158825675,
-            40.918719012147500, 43.327073280915000, 48.005150881167160,
+        let riemann_zeros = [
+            14.134725141734695,
+            21.022039638771556,
+            25.010857580145687,
+            30.424876125859512,
+            32.935061587739189,
+            37.586178158825675,
+            40.918719012147500,
+            43.327073280915000,
+            48.005150881167160,
             49.773832477672300,
         ];
 
         // Scan zeros of G(s) on the critical line.
         let zeros = scan_critical_line_zeros_f64(
             &|sigma, t| xi_weighted_mellin_f64(sigma, t, lambda, xi, n_modes, 300),
-            5.0, 55.0, 5000,
+            5.0,
+            55.0,
+            5000,
         );
 
         eprintln!("\nG(s) = ∫ f_λ·ω·u^{{s-1}} zeros on critical line (λ = √13):");
-        eprintln!("{:>5} {:>15} {:>15} {:>12}", "k", "G zero", "Riemann zero", "difference");
+        eprintln!(
+            "{:>5} {:>15} {:>15} {:>12}",
+            "k", "G zero", "Riemann zero", "difference"
+        );
         for (i, &rz) in riemann_zeros.iter().enumerate() {
-            let closest = zeros.iter()
+            let closest = zeros
+                .iter()
                 .map(|&z| (z, (z - rz).abs()))
                 .min_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((z, diff)) = closest {
@@ -419,8 +453,16 @@ mod tests {
         // With flat ξ, G(s) = Λ_λ(s) (the weighting is constant 1).
         let re_diff = (g_re - l_re).abs();
         let im_diff = (g_im - l_im).abs();
-        assert!(re_diff < 1e-10, "G and Λ_λ should match (re diff: {:.2e})", re_diff);
-        assert!(im_diff < 1e-10, "G and Λ_λ should match (im diff: {:.2e})", im_diff);
+        assert!(
+            re_diff < 1e-10,
+            "G and Λ_λ should match (re diff: {:.2e})",
+            re_diff
+        );
+        assert!(
+            im_diff < 1e-10,
+            "G and Λ_λ should match (im diff: {:.2e})",
+            im_diff
+        );
     }
 
     /// omega_f64(t) should peak near t = 1 and decay for large t.
@@ -432,7 +474,6 @@ mod tests {
         assert!(omega_f64(10.0) < omega_f64(5.0)); // monotone decay for t > 1
     }
 }
-
 
 // ===========================================================================
 // High-precision Mellin computation (requires ccm-rug feature)
@@ -479,29 +520,36 @@ pub fn omega_hp(t: &rug::Float) -> rug::Float {
 /// concurrently on a cache miss.
 #[cfg(feature = "hp")]
 pub fn xi_weighted_mellin_hp(
-    s_re: &rug::Float, s_im: &rug::Float,
+    s_re: &rug::Float,
+    s_im: &rug::Float,
     lambda: &rug::Float,
     xi_hp: &[rug::Float],
     n_modes: usize,
     gl_nodes: &[rug::Float],
     gl_weights: &[rug::Float],
 ) -> (rug::Float, rug::Float) {
-    use rug::Float;
     use rug::ops::Pow;
+    use rug::Float;
 
     let prec = lambda.prec();
     let one = Float::with_val(prec, 1);
     let pi_v = Float::with_val(prec, rug::float::Constant::Pi);
     let two_pi = {
-        let mut v = pi_v.clone(); v *= 2u32; v
+        let mut v = pi_v.clone();
+        v *= 2u32;
+        v
     };
 
     // L = 2 ln λ
     let l = {
-        let mut v = lambda.clone().ln(); v *= 2u32; v
+        let mut v = lambda.clone().ln();
+        v *= 2u32;
+        v
     };
     let inv_sqrt_l = {
-        let mut v = l.clone().sqrt(); v = v.recip(); v
+        let mut v = l.clone().sqrt();
+        v = v.recip();
+        v
     };
 
     let n_quad = gl_nodes.len();
@@ -510,14 +558,22 @@ pub fn xi_weighted_mellin_hp(
 
     // Map GL nodes from [-1, 1] to [λ⁻¹, λ].
     let a = {
-        let mut v = lambda.clone(); v = v.recip(); v
+        let mut v = lambda.clone();
+        v = v.recip();
+        v
     };
     let b = lambda.clone();
     let mid = {
-        let mut v = a.clone(); v += &b; v /= 2u32; v
+        let mut v = a.clone();
+        v += &b;
+        v /= 2u32;
+        v
     };
     let half_range = {
-        let mut v = b.clone(); v -= &a; v /= 2u32; v
+        let mut v = b.clone();
+        v -= &a;
+        v /= 2u32;
+        v
     };
 
     // ξ components: ξ_0 = xi_hp[n_modes], ξ_n = xi_hp[n_modes + n]
@@ -608,13 +664,14 @@ pub fn xi_weighted_mellin_hp(
 /// concurrently on a cache miss.
 #[cfg(feature = "hp")]
 pub fn truncated_lambda_hp(
-    s_re: &rug::Float, s_im: &rug::Float,
+    s_re: &rug::Float,
+    s_im: &rug::Float,
     lambda: &rug::Float,
     gl_nodes: &[rug::Float],
     gl_weights: &[rug::Float],
 ) -> (rug::Float, rug::Float) {
-    use rug::Float;
     use rug::ops::Pow;
+    use rug::Float;
 
     let prec = lambda.prec();
     let one = Float::with_val(prec, 1);
@@ -623,10 +680,24 @@ pub fn truncated_lambda_hp(
     let nodes = gl_nodes;
     let weights = gl_weights;
 
-    let a = { let mut v = lambda.clone(); v = v.recip(); v };
+    let a = {
+        let mut v = lambda.clone();
+        v = v.recip();
+        v
+    };
     let b = lambda.clone();
-    let mid = { let mut v = a.clone(); v += &b; v /= 2u32; v };
-    let half_range = { let mut v = b.clone(); v -= &a; v /= 2u32; v };
+    let mid = {
+        let mut v = a.clone();
+        v += &b;
+        v /= 2u32;
+        v
+    };
+    let half_range = {
+        let mut v = b.clone();
+        v -= &a;
+        v /= 2u32;
+        v
+    };
 
     let mut sum_re = Float::with_val(prec, 0);
     let mut sum_im = Float::with_val(prec, 0);
@@ -649,7 +720,11 @@ pub fn truncated_lambda_hp(
             exp -= &one;
             u.clone().pow(exp)
         };
-        let phase_u = { let mut v = s_im.clone(); v *= &ln_u; v };
+        let phase_u = {
+            let mut v = s_im.clone();
+            v *= &ln_u;
+            v
+        };
         let cos_phase = phase_u.clone().cos();
         let sin_phase = phase_u.sin();
 
@@ -696,9 +771,8 @@ pub fn scan_critical_line_zeros_hp<F>(
 where
     F: Fn(&rug::Float, &rug::Float) -> (rug::Float, rug::Float) + Sync,
 {
-    // Zero-overhead pass-through by default (full parallelism everywhere).
-    // If XC_HP_SAFE_MODE=1 is set, routes through the capped rayon pool +
-    // large-stack outer thread instead — see xc_numerics::hp_runtime docs.
+    // Zero-overhead full-parallel default. Safe-capped callers explicitly
+    // wrap this workflow with run_hp_with_policy and record the policy.
     xc_numerics::hp_runtime::run_hp(|| {
         scan_critical_line_zeros_hp_inner(eval_fn, t_min, t_max, n_scan, bisect_iter)
     })
@@ -720,7 +794,11 @@ where
 
     let prec = t_min.prec().max(t_max.prec());
     // half = 1/2 built from integers — no f64 round-trip.
-    let half = { let mut v = Float::with_val(prec, 1); v /= 2u32; v };
+    let half = {
+        let mut v = Float::with_val(prec, 1);
+        v /= 2u32;
+        v
+    };
     let mut dt = t_max.clone();
     dt -= t_min;
     dt /= Float::with_val(prec, n_scan as i64);
@@ -743,8 +821,11 @@ where
         let prev = &re_values[i - 1];
         let curr = &re_values[i];
         let opposite_signs = (prev.is_sign_negative() != curr.is_sign_negative())
-            && !prev.is_zero() && !curr.is_zero();
-        if !opposite_signs { continue; }
+            && !prev.is_zero()
+            && !curr.is_zero();
+        if !opposite_signs {
+            continue;
+        }
         let mut a = dt.clone();
         a *= Float::with_val(prec, (i - 1) as i64);
         a += t_min;
@@ -776,9 +857,13 @@ where
         mid /= 2u32;
         let (fa, _) = eval_fn(sigma, &a);
         let (fm, _) = eval_fn(sigma, &mid);
-        let opposite = (fa.is_sign_negative() != fm.is_sign_negative())
-            && !fa.is_zero() && !fm.is_zero();
-        if opposite { b = mid; } else { a = mid; }
+        let opposite =
+            (fa.is_sign_negative() != fm.is_sign_negative()) && !fa.is_zero() && !fm.is_zero();
+        if opposite {
+            b = mid;
+        } else {
+            a = mid;
+        }
     }
     let mut out = Float::with_val(prec, &a);
     out += &b;
@@ -804,11 +889,14 @@ mod hp_tests {
             diff -= Float::with_val(prec, v_f64);
             let abs_diff = diff.abs();
             let tol = Float::with_val(prec, Float::parse("1e-12").unwrap());
-            assert!(abs_diff < tol,
+            assert!(
+                abs_diff < tol,
                 "omega_hp({}) = {} vs omega_f64 = {} (|diff| = {})",
-                t, xc_numerics::fmt::display_hp(&v_hp, 20),
+                t,
+                xc_numerics::fmt::display_hp(&v_hp, 20),
                 v_f64,
-                xc_numerics::fmt::display_hp(&abs_diff, 6));
+                xc_numerics::fmt::display_hp(&abs_diff, 6)
+            );
         }
     }
 
@@ -832,9 +920,11 @@ mod hp_tests {
         // ≈ t·e^{-t} for large t.
         if let Some(rel) = xc_numerics::fmt::relative_difference(&v, &expected) {
             let tol = Float::with_val(prec, Float::parse("1e-100").unwrap());
-            assert!(rel < tol,
+            assert!(
+                rel < tol,
                 "ω(499) [truncated] should match t·e^{{-t}} closely; rel diff = {}",
-                xc_numerics::fmt::display_hp(&rel, 6));
+                xc_numerics::fmt::display_hp(&rel, 6)
+            );
         }
     }
 
@@ -848,7 +938,10 @@ mod hp_tests {
         let s_im = Float::with_val(prec, 0);
         let lambda = Float::with_val(prec, 50);
         let (nodes, weights) = xc_numerics::quadrature::gauss_legendre_nodes(
-            200, prec, xc_numerics::quadrature::CacheMode::default());
+            200,
+            prec,
+            xc_numerics::quadrature::CacheMode::default(),
+        );
         let (re, im) = truncated_lambda_hp(&s_re, &s_im, &lambda, &nodes, &weights);
         let mut expected = Float::with_val(prec, rug::float::Constant::Pi);
         expected.square_mut();
@@ -856,11 +949,13 @@ mod hp_tests {
         // Same accuracy expectation as the f64 version: rel err < 1%.
         let rel = xc_numerics::fmt::relative_difference(&re, &expected).unwrap();
         let tol = Float::with_val(prec, Float::parse("0.01").unwrap());
-        assert!(rel < tol,
+        assert!(
+            rel < tol,
             "Λ_50(2) = {} vs π²/6 = {}; rel err = {}",
             xc_numerics::fmt::display_hp(&re, 30),
             xc_numerics::fmt::display_hp(&expected, 30),
-            xc_numerics::fmt::display_hp(&rel, 6));
+            xc_numerics::fmt::display_hp(&rel, 6)
+        );
         // Imaginary part should be zero.
         assert!(im.clone().abs() < Float::with_val(prec, Float::parse("1e-50").unwrap()));
     }
@@ -884,13 +979,21 @@ mod hp_tests {
         let mut xi = vec![Float::with_val(prec, 0); 2 * n_modes + 1];
         xi[n_modes] = sqrt_l;
 
-        let s_re = { let mut v = Float::with_val(prec, 1); v /= 2u32; v };
+        let s_re = {
+            let mut v = Float::with_val(prec, 1);
+            v /= 2u32;
+            v
+        };
         let s_im = Float::with_val(prec, 14);
 
         let n_quad = 100;
         let (gl_nodes, gl_weights) = xc_numerics::quadrature::gauss_legendre_nodes(
-            n_quad, prec, xc_numerics::quadrature::CacheMode::default());
-        let (g_re, g_im) = xi_weighted_mellin_hp(&s_re, &s_im, &lambda, &xi, n_modes, &gl_nodes, &gl_weights);
+            n_quad,
+            prec,
+            xc_numerics::quadrature::CacheMode::default(),
+        );
+        let (g_re, g_im) =
+            xi_weighted_mellin_hp(&s_re, &s_im, &lambda, &xi, n_modes, &gl_nodes, &gl_weights);
         let (l_re, l_im) = truncated_lambda_hp(&s_re, &s_im, &lambda, &gl_nodes, &gl_weights);
 
         // With flat ξ, G(s) = Λ_λ(s).
@@ -898,9 +1001,11 @@ mod hp_tests {
         re_diff -= &l_re;
         let abs_re = re_diff.abs();
         let tol = Float::with_val(prec, Float::parse("1e-50").unwrap());
-        assert!(abs_re < tol,
+        assert!(
+            abs_re < tol,
             "G_re and Λ_re should match (|diff| = {})",
-            xc_numerics::fmt::display_hp(&abs_re, 6));
+            xc_numerics::fmt::display_hp(&abs_re, 6)
+        );
         let mut im_diff = g_im.clone();
         im_diff -= &l_im;
         assert!(im_diff.abs() < tol);
@@ -920,24 +1025,45 @@ mod hp_tests {
         // compute (fresh at this prec/npts combo) does not run inside
         // concurrent rayon tasks — that causes GMP allocation contention.
         let (nodes, weights) = xc_numerics::quadrature::gauss_legendre_nodes(
-            200, prec, xc_numerics::quadrature::CacheMode::JsonZip);
-
-        let zeros = scan_critical_line_zeros_hp(
-            &|sigma_hp, t_hp| {
-                truncated_lambda_hp(sigma_hp, t_hp, &lambda, &nodes, &weights)
-            },
-            &t_min, &t_max, 200, 30,
+            200,
+            prec,
+            xc_numerics::quadrature::CacheMode::JsonZip,
         );
 
-        let target = Float::with_val(prec, Float::parse("14.134725141734693790457251983").unwrap());
-        let closest = zeros.iter()
-            .map(|z| { let mut d = z.clone(); d -= &target; d.abs() })
+        let zeros = scan_critical_line_zeros_hp(
+            &|sigma_hp, t_hp| truncated_lambda_hp(sigma_hp, t_hp, &lambda, &nodes, &weights),
+            &t_min,
+            &t_max,
+            200,
+            30,
+        );
+
+        let target = Float::with_val(
+            prec,
+            Float::parse("14.134725141734693790457251983").unwrap(),
+        );
+        let closest = zeros
+            .iter()
+            .map(|z| {
+                let mut d = z.clone();
+                d -= &target;
+                d.abs()
+            })
             .min_by(|a, b| a.total_cmp(b));
         let closest = closest.expect("should find at least one zero");
-        let tol = { let mut v = Float::with_val(prec, 1); v /= 2u32; v };
-        assert!(closest < tol,
+        let tol = {
+            let mut v = Float::with_val(prec, 1);
+            v /= 2u32;
+            v
+        };
+        assert!(
+            closest < tol,
             "should find zero within 0.5 of 14.13; closest |diff| = {} (zeros: {:?})",
             xc_numerics::fmt::display_hp(&closest, 6),
-            zeros.iter().map(|z| xc_numerics::fmt::display_hp(z, 8)).collect::<Vec<_>>());
+            zeros
+                .iter()
+                .map(|z| xc_numerics::fmt::display_hp(z, 8))
+                .collect::<Vec<_>>()
+        );
     }
 }

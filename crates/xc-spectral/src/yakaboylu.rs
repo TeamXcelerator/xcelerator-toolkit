@@ -56,8 +56,10 @@ use anyhow::Result;
 /// `s_re`, `s_im` are real and imaginary parts of s.
 /// `sp_re`, `sp_im` are real and imaginary parts of s'.
 pub fn v_r_matrix_element_f64(
-    s_re: f64, s_im: f64,
-    sp_re: f64, sp_im: f64,
+    s_re: f64,
+    s_im: f64,
+    sp_re: f64,
+    sp_im: f64,
     epsilon: f64,
 ) -> (f64, f64) {
     // (s̄ + s' - 1) = (s_re - i·s_im) + (sp_re + i·sp_im) - 1
@@ -80,18 +82,15 @@ pub fn v_r_matrix_element_f64(
 
 /// Test the Lorentzian limit on a pair of critical-line zeros (f64).
 /// Returns `(M(ε), |M(ε) - target|)` where target is δ_{γ,γ'}.
-pub fn test_lorentzian_limit_f64(
-    gamma1: f64, gamma2: f64,
-    epsilon: f64,
-) -> (f64, f64, f64) {
+pub fn test_lorentzian_limit_f64(gamma1: f64, gamma2: f64, epsilon: f64) -> (f64, f64, f64) {
     let s_re = 0.5;
     let sp_re = 0.5;
-    let (m_re, m_im) = v_r_matrix_element_f64(
-        s_re, gamma1,
-        sp_re, gamma2,
-        epsilon,
-    );
-    let target = if (gamma1 - gamma2).abs() < 1e-30 { 1.0 } else { 0.0 };
+    let (m_re, m_im) = v_r_matrix_element_f64(s_re, gamma1, sp_re, gamma2, epsilon);
+    let target = if (gamma1 - gamma2).abs() < 1e-30 {
+        1.0
+    } else {
+        0.0
+    };
     let dev = ((m_re - target).powi(2) + m_im.powi(2)).sqrt();
     (m_re, m_im, dev)
 }
@@ -101,7 +100,7 @@ pub fn test_lorentzian_limit_f64(
 /// On critical-line zeros, this should be approximately the identity matrix
 /// (each ρ pairs only with itself since 1-ρ̄ = ρ on the critical line).
 ///
-/// Returns the matrix as a flat Vec<f64> in row-major order.
+/// Returns the matrix as a flat `Vec<f64>` in row-major order.
 /// We use small-but-not-zero ε to stay within f64 precision.
 pub fn build_w_matrix_f64(zeros: &[f64], epsilon: f64) -> Vec<f64> {
     let n = zeros.len();
@@ -110,11 +109,7 @@ pub fn build_w_matrix_f64(zeros: &[f64], epsilon: f64) -> Vec<f64> {
         for j in 0..n {
             // ρ_i = 1/2 + i·γ_i. 1 - ρ̄_j = 1 - (1/2 - i·γ_j) = 1/2 + i·γ_j = ρ_j (on line)
             // So we want ⟨Ψ_ρ_i | V̂_R | Ψ_ρ_j⟩ which on the line is the Lorentzian.
-            let (m_re, _m_im) = v_r_matrix_element_f64(
-                0.5, zeros[i],
-                0.5, zeros[j],
-                epsilon,
-            );
+            let (m_re, _m_im) = v_r_matrix_element_f64(0.5, zeros[i], 0.5, zeros[j], epsilon);
             w[i * n + j] = m_re;
         }
     }
@@ -126,21 +121,25 @@ pub fn build_w_matrix_f64(zeros: &[f64], epsilon: f64) -> Vec<f64> {
 pub fn smallest_eigenvalue_f64(matrix: &[f64], n: usize) -> Result<f64> {
     use nalgebra::{DMatrix, SymmetricEigen};
     if matrix.len() != n * n {
-        anyhow::bail!("matrix size mismatch: got {}, expected {}", matrix.len(), n * n);
+        anyhow::bail!(
+            "matrix size mismatch: got {}, expected {}",
+            matrix.len(),
+            n * n
+        );
     }
     let m = DMatrix::from_row_slice(n, n, matrix);
     let eig = SymmetricEigen::new(m);
-    let smallest = eig.eigenvalues.iter().cloned()
+    let smallest = eig
+        .eigenvalues
+        .iter()
+        .cloned()
         .fold(f64::INFINITY, f64::min);
     Ok(smallest)
 }
 
 /// Test W positivity on the first N Riemann zeros (f64 path).
 /// Returns the f64 result struct.
-pub fn test_w_positivity_f64(
-    zeros: &[f64],
-    epsilon: f64,
-) -> Result<WPositivityResultF64> {
+pub fn test_w_positivity_f64(zeros: &[f64], epsilon: f64) -> Result<WPositivityResultF64> {
     let n = zeros.len();
     let w = build_w_matrix_f64(zeros, epsilon);
     let smallest = smallest_eigenvalue_f64(&w, n)?;
@@ -151,7 +150,11 @@ pub fn test_w_positivity_f64(
     let mut evals: Vec<f64> = eig.eigenvalues.iter().copied().collect();
     evals.sort_by(|a, b| a.total_cmp(b));
     let largest = evals.last().copied().unwrap_or(0.0);
-    let cond = if smallest.abs() > 1e-300 { largest / smallest.abs() } else { f64::INFINITY };
+    let cond = if smallest.abs() > 1e-300 {
+        largest / smallest.abs()
+    } else {
+        f64::INFINITY
+    };
 
     Ok(WPositivityResultF64 {
         n_zeros: n,
@@ -197,8 +200,10 @@ pub struct WPositivityResultF64 {
 /// Same closed-form formula but at user-chosen precision.
 #[cfg(feature = "hp")]
 pub fn v_r_matrix_element_hp(
-    s_re: &rug::Float, s_im: &rug::Float,
-    sp_re: &rug::Float, sp_im: &rug::Float,
+    s_re: &rug::Float,
+    s_im: &rug::Float,
+    sp_re: &rug::Float,
+    sp_im: &rug::Float,
     epsilon: &rug::Float,
 ) -> (rug::Float, rug::Float) {
     let prec = epsilon.prec();
@@ -258,7 +263,8 @@ mod tests {
             assert!(
                 (m_re - 1.0).abs() < 1e-12,
                 "diagonal should be 1 (got {} at eps={})",
-                m_re, eps
+                m_re,
+                eps
             );
             assert!(m_im.abs() < 1e-12, "im part should be 0 (got {})", m_im);
         }
@@ -278,7 +284,8 @@ mod tests {
             assert!(
                 rel_err < 1e-12,
                 "off-diagonal should match Lorentzian (got {}, predicted {})",
-                m_re, predicted
+                m_re,
+                predicted
             );
         }
     }
@@ -422,7 +429,6 @@ mod tests {
     }
 }
 
-
 // ===========================================================================
 // High-precision (HP) Yakaboylu W-positivity pipeline.
 //
@@ -443,12 +449,8 @@ pub mod hp {
     ///
     /// On critical-line zeros (β = 1/2), `1 - ρ̄_j = ρ_j`, so we use
     /// `s = 1/2 + iγ_i` and `s' = 1/2 + iγ_j`. Returns the matrix as
-    /// a flat Vec<Float> in row-major order.
-    pub fn build_w_matrix(
-        gammas: &[Float],
-        epsilon: &Float,
-        prec: u32,
-    ) -> Vec<Float> {
+    /// a flat `Vec<Float>` in row-major order.
+    pub fn build_w_matrix(gammas: &[Float], epsilon: &Float, prec: u32) -> Vec<Float> {
         let n = gammas.len();
 
         // s_re = 1/2 (HP literal, exact at any precision).
@@ -458,16 +460,19 @@ pub mod hp {
         // Build row-by-row in parallel; each row of W_{ij} for fixed i
         // calls v_r_matrix_element_hp(half, γ_i, half, γ_j, ε) for every j,
         // all independent across i and j.
-        let rows: Vec<Vec<Float>> = (0..n).into_par_iter().map(|i| {
-            (0..n).map(|j| {
-                let (m_re, _m_im) = super::v_r_matrix_element_hp(
-                    &half, &gammas[i],
-                    &half, &gammas[j],
-                    epsilon,
-                );
-                m_re
-            }).collect()
-        }).collect();
+        let rows: Vec<Vec<Float>> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                (0..n)
+                    .map(|j| {
+                        let (m_re, _m_im) = super::v_r_matrix_element_hp(
+                            &half, &gammas[i], &half, &gammas[j], epsilon,
+                        );
+                        m_re
+                    })
+                    .collect()
+            })
+            .collect();
 
         // Flatten row-major.
         let mut w: Vec<Float> = Vec::with_capacity(n * n);
@@ -481,11 +486,17 @@ pub mod hp {
     /// precision, using the HP eigensolver in `xc_numerics::eigen`.
     pub fn smallest_eigenvalue(matrix: &[Float], n: usize, prec: u32) -> Result<Float> {
         if matrix.len() != n * n {
-            anyhow::bail!("matrix size mismatch: got {}, expected {}", matrix.len(), n * n);
+            anyhow::bail!(
+                "matrix size mismatch: got {}, expected {}",
+                matrix.len(),
+                n * n
+            );
         }
         let evals = dense_symmetric_eigenvalues_hp(matrix, n, prec)?;
         // Eigenvalues are returned ascending; smallest is first.
-        evals.into_iter().next()
+        evals
+            .into_iter()
+            .next()
             .ok_or_else(|| anyhow::anyhow!("no eigenvalues returned"))
     }
 
@@ -522,9 +533,13 @@ pub mod hp {
         // Should already be ascending from the eigensolver, but defensive.
         evals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        let smallest = evals.first().cloned()
+        let smallest = evals
+            .first()
+            .cloned()
             .unwrap_or_else(|| Float::with_val(prec, 0));
-        let largest = evals.last().cloned()
+        let largest = evals
+            .last()
+            .cloned()
             .unwrap_or_else(|| Float::with_val(prec, 0));
 
         // Condition number = |largest| / |smallest|. Threshold for "smallest
@@ -582,20 +597,26 @@ pub mod hp {
             };
             for eps_str in &["0.1", "0.01", "0.001", "1e-6", "1e-10"] {
                 let eps = hp(prec, eps_str);
-                let (m_re, m_im) = super::super::v_r_matrix_element_hp(
-                    &half, &gamma, &half, &gamma, &eps,
-                );
+                let (m_re, m_im) =
+                    super::super::v_r_matrix_element_hp(&half, &gamma, &half, &gamma, &eps);
                 let mut diff = m_re.clone();
                 diff -= 1u32;
                 let abs_diff = diff.abs();
                 let tol = hp(prec, "1e-50");
-                assert!(abs_diff < tol,
+                assert!(
+                    abs_diff < tol,
                     "HP diagonal at eps={}: got {} (off by {})",
-                    eps_str, display_hp(&m_re, 6), display_hp(&abs_diff, 4));
+                    eps_str,
+                    display_hp(&m_re, 6),
+                    display_hp(&abs_diff, 4)
+                );
                 let abs_im = m_im.abs();
-                assert!(abs_im < tol,
+                assert!(
+                    abs_im < tol,
                     "HP im part at eps={}: got {} (should be 0)",
-                    eps_str, display_hp(&abs_im, 4));
+                    eps_str,
+                    display_hp(&abs_im, 4)
+                );
             }
         }
 
@@ -620,9 +641,13 @@ pub mod hp {
                 let mut diff = w[i * 5 + i].clone();
                 diff -= &one;
                 let abs_diff = diff.abs();
-                assert!(abs_diff < tol,
+                assert!(
+                    abs_diff < tol,
                     "diagonal[{}] should be 1, got {} (delta {})",
-                    i, display_hp(&w[i * 5 + i], 6), display_hp(&abs_diff, 4));
+                    i,
+                    display_hp(&w[i * 5 + i], 6),
+                    display_hp(&abs_diff, 4)
+                );
             }
 
             // Off-diagonal (0, 1) should be ε² / (γ_2 - γ_1)².
@@ -630,8 +655,11 @@ pub mod hp {
             // Predicted ≈ 1e-6 / 47.4 ≈ 2.1e-8.
             let off_01 = w[1].clone().abs(); // row 0, col 1 in row-major 5×5
             let upper = hp(prec, "1e-7");
-            assert!(off_01 < upper,
-                "off-diagonal should be small, got {}", display_hp(&off_01, 6));
+            assert!(
+                off_01 < upper,
+                "off-diagonal should be small, got {}",
+                display_hp(&off_01, 6)
+            );
         }
 
         /// HP W positivity on critical-line zeros: smallest eigenvalue ≈ 1.
@@ -648,9 +676,11 @@ pub mod hp {
             ];
             let eps = hp(prec, "1e-4");
             let result = test_w_positivity(&gammas, &eps, prec).unwrap();
-            assert!(result.positive_definite,
+            assert!(
+                result.positive_definite,
                 "W should be positive-definite on critical-line zeros (smallest = {})",
-                display_hp(&result.smallest_eigenvalue, 6));
+                display_hp(&result.smallest_eigenvalue, 6)
+            );
             // All eigenvalues should be ≈ 1 at small ε.
             let one = Float::with_val(prec, 1);
             let tol = hp(prec, "1e-6");
@@ -658,9 +688,12 @@ pub mod hp {
                 let mut diff = v.clone();
                 diff -= &one;
                 let abs_diff = diff.abs();
-                assert!(abs_diff < tol,
+                assert!(
+                    abs_diff < tol,
                     "eigenvalue should be ≈1 at small ε, got {} (delta {})",
-                    display_hp(v, 6), display_hp(&abs_diff, 4));
+                    display_hp(v, 6),
+                    display_hp(&abs_diff, 4)
+                );
             }
         }
 
@@ -681,42 +714,64 @@ pub mod hp {
             let gamma = hp(prec, "14.134725141734693790457251983562470270784257");
             let eps = hp(prec, "1e-4");
 
-            let (w11, _) = super::super::v_r_matrix_element_hp(
-                &beta, &gamma, &beta, &gamma, &eps);
-            let (w12, _) = super::super::v_r_matrix_element_hp(
-                &beta, &gamma, &one_minus_beta, &gamma, &eps);
-            let (w21, _) = super::super::v_r_matrix_element_hp(
-                &one_minus_beta, &gamma, &beta, &gamma, &eps);
+            let (w11, _) = super::super::v_r_matrix_element_hp(&beta, &gamma, &beta, &gamma, &eps);
+            let (w12, _) =
+                super::super::v_r_matrix_element_hp(&beta, &gamma, &one_minus_beta, &gamma, &eps);
+            let (w21, _) =
+                super::super::v_r_matrix_element_hp(&one_minus_beta, &gamma, &beta, &gamma, &eps);
             let (w22, _) = super::super::v_r_matrix_element_hp(
-                &one_minus_beta, &gamma, &one_minus_beta, &gamma, &eps);
+                &one_minus_beta,
+                &gamma,
+                &one_minus_beta,
+                &gamma,
+                &eps,
+            );
 
             // W_12 should be ≈ 1 (involution-paired).
             let one = Float::with_val(prec, 1);
             let tol_one = hp(prec, "1e-6");
-            let mut d12 = w12.clone(); d12 -= &one; let d12_abs = d12.abs();
-            assert!(d12_abs < tol_one,
-                "W_12 should be ≈1, got {}", display_hp(&w12, 6));
-            let mut d21 = w21.clone(); d21 -= &one; let d21_abs = d21.abs();
-            assert!(d21_abs < tol_one,
-                "W_21 should be ≈1, got {}", display_hp(&w21, 6));
+            let mut d12 = w12.clone();
+            d12 -= &one;
+            let d12_abs = d12.abs();
+            assert!(
+                d12_abs < tol_one,
+                "W_12 should be ≈1, got {}",
+                display_hp(&w12, 6)
+            );
+            let mut d21 = w21.clone();
+            d21 -= &one;
+            let d21_abs = d21.abs();
+            assert!(
+                d21_abs < tol_one,
+                "W_21 should be ≈1, got {}",
+                display_hp(&w21, 6)
+            );
 
             // W_11, W_22 should be ≈ 0.
             let tol_zero = hp(prec, "1e-6");
             let abs_w11 = w11.clone().abs();
             let abs_w22 = w22.clone().abs();
-            assert!(abs_w11 < tol_zero,
-                "W_11 should be ≈0, got {}", display_hp(&w11, 6));
-            assert!(abs_w22 < tol_zero,
-                "W_22 should be ≈0, got {}", display_hp(&w22, 6));
+            assert!(
+                abs_w11 < tol_zero,
+                "W_11 should be ≈0, got {}",
+                display_hp(&w11, 6)
+            );
+            assert!(
+                abs_w22 < tol_zero,
+                "W_22 should be ≈0, got {}",
+                display_hp(&w22, 6)
+            );
 
             // Smallest eigenvalue of [[~0, 1], [1, ~0]] is ≈ -1.
             let matrix = vec![w11, w12, w21, w22];
             let smallest = smallest_eigenvalue(&matrix, 2, prec).unwrap();
             // Smallest ≈ -1 confirms W is indefinite.
             let neg_99 = hp(prec, "-0.99");
-            assert!(smallest < neg_99,
+            assert!(
+                smallest < neg_99,
                 "smallest eigenvalue should be ≈-1 for off-line case, got {}",
-                display_hp(&smallest, 6));
+                display_hp(&smallest, 6)
+            );
         }
     }
 }

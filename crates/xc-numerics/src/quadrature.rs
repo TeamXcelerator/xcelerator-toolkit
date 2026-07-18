@@ -7,38 +7,52 @@
 //! polynomials and cached to disk under `<cwd>/data/gl_cache/` so they're
 //! reused across runs at the same `(n_pts, precision_bits)`.
 //!
-//! Cache lookup is governed by [`CacheMode`] (HP path). The full lookup
-//! order, for the default `CacheMode::DynamicFetch`, is:
-//! 1. `<cwd>/data/gl_cache/prec{prec}_npts{n}.json` (uncompressed)
-//! 2. `<cwd>/data/gl_cache/prec{prec}_npts{n}.json.zip` (zip archive
-//!    containing one entry of the same name without `.zip`).
-//!    Auto-decompressed on first read; the result is also written
-//!    out as the uncompressed `.json` so future reads in the same
-//!    process and on the same machine hit path (1) directly.
-//! 3. **Remote fetch** from the public consolidated cache repository
-//!    `TeamXcelerator/xcelerator-gl-cache` via `curl`. The deterministic
-//!    URL is derived from `(n, prec)` using the precision-first,
-//!    npts-thousand-bucketed layout. On success the `.json.zip` is
-//!    written to the local cache dir and decompressed to `.json`, so
-//!    subsequent reads hit path (1). The fetch is HTTP-status-aware:
-//!    only a 404 is a definitive miss; 429 (rate limit) / 5xx / network
-//!    failures are retried with backoff. Falls through to compute if
-//!    `curl` is unavailable, the file 404s, or retries are exhausted.
-//! 4. Compute fresh via Newton iteration; cache result to (1)+(2).
+//! The standalone HP API reads a local deterministic `.json.zip`, directly
+//! in memory, and computes and stores that representation on a miss.
+//! Remote local/private/public resolution belongs exclusively to the managed
+//! cache fabric exposed by `gauss_legendre_nodes_via_cache`.
 //!
-//! [`CacheMode`] selects how far down this list a lookup goes:
+//! `CacheMode` selects how far down this list a lookup goes:
 //! - `Off`          — no cache read or write; always compute.
 //! - `JsonOnly`     — step (1) only.
-//! - `JsonZip`      — steps (1)+(2) (the pre-remote behavior).
-//! - `DynamicFetch` — steps (1)+(2)+(3) (**default**).
+//! - `JsonZip`      — local compressed cache (**default**).
 //!
-//! `gauss_legendre_nodes(n, prec, mode)` takes the [`CacheMode`]
-//! explicitly; pass `CacheMode::default()` (== `DynamicFetch`) for the
-//! standard behavior.
+//! `gauss_legendre_nodes(n, prec, mode)` takes the `CacheMode`
+//! explicitly; pass `CacheMode::default()` for standard local behavior.
 //!
-//! New computes write the uncompressed `.json` (and, for `JsonZip` /
-//! `DynamicFetch`, the `.json.zip` alongside). Remote fetch is read-only
-//! with respect to the remote repository.
+//! New computes write only the compressed representation.
+
+/// Machine-readable quadrature artifact decomposition. Nodes and weights are
+/// independent of downstream integrands and can be reused wherever order,
+/// backend, precision, and generation semantics match.
+pub fn quadrature_artifact_reuse_plan() -> xc_core::ArtifactReusePlan {
+    use xc_core::{ArtifactReuseNode, ArtifactReusePlan};
+    ArtifactReusePlan {
+        schema_version: 1,
+        domain: "quadrature".to_owned(),
+        semantics_version: "gauss-legendre-v0.13.0-v1".to_owned(),
+        artifacts: vec![
+            ArtifactReuseNode {
+                kind: "rule_nodes_weights".to_owned(),
+                independently_cacheable: true,
+                dependencies: Vec::new(),
+                invalidated_by: vec![
+                    "rule_family".to_owned(),
+                    "order".to_owned(),
+                    "scalar_backend".to_owned(),
+                    "precision_bits".to_owned(),
+                    "generation_semantics".to_owned(),
+                ],
+            },
+            ArtifactReuseNode {
+                kind: "rule_validation".to_owned(),
+                independently_cacheable: true,
+                dependencies: vec!["rule_nodes_weights".to_owned()],
+                invalidated_by: vec!["validation_policy".to_owned()],
+            },
+        ],
+    }
+}
 
 /// 64-point Gauss-Legendre quadrature on [a, b] at f64 precision.
 /// For a configurable number of points, use `gauss_legendre_npt_f64`.
@@ -46,7 +60,31 @@ pub fn gauss_legendre_64pt_f64<F: Fn(f64) -> f64>(f: F, a: f64, b: f64) -> f64 {
     gauss_legendre_npt_f64(f, a, b, 64)
 }
 
-/// N-point Gauss-Legendre quadrature on [a, b] at f64 precision.
+/// Approximates an integral with an `n`-point Gauss--Legendre rule.
+///
+/// # Mathematical semantics
+/// Maps the canonical nodes on `[-1, 1]` to `[a, b]` and returns the weighted
+/// sum. It is exact for polynomials through degree `2n - 1` in exact
+/// arithmetic; it does not prove an error bound for a general integrand.
+///
+/// # Precision
+/// Nodes, weights, function values, and accumulation all use binary64. Choose
+/// an HP quadrature route when binary64 rounding is not an explicit policy.
+///
+/// # Failure states
+/// This convenience function has no typed error channel. Non-finite bounds or
+/// integrand values propagate through binary64 arithmetic, and callers must
+/// validate them when such values are inadmissible.
+///
+/// # Assurance and validity
+/// The result is exploratory unless independently cross-checked or enclosed by
+/// a separate certified integration method.
+///
+/// # Cache effects
+/// This function performs no cache lookup, persistence, or publication.
+///
+/// # Example
+/// Compiled example: `crates/xc-numerics/examples/quadrature.rs`.
 pub fn gauss_legendre_npt_f64<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, n: usize) -> f64 {
     let (nodes, weights) = gl_nodes_weights_f64(n);
     let mid = 0.5 * (a + b);
@@ -82,7 +120,9 @@ pub fn gl_nodes_weights_f64(n: usize) -> (Vec<f64>, Vec<f64>) {
 }
 
 fn legendre_p_deriv_f64(n: usize, x: f64) -> (f64, f64) {
-    if n == 0 { return (1.0, 0.0); }
+    if n == 0 {
+        return (1.0, 0.0);
+    }
     let mut p0 = 1.0_f64;
     let mut p1 = x;
     for k in 1..n {
@@ -101,10 +141,195 @@ fn legendre_p_deriv_f64(n: usize, x: f64) -> (f64, f64) {
 #[cfg(feature = "hp")]
 mod hp {
     use rug::{ops::Pow, Float};
+    use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
+    use xc_cache::{
+        resolve_or_compute_json_artifact, ArtifactCacheContext, ArtifactExecutionCacheRequest,
+        CacheError, CacheQuality, SemanticKeyEnvelope, ToolkitVersion,
+    };
+    use xc_core::CacheAccessProvenance;
 
     /// A Gauss-Legendre quadrature table: `(nodes, weights)`, each vector
     /// of length `n` on `[-1, 1]`.
     type GlTable = (Vec<Float>, Vec<Float>);
+
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PortableGlTable {
+        schema_version: u32,
+        order: usize,
+        precision_bits: u32,
+        nodes: Vec<String>,
+        weights: Vec<String>,
+    }
+
+    /// Cache-fabric controls for one HP Gauss--Legendre rule resolution.
+    pub type QuadratureCacheRequest<'a> = ArtifactCacheContext<'a>;
+
+    /// An HP Gauss--Legendre rule and its auditable cache decision.
+    pub struct CachedQuadratureRule {
+        pub nodes: Vec<Float>,
+        pub weights: Vec<Float>,
+        pub cache_access: CacheAccessProvenance,
+        pub artifact_manifest: xc_cache::ArtifactManifest,
+    }
+
+    fn portable_table(n: usize, prec: u32, table: GlTable) -> PortableGlTable {
+        PortableGlTable {
+            schema_version: 1,
+            order: n,
+            precision_bits: prec,
+            nodes: table.0.iter().map(Float::to_string).collect(),
+            weights: table.1.iter().map(Float::to_string).collect(),
+        }
+    }
+
+    fn decode_portable_table(
+        table: &PortableGlTable,
+        n: usize,
+        prec: u32,
+    ) -> Result<GlTable, CacheError> {
+        if table.schema_version != 1
+            || table.order != n
+            || table.precision_bits != prec
+            || table.nodes.len() != n
+            || table.weights.len() != n
+        {
+            return Err(CacheError::InvalidManifest(
+                "quadrature payload identity or dimensions do not match its semantic key"
+                    .to_owned(),
+            ));
+        }
+        let parse = |value: &str| {
+            Float::parse(value)
+                .map(|parsed| Float::with_val(prec, parsed))
+                .map_err(|error| {
+                    CacheError::InvalidManifest(format!(
+                        "quadrature payload contains an invalid HP scalar: {error}"
+                    ))
+                })
+        };
+        let nodes: Vec<Float> = table
+            .nodes
+            .iter()
+            .map(|value| parse(value))
+            .collect::<Result<_, _>>()?;
+        let weights: Vec<Float> = table
+            .weights
+            .iter()
+            .map(|value| parse(value))
+            .collect::<Result<_, _>>()?;
+        if let Some(reason) = cache_structural_check(&nodes, &weights, prec) {
+            return Err(CacheError::InvalidManifest(format!(
+                "quadrature payload failed structural validation: {reason}"
+            )));
+        }
+        Ok((nodes, weights))
+    }
+
+    /// Resolves or computes an HP Gauss--Legendre rule through the common cache fabric.
+    ///
+    /// # Mathematical semantics
+    /// The artifact is the ordered Gauss--Legendre nodes and weights on `[-1, 1]`.
+    /// Its semantic identity includes the order, MPFR precision, normalization, and
+    /// v0.13.0 generation semantics.
+    ///
+    /// # Precision
+    /// Both computation and decoding round at `precision_bits` using `rug::Float`.
+    /// Decimal payload strings preserve substantially more than binary64 precision.
+    ///
+    /// # Failure states
+    /// Invalid inputs, cache corruption, incompatible policy, missing required reuse,
+    /// and unavailable writable overlays return a typed [`CacheError`]. Corruption
+    /// never silently falls through to a fresh computation.
+    ///
+    /// # Assurance and validity
+    /// Reused and fresh rules must pass weight-sum, first-moment, and mirror-identity
+    /// checks at the requested precision before they are returned.
+    ///
+    /// # Cache effects
+    /// Behavior is entirely controlled by `cache`. `PreferReuse` may write only when
+    /// `write_on_miss` is true; `RequireReuse` never computes or writes; `Disabled`
+    /// performs no cache I/O. Remote access is delegated to configured overlays.
+    ///
+    /// # Example
+    /// See the cache-fabric round-trip test in this module for a local overlay setup.
+    pub fn gauss_legendre_nodes_via_cache(
+        n: usize,
+        precision_bits: u32,
+        cache: QuadratureCacheRequest<'_>,
+    ) -> Result<CachedQuadratureRule, CacheError> {
+        if n == 0 || precision_bits < 16 {
+            return Err(CacheError::InvalidManifest(
+                "quadrature order must be positive and precision must be at least 16 bits"
+                    .to_owned(),
+            ));
+        }
+        let semantic_key = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "gauss_legendre_rule".to_owned(),
+            mathematical_semantics_version: "gauss-legendre-v0.13.0-v1".to_owned(),
+            resolved_mathematical_parameters: serde_json::json!({
+                "order": n,
+                "precision_bits": precision_bits,
+                "scalar_backend": "rug_mpfr",
+                "generation_semantics": "newton-legendre-roots-v1"
+            }),
+            normalization: Some("nodes_on_minus_one_one_weights_sum_two".to_owned()),
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        let logical_key = format!("gauss-legendre/{n}/{precision_bits}");
+        let execution_request = ArtifactExecutionCacheRequest {
+            operation: "quadrature.gauss_legendre.resolve_or_compute",
+            semantic_key: &semantic_key,
+            logical_key: &logical_key,
+            resolver: cache.resolver,
+            acceptance: cache.acceptance,
+            ordered_overlays: cache.ordered_overlays,
+            mode: cache.mode,
+            write_on_miss: cache.write_on_miss,
+            write_visibility: cache.write_visibility,
+            produced_quality: CacheQuality::Validated,
+            producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+            minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+            maximum_reader_version: None,
+            tags: BTreeMap::from([
+                ("domain".to_owned(), "quadrature".to_owned()),
+                ("rule_family".to_owned(), "gauss_legendre".to_owned()),
+            ]),
+            provenance_digest: None,
+            production_sink: cache.production_sink,
+        };
+        let resolved = resolve_or_compute_json_artifact(
+            &execution_request,
+            || {
+                Ok(portable_table(
+                    n,
+                    precision_bits,
+                    gauss_legendre_compute(n, precision_bits),
+                ))
+            },
+            |table| decode_portable_table(table, n, precision_bits).map(|_| ()),
+        )?;
+        let (nodes, weights) = decode_portable_table(&resolved.value, n, precision_bits)?;
+        let artifact_manifest = resolved
+            .produced_manifest
+            .or(resolved.reused_manifest)
+            .ok_or_else(|| {
+                CacheError::InvalidManifest(
+                    "enabled quadrature cache execution returned no artifact manifest".to_owned(),
+                )
+            })?;
+        Ok(CachedQuadratureRule {
+            nodes,
+            weights,
+            cache_access: resolved.access,
+            artifact_manifest,
+        })
+    }
 
     /// Controls how `gauss_legendre_nodes` resolves a `(n, prec)` table.
     ///
@@ -115,53 +340,21 @@ mod hp {
     ///   write any cache file.
     /// - `JsonOnly`     — read a local uncompressed `.json` if present;
     ///   otherwise compute. Does not consult `.json.zip` or the remote.
-    /// - `JsonZip`      — local `.json`, then local `.json.zip`
-    ///   (decompressing to `.json`), then compute. This is the
-    ///   pre-remote-fetch behavior.
-    /// - `DynamicFetch` — local `.json`, then local `.json.zip`, then a
-    ///   remote download from the public `xcelerator-gl-cache` repo, then
-    ///   compute. **Default.**
+    /// - `JsonZip`      — local `.json.zip`, read in memory, then compute.
+    ///   This is the default for the standalone API. Managed remote resolution
+    ///   is provided by `gauss_legendre_nodes_via_cache`.
     ///
     /// On a fresh compute, `JsonOnly` writes only the `.json`; `JsonZip`
-    /// and `DynamicFetch` write both `.json` and `.json.zip`; `Off`
-    /// writes nothing.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    #[derive(Default)]
+    /// writes a `.json.zip`; `Off` writes nothing.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum CacheMode {
         /// No caching: always compute, never touch disk or network.
         Off,
         /// Local uncompressed `.json` only.
         JsonOnly,
-        /// Local `.json` then local `.json.zip` (pre-remote behavior).
-        JsonZip,
-        /// Local `.json`, local `.json.zip`, then remote fetch (default).
+        /// Local `.json.zip`, followed by computation on a miss (default).
         #[default]
-        DynamicFetch,
-    }
-
-    
-
-    /// Base raw URLs of the public consolidated GL cache repositories, in
-    /// probe order. Files live at
-    /// `{base}/gl_cache/prec{P}/npts{B}-{B+999}/prec{P}_npts{N}.json.zip`
-    /// where `B = (N / 1000) * 1000`.
-    ///
-    /// An array (mirroring `xc_spectral::ccm::hp::tau_cache::REMOTE_BASES`)
-    /// so a second/overflow GL cache repo can be added with a one-line
-    /// change here, the same pattern already used for the τ cache.
-    const REMOTE_BASES: &[&str] = &[
-        "https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main",
-    ];
-
-    fn active_bases() -> Vec<String> {
-        match std::env::var("XC_GL_CACHE_BASES") {
-            Ok(v) if !v.trim().is_empty() => v
-                .split(',')
-                .map(|s| s.trim().trim_end_matches('/').to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
-            _ => REMOTE_BASES.iter().map(|s| s.to_string()).collect(),
-        }
+        JsonZip,
     }
 
     /// Toolkit version string embedded in every GL cache file written by
@@ -177,17 +370,21 @@ mod hp {
     /// produced by an older toolkit are treated as cache misses and
     /// recomputed. Update this constant when a change to the GL
     /// computation changes the stored values.
-    const CACHE_MIN_TOOLKIT_VERSION: &str = "0.12.0";
-
     fn effective_min_version() -> String {
-        std::env::var("XC_GL_CACHE_MIN_VER")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| CACHE_MIN_TOOLKIT_VERSION.to_string())
+        xc_cache::artifact_compatibility_policy("quadrature", "gauss_legendre_rule")
+            .expect("quadrature compatibility policy")
+            .minimum_producer_version
+            .to_string()
     }
 
-    #[inline] fn fl_i(prec: u32, v: i64) -> Float { Float::with_val(prec, v) }
-    #[inline] fn pi(prec: u32) -> Float { Float::with_val(prec, rug::float::Constant::Pi) }
+    #[inline]
+    fn fl_i(prec: u32, v: i64) -> Float {
+        Float::with_val(prec, v)
+    }
+    #[inline]
+    fn pi(prec: u32) -> Float {
+        Float::with_val(prec, rug::float::Constant::Pi)
+    }
 
     /// Tolerance for structural identity checks on a loaded cache file.
     /// At precision `prec` bits, this is `2^-(prec - 8)` — 8 guard bits
@@ -215,23 +412,24 @@ mod hp {
     /// Used by `load_gl_cache` to discard structurally-broken cache
     /// files (e.g. wrong precision, value corruption, accidental edit)
     /// before they pollute downstream HP integration.
-    fn cache_structural_check(
-        nodes: &[Float],
-        weights: &[Float],
-        prec: u32,
-    ) -> Option<String> {
+    fn cache_structural_check(nodes: &[Float], weights: &[Float], prec: u32) -> Option<String> {
         let n = nodes.len();
         if weights.len() != n {
             return Some(format!(
-                "weight count {} != node count {}", weights.len(), n
+                "weight count {} != node count {}",
+                weights.len(),
+                n
             ));
         }
         let tol = cache_structural_tol(prec);
 
         // Identity 1: Σ w_i = 2.
         let mut wsum = Float::with_val(prec, 0);
-        for w in weights { wsum += w; }
-        let mut wdiff = wsum.clone(); wdiff -= 2u32;
+        for w in weights {
+            wsum += w;
+        }
+        let mut wdiff = wsum.clone();
+        wdiff -= 2u32;
         let abs_wdiff = wdiff.abs();
         if !abs_wdiff.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false) {
             return Some(format!(
@@ -263,7 +461,10 @@ mod hp {
             if !abs_ns.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false) {
                 return Some(format!(
                     "antisymmetry: nodes[{}] + nodes[{}] = {} (tol {})",
-                    i, n - 1 - i, abs_ns, tol
+                    i,
+                    n - 1 - i,
+                    abs_ns,
+                    tol
                 ));
             }
             let mut wm = weights[i].clone();
@@ -272,7 +473,10 @@ mod hp {
             if !abs_wm.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false) {
                 return Some(format!(
                     "weight mirror: weights[{}] - weights[{}] = {} (tol {})",
-                    i, n - 1 - i, abs_wm, tol
+                    i,
+                    n - 1 - i,
+                    abs_wm,
+                    tol
                 ));
             }
         }
@@ -283,16 +487,15 @@ mod hp {
     /// Compute (or load from cache) Gauss-Legendre nodes and weights
     /// at the given precision in bits, for `n` points on `[-1, 1]`.
     ///
-    /// `mode` selects the cache strategy; see [`CacheMode`] and the
+    /// `mode` selects the cache strategy; see `CacheMode` and the
     /// module docs for the lookup order. Pass `CacheMode::default()`
-    /// (== `DynamicFetch`) for the standard behavior.
-    pub fn gauss_legendre_nodes(
-        n: usize,
-        prec: u32,
-        mode: CacheMode,
-    ) -> (Vec<Float>, Vec<Float>) {
+    /// for the standard local behavior. Use `gauss_legendre_nodes_via_cache`
+    /// when managed local/private/public resolution is required.
+    pub fn gauss_legendre_nodes(n: usize, prec: u32, mode: CacheMode) -> (Vec<Float>, Vec<Float>) {
         if mode != CacheMode::Off {
-            if let Some(cached) = load_gl_cache(n, prec, mode) { return cached; }
+            if let Some(cached) = load_gl_cache(n, prec, mode) {
+                return cached;
+            }
         }
         let result = gauss_legendre_compute(n, prec);
         if mode != CacheMode::Off {
@@ -337,7 +540,9 @@ mod hp {
         let nodes_arr = obj.get("nodes")?.as_array()?;
         let weights_arr = obj.get("weights")?.as_array()?;
 
-        if nodes_arr.len() != n || weights_arr.len() != n { return None; }
+        if nodes_arr.len() != n || weights_arr.len() != n {
+            return None;
+        }
         let mut nodes = Vec::with_capacity(n);
         let mut weights = Vec::with_capacity(n);
         for s in nodes_arr {
@@ -371,35 +576,28 @@ mod hp {
     fn warn_cache_skip(path: &std::path::Path, reason: &str) {
         eprintln!(
             "[gl_cache] WARNING: skipping {} ({}); recomputing",
-            path.display(), reason
+            path.display(),
+            reason
         );
     }
 
     fn load_gl_cache(n: usize, prec: u32, mode: CacheMode) -> Option<(Vec<Float>, Vec<Float>)> {
-        if mode == CacheMode::Off { return None; }
+        if mode == CacheMode::Off {
+            return None;
+        }
 
         // Caches are stored as .json.zip only — we read straight from the
         // zip (decompress in memory) and never write a decompressed .json.
         // This keeps local disk usage ~2x smaller so more configs stay
         // cached during sweeps. JsonOnly is now a no-op for reads (kept
         // for API compatibility) since no uncompressed .json is written.
-        if mode == CacheMode::JsonOnly { return None; }
-
-        // Tier 1 (JsonZip, DynamicFetch): local zip — decompress in memory.
-        if let Some(result) = try_load_local_zip(n, prec) {
-            return Some(result);
+        if mode == CacheMode::JsonOnly {
+            return None;
         }
 
-        // JsonZip stops here.
-        if mode == CacheMode::JsonZip { return None; }
-
-        // Tier 2 (DynamicFetch only): remote fetch from the public
-        // consolidated GL cache repo. On success the .json.zip lands in
-        // the local cache dir; we then re-run the local-zip loader.
-        if fetch_remote_zip(n, prec) {
-            if let Some(result) = try_load_local_zip(n, prec) {
-                return Some(result);
-            }
+        // Local zip — decompress in memory.
+        if let Some(result) = try_load_local_zip(n, prec) {
+            return Some(result);
         }
 
         None
@@ -410,12 +608,12 @@ mod hp {
     /// Returns `None` if the zip is absent, corrupt, or structurally invalid.
     fn try_load_local_zip(n: usize, prec: u32) -> Option<(Vec<Float>, Vec<Float>)> {
         let zip_path = gl_cache_zip_path(n, prec)?;
-        if !zip_path.exists() { return None; }
+        if !zip_path.exists() {
+            return None;
+        }
         match load_from_zip(&zip_path, n, prec) {
             Some((parsed, _json_string)) => {
-                if let Some(reason) =
-                    cache_structural_check(&parsed.0, &parsed.1, prec)
-                {
+                if let Some(reason) = cache_structural_check(&parsed.0, &parsed.1, prec) {
                     warn_cache_skip(&zip_path, &reason);
                     None
                 } else {
@@ -423,138 +621,21 @@ mod hp {
                 }
             }
             None => {
-                warn_cache_skip(
-                    &zip_path,
-                    "zip open / decompress / shape parse failed",
-                );
+                warn_cache_skip(&zip_path, "zip open / decompress / shape parse failed");
                 None
             }
         }
-    }
-
-    /// Deterministic remote URL for the `(n, prec)` cache fixture in a
-    /// specific base repo, using the precision-first, npts-thousand-
-    /// bucketed layout.
-    fn remote_zip_url(base: &str, n: usize, prec: u32) -> String {
-        let bucket = (n / 1000) * 1000;
-        format!(
-            "{base}/gl_cache/prec{p}/npts{b}-{bend}/prec{p}_npts{n}.json.zip",
-            base = base, p = prec, b = bucket, bend = bucket + 999, n = n
-        )
-    }
-
-    /// Test-only accessor for `remote_zip_url` (the function itself is
-    /// private; this lets the cache-tests module assert URL formatting
-    /// without making the builder public API). Returns results for all
-    /// configured bases, in probe order.
-    #[cfg(test)]
-    pub fn remote_zip_url_for_test(n: usize, prec: u32) -> Vec<String> {
-        REMOTE_BASES.iter().map(|base| remote_zip_url(base, n, prec)).collect()
     }
 
     /// Test-only accessor for `parse_gl_json` (lets version-rejection
     /// tests call the parser directly without touching disk).
     #[cfg(test)]
     pub fn parse_gl_json_for_test(
-        data: &str, n: usize, prec: u32,
+        data: &str,
+        n: usize,
+        prec: u32,
     ) -> Option<(Vec<Float>, Vec<Float>)> {
         parse_gl_json(data, n, prec)
-    }
-
-    /// Download the `(n, prec)` `.json.zip` from the public cache repo
-    /// Download the `(n, prec)` `.json.zip` from the public cache repo
-    /// into the local cache dir via `curl`. Returns `true` if a file was
-    /// written. Graceful: missing `curl`, a genuine 404 (un-cached
-    /// config), or repeated transient failure returns `false` and the
-    /// caller falls through to compute.
-    ///
-    /// Robust to `raw.githubusercontent.com` rate-limiting: it captures
-    /// the real HTTP status code (`--write-out %{http_code}`) and retries
-    /// with backoff on 429/5xx/no-response. Only a 404 is treated as a
-    /// definitive miss (no retry). Downloads to a temp path and renames
-    /// on success so a partial/failed download never leaves a truncated
-    /// `.json.zip`.
-    fn fetch_remote_zip(n: usize, prec: u32) -> bool {
-        let zip_path = match gl_cache_zip_path(n, prec) {
-            Some(p) => p,
-            None => return false,
-        };
-
-        // Iterate over REMOTE_BASES in order, trying each repo until one
-        // has the file. Mirrors the τ-cache multi-repo probe logic.
-        for base in active_bases() {
-            let url = remote_zip_url(&base, n, prec);
-
-            const MAX_TRIES: usize = 5;
-            for attempt in 0..MAX_TRIES {
-                match curl_attempt_gl(&url, &zip_path) {
-                    CurlOutcome::Ok => {
-                        // Routine cache hit — silent. Only corruption /
-                        // recompute paths warn (see warn_cache_skip).
-                        return true;
-                    }
-                    // 404: this config isn't cached in this repo. Break
-                    // out of the retry loop and try the next repo.
-                    CurlOutcome::HttpError => break,
-                    // 429 / 5xx / network: retry with growing backoff.
-                    CurlOutcome::Transient => {
-                        if attempt + 1 < MAX_TRIES {
-                            let secs = 2 * (attempt as u64 + 1);
-                            std::thread::sleep(std::time::Duration::from_secs(secs));
-                        }
-                    }
-                }
-            }
-        }
-        false
-    }
-
-    /// Outcome of a single GL `curl` download attempt, classified by the
-    /// actual HTTP status code (mirrors the τ-cache fetch logic).
-    enum CurlOutcome {
-        /// HTTP 2xx, file written and renamed into place.
-        Ok,
-        /// HTTP 404 — the fixture isn't in the remote repo. Definitive.
-        HttpError,
-        /// 429 (rate limit), 5xx, no response, missing curl, network /
-        /// write error. Retryable; never a definitive miss.
-        Transient,
-    }
-
-    /// `curl` one URL to `dest`, capturing the HTTP status so 404
-    /// (definitive) is distinguished from 429/5xx (transient). Writes to
-    /// a temp path and renames on a 2xx so a failed download never leaves
-    /// a truncated file.
-    fn curl_attempt_gl(url: &str, dest: &std::path::Path) -> CurlOutcome {
-        let tmp = dest.with_extension("zip.partial");
-        let _ = std::fs::remove_file(&tmp);
-        let mut cmd = std::process::Command::new("curl");
-        cmd.arg("--silent").arg("--show-error").arg("--location")
-            .arg("--retry").arg("3").arg("--retry-delay").arg("1");
-        if let Ok(tok) = std::env::var("XC_CACHE_AUTH") {
-            if !tok.trim().is_empty() {
-                cmd.arg("-H").arg(format!("Authorization: token {}", tok.trim()));
-            }
-        }
-        let output = cmd
-            .arg("--write-out").arg("%{http_code}")
-            .arg("-o").arg(&tmp).arg(url)
-            .output();
-        match output {
-            Ok(out) if out.status.success() => {
-                let code: u32 = String::from_utf8_lossy(&out.stdout)
-                    .trim().parse().unwrap_or(0);
-                match code {
-                    200..=299 => match std::fs::rename(&tmp, dest) {
-                        Ok(()) => CurlOutcome::Ok,
-                        Err(_) => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
-                    },
-                    404 => { let _ = std::fs::remove_file(&tmp); CurlOutcome::HttpError }
-                    _ => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
-                }
-            }
-            _ => { let _ = std::fs::remove_file(&tmp); CurlOutcome::Transient }
-        }
     }
 
     /// Read a zip cache file. Expects the archive to contain exactly one
@@ -564,11 +645,7 @@ mod hp {
     /// Returns the parsed `(nodes, weights)` plus the raw JSON string,
     /// so the caller can write the decompressed copy to disk without
     /// re-serializing.
-    fn load_from_zip(
-        zip_path: &std::path::Path,
-        n: usize,
-        prec: u32,
-    ) -> Option<(GlTable, String)> {
+    fn load_from_zip(zip_path: &std::path::Path, n: usize, prec: u32) -> Option<(GlTable, String)> {
         use std::io::Read;
         let file = std::fs::File::open(zip_path).ok()?;
         let mut archive = zip::ZipArchive::new(file).ok()?;
@@ -583,8 +660,10 @@ mod hp {
     fn save_gl_cache(n: usize, prec: u32, nodes: &[Float], weights: &[Float], mode: CacheMode) {
         // Off writes nothing. JsonOnly also writes nothing now: the cache
         // is zip-only (we never persist a decompressed .json), so the
-        // only meaningful write modes are JsonZip / DynamicFetch.
-        if matches!(mode, CacheMode::Off | CacheMode::JsonOnly) { return; }
+        // only meaningful write mode is JsonZip.
+        if matches!(mode, CacheMode::Off | CacheMode::JsonOnly) {
+            return;
+        }
 
         // Serialize to the versioned JSON envelope, then write ONLY the
         // deflated .json.zip. No uncompressed .json is written — readers
@@ -623,13 +702,18 @@ mod hp {
             {
                 let cursor = std::io::Cursor::new(&mut buf);
                 let mut writer = zip::ZipWriter::new(cursor);
-                let opts: zip::write::SimpleFileOptions =
-                    zip::write::SimpleFileOptions::default()
-                        .compression_method(zip::CompressionMethod::Deflated)
-                        .large_file(true);
-                if writer.start_file(&entry_name, opts).is_err() { return; }
-                if writer.write_all(json_str.as_bytes()).is_err() { return; }
-                if writer.finish().is_err() { return; }
+                let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated)
+                    .large_file(true);
+                if writer.start_file(&entry_name, opts).is_err() {
+                    return;
+                }
+                if writer.write_all(json_str.as_bytes()).is_err() {
+                    return;
+                }
+                if writer.finish().is_err() {
+                    return;
+                }
             }
             let _ = std::fs::write(&zip_path, &buf);
         }
@@ -649,14 +733,27 @@ mod hp {
             let eps_threshold = Float::with_val(prec, 2).pow(-((prec as i32) - 8));
             for _ in 0..50 {
                 let (pn, pn_prime) = legendre_p_and_deriv(n, &x, prec);
-                let mut dx = pn; dx /= &pn_prime;
+                let mut dx = pn;
+                dx /= &pn_prime;
                 x -= &dx;
-                if dx.cmp_abs(&eps_threshold).map(|o| o.is_lt()).unwrap_or(false) { break; }
+                if dx
+                    .cmp_abs(&eps_threshold)
+                    .map(|o| o.is_lt())
+                    .unwrap_or(false)
+                {
+                    break;
+                }
             }
             let (_pn, pn_prime) = legendre_p_and_deriv(n, &x, prec);
-            let one_minus_x2 = { let mut v = one.clone(); v -= x.clone().square(); v };
-            let mut den = one_minus_x2; den *= &pn_prime.square();
-            let mut w = Float::with_val(prec, 2); w /= &den;
+            let one_minus_x2 = {
+                let mut v = one.clone();
+                v -= x.clone().square();
+                v
+            };
+            let mut den = one_minus_x2;
+            den *= &pn_prime.square();
+            let mut w = Float::with_val(prec, 2);
+            w /= &den;
             nodes.push(x);
             weights.push(w);
         }
@@ -669,21 +766,36 @@ mod hp {
 
     fn legendre_p_and_deriv(n: usize, x: &Float, prec: u32) -> (Float, Float) {
         let one = Float::with_val(prec, 1);
-        if n == 0 { return (one, Float::with_val(prec, 0)); }
+        if n == 0 {
+            return (one, Float::with_val(prec, 0));
+        }
         let mut p0 = Float::with_val(prec, 1);
         let mut p1 = x.clone();
-        if n == 1 { return (p1, one); }
+        if n == 1 {
+            return (p1, one);
+        }
         for k in 1..n {
             let kf = k as i64;
-            let mut t1 = x.clone(); t1 *= &p1; t1 *= fl_i(prec, 2 * kf + 1);
-            let mut t2 = p0.clone(); t2 *= fl_i(prec, kf);
-            let mut p_next = t1; p_next -= &t2; p_next /= fl_i(prec, kf + 1);
-            p0 = p1; p1 = p_next;
+            let mut t1 = x.clone();
+            t1 *= &p1;
+            t1 *= fl_i(prec, 2 * kf + 1);
+            let mut t2 = p0.clone();
+            t2 *= fl_i(prec, kf);
+            let mut p_next = t1;
+            p_next -= &t2;
+            p_next /= fl_i(prec, kf + 1);
+            p0 = p1;
+            p1 = p_next;
         }
         let nf = n as i64;
-        let mut numer = x.clone(); numer *= &p1; numer -= &p0; numer *= fl_i(prec, nf);
-        let mut denom = x.clone().square(); denom -= 1u32;
-        let mut deriv = numer; deriv /= &denom;
+        let mut numer = x.clone();
+        numer *= &p1;
+        numer -= &p0;
+        numer *= fl_i(prec, nf);
+        let mut denom = x.clone().square();
+        denom -= 1u32;
+        let mut deriv = numer;
+        deriv /= &denom;
         (p1, deriv)
     }
 
@@ -695,16 +807,33 @@ mod hp {
     #[derive(Debug, Clone)]
     pub enum CacheFileStatus {
         /// File loaded and passed all structural identity checks.
-        Ok { path: std::path::PathBuf, n: usize, prec: u32 },
+        Ok {
+            path: std::path::PathBuf,
+            n: usize,
+            prec: u32,
+        },
         /// File path was not in the expected `prec{P}_npts{N}.json[.zip]`
         /// pattern; skipped.
-        Skipped { path: std::path::PathBuf, reason: String },
+        Skipped {
+            path: std::path::PathBuf,
+            reason: String,
+        },
         /// File was in the expected pattern but failed to load (malformed
         /// JSON, malformed zip, IO error).
-        LoadFailed { path: std::path::PathBuf, n: usize, prec: u32, reason: String },
+        LoadFailed {
+            path: std::path::PathBuf,
+            n: usize,
+            prec: u32,
+            reason: String,
+        },
         /// File loaded successfully but failed at least one of the GL
         /// structural identities (Σw=2, Σx·w=0, antisymmetry).
-        StructurallyInvalid { path: std::path::PathBuf, n: usize, prec: u32, reason: String },
+        StructurallyInvalid {
+            path: std::path::PathBuf,
+            n: usize,
+            prec: u32,
+            reason: String,
+        },
     }
 
     /// Aggregate report from `verify_gl_cache_dir`.
@@ -721,25 +850,33 @@ mod hp {
     impl CacheVerifyReport {
         /// Count of files that passed all checks.
         pub fn ok_count(&self) -> usize {
-            self.statuses.iter().filter(|s| matches!(s, CacheFileStatus::Ok { .. })).count()
+            self.statuses
+                .iter()
+                .filter(|s| matches!(s, CacheFileStatus::Ok { .. }))
+                .count()
         }
         /// Count of files that failed at least one check (load or
         /// structural). Skipped files are not counted as failures.
         pub fn failure_count(&self) -> usize {
-            self.statuses.iter().filter(|s| {
-                matches!(s,
-                    CacheFileStatus::LoadFailed { .. }
-                    | CacheFileStatus::StructurallyInvalid { .. }
-                )
-            }).count()
+            self.statuses
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s,
+                        CacheFileStatus::LoadFailed { .. }
+                            | CacheFileStatus::StructurallyInvalid { .. }
+                    )
+                })
+                .count()
         }
         /// All failure entries (load + structural), for callers that
         /// want to print only the bad files.
         pub fn failures(&self) -> impl Iterator<Item = &CacheFileStatus> {
             self.statuses.iter().filter(|s| {
-                matches!(s,
+                matches!(
+                    s,
                     CacheFileStatus::LoadFailed { .. }
-                    | CacheFileStatus::StructurallyInvalid { .. }
+                        | CacheFileStatus::StructurallyInvalid { .. }
                 )
             })
         }
@@ -755,8 +892,7 @@ mod hp {
         // stem now: "prec{P}_npts{N}"
         let after_prec = stem.strip_prefix("prec")?;
         let (prec_str, n_str) = after_prec.split_once("_npts")?;
-        
-        
+
         let prec: u32 = prec_str.parse().ok()?;
         let n: usize = n_str.parse().ok()?;
         Some((n, prec))
@@ -780,9 +916,7 @@ mod hp {
     /// thousands of cache files this can take several seconds; for
     /// production use callers may want to prune the directory first
     /// to the precisions they actually plan to use.
-    pub fn verify_gl_cache_dir(
-        dir: &std::path::Path,
-    ) -> std::io::Result<CacheVerifyReport> {
+    pub fn verify_gl_cache_dir(dir: &std::path::Path) -> std::io::Result<CacheVerifyReport> {
         let mut statuses: Vec<CacheFileStatus> = Vec::new();
 
         if !dir.exists() {
@@ -796,7 +930,9 @@ mod hp {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if !path.is_file() { continue; }
+            if !path.is_file() {
+                continue;
+            }
             let name = match path.file_name().and_then(|s| s.to_str()) {
                 Some(n) => n,
                 None => continue,
@@ -830,7 +966,8 @@ mod hp {
                 None => {
                     statuses.push(CacheFileStatus::LoadFailed {
                         path: path.clone(),
-                        n, prec,
+                        n,
+                        prec,
                         reason: "parse / decompress failed".to_string(),
                     });
                     continue;
@@ -844,7 +981,10 @@ mod hp {
                 }
                 Some(reason) => {
                     statuses.push(CacheFileStatus::StructurallyInvalid {
-                        path, n, prec, reason
+                        path,
+                        n,
+                        prec,
+                        reason,
                     });
                 }
             }
@@ -859,15 +999,79 @@ mod hp {
 
 #[cfg(feature = "hp")]
 pub use hp::{
-    gauss_legendre_nodes,
-    CacheMode,
-    verify_gl_cache_dir, CacheVerifyReport, CacheFileStatus,
+    gauss_legendre_nodes, gauss_legendre_nodes_via_cache, verify_gl_cache_dir, CacheFileStatus,
+    CacheMode, CacheVerifyReport, CachedQuadratureRule, QuadratureCacheRequest,
 };
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "hp")]
+    #[test]
+    fn hp_quadrature_uses_common_cache_fabric_for_round_trip() {
+        use xc_cache::{
+            ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheQuality, CacheResolver,
+            CacheVisibility, FilesystemCacheStore, ToolkitVersion,
+        };
+        use xc_core::{CacheLookupOutcome, CacheReuseDisposition};
+
+        let root = std::env::temp_dir().join(format!(
+            "xc-numerics-quadrature-fabric-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "workstation",
+                &root,
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let request = || QuadratureCacheRequest {
+            resolver: Some(&resolver),
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["workstation".to_owned()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy:
+                xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let first = gauss_legendre_nodes_via_cache(4, 128, request()).unwrap();
+        let second = gauss_legendre_nodes_via_cache(4, 128, request()).unwrap();
+        assert_eq!(first.cache_access.lookup_outcome, CacheLookupOutcome::Miss);
+        assert_eq!(second.cache_access.lookup_outcome, CacheLookupOutcome::Hit);
+        assert_eq!(
+            second.cache_access.reuse_disposition,
+            CacheReuseDisposition::Reused
+        );
+        assert_eq!(first.nodes, second.nodes);
+        assert_eq!(first.weights, second.weights);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quadrature_reuse_plan_is_machine_readable() {
+        let plan = quadrature_artifact_reuse_plan();
+        plan.validate().unwrap();
+        assert!(plan
+            .artifacts
+            .iter()
+            .any(|node| node.kind == "rule_nodes_weights"));
+    }
 
     /// GL-64 should integrate x² on [0, 1] exactly (polynomial degree < 2*64).
     #[test]
@@ -875,7 +1079,13 @@ mod tests {
         let result = gauss_legendre_64pt_f64(|x| x * x, 0.0, 1.0);
         let expected = 1.0 / 3.0;
         let rel_err = (result - expected).abs() / expected;
-        assert!(rel_err < 1e-14, "GL-64 x² integral: got {}, expected {}, rel err {:.2e}", result, expected, rel_err);
+        assert!(
+            rel_err < 1e-14,
+            "GL-64 x² integral: got {}, expected {}, rel err {:.2e}",
+            result,
+            expected,
+            rel_err
+        );
     }
 
     /// GL-64 should integrate sin(x) on [0, π] to high accuracy.
@@ -884,7 +1094,13 @@ mod tests {
         let result = gauss_legendre_64pt_f64(|x| x.sin(), 0.0, std::f64::consts::PI);
         let expected = 2.0;
         let rel_err = (result - expected).abs() / expected;
-        assert!(rel_err < 1e-13, "GL-64 sin integral: got {}, expected {}, rel err {:.2e}", result, expected, rel_err);
+        assert!(
+            rel_err < 1e-13,
+            "GL-64 sin integral: got {}, expected {}, rel err {:.2e}",
+            result,
+            expected,
+            rel_err
+        );
     }
 
     /// GL-64 should integrate exp(-x²) on [-5, 5] ≈ √π.
@@ -893,7 +1109,13 @@ mod tests {
         let result = gauss_legendre_64pt_f64(|x| (-x * x).exp(), -5.0, 5.0);
         let expected = std::f64::consts::PI.sqrt();
         let rel_err = (result - expected).abs() / expected;
-        assert!(rel_err < 1e-10, "GL-64 Gaussian integral: got {}, expected {}, rel err {:.2e}", result, expected, rel_err);
+        assert!(
+            rel_err < 1e-10,
+            "GL-64 Gaussian integral: got {}, expected {}, rel err {:.2e}",
+            result,
+            expected,
+            rel_err
+        );
     }
 
     /// `gauss_legendre_npt_f64` at N=8 should integrate any polynomial
@@ -906,9 +1128,13 @@ mod tests {
         let abs_err = (result - expected).abs();
         // GL with N nodes is exact (modulo f64 rounding) for polynomials
         // of degree ≤ 2N-1.
-        assert!(abs_err < 1e-14,
+        assert!(
+            abs_err < 1e-14,
             "GL-8 ∫x¹⁵ on [0,1]: got {}, expected {}, abs err {:.2e}",
-            result, expected, abs_err);
+            result,
+            expected,
+            abs_err
+        );
     }
 
     /// `gauss_legendre_npt_f64` at N=4 should integrate ∫₀¹ x⁷ = 1/8
@@ -918,9 +1144,13 @@ mod tests {
         let result = gauss_legendre_npt_f64(|x| x.powi(7), 0.0, 1.0, 4);
         let expected = 1.0 / 8.0;
         let abs_err = (result - expected).abs();
-        assert!(abs_err < 1e-14,
+        assert!(
+            abs_err < 1e-14,
             "GL-4 ∫x⁷ on [0,1]: got {}, expected {}, abs err {:.2e}",
-            result, expected, abs_err);
+            result,
+            expected,
+            abs_err
+        );
     }
 
     /// `gauss_legendre_npt_f64` should fail to integrate degree 2N exactly:
@@ -935,9 +1165,11 @@ mod tests {
         let abs_err = (result - expected).abs();
         // Error at N=4 for degree 2N=8 is O(10⁻⁵) for x⁸ on [0,1].
         // We just check it's larger than the polynomial-exact case (~1e-14).
-        assert!(abs_err > 1e-7,
+        assert!(
+            abs_err > 1e-7,
             "GL-4 ∫x⁸ should have appreciable error (degree exceeds 2N-1); got {:.2e}",
-            abs_err);
+            abs_err
+        );
     }
 }
 
@@ -982,10 +1214,15 @@ mod hp_cache_tests {
             // restored the original cwd). Without this recovery, one
             // test panic cascades into all subsequent tests panicking
             // on "cwd lock poisoned" instead of running.
-            let lock = CWD_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let lock = CWD_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let original = std::env::current_dir().expect("no cwd");
             std::env::set_current_dir(temp).expect("set_current_dir to temp");
-            CwdGuard { original, _lock: lock }
+            CwdGuard {
+                original,
+                _lock: lock,
+            }
         }
     }
     impl Drop for CwdGuard {
@@ -1010,8 +1247,14 @@ mod hp_cache_tests {
             .unwrap_or(0);
         let pid = std::process::id();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..").join("..").join("target").join("test-tmp")
-            .join(format!("xc_numerics_gl_cache_test_{}_{}_{}", tag, pid, nanos));
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("test-tmp")
+            .join(format!(
+                "xc_numerics_gl_cache_test_{}_{}_{}",
+                tag, pid, nanos
+            ));
         std::fs::create_dir_all(&dir).expect("create test tmp dir");
         dir
     }
@@ -1101,21 +1344,27 @@ mod hp_cache_tests {
         // (nodes[i] + nodes[n-1-i]) of two strings parsed independently
         // at HP gives exactly 0 (since one parsed value is the negation
         // of the other, character-for-character).
-        let nodes: Vec<String> = (0..n).map(|i| {
-            if 2 * i + 1 < n {
-                // Lower half.
-                let v = epsilon + 0.1 * (i as f64);
-                format!("-{:.20e}", v)
-            } else if 2 * i + 1 == n {
-                // Center (only for odd n).
-                "0".to_string()
-            } else {
-                // Upper half: mirror of lower half.
-                let j = n - 1 - i;
-                let v = epsilon + 0.1 * (j as f64);
-                format!("{:.20e}", v)
-            }
-        }).collect();
+        let nodes: Vec<String> = (0..n)
+            .map(|i| {
+                match (2 * i + 1).cmp(&n) {
+                    std::cmp::Ordering::Less => {
+                        // Lower half.
+                        let v = epsilon + 0.1 * (i as f64);
+                        format!("-{:.20e}", v)
+                    }
+                    std::cmp::Ordering::Equal => {
+                        // Center (only for odd n).
+                        "0".to_string()
+                    }
+                    std::cmp::Ordering::Greater => {
+                        // Upper half: mirror of lower half.
+                        let j = n - 1 - i;
+                        let v = epsilon + 0.1 * (j as f64);
+                        format!("{:.20e}", v)
+                    }
+                }
+            })
+            .collect();
 
         // Weights are already exact decimal strings.
         let weights: Vec<String> = weights_exact.iter().map(|s| s.to_string()).collect();
@@ -1135,7 +1384,8 @@ mod hp_cache_tests {
             "precision_bits": prec,
             "nodes": zeros.clone(),
             "weights": zeros,
-        }).to_string()
+        })
+        .to_string()
     }
 
     /// Round-trip helper: compute or load nodes/weights, then verify
@@ -1196,11 +1446,15 @@ mod hp_cache_tests {
         let mut smallest_abs = f64::INFINITY;
         for x in &nodes {
             let a = x.clone().abs().to_f64();
-            if a < smallest_abs { smallest_abs = a; }
+            if a < smallest_abs {
+                smallest_abs = a;
+            }
         }
-        assert!(smallest_abs > 0.3,
+        assert!(
+            smallest_abs > 0.3,
             "expected smallest |node| ~0.5 from .zip fixture (zip-only contract), got {}",
-            smallest_abs);
+            smallest_abs
+        );
     }
 
     /// Zip fallback test: when only `.json.zip` exists, the toolkit
@@ -1231,15 +1485,20 @@ mod hp_cache_tests {
         zip_writer.finish().unwrap();
 
         let json_path = cache_dir.join(format!("prec{}_npts{}.json", prec, n));
-        assert!(!json_path.exists(), "uncompressed .json should not exist before read");
+        assert!(
+            !json_path.exists(),
+            "uncompressed .json should not exist before read"
+        );
 
         let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
         // Zip-only contract: reading from the .json.zip must NOT write a
         // decompressed .json — the zip is read in-memory each time.
-        assert!(!json_path.exists(),
-            "zip-only: no decompressed .json should be written after read");
+        assert!(
+            !json_path.exists(),
+            "zip-only: no decompressed .json should be written after read"
+        );
     }
 
     /// Compute-and-cache test: when neither `.json` nor `.json.zip`
@@ -1255,21 +1514,35 @@ mod hp_cache_tests {
         // Note: we deliberately do NOT create data/gl_cache/ ahead of
         // time — the toolkit must create the directory on demand.
 
-        let json_path = temp.join("data").join("gl_cache")
+        let json_path = temp
+            .join("data")
+            .join("gl_cache")
             .join(format!("prec{}_npts{}.json", prec, n));
-        let zip_path = temp.join("data").join("gl_cache")
+        let zip_path = temp
+            .join("data")
+            .join("gl_cache")
             .join(format!("prec{}_npts{}.json.zip", prec, n));
-        assert!(!json_path.exists(), "cache file should not exist before compute");
-        assert!(!zip_path.exists(), "cache zip should not exist before compute");
+        assert!(
+            !json_path.exists(),
+            "cache file should not exist before compute"
+        );
+        assert!(
+            !zip_path.exists(),
+            "cache zip should not exist before compute"
+        );
 
         let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
         // Zip-only: fresh compute writes the .json.zip, never the .json.
-        assert!(zip_path.exists(),
-            "fresh compute should write the .json.zip to <cwd>/data/gl_cache/...");
-        assert!(!json_path.exists(),
-            "zip-only: fresh compute must not write an uncompressed .json");
+        assert!(
+            zip_path.exists(),
+            "fresh compute should write the .json.zip to <cwd>/data/gl_cache/..."
+        );
+        assert!(
+            !json_path.exists(),
+            "zip-only: fresh compute must not write an uncompressed .json"
+        );
 
         // Sanity: cached value should round-trip. Re-reading should
         // not recompute (fast path), and we should get back the same
@@ -1296,9 +1569,13 @@ mod hp_cache_tests {
 
         let n = 8;
         let prec: u32 = 128;
-        let json_path = temp.join("data").join("gl_cache")
+        let json_path = temp
+            .join("data")
+            .join("gl_cache")
             .join(format!("prec{}_npts{}.json", prec, n));
-        let zip_path = temp.join("data").join("gl_cache")
+        let zip_path = temp
+            .join("data")
+            .join("gl_cache")
             .join(format!("prec{}_npts{}.json.zip", prec, n));
 
         let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::Off);
@@ -1335,10 +1612,10 @@ mod hp_cache_tests {
             let payload = serde_json::json!([ns, ws]).to_string();
             let f = std::fs::File::create(&zip_path).unwrap();
             let mut zw = zip::ZipWriter::new(f);
-            let opts: zip::write::SimpleFileOptions =
-                zip::write::SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Deflated);
-            zw.start_file(format!("prec{}_npts{}.json", prec, n), opts).unwrap();
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zw.start_file(format!("prec{}_npts{}.json", prec, n), opts)
+                .unwrap();
             zw.write_all(payload.as_bytes()).unwrap();
             zw.finish().unwrap();
         }
@@ -1352,23 +1629,28 @@ mod hp_cache_tests {
 
         // The smallest |node| of a real GL-4 table is ~0.339, NOT the
         // planted 0.01 — proving the zip was not consulted.
-        let smallest = nodes.iter()
+        let smallest = nodes
+            .iter()
             .map(|x| x.clone().abs())
             .min_by(|a, b| a.partial_cmp(b).unwrap())
             .unwrap();
         let bogus = Float::with_val(prec, Float::parse("0.02").unwrap());
-        assert!(smallest > bogus,
+        assert!(
+            smallest > bogus,
             "JsonOnly must not have used the planted zip (smallest |node| = {})",
-            smallest);
+            smallest
+        );
 
         // Zip-only contract: JsonOnly is now a read/write no-op. It must
         // not consult the zip and must not write any .json.
-        assert!(!json_path.exists(),
-            "zip-only: JsonOnly must not write a decompressed .json");
+        assert!(
+            !json_path.exists(),
+            "zip-only: JsonOnly must not write a decompressed .json"
+        );
     }
 
     /// A GL cache file whose `toolkit_version` is older than the current
-    /// `CACHE_MIN_TOOLKIT_VERSION` must be rejected (returns `None` from
+    /// the quadrature family producer floor must be rejected (returns `None` from
     /// the parser so the caller falls through to recompute). This
     /// simulates loading a stale file written by an older toolkit build
     /// whose output is no longer trusted.
@@ -1385,94 +1667,13 @@ mod hp_cache_tests {
             "precision_bits": prec,
             "nodes": ns,
             "weights": ws,
-        }).to_string();
-        // parse_gl_json must return None because 0.0.1 < CACHE_MIN_TOOLKIT_VERSION.
+        })
+        .to_string();
+        // parse_gl_json must return None because 0.0.1 is below the family floor.
         assert!(
             hp::parse_gl_json_for_test(&payload, n, prec).is_none(),
             "parser should reject a stale cache file with toolkit_version=0.0.1"
         );
-    }
-
-    /// The remote URL is deterministically derived from `(n, prec)` using
-    /// the precision-first, npts-thousand-bucketed layout of the public
-    /// xcelerator-gl-cache repo.
-    #[test]
-    fn remote_url_uses_bucketed_layout() {
-        // npts 4000 → bucket 4000-4999.
-        assert_eq!(
-            hp::remote_zip_url_for_test(4000, 3338),
-            vec!["https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main/gl_cache/prec3338/npts4000-4999/prec3338_npts4000.json.zip"]
-        );
-        // npts 600 → bucket 0-999.
-        assert_eq!(
-            hp::remote_zip_url_for_test(600, 681),
-            vec!["https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main/gl_cache/prec681/npts0-999/prec681_npts600.json.zip"]
-        );
-        // npts 6169 → bucket 6000-6999.
-        assert_eq!(
-            hp::remote_zip_url_for_test(6169, 3338),
-            vec!["https://raw.githubusercontent.com/TeamXcelerator/xcelerator-gl-cache/main/gl_cache/prec3338/npts6000-6999/prec3338_npts6169.json.zip"]
-        );
-    }
-
-    /// Live end-to-end remote-fetch test against the PUBLIC
-    /// `xcelerator-gl-cache` repo. `#[ignore]`d so it never runs in the
-    /// default suite (it requires network + `curl` + the public repo to
-    /// be reachable and to contain the fixture). Run explicitly with:
-    ///
-    /// ```text
-    /// cargo test -p xc-numerics --features hp -- --ignored remote_fetch_live
-    /// ```
-    ///
-    /// Uses (n=600, prec=681), which is a known fixture in the repo
-    /// (a standard HP-1000 fixture). In a fresh temp cwd with NO local cache,
-    /// `DynamicFetch` must miss tiers 1 and 2, hit the remote tier,
-    /// download the `.json.zip`, decompress + validate it, write both
-    /// the local `.json.zip` and the decompressed `.json`, and return
-    /// structurally-valid nodes/weights.
-    #[test]
-    #[ignore = "live network: hits the public xcelerator-gl-cache repo; run with --ignored"]
-    fn remote_fetch_live_downloads_and_validates() {
-        let temp = fresh_temp_dir("remote_fetch_live");
-        let _guard = CwdGuard::enter(&temp);
-
-        let n = 600;
-        let prec: u32 = 681;
-        let cache_dir = temp.join("data").join("gl_cache");
-        let json_path = cache_dir.join(format!("prec{}_npts{}.json", prec, n));
-        let zip_path = cache_dir.join(format!("prec{}_npts{}.json.zip", prec, n));
-
-        // Precondition: nothing local. (fresh_temp_dir guarantees this,
-        // but assert to make the test's premise explicit.)
-        assert!(!json_path.exists(), "no local .json should exist before fetch");
-        assert!(!zip_path.exists(), "no local .json.zip should exist before fetch");
-
-        // DynamicFetch: should fall through to the remote tier and pull
-        // the fixture from the public repo.
-        let (nodes, weights) =
-            hp::gauss_legendre_nodes(n, prec, hp::CacheMode::DynamicFetch);
-
-        // Returned values must be structurally valid GL-600 @ HP-681.
-        assert_well_formed(n, prec, &nodes, &weights);
-
-        // The remote tier must have landed the .json.zip locally. Zip-only
-        // contract: no decompressed .json is written.
-        assert!(zip_path.exists(),
-            "remote fetch should have written the .json.zip to the local cache");
-        assert!(!json_path.exists(),
-            "zip-only: local-zip load must not write a decompressed .json");
-
-        // A second call must now hit the local .json.zip (tier 1) and
-        // return bit-identical values.
-        let (nodes2, weights2) =
-            hp::gauss_legendre_nodes(n, prec, hp::CacheMode::DynamicFetch);
-        assert_eq!(nodes.len(), nodes2.len());
-        for (a, b) in nodes.iter().zip(nodes2.iter()) {
-            assert_eq!(a.to_string(), b.to_string(), "node round-trip after fetch");
-        }
-        for (a, b) in weights.iter().zip(weights2.iter()) {
-            assert_eq!(a.to_string(), b.to_string(), "weight round-trip after fetch");
-        }
     }
 
     /// Zip-only contract: fresh compute writes ONLY the `.json.zip`
@@ -1485,23 +1686,34 @@ mod hp_cache_tests {
         let n = 8;
         let prec: u32 = 128;
 
-        let json_path = temp.join("data").join("gl_cache")
+        let json_path = temp
+            .join("data")
+            .join("gl_cache")
             .join(format!("prec{}_npts{}.json", prec, n));
-        let zip_path = temp.join("data").join("gl_cache")
+        let zip_path = temp
+            .join("data")
+            .join("gl_cache")
             .join(format!("prec{}_npts{}.json.zip", prec, n));
         assert!(!json_path.exists(), ".json should not exist before compute");
-        assert!(!zip_path.exists(), ".json.zip should not exist before compute");
+        assert!(
+            !zip_path.exists(),
+            ".json.zip should not exist before compute"
+        );
 
         // Trigger fresh compute.
         let (nodes, weights) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         assert_well_formed(n, prec, &nodes, &weights);
 
         // Only the .zip must exist after compute.
-        assert!(zip_path.exists(),
+        assert!(
+            zip_path.exists(),
             "fresh compute should write {} (the zip-only cache)",
-            zip_path.display());
-        assert!(!json_path.exists(),
-            "zip-only: fresh compute must not write an uncompressed .json");
+            zip_path.display()
+        );
+        assert!(
+            !json_path.exists(),
+            "zip-only: fresh compute must not write an uncompressed .json"
+        );
 
         // Round-trip: a second read goes through the zip again (no .json
         // exists) and must yield bit-identical nodes/weights.
@@ -1548,9 +1760,12 @@ mod hp_cache_tests {
         let abs_err = diff.abs();
         // GL-16 nails any polynomial of degree ≤ 31 to working precision.
         let tol = Float::with_val(prec, rug::Float::parse("1e-30").unwrap());
-        assert!(abs_err.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false),
+        assert!(
+            abs_err.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false),
             "GL-{} integral of x² should match 2/3 to working precision; abs err = {}",
-            n, abs_err);
+            n,
+            abs_err
+        );
     }
 
     /// HP GL nodes/weights satisfy classical structural identities:
@@ -1578,26 +1793,40 @@ mod hp_cache_tests {
             let mut sum = nodes[i].clone();
             sum += &nodes[n - 1 - i];
             let abs_sum = sum.abs();
-            assert!(abs_sum.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false),
+            assert!(
+                abs_sum.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false),
                 "node symmetry: nodes[{}] + nodes[{}] should be 0; got {}",
-                i, n - 1 - i, abs_sum);
+                i,
+                n - 1 - i,
+                abs_sum
+            );
             // Weights mirror too.
             let mut wdiff = weights[i].clone();
             wdiff -= &weights[n - 1 - i];
             let abs_wdiff = wdiff.abs();
-            assert!(abs_wdiff.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false),
+            assert!(
+                abs_wdiff.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false),
                 "weight symmetry: weights[{}] - weights[{}] should be 0; got {}",
-                i, n - 1 - i, abs_wdiff);
+                i,
+                n - 1 - i,
+                abs_wdiff
+            );
         }
 
         // 2. Sum of weights = 2.
         let mut wsum = Float::with_val(prec, 0);
-        for w in &weights { wsum += w; }
+        for w in &weights {
+            wsum += w;
+        }
         let mut wdiff = wsum.clone();
         wdiff -= 2u32;
         let abs_wdiff = wdiff.abs();
-        assert!(abs_wdiff.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false),
-            "Σ weights should be 2; got {} (diff {})", wsum, abs_wdiff);
+        assert!(
+            abs_wdiff.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false),
+            "Σ weights should be 2; got {} (diff {})",
+            wsum,
+            abs_wdiff
+        );
 
         // 3. First moment: Σ x_i · w_i = 0.
         let mut moment = Float::with_val(prec, 0);
@@ -1607,8 +1836,11 @@ mod hp_cache_tests {
             moment += &t;
         }
         let abs_moment = moment.abs();
-        assert!(abs_moment.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false),
-            "Σ x_i w_i should be 0; got {}", abs_moment);
+        assert!(
+            abs_moment.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false),
+            "Σ x_i w_i should be 0; got {}",
+            abs_moment
+        );
     }
 
     /// A structurally-invalid `.json.zip` (shape OK, but values violate
@@ -1637,7 +1869,8 @@ mod hp_cache_tests {
             let mut zw = zip::ZipWriter::new(f);
             let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
-            zw.start_file(format!("prec{}_npts{}.json", prec, n), opts).unwrap();
+            zw.start_file(format!("prec{}_npts{}.json", prec, n), opts)
+                .unwrap();
             zw.write_all(bad_payload.as_bytes()).unwrap();
             zw.finish().unwrap();
         }
@@ -1651,27 +1884,40 @@ mod hp_cache_tests {
         // Sanity: real GL nodes are antisymmetric on [-1, 1] and
         // weights sum to 2. The bad payload had neither property.
         let mut wsum = Float::with_val(prec, 0);
-        for w in &weights { wsum += w; }
-        let mut wdiff = wsum.clone(); wdiff -= 2u32;
+        for w in &weights {
+            wsum += w;
+        }
+        let mut wdiff = wsum.clone();
+        wdiff -= 2u32;
         let abs_wdiff = wdiff.abs();
         let tol = Float::with_val(prec, rug::Float::parse("1e-30").unwrap());
-        assert!(abs_wdiff.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false),
-            "fresh compute should produce Σw=2; got Σw={}", wsum);
+        assert!(
+            abs_wdiff.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false),
+            "fresh compute should produce Σw=2; got Σw={}",
+            wsum
+        );
 
         // After fresh compute, save_gl_cache overwrites the bad .json.zip
         // with valid GL data (cleanup-then-write). Reading the zip now
         // must give real GL data that passes structural checks.
-        assert!(zip_path.exists(), "the .json.zip should still exist after recompute");
+        assert!(
+            zip_path.exists(),
+            "the .json.zip should still exist after recompute"
+        );
         let (nodes2, _w2) = hp::gauss_legendre_nodes(n, prec, hp::CacheMode::JsonZip);
         let mut antisym_ok = true;
         for (a, b) in nodes2.iter().zip(nodes2.iter().rev()) {
-            let mut s = a.clone(); s += b;
+            let mut s = a.clone();
+            s += b;
             if s.clone().abs() > Float::with_val(prec, rug::Float::parse("1e-30").unwrap()) {
-                antisym_ok = false; break;
+                antisym_ok = false;
+                break;
             }
         }
-        assert!(antisym_ok,
-            "after recompute the cached zip should hold valid antisymmetric GL nodes");
+        assert!(
+            antisym_ok,
+            "after recompute the cached zip should hold valid antisymmetric GL nodes"
+        );
     }
 
     /// A truncated/corrupt `.json.zip` must be detected and skipped
@@ -1696,8 +1942,10 @@ mod hp_cache_tests {
         assert_well_formed(n, prec, &nodes, &weights);
 
         // The corrupt file is preserved on disk.
-        assert!(zip_path.exists(),
-            "corrupt zip should be preserved on disk for the user to inspect");
+        assert!(
+            zip_path.exists(),
+            "corrupt zip should be preserved on disk for the user to inspect"
+        );
     }
 
     /// `verify_gl_cache_dir` reports OK for valid cache files and
@@ -1725,7 +1973,8 @@ mod hp_cache_tests {
             "precision_bits": 64_u32,
             "nodes": ns,
             "weights": ws,
-        }).to_string();
+        })
+        .to_string();
         let valid_path = cache_dir.join("prec64_npts4.json");
         std::fs::write(&valid_path, valid_json).unwrap();
 
@@ -1740,7 +1989,8 @@ mod hp_cache_tests {
             "precision_bits": 64_u32,
             "nodes": bad_ns,
             "weights": bad_ws,
-        }).to_string();
+        })
+        .to_string();
         let bad_path = cache_dir.join("prec64_npts5.json");
         std::fs::write(&bad_path, bad_json).unwrap();
 
@@ -1755,8 +2005,12 @@ mod hp_cache_tests {
         let report = hp::verify_gl_cache_dir(&cache_dir).unwrap();
         assert_eq!(report.directory, cache_dir);
         // 4 entries; one OK, one StructurallyInvalid, one Skipped, one LoadFailed.
-        assert_eq!(report.statuses.len(), 4,
-            "expected 4 statuses (one per file); got {}", report.statuses.len());
+        assert_eq!(
+            report.statuses.len(),
+            4,
+            "expected 4 statuses (one per file); got {}",
+            report.statuses.len()
+        );
 
         let mut saw_ok = false;
         let mut saw_invalid = false;
@@ -1794,8 +2048,11 @@ mod hp_cache_tests {
         assert!(saw_loadfail, "missing LoadFailed status");
 
         assert_eq!(report.ok_count(), 1);
-        assert_eq!(report.failure_count(), 2,
-            "LoadFailed + StructurallyInvalid both count as failures; expected 2");
+        assert_eq!(
+            report.failure_count(),
+            2,
+            "LoadFailed + StructurallyInvalid both count as failures; expected 2"
+        );
 
         // Files preserved (verify_gl_cache_dir is read-only).
         assert!(valid_path.exists());

@@ -1,0 +1,22 @@
+[package]
+name = "xc-root"
+description = "Reusable root discovery, refinement, and verification contracts for real and meromorphic functions."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license-file.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+hp = ["dep:rayon", "dep:rug", "xc-numerics/hp"]
+
+[dependencies]
+rug = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
+serde = { workspace = true }
+xc-core = { workspace = true }
+xc-certify = { workspace = true }
+xc-numerics = { workspace = true }

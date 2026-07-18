@@ -1,28 +1,55 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/xc-core",
+    "crates/xc-operator",
+    "crates/xc-solver",
+    "crates/xc-root",
+    "crates/xc-cache",
+    "crates/xc-certify",
+    "crates/xc-variational",
     "crates/xc-numerics",
     "crates/xc-zeta",
     "crates/xc-spectral",
+    "crates/xc-cli",
 ]
+exclude = ["tests/external-consumer"]
 
 [workspace.package]
-version = "0.12.1"
+version = "0.13.0"
 edition = "2021"
 authors = ["Ronnie Andrews, Jr. <5178942+TeamXceleratorDev@users.noreply.github.com>"]
-license-file = "../../LICENSE"
+license-file = "LICENSE"
 publish = false
 repository = "https://github.com/TeamXcelerator/xcelerator-toolkit"
+rust-version = "1.85"
 
 [workspace.dependencies]
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
+sha2 = "0.10"
 nalgebra = "0.33"
 rayon = "1.10"
-rug = { version = "1.30", default-features = false, features = ["float", "integer"] }
-zip = { version = "2.2", default-features = false, features = ["deflate"] }
+rug = { version = "1.30", default-features = false, features = ["std", "float", "integer", "rational"] }
+zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
+xc-core = { version = "0.13.0", path = "crates/xc-core" }
+xc-numerics = { version = "0.13.0", path = "crates/xc-numerics" }
+xc-operator = { version = "0.13.0", path = "crates/xc-operator" }
+xc-solver = { version = "0.13.0", path = "crates/xc-solver" }
+xc-root = { version = "0.13.0", path = "crates/xc-root" }
+xc-cache = { version = "0.13.0", path = "crates/xc-cache" }
+xc-certify = { version = "0.13.0", path = "crates/xc-certify" }
+xc-variational = { version = "0.13.0", path = "crates/xc-variational" }
+xc-zeta = { version = "0.13.0", path = "crates/xc-zeta" }
+xc-spectral = { version = "0.13.0", path = "crates/xc-spectral" }
 
 [profile.release]
 opt-level = 3
 lto = "thin"
+codegen-units = 1
+
+[profile.research]
+inherits = "release"
+debug = 1
+overflow-checks = true

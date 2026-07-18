@@ -1,0 +1,18 @@
+[package]
+name = "xcelerator-external-consumer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = []
+hp = ["dep:rug", "dep:xc-numerics", "xc-certify/hp"]
+
+[dependencies]
+xc-cache = { path = "../../crates/xc-cache" }
+xc-certify = { path = "../../crates/xc-certify" }
+xc-core = { path = "../../crates/xc-core" }
+xc-operator = { path = "../../crates/xc-operator" }
+xc-solver = { path = "../../crates/xc-solver" }
+rug = { version = "1.30", default-features = false, features = ["std", "integer", "rational"], optional = true }
+xc-numerics = { path = "../../crates/xc-numerics", optional = true, features = ["hp"] }

@@ -165,11 +165,13 @@ impl LFunctionSpec {
 
     /// Compute χ(p^j) = χ(p)^j as an exact integer in `{-1, 0, +1}`.
     #[inline]
+    // Keep remainder arithmetic for the Rust 1.85 MSRV.
+    #[allow(unknown_lints, clippy::manual_is_multiple_of)]
     pub fn chi_at_prime_power(&self, p: u64, j: u32) -> i8 {
         let chi_p = self.chi_at(p);
         if chi_p == 0 {
             0
-        } else if j.is_multiple_of(2) {
+        } else if j % 2 == 0 {
             // χ(p) ∈ {-1, +1} squared is +1.
             1
         } else {
@@ -276,7 +278,8 @@ mod tests {
         // χ(2) = -1 ⇒ χ(2)=-1, χ(4)=1, χ(8)=-1
         // χ(3) = 0 ⇒ χ(3)=0, χ(9)=0
         // χ(5) = -1, χ(7) = 1, χ(11) = -1, χ(13) = 1
-        let mut seen: Vec<(u64, f64)> = pp.iter()
+        let mut seen: Vec<(u64, f64)> = pp
+            .iter()
             .map(|&(k, p, j)| (k, c.chi_at_prime_power_f64(p, j)))
             .collect();
         seen.sort_by_key(|&(k, _)| k);

@@ -27,24 +27,36 @@
 //! The HP tier is gated behind the `hp` feature.
 
 pub mod ccm;
-pub mod prolate;
-pub mod mellin;
-pub mod yakaboylu;
 pub mod lfunction;
+pub mod mellin;
+pub mod prolate;
 #[cfg(feature = "hp")]
 pub mod screw;
+pub mod yakaboylu;
 
-/// Debug logging macro — only prints when `XCELERATOR_DEBUG=1` is set.
+/// Debug logging macro controlled by [`set_hp_debug_logging`].
 ///
 /// Use this instead of bare `eprintln!` for diagnostic/progress messages.
-/// In production runs (no env var), the check is a single
-/// `std::env::var` call that short-circuits and costs essentially nothing.
+/// Disabled by default; the atomic check is inexpensive and does not alter
+/// numerical decisions.
 ///
 /// Usage: `hp_debug!("message {}", value);`
+static HP_DEBUG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Explicitly enables or disables diagnostic HP progress logging.
+pub fn set_hp_debug_logging(enabled: bool) {
+    HP_DEBUG_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[doc(hidden)]
+pub fn hp_debug_enabled() -> bool {
+    HP_DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[macro_export]
 macro_rules! hp_debug {
     ($($arg:tt)*) => {
-        if std::env::var("XCELERATOR_DEBUG").as_deref() == Ok("1") {
+        if $crate::hp_debug_enabled() {
             eprintln!($($arg)*);
         }
     };
@@ -76,7 +88,10 @@ pub(crate) static TEST_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(all(test, feature = "hp"))]
 pub(crate) fn test_tmp_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..").join("..").join("target").join("test-tmp")
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("test-tmp")
 }
 
 /// Make a fresh, unique throwaway directory under [`test_tmp_root`].
@@ -88,7 +103,8 @@ pub(crate) fn test_tmp_root() -> std::path::PathBuf {
 pub(crate) fn fresh_test_dir(tag: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos()).unwrap_or(0);
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let dir = test_tmp_root().join(format!("{}_{}_{}", tag, std::process::id(), nanos));
     std::fs::create_dir_all(&dir).expect("create test tmp dir");
     dir

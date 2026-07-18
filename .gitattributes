@@ -12,3 +12,9 @@ data/*.json -text
 *.toml text
 *.md text
 *.lock text
+
+# Repository administration tooling and manifests.
+scripts/*.py text eol=lf
+scripts/tests/*.py text eol=lf
+config/*.json text eol=lf
+config/*.txt text eol=lf

@@ -16,8 +16,8 @@
 
 #![cfg(feature = "hp")]
 
-use serde_json::Value;
 use rug::Float;
+use serde_json::Value;
 
 use xc_numerics::eigen::dense_symmetric_eigenvalues_hp;
 use xc_numerics::fmt::{display_hp, matching_digits};
@@ -25,7 +25,7 @@ use xc_numerics::fmt::{display_hp, matching_digits};
 /// Working precision for our HP solver. PARI generates at 2000 digits;
 /// we run at 1000 and require ≥500 matching digits — more than enough
 /// margin to expose any bugs.
-const TEST_PRECISION_BITS: u32 = 3338;  // ≈ 1000 decimal digits
+const TEST_PRECISION_BITS: u32 = 3338; // ≈ 1000 decimal digits
 const MIN_MATCHING_DIGITS: f64 = 500.0;
 
 fn fixture_path() -> std::path::PathBuf {
@@ -71,22 +71,37 @@ fn pari_cross_check_all_cases() {
     for case in cases {
         let name = case["name"].as_str().expect("case name");
         let n = case["n"].as_u64().expect("case n") as usize;
-        let mat_strs: Vec<&str> = case["matrix"].as_array().expect("matrix")
+        let mat_strs: Vec<&str> = case["matrix"]
+            .as_array()
+            .expect("matrix")
             .iter()
             .map(|v| v.as_str().expect("matrix entry"))
             .collect();
-        let eval_strs: Vec<&str> = case["eigenvalues_ascending"].as_array().expect("eigenvalues")
+        let eval_strs: Vec<&str> = case["eigenvalues_ascending"]
+            .as_array()
+            .expect("eigenvalues")
             .iter()
             .map(|v| v.as_str().expect("eigenvalue"))
             .collect();
 
-        assert_eq!(mat_strs.len(), n * n, "case {} matrix length mismatch", name);
-        assert_eq!(eval_strs.len(), n, "case {} eigenvalue count mismatch", name);
+        assert_eq!(
+            mat_strs.len(),
+            n * n,
+            "case {} matrix length mismatch",
+            name
+        );
+        assert_eq!(
+            eval_strs.len(),
+            n,
+            "case {} eigenvalue count mismatch",
+            name
+        );
 
         // Parse matrix into HP at our test precision.
         // PARI's printf %Pe inserts whitespace before the exponent (e.g.
         // "2.0...0 e0"); strip whitespace before parsing so rug accepts it.
-        let matrix: Vec<Float> = mat_strs.iter()
+        let matrix: Vec<Float> = mat_strs
+            .iter()
             .map(|s| {
                 let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
                 Float::with_val(prec, Float::parse(&cleaned).expect("parse matrix entry"))
@@ -94,7 +109,8 @@ fn pari_cross_check_all_cases() {
             .collect();
 
         // Reference eigenvalues at our test precision.
-        let reference: Vec<Float> = eval_strs.iter()
+        let reference: Vec<Float> = eval_strs
+            .iter()
             .map(|s| {
                 let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
                 Float::with_val(prec, Float::parse(&cleaned).expect("parse eigenvalue"))
@@ -104,9 +120,14 @@ fn pari_cross_check_all_cases() {
         // Run our solver.
         let computed = dense_symmetric_eigenvalues_hp(&matrix, n, prec)
             .unwrap_or_else(|e| panic!("case {}: solver failed: {}", name, e));
-        assert_eq!(computed.len(), n,
+        assert_eq!(
+            computed.len(),
+            n,
             "case {}: solver returned {} eigenvalues, expected {}",
-            name, computed.len(), n);
+            name,
+            computed.len(),
+            n
+        );
 
         // Verify each computed eigenvalue matches the reference to
         // ≥MIN_MATCHING_DIGITS decimal digits.
@@ -116,7 +137,8 @@ fn pari_cross_check_all_cases() {
                 panic!(
                     "case '{}' eigenvalue {} matches PARI reference to only {} digits \
                      (need ≥{}). computed={}, reference={}",
-                    name, k,
+                    name,
+                    k,
                     display_hp(&m, 4),
                     MIN_MATCHING_DIGITS,
                     display_hp(c, 8),
@@ -126,11 +148,15 @@ fn pari_cross_check_all_cases() {
             total_eigenvalues_checked += 1;
         }
 
-        eprintln!("[eigen_reference] case '{}' (n={}): all {} eigenvalues match PARI to ≥{} digits",
-            name, n, n, MIN_MATCHING_DIGITS as u32);
+        eprintln!(
+            "[eigen_reference] case '{}' (n={}): all {} eigenvalues match PARI to ≥{} digits",
+            name, n, n, MIN_MATCHING_DIGITS as u32
+        );
         total_cases += 1;
     }
 
-    eprintln!("[eigen_reference] verified {} cases, {} total eigenvalues",
-        total_cases, total_eigenvalues_checked);
+    eprintln!(
+        "[eigen_reference] verified {} cases, {} total eigenvalues",
+        total_cases, total_eigenvalues_checked
+    );
 }

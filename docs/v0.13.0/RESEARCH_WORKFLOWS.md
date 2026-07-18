@@ -1,0 +1,75 @@
+# Research workflow entry points
+
+Version target: `0.13.0`
+
+These examples are stable, nonmutating entry points for the three release-required research workflows. Run them from the repository root. Successful commands write machine-readable JSON to standard output and return status 0; failures write Rust error context to standard error and return nonzero. None reads credentials, publishes cache data, or mutates a remote repository.
+
+## CCM observation planning
+
+The high-precision CCM API uses the managed cache without consumer setup. A full tau hit is loaded directly. On a miss, the toolkit resolves or computes compact archimedean integrals and the prime-component matrix, assembles and validates the full tau matrix, and records the dependency chain. Forced-even work additionally reuses an even-sector operator and LU factorization. Normal runs retain the selected eigenpair, secular source, one bundled root range, and configuration evidence; evenness runs retain both natural and forced states plus their validation record. Author-mode publication stages the same objects to their configured public/private family shards without requiring the consuming application to implement a publishing pipeline.
+
+For intentional replacement, author mode may set `XC_CACHE_MODE=refresh`, `XC_CACHE_REMOTE=none`, and `XC_PUBLISH_REPLACE=true` together with its explicit publication target and execution flag. This recomputes once without reading cache data, replaces the selected semantic entries, and prunes only current-tree objects proven unreferenced by a bounded post-publication shard audit. Historical Git storage is retained and remains capacity-accounted.
+
+```powershell
+cargo run -p xc-spectral --example ccm_window_plan --locked
+```
+
+The result is a serialized `ObservationPlan` for the first 100 zeros. It reports the estimated height, minimum mode reach, recommended precision, guard digits, and assumptions. This is a feasibility observation, not a proof of continuum convergence.
+
+To replay a complete finite f64 observation previously created by `run_saved_ccm_f64_observation`, supply the saved record and a freshly captured execution fingerprint:
+
+```powershell
+cargo run -p xc-spectral --example ccm_reproduce --locked -- saved-observation.json current-fingerprint.json
+```
+
+Replay reconstructs the Weil matrix, smallest eigenpair, normalized even source, and rational spectrum from the saved configuration. It refuses an execution-fingerprint mismatch and compares the timing-independent numerical payload exactly. The saved answer is comparison evidence only and is never supplied to the computation. Success reproduces a finite binary64 observation, not an HP certificate or an infinite-dimensional conclusion.
+
+## Finite certificate construction and verification
+
+```powershell
+cargo run -p xc-certify --example finite_certificate --locked
+```
+
+The example constructs a finite-dimensional positive-definiteness certificate, recomputes its canonical certificate identity, independently runs the bundle verifier, and emits the verified `CertificateBundle`. The JSON separates its finite claim, achieved assurance, backend, precision, matrix identity, inertia evidence, assumptions, and provenance.
+
+## Exact Maynard–Tao lower bound
+
+This route needs the `hp` feature and therefore a supported GNU/Linux toolchain with GMP/MPFR, such as the project's existing HP WSL environment:
+
+```bash
+cargo run -p xc-variational --example mk_constant --features hp --locked
+```
+
+The result is a serialized `MkRayleighCertificate` for the constant degree-zero candidate at `k = 2`. Its exact numerator, denominator, and quotient establish a rigorous lower bound within the declared finite polynomial search space. For the larger symmetric discovery-plus-exact-evaluation example, run:
+
+```bash
+cargo run -p xc-variational --example mk_symmetric --features hp --locked
+```
+
+The exploratory eigensolver in `mk_symmetric` proposes coefficients, but the reported lower bound is recomputed after exact rationalization and does not inherit assurance from floating-point discovery.
+
+## Library-level normal use
+
+Every production workspace crate has a compiled normal-use target recorded in `EXAMPLE_INVENTORY.json`. The smaller library examples can be run independently:
+
+```powershell
+cargo run -p xc-numerics --example quadrature --locked
+cargo run -p xc-operator --example matrix_action --locked
+cargo run -p xc-root --example bracketed_root --locked
+cargo run -p xc-solver --example plan --locked
+cargo run -p xc-core --example publication_export --locked
+cargo run -p xc-zeta --example reference_zeros --locked
+```
+
+The cache examples separately demonstrate overlay resolution, permission failure, publication planning, and verification without executing remote mutation. `xc` is a binary-first crate, so its compiled normal-use target is the binary rather than an artificial example wrapper.
+
+## Validation commands
+
+The bounded default examples are exercised directly with:
+
+```powershell
+cargo run -p xc-spectral --example ccm_window_plan --locked
+cargo run -p xc-certify --example finite_certificate --locked
+```
+
+The HP examples are compiled and run on a supported GNU/Linux HP environment. Windows MSVC is intentionally not presented as an HP route because `gmp-mpfr-sys` does not support that target.
