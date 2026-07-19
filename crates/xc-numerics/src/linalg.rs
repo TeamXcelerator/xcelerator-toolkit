@@ -569,6 +569,35 @@ pub fn rayleigh_quotient(a: &[Float], dim: usize, xi: &[Float], prec: u32) -> Fl
     crate::reduction::deterministic_pairwise_sum_hp_owned(contribs, prec)
 }
 
+/// Outcome of the shifted refinement attempted after unshifted inverse
+/// iteration.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ShiftedRefinementOutcome {
+    NotAttempted,
+    Accepted,
+    RejectedEigenvalueJump,
+    Singular,
+}
+
+/// Structured stopping evidence for high-precision inverse iteration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InverseIterationDiagnostics {
+    pub configured_step_limit: usize,
+    pub unshifted_steps: usize,
+    pub unshifted_converged: bool,
+    pub final_relative_rayleigh_change: Option<Float>,
+    pub shifted_refinement: ShiftedRefinementOutcome,
+    pub final_relative_residual_norm: Float,
+}
+
+/// High-precision eigenpair plus its complete stopping evidence.
+#[derive(Debug, Clone)]
+pub struct InverseIterationOutput {
+    pub eigenvalue: Float,
+    pub eigenvector: Vec<Float>,
+    pub diagnostics: InverseIterationDiagnostics,
+}
+
 /// Inverse iteration to find the smallest-eigenpair of a symmetric
 /// matrix at high precision.
 ///
@@ -608,7 +637,19 @@ pub fn inverse_iteration(
     max_steps: usize,
     force_even: bool,
 ) -> Result<(Float, Vec<Float>)> {
-    inverse_iteration_from(a, dim, prec, max_steps, force_even, None)
+    let output = inverse_iteration_detailed(a, dim, prec, max_steps, force_even)?;
+    Ok((output.eigenvalue, output.eigenvector))
+}
+
+/// Diagnostic-preserving variant of [`inverse_iteration`].
+pub fn inverse_iteration_detailed(
+    a: &[Float],
+    dim: usize,
+    prec: u32,
+    max_steps: usize,
+    force_even: bool,
+) -> Result<InverseIterationOutput> {
+    inverse_iteration_from_detailed(a, dim, prec, max_steps, force_even, None)
 }
 
 /// Inverse iteration with an optional warm-start vector.
@@ -624,6 +665,19 @@ pub fn inverse_iteration_from(
     force_even: bool,
     start: Option<Vec<Float>>,
 ) -> Result<(Float, Vec<Float>)> {
+    let output = inverse_iteration_from_detailed(a, dim, prec, max_steps, force_even, start)?;
+    Ok((output.eigenvalue, output.eigenvector))
+}
+
+/// Diagnostic-preserving variant of [`inverse_iteration_from`].
+pub fn inverse_iteration_from_detailed(
+    a: &[Float],
+    dim: usize,
+    prec: u32,
+    max_steps: usize,
+    force_even: bool,
+    start: Option<Vec<Float>>,
+) -> Result<InverseIterationOutput> {
     inverse_iteration_from_optional_factors(a, dim, prec, max_steps, force_even, start, None)
 }
 
@@ -640,6 +694,22 @@ pub fn inverse_iteration_from_factors(
     force_even: bool,
     start: Option<Vec<Float>>,
 ) -> Result<(Float, Vec<Float>)> {
+    let output = inverse_iteration_from_factors_detailed(
+        a, factors, dim, prec, max_steps, force_even, start,
+    )?;
+    Ok((output.eigenvalue, output.eigenvector))
+}
+
+/// Diagnostic-preserving variant of [`inverse_iteration_from_factors`].
+pub fn inverse_iteration_from_factors_detailed(
+    a: &[Float],
+    factors: &LuFactors,
+    dim: usize,
+    prec: u32,
+    max_steps: usize,
+    force_even: bool,
+    start: Option<Vec<Float>>,
+) -> Result<InverseIterationOutput> {
     if factors.lu.len() != dim * dim || factors.perm.len() != dim {
         return Err(anyhow!(
             "LU factor dimensions do not match inverse-iteration matrix"
@@ -664,7 +734,10 @@ fn inverse_iteration_from_optional_factors(
     force_even: bool,
     start: Option<Vec<Float>>,
     retained_factors: Option<&LuFactors>,
-) -> Result<(Float, Vec<Float>)> {
+) -> Result<InverseIterationOutput> {
+    if max_steps == 0 {
+        return Err(anyhow!("inverse-iteration limit must be positive"));
+    }
     let computed_factors;
     let lu = if let Some(factors) = retained_factors {
         factors
@@ -714,9 +787,13 @@ fn inverse_iteration_from_optional_factors(
     let convergence_threshold = Float::with_val(prec, 2).pow(-((prec as i32) - 32));
     let mut even_projection_threshold = Float::with_val(prec, 1);
     even_projection_threshold /= 2u32;
+    let mut converged = false;
+    let mut final_relative_change: Option<Float> = None;
+    let mut unshifted_steps = 0usize;
 
     let iter_start = std::time::Instant::now();
     for step in 0..max_steps {
+        unshifted_steps = step + 1;
         let mut v = lu_solve(lu, &xi, dim, prec);
         normalize_l2(&mut v);
         if force_even {
@@ -778,14 +855,19 @@ fn inverse_iteration_from_optional_factors(
         if step > 2 {
             let mut diff = mu.clone();
             diff -= &prev_mu;
-            let converged = if !mu.is_zero() {
+            let step_converged = if !mu.is_zero() {
                 let mut r = diff.clone().abs();
                 r /= &mu.clone().abs();
+                final_relative_change = Some(r.clone());
                 r < convergence_threshold
             } else {
-                diff.clone().abs() < convergence_threshold
+                let absolute_change = diff.clone().abs();
+                let converged = absolute_change < convergence_threshold;
+                final_relative_change = Some(absolute_change);
+                converged
             };
-            if converged {
+            if step_converged {
+                converged = true;
                 crate::hp_debug!(
                     "[HP invit] inverse iteration converged at step {}/{} on N={} (elapsed {:.1}s)",
                     step + 1,
@@ -810,6 +892,17 @@ fn inverse_iteration_from_optional_factors(
         }
     }
 
+    if !converged {
+        let final_change = final_relative_change
+            .as_ref()
+            .map(|value| crate::fmt::display_hp(value, 10))
+            .unwrap_or_else(|| "not measured".to_owned());
+        crate::hp_debug!(
+            "[HP invit] unshifted phase reached {max_steps} steps (final relative Rayleigh change={}); attempting residual-verified shifted refinement",
+            final_change
+        );
+    }
+
     // ── Part 2: Shifted inverse iteration refinement ─────────────────────
     // The Rayleigh-quotient convergence above gives μ at full precision but
     // ξ only at √(tol) ≈ half-precision. One step of shifted inverse
@@ -831,7 +924,7 @@ fn inverse_iteration_from_optional_factors(
         })
         .collect();
 
-    match lu_factor(&shifted_a, dim) {
+    let shifted_refinement = match lu_factor(&shifted_a, dim) {
         Ok(shifted_lu) => {
             let mut xi_refined = lu_solve(&shifted_lu, &xi, dim, prec);
             normalize_l2(&mut xi_refined);
@@ -872,11 +965,13 @@ fn inverse_iteration_from_optional_factors(
                 xi = xi_refined;
                 mu = mu_refined;
                 crate::hp_debug!("[HP invit] shifted refinement accepted (delta_mu/mu < 1%)",);
+                ShiftedRefinementOutcome::Accepted
             } else {
                 crate::hp_debug!(
                     "[HP invit] shifted refinement REJECTED: eigenvalue jumped (delta/mu = {}), keeping original ξ",
                     crate::fmt::display_hp(&check_ratio, 8)
                 );
+                ShiftedRefinementOutcome::RejectedEigenvalueJump
             }
         }
         Err(_) => {
@@ -885,8 +980,9 @@ fn inverse_iteration_from_optional_factors(
             crate::hp_debug!(
                 "[HP invit] shifted matrix singular at μ — skipping refinement (eigvec at sqrt-precision)",
             );
+            ShiftedRefinementOutcome::Singular
         }
-    }
+    };
 
     // ── Part 1 residual check (diagnostic, not a loop — just verification) ──
     // Compute ||A·ξ − μ·ξ||∞ for logging. This lets us track eigenvector
@@ -921,8 +1017,31 @@ fn inverse_iteration_from_optional_factors(
         prec,
         dim
     );
+    let mut vector_maximum = Float::with_val(prec, 0);
+    for value in &xi {
+        let magnitude = value.clone().abs();
+        if magnitude > vector_maximum {
+            vector_maximum = magnitude;
+        }
+    }
+    if vector_maximum.is_zero() {
+        return Err(anyhow!("inverse iteration produced a zero eigenvector"));
+    }
+    let mut relative_residual_norm = residual_norm;
+    relative_residual_norm /= vector_maximum;
 
-    Ok((mu, xi))
+    Ok(InverseIterationOutput {
+        eigenvalue: mu,
+        eigenvector: xi,
+        diagnostics: InverseIterationDiagnostics {
+            configured_step_limit: max_steps,
+            unshifted_steps,
+            unshifted_converged: converged,
+            final_relative_rayleigh_change: final_relative_change,
+            shifted_refinement,
+            final_relative_residual_norm: relative_residual_norm,
+        },
+    })
 }
 
 // Matrix fixtures below use the row-major index convention `a[i * dim + j]`
@@ -2616,6 +2735,21 @@ mod tests {
             nd < hp(prec, "1e-15"),
             "1×1 eigenvector should have ℓ²-norm 1"
         );
+    }
+
+    #[test]
+    fn inverse_iteration_records_limit_reached_and_shifted_rescue() {
+        let prec = 128;
+        let a = vec![hp(prec, "1"), hp(prec, "0"), hp(prec, "0"), hp(prec, "2")];
+        let output = inverse_iteration_detailed(&a, 2, prec, 1, false).unwrap();
+        assert_eq!(output.diagnostics.configured_step_limit, 1);
+        assert_eq!(output.diagnostics.unshifted_steps, 1);
+        assert!(!output.diagnostics.unshifted_converged);
+        assert_ne!(
+            output.diagnostics.shifted_refinement,
+            ShiftedRefinementOutcome::NotAttempted
+        );
+        assert!(output.diagnostics.final_relative_residual_norm >= 0);
     }
 
     /// `tridiag_lu_factor_hp` with mismatched slice lengths should return

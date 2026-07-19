@@ -394,7 +394,7 @@ mod tests {
                 observed_scalar_backend: "mpfr",
                 observed_precision_bits: Some(256),
                 observed_dimensions: &[2, 2],
-                reader_version: &ToolkitVersion::parse("0.13.1").unwrap(),
+                reader_version: &ToolkitVersion::parse("0.13.0").unwrap(),
                 manifest: &manifest,
             })
             .unwrap();

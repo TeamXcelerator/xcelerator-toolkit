@@ -6,7 +6,8 @@
 //! Strategy:
 //! - Build the (2N+1)×(2N+1) Weil form matrix at user-chosen precision.
 //! - Find smallest eigenpair by inverse iteration (from xc-numerics).
-//! - Solve spectrum equation by Newton's method.
+//! - Solve the spectrum equation with Halley's method by default, with
+//!   explicit Newton selection available for controlled comparisons.
 
 use anyhow::{bail, Result};
 use rayon::prelude::*;
@@ -21,11 +22,7 @@ use xc_cache::{
     ToolkitVersion,
 };
 
-use super::{
-    prime_powers_up_to,
-    window::{discover_roots_f64, DiscoveryOptionsF64, SecularFunctionF64, ZeroTarget},
-    CcmParams, CcmResult,
-};
+use super::{prime_powers_up_to, window::ZeroTarget, CcmParams, CcmResult};
 
 enum CcmCacheRoute<'a> {
     Standalone,
@@ -199,6 +196,106 @@ struct PortableWeilEigenpair {
     force_even: bool,
     eigenvalue: String,
     eigenvector: Vec<String>,
+    inverse_iteration: PortableInverseIterationDiagnostics,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableInverseIterationDiagnostics {
+    pub configured_step_limit: usize,
+    pub unshifted_steps: usize,
+    pub unshifted_converged: bool,
+    pub final_relative_rayleigh_change: Option<String>,
+    pub shifted_refinement: String,
+    pub final_relative_residual_norm: String,
+}
+
+impl PortableInverseIterationDiagnostics {
+    fn from_runtime(value: &xc_numerics::linalg::InverseIterationDiagnostics) -> Self {
+        use xc_numerics::linalg::ShiftedRefinementOutcome;
+        Self {
+            configured_step_limit: value.configured_step_limit,
+            unshifted_steps: value.unshifted_steps,
+            unshifted_converged: value.unshifted_converged,
+            final_relative_rayleigh_change: value
+                .final_relative_rayleigh_change
+                .as_ref()
+                .map(Float::to_string),
+            shifted_refinement: match value.shifted_refinement {
+                ShiftedRefinementOutcome::NotAttempted => "not_attempted",
+                ShiftedRefinementOutcome::Accepted => "accepted",
+                ShiftedRefinementOutcome::RejectedEigenvalueJump => "rejected_eigenvalue_jump",
+                ShiftedRefinementOutcome::Singular => "singular",
+            }
+            .to_owned(),
+            final_relative_residual_norm: value.final_relative_residual_norm.to_string(),
+        }
+    }
+
+    fn to_runtime(
+        &self,
+        precision_bits: u32,
+    ) -> std::result::Result<xc_numerics::linalg::InverseIterationDiagnostics, CacheError> {
+        use xc_numerics::linalg::ShiftedRefinementOutcome;
+        if self.configured_step_limit == 0
+            || self.unshifted_steps > self.configured_step_limit
+            || (self.unshifted_steps == 0 && self.unshifted_converged)
+        {
+            return Err(CacheError::InvalidManifest(
+                "CCM inverse-iteration diagnostics contain invalid step counts".to_owned(),
+            ));
+        }
+        let parse = |value: &str| {
+            Float::parse(value)
+                .map(|parsed| Float::with_val(precision_bits, parsed))
+                .map_err(|error| {
+                    CacheError::InvalidManifest(format!(
+                        "CCM inverse-iteration diagnostics contain an invalid HP scalar: {error}"
+                    ))
+                })
+        };
+        let final_relative_rayleigh_change = self
+            .final_relative_rayleigh_change
+            .as_deref()
+            .map(parse)
+            .transpose()?;
+        let final_relative_residual_norm = parse(&self.final_relative_residual_norm)?;
+        if final_relative_rayleigh_change
+            .as_ref()
+            .is_some_and(|value| value < &Float::with_val(precision_bits, 0))
+            || final_relative_residual_norm < 0
+        {
+            return Err(CacheError::InvalidManifest(
+                "CCM inverse-iteration diagnostics contain a negative metric".to_owned(),
+            ));
+        }
+        let shifted_refinement = match self.shifted_refinement.as_str() {
+            "not_attempted" => ShiftedRefinementOutcome::NotAttempted,
+            "accepted" => ShiftedRefinementOutcome::Accepted,
+            "rejected_eigenvalue_jump" => ShiftedRefinementOutcome::RejectedEigenvalueJump,
+            "singular" => ShiftedRefinementOutcome::Singular,
+            _ => {
+                return Err(CacheError::InvalidManifest(
+                    "CCM inverse-iteration diagnostics contain an unknown shifted outcome"
+                        .to_owned(),
+                ))
+            }
+        };
+        if self.unshifted_steps == 0 || shifted_refinement == ShiftedRefinementOutcome::NotAttempted
+        {
+            return Err(CacheError::InvalidManifest(
+                "computed CCM eigenpair diagnostics omit required stopping evidence".to_owned(),
+            ));
+        }
+        Ok(xc_numerics::linalg::InverseIterationDiagnostics {
+            configured_step_limit: self.configured_step_limit,
+            unshifted_steps: self.unshifted_steps,
+            unshifted_converged: self.unshifted_converged,
+            final_relative_rayleigh_change,
+            shifted_refinement,
+            final_relative_residual_norm,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -214,11 +311,61 @@ struct PortableSecularSource {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "status", content = "value")]
+#[serde(deny_unknown_fields)]
+struct PortableRootRefinement {
+    value: String,
+    iterations: usize,
+    final_correction: String,
+    residual: String,
+    achieved_decimal_digits: String,
+}
+
+impl PortableRootRefinement {
+    fn from_runtime(result: &RootRefinement) -> Self {
+        Self {
+            value: result.value.to_string(),
+            iterations: result.diagnostics.iterations,
+            final_correction: result.diagnostics.final_correction.to_string(),
+            residual: result.diagnostics.residual.to_string(),
+            achieved_decimal_digits: result.diagnostics.achieved_decimal_digits.to_string(),
+        }
+    }
+
+    fn to_runtime(&self, precision_bits: u32) -> std::result::Result<RootRefinement, CacheError> {
+        let values = parse_hp_vector(
+            &[
+                self.value.clone(),
+                self.final_correction.clone(),
+                self.residual.clone(),
+                self.achieved_decimal_digits.clone(),
+            ],
+            precision_bits,
+        )?;
+        if self.iterations == 0 || values[1] < 0 || values[2] < 0 || values[3] < 0 {
+            return Err(CacheError::InvalidManifest(
+                "CCM root diagnostics contain an invalid iteration count or negative metric"
+                    .to_owned(),
+            ));
+        }
+        Ok(RootRefinement {
+            value: values[0].clone(),
+            diagnostics: RootRefinementDiagnostics {
+                iterations: self.iterations,
+                final_correction: values[1].clone(),
+                residual: values[2].clone(),
+                achieved_decimal_digits: values[3].clone(),
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "details")]
 enum PortableRootOutcome {
-    Converged(String),
-    Approximate(String),
-    Failed,
+    Converged(PortableRootRefinement),
+    Stagnated(PortableRootRefinement),
+    Approximate(PortableRootRefinement),
+    Failed { iterations: usize, reason: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -237,6 +384,7 @@ struct PortableRootRange {
     outcomes: Vec<PortableRootOutcome>,
     solver: String,
     solver_steps: usize,
+    accuracy_guard_bits: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -265,8 +413,10 @@ struct PortableRunEvidence {
     root_count: usize,
     weil_min_eigenvalue: String,
     converged_roots: usize,
+    stagnated_roots: usize,
     approximate_roots: usize,
     failed_roots: usize,
+    inverse_iteration: PortableInverseIterationDiagnostics,
 }
 
 fn lambda_squared_cache_identity(params: &CcmParams) -> String {
@@ -460,11 +610,13 @@ pub struct HighPrecConfig {
     /// Maximum number of solver steps per Riemann-zero seed.
     /// Applies to both Halley (default) and Newton solvers.
     ///
-    /// In practice the solver exits early via full-precision convergence
-    /// (`|dz| < tol`) or stagnation detection (construction ceiling reached).
+    /// In practice the solver exits early when the relative correction meets
+    /// the requested-accuracy threshold. Guard bits remain available for
+    /// cancellation. A representational stall is reported as stagnation and
+    /// rejected by ordinary production APIs.
     /// This cap is a safety net only — it prevents infinite loops on
     /// pathological/wandering seeds and is never reached on real configs.
-    /// The deterministic default is at least 200; callers may override it
+    /// The deterministic default is 2,000; callers may override it
     /// explicitly on this configuration value.
     pub solver_steps: usize,
     /// Root-finding method used to refine Riemann-zero seeds.
@@ -521,12 +673,24 @@ impl RootSolver {
     }
 }
 
-/// Conversion factor: decimal digits to binary bits.
-/// log₂(10) ≈ 3.32193. We use 3.322 and add 16 guard bits.
+/// Conversion factor retained for callers that need an approximate display
+/// conversion. Configuration construction itself uses integer arithmetic so
+/// the cache identity is independent of host floating-point evaluation.
 pub const DIGITS_TO_BITS_FACTOR: f64 = 3.322;
 
-/// Extra guard bits added beyond the strict digits-to-bits conversion.
-pub const GUARD_BITS: u32 = 16;
+/// Extra working bits beyond the requested decimal accuracy.
+///
+/// Secular evaluation loses several bits to cancellation near a root. A
+/// 64-bit reserve lets the point solver satisfy the requested accuracy rather
+/// than incorrectly treating the last representable working bit as the
+/// accuracy contract.
+pub const GUARD_BITS: u32 = 64;
+
+/// Consecutive point-solver steps without any smaller correction before the
+/// outcome is classified as stagnated. Halley should improve cubically near a
+/// simple root; this deliberately long window preserves genuinely slow
+/// monotone convergence while terminating precision-floor oscillation.
+pub const ROOT_STAGNATION_WINDOW: usize = 128;
 
 /// Minimum quadrature points for the HP tier.
 pub const MIN_QUAD_POINTS: usize = 600;
@@ -546,24 +710,31 @@ pub const HP_SINGULARITY_GUARD_STR: &str = "1e-30";
 impl HighPrecConfig {
     /// Construct a config from a target decimal-digit working precision.
     ///
-    /// Bits are computed via `digits × DIGITS_TO_BITS_FACTOR + GUARD_BITS`,
-    /// rounded up. Quadrature points are `digits × QUAD_POINTS_PER_DIGIT`,
+    /// Bits are computed with an upward integer bound for
+    /// `digits × log₂(10)`, then `GUARD_BITS` are added. Quadrature points
+    /// are `digits × QUAD_POINTS_PER_DIGIT`,
     /// clamped to `[MIN_QUAD_POINTS, MAX_QUAD_POINTS]`. Other fields take
-    /// the defaults `inverse_iter_steps=200, solver_steps=20,
+    /// the defaults `inverse_iter_steps=2000, solver_steps=2000,
     /// n_eigenvalues=50`.
     pub fn for_decimal_digits(digits: u32) -> Self {
-        let bits = ((digits as f64) * DIGITS_TO_BITS_FACTOR).ceil() as u32 + GUARD_BITS;
+        // 332193/100000 is a strict upward decimal bound for log2(10).
+        // Integer arithmetic makes the precision contract deterministic on
+        // every supported platform and avoids routing HP configuration
+        // through binary64.
+        let requested_bits = u64::from(digits)
+            .saturating_mul(332_193)
+            .div_ceil(100_000)
+            .min(u64::from(u32::MAX - GUARD_BITS)) as u32;
+        let bits = requested_bits + GUARD_BITS;
         // solver_steps: high safety cap — in practice the solver exits early
-        // via full-precision convergence or stagnation detection (construction
-        // ceiling). The cap only fires for pathological/wandering seeds and
-        // prevents an infinite loop. Default 200 steps is never reached on
-        // any real (λ², N, P) config; it is purely a safety net.
-        let p = digits as f64;
-        let k = (p / 10.0).log2().ceil() as usize;
-        let solver_steps = k.max(200);
+        // after meeting the requested accuracy. Stagnation remains a distinct
+        // rejected outcome. The cap prevents an infinite loop, and the
+        // deliberately generous 2,000-step
+        // default favors a slow accurate result over an early approximation.
+        let solver_steps = 2_000;
         Self {
             precision_bits: bits,
-            inverse_iter_steps: 200,
+            inverse_iter_steps: 2_000,
             solver_steps,
             root_solver: RootSolver::Halley,
             quad_points: ((digits as usize) * QUAD_POINTS_PER_DIGIT)
@@ -584,41 +755,53 @@ impl HighPrecConfig {
 
 /// Status of a single solver run for one CCM secular-root seed.
 ///
-/// The three-state result lets callers distinguish clean convergence,
-/// a best-effort approximation (step limit hit), and a degenerate failure
-/// (denominator zero — result is garbage and should not be used).
+/// Diagnostics retained for every numerical root value, including outcomes
+/// which are rejected by the validated cache path.
+#[derive(Debug, Clone)]
+pub struct RootRefinementDiagnostics {
+    pub iterations: usize,
+    pub final_correction: Float,
+    pub residual: Float,
+    pub achieved_decimal_digits: Float,
+}
+
+/// A root value together with its stopping diagnostics.
+#[derive(Debug, Clone)]
+pub struct RootRefinement {
+    pub value: Float,
+    pub diagnostics: RootRefinementDiagnostics,
+}
+
+/// Status of one CCM root refinement. Only `Converged` is acceptable for a
+/// complete result or a reusable validated cache artifact.
 #[derive(Debug, Clone)]
 pub enum EigenvalueResult {
-    /// Solver converged to HP tolerance within the step limit.
-    /// The value is reliable to the working precision.
-    Converged(Float),
-    /// Solver hit the step limit before reaching HP tolerance.
-    /// The value is the best approximation found — it may be accurate
-    /// to many digits (often still useful) but is NOT fully converged.
-    Approximate(Float),
-    /// Solver hit a degenerate denominator (pole/zero). The result is
-    /// garbage and must not be used.
-    Failed,
+    Converged(RootRefinement),
+    Stagnated(RootRefinement),
+    Approximate(RootRefinement),
+    Failed { iterations: usize, reason: String },
 }
 
 impl EigenvalueResult {
-    /// Return the inner `Float` value if present (Converged or Approximate),
-    /// or `None` if Failed.
+    /// Return the numerical value for diagnostic inspection.
     pub fn value(&self) -> Option<&Float> {
         match self {
-            EigenvalueResult::Converged(v) | EigenvalueResult::Approximate(v) => Some(v),
-            EigenvalueResult::Failed => None,
+            Self::Converged(result) | Self::Stagnated(result) | Self::Approximate(result) => {
+                Some(&result.value)
+            }
+            Self::Failed { .. } => None,
         }
     }
 
     /// Returns `true` if this result is fully converged.
     pub fn is_converged(&self) -> bool {
-        matches!(self, EigenvalueResult::Converged(_))
+        matches!(self, Self::Converged(_))
     }
 
-    /// Returns `true` if this result has any usable value (Converged or Approximate).
+    /// Returns `true` if a diagnostic numerical value is present. This does
+    /// not imply that the value is acceptable for reuse or publication.
     pub fn has_value(&self) -> bool {
-        !matches!(self, EigenvalueResult::Failed)
+        !matches!(self, Self::Failed { .. })
     }
 }
 
@@ -631,10 +814,8 @@ pub struct HighPrecResult {
     /// equation (equivalently, the finite `D_log` spectrum).
     ///
     /// Each entry is one of:
-    /// - `Converged(v)` — fully converged to HP tolerance; reliable.
-    /// - `Approximate(v)` — best approximation after step limit; may still
-    ///   match many digits but is NOT certified to HP precision.
-    /// - `Failed` — degenerate denominator; garbage, do not use.
+    /// Only `Converged` entries are returned by the ordinary production APIs.
+    /// Other variants retain diagnostics for explicit low-level inspection.
     pub eigenvalues_pos: Vec<EigenvalueResult>,
     /// One-based index assigned to the first entry in `eigenvalues_pos`.
     /// Empty source-only runs retain the requested start for provenance.
@@ -646,8 +827,12 @@ pub struct HighPrecResult {
     /// stored in the V_n basis order (centered index `0` at position
     /// `n_modes`).
     pub xi: Vec<Float>,
-    /// Wall-clock seconds for the entire HP run (matrix build +
-    /// eigenvector + Newton).
+    /// Structured stopping evidence for the eigenstate solve. Reaching the
+    /// unshifted limit is retained even when shifted refinement subsequently
+    /// produces an acceptable Tau residual.
+    pub inverse_iteration_diagnostics: xc_numerics::linalg::InverseIterationDiagnostics,
+    /// Wall-clock seconds for the entire HP run (matrix build, eigenstate,
+    /// independent discovery, and configured root refinement).
     pub elapsed_seconds: f64,
     /// MPFR working precision used for this run, in bits.
     pub precision_bits: u32,
@@ -657,9 +842,48 @@ pub struct HighPrecResult {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "status", content = "value")]
 pub enum PortableEigenvalueResult {
-    Converged(xc_numerics::fmt::PortableHpFloat),
-    Approximate(xc_numerics::fmt::PortableHpFloat),
-    Failed,
+    Converged(PortableRootRefinementResult),
+    Stagnated(PortableRootRefinementResult),
+    Approximate(PortableRootRefinementResult),
+    Failed { iterations: usize, reason: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableRootRefinementResult {
+    pub value: xc_numerics::fmt::PortableHpFloat,
+    pub iterations: usize,
+    pub final_correction: xc_numerics::fmt::PortableHpFloat,
+    pub residual: xc_numerics::fmt::PortableHpFloat,
+    pub achieved_decimal_digits: xc_numerics::fmt::PortableHpFloat,
+}
+
+impl PortableRootRefinementResult {
+    fn from_runtime(result: &RootRefinement) -> Result<Self> {
+        Ok(Self {
+            value: xc_numerics::fmt::PortableHpFloat::from_float(&result.value)?,
+            iterations: result.diagnostics.iterations,
+            final_correction: xc_numerics::fmt::PortableHpFloat::from_float(
+                &result.diagnostics.final_correction,
+            )?,
+            residual: xc_numerics::fmt::PortableHpFloat::from_float(&result.diagnostics.residual)?,
+            achieved_decimal_digits: xc_numerics::fmt::PortableHpFloat::from_float(
+                &result.diagnostics.achieved_decimal_digits,
+            )?,
+        })
+    }
+
+    fn to_runtime(&self) -> Result<RootRefinement> {
+        Ok(RootRefinement {
+            value: self.value.to_float()?,
+            diagnostics: RootRefinementDiagnostics {
+                iterations: self.iterations,
+                final_correction: self.final_correction.to_float()?,
+                residual: self.residual.to_float()?,
+                achieved_decimal_digits: self.achieved_decimal_digits.to_float()?,
+            },
+        })
+    }
 }
 
 /// Portable CCM result payload for use inside [`xc_core::ResearchResult`].
@@ -670,6 +894,7 @@ pub struct PortableHighPrecResult {
     pub first_positive_root_index: usize,
     pub weil_min_eigenvalue: xc_numerics::fmt::PortableHpFloat,
     pub xi: Vec<xc_numerics::fmt::PortableHpFloat>,
+    pub inverse_iteration_diagnostics: PortableInverseIterationDiagnostics,
     pub elapsed_seconds: f64,
     pub precision_bits: u32,
 }
@@ -688,15 +913,24 @@ impl PortableHighPrecResult {
             .eigenvalues_pos
             .iter()
             .map(|value| match value {
-                EigenvalueResult::Converged(value) => {
-                    xc_numerics::fmt::PortableHpFloat::from_float(value)
+                EigenvalueResult::Converged(result) => {
+                    PortableRootRefinementResult::from_runtime(result)
                         .map(PortableEigenvalueResult::Converged)
                 }
-                EigenvalueResult::Approximate(value) => {
-                    xc_numerics::fmt::PortableHpFloat::from_float(value)
+                EigenvalueResult::Stagnated(result) => {
+                    PortableRootRefinementResult::from_runtime(result)
+                        .map(PortableEigenvalueResult::Stagnated)
+                }
+                EigenvalueResult::Approximate(result) => {
+                    PortableRootRefinementResult::from_runtime(result)
                         .map(PortableEigenvalueResult::Approximate)
                 }
-                EigenvalueResult::Failed => Ok(PortableEigenvalueResult::Failed),
+                EigenvalueResult::Failed { iterations, reason } => {
+                    Ok(PortableEigenvalueResult::Failed {
+                        iterations: *iterations,
+                        reason: reason.clone(),
+                    })
+                }
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Self {
@@ -710,6 +944,9 @@ impl PortableHighPrecResult {
                 .iter()
                 .map(xc_numerics::fmt::PortableHpFloat::from_float)
                 .collect::<std::result::Result<Vec<_>, _>>()?,
+            inverse_iteration_diagnostics: PortableInverseIterationDiagnostics::from_runtime(
+                &result.inverse_iteration_diagnostics,
+            ),
             elapsed_seconds: result.elapsed_seconds,
             precision_bits: result.precision_bits,
         })
@@ -728,13 +965,21 @@ impl PortableHighPrecResult {
             .eigenvalues_pos
             .iter()
             .map(|value| match value {
-                PortableEigenvalueResult::Converged(value) => {
-                    value.to_float().map(EigenvalueResult::Converged)
+                PortableEigenvalueResult::Converged(result) => {
+                    result.to_runtime().map(EigenvalueResult::Converged)
                 }
-                PortableEigenvalueResult::Approximate(value) => {
-                    value.to_float().map(EigenvalueResult::Approximate)
+                PortableEigenvalueResult::Stagnated(result) => {
+                    result.to_runtime().map(EigenvalueResult::Stagnated)
                 }
-                PortableEigenvalueResult::Failed => Ok(EigenvalueResult::Failed),
+                PortableEigenvalueResult::Approximate(result) => {
+                    result.to_runtime().map(EigenvalueResult::Approximate)
+                }
+                PortableEigenvalueResult::Failed { iterations, reason } => {
+                    Ok(EigenvalueResult::Failed {
+                        iterations: *iterations,
+                        reason: reason.clone(),
+                    })
+                }
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(HighPrecResult {
@@ -746,6 +991,10 @@ impl PortableHighPrecResult {
                 .iter()
                 .map(xc_numerics::fmt::PortableHpFloat::to_float)
                 .collect::<std::result::Result<Vec<_>, _>>()?,
+            inverse_iteration_diagnostics: self
+                .inverse_iteration_diagnostics
+                .to_runtime(self.precision_bits)
+                .map_err(anyhow::Error::from)?,
             elapsed_seconds: self.elapsed_seconds,
             precision_bits: self.precision_bits,
         })
@@ -782,11 +1031,7 @@ impl HighPrecResult {
             eigenvalues_pos: self
                 .eigenvalues_pos
                 .iter()
-                .map(|r| match r {
-                    EigenvalueResult::Converged(f) => f.to_f64(),
-                    EigenvalueResult::Approximate(f) => f.to_f64(),
-                    EigenvalueResult::Failed => f64::NAN, // degenerate — NaN signals garbage
-                })
+                .map(|result| result.value().map_or(f64::NAN, Float::to_f64))
                 .collect(),
             weil_min_eigenvalue: self.weil_min_eigenvalue.to_f64(),
             xi: self.xi.iter().map(|f| f.to_f64()).collect(),
@@ -1696,9 +1941,16 @@ fn decode_weil_eigenpair(
     params: &CcmParams,
     cfg: &HighPrecConfig,
     tau: &[Float],
-) -> std::result::Result<(Float, Vec<Float>), CacheError> {
+) -> std::result::Result<
+    (
+        Float,
+        Vec<Float>,
+        xc_numerics::linalg::InverseIterationDiagnostics,
+    ),
+    CacheError,
+> {
     let prec = cfg.precision_bits;
-    if artifact.schema_version != 1
+    if artifact.schema_version != 2
         || artifact.lambda_squared != lambda_squared_cache_identity(params)
         || artifact.n_modes != params.n_modes
         || artifact.precision_bits != prec
@@ -1724,12 +1976,31 @@ fn decode_weil_eigenpair(
         .iter()
         .map(|entry| parse(entry))
         .collect::<std::result::Result<_, _>>()?;
+    let diagnostics = artifact.inverse_iteration.to_runtime(prec)?;
+    if diagnostics.configured_step_limit != cfg.inverse_iter_steps {
+        return Err(CacheError::InvalidManifest(
+            "CCM Weil eigenpair uses a different inverse-iteration limit".to_owned(),
+        ));
+    }
     if !weil_eigvec_cache::residual_ok(tau, params.matrix_size(), &xi, &eps_n, prec) {
         return Err(CacheError::InvalidManifest(
             "CCM Weil eigenpair failed its tau residual validation".to_owned(),
         ));
     }
-    Ok((eps_n, xi))
+    let replayed_residual =
+        weil_eigvec_cache::relative_residual_norm(tau, params.matrix_size(), &xi, &eps_n, prec)
+            .ok_or_else(|| {
+                CacheError::InvalidManifest(
+                    "CCM Weil eigenpair has no finite relative Tau residual".to_owned(),
+                )
+            })?;
+    if replayed_residual != diagnostics.final_relative_residual_norm {
+        return Err(CacheError::InvalidManifest(
+            "CCM Weil eigenpair stopping evidence does not match its replayed Tau residual"
+                .to_owned(),
+        ));
+    }
+    Ok((eps_n, xi, diagnostics))
 }
 
 fn build_even_sector_matrix(tau: &[Float], n_modes: usize, prec: u32) -> Vec<Float> {
@@ -2742,19 +3013,25 @@ fn weil_eigenpair_via_cache(
     tau: &[Float],
     tau_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
-) -> Result<(Float, Vec<Float>, ArtifactManifest)> {
+) -> Result<(
+    Float,
+    Vec<Float>,
+    xc_numerics::linalg::InverseIterationDiagnostics,
+    ArtifactManifest,
+)> {
     let prec = cfg.precision_bits;
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_weil_eigenpair".to_owned(),
-        mathematical_semantics_version: "ccm-smallest-weil-eigenpair-v0.13.0-v1".to_owned(),
+        mathematical_semantics_version: "ccm-smallest-weil-eigenpair-v0.13.0-v2".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
             "precision_bits": prec,
             "scalar_backend": "rug_mpfr",
             "force_even": cfg.force_even,
-            "normalization": "sum_xi_equals_sqrt_log_lambda_squared"
+            "normalization": "sum_xi_equals_sqrt_log_lambda_squared",
+            "inverse_iteration_step_limit": cfg.inverse_iter_steps
         }),
         normalization: Some("sum_xi_equals_sqrt_log_lambda_squared".to_owned()),
         target: Some("smallest_weil_form_eigenpair".to_owned()),
@@ -2793,7 +3070,7 @@ fn weil_eigenpair_via_cache(
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            let (eps_n, xi, factor_manifest) = if cfg.force_even {
+            let (eps_n, xi, diagnostics, factor_manifest) = if cfg.force_even {
                 let (sector, sector_manifest) =
                     resolve_even_sector_matrix_via_cache(params, cfg, tau, tau_manifest, cache)
                         .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
@@ -2806,7 +3083,7 @@ fn weil_eigenpair_via_cache(
                     cache,
                 )
                 .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
-                let (eps_n, sector_vector) = xc_numerics::linalg::inverse_iteration_from_factors(
+                let output = xc_numerics::linalg::inverse_iteration_from_factors_detailed(
                     &sector,
                     &factors,
                     params.n_modes + 1,
@@ -2816,17 +3093,18 @@ fn weil_eigenpair_via_cache(
                     None,
                 )
                 .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
-                let expanded = expand_even_sector_vector(&sector_vector, params.n_modes, prec);
+                let expanded = expand_even_sector_vector(&output.eigenvector, params.n_modes, prec);
                 (
-                    eps_n,
+                    output.eigenvalue,
                     normalize_eigenvector(&expanded, l, prec),
+                    output.diagnostics,
                     factor_manifest,
                 )
             } else {
                 let (factors, factor_manifest) =
                     resolve_factorization_via_cache(params, cfg, tau, tau_manifest, "full", cache)
                         .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
-                let (eps_n, xi_raw) = xc_numerics::linalg::inverse_iteration_from_factors(
+                let output = xc_numerics::linalg::inverse_iteration_from_factors_detailed(
                     tau,
                     &factors,
                     params.matrix_size(),
@@ -2837,20 +3115,37 @@ fn weil_eigenpair_via_cache(
                 )
                 .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
                 (
-                    eps_n,
-                    normalize_eigenvector(&xi_raw, l, prec),
+                    output.eigenvalue,
+                    normalize_eigenvector(&output.eigenvector, l, prec),
+                    output.diagnostics,
                     factor_manifest,
                 )
             };
+            let mut diagnostics = diagnostics;
+            diagnostics.final_relative_residual_norm = weil_eigvec_cache::relative_residual_norm(
+                tau,
+                params.matrix_size(),
+                &xi,
+                &eps_n,
+                prec,
+            )
+            .ok_or_else(|| {
+                CacheError::InvalidManifest(
+                    "CCM inverse iteration produced an invalid eigenvector".to_owned(),
+                )
+            })?;
             Ok((
                 PortableWeilEigenpair {
-                    schema_version: 1,
+                    schema_version: 2,
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
                     precision_bits: prec,
                     force_even: cfg.force_even,
                     eigenvalue: eps_n.to_string(),
                     eigenvector: xi.iter().map(Float::to_string).collect(),
+                    inverse_iteration: PortableInverseIterationDiagnostics::from_runtime(
+                        &diagnostics,
+                    ),
                 },
                 vec![DependencyRef {
                     key: factor_manifest.key,
@@ -2865,8 +3160,9 @@ fn weil_eigenpair_via_cache(
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("Weil eigenpair execution returned no manifest"))?;
-    let (eigenvalue, eigenvector) = decode_weil_eigenpair(&resolved.value, params, cfg, tau)?;
-    Ok((eigenvalue, eigenvector, manifest))
+    let (eigenvalue, eigenvector, diagnostics) =
+        decode_weil_eigenpair(&resolved.value, params, cfg, tau)?;
+    Ok((eigenvalue, eigenvector, diagnostics, manifest))
 }
 
 fn resolve_secular_source_via_cache(
@@ -2971,22 +3267,73 @@ fn compute_root_range(
     cfg: &HighPrecConfig,
     seeds: &[Float],
 ) -> Vec<EigenvalueResult> {
-    seeds
-        .iter()
-        .map(|seed| {
-            solve_r_zero(
-                xi,
-                params.n_modes,
-                l,
-                seed,
-                cfg.precision_bits,
-                cfg.solver_steps,
-                cfg.root_solver,
-            )
-        })
-        .collect()
+    let mut outcomes = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        let outcome = solve_r_zero(
+            xi,
+            params.n_modes,
+            l,
+            seed,
+            cfg.precision_bits,
+            cfg.solver_steps,
+            cfg.root_solver,
+        );
+        let converged = outcome.is_converged();
+        outcomes.push(outcome);
+        // A validated ordered window cannot contain a gap. Preserve the
+        // complete diagnostics for the first rejected root, but do not spend
+        // hours refining later roots after the request is already known to
+        // be unsatisfiable.
+        if !converged {
+            break;
+        }
+    }
+    outcomes
 }
 
+fn ensure_all_roots_converged(outcomes: &[EigenvalueResult]) -> Result<()> {
+    let mut previous: Option<&Float> = None;
+    for (offset, outcome) in outcomes.iter().enumerate() {
+        let result = match outcome {
+            EigenvalueResult::Converged(result) => result,
+            EigenvalueResult::Stagnated(result) => {
+                bail!(
+                    "CCM root {} stagnated after {} iterations (correction={}, residual={}, achieved_digits={})",
+                    offset + 1,
+                    result.diagnostics.iterations,
+                    xc_numerics::fmt::display_hp(&result.diagnostics.final_correction, 8),
+                    xc_numerics::fmt::display_hp(&result.diagnostics.residual, 8),
+                    xc_numerics::fmt::display_hp(&result.diagnostics.achieved_decimal_digits, 8)
+                )
+            }
+            EigenvalueResult::Approximate(result) => {
+                bail!(
+                    "CCM root {} reached the {}-iteration limit (correction={}, residual={}, achieved_digits={})",
+                    offset + 1,
+                    result.diagnostics.iterations,
+                    xc_numerics::fmt::display_hp(&result.diagnostics.final_correction, 8),
+                    xc_numerics::fmt::display_hp(&result.diagnostics.residual, 8),
+                    xc_numerics::fmt::display_hp(&result.diagnostics.achieved_decimal_digits, 8)
+                )
+            }
+            EigenvalueResult::Failed { iterations, reason } => {
+                bail!(
+                    "CCM root {} failed after {} iterations: {}",
+                    offset + 1,
+                    iterations,
+                    reason
+                )
+            }
+        };
+        if result.value <= 0 || previous.is_some_and(|value| &result.value <= value) {
+            bail!("CCM converged roots are not a strictly increasing positive sequence");
+        }
+        previous = Some(&result.value);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn decode_root_range(
     artifact: &PortableRootRange,
     params: &CcmParams,
@@ -2994,9 +3341,11 @@ fn decode_root_range(
     first_root_index: usize,
     seeds: &[Float],
     artifact_mode: RootArtifactMode,
+    xi: &[Float],
+    l: &Float,
 ) -> std::result::Result<Vec<EigenvalueResult>, CacheError> {
     let expected_seeds: Vec<String> = seeds.iter().map(Float::to_string).collect();
-    if artifact.schema_version != 2
+    if artifact.schema_version != 3
         || artifact.lambda_squared != lambda_squared_cache_identity(params)
         || artifact.n_modes != params.n_modes
         || artifact.precision_bits != cfg.precision_bits
@@ -3015,6 +3364,7 @@ fn decode_root_range(
         || artifact.outcomes.len() != seeds.len()
         || artifact.solver != cfg.root_solver.display_name().to_ascii_lowercase()
         || artifact.solver_steps != cfg.solver_steps
+        || artifact.accuracy_guard_bits != GUARD_BITS
     {
         return Err(CacheError::InvalidManifest(
             "CCM root-range payload does not match its semantic identity".to_owned(),
@@ -3024,23 +3374,59 @@ fn decode_root_range(
         .outcomes
         .iter()
         .map(|outcome| match outcome {
-            PortableRootOutcome::Converged(value) => {
-                parse_hp_vector(std::slice::from_ref(value), cfg.precision_bits)
-                    .map(|parsed| EigenvalueResult::Converged(parsed[0].clone()))
-            }
-            PortableRootOutcome::Approximate(value) => {
-                parse_hp_vector(std::slice::from_ref(value), cfg.precision_bits)
-                    .map(|parsed| EigenvalueResult::Approximate(parsed[0].clone()))
-            }
-            PortableRootOutcome::Failed => Ok(EigenvalueResult::Failed),
+            PortableRootOutcome::Converged(result) => result
+                .to_runtime(cfg.precision_bits)
+                .map(EigenvalueResult::Converged),
+            PortableRootOutcome::Stagnated(result) => result
+                .to_runtime(cfg.precision_bits)
+                .map(EigenvalueResult::Stagnated),
+            PortableRootOutcome::Approximate(result) => result
+                .to_runtime(cfg.precision_bits)
+                .map(EigenvalueResult::Approximate),
+            PortableRootOutcome::Failed { iterations, reason } => Ok(EigenvalueResult::Failed {
+                iterations: *iterations,
+                reason: reason.clone(),
+            }),
         })
         .collect::<std::result::Result<_, _>>()?;
+    let mut two_pi_over_l = pi(cfg.precision_bits);
+    two_pi_over_l *= 2u32;
+    two_pi_over_l /= l;
     let mut previous: Option<&Float> = None;
     for outcome in &decoded {
-        let value = match outcome {
-            EigenvalueResult::Converged(value) | EigenvalueResult::Approximate(value) => value,
-            EigenvalueResult::Failed => continue,
+        let result = match outcome {
+            EigenvalueResult::Converged(result) => result,
+            EigenvalueResult::Stagnated(_)
+            | EigenvalueResult::Approximate(_)
+            | EigenvalueResult::Failed { .. } => {
+                return Err(CacheError::InvalidManifest(
+                    "validated CCM root-range payload contains a non-converged root".to_owned(),
+                ))
+            }
         };
+        let value = &result.value;
+        if result.diagnostics.iterations > cfg.solver_steps
+            || result.diagnostics.final_correction
+                >= root_correction_tolerance(value, cfg.precision_bits)
+            || achieved_decimal_digits(
+                value,
+                &result.diagnostics.final_correction,
+                cfg.precision_bits,
+            ) != result.diagnostics.achieved_decimal_digits
+            || secular_residual_at(
+                xi,
+                params.n_modes,
+                &two_pi_over_l,
+                value,
+                cfg.precision_bits,
+            )
+            .is_none_or(|residual| residual != result.diagnostics.residual)
+        {
+            return Err(CacheError::InvalidManifest(
+                "validated CCM root-range payload has inconsistent convergence diagnostics"
+                    .to_owned(),
+            ));
+        }
         if value <= &Float::with_val(cfg.precision_bits, 0)
             || previous.is_some_and(|prior| value <= prior)
         {
@@ -3079,7 +3465,11 @@ fn resolve_root_range_via_cache(
             RootArtifactMode::ReferenceSeededRefinement => "ccm_root_refinement",
         }
         .to_owned(),
-        mathematical_semantics_version: "ccm-root-range-v0.13.0-v2".to_owned(),
+        mathematical_semantics_version: match artifact_mode {
+            RootArtifactMode::Independent => "ccm-root-range-v0.13.0-v5",
+            RootArtifactMode::ReferenceSeededRefinement => "ccm-root-range-v0.13.0-v4",
+        }
+        .to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -3095,7 +3485,8 @@ fn resolve_root_range_via_cache(
                 RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
             },
             "solver": cfg.root_solver.display_name().to_ascii_lowercase(),
-            "solver_steps": cfg.solver_steps
+            "solver_steps": cfg.solver_steps,
+            "accuracy_guard_bits": GUARD_BITS
         }),
         normalization: None,
         target: Some("positive_ccm_spectral_roots".to_owned()),
@@ -3131,7 +3522,10 @@ fn resolve_root_range_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse(match artifact_mode {
+            RootArtifactMode::Independent => "0.13.0",
+            RootArtifactMode::ReferenceSeededRefinement => "0.13.0",
+        })?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -3150,21 +3544,29 @@ fn resolve_root_range_via_cache(
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            let outcomes = compute_root_range(xi, params, l, cfg, seeds)
+            let computed = compute_root_range(xi, params, l, cfg, seeds);
+            ensure_all_roots_converged(&computed)
+                .map_err(|error| CacheError::InvalidTransition(error.to_string()))?;
+            let outcomes = computed
                 .into_iter()
                 .map(|outcome| match outcome {
-                    EigenvalueResult::Converged(value) => {
-                        PortableRootOutcome::Converged(value.to_string())
+                    EigenvalueResult::Converged(result) => PortableRootOutcome::Converged(
+                        PortableRootRefinement::from_runtime(&result),
+                    ),
+                    EigenvalueResult::Stagnated(result) => PortableRootOutcome::Stagnated(
+                        PortableRootRefinement::from_runtime(&result),
+                    ),
+                    EigenvalueResult::Approximate(result) => PortableRootOutcome::Approximate(
+                        PortableRootRefinement::from_runtime(&result),
+                    ),
+                    EigenvalueResult::Failed { iterations, reason } => {
+                        PortableRootOutcome::Failed { iterations, reason }
                     }
-                    EigenvalueResult::Approximate(value) => {
-                        PortableRootOutcome::Approximate(value.to_string())
-                    }
-                    EigenvalueResult::Failed => PortableRootOutcome::Failed,
                 })
                 .collect();
             Ok((
                 PortableRootRange {
-                    schema_version: 2,
+                    schema_version: 3,
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
                     precision_bits: cfg.precision_bits,
@@ -3182,6 +3584,7 @@ fn resolve_root_range_via_cache(
                     outcomes,
                     solver: cfg.root_solver.display_name().to_ascii_lowercase(),
                     solver_steps: cfg.solver_steps,
+                    accuracy_guard_bits: GUARD_BITS,
                 },
                 vec![DependencyRef {
                     key: secular_manifest.key.clone(),
@@ -3198,6 +3601,8 @@ fn resolve_root_range_via_cache(
                 first_root_index,
                 seeds,
                 artifact_mode,
+                xi,
+                l,
             )
             .map(|_| ())
         },
@@ -3214,6 +3619,8 @@ fn resolve_root_range_via_cache(
             first_root_index,
             seeds,
             artifact_mode,
+            xi,
+            l,
         )?,
         manifest,
     ))
@@ -3224,6 +3631,7 @@ fn record_run_evidence_via_cache(
     params: &CcmParams,
     cfg: &HighPrecConfig,
     eps_n: &Float,
+    inverse_iteration: &xc_numerics::linalg::InverseIterationDiagnostics,
     roots: &[EigenvalueResult],
     first_root_index: usize,
     eigenpair_manifest: &ArtifactManifest,
@@ -3239,18 +3647,19 @@ fn record_run_evidence_via_cache(
         .ok_or_else(|| anyhow::anyhow!("CCM run-evidence root range overflows usize"))?;
     let counts = roots
         .iter()
-        .fold((0usize, 0usize, 0usize), |mut counts, root| {
+        .fold((0usize, 0usize, 0usize, 0usize), |mut counts, root| {
             match root {
                 EigenvalueResult::Converged(_) => counts.0 += 1,
-                EigenvalueResult::Approximate(_) => counts.1 += 1,
-                EigenvalueResult::Failed => counts.2 += 1,
+                EigenvalueResult::Stagnated(_) => counts.1 += 1,
+                EigenvalueResult::Approximate(_) => counts.2 += 1,
+                EigenvalueResult::Failed { .. } => counts.3 += 1,
             }
             counts
         });
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_convergence_diagnostics".to_owned(),
-        mathematical_semantics_version: "ccm-run-evidence-v0.13.0-v1".to_owned(),
+        mathematical_semantics_version: "ccm-run-evidence-v0.13.0-v3".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -3305,7 +3714,7 @@ fn record_run_evidence_via_cache(
         || {
             Ok((
                 PortableRunEvidence {
-                    schema_version: 1,
+                    schema_version: 3,
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
                     precision_bits: cfg.precision_bits,
@@ -3316,14 +3725,18 @@ fn record_run_evidence_via_cache(
                     root_count: roots.len(),
                     weil_min_eigenvalue: eps_n.to_string(),
                     converged_roots: counts.0,
-                    approximate_roots: counts.1,
-                    failed_roots: counts.2,
+                    stagnated_roots: counts.1,
+                    approximate_roots: counts.2,
+                    failed_roots: counts.3,
+                    inverse_iteration: PortableInverseIterationDiagnostics::from_runtime(
+                        inverse_iteration,
+                    ),
                 },
                 canonical_dependency_refs(vec![eigenpair_manifest.clone(), root_manifest.clone()]),
             ))
         },
         |artifact| {
-            if artifact.schema_version != 1
+            if artifact.schema_version != 3
                 || artifact.lambda_squared != lambda_squared_cache_identity(params)
                 || artifact.n_modes != params.n_modes
                 || artifact.precision_bits != cfg.precision_bits
@@ -3334,11 +3747,27 @@ fn record_run_evidence_via_cache(
                 || artifact.root_count != roots.len()
                 || artifact.weil_min_eigenvalue != eps_n.to_string()
                 || artifact.converged_roots != counts.0
-                || artifact.approximate_roots != counts.1
-                || artifact.failed_roots != counts.2
+                || artifact.stagnated_roots != counts.1
+                || artifact.approximate_roots != counts.2
+                || artifact.failed_roots != counts.3
             {
                 return Err(CacheError::InvalidManifest(
                     "CCM run evidence does not match its semantic identity".to_owned(),
+                ));
+            }
+            let decoded_inverse = artifact.inverse_iteration.to_runtime(cfg.precision_bits)?;
+            if decoded_inverse.configured_step_limit != inverse_iteration.configured_step_limit
+                || decoded_inverse.unshifted_steps != inverse_iteration.unshifted_steps
+                || decoded_inverse.unshifted_converged != inverse_iteration.unshifted_converged
+                || decoded_inverse.final_relative_rayleigh_change
+                    != inverse_iteration.final_relative_rayleigh_change
+                || decoded_inverse.shifted_refinement != inverse_iteration.shifted_refinement
+                || decoded_inverse.final_relative_residual_norm
+                    != inverse_iteration.final_relative_residual_norm
+            {
+                return Err(CacheError::InvalidManifest(
+                    "CCM run evidence contains inconsistent inverse-iteration diagnostics"
+                        .to_owned(),
                 ));
             }
             parse_hp_vector(
@@ -3527,54 +3956,51 @@ fn independently_discovered_starting_points(
     target: &ZeroTarget,
     precision_bits: u32,
 ) -> Result<(usize, Vec<Float>)> {
-    let spacing = 2.0 * std::f64::consts::PI / l.to_f64();
-    let poles = (-(params.n_modes as i64)..=(params.n_modes as i64))
-        .map(|index| spacing * index as f64)
-        .collect::<Vec<_>>();
-    let weights = xi.iter().map(Float::to_f64).collect::<Vec<_>>();
-    let secular = SecularFunctionF64::new(poles, weights)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let maximum = spacing * params.n_modes as f64;
+    if xi.len() != params.matrix_size() {
+        bail!("independent HP discovery requires one weight per CCM pole");
+    }
+    let mut spacing = pi(precision_bits);
+    spacing *= 2u32;
+    spacing /= l;
+    let mut maximum = spacing.clone();
+    maximum *= params.n_modes;
+    let zero = Float::with_val(precision_bits, 0);
     let (scan_upper, lower_filter) = match target {
         ZeroTarget::FirstK { count } => {
             if *count == 0 {
                 bail!("independent CCM prefix count must be positive");
             }
-            (maximum, 0.0)
+            (maximum.clone(), zero.clone())
         }
         ZeroTarget::IndexRange { first, last } => {
             if *first == 0 || first > last {
                 bail!("independent CCM root indices require 1 <= first <= last");
             }
-            (maximum, 0.0)
+            (maximum.clone(), zero.clone())
         }
         ZeroTarget::HeightWindow { lower, upper } => {
-            let lower = lower.parse::<f64>()?;
-            let upper = upper.parse::<f64>()?;
-            if lower <= 0.0 || lower >= upper || upper > maximum {
+            let lower = Float::with_val(precision_bits, Float::parse(lower)?);
+            let upper = Float::with_val(precision_bits, Float::parse(upper)?);
+            if lower <= 0 || lower >= upper || upper > maximum {
                 bail!("independent positive height window lies outside the finite CCM reach");
             }
             (upper, lower)
         }
         ZeroTarget::SymmetricHeightWindow { height } => {
-            let upper = height.parse::<f64>()?;
-            if upper <= 0.0 || upper > maximum {
+            let upper = Float::with_val(precision_bits, Float::parse(height)?);
+            if upper <= 0 || upper > maximum {
                 bail!("independent symmetric height window lies outside the finite CCM reach");
             }
-            (upper, 0.0)
+            (upper, zero.clone())
         }
     };
-    let discovered = discover_roots_f64(&secular, 0.0, scan_upper, &DiscoveryOptionsF64::default())
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let values = discovered
-        .iter()
-        .map(|root| root.midpoint.parse::<f64>().map_err(anyhow::Error::from))
-        .collect::<Result<Vec<_>>>()?;
-    let (first_index, selected): (usize, &[f64]) = match target {
+    let values =
+        discover_secular_roots_hp(xi, params.n_modes, &spacing, &scan_upper, precision_bits)?;
+    let (first_index, selected): (usize, &[Float]) = match target {
         ZeroTarget::FirstK { count } => {
             if values.len() < *count {
                 bail!(
-                    "independent computed discovery found only {} positive roots, but target requires index {count}; use certified FLINT discovery or increase finite reach",
+                    "independent HP discovery found only {} positive roots, but target requires index {count}; use certified FLINT discovery or increase finite reach",
                     values.len()
                 );
             }
@@ -3583,14 +4009,14 @@ fn independently_discovered_starting_points(
         ZeroTarget::IndexRange { first, last } => {
             if values.len() < *last {
                 bail!(
-                    "independent computed discovery found only {} positive roots, but target requires index {last}; use certified FLINT discovery or increase finite reach",
+                    "independent HP discovery found only {} positive roots, but target requires index {last}; use certified FLINT discovery or increase finite reach",
                     values.len()
                 );
             }
             (*first, &values[*first - 1..*last])
         }
         ZeroTarget::HeightWindow { .. } | ZeroTarget::SymmetricHeightWindow { .. } => {
-            let first_offset = values.partition_point(|value| *value <= lower_filter);
+            let first_offset = values.partition_point(|value| value <= &lower_filter);
             let selected = &values[first_offset..];
             if selected.is_empty() {
                 bail!("independent computed height window contains no discovered roots");
@@ -3598,13 +4024,123 @@ fn independently_discovered_starting_points(
             (first_offset + 1, selected)
         }
     };
-    Ok((
-        first_index,
-        selected
-            .iter()
-            .map(|value| Float::with_val(precision_bits, *value))
-            .collect(),
-    ))
+    Ok((first_index, selected.to_vec()))
+}
+
+fn evaluate_secular_hp(
+    xi: &[Float],
+    n_modes: usize,
+    spacing: &Float,
+    point: &Float,
+    precision_bits: u32,
+) -> Result<Float> {
+    let mut value = Float::with_val(precision_bits, 0);
+    for mode in -(n_modes as i64)..=(n_modes as i64) {
+        let index = (mode + n_modes as i64) as usize;
+        let mut pole = spacing.clone();
+        pole *= fl_i(precision_bits, mode);
+        let mut denominator = point.clone();
+        denominator -= pole;
+        if denominator.is_zero() {
+            bail!("independent HP discovery evaluated a secular pole");
+        }
+        let mut term = xi[index].clone();
+        term /= denominator;
+        value += term;
+    }
+    Ok(value)
+}
+
+/// Computed-assurance discovery using the full MPFR source. Pole-free
+/// intervals are scanned in order and sign-changing brackets are bisected to
+/// 128 bits before the configured HP point solver runs. This prevents the
+/// severe loss of source information caused by converting a deep CCM state to
+/// binary64 and makes pole crossing by the subsequent point solver unlikely.
+fn discover_secular_roots_hp(
+    xi: &[Float],
+    n_modes: usize,
+    spacing: &Float,
+    scan_upper: &Float,
+    precision_bits: u32,
+) -> Result<Vec<Float>> {
+    const SUBDIVISIONS: usize = 16;
+    const BISECTION_STEPS: usize = 128;
+
+    let mut boundaries = vec![Float::with_val(precision_bits, 0)];
+    for mode in 1..=n_modes {
+        let mut pole = spacing.clone();
+        pole *= mode;
+        if pole < *scan_upper {
+            boundaries.push(pole);
+        }
+    }
+    boundaries.push(scan_upper.clone());
+
+    let margin_fraction = Float::with_val(precision_bits, 2).pow(-64i32);
+    let mut roots = Vec::new();
+    for interval in boundaries.windows(2) {
+        let mut width = interval[1].clone();
+        width -= &interval[0];
+        if width <= 0 {
+            continue;
+        }
+        let mut margin = width.clone();
+        margin *= &margin_fraction;
+        let mut left = interval[0].clone();
+        left += &margin;
+        let mut right = interval[1].clone();
+        right -= &margin;
+        if left >= right {
+            continue;
+        }
+
+        let mut previous_point = left.clone();
+        let mut previous_value =
+            evaluate_secular_hp(xi, n_modes, spacing, &previous_point, precision_bits)?;
+        for subdivision in 1..=SUBDIVISIONS {
+            let mut point = right.clone();
+            point -= &left;
+            point *= subdivision;
+            point /= SUBDIVISIONS;
+            point += &left;
+            let value = evaluate_secular_hp(xi, n_modes, spacing, &point, precision_bits)?;
+            let changes_sign = previous_value.is_zero()
+                || value.is_zero()
+                || previous_value.is_sign_positive() != value.is_sign_positive();
+            if changes_sign {
+                let mut bracket_left = previous_point.clone();
+                let mut bracket_right = point.clone();
+                let mut left_value = previous_value.clone();
+                for _ in 0..BISECTION_STEPS {
+                    let mut midpoint = bracket_left.clone();
+                    midpoint += &bracket_right;
+                    midpoint /= 2u32;
+                    let midpoint_value =
+                        evaluate_secular_hp(xi, n_modes, spacing, &midpoint, precision_bits)?;
+                    if midpoint_value.is_zero() {
+                        bracket_left = midpoint.clone();
+                        bracket_right = midpoint;
+                        break;
+                    }
+                    if left_value.is_sign_positive() != midpoint_value.is_sign_positive() {
+                        bracket_right = midpoint;
+                    } else {
+                        bracket_left = midpoint;
+                        left_value = midpoint_value;
+                    }
+                }
+                let mut root = bracket_left;
+                root += bracket_right;
+                root /= 2u32;
+                if root > 0 && roots.last().is_none_or(|previous| &root > previous) {
+                    roots.push(root);
+                }
+            }
+            previous_point = point;
+            previous_value = value;
+        }
+    }
+    Ok(roots)
 }
 
 fn run_inner(
@@ -3639,105 +4175,151 @@ fn run_inner(
     // sits *after* `build_tau_hp` precisely so τ is available for the
     // residual validation (the strongest integrity test for ξ).
     //
-    let (eps_n, xi, eigenpair_manifest) = if let CcmCacheRoute::Fabric(cache) = &cache_route {
-        let (eps_n, xi, manifest) = weil_eigenpair_via_cache(
-            params,
-            cfg,
-            &l,
-            &tau,
-            tau_manifest
-                .as_ref()
-                .expect("fabric tau route retains its exact manifest"),
-            cache,
-        )?;
-        (eps_n, xi, Some(manifest))
-    } else {
-        let lambda_sq = params.lambda_sq;
-        let n_modes_key = params.n_modes;
-        let mut cached_pair: Option<(Float, Vec<Float>)> = None;
-        if let Some(c) =
-            weil_eigvec_cache::load(lambda_sq, n_modes_key, prec, cfg.cache_mode, cfg.force_even)
-        {
-            if weil_eigvec_cache::residual_ok(&tau, dim, &c.xi, &c.eps_n, prec) {
-                eprintln!(
+    let (eps_n, xi, inverse_iteration_diagnostics, eigenpair_manifest) =
+        if let CcmCacheRoute::Fabric(cache) = &cache_route {
+            let (eps_n, xi, diagnostics, manifest) = weil_eigenpair_via_cache(
+                params,
+                cfg,
+                &l,
+                &tau,
+                tau_manifest
+                    .as_ref()
+                    .expect("fabric tau route retains its exact manifest"),
+                cache,
+            )?;
+            (eps_n, xi, diagnostics, Some(manifest))
+        } else {
+            let lambda_sq = params.lambda_sq;
+            let n_modes_key = params.n_modes;
+            let mut cached_pair: Option<(
+                Float,
+                Vec<Float>,
+                xc_numerics::linalg::InverseIterationDiagnostics,
+            )> = None;
+            if let Some(c) = weil_eigvec_cache::load(
+                lambda_sq,
+                n_modes_key,
+                prec,
+                cfg.cache_mode,
+                cfg.force_even,
+            ) {
+                let replayed_residual =
+                    weil_eigvec_cache::relative_residual_norm(&tau, dim, &c.xi, &c.eps_n, prec);
+                if c.diagnostics.configured_step_limit == cfg.inverse_iter_steps
+                    && replayed_residual
+                        .as_ref()
+                        .is_some_and(|value| value == &c.diagnostics.final_relative_residual_norm)
+                    && weil_eigvec_cache::residual_ok(&tau, dim, &c.xi, &c.eps_n, prec)
+                {
+                    eprintln!(
                 "[HP] loaded cached Weil eigenvector for λ²={}, N={}, prec={} bits (τ-residual validated)",
                 lambda_sq.value_f64, n_modes_key, prec
             );
-                cached_pair = Some((c.eps_n, c.xi));
-            } else {
-                crate::hp_debug!(
-                    "[HP] WARNING: cached Weil eigenvector for λ²={}, N={}, prec={} failed \
+                    cached_pair = Some((c.eps_n, c.xi, c.diagnostics));
+                } else {
+                    crate::hp_debug!(
+                        "[HP] WARNING: cached Weil eigenvector for λ²={}, N={}, prec={} failed \
                  τ-residual validation; recomputing",
-                    lambda_sq.value_f64,
-                    n_modes_key,
-                    prec
-                );
+                        lambda_sq.value_f64,
+                        n_modes_key,
+                        prec
+                    );
+                }
             }
-        }
-        let pair = match cached_pair {
-            Some(pair) => pair,
-            None => {
-                // Warm-start from nearby-precision cache if enabled.
-                // Scan for a cached ξ at a nearby precision to use as the
-                // starting vector for inverse iteration instead of the Gaussian.
-                let warm_xi: Option<Vec<Float>> = if cfg.warm_start {
-                    weil_eigvec_cache::find_warm_start(
+            let pair = match cached_pair {
+                Some(pair) => pair,
+                None => {
+                    // Warm-start from nearby-precision cache if enabled.
+                    // Scan for a cached ξ at a nearby precision to use as the
+                    // starting vector for inverse iteration instead of the Gaussian.
+                    let warm_xi: Option<Vec<Float>> = if cfg.warm_start {
+                        weil_eigvec_cache::find_warm_start(
+                            lambda_sq,
+                            n_modes_key,
+                            prec,
+                            cfg.warm_start_tolerance_bits,
+                            cfg.force_even,
+                        )
+                    } else {
+                        None
+                    };
+
+                    // Find smallest eigenpair by inverse iteration.
+                    eprintln!(
+                        "[HP] LU factoring {}×{} matrix (one-time cost)...",
+                        dim, dim
+                    );
+                    let output = if let Some(warm) = warm_xi {
+                        crate::hp_debug!("[HP] starting inverse iteration from warm-start vector");
+                        xc_numerics::linalg::inverse_iteration_from_detailed(
+                            &tau,
+                            dim,
+                            prec,
+                            cfg.inverse_iter_steps,
+                            cfg.force_even,
+                            Some(warm),
+                        )?
+                    } else {
+                        xc_numerics::linalg::inverse_iteration_detailed(
+                            &tau,
+                            dim,
+                            prec,
+                            cfg.inverse_iter_steps,
+                            cfg.force_even,
+                        )?
+                    };
+                    crate::hp_debug!("[HP] LU factorization done.");
+                    // Normalize: Σ ξ_j = √L.
+                    let eps_n = output.eigenvalue;
+                    let xi = normalize_eigenvector(&output.eigenvector, &l, prec);
+                    let mut diagnostics = output.diagnostics;
+                    diagnostics.final_relative_residual_norm =
+                        weil_eigvec_cache::relative_residual_norm(&tau, dim, &xi, &eps_n, prec)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "CCM inverse iteration produced an invalid eigenvector"
+                                )
+                            })?;
+                    eprintln!("[HP] Eigenvector computed. Solving spectrum...");
+                    weil_eigvec_cache::save(
                         lambda_sq,
                         n_modes_key,
                         prec,
-                        cfg.warm_start_tolerance_bits,
+                        &eps_n,
+                        &xi,
+                        &diagnostics,
+                        cfg.cache_mode,
                         cfg.force_even,
-                    )
-                } else {
-                    None
-                };
-
-                // Find smallest eigenpair by inverse iteration.
-                eprintln!(
-                    "[HP] LU factoring {}×{} matrix (one-time cost)...",
-                    dim, dim
-                );
-                let (eps_n, xi_raw) = if let Some(warm) = warm_xi {
-                    crate::hp_debug!("[HP] starting inverse iteration from warm-start vector");
-                    xc_numerics::linalg::inverse_iteration_from(
-                        &tau,
-                        dim,
-                        prec,
-                        cfg.inverse_iter_steps,
-                        cfg.force_even,
-                        Some(warm),
-                    )?
-                } else {
-                    xc_numerics::linalg::inverse_iteration(
-                        &tau,
-                        dim,
-                        prec,
-                        cfg.inverse_iter_steps,
-                        cfg.force_even,
-                    )?
-                };
-                crate::hp_debug!("[HP] LU factorization done.");
-                // Normalize: Σ ξ_j = √L.
-                let xi = normalize_eigenvector(&xi_raw, &l, prec);
-                eprintln!("[HP] Eigenvector computed. Solving spectrum...");
-                weil_eigvec_cache::save(
-                    lambda_sq,
-                    n_modes_key,
-                    prec,
-                    &eps_n,
-                    &xi,
-                    cfg.cache_mode,
-                    cfg.force_even,
-                );
-                (eps_n, xi)
-            }
+                    );
+                    (eps_n, xi, diagnostics)
+                }
+            };
+            (pair.0, pair.1, pair.2, None)
         };
-        (pair.0, pair.1, None)
-    };
 
-    // Find finite D_log spectral roots as zeros of R(z), seeded from HP
-    // reference zeros.
-    // Each solver refinement is independent across seeds — parallelize.
+    if !weil_eigvec_cache::residual_ok(&tau, dim, &xi, &eps_n, prec) {
+        bail!(
+            "CCM inverse iteration did not meet the working-precision tau-residual acceptance floor after {} steps",
+            cfg.inverse_iter_steps
+        );
+    }
+    if !inverse_iteration_diagnostics.unshifted_converged {
+        eprintln!(
+            "[HP] eigenstate provenance: unshifted limit reached ({}/{} steps), shifted refinement={:?}, final relative Tau residual={}",
+            inverse_iteration_diagnostics.unshifted_steps,
+            inverse_iteration_diagnostics.configured_step_limit,
+            inverse_iteration_diagnostics.shifted_refinement,
+            xc_numerics::fmt::display_hp(
+                &inverse_iteration_diagnostics.final_relative_residual_norm,
+                10
+            )
+        );
+    }
+
+    // Find finite D_log spectral roots as zeros of R(z). The normal path
+    // discovers starting points directly from the full-precision secular
+    // source; the explicitly seeded API is retained for post-discovery
+    // comparison and refinement.
     let (first_root_index, hp_seeds, artifact_mode) = match acquisition {
         RootAcquisition::SourceOnly => (1, Vec::new(), RootArtifactMode::Independent),
         RootAcquisition::Independent(target) => {
@@ -3808,28 +4390,8 @@ fn run_inner(
             )?;
             (roots, Some(manifest))
         } else {
-            let roots = hp_seeds
-                .iter()
-                .map(|seed| {
-                    let result = solve_r_zero(
-                        &xi,
-                        params.n_modes,
-                        &l,
-                        seed,
-                        prec,
-                        cfg.solver_steps,
-                        cfg.root_solver,
-                    );
-                    if matches!(result, EigenvalueResult::Failed) {
-                        crate::hp_debug!(
-                            "[HP] WARNING: {} hit degenerate denominator for seed {} — skipping",
-                            cfg.root_solver.display_name(),
-                            xc_numerics::fmt::display_hp(seed, 10)
-                        );
-                    }
-                    result
-                })
-                .collect();
+            let roots = compute_root_range(&xi, params, &l, cfg, &hp_seeds);
+            ensure_all_roots_converged(&roots)?;
             (roots, None)
         };
     if let (CcmCacheRoute::Fabric(cache), Some(root_manifest)) = (&cache_route, &root_manifest) {
@@ -3837,6 +4399,7 @@ fn run_inner(
             params,
             cfg,
             &eps_n,
+            &inverse_iteration_diagnostics,
             &eigenvalues_pos,
             first_root_index,
             eigenpair_manifest
@@ -3889,6 +4452,7 @@ fn run_inner(
         first_positive_root_index: first_root_index,
         weil_min_eigenvalue: eps_n,
         xi,
+        inverse_iteration_diagnostics,
         elapsed_seconds: start.elapsed().as_secs_f64(),
         precision_bits: prec,
     })
@@ -3970,11 +4534,11 @@ fn measure_evenness_via_cache(
 
     let mut natural_cfg = cfg.clone();
     natural_cfg.force_even = false;
-    let (natural_eval, natural_xi, natural_manifest) =
+    let (natural_eval, natural_xi, _natural_diagnostics, natural_manifest) =
         weil_eigenpair_via_cache(params, &natural_cfg, &l, &tau, &tau_manifest, cache)?;
     let mut forced_cfg = cfg.clone();
     forced_cfg.force_even = true;
-    let (forced_eval, _forced_xi, forced_manifest) =
+    let (forced_eval, _forced_xi, _forced_diagnostics, forced_manifest) =
         weil_eigenpair_via_cache(params, &forced_cfg, &l, &tau, &tau_manifest, cache)?;
     let calculated = evenness_from_natural_state(
         params,
@@ -5429,7 +5993,7 @@ fn log_lambda_sq_hp(params: &CcmParams, prec: u32) -> Float {
 }
 
 // ===========================================================================
-// Newton refinement of R(z) zeros
+// High-precision refinement of R(z) zeros
 // ===========================================================================
 
 /// Root-finding method for R(z) zeros.
@@ -5437,9 +6001,10 @@ fn log_lambda_sq_hp(params: &CcmParams, prec: u32) -> Float {
 /// Selected explicitly through [`HighPrecConfig::root_solver`]:
 ///   - `"halley"` (default): cubic convergence, 3 passes per step, ~33%
 ///     fewer steps than Newton. Requires seeds reasonably close to the
-///     true eigenvalue — satisfied in practice by the f64 warm seeds.
-///   - `"newton"`: quadratic convergence, 2 passes per step. Use if Halley
-///     exhibits convergence issues on a specific config.
+///     true eigenvalue — satisfied by the pole-aware MPFR discovery brackets.
+///   - `"newton"`: quadratic convergence, 2 passes per step, retained only
+///     for explicit algorithm-comparison experiments. It is never selected
+///     automatically after a Halley outcome.
 fn solve_r_zero(
     xi: &[Float],
     n_max: usize,
@@ -5455,18 +6020,100 @@ fn solve_r_zero(
     }
 }
 
+fn secular_residual_at(
+    xi: &[Float],
+    n_max: usize,
+    two_pi_over_l: &Float,
+    z: &Float,
+    prec: u32,
+) -> Option<Float> {
+    let mut residual = Float::with_val(prec, 0);
+    for j in -(n_max as i64)..=(n_max as i64) {
+        let idx = (j + n_max as i64) as usize;
+        let mut pole = two_pi_over_l.clone();
+        pole *= fl_i(prec, j);
+        let mut denominator = z.clone();
+        denominator -= pole;
+        if denominator.is_zero() {
+            return None;
+        }
+        let mut term = xi[idx].clone();
+        term /= denominator;
+        residual += term;
+    }
+    Some(residual.abs())
+}
+
+fn achieved_decimal_digits(value: &Float, correction: &Float, prec: u32) -> Float {
+    let mut maximum = Float::with_val(prec, 2).log10();
+    maximum *= prec.saturating_sub(GUARD_BITS);
+    if correction.is_zero() {
+        return maximum;
+    }
+    let mut scale = value.clone().abs();
+    if scale < 1 {
+        scale = Float::with_val(prec, 1);
+    }
+    let mut relative = correction.clone().abs();
+    relative /= scale;
+    if relative >= 1 {
+        return Float::with_val(prec, 0);
+    }
+    let mut digits = relative.log10();
+    digits = -digits;
+    if digits > maximum {
+        maximum
+    } else {
+        digits
+    }
+}
+
+/// Relative correction threshold corresponding to the caller's requested
+/// accuracy. `for_decimal_digits` reserves `GUARD_BITS` beyond that contract;
+/// those working bits absorb secular-sum cancellation and are not themselves
+/// demanded from the final root.
+fn root_correction_tolerance(value: &Float, prec: u32) -> Float {
+    let target_bits = prec.saturating_sub(GUARD_BITS).max(1);
+    let mut tolerance = Float::with_val(prec, 2).pow(-(target_bits as i32));
+    let mut scale = value.clone().abs();
+    if scale < 1 {
+        scale = Float::with_val(prec, 1);
+    }
+    tolerance *= scale;
+    tolerance
+}
+
+fn root_refinement(
+    xi: &[Float],
+    n_max: usize,
+    two_pi_over_l: &Float,
+    value: Float,
+    iterations: usize,
+    final_correction: Float,
+    prec: u32,
+) -> Option<RootRefinement> {
+    let residual = secular_residual_at(xi, n_max, two_pi_over_l, &value, prec)?;
+    let achieved_decimal_digits = achieved_decimal_digits(&value, &final_correction, prec);
+    Some(RootRefinement {
+        value,
+        diagnostics: RootRefinementDiagnostics {
+            iterations,
+            final_correction,
+            residual,
+            achieved_decimal_digits,
+        },
+    })
+}
+
 /// Newton's method for a zero of R(z) = Σ ξ_j / (z − 2πj/L).
 ///
 /// Quadratic convergence: correct digits double each step.
 /// Uses R(z) and R'(z) — 2 passes over the poles per step.
 ///
 /// Returns:
-/// - `Converged(z)` if the step size dropped below HP tolerance, OR if
-///   the step stagnated (stopped shrinking) while already below the f64
-///   floor — signals the construction's precision ceiling was reached.
-/// - `Approximate(z)` if the step limit was exhausted before either
-///   convergence or stagnation (best approximation found).
-/// - `Failed` only if R'(z) = 0 (degenerate denominator — garbage).
+/// Stagnation is detected from a representational stall, a two-cycle, or the
+/// absence of any smaller correction for `ROOT_STAGNATION_WINDOW` steps. It
+/// is reported distinctly and is never accepted as convergence.
 fn newton_xi_hat_zero(
     xi: &[Float],
     n_max: usize,
@@ -5482,12 +6129,18 @@ fn newton_xi_hat_zero(
         v
     };
     let mut z = seed.clone();
-    let tol = Float::with_val(prec, 2).pow(-((prec as i32) - 16));
-    // Stagnation floor: if |dz| stops shrinking while already below f64
-    // precision, we've hit the construction's accuracy ceiling. Accept.
-    let stagnation_tol = Float::with_val(prec, 2).pow(-53);
-    let mut prev_dz = Float::with_val(prec, f64::INFINITY);
-    for _ in 0..n_steps {
+    if n_steps == 0 {
+        return EigenvalueResult::Failed {
+            iterations: 0,
+            reason: "root iteration limit must be positive".to_owned(),
+        };
+    }
+    let mut point_before_previous: Option<Float> = None;
+    let mut last_correction = Float::with_val(prec, 0);
+    let mut best_correction: Option<Float> = None;
+    let mut nonimproving_steps = 0usize;
+    for iteration in 1..=n_steps {
+        let previous_point = z.clone();
         let mut r = Float::with_val(prec, 0);
         let mut r_prime = Float::with_val(prec, 0);
         for j in -(n_max as i64)..=(n_max as i64) {
@@ -5506,34 +6159,60 @@ fn newton_xi_hat_zero(
             r_prime -= &dterm;
         }
         if r_prime.is_zero() {
-            return EigenvalueResult::Failed;
+            return EigenvalueResult::Failed {
+                iterations: iteration,
+                reason: "Newton derivative is zero".to_owned(),
+            };
         }
         let mut dz = r;
         dz /= &r_prime;
         z -= &dz;
         let abs_dz = dz.abs();
+        last_correction = abs_dz.clone();
         // Converged to full HP precision.
-        if abs_dz.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false) {
-            return EigenvalueResult::Converged(z);
-        }
-        // Stagnated: step stopped shrinking while already below f64 floor.
-        // The construction's accuracy ceiling has been reached.
-        if abs_dz >= prev_dz
-            && prev_dz
-                .cmp_abs(&stagnation_tol)
-                .map(|o| o.is_lt())
-                .unwrap_or(false)
+        let tolerance = root_correction_tolerance(&z, prec);
+        if abs_dz
+            .cmp_abs(&tolerance)
+            .map(|o| o.is_lt())
+            .unwrap_or(false)
         {
-            return EigenvalueResult::Converged(z);
+            return match root_refinement(xi, n_max, &two_pi_over_l, z, iteration, abs_dz, prec) {
+                Some(result) => EigenvalueResult::Converged(result),
+                None => EigenvalueResult::Failed {
+                    iterations: iteration,
+                    reason: "Newton converged onto a secular pole".to_owned(),
+                },
+            };
         }
-        prev_dz = abs_dz;
+        if best_correction.as_ref().is_none_or(|best| &abs_dz < best) {
+            best_correction = Some(abs_dz.clone());
+            nonimproving_steps = 0;
+        } else {
+            nonimproving_steps += 1;
+        }
+        if z == previous_point
+            || point_before_previous
+                .as_ref()
+                .is_some_and(|point| point == &z)
+            || nonimproving_steps >= ROOT_STAGNATION_WINDOW
+        {
+            return match root_refinement(xi, n_max, &two_pi_over_l, z, iteration, abs_dz, prec) {
+                Some(result) => EigenvalueResult::Stagnated(result),
+                None => EigenvalueResult::Failed {
+                    iterations: iteration,
+                    reason: "Newton stagnated on a secular pole".to_owned(),
+                },
+            };
+        }
+        point_before_previous = Some(previous_point);
     }
-    // Step limit exhausted — return best approximation, not a hard failure.
-    crate::hp_debug!(
-        "[HP] WARNING: Newton failed to converge for seed {} — returning Approximate",
-        xc_numerics::fmt::display_hp(seed, 10)
-    );
-    EigenvalueResult::Approximate(z)
+    match root_refinement(xi, n_max, &two_pi_over_l, z, n_steps, last_correction, prec) {
+        Some(result) => EigenvalueResult::Approximate(result),
+        None => EigenvalueResult::Failed {
+            iterations: n_steps,
+            reason: "Newton iteration limit reached on a secular pole".to_owned(),
+        },
+    }
 }
 
 /// Halley's method for a zero of R(z) = Σ ξ_j / (z − 2πj/L).
@@ -5542,13 +6221,9 @@ fn newton_xi_hat_zero(
 /// Uses R(z), R'(z), and R''(z) — 3 passes over the poles per step.
 /// Step: z ← z − 2·R·R' / (2·R'² − R·R'')
 ///
-/// Returns:
-/// - `Converged(z)` if the step size dropped below HP tolerance, OR if
-///   the step stagnated (stopped shrinking) while already below the f64
-///   floor — signals the construction's precision ceiling was reached.
-/// - `Approximate(z)` if the step limit was exhausted before either
-///   convergence or stagnation (best approximation found).
-/// - `Failed` only if the Halley denominator is zero (degenerate).
+/// Stagnation is detected from a representational stall, a two-cycle, or the
+/// absence of any smaller correction for `ROOT_STAGNATION_WINDOW` steps. It
+/// is reported distinctly and is never accepted as convergence.
 fn halley_xi_hat_zero(
     xi: &[Float],
     n_max: usize,
@@ -5564,12 +6239,18 @@ fn halley_xi_hat_zero(
         v
     };
     let mut z = seed.clone();
-    let tol = Float::with_val(prec, 2).pow(-((prec as i32) - 16));
-    // Stagnation floor: if |dz| stops shrinking while already below f64
-    // precision, we've hit the construction's accuracy ceiling. Accept.
-    let stagnation_tol = Float::with_val(prec, 2).pow(-53);
-    let mut prev_dz = Float::with_val(prec, f64::INFINITY);
-    for _ in 0..n_steps {
+    if n_steps == 0 {
+        return EigenvalueResult::Failed {
+            iterations: 0,
+            reason: "root iteration limit must be positive".to_owned(),
+        };
+    }
+    let mut point_before_previous: Option<Float> = None;
+    let mut last_correction = Float::with_val(prec, 0);
+    let mut best_correction: Option<Float> = None;
+    let mut nonimproving_steps = 0usize;
+    for iteration in 1..=n_steps {
+        let previous_point = z.clone();
         let mut r = Float::with_val(prec, 0);
         let mut r_prime = Float::with_val(prec, 0);
         let mut r_dprime = Float::with_val(prec, 0);
@@ -5606,7 +6287,10 @@ fn halley_xi_hat_zero(
         denom -= &rr2;
 
         if denom.is_zero() {
-            return EigenvalueResult::Failed;
+            return EigenvalueResult::Failed {
+                iterations: iteration,
+                reason: "Halley denominator is zero".to_owned(),
+            };
         }
 
         let mut dz = r.clone();
@@ -5615,28 +6299,51 @@ fn halley_xi_hat_zero(
         dz /= &denom;
         z -= &dz;
         let abs_dz = dz.abs();
+        last_correction = abs_dz.clone();
         // Converged to full HP precision.
-        if abs_dz.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false) {
-            return EigenvalueResult::Converged(z);
-        }
-        // Stagnated: step stopped shrinking while already below f64 floor.
-        // The construction's accuracy ceiling has been reached.
-        if abs_dz >= prev_dz
-            && prev_dz
-                .cmp_abs(&stagnation_tol)
-                .map(|o| o.is_lt())
-                .unwrap_or(false)
+        let tolerance = root_correction_tolerance(&z, prec);
+        if abs_dz
+            .cmp_abs(&tolerance)
+            .map(|o| o.is_lt())
+            .unwrap_or(false)
         {
-            return EigenvalueResult::Converged(z);
+            return match root_refinement(xi, n_max, &two_pi_over_l, z, iteration, abs_dz, prec) {
+                Some(result) => EigenvalueResult::Converged(result),
+                None => EigenvalueResult::Failed {
+                    iterations: iteration,
+                    reason: "Halley converged onto a secular pole".to_owned(),
+                },
+            };
         }
-        prev_dz = abs_dz;
+        if best_correction.as_ref().is_none_or(|best| &abs_dz < best) {
+            best_correction = Some(abs_dz.clone());
+            nonimproving_steps = 0;
+        } else {
+            nonimproving_steps += 1;
+        }
+        if z == previous_point
+            || point_before_previous
+                .as_ref()
+                .is_some_and(|point| point == &z)
+            || nonimproving_steps >= ROOT_STAGNATION_WINDOW
+        {
+            return match root_refinement(xi, n_max, &two_pi_over_l, z, iteration, abs_dz, prec) {
+                Some(result) => EigenvalueResult::Stagnated(result),
+                None => EigenvalueResult::Failed {
+                    iterations: iteration,
+                    reason: "Halley stagnated on a secular pole".to_owned(),
+                },
+            };
+        }
+        point_before_previous = Some(previous_point);
     }
-    // Step limit exhausted — return best approximation, not a hard failure.
-    crate::hp_debug!(
-        "[HP] WARNING: Halley failed to converge for seed {} — returning Approximate",
-        xc_numerics::fmt::display_hp(seed, 10)
-    );
-    EigenvalueResult::Approximate(z)
+    match root_refinement(xi, n_max, &two_pi_over_l, z, n_steps, last_correction, prec) {
+        Some(result) => EigenvalueResult::Approximate(result),
+        None => EigenvalueResult::Failed {
+            iterations: n_steps,
+            reason: "Halley iteration limit reached on a secular pole".to_owned(),
+        },
+    }
 }
 
 // ===========================================================================
@@ -6430,6 +7137,7 @@ mod weil_eigvec_cache {
     use xc_numerics::quadrature::CacheMode;
 
     use super::super::LambdaSq;
+    use super::PortableInverseIterationDiagnostics;
 
     /// Toolkit version string embedded in every weil eigvec cache file
     /// written by this build.
@@ -6452,13 +7160,14 @@ mod weil_eigvec_cache {
     }
 
     /// Current schema version for the weil eigvec JSON envelope.
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32 = 2;
 
     /// A ξ entry loaded from the cache: the eigenvector plus its
     /// eigenvalue ε_N, both at the requested working precision.
     pub(super) struct CachedXi {
         pub eps_n: Float,
         pub xi: Vec<Float>,
+        pub diagnostics: xc_numerics::linalg::InverseIterationDiagnostics,
     }
 
     fn cache_dir() -> Option<std::path::PathBuf> {
@@ -6609,6 +7318,10 @@ mod weil_eigvec_cache {
         let v: serde_json::Value = serde_json::from_str(data).ok()?;
         let obj = v.as_object()?;
 
+        if obj.get("schema_version").and_then(|x| x.as_u64())? as u32 != SCHEMA_VERSION {
+            return None;
+        }
+
         let file_ver = obj.get("toolkit_version").and_then(|x| x.as_str())?;
         if version_is_older(file_ver, &effective_min_version()) {
             return None;
@@ -6643,7 +7356,14 @@ mod weil_eigvec_cache {
             }
             xi.push(f);
         }
-        Some(CachedXi { eps_n, xi })
+        let portable: PortableInverseIterationDiagnostics =
+            serde_json::from_value(obj.get("inverse_iteration")?.clone()).ok()?;
+        let diagnostics = portable.to_runtime(prec).ok()?;
+        Some(CachedXi {
+            eps_n,
+            xi,
+            diagnostics,
+        })
     }
 
     /// Returns `true` if version string `a` is strictly older than `b`.
@@ -6663,15 +7383,15 @@ mod weil_eigvec_cache {
     /// sits below the working-precision floor. This is the strong
     /// integrity test that catches a structurally-valid-but-wrong ξ
     /// (e.g. a different eigenvector, or one from a subtly different τ).
-    pub(super) fn residual_ok(
+    pub(super) fn relative_residual_norm(
         tau: &[Float],
         dim: usize,
         xi: &[Float],
         eps_n: &Float,
         prec: u32,
-    ) -> bool {
+    ) -> Option<Float> {
         if xi.len() != dim || tau.len() != dim * dim {
-            return false;
+            return None;
         }
 
         // ‖ξ‖_∞ for the relative bound. A zero vector can never be a
@@ -6684,7 +7404,7 @@ mod weil_eigvec_cache {
             }
         }
         if xi_linf.is_zero() {
-            return false;
+            return None;
         }
 
         // max_i | (τξ)_i − ε_N ξ_i |, rows computed in parallel then a
@@ -6721,6 +7441,19 @@ mod weil_eigvec_cache {
         // floor.
         let mut rel = resid_inf;
         rel /= &xi_linf;
+        Some(rel)
+    }
+
+    pub(super) fn residual_ok(
+        tau: &[Float],
+        dim: usize,
+        xi: &[Float],
+        eps_n: &Float,
+        prec: u32,
+    ) -> bool {
+        let Some(rel) = relative_residual_norm(tau, dim, xi, eps_n, prec) else {
+            return false;
+        };
         let floor = Float::with_val(prec, 2).pow(-((prec as i32) - 32));
         rel.cmp_abs(&floor).map(|o| o.is_lt()).unwrap_or(false)
     }
@@ -6819,6 +7552,7 @@ mod weil_eigvec_cache {
         prec: u32,
         eps_n: &Float,
         xi: &[Float],
+        diagnostics: &xc_numerics::linalg::InverseIterationDiagnostics,
     ) -> Vec<u8> {
         let xi_strings: Vec<String> = xi.iter().map(|f| f.to_string()).collect();
         let payload = serde_json::json!({
@@ -6830,6 +7564,7 @@ mod weil_eigvec_cache {
             "precision_bits": prec,
             "weil_min_eigenvalue": eps_n.to_string(),
             "xi": xi_strings,
+            "inverse_iteration": PortableInverseIterationDiagnostics::from_runtime(diagnostics),
         });
         serde_json::to_vec(&payload).unwrap_or_default()
     }
@@ -6870,12 +7605,14 @@ mod weil_eigvec_cache {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn save(
         lambda_sq: LambdaSq,
         n_modes: usize,
         prec: u32,
         eps_n: &Float,
         xi: &[Float],
+        diagnostics: &xc_numerics::linalg::InverseIterationDiagnostics,
         mode: CacheMode,
         force_even: bool,
     ) {
@@ -6884,7 +7621,7 @@ mod weil_eigvec_cache {
             return;
         }
 
-        let json_bytes = serialize_to_json(lambda_sq, n_modes, prec, eps_n, xi);
+        let json_bytes = serialize_to_json(lambda_sq, n_modes, prec, eps_n, xi, diagnostics);
         if json_bytes.is_empty() {
             return;
         }
@@ -6946,6 +7683,65 @@ mod tests {
         assert_eq!(first, 2);
         assert_eq!(points.len(), 2);
         assert!(points[0] > 0 && points[0] < points[1]);
+    }
+
+    #[test]
+    fn independent_discovery_preserves_weights_below_binary64_range() {
+        let precision = 2048;
+        let params = CcmParams::from_lambda_sq_integer(13, 4);
+        let l = Float::with_val(precision, 13).ln();
+        let tiny = Float::with_val(precision, Float::parse("1e-400").unwrap());
+        assert_eq!(tiny.to_f64(), 0.0, "fixture must underflow in binary64");
+        let xi = vec![tiny; params.matrix_size()];
+        let (first, points) = independently_discovered_starting_points(
+            &params,
+            &l,
+            &xi,
+            &ZeroTarget::IndexRange { first: 1, last: 3 },
+            precision,
+        )
+        .unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(points.len(), 3);
+        assert!(points.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn validated_root_windows_reject_every_nonconverged_status() {
+        let precision = 256;
+        let diagnostic = |value: u32| RootRefinement {
+            value: Float::with_val(precision, value),
+            diagnostics: RootRefinementDiagnostics {
+                iterations: 2_000,
+                final_correction: Float::with_val(precision, Float::parse("1e-50").unwrap()),
+                residual: Float::with_val(precision, Float::parse("1e-60").unwrap()),
+                achieved_decimal_digits: Float::with_val(precision, 50),
+            },
+        };
+        assert!(ensure_all_roots_converged(&[
+            EigenvalueResult::Converged(diagnostic(1)),
+            EigenvalueResult::Converged(diagnostic(2)),
+        ])
+        .is_ok());
+        assert!(
+            ensure_all_roots_converged(&[EigenvalueResult::Stagnated(diagnostic(1))])
+                .unwrap_err()
+                .to_string()
+                .contains("stagnated")
+        );
+        assert!(
+            ensure_all_roots_converged(&[EigenvalueResult::Approximate(diagnostic(1))])
+                .unwrap_err()
+                .to_string()
+                .contains("iteration limit")
+        );
+        assert!(ensure_all_roots_converged(&[EigenvalueResult::Failed {
+            iterations: 3,
+            reason: "degenerate derivative".to_owned(),
+        }])
+        .unwrap_err()
+        .to_string()
+        .contains("degenerate derivative"));
     }
 
     #[test]
@@ -7334,17 +8130,27 @@ mod tests {
     #[test]
     fn portable_ccm_hp_result_round_trips_values_status_and_precision() {
         let precision_bits = 512;
+        let refinement = |precision: u32, value: &str| RootRefinement {
+            value: Float::with_val(precision, Float::parse(value).unwrap()),
+            diagnostics: RootRefinementDiagnostics {
+                iterations: 17,
+                final_correction: Float::with_val(precision, Float::parse("1e-100").unwrap()),
+                residual: Float::with_val(precision, Float::parse("1e-110").unwrap()),
+                achieved_decimal_digits: Float::with_val(precision, 100),
+            },
+        };
         let runtime = HighPrecResult {
             eigenvalues_pos: vec![
-                EigenvalueResult::Converged(Float::with_val(
+                EigenvalueResult::Converged(refinement(
                     precision_bits,
-                    Float::parse("14.134725141734693790457251983562").unwrap(),
+                    "14.134725141734693790457251983562",
                 )),
-                EigenvalueResult::Approximate(Float::with_val(
-                    768,
-                    Float::parse("21.022039638771554992628479593896").unwrap(),
-                )),
-                EigenvalueResult::Failed,
+                EigenvalueResult::Stagnated(refinement(768, "21.022039638771554992628479593896")),
+                EigenvalueResult::Approximate(refinement(640, "25.010857580145688763213790992563")),
+                EigenvalueResult::Failed {
+                    iterations: 9,
+                    reason: "test failure".to_owned(),
+                },
             ],
             first_positive_root_index: 17,
             weil_min_eigenvalue: Float::with_val(precision_bits, Float::parse("1e-120").unwrap()),
@@ -7352,6 +8158,20 @@ mod tests {
                 Float::with_val(384, Float::parse("-0.125").unwrap()),
                 Float::with_val(640, Float::parse("0.75").unwrap()),
             ],
+            inverse_iteration_diagnostics: xc_numerics::linalg::InverseIterationDiagnostics {
+                configured_step_limit: 2_000,
+                unshifted_steps: 2_000,
+                unshifted_converged: false,
+                final_relative_rayleigh_change: Some(Float::with_val(
+                    precision_bits,
+                    Float::parse("1e-90").unwrap(),
+                )),
+                shifted_refinement: xc_numerics::linalg::ShiftedRefinementOutcome::Accepted,
+                final_relative_residual_norm: Float::with_val(
+                    precision_bits,
+                    Float::parse("1e-120").unwrap(),
+                ),
+            },
             elapsed_seconds: 1.25,
             precision_bits,
         };
@@ -7371,7 +8191,11 @@ mod tests {
             runtime.weil_min_eigenvalue
         );
         assert_eq!(reconstructed.xi, runtime.xi);
-        assert_eq!(reconstructed.spectral_root_index_range(), Some(17..=19));
+        assert_eq!(
+            reconstructed.inverse_iteration_diagnostics,
+            runtime.inverse_iteration_diagnostics
+        );
+        assert_eq!(reconstructed.spectral_root_index_range(), Some(17..=20));
         for (actual, expected) in reconstructed
             .eigenvalues_pos
             .iter()
@@ -7379,14 +8203,36 @@ mod tests {
         {
             match (actual, expected) {
                 (EigenvalueResult::Converged(actual), EigenvalueResult::Converged(expected))
+                | (EigenvalueResult::Stagnated(actual), EigenvalueResult::Stagnated(expected))
                 | (
                     EigenvalueResult::Approximate(actual),
                     EigenvalueResult::Approximate(expected),
                 ) => {
-                    assert_eq!(actual, expected);
-                    assert_eq!(actual.prec(), expected.prec());
+                    assert_eq!(actual.value, expected.value);
+                    assert_eq!(actual.value.prec(), expected.value.prec());
+                    assert_eq!(
+                        actual.diagnostics.final_correction,
+                        expected.diagnostics.final_correction
+                    );
+                    assert_eq!(actual.diagnostics.residual, expected.diagnostics.residual);
+                    assert_eq!(
+                        actual.diagnostics.iterations,
+                        expected.diagnostics.iterations
+                    );
                 }
-                (EigenvalueResult::Failed, EigenvalueResult::Failed) => {}
+                (
+                    EigenvalueResult::Failed {
+                        iterations: actual_iterations,
+                        reason: actual_reason,
+                    },
+                    EigenvalueResult::Failed {
+                        iterations: expected_iterations,
+                        reason: expected_reason,
+                    },
+                ) => {
+                    assert_eq!(actual_iterations, expected_iterations);
+                    assert_eq!(actual_reason, expected_reason);
+                }
                 _ => panic!("saved CCM eigenvalue status changed"),
             }
         }
@@ -7565,13 +8411,12 @@ mod tests {
     #[test]
     fn config_for_200_digits() {
         let cfg = HighPrecConfig::for_decimal_digits(200);
-        // 200 * 3.322 = 664.4 → ceil = 665 + 16 guard = 681 bits
-        assert_eq!(cfg.precision_bits, 681);
+        // ceil(200 * log2(10)) = 665 + 64 guard = 729 bits
+        assert_eq!(cfg.precision_bits, 729);
         // 200 * 3 = 600, clamped to [600, 4000] → 600
         assert_eq!(cfg.quad_points, 600);
-        assert_eq!(cfg.inverse_iter_steps, 200);
-        // solver_steps = max(200, ceil(log2(200/10))) = 200 (safety cap)
-        assert_eq!(cfg.solver_steps, 200);
+        assert_eq!(cfg.inverse_iter_steps, 2_000);
+        assert_eq!(cfg.solver_steps, 2_000);
         assert_eq!(cfg.n_eigenvalues, 50);
         assert!(cfg.force_even, "force_even should default to true");
     }
@@ -7765,8 +8610,8 @@ mod tests {
     #[test]
     fn config_for_500_digits() {
         let cfg = HighPrecConfig::for_decimal_digits(500);
-        // 500 * 3.322 = 1661 → ceil = 1661 + 16 = 1677 bits
-        assert_eq!(cfg.precision_bits, 1677);
+        // ceil(500 * log2(10)) = 1661 + 64 guard = 1725 bits
+        assert_eq!(cfg.precision_bits, 1725);
         // 500 * 3 = 1500, clamped to [600, 4000] → 1500
         assert_eq!(cfg.quad_points, 1500);
     }
@@ -8005,35 +8850,27 @@ mod tests {
         );
     }
 
-    /// R4 test: solver_steps is a high safety cap (never reached in practice;
-    /// solver exits via convergence or stagnation detection). Scales with
-    /// precision but is always at least 200.
+    /// R4 test: root and inverse-iteration limits deliberately favor slow,
+    /// accurate convergence over early approximate results.
     #[test]
-    fn config_newton_steps_adaptive_with_precision() {
-        // All precision levels: k=ceil(log2(P/10)).max(200) = 200
+    fn config_uses_generous_fixed_halley_and_inverse_limits() {
         let cfg60 = HighPrecConfig::for_decimal_digits(60);
-        assert_eq!(
-            cfg60.solver_steps, 200,
-            "HP-60 should use safety cap of 200"
-        );
+        assert_eq!(cfg60.root_solver, RootSolver::Halley);
+        assert_eq!(cfg60.solver_steps, 2_000);
+        assert_eq!(cfg60.inverse_iter_steps, 2_000);
 
         let cfg200 = HighPrecConfig::for_decimal_digits(200);
-        assert_eq!(
-            cfg200.solver_steps, 200,
-            "HP-200 should use safety cap of 200"
-        );
+        assert_eq!(cfg200.solver_steps, 2_000);
+        assert_eq!(cfg200.inverse_iter_steps, 2_000);
 
         let cfg1000 = HighPrecConfig::for_decimal_digits(1000);
-        assert_eq!(
-            cfg1000.solver_steps, 200,
-            "HP-1000 should use safety cap of 200"
-        );
+        assert_eq!(cfg1000.precision_bits, 3_386);
+        assert_eq!(cfg1000.solver_steps, 2_000);
+        assert_eq!(cfg1000.inverse_iter_steps, 2_000);
 
         let cfg2000 = HighPrecConfig::for_decimal_digits(2000);
-        assert_eq!(
-            cfg2000.solver_steps, 200,
-            "HP-2000 should use safety cap of 200"
-        );
+        assert_eq!(cfg2000.solver_steps, 2_000);
+        assert_eq!(cfg2000.inverse_iter_steps, 2_000);
 
         // Steps must be non-decreasing with precision
         assert!(cfg200.solver_steps >= cfg60.solver_steps);
@@ -8081,10 +8918,9 @@ mod tests {
         );
     }
     /// Uses λ²=13, N=10 which has good eigenvalue convergence.
-    /// The f64 seed path is exercised when xi is available.
     #[test]
     #[ignore = "HP matrix compute — GMP arena exhaustion in long debug test runs on WSL2; run with: RAYON_NUM_THREADS=2 cargo test --features hp -- --include-ignored --test-threads=1"]
-    fn run_uses_f64_seeds_at_small_n() {
+    fn indexed_seeded_run_returns_requested_root_count() {
         let params = CcmParams::from_lambda_sq_integer(13, 8); // N=8, tiny
         let mut cfg = HighPrecConfig::for_decimal_digits(60);
         cfg.n_eigenvalues = 1;
@@ -8554,13 +9390,21 @@ mod tests {
             .collect();
         let xi_strs: Vec<String> = xi.iter().map(|f| f.to_string()).collect();
         let good = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "toolkit_version": super::weil_eigvec_cache::toolkit_version_for_test(),
             "lambda_sq": lambda_sq.value_f64,
             "n_modes": n_modes,
             "precision_bits": prec,
             "weil_min_eigenvalue": "1.5e-40",
             "xi": xi_strs,
+            "inverse_iteration": {
+                "configured_step_limit": 2000,
+                "unshifted_steps": 7,
+                "unshifted_converged": true,
+                "final_relative_rayleigh_change": "1e-30",
+                "shifted_refinement": "accepted",
+                "final_relative_residual_norm": "1e-40"
+            }
         })
         .to_string();
         let parsed =
@@ -8593,9 +9437,17 @@ mod tests {
         let mut short_strs = xi_strs.clone();
         short_strs.pop();
         let short = serde_json::json!({
-            "schema_version": 1, "toolkit_version": super::weil_eigvec_cache::toolkit_version_for_test(),
+            "schema_version": 2, "toolkit_version": super::weil_eigvec_cache::toolkit_version_for_test(),
             "lambda_sq": lambda_sq.value_f64, "n_modes": n_modes,
             "precision_bits": prec, "weil_min_eigenvalue": "1.5e-40", "xi": short_strs,
+            "inverse_iteration": {
+                "configured_step_limit": 2000,
+                "unshifted_steps": 7,
+                "unshifted_converged": true,
+                "final_relative_rayleigh_change": "1e-30",
+                "shifted_refinement": "accepted",
+                "final_relative_residual_norm": "1e-40"
+            }
         }).to_string();
         assert!(
             parse_json(&short, lambda_sq, n_modes, prec).is_none(),
@@ -8691,9 +9543,29 @@ mod tests {
         let xi: Vec<Float> = (0..dim)
             .map(|i| Float::with_val(prec, Float::parse(format!("0.{}1", i + 1)).unwrap()))
             .collect();
+        let diagnostics = xc_numerics::linalg::InverseIterationDiagnostics {
+            configured_step_limit: 2_000,
+            unshifted_steps: 7,
+            unshifted_converged: true,
+            final_relative_rayleigh_change: Some(Float::with_val(
+                prec,
+                Float::parse("1e-30").unwrap(),
+            )),
+            shifted_refinement: xc_numerics::linalg::ShiftedRefinementOutcome::Accepted,
+            final_relative_residual_norm: Float::with_val(prec, Float::parse("1e-40").unwrap()),
+        };
 
         // Off: writes nothing, reads nothing.
-        save(lambda_sq, n_modes, prec, &eps, &xi, CacheMode::Off, true);
+        save(
+            lambda_sq,
+            n_modes,
+            prec,
+            &eps,
+            &xi,
+            &diagnostics,
+            CacheMode::Off,
+            true,
+        );
         assert!(
             load(lambda_sq, n_modes, prec, CacheMode::Off, true).is_none(),
             "Off should never read"
@@ -8711,6 +9583,7 @@ mod tests {
             prec,
             &eps,
             &xi,
+            &diagnostics,
             CacheMode::JsonZip,
             true,
         );
@@ -8739,6 +9612,7 @@ mod tests {
             got.eps_n.to_string(),
             "eps_n must round-trip exactly"
         );
+        assert_eq!(got.diagnostics, diagnostics);
 
         // JsonOnly is now a read no-op (no uncompressed .json exists).
         assert!(

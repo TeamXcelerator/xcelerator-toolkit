@@ -190,4 +190,29 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("precedes"));
     }
+
+    #[test]
+    fn current_ccm_artifact_floors_match_the_release() {
+        let discovery =
+            artifact_compatibility_policy("ccm-roots", "ccm_root_discovery_window").unwrap();
+        let refinement = artifact_compatibility_policy("ccm-roots", "ccm_root_refinement").unwrap();
+        let tau = artifact_compatibility_policy("ccm-matrices", "ccm_tau_matrix").unwrap();
+        let eigenpair = artifact_compatibility_policy("weil-states", "ccm_weil_eigenpair").unwrap();
+        assert_eq!(
+            discovery.minimum_producer_version,
+            ToolkitVersion::parse("0.13.0").unwrap()
+        );
+        assert_eq!(
+            refinement.minimum_producer_version,
+            ToolkitVersion::parse("0.13.0").unwrap()
+        );
+        assert_eq!(
+            eigenpair.minimum_producer_version,
+            ToolkitVersion::parse("0.13.0").unwrap()
+        );
+        assert_eq!(
+            tau.minimum_producer_version,
+            ToolkitVersion::parse("0.13.0").unwrap()
+        );
+    }
 }
