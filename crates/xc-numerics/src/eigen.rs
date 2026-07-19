@@ -566,59 +566,74 @@ pub fn tridiag_selected_eigenvalues_hp(
         ));
     }
 
-    let mut sturm_evaluations = 2usize;
-    let mut enclosures = Vec::with_capacity(last_index - first_index + 1);
-    for index in first_index..=last_index {
-        let mut lower = global_lower.clone();
-        let mut upper = global_upper.clone();
-        let mut lower_count = global_lower_count;
-        let mut upper_count = global_upper_count;
-        let mut iterations = 0usize;
-        loop {
-            let mut width = upper.clone();
-            width -= &lower;
-            if width <= tolerance {
-                break;
+    // Every algebraic index follows an independent deterministic bisection
+    // over the same immutable tridiagonal input. Indexed parallel collection
+    // preserves the requested order and each individual arithmetic sequence.
+    let indexed = (first_index..=last_index)
+        .into_par_iter()
+        .map(|index| {
+            let mut lower = global_lower.clone();
+            let mut upper = global_upper.clone();
+            let mut lower_count = global_lower_count;
+            let mut upper_count = global_upper_count;
+            let mut iterations = 0usize;
+            loop {
+                let mut width = upper.clone();
+                width -= &lower;
+                if width <= tolerance {
+                    break;
+                }
+                if iterations == maximum_iterations {
+                    return Err(anyhow!(
+                        "HP Sturm bisection did not enclose eigenvalue {index} within the requested tolerance after {maximum_iterations} iterations"
+                    ));
+                }
+                let mut midpoint = lower.clone();
+                midpoint += &upper;
+                midpoint /= 2u32;
+                if midpoint == lower || midpoint == upper {
+                    return Err(anyhow!(
+                        "HP Sturm bisection stagnated at {prec} bits for eigenvalue {index}; precision escalation is required"
+                    ));
+                }
+                let midpoint_count =
+                    tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &midpoint, prec);
+                if midpoint_count <= index {
+                    lower = midpoint;
+                    lower_count = midpoint_count;
+                } else {
+                    upper = midpoint;
+                    upper_count = midpoint_count;
+                }
+                iterations += 1;
             }
-            if iterations == maximum_iterations {
+            if lower_count > index || upper_count <= index {
                 return Err(anyhow!(
-                    "HP Sturm bisection did not enclose eigenvalue {index} within the requested tolerance after {maximum_iterations} iterations"
+                    "HP Sturm endpoint counts do not enclose eigenvalue {index}: [{lower_count}, {upper_count}]"
                 ));
             }
-            let mut midpoint = lower.clone();
-            midpoint += &upper;
-            midpoint /= 2u32;
-            if midpoint == lower || midpoint == upper {
-                return Err(anyhow!(
-                    "HP Sturm bisection stagnated at {prec} bits for eigenvalue {index}; precision escalation is required"
-                ));
-            }
-            let midpoint_count =
-                tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &midpoint, prec);
-            sturm_evaluations += 1;
-            if midpoint_count <= index {
-                lower = midpoint;
-                lower_count = midpoint_count;
-            } else {
-                upper = midpoint;
-                upper_count = midpoint_count;
-            }
-            iterations += 1;
-        }
-        if lower_count > index || upper_count <= index {
-            return Err(anyhow!(
-                "HP Sturm endpoint counts do not enclose eigenvalue {index}: [{lower_count}, {upper_count}]"
-            ));
-        }
-        enclosures.push(HpTridiagonalEigenvalueEnclosure {
-            index,
-            lower,
-            upper,
-            lower_count,
-            upper_count,
-            iterations,
-        });
-    }
+            Ok((
+                HpTridiagonalEigenvalueEnclosure {
+                    index,
+                    lower,
+                    upper,
+                    lower_count,
+                    upper_count,
+                    iterations,
+                },
+                iterations,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let sturm_evaluations = indexed.iter().try_fold(2usize, |total, (_, evaluations)| {
+        total
+            .checked_add(*evaluations)
+            .ok_or_else(|| anyhow!("HP Sturm evaluation count overflow"))
+    })?;
+    let enclosures = indexed
+        .into_iter()
+        .map(|(enclosure, _)| enclosure)
+        .collect();
     Ok(HpSelectedTridiagonalSpectrum {
         precision_bits: prec,
         first_index,
@@ -1596,6 +1611,18 @@ pub fn dense_symmetric_eigenvalues_hp(a: &[Float], n: usize, prec: u32) -> Resul
     tridiag_eigenvalues_hp(&diag, &off_diag, prec)
 }
 
+/// Reduce a dense symmetric HP matrix to its deterministic tridiagonal form
+/// without accumulating the orthogonal basis. The returned diagonal and
+/// off-diagonal are exactly those consumed by [`dense_symmetric_eigenvalues_hp`].
+pub fn dense_symmetric_tridiagonal_hp(
+    a: &[Float],
+    n: usize,
+    prec: u32,
+) -> Result<(Vec<Float>, Vec<Float>)> {
+    let (diag, off_diag, _) = householder_tridiag_hp_impl(a, n, prec, false)?;
+    Ok((diag, off_diag))
+}
+
 /// Compute one eigenvector of a dense symmetric matrix at the given
 /// known eigenvalue. Useful when you have eigenvalues from
 /// `dense_symmetric_eigenvalues_hp` and want a specific eigenvector.
@@ -1833,6 +1860,29 @@ mod tests {
             assert!(enclosure.lower_count <= enclosure.index);
             assert!(enclosure.upper_count > enclosure.index);
         }
+    }
+
+    #[test]
+    fn hp_selected_sturm_is_bit_identical_across_thread_counts() {
+        let prec = 192;
+        let dimension = 12usize;
+        let diag = vec![hp(prec, "2"); dimension];
+        let off_diag = vec![hp(prec, "-1"); dimension - 1];
+        let tolerance = hp(prec, "1e-35");
+        let run = || {
+            tridiag_selected_eigenvalues_hp(&diag, &off_diag, 0, 5, &tolerance, 300, prec).unwrap()
+        };
+        let serial = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(run);
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(run);
+        assert_eq!(serial, parallel);
     }
 
     #[test]
@@ -3852,6 +3902,26 @@ mod tests {
         let mut middle = jacobi.eigenvalues[1].clone();
         middle -= 2;
         assert!(middle.abs() < tolerance);
+    }
+
+    #[test]
+    fn staged_tridiagonal_qr_is_bit_identical_to_dense_qr() {
+        let prec = 256;
+        let matrix = vec![
+            hp(prec, "4"),
+            hp(prec, "1.25"),
+            hp(prec, "-0.5"),
+            hp(prec, "1.25"),
+            hp(prec, "3"),
+            hp(prec, "0.75"),
+            hp(prec, "-0.5"),
+            hp(prec, "0.75"),
+            hp(prec, "2"),
+        ];
+        let direct = dense_symmetric_eigenvalues_hp(&matrix, 3, prec).unwrap();
+        let (diagonal, off_diagonal) = dense_symmetric_tridiagonal_hp(&matrix, 3, prec).unwrap();
+        let staged = tridiag_eigenvalues_hp(&diagonal, &off_diagonal, prec).unwrap();
+        assert_eq!(staged, direct);
     }
 
     #[test]

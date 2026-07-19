@@ -13,6 +13,7 @@ use anyhow::{bail, Result};
 use rayon::prelude::*;
 use rug::{ops::Pow, Float};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::Instant;
 use xc_cache::{
@@ -112,12 +113,53 @@ struct PortableOddSectorMatrix {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PortableSectorTridiagonal {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    parity: CcmParity,
+    dimension: usize,
+    diagonal: Vec<String>,
+    off_diagonal: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableSectorEigenvalueEnclosure {
+    index: usize,
+    lower: String,
+    upper: String,
+    lower_count: usize,
+    upper_count: usize,
+    iterations: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableSectorEigenvalues {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    parity: CcmParity,
+    dimension: usize,
+    route: CcmSectorEigenvalueRoute,
+    complete: bool,
+    requested_eigenvalues: usize,
+    eigenvalues: Vec<String>,
+    selected_enclosures: Vec<PortableSectorEigenvalueEnclosure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PortableSectorSpectrum {
     schema_version: u32,
     lambda_squared: String,
     n_modes: usize,
     precision_bits: u32,
     parity: CcmParity,
+    eigenvalue_route: CcmSectorEigenvalueRoute,
     dimension: usize,
     requested_eigenpairs: usize,
     eigenvalues: Vec<String>,
@@ -1050,6 +1092,74 @@ pub enum CcmParity {
     Odd,
 }
 
+/// Algorithm used to obtain algebraically indexed parity-sector eigenvalues.
+/// The value is persisted in semantic identity and can never be substituted by
+/// a cache resolver.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CcmSectorEigenvalueRoute {
+    /// Compute only the requested algebraic prefix through HP Sturm isolation.
+    Selected,
+    /// Compute and retain the complete spectrum through Householder plus QR.
+    CompleteQr,
+    /// Compute complete QR values and independently enclose the requested
+    /// prefix with Sturm counts before accepting them.
+    CrossChecked,
+}
+
+impl CcmSectorEigenvalueRoute {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Selected => "selected",
+            Self::CompleteQr => "complete_qr",
+            Self::CrossChecked => "cross_checked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CcmSectorAnalysisOptions {
+    pub requested_eigenpairs: usize,
+    pub eigenvalue_route: CcmSectorEigenvalueRoute,
+}
+
+impl CcmSectorAnalysisOptions {
+    pub fn selected(requested_eigenpairs: usize) -> Self {
+        Self {
+            requested_eigenpairs,
+            eigenvalue_route: CcmSectorEigenvalueRoute::Selected,
+        }
+    }
+
+    pub fn maximum(requested_eigenpairs: usize) -> Self {
+        Self {
+            requested_eigenpairs,
+            eigenvalue_route: CcmSectorEigenvalueRoute::CompleteQr,
+        }
+    }
+
+    pub fn cross_checked(requested_eigenpairs: usize) -> Self {
+        Self {
+            requested_eigenpairs,
+            eigenvalue_route: CcmSectorEigenvalueRoute::CrossChecked,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SectorTridiagonalHp {
+    diagonal: Vec<Float>,
+    off_diagonal: Vec<Float>,
+}
+
+#[derive(Clone, Debug)]
+struct SectorEigenvaluesHp {
+    route: CcmSectorEigenvalueRoute,
+    complete: bool,
+    values: Vec<Float>,
+    selected_enclosures: Vec<xc_numerics::eigen::HpTridiagonalEigenvalueEnclosure>,
+}
+
 impl CcmParity {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1073,6 +1183,10 @@ pub struct CcmSectorEigenpairHp {
 pub struct CcmSectorSpectrumHp {
     pub parity: CcmParity,
     pub dimension: usize,
+    pub eigenvalue_route: CcmSectorEigenvalueRoute,
+    /// Complete ordered sector spectrum when a complete or cross-checked route
+    /// was requested. Selected runs deliberately leave this absent.
+    pub complete_eigenvalues: Option<Vec<Float>>,
     pub eigenpairs: Vec<CcmSectorEigenpairHp>,
 }
 
@@ -1494,30 +1608,32 @@ fn certify_tau_from_retained_computation(
     bail!("cross-checked or certified CCM assurance requires the xc-spectral arb feature")
 }
 
+fn parse_hp_scalar(value: &str, precision_bits: u32) -> std::result::Result<Float, CacheError> {
+    Float::parse(value)
+        .map(|parsed| Float::with_val(precision_bits, parsed))
+        .map_err(|error| {
+            CacheError::InvalidManifest(format!(
+                "CCM component contains an invalid HP scalar: {error}"
+            ))
+        })
+        .and_then(|parsed| {
+            if parsed.is_finite() {
+                Ok(parsed)
+            } else {
+                Err(CacheError::InvalidManifest(
+                    "CCM component contains a non-finite HP scalar".to_owned(),
+                ))
+            }
+        })
+}
+
 fn parse_hp_vector(
     values: &[String],
     precision_bits: u32,
 ) -> std::result::Result<Vec<Float>, CacheError> {
     values
         .iter()
-        .map(|value| {
-            Float::parse(value)
-                .map(|parsed| Float::with_val(precision_bits, parsed))
-                .map_err(|error| {
-                    CacheError::InvalidManifest(format!(
-                        "CCM component contains an invalid HP scalar: {error}"
-                    ))
-                })
-                .and_then(|parsed| {
-                    if parsed.is_finite() {
-                        Ok(parsed)
-                    } else {
-                        Err(CacheError::InvalidManifest(
-                            "CCM component contains a non-finite HP scalar".to_owned(),
-                        ))
-                    }
-                })
-        })
+        .map(|value| parse_hp_scalar(value, precision_bits))
         .collect()
 }
 
@@ -2306,6 +2422,616 @@ fn resolve_odd_sector_matrix_via_cache(
     ))
 }
 
+fn decode_sector_tridiagonal(
+    artifact: &PortableSectorTridiagonal,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    parity: CcmParity,
+    dimension: usize,
+) -> std::result::Result<SectorTridiagonalHp, CacheError> {
+    if artifact.schema_version != 1
+        || artifact.lambda_squared != lambda_squared_cache_identity(params)
+        || artifact.n_modes != params.n_modes
+        || artifact.precision_bits != cfg.precision_bits
+        || artifact.parity != parity
+        || artifact.dimension != dimension
+        || artifact.diagonal.len() != dimension
+        || artifact.off_diagonal.len() + 1 != dimension
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM sector tridiagonal does not match its semantic identity".to_owned(),
+        ));
+    }
+    let diagonal = parse_hp_vector(&artifact.diagonal, cfg.precision_bits)?;
+    let off_diagonal = parse_hp_vector(&artifact.off_diagonal, cfg.precision_bits)?;
+    if diagonal
+        .iter()
+        .chain(&off_diagonal)
+        .any(|value| !value.is_finite())
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM sector tridiagonal contains a non-finite value".to_owned(),
+        ));
+    }
+    Ok(SectorTridiagonalHp {
+        diagonal,
+        off_diagonal,
+    })
+}
+
+fn hp_invariant_close(left: &Float, right: &Float, precision_bits: u32) -> bool {
+    let mut difference = left.clone();
+    difference -= right;
+    difference.abs_mut();
+    let mut scale = left.clone().abs();
+    let right_scale = right.clone().abs();
+    if right_scale > scale {
+        scale = right_scale;
+    }
+    scale += 1u32;
+    scale *= Float::with_val(precision_bits, 2).pow(-((precision_bits / 4).max(8) as i32));
+    difference <= scale
+}
+
+fn sector_tridiagonal_invariants_match(
+    matrix: &[Float],
+    tridiagonal: &SectorTridiagonalHp,
+    dimension: usize,
+    precision_bits: u32,
+) -> bool {
+    if matrix.len() != dimension * dimension
+        || tridiagonal.diagonal.len() != dimension
+        || tridiagonal.off_diagonal.len() + 1 != dimension
+    {
+        return false;
+    }
+    let mut matrix_trace = Float::with_val(precision_bits, 0);
+    let mut matrix_frobenius = Float::with_val(precision_bits, 0);
+    for row in 0..dimension {
+        matrix_trace += &matrix[row * dimension + row];
+        for column in 0..dimension {
+            let mut square = matrix[row * dimension + column].clone();
+            square.square_mut();
+            matrix_frobenius += square;
+        }
+    }
+    let mut tridiagonal_trace = Float::with_val(precision_bits, 0);
+    let mut tridiagonal_frobenius = Float::with_val(precision_bits, 0);
+    for value in &tridiagonal.diagonal {
+        tridiagonal_trace += value;
+        let mut square = value.clone();
+        square.square_mut();
+        tridiagonal_frobenius += square;
+    }
+    for value in &tridiagonal.off_diagonal {
+        let mut square = value.clone();
+        square.square_mut();
+        square *= 2u32;
+        tridiagonal_frobenius += square;
+    }
+    hp_invariant_close(&matrix_trace, &tridiagonal_trace, precision_bits)
+        && hp_invariant_close(&matrix_frobenius, &tridiagonal_frobenius, precision_bits)
+}
+
+fn resolve_sector_tridiagonal_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    parity: CcmParity,
+    matrix: &[Float],
+    matrix_manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(SectorTridiagonalHp, ArtifactManifest)> {
+    let dimension = match parity {
+        CcmParity::Even => params.n_modes + 1,
+        CcmParity::Odd => params.n_modes,
+    };
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_sector_tridiagonal".to_owned(),
+        mathematical_semantics_version: "ccm-parity-tridiagonal-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": cfg.precision_bits,
+            "parity": parity.as_str(),
+            "sector_matrix_content_digest": matrix_manifest.content_digest.0
+        }),
+        normalization: Some("householder_diagonal_and_signed_off_diagonal".to_owned()),
+        target: Some("symmetric_tridiagonal_reduction".to_owned()),
+        subspace: Some(parity.as_str().to_owned()),
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: Some("dense_householder_no_q_accumulation".to_owned()),
+    };
+    let logical_key = format!(
+        "ccm/sector-tridiagonal/{}/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        cfg.precision_bits,
+        parity.as_str()
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.sector_tridiagonal.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "sector_tridiagonal".to_owned()),
+            ("parity".to_owned(), parity.as_str().to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let validated = RefCell::new(None);
+    let started = Instant::now();
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            let (diagonal, off_diagonal) = xc_numerics::eigen::dense_symmetric_tridiagonal_hp(
+                matrix,
+                dimension,
+                cfg.precision_bits,
+            )
+            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            Ok((
+                PortableSectorTridiagonal {
+                    schema_version: 1,
+                    lambda_squared: lambda_squared_cache_identity(params),
+                    n_modes: params.n_modes,
+                    precision_bits: cfg.precision_bits,
+                    parity,
+                    dimension,
+                    diagonal: diagonal.iter().map(Float::to_string).collect(),
+                    off_diagonal: off_diagonal.iter().map(Float::to_string).collect(),
+                },
+                vec![DependencyRef {
+                    key: matrix_manifest.key.clone(),
+                    content_digest: matrix_manifest.content_digest.clone(),
+                    required_quality: CacheQuality::Validated,
+                }],
+            ))
+        },
+        |artifact| {
+            let tridiagonal = decode_sector_tridiagonal(artifact, params, cfg, parity, dimension)?;
+            if !sector_tridiagonal_invariants_match(
+                matrix,
+                &tridiagonal,
+                dimension,
+                cfg.precision_bits,
+            ) {
+                return Err(CacheError::InvalidManifest(
+                    "CCM sector tridiagonal failed trace or Frobenius replay".to_owned(),
+                ));
+            }
+            validated.replace(Some(tridiagonal));
+            Ok(())
+        },
+    )?;
+    let was_produced = resolved.produced_manifest.is_some();
+    let manifest = resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("sector-tridiagonal execution returned no manifest"))?;
+    let tridiagonal = validated.into_inner().ok_or_else(|| {
+        anyhow::anyhow!("sector-tridiagonal execution retained no validated runtime value")
+    })?;
+    eprintln!(
+        "[HP] {parity:?} sector tridiagonal: {} in {:.3}s",
+        if was_produced { "computed" } else { "reused" },
+        started.elapsed().as_secs_f64()
+    );
+    Ok((tridiagonal, manifest))
+}
+
+fn selected_sector_tolerance(precision_bits: u32) -> Float {
+    Float::with_val(precision_bits, 2).pow(-((precision_bits.saturating_sub(32)) as i32))
+}
+
+fn compute_sector_eigenvalues(
+    tridiagonal: &SectorTridiagonalHp,
+    dimension: usize,
+    requested_eigenvalues: usize,
+    route: CcmSectorEigenvalueRoute,
+    precision_bits: u32,
+) -> Result<SectorEigenvaluesHp> {
+    let selected = || {
+        xc_numerics::eigen::tridiag_selected_eigenvalues_hp(
+            &tridiagonal.diagonal,
+            &tridiagonal.off_diagonal,
+            0,
+            requested_eigenvalues - 1,
+            &selected_sector_tolerance(precision_bits),
+            (precision_bits as usize).saturating_mul(2),
+            precision_bits,
+        )
+    };
+    match route {
+        CcmSectorEigenvalueRoute::Selected => {
+            let spectrum = selected()?;
+            let values = spectrum
+                .enclosures
+                .iter()
+                .map(|enclosure| {
+                    let mut midpoint = enclosure.lower.clone();
+                    midpoint += &enclosure.upper;
+                    midpoint /= 2u32;
+                    midpoint
+                })
+                .collect();
+            Ok(SectorEigenvaluesHp {
+                route,
+                complete: false,
+                values,
+                selected_enclosures: spectrum.enclosures,
+            })
+        }
+        CcmSectorEigenvalueRoute::CompleteQr => Ok(SectorEigenvaluesHp {
+            route,
+            complete: true,
+            values: xc_numerics::eigen::tridiag_eigenvalues_hp(
+                &tridiagonal.diagonal,
+                &tridiagonal.off_diagonal,
+                precision_bits,
+            )?,
+            selected_enclosures: Vec::new(),
+        }),
+        CcmSectorEigenvalueRoute::CrossChecked => {
+            let values = xc_numerics::eigen::tridiag_eigenvalues_hp(
+                &tridiagonal.diagonal,
+                &tridiagonal.off_diagonal,
+                precision_bits,
+            )?;
+            if values.len() != dimension {
+                bail!("complete QR sector spectrum has the wrong dimension");
+            }
+            let selected = selected()?;
+            for enclosure in &selected.enclosures {
+                if values[enclosure.index] < enclosure.lower
+                    || values[enclosure.index] > enclosure.upper
+                {
+                    bail!(
+                        "QR eigenvalue {} escaped its independently selected Sturm enclosure",
+                        enclosure.index
+                    );
+                }
+            }
+            Ok(SectorEigenvaluesHp {
+                route,
+                complete: true,
+                values,
+                selected_enclosures: selected.enclosures,
+            })
+        }
+    }
+}
+
+fn portable_sector_eigenvalues(
+    values: &SectorEigenvaluesHp,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    parity: CcmParity,
+    dimension: usize,
+    requested_eigenvalues: usize,
+) -> PortableSectorEigenvalues {
+    PortableSectorEigenvalues {
+        schema_version: 1,
+        lambda_squared: lambda_squared_cache_identity(params),
+        n_modes: params.n_modes,
+        precision_bits: cfg.precision_bits,
+        parity,
+        dimension,
+        route: values.route,
+        complete: values.complete,
+        requested_eigenvalues,
+        eigenvalues: values.values.iter().map(Float::to_string).collect(),
+        selected_enclosures: values
+            .selected_enclosures
+            .iter()
+            .map(|enclosure| PortableSectorEigenvalueEnclosure {
+                index: enclosure.index,
+                lower: enclosure.lower.to_string(),
+                upper: enclosure.upper.to_string(),
+                lower_count: enclosure.lower_count,
+                upper_count: enclosure.upper_count,
+                iterations: enclosure.iterations,
+            })
+            .collect(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_sector_eigenvalues(
+    artifact: &PortableSectorEigenvalues,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    parity: CcmParity,
+    dimension: usize,
+    requested_eigenvalues: usize,
+    route: CcmSectorEigenvalueRoute,
+    tridiagonal: &SectorTridiagonalHp,
+) -> std::result::Result<SectorEigenvaluesHp, CacheError> {
+    let expected_value_count = if route == CcmSectorEigenvalueRoute::Selected {
+        requested_eigenvalues
+    } else {
+        dimension
+    };
+    let expected_enclosure_count = if route == CcmSectorEigenvalueRoute::CompleteQr {
+        0
+    } else {
+        requested_eigenvalues
+    };
+    if artifact.schema_version != 1
+        || artifact.lambda_squared != lambda_squared_cache_identity(params)
+        || artifact.n_modes != params.n_modes
+        || artifact.precision_bits != cfg.precision_bits
+        || artifact.parity != parity
+        || artifact.dimension != dimension
+        || artifact.route != route
+        || artifact.complete != (route != CcmSectorEigenvalueRoute::Selected)
+        || artifact.requested_eigenvalues != requested_eigenvalues
+        || artifact.eigenvalues.len() != expected_value_count
+        || artifact.selected_enclosures.len() != expected_enclosure_count
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM sector eigenvalues do not match their semantic identity".to_owned(),
+        ));
+    }
+    let values = parse_hp_vector(&artifact.eigenvalues, cfg.precision_bits)?;
+    if values.iter().any(|value| !value.is_finite())
+        || values.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM sector eigenvalues are non-finite or not strictly ordered".to_owned(),
+        ));
+    }
+    let mut selected_enclosures = Vec::with_capacity(expected_enclosure_count);
+    for (expected_index, enclosure) in artifact.selected_enclosures.iter().enumerate() {
+        let lower = parse_hp_scalar(&enclosure.lower, cfg.precision_bits)?;
+        let upper = parse_hp_scalar(&enclosure.upper, cfg.precision_bits)?;
+        if enclosure.index != expected_index
+            || !lower.is_finite()
+            || !upper.is_finite()
+            || lower >= upper
+            || enclosure.lower_count > expected_index
+            || enclosure.upper_count <= expected_index
+            || enclosure.iterations == 0
+        {
+            return Err(CacheError::InvalidManifest(
+                "CCM selected eigenvalue enclosure is invalid".to_owned(),
+            ));
+        }
+        let value = &values[expected_index];
+        if value < &lower || value > &upper {
+            return Err(CacheError::InvalidManifest(
+                "CCM selected eigenvalue escaped its indexed enclosure".to_owned(),
+            ));
+        }
+        let replay_lower = xc_numerics::eigen::tridiag_sturm_count_below_hp(
+            &tridiagonal.diagonal,
+            &tridiagonal.off_diagonal,
+            &lower,
+            cfg.precision_bits,
+        )
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+        let replay_upper = xc_numerics::eigen::tridiag_sturm_count_below_hp(
+            &tridiagonal.diagonal,
+            &tridiagonal.off_diagonal,
+            &upper,
+            cfg.precision_bits,
+        )
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+        if replay_lower != enclosure.lower_count || replay_upper != enclosure.upper_count {
+            return Err(CacheError::InvalidManifest(
+                "CCM selected eigenvalue enclosure failed Sturm-count replay".to_owned(),
+            ));
+        }
+        selected_enclosures.push(xc_numerics::eigen::HpTridiagonalEigenvalueEnclosure {
+            index: enclosure.index,
+            lower,
+            upper,
+            lower_count: enclosure.lower_count,
+            upper_count: enclosure.upper_count,
+            iterations: enclosure.iterations,
+        });
+    }
+    if artifact.complete {
+        let mut eigenvalue_trace = Float::with_val(cfg.precision_bits, 0);
+        let mut eigenvalue_square_sum = Float::with_val(cfg.precision_bits, 0);
+        for value in &values {
+            eigenvalue_trace += value;
+            let mut square = value.clone();
+            square.square_mut();
+            eigenvalue_square_sum += square;
+        }
+        let mut tridiagonal_trace = Float::with_val(cfg.precision_bits, 0);
+        let mut tridiagonal_square_sum = Float::with_val(cfg.precision_bits, 0);
+        for value in &tridiagonal.diagonal {
+            tridiagonal_trace += value;
+            let mut square = value.clone();
+            square.square_mut();
+            tridiagonal_square_sum += square;
+        }
+        for value in &tridiagonal.off_diagonal {
+            let mut square = value.clone();
+            square.square_mut();
+            square *= 2u32;
+            tridiagonal_square_sum += square;
+        }
+        if !hp_invariant_close(&eigenvalue_trace, &tridiagonal_trace, cfg.precision_bits)
+            || !hp_invariant_close(
+                &eigenvalue_square_sum,
+                &tridiagonal_square_sum,
+                cfg.precision_bits,
+            )
+        {
+            return Err(CacheError::InvalidManifest(
+                "complete CCM sector eigenvalues failed trace or Frobenius replay".to_owned(),
+            ));
+        }
+    }
+    Ok(SectorEigenvaluesHp {
+        route,
+        complete: artifact.complete,
+        values,
+        selected_enclosures,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_sector_eigenvalues_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    parity: CcmParity,
+    dimension: usize,
+    requested_eigenvalues: usize,
+    route: CcmSectorEigenvalueRoute,
+    tridiagonal: &SectorTridiagonalHp,
+    tridiagonal_manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(SectorEigenvaluesHp, ArtifactManifest)> {
+    // A complete QR result is independent of how many eigenvectors the caller
+    // will retain. Key it as the complete dimension so later requests for a
+    // larger vector prefix reuse the same expensive spectrum artifact.
+    let artifact_request_count = if route == CcmSectorEigenvalueRoute::CompleteQr {
+        dimension
+    } else {
+        requested_eigenvalues
+    };
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_sector_eigenvalues".to_owned(),
+        mathematical_semantics_version: "ccm-parity-sector-eigenvalues-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": cfg.precision_bits,
+            "parity": parity.as_str(),
+            "dimension": dimension,
+            "route": route.as_str(),
+            "requested_eigenvalues": artifact_request_count,
+            "tridiagonal_content_digest": tridiagonal_manifest.content_digest.0
+        }),
+        normalization: Some("strict_algebraic_order".to_owned()),
+        target: Some(if route == CcmSectorEigenvalueRoute::Selected {
+            "requested_parity_sector_eigenvalue_prefix".to_owned()
+        } else {
+            "complete_parity_sector_eigenvalue_spectrum".to_owned()
+        }),
+        subspace: Some(parity.as_str().to_owned()),
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: Some(
+            match route {
+                CcmSectorEigenvalueRoute::Selected => "hp_sturm_indexed_bisection",
+                CcmSectorEigenvalueRoute::CompleteQr => "implicit_wilkinson_shift_tridiagonal_qr",
+                CcmSectorEigenvalueRoute::CrossChecked => {
+                    "implicit_wilkinson_shift_tridiagonal_qr_cross_checked_by_hp_sturm"
+                }
+            }
+            .to_owned(),
+        ),
+    };
+    let logical_key = format!(
+        "ccm/sector-eigenvalues/{}/{}/{}/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        cfg.precision_bits,
+        parity.as_str(),
+        route.as_str(),
+        artifact_request_count
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.sector_eigenvalues.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "sector_eigenvalues".to_owned()),
+            ("parity".to_owned(), parity.as_str().to_owned()),
+            ("route".to_owned(), route.as_str().to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let validated = RefCell::new(None);
+    let started = Instant::now();
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            let values = compute_sector_eigenvalues(
+                tridiagonal,
+                dimension,
+                artifact_request_count,
+                route,
+                cfg.precision_bits,
+            )
+            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            Ok((
+                portable_sector_eigenvalues(
+                    &values,
+                    params,
+                    cfg,
+                    parity,
+                    dimension,
+                    artifact_request_count,
+                ),
+                vec![DependencyRef {
+                    key: tridiagonal_manifest.key.clone(),
+                    content_digest: tridiagonal_manifest.content_digest.clone(),
+                    required_quality: CacheQuality::Validated,
+                }],
+            ))
+        },
+        |artifact| {
+            validated.replace(Some(decode_sector_eigenvalues(
+                artifact,
+                params,
+                cfg,
+                parity,
+                dimension,
+                artifact_request_count,
+                route,
+                tridiagonal,
+            )?));
+            Ok(())
+        },
+    )?;
+    let was_produced = resolved.produced_manifest.is_some();
+    let manifest = resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("sector-eigenvalue execution returned no manifest"))?;
+    let values = validated.into_inner().ok_or_else(|| {
+        anyhow::anyhow!("sector-eigenvalue execution retained no validated runtime value")
+    })?;
+    eprintln!(
+        "[HP] {parity:?} sector eigenvalues ({}): {} {} values in {:.3}s",
+        route.as_str(),
+        if was_produced { "computed" } else { "reused" },
+        values.values.len(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok((values, manifest))
+}
+
 fn sector_eigenpair_residual_norm(
     matrix: &[Float],
     dimension: usize,
@@ -2338,43 +3064,60 @@ fn compute_sector_spectrum(
     dimension: usize,
     parity: CcmParity,
     requested_eigenpairs: usize,
+    eigenvalues: &SectorEigenvaluesHp,
     cfg: &HighPrecConfig,
 ) -> Result<CcmSectorSpectrumHp> {
-    if dimension == 0 || requested_eigenpairs == 0 || requested_eigenpairs > dimension {
+    if dimension == 0
+        || requested_eigenpairs == 0
+        || requested_eigenpairs > dimension
+        || eigenvalues.values.len() < requested_eigenpairs
+    {
         bail!("requested CCM sector spectrum is outside the sector dimension");
     }
-    let eigenvalues =
-        xc_numerics::eigen::dense_symmetric_eigenvalues_hp(matrix, dimension, cfg.precision_bits)?;
-    let mut eigenpairs = Vec::with_capacity(requested_eigenpairs);
-    for (algebraic_index, eigenvalue) in eigenvalues
-        .into_iter()
+    let eigenvector_start = Instant::now();
+    // Each retained eigenvector is recovered from the same immutable matrix and
+    // a distinct eigenvalue. An indexed Rayon collect runs those independent
+    // solves concurrently while preserving algebraic order exactly. Rayon uses
+    // its existing global pool here, so nested helper parallelism cannot create
+    // an additional oversubscribed thread pool.
+    let eigenpairs = eigenvalues
+        .values
+        .par_iter()
         .take(requested_eigenpairs)
+        .cloned()
         .enumerate()
-    {
-        let eigenvector = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
-            matrix,
-            dimension,
-            &eigenvalue,
-            cfg.precision_bits,
-            cfg.inverse_iter_steps,
-        )?;
-        let residual_norm = sector_eigenpair_residual_norm(
-            matrix,
-            dimension,
-            &eigenvalue,
-            &eigenvector,
-            cfg.precision_bits,
-        )?;
-        eigenpairs.push(CcmSectorEigenpairHp {
-            algebraic_index,
-            eigenvalue,
-            eigenvector,
-            residual_norm,
-        });
-    }
+        .map(|(algebraic_index, eigenvalue)| {
+            let eigenvector = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
+                matrix,
+                dimension,
+                &eigenvalue,
+                cfg.precision_bits,
+                cfg.inverse_iter_steps,
+            )?;
+            let residual_norm = sector_eigenpair_residual_norm(
+                matrix,
+                dimension,
+                &eigenvalue,
+                &eigenvector,
+                cfg.precision_bits,
+            )?;
+            Ok(CcmSectorEigenpairHp {
+                algebraic_index,
+                eigenvalue,
+                eigenvector,
+                residual_norm,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    eprintln!(
+        "[HP] {parity:?} sector spectrum: {requested_eigenpairs} retained eigenvectors={:.3}s",
+        eigenvector_start.elapsed().as_secs_f64(),
+    );
     Ok(CcmSectorSpectrumHp {
         parity,
         dimension,
+        eigenvalue_route: eigenvalues.route,
+        complete_eigenvalues: eigenvalues.complete.then(|| eigenvalues.values.clone()),
         eigenpairs,
     })
 }
@@ -2386,6 +3129,7 @@ fn portable_sector_spectrum(spectrum: &CcmSectorSpectrumHp) -> PortableSectorSpe
         n_modes: 0,
         precision_bits: 0,
         parity: spectrum.parity,
+        eigenvalue_route: spectrum.eigenvalue_route,
         dimension: spectrum.dimension,
         requested_eigenpairs: spectrum.eigenpairs.len(),
         eigenvalues: spectrum
@@ -2406,30 +3150,26 @@ fn portable_sector_spectrum(spectrum: &CcmSectorSpectrumHp) -> PortableSectorSpe
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_sector_spectrum(
     artifact: &PortableSectorSpectrum,
     params: &CcmParams,
     cfg: &HighPrecConfig,
     parity: CcmParity,
+    eigenvalue_route: CcmSectorEigenvalueRoute,
     matrix: &[Float],
     dimension: usize,
     requested_eigenpairs: usize,
 ) -> std::result::Result<CcmSectorSpectrumHp, CacheError> {
-    if artifact.schema_version != 1
-        || artifact.lambda_squared != lambda_squared_cache_identity(params)
-        || artifact.n_modes != params.n_modes
-        || artifact.precision_bits != cfg.precision_bits
-        || artifact.parity != parity
-        || artifact.dimension != dimension
-        || artifact.requested_eigenpairs != requested_eigenpairs
-        || artifact.eigenvalues.len() != requested_eigenpairs
-        || artifact.eigenvectors.len() != requested_eigenpairs
-        || artifact.residual_norms.len() != requested_eigenpairs
-    {
-        return Err(CacheError::InvalidManifest(
-            "CCM sector spectrum does not match its semantic identity".to_owned(),
-        ));
-    }
+    validate_sector_spectrum_identity(
+        artifact,
+        params,
+        cfg,
+        parity,
+        eigenvalue_route,
+        dimension,
+        requested_eigenpairs,
+    )?;
     let eigenvalues = parse_hp_vector(&artifact.eigenvalues, cfg.precision_bits)?;
     if eigenvalues.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(CacheError::InvalidManifest(
@@ -2470,10 +3210,41 @@ fn decode_sector_spectrum(
     Ok(CcmSectorSpectrumHp {
         parity,
         dimension,
+        eigenvalue_route,
+        complete_eigenvalues: None,
         eigenpairs,
     })
 }
 
+fn validate_sector_spectrum_identity(
+    artifact: &PortableSectorSpectrum,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    parity: CcmParity,
+    eigenvalue_route: CcmSectorEigenvalueRoute,
+    dimension: usize,
+    requested_eigenpairs: usize,
+) -> std::result::Result<(), CacheError> {
+    if artifact.schema_version != 1
+        || artifact.lambda_squared != lambda_squared_cache_identity(params)
+        || artifact.n_modes != params.n_modes
+        || artifact.precision_bits != cfg.precision_bits
+        || artifact.parity != parity
+        || artifact.eigenvalue_route != eigenvalue_route
+        || artifact.dimension != dimension
+        || artifact.requested_eigenpairs != requested_eigenpairs
+        || artifact.eigenvalues.len() != requested_eigenpairs
+        || artifact.eigenvectors.len() != requested_eigenpairs
+        || artifact.residual_norms.len() != requested_eigenpairs
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM sector spectrum does not match its semantic identity".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn resolve_sector_spectrum_via_cache(
     params: &CcmParams,
     cfg: &HighPrecConfig,
@@ -2481,6 +3252,8 @@ fn resolve_sector_spectrum_via_cache(
     matrix: &[Float],
     matrix_manifest: &ArtifactManifest,
     requested_eigenpairs: usize,
+    eigenvalues: &SectorEigenvaluesHp,
+    eigenvalues_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<(CcmSectorSpectrumHp, ArtifactManifest)> {
     let dimension = match parity {
@@ -2490,27 +3263,32 @@ fn resolve_sector_spectrum_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_sector_spectrum".to_owned(),
-        mathematical_semantics_version: "ccm-parity-sector-spectrum-v0.13.0-v1".to_owned(),
+        mathematical_semantics_version: "ccm-parity-sector-spectrum-v0.13.0-v2".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
             "precision_bits": cfg.precision_bits,
             "parity": parity.as_str(),
+            "eigenvalue_route": eigenvalues.route.as_str(),
             "requested_eigenpairs": requested_eigenpairs,
-            "sector_matrix_content_digest": matrix_manifest.content_digest.0
+            "sector_matrix_content_digest": matrix_manifest.content_digest.0,
+            "sector_eigenvalues_content_digest": eigenvalues_manifest.content_digest.0
         }),
         normalization: Some("l2_unit_sector_vectors_algebraic_order".to_owned()),
         target: Some("lowest_parity_sector_eigenpairs".to_owned()),
         subspace: Some(parity.as_str().to_owned()),
         source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some("dense_householder_qr_plus_shifted_inverse_iteration".to_owned()),
+        algorithm_semantics: Some(
+            "indexed_eigenvalues_plus_dense_shifted_inverse_iteration".to_owned(),
+        ),
     };
     let logical_key = format!(
-        "ccm/sector-spectrum/{}/{}/{}/{}/{}",
+        "ccm/sector-spectrum/{}/{}/{}/{}/{}/{}",
         lambda_squared_cache_identity(params),
         params.n_modes,
         cfg.precision_bits,
         parity.as_str(),
+        eigenvalues.route.as_str(),
         requested_eigenpairs
     );
     let request = ArtifactExecutionCacheRequest {
@@ -2535,51 +3313,57 @@ fn resolve_sector_spectrum_via_cache(
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
+    // Validation decodes and replays every portable spectrum. Retain that
+    // validated runtime value so the caller does not parse the same HP decimal
+    // vectors and repeat every residual calculation a second time.
+    let validated_spectrum = RefCell::new(None);
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            let spectrum =
-                compute_sector_spectrum(matrix, dimension, parity, requested_eigenpairs, cfg)
-                    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            let spectrum = compute_sector_spectrum(
+                matrix,
+                dimension,
+                parity,
+                requested_eigenpairs,
+                eigenvalues,
+                cfg,
+            )
+            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
             let mut portable = portable_sector_spectrum(&spectrum);
             portable.lambda_squared = lambda_squared_cache_identity(params);
             portable.n_modes = params.n_modes;
             portable.precision_bits = cfg.precision_bits;
             Ok((
                 portable,
-                vec![DependencyRef {
-                    key: matrix_manifest.key.clone(),
-                    content_digest: matrix_manifest.content_digest.clone(),
-                    required_quality: CacheQuality::Validated,
-                }],
+                canonical_dependency_refs(vec![
+                    matrix_manifest.clone(),
+                    eigenvalues_manifest.clone(),
+                ]),
             ))
         },
         |artifact| {
-            decode_sector_spectrum(
+            let spectrum = decode_sector_spectrum(
                 artifact,
                 params,
                 cfg,
                 parity,
+                eigenvalues.route,
                 matrix,
                 dimension,
                 requested_eigenpairs,
-            )
-            .map(|_| ())
+            )?;
+            validated_spectrum.replace(Some(spectrum));
+            Ok(())
         },
     )?;
     let manifest = resolved
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("sector-spectrum execution returned no manifest"))?;
-    let spectrum = decode_sector_spectrum(
-        &resolved.value,
-        params,
-        cfg,
-        parity,
-        matrix,
-        dimension,
-        requested_eigenpairs,
-    )?;
+    let mut spectrum = validated_spectrum.into_inner().ok_or_else(|| {
+        anyhow::anyhow!("sector-spectrum execution did not retain its validated runtime values")
+    })?;
+    spectrum.complete_eigenvalues = eigenvalues.complete.then(|| eigenvalues.values.clone());
     Ok((spectrum, manifest))
 }
 
@@ -2753,9 +3537,10 @@ fn resolve_sector_gap_via_cache(
 fn analyze_sector_gap_inner(
     params: &CcmParams,
     cfg: &HighPrecConfig,
-    requested_eigenpairs: usize,
+    options: CcmSectorAnalysisOptions,
     cache: Option<&ArtifactCacheContext<'_>>,
 ) -> Result<CcmSectorGapHp> {
+    let requested_eigenpairs = options.requested_eigenpairs;
     if requested_eigenpairs < 2 || requested_eigenpairs > params.n_modes {
         bail!("CCM sector-gap analysis requires between two and N eigenpairs per sector");
     }
@@ -2767,6 +3552,44 @@ fn analyze_sector_gap_inner(
             resolve_even_sector_matrix_via_cache(params, cfg, &tau, &tau_manifest, cache)?;
         let (odd_matrix, odd_matrix_manifest) =
             resolve_odd_sector_matrix_via_cache(params, cfg, &tau, &tau_manifest, cache)?;
+        let (even_tridiagonal, even_tridiagonal_manifest) = resolve_sector_tridiagonal_via_cache(
+            params,
+            cfg,
+            CcmParity::Even,
+            &even_matrix,
+            &even_matrix_manifest,
+            cache,
+        )?;
+        let (odd_tridiagonal, odd_tridiagonal_manifest) = resolve_sector_tridiagonal_via_cache(
+            params,
+            cfg,
+            CcmParity::Odd,
+            &odd_matrix,
+            &odd_matrix_manifest,
+            cache,
+        )?;
+        let (even_eigenvalues, even_eigenvalues_manifest) = resolve_sector_eigenvalues_via_cache(
+            params,
+            cfg,
+            CcmParity::Even,
+            params.n_modes + 1,
+            requested_eigenpairs,
+            options.eigenvalue_route,
+            &even_tridiagonal,
+            &even_tridiagonal_manifest,
+            cache,
+        )?;
+        let (odd_eigenvalues, odd_eigenvalues_manifest) = resolve_sector_eigenvalues_via_cache(
+            params,
+            cfg,
+            CcmParity::Odd,
+            params.n_modes,
+            requested_eigenpairs,
+            options.eigenvalue_route,
+            &odd_tridiagonal,
+            &odd_tridiagonal_manifest,
+            cache,
+        )?;
         let (even, even_manifest) = resolve_sector_spectrum_via_cache(
             params,
             cfg,
@@ -2774,6 +3597,8 @@ fn analyze_sector_gap_inner(
             &even_matrix,
             &even_matrix_manifest,
             requested_eigenpairs,
+            &even_eigenvalues,
+            &even_eigenvalues_manifest,
             cache,
         )?;
         let (odd, odd_manifest) = resolve_sector_spectrum_via_cache(
@@ -2783,6 +3608,8 @@ fn analyze_sector_gap_inner(
             &odd_matrix,
             &odd_matrix_manifest,
             requested_eigenpairs,
+            &odd_eigenvalues,
+            &odd_eigenvalues_manifest,
             cache,
         )?;
         resolve_sector_gap_via_cache(params, cfg, even, odd, &even_manifest, &odd_manifest, cache)
@@ -2792,11 +3619,45 @@ fn analyze_sector_gap_inner(
         force_symmetric(&mut tau, params.matrix_size());
         let even_matrix = build_even_sector_matrix(&tau, params.n_modes, cfg.precision_bits);
         let odd_matrix = build_odd_sector_matrix(&tau, params.n_modes, cfg.precision_bits);
+        let (even_diagonal, even_off_diagonal) =
+            xc_numerics::eigen::dense_symmetric_tridiagonal_hp(
+                &even_matrix,
+                params.n_modes + 1,
+                cfg.precision_bits,
+            )?;
+        let even_tridiagonal = SectorTridiagonalHp {
+            diagonal: even_diagonal,
+            off_diagonal: even_off_diagonal,
+        };
+        let (odd_diagonal, odd_off_diagonal) = xc_numerics::eigen::dense_symmetric_tridiagonal_hp(
+            &odd_matrix,
+            params.n_modes,
+            cfg.precision_bits,
+        )?;
+        let odd_tridiagonal = SectorTridiagonalHp {
+            diagonal: odd_diagonal,
+            off_diagonal: odd_off_diagonal,
+        };
+        let even_eigenvalues = compute_sector_eigenvalues(
+            &even_tridiagonal,
+            params.n_modes + 1,
+            requested_eigenpairs,
+            options.eigenvalue_route,
+            cfg.precision_bits,
+        )?;
+        let odd_eigenvalues = compute_sector_eigenvalues(
+            &odd_tridiagonal,
+            params.n_modes,
+            requested_eigenpairs,
+            options.eigenvalue_route,
+            cfg.precision_bits,
+        )?;
         let even = compute_sector_spectrum(
             &even_matrix,
             params.n_modes + 1,
             CcmParity::Even,
             requested_eigenpairs,
+            &even_eigenvalues,
             cfg,
         )?;
         let odd = compute_sector_spectrum(
@@ -2804,6 +3665,7 @@ fn analyze_sector_gap_inner(
             params.n_modes,
             CcmParity::Odd,
             requested_eigenpairs,
+            &odd_eigenvalues,
             cfg,
         )?;
         compute_sector_gap(even, odd, cfg.precision_bits)
@@ -2820,21 +3682,34 @@ pub fn analyze_sector_gap(
     cfg: &HighPrecConfig,
     requested_eigenpairs: usize,
 ) -> Result<CcmSectorGapHp> {
+    analyze_sector_gap_with_options(
+        params,
+        cfg,
+        CcmSectorAnalysisOptions::selected(requested_eigenpairs),
+    )
+}
+
+/// Route-explicit sector analysis. Maximum-capture callers should select
+/// [`CcmSectorAnalysisOptions::maximum`] so the complete QR spectra are
+/// retained; ordinary GapLog analysis defaults to selected indexed values.
+pub fn analyze_sector_gap_with_options(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    options: CcmSectorAnalysisOptions,
+) -> Result<CcmSectorGapHp> {
     let managed =
         xc_cache::ManagedArtifactCacheSession::from_environment().map_err(anyhow::Error::from)?;
     if let Some(managed) = &managed {
         let cache = managed.context();
         let result = xc_numerics::hp_runtime::run_hp(|| {
-            analyze_sector_gap_inner(params, cfg, requested_eigenpairs, Some(&cache))
+            analyze_sector_gap_inner(params, cfg, options, Some(&cache))
         })?;
         managed
             .finalize_publication_inventory()
             .map_err(anyhow::Error::from)?;
         Ok(result)
     } else {
-        xc_numerics::hp_runtime::run_hp(|| {
-            analyze_sector_gap_inner(params, cfg, requested_eigenpairs, None)
-        })
+        xc_numerics::hp_runtime::run_hp(|| analyze_sector_gap_inner(params, cfg, options, None))
     }
 }
 
@@ -2848,9 +3723,21 @@ pub fn analyze_sector_gap_via_cache(
     requested_eigenpairs: usize,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<CcmSectorGapHp> {
-    xc_numerics::hp_runtime::run_hp(|| {
-        analyze_sector_gap_inner(params, cfg, requested_eigenpairs, Some(cache))
-    })
+    analyze_sector_gap_with_options_via_cache(
+        params,
+        cfg,
+        CcmSectorAnalysisOptions::selected(requested_eigenpairs),
+        cache,
+    )
+}
+
+pub fn analyze_sector_gap_with_options_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    options: CcmSectorAnalysisOptions,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<CcmSectorGapHp> {
+    xc_numerics::hp_runtime::run_hp(|| analyze_sector_gap_inner(params, cfg, options, Some(cache)))
 }
 
 fn factorization_residual_ok(
@@ -2894,6 +3781,7 @@ fn resolve_factorization_via_cache(
     subspace: &str,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<(xc_numerics::linalg::LuFactors, ArtifactManifest)> {
+    let resolution_start = Instant::now();
     let dimension = if subspace == "even" {
         params.n_modes + 1
     } else {
@@ -2945,6 +3833,10 @@ fn resolve_factorization_via_cache(
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
+    // Validation parses and checks every portable LU entry. Retain that exact
+    // validated representation so downstream inverse iteration does not parse
+    // tens of thousands of multi-kilobit decimal strings a second time.
+    let validated_factors = RefCell::new(None);
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
@@ -2987,6 +3879,7 @@ fn resolve_factorization_via_cache(
                 perm: artifact.permutation.clone(),
             };
             if factorization_residual_ok(matrix, &factors, dimension, cfg.precision_bits) {
+                validated_factors.replace(Some(factors));
                 Ok(())
             } else {
                 Err(CacheError::InvalidManifest(
@@ -2995,17 +3888,20 @@ fn resolve_factorization_via_cache(
             }
         },
     )?;
+    let was_produced = resolved.produced_manifest.is_some();
     let manifest = resolved
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("factorization execution returned no manifest"))?;
-    Ok((
-        xc_numerics::linalg::LuFactors {
-            lu: parse_hp_vector(&resolved.value.lu, cfg.precision_bits)?,
-            perm: resolved.value.permutation,
-        },
-        manifest,
-    ))
+    let factors = validated_factors.into_inner().ok_or_else(|| {
+        anyhow::anyhow!("factorization execution did not retain its validated runtime factors")
+    })?;
+    eprintln!(
+        "[HP] {subspace} LU factorization: {} in {:.3}s",
+        if was_produced { "computed" } else { "reused" },
+        resolution_start.elapsed().as_secs_f64(),
+    );
+    Ok((factors, manifest))
 }
 
 fn weil_eigenpair_via_cache(
@@ -8111,6 +9007,63 @@ mod tests {
         assert_eq!(first_sector_gap.gap_log, second_sector_gap.gap_log);
         assert_eq!(first_sector_gap.even.eigenpairs.len(), 2);
         assert_eq!(first_sector_gap.odd.eigenpairs.len(), 2);
+        assert_eq!(
+            first_sector_gap.even.eigenvalue_route,
+            CcmSectorEigenvalueRoute::Selected
+        );
+        assert!(first_sector_gap.even.complete_eigenvalues.is_none());
+        let complete_sector_gap = analyze_sector_gap_with_options_via_cache(
+            &params,
+            &cfg,
+            CcmSectorAnalysisOptions::maximum(2),
+            &context,
+        )
+        .unwrap();
+        let reused_complete_sector_gap = analyze_sector_gap_with_options_via_cache(
+            &params,
+            &cfg,
+            CcmSectorAnalysisOptions::maximum(2),
+            &context,
+        )
+        .unwrap();
+        assert_eq!(
+            complete_sector_gap.even.eigenvalue_route,
+            CcmSectorEigenvalueRoute::CompleteQr
+        );
+        assert_eq!(
+            complete_sector_gap
+                .even
+                .complete_eigenvalues
+                .as_ref()
+                .unwrap()
+                .len(),
+            params.n_modes + 1
+        );
+        assert_eq!(
+            complete_sector_gap
+                .odd
+                .complete_eigenvalues
+                .as_ref()
+                .unwrap()
+                .len(),
+            params.n_modes
+        );
+        assert_eq!(
+            complete_sector_gap.even.complete_eigenvalues,
+            reused_complete_sector_gap.even.complete_eigenvalues
+        );
+        assert_eq!(
+            complete_sector_gap.odd.complete_eigenvalues,
+            reused_complete_sector_gap.odd.complete_eigenvalues
+        );
+        assert_eq!(
+            complete_sector_gap.even.eigenpairs[0].eigenvalue,
+            reused_complete_sector_gap.even.eigenpairs[0].eigenvalue
+        );
+        assert_eq!(
+            complete_sector_gap.even.eigenpairs[0].eigenvector,
+            reused_complete_sector_gap.even.eigenpairs[0].eigenvector
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8191,6 +9144,136 @@ mod tests {
     }
 
     #[test]
+    fn parallel_sector_recovery_is_bit_identical_to_algebraic_order_recovery() {
+        let precision_bits = 192;
+        let dimension = 3;
+        let matrix = vec![
+            Float::with_val(precision_bits, 2),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 5),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 9),
+        ];
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.precision_bits = precision_bits;
+        cfg.inverse_iter_steps = 12;
+
+        let eigenvalues =
+            xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&matrix, dimension, precision_bits)
+                .unwrap();
+        let routed_eigenvalues = SectorEigenvaluesHp {
+            route: CcmSectorEigenvalueRoute::CompleteQr,
+            complete: true,
+            values: eigenvalues.clone(),
+            selected_enclosures: Vec::new(),
+        };
+        let parallel = compute_sector_spectrum(
+            &matrix,
+            dimension,
+            CcmParity::Odd,
+            2,
+            &routed_eigenvalues,
+            &cfg,
+        )
+        .unwrap();
+        let sequential = eigenvalues
+            .into_iter()
+            .take(2)
+            .enumerate()
+            .map(|(algebraic_index, eigenvalue)| {
+                let eigenvector = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
+                    &matrix,
+                    dimension,
+                    &eigenvalue,
+                    precision_bits,
+                    cfg.inverse_iter_steps,
+                )
+                .unwrap();
+                let residual_norm = sector_eigenpair_residual_norm(
+                    &matrix,
+                    dimension,
+                    &eigenvalue,
+                    &eigenvector,
+                    precision_bits,
+                )
+                .unwrap();
+                CcmSectorEigenpairHp {
+                    algebraic_index,
+                    eigenvalue,
+                    eigenvector,
+                    residual_norm,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(parallel.eigenpairs.len(), sequential.len());
+        for (parallel, sequential) in parallel.eigenpairs.iter().zip(&sequential) {
+            assert_eq!(parallel.algebraic_index, sequential.algebraic_index);
+            assert_eq!(parallel.eigenvalue, sequential.eigenvalue);
+            assert_eq!(parallel.eigenvector, sequential.eigenvector);
+            assert_eq!(parallel.residual_norm, sequential.residual_norm);
+        }
+    }
+
+    #[test]
+    fn selected_complete_and_cross_checked_sector_routes_reconcile() {
+        let precision_bits = 192;
+        let tridiagonal = SectorTridiagonalHp {
+            diagonal: vec![
+                Float::with_val(precision_bits, 2),
+                Float::with_val(precision_bits, 5),
+                Float::with_val(precision_bits, 9),
+            ],
+            off_diagonal: vec![
+                Float::with_val(precision_bits, 0),
+                Float::with_val(precision_bits, 0),
+            ],
+        };
+        let selected = compute_sector_eigenvalues(
+            &tridiagonal,
+            3,
+            2,
+            CcmSectorEigenvalueRoute::Selected,
+            precision_bits,
+        )
+        .unwrap();
+        let complete = compute_sector_eigenvalues(
+            &tridiagonal,
+            3,
+            3,
+            CcmSectorEigenvalueRoute::CompleteQr,
+            precision_bits,
+        )
+        .unwrap();
+        let cross_checked = compute_sector_eigenvalues(
+            &tridiagonal,
+            3,
+            2,
+            CcmSectorEigenvalueRoute::CrossChecked,
+            precision_bits,
+        )
+        .unwrap();
+
+        assert!(!selected.complete);
+        assert_eq!(selected.values.len(), 2);
+        assert_eq!(selected.selected_enclosures.len(), 2);
+        assert!(complete.complete);
+        assert_eq!(complete.values.len(), 3);
+        assert!(complete.selected_enclosures.is_empty());
+        assert!(cross_checked.complete);
+        assert_eq!(cross_checked.values, complete.values);
+        assert_eq!(cross_checked.selected_enclosures.len(), 2);
+        for enclosure in &selected.selected_enclosures {
+            assert!(enclosure.lower <= complete.values[enclosure.index]);
+            assert!(enclosure.upper >= complete.values[enclosure.index]);
+        }
+    }
+
+    #[test]
     fn sector_gap_uses_depth_difference_not_eigenvalue_subtraction() {
         let precision_bits = 256;
         let pair = |index: usize, value: &str| CcmSectorEigenpairHp {
@@ -8202,11 +9285,15 @@ mod tests {
         let even = CcmSectorSpectrumHp {
             parity: CcmParity::Even,
             dimension: 1,
+            eigenvalue_route: CcmSectorEigenvalueRoute::Selected,
+            complete_eigenvalues: None,
             eigenpairs: vec![pair(0, "1e-20"), pair(1, "2")],
         };
         let odd = CcmSectorSpectrumHp {
             parity: CcmParity::Odd,
             dimension: 1,
+            eigenvalue_route: CcmSectorEigenvalueRoute::Selected,
+            complete_eigenvalues: None,
             eigenpairs: vec![pair(0, "1e-16"), pair(1, "3")],
         };
         let gap = compute_sector_gap(even, odd, precision_bits).unwrap();

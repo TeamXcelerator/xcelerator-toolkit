@@ -493,9 +493,11 @@ pub fn family_for_artifact_kind(kind: &str) -> Option<&'static str> {
         "ccm_tau_matrix"
         | "ccm_even_sector_matrix"
         | "ccm_odd_sector_matrix"
+        | "ccm_sector_tridiagonal"
         | "ccm_reduced_operator"
         | "ccm_factorization" => Some("ccm-matrices"),
         "ccm_weil_eigenpair"
+        | "ccm_sector_eigenvalues"
         | "ccm_sector_spectrum"
         | "ccm_weil_plunge_state"
         | "ccm_weil_sonin_state"
@@ -764,6 +766,22 @@ mod tests {
     use crate::{ArtifactKey, ArtifactManifest, CacheQuality, CacheVisibility, ToolkitVersion};
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn granular_ccm_sector_artifacts_route_to_existing_shards() {
+        assert_eq!(
+            family_for_artifact_kind("ccm_sector_tridiagonal"),
+            Some("ccm-matrices")
+        );
+        assert_eq!(
+            family_for_artifact_kind("ccm_sector_eigenvalues"),
+            Some("weil-states")
+        );
+        assert_eq!(
+            family_for_artifact_kind("ccm_sector_spectrum"),
+            Some("weil-states")
+        );
+    }
 
     fn record() -> ProducedArtifactRecord {
         let semantic_key = crate::SemanticKeyEnvelope {

@@ -11,6 +11,7 @@ use std::fs;
 use std::io::Cursor;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use xc_core::{
     CacheAccessProvenance, CacheCandidateRejectionProvenance, CacheLookupOutcome,
     CacheReuseDisposition, CacheSourceProvenance, CacheValidatedArtifactProvenance,
@@ -311,6 +312,35 @@ pub struct ManagedArtifactCacheSession {
     replace_existing_publication: bool,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CompletedManagedPublicationKey {
+    staging_root: PathBuf,
+    repository_owner: String,
+    target: xc_core::PublicationTarget,
+    manifest_digest: ContentDigest,
+    transport_digest: ContentDigest,
+}
+
+fn completed_managed_publications() -> &'static Mutex<BTreeSet<CompletedManagedPublicationKey>> {
+    static COMPLETED: OnceLock<Mutex<BTreeSet<CompletedManagedPublicationKey>>> = OnceLock::new();
+    COMPLETED.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn managed_publication_key(
+    draft: &crate::CanonicalProductionDraft,
+    staging_root: &Path,
+    repository_owner: &str,
+    target: xc_core::PublicationTarget,
+) -> Result<CompletedManagedPublicationKey, CacheError> {
+    Ok(CompletedManagedPublicationKey {
+        staging_root: staging_root.to_path_buf(),
+        repository_owner: repository_owner.to_owned(),
+        target,
+        manifest_digest: draft.manifest.digest()?,
+        transport_digest: draft.encoding.digest()?,
+    })
+}
+
 impl ManagedArtifactCacheSession {
     pub fn new(config: ManagedArtifactCacheConfig) -> Result<Self, CacheError> {
         let remote_cache_mode = config.remote_cache_mode;
@@ -471,6 +501,56 @@ impl ManagedArtifactCacheSession {
         )
     }
 
+    fn pending_staged_drafts(&self) -> Result<Vec<crate::CanonicalProductionDraft>, CacheError> {
+        let Some(sink) = &self.production_sink else {
+            return Ok(Vec::new());
+        };
+        let completed = completed_managed_publications().lock().map_err(|_| {
+            CacheError::InvalidTransition(
+                "managed publication completion registry lock was poisoned".to_owned(),
+            )
+        })?;
+        self.staged_drafts()?
+            .into_iter()
+            .filter_map(|draft| {
+                let key = managed_publication_key(
+                    &draft,
+                    sink.staging_root(),
+                    &self.repository_owner,
+                    self.publication_target,
+                );
+                match key {
+                    Ok(key) if completed.contains(&key) => None,
+                    Ok(_) => Some(Ok(draft)),
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect()
+    }
+
+    fn mark_staged_drafts_completed(
+        &self,
+        drafts: &[crate::CanonicalProductionDraft],
+    ) -> Result<(), CacheError> {
+        let Some(sink) = &self.production_sink else {
+            return Ok(());
+        };
+        let mut completed = completed_managed_publications().lock().map_err(|_| {
+            CacheError::InvalidTransition(
+                "managed publication completion registry lock was poisoned".to_owned(),
+            )
+        })?;
+        for draft in drafts {
+            completed.insert(managed_publication_key(
+                draft,
+                sink.staging_root(),
+                &self.repository_owner,
+                self.publication_target,
+            )?);
+        }
+        Ok(())
+    }
+
     /// Finalizes the exact target inventory and, when the author explicitly
     /// enabled remote mutation, executes every eligible draft through the
     /// toolkit-owned resumable GitHub publisher before returning.
@@ -478,14 +558,34 @@ impl ManagedArtifactCacheSession {
         let Some(sink) = &self.production_sink else {
             return Ok(None);
         };
+        // A CCM run creates several managed sessions over one staging root.
+        // Keep every draft on disk for dependency resolution and crash resume,
+        // but do not repeat successful GitHub orchestration later in the same
+        // process. The registry is intentionally process-local: a restarted
+        // process sees every staged draft and safely resumes from its journals.
+        let pending_drafts = self.pending_staged_drafts()?;
+        let pending_inventory = crate::build_managed_publication_inventory(
+            &pending_drafts,
+            self.publication_target,
+            &self.repository_owner,
+            self.profile,
+            self.requested_assurance,
+            self.certification_failure_policy,
+            self.execute_remote_mutations,
+        )?;
+        // The durable inventory remains cumulative and therefore describes
+        // the complete run. Only remote execution is filtered to pending work.
         let inventory = self.publication_inventory()?;
         let path = sink.staging_root().join("publication-inventory.json");
         let bytes = serde_json::to_vec_pretty(&inventory)?;
         crate::atomic_replace(&path, &bytes)?;
-        if self.execute_remote_mutations && !inventory.ready_for_remote_execution {
+        if self.execute_remote_mutations
+            && !pending_drafts.is_empty()
+            && !pending_inventory.ready_for_remote_execution
+        {
             match self.certification_failure_policy {
                 CertificationFailurePolicy::RetainComputedFailRun => {
-                    let ineligible = inventory
+                    let ineligible = pending_inventory
                         .entries
                         .iter()
                         .filter(|entry| !entry.assurance_eligible)
@@ -508,9 +608,9 @@ impl ManagedArtifactCacheSession {
                 CertificationFailurePolicy::RetainComputedSkipPublication => {}
             }
         }
-        if self.execute_remote_mutations && inventory.ready_for_remote_execution {
+        if self.execute_remote_mutations && pending_inventory.ready_for_remote_execution {
             let report = crate::execute_managed_drafts_on_github(
-                &self.staged_drafts()?,
+                &pending_drafts,
                 self.publication_target,
                 &self.repository_owner,
                 &sink.staging_root().join("journals"),
@@ -521,14 +621,17 @@ impl ManagedArtifactCacheSession {
                 .staging_root()
                 .join("publication-execution-report.json");
             crate::atomic_replace(&report_path, &serde_json::to_vec_pretty(&report)?)?;
+            if report.all_completed {
+                self.mark_staged_drafts_completed(&pending_drafts)?;
+            }
             eprintln!(
                 "{}",
                 format_publication_completion(
                     self.requested_assurance,
                     self.publication_target,
                     report.artifacts.len(),
-                    inventory.entries.len(),
-                    inventory.total_target_package_bytes,
+                    pending_inventory.entries.len(),
+                    pending_inventory.total_target_package_bytes,
                     report
                         .artifacts
                         .iter()
@@ -2163,6 +2266,66 @@ mod tests {
                 .len()
                 < 4096
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_same_process_publication_filter_retains_restart_staging() {
+        let root = root("managed-completed-publication-filter");
+        let _ = fs::remove_dir_all(&root);
+        let session = ManagedArtifactCacheSession::new(ManagedArtifactCacheConfig {
+            profile: ManagedRunProfile::Author,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            cache_root: root.join("cache"),
+            staging_root: Some(root.join("staging")),
+            publication_target: xc_core::PublicationTarget::Public,
+            repository_owner: "ManagedCompletionFilterFixture".to_owned(),
+            remote_cache_mode: ManagedRemoteCacheMode::None,
+            cache_mode: ArtifactExecutionCacheMode::PreferReuse,
+            replace_existing_publication: false,
+            execute_remote_mutations: false,
+        })
+        .unwrap();
+        let key = semantic_key();
+        let cache = session.context();
+        let request = ArtifactExecutionCacheRequest {
+            operation: "quadrature.load_or_compute",
+            semantic_key: &key,
+            logical_key: "gauss-legendre/4/128",
+            resolver: cache.resolver,
+            acceptance: cache.acceptance,
+            ordered_overlays: cache.ordered_overlays,
+            mode: cache.mode,
+            write_on_miss: cache.write_on_miss,
+            write_visibility: cache.write_visibility,
+            produced_quality: CacheQuality::Validated,
+            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            maximum_reader_version: None,
+            tags: BTreeMap::new(),
+            provenance_digest: None,
+            production_sink: cache.production_sink,
+        };
+        resolve_or_compute_json_artifact(
+            &request,
+            || Ok(vec!["node-a".to_owned(), "node-b".to_owned()]),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        let pending = session.pending_staged_drafts().unwrap();
+        assert_eq!(pending.len(), 1);
+        session.mark_staged_drafts_completed(&pending).unwrap();
+        assert!(session.pending_staged_drafts().unwrap().is_empty());
+        assert_eq!(session.staged_drafts().unwrap().len(), 1);
+        assert_eq!(session.publication_inventory().unwrap().entries.len(), 1);
+        session.finalize_publication_inventory().unwrap();
+        let durable_inventory: crate::ManagedPublicationInventory = serde_json::from_slice(
+            &fs::read(root.join("staging/publication-inventory.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(durable_inventory.entries.len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 

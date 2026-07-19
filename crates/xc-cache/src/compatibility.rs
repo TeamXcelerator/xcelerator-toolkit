@@ -79,8 +79,10 @@ pub fn artifact_compatibility_policy(
         "ccm_tau_matrix" => "0.13.0",
         "ccm_even_sector_matrix" => "0.13.0",
         "ccm_odd_sector_matrix" => "0.13.0",
+        "ccm_sector_tridiagonal" => "0.13.0",
         "ccm_reduced_operator" => "0.13.0",
         "ccm_factorization" => "0.13.0",
+        "ccm_sector_eigenvalues" => "0.13.0",
         "ccm_sector_spectrum" => "0.13.0",
         "ccm_sector_gap" => "0.13.0",
         "ccm_weil_eigenpair" => "0.13.0",
@@ -197,6 +199,10 @@ mod tests {
             artifact_compatibility_policy("ccm-roots", "ccm_root_discovery_window").unwrap();
         let refinement = artifact_compatibility_policy("ccm-roots", "ccm_root_refinement").unwrap();
         let tau = artifact_compatibility_policy("ccm-matrices", "ccm_tau_matrix").unwrap();
+        let tridiagonal =
+            artifact_compatibility_policy("ccm-matrices", "ccm_sector_tridiagonal").unwrap();
+        let sector_eigenvalues =
+            artifact_compatibility_policy("weil-states", "ccm_sector_eigenvalues").unwrap();
         let eigenpair = artifact_compatibility_policy("weil-states", "ccm_weil_eigenpair").unwrap();
         assert_eq!(
             discovery.minimum_producer_version,
@@ -212,6 +218,14 @@ mod tests {
         );
         assert_eq!(
             tau.minimum_producer_version,
+            ToolkitVersion::parse("0.13.0").unwrap()
+        );
+        assert_eq!(
+            tridiagonal.minimum_producer_version,
+            ToolkitVersion::parse("0.13.0").unwrap()
+        );
+        assert_eq!(
+            sector_eigenvalues.minimum_producer_version,
             ToolkitVersion::parse("0.13.0").unwrap()
         );
     }
