@@ -203,8 +203,8 @@ impl CcmParams {
 /// Result of a single CCM run at f64 precision.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CcmResult {
-    /// Newton-refined positive eigenvalues at f64 precision, in the
-    /// order returned by Newton (paired with the Riemann-zero seeds).
+    /// Positive roots of the eigenpair-derived CCM secular equation at f64
+    /// precision, in the order paired with the supplied seeds.
     pub eigenvalues_pos: Vec<f64>,
     /// Smallest Weil-form eigenvalue (the spectral gap quantity ε_N).
     pub weil_min_eigenvalue: f64,
@@ -213,6 +213,15 @@ pub struct CcmResult {
     pub xi: Vec<f64>,
     /// Wall-clock seconds for the entire f64 run.
     pub elapsed_seconds: f64,
+}
+
+impl CcmResult {
+    /// Positive finite `D_log` spectral roots.
+    ///
+    /// These are distinct from eigenvalues of the Tau/Weil quadratic form.
+    pub fn spectral_roots(&self) -> &[f64] {
+        &self.eigenvalues_pos
+    }
 }
 
 /// Enumerate prime powers `n = p^k` with `1 < n ≤ bound`.

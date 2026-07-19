@@ -289,8 +289,12 @@ impl LinearOperator<f64> for DenseSymmetricF64 {
 
     fn apply(&self, x: &[f64], y: &mut [f64]) -> Result<(), OperatorError> {
         check_dimensions(self.n, x, y)?;
-        for (i, yi) in y.iter_mut().enumerate() {
-            *yi = (0..self.n).map(|j| self.data[i * self.n + j] * x[j]).sum();
+        for (row, output) in self.data.chunks_exact(self.n).zip(y.iter_mut()) {
+            *output = row
+                .iter()
+                .zip(x)
+                .map(|(entry, component)| entry * component)
+                .sum();
         }
         Ok(())
     }
@@ -1238,14 +1242,20 @@ impl DenseSymmetricHp {
         }
         let data: Vec<Float> = data
             .into_iter()
-            .map(|value| Float::with_val(precision_bits, value))
+            .map(|value| {
+                if value.prec() == precision_bits {
+                    value
+                } else {
+                    Float::with_val(precision_bits, value)
+                }
+            })
             .collect();
         for row in 0..n {
             for column in 0..row {
                 let mut difference = data[row * n + column].clone();
                 difference -= &data[column * n + row];
                 difference.abs_mut();
-                if difference > symmetry_tolerance.clone() {
+                if &difference > symmetry_tolerance {
                     return Err(OperatorError::InvalidData(format!(
                         "HP matrix is not symmetric at ({row}, {column})"
                     )));
@@ -1366,11 +1376,23 @@ impl TridiagonalHp {
         }
         let diagonal: Vec<Float> = diagonal
             .into_iter()
-            .map(|value| Float::with_val(precision_bits, value))
+            .map(|value| {
+                if value.prec() == precision_bits {
+                    value
+                } else {
+                    Float::with_val(precision_bits, value)
+                }
+            })
             .collect();
         let off_diagonal: Vec<Float> = off_diagonal
             .into_iter()
-            .map(|value| Float::with_val(precision_bits, value))
+            .map(|value| {
+                if value.prec() == precision_bits {
+                    value
+                } else {
+                    Float::with_val(precision_bits, value)
+                }
+            })
             .collect();
         let mut norm_bound = Float::with_val(precision_bits, 0);
         for row in 0..diagonal.len() {
@@ -1506,6 +1528,46 @@ mod hp_operator_tests {
         assert_eq!(y[0], 0);
         assert_eq!(y[1], 6.5);
         assert_eq!(y[2], 13);
+    }
+
+    #[test]
+    fn hp_operator_constructors_preserve_values_at_matching_precision() {
+        let precision = 257;
+        let dense_data = ["1.25", "-0.375", "-0.375", "2.5"]
+            .into_iter()
+            .map(|value| Float::with_val(precision, Float::parse(value).unwrap()))
+            .collect::<Vec<_>>();
+        let expected_dense = dense_data.clone();
+        let dense = DenseSymmetricHp::new(
+            "matching-precision-dense",
+            2,
+            dense_data,
+            precision,
+            &Float::with_val(precision, 0),
+        )
+        .unwrap();
+        assert_eq!(dense.data(), expected_dense);
+        assert!(dense.data().iter().all(|value| value.prec() == precision));
+
+        let diagonal = ["1.25", "2.5", "3.75"]
+            .into_iter()
+            .map(|value| Float::with_val(precision, Float::parse(value).unwrap()))
+            .collect::<Vec<_>>();
+        let off_diagonal = ["-0.125", "0.625"]
+            .into_iter()
+            .map(|value| Float::with_val(precision, Float::parse(value).unwrap()))
+            .collect::<Vec<_>>();
+        let expected_diagonal = diagonal.clone();
+        let expected_off_diagonal = off_diagonal.clone();
+        let tridiagonal = TridiagonalHp::new(
+            "matching-precision-tridiagonal",
+            diagonal,
+            off_diagonal,
+            precision,
+        )
+        .unwrap();
+        assert_eq!(tridiagonal.diagonal(), expected_diagonal);
+        assert_eq!(tridiagonal.off_diagonal(), expected_off_diagonal);
     }
 
     #[test]

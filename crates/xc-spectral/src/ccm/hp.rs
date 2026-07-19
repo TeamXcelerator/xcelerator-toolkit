@@ -21,11 +21,40 @@ use xc_cache::{
     ToolkitVersion,
 };
 
-use super::{prime_powers_up_to, CcmParams, CcmResult};
+use super::{
+    prime_powers_up_to,
+    window::{discover_roots_f64, DiscoveryOptionsF64, SecularFunctionF64, ZeroTarget},
+    CcmParams, CcmResult,
+};
 
 enum CcmCacheRoute<'a> {
     Standalone,
     Fabric(&'a ArtifactCacheContext<'a>),
+}
+
+#[derive(Clone, Copy)]
+enum RootAcquisition<'a> {
+    SourceOnly,
+    Independent(&'a ZeroTarget),
+    ReferenceSeeded {
+        first_root_index: usize,
+        seeds: &'a [Float],
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootArtifactMode {
+    Independent,
+    ReferenceSeededRefinement,
+}
+
+impl RootArtifactMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Independent => "independent",
+            Self::ReferenceSeededRefinement => "reference_seeded_refinement",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -71,6 +100,53 @@ struct PortableEvenSectorMatrix {
     precision_bits: u32,
     dimension: usize,
     entries: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableOddSectorMatrix {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    dimension: usize,
+    entries: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableSectorSpectrum {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    parity: CcmParity,
+    dimension: usize,
+    requested_eigenpairs: usize,
+    eigenvalues: Vec<String>,
+    eigenvectors: Vec<Vec<String>>,
+    residual_norms: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableSectorGap {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    even_spectrum_content_digest: String,
+    odd_spectrum_content_digest: String,
+    lambda_even: String,
+    lambda_odd: String,
+    d_even: String,
+    d_odd: String,
+    gap_log: String,
+    lambda_difference: String,
+    difference_depth: String,
+    ordering: i8,
+    even_simple: bool,
+    even_simplicity_margin: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -154,7 +230,10 @@ struct PortableRootRange {
     precision_bits: u32,
     force_even: bool,
     first_root_index: usize,
-    seeds: Vec<String>,
+    discovery_mode: String,
+    reference_seeds_used: bool,
+    completeness: String,
+    starting_points: Vec<String>,
     outcomes: Vec<PortableRootOutcome>,
     solver: String,
     solver_steps: usize,
@@ -180,6 +259,9 @@ struct PortableRunEvidence {
     n_modes: usize,
     precision_bits: u32,
     force_even: bool,
+    discovery_mode: String,
+    first_root_index: usize,
+    last_root_index: usize,
     root_count: usize,
     weil_min_eigenvalue: String,
     converged_roots: usize,
@@ -391,8 +473,8 @@ pub struct HighPrecConfig {
     /// computation of α_L, β_L, γ_L. Clamped to `[MIN_QUAD_POINTS,
     /// MAX_QUAD_POINTS]` regardless of input.
     pub quad_points: usize,
-    /// Number of positive eigenvalues to compute. Newton refinement
-    /// runs over the first `n_eigenvalues` reference Riemann zeros.
+    /// Number of positive CCM secular roots to discover independently and
+    /// refine. Zero requests an explicit source-only run.
     pub n_eigenvalues: usize,
     /// Cache strategy for the GL-node and τ-matrix disk caches. See
     /// [`xc_numerics::quadrature::CacheMode`]. The default standalone mode
@@ -500,7 +582,7 @@ impl HighPrecConfig {
     }
 }
 
-/// Status of a single solver run for one eigenvalue seed.
+/// Status of a single solver run for one CCM secular-root seed.
 ///
 /// The three-state result lets callers distinguish clean convergence,
 /// a best-effort approximation (step limit hit), and a degenerate failure
@@ -545,7 +627,8 @@ impl EigenvalueResult {
 /// All HP fields stay in `rug::Float` at the working precision specified
 /// in the config; lossy f64 views are exposed via `to_f64_result`.
 pub struct HighPrecResult {
-    /// Solver results for positive eigenvalues.
+    /// Solver results for positive roots of the eigenpair-derived CCM secular
+    /// equation (equivalently, the finite `D_log` spectrum).
     ///
     /// Each entry is one of:
     /// - `Converged(v)` — fully converged to HP tolerance; reliable.
@@ -553,6 +636,9 @@ pub struct HighPrecResult {
     ///   match many digits but is NOT certified to HP precision.
     /// - `Failed` — degenerate denominator; garbage, do not use.
     pub eigenvalues_pos: Vec<EigenvalueResult>,
+    /// One-based index assigned to the first entry in `eigenvalues_pos`.
+    /// Empty source-only runs retain the requested start for provenance.
+    pub first_positive_root_index: usize,
     /// Smallest eigenvalue of the Weil quadratic form (the spectral
     /// gap quantity ε_N at this `(λ², N)`).
     pub weil_min_eigenvalue: Float,
@@ -581,6 +667,7 @@ pub enum PortableEigenvalueResult {
 #[serde(deny_unknown_fields)]
 pub struct PortableHighPrecResult {
     pub eigenvalues_pos: Vec<PortableEigenvalueResult>,
+    pub first_positive_root_index: usize,
     pub weil_min_eigenvalue: xc_numerics::fmt::PortableHpFloat,
     pub xi: Vec<xc_numerics::fmt::PortableHpFloat>,
     pub elapsed_seconds: f64,
@@ -589,6 +676,14 @@ pub struct PortableHighPrecResult {
 
 impl PortableHighPrecResult {
     pub fn from_runtime(result: &HighPrecResult) -> Result<Self> {
+        if result.first_positive_root_index == 0
+            || result
+                .first_positive_root_index
+                .checked_add(result.eigenvalues_pos.len().saturating_sub(1))
+                .is_none()
+        {
+            bail!("CCM positive-root index range is invalid");
+        }
         let eigenvalues_pos = result
             .eigenvalues_pos
             .iter()
@@ -606,6 +701,7 @@ impl PortableHighPrecResult {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Self {
             eigenvalues_pos,
+            first_positive_root_index: result.first_positive_root_index,
             weil_min_eigenvalue: xc_numerics::fmt::PortableHpFloat::from_float(
                 &result.weil_min_eigenvalue,
             )?,
@@ -620,6 +716,14 @@ impl PortableHighPrecResult {
     }
 
     pub fn to_runtime(&self) -> Result<HighPrecResult> {
+        if self.first_positive_root_index == 0
+            || self
+                .first_positive_root_index
+                .checked_add(self.eigenvalues_pos.len().saturating_sub(1))
+                .is_none()
+        {
+            bail!("portable CCM result has an invalid positive-root index range");
+        }
         let eigenvalues_pos = self
             .eigenvalues_pos
             .iter()
@@ -635,6 +739,7 @@ impl PortableHighPrecResult {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(HighPrecResult {
             eigenvalues_pos,
+            first_positive_root_index: self.first_positive_root_index,
             weil_min_eigenvalue: self.weil_min_eigenvalue.to_float()?,
             xi: self
                 .xi
@@ -648,6 +753,25 @@ impl PortableHighPrecResult {
 }
 
 impl HighPrecResult {
+    /// Positive CCM secular roots in the requested window.
+    ///
+    /// This terminology avoids confusing these values with the distinct Tau
+    /// or Weil-form eigenvalues. The `eigenvalues_pos` field remains the
+    /// serialized API name used by existing consumers.
+    pub fn spectral_roots(&self) -> &[EigenvalueResult] {
+        &self.eigenvalues_pos
+    }
+
+    /// Inclusive one-based root-index range represented by this result.
+    pub fn spectral_root_index_range(&self) -> Option<std::ops::RangeInclusive<usize>> {
+        if self.eigenvalues_pos.is_empty() || self.first_positive_root_index == 0 {
+            return None;
+        }
+        self.first_positive_root_index
+            .checked_add(self.eigenvalues_pos.len() - 1)
+            .map(|last| self.first_positive_root_index..=last)
+    }
+
     // HP_F64_REPORT_BOUNDARY_BEGIN: explicit lossy CLI/plot projection only.
     /// Lossy conversion to the f64-tier `CcmResult`. Eigenvalues, ξ
     /// entries, and ε_N collapse to f64; the f64 underflow boundary at
@@ -672,10 +796,57 @@ impl HighPrecResult {
     // HP_F64_REPORT_BOUNDARY_END
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CcmParity {
     Even,
     Odd,
+}
+
+impl CcmParity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Even => "even",
+            Self::Odd => "odd",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+/// One algebraically indexed eigenpair of an explicit CCM parity block.
+pub struct CcmSectorEigenpairHp {
+    pub algebraic_index: usize,
+    pub eigenvalue: Float,
+    pub eigenvector: Vec<Float>,
+    pub residual_norm: Float,
+}
+
+#[derive(Clone, Debug)]
+/// Ordered low spectrum retained for one even or odd CCM parity block.
+pub struct CcmSectorSpectrumHp {
+    pub parity: CcmParity,
+    pub dimension: usize,
+    pub eigenpairs: Vec<CcmSectorEigenpairHp>,
+}
+
+#[derive(Clone, Debug)]
+/// Replayable comparison of the lowest even and odd parity-block states.
+///
+/// `gap_log` is `D_even-D_odd`; `difference_depth` is a distinct diagnostic
+/// derived from the direct eigenvalue difference.
+pub struct CcmSectorGapHp {
+    pub even: CcmSectorSpectrumHp,
+    pub odd: CcmSectorSpectrumHp,
+    pub lambda_even: Float,
+    pub lambda_odd: Float,
+    pub d_even: Float,
+    pub d_odd: Float,
+    pub gap_log: Float,
+    pub lambda_difference: Float,
+    pub difference_depth: Float,
+    pub ordering: i8,
+    pub even_simple: bool,
+    pub even_simplicity_margin: Float,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -931,28 +1102,21 @@ fn euler(prec: u32) -> Float {
 
 /// Force exact symmetry on a `dim × dim` row-major HP matrix in-place.
 ///
-/// Computes `(M[i,j] + M[j,i]) / 2` for every upper-triangle pair
-/// (parallel compute, sequential write-back to avoid aliasing), then
-/// stores the average in both M[i,j] and M[j,i]. The diagonal is
-/// untouched. This is called on the τ-matrix before eigenvector
+/// Computes `(M[i,j] + M[j,i]) / 2` for every upper-triangle pair and
+/// immediately stores the average in both positions. This removes the former
+/// O(dim²) index and MPFR-result scratch while retaining identical arithmetic.
+/// The diagonal is untouched. This is called on the τ-matrix before eigenvector
 /// computation to ensure that floating-point construction noise doesn't
 /// break the assumed symmetry of the Weil quadratic form.
 fn force_symmetric(matrix: &mut [Float], dim: usize) {
-    let pairs: Vec<(usize, usize)> = (0..dim)
-        .flat_map(|i| ((i + 1)..dim).map(move |j| (i, j)))
-        .collect();
-    let symmetrized: Vec<(usize, usize, Float)> = pairs
-        .par_iter()
-        .map(|&(i, j)| {
+    for i in 0..dim {
+        for j in (i + 1)..dim {
             let mut sum = matrix[i * dim + j].clone();
             sum += &matrix[j * dim + i];
             sum /= 2u32;
-            (i, j, sum)
-        })
-        .collect();
-    for (i, j, sum) in symmetrized {
-        matrix[i * dim + j] = sum.clone();
-        matrix[j * dim + i] = sum;
+            matrix[i * dim + j] = sum.clone();
+            matrix[j * dim + i] = sum;
+        }
     }
 }
 
@@ -1598,6 +1762,52 @@ fn build_even_sector_matrix(tau: &[Float], n_modes: usize, prec: u32) -> Vec<Flo
     sector
 }
 
+/// Restrict the full Weil form to the historical orthonormal odd basis
+/// `(e_k - e_-k)/sqrt(2)`, `k=1..=N`.
+///
+/// The reduced entry `Q[k,j] - Q[k,-j]` is the established sector-gap
+/// convention. It is exactly the four-term
+/// orthogonal projection when the full form is centrosymmetric.  Keeping this
+/// operation order preserves the established MPFR values.
+fn build_odd_sector_matrix(tau: &[Float], n_modes: usize, prec: u32) -> Vec<Float> {
+    let full_dim = 2 * n_modes + 1;
+    let center = n_modes;
+    let mut sector = vec![Float::with_val(prec, 0); n_modes * n_modes];
+    for k in 1..=n_modes {
+        let plus_k = center + k;
+        for j in 1..=n_modes {
+            let minus_j = center - j;
+            let plus_j = center + j;
+            let mut value = tau[plus_k * full_dim + plus_j].clone();
+            value -= &tau[plus_k * full_dim + minus_j];
+            sector[(k - 1) * n_modes + (j - 1)] = value;
+        }
+    }
+    sector
+}
+
+#[cfg(test)]
+fn expand_odd_sector_vector(vector: &[Float], n_modes: usize, prec: u32) -> Vec<Float> {
+    debug_assert_eq!(vector.len(), n_modes);
+    let mut expanded = vec![Float::with_val(prec, 0); 2 * n_modes + 1];
+    let sqrt_two = Float::with_val(prec, 2).sqrt();
+    for k in 1..=n_modes {
+        let mut value = vector[k - 1].clone();
+        value /= &sqrt_two;
+        expanded[n_modes + k] = value.clone();
+        expanded[n_modes - k] = -value;
+    }
+    expanded
+}
+
+fn matrix_is_exactly_symmetric(matrix: &[Float], dimension: usize) -> bool {
+    matrix.len() == dimension * dimension
+        && (0..dimension).all(|row| {
+            ((row + 1)..dimension)
+                .all(|column| matrix[row * dimension + column] == matrix[column * dimension + row])
+        })
+}
+
 fn expand_even_sector_vector(vector: &[Float], n_modes: usize, prec: u32) -> Vec<Float> {
     let mut expanded = vec![Float::with_val(prec, 0); 2 * n_modes + 1];
     expanded[n_modes] = vector[0].clone();
@@ -1713,6 +1923,661 @@ fn resolve_even_sector_matrix_via_cache(
         parse_hp_vector(&resolved.value.entries, cfg.precision_bits)?,
         manifest,
     ))
+}
+
+fn resolve_odd_sector_matrix_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    tau: &[Float],
+    tau_manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(Vec<Float>, ArtifactManifest)> {
+    let dimension = params.n_modes;
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_odd_sector_matrix".to_owned(),
+        mathematical_semantics_version: "ccm-odd-sector-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": cfg.precision_bits,
+            "tau_content_digest": tau_manifest.content_digest.0
+        }),
+        normalization: Some("orthonormal_reflection_odd_basis_row_major".to_owned()),
+        target: Some("odd_sector_weil_form".to_owned()),
+        subspace: Some("odd".to_owned()),
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: Some("centrosymmetric_q_plus_plus_minus_q_plus_minus".to_owned()),
+    };
+    let logical_key = format!(
+        "ccm/odd-sector/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        cfg.precision_bits
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.odd_sector.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "odd_sector_matrix".to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            let sector = build_odd_sector_matrix(tau, params.n_modes, cfg.precision_bits);
+            if !matrix_is_exactly_symmetric(&sector, dimension) {
+                return Err(CacheError::InvalidManifest(
+                    "CCM odd-sector projection is not exactly symmetric".to_owned(),
+                ));
+            }
+            Ok((
+                PortableOddSectorMatrix {
+                    schema_version: 1,
+                    lambda_squared: lambda_squared_cache_identity(params),
+                    n_modes: params.n_modes,
+                    precision_bits: cfg.precision_bits,
+                    dimension,
+                    entries: sector.iter().map(Float::to_string).collect(),
+                },
+                vec![DependencyRef {
+                    key: tau_manifest.key.clone(),
+                    content_digest: tau_manifest.content_digest.clone(),
+                    required_quality: CacheQuality::Validated,
+                }],
+            ))
+        },
+        |artifact| {
+            if artifact.schema_version != 1
+                || artifact.lambda_squared != lambda_squared_cache_identity(params)
+                || artifact.n_modes != params.n_modes
+                || artifact.precision_bits != cfg.precision_bits
+                || artifact.dimension != dimension
+                || artifact.entries.len() != dimension * dimension
+            {
+                return Err(CacheError::InvalidManifest(
+                    "CCM odd-sector matrix does not match its semantic identity".to_owned(),
+                ));
+            }
+            let decoded = parse_hp_vector(&artifact.entries, cfg.precision_bits)?;
+            let expected = build_odd_sector_matrix(tau, params.n_modes, cfg.precision_bits);
+            if decoded != expected || !matrix_is_exactly_symmetric(&decoded, dimension) {
+                return Err(CacheError::InvalidManifest(
+                    "CCM odd-sector matrix is inconsistent with its full tau dependency".to_owned(),
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    let manifest = resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("odd-sector execution returned no artifact manifest"))?;
+    Ok((
+        parse_hp_vector(&resolved.value.entries, cfg.precision_bits)?,
+        manifest,
+    ))
+}
+
+fn sector_eigenpair_residual_norm(
+    matrix: &[Float],
+    dimension: usize,
+    eigenvalue: &Float,
+    eigenvector: &[Float],
+    precision_bits: u32,
+) -> Result<Float> {
+    if matrix.len() != dimension * dimension || eigenvector.len() != dimension {
+        bail!("sector eigenpair dimensions do not match the matrix");
+    }
+    let mut squared_norm = Float::with_val(precision_bits, 0);
+    for row in 0..dimension {
+        let mut residual = Float::with_val(precision_bits, 0);
+        for column in 0..dimension {
+            let mut term = matrix[row * dimension + column].clone();
+            term *= &eigenvector[column];
+            residual += term;
+        }
+        let mut expected = eigenvector[row].clone();
+        expected *= eigenvalue;
+        residual -= expected;
+        residual.square_mut();
+        squared_norm += residual;
+    }
+    Ok(squared_norm.sqrt())
+}
+
+fn compute_sector_spectrum(
+    matrix: &[Float],
+    dimension: usize,
+    parity: CcmParity,
+    requested_eigenpairs: usize,
+    cfg: &HighPrecConfig,
+) -> Result<CcmSectorSpectrumHp> {
+    if dimension == 0 || requested_eigenpairs == 0 || requested_eigenpairs > dimension {
+        bail!("requested CCM sector spectrum is outside the sector dimension");
+    }
+    let eigenvalues =
+        xc_numerics::eigen::dense_symmetric_eigenvalues_hp(matrix, dimension, cfg.precision_bits)?;
+    let mut eigenpairs = Vec::with_capacity(requested_eigenpairs);
+    for (algebraic_index, eigenvalue) in eigenvalues
+        .into_iter()
+        .take(requested_eigenpairs)
+        .enumerate()
+    {
+        let eigenvector = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
+            matrix,
+            dimension,
+            &eigenvalue,
+            cfg.precision_bits,
+            cfg.inverse_iter_steps,
+        )?;
+        let residual_norm = sector_eigenpair_residual_norm(
+            matrix,
+            dimension,
+            &eigenvalue,
+            &eigenvector,
+            cfg.precision_bits,
+        )?;
+        eigenpairs.push(CcmSectorEigenpairHp {
+            algebraic_index,
+            eigenvalue,
+            eigenvector,
+            residual_norm,
+        });
+    }
+    Ok(CcmSectorSpectrumHp {
+        parity,
+        dimension,
+        eigenpairs,
+    })
+}
+
+fn portable_sector_spectrum(spectrum: &CcmSectorSpectrumHp) -> PortableSectorSpectrum {
+    PortableSectorSpectrum {
+        schema_version: 1,
+        lambda_squared: String::new(),
+        n_modes: 0,
+        precision_bits: 0,
+        parity: spectrum.parity,
+        dimension: spectrum.dimension,
+        requested_eigenpairs: spectrum.eigenpairs.len(),
+        eigenvalues: spectrum
+            .eigenpairs
+            .iter()
+            .map(|pair| pair.eigenvalue.to_string())
+            .collect(),
+        eigenvectors: spectrum
+            .eigenpairs
+            .iter()
+            .map(|pair| pair.eigenvector.iter().map(Float::to_string).collect())
+            .collect(),
+        residual_norms: spectrum
+            .eigenpairs
+            .iter()
+            .map(|pair| pair.residual_norm.to_string())
+            .collect(),
+    }
+}
+
+fn decode_sector_spectrum(
+    artifact: &PortableSectorSpectrum,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    parity: CcmParity,
+    matrix: &[Float],
+    dimension: usize,
+    requested_eigenpairs: usize,
+) -> std::result::Result<CcmSectorSpectrumHp, CacheError> {
+    if artifact.schema_version != 1
+        || artifact.lambda_squared != lambda_squared_cache_identity(params)
+        || artifact.n_modes != params.n_modes
+        || artifact.precision_bits != cfg.precision_bits
+        || artifact.parity != parity
+        || artifact.dimension != dimension
+        || artifact.requested_eigenpairs != requested_eigenpairs
+        || artifact.eigenvalues.len() != requested_eigenpairs
+        || artifact.eigenvectors.len() != requested_eigenpairs
+        || artifact.residual_norms.len() != requested_eigenpairs
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM sector spectrum does not match its semantic identity".to_owned(),
+        ));
+    }
+    let eigenvalues = parse_hp_vector(&artifact.eigenvalues, cfg.precision_bits)?;
+    if eigenvalues.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(CacheError::InvalidManifest(
+            "CCM sector spectrum is not strictly ordered".to_owned(),
+        ));
+    }
+    let stored_residuals = parse_hp_vector(&artifact.residual_norms, cfg.precision_bits)?;
+    let mut eigenpairs = Vec::with_capacity(requested_eigenpairs);
+    let tolerance =
+        Float::with_val(cfg.precision_bits, 2).pow(-((cfg.precision_bits / 4).max(8) as i32));
+    for index in 0..requested_eigenpairs {
+        let eigenvector = parse_hp_vector(&artifact.eigenvectors[index], cfg.precision_bits)?;
+        if eigenvector.len() != dimension {
+            return Err(CacheError::InvalidManifest(
+                "CCM sector eigenvector has the wrong dimension".to_owned(),
+            ));
+        }
+        let residual = sector_eigenpair_residual_norm(
+            matrix,
+            dimension,
+            &eigenvalues[index],
+            &eigenvector,
+            cfg.precision_bits,
+        )
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+        if residual > tolerance || residual != stored_residuals[index] {
+            return Err(CacheError::InvalidManifest(
+                "CCM sector eigenpair failed exact residual replay".to_owned(),
+            ));
+        }
+        eigenpairs.push(CcmSectorEigenpairHp {
+            algebraic_index: index,
+            eigenvalue: eigenvalues[index].clone(),
+            eigenvector,
+            residual_norm: residual,
+        });
+    }
+    Ok(CcmSectorSpectrumHp {
+        parity,
+        dimension,
+        eigenpairs,
+    })
+}
+
+fn resolve_sector_spectrum_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    parity: CcmParity,
+    matrix: &[Float],
+    matrix_manifest: &ArtifactManifest,
+    requested_eigenpairs: usize,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(CcmSectorSpectrumHp, ArtifactManifest)> {
+    let dimension = match parity {
+        CcmParity::Even => params.n_modes + 1,
+        CcmParity::Odd => params.n_modes,
+    };
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_sector_spectrum".to_owned(),
+        mathematical_semantics_version: "ccm-parity-sector-spectrum-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": cfg.precision_bits,
+            "parity": parity.as_str(),
+            "requested_eigenpairs": requested_eigenpairs,
+            "sector_matrix_content_digest": matrix_manifest.content_digest.0
+        }),
+        normalization: Some("l2_unit_sector_vectors_algebraic_order".to_owned()),
+        target: Some("lowest_parity_sector_eigenpairs".to_owned()),
+        subspace: Some(parity.as_str().to_owned()),
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: Some("dense_householder_qr_plus_shifted_inverse_iteration".to_owned()),
+    };
+    let logical_key = format!(
+        "ccm/sector-spectrum/{}/{}/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        cfg.precision_bits,
+        parity.as_str(),
+        requested_eigenpairs
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.sector_spectrum.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "sector_spectrum".to_owned()),
+            ("parity".to_owned(), parity.as_str().to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            let spectrum =
+                compute_sector_spectrum(matrix, dimension, parity, requested_eigenpairs, cfg)
+                    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            let mut portable = portable_sector_spectrum(&spectrum);
+            portable.lambda_squared = lambda_squared_cache_identity(params);
+            portable.n_modes = params.n_modes;
+            portable.precision_bits = cfg.precision_bits;
+            Ok((
+                portable,
+                vec![DependencyRef {
+                    key: matrix_manifest.key.clone(),
+                    content_digest: matrix_manifest.content_digest.clone(),
+                    required_quality: CacheQuality::Validated,
+                }],
+            ))
+        },
+        |artifact| {
+            decode_sector_spectrum(
+                artifact,
+                params,
+                cfg,
+                parity,
+                matrix,
+                dimension,
+                requested_eigenpairs,
+            )
+            .map(|_| ())
+        },
+    )?;
+    let manifest = resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("sector-spectrum execution returned no manifest"))?;
+    let spectrum = decode_sector_spectrum(
+        &resolved.value,
+        params,
+        cfg,
+        parity,
+        matrix,
+        dimension,
+        requested_eigenpairs,
+    )?;
+    Ok((spectrum, manifest))
+}
+
+fn negative_log10_abs(value: &Float, precision_bits: u32) -> Result<Float> {
+    let magnitude = value.clone().abs();
+    if magnitude.is_zero() || !magnitude.is_finite() {
+        bail!("CCM logarithmic depth requires a finite nonzero value");
+    }
+    let mut depth = magnitude.log10();
+    depth = -depth;
+    Ok(Float::with_val(precision_bits, depth))
+}
+
+fn compute_sector_gap(
+    even: CcmSectorSpectrumHp,
+    odd: CcmSectorSpectrumHp,
+    precision_bits: u32,
+) -> Result<CcmSectorGapHp> {
+    if even.parity != CcmParity::Even
+        || odd.parity != CcmParity::Odd
+        || even.eigenpairs.len() < 2
+        || odd.eigenpairs.len() < 2
+    {
+        bail!("CCM sector-gap analysis requires two ordered eigenpairs per parity sector");
+    }
+    let lambda_even = even.eigenpairs[0].eigenvalue.clone();
+    let lambda_odd = odd.eigenpairs[0].eigenvalue.clone();
+    let d_even = negative_log10_abs(&lambda_even, precision_bits)?;
+    let d_odd = negative_log10_abs(&lambda_odd, precision_bits)?;
+    let mut gap_log = d_even.clone();
+    gap_log -= &d_odd;
+    let mut lambda_difference = lambda_odd.clone();
+    lambda_difference -= &lambda_even;
+    let difference_depth = negative_log10_abs(&lambda_difference, precision_bits)?;
+    let ordering = match lambda_difference.cmp0() {
+        Some(std::cmp::Ordering::Greater) => 1,
+        Some(std::cmp::Ordering::Less) => -1,
+        _ => 0,
+    };
+    let mut even_simplicity_margin = even.eigenpairs[1].eigenvalue.clone();
+    even_simplicity_margin -= &lambda_even;
+    let even_simple = even_simplicity_margin > 0;
+    Ok(CcmSectorGapHp {
+        even,
+        odd,
+        lambda_even,
+        lambda_odd,
+        d_even,
+        d_odd,
+        gap_log,
+        lambda_difference,
+        difference_depth,
+        ordering,
+        even_simple,
+        even_simplicity_margin,
+    })
+}
+
+fn portable_sector_gap(
+    result: &CcmSectorGapHp,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    even_manifest: &ArtifactManifest,
+    odd_manifest: &ArtifactManifest,
+) -> PortableSectorGap {
+    PortableSectorGap {
+        schema_version: 1,
+        lambda_squared: lambda_squared_cache_identity(params),
+        n_modes: params.n_modes,
+        precision_bits: cfg.precision_bits,
+        even_spectrum_content_digest: even_manifest.content_digest.0.clone(),
+        odd_spectrum_content_digest: odd_manifest.content_digest.0.clone(),
+        lambda_even: result.lambda_even.to_string(),
+        lambda_odd: result.lambda_odd.to_string(),
+        d_even: result.d_even.to_string(),
+        d_odd: result.d_odd.to_string(),
+        gap_log: result.gap_log.to_string(),
+        lambda_difference: result.lambda_difference.to_string(),
+        difference_depth: result.difference_depth.to_string(),
+        ordering: result.ordering,
+        even_simple: result.even_simple,
+        even_simplicity_margin: result.even_simplicity_margin.to_string(),
+    }
+}
+
+fn resolve_sector_gap_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    even: CcmSectorSpectrumHp,
+    odd: CcmSectorSpectrumHp,
+    even_manifest: &ArtifactManifest,
+    odd_manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(CcmSectorGapHp, ArtifactManifest)> {
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_sector_gap".to_owned(),
+        mathematical_semantics_version: "ccm-even-odd-gap-log-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": cfg.precision_bits,
+            "even_spectrum_content_digest": even_manifest.content_digest.0,
+            "odd_spectrum_content_digest": odd_manifest.content_digest.0,
+            "definition": "log10(abs(lambda_odd)/abs(lambda_even))"
+        }),
+        normalization: None,
+        target: Some("finite_ccm_even_odd_sector_gap".to_owned()),
+        subspace: Some("even_vs_odd".to_owned()),
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: Some(
+            "mpfr_depth_difference_and_direct_eigenvalue_ordering".to_owned(),
+        ),
+    };
+    let logical_key = format!(
+        "ccm/sector-gap/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        cfg.precision_bits
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.sector_gap.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "sector_gap".to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let expected = compute_sector_gap(even.clone(), odd.clone(), cfg.precision_bits)?;
+    let expected_payload = portable_sector_gap(&expected, params, cfg, even_manifest, odd_manifest);
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            Ok((
+                expected_payload.clone(),
+                canonical_dependency_refs(vec![even_manifest.clone(), odd_manifest.clone()]),
+            ))
+        },
+        |artifact| {
+            if artifact != &expected_payload {
+                return Err(CacheError::InvalidManifest(
+                    "CCM sector-gap payload does not replay from its sector spectra".to_owned(),
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    let manifest = resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("sector-gap execution returned no manifest"))?;
+    if resolved.value != expected_payload {
+        bail!("resolved CCM sector-gap artifact disagrees with replayed values");
+    }
+    Ok((expected, manifest))
+}
+
+fn analyze_sector_gap_inner(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    requested_eigenpairs: usize,
+    cache: Option<&ArtifactCacheContext<'_>>,
+) -> Result<CcmSectorGapHp> {
+    if requested_eigenpairs < 2 || requested_eigenpairs > params.n_modes {
+        bail!("CCM sector-gap analysis requires between two and N eigenpairs per sector");
+    }
+    let l = log_lambda_sq_hp(params, cfg.precision_bits);
+    if let Some(cache) = cache {
+        let (mut tau, tau_manifest) = build_tau_hp_via_cache(params, &l, cfg, cache)?;
+        force_symmetric(&mut tau, params.matrix_size());
+        let (even_matrix, even_matrix_manifest) =
+            resolve_even_sector_matrix_via_cache(params, cfg, &tau, &tau_manifest, cache)?;
+        let (odd_matrix, odd_matrix_manifest) =
+            resolve_odd_sector_matrix_via_cache(params, cfg, &tau, &tau_manifest, cache)?;
+        let (even, even_manifest) = resolve_sector_spectrum_via_cache(
+            params,
+            cfg,
+            CcmParity::Even,
+            &even_matrix,
+            &even_matrix_manifest,
+            requested_eigenpairs,
+            cache,
+        )?;
+        let (odd, odd_manifest) = resolve_sector_spectrum_via_cache(
+            params,
+            cfg,
+            CcmParity::Odd,
+            &odd_matrix,
+            &odd_matrix_manifest,
+            requested_eigenpairs,
+            cache,
+        )?;
+        resolve_sector_gap_via_cache(params, cfg, even, odd, &even_manifest, &odd_manifest, cache)
+            .map(|(gap, _)| gap)
+    } else {
+        let mut tau = build_tau_hp(params, &l, cfg)?;
+        force_symmetric(&mut tau, params.matrix_size());
+        let even_matrix = build_even_sector_matrix(&tau, params.n_modes, cfg.precision_bits);
+        let odd_matrix = build_odd_sector_matrix(&tau, params.n_modes, cfg.precision_bits);
+        let even = compute_sector_spectrum(
+            &even_matrix,
+            params.n_modes + 1,
+            CcmParity::Even,
+            requested_eigenpairs,
+            cfg,
+        )?;
+        let odd = compute_sector_spectrum(
+            &odd_matrix,
+            params.n_modes,
+            CcmParity::Odd,
+            requested_eigenpairs,
+            cfg,
+        )?;
+        compute_sector_gap(even, odd, cfg.precision_bits)
+    }
+}
+
+/// Compute or reuse the lowest requested eigenpairs in both reflection-parity
+/// sectors and derive the full-precision finite-model GapLog record.
+///
+/// This is an explicit research operation.  Ordinary CCM root reproduction
+/// continues to pay only for the standard even source state.
+pub fn analyze_sector_gap(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    requested_eigenpairs: usize,
+) -> Result<CcmSectorGapHp> {
+    let managed =
+        xc_cache::ManagedArtifactCacheSession::from_environment().map_err(anyhow::Error::from)?;
+    if let Some(managed) = &managed {
+        let cache = managed.context();
+        let result = xc_numerics::hp_runtime::run_hp(|| {
+            analyze_sector_gap_inner(params, cfg, requested_eigenpairs, Some(&cache))
+        })?;
+        managed
+            .finalize_publication_inventory()
+            .map_err(anyhow::Error::from)?;
+        Ok(result)
+    } else {
+        xc_numerics::hp_runtime::run_hp(|| {
+            analyze_sector_gap_inner(params, cfg, requested_eigenpairs, None)
+        })
+    }
+}
+
+/// Explicit-cache variant of [`analyze_sector_gap`].
+///
+/// The caller controls overlay order, reuse policy, staging, and publication
+/// finalization through `cache`; this function performs no direct network I/O.
+pub fn analyze_sector_gap_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    requested_eigenpairs: usize,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<CcmSectorGapHp> {
+    xc_numerics::hp_runtime::run_hp(|| {
+        analyze_sector_gap_inner(params, cfg, requested_eigenpairs, Some(cache))
+    })
 }
 
 fn factorization_residual_ok(
@@ -2126,16 +2991,27 @@ fn decode_root_range(
     artifact: &PortableRootRange,
     params: &CcmParams,
     cfg: &HighPrecConfig,
+    first_root_index: usize,
     seeds: &[Float],
+    artifact_mode: RootArtifactMode,
 ) -> std::result::Result<Vec<EigenvalueResult>, CacheError> {
     let expected_seeds: Vec<String> = seeds.iter().map(Float::to_string).collect();
-    if artifact.schema_version != 1
+    if artifact.schema_version != 2
         || artifact.lambda_squared != lambda_squared_cache_identity(params)
         || artifact.n_modes != params.n_modes
         || artifact.precision_bits != cfg.precision_bits
         || artifact.force_even != cfg.force_even
-        || artifact.first_root_index != 1
-        || artifact.seeds != expected_seeds
+        || first_root_index == 0
+        || artifact.first_root_index != first_root_index
+        || artifact.discovery_mode != artifact_mode.as_str()
+        || artifact.reference_seeds_used
+            != (artifact_mode == RootArtifactMode::ReferenceSeededRefinement)
+        || artifact.completeness
+            != match artifact_mode {
+                RootArtifactMode::Independent => "unverified_computed_discovery",
+                RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
+            }
+        || artifact.starting_points != expected_seeds
         || artifact.outcomes.len() != seeds.len()
         || artifact.solver != cfg.root_solver.display_name().to_ascii_lowercase()
         || artifact.solver_steps != cfg.solver_steps
@@ -2177,28 +3053,47 @@ fn decode_root_range(
     Ok(decoded)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_root_range_via_cache(
     params: &CcmParams,
     cfg: &HighPrecConfig,
     l: &Float,
     xi: &[Float],
+    first_root_index: usize,
     seeds: &[Float],
     secular_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
+    artifact_mode: RootArtifactMode,
 ) -> Result<(Vec<EigenvalueResult>, ArtifactManifest)> {
+    if first_root_index == 0 || seeds.is_empty() {
+        bail!("CCM indexed root refinement requires a positive index and nonempty seed window");
+    }
+    let last_root_index = first_root_index
+        .checked_add(seeds.len() - 1)
+        .ok_or_else(|| anyhow::anyhow!("CCM indexed root window overflows usize"))?;
     let seed_strings: Vec<String> = seeds.iter().map(Float::to_string).collect();
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
-        artifact_kind: "ccm_root_refinement".to_owned(),
-        mathematical_semantics_version: "ccm-root-range-v0.13.0-v1".to_owned(),
+        artifact_kind: match artifact_mode {
+            RootArtifactMode::Independent => "ccm_root_discovery_window",
+            RootArtifactMode::ReferenceSeededRefinement => "ccm_root_refinement",
+        }
+        .to_owned(),
+        mathematical_semantics_version: "ccm-root-range-v0.13.0-v2".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
             "precision_bits": cfg.precision_bits,
             "force_even": cfg.force_even,
-            "first_root_index": 1,
+            "first_root_index": first_root_index,
             "root_count": seeds.len(),
-            "seeds": seed_strings,
+            "discovery_mode": artifact_mode.as_str(),
+            "starting_points": seed_strings,
+            "reference_seeds_used": artifact_mode == RootArtifactMode::ReferenceSeededRefinement,
+            "completeness": match artifact_mode {
+                RootArtifactMode::Independent => "unverified_computed_discovery",
+                RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
+            },
             "solver": cfg.root_solver.display_name().to_ascii_lowercase(),
             "solver_steps": cfg.solver_steps
         }),
@@ -2209,15 +3104,23 @@ fn resolve_root_range_via_cache(
         algorithm_semantics: Some(cfg.root_solver.display_name().to_ascii_lowercase()),
     };
     let logical_key = format!(
-        "ccm/root-range/{}/{}/{}/{}/1-{}",
+        "ccm/{}/{}/{}/{}/{}/{}-{}",
+        match artifact_mode {
+            RootArtifactMode::Independent => "root-discovery",
+            RootArtifactMode::ReferenceSeededRefinement => "root-refinement",
+        },
         lambda_squared_cache_identity(params),
         params.n_modes,
         cfg.precision_bits,
         if cfg.force_even { "even" } else { "natural" },
-        seeds.len()
+        first_root_index,
+        last_root_index
     );
     let request = ArtifactExecutionCacheRequest {
-        operation: "ccm.root_range.resolve_or_compute",
+        operation: match artifact_mode {
+            RootArtifactMode::Independent => "ccm.root_discovery.resolve_or_compute",
+            RootArtifactMode::ReferenceSeededRefinement => "ccm.root_refinement.resolve_or_compute",
+        },
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
@@ -2232,7 +3135,14 @@ fn resolve_root_range_via_cache(
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
-            ("artifact".to_owned(), "root_range".to_owned()),
+            (
+                "artifact".to_owned(),
+                match artifact_mode {
+                    RootArtifactMode::Independent => "root_discovery_window",
+                    RootArtifactMode::ReferenceSeededRefinement => "root_refinement",
+                }
+                .to_owned(),
+            ),
         ]),
         provenance_digest: None,
         production_sink: cache.production_sink,
@@ -2254,13 +3164,21 @@ fn resolve_root_range_via_cache(
                 .collect();
             Ok((
                 PortableRootRange {
-                    schema_version: 1,
+                    schema_version: 2,
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
                     precision_bits: cfg.precision_bits,
                     force_even: cfg.force_even,
-                    first_root_index: 1,
-                    seeds: seeds.iter().map(Float::to_string).collect(),
+                    first_root_index,
+                    discovery_mode: artifact_mode.as_str().to_owned(),
+                    reference_seeds_used: artifact_mode
+                        == RootArtifactMode::ReferenceSeededRefinement,
+                    completeness: match artifact_mode {
+                        RootArtifactMode::Independent => "unverified_computed_discovery",
+                        RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
+                    }
+                    .to_owned(),
+                    starting_points: seeds.iter().map(Float::to_string).collect(),
                     outcomes,
                     solver: cfg.root_solver.display_name().to_ascii_lowercase(),
                     solver_steps: cfg.solver_steps,
@@ -2272,27 +3190,53 @@ fn resolve_root_range_via_cache(
                 }],
             ))
         },
-        |artifact| decode_root_range(artifact, params, cfg, seeds).map(|_| ()),
+        |artifact| {
+            decode_root_range(
+                artifact,
+                params,
+                cfg,
+                first_root_index,
+                seeds,
+                artifact_mode,
+            )
+            .map(|_| ())
+        },
     )?;
     let manifest = resolved
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("root-range execution returned no manifest"))?;
     Ok((
-        decode_root_range(&resolved.value, params, cfg, seeds)?,
+        decode_root_range(
+            &resolved.value,
+            params,
+            cfg,
+            first_root_index,
+            seeds,
+            artifact_mode,
+        )?,
         manifest,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_run_evidence_via_cache(
     params: &CcmParams,
     cfg: &HighPrecConfig,
     eps_n: &Float,
     roots: &[EigenvalueResult],
+    first_root_index: usize,
     eigenpair_manifest: &ArtifactManifest,
     root_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
+    artifact_mode: RootArtifactMode,
 ) -> Result<ArtifactManifest> {
+    if first_root_index == 0 || roots.is_empty() {
+        bail!("CCM run evidence requires a nonempty one-based root range");
+    }
+    let last_root_index = first_root_index
+        .checked_add(roots.len() - 1)
+        .ok_or_else(|| anyhow::anyhow!("CCM run-evidence root range overflows usize"))?;
     let counts = roots
         .iter()
         .fold((0usize, 0usize, 0usize), |mut counts, root| {
@@ -2312,6 +3256,9 @@ fn record_run_evidence_via_cache(
             "n_modes": params.n_modes,
             "precision_bits": cfg.precision_bits,
             "force_even": cfg.force_even,
+            "discovery_mode": artifact_mode.as_str(),
+            "first_root_index": first_root_index,
+            "last_root_index": last_root_index,
             "root_count": roots.len(),
             "eigenpair_content_digest": eigenpair_manifest.content_digest.0,
             "root_range_content_digest": root_manifest.content_digest.0
@@ -2323,12 +3270,14 @@ fn record_run_evidence_via_cache(
         algorithm_semantics: None,
     };
     let logical_key = format!(
-        "ccm/run-evidence/{}/{}/{}/{}/{}",
+        "ccm/run-evidence/{}/{}/{}/{}/{}/{}-{}",
+        artifact_mode.as_str(),
         lambda_squared_cache_identity(params),
         params.n_modes,
         cfg.precision_bits,
         if cfg.force_even { "even" } else { "natural" },
-        roots.len()
+        first_root_index,
+        last_root_index
     );
     let request = ArtifactExecutionCacheRequest {
         operation: "ccm.run_evidence.resolve_or_compute",
@@ -2361,6 +3310,9 @@ fn record_run_evidence_via_cache(
                     n_modes: params.n_modes,
                     precision_bits: cfg.precision_bits,
                     force_even: cfg.force_even,
+                    discovery_mode: artifact_mode.as_str().to_owned(),
+                    first_root_index,
+                    last_root_index,
                     root_count: roots.len(),
                     weil_min_eigenvalue: eps_n.to_string(),
                     converged_roots: counts.0,
@@ -2376,6 +3328,9 @@ fn record_run_evidence_via_cache(
                 || artifact.n_modes != params.n_modes
                 || artifact.precision_bits != cfg.precision_bits
                 || artifact.force_even != cfg.force_even
+                || artifact.discovery_mode != artifact_mode.as_str()
+                || artifact.first_root_index != first_root_index
+                || artifact.last_root_index != last_root_index
                 || artifact.root_count != roots.len()
                 || artifact.weil_min_eigenvalue != eps_n.to_string()
                 || artifact.converged_roots != counts.0
@@ -2399,22 +3354,70 @@ fn record_run_evidence_via_cache(
         .ok_or_else(|| anyhow::anyhow!("run-evidence execution returned no manifest"))
 }
 
-/// Top-level entry. Build matrix, find eigenvector, solve spectrum.
-///
-/// `zero_seeds` are the reference Riemann zero imaginary parts used as
-/// Newton seeds. They should be at full working precision (decimal strings
-/// parsed to `Float`) — NOT f64-truncated. Using f64 seeds causes Newton
-/// divergence at high eigenvalue index.
-/// High-precision CCM run.
+/// Build the finite CCM source, independently discover the requested positive
+/// root prefix, and refine it at the configured HP precision.
 ///
 /// The call is routed through [`xc_numerics::hp_runtime::run_hp`], whose
 /// default is a direct full-parallel call. Safe-capped execution is selected
 /// only through `run_hp_with_policy`, and the same explicit policy is recorded
 /// in provenance; no environment variable changes this route.
-pub fn run(
+pub fn run(params: &CcmParams, cfg: &HighPrecConfig) -> Result<HighPrecResult> {
+    if cfg.n_eigenvalues == 0 {
+        return build_source(params, cfg);
+    }
+    run_independent(
+        params,
+        cfg,
+        &ZeroTarget::FirstK {
+            count: cfg.n_eigenvalues,
+        },
+    )
+}
+
+/// Compute the Tau/eigenstate/secular source without requesting roots.
+pub fn build_source(params: &CcmParams, cfg: &HighPrecConfig) -> Result<HighPrecResult> {
+    run_with_acquisition(params, cfg, RootAcquisition::SourceOnly)
+}
+
+/// Independently discover and then refine a requested finite-source window.
+/// No external reference ordinates are accepted by this API.
+pub fn run_independent(
     params: &CcmParams,
     cfg: &HighPrecConfig,
+    target: &ZeroTarget,
+) -> Result<HighPrecResult> {
+    run_with_acquisition(params, cfg, RootAcquisition::Independent(target))
+}
+
+/// Refine a caller-supplied, explicitly indexed root window while reusing the
+/// same managed Tau and secular-source artifacts as every other window.
+///
+/// This API performs refinement, not independent discovery.  Reference-free
+/// discovery and completeness certification are provided by
+/// [`super::certified_roots`].
+pub fn run_indexed_seeded(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    first_root_index: usize,
     zero_seeds: &[Float],
+) -> Result<HighPrecResult> {
+    if first_root_index == 0 || zero_seeds.is_empty() {
+        bail!("indexed CCM refinement requires a positive first index and nonempty seed window");
+    }
+    run_with_acquisition(
+        params,
+        cfg,
+        RootAcquisition::ReferenceSeeded {
+            first_root_index,
+            seeds: zero_seeds,
+        },
+    )
+}
+
+fn run_with_acquisition(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    acquisition: RootAcquisition<'_>,
 ) -> Result<HighPrecResult> {
     let managed =
         xc_cache::ManagedArtifactCacheSession::from_environment().map_err(anyhow::Error::from)?;
@@ -2428,7 +3431,7 @@ pub fn run(
         }
         let cache = managed.context();
         let result = xc_numerics::hp_runtime::run_hp(|| {
-            run_inner(params, cfg, zero_seeds, CcmCacheRoute::Fabric(&cache))
+            run_inner(params, cfg, acquisition, CcmCacheRoute::Fabric(&cache))
         })?;
         managed
             .finalize_publication_inventory()
@@ -2436,7 +3439,7 @@ pub fn run(
         Ok(result)
     } else {
         xc_numerics::hp_runtime::run_hp(|| {
-            run_inner(params, cfg, zero_seeds, CcmCacheRoute::Standalone)
+            run_inner(params, cfg, acquisition, CcmCacheRoute::Standalone)
         })
     }
 }
@@ -2445,7 +3448,7 @@ pub fn run(
 ///
 /// # Mathematical semantics
 /// Builds the localized Weil form, obtains its selected smallest eigenpair,
-/// and refines the positive spectrum from the supplied Riemann-zero seeds.
+/// and independently discovers positive finite `D_log` spectral roots.
 ///
 /// # Precision
 /// All numerical construction and validation uses the precision in `cfg`.
@@ -2469,18 +3472,145 @@ pub fn run(
 pub fn run_via_cache(
     params: &CcmParams,
     cfg: &HighPrecConfig,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<HighPrecResult> {
+    if cfg.n_eigenvalues == 0 {
+        return xc_numerics::hp_runtime::run_hp(|| {
+            run_inner(
+                params,
+                cfg,
+                RootAcquisition::SourceOnly,
+                CcmCacheRoute::Fabric(cache),
+            )
+        });
+    }
+    let target = ZeroTarget::FirstK {
+        count: cfg.n_eigenvalues,
+    };
+    xc_numerics::hp_runtime::run_hp(|| {
+        run_inner(
+            params,
+            cfg,
+            RootAcquisition::Independent(&target),
+            CcmCacheRoute::Fabric(cache),
+        )
+    })
+}
+
+pub fn run_indexed_seeded_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    first_root_index: usize,
     zero_seeds: &[Float],
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<HighPrecResult> {
+    if first_root_index == 0 || zero_seeds.is_empty() {
+        bail!("indexed CCM refinement requires a positive first index and nonempty seed window");
+    }
     xc_numerics::hp_runtime::run_hp(|| {
-        run_inner(params, cfg, zero_seeds, CcmCacheRoute::Fabric(cache))
+        run_inner(
+            params,
+            cfg,
+            RootAcquisition::ReferenceSeeded {
+                first_root_index,
+                seeds: zero_seeds,
+            },
+            CcmCacheRoute::Fabric(cache),
+        )
     })
+}
+
+fn independently_discovered_starting_points(
+    params: &CcmParams,
+    l: &Float,
+    xi: &[Float],
+    target: &ZeroTarget,
+    precision_bits: u32,
+) -> Result<(usize, Vec<Float>)> {
+    let spacing = 2.0 * std::f64::consts::PI / l.to_f64();
+    let poles = (-(params.n_modes as i64)..=(params.n_modes as i64))
+        .map(|index| spacing * index as f64)
+        .collect::<Vec<_>>();
+    let weights = xi.iter().map(Float::to_f64).collect::<Vec<_>>();
+    let secular = SecularFunctionF64::new(poles, weights)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let maximum = spacing * params.n_modes as f64;
+    let (scan_upper, lower_filter) = match target {
+        ZeroTarget::FirstK { count } => {
+            if *count == 0 {
+                bail!("independent CCM prefix count must be positive");
+            }
+            (maximum, 0.0)
+        }
+        ZeroTarget::IndexRange { first, last } => {
+            if *first == 0 || first > last {
+                bail!("independent CCM root indices require 1 <= first <= last");
+            }
+            (maximum, 0.0)
+        }
+        ZeroTarget::HeightWindow { lower, upper } => {
+            let lower = lower.parse::<f64>()?;
+            let upper = upper.parse::<f64>()?;
+            if lower <= 0.0 || lower >= upper || upper > maximum {
+                bail!("independent positive height window lies outside the finite CCM reach");
+            }
+            (upper, lower)
+        }
+        ZeroTarget::SymmetricHeightWindow { height } => {
+            let upper = height.parse::<f64>()?;
+            if upper <= 0.0 || upper > maximum {
+                bail!("independent symmetric height window lies outside the finite CCM reach");
+            }
+            (upper, 0.0)
+        }
+    };
+    let discovered = discover_roots_f64(&secular, 0.0, scan_upper, &DiscoveryOptionsF64::default())
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let values = discovered
+        .iter()
+        .map(|root| root.midpoint.parse::<f64>().map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    let (first_index, selected): (usize, &[f64]) = match target {
+        ZeroTarget::FirstK { count } => {
+            if values.len() < *count {
+                bail!(
+                    "independent computed discovery found only {} positive roots, but target requires index {count}; use certified FLINT discovery or increase finite reach",
+                    values.len()
+                );
+            }
+            (1, &values[..*count])
+        }
+        ZeroTarget::IndexRange { first, last } => {
+            if values.len() < *last {
+                bail!(
+                    "independent computed discovery found only {} positive roots, but target requires index {last}; use certified FLINT discovery or increase finite reach",
+                    values.len()
+                );
+            }
+            (*first, &values[*first - 1..*last])
+        }
+        ZeroTarget::HeightWindow { .. } | ZeroTarget::SymmetricHeightWindow { .. } => {
+            let first_offset = values.partition_point(|value| *value <= lower_filter);
+            let selected = &values[first_offset..];
+            if selected.is_empty() {
+                bail!("independent computed height window contains no discovered roots");
+            }
+            (first_offset + 1, selected)
+        }
+    };
+    Ok((
+        first_index,
+        selected
+            .iter()
+            .map(|value| Float::with_val(precision_bits, *value))
+            .collect(),
+    ))
 }
 
 fn run_inner(
     params: &CcmParams,
     cfg: &HighPrecConfig,
-    zero_seeds: &[Float],
+    acquisition: RootAcquisition<'_>,
     cache_route: CcmCacheRoute<'_>,
 ) -> Result<HighPrecResult> {
     let start = Instant::now();
@@ -2605,30 +3735,58 @@ fn run_inner(
         (pair.0, pair.1, None)
     };
 
-    // Find eigenvalues as zeros of R(z), seeded from HP reference zeros.
+    // Find finite D_log spectral roots as zeros of R(z), seeded from HP
+    // reference zeros.
     // Each solver refinement is independent across seeds — parallelize.
-    let n_eigs = cfg.n_eigenvalues.min(zero_seeds.len());
+    let (first_root_index, hp_seeds, artifact_mode) = match acquisition {
+        RootAcquisition::SourceOnly => (1, Vec::new(), RootArtifactMode::Independent),
+        RootAcquisition::Independent(target) => {
+            let (first, points) =
+                independently_discovered_starting_points(params, &l, &xi, target, prec)?;
+            (first, points, RootArtifactMode::Independent)
+        }
+        RootAcquisition::ReferenceSeeded {
+            first_root_index,
+            seeds,
+        } => {
+            if first_root_index == 0 || seeds.is_empty() {
+                bail!("reference-seeded CCM refinement requires a nonempty one-based range");
+            }
+            (
+                first_root_index,
+                seeds
+                    .iter()
+                    .map(|seed| Float::with_val(prec, seed))
+                    .collect(),
+                RootArtifactMode::ReferenceSeededRefinement,
+            )
+        }
+    };
 
-    // Seed the HP solver from the reference Riemann zeros. At large N
-    // the CCM eigenvalues are close to the Riemann zeros, so these are
-    // good seeds. At small N the f64 bisection solver finds eigenvalues
-    // in bracket order (k², (k+1)²) which does NOT correspond 1:1 to
-    // Riemann zero indices — using f64 seeds causes cross-overs and
-    // completely wrong eigenvalues in the wrong slots. Riemann zero seeds
-    // are robust across all (λ², N) configurations.
-    let hp_seeds: Vec<Float> = zero_seeds[..n_eigs]
-        .iter()
-        .map(|s| Float::with_val(prec, s))
-        .collect();
+    // Starting points either come from the finite secular source itself or
+    // from the explicitly named reference-refinement API.
     crate::hp_debug!(
-        "[HP] using {} reference Riemann zeros as HP {} seeds (N={})",
+        "[HP] using {} {} starting points for HP {} refinement (N={})",
         hp_seeds.len(),
+        artifact_mode.as_str(),
         cfg.root_solver.display_name(),
         params.n_modes
     );
 
     let (eigenvalues_pos, root_manifest): (Vec<EigenvalueResult>, Option<ArtifactManifest>) =
-        if let CcmCacheRoute::Fabric(cache) = &cache_route {
+        if hp_seeds.is_empty() {
+            if let CcmCacheRoute::Fabric(cache) = &cache_route {
+                resolve_secular_source_via_cache(
+                    params,
+                    cfg,
+                    eigenpair_manifest
+                        .as_ref()
+                        .expect("fabric eigenpair route retains its exact manifest"),
+                    cache,
+                )?;
+            }
+            (Vec::new(), None)
+        } else if let CcmCacheRoute::Fabric(cache) = &cache_route {
             let secular_manifest = resolve_secular_source_via_cache(
                 params,
                 cfg,
@@ -2642,9 +3800,11 @@ fn run_inner(
                 cfg,
                 &l,
                 &xi,
+                first_root_index,
                 &hp_seeds,
                 &secular_manifest,
                 cache,
+                artifact_mode,
             )?;
             (roots, Some(manifest))
         } else {
@@ -2672,24 +3832,24 @@ fn run_inner(
                 .collect();
             (roots, None)
         };
-    if let CcmCacheRoute::Fabric(cache) = &cache_route {
+    if let (CcmCacheRoute::Fabric(cache), Some(root_manifest)) = (&cache_route, &root_manifest) {
         record_run_evidence_via_cache(
             params,
             cfg,
             &eps_n,
             &eigenvalues_pos,
+            first_root_index,
             eigenpair_manifest
                 .as_ref()
                 .expect("fabric eigenpair route retains its exact manifest"),
-            root_manifest
-                .as_ref()
-                .expect("fabric root route retains its exact manifest"),
+            root_manifest,
             cache,
+            artifact_mode,
         )?;
     }
     // After all solves, verify each computed eigenvalue is closest
     // to its assigned seed (detect cross-overs). Log warnings for any
-    // mismatches but don't reorder — ordering is by seed, not by value.
+    // mismatches but do not reorder; ordering is fixed before HP refinement.
     for (k, ev_result) in eigenvalues_pos.iter().enumerate() {
         let ev = match ev_result.value() {
             Some(z) => z,
@@ -2714,8 +3874,10 @@ fn run_inner(
             let dist_j = dist_j.abs();
             if dist_j < dist_k {
                 crate::hp_debug!(
-                    "[HP] WARNING: eigenvalue {} is closer to seed {} than its own seed {} — possible cross-over",
-                    k + 1, j + 1, k + 1
+                    "[HP] WARNING: spectral root {} is closer to seed {} than its own seed {} — possible cross-over",
+                    first_root_index + k,
+                    first_root_index + j,
+                    first_root_index + k
                 );
                 break;
             }
@@ -2724,6 +3886,7 @@ fn run_inner(
 
     Ok(HighPrecResult {
         eigenvalues_pos,
+        first_positive_root_index: first_root_index,
         weil_min_eigenvalue: eps_n,
         xi,
         elapsed_seconds: start.elapsed().as_secs_f64(),
@@ -3489,27 +4652,22 @@ fn compute_archimedean_integrals_tracked(
     eprintln!("[HP] GL tables ready. Computing alpha_L, beta_L, gamma_L integrals...");
 
     let indices: Vec<usize> = (0..=n_modes).collect();
-    let alpha = indices
+    let kappa_half = compute_kappa_half(l, prec);
+    let fused: Vec<(Float, Float, Float)> = indices
         .par_iter()
         .map(|&n| {
             let (nodes, weights) = gl_cache.get(&pts_for_n[n]).unwrap();
-            compute_alpha_l(n as i64, l, prec, nodes, weights)
+            compute_archimedean_integrals_l(n as i64, l, prec, nodes, weights, &kappa_half)
         })
         .collect();
-    let beta = indices
-        .par_iter()
-        .map(|&n| {
-            let (nodes, weights) = gl_cache.get(&pts_for_n[n]).unwrap();
-            compute_beta_l(n as i64, l, prec, nodes, weights)
-        })
-        .collect();
-    let gamma = indices
-        .par_iter()
-        .map(|&n| {
-            let (nodes, weights) = gl_cache.get(&pts_for_n[n]).unwrap();
-            compute_gamma_l(n as i64, l, prec, nodes, weights)
-        })
-        .collect();
+    let mut alpha = Vec::with_capacity(fused.len());
+    let mut beta = Vec::with_capacity(fused.len());
+    let mut gamma = Vec::with_capacity(fused.len());
+    for (alpha_value, beta_value, gamma_value) in fused {
+        alpha.push(alpha_value);
+        beta.push(beta_value);
+        gamma.push(gamma_value);
+    }
     Ok((
         ComputedArchimedeanIntegrals { alpha, beta, gamma },
         quadrature_manifests,
@@ -3589,6 +4747,113 @@ fn assemble_pole_and_archimedean_components(
 }
 
 fn compute_prime_component_matrix(
+    n_modes: usize,
+    prime_cutoff: u64,
+    l: &Float,
+    prec: u32,
+) -> Vec<Float> {
+    let dim = 2 * n_modes + 1;
+    let pi_v = pi(prec);
+    let mut two_pi = pi_v.clone();
+    two_pi *= 2u32;
+    let mode_values = (-(n_modes as i64)..=(n_modes as i64))
+        .map(|mode| fl_i(prec, mode))
+        .collect::<Vec<_>>();
+    let mode_frequencies = mode_values
+        .iter()
+        .map(|mode| {
+            let mut frequency = two_pi.clone();
+            frequency *= mode;
+            frequency /= l;
+            frequency
+        })
+        .collect::<Vec<_>>();
+    let difference_denominators = (-(2 * n_modes as i64)..=(2 * n_modes as i64))
+        .map(|difference| {
+            let mut denominator = pi_v.clone();
+            denominator *= fl_i(prec, difference);
+            denominator
+        })
+        .collect::<Vec<_>>();
+    struct PrimeKernelTable {
+        log_prime: Float,
+        sqrt_power: Float,
+        diagonal_factor: Float,
+        sines: Vec<Float>,
+        cosines: Vec<Float>,
+    }
+    let prime_data: Vec<PrimeKernelTable> = prime_powers_up_to(prime_cutoff)
+        .into_iter()
+        .map(|(power, prime, _)| {
+            let log_power = Float::with_val(prec, power).ln();
+            let log_prime = Float::with_val(prec, prime).ln();
+            let sqrt_power = Float::with_val(prec, power).sqrt();
+            let mut diagonal_factor = Float::with_val(prec, 1);
+            let mut ratio = log_power.clone();
+            ratio /= l;
+            diagonal_factor -= ratio;
+            diagonal_factor *= 2u32;
+            let phases = mode_frequencies
+                .iter()
+                .map(|frequency| {
+                    let mut phase = frequency.clone();
+                    phase *= &log_power;
+                    phase
+                })
+                .collect::<Vec<_>>();
+            let sines = phases.iter().map(|phase| phase.clone().sin()).collect();
+            let cosines = phases.into_iter().map(Float::cos).collect();
+            PrimeKernelTable {
+                log_prime,
+                sqrt_power,
+                diagonal_factor,
+                sines,
+                cosines,
+            }
+        })
+        .collect();
+    let cells: Vec<(i64, i64)> = (-(n_modes as i64)..=(n_modes as i64))
+        .flat_map(|n| (-(n_modes as i64)..=(n_modes as i64)).map(move |m| (n, m)))
+        .collect();
+    let values: Vec<Float> = cells
+        .par_iter()
+        .map(|&(n, m)| {
+            let n_index = (n + n_modes as i64) as usize;
+            let m_index = (m + n_modes as i64) as usize;
+            let mut sum = Float::with_val(prec, 0);
+            for data in &prime_data {
+                let kernel = if n == m {
+                    let mut factor = data.diagonal_factor.clone();
+                    factor *= &data.cosines[n_index];
+                    factor
+                } else {
+                    let mut difference = data.sines[m_index].clone();
+                    difference -= &data.sines[n_index];
+                    difference /= &difference_denominators[(n - m + 2 * n_modes as i64) as usize];
+                    difference
+                };
+                let mut term = kernel;
+                term *= &data.log_prime;
+                term /= &data.sqrt_power;
+                sum += term;
+            }
+            sum
+        })
+        .collect();
+    let mut matrix = vec![Float::with_val(prec, 0); dim * dim];
+    for (index, &(n, m)) in cells.iter().enumerate() {
+        let row = (n + n_modes as i64) as usize;
+        let column = (m + n_modes as i64) as usize;
+        matrix[row * dim + column] = values[index].clone();
+    }
+    matrix
+}
+
+// Frozen allocating implementation retained only as an exact-equivalence
+// oracle for the precomputed prime-kernel tables above. Do not relax the
+// comparison to a tolerance: a change here would change cached matrix bytes.
+#[cfg(test)]
+fn compute_prime_component_matrix_reference(
     n_modes: usize,
     prime_cutoff: u64,
     l: &Float,
@@ -3755,30 +5020,23 @@ fn build_tau_components_exact_tracked(
     eprintln!("[HP] GL tables ready. Computing α_L, β_L, γ_L integrals...");
 
     let indices: Vec<usize> = (0..=n_max).collect();
-    let alpha_l: Vec<Float> = indices
+    let kappa_half = compute_kappa_half(l, prec);
+    let fused_integrals: Vec<(Float, Float, Float)> = indices
         .par_iter()
         .map(|&n| {
             let pts = pts_for_n[n];
             let (nodes, weights) = gl_cache.get(&pts).unwrap();
-            compute_alpha_l(n as i64, l, prec, nodes, weights)
+            compute_archimedean_integrals_l(n as i64, l, prec, nodes, weights, &kappa_half)
         })
         .collect();
-    let beta_l: Vec<Float> = indices
-        .par_iter()
-        .map(|&n| {
-            let pts = pts_for_n[n];
-            let (nodes, weights) = gl_cache.get(&pts).unwrap();
-            compute_beta_l(n as i64, l, prec, nodes, weights)
-        })
-        .collect();
-    let gamma_l: Vec<Float> = indices
-        .par_iter()
-        .map(|&n| {
-            let pts = pts_for_n[n];
-            let (nodes, weights) = gl_cache.get(&pts).unwrap();
-            compute_gamma_l(n as i64, l, prec, nodes, weights)
-        })
-        .collect();
+    let mut alpha_l = Vec::with_capacity(fused_integrals.len());
+    let mut beta_l = Vec::with_capacity(fused_integrals.len());
+    let mut gamma_l = Vec::with_capacity(fused_integrals.len());
+    for (alpha_value, beta_value, gamma_value) in fused_integrals {
+        alpha_l.push(alpha_value);
+        beta_l.push(beta_value);
+        gamma_l.push(gamma_value);
+    }
     eprintln!(
         "[HP] Integrals done. Assembling {}×{} τ-matrix...",
         dim, dim
@@ -3930,6 +5188,94 @@ fn signed_alpha(table: &[Float], n: i64, prec: u32) -> Float {
     }
 }
 
+fn compute_kappa_half(l: &Float, prec: u32) -> Float {
+    let exp_l = l.clone().exp();
+    let mut numerator = exp_l.clone();
+    numerator -= 1u32;
+    let mut denominator = exp_l;
+    denominator += 1u32;
+    numerator /= &denominator;
+    let mut four_pi = pi(prec);
+    four_pi *= 4u32;
+    numerator *= &four_pi;
+    let mut kappa_half = numerator.ln();
+    kappa_half += euler(prec);
+    kappa_half /= 2u32;
+    kappa_half
+}
+
+/// Evaluate alpha, beta, and gamma in one ordered quadrature pass. Each
+/// accumulator follows the exact operation order of its former standalone
+/// evaluator; only node mapping, rho, phase cosine, and kappa are shared.
+fn compute_archimedean_integrals_l(
+    n: i64,
+    l: &Float,
+    prec: u32,
+    nodes: &[Float],
+    weights: &[Float],
+    kappa_half: &Float,
+) -> (Float, Float, Float) {
+    let pi_value = pi(prec);
+    let mut frequency = pi_value.clone();
+    frequency *= 2u32;
+    frequency *= fl_i(prec, n);
+    frequency /= l;
+    let mut half_l = l.clone();
+    half_l /= 2u32;
+    let singularity_guard = Float::with_val(
+        prec,
+        Float::parse(HP_SINGULARITY_GUARD_STR).expect("static singularity guard parses"),
+    );
+    let mut alpha = Float::with_val(prec, 0);
+    let mut beta = Float::with_val(prec, 0);
+    let mut gamma = Float::with_val(prec, 0);
+    for (node, weight) in nodes.iter().zip(weights) {
+        let mut x = node.clone();
+        x += 1u32;
+        x *= &half_l;
+        let rho = rho_hp_with_guard(&x, &singularity_guard, prec);
+        let mut phase = frequency.clone();
+        phase *= &x;
+        // Keep MPFR's standalone sin/cos routes so the fused evaluator is
+        // byte-identical to the former separate integrands.
+        let sine = phase.clone().sin();
+        let cosine = phase.cos();
+
+        if n != 0 {
+            let mut alpha_value = sine;
+            alpha_value *= &rho;
+            let mut alpha_term = weight.clone();
+            alpha_term *= &alpha_value;
+            alpha += &alpha_term;
+        }
+
+        let mut beta_value = x.clone();
+        beta_value *= &cosine;
+        beta_value *= &rho;
+        let mut beta_term = weight.clone();
+        beta_term *= &beta_value;
+        beta += &beta_term;
+
+        let mut negative_half = x;
+        negative_half /= -2i32;
+        let exponential = negative_half.exp();
+        let mut gamma_value = cosine;
+        gamma_value -= &exponential;
+        gamma_value *= &rho;
+        let mut gamma_term = weight.clone();
+        gamma_term *= &gamma_value;
+        gamma += &gamma_term;
+    }
+    alpha *= &half_l;
+    alpha /= &pi_value;
+    beta *= &half_l;
+    beta /= l;
+    gamma *= &half_l;
+    gamma += kappa_half;
+    (alpha, beta, gamma)
+}
+
+#[cfg(test)]
 fn compute_alpha_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Float]) -> Float {
     if n == 0 {
         return Float::with_val(prec, 0);
@@ -3951,6 +5297,7 @@ fn compute_alpha_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Flo
     v
 }
 
+#[cfg(test)]
 fn compute_beta_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Float]) -> Float {
     let pi_v = pi(prec);
     let mut freq = pi_v.clone();
@@ -3971,6 +5318,7 @@ fn compute_beta_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Floa
     v
 }
 
+#[cfg(test)]
 fn compute_gamma_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Float]) -> Float {
     let pi_v = pi(prec);
     let mut freq = pi_v.clone();
@@ -3990,29 +5338,19 @@ fn compute_gamma_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Flo
         diff
     };
     let mut v = quad_eval(nodes, weights, l, f);
-    let kappa_half = {
-        let exp_l = l.clone().exp();
-        let mut num = exp_l.clone();
-        num -= 1u32;
-        let mut den = exp_l;
-        den += 1u32;
-        let mut ratio = num;
-        ratio /= &den;
-        let mut four_pi = pi_v;
-        four_pi *= 4u32;
-        ratio *= &four_pi;
-        let mut k = ratio.ln();
-        k += euler(prec);
-        k /= 2u32;
-        k
-    };
+    let kappa_half = compute_kappa_half(l, prec);
     v += &kappa_half;
     v
 }
 
+#[cfg(test)]
 fn rho_hp(x: &Float, prec: u32) -> Float {
     let tiny = Float::with_val(prec, Float::parse(HP_SINGULARITY_GUARD_STR).unwrap());
-    if x.cmp_abs(&tiny).map(|o| o.is_lt()).unwrap_or(false) {
+    rho_hp_with_guard(x, &tiny, prec)
+}
+
+fn rho_hp_with_guard(x: &Float, tiny: &Float, prec: u32) -> Float {
+    if x.cmp_abs(tiny).map(|o| o.is_lt()).unwrap_or(false) {
         let mut v = x.clone().recip();
         v /= 2u32;
         v += {
@@ -4033,6 +5371,7 @@ fn rho_hp(x: &Float, prec: u32) -> Float {
     }
 }
 
+#[cfg(test)]
 fn quad_eval<F>(nodes: &[Float], weights: &[Float], l: &Float, f: F) -> Float
 where
     F: Fn(&Float) -> Float,
@@ -5591,6 +6930,84 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
+    fn independent_starting_points_are_default_seed_source() {
+        let precision = 192;
+        let params = CcmParams::from_lambda_sq_integer(13, 4);
+        let l = Float::with_val(precision, 13).ln();
+        let xi = vec![Float::with_val(precision, 1); params.matrix_size()];
+        let (first, points) = independently_discovered_starting_points(
+            &params,
+            &l,
+            &xi,
+            &ZeroTarget::IndexRange { first: 2, last: 3 },
+            precision,
+        )
+        .unwrap();
+        assert_eq!(first, 2);
+        assert_eq!(points.len(), 2);
+        assert!(points[0] > 0 && points[0] < points[1]);
+    }
+
+    #[test]
+    fn fused_archimedean_integrals_are_bit_identical_to_separate_evaluators() {
+        let precision = 256;
+        let l = Float::with_val(precision, 13).ln();
+        let nodes = ["-0.91", "-0.43", "0", "0.37", "0.88"]
+            .iter()
+            .map(|value| Float::with_val(precision, Float::parse(value).unwrap()))
+            .collect::<Vec<_>>();
+        let weights = ["0.12", "0.23", "0.31", "0.22", "0.12"]
+            .iter()
+            .map(|value| Float::with_val(precision, Float::parse(value).unwrap()))
+            .collect::<Vec<_>>();
+        let kappa_half = compute_kappa_half(&l, precision);
+        for mode in 0..=6 {
+            let fused =
+                compute_archimedean_integrals_l(mode, &l, precision, &nodes, &weights, &kappa_half);
+            assert_eq!(
+                fused.0,
+                compute_alpha_l(mode, &l, precision, &nodes, &weights),
+                "alpha changed at mode {mode}"
+            );
+            assert_eq!(
+                fused.1,
+                compute_beta_l(mode, &l, precision, &nodes, &weights),
+                "beta changed at mode {mode}"
+            );
+            assert_eq!(
+                fused.2,
+                compute_gamma_l(mode, &l, precision, &nodes, &weights),
+                "gamma changed at mode {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn precomputed_prime_kernels_are_bit_identical_to_reference() {
+        for precision in [128, 257] {
+            let l = Float::with_val(precision, 13).ln();
+            for n_modes in 0..=4 {
+                let optimized = compute_prime_component_matrix(n_modes, 19, &l, precision);
+                let reference =
+                    compute_prime_component_matrix_reference(n_modes, 19, &l, precision);
+                assert_eq!(
+                    optimized.len(),
+                    reference.len(),
+                    "matrix shape changed at precision={precision}, N={n_modes}"
+                );
+                for (index, (actual, expected)) in
+                    optimized.iter().zip(reference.iter()).enumerate()
+                {
+                    assert_eq!(
+                        actual, expected,
+                        "prime component changed at precision={precision}, N={n_modes}, cell={index}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn tau_matrix_round_trips_through_common_cache_fabric() {
         use xc_cache::{
             ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
@@ -5647,14 +7064,24 @@ mod tests {
             .iter()
             .any(|dependency| dependency.key.kind == "ccm_prime_component"));
         let seeds = vec![Float::with_val(cfg.precision_bits, 14)];
-        let first_run = run_via_cache(&params, &cfg, &seeds, &context).unwrap();
-        let second_run = run_via_cache(&params, &cfg, &seeds, &context).unwrap();
+        let first_run = run_indexed_seeded_via_cache(&params, &cfg, 1, &seeds, &context).unwrap();
+        let second_run = run_indexed_seeded_via_cache(&params, &cfg, 1, &seeds, &context).unwrap();
         assert_eq!(
             first_run.weil_min_eigenvalue,
             second_run.weil_min_eigenvalue
         );
         assert_eq!(first_run.xi, second_run.xi);
         assert_eq!(first_run.eigenvalues_pos.len(), 1);
+        assert_eq!(first_run.spectral_root_index_range(), Some(1..=1));
+        let first_indexed =
+            run_indexed_seeded_via_cache(&params, &cfg, 17, &seeds, &context).unwrap();
+        let second_indexed =
+            run_indexed_seeded_via_cache(&params, &cfg, 17, &seeds, &context).unwrap();
+        assert_eq!(first_indexed.spectral_root_index_range(), Some(17..=17));
+        assert_eq!(
+            first_indexed.eigenvalues_pos[0].value(),
+            second_indexed.eigenvalues_pos[0].value()
+        );
         let first_evenness = measure_evenness_via_cache(&params, &cfg, &context).unwrap();
         let second_evenness = measure_evenness_via_cache(&params, &cfg, &context).unwrap();
         assert_eq!(
@@ -5669,6 +7096,13 @@ mod tests {
             first_evenness.forced_eigenvalue,
             second_evenness.forced_eigenvalue
         );
+        let first_sector_gap = analyze_sector_gap_via_cache(&params, &cfg, 2, &context).unwrap();
+        let second_sector_gap = analyze_sector_gap_via_cache(&params, &cfg, 2, &context).unwrap();
+        assert_eq!(first_sector_gap.lambda_even, second_sector_gap.lambda_even);
+        assert_eq!(first_sector_gap.lambda_odd, second_sector_gap.lambda_odd);
+        assert_eq!(first_sector_gap.gap_log, second_sector_gap.gap_log);
+        assert_eq!(first_sector_gap.even.eigenpairs.len(), 2);
+        assert_eq!(first_sector_gap.odd.eigenpairs.len(), 2);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5698,6 +7132,83 @@ mod tests {
         let mut difference = full;
         difference -= reduced;
         assert!(difference.abs() < Float::with_val(precision_bits, 2).pow(-240));
+    }
+
+    #[test]
+    fn odd_sector_projection_preserves_historical_values_and_quadratic_form() {
+        let precision_bits = 256;
+        let n_modes = 2;
+        let dim = 2 * n_modes + 1;
+        let mut tau = vec![Float::with_val(precision_bits, 0); dim * dim];
+        for row in 0..dim {
+            let signed_row = row as i32 - n_modes as i32;
+            for column in 0..dim {
+                let signed_column = column as i32 - n_modes as i32;
+                let diagonal = if row == column { 40 } else { 0 };
+                let value =
+                    diagonal + signed_row * signed_column + (signed_row - signed_column).abs();
+                tau[row * dim + column] = Float::with_val(precision_bits, value);
+            }
+        }
+        assert!(matrix_is_exactly_symmetric(&tau, dim));
+        for row in 0..dim {
+            for column in 0..dim {
+                assert_eq!(
+                    tau[row * dim + column],
+                    tau[(dim - 1 - row) * dim + (dim - 1 - column)]
+                );
+            }
+        }
+
+        let sector = build_odd_sector_matrix(&tau, n_modes, precision_bits);
+        for k in 1..=n_modes {
+            for j in 1..=n_modes {
+                let mut historical = tau[(n_modes + k) * dim + (n_modes + j)].clone();
+                historical -= &tau[(n_modes + k) * dim + (n_modes - j)];
+                assert_eq!(sector[(k - 1) * n_modes + (j - 1)], historical);
+            }
+        }
+        assert!(matrix_is_exactly_symmetric(&sector, n_modes));
+
+        let y = vec![
+            Float::with_val(precision_bits, 2),
+            Float::with_val(precision_bits, -3),
+        ];
+        let x = expand_odd_sector_vector(&y, n_modes, precision_bits);
+        let full = xc_numerics::linalg::rayleigh_quotient(&tau, dim, &x, precision_bits);
+        let reduced = xc_numerics::linalg::rayleigh_quotient(&sector, n_modes, &y, precision_bits);
+        let mut difference = full;
+        difference -= reduced;
+        assert!(difference.abs() < Float::with_val(precision_bits, 2).pow(-240));
+    }
+
+    #[test]
+    fn sector_gap_uses_depth_difference_not_eigenvalue_subtraction() {
+        let precision_bits = 256;
+        let pair = |index: usize, value: &str| CcmSectorEigenpairHp {
+            algebraic_index: index,
+            eigenvalue: Float::with_val(precision_bits, Float::parse(value).unwrap()),
+            eigenvector: vec![Float::with_val(precision_bits, 1)],
+            residual_norm: Float::with_val(precision_bits, 0),
+        };
+        let even = CcmSectorSpectrumHp {
+            parity: CcmParity::Even,
+            dimension: 1,
+            eigenpairs: vec![pair(0, "1e-20"), pair(1, "2")],
+        };
+        let odd = CcmSectorSpectrumHp {
+            parity: CcmParity::Odd,
+            dimension: 1,
+            eigenpairs: vec![pair(0, "1e-16"), pair(1, "3")],
+        };
+        let gap = compute_sector_gap(even, odd, precision_bits).unwrap();
+        let expected = Float::with_val(precision_bits, 4);
+        let mut error = gap.gap_log.clone();
+        error -= expected;
+        assert!(error.abs() < Float::with_val(precision_bits, 2).pow(-240));
+        assert_eq!(gap.ordering, 1);
+        assert!(gap.even_simple);
+        assert_ne!(gap.gap_log, gap.difference_depth);
     }
 
     #[cfg(feature = "arb")]
@@ -5771,7 +7282,27 @@ mod tests {
             Some(xc_cache::ArtifactAssuranceState::Certified)
         );
         assert_eq!(tau_draft.assurance_evidence_digests.len(), 2);
-        assert_eq!(sink.drafts().unwrap().len(), 2);
+        let draft_identities = sink
+            .drafts()
+            .unwrap()
+            .into_iter()
+            .map(|draft| (draft.family, draft.source_artifact_key.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            draft_identities,
+            vec![
+                ("quadrature".to_owned(), "gauss_legendre_rule".to_owned()),
+                (
+                    "ccm-components".to_owned(),
+                    "ccm_archimedean_integrals".to_owned()
+                ),
+                (
+                    "ccm-components".to_owned(),
+                    "ccm_prime_component".to_owned()
+                ),
+                ("ccm-matrices".to_owned(), "ccm_tau_matrix".to_owned()),
+            ]
+        );
         let inventory = xc_cache::build_managed_publication_inventory(
             &sink.drafts().unwrap(),
             xc_core::PublicationTarget::Both,
@@ -5783,7 +7314,7 @@ mod tests {
         )
         .unwrap();
         assert!(inventory.ready_for_remote_execution);
-        assert_eq!(inventory.entries.len(), 4);
+        assert_eq!(inventory.entries.len(), 8);
         assert!(inventory
             .entries
             .iter()
@@ -5815,6 +7346,7 @@ mod tests {
                 )),
                 EigenvalueResult::Failed,
             ],
+            first_positive_root_index: 17,
             weil_min_eigenvalue: Float::with_val(precision_bits, Float::parse("1e-120").unwrap()),
             xi: vec![
                 Float::with_val(384, Float::parse("-0.125").unwrap()),
@@ -5839,6 +7371,7 @@ mod tests {
             runtime.weil_min_eigenvalue
         );
         assert_eq!(reconstructed.xi, runtime.xi);
+        assert_eq!(reconstructed.spectral_root_index_range(), Some(17..=19));
         for (actual, expected) in reconstructed
             .eigenvalues_pos
             .iter()
@@ -6350,7 +7883,8 @@ mod tests {
         assert_eq!(cfg.quad_points, MIN_QUAD_POINTS);
     }
 
-    /// hp::run() at small N should produce eigenvalues near Riemann zeros.
+    /// Explicit seeded refinement at small N should produce roots near the
+    /// corresponding comparison ordinates.
     /// Uses λ²=13, N=10 (21×21 matrix) at 64-digit precision — fast enough
     /// for a unit test (~1-2 seconds).
     #[test]
@@ -6376,7 +7910,7 @@ mod tests {
             .map(|s| Float::with_val(prec, Float::parse(s).unwrap()))
             .collect();
 
-        let result = run(&params, &cfg, &zero_seeds).unwrap();
+        let result = run_indexed_seeded(&params, &cfg, 1, &zero_seeds).unwrap();
 
         // At N=10, the f64 solver finds however many eigenvalues exist
         // in the standard brackets. Just verify we got at least 1.
@@ -6523,14 +8057,14 @@ mod tests {
 
         // Newton result
         cfg.root_solver = RootSolver::Newton;
-        let result_n = run(&params, &cfg, &zero_seeds).unwrap();
+        let result_n = run_indexed_seeded(&params, &cfg, 1, &zero_seeds).unwrap();
         let ev_newton = result_n.eigenvalues_pos[0]
             .value()
             .expect("Newton should converge");
 
         // Halley result
         cfg.root_solver = RootSolver::Halley;
-        let result_h = run(&params, &cfg, &zero_seeds).unwrap();
+        let result_h = run_indexed_seeded(&params, &cfg, 1, &zero_seeds).unwrap();
         let ev_halley = result_h.eigenvalues_pos[0]
             .value()
             .expect("Halley should converge");
@@ -6561,7 +8095,7 @@ mod tests {
             .iter()
             .map(|s| Float::with_val(prec, Float::parse(s).unwrap()))
             .collect();
-        let result = run(&params, &cfg, &zero_seeds).unwrap();
+        let result = run_indexed_seeded(&params, &cfg, 1, &zero_seeds).unwrap();
         // Should produce 1 eigenvalue (Some or None — just check no panic)
         assert_eq!(
             result.eigenvalues_pos.len(),

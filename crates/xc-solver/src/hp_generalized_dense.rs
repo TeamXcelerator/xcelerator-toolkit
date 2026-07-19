@@ -1,5 +1,5 @@
 use super::{GeneralizedExtremeConfigHp, HpCrossCheckTolerance, SolverError};
-use rug::Float;
+use rug::{ops::NegAssign, Float};
 use xc_core::{AssuranceLevel, EigenTarget, ResultStatus, SolverProvenance, TerminationReason};
 use xc_operator::GeneralizedEigenProblem;
 
@@ -256,7 +256,7 @@ fn canonicalize(vector: &mut [Float]) {
         .is_some_and(Float::is_sign_negative)
     {
         for value in vector {
-            *value = -value.clone();
+            value.neg_assign();
         }
     }
 }
@@ -475,7 +475,7 @@ pub fn cross_check_generalized_hp_reports(
         .metric
         .apply(&dense_whitening.eigenvector, &mut metric_image)?;
     for value in &mut metric_image {
-        *value = Float::with_val(precision_bits, &*value);
+        super::reprecision_hp_value(value, precision_bits);
     }
     let overlap = dot(&matrix_free.eigenvector, &metric_image, precision_bits);
     let mut one_minus_metric_overlap_squared = overlap;

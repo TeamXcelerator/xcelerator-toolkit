@@ -717,7 +717,7 @@ mod tests {
 pub mod hp {
     use anyhow::Result;
     use rayon::prelude::*;
-    use rug::Float;
+    use rug::{ops::NegAssign, Float};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
     use xc_cache::{
@@ -1040,28 +1040,30 @@ pub mod hp {
         let mut gram = stiffness.clone();
         for row in 0..basis_dimension {
             for column in 0..=row {
-                let gram_value = xc_numerics::reduction::deterministic_pairwise_sum_hp(
-                    &basis[row]
-                        .iter()
-                        .zip(&basis[column])
-                        .map(|(left, right)| {
-                            let mut value = Float::with_val(precision_bits, left);
-                            value *= right;
-                            value
-                        })
-                        .collect::<Vec<_>>(),
+                let gram_terms = basis[row]
+                    .iter()
+                    .zip(&basis[column])
+                    .map(|(left, right)| {
+                        let mut value = Float::with_val(precision_bits, left);
+                        value *= right;
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                let gram_value = xc_numerics::reduction::deterministic_pairwise_sum_hp_owned(
+                    gram_terms,
                     precision_bits,
                 );
-                let stiffness_value = xc_numerics::reduction::deterministic_pairwise_sum_hp(
-                    &basis[row]
-                        .iter()
-                        .zip(&applied[column])
-                        .map(|(left, right)| {
-                            let mut value = Float::with_val(precision_bits, left);
-                            value *= right;
-                            value
-                        })
-                        .collect::<Vec<_>>(),
+                let stiffness_terms = basis[row]
+                    .iter()
+                    .zip(&applied[column])
+                    .map(|(left, right)| {
+                        let mut value = Float::with_val(precision_bits, left);
+                        value *= right;
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                let stiffness_value = xc_numerics::reduction::deterministic_pairwise_sum_hp_owned(
+                    stiffness_terms,
                     precision_bits,
                 );
                 let indices = [
@@ -2139,12 +2141,12 @@ pub mod hp {
         let zero = Float::with_val(prec, 0);
         if h0_vec[center] < zero {
             for v in h0_vec.iter_mut() {
-                *v = -v.clone();
+                v.neg_assign();
             }
         }
         if h4_vec[center] < zero {
             for v in h4_vec.iter_mut() {
-                *v = -v.clone();
+                v.neg_assign();
             }
         }
 

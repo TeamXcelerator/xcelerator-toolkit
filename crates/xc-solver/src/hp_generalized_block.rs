@@ -1,5 +1,9 @@
 use super::{check_solver_cancellation, SolverError};
-use rug::{float::Special, ops::Pow, Assign, Float};
+use rug::{
+    float::Special,
+    ops::{NegAssign, Pow},
+    Assign, Float,
+};
 use serde::{Deserialize, Serialize};
 use xc_core::{
     AssuranceLevel, CancellationToken, DecimalLiteral, EigenTarget, PrecisionPolicy, ResultStatus,
@@ -232,7 +236,7 @@ where
                 "HP block generalized operator produced a nonfinite value".to_owned(),
             ));
         }
-        *value = Float::with_val(precision_bits, &*value);
+        super::reprecision_hp_value(value, precision_bits);
     }
     Ok(output)
 }
@@ -250,7 +254,7 @@ fn canonicalize(basis: &mut BasisVectorHp) {
             &mut basis.applied_metric,
         ] {
             for value in vector {
-                *value = -value.clone();
+                value.neg_assign();
             }
         }
     }
@@ -261,6 +265,7 @@ fn add_b_orthonormal_vector(
     mut candidate: Vec<Float>,
     basis: &mut Vec<BasisVectorHp>,
     precision_bits: u32,
+    relative_rank_threshold: &Float,
     operator_applications: &mut usize,
     metric_applications: &mut usize,
 ) -> Result<bool, SolverError> {
@@ -286,8 +291,7 @@ fn add_b_orthonormal_vector(
         }
     }
     let norm_squared = dot(&candidate, &applied_metric, precision_bits);
-    let mut rank_threshold = Float::with_val(precision_bits, 2);
-    rank_threshold = rank_threshold.pow(-((precision_bits / 2) as i32));
+    let mut rank_threshold = relative_rank_threshold.clone();
     rank_threshold *= initial_norm_squared;
     if norm_squared <= rank_threshold {
         return Ok(false);
@@ -667,6 +671,8 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
         let mut operator_applications = 0usize;
         let mut metric_applications = 0usize;
         let mut preconditioner_applications = 0usize;
+        let relative_rank_threshold =
+            Float::with_val(config.precision_bits, 2).pow(-((config.precision_bits / 2) as i32));
         let mut initial_basis = Vec::with_capacity(retained);
         for column in 0..retained {
             let candidate: Vec<Float> = (0..dimension)
@@ -680,6 +686,7 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                 candidate,
                 &mut initial_basis,
                 config.precision_bits,
+                &relative_rank_threshold,
                 &mut operator_applications,
                 &mut metric_applications,
             )?;
@@ -695,6 +702,7 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                 candidate,
                 &mut initial_basis,
                 config.precision_bits,
+                &relative_rank_threshold,
                 &mut operator_applications,
                 &mut metric_applications,
             )?;
@@ -961,7 +969,7 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                                     "HP block preconditioner produced a nonfinite value".to_owned(),
                                 ));
                             }
-                            *value = Float::with_val(config.precision_bits, &*value);
+                            super::reprecision_hp_value(value, config.precision_bits);
                         }
                         preconditioner_applications += 1;
                         Ok(output)
@@ -982,6 +990,7 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                     candidate,
                     &mut trial_basis,
                     config.precision_bits,
+                    &relative_rank_threshold,
                     &mut operator_applications,
                     &mut metric_applications,
                 )?;

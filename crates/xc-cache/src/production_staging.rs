@@ -496,6 +496,7 @@ pub fn family_for_artifact_kind(kind: &str) -> Option<&'static str> {
         | "ccm_reduced_operator"
         | "ccm_factorization" => Some("ccm-matrices"),
         "ccm_weil_eigenpair"
+        | "ccm_sector_spectrum"
         | "ccm_weil_plunge_state"
         | "ccm_weil_sonin_state"
         | "ccm_source_eigenbasis" => Some("weil-states"),
@@ -505,10 +506,13 @@ pub fn family_for_artifact_kind(kind: &str) -> Option<&'static str> {
         | "ccm_prolate_candidate"
         | "ccm_band_concentration" => Some("prolate"),
         "ccm_secular_source"
+        | "ccm_root_count_window"
         | "ccm_root_discovery_window"
         | "ccm_root_refinement"
         | "ccm_spectral_window" => Some("ccm-roots"),
         "ccm_convergence_diagnostics"
+        | "ccm_sector_gap"
+        | "ccm_post_discovery_comparison"
         | "ccm_cross_check_record"
         | "ccm_validation_record"
         | "ccm_certificate_bundle" => Some("ccm-evidence"),

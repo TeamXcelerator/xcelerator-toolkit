@@ -196,7 +196,7 @@ Author refresh and replacement are explicit operations. `XC_CACHE_MODE=refresh` 
 
 ## Domain reuse
 
-CCM preserves the full assembled tau matrix as the first and fastest ordinary cache hit. On a full-matrix miss it independently resolves compact alpha/beta/gamma archimedean integrals and the expensive prime-component matrix, reconstructs the analytic pole and archimedean matrices, assembles and validates tau, and records the exact component dependencies. The default forced-even path then reuses an orthonormal even-sector matrix and its solver-specific LU factorization; natural-state work uses the full matrix and a separate factorization. Selected natural and forced eigenpairs, secular sources, configuration evidence, and optional certificates remain independent artifacts.
+CCM preserves the full assembled tau matrix as the first and fastest ordinary cache hit. On a full-matrix miss it independently resolves compact alpha/beta/gamma archimedean integrals and the expensive prime-component matrix, reconstructs the analytic pole and archimedean matrices, assembles and validates tau, and records the exact component dependencies. The default reproduction path then reuses an orthonormal even-sector matrix and its solver-specific LU factorization; natural-state work uses the full matrix and a separate factorization. Explicit sector research additionally derives the historical odd basis `(e_k-e_-k)/sqrt(2)`, computes independently addressable low even and odd spectra, and derives GapLog from those exact spectrum artifacts. Selected natural and forced-even ground states, parity spectra, secular sources, configuration evidence, and optional certificates remain independent artifacts.
 
 The concrete CCM execution graph and shard placement are:
 
@@ -206,15 +206,28 @@ The concrete CCM execution graph and shard placement are:
 | `ccm_prime_component` | `ccm-components` | Reusable expensive prime-component matrix, including prime-content metadata |
 | `ccm_tau_matrix` | `ccm-matrices` | Preferred full-matrix hit and assembly boundary |
 | `ccm_even_sector_matrix` | `ccm-matrices` | Orthonormal parity reduction used by forced-even solves |
+| `ccm_odd_sector_matrix` | `ccm-matrices` | Historical orthonormal odd-parity reduction used by sector research |
 | `ccm_factorization` | `ccm-matrices` | Full or even LU factors used directly by inverse iteration |
 | `ccm_weil_eigenpair` | `weil-states` | Natural or forced-even selected state |
+| `ccm_sector_spectrum` | `weil-states` | Ordered low eigenpairs for one explicitly named even or odd sector |
 | `ccm_secular_source` | `ccm-roots` | Stable identity for the normalized eigenpair-derived secular equation |
-| `ccm_root_refinement` | `ccm-roots` | Bounded ordered root range with exact seeds and solver policy |
+| `ccm_root_count_window` | `ccm-roots` | Exact finite-source root count for one rational height window |
+| `ccm_root_discovery_window` | `ccm-roots` | Reference-free computed or certified root window with explicit discovery provenance |
+| `ccm_root_refinement` | `ccm-roots` | Bounded, one-based indexed root range with exact seeds and solver policy |
+| `ccm_spectral_window` | `ccm-roots` | Reference-free discovered window with count reconciliation and optional root certificates |
 | `ccm_convergence_diagnostics` | `ccm-evidence` | Per-configuration result and convergence summary |
 | `ccm_validation_record` | `ccm-evidence` | Natural-versus-forced evenness evidence |
+| `ccm_sector_gap` | `ccm-evidence` | Even/odd ground-state depths, `GapLog=D_even-D_odd`, direct difference, ordering, and simplicity margin |
+| `ccm_post_discovery_comparison` | `ccm-evidence` | External-reference comparison attached only after independent discovery is complete |
 
 Cheap prime enumeration and the analytic pole formula are embedded in the semantic identity or payload metadata of their consumers. They are deliberately not fetched as separate objects. Every matrix or state cache hit is checked against its exact dependency: parity matrices are reconstructed from tau, factorizations pass a deterministic solve residual, eigenpairs pass the tau residual, root ranges must be finite, positive, ordered, and identity-bound, and evidence values must equal the results produced by their dependencies.
 
-Root refinement is stored as a bounded ordered range, not one remote object per scalar root. A range records its exact seeds or discovery window, solver semantics, convergence state, values, and source dependency. An exact repeated request reuses the range; a differently sized request reuses the expensive secular source and records its results as one new range object. This keeps research data directly accessible without allowing child-object counts or remote lookup overhead to dominate the numerical calculation.
+Roots are stored as bounded ordered windows, not one remote object per scalar root. Independent discovery and reference-seeded refinement are different artifact kinds and cannot satisfy one another's semantic requests. An independent range records its one-based bounds assigned by cumulative finite-source counts, discovery/count methods, `reference_seeds_used=false`, convergence state, values, and exact secular-source dependency. A refinement range records its exact supplied starting points and `reference_seeds_used=true`. The run-evidence artifact carries the same mode, index bounds, and exact root dependency. This keeps research data directly accessible without allowing child-object counts or remote lookup overhead to dominate the numerical calculation.
+
+The exact FLINT numerator certificate proves the roots of the stored point-valued finite secular source. It must not be relabeled as an end-to-end interval certificate for the mathematical finite CCM operator unless Tau uncertainty, selected-eigenvalue simplicity and gap, eigenvector error, normalization, and residue intervals have all been propagated. Artifact claim scope records this distinction; an exact stored-point surrogate remains valuable rigorous software evidence but is not the stronger finite-operator claim.
+
+The Tau/Weil spectrum and the roots of the eigenpair-derived secular equation are separate mathematical objects. The ordinary CCM reproduction route uses the lowest even Tau eigenpair as the secular source; higher Tau eigenpairs are not interpreted as successive zeta zeros. Extending a finite calculation beyond the first root prefix therefore means requesting additional indexed secular-root windows while increasing `N`, precision, and cutoff according to convergence evidence. No finite artifact is labeled as containing “all zeros.”
+
+Sector GapLog is also separate from a secular-root gap. For the lowest algebraic eigenvalue in each parity block, the stored definition is `D_even=-log10(abs(lambda_even))`, `D_odd=-log10(abs(lambda_odd))`, and `GapLog=D_even-D_odd=log10(abs(lambda_odd)/abs(lambda_even))`. The raw difference `lambda_odd-lambda_even`, its sign, and `-log10(abs(lambda_odd-lambda_even))` are retained as distinct fields so downstream research cannot silently substitute one definition for another. At least the first two eigenpairs per sector are retained so the even ground-state simplicity margin is independently available.
 
 Mk assigns separate artifacts to exact moments, basis and symmetry data, transformations, dense fixtures, matrix-free or structured operators, approximation bounds, adaptive-space histories, checkpoints, candidates, and quotient certificates. Corrected construction semantics invalidate only their dependent closure.

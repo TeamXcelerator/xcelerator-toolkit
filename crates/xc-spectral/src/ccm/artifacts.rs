@@ -84,10 +84,28 @@ pub fn ccm_artifact_reuse_plan() -> xc_core::ArtifactReusePlan {
                 &["parity_basis_semantics"],
             ),
             node(
+                "odd_sector_matrix",
+                true,
+                &["tau_matrix"],
+                &["parity_basis_semantics"],
+            ),
+            node(
                 "factorization",
                 true,
-                &["tau_matrix", "even_sector_matrix"],
+                &["tau_matrix", "even_sector_matrix", "odd_sector_matrix"],
                 &["subspace", "factorization_semantics", "precision_bits"],
+            ),
+            node(
+                "sector_spectrum",
+                true,
+                &["even_sector_matrix", "odd_sector_matrix"],
+                &["subspace", "eigenpair_count", "solver_semantics"],
+            ),
+            node(
+                "sector_gap",
+                true,
+                &["sector_spectrum"],
+                &["gap_semantics", "precision_bits"],
             ),
             node(
                 "weil_eigenpair",
@@ -102,21 +120,39 @@ pub fn ccm_artifact_reuse_plan() -> xc_core::ArtifactReusePlan {
                 &["source_semantics"],
             ),
             node(
-                "root_range",
+                "root_count_window",
                 true,
                 &["secular_source"],
-                &["root_range", "refinement_policy", "target_digits"],
+                &["window_boundaries", "count_semantics"],
+            ),
+            node(
+                "root_discovery_window",
+                true,
+                &["secular_source", "root_count_window"],
+                &["root_range", "isolation_policy", "target_digits"],
+            ),
+            node(
+                "root_refinement",
+                true,
+                &["secular_source"],
+                &["reference_seeds", "refinement_policy", "target_digits"],
+            ),
+            node(
+                "post_discovery_comparison",
+                true,
+                &["root_discovery_window"],
+                &["reference_dataset", "comparison_semantics"],
             ),
             node(
                 "configuration_evidence",
                 true,
-                &["weil_eigenpair", "root_range"],
+                &["weil_eigenpair", "root_discovery_window"],
                 &["evidence_semantics"],
             ),
             node(
                 "certificate",
                 true,
-                &["root_range", "configuration_evidence"],
+                &["root_discovery_window", "configuration_evidence"],
                 &["certificate_policy", "assurance"],
             ),
         ],
@@ -132,13 +168,18 @@ pub enum CcmArtifactKind {
     PoleComponent,
     TauMatrix,
     EvenSectorMatrix,
+    OddSectorMatrix,
     Factorization,
+    SectorSpectrum,
+    SectorGap,
     WeilEigenpair,
     ProlateCandidate,
     SecularSource,
+    RootCountWindow,
     RootDiscoveryWindow,
     RootRefinement,
     SpectralWindow,
+    PostDiscoveryComparison,
     ConvergenceDiagnostics,
     CertificateBundle,
 }
@@ -152,13 +193,18 @@ impl CcmArtifactKind {
             Self::PoleComponent => "ccm_pole_component",
             Self::TauMatrix => "ccm_tau_matrix",
             Self::EvenSectorMatrix => "ccm_even_sector_matrix",
+            Self::OddSectorMatrix => "ccm_odd_sector_matrix",
             Self::Factorization => "ccm_factorization",
+            Self::SectorSpectrum => "ccm_sector_spectrum",
+            Self::SectorGap => "ccm_sector_gap",
             Self::WeilEigenpair => "ccm_weil_eigenpair",
             Self::ProlateCandidate => "ccm_prolate_candidate",
             Self::SecularSource => "ccm_secular_source",
+            Self::RootCountWindow => "ccm_root_count_window",
             Self::RootDiscoveryWindow => "ccm_root_discovery_window",
             Self::RootRefinement => "ccm_root_refinement",
             Self::SpectralWindow => "ccm_spectral_window",
+            Self::PostDiscoveryComparison => "ccm_post_discovery_comparison",
             Self::ConvergenceDiagnostics => "ccm_convergence_diagnostics",
             Self::CertificateBundle => "ccm_certificate_bundle",
         }
@@ -222,6 +268,8 @@ pub struct CcmWindowParameters {
     pub target_digits: u32,
     pub assurance: String,
     pub discovery_method: String,
+    pub count_method: String,
+    pub ordinal_assignment: String,
     pub reference_seeded: bool,
 }
 
@@ -338,6 +386,29 @@ impl CcmCacheKeyBuilder {
         )
     }
 
+    pub fn parity_sector_matrix_key(
+        &self,
+        source: &CcmSourceParameters,
+        tau_dependency: &DependencyRef,
+        parity: &str,
+    ) -> Result<ArtifactKey, CacheError> {
+        source.validate()?;
+        let kind = match parity {
+            "even" => CcmArtifactKind::EvenSectorMatrix,
+            "odd" => CcmArtifactKind::OddSectorMatrix,
+            _ => {
+                return Err(CacheError::InvalidManifest(
+                    "CCM parity sector must be even or odd".to_owned(),
+                ))
+            }
+        };
+        self.key(
+            kind,
+            format!("{}/matrix={parity}", self.source_logical_key(source)),
+            &(source, tau_dependency, parity),
+        )
+    }
+
     pub fn eigenpair_key(
         &self,
         parameters: &CcmEigenpairParameters,
@@ -375,9 +446,14 @@ impl CcmCacheKeyBuilder {
         &self,
         parameters: &CcmWindowParameters,
     ) -> Result<ArtifactKey, CacheError> {
-        if !parameters.secular_source_digest.validate() {
+        if !parameters.secular_source_digest.validate()
+            || parameters.discovery_method.trim().is_empty()
+            || parameters.count_method.trim().is_empty()
+            || parameters.ordinal_assignment != "exact_cumulative_finite_source_root_count"
+            || parameters.reference_seeded
+        {
             return Err(CacheError::InvalidManifest(
-                "invalid secular source digest".to_owned(),
+                "CCM discovery windows must be reference-free and exact-count indexed".to_owned(),
             ));
         }
         self.key(
@@ -432,7 +508,7 @@ mod tests {
         let root = plan
             .artifacts
             .iter()
-            .find(|node| node.kind == "root_range")
+            .find(|node| node.kind == "root_refinement")
             .unwrap();
         assert_eq!(root.dependencies, vec!["secular_source"]);
         assert!(!root.invalidated_by.iter().any(|field| field == "n_modes"));
@@ -485,5 +561,47 @@ mod tests {
             .matrix_key(&source(), &[dependency(b"b")], true)
             .unwrap();
         assert_ne!(first.parameters_digest, second.parameters_digest);
+    }
+
+    #[test]
+    fn parity_sector_keys_are_distinct_and_depend_on_the_exact_tau() {
+        let builder = CcmCacheKeyBuilder::default();
+        let dependency = DependencyRef {
+            key: ArtifactKey::new("ccm_tau_matrix", "tau", b"{}").unwrap(),
+            content_digest: ContentDigest::sha256(b"tau-payload"),
+            required_quality: CacheQuality::Validated,
+        };
+        let even = builder
+            .parity_sector_matrix_key(&source(), &dependency, "even")
+            .unwrap();
+        let odd = builder
+            .parity_sector_matrix_key(&source(), &dependency, "odd")
+            .unwrap();
+        assert_eq!(even.kind, CcmArtifactKind::EvenSectorMatrix.as_str());
+        assert_eq!(odd.kind, CcmArtifactKind::OddSectorMatrix.as_str());
+        assert_ne!(even, odd);
+        assert!(builder
+            .parity_sector_matrix_key(&source(), &dependency, "natural")
+            .is_err());
+    }
+
+    #[test]
+    fn independent_discovery_key_rejects_reference_seed_provenance() {
+        let builder = CcmCacheKeyBuilder::default();
+        let mut parameters = CcmWindowParameters {
+            secular_source_digest: ContentDigest::sha256(b"finite-source"),
+            target: "index_range=2-4".to_owned(),
+            lower_height: "10".to_owned(),
+            upper_height: "40".to_owned(),
+            target_digits: 30,
+            assurance: "computed".to_owned(),
+            discovery_method: "pole_aware_finite_source".to_owned(),
+            count_method: "exact_finite_source_count".to_owned(),
+            ordinal_assignment: "exact_cumulative_finite_source_root_count".to_owned(),
+            reference_seeded: false,
+        };
+        builder.discovery_window_key(&parameters).unwrap();
+        parameters.reference_seeded = true;
+        assert!(builder.discovery_window_key(&parameters).is_err());
     }
 }

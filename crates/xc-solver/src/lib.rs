@@ -81,6 +81,14 @@ impl From<OperatorError> for SolverError {
     }
 }
 
+#[cfg(feature = "hp-reference")]
+#[inline]
+fn reprecision_hp_value(value: &mut rug::Float, precision_bits: u32) {
+    if value.prec() != precision_bits {
+        *value = rug::Float::with_val(precision_bits, &*value);
+    }
+}
+
 /// Route-neutral performance counters. Timing is observational only and must
 /// never participate in a numerical acceptance decision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -208,26 +216,17 @@ fn deterministic_seed(n: usize) -> Vec<f64> {
     x
 }
 
-fn rayleigh(
+fn evaluate_eigenpair(
     operator: &dyn SymmetricOperator<f64>,
     vector: &[f64],
     workspace: &mut [f64],
-) -> Result<f64, SolverError> {
+) -> Result<(f64, f64, f64, f64), SolverError> {
     operator.apply(vector, workspace)?;
-    Ok(dot(vector, workspace) / dot(vector, vector))
-}
-
-fn diagnostics(
-    operator: &dyn SymmetricOperator<f64>,
-    eigenvalue: f64,
-    eigenvector: &[f64],
-    workspace: &mut [f64],
-) -> Result<(f64, f64, f64), SolverError> {
-    operator.apply(eigenvector, workspace)?;
-    let vector_norm = norm(eigenvector);
+    let eigenvalue = dot(vector, workspace) / dot(vector, vector);
+    let vector_norm = norm(vector);
     let mut residual_sq = 0.0;
     let mut applied_sq = 0.0;
-    for (av, v) in workspace.iter().zip(eigenvector) {
+    for (av, v) in workspace.iter().zip(vector) {
         let r = av - eigenvalue * v;
         residual_sq += r * r;
         applied_sq += av * av;
@@ -241,7 +240,7 @@ fn diagnostics(
         .unwrap_or(applied_norm / vector_norm.max(f64::MIN_POSITIVE));
     let backward = residual
         / (norm_bound * vector_norm + eigenvalue.abs() * vector_norm).max(f64::MIN_POSITIVE);
-    Ok((residual, relative, backward))
+    Ok((eigenvalue, residual, relative, backward))
 }
 
 fn supported_extreme(target: &EigenTarget) -> Result<bool, SolverError> {
@@ -342,10 +341,8 @@ impl EigenSolverF64 for ShiftedPowerSolverF64 {
             normalize(&mut transformed)?;
             std::mem::swap(&mut x, &mut transformed);
 
-            let lambda = rayleigh(problem.operator, &x, &mut ax)?;
-            applications += 1;
-            let (residual, relative, backward) =
-                diagnostics(problem.operator, lambda, &x, &mut ax)?;
+            let (lambda, residual, relative, backward) =
+                evaluate_eigenpair(problem.operator, &x, &mut ax)?;
             applications += 1;
 
             if iteration >= config.stopping.minimum_iterations
@@ -525,10 +522,8 @@ impl EigenSolverF64 for LanczosSolverF64 {
             alphas.push(alpha);
 
             let (_ritz_theta, vector) = self.ritz_pair(&alphas, &betas, &basis, largest)?;
-            let lambda = rayleigh(problem.operator, &vector, &mut workspace)?;
-            applications += 1;
-            let (residual, relative, backward) =
-                diagnostics(problem.operator, lambda, &vector, &mut workspace)?;
+            let (lambda, residual, relative, backward) =
+                evaluate_eigenpair(problem.operator, &vector, &mut workspace)?;
             applications += 1;
 
             if iteration >= config.stopping.minimum_iterations
@@ -1871,9 +1866,8 @@ impl EigenSolverF64 for DenseReferenceSolverF64 {
             .collect();
         normalize(&mut vector)?;
         let mut workspace = vec![0.0; n];
-        let lambda = rayleigh(problem.operator, &vector, &mut workspace)?;
-        let (residual, relative, backward) =
-            diagnostics(problem.operator, lambda, &vector, &mut workspace)?;
+        let (lambda, residual, relative, backward) =
+            evaluate_eigenpair(problem.operator, &vector, &mut workspace)?;
         let (status, termination) = if backward <= backward_tolerance {
             (
                 ResultStatus::Converged,
@@ -1897,7 +1891,7 @@ impl EigenSolverF64 for DenseReferenceSolverF64 {
             relative_residual: relative,
             scaled_backward_error: backward,
             iterations: 1,
-            operator_applications: n + 2,
+            operator_applications: n + 1,
             algorithm: self.name().to_owned(),
             status,
             termination,
@@ -1974,7 +1968,7 @@ mod tests {
     use super::*;
     use xc_core::{CancellationReason, PrecisionPolicy, Reproducibility, StoppingPolicy, Subspace};
     use xc_operator::{
-        DenseSymmetricF64, DiagonalF64, MatrixFreeSymmetricF64, PackedSymmetricF64,
+        DenseSymmetricF64, DiagonalF64, LinearOperator, MatrixFreeSymmetricF64, PackedSymmetricF64,
         SymmetricBandedF64, SymmetricOperator,
     };
 
@@ -1995,6 +1989,42 @@ mod tests {
             allow_lower_precision_seed: false,
             allow_randomized_seed: false,
         }
+    }
+
+    #[test]
+    fn shared_rayleigh_image_is_bit_identical_to_two_application_route() {
+        let operator = DiagonalF64::new("diagnostic-equivalence", vec![1.25, -3.5, 7.0]).unwrap();
+        let vector = [0.25, -0.75, 0.5];
+        let mut rayleigh_image = [0.0; 3];
+        operator.apply(&vector, &mut rayleigh_image).unwrap();
+        let expected_value = dot(&vector, &rayleigh_image) / dot(&vector, &vector);
+        let mut diagnostic_image = [0.0; 3];
+        operator.apply(&vector, &mut diagnostic_image).unwrap();
+        let vector_norm = norm(&vector);
+        let mut residual_sq = 0.0;
+        let mut applied_sq = 0.0;
+        for (applied, component) in diagnostic_image.iter().zip(vector) {
+            let residual = applied - expected_value * component;
+            residual_sq += residual * residual;
+            applied_sq += applied * applied;
+        }
+        let expected_residual = residual_sq.sqrt();
+        let applied_norm = applied_sq.sqrt();
+        let expected_relative = expected_residual
+            / (applied_norm + expected_value.abs() * vector_norm).max(f64::MIN_POSITIVE);
+        let norm_bound = operator.norm_bound().unwrap();
+        let expected_backward = expected_residual
+            / (norm_bound * vector_norm + expected_value.abs() * vector_norm)
+                .max(f64::MIN_POSITIVE);
+
+        let mut optimized_image = [0.0; 3];
+        let (value, residual, relative, backward) =
+            evaluate_eigenpair(&operator, &vector, &mut optimized_image).unwrap();
+        assert_eq!(value.to_bits(), expected_value.to_bits());
+        assert_eq!(residual.to_bits(), expected_residual.to_bits());
+        assert_eq!(relative.to_bits(), expected_relative.to_bits());
+        assert_eq!(backward.to_bits(), expected_backward.to_bits());
+        assert_eq!(optimized_image, diagnostic_image);
     }
 
     #[test]

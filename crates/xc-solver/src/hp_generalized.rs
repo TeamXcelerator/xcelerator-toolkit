@@ -1,5 +1,9 @@
 use super::{check_solver_cancellation, SolverError};
-use rug::{float::Special, ops::Pow, Assign, Float};
+use rug::{
+    float::Special,
+    ops::{NegAssign, Pow},
+    Assign, Float,
+};
 use serde::{Deserialize, Serialize};
 use xc_core::{
     AssuranceLevel, CancellationToken, DecimalLiteral, EigenTarget, PrecisionPolicy, ResultStatus,
@@ -99,7 +103,7 @@ where
                 "HP operator application produced a nonfinite value".to_owned(),
             ));
         }
-        *value = Float::with_val(precision_bits, &*value);
+        super::reprecision_hp_value(value, precision_bits);
     }
     Ok(output)
 }
@@ -117,7 +121,7 @@ fn canonicalize(iterate: &mut GeneralizedIterateHp) {
             &mut iterate.applied_metric,
         ] {
             for value in vector {
-                *value = -value.clone();
+                value.neg_assign();
             }
         }
     }

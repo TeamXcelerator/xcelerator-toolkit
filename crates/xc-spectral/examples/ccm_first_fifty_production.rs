@@ -86,7 +86,7 @@ fn verify(evidence: &ProductionFirstFiftyEvidence) -> Result<()> {
     let bundled_digest = ContentDigest::sha256(BUNDLED_ZETA_ZEROS_JSON);
     if evidence.schema_version != 1
         || evidence.toolkit_version != env!("CARGO_PKG_VERSION")
-        || evidence.source_method != "xc_spectral::ccm::hp::run with an empty reference-seed slice"
+        || evidence.source_method != "xc_spectral::ccm::hp::build_source"
         || evidence.source_cache_mode != "off_pure_compute"
         || evidence.source_reference_seed_count != 0
         || evidence.reference_resource != BUNDLED_ZETA_ZEROS_RESOURCE
@@ -116,7 +116,7 @@ fn generate(output_path: &Path) -> Result<()> {
     let params = CcmParams::from_lambda_sq_integer(CUTOFF, MODES);
     let mut config = HighPrecConfig::for_decimal_digits(DECIMAL_DIGITS);
     config.cache_mode = xc_numerics::quadrature::CacheMode::Off;
-    let result = hp::run(&params, &config, &[])?;
+    let result = hp::build_source(&params, &config)?;
     let source_result = PortableHighPrecResult::from_runtime(&result)?;
     let certificate = replay_certificate(&source_result)?;
     let references = reference_dataset(BUNDLED_ZETA_ZEROS_JSON)?;
@@ -125,7 +125,7 @@ fn generate(output_path: &Path) -> Result<()> {
     let evidence = ProductionFirstFiftyEvidence {
         schema_version: 1,
         toolkit_version: env!("CARGO_PKG_VERSION").to_owned(),
-        source_method: "xc_spectral::ccm::hp::run with an empty reference-seed slice".to_owned(),
+        source_method: "xc_spectral::ccm::hp::build_source".to_owned(),
         source_cache_mode: "off_pure_compute".to_owned(),
         source_reference_seed_count: 0,
         source_result,

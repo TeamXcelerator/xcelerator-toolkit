@@ -150,9 +150,10 @@ pub enum ZeroTarget {
     SymmetricHeightWindow { height: String },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveryMode {
+    #[default]
     Independent,
     ReferenceSeededAudit,
 }
@@ -165,7 +166,38 @@ pub struct CcmObservationRequest {
     pub n_modes: usize,
     pub precision_bits: u32,
     pub assurance: AssuranceLevel,
+    #[serde(default)]
     pub discovery_mode: DiscoveryMode,
+}
+
+impl CcmObservationRequest {
+    /// Construct a reference-free observation request. Independent discovery
+    /// is deliberately the ordinary API; reference-seeded refinement must be
+    /// selected explicitly with [`Self::reference_seeded_audit`].
+    pub fn independent(
+        target: ZeroTarget,
+        target_digits: u32,
+        lambda_sq: f64,
+        n_modes: usize,
+        precision_bits: u32,
+        assurance: AssuranceLevel,
+    ) -> Self {
+        Self {
+            target,
+            target_digits,
+            lambda_sq,
+            n_modes,
+            precision_bits,
+            assurance,
+            discovery_mode: DiscoveryMode::Independent,
+        }
+    }
+
+    /// Explicit opt-in for a reference-seeded comparison/refinement run.
+    pub fn reference_seeded_audit(mut self) -> Self {
+        self.discovery_mode = DiscoveryMode::ReferenceSeededAudit;
+        self
+    }
 }
 
 impl CcmObservationRequest {
@@ -1443,6 +1475,30 @@ fn parse_finite(value: &str, name: &str) -> Result<f64, WindowError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_requests_default_to_independent_discovery() {
+        let request = CcmObservationRequest::independent(
+            ZeroTarget::FirstK { count: 3 },
+            20,
+            13.0,
+            120,
+            256,
+            AssuranceLevel::Computed,
+        );
+        assert_eq!(request.discovery_mode, DiscoveryMode::Independent);
+
+        let encoded = serde_json::to_value(&request).unwrap();
+        let mut without_mode = encoded.as_object().unwrap().clone();
+        without_mode.remove("discovery_mode");
+        let decoded: CcmObservationRequest =
+            serde_json::from_value(serde_json::Value::Object(without_mode)).unwrap();
+        assert_eq!(decoded.discovery_mode, DiscoveryMode::Independent);
+        assert_eq!(
+            request.clone().reference_seeded_audit().discovery_mode,
+            DiscoveryMode::ReferenceSeededAudit
+        );
+    }
 
     #[test]
     fn publication_claim_artifact_separates_finite_sequence_and_continuum_status() {

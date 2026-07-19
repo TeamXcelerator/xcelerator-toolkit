@@ -346,15 +346,41 @@ impl CertifiedSecularFunction {
         if first_pole >= last_pole || last_pole >= self.poles.len() {
             bail!("FLINT numerator count needs an ordered in-range pole span");
         }
-        let (poles, numerator) = self.exact_numerator_data()?;
-        let (count, square_free) = crate::ccm::arb_bridge::rational_polynomial_root_count(
-            &numerator,
-            &poles[first_pole],
-            &poles[last_pole],
-        )?;
+        let (poles, _) = self.exact_numerator_data()?;
+        let mut count =
+            self.exact_flint_numerator_count_in_window(&poles[first_pole], &poles[last_pole])?;
+        count.pole_count = last_pole - first_pole + 1;
+        count.open_intervals_counted = last_pole - first_pole;
+        Ok(count)
+    }
+
+    /// Count all distinct real roots in an arbitrary exact rational window.
+    /// This is the primitive used for height-window discovery and ordinal
+    /// assignment; neither endpoint may be derived from a reference zero in
+    /// an independent run.
+    #[cfg(feature = "arb")]
+    pub fn exact_flint_numerator_count_in_window(
+        &self,
+        lower: &Rational,
+        upper: &Rational,
+    ) -> Result<SecularCountCertificate> {
+        if lower >= upper {
+            bail!("FLINT numerator count requires lower < upper");
+        }
+        let (_, numerator) = self.exact_numerator_data()?;
+        let (count, square_free) =
+            crate::ccm::arb_bridge::rational_polynomial_root_count(&numerator, lower, upper)?;
         Ok(SecularCountCertificate {
-            pole_count: last_pole - first_pole + 1,
-            open_intervals_counted: last_pole - first_pole,
+            pole_count: self
+                .poles
+                .iter()
+                .filter(|pole| {
+                    pole.lower()
+                        .to_rational()
+                        .is_some_and(|value| &value >= lower && &value <= upper)
+                })
+                .count(),
+            open_intervals_counted: 0,
             certified_root_count: count,
             residue_sign: "not_required".to_owned(),
             method: "FLINT/Arb certified integer-polynomial complex-root isolation and real-window classification"
@@ -377,14 +403,37 @@ impl CertifiedSecularFunction {
         if isolation_bits < 16 || isolation_bits >= self.precision_bits() {
             bail!("FLINT numerator isolation width must fit below the source precision");
         }
-        let (poles, numerator) = self.exact_numerator_data()?;
+        let (poles, _) = self.exact_numerator_data()?;
         if first_pole >= last_pole || last_pole >= poles.len() {
             bail!("FLINT numerator window needs an ordered in-range pole span");
         }
-        let (mut candidates, square_free) = crate::ccm::arb_bridge::rational_polynomial_real_roots(
-            &numerator,
+        self.certify_flint_numerator_rational_window(
             &poles[first_pole],
             &poles[last_pole],
+            isolation_bits,
+            options,
+        )
+    }
+
+    /// Isolate and certify every real root in an arbitrary exact rational
+    /// window. Completeness comes from the exact numerator count, while each
+    /// retained root receives an interval-Newton existence/uniqueness proof.
+    #[cfg(feature = "arb")]
+    pub fn certify_flint_numerator_rational_window(
+        &self,
+        lower_bound: &Rational,
+        upper_bound: &Rational,
+        isolation_bits: u32,
+        options: &IntervalNewtonOptions,
+    ) -> Result<SecularWindowCertificate> {
+        let (_, numerator) = self.exact_numerator_data()?;
+        if lower_bound >= upper_bound {
+            bail!("FLINT numerator window requires lower < upper");
+        }
+        let (mut candidates, square_free) = crate::ccm::arb_bridge::rational_polynomial_real_roots(
+            &numerator,
+            lower_bound,
+            upper_bound,
             self.precision_bits(),
         )?;
         if !square_free {
@@ -403,15 +452,10 @@ impl CertifiedSecularFunction {
                 .partial_cmp(right.lower())
                 .expect("certified Arb root endpoints are finite")
         });
-        let count = SecularCountCertificate {
-            pole_count: last_pole - first_pole + 1,
-            open_intervals_counted: last_pole - first_pole,
-            certified_root_count: candidates.len(),
-            residue_sign: "not_required".to_owned(),
-            method: "FLINT/Arb certified integer-polynomial complex-root isolation and real-window classification"
-                .to_owned(),
-            square_free,
-        };
+        let count = self.exact_flint_numerator_count_in_window(lower_bound, upper_bound)?;
+        if count.certified_root_count != candidates.len() || count.square_free != square_free {
+            bail!("FLINT root isolation disagrees with its independent exact count");
+        }
         let roots = candidates
             .into_iter()
             .map(|candidate| {
@@ -660,6 +704,65 @@ pub struct ProductionFirstPositiveCcmRootCertificate {
     pub discovery_method: String,
     pub count_method: String,
     pub finite_model_statement: String,
+}
+
+/// Reference-free root selection for a finite production CCM source.
+/// Positive indices are assigned by exact cumulative counts from the zero
+/// pole; they are never copied from an external zeta-zero table.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "target")]
+pub enum IndependentCcmRootTarget {
+    Prefix { count: usize },
+    IndexRange { first: usize, last: usize },
+    PositiveHeightWindow { lower: String, upper: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FiniteSourceCertificationScope {
+    /// Exact certification of the stored dyadic/MPFR point source. This does
+    /// not claim that Tau/eigenvector uncertainty was propagated.
+    ExactStoredPointSource,
+    /// Reserved for a certificate that propagates interval Tau, spectral-gap,
+    /// eigenvector, normalization, and residue uncertainty end to end.
+    IntervalFiniteCcmOperator,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProductionIndependentCcmRootCertificate {
+    pub schema_version: u32,
+    pub integer_cutoff_c: u64,
+    pub modes: usize,
+    pub precision_bits: u32,
+    pub isolation_bits: u32,
+    pub interval_newton: IntervalNewtonOptions,
+    pub target: IndependentCcmRootTarget,
+    /// Exact rational discovery boundaries used by FLINT.
+    pub lower_bound: String,
+    pub upper_bound: String,
+    /// Number of positive finite-source roots strictly before `lower_bound`.
+    pub positive_roots_before_window: usize,
+    /// Offset and length of the requested roots within `window.roots`.
+    pub selected_root_offset: usize,
+    pub selected_root_count: usize,
+    pub first_selected_positive_index: Option<usize>,
+    pub last_selected_positive_index: Option<usize>,
+    pub source_weights: Vec<String>,
+    pub source_weights_digest: ContentDigest,
+    pub source_certification_scope: FiniteSourceCertificationScope,
+    pub window: SecularWindowCertificate,
+    pub reference_seeds_used: bool,
+    pub discovery_method: String,
+    pub count_method: String,
+    pub finite_model_statement: String,
+}
+
+impl ProductionIndependentCcmRootCertificate {
+    pub fn selected_roots(&self) -> &[IntervalRootCertificate] {
+        &self.window.roots
+            [self.selected_root_offset..self.selected_root_offset + self.selected_root_count]
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1105,6 +1208,244 @@ pub fn verify_production_first_positive_ccm_root_certificate(
     Ok(())
 }
 
+#[cfg(feature = "arb")]
+fn parse_discovery_boundary(text: &str, precision_bits: u32) -> Result<Rational> {
+    let parsed = Float::parse(text).context("parse independent CCM discovery boundary")?;
+    Float::with_val(precision_bits, parsed)
+        .to_rational()
+        .context("convert independent CCM discovery boundary to an exact rational")
+}
+
+#[cfg(feature = "arb")]
+fn cumulative_positive_count(
+    source: &CertifiedSecularFunction,
+    zero_pole: usize,
+    boundary_pole: usize,
+) -> Result<usize> {
+    if boundary_pole == zero_pole {
+        return Ok(0);
+    }
+    Ok(source
+        .exact_flint_numerator_count_between_poles(zero_pole, boundary_pole)?
+        .certified_root_count)
+}
+
+/// Discover an independently indexed positive root prefix, index range, or
+/// height window. The only inputs are the finite CCM source and the requested
+/// target. Exact cumulative finite-source counts assign ordinals before any
+/// optional comparison with an external zero dataset.
+#[cfg(feature = "arb")]
+pub fn certify_production_independent_ccm_roots(
+    weights: &[Float],
+    integer_cutoff_c: u64,
+    modes: usize,
+    target: &IndependentCcmRootTarget,
+    precision_bits: u32,
+    isolation_bits: u32,
+    interval_newton: &IntervalNewtonOptions,
+) -> Result<ProductionIndependentCcmRootCertificate> {
+    if integer_cutoff_c <= 1
+        || modes == 0
+        || weights.len() != 2 * modes + 1
+        || precision_bits <= 64
+        || isolation_bits < 16
+        || isolation_bits >= precision_bits
+    {
+        bail!("production independent CCM request is invalid");
+    }
+    let source = CertifiedSecularFunction::from_integer_ccm_state(
+        integer_cutoff_c,
+        modes,
+        weights,
+        precision_bits,
+    )?;
+    let (poles, _) = source.exact_numerator_data()?;
+    let zero_pole = modes;
+    let maximum_pole = 2 * modes;
+
+    let (lower_bound, upper_bound, roots_before, selected_offset, selected_count, first_index) =
+        match target {
+            IndependentCcmRootTarget::Prefix { count } => {
+                if *count == 0 {
+                    bail!("independent CCM prefix count must be positive");
+                }
+                let requested = IndependentCcmRootTarget::IndexRange {
+                    first: 1,
+                    last: *count,
+                };
+                let certificate = certify_production_independent_ccm_roots(
+                    weights,
+                    integer_cutoff_c,
+                    modes,
+                    &requested,
+                    precision_bits,
+                    isolation_bits,
+                    interval_newton,
+                )?;
+                return Ok(ProductionIndependentCcmRootCertificate {
+                    target: target.clone(),
+                    ..certificate
+                });
+            }
+            IndependentCcmRootTarget::IndexRange { first, last } => {
+                if *first == 0 || first > last {
+                    bail!("independent CCM positive indices require 1 <= first <= last");
+                }
+                let available = cumulative_positive_count(&source, zero_pole, maximum_pole)?;
+                if *last > available {
+                    bail!(
+                        "finite CCM source has only {available} positive roots inside its positive pole range; requested index {last}"
+                    );
+                }
+
+                // Largest pole boundary with a cumulative count below `first`.
+                let mut low = zero_pole;
+                let mut high = maximum_pole;
+                while high - low > 1 {
+                    let middle = low + (high - low) / 2;
+                    if cumulative_positive_count(&source, zero_pole, middle)? < *first {
+                        low = middle;
+                    } else {
+                        high = middle;
+                    }
+                }
+                let first_boundary = low;
+                let before = cumulative_positive_count(&source, zero_pole, first_boundary)?;
+
+                // Smallest pole boundary whose cumulative count reaches `last`.
+                let mut low = first_boundary;
+                let mut high = maximum_pole;
+                while high - low > 1 {
+                    let middle = low + (high - low) / 2;
+                    if cumulative_positive_count(&source, zero_pole, middle)? >= *last {
+                        high = middle;
+                    } else {
+                        low = middle;
+                    }
+                }
+                let last_boundary = high;
+                (
+                    poles[first_boundary].clone(),
+                    poles[last_boundary].clone(),
+                    before,
+                    *first - 1 - before,
+                    *last - *first + 1,
+                    Some(*first),
+                )
+            }
+            IndependentCcmRootTarget::PositiveHeightWindow { lower, upper } => {
+                let lower = parse_discovery_boundary(lower, precision_bits)?;
+                let upper = parse_discovery_boundary(upper, precision_bits)?;
+                if lower <= 0 || lower >= upper || upper > poles[maximum_pole] {
+                    bail!(
+                        "positive CCM height window requires 0 < lower < upper <= largest positive pole"
+                    );
+                }
+                let before = source
+                    .exact_flint_numerator_count_in_window(&poles[zero_pole], &lower)?
+                    .certified_root_count;
+                let selected = source
+                    .exact_flint_numerator_count_in_window(&lower, &upper)?
+                    .certified_root_count;
+                if selected == 0 {
+                    bail!("independent CCM height window contains no finite-source roots");
+                }
+                (lower, upper, before, 0, selected, Some(before + 1))
+            }
+        };
+
+    let window = source.certify_flint_numerator_rational_window(
+        &lower_bound,
+        &upper_bound,
+        isolation_bits,
+        interval_newton,
+    )?;
+    if selected_offset
+        .checked_add(selected_count)
+        .is_none_or(|end| end > window.roots.len())
+    {
+        bail!("independent CCM target is not contained in its certified root window");
+    }
+    let last_index = first_index.and_then(|first| first.checked_add(selected_count - 1));
+    let source_weights = weights
+        .iter()
+        .map(|weight| serialize_float(&Float::with_val(precision_bits, weight), precision_bits))
+        .collect::<Vec<_>>();
+    Ok(ProductionIndependentCcmRootCertificate {
+        schema_version: 1,
+        integer_cutoff_c,
+        modes,
+        precision_bits,
+        isolation_bits,
+        interval_newton: interval_newton.clone(),
+        target: target.clone(),
+        lower_bound: lower_bound.to_string(),
+        upper_bound: upper_bound.to_string(),
+        positive_roots_before_window: roots_before,
+        selected_root_offset: selected_offset,
+        selected_root_count: selected_count,
+        first_selected_positive_index: first_index,
+        last_selected_positive_index: last_index,
+        source_weights_digest: weights_digest(&source_weights)?,
+        source_certification_scope: FiniteSourceCertificationScope::ExactStoredPointSource,
+        source_weights,
+        window,
+        reference_seeds_used: false,
+        discovery_method:
+            "exact_cumulative_finite_source_counts_then_flint_arb_isolation_and_interval_newton"
+                .to_owned(),
+        count_method:
+            "flint_arb_complete_complex_root_isolation_with_real_window_classification"
+                .to_owned(),
+        finite_model_statement: "certified independently indexed roots of one finite production CCM secular source; external zeta-zero data did not seed, bound, count, or alter discovery"
+            .to_owned(),
+    })
+}
+
+#[cfg(feature = "arb")]
+pub fn verify_production_independent_ccm_root_certificate(
+    certificate: &ProductionIndependentCcmRootCertificate,
+) -> Result<()> {
+    if certificate.schema_version != 1
+        || certificate.reference_seeds_used
+        || certificate.source_weights.len() != 2 * certificate.modes + 1
+        || !certificate.source_weights_digest.validate()
+        || certificate.source_weights_digest != weights_digest(&certificate.source_weights)?
+        || certificate.source_certification_scope
+            != FiniteSourceCertificationScope::ExactStoredPointSource
+        || certificate.discovery_method
+            != "exact_cumulative_finite_source_counts_then_flint_arb_isolation_and_interval_newton"
+        || certificate.count_method
+            != "flint_arb_complete_complex_root_isolation_with_real_window_classification"
+        || certificate.selected_root_count == 0
+    {
+        bail!("production independent CCM certificate identity is invalid");
+    }
+    let weights = certificate
+        .source_weights
+        .iter()
+        .map(|weight| {
+            Ok(Float::with_val(
+                certificate.precision_bits,
+                Float::parse(weight).context("parse independent CCM source weight")?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let replay = certify_production_independent_ccm_roots(
+        &weights,
+        certificate.integer_cutoff_c,
+        certificate.modes,
+        &certificate.target,
+        certificate.precision_bits,
+        certificate.isolation_bits,
+        &certificate.interval_newton,
+    )?;
+    if &replay != certificate {
+        bail!("production independent CCM certificate does not replay from its source");
+    }
+    Ok(())
+}
+
 fn certified_decimal_digits(root: &IntervalRootCertificate) -> Result<u32> {
     let lower = parse_endpoint(&root.lower, root.precision_bits)?;
     let upper = parse_endpoint(&root.upper, root.precision_bits)?;
@@ -1317,6 +1658,74 @@ pub fn verify_production_post_discovery_reference_comparison(
         || &replay != comparison
     {
         bail!("production post-discovery comparison does not match replayed evidence");
+    }
+    Ok(())
+}
+
+/// Attach external reference ordinates to an independently indexed production
+/// window only after its exact count and root isolation replay successfully.
+#[cfg(feature = "arb")]
+pub fn compare_production_independent_roots_to_references(
+    certificate: &ProductionIndependentCcmRootCertificate,
+    references: &ReferenceZeroDataset,
+) -> Result<PostDiscoveryReferenceComparison> {
+    verify_production_independent_ccm_root_certificate(certificate)?;
+    references.validate()?;
+    let first = certificate
+        .first_selected_positive_index
+        .context("independent production comparison requires positive root indices")?;
+    let last = certificate
+        .last_selected_positive_index
+        .context("independent production comparison requires positive root indices")?;
+    if references.positive_ordinates.len() < last {
+        bail!("reference-zero dataset does not cover the independent production window");
+    }
+    let precision = certificate.precision_bits.max(references.precision_bits);
+    let records = certificate
+        .selected_roots()
+        .iter()
+        .zip(&references.positive_ordinates[first - 1..last])
+        .enumerate()
+        .map(|(offset, (root, reference))| {
+            let lower = parse_endpoint(&root.lower, precision)?;
+            let upper = parse_endpoint(&root.upper, precision)?;
+            let reference_value = parse_endpoint(reference, precision)?;
+            let mut midpoint = Float::with_val(precision, &lower + &upper);
+            midpoint /= 2;
+            let mut error = Float::with_val(precision, midpoint - &reference_value);
+            error.abs_mut();
+            Ok(RootReferenceComparisonRecord {
+                positive_index: first + offset,
+                enclosure_lower: root.lower.clone(),
+                enclosure_upper: root.upper.clone(),
+                reference_ordinate: reference.clone(),
+                absolute_midpoint_error: serialize_float(&error, precision),
+                measured_agreement_digits: measured_agreement_digits(&error, precision),
+                reference_inside_enclosure: reference_value >= lower && reference_value <= upper,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PostDiscoveryReferenceComparison {
+        schema_version: 1,
+        root_certificate_digest: ContentDigest::sha256(&serde_json::to_vec(certificate)?),
+        source_weights_digest: certificate.source_weights_digest.clone(),
+        reference_dataset_digest: references.dataset_digest.clone(),
+        reference_influenced_discovery: false,
+        records,
+        finite_comparison_statement: "post-discovery comparison of an independently indexed finite production CCM root window; references did not seed, bound, count, or alter discovery"
+            .to_owned(),
+    })
+}
+
+#[cfg(feature = "arb")]
+pub fn verify_production_independent_post_discovery_comparison(
+    comparison: &PostDiscoveryReferenceComparison,
+    certificate: &ProductionIndependentCcmRootCertificate,
+    references: &ReferenceZeroDataset,
+) -> Result<()> {
+    let replay = compare_production_independent_roots_to_references(certificate, references)?;
+    if comparison.reference_influenced_discovery || &replay != comparison {
+        bail!("independent production post-discovery comparison does not replay");
     }
     Ok(())
 }
@@ -1536,6 +1945,47 @@ mod tests {
 
     #[cfg(feature = "arb")]
     #[test]
+    fn independent_targets_assign_ordinals_without_reference_data() {
+        let precision = 192;
+        let modes = 6;
+        let weights = vec![Float::with_val(precision, 1); 2 * modes + 1];
+        let options = IntervalNewtonOptions {
+            width_tolerance: DecimalLiteral::new("1e-30").unwrap(),
+            maximum_iterations: 30,
+        };
+        let certificate = certify_production_independent_ccm_roots(
+            &weights,
+            13,
+            modes,
+            &IndependentCcmRootTarget::IndexRange { first: 2, last: 4 },
+            precision,
+            64,
+            &options,
+        )
+        .unwrap();
+        assert!(!certificate.reference_seeds_used);
+        assert_eq!(certificate.first_selected_positive_index, Some(2));
+        assert_eq!(certificate.last_selected_positive_index, Some(4));
+        assert_eq!(certificate.selected_roots().len(), 3);
+        verify_production_independent_ccm_root_certificate(&certificate).unwrap();
+
+        let prefix = certify_production_independent_ccm_roots(
+            &weights,
+            13,
+            modes,
+            &IndependentCcmRootTarget::Prefix { count: 4 },
+            precision,
+            64,
+            &options,
+        )
+        .unwrap();
+        assert_eq!(prefix.first_selected_positive_index, Some(1));
+        assert_eq!(prefix.last_selected_positive_index, Some(4));
+        assert_eq!(prefix.selected_roots().len(), 4);
+    }
+
+    #[cfg(feature = "arb")]
+    #[test]
     fn production_mixed_sign_prefix_replays_before_reference_comparison() {
         let precision = 192;
         let modes = 10;
@@ -1544,7 +1994,7 @@ mod tests {
         config.precision_bits = precision;
         config.quad_points = crate::ccm::hp::MIN_QUAD_POINTS;
         config.cache_mode = xc_numerics::quadrature::CacheMode::Off;
-        let result = crate::ccm::hp::run(&params, &config, &[]).unwrap();
+        let result = crate::ccm::hp::build_source(&params, &config).unwrap();
         let options = IntervalNewtonOptions {
             width_tolerance: DecimalLiteral::new("1e-30").unwrap(),
             maximum_iterations: 30,

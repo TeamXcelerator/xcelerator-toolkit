@@ -144,10 +144,10 @@ impl ShiftInvertFactoryHp for DenseShiftInvertFactoryHp {
             .iter()
             .map(|value| Float::with_val(precision_bits, value))
             .collect();
-        Ok(Box::new(DenseShiftInvertFactorizationHp::factor(
+        Ok(Box::new(DenseShiftInvertFactorizationHp::factor_owned(
             format!("{}@{precision_bits}", self.id),
             self.dimension,
-            &matrix,
+            matrix,
             self.shift.clone(),
             precision_bits,
         )?))
@@ -181,11 +181,28 @@ impl DenseShiftInvertFactorizationHp {
                     .to_owned(),
             ));
         }
-        let shift_value = parse_finite(&shift, precision_bits, "shift")?;
-        let mut lu: Vec<Float> = matrix
+        let matrix = matrix
             .iter()
             .map(|value| Float::with_val(precision_bits, value))
             .collect();
+        Self::factor_owned(id, dimension, matrix, shift, precision_bits)
+    }
+
+    fn factor_owned(
+        id: impl Into<String>,
+        dimension: usize,
+        mut lu: Vec<Float>,
+        shift: DecimalLiteral,
+        precision_bits: u32,
+    ) -> Result<Self, SolverError> {
+        if dimension == 0 || lu.len() != dimension.saturating_mul(dimension) || precision_bits <= 32
+        {
+            return Err(SolverError::InvalidConfiguration(
+                "dense shift-invert factorization requires a square positive matrix and precision above 32 bits"
+                    .to_owned(),
+            ));
+        }
+        let shift_value = parse_finite(&shift, precision_bits, "shift")?;
         for value in &lu {
             if !value.is_finite() {
                 return Err(SolverError::InvalidConfiguration(
@@ -296,7 +313,11 @@ impl ShiftInvertSolveHp for DenseShiftInvertFactorizationHp {
             }
         }
         for (output, value) in output.iter_mut().zip(solution) {
-            *output = Float::with_val(working_precision_bits, value);
+            *output = if value.prec() == working_precision_bits {
+                value
+            } else {
+                Float::with_val(working_precision_bits, value)
+            };
         }
         Ok(())
     }
@@ -1393,5 +1414,65 @@ mod tests {
         assert!(first.abs() < Float::with_val(precision, 1e-30));
         assert!(second.abs() < Float::with_val(precision, 1e-30));
         assert_eq!(factorization.descriptor().dimension, 2);
+    }
+
+    #[test]
+    fn owned_factory_factorization_is_exactly_equivalent_to_borrowed_input() {
+        let precision = 257;
+        let dimension = 5;
+        let matrix = (0..dimension * dimension)
+            .map(|index| {
+                let row = index / dimension;
+                let column = index % dimension;
+                let low = row.min(column);
+                let high = row.max(column);
+                let mut value = Float::with_val(precision, low * 13 + high * 7 + 1);
+                value /= 31;
+                if row == column {
+                    value += 7;
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        let shift = DecimalLiteral::new("0.125").unwrap();
+        let borrowed = DenseShiftInvertFactorizationHp::factor(
+            "equivalent",
+            dimension,
+            &matrix,
+            shift.clone(),
+            precision,
+        )
+        .unwrap();
+        let owned = DenseShiftInvertFactorizationHp::factor_owned(
+            "equivalent",
+            dimension,
+            matrix
+                .iter()
+                .map(|value| Float::with_val(precision, value))
+                .collect(),
+            shift,
+            precision,
+        )
+        .unwrap();
+        assert_eq!(owned.lu, borrowed.lu);
+        assert_eq!(owned.pivots, borrowed.pivots);
+        assert_eq!(owned.descriptor, borrowed.descriptor);
+
+        let right_hand_side = (0..dimension)
+            .map(|index| {
+                let mut value = Float::with_val(precision, index + 1);
+                value /= 17;
+                value
+            })
+            .collect::<Vec<_>>();
+        let mut borrowed_solution = vec![zero(precision); dimension];
+        let mut owned_solution = vec![zero(precision); dimension];
+        borrowed
+            .solve_shifted(&right_hand_side, &mut borrowed_solution, precision)
+            .unwrap();
+        owned
+            .solve_shifted(&right_hand_side, &mut owned_solution, precision)
+            .unwrap();
+        assert_eq!(owned_solution, borrowed_solution);
     }
 }

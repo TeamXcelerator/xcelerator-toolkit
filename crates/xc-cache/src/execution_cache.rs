@@ -7,7 +7,9 @@ use crate::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Cursor, Read, Write};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use xc_core::{
     CacheAccessProvenance, CacheCandidateRejectionProvenance, CacheLookupOutcome,
@@ -841,6 +843,7 @@ impl DirectoryArtifactProductionSink {
         }
     }
 
+    #[cfg(test)]
     fn encode_payload_zip(payload: &[u8]) -> Result<Vec<u8>, CacheError> {
         let cursor = Cursor::new(Vec::new());
         let mut writer = ZipWriter::new(cursor);
@@ -858,6 +861,82 @@ impl DirectoryArtifactProductionSink {
             .finish()
             .map_err(|error| CacheError::Io(error.to_string()))?
             .into_inner())
+    }
+
+    fn zip_contains_payload(path: &Path, payload: &[u8]) -> Result<bool, CacheError> {
+        let file = fs::File::open(path)?;
+        let mut archive =
+            ZipArchive::new(file).map_err(|error| CacheError::Io(error.to_string()))?;
+        if archive.len() != 1 {
+            return Ok(false);
+        }
+        let mut entry = match archive.by_name("payload.json") {
+            Ok(entry) => entry,
+            Err(_) => return Ok(false),
+        };
+        if entry.size() != payload.len() as u64 {
+            return Ok(false);
+        }
+        let mut offset = 0usize;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = entry.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            if payload.get(offset..offset + read) != Some(&buffer[..read]) {
+                return Ok(false);
+            }
+            offset += read;
+        }
+        Ok(offset == payload.len())
+    }
+
+    fn write_payload_zip_immutable(path: &Path, payload: &[u8]) -> Result<(), CacheError> {
+        if path.exists() {
+            if Self::zip_contains_payload(path, payload)? {
+                return Ok(());
+            }
+            return Err(CacheError::InvalidManifest(format!(
+                "artifact production queue path already contains a different payload: {}",
+                path.display()
+            )));
+        }
+        let parent = path.parent().ok_or_else(|| {
+            CacheError::InvalidManifest("queued artifact path has no parent".to_owned())
+        })?;
+        fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(
+            ".{}.{}.tmp",
+            path.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        let output = fs::File::create(&temporary)?;
+        let mut writer = ZipWriter::new(output);
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .compression_level(Some(6))
+            .last_modified_time(DateTime::default())
+            .unix_permissions(0o644)
+            .large_file(true);
+        writer
+            .start_file("payload.json", options)
+            .map_err(|error| CacheError::Io(error.to_string()))?;
+        writer.write_all(payload)?;
+        writer
+            .finish()
+            .map_err(|error| CacheError::Io(error.to_string()))?;
+        match fs::rename(&temporary, path) {
+            Ok(()) => Ok(()),
+            Err(_error) if path.exists() && Self::zip_contains_payload(path, payload)? => {
+                let _ = fs::remove_file(&temporary);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                Err(CacheError::Io(error.to_string()))
+            }
+        }
     }
 }
 
@@ -881,8 +960,10 @@ impl ArtifactProductionSink for DirectoryArtifactProductionSink {
             ));
         }
         let artifact_root = self.artifact_root(&artifact)?;
-        let encoded_payload = Self::encode_payload_zip(&artifact.payload)?;
-        Self::write_immutable(&artifact_root.join("payload.json.zip"), &encoded_payload)?;
+        Self::write_payload_zip_immutable(
+            &artifact_root.join("payload.json.zip"),
+            &artifact.payload,
+        )?;
         let queued = QueuedProducedArtifactRecord {
             schema_version: 1,
             operation: artifact.operation,
@@ -2030,6 +2111,7 @@ mod tests {
         let sink = DirectoryArtifactProductionSink::new(&root).unwrap();
         let semantic_key = semantic_key();
         let payload = serde_json::to_vec(&vec!["node-a", "node-b"]).unwrap();
+        let expected_zip = DirectoryArtifactProductionSink::encode_payload_zip(&payload).unwrap();
         let semantic_digest = semantic_key.digest().unwrap();
         let record = ProducedArtifactRecord {
             operation: "quadrature.load_or_compute".to_owned(),
@@ -2071,7 +2153,9 @@ mod tests {
             .join(&record.manifest.content_digest.0);
         let saved = load_queued_produced_artifact(&artifact_root.join("record.json")).unwrap();
         assert_eq!(saved, record);
-        assert!(artifact_root.join("payload.json.zip").is_file());
+        let payload_zip = artifact_root.join("payload.json.zip");
+        assert!(payload_zip.is_file());
+        assert_eq!(fs::read(payload_zip).unwrap(), expected_zip);
         assert!(!artifact_root.join("payload.json").exists());
         assert!(
             fs::metadata(artifact_root.join("record.json"))

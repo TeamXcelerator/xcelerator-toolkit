@@ -1139,10 +1139,42 @@ pub fn tridiag_eigenvector_for_value_hp(
 ///
 /// Eigenvectors of `A` are recovered as `Q · v` where `v` is an eigenvector
 /// of `T` in the tridiagonal basis.
+fn apply_householder_trailing_update_hp(
+    h: &mut [Float],
+    n: usize,
+    k: usize,
+    v: &[Float],
+    q_vec: &[Float],
+) {
+    let m = v.len();
+    h[(k + 1) * n..]
+        .par_chunks_mut(n)
+        .enumerate()
+        .for_each(|(i, row)| {
+            for j in 0..m {
+                let mut delta = v[i].clone();
+                delta *= &q_vec[j];
+                let mut delta2 = q_vec[i].clone();
+                delta2 *= &v[j];
+                delta += &delta2;
+                row[k + 1 + j] -= &delta;
+            }
+        });
+}
+
 pub fn householder_tridiag_hp(
     a: &[Float],
     n: usize,
     prec: u32,
+) -> Result<(Vec<Float>, Vec<Float>, Vec<Float>)> {
+    householder_tridiag_hp_impl(a, n, prec, true)
+}
+
+fn householder_tridiag_hp_impl(
+    a: &[Float],
+    n: usize,
+    prec: u32,
+    accumulate_q: bool,
 ) -> Result<(Vec<Float>, Vec<Float>, Vec<Float>)> {
     if a.len() != n * n {
         return Err(anyhow!("matrix length {} != n² = {}", a.len(), n * n));
@@ -1153,9 +1185,15 @@ pub fn householder_tridiag_hp(
     // right as we go, accumulating into Q. (Equivalently, store Householder
     // vectors and reconstruct Q at the end — that's slightly more compact
     // but more code. We do the direct accumulation for simplicity.)
-    let mut q: Vec<Float> = vec![hp_zero(prec); n * n];
-    for i in 0..n {
-        q[i * n + i] = hp_one(prec);
+    let mut q: Vec<Float> = if accumulate_q {
+        vec![hp_zero(prec); n * n]
+    } else {
+        Vec::new()
+    };
+    if accumulate_q {
+        for i in 0..n {
+            q[i * n + i] = hp_one(prec);
+        }
     }
 
     // For each column k = 0..n-2, build a Householder reflector that
@@ -1174,7 +1212,7 @@ pub fn householder_tridiag_hp(
                 t
             })
             .collect();
-        let alpha_sq = crate::reduction::deterministic_pairwise_sum_hp(&alpha_terms, prec);
+        let alpha_sq = crate::reduction::deterministic_pairwise_sum_hp_owned(alpha_terms, prec);
         let alpha = alpha_sq.sqrt();
 
         // If subdiagonal is already zero, skip.
@@ -1200,7 +1238,7 @@ pub fn householder_tridiag_hp(
         };
 
         // v = x; v[0] += alpha_signed (i.e. shift away from zero)
-        let mut v = x.clone();
+        let mut v = x;
         // v[0] = x[0] - sign(x[0])*α  (this guarantees |v[0]| > |x[0]|)
         // Equivalently, v[0] += -sign(x[0])*α = -alpha_signed (with our convention).
         let mut v0 = v[0].clone();
@@ -1216,7 +1254,7 @@ pub fn householder_tridiag_hp(
                 t
             })
             .collect();
-        let v_norm_sq = crate::reduction::deterministic_pairwise_sum_hp(&v_norm_terms, prec);
+        let v_norm_sq = crate::reduction::deterministic_pairwise_sum_hp_owned(v_norm_terms, prec);
         if v_norm_sq.is_zero() {
             continue;
         }
@@ -1280,7 +1318,7 @@ pub fn householder_tridiag_hp(
                 t
             })
             .collect();
-        let vt_p = crate::reduction::deterministic_pairwise_sum_hp(&vt_p_terms, prec);
+        let vt_p = crate::reduction::deterministic_pairwise_sum_hp_owned(vt_p_terms, prec);
 
         // K = (vᵀ p) / ‖v‖² — projection coefficient of p onto v.
         // Since p = β·A·v with β = 2/‖v‖², we have vᵀp = β·vᵀAv, so
@@ -1303,31 +1341,9 @@ pub fn householder_tridiag_hp(
             .collect();
 
         // h_sub ← h_sub - v·qᵀ - q·vᵀ
-        // Each row update i is independent of other rows, so compute the
-        // per-row delta vectors in parallel, then apply them to h. We
-        // collect into a Vec<Vec<Float>> to avoid the borrowing dance of
-        // mutating disjoint slices of h within rayon's borrow rules.
-        let row_deltas: Vec<Vec<Float>> = (0..m)
-            .into_par_iter()
-            .map(|i| {
-                let mut row = Vec::with_capacity(m);
-                for j in 0..m {
-                    let mut delta = v[i].clone();
-                    delta *= &q_vec[j];
-                    let mut delta2 = q_vec[i].clone();
-                    delta2 *= &v[j];
-                    delta += &delta2;
-                    row.push(delta);
-                }
-                row
-            })
-            .collect();
-        for (i, row) in row_deltas.iter().enumerate() {
-            for (j, delta) in row.iter().enumerate() {
-                let cell = (k + 1 + i) * n + (k + 1 + j);
-                h[cell] -= delta;
-            }
-        }
+        // Each trailing row is disjoint. Update it directly to avoid an
+        // additional m-by-m MPFR matrix while preserving the old cell order.
+        apply_householder_trailing_update_hp(&mut h, n, k, &v, &q_vec);
 
         // Set the (k+1, k) and (k, k+1) entries to alpha_signed (the new
         // off-diagonal after Householder zeroes out the rest of column k).
@@ -1365,23 +1381,25 @@ pub fn householder_tridiag_hp(
         // Update Q: Q ← Q · H_full where H_full = I - 2 v vᵀ / ‖v‖² in the
         // bottom-right block. So for each row i of Q, columns k+1..n,
         // q_row = q_row - (2/‖v‖² · q_row · v) · vᵀ. Each row independent.
-        q.par_chunks_mut(n).for_each(|q_row| {
-            // Compute coefficient: c = (2/‖v‖²) · sum_j q_row[k+1+j] · v[j]
-            let mut c = hp_zero(prec);
-            for j in 0..m {
-                let mut t = q_row[k + 1 + j].clone();
-                t *= &v[j];
-                c += &t;
-            }
-            c *= 2u32;
-            c /= &v_norm_sq;
-            // Update: q_row[k+1+j] -= c · v[j]
-            for j in 0..m {
-                let mut delta = c.clone();
-                delta *= &v[j];
-                q_row[k + 1 + j] -= &delta;
-            }
-        });
+        if accumulate_q {
+            q.par_chunks_mut(n).for_each(|q_row| {
+                // Compute coefficient: c = (2/‖v‖²) · sum_j q_row[k+1+j] · v[j]
+                let mut c = hp_zero(prec);
+                for j in 0..m {
+                    let mut t = q_row[k + 1 + j].clone();
+                    t *= &v[j];
+                    c += &t;
+                }
+                c *= 2u32;
+                c /= &v_norm_sq;
+                // Update: q_row[k+1+j] -= c · v[j]
+                for j in 0..m {
+                    let mut delta = c.clone();
+                    delta *= &v[j];
+                    q_row[k + 1 + j] -= &delta;
+                }
+            });
+        }
     }
 
     // Extract diagonal and off-diagonal.
@@ -1574,7 +1592,7 @@ fn maximum_off_diagonal_hp(matrix: &[Float], n: usize, prec: u32) -> Float {
 /// Returns eigenvalues sorted ascending. Eigenvectors are not computed
 /// to save memory at HP scale.
 pub fn dense_symmetric_eigenvalues_hp(a: &[Float], n: usize, prec: u32) -> Result<Vec<Float>> {
-    let (diag, off_diag, _q) = householder_tridiag_hp(a, n, prec)?;
+    let (diag, off_diag, _) = householder_tridiag_hp_impl(a, n, prec, false)?;
     tridiag_eigenvalues_hp(&diag, &off_diag, prec)
 }
 
@@ -1646,6 +1664,103 @@ mod tests {
 
     fn hp(prec: u32, s: &str) -> Float {
         Float::with_val(prec, Float::parse(s).unwrap())
+    }
+
+    fn allocating_householder_trailing_update_reference(
+        h: &mut [Float],
+        n: usize,
+        k: usize,
+        v: &[Float],
+        q_vec: &[Float],
+    ) {
+        let m = v.len();
+        let row_deltas: Vec<Vec<Float>> = (0..m)
+            .map(|i| {
+                (0..m)
+                    .map(|j| {
+                        let mut delta = v[i].clone();
+                        delta *= &q_vec[j];
+                        let mut delta2 = q_vec[i].clone();
+                        delta2 *= &v[j];
+                        delta += &delta2;
+                        delta
+                    })
+                    .collect()
+            })
+            .collect();
+        for (i, row) in row_deltas.iter().enumerate() {
+            for (j, delta) in row.iter().enumerate() {
+                h[(k + 1 + i) * n + (k + 1 + j)] -= delta;
+            }
+        }
+    }
+
+    #[test]
+    fn in_place_householder_update_is_bit_identical_to_allocating_reference() {
+        let precision = 257;
+        for n in 2..=9 {
+            for k in 0..n - 1 {
+                let m = n - k - 1;
+                let matrix = (0..n * n)
+                    .map(|index| {
+                        let mut value = Float::with_val(precision, index + 3);
+                        value /= 11;
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                let v = (0..m)
+                    .map(|index| {
+                        let mut value = Float::with_val(precision, index + 2);
+                        value /= 7;
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                let q_vec = (0..m)
+                    .map(|index| {
+                        let mut value = Float::with_val(precision, index + 5);
+                        value /= 13;
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                let mut reference = matrix.clone();
+                let mut actual = matrix;
+                allocating_householder_trailing_update_reference(&mut reference, n, k, &v, &q_vec);
+                apply_householder_trailing_update_hp(&mut actual, n, k, &v, &q_vec);
+                assert_eq!(actual, reference, "update changed at n={n}, k={k}");
+            }
+        }
+    }
+
+    #[test]
+    fn values_only_householder_is_bit_identical_without_building_q() {
+        let precision = 257;
+        for n in 1..=9 {
+            let matrix = (0..n * n)
+                .map(|index| {
+                    let row = index / n;
+                    let column = index % n;
+                    let low = row.min(column);
+                    let high = row.max(column);
+                    let mut value = Float::with_val(precision, low * 17 + high * 11 + 3);
+                    value /= 19;
+                    if row == column {
+                        value += (n + 2) as u32;
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
+            let (reference_diag, reference_off_diag, q) =
+                householder_tridiag_hp_impl(&matrix, n, precision, true).unwrap();
+            let (actual_diag, actual_off_diag, no_q) =
+                householder_tridiag_hp_impl(&matrix, n, precision, false).unwrap();
+            assert_eq!(actual_diag, reference_diag, "diagonal changed at n={n}");
+            assert_eq!(
+                actual_off_diag, reference_off_diag,
+                "off-diagonal changed at n={n}"
+            );
+            assert_eq!(q.len(), n * n);
+            assert!(no_q.is_empty());
+        }
     }
 
     /// Tridiagonal QR on a diagonal matrix should return the diagonal

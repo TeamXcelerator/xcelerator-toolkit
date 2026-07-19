@@ -2528,9 +2528,24 @@ impl MkCertifiedDegreeBandAction {
                 "degree-band action does not match its exact omitted-entry replay".to_owned(),
             ));
         }
+        let mut retained_rows = Vec::with_capacity(reference.dimension());
+        for row in 0..reference.dimension() {
+            let row_degree = reference.orbits()[row].partition.total_degree();
+            let mut retained = Vec::new();
+            for column in 0..reference.dimension() {
+                let column_degree = reference.orbits()[column].partition.total_degree();
+                if row_degree.abs_diff(column_degree) <= self.half_width {
+                    retained.push((
+                        column,
+                        symmetric_form_entry(reference, self.form, row, column)?,
+                    ));
+                }
+            }
+            retained_rows.push(retained);
+        }
         Ok(VerifiedMkDegreeBandAction {
-            action: self,
             reference,
+            retained_rows,
         })
     }
 
@@ -2546,8 +2561,8 @@ impl MkCertifiedDegreeBandAction {
 /// operator applications use the retained band directly and do not rebuild
 /// the O(N^2) omitted-entry proof on every iteration.
 pub struct VerifiedMkDegreeBandAction<'a> {
-    action: &'a MkCertifiedDegreeBandAction,
     reference: &'a MkSymmetricReference,
+    retained_rows: Vec<Vec<(usize, Rational)>>,
 }
 
 impl VerifiedMkDegreeBandAction<'_> {
@@ -2559,16 +2574,11 @@ impl VerifiedMkDegreeBandAction<'_> {
             });
         }
         let mut output = vec![Rational::from((0, 1)); self.reference.dimension()];
-        for (row, output_entry) in output.iter_mut().enumerate() {
-            let row_degree = self.reference.orbits()[row].partition.total_degree();
-            for (column, coefficient) in input.iter().enumerate() {
-                let column_degree = self.reference.orbits()[column].partition.total_degree();
-                if row_degree.abs_diff(column_degree) <= self.action.half_width {
-                    let mut term =
-                        symmetric_form_entry(self.reference, self.action.form, row, column)?;
-                    term *= coefficient;
-                    *output_entry += term;
-                }
+        for (output_entry, retained) in output.iter_mut().zip(&self.retained_rows) {
+            for (column, entry) in retained {
+                let mut term = entry.clone();
+                term *= &input[*column];
+                *output_entry += term;
             }
         }
         Ok(output)
@@ -4102,6 +4112,20 @@ mod tests {
             .unwrap()
             .apply_exact(&input)
             .unwrap();
+        let mut on_the_fly = vec![Rational::from((0, 1)); reference.dimension()];
+        for (row, output) in on_the_fly.iter_mut().enumerate() {
+            let row_degree = reference.orbits()[row].partition.total_degree();
+            for (column, coefficient) in input.iter().enumerate() {
+                let column_degree = reference.orbits()[column].partition.total_degree();
+                if row_degree.abs_diff(column_degree) <= action.half_width {
+                    let mut term =
+                        symmetric_form_entry(&reference, action.form, row, column).unwrap();
+                    term *= coefficient;
+                    *output += term;
+                }
+            }
+        }
+        assert_eq!(approximate, on_the_fly);
         let dense = reference.dense_j_total_exact().unwrap();
         let mut exact = vec![Rational::from((0, 1)); reference.dimension()];
         for row in 0..reference.dimension() {

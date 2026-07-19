@@ -75,6 +75,33 @@ pub fn deterministic_pairwise_sum_hp(values: &[Float], precision_bits: u32) -> F
     level.pop().expect("nonempty input produces one root")
 }
 
+/// Consume MPFR leaves through the same canonical adjacent-pair tree as
+/// [`deterministic_pairwise_sum_hp`]. Moving each left leaf into the next
+/// level avoids cloning every MPFR allocation while preserving every
+/// rounding operation and the complete reduction-tree shape.
+pub fn deterministic_pairwise_sum_hp_owned(mut values: Vec<Float>, precision_bits: u32) -> Float {
+    if values.is_empty() {
+        return Float::with_val(precision_bits, 0);
+    }
+    for value in &mut values {
+        if value.prec() != precision_bits {
+            *value = Float::with_val(precision_bits, &*value);
+        }
+    }
+    while values.len() > 1 {
+        let mut next = Vec::with_capacity(values.len().div_ceil(2));
+        let mut leaves = values.into_iter();
+        while let Some(mut left) = leaves.next() {
+            if let Some(right) = leaves.next() {
+                left += &right;
+            }
+            next.push(left);
+        }
+        values = next;
+    }
+    values.pop().expect("nonempty input produces one root")
+}
+
 /// Sum MPFR values with parallel fixed-index leaf chunks and a serial,
 /// adjacent pairwise tree whose shape is independent of worker scheduling.
 pub fn deterministic_parallel_sum_hp(
@@ -242,6 +269,24 @@ mod tests {
                 value
             })
             .collect()
+    }
+
+    #[test]
+    fn owned_pairwise_reduction_is_bit_identical_to_borrowed_tree() {
+        for length in 0..67 {
+            let values = cancellation_fixture()
+                .into_iter()
+                .take(length)
+                .collect::<Vec<_>>();
+            let borrowed = deterministic_pairwise_sum_hp(&values, 256);
+            let owned = deterministic_pairwise_sum_hp_owned(values, 256);
+            assert_eq!(borrowed, owned, "tree changed at length {length}");
+            assert_eq!(
+                encode(&borrowed, 256),
+                encode(&owned, 256),
+                "serialized value changed at length {length}"
+            );
+        }
     }
 
     #[test]

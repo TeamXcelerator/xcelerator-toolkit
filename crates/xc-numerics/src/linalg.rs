@@ -24,10 +24,8 @@ fn hp_zero(prec: u32) -> Float {
     Float::with_val(prec, 0)
 }
 
-fn needs_even_projection(odd_deviation: &Float, prec: u32) -> bool {
-    let mut threshold = Float::with_val(prec, 1);
-    threshold /= 2u32;
-    odd_deviation > &threshold
+fn needs_even_projection(odd_deviation: &Float, threshold: &Float) -> bool {
+    odd_deviation > threshold
 }
 
 // ===========================================================================
@@ -86,39 +84,21 @@ pub fn lu_factor(a: &[Float], dim: usize) -> Result<LuFactors> {
         if pivot.is_zero() {
             return Err(anyhow!("singular matrix"));
         }
-        let factors: Vec<Float> = ((k + 1)..dim)
-            .map(|i| {
-                let mut f = lu[i * dim + k].clone();
-                f /= &pivot;
-                f
-            })
-            .collect();
-        for (idx, i) in ((k + 1)..dim).enumerate() {
-            lu[i * dim + k] = factors[idx].clone();
-        }
         let pivot_row: Vec<Float> = ((k + 1)..dim).map(|j| lu[k * dim + j].clone()).collect();
-        let updates: Vec<Vec<Float>> = factors
-            .par_iter()
-            .enumerate()
-            .map(|(idx, factor)| {
-                let i = k + 1 + idx;
-                ((k + 1)..dim)
-                    .enumerate()
-                    .map(|(j_off, j)| {
-                        let mut val = lu[i * dim + j].clone();
-                        let mut prod = pivot_row[j_off].clone();
-                        prod *= factor;
-                        val -= &prod;
-                        val
-                    })
-                    .collect()
-            })
-            .collect();
-        for (idx, i) in ((k + 1)..dim).enumerate() {
+        // Each trailing row is disjoint, so Rayon may update it in place.
+        // Within a row the arithmetic is deliberately identical to the
+        // former allocating route: compute the multiplier once, then for
+        // increasing j evaluate `old - pivot_row[j] * multiplier`.
+        lu[(k + 1) * dim..].par_chunks_mut(dim).for_each(|row| {
+            let mut factor = row[k].clone();
+            factor /= &pivot;
+            row[k] = factor.clone();
             for (j_off, j) in ((k + 1)..dim).enumerate() {
-                lu[i * dim + j] = updates[idx][j_off].clone();
+                let mut product = pivot_row[j_off].clone();
+                product *= &factor;
+                row[j] -= &product;
             }
-        }
+        });
     }
     Ok(LuFactors { lu, perm })
 }
@@ -196,7 +176,7 @@ pub fn lu_solve_with(
                     t
                 })
                 .collect();
-            let sum = crate::reduction::deterministic_pairwise_sum_hp(&terms, prec);
+            let sum = crate::reduction::deterministic_pairwise_sum_hp_owned(terms, prec);
             let mut s = pb[i].clone();
             s -= &sum;
             s
@@ -227,7 +207,7 @@ pub fn lu_solve_with(
                     t
                 })
                 .collect();
-            let sum = crate::reduction::deterministic_pairwise_sum_hp(&terms, prec);
+            let sum = crate::reduction::deterministic_pairwise_sum_hp_owned(terms, prec);
             let mut s = y[i].clone();
             s -= &sum;
             s
@@ -556,7 +536,7 @@ pub fn normalize_l2(v: &mut [Float]) {
             t
         })
         .collect();
-    let norm_sq = crate::reduction::deterministic_pairwise_sum_hp(&squares, prec);
+    let norm_sq = crate::reduction::deterministic_pairwise_sum_hp_owned(squares, prec);
     let norm = norm_sq.sqrt();
     v.par_iter_mut().for_each(|vk| {
         *vk /= &norm;
@@ -586,7 +566,7 @@ pub fn rayleigh_quotient(a: &[Float], dim: usize, xi: &[Float], prec: u32) -> Fl
             contrib
         })
         .collect();
-    crate::reduction::deterministic_pairwise_sum_hp(&contribs, prec)
+    crate::reduction::deterministic_pairwise_sum_hp_owned(contribs, prec)
 }
 
 /// Inverse iteration to find the smallest-eigenpair of a symmetric
@@ -696,13 +676,15 @@ fn inverse_iteration_from_optional_factors(
     // Initial guess: warm-start from provided vector, or fall back to
     // Gaussian centered at the middle index.
     let mut xi: Vec<Float> = if let Some(warm) = start {
-        // Re-precision the warm-start vector (it may be at a different prec)
+        // Preserve the established decimal warm-start route. Direct MPFR
+        // reprecision retains additional low bits when increasing precision,
+        // which can change the iteration trajectory and cached result bytes.
         warm.into_iter()
-            .map(|v| {
-                let s = v.to_string();
+            .map(|value| {
+                let encoded = value.to_string();
                 Float::with_val(
                     prec,
-                    Float::parse(&s).unwrap_or_else(|_| Float::parse("0").unwrap()),
+                    Float::parse(&encoded).unwrap_or_else(|_| Float::parse("0").unwrap()),
                 )
             })
             .collect()
@@ -729,6 +711,9 @@ fn inverse_iteration_from_optional_factors(
 
     let mut mu = hp_zero(prec);
     let mut prev_mu = mu.clone();
+    let convergence_threshold = Float::with_val(prec, 2).pow(-((prec as i32) - 32));
+    let mut even_projection_threshold = Float::with_val(prec, 1);
+    even_projection_threshold /= 2u32;
 
     let iter_start = std::time::Instant::now();
     for step in 0..max_steps {
@@ -764,7 +749,7 @@ fn inverse_iteration_from_optional_factors(
             // Threshold: projection needed if deviation > 0.5 (halfway between
             // even=0 and odd=2). Below threshold the vector is already even
             // enough — skip projection to save cost.
-            let needs_projection = needs_even_projection(&odd_dev, prec);
+            let needs_projection = needs_even_projection(&odd_dev, &even_projection_threshold);
             if needs_projection {
                 crate::hp_debug!(
                     "[HP invit] step {}: natural vector is odd (deviation={}), applying even projection",
@@ -796,9 +781,9 @@ fn inverse_iteration_from_optional_factors(
             let converged = if !mu.is_zero() {
                 let mut r = diff.clone().abs();
                 r /= &mu.clone().abs();
-                r < Float::with_val(prec, 2).pow(-((prec as i32) - 32))
+                r < convergence_threshold
             } else {
-                diff.clone().abs() < Float::with_val(prec, 2).pow(-((prec as i32) - 32))
+                diff.clone().abs() < convergence_threshold
             };
             if converged {
                 crate::hp_debug!(
@@ -948,6 +933,102 @@ fn inverse_iteration_from_optional_factors(
 #[allow(clippy::erasing_op, clippy::identity_op)]
 mod tests {
     use super::*;
+
+    fn allocating_lu_factor_reference(a: &[Float], dim: usize) -> Result<LuFactors> {
+        let mut lu = a.to_vec();
+        let mut perm: Vec<usize> = (0..dim).collect();
+        for k in 0..dim {
+            let mut max_idx = k;
+            let mut max_val = lu[k * dim + k].clone().abs();
+            for i in (k + 1)..dim {
+                let value = lu[i * dim + k].clone().abs();
+                if value > max_val {
+                    max_val = value;
+                    max_idx = i;
+                }
+            }
+            if max_idx != k {
+                for j in 0..dim {
+                    lu.swap(k * dim + j, max_idx * dim + j);
+                }
+                perm.swap(k, max_idx);
+            }
+            let pivot = lu[k * dim + k].clone();
+            if pivot.is_zero() {
+                return Err(anyhow!("singular matrix"));
+            }
+            let factors: Vec<Float> = ((k + 1)..dim)
+                .map(|i| {
+                    let mut factor = lu[i * dim + k].clone();
+                    factor /= &pivot;
+                    factor
+                })
+                .collect();
+            for (offset, i) in ((k + 1)..dim).enumerate() {
+                lu[i * dim + k] = factors[offset].clone();
+            }
+            let pivot_row: Vec<Float> = ((k + 1)..dim).map(|j| lu[k * dim + j].clone()).collect();
+            let updates: Vec<Vec<Float>> = factors
+                .iter()
+                .enumerate()
+                .map(|(offset, factor)| {
+                    let i = k + 1 + offset;
+                    ((k + 1)..dim)
+                        .enumerate()
+                        .map(|(j_offset, j)| {
+                            let mut value = lu[i * dim + j].clone();
+                            let mut product = pivot_row[j_offset].clone();
+                            product *= factor;
+                            value -= &product;
+                            value
+                        })
+                        .collect()
+                })
+                .collect();
+            for (offset, i) in ((k + 1)..dim).enumerate() {
+                for (j_offset, j) in ((k + 1)..dim).enumerate() {
+                    lu[i * dim + j] = updates[offset][j_offset].clone();
+                }
+            }
+        }
+        Ok(LuFactors { lu, perm })
+    }
+
+    #[test]
+    fn in_place_lu_is_bit_identical_to_allocating_reference() {
+        let precision = 256;
+        for dimension in 1..=9 {
+            let matrix = (0..dimension * dimension)
+                .map(|index| {
+                    let row = index / dimension;
+                    let column = index % dimension;
+                    let numerator = ((row * 17 + column * 11 + 3) % 23) as i32 - 11;
+                    let mut value = Float::with_val(precision, numerator);
+                    value /= 7;
+                    if row == column {
+                        value += (dimension + 3) as u32;
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
+            let expected = allocating_lu_factor_reference(&matrix, dimension).unwrap();
+            let actual = lu_factor(&matrix, dimension).unwrap();
+            assert_eq!(
+                actual.perm, expected.perm,
+                "pivot path changed at n={dimension}"
+            );
+            assert_eq!(actual.lu, expected.lu, "LU values changed at n={dimension}");
+
+            let rhs = (0..dimension)
+                .map(|index| Float::with_val(precision, index + 1))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                lu_solve_with(&actual, &rhs, dimension, precision, false),
+                lu_solve_with(&expected, &rhs, dimension, precision, false),
+                "solved vector changed at n={dimension}"
+            );
+        }
+    }
     use crate::fmt::{display_hp, matching_digits, relative_difference};
     use rug::Float;
 
@@ -959,11 +1040,11 @@ mod tests {
         let epsilon = Float::with_val(prec, 2).pow(-200);
         let mut below = threshold.clone();
         below -= &epsilon;
-        let mut above = threshold;
+        let mut above = threshold.clone();
         above += epsilon;
 
-        assert!(!needs_even_projection(&below, prec));
-        assert!(needs_even_projection(&above, prec));
+        assert!(!needs_even_projection(&below, &threshold));
+        assert!(needs_even_projection(&above, &threshold));
     }
 
     /// Build an HP `Float` from an integer-valued seed at the given precision.

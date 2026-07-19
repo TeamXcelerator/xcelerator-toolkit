@@ -719,7 +719,66 @@ mod hp {
         }
     }
 
-    fn gauss_legendre_compute(n: usize, prec: u32) -> (Vec<Float>, Vec<Float>) {
+    pub(super) fn gauss_legendre_compute(n: usize, prec: u32) -> (Vec<Float>, Vec<Float>) {
+        let pi_v = pi(prec);
+        let one = Float::with_val(prec, 1);
+        let four_n_plus_two = fl_i(prec, (4 * n + 2) as i64);
+        let eps_threshold = Float::with_val(prec, 2).pow(-((prec as i32) - 8));
+        // Root construction deliberately remains serial. Callers already
+        // parallelize across distinct GL table sizes; another Rayon layer
+        // here adds nested scheduling and concurrent GMP allocation without
+        // improving the common CCM precomputation path.
+        let mut combined = (1..=n)
+            .map(|k| gauss_legendre_root(n, k, prec, &pi_v, &one, &four_n_plus_two, &eps_threshold))
+            .collect::<Vec<_>>();
+        combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        combined.into_iter().unzip()
+    }
+
+    fn gauss_legendre_root(
+        n: usize,
+        k: usize,
+        prec: u32,
+        pi_v: &Float,
+        one: &Float,
+        four_n_plus_two: &Float,
+        eps_threshold: &Float,
+    ) -> (Float, Float) {
+        let mut phi = pi_v.clone();
+        phi *= fl_i(prec, (4 * k - 1) as i64);
+        phi /= four_n_plus_two;
+        let mut x = phi.cos();
+        for _ in 0..50 {
+            let (pn, pn_prime) = legendre_p_and_deriv(n, &x, prec);
+            let mut dx = pn;
+            dx /= &pn_prime;
+            x -= &dx;
+            if dx
+                .cmp_abs(eps_threshold)
+                .map(|ordering| ordering.is_lt())
+                .unwrap_or(false)
+            {
+                break;
+            }
+        }
+        let (_pn, pn_prime) = legendre_p_and_deriv(n, &x, prec);
+        let one_minus_x2 = {
+            let mut value = one.clone();
+            value -= x.clone().square();
+            value
+        };
+        let mut denominator = one_minus_x2;
+        denominator *= &pn_prime.square();
+        let mut weight = Float::with_val(prec, 2);
+        weight /= &denominator;
+        (x, weight)
+    }
+
+    #[cfg(test)]
+    pub(super) fn gauss_legendre_compute_allocating_reference(
+        n: usize,
+        prec: u32,
+    ) -> (Vec<Float>, Vec<Float>) {
         let pi_v = pi(prec);
         let one = Float::with_val(prec, 1);
         let mut nodes = Vec::with_capacity(n);
@@ -738,7 +797,7 @@ mod hp {
                 x -= &dx;
                 if dx
                     .cmp_abs(&eps_threshold)
-                    .map(|o| o.is_lt())
+                    .map(|ordering| ordering.is_lt())
                     .unwrap_or(false)
                 {
                     break;
@@ -746,21 +805,21 @@ mod hp {
             }
             let (_pn, pn_prime) = legendre_p_and_deriv(n, &x, prec);
             let one_minus_x2 = {
-                let mut v = one.clone();
-                v -= x.clone().square();
-                v
+                let mut value = one.clone();
+                value -= x.clone().square();
+                value
             };
-            let mut den = one_minus_x2;
-            den *= &pn_prime.square();
-            let mut w = Float::with_val(prec, 2);
-            w /= &den;
+            let mut denominator = one_minus_x2;
+            denominator *= &pn_prime.square();
+            let mut weight = Float::with_val(prec, 2);
+            weight /= &denominator;
             nodes.push(x);
-            weights.push(w);
+            weights.push(weight);
         }
         let mut combined: Vec<(Float, Float)> = nodes.into_iter().zip(weights).collect();
-        combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        let nodes: Vec<Float> = combined.iter().map(|p| p.0.clone()).collect();
-        let weights: Vec<Float> = combined.iter().map(|p| p.1.clone()).collect();
+        combined.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap());
+        let nodes = combined.iter().map(|pair| pair.0.clone()).collect();
+        let weights = combined.iter().map(|pair| pair.1.clone()).collect();
         (nodes, weights)
     }
 
@@ -1197,6 +1256,18 @@ mod hp_cache_tests {
     /// per-thread), so two cache tests racing would corrupt each
     /// other. The mutex enforces sequential access.
     static CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn allocation_reduction_preserves_exact_gl_payload_values() {
+        for (order, precision) in [(1, 128), (8, 192), (33, 257)] {
+            let reference = hp::gauss_legendre_compute_allocating_reference(order, precision);
+            let actual = hp::gauss_legendre_compute(order, precision);
+            assert_eq!(
+                actual, reference,
+                "GL values changed at n={order}, p={precision}"
+            );
+        }
+    }
 
     /// Guard that restores the original cwd when dropped, so a panic
     /// inside a test doesn't leave the test runner in a temp dir

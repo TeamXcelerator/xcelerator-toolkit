@@ -195,6 +195,16 @@ impl ThickRestartLanczosHp {
         config: &ThickRestartLanczosConfigHp,
         cancellation: &CancellationToken,
     ) -> Result<ThickRestartLanczosReportHp, SolverError> {
+        self.solve_controlled_with_direct_image_reuse(operator, config, cancellation, true)
+    }
+
+    fn solve_controlled_with_direct_image_reuse(
+        &self,
+        operator: &dyn SymmetricOperator<Float>,
+        config: &ThickRestartLanczosConfigHp,
+        cancellation: &CancellationToken,
+        reuse_direct_images: bool,
+    ) -> Result<ThickRestartLanczosReportHp, SolverError> {
         check_solver_cancellation(cancellation)?;
         let largest = match config.target {
             EigenTarget::AlgebraicLargest => true,
@@ -278,6 +288,12 @@ impl ThickRestartLanczosHp {
                 candidate[coordinate].assign(1);
                 let _ = add_orthonormal(candidate, &mut basis, config.precision_bits);
             }
+            // Retain only direct A*q results computed during this expansion.
+            // Reconstructed Ritz images from an earlier restart deliberately
+            // are not reused: their different MPFR operation route can differ
+            // in low bits from a fresh operator application.
+            let mut retained_applied: Vec<Option<Vec<Float>>> =
+                (0..basis.len()).map(|_| None).collect();
             while basis.len() < config.maximum_subspace_dimension {
                 check_solver_cancellation(cancellation)?;
                 let candidate = apply(
@@ -286,12 +302,19 @@ impl ThickRestartLanczosHp {
                     config.precision_bits,
                 )?;
                 operator_applications += 1;
-                if !add_orthonormal(candidate, &mut basis, config.precision_bits) {
+                let current = basis.len() - 1;
+                if reuse_direct_images {
+                    retained_applied[current] = Some(candidate.clone());
+                }
+                if add_orthonormal(candidate, &mut basis, config.precision_bits) {
+                    retained_applied.push(None);
+                } else {
                     let mut expanded = false;
                     for coordinate in 0..dimension {
                         let mut fallback = vec![zero(config.precision_bits); dimension];
                         fallback[coordinate].assign(1);
                         if add_orthonormal(fallback, &mut basis, config.precision_bits) {
+                            retained_applied.push(None);
                             expanded = true;
                             break;
                         }
@@ -309,9 +332,13 @@ impl ThickRestartLanczosHp {
                 ));
             }
             let mut applied = Vec::with_capacity(basis.len());
-            for vector in &basis {
-                applied.push(apply(operator, vector, config.precision_bits)?);
-                operator_applications += 1;
+            for (vector, retained_image) in basis.iter().zip(retained_applied) {
+                if let Some(image) = retained_image {
+                    applied.push(image);
+                } else {
+                    applied.push(apply(operator, vector, config.precision_bits)?);
+                    operator_applications += 1;
+                }
             }
             let subspace_dimension = basis.len();
             let mut projected =
@@ -679,5 +706,58 @@ mod tests {
         assert_eq!(cluster.dimension, 2);
         assert_eq!(cluster.requested_members, 1);
         assert_eq!(cluster.projected_operator.len(), 4);
+    }
+
+    #[test]
+    fn retained_direct_operator_images_preserve_every_numerical_output() {
+        let precision = 192;
+        let values = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let operator = DenseSymmetricHp::new(
+            "direct-image-equivalence",
+            values.len(),
+            diagonal(precision, &values),
+            precision,
+            &zero(precision),
+        )
+        .unwrap();
+        let mut config = config(EigenTarget::AlgebraicSmallest);
+        config.maximum_subspace_dimension = 8;
+        config.maximum_restarts = 12;
+        let cancellation = CancellationToken::new();
+        let reference = ThickRestartLanczosHp
+            .solve_controlled_with_direct_image_reuse(&operator, &config, &cancellation, false)
+            .unwrap();
+        let optimized = ThickRestartLanczosHp
+            .solve_controlled_with_direct_image_reuse(&operator, &config, &cancellation, true)
+            .unwrap();
+
+        assert!(optimized.operator_applications < reference.operator_applications);
+        assert_eq!(optimized.status, reference.status);
+        assert_eq!(optimized.termination, reference.termination);
+        assert_eq!(optimized.restarts, reference.restarts);
+        assert_eq!(optimized.krylov_steps, reference.krylov_steps);
+        assert_eq!(
+            optimized.maximum_orthogonality_error,
+            reference.maximum_orthogonality_error
+        );
+        assert_eq!(
+            optimized.maximum_ritz_value_stability,
+            reference.maximum_ritz_value_stability
+        );
+        assert_eq!(
+            optimized.retained_eigenpairs.len(),
+            reference.retained_eigenpairs.len()
+        );
+        for (actual, expected) in optimized
+            .retained_eigenpairs
+            .iter()
+            .zip(&reference.retained_eigenpairs)
+        {
+            assert_eq!(actual.eigenvalue, expected.eigenvalue);
+            assert_eq!(actual.eigenvector, expected.eigenvector);
+            assert_eq!(actual.residual_norm, expected.residual_norm);
+            assert_eq!(actual.scaled_backward_error, expected.scaled_backward_error);
+            assert_eq!(actual.diagnostics, expected.diagnostics);
+        }
     }
 }
