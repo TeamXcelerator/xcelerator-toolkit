@@ -772,8 +772,9 @@ pub struct RootRefinement {
     pub diagnostics: RootRefinementDiagnostics,
 }
 
-/// Status of one CCM root refinement. Only `Converged` is acceptable for a
-/// complete result or a reusable validated cache artifact.
+/// Status of one CCM root refinement. Computed workflows retain finite
+/// `Stagnated` and `Approximate` values with their exact diagnostics;
+/// certification still requires `Converged`.
 #[derive(Debug, Clone)]
 pub enum EigenvalueResult {
     Converged(RootRefinement),
@@ -798,8 +799,9 @@ impl EigenvalueResult {
         matches!(self, Self::Converged(_))
     }
 
-    /// Returns `true` if a diagnostic numerical value is present. This does
-    /// not imply that the value is acceptable for reuse or publication.
+    /// Returns `true` if a numerical value is present. Computed workflows may
+    /// retain and reuse such a value, but this does not imply convergence or
+    /// certified assurance.
     pub fn has_value(&self) -> bool {
         !matches!(self, Self::Failed { .. })
     }
@@ -3278,43 +3280,59 @@ fn compute_root_range(
             cfg.solver_steps,
             cfg.root_solver,
         );
-        let converged = outcome.is_converged();
+        let has_value = outcome.has_value();
         outcomes.push(outcome);
-        // A validated ordered window cannot contain a gap. Preserve the
-        // complete diagnostics for the first rejected root, but do not spend
-        // hours refining later roots after the request is already known to
-        // be unsatisfiable.
-        if !converged {
+        // A result with no numerical value leaves an unfillable gap in the
+        // ordered window. Precision-limited values remain useful computed
+        // evidence, so continue refining the remainder of the request.
+        if !has_value {
             break;
         }
     }
     outcomes
 }
 
-fn ensure_all_roots_converged(outcomes: &[EigenvalueResult]) -> Result<()> {
+fn ensure_root_window_usable(
+    outcomes: &[EigenvalueResult],
+    expected_count: usize,
+    require_converged: bool,
+) -> Result<()> {
+    if outcomes.len() != expected_count {
+        bail!(
+            "CCM root window is incomplete: expected {} outcomes, received {}",
+            expected_count,
+            outcomes.len()
+        );
+    }
     let mut previous: Option<&Float> = None;
     for (offset, outcome) in outcomes.iter().enumerate() {
         let result = match outcome {
             EigenvalueResult::Converged(result) => result,
             EigenvalueResult::Stagnated(result) => {
-                bail!(
-                    "CCM root {} stagnated after {} iterations (correction={}, residual={}, achieved_digits={})",
-                    offset + 1,
-                    result.diagnostics.iterations,
-                    xc_numerics::fmt::display_hp(&result.diagnostics.final_correction, 8),
-                    xc_numerics::fmt::display_hp(&result.diagnostics.residual, 8),
-                    xc_numerics::fmt::display_hp(&result.diagnostics.achieved_decimal_digits, 8)
-                )
+                if require_converged {
+                    bail!(
+                        "CCM root {} stagnated after {} iterations (correction={}, residual={}, achieved_digits={})",
+                        offset + 1,
+                        result.diagnostics.iterations,
+                        xc_numerics::fmt::display_hp(&result.diagnostics.final_correction, 8),
+                        xc_numerics::fmt::display_hp(&result.diagnostics.residual, 8),
+                        xc_numerics::fmt::display_hp(&result.diagnostics.achieved_decimal_digits, 8)
+                    )
+                }
+                result
             }
             EigenvalueResult::Approximate(result) => {
-                bail!(
-                    "CCM root {} reached the {}-iteration limit (correction={}, residual={}, achieved_digits={})",
-                    offset + 1,
-                    result.diagnostics.iterations,
-                    xc_numerics::fmt::display_hp(&result.diagnostics.final_correction, 8),
-                    xc_numerics::fmt::display_hp(&result.diagnostics.residual, 8),
-                    xc_numerics::fmt::display_hp(&result.diagnostics.achieved_decimal_digits, 8)
-                )
+                if require_converged {
+                    bail!(
+                        "CCM root {} reached the {}-iteration limit (correction={}, residual={}, achieved_digits={})",
+                        offset + 1,
+                        result.diagnostics.iterations,
+                        xc_numerics::fmt::display_hp(&result.diagnostics.final_correction, 8),
+                        xc_numerics::fmt::display_hp(&result.diagnostics.residual, 8),
+                        xc_numerics::fmt::display_hp(&result.diagnostics.achieved_decimal_digits, 8)
+                    )
+                }
+                result
             }
             EigenvalueResult::Failed { iterations, reason } => {
                 bail!(
@@ -3326,11 +3344,30 @@ fn ensure_all_roots_converged(outcomes: &[EigenvalueResult]) -> Result<()> {
             }
         };
         if result.value <= 0 || previous.is_some_and(|value| &result.value <= value) {
-            bail!("CCM converged roots are not a strictly increasing positive sequence");
+            bail!("CCM root values are not a strictly increasing positive sequence");
         }
         previous = Some(&result.value);
     }
     Ok(())
+}
+
+fn report_precision_limited_roots(outcomes: &[EigenvalueResult], first_root_index: usize) {
+    for (offset, outcome) in outcomes.iter().enumerate() {
+        let (status, result) = match outcome {
+            EigenvalueResult::Stagnated(result) => ("STAGNATED", result),
+            EigenvalueResult::Approximate(result) => ("APPROXIMATE", result),
+            EigenvalueResult::Converged(_) | EigenvalueResult::Failed { .. } => continue,
+        };
+        eprintln!(
+            "[HP] root {} status: {} after {} iterations; retained as computed approximation (correction={}, residual={}, achieved_digits={})",
+            first_root_index + offset,
+            status,
+            result.diagnostics.iterations,
+            xc_numerics::fmt::display_hp(&result.diagnostics.final_correction, 8),
+            xc_numerics::fmt::display_hp(&result.diagnostics.residual, 8),
+            xc_numerics::fmt::display_hp(&result.diagnostics.achieved_decimal_digits, 8)
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3343,6 +3380,7 @@ fn decode_root_range(
     artifact_mode: RootArtifactMode,
     xi: &[Float],
     l: &Float,
+    require_converged: bool,
 ) -> std::result::Result<Vec<EigenvalueResult>, CacheError> {
     let expected_seeds: Vec<String> = seeds.iter().map(Float::to_string).collect();
     if artifact.schema_version != 3
@@ -3394,20 +3432,28 @@ fn decode_root_range(
     two_pi_over_l /= l;
     let mut previous: Option<&Float> = None;
     for outcome in &decoded {
-        let result = match outcome {
-            EigenvalueResult::Converged(result) => result,
-            EigenvalueResult::Stagnated(_)
-            | EigenvalueResult::Approximate(_)
-            | EigenvalueResult::Failed { .. } => {
+        let (result, status) = match outcome {
+            EigenvalueResult::Converged(result) => (result, "converged"),
+            EigenvalueResult::Stagnated(result) => (result, "stagnated"),
+            EigenvalueResult::Approximate(result) => (result, "approximate"),
+            EigenvalueResult::Failed { .. } => {
                 return Err(CacheError::InvalidManifest(
-                    "validated CCM root-range payload contains a non-converged root".to_owned(),
+                    "computed CCM root-range payload contains a failed root".to_owned(),
                 ))
             }
         };
+        if require_converged && status != "converged" {
+            return Err(CacheError::InvalidManifest(format!(
+                "requested assurance rejects {status} CCM root-range evidence"
+            )));
+        }
         let value = &result.value;
+        let correction_meets_target = result.diagnostics.final_correction
+            < root_correction_tolerance(value, cfg.precision_bits);
         if result.diagnostics.iterations > cfg.solver_steps
-            || result.diagnostics.final_correction
-                >= root_correction_tolerance(value, cfg.precision_bits)
+            || (status == "converged" && !correction_meets_target)
+            || (status != "converged" && correction_meets_target)
+            || (status == "approximate" && result.diagnostics.iterations != cfg.solver_steps)
             || achieved_decimal_digits(
                 value,
                 &result.diagnostics.final_correction,
@@ -3458,6 +3504,7 @@ fn resolve_root_range_via_cache(
         .checked_add(seeds.len() - 1)
         .ok_or_else(|| anyhow::anyhow!("CCM indexed root window overflows usize"))?;
     let seed_strings: Vec<String> = seeds.iter().map(Float::to_string).collect();
+    let require_converged = cache.requested_assurance != xc_core::AssuranceLevel::Computed;
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: match artifact_mode {
@@ -3466,8 +3513,8 @@ fn resolve_root_range_via_cache(
         }
         .to_owned(),
         mathematical_semantics_version: match artifact_mode {
-            RootArtifactMode::Independent => "ccm-root-range-v0.13.0-v5",
-            RootArtifactMode::ReferenceSeededRefinement => "ccm-root-range-v0.13.0-v4",
+            RootArtifactMode::Independent => "ccm-root-range-v0.13.0-v6",
+            RootArtifactMode::ReferenceSeededRefinement => "ccm-root-range-v0.13.0-v5",
         }
         .to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
@@ -3545,7 +3592,7 @@ fn resolve_root_range_via_cache(
         &request,
         || {
             let computed = compute_root_range(xi, params, l, cfg, seeds);
-            ensure_all_roots_converged(&computed)
+            ensure_root_window_usable(&computed, seeds.len(), require_converged)
                 .map_err(|error| CacheError::InvalidTransition(error.to_string()))?;
             let outcomes = computed
                 .into_iter()
@@ -3603,6 +3650,7 @@ fn resolve_root_range_via_cache(
                 artifact_mode,
                 xi,
                 l,
+                require_converged,
             )
             .map(|_| ())
         },
@@ -3621,6 +3669,7 @@ fn resolve_root_range_via_cache(
             artifact_mode,
             xi,
             l,
+            require_converged,
         )?,
         manifest,
     ))
@@ -4391,9 +4440,10 @@ fn run_inner(
             (roots, Some(manifest))
         } else {
             let roots = compute_root_range(&xi, params, &l, cfg, &hp_seeds);
-            ensure_all_roots_converged(&roots)?;
+            ensure_root_window_usable(&roots, hp_seeds.len(), false)?;
             (roots, None)
         };
+    report_precision_limited_roots(&eigenvalues_pos, first_root_index);
     if let (CcmCacheRoute::Fabric(cache), Some(root_manifest)) = (&cache_route, &root_manifest) {
         record_run_evidence_via_cache(
             params,
@@ -7707,7 +7757,7 @@ mod tests {
     }
 
     #[test]
-    fn validated_root_windows_reject_every_nonconverged_status() {
+    fn computed_root_windows_retain_approximations_while_strict_windows_reject_them() {
         let precision = 256;
         let diagnostic = |value: u32| RootRefinement {
             value: Float::with_val(precision, value),
@@ -7718,30 +7768,128 @@ mod tests {
                 achieved_decimal_digits: Float::with_val(precision, 50),
             },
         };
-        assert!(ensure_all_roots_converged(&[
-            EigenvalueResult::Converged(diagnostic(1)),
-            EigenvalueResult::Converged(diagnostic(2)),
-        ])
+        assert!(ensure_root_window_usable(
+            &[
+                EigenvalueResult::Converged(diagnostic(1)),
+                EigenvalueResult::Converged(diagnostic(2)),
+            ],
+            2,
+            true,
+        )
+        .is_ok());
+        assert!(ensure_root_window_usable(
+            &[
+                EigenvalueResult::Stagnated(diagnostic(1)),
+                EigenvalueResult::Approximate(diagnostic(2)),
+            ],
+            2,
+            false,
+        )
         .is_ok());
         assert!(
-            ensure_all_roots_converged(&[EigenvalueResult::Stagnated(diagnostic(1))])
+            ensure_root_window_usable(&[EigenvalueResult::Stagnated(diagnostic(1))], 1, true,)
                 .unwrap_err()
                 .to_string()
                 .contains("stagnated")
         );
-        assert!(
-            ensure_all_roots_converged(&[EigenvalueResult::Approximate(diagnostic(1))])
-                .unwrap_err()
-                .to_string()
-                .contains("iteration limit")
-        );
-        assert!(ensure_all_roots_converged(&[EigenvalueResult::Failed {
-            iterations: 3,
-            reason: "degenerate derivative".to_owned(),
-        }])
+        assert!(ensure_root_window_usable(
+            &[EigenvalueResult::Approximate(diagnostic(1))],
+            1,
+            true,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("iteration limit"));
+        assert!(ensure_root_window_usable(
+            &[EigenvalueResult::Failed {
+                iterations: 3,
+                reason: "degenerate derivative".to_owned(),
+            }],
+            1,
+            false,
+        )
         .unwrap_err()
         .to_string()
         .contains("degenerate derivative"));
+    }
+
+    #[test]
+    fn computed_cache_replays_stagnated_root_evidence_without_claiming_convergence() {
+        let mut cfg = HighPrecConfig::for_decimal_digits(60);
+        cfg.precision_bits = 256;
+        let params = CcmParams::from_lambda_sq_integer(13, 1);
+        let l = Float::with_val(cfg.precision_bits, 13).ln();
+        let xi = vec![Float::with_val(cfg.precision_bits, 1); params.matrix_size()];
+        let value = Float::with_val(cfg.precision_bits, 1);
+        let correction = Float::with_val(cfg.precision_bits, Float::parse("1e-50").unwrap());
+        assert!(correction >= root_correction_tolerance(&value, cfg.precision_bits));
+        let mut two_pi_over_l = pi(cfg.precision_bits);
+        two_pi_over_l *= 2u32;
+        two_pi_over_l /= &l;
+        let result = RootRefinement {
+            value: value.clone(),
+            diagnostics: RootRefinementDiagnostics {
+                iterations: 17,
+                final_correction: correction.clone(),
+                residual: secular_residual_at(
+                    &xi,
+                    params.n_modes,
+                    &two_pi_over_l,
+                    &value,
+                    cfg.precision_bits,
+                )
+                .unwrap(),
+                achieved_decimal_digits: achieved_decimal_digits(
+                    &value,
+                    &correction,
+                    cfg.precision_bits,
+                ),
+            },
+        };
+        let artifact = PortableRootRange {
+            schema_version: 3,
+            lambda_squared: lambda_squared_cache_identity(&params),
+            n_modes: params.n_modes,
+            precision_bits: cfg.precision_bits,
+            force_even: cfg.force_even,
+            first_root_index: 1,
+            discovery_mode: RootArtifactMode::Independent.as_str().to_owned(),
+            reference_seeds_used: false,
+            completeness: "unverified_computed_discovery".to_owned(),
+            starting_points: vec![value.to_string()],
+            outcomes: vec![PortableRootOutcome::Stagnated(
+                PortableRootRefinement::from_runtime(&result),
+            )],
+            solver: cfg.root_solver.display_name().to_ascii_lowercase(),
+            solver_steps: cfg.solver_steps,
+            accuracy_guard_bits: GUARD_BITS,
+        };
+        assert!(decode_root_range(
+            &artifact,
+            &params,
+            &cfg,
+            1,
+            std::slice::from_ref(&value),
+            RootArtifactMode::Independent,
+            &xi,
+            &l,
+            false,
+        )
+        .is_ok());
+        assert!(decode_root_range(
+            &artifact,
+            &params,
+            &cfg,
+            1,
+            &[value],
+            RootArtifactMode::Independent,
+            &xi,
+            &l,
+            true,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("requested assurance rejects stagnated"));
     }
 
     #[test]
