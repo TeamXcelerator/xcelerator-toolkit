@@ -3351,23 +3351,78 @@ fn ensure_root_window_usable(
     Ok(())
 }
 
-fn report_precision_limited_roots(outcomes: &[EigenvalueResult], first_root_index: usize) {
-    for (offset, outcome) in outcomes.iter().enumerate() {
-        let (status, result) = match outcome {
-            EigenvalueResult::Stagnated(result) => ("STAGNATED", result),
-            EigenvalueResult::Approximate(result) => ("APPROXIMATE", result),
-            EigenvalueResult::Converged(_) | EigenvalueResult::Failed { .. } => continue,
-        };
-        eprintln!(
-            "[HP] root {} status: {} after {} iterations; retained as computed approximation (correction={}, residual={}, achieved_digits={})",
-            first_root_index + offset,
-            status,
-            result.diagnostics.iterations,
-            xc_numerics::fmt::display_hp(&result.diagnostics.final_correction, 8),
-            xc_numerics::fmt::display_hp(&result.diagnostics.residual, 8),
-            xc_numerics::fmt::display_hp(&result.diagnostics.achieved_decimal_digits, 8)
-        );
+fn format_index_ranges(indices: &[usize]) -> String {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < indices.len() {
+        let first = indices[start];
+        let mut end = start;
+        while end + 1 < indices.len() && indices[end + 1] == indices[end] + 1 {
+            end += 1;
+        }
+        if start == end {
+            ranges.push(first.to_string());
+        } else {
+            ranges.push(format!("{}-{}", first, indices[end]));
+        }
+        start = end + 1;
     }
+    ranges.join(",")
+}
+
+fn report_precision_limited_category(label: &str, roots: &[(usize, &RootRefinement)]) {
+    if roots.is_empty() {
+        return;
+    }
+    let indices: Vec<usize> = roots.iter().map(|(index, _)| *index).collect();
+    let mut minimum_digits = roots[0].1.diagnostics.achieved_decimal_digits.clone();
+    let mut maximum_digits = minimum_digits.clone();
+    let mut maximum_iterations = 0usize;
+    for (_, root) in roots {
+        if root.diagnostics.achieved_decimal_digits < minimum_digits {
+            minimum_digits = root.diagnostics.achieved_decimal_digits.clone();
+        }
+        if root.diagnostics.achieved_decimal_digits > maximum_digits {
+            maximum_digits = root.diagnostics.achieved_decimal_digits.clone();
+        }
+        maximum_iterations = maximum_iterations.max(root.diagnostics.iterations);
+    }
+    eprintln!(
+        "[HP] {label} roots retained as computed approximations: indices={}; achieved_digits={}..{}; maximum_iterations={}; full per-root diagnostics are stored in the artifact",
+        format_index_ranges(&indices),
+        xc_numerics::fmt::display_hp(&minimum_digits, 8),
+        xc_numerics::fmt::display_hp(&maximum_digits, 8),
+        maximum_iterations
+    );
+}
+
+fn report_root_status_summary(outcomes: &[EigenvalueResult], first_root_index: usize) {
+    if outcomes.is_empty() {
+        return;
+    }
+    let mut converged = 0usize;
+    let mut stagnated = Vec::new();
+    let mut approximate = Vec::new();
+    let mut failed = 0usize;
+    for (offset, outcome) in outcomes.iter().enumerate() {
+        let index = first_root_index + offset;
+        match outcome {
+            EigenvalueResult::Converged(_) => converged += 1,
+            EigenvalueResult::Stagnated(result) => stagnated.push((index, result)),
+            EigenvalueResult::Approximate(result) => approximate.push((index, result)),
+            EigenvalueResult::Failed { .. } => failed += 1,
+        }
+    }
+    eprintln!(
+        "[HP] root status summary: {} total; {} converged, {} stagnated, {} approximate, {} failed",
+        outcomes.len(),
+        converged,
+        stagnated.len(),
+        approximate.len(),
+        failed
+    );
+    report_precision_limited_category("stagnated", &stagnated);
+    report_precision_limited_category("iteration-limited", &approximate);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4443,7 +4498,7 @@ fn run_inner(
             ensure_root_window_usable(&roots, hp_seeds.len(), false)?;
             (roots, None)
         };
-    report_precision_limited_roots(&eigenvalues_pos, first_root_index);
+    report_root_status_summary(&eigenvalues_pos, first_root_index);
     if let (CcmCacheRoute::Fabric(cache), Some(root_manifest)) = (&cache_route, &root_manifest) {
         record_run_evidence_via_cache(
             params,
@@ -7811,6 +7866,15 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("degenerate derivative"));
+    }
+
+    #[test]
+    fn precision_limited_root_indices_are_compacted_into_ranges() {
+        assert_eq!(
+            format_index_ranges(&[37, 39, 40, 41, 43, 44, 45, 46, 48, 49, 50]),
+            "37,39-41,43-46,48-50"
+        );
+        assert_eq!(format_index_ranges(&[]), "");
     }
 
     #[test]
