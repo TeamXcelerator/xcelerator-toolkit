@@ -2718,12 +2718,16 @@ fn validate_sector_transform(
     transform: &SectorTransformHp,
     dimension: usize,
     precision_bits: u32,
-) -> bool {
+) -> std::result::Result<(), String> {
     if matrix.len() != dimension * dimension || transform.basis.len() != dimension * dimension {
-        return false;
+        return Err("matrix or basis dimensions are inconsistent".to_owned());
     }
-    let tolerance =
-        Float::with_val(precision_bits, 2).pow(-((precision_bits.saturating_sub(32)) as i32));
+    // `HighPrecConfig::for_decimal_digits` reserves GUARD_BITS beyond the
+    // caller's requested precision. Validation must enforce the requested
+    // contract, not demand that an O(n^3) accumulated transformation retain
+    // half of those guard bits as additional answer digits.
+    let orthogonality_tolerance = Float::with_val(precision_bits, 2)
+        .pow(-((precision_bits.saturating_sub(GUARD_BITS).max(1)) as i32));
 
     // Check every basis-vector norm and every adjacent dot product.  This is
     // O(n^2), so cached transforms remain cheap to validate at research sizes.
@@ -2741,10 +2745,39 @@ fn validate_sector_transform(
             }
         }
         norm -= 1u32;
-        if norm.abs() > tolerance || adjacent.abs() > tolerance {
-            return false;
+        let norm_error = norm.abs();
+        let adjacent_error = adjacent.abs();
+        if norm_error > orthogonality_tolerance {
+            return Err(format!(
+                "basis column {column} norm error {} exceeds requested-precision tolerance {}",
+                norm_error, orthogonality_tolerance
+            ));
+        }
+        if adjacent_error > orthogonality_tolerance {
+            return Err(format!(
+                "basis columns {column} and {} inner-product error {} exceeds requested-precision tolerance {}",
+                column + 1,
+                adjacent_error,
+                orthogonality_tolerance
+            ));
         }
     }
+
+    // A Q = Q T is a homogeneous identity. Use a relative infinity-scale
+    // threshold so an otherwise identical matrix expressed at a different
+    // magnitude cannot be spuriously rejected by an absolute cutoff.
+    let mut matrix_scale = Float::with_val(precision_bits, 1);
+    for row in 0..dimension {
+        let mut row_sum = Float::with_val(precision_bits, 0);
+        for column in 0..dimension {
+            row_sum += matrix[row * dimension + column].clone().abs();
+        }
+        if row_sum > matrix_scale {
+            matrix_scale = row_sum;
+        }
+    }
+    let mut similarity_tolerance = orthogonality_tolerance.clone();
+    similarity_tolerance *= matrix_scale;
 
     // Replay A Q = Q T for boundary and central columns.  Every retained
     // eigenvector is additionally replayed against A before acceptance.
@@ -2772,12 +2805,16 @@ fn validate_sector_transform(
                 right += term;
             }
             left -= right;
-            if left.abs() > tolerance {
-                return false;
+            let residual = left.abs();
+            if residual > similarity_tolerance {
+                return Err(format!(
+                    "A Q = Q T residual at row {row}, column {column} is {} and exceeds scale-aware tolerance {}",
+                    residual, similarity_tolerance
+                ));
             }
         }
     }
-    true
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2896,16 +2933,16 @@ fn resolve_sector_transform_via_cache(
             let transform = SectorTransformHp {
                 basis: parse_hp_vector(&artifact.basis, cfg.precision_bits)?,
             };
-            if !validate_sector_transform(
+            if let Err(reason) = validate_sector_transform(
                 matrix,
                 tridiagonal,
                 &transform,
                 dimension,
                 cfg.precision_bits,
             ) {
-                return Err(CacheError::InvalidManifest(
-                    "CCM sector transform failed orthogonality or A Q = Q T replay".to_owned(),
-                ));
+                return Err(CacheError::InvalidManifest(format!(
+                    "CCM sector transform failed orthogonality or A Q = Q T replay: {reason}"
+                )));
             }
             validated.replace(Some(transform));
             Ok(())
@@ -9895,6 +9932,60 @@ mod tests {
             assert_eq!(parallel.eigenvector, sequential.eigenvector);
             assert_eq!(parallel.residual_norm, sequential.residual_norm);
         }
+    }
+
+    #[test]
+    fn sector_transform_validation_uses_requested_precision_and_matrix_scale() {
+        let precision_bits = 256;
+        let dimension = 4;
+        let scale = Float::with_val(
+            precision_bits,
+            Float::parse("1e40").expect("valid HP scale"),
+        );
+        let mut matrix = vec![
+            Float::with_val(precision_bits, 4),
+            Float::with_val(precision_bits, 1),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 1),
+            Float::with_val(precision_bits, 6),
+            Float::with_val(precision_bits, 2),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 2),
+            Float::with_val(precision_bits, 9),
+            Float::with_val(precision_bits, 1),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 1),
+            Float::with_val(precision_bits, 12),
+        ];
+        for value in &mut matrix {
+            *value *= &scale;
+        }
+        let (diagonal, off_diagonal, basis) =
+            xc_numerics::eigen::householder_tridiag_hp(&matrix, dimension, precision_bits).unwrap();
+        let tridiagonal = SectorTridiagonalHp {
+            diagonal,
+            off_diagonal,
+        };
+        let transform = SectorTransformHp { basis };
+        validate_sector_transform(&matrix, &tridiagonal, &transform, dimension, precision_bits)
+            .unwrap();
+
+        let mut corrupted = transform;
+        corrupted.basis[0] += Float::with_val(
+            precision_bits,
+            Float::parse("1e-20").expect("valid HP perturbation"),
+        );
+        assert!(validate_sector_transform(
+            &matrix,
+            &tridiagonal,
+            &corrupted,
+            dimension,
+            precision_bits,
+        )
+        .is_err());
     }
 
     #[test]
