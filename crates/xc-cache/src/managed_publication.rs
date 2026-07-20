@@ -418,24 +418,7 @@ fn ensure_managed_shard_sidecars(
         let mut staged_bytes = 0u64;
         if ledger_digest.is_none() {
             let payload_bytes =
-                ["objects", "artifacts"]
-                    .into_iter()
-                    .try_fold(0u64, |total, prefix| {
-                        total
-                            .checked_add(bounded_prefix_bytes(
-                                remote,
-                                repository,
-                                &head,
-                                prefix,
-                                prefix == "objects",
-                                cancellation,
-                            )?)
-                            .ok_or_else(|| {
-                                CacheError::ResourceLimit(
-                                    "bootstrap payload accounting exceeds u64".to_owned(),
-                                )
-                            })
-                    })?;
+                bounded_prefix_bytes(remote, repository, &head, "objects", true, cancellation)?;
             let metadata_bytes = [
                 "manifests",
                 "encodings",
