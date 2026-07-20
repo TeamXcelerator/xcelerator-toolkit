@@ -2609,7 +2609,7 @@ fn resolve_sector_tridiagonal_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_sector_tridiagonal".to_owned(),
-        mathematical_semantics_version: "ccm-parity-tridiagonal-v0.13.0-v2".to_owned(),
+        mathematical_semantics_version: "ccm-parity-tridiagonal-v0.13.0-v3".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -2621,7 +2621,9 @@ fn resolve_sector_tridiagonal_via_cache(
         target: Some("symmetric_tridiagonal_reduction".to_owned()),
         subspace: Some(parity.as_str().to_owned()),
         source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some("dense_householder_with_reusable_q_capture_v1".to_owned()),
+        algorithm_semantics: Some(
+            "dense_householder_with_consistent_signed_off_diagonal_and_reusable_q_v2".to_owned(),
+        ),
     };
     let logical_key = format!(
         "ccm/sector-tridiagonal/{}/{}/{}/{}",
@@ -2836,7 +2838,7 @@ fn resolve_sector_transform_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_sector_transform".to_owned(),
-        mathematical_semantics_version: "ccm-parity-householder-basis-v0.13.0-v1".to_owned(),
+        mathematical_semantics_version: "ccm-parity-householder-basis-v0.13.0-v2".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,

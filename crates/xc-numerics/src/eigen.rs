@@ -1360,30 +1360,11 @@ fn householder_tridiag_hp_impl(
         // additional m-by-m MPFR matrix while preserving the old cell order.
         apply_householder_trailing_update_hp(&mut h, n, k, &v, &q_vec);
 
-        // Set the (k+1, k) and (k, k+1) entries to alpha_signed (the new
-        // off-diagonal after Householder zeroes out the rest of column k).
-        // The Householder transform leaves h[k, k] unchanged.
-        // h[k+1, k] = -alpha_signed (this is the standard Householder result;
-        // sign convention may flip depending on which sign we chose for v[0]).
-        // We computed v[0] = x[0] - sign(x[0])*α, which means after H is
-        // applied, the first element becomes sign(x[0])*α. Match accordingly.
-        let new_off_diag = if sign_x0_negative {
-            // alpha_signed = -α; new entry = -alpha_signed = α (positive).
-            // But we want the standard convention where the new off-diagonal
-            // has sign matching the original. Use -alpha_signed.
-            let mut t = alpha_signed.clone();
-            t = -t;
-            t
-        } else {
-            // alpha_signed = α; new entry = -α (sign flipped by reflection).
-            let mut t = alpha_signed.clone();
-            t = -t;
-            t
-        };
-        // Actually the above two branches give the same -alpha_signed.
-        // After the symmetric H update above, h[k+1, k] should already be
-        // close to the reflected value; we set it explicitly to avoid
-        // numerical drift.
+        // Direct substitution into H = I - 2vv^T/(v^Tv) gives
+        // Hx = sign(x[0])||x||e1 for the `v` constructed above. Negating
+        // this value preserves eigenvalues but breaks Q^T A Q = T and makes
+        // back-transformed eigenvectors invalid.
+        let new_off_diag = alpha_signed;
         h[(k + 1) * n + k] = new_off_diag.clone();
         h[k * n + (k + 1)] = new_off_diag;
 
@@ -2189,6 +2170,50 @@ mod tests {
     /// from orthogonality the tridiagonalization is wrong even if
     /// `dense_symmetric_eigenvalues_hp` happens to deliver the right
     /// eigenvalues by lucky cancellation in tridiag QR.
+    #[test]
+    fn householder_q_and_tridiagonal_satisfy_similarity_relation() {
+        let prec = 256;
+        let n = 5;
+        let raw = [
+            "4", "1", "2", "0", "1", "1", "3", "1", "1", "0", "2", "1", "5", "2", "1", "0", "1",
+            "2", "6", "3", "1", "0", "1", "3", "7",
+        ];
+        let a: Vec<Float> = raw.iter().map(|value| hp(prec, value)).collect();
+        let (diagonal, off_diagonal, q) = householder_tridiag_hp(&a, n, prec).unwrap();
+        let tolerance = hp(prec, "1e-60");
+
+        // Q^T A Q = T is equivalent to A Q = Q T. Check every entry so a
+        // sign mismatch in a stored off-diagonal cannot hide behind the
+        // sign-invariance of the tridiagonal eigenvalues.
+        for row in 0..n {
+            for column in 0..n {
+                let mut aq = hp(prec, "0");
+                for inner in 0..n {
+                    let mut term = a[row * n + inner].clone();
+                    term *= &q[inner * n + column];
+                    aq += term;
+                }
+                let mut qt = q[row * n + column].clone();
+                qt *= &diagonal[column];
+                if column > 0 {
+                    let mut term = q[row * n + column - 1].clone();
+                    term *= &off_diagonal[column - 1];
+                    qt += term;
+                }
+                if column + 1 < n {
+                    let mut term = q[row * n + column + 1].clone();
+                    term *= &off_diagonal[column];
+                    qt += term;
+                }
+                aq -= qt;
+                assert!(
+                    aq.abs() < tolerance,
+                    "A Q = Q T failed at row {row}, column {column}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn householder_q_is_orthogonal() {
         let prec = 256;
