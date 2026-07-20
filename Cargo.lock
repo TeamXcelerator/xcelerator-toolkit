@@ -583,6 +583,7 @@ dependencies = [
 name = "xc-cache"
 version = "0.13.0"
 dependencies = [
+ "rayon",
  "serde",
  "serde_json",
  "sha2",

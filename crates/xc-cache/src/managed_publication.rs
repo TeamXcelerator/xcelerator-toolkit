@@ -12,6 +12,7 @@ use crate::{
     TopologyRegistry, TopologyShardRoute, TopologyShardStatus, TopologyTrustPolicy,
     TransportPolicy, ValidatorEvidence,
 };
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,7 +41,7 @@ pub struct ManagedPreparedArtifactPublication {
     pub coordinated: CoordinatedPublicationPlan,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManagedPublicationExecutionReport {
     pub transaction_id: String,
     pub completed: bool,
@@ -48,12 +49,32 @@ pub struct ManagedPublicationExecutionReport {
     pub final_journal_digest: ContentDigest,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManagedRunPublicationReport {
     pub schema_version: u32,
     pub artifacts: Vec<ManagedPublicationExecutionReport>,
     pub all_completed: bool,
     #[serde(default)]
+    pub current_tree_paths_removed: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ManagedPublicationExecutionPhaseSummary {
+    pub phase_index: usize,
+    pub phase_digest: ContentDigest,
+    pub relative_report_path: String,
+    pub artifact_count: usize,
+    pub completed_artifact_count: usize,
+    pub all_completed: bool,
+    pub current_tree_paths_removed: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ManagedCumulativePublicationExecutionReport {
+    pub schema_version: u32,
+    pub phases: Vec<ManagedPublicationExecutionPhaseSummary>,
+    pub artifacts: Vec<ManagedPublicationExecutionReport>,
+    pub all_completed: bool,
     pub current_tree_paths_removed: usize,
 }
 
@@ -1038,8 +1059,8 @@ pub fn execute_prepared_managed_artifact_publication(
     })
 }
 
-pub fn execute_managed_drafts_on_github(
-    drafts: &[CanonicalProductionDraft],
+fn execute_managed_family_drafts_on_github(
+    drafts: &[&CanonicalProductionDraft],
     target: PublicationTarget,
     owner: &str,
     journal_root: &Path,
@@ -1057,44 +1078,63 @@ pub fn execute_managed_drafts_on_github(
     let checkpoints = crate::PublicationJournalStore::new(journal_root);
     let mut reports = Vec::new();
     let mut replacement_families = BTreeSet::new();
+    let first_draft = drafts.first().ok_or_else(|| {
+        CacheError::InvalidTransition("managed family publication received no drafts".to_owned())
+    })?;
+    if drafts
+        .iter()
+        .any(|draft| draft.family != first_draft.family)
+    {
+        return Err(CacheError::InvalidTransition(
+            "managed family publication requires exactly one artifact family".to_owned(),
+        ));
+    }
+
+    // Authenticate and initialize each destination once for the complete
+    // family. Every artifact retains its own transaction journal and audit
+    // receipt, but no longer pays for a fresh bare repository and fetch.
+    let mut sessions = BTreeMap::new();
+    for destination in destinations.iter().copied() {
+        let authorized_repository = repository(owner, &first_draft.family, destination);
+        sessions.insert(destination, probe.probe_repository(&authorized_repository)?);
+    }
+    let principals = sessions
+        .values()
+        .map(|session| session.evidence().principal.as_str())
+        .collect::<BTreeSet<_>>();
+    if principals.len() != 1 {
+        return Err(CacheError::Authentication(
+            "managed dual publication resolved different GitHub principals".to_owned(),
+        ));
+    }
+    let principal = principals
+        .into_iter()
+        .next()
+        .expect("target has a session")
+        .to_owned();
+    let mut remotes = BTreeMap::new();
+    for destination in destinations.iter().copied() {
+        let target_roots = drafts
+            .iter()
+            .map(|draft| target_staging_root(&draft.staged_parts_root, destination))
+            .collect::<Vec<_>>();
+        let temporary_root = journal_root
+            .join("git-transport")
+            .join("family")
+            .join(&first_draft.family)
+            .join(visibility_name(destination));
+        let remote = crate::GitCliRemoteStore::new(
+            temporary_root,
+            target_roots[0].clone(),
+            format!("Xcelerator Toolkit ({principal})"),
+            "xcelerator-toolkit@users.noreply.github.com",
+        )?
+        .with_additional_staged_parts_roots(target_roots.into_iter().skip(1))?
+        .with_resource_policy(resources.clone());
+        remotes.insert(destination, remote);
+    }
+
     for draft in drafts {
-        let mut sessions = BTreeMap::new();
-        for destination in destinations.iter().copied() {
-            let authorized_repository = repository(owner, &draft.family, destination);
-            sessions.insert(destination, probe.probe_repository(&authorized_repository)?);
-        }
-        let principals = sessions
-            .values()
-            .map(|session| session.evidence().principal.as_str())
-            .collect::<BTreeSet<_>>();
-        if principals.len() != 1 {
-            return Err(CacheError::Authentication(
-                "managed dual publication resolved different GitHub principals".to_owned(),
-            ));
-        }
-        let principal = principals
-            .into_iter()
-            .next()
-            .expect("target has a session")
-            .to_owned();
-
-        let mut remotes = BTreeMap::new();
-        for destination in destinations.iter().copied() {
-            let target_root = target_staging_root(&draft.staged_parts_root, destination);
-            let temporary_root = journal_root
-                .join("git-transport")
-                .join(&draft.manifest.semantic_digest.0)
-                .join(visibility_name(destination));
-            let remote = crate::GitCliRemoteStore::new(
-                temporary_root,
-                target_root,
-                format!("Xcelerator Toolkit ({principal})"),
-                "xcelerator-toolkit@users.noreply.github.com",
-            )?
-            .with_resource_policy(resources.clone());
-            remotes.insert(destination, remote);
-        }
-
         let semantic_prefix = &draft.manifest.semantic_digest.0[..2];
         let mut heads = BTreeMap::new();
         let mut ledgers = BTreeMap::new();
@@ -1137,7 +1177,7 @@ pub fn execute_managed_drafts_on_github(
         }
         let context = ManagedPublicationPlanningContext {
             owner: owner.to_owned(),
-            principal,
+            principal: principal.clone(),
             target,
             target_heads: heads,
             capacity_ledgers: ledgers,
@@ -1176,17 +1216,17 @@ pub fn execute_managed_drafts_on_github(
             event_unix_seconds,
             replace_existing_semantic,
         )?;
-        for destination in destinations.iter().copied() {
-            remotes[&destination].cleanup_session(&repository_url(
-                owner,
-                &draft.family,
-                destination,
-            ))?;
-        }
         reports.push(report);
         if replace_existing_semantic {
             replacement_families.insert(draft.family.clone());
         }
+    }
+    for destination in destinations.iter().copied() {
+        remotes[&destination].cleanup_session(&repository_url(
+            owner,
+            &first_draft.family,
+            destination,
+        ))?;
     }
     let mut current_tree_paths_removed = 0usize;
     if replace_existing_semantic {
@@ -1231,6 +1271,69 @@ pub fn execute_managed_drafts_on_github(
         schema_version: 1,
         all_completed: reports.iter().all(|report| report.completed),
         artifacts: reports,
+        current_tree_paths_removed,
+    })
+}
+
+pub fn execute_managed_drafts_on_github(
+    drafts: &[CanonicalProductionDraft],
+    target: PublicationTarget,
+    owner: &str,
+    journal_root: &Path,
+    resources: &xc_core::ResourcePolicy,
+    replace_existing_semantic: bool,
+) -> Result<ManagedRunPublicationReport, CacheError> {
+    let mut by_family = BTreeMap::<String, Vec<&CanonicalProductionDraft>>::new();
+    for draft in drafts {
+        by_family
+            .entry(draft.family.clone())
+            .or_default()
+            .push(draft);
+    }
+    let groups = by_family.into_values().collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    let reports = groups
+        .par_iter()
+        .map(|family_drafts| {
+            let family = family_drafts
+                .first()
+                .map(|draft| draft.family.as_str())
+                .unwrap_or("empty");
+            let family_started = std::time::Instant::now();
+            let report = execute_managed_family_drafts_on_github(
+                family_drafts,
+                target,
+                owner,
+                journal_root,
+                resources,
+                replace_existing_semantic,
+            )?;
+            eprintln!(
+                "publication family {family}: {} artifacts in {:.3}s",
+                report.artifacts.len(),
+                family_started.elapsed().as_secs_f64()
+            );
+            Ok(report)
+        })
+        .collect::<Result<Vec<_>, CacheError>>()?;
+
+    let artifacts = reports
+        .iter()
+        .flat_map(|report| report.artifacts.iter().cloned())
+        .collect::<Vec<_>>();
+    let current_tree_paths_removed = reports.iter().fold(0usize, |total, report| {
+        total.saturating_add(report.current_tree_paths_removed)
+    });
+    eprintln!(
+        "publication execution: {} artifacts across {} shard families in {:.3}s",
+        artifacts.len(),
+        reports.len(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(ManagedRunPublicationReport {
+        schema_version: 1,
+        all_completed: reports.iter().all(|report| report.all_completed),
+        artifacts,
         current_tree_paths_removed,
     })
 }

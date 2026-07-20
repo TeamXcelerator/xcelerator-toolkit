@@ -108,12 +108,23 @@ pub fn ccm_artifact_reuse_plan() -> xc_core::ArtifactReusePlan {
                 &["subspace", "eigenvalue_route", "requested_eigenvalues"],
             ),
             node(
+                "sector_transform",
+                true,
+                &[
+                    "sector_tridiagonal",
+                    "even_sector_matrix",
+                    "odd_sector_matrix",
+                ],
+                &["subspace", "basis_semantics", "precision_bits"],
+            ),
+            node(
                 "sector_spectrum",
                 true,
                 &[
                     "even_sector_matrix",
                     "odd_sector_matrix",
                     "sector_eigenvalues",
+                    "sector_transform",
                 ],
                 &[
                     "subspace",
@@ -190,6 +201,7 @@ pub enum CcmArtifactKind {
     EvenSectorMatrix,
     OddSectorMatrix,
     SectorTridiagonal,
+    SectorTransform,
     Factorization,
     SectorEigenvalues,
     SectorSpectrum,
@@ -217,6 +229,7 @@ impl CcmArtifactKind {
             Self::EvenSectorMatrix => "ccm_even_sector_matrix",
             Self::OddSectorMatrix => "ccm_odd_sector_matrix",
             Self::SectorTridiagonal => "ccm_sector_tridiagonal",
+            Self::SectorTransform => "ccm_sector_transform",
             Self::Factorization => "ccm_factorization",
             Self::SectorEigenvalues => "ccm_sector_eigenvalues",
             Self::SectorSpectrum => "ccm_sector_spectrum",

@@ -30,6 +30,11 @@ enum CcmCacheRoute<'a> {
     Fabric(&'a ArtifactCacheContext<'a>),
 }
 
+struct RetainedCcmSource {
+    tau: Vec<Float>,
+    tau_manifest: Option<ArtifactManifest>,
+}
+
 #[derive(Clone, Copy)]
 enum RootAcquisition<'a> {
     SourceOnly,
@@ -122,6 +127,18 @@ struct PortableSectorTridiagonal {
     dimension: usize,
     diagonal: Vec<String>,
     off_diagonal: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableSectorTransform {
+    schema_version: u32,
+    lambda_squared: String,
+    n_modes: usize,
+    precision_bits: u32,
+    parity: CcmParity,
+    dimension: usize,
+    basis: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1153,6 +1170,11 @@ struct SectorTridiagonalHp {
 }
 
 #[derive(Clone, Debug)]
+struct SectorTransformHp {
+    basis: Vec<Float>,
+}
+
+#[derive(Clone, Debug)]
 struct SectorEigenvaluesHp {
     route: CcmSectorEigenvalueRoute,
     complete: bool,
@@ -1208,6 +1230,62 @@ pub struct CcmSectorGapHp {
     pub ordering: i8,
     pub even_simple: bool,
     pub even_simplicity_margin: Float,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CcmResearchCaptureOptions {
+    pub capture_evenness: bool,
+    pub sector_analysis: Option<CcmSectorAnalysisOptions>,
+}
+
+impl CcmResearchCaptureOptions {
+    pub fn maximum(requested_sector_eigenpairs: usize) -> Self {
+        Self {
+            capture_evenness: true,
+            sector_analysis: Some(CcmSectorAnalysisOptions::maximum(
+                requested_sector_eigenpairs,
+            )),
+        }
+    }
+}
+
+pub struct CcmResearchCaptureResult {
+    pub primary: HighPrecResult,
+    pub evenness: Option<EvennessResult>,
+    pub sector_gap: Option<CcmSectorGapHp>,
+}
+
+fn evenness_from_sector_gap(
+    params: &CcmParams,
+    precision_bits: u32,
+    gap: &CcmSectorGapHp,
+) -> Result<EvennessResult> {
+    let (natural_eigenvalue, natural_vector) = match gap.ordering {
+        1 => (
+            gap.lambda_even.clone(),
+            expand_even_sector_vector(
+                &gap.even.eigenpairs[0].eigenvector,
+                params.n_modes,
+                precision_bits,
+            ),
+        ),
+        -1 => (
+            gap.lambda_odd.clone(),
+            expand_odd_sector_vector(
+                &gap.odd.eigenpairs[0].eigenvector,
+                params.n_modes,
+                precision_bits,
+            ),
+        ),
+        _ => bail!("CCM natural evenness is ambiguous at an even/odd degeneracy"),
+    };
+    Ok(evenness_from_natural_state(
+        params,
+        precision_bits,
+        natural_eigenvalue,
+        &natural_vector,
+        gap.lambda_even.clone(),
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2175,7 +2253,6 @@ fn build_odd_sector_matrix(tau: &[Float], n_modes: usize, prec: u32) -> Vec<Floa
     sector
 }
 
-#[cfg(test)]
 fn expand_odd_sector_vector(vector: &[Float], n_modes: usize, prec: u32) -> Vec<Float> {
     debug_assert_eq!(vector.len(), n_modes);
     let mut expanded = vec![Float::with_val(prec, 0); 2 * n_modes + 1];
@@ -2520,7 +2597,11 @@ fn resolve_sector_tridiagonal_via_cache(
     matrix: &[Float],
     matrix_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
-) -> Result<(SectorTridiagonalHp, ArtifactManifest)> {
+) -> Result<(
+    SectorTridiagonalHp,
+    ArtifactManifest,
+    Option<SectorTransformHp>,
+)> {
     let dimension = match parity {
         CcmParity::Even => params.n_modes + 1,
         CcmParity::Odd => params.n_modes,
@@ -2528,7 +2609,7 @@ fn resolve_sector_tridiagonal_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_sector_tridiagonal".to_owned(),
-        mathematical_semantics_version: "ccm-parity-tridiagonal-v0.13.0-v1".to_owned(),
+        mathematical_semantics_version: "ccm-parity-tridiagonal-v0.13.0-v2".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -2540,7 +2621,7 @@ fn resolve_sector_tridiagonal_via_cache(
         target: Some("symmetric_tridiagonal_reduction".to_owned()),
         subspace: Some(parity.as_str().to_owned()),
         source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some("dense_householder_no_q_accumulation".to_owned()),
+        algorithm_semantics: Some("dense_householder_with_reusable_q_capture_v1".to_owned()),
     };
     let logical_key = format!(
         "ccm/sector-tridiagonal/{}/{}/{}/{}",
@@ -2572,16 +2653,15 @@ fn resolve_sector_tridiagonal_via_cache(
         production_sink: cache.production_sink,
     };
     let validated = RefCell::new(None);
+    let computed_transform = RefCell::new(None);
     let started = Instant::now();
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            let (diagonal, off_diagonal) = xc_numerics::eigen::dense_symmetric_tridiagonal_hp(
-                matrix,
-                dimension,
-                cfg.precision_bits,
-            )
-            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            let (diagonal, off_diagonal, basis) =
+                xc_numerics::eigen::householder_tridiag_hp(matrix, dimension, cfg.precision_bits)
+                    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            computed_transform.replace(Some(SectorTransformHp { basis }));
             Ok((
                 PortableSectorTridiagonal {
                     schema_version: 1,
@@ -2629,7 +2709,222 @@ fn resolve_sector_tridiagonal_via_cache(
         if was_produced { "computed" } else { "reused" },
         started.elapsed().as_secs_f64()
     );
-    Ok((tridiagonal, manifest))
+    Ok((tridiagonal, manifest, computed_transform.into_inner()))
+}
+
+fn validate_sector_transform(
+    matrix: &[Float],
+    tridiagonal: &SectorTridiagonalHp,
+    transform: &SectorTransformHp,
+    dimension: usize,
+    precision_bits: u32,
+) -> bool {
+    if matrix.len() != dimension * dimension || transform.basis.len() != dimension * dimension {
+        return false;
+    }
+    let tolerance =
+        Float::with_val(precision_bits, 2).pow(-((precision_bits.saturating_sub(32)) as i32));
+
+    // Check every basis-vector norm and every adjacent dot product.  This is
+    // O(n^2), so cached transforms remain cheap to validate at research sizes.
+    for column in 0..dimension {
+        let mut norm = Float::with_val(precision_bits, 0);
+        let mut adjacent = Float::with_val(precision_bits, 0);
+        for row in 0..dimension {
+            let mut square = transform.basis[row * dimension + column].clone();
+            square.square_mut();
+            norm += square;
+            if column + 1 < dimension {
+                let mut product = transform.basis[row * dimension + column].clone();
+                product *= &transform.basis[row * dimension + column + 1];
+                adjacent += product;
+            }
+        }
+        norm -= 1u32;
+        if norm.abs() > tolerance || adjacent.abs() > tolerance {
+            return false;
+        }
+    }
+
+    // Replay A Q = Q T for boundary and central columns.  Every retained
+    // eigenvector is additionally replayed against A before acceptance.
+    let mut columns = vec![0, dimension / 2, dimension - 1];
+    columns.sort_unstable();
+    columns.dedup();
+    for column in columns {
+        for row in 0..dimension {
+            let mut left = Float::with_val(precision_bits, 0);
+            for inner in 0..dimension {
+                let mut term = matrix[row * dimension + inner].clone();
+                term *= &transform.basis[inner * dimension + column];
+                left += term;
+            }
+            let mut right = transform.basis[row * dimension + column].clone();
+            right *= &tridiagonal.diagonal[column];
+            if column > 0 {
+                let mut term = transform.basis[row * dimension + column - 1].clone();
+                term *= &tridiagonal.off_diagonal[column - 1];
+                right += term;
+            }
+            if column + 1 < dimension {
+                let mut term = transform.basis[row * dimension + column + 1].clone();
+                term *= &tridiagonal.off_diagonal[column];
+                right += term;
+            }
+            left -= right;
+            if left.abs() > tolerance {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_sector_transform_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    parity: CcmParity,
+    matrix: &[Float],
+    matrix_manifest: &ArtifactManifest,
+    tridiagonal: &SectorTridiagonalHp,
+    tridiagonal_manifest: &ArtifactManifest,
+    precomputed: Option<&SectorTransformHp>,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(SectorTransformHp, ArtifactManifest)> {
+    let dimension = match parity {
+        CcmParity::Even => params.n_modes + 1,
+        CcmParity::Odd => params.n_modes,
+    };
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_sector_transform".to_owned(),
+        mathematical_semantics_version: "ccm-parity-householder-basis-v0.13.0-v1".to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": cfg.precision_bits,
+            "parity": parity.as_str(),
+            "sector_matrix_content_digest": matrix_manifest.content_digest.0,
+            "sector_tridiagonal_content_digest": tridiagonal_manifest.content_digest.0
+        }),
+        normalization: Some("row_major_orthogonal_householder_basis".to_owned()),
+        target: Some("tridiagonal_to_dense_eigenvector_transform".to_owned()),
+        subspace: Some(parity.as_str().to_owned()),
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: Some("dense_householder_q_accumulation".to_owned()),
+    };
+    let logical_key = format!(
+        "ccm/sector-transform/{}/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        cfg.precision_bits,
+        parity.as_str()
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.sector_transform.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Validated,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "sector_transform".to_owned()),
+            ("parity".to_owned(), parity.as_str().to_owned()),
+        ]),
+        provenance_digest: None,
+        production_sink: cache.production_sink,
+    };
+    let validated = RefCell::new(None);
+    let started = Instant::now();
+    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+        &request,
+        || {
+            let basis = if let Some(precomputed) = precomputed {
+                precomputed.basis.clone()
+            } else {
+                let (diagonal, off_diagonal, basis) = xc_numerics::eigen::householder_tridiag_hp(
+                    matrix,
+                    dimension,
+                    cfg.precision_bits,
+                )
+                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                if diagonal != tridiagonal.diagonal || off_diagonal != tridiagonal.off_diagonal {
+                    return Err(CacheError::InvalidManifest(
+                        "CCM Householder basis did not reproduce the cached tridiagonal".to_owned(),
+                    ));
+                }
+                basis
+            };
+            Ok((
+                PortableSectorTransform {
+                    schema_version: 1,
+                    lambda_squared: lambda_squared_cache_identity(params),
+                    n_modes: params.n_modes,
+                    precision_bits: cfg.precision_bits,
+                    parity,
+                    dimension,
+                    basis: basis.iter().map(Float::to_string).collect(),
+                },
+                canonical_dependency_refs(vec![
+                    matrix_manifest.clone(),
+                    tridiagonal_manifest.clone(),
+                ]),
+            ))
+        },
+        |artifact| {
+            if artifact.schema_version != 1
+                || artifact.lambda_squared != lambda_squared_cache_identity(params)
+                || artifact.n_modes != params.n_modes
+                || artifact.precision_bits != cfg.precision_bits
+                || artifact.parity != parity
+                || artifact.dimension != dimension
+                || artifact.basis.len() != dimension * dimension
+            {
+                return Err(CacheError::InvalidManifest(
+                    "CCM sector transform does not match its semantic identity".to_owned(),
+                ));
+            }
+            let transform = SectorTransformHp {
+                basis: parse_hp_vector(&artifact.basis, cfg.precision_bits)?,
+            };
+            if !validate_sector_transform(
+                matrix,
+                tridiagonal,
+                &transform,
+                dimension,
+                cfg.precision_bits,
+            ) {
+                return Err(CacheError::InvalidManifest(
+                    "CCM sector transform failed orthogonality or A Q = Q T replay".to_owned(),
+                ));
+            }
+            validated.replace(Some(transform));
+            Ok(())
+        },
+    )?;
+    let was_produced = resolved.produced_manifest.is_some();
+    let manifest = resolved
+        .produced_manifest
+        .or(resolved.reused_manifest)
+        .ok_or_else(|| anyhow::anyhow!("sector-transform execution returned no manifest"))?;
+    let transform = validated.into_inner().ok_or_else(|| {
+        anyhow::anyhow!("sector-transform execution retained no validated runtime value")
+    })?;
+    eprintln!(
+        "[HP] {parity:?} sector transform: {} in {:.3}s",
+        if was_produced { "computed" } else { "reused" },
+        started.elapsed().as_secs_f64()
+    );
+    Ok((transform, manifest))
 }
 
 fn selected_sector_tolerance(precision_bits: u32) -> Float {
@@ -3059,12 +3354,15 @@ fn sector_eigenpair_residual_norm(
     Ok(squared_norm.sqrt())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_sector_spectrum(
     matrix: &[Float],
     dimension: usize,
     parity: CcmParity,
     requested_eigenpairs: usize,
     eigenvalues: &SectorEigenvaluesHp,
+    tridiagonal: &SectorTridiagonalHp,
+    transform: &SectorTransformHp,
     cfg: &HighPrecConfig,
 ) -> Result<CcmSectorSpectrumHp> {
     if dimension == 0
@@ -3087,13 +3385,32 @@ fn compute_sector_spectrum(
         .cloned()
         .enumerate()
         .map(|(algebraic_index, eigenvalue)| {
-            let eigenvector = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
-                matrix,
-                dimension,
+            let tridiagonal_vector = xc_numerics::eigen::tridiag_eigenvector_for_value_hp(
+                &tridiagonal.diagonal,
+                &tridiagonal.off_diagonal,
                 &eigenvalue,
                 cfg.precision_bits,
-                cfg.inverse_iter_steps,
+                xc_numerics::eigen::TridiagEigvecOptions {
+                    max_steps: cfg.inverse_iter_steps,
+                    early_termination: true,
+                    solver: xc_numerics::eigen::TridiagSolver::Banded,
+                },
             )?;
+            let eigenvector = (0..dimension)
+                .map(|row| {
+                    let terms = (0..dimension)
+                        .map(|column| {
+                            let mut term = transform.basis[row * dimension + column].clone();
+                            term *= &tridiagonal_vector[column];
+                            term
+                        })
+                        .collect();
+                    xc_numerics::reduction::deterministic_pairwise_sum_hp_owned(
+                        terms,
+                        cfg.precision_bits,
+                    )
+                })
+                .collect::<Vec<_>>();
             let residual_norm = sector_eigenpair_residual_norm(
                 matrix,
                 dimension,
@@ -3110,7 +3427,7 @@ fn compute_sector_spectrum(
         })
         .collect::<Result<Vec<_>>>()?;
     eprintln!(
-        "[HP] {parity:?} sector spectrum: {requested_eigenpairs} retained eigenvectors={:.3}s",
+        "[HP] {parity:?} sector spectrum: {requested_eigenpairs} retained eigenvectors via banded tridiagonal solve={:.3}s",
         eigenvector_start.elapsed().as_secs_f64(),
     );
     Ok(CcmSectorSpectrumHp {
@@ -3254,6 +3571,10 @@ fn resolve_sector_spectrum_via_cache(
     requested_eigenpairs: usize,
     eigenvalues: &SectorEigenvaluesHp,
     eigenvalues_manifest: &ArtifactManifest,
+    tridiagonal: &SectorTridiagonalHp,
+    tridiagonal_manifest: &ArtifactManifest,
+    transform: &SectorTransformHp,
+    transform_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<(CcmSectorSpectrumHp, ArtifactManifest)> {
     let dimension = match parity {
@@ -3263,7 +3584,7 @@ fn resolve_sector_spectrum_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_sector_spectrum".to_owned(),
-        mathematical_semantics_version: "ccm-parity-sector-spectrum-v0.13.0-v2".to_owned(),
+        mathematical_semantics_version: "ccm-parity-sector-spectrum-v0.13.0-v3".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -3272,14 +3593,16 @@ fn resolve_sector_spectrum_via_cache(
             "eigenvalue_route": eigenvalues.route.as_str(),
             "requested_eigenpairs": requested_eigenpairs,
             "sector_matrix_content_digest": matrix_manifest.content_digest.0,
-            "sector_eigenvalues_content_digest": eigenvalues_manifest.content_digest.0
+            "sector_eigenvalues_content_digest": eigenvalues_manifest.content_digest.0,
+            "sector_tridiagonal_content_digest": tridiagonal_manifest.content_digest.0,
+            "sector_transform_content_digest": transform_manifest.content_digest.0
         }),
         normalization: Some("l2_unit_sector_vectors_algebraic_order".to_owned()),
         target: Some("lowest_parity_sector_eigenpairs".to_owned()),
         subspace: Some(parity.as_str().to_owned()),
         source_data_identities: BTreeMap::new(),
         algorithm_semantics: Some(
-            "indexed_eigenvalues_plus_dense_shifted_inverse_iteration".to_owned(),
+            "indexed_eigenvalues_plus_banded_tridiagonal_inverse_iteration_and_householder_backtransform_v1".to_owned(),
         ),
     };
     let logical_key = format!(
@@ -3326,6 +3649,8 @@ fn resolve_sector_spectrum_via_cache(
                 parity,
                 requested_eigenpairs,
                 eigenvalues,
+                tridiagonal,
+                transform,
                 cfg,
             )
             .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
@@ -3338,6 +3663,8 @@ fn resolve_sector_spectrum_via_cache(
                 canonical_dependency_refs(vec![
                     matrix_manifest.clone(),
                     eigenvalues_manifest.clone(),
+                    tridiagonal_manifest.clone(),
+                    transform_manifest.clone(),
                 ]),
             ))
         },
@@ -3534,140 +3861,197 @@ fn resolve_sector_gap_via_cache(
     Ok((expected, manifest))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn resolve_sector_branch_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    parity: CcmParity,
+    matrix: &[Float],
+    matrix_manifest: &ArtifactManifest,
+    requested_eigenpairs: usize,
+    route: CcmSectorEigenvalueRoute,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<(CcmSectorSpectrumHp, ArtifactManifest)> {
+    let dimension = match parity {
+        CcmParity::Even => params.n_modes + 1,
+        CcmParity::Odd => params.n_modes,
+    };
+    let (tridiagonal, tridiagonal_manifest, precomputed_transform) =
+        resolve_sector_tridiagonal_via_cache(params, cfg, parity, matrix, matrix_manifest, cache)?;
+    let (transform, transform_manifest) = resolve_sector_transform_via_cache(
+        params,
+        cfg,
+        parity,
+        matrix,
+        matrix_manifest,
+        &tridiagonal,
+        &tridiagonal_manifest,
+        precomputed_transform.as_ref(),
+        cache,
+    )?;
+    let (eigenvalues, eigenvalues_manifest) = resolve_sector_eigenvalues_via_cache(
+        params,
+        cfg,
+        parity,
+        dimension,
+        requested_eigenpairs,
+        route,
+        &tridiagonal,
+        &tridiagonal_manifest,
+        cache,
+    )?;
+    resolve_sector_spectrum_via_cache(
+        params,
+        cfg,
+        parity,
+        matrix,
+        matrix_manifest,
+        requested_eigenpairs,
+        &eigenvalues,
+        &eigenvalues_manifest,
+        &tridiagonal,
+        &tridiagonal_manifest,
+        &transform,
+        &transform_manifest,
+        cache,
+    )
+}
+
+fn compute_sector_branch(
+    matrix: &[Float],
+    dimension: usize,
+    parity: CcmParity,
+    requested_eigenpairs: usize,
+    route: CcmSectorEigenvalueRoute,
+    cfg: &HighPrecConfig,
+) -> Result<CcmSectorSpectrumHp> {
+    let (diagonal, off_diagonal, basis) =
+        xc_numerics::eigen::householder_tridiag_hp(matrix, dimension, cfg.precision_bits)?;
+    let tridiagonal = SectorTridiagonalHp {
+        diagonal,
+        off_diagonal,
+    };
+    let transform = SectorTransformHp { basis };
+    let eigenvalues = compute_sector_eigenvalues(
+        &tridiagonal,
+        dimension,
+        requested_eigenpairs,
+        route,
+        cfg.precision_bits,
+    )?;
+    compute_sector_spectrum(
+        matrix,
+        dimension,
+        parity,
+        requested_eigenpairs,
+        &eigenvalues,
+        &tridiagonal,
+        &transform,
+        cfg,
+    )
+}
+
 fn analyze_sector_gap_inner(
     params: &CcmParams,
     cfg: &HighPrecConfig,
     options: CcmSectorAnalysisOptions,
     cache: Option<&ArtifactCacheContext<'_>>,
 ) -> Result<CcmSectorGapHp> {
+    let l = log_lambda_sq_hp(params, cfg.precision_bits);
+    let source = if let Some(cache) = cache {
+        let (tau, tau_manifest) = build_tau_hp_via_cache(params, &l, cfg, cache)?;
+        RetainedCcmSource {
+            tau,
+            tau_manifest: Some(tau_manifest),
+        }
+    } else {
+        RetainedCcmSource {
+            tau: build_tau_hp(params, &l, cfg)?,
+            tau_manifest: None,
+        }
+    };
+    analyze_sector_gap_from_retained_source(params, cfg, options, cache, source)
+}
+
+fn analyze_sector_gap_from_retained_source(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    options: CcmSectorAnalysisOptions,
+    cache: Option<&ArtifactCacheContext<'_>>,
+    mut source: RetainedCcmSource,
+) -> Result<CcmSectorGapHp> {
     let requested_eigenpairs = options.requested_eigenpairs;
     if requested_eigenpairs < 2 || requested_eigenpairs > params.n_modes {
         bail!("CCM sector-gap analysis requires between two and N eigenpairs per sector");
     }
-    let l = log_lambda_sq_hp(params, cfg.precision_bits);
     if let Some(cache) = cache {
-        let (mut tau, tau_manifest) = build_tau_hp_via_cache(params, &l, cfg, cache)?;
+        let tau_manifest = source.tau_manifest.take().ok_or_else(|| {
+            anyhow::anyhow!("managed retained CCM source is missing its Tau manifest")
+        })?;
+        let mut tau = source.tau;
         force_symmetric(&mut tau, params.matrix_size());
         let (even_matrix, even_matrix_manifest) =
             resolve_even_sector_matrix_via_cache(params, cfg, &tau, &tau_manifest, cache)?;
         let (odd_matrix, odd_matrix_manifest) =
             resolve_odd_sector_matrix_via_cache(params, cfg, &tau, &tau_manifest, cache)?;
-        let (even_tridiagonal, even_tridiagonal_manifest) = resolve_sector_tridiagonal_via_cache(
-            params,
-            cfg,
-            CcmParity::Even,
-            &even_matrix,
-            &even_matrix_manifest,
-            cache,
-        )?;
-        let (odd_tridiagonal, odd_tridiagonal_manifest) = resolve_sector_tridiagonal_via_cache(
-            params,
-            cfg,
-            CcmParity::Odd,
-            &odd_matrix,
-            &odd_matrix_manifest,
-            cache,
-        )?;
-        let (even_eigenvalues, even_eigenvalues_manifest) = resolve_sector_eigenvalues_via_cache(
-            params,
-            cfg,
-            CcmParity::Even,
-            params.n_modes + 1,
-            requested_eigenpairs,
-            options.eigenvalue_route,
-            &even_tridiagonal,
-            &even_tridiagonal_manifest,
-            cache,
-        )?;
-        let (odd_eigenvalues, odd_eigenvalues_manifest) = resolve_sector_eigenvalues_via_cache(
-            params,
-            cfg,
-            CcmParity::Odd,
-            params.n_modes,
-            requested_eigenpairs,
-            options.eigenvalue_route,
-            &odd_tridiagonal,
-            &odd_tridiagonal_manifest,
-            cache,
-        )?;
-        let (even, even_manifest) = resolve_sector_spectrum_via_cache(
-            params,
-            cfg,
-            CcmParity::Even,
-            &even_matrix,
-            &even_matrix_manifest,
-            requested_eigenpairs,
-            &even_eigenvalues,
-            &even_eigenvalues_manifest,
-            cache,
-        )?;
-        let (odd, odd_manifest) = resolve_sector_spectrum_via_cache(
-            params,
-            cfg,
-            CcmParity::Odd,
-            &odd_matrix,
-            &odd_matrix_manifest,
-            requested_eigenpairs,
-            &odd_eigenvalues,
-            &odd_eigenvalues_manifest,
-            cache,
-        )?;
+        let (even_result, odd_result) = rayon::join(
+            || {
+                resolve_sector_branch_via_cache(
+                    params,
+                    cfg,
+                    CcmParity::Even,
+                    &even_matrix,
+                    &even_matrix_manifest,
+                    requested_eigenpairs,
+                    options.eigenvalue_route,
+                    cache,
+                )
+            },
+            || {
+                resolve_sector_branch_via_cache(
+                    params,
+                    cfg,
+                    CcmParity::Odd,
+                    &odd_matrix,
+                    &odd_matrix_manifest,
+                    requested_eigenpairs,
+                    options.eigenvalue_route,
+                    cache,
+                )
+            },
+        );
+        let (even, even_manifest) = even_result?;
+        let (odd, odd_manifest) = odd_result?;
         resolve_sector_gap_via_cache(params, cfg, even, odd, &even_manifest, &odd_manifest, cache)
             .map(|(gap, _)| gap)
     } else {
-        let mut tau = build_tau_hp(params, &l, cfg)?;
+        let mut tau = source.tau;
         force_symmetric(&mut tau, params.matrix_size());
         let even_matrix = build_even_sector_matrix(&tau, params.n_modes, cfg.precision_bits);
         let odd_matrix = build_odd_sector_matrix(&tau, params.n_modes, cfg.precision_bits);
-        let (even_diagonal, even_off_diagonal) =
-            xc_numerics::eigen::dense_symmetric_tridiagonal_hp(
-                &even_matrix,
-                params.n_modes + 1,
-                cfg.precision_bits,
-            )?;
-        let even_tridiagonal = SectorTridiagonalHp {
-            diagonal: even_diagonal,
-            off_diagonal: even_off_diagonal,
-        };
-        let (odd_diagonal, odd_off_diagonal) = xc_numerics::eigen::dense_symmetric_tridiagonal_hp(
-            &odd_matrix,
-            params.n_modes,
-            cfg.precision_bits,
-        )?;
-        let odd_tridiagonal = SectorTridiagonalHp {
-            diagonal: odd_diagonal,
-            off_diagonal: odd_off_diagonal,
-        };
-        let even_eigenvalues = compute_sector_eigenvalues(
-            &even_tridiagonal,
-            params.n_modes + 1,
-            requested_eigenpairs,
-            options.eigenvalue_route,
-            cfg.precision_bits,
-        )?;
-        let odd_eigenvalues = compute_sector_eigenvalues(
-            &odd_tridiagonal,
-            params.n_modes,
-            requested_eigenpairs,
-            options.eigenvalue_route,
-            cfg.precision_bits,
-        )?;
-        let even = compute_sector_spectrum(
-            &even_matrix,
-            params.n_modes + 1,
-            CcmParity::Even,
-            requested_eigenpairs,
-            &even_eigenvalues,
-            cfg,
-        )?;
-        let odd = compute_sector_spectrum(
-            &odd_matrix,
-            params.n_modes,
-            CcmParity::Odd,
-            requested_eigenpairs,
-            &odd_eigenvalues,
-            cfg,
-        )?;
+        let (even, odd) = rayon::join(
+            || {
+                compute_sector_branch(
+                    &even_matrix,
+                    params.n_modes + 1,
+                    CcmParity::Even,
+                    requested_eigenpairs,
+                    options.eigenvalue_route,
+                    cfg,
+                )
+            },
+            || {
+                compute_sector_branch(
+                    &odd_matrix,
+                    params.n_modes,
+                    CcmParity::Odd,
+                    requested_eigenpairs,
+                    options.eigenvalue_route,
+                    cfg,
+                )
+            },
+        );
+        let (even, odd) = (even?, odd?);
         compute_sector_gap(even, odd, cfg.precision_bits)
     }
 }
@@ -3921,7 +4305,7 @@ fn weil_eigenpair_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_weil_eigenpair".to_owned(),
-        mathematical_semantics_version: "ccm-smallest-weil-eigenpair-v0.13.0-v2".to_owned(),
+        mathematical_semantics_version: "ccm-smallest-weil-eigenpair-v0.13.0-v3".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -3935,7 +4319,10 @@ fn weil_eigenpair_via_cache(
         target: Some("smallest_weil_form_eigenpair".to_owned()),
         subspace: cfg.force_even.then(|| "even".to_owned()),
         source_data_identities: BTreeMap::new(),
-        algorithm_semantics: None,
+        algorithm_semantics: Some(
+            "dense_inverse_iteration_with_half_precision_basin_shifted_rescue_and_full_tau_residual_gate_v1"
+                .to_owned(),
+        ),
     };
     let logical_key = format!(
         "ccm/weil-eigenpair/{}/{}/{}/{}",
@@ -4165,9 +4552,8 @@ fn compute_root_range(
     cfg: &HighPrecConfig,
     seeds: &[Float],
 ) -> Vec<EigenvalueResult> {
-    let mut outcomes = Vec::with_capacity(seeds.len());
-    for seed in seeds {
-        let outcome = solve_r_zero(
+    let solve = |seed: &Float| {
+        solve_r_zero(
             xi,
             params.n_modes,
             l,
@@ -4175,15 +4561,19 @@ fn compute_root_range(
             cfg.precision_bits,
             cfg.solver_steps,
             cfg.root_solver,
-        );
-        let has_value = outcome.has_value();
-        outcomes.push(outcome);
-        // A result with no numerical value leaves an unfillable gap in the
-        // ordered window. Precision-limited values remain useful computed
-        // evidence, so continue refining the remainder of the request.
-        if !has_value {
-            break;
-        }
+        )
+    };
+    // Each seed defines an independent pole-safe refinement. `par_iter` on a
+    // slice is indexed, so collect retains the exact algebraic seed order.
+    // The sequential truncation below preserves the established rule that a
+    // valueless failure leaves an unfillable ordered-window gap.
+    let mut outcomes = if seeds.len() < 2 {
+        seeds.iter().map(solve).collect::<Vec<_>>()
+    } else {
+        seeds.par_iter().map(solve).collect::<Vec<_>>()
+    };
+    if let Some(first_failure) = outcomes.iter().position(|outcome| !outcome.has_value()) {
+        outcomes.truncate(first_failure + 1);
     }
     outcomes
 }
@@ -4818,6 +5208,102 @@ pub fn run_independent(
     run_with_acquisition(params, cfg, RootAcquisition::Independent(target))
 }
 
+/// Run independent root discovery and all requested research diagnostics in
+/// one toolkit-owned cache/publication session. Independent supplemental
+/// branches share the Rayon pool and publication is finalized exactly once.
+pub fn run_independent_with_research_capture(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    target: &ZeroTarget,
+    options: CcmResearchCaptureOptions,
+) -> Result<CcmResearchCaptureResult> {
+    let managed =
+        xc_cache::ManagedArtifactCacheSession::from_environment().map_err(anyhow::Error::from)?;
+    let execute = |cache: Option<&ArtifactCacheContext<'_>>| {
+        let (primary, retained_source) = run_inner_retaining_source(
+            params,
+            cfg,
+            RootAcquisition::Independent(target),
+            cache
+                .map(CcmCacheRoute::Fabric)
+                .unwrap_or(CcmCacheRoute::Standalone),
+        )?;
+        let supplemental_started = Instant::now();
+        // A parity-sector decomposition is a stronger and substantially less
+        // expensive natural-state calculation than repeating full dense
+        // inverse iteration. The winning sector vector is lifted to the full
+        // reflection basis and passed through the same evenness calculation.
+        let (sector_gap, retained_source) = match options.sector_analysis {
+            Some(sector_options) => (
+                Some(analyze_sector_gap_from_retained_source(
+                    params,
+                    cfg,
+                    sector_options,
+                    cache,
+                    retained_source,
+                )?),
+                None,
+            ),
+            None => (None, Some(retained_source)),
+        };
+        let evenness = if options.capture_evenness {
+            if let Some(gap) = &sector_gap {
+                Some(evenness_from_sector_gap(params, cfg.precision_bits, gap)?)
+            } else if cache.is_none() {
+                Some(measure_evenness_from_tau(
+                    params,
+                    cfg,
+                    retained_source
+                        .expect("source is retained when sector analysis is disabled")
+                        .tau,
+                )?)
+            } else {
+                let mut source =
+                    retained_source.expect("source is retained when sector analysis is disabled");
+                let tau_manifest = source.tau_manifest.take().ok_or_else(|| {
+                    anyhow::anyhow!("managed retained CCM source is missing its Tau manifest")
+                })?;
+                Some(measure_evenness_from_retained_source_via_cache(
+                    params,
+                    cfg,
+                    source.tau,
+                    tau_manifest,
+                    cache.expect("managed branch has a cache context"),
+                )?)
+            }
+        } else {
+            None
+        };
+        eprintln!(
+            "[HP] supplemental research capture completed in {:.3}s",
+            supplemental_started.elapsed().as_secs_f64()
+        );
+        Ok(CcmResearchCaptureResult {
+            primary,
+            evenness,
+            sector_gap,
+        })
+    };
+
+    if let Some(managed) = &managed {
+        #[cfg(not(feature = "arb"))]
+        if managed.requested_assurance() != xc_core::AssuranceLevel::Computed {
+            bail!(
+                "requested {:?} assurance requires an xc-spectral build with the arb feature",
+                managed.requested_assurance()
+            );
+        }
+        let cache = managed.context();
+        let result = xc_numerics::hp_runtime::run_hp(|| execute(Some(&cache)))?;
+        managed
+            .finalize_publication_inventory()
+            .map_err(anyhow::Error::from)?;
+        Ok(result)
+    } else {
+        xc_numerics::hp_runtime::run_hp(|| execute(None))
+    }
+}
+
 /// Refine a caller-supplied, explicitly indexed root window while reusing the
 /// same managed Tau and secular-source artifacts as every other window.
 ///
@@ -5063,9 +5549,6 @@ fn discover_secular_roots_hp(
     scan_upper: &Float,
     precision_bits: u32,
 ) -> Result<Vec<Float>> {
-    const SUBDIVISIONS: usize = 16;
-    const BISECTION_STEPS: usize = 128;
-
     let mut boundaries = vec![Float::with_val(precision_bits, 0)];
     for mode in 1..=n_modes {
         let mut pole = spacing.clone();
@@ -5077,68 +5560,138 @@ fn discover_secular_roots_hp(
     boundaries.push(scan_upper.clone());
 
     let margin_fraction = Float::with_val(precision_bits, 2).pow(-64i32);
+    // Pole intervals do not share state. Parallel indexed collection retains
+    // interval order, while each interval keeps its established sequential
+    // subdivision and bisection arithmetic exactly unchanged.
+    let interval_roots = boundaries
+        .par_windows(2)
+        .map(|interval| {
+            discover_secular_roots_in_interval_hp(
+                xi,
+                n_modes,
+                spacing,
+                interval,
+                &margin_fraction,
+                precision_bits,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut roots = Vec::new();
+    for root in interval_roots.into_iter().flatten() {
+        if root > 0 && roots.last().is_none_or(|previous| &root > previous) {
+            roots.push(root);
+        }
+    }
+    Ok(roots)
+}
+
+#[cfg(test)]
+fn discover_secular_roots_hp_sequential_reference(
+    xi: &[Float],
+    n_modes: usize,
+    spacing: &Float,
+    scan_upper: &Float,
+    precision_bits: u32,
+) -> Result<Vec<Float>> {
+    let mut boundaries = vec![Float::with_val(precision_bits, 0)];
+    for mode in 1..=n_modes {
+        let mut pole = spacing.clone();
+        pole *= mode;
+        if pole < *scan_upper {
+            boundaries.push(pole);
+        }
+    }
+    boundaries.push(scan_upper.clone());
+    let margin_fraction = Float::with_val(precision_bits, 2).pow(-64i32);
     let mut roots = Vec::new();
     for interval in boundaries.windows(2) {
-        let mut width = interval[1].clone();
-        width -= &interval[0];
-        if width <= 0 {
-            continue;
+        for root in discover_secular_roots_in_interval_hp(
+            xi,
+            n_modes,
+            spacing,
+            interval,
+            &margin_fraction,
+            precision_bits,
+        )? {
+            if root > 0 && roots.last().is_none_or(|previous| &root > previous) {
+                roots.push(root);
+            }
         }
-        let mut margin = width.clone();
-        margin *= &margin_fraction;
-        let mut left = interval[0].clone();
-        left += &margin;
-        let mut right = interval[1].clone();
-        right -= &margin;
-        if left >= right {
-            continue;
-        }
+    }
+    Ok(roots)
+}
 
-        let mut previous_point = left.clone();
-        let mut previous_value =
-            evaluate_secular_hp(xi, n_modes, spacing, &previous_point, precision_bits)?;
-        for subdivision in 1..=SUBDIVISIONS {
-            let mut point = right.clone();
-            point -= &left;
-            point *= subdivision;
-            point /= SUBDIVISIONS;
-            point += &left;
-            let value = evaluate_secular_hp(xi, n_modes, spacing, &point, precision_bits)?;
-            let changes_sign = previous_value.is_zero()
-                || value.is_zero()
-                || previous_value.is_sign_positive() != value.is_sign_positive();
-            if changes_sign {
-                let mut bracket_left = previous_point.clone();
-                let mut bracket_right = point.clone();
-                let mut left_value = previous_value.clone();
-                for _ in 0..BISECTION_STEPS {
-                    let mut midpoint = bracket_left.clone();
-                    midpoint += &bracket_right;
-                    midpoint /= 2u32;
-                    let midpoint_value =
-                        evaluate_secular_hp(xi, n_modes, spacing, &midpoint, precision_bits)?;
-                    if midpoint_value.is_zero() {
-                        bracket_left = midpoint.clone();
-                        bracket_right = midpoint;
-                        break;
-                    }
-                    if left_value.is_sign_positive() != midpoint_value.is_sign_positive() {
-                        bracket_right = midpoint;
-                    } else {
-                        bracket_left = midpoint;
-                        left_value = midpoint_value;
-                    }
+fn discover_secular_roots_in_interval_hp(
+    xi: &[Float],
+    n_modes: usize,
+    spacing: &Float,
+    interval: &[Float],
+    margin_fraction: &Float,
+    precision_bits: u32,
+) -> Result<Vec<Float>> {
+    const SUBDIVISIONS: usize = 16;
+    const BISECTION_STEPS: usize = 128;
+
+    let mut width = interval[1].clone();
+    width -= &interval[0];
+    if width <= 0 {
+        return Ok(Vec::new());
+    }
+    let mut margin = width.clone();
+    margin *= margin_fraction;
+    let mut left = interval[0].clone();
+    left += &margin;
+    let mut right = interval[1].clone();
+    right -= &margin;
+    if left >= right {
+        return Ok(Vec::new());
+    }
+
+    let mut roots = Vec::new();
+    let mut previous_point = left.clone();
+    let mut previous_value =
+        evaluate_secular_hp(xi, n_modes, spacing, &previous_point, precision_bits)?;
+    for subdivision in 1..=SUBDIVISIONS {
+        let mut point = right.clone();
+        point -= &left;
+        point *= subdivision;
+        point /= SUBDIVISIONS;
+        point += &left;
+        let value = evaluate_secular_hp(xi, n_modes, spacing, &point, precision_bits)?;
+        let changes_sign = previous_value.is_zero()
+            || value.is_zero()
+            || previous_value.is_sign_positive() != value.is_sign_positive();
+        if changes_sign {
+            let mut bracket_left = previous_point.clone();
+            let mut bracket_right = point.clone();
+            let mut left_value = previous_value.clone();
+            for _ in 0..BISECTION_STEPS {
+                let mut midpoint = bracket_left.clone();
+                midpoint += &bracket_right;
+                midpoint /= 2u32;
+                let midpoint_value =
+                    evaluate_secular_hp(xi, n_modes, spacing, &midpoint, precision_bits)?;
+                if midpoint_value.is_zero() {
+                    bracket_left = midpoint.clone();
+                    bracket_right = midpoint;
+                    break;
                 }
-                let mut root = bracket_left;
-                root += bracket_right;
-                root /= 2u32;
-                if root > 0 && roots.last().is_none_or(|previous| &root > previous) {
-                    roots.push(root);
+                if left_value.is_sign_positive() != midpoint_value.is_sign_positive() {
+                    bracket_right = midpoint;
+                } else {
+                    bracket_left = midpoint;
+                    left_value = midpoint_value;
                 }
             }
-            previous_point = point;
-            previous_value = value;
+            let mut root = bracket_left;
+            root += bracket_right;
+            root /= 2u32;
+            if root > 0 && roots.last().is_none_or(|previous| &root > previous) {
+                roots.push(root);
+            }
         }
+        previous_point = point;
+        previous_value = value;
     }
     Ok(roots)
 }
@@ -5149,11 +5702,21 @@ fn run_inner(
     acquisition: RootAcquisition<'_>,
     cache_route: CcmCacheRoute<'_>,
 ) -> Result<HighPrecResult> {
+    run_inner_retaining_source(params, cfg, acquisition, cache_route).map(|(result, _)| result)
+}
+
+fn run_inner_retaining_source(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    acquisition: RootAcquisition<'_>,
+    cache_route: CcmCacheRoute<'_>,
+) -> Result<(HighPrecResult, RetainedCcmSource)> {
     let start = Instant::now();
     let prec = cfg.precision_bits;
     let dim = params.matrix_size();
 
     let l = log_lambda_sq_hp(params, prec);
+    let tau_started = Instant::now();
     let (mut tau, tau_manifest) = match &cache_route {
         CcmCacheRoute::Standalone => (build_tau_hp(params, &l, cfg)?, None),
         CcmCacheRoute::Fabric(cache) => {
@@ -5161,6 +5724,10 @@ fn run_inner(
             (tau, Some(manifest))
         }
     };
+    eprintln!(
+        "[HP] phase timing: tau construction/reuse={:.3}s",
+        tau_started.elapsed().as_secs_f64()
+    );
 
     // Force exact symmetry of the τ-matrix (parallel compute, sequential write).
     force_symmetric(&mut tau, dim);
@@ -5175,6 +5742,7 @@ fn run_inner(
     // sits *after* `build_tau_hp` precisely so τ is available for the
     // residual validation (the strongest integrity test for ξ).
     //
+    let eigenstate_started = Instant::now();
     let (eps_n, xi, inverse_iteration_diagnostics, eigenpair_manifest) =
         if let CcmCacheRoute::Fabric(cache) = &cache_route {
             let (eps_n, xi, diagnostics, manifest) = weil_eigenpair_via_cache(
@@ -5296,6 +5864,10 @@ fn run_inner(
             };
             (pair.0, pair.1, pair.2, None)
         };
+    eprintln!(
+        "[HP] phase timing: Weil eigenstate construction/reuse={:.3}s",
+        eigenstate_started.elapsed().as_secs_f64()
+    );
 
     if !weil_eigvec_cache::residual_ok(&tau, dim, &xi, &eps_n, prec) {
         bail!(
@@ -5304,8 +5876,16 @@ fn run_inner(
         );
     }
     if !inverse_iteration_diagnostics.unshifted_converged {
+        let termination = if inverse_iteration_diagnostics.unshifted_steps
+            < inverse_iteration_diagnostics.configured_step_limit
+        {
+            "early residual-verified shifted rescue"
+        } else {
+            "unshifted limit reached"
+        };
         eprintln!(
-            "[HP] eigenstate provenance: unshifted limit reached ({}/{} steps), shifted refinement={:?}, final relative Tau residual={}",
+            "[HP] eigenstate provenance: {} ({}/{} steps), shifted refinement={:?}, final relative Tau residual={}",
+            termination,
             inverse_iteration_diagnostics.unshifted_steps,
             inverse_iteration_diagnostics.configured_step_limit,
             inverse_iteration_diagnostics.shifted_refinement,
@@ -5320,6 +5900,7 @@ fn run_inner(
     // discovers starting points directly from the full-precision secular
     // source; the explicitly seeded API is retained for post-discovery
     // comparison and refinement.
+    let roots_started = Instant::now();
     let (first_root_index, hp_seeds, artifact_mode) = match acquisition {
         RootAcquisition::SourceOnly => (1, Vec::new(), RootArtifactMode::Independent),
         RootAcquisition::Independent(target) => {
@@ -5395,6 +5976,10 @@ fn run_inner(
             (roots, None)
         };
     report_root_status_summary(&eigenvalues_pos, first_root_index);
+    eprintln!(
+        "[HP] phase timing: root discovery/refinement={:.3}s",
+        roots_started.elapsed().as_secs_f64()
+    );
     if let (CcmCacheRoute::Fabric(cache), Some(root_manifest)) = (&cache_route, &root_manifest) {
         record_run_evidence_via_cache(
             params,
@@ -5448,15 +6033,18 @@ fn run_inner(
         }
     }
 
-    Ok(HighPrecResult {
-        eigenvalues_pos,
-        first_positive_root_index: first_root_index,
-        weil_min_eigenvalue: eps_n,
-        xi,
-        inverse_iteration_diagnostics,
-        elapsed_seconds: start.elapsed().as_secs_f64(),
-        precision_bits: prec,
-    })
+    Ok((
+        HighPrecResult {
+            eigenvalues_pos,
+            first_positive_root_index: first_root_index,
+            weil_min_eigenvalue: eps_n,
+            xi,
+            inverse_iteration_diagnostics,
+            elapsed_seconds: start.elapsed().as_secs_f64(),
+            precision_bits: prec,
+        },
+        RetainedCcmSource { tau, tau_manifest },
+    ))
 }
 
 /// Measure the natural evenness of the smallest eigenvector before
@@ -5530,7 +6118,18 @@ fn measure_evenness_via_cache(
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<EvennessResult> {
     let l = log_lambda_sq_hp(params, cfg.precision_bits);
-    let (mut tau, tau_manifest) = build_tau_hp_via_cache(params, &l, cfg, cache)?;
+    let (tau, tau_manifest) = build_tau_hp_via_cache(params, &l, cfg, cache)?;
+    measure_evenness_from_retained_source_via_cache(params, cfg, tau, tau_manifest, cache)
+}
+
+fn measure_evenness_from_retained_source_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    mut tau: Vec<Float>,
+    tau_manifest: ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<EvennessResult> {
+    let l = log_lambda_sq_hp(params, cfg.precision_bits);
     force_symmetric(&mut tau, params.matrix_size());
 
     let mut natural_cfg = cfg.clone();
@@ -8708,6 +9307,96 @@ mod tests {
     }
 
     #[test]
+    fn parallel_secular_discovery_is_bit_identical_to_ordered_reference() {
+        let precision = 256;
+        let n_modes = 8;
+        let spacing = Float::with_val(precision, Float::parse("1.75").unwrap());
+        let scan_upper = Float::with_val(precision, 16);
+        let xi = (0..(2 * n_modes + 1))
+            .map(|index| Float::with_val(precision, index + 1))
+            .collect::<Vec<_>>();
+        let parallel =
+            discover_secular_roots_hp(&xi, n_modes, &spacing, &scan_upper, precision).unwrap();
+        let sequential = discover_secular_roots_hp_sequential_reference(
+            &xi,
+            n_modes,
+            &spacing,
+            &scan_upper,
+            precision,
+        )
+        .unwrap();
+        assert_eq!(parallel, sequential);
+    }
+
+    #[test]
+    fn parallel_root_refinement_is_bit_identical_to_seed_order_reference() {
+        let precision = 256;
+        let params = CcmParams::from_lambda_sq_integer(13, 5);
+        let l = Float::with_val(precision, 13).ln();
+        let xi = vec![Float::with_val(precision, 1); params.matrix_size()];
+        let mut cfg = HighPrecConfig::for_decimal_digits(60);
+        cfg.precision_bits = precision;
+        cfg.solver_steps = 24;
+        let (_, seeds) = independently_discovered_starting_points(
+            &params,
+            &l,
+            &xi,
+            &ZeroTarget::FirstK { count: 3 },
+            precision,
+        )
+        .unwrap();
+        let parallel = compute_root_range(&xi, &params, &l, &cfg, &seeds);
+        let sequential = seeds
+            .iter()
+            .map(|seed| {
+                solve_r_zero(
+                    &xi,
+                    params.n_modes,
+                    &l,
+                    seed,
+                    cfg.precision_bits,
+                    cfg.solver_steps,
+                    cfg.root_solver,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(parallel.len(), sequential.len());
+        for (parallel, sequential) in parallel.iter().zip(&sequential) {
+            match (parallel, sequential) {
+                (EigenvalueResult::Converged(left), EigenvalueResult::Converged(right))
+                | (EigenvalueResult::Stagnated(left), EigenvalueResult::Stagnated(right))
+                | (EigenvalueResult::Approximate(left), EigenvalueResult::Approximate(right)) => {
+                    assert_eq!(left.value, right.value);
+                    assert_eq!(left.diagnostics.iterations, right.diagnostics.iterations);
+                    assert_eq!(
+                        left.diagnostics.final_correction,
+                        right.diagnostics.final_correction
+                    );
+                    assert_eq!(left.diagnostics.residual, right.diagnostics.residual);
+                    assert_eq!(
+                        left.diagnostics.achieved_decimal_digits,
+                        right.diagnostics.achieved_decimal_digits
+                    );
+                }
+                (
+                    EigenvalueResult::Failed {
+                        iterations: left_iterations,
+                        reason: left_reason,
+                    },
+                    EigenvalueResult::Failed {
+                        iterations: right_iterations,
+                        reason: right_reason,
+                    },
+                ) => {
+                    assert_eq!(left_iterations, right_iterations);
+                    assert_eq!(left_reason, right_reason);
+                }
+                _ => panic!("parallel refinement changed an outcome status"),
+            }
+        }
+    }
+
+    #[test]
     fn computed_root_windows_retain_approximations_while_strict_windows_reject_them() {
         let precision = 256;
         let diagnostic = |value: u32| RootRefinement {
@@ -9144,7 +9833,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_sector_recovery_is_bit_identical_to_algebraic_order_recovery() {
+    fn parallel_banded_sector_recovery_is_bit_identical_to_sequential_recovery() {
         let precision_bits = 192;
         let dimension = 3;
         let matrix = vec![
@@ -9171,51 +9860,121 @@ mod tests {
             values: eigenvalues.clone(),
             selected_enclosures: Vec::new(),
         };
+        let (diagonal, off_diagonal, basis) =
+            xc_numerics::eigen::householder_tridiag_hp(&matrix, dimension, precision_bits).unwrap();
+        let tridiagonal = SectorTridiagonalHp {
+            diagonal,
+            off_diagonal,
+        };
+        let transform = SectorTransformHp { basis };
         let parallel = compute_sector_spectrum(
             &matrix,
             dimension,
             CcmParity::Odd,
             2,
             &routed_eigenvalues,
+            &tridiagonal,
+            &transform,
             &cfg,
         )
         .unwrap();
-        let sequential = eigenvalues
-            .into_iter()
-            .take(2)
-            .enumerate()
-            .map(|(algebraic_index, eigenvalue)| {
-                let eigenvector = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
-                    &matrix,
-                    dimension,
-                    &eigenvalue,
-                    precision_bits,
-                    cfg.inverse_iter_steps,
-                )
-                .unwrap();
-                let residual_norm = sector_eigenpair_residual_norm(
-                    &matrix,
-                    dimension,
-                    &eigenvalue,
-                    &eigenvector,
-                    precision_bits,
-                )
-                .unwrap();
-                CcmSectorEigenpairHp {
-                    algebraic_index,
-                    eigenvalue,
-                    eigenvector,
-                    residual_norm,
-                }
-            })
-            .collect::<Vec<_>>();
+        let sequential = compute_sector_branch(
+            &matrix,
+            dimension,
+            CcmParity::Odd,
+            2,
+            CcmSectorEigenvalueRoute::CompleteQr,
+            &cfg,
+        )
+        .unwrap();
 
-        assert_eq!(parallel.eigenpairs.len(), sequential.len());
-        for (parallel, sequential) in parallel.eigenpairs.iter().zip(&sequential) {
+        assert_eq!(parallel.eigenpairs.len(), sequential.eigenpairs.len());
+        for (parallel, sequential) in parallel.eigenpairs.iter().zip(&sequential.eigenpairs) {
             assert_eq!(parallel.algebraic_index, sequential.algebraic_index);
             assert_eq!(parallel.eigenvalue, sequential.eigenvalue);
             assert_eq!(parallel.eigenvector, sequential.eigenvector);
             assert_eq!(parallel.residual_norm, sequential.residual_norm);
+        }
+    }
+
+    #[test]
+    fn banded_householder_sector_vectors_match_dense_reference_up_to_phase() {
+        let precision_bits = 256;
+        let dimension = 4;
+        let matrix = vec![
+            Float::with_val(precision_bits, 4),
+            Float::with_val(precision_bits, 1),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 1),
+            Float::with_val(precision_bits, 6),
+            Float::with_val(precision_bits, 2),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 2),
+            Float::with_val(precision_bits, 9),
+            Float::with_val(precision_bits, 1),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 0),
+            Float::with_val(precision_bits, 1),
+            Float::with_val(precision_bits, 12),
+        ];
+        let mut cfg = HighPrecConfig::for_decimal_digits(60);
+        cfg.precision_bits = precision_bits;
+        cfg.inverse_iter_steps = 200;
+        let eigenvalues =
+            xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&matrix, dimension, precision_bits)
+                .unwrap();
+        let routed = SectorEigenvaluesHp {
+            route: CcmSectorEigenvalueRoute::CompleteQr,
+            complete: true,
+            values: eigenvalues.clone(),
+            selected_enclosures: Vec::new(),
+        };
+        let (diagonal, off_diagonal, basis) =
+            xc_numerics::eigen::householder_tridiag_hp(&matrix, dimension, precision_bits).unwrap();
+        let optimized = compute_sector_spectrum(
+            &matrix,
+            dimension,
+            CcmParity::Even,
+            2,
+            &routed,
+            &SectorTridiagonalHp {
+                diagonal,
+                off_diagonal,
+            },
+            &SectorTransformHp { basis },
+            &cfg,
+        )
+        .unwrap();
+        let tolerance = Float::with_val(precision_bits, 10).pow(-50i32);
+        for (index, optimized_pair) in optimized.eigenpairs.iter().enumerate() {
+            let dense = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
+                &matrix,
+                dimension,
+                &eigenvalues[index],
+                precision_bits,
+                cfg.inverse_iter_steps,
+            )
+            .unwrap();
+            let dot_terms = optimized_pair
+                .eigenvector
+                .iter()
+                .zip(&dense)
+                .map(|(left, right)| {
+                    let mut product = left.clone();
+                    product *= right;
+                    product
+                })
+                .collect();
+            let mut phase_agreement = xc_numerics::reduction::deterministic_pairwise_sum_hp_owned(
+                dot_terms,
+                precision_bits,
+            )
+            .abs();
+            phase_agreement -= 1u32;
+            assert!(phase_agreement.abs() < tolerance);
+            assert!(optimized_pair.residual_norm < tolerance);
         }
     }
 

@@ -17,7 +17,7 @@ use xc_core::{CancellationToken, ResourcePolicy};
 pub struct GitCliRemoteStore {
     git_executable: OsString,
     temporary_root: PathBuf,
-    staged_parts_root: PathBuf,
+    staged_parts_roots: Vec<PathBuf>,
     author_name: String,
     author_email: String,
     resources: ResourcePolicy,
@@ -34,7 +34,7 @@ impl GitCliRemoteStore {
         let store = Self {
             git_executable: OsString::from("git"),
             temporary_root: temporary_root.into(),
-            staged_parts_root: staged_parts_root.into(),
+            staged_parts_roots: vec![staged_parts_root.into()],
             author_name: author_name.into(),
             author_email: author_email.into(),
             resources: ResourcePolicy::default(),
@@ -46,8 +46,25 @@ impl GitCliRemoteStore {
             ));
         }
         fs::create_dir_all(&store.temporary_root)?;
-        fs::create_dir_all(&store.staged_parts_root)?;
+        fs::create_dir_all(&store.staged_parts_roots[0])?;
         Ok(store)
+    }
+
+    /// Add immutable staging roots to one transport session. Managed
+    /// publication uses this to send several artifacts to the same shard
+    /// without copying their potentially large encoded parts into a combined
+    /// temporary directory.
+    pub fn with_additional_staged_parts_roots(
+        mut self,
+        roots: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Self, CacheError> {
+        for root in roots {
+            fs::create_dir_all(&root)?;
+            if !self.staged_parts_roots.contains(&root) {
+                self.staged_parts_roots.push(root);
+            }
+        }
+        Ok(self)
     }
 
     pub fn with_git_executable(mut self, executable: impl Into<OsString>) -> Self {
@@ -132,6 +149,24 @@ impl GitCliRemoteStore {
     fn fetch_revision(&self, repository: &str, revision: &str) -> Result<PathBuf, CacheError> {
         validate_revision(revision)?;
         let session = self.ensure_session(repository)?;
+        // A multi-artifact managed publication advances one shard through a
+        // chain of locally created commits. After a successful push, the next
+        // expected head is already present in this bare session; avoid a
+        // redundant network fetch while retaining the independent remote-head
+        // compare-and-swap immediately before every mutation.
+        let local = run_git_allow_failure(
+            &self.git_executable,
+            Some(&session),
+            [
+                OsString::from("cat-file"),
+                OsString::from("-e"),
+                OsString::from(format!("{revision}^{{commit}}")),
+            ],
+            &[],
+        )?;
+        if local.status.success() {
+            return Ok(session);
+        }
         run_git(
             &self.git_executable,
             Some(&session),
@@ -150,29 +185,42 @@ impl GitCliRemoteStore {
 
     fn staged_part_path(&self, part: &TransportPart) -> Result<PathBuf, CacheError> {
         validate_relative_git_path(&part.repository_path)?;
-        let mut path = self.staged_parts_root.clone();
-        for component in Path::new(&part.repository_path).components() {
-            match component {
-                Component::Normal(component) => path.push(component),
-                _ => {
-                    return Err(CacheError::InvalidManifest(
-                        "transport part path is not a normalized relative path".to_owned(),
-                    ));
+        let components = Path::new(&part.repository_path)
+            .components()
+            .map(|component| match component {
+                Component::Normal(component) => Ok(component.to_owned()),
+                _ => Err(CacheError::InvalidManifest(
+                    "transport part path is not a normalized relative path".to_owned(),
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut observed = None;
+        for root in self.staged_parts_roots.iter().rev() {
+            let mut path = root.clone();
+            path.extend(&components);
+            if path.is_file() {
+                let (digest, size) = digest_file(&path)?;
+                if digest == part.content_digest && size == part.size_bytes {
+                    return Ok(path);
                 }
+                observed = Some((digest, size));
             }
         }
-        Ok(path)
+        if let Some((digest, size)) = observed {
+            return Err(CacheError::DigestMismatch {
+                expected: format!("{} ({} bytes)", part.content_digest, part.size_bytes),
+                actual: format!("{digest} ({size} bytes)"),
+            });
+        }
+        Err(CacheError::NotFound(format!(
+            "staged transport part {:?} in {} configured roots",
+            part.repository_path,
+            self.staged_parts_roots.len()
+        )))
     }
 
     fn hash_staged_blob(&self, session: &Path, part: &TransportPart) -> Result<String, CacheError> {
         let path = self.staged_part_path(part)?;
-        let (digest, size) = digest_file(&path)?;
-        if digest != part.content_digest || size != part.size_bytes {
-            return Err(CacheError::DigestMismatch {
-                expected: format!("{} ({} bytes)", part.content_digest, part.size_bytes),
-                actual: format!("{} ({size} bytes)", digest),
-            });
-        }
         let output = run_git(
             &self.git_executable,
             Some(session),
@@ -877,6 +925,39 @@ mod tests {
         command.args(arguments);
         command.stdout(Stdio::null()).stderr(Stdio::null());
         command.status().is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn multiple_staging_roots_select_the_identity_matching_file() {
+        let root = temporary_root("git-cli-multiple-staging-roots");
+        let _ = fs::remove_dir_all(&root);
+        let first = root.join("first");
+        let second = root.join("second");
+        let relative = Path::new("indexes/family/partition.json");
+        fs::create_dir_all(first.join(relative).parent().unwrap()).unwrap();
+        fs::create_dir_all(second.join(relative).parent().unwrap()).unwrap();
+        fs::write(first.join(relative), b"older sidecar").unwrap();
+        fs::write(second.join(relative), b"current sidecar").unwrap();
+        let part = TransportPart {
+            sequence: 0,
+            repository_path: relative.to_string_lossy().replace('\\', "/"),
+            size_bytes: b"current sidecar".len() as u64,
+            content_digest: ContentDigest::sha256(b"current sidecar"),
+        };
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            &first,
+            "Test Publisher",
+            "test@example.invalid",
+        )
+        .unwrap()
+        .with_additional_staged_parts_roots(vec![second.clone()])
+        .unwrap();
+        assert_eq!(
+            store.staged_part_path(&part).unwrap(),
+            second.join(relative)
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

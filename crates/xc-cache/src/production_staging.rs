@@ -494,6 +494,7 @@ pub fn family_for_artifact_kind(kind: &str) -> Option<&'static str> {
         | "ccm_even_sector_matrix"
         | "ccm_odd_sector_matrix"
         | "ccm_sector_tridiagonal"
+        | "ccm_sector_transform"
         | "ccm_reduced_operator"
         | "ccm_factorization" => Some("ccm-matrices"),
         "ccm_weil_eigenpair"
@@ -771,6 +772,10 @@ mod tests {
     fn granular_ccm_sector_artifacts_route_to_existing_shards() {
         assert_eq!(
             family_for_artifact_kind("ccm_sector_tridiagonal"),
+            Some("ccm-matrices")
+        );
+        assert_eq!(
+            family_for_artifact_kind("ccm_sector_transform"),
             Some("ccm-matrices")
         );
         assert_eq!(

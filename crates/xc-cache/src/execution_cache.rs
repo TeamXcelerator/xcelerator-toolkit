@@ -617,10 +617,7 @@ impl ManagedArtifactCacheSession {
                 &xc_core::ResourcePolicy::default(),
                 self.replace_existing_publication,
             )?;
-            let report_path = sink
-                .staging_root()
-                .join("publication-execution-report.json");
-            crate::atomic_replace(&report_path, &serde_json::to_vec_pretty(&report)?)?;
+            let persisted = persist_publication_execution_report(sink.staging_root(), &report)?;
             if report.all_completed {
                 self.mark_staged_drafts_completed(&pending_drafts)?;
             }
@@ -638,12 +635,175 @@ impl ManagedArtifactCacheSession {
                         .filter(|item| item.completed)
                         .count(),
                     report.current_tree_paths_removed,
-                    &report_path,
+                    &persisted.phase_path,
+                    &persisted.cumulative_path,
+                    persisted.cumulative.artifacts.len(),
+                    persisted.cumulative.phases.len(),
                 )
             );
         }
         Ok(Some(path))
     }
+}
+
+struct PersistedPublicationExecutionReport {
+    phase_path: PathBuf,
+    cumulative_path: PathBuf,
+    cumulative: crate::ManagedCumulativePublicationExecutionReport,
+}
+
+fn persist_publication_execution_report(
+    staging_root: &Path,
+    report: &crate::ManagedRunPublicationReport,
+) -> Result<PersistedPublicationExecutionReport, CacheError> {
+    let phase_bytes = serde_json::to_vec_pretty(report)?;
+    let phase_digest = ContentDigest::sha256(&serde_json::to_vec(report)?);
+    let phase_directory = staging_root.join("publication-execution-reports");
+    fs::create_dir_all(&phase_directory)?;
+    let mut existing_phase_paths = fs::read_dir(&phase_directory)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    existing_phase_paths.sort();
+    let digest_suffix = format!("-{}.json", phase_digest.0);
+    let phase_path = existing_phase_paths
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.ends_with(&digest_suffix))
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            let next_index = existing_phase_paths
+                .iter()
+                .filter_map(|path| {
+                    path.file_name()
+                        .and_then(|value| value.to_str())
+                        .and_then(|name| name.split_once('-'))
+                        .and_then(|(index, _)| index.parse::<usize>().ok())
+                })
+                .max()
+                .unwrap_or(0)
+                + 1;
+            phase_directory.join(format!("{next_index:020}-{}.json", phase_digest.0))
+        });
+    if phase_path.exists() {
+        let existing: crate::ManagedRunPublicationReport =
+            serde_json::from_slice(&fs::read(&phase_path)?)?;
+        if existing != *report {
+            return Err(CacheError::InvalidTransition(format!(
+                "publication phase report digest collision at {}",
+                phase_path.display()
+            )));
+        }
+    } else {
+        crate::atomic_replace(&phase_path, &phase_bytes)?;
+    }
+
+    let mut phase_paths = fs::read_dir(&phase_directory)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    phase_paths.sort();
+
+    let mut phases = Vec::with_capacity(phase_paths.len());
+    let mut artifacts = BTreeMap::<String, crate::ManagedPublicationExecutionReport>::new();
+    let mut current_tree_paths_removed = 0usize;
+    for path in phase_paths {
+        let bytes = fs::read(&path)?;
+        let phase: crate::ManagedRunPublicationReport = serde_json::from_slice(&bytes)?;
+        let digest = ContentDigest::sha256(&serde_json::to_vec(&phase)?);
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                CacheError::InvalidTransition(format!(
+                    "publication phase report has an invalid filename at {}",
+                    path.display()
+                ))
+            })?;
+        let (phase_index, digest_name) = name.split_once('-').ok_or_else(|| {
+            CacheError::InvalidTransition(format!(
+                "publication phase report filename has no sequence at {}",
+                path.display()
+            ))
+        })?;
+        let phase_index = phase_index.parse::<usize>().map_err(|_| {
+            CacheError::InvalidTransition(format!(
+                "publication phase report has an invalid sequence at {}",
+                path.display()
+            ))
+        })?;
+        let expected_digest_name = format!("{}.json", digest.0);
+        if digest_name != expected_digest_name {
+            return Err(CacheError::InvalidTransition(format!(
+                "publication phase report filename does not match its content at {}",
+                path.display()
+            )));
+        }
+        current_tree_paths_removed = current_tree_paths_removed
+            .checked_add(phase.current_tree_paths_removed)
+            .ok_or_else(|| {
+                CacheError::InvalidTransition(
+                    "cumulative publication cleanup count overflow".to_owned(),
+                )
+            })?;
+        for artifact in &phase.artifacts {
+            match artifacts.get(&artifact.transaction_id) {
+                None => {
+                    artifacts.insert(artifact.transaction_id.clone(), artifact.clone());
+                }
+                Some(existing)
+                    if existing.final_journal_digest == artifact.final_journal_digest
+                        && existing.completed == artifact.completed => {}
+                Some(existing) if !existing.completed && artifact.completed => {
+                    artifacts.insert(artifact.transaction_id.clone(), artifact.clone());
+                }
+                Some(existing) if existing.completed && !artifact.completed => {}
+                Some(_) => {
+                    return Err(CacheError::InvalidTransition(format!(
+                        "conflicting publication reports for transaction {}",
+                        artifact.transaction_id
+                    )));
+                }
+            }
+        }
+        let completed_artifact_count = phase
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.completed)
+            .count();
+        let relative_report_path = path
+            .strip_prefix(staging_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        phases.push(crate::ManagedPublicationExecutionPhaseSummary {
+            phase_index,
+            phase_digest: digest,
+            relative_report_path,
+            artifact_count: phase.artifacts.len(),
+            completed_artifact_count,
+            all_completed: phase.all_completed,
+            current_tree_paths_removed: phase.current_tree_paths_removed,
+        });
+    }
+    let artifacts = artifacts.into_values().collect::<Vec<_>>();
+    let cumulative = crate::ManagedCumulativePublicationExecutionReport {
+        schema_version: 1,
+        all_completed: artifacts.iter().all(|artifact| artifact.completed),
+        phases,
+        artifacts,
+        current_tree_paths_removed,
+    };
+    let cumulative_path = staging_root.join("publication-execution-report.json");
+    crate::atomic_replace(&cumulative_path, &serde_json::to_vec_pretty(&cumulative)?)?;
+    Ok(PersistedPublicationExecutionReport {
+        phase_path,
+        cumulative_path,
+        cumulative,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -655,7 +815,10 @@ fn format_publication_completion(
     total_bytes: u64,
     completed_transactions: usize,
     current_tree_paths_removed: usize,
-    report_path: &Path,
+    phase_report_path: &Path,
+    cumulative_report_path: &Path,
+    cumulative_artifact_count: usize,
+    phase_count: usize,
 ) -> String {
     let assurance = match assurance {
         xc_core::AssuranceLevel::Computed => "computed",
@@ -673,9 +836,11 @@ fn format_publication_completion(
          {target_copy_count}\n  targets: {target}\n  assurance: {assurance}\n  total packaged: \
          {total_bytes} bytes ({:.1} MB)\n  completed transactions: \
          {completed_transactions}/{artifact_count}\n  old current-tree paths removed: \
-         {current_tree_paths_removed}\n  report: {}",
+         {current_tree_paths_removed}\n  phase report: {}\n  cumulative report: {} \
+         ({cumulative_artifact_count} artifacts across {phase_count} phases)",
         total_bytes as f64 / 1_000_000.0,
-        report_path.display()
+        phase_report_path.display(),
+        cumulative_report_path.display()
     )
 }
 
@@ -1663,7 +1828,10 @@ mod tests {
             61_082_844,
             3,
             7,
+            Path::new("staging/publication-execution-reports/phase.json"),
             Path::new("staging/publication-execution-report.json"),
+            10,
+            3,
         );
         assert_eq!(
             summary,
@@ -1676,10 +1844,66 @@ mod tests {
                 "  total packaged: 61082844 bytes (61.1 MB)\n",
                 "  completed transactions: 3/3\n",
                 "  old current-tree paths removed: 7\n",
-                "  report: staging/publication-execution-report.json"
+                "  phase report: staging/publication-execution-reports/phase.json\n",
+                "  cumulative report: staging/publication-execution-report.json ",
+                "(10 artifacts across 3 phases)"
             )
         );
         assert!(summary.is_ascii());
+    }
+
+    #[test]
+    fn publication_reports_preserve_phases_and_build_a_cumulative_run_report() {
+        fn phase(ids: &[&str], removed: usize) -> crate::ManagedRunPublicationReport {
+            crate::ManagedRunPublicationReport {
+                schema_version: 1,
+                artifacts: ids
+                    .iter()
+                    .map(|id| crate::ManagedPublicationExecutionReport {
+                        transaction_id: (*id).to_owned(),
+                        completed: true,
+                        steps_executed: 4,
+                        final_journal_digest: ContentDigest::sha256(id.as_bytes()),
+                    })
+                    .collect(),
+                all_completed: true,
+                current_tree_paths_removed: removed,
+            }
+        }
+
+        let root = root("cumulative-publication-report");
+        let _ = fs::remove_dir_all(&root);
+        let first = phase(&["transaction-a", "transaction-b"], 2);
+        let second = phase(&["transaction-c"], 3);
+
+        let first_persisted = persist_publication_execution_report(&root, &first).unwrap();
+        assert!(first_persisted.phase_path.exists());
+        assert_eq!(first_persisted.cumulative.phases.len(), 1);
+        assert_eq!(first_persisted.cumulative.artifacts.len(), 2);
+        assert_eq!(first_persisted.cumulative.current_tree_paths_removed, 2);
+
+        let second_persisted = persist_publication_execution_report(&root, &second).unwrap();
+        assert!(second_persisted.phase_path.exists());
+        assert_eq!(second_persisted.cumulative.phases.len(), 2);
+        assert_eq!(second_persisted.cumulative.phases[0].phase_index, 1);
+        assert_eq!(second_persisted.cumulative.phases[1].phase_index, 2);
+        assert_eq!(second_persisted.cumulative.artifacts.len(), 3);
+        assert_eq!(second_persisted.cumulative.current_tree_paths_removed, 5);
+        assert!(second_persisted.cumulative.all_completed);
+
+        let repeated = persist_publication_execution_report(&root, &first).unwrap();
+        assert_eq!(repeated.cumulative.phases.len(), 2);
+        assert_eq!(repeated.cumulative.artifacts.len(), 3);
+        let durable: crate::ManagedCumulativePublicationExecutionReport =
+            serde_json::from_slice(&fs::read(&repeated.cumulative_path).unwrap()).unwrap();
+        assert_eq!(durable, repeated.cumulative);
+        assert_eq!(
+            fs::read_dir(root.join("publication-execution-reports"))
+                .unwrap()
+                .count(),
+            2
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[derive(Default)]

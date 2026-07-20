@@ -598,6 +598,115 @@ pub struct InverseIterationOutput {
     pub diagnostics: InverseIterationDiagnostics,
 }
 
+fn relative_eigen_residual_infinity(
+    matrix: &[Float],
+    dimension: usize,
+    eigenvector: &[Float],
+    eigenvalue: &Float,
+    precision_bits: u32,
+) -> Option<Float> {
+    let residuals = (0..dimension)
+        .into_par_iter()
+        .map(|row| {
+            let mut residual = hp_zero(precision_bits);
+            for column in 0..dimension {
+                let mut term = matrix[row * dimension + column].clone();
+                term *= &eigenvector[column];
+                residual += term;
+            }
+            let mut expected = eigenvalue.clone();
+            expected *= &eigenvector[row];
+            residual -= expected;
+            residual.abs()
+        })
+        .collect::<Vec<_>>();
+    let residual_maximum = residuals
+        .into_iter()
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))?;
+    let vector_maximum = eigenvector
+        .iter()
+        .map(|value| value.clone().abs())
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))?;
+    if vector_maximum.is_zero()
+        || !vector_maximum.is_finite()
+        || !residual_maximum.is_finite()
+        || !eigenvalue.is_finite()
+    {
+        return None;
+    }
+    let mut relative = residual_maximum;
+    relative /= vector_maximum;
+    Some(relative)
+}
+
+fn try_residual_verified_shifted_refinement(
+    matrix: &[Float],
+    dimension: usize,
+    precision_bits: u32,
+    force_even: bool,
+    eigenvalue: &Float,
+    eigenvector: &[Float],
+) -> Result<Option<(Float, Vec<Float>, Float)>> {
+    let shifted = (0..dimension * dimension)
+        .into_par_iter()
+        .map(|index| {
+            let row = index / dimension;
+            let column = index % dimension;
+            let mut value = matrix[index].clone();
+            if row == column {
+                value -= eigenvalue;
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    let Ok(factors) = lu_factor(&shifted, dimension) else {
+        return Ok(None);
+    };
+    let mut refined = lu_solve(&factors, eigenvector, dimension, precision_bits);
+    normalize_l2(&mut refined);
+    if force_even {
+        refined = (0..dimension)
+            .into_par_iter()
+            .map(|index| {
+                let mut value = refined[index].clone();
+                value += &refined[dimension - 1 - index];
+                value /= 2u32;
+                value
+            })
+            .collect();
+        normalize_l2(&mut refined);
+    }
+    let refined_eigenvalue = rayleigh_quotient(matrix, dimension, &refined, precision_bits);
+    let mut change = refined_eigenvalue.clone();
+    change -= eigenvalue;
+    let change_ratio = if eigenvalue.is_zero() {
+        change.abs()
+    } else {
+        let mut ratio = change.abs();
+        ratio /= eigenvalue.clone().abs();
+        ratio
+    };
+    let mut jump_tolerance = Float::with_val(precision_bits, 1);
+    jump_tolerance /= 100u32;
+    if change_ratio >= jump_tolerance {
+        return Ok(None);
+    }
+    let Some(relative_residual) = relative_eigen_residual_infinity(
+        matrix,
+        dimension,
+        &refined,
+        &refined_eigenvalue,
+        precision_bits,
+    ) else {
+        return Ok(None);
+    };
+    let residual_floor = Float::with_val(precision_bits, 2).pow(-((precision_bits as i32) - 32));
+    if !relative_residual.is_finite() || relative_residual >= residual_floor {
+        return Ok(None);
+    }
+    Ok(Some((refined_eigenvalue, refined, relative_residual)))
+}
+
 /// Inverse iteration to find the smallest-eigenpair of a symmetric
 /// matrix at high precision.
 ///
@@ -785,6 +894,9 @@ fn inverse_iteration_from_optional_factors(
     let mut mu = hp_zero(prec);
     let mut prev_mu = mu.clone();
     let convergence_threshold = Float::with_val(prec, 2).pow(-((prec as i32) - 32));
+    let early_rescue_threshold =
+        Float::with_val(prec, 2).pow(-(((prec.saturating_sub(32) / 2).max(8)) as i32));
+    let mut early_rescue_attempted = false;
     let mut even_projection_threshold = Float::with_val(prec, 1);
     even_projection_threshold /= 2u32;
     let mut converged = false;
@@ -876,6 +988,40 @@ fn inverse_iteration_from_optional_factors(
                     iter_start.elapsed().as_secs_f64()
                 );
                 break;
+            }
+            if !early_rescue_attempted
+                && final_relative_change
+                    .as_ref()
+                    .is_some_and(|change| change < &early_rescue_threshold)
+            {
+                early_rescue_attempted = true;
+                crate::hp_debug!(
+                    "[HP invit] entering residual-verified shifted rescue at step {}/{}",
+                    step + 1,
+                    max_steps
+                );
+                if let Some((refined_eigenvalue, refined_eigenvector, relative_residual)) =
+                    try_residual_verified_shifted_refinement(a, dim, prec, force_even, &mu, &xi)?
+                {
+                    crate::hp_debug!(
+                        "[HP invit] early shifted rescue accepted with full residual verification"
+                    );
+                    return Ok(InverseIterationOutput {
+                        eigenvalue: refined_eigenvalue,
+                        eigenvector: refined_eigenvector,
+                        diagnostics: InverseIterationDiagnostics {
+                            configured_step_limit: max_steps,
+                            unshifted_steps,
+                            unshifted_converged: false,
+                            final_relative_rayleigh_change: final_relative_change,
+                            shifted_refinement: ShiftedRefinementOutcome::Accepted,
+                            final_relative_residual_norm: relative_residual,
+                        },
+                    });
+                }
+                crate::hp_debug!(
+                    "[HP invit] early shifted rescue did not meet the full residual floor; continuing unshifted iteration"
+                );
             }
         }
         prev_mu = mu.clone();
