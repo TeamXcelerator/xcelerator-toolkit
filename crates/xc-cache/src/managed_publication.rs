@@ -21,6 +21,24 @@ use xc_core::{PublicationAuthority, PublicationAuthorityMode, PublicationTarget}
 
 pub const MANAGED_VALIDATOR_ID: &str = "toolkit-integrated-validation-v1";
 
+fn producer_source_revision() -> Result<String, CacheError> {
+    let revision = option_env!("XC_SOURCE_REVISION").ok_or_else(|| {
+        CacheError::InvalidManifest(
+            "author publication requires an exact toolkit Git revision; build from a Git checkout or set XC_SOURCE_REVISION to the full commit hash".to_owned(),
+        )
+    })?;
+    if revision.len() != 40
+        || !revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(CacheError::InvalidManifest(
+            "author publication requires XC_SOURCE_REVISION to be a full 40-character lowercase hexadecimal Git commit".to_owned(),
+        ));
+    }
+    Ok(revision.to_owned())
+}
+
 #[derive(Clone, Debug)]
 pub struct ManagedPublicationPlanningContext {
     pub owner: String,
@@ -221,6 +239,7 @@ fn bounded_prefix_bytes(
     repository: &str,
     revision: &str,
     prefix: &str,
+    canonical_objects_only: bool,
     cancellation: &xc_core::CancellationToken,
 ) -> Result<u64, CacheError> {
     let listing = remote.list_committed_paths(
@@ -231,20 +250,46 @@ fn bounded_prefix_bytes(
         128 * 1024 * 1024,
         cancellation,
     )?;
-    listing.paths.iter().try_fold(0u64, |total, path| {
-        let mut sink = std::io::sink();
-        let report = remote.read_committed_path(
-            repository,
-            revision,
-            path,
-            crate::GITHUB_HARD_FILE_BOUNDARY_BYTES - 1,
-            cancellation,
-            &mut sink,
-        )?;
-        total.checked_add(report.size_bytes).ok_or_else(|| {
-            CacheError::ResourceLimit("bootstrap shard byte accounting exceeds u64".to_owned())
+    listing
+        .paths
+        .iter()
+        .filter(|path| !canonical_objects_only || canonical_payload_object_path(path))
+        .try_fold(0u64, |total, path| {
+            let mut sink = std::io::sink();
+            let report = remote.read_committed_path(
+                repository,
+                revision,
+                path,
+                crate::GITHUB_HARD_FILE_BOUNDARY_BYTES - 1,
+                cancellation,
+                &mut sink,
+            )?;
+            total.checked_add(report.size_bytes).ok_or_else(|| {
+                CacheError::ResourceLimit("bootstrap shard byte accounting exceeds u64".to_owned())
+            })
         })
-    })
+}
+
+fn canonical_payload_object_path(path: &str) -> bool {
+    let mut components = path.split('/');
+    let (Some("objects"), Some("sha256"), Some(prefix), Some(file), None) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        return false;
+    };
+    let Some(digest) = file.strip_suffix(".part") else {
+        return false;
+    };
+    digest.len() == 64
+        && prefix.len() == 2
+        && prefix == &digest[..2]
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Serialize)]
@@ -382,6 +427,7 @@ fn ensure_managed_shard_sidecars(
                                 repository,
                                 &head,
                                 prefix,
+                                prefix == "objects",
                                 cancellation,
                             )?)
                             .ok_or_else(|| {
@@ -406,6 +452,7 @@ fn ensure_managed_shard_sidecars(
                         repository,
                         &head,
                         prefix,
+                        false,
                         cancellation,
                     )?)
                     .ok_or_else(|| {
@@ -694,6 +741,7 @@ pub fn prepare_managed_artifact_publication(
     public_evidence.push(public_validation.clone());
     public_evidence.sort();
     public_evidence.dedup();
+    let source_revision = producer_source_revision()?;
     let placeholder_attestation = AttestationEnvelope {
         schema_version: 1,
         kind: if draft.achieved_assurance == ArtifactAssuranceState::Certified {
@@ -710,9 +758,7 @@ pub fn prepare_managed_artifact_publication(
             "xcelerator-toolkit".to_owned(),
             env!("CARGO_PKG_VERSION").to_owned(),
         )]),
-        source_revision: option_env!("XC_SOURCE_REVISION")
-            .unwrap_or(env!("CARGO_PKG_VERSION"))
-            .to_owned(),
+        source_revision,
         event_unix_seconds: context.event_unix_seconds,
         location: None,
         evidence_digests: public_evidence,
@@ -1656,6 +1702,15 @@ mod tests {
     }
 
     #[test]
+    fn managed_publication_embeds_a_full_source_commit() {
+        let revision = producer_source_revision().unwrap();
+        assert_eq!(revision.len(), 40);
+        assert!(revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    }
+
+    #[test]
     fn missing_live_sidecars_are_initialized_without_replacing_bootstrap_content() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -1668,15 +1723,18 @@ mod tests {
         let remote = FilesystemMemoryRemote::new(staging.clone());
         let repository = "https://github.com/example-org/restricted-quadrature-0001.git";
         let authorized = "example-org/restricted-quadrature-0001";
+        let stored_object_digest = ContentDigest::sha256(b"stored-object");
+        let stored_object_path = format!(
+            "objects/sha256/{}/{}.part",
+            &stored_object_digest.0[..2],
+            stored_object_digest.0
+        );
         remote.insert_repository(
             repository.to_owned(),
             "bootstrap-head".to_owned(),
             BTreeMap::from([
                 ("README.md".to_owned(), b"bootstrap repository".to_vec()),
-                (
-                    "objects/sha256/aa/stored".to_owned(),
-                    b"stored-object".to_vec(),
-                ),
+                (stored_object_path, b"stored-object".to_vec()),
             ]),
         );
         let session = AuthenticatedGitHubSession::verified_for_test(

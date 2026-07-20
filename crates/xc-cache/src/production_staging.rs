@@ -479,48 +479,84 @@ impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
     }
 }
 
-pub fn family_for_artifact_kind(kind: &str) -> Option<&'static str> {
-    match kind {
-        "gauss_legendre_rule"
-        | "quadrature_rule"
-        | "quadrature_reference_table"
-        | "quadrature_validation" => Some("quadrature"),
-        "ccm_prime_enumeration"
-        | "ccm_archimedean_integrals"
-        | "ccm_archimedean_component"
-        | "ccm_prime_component"
-        | "ccm_pole_component" => Some("ccm-components"),
-        "ccm_tau_matrix"
-        | "ccm_even_sector_matrix"
-        | "ccm_odd_sector_matrix"
-        | "ccm_sector_tridiagonal"
-        | "ccm_sector_transform"
-        | "ccm_reduced_operator"
-        | "ccm_factorization" => Some("ccm-matrices"),
-        "ccm_weil_eigenpair"
-        | "ccm_sector_eigenvalues"
-        | "ccm_sector_spectrum"
-        | "ccm_weil_plunge_state"
-        | "ccm_weil_sonin_state"
-        | "ccm_source_eigenbasis" => Some("weil-states"),
-        "prolate_eigenvalue_spectrum"
-        | "ccm_prolate_spectrum"
-        | "ccm_prolate_basis"
-        | "ccm_prolate_candidate"
-        | "ccm_band_concentration" => Some("prolate"),
-        "ccm_secular_source"
-        | "ccm_root_count_window"
-        | "ccm_root_discovery_window"
-        | "ccm_root_refinement"
-        | "ccm_spectral_window" => Some("ccm-roots"),
-        "ccm_convergence_diagnostics"
-        | "ccm_sector_gap"
-        | "ccm_post_discovery_comparison"
-        | "ccm_cross_check_record"
-        | "ccm_validation_record"
-        | "ccm_certificate_bundle" => Some("ccm-evidence"),
+const QUADRATURE_KINDS: &[&str] = &[
+    "gauss_legendre_rule",
+    "quadrature_rule",
+    "quadrature_reference_table",
+    "quadrature_validation",
+];
+const CCM_COMPONENT_KINDS: &[&str] = &[
+    "ccm_prime_enumeration",
+    "ccm_archimedean_integrals",
+    "ccm_archimedean_component",
+    "ccm_prime_component",
+    "ccm_pole_component",
+];
+const CCM_MATRIX_KINDS: &[&str] = &[
+    "ccm_tau_matrix",
+    "ccm_even_sector_matrix",
+    "ccm_odd_sector_matrix",
+    "ccm_sector_tridiagonal",
+    "ccm_sector_transform",
+    "ccm_reduced_operator",
+    "ccm_factorization",
+];
+const WEIL_STATE_KINDS: &[&str] = &[
+    "ccm_weil_eigenpair",
+    "ccm_sector_eigenvalues",
+    "ccm_sector_spectrum",
+    "ccm_weil_plunge_state",
+    "ccm_weil_sonin_state",
+    "ccm_source_eigenbasis",
+];
+const PROLATE_KINDS: &[&str] = &[
+    "prolate_eigenvalue_spectrum",
+    "ccm_prolate_spectrum",
+    "ccm_prolate_basis",
+    "ccm_prolate_candidate",
+    "ccm_band_concentration",
+];
+const CCM_ROOT_KINDS: &[&str] = &[
+    "ccm_secular_source",
+    "ccm_root_count_window",
+    "ccm_root_discovery_window",
+    "ccm_root_refinement",
+    "ccm_spectral_window",
+];
+const CCM_EVIDENCE_KINDS: &[&str] = &[
+    "ccm_convergence_diagnostics",
+    "ccm_sector_gap",
+    "ccm_post_discovery_comparison",
+    "ccm_cross_check_record",
+    "ccm_validation_record",
+    "ccm_certificate_bundle",
+];
+
+pub fn artifact_kinds_for_family(family: &str) -> Option<&'static [&'static str]> {
+    match family {
+        "quadrature" => Some(QUADRATURE_KINDS),
+        "ccm-components" => Some(CCM_COMPONENT_KINDS),
+        "ccm-matrices" => Some(CCM_MATRIX_KINDS),
+        "weil-states" => Some(WEIL_STATE_KINDS),
+        "prolate" => Some(PROLATE_KINDS),
+        "ccm-roots" => Some(CCM_ROOT_KINDS),
+        "ccm-evidence" => Some(CCM_EVIDENCE_KINDS),
         _ => None,
     }
+}
+
+pub fn family_for_artifact_kind(kind: &str) -> Option<&'static str> {
+    [
+        "quadrature",
+        "ccm-components",
+        "ccm-matrices",
+        "weil-states",
+        "prolate",
+        "ccm-roots",
+        "ccm-evidence",
+    ]
+    .into_iter()
+    .find(|family| artifact_kinds_for_family(family).is_some_and(|kinds| kinds.contains(&kind)))
 }
 
 pub fn stage_produced_artifact(
@@ -786,6 +822,28 @@ mod tests {
             family_for_artifact_kind("ccm_sector_spectrum"),
             Some("weil-states")
         );
+    }
+
+    #[test]
+    fn family_declarations_and_reverse_routing_are_exact() {
+        let families = [
+            "quadrature",
+            "ccm-components",
+            "ccm-matrices",
+            "weil-states",
+            "prolate",
+            "ccm-roots",
+            "ccm-evidence",
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for family in families {
+            let kinds = artifact_kinds_for_family(family).unwrap();
+            assert!(!kinds.is_empty());
+            for kind in kinds {
+                assert!(seen.insert(*kind), "duplicate artifact kind {kind}");
+                assert_eq!(family_for_artifact_kind(kind), Some(family));
+            }
+        }
     }
 
     fn record() -> ProducedArtifactRecord {

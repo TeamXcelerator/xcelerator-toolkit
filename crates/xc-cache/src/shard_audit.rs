@@ -664,11 +664,12 @@ pub fn audit_remote_shard(
         ShardAuditIssueKind::UnreferencedEncoding,
         &mut issues,
     );
-    let unreferenced_object_count = report_unreferenced(
+    let unreferenced_object_count = report_unreferenced_matching(
         &listings["objects"],
         &referenced_paths,
         ShardAuditIssueKind::UnreferencedObject,
         &mut issues,
+        canonical_payload_object_path,
     );
     let receipt_paths = listings["transactions"]
         .paths
@@ -879,7 +880,7 @@ fn audit_payload_batch_records(
         }
 
         for object in &record.objects {
-            if !object.repository_path.starts_with("objects/")
+            if !canonical_payload_object_path(&object.repository_path)
                 || !all_paths.contains(&object.repository_path)
             {
                 issue(
@@ -946,7 +947,11 @@ fn audit_payload_batch_records(
         record_digests.insert(path.clone(), document.source.content_digest);
     }
 
-    for path in &object_listing.paths {
+    for path in object_listing
+        .paths
+        .iter()
+        .filter(|path| canonical_payload_object_path(path))
+    {
         if !declared_by_path.contains_key(path) {
             issue(
                 issues,
@@ -1089,16 +1094,48 @@ fn recoverable_document_error(error: &CacheError) -> bool {
     )
 }
 
+fn canonical_payload_object_path(path: &str) -> bool {
+    let mut components = path.split('/');
+    let (Some("objects"), Some("sha256"), Some(prefix), Some(file), None) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) else {
+        return false;
+    };
+    let Some(digest) = file.strip_suffix(".part") else {
+        return false;
+    };
+    digest.len() == 64
+        && prefix.len() == 2
+        && prefix == &digest[..2]
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn report_unreferenced(
     listing: &RemotePathListReport,
     referenced_paths: &BTreeSet<String>,
     kind: ShardAuditIssueKind,
     issues: &mut Vec<ShardAuditIssue>,
 ) -> u64 {
+    report_unreferenced_matching(listing, referenced_paths, kind, issues, |_| true)
+}
+
+fn report_unreferenced_matching(
+    listing: &RemotePathListReport,
+    referenced_paths: &BTreeSet<String>,
+    kind: ShardAuditIssueKind,
+    issues: &mut Vec<ShardAuditIssue>,
+    include: impl Fn(&str) -> bool,
+) -> u64 {
     let paths = listing
         .paths
         .iter()
-        .filter(|path| !referenced_paths.contains(*path))
+        .filter(|path| include(path) && !referenced_paths.contains(*path))
         .collect::<Vec<_>>();
     for path in &paths {
         issue(
@@ -1498,6 +1535,28 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.kind == ShardAuditIssueKind::PayloadHistoryGap));
+    }
+
+    #[test]
+    fn audit_ignores_non_payload_bootstrap_placeholders() {
+        let mut remote = fixture();
+        remote
+            .paths
+            .insert("objects/.gitkeep".to_owned(), b"\n".to_vec());
+        let report = audit_remote_shard(
+            &remote,
+            "team/shard",
+            "main",
+            &remote.revision,
+            "fixture-001",
+            &policy(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(report.unreferenced_object_count, 0);
+        assert!(report.capacity.durable_record_coverage_complete);
+        assert!(report.capacity.ledger_matches_durable_payload_history);
+        assert!(report.issues.is_empty());
     }
 
     #[test]
