@@ -531,6 +531,14 @@ const CCM_EVIDENCE_KINDS: &[&str] = &[
     "ccm_validation_record",
     "ccm_certificate_bundle",
 ];
+const MAYNARD_TAO_KINDS: &[&str] = &[
+    "maynard_basis",
+    "maynard_moment_table",
+    "maynard_operator",
+    "maynard_candidate",
+    "maynard_bound",
+    "maynard_certificate",
+];
 
 pub fn artifact_kinds_for_family(family: &str) -> Option<&'static [&'static str]> {
     match family {
@@ -541,6 +549,7 @@ pub fn artifact_kinds_for_family(family: &str) -> Option<&'static [&'static str]
         "prolate" => Some(PROLATE_KINDS),
         "ccm-roots" => Some(CCM_ROOT_KINDS),
         "ccm-evidence" => Some(CCM_EVIDENCE_KINDS),
+        "maynard-tao" => Some(MAYNARD_TAO_KINDS),
         _ => None,
     }
 }
@@ -554,6 +563,7 @@ pub fn family_for_artifact_kind(kind: &str) -> Option<&'static str> {
         "prolate",
         "ccm-roots",
         "ccm-evidence",
+        "maynard-tao",
     ]
     .into_iter()
     .find(|family| artifact_kinds_for_family(family).is_some_and(|kinds| kinds.contains(&kind)))
@@ -834,6 +844,7 @@ mod tests {
             "prolate",
             "ccm-roots",
             "ccm-evidence",
+            "maynard-tao",
         ];
         let mut seen = std::collections::BTreeSet::new();
         for family in families {
