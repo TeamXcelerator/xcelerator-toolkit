@@ -523,7 +523,7 @@ fn validate_bundle(
     Ok(())
 }
 
-fn validate_public_documents(
+pub(crate) fn validate_public_documents(
     journal: &PublicationTransactionJournal,
     destination: PublicationDestination,
     bundle: &PublicationMetadataBundle,

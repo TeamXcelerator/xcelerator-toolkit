@@ -9,7 +9,7 @@ use crate::{
     CoordinatedPublicationPlan, GitHubRepositoryEndpoint, PublicSanitizerProfile,
     PublicationDestination, PublicationMetadataBundle, RemoteGitStore,
     TargetPublicationAuthorizationRequest, TargetPublicationPlanningInput, ToolkitVersion,
-    TopologyRegistry, TopologyShardRoute, TopologyShardStatus, TopologyTrustPolicy,
+    TopologyRegistry, TopologyShardRoute, TopologyShardStatus, TopologyTrustPolicy, TransportPart,
     TransportPolicy, ValidatorEvidence,
 };
 use rayon::prelude::*;
@@ -221,8 +221,15 @@ fn preflight_producer_monotonicity(
 ) -> Result<(), CacheError> {
     let path = format!("indexes/{family}/{}.json", &semantic_digest.0[..2]);
     let index =
-        crate::RemoteShardReader::new(remote, 4 * 1024 * 1024)?
-            .read_json::<crate::ShardIndexPartition>(repository, revision, &path, cancellation)?;
+        match crate::RemoteShardReader::new(remote, 4 * 1024 * 1024)?
+            .read_json::<crate::ShardIndexPartition>(repository, revision, &path, cancellation)
+        {
+            // A clean shard has no partition for an unseen semantic prefix. It is
+            // an empty monotonicity domain, not a publication failure.
+            Ok(index) => index,
+            Err(CacheError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
     index.value.validate()?;
     if index.value.family != family {
         return Err(CacheError::InvalidManifest(
@@ -232,6 +239,517 @@ fn preflight_producer_monotonicity(
     index
         .value
         .ensure_monotonic_producer(semantic_digest, producer_toolkit_version)
+}
+
+fn completed_remote_publication(
+    prepared: &ManagedPreparedArtifactPublication,
+    remotes: &BTreeMap<PublicationDestination, &dyn crate::RemoteGitStore>,
+    cancellation: &xc_core::CancellationToken,
+) -> Result<Option<ManagedPublicationExecutionReport>, CacheError> {
+    let journal = prepared.coordinated.journal.as_ref().ok_or_else(|| {
+        CacheError::InvalidTransition(
+            "managed publication has no authorized transaction journal".to_owned(),
+        )
+    })?;
+    let mut receipt_digests = BTreeMap::new();
+    for (destination, target) in &journal.targets {
+        let remote = remotes.get(destination).ok_or_else(|| {
+            CacheError::InvalidManifest(
+                "managed publication is missing a destination remote".to_owned(),
+            )
+        })?;
+        let revision = remote.read_ref(&target.repository, &target.branch)?;
+        let index_path = format!(
+            "indexes/{}/{}.json",
+            prepared.bundles[destination].family,
+            &journal.semantic_digest.0[..2]
+        );
+        let index = match crate::RemoteShardReader::new(*remote, 4 * 1024 * 1024)?
+            .read_json::<crate::ShardIndexPartition>(
+            &target.repository,
+            &revision,
+            &index_path,
+            cancellation,
+        ) {
+            Ok(index) => index,
+            Err(CacheError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        index.value.validate()?;
+        let manifest_digest = &journal.target_manifest_digests[destination];
+        let transport_digest = prepared.bundles[destination].encoding.digest()?;
+        let Some(entry) = index.value.lookup(&journal.semantic_digest).find(|entry| {
+            entry.canonical_payload_digest == journal.payload_digest
+                && &entry.manifest_digest == manifest_digest
+                && entry.transport_digests.contains(&transport_digest)
+                && entry.publication_transaction_id == journal.transaction_id
+                && entry.disposition == ArtifactDisposition::Active
+        }) else {
+            return Ok(None);
+        };
+        let receipt_path = format!(
+            "transactions/{}/{}/receipt.json",
+            journal.transaction_id,
+            visibility_name(*destination)
+        );
+        let receipt = match crate::RemoteShardReader::new(*remote, 4 * 1024 * 1024)?
+            .read_json::<crate::PublicationReceipt>(
+            &target.repository,
+            &revision,
+            &receipt_path,
+            cancellation,
+        ) {
+            Ok(receipt) => receipt,
+            Err(CacheError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        receipt.value.validate()?;
+        let receipt_digest = receipt.value.digest()?;
+        let manifest_path = format!(
+            "manifests/{}/{}.json",
+            &journal.semantic_digest.0[..2],
+            manifest_digest.0
+        );
+        if receipt.source.content_digest != receipt_digest
+            || receipt.value.transaction_id != journal.transaction_id
+            || receipt.value.idempotency_key != journal.idempotency_key
+            || receipt.value.destination != *destination
+            || receipt.value.principal != target.permission_evidence.principal
+            || receipt.value.authorized_repository != target.authorized_repository
+            || receipt.value.shard_id != target.shard_id
+            || receipt.value.branch != target.branch
+            || receipt.value.semantic_digest != journal.semantic_digest
+            || receipt.value.canonical_payload_digest != journal.payload_digest
+            || &receipt.value.manifest_digest != manifest_digest
+            || receipt.value.transport_digest != transport_digest
+            || receipt.value.policy_digest != journal.policy_digest
+            || receipt.value.metadata_file_digests.get(&manifest_path)
+                != Some(&entry.manifest_digest)
+        {
+            return Ok(None);
+        }
+        // The receipt binds the index snapshot created by this transaction.
+        // The live partition legitimately changes as later artifacts are
+        // appended, so its current file digest must not equal that historical
+        // snapshot. The exact active entry above establishes continued
+        // discoverability in the current partition.
+        receipt_digests.insert(*destination, receipt_digest);
+    }
+    Ok(Some(ManagedPublicationExecutionReport {
+        transaction_id: journal.transaction_id.clone(),
+        completed: true,
+        steps_executed: 0,
+        final_journal_digest: canonical_digest(&receipt_digests)?,
+    }))
+}
+
+/// Publish a family as repository-level byte batches. Logical manifests and
+/// index entries remain one-per-artifact; only the Git transport transaction is
+/// shared. This is the normal path for families containing more than one
+/// artifact.
+#[allow(clippy::too_many_arguments)]
+fn execute_family_batch_publication(
+    drafts: &[&CanonicalProductionDraft],
+    destination: PublicationDestination,
+    owner: &str,
+    principal: &str,
+    sessions: &BTreeMap<PublicationDestination, AuthenticatedGitHubSession>,
+    journal_root: &Path,
+    resources: &xc_core::ResourcePolicy,
+    _replace_existing_semantic: bool,
+    event_unix_seconds: u64,
+) -> Result<Vec<ManagedPublicationExecutionReport>, CacheError> {
+    let first = drafts.first().ok_or_else(|| {
+        CacheError::InvalidTransition("family batch publication received no drafts".to_owned())
+    })?;
+    let authorized = repository(owner, &first.family, destination);
+    let repository_url = repository_url(owner, &first.family, destination);
+    let shard = shard_id(&first.family, destination);
+    let cancellation = xc_core::CancellationToken::for_policy(resources);
+    let staging_root = journal_root
+        .join("family-batches")
+        .join(&first.family)
+        .join(visibility_name(destination));
+    std::fs::create_dir_all(&staging_root)?;
+    let remote = crate::GitCliRemoteStore::new(
+        journal_root
+            .join("git-transport")
+            .join("family-batch")
+            .join(&first.family)
+            .join(visibility_name(destination)),
+        staging_root.clone(),
+        format!("Xcelerator Toolkit ({principal})"),
+        "xcelerator-toolkit@users.noreply.github.com",
+    )?
+    .with_resource_policy(resources.clone());
+    let session = sessions.get(&destination).ok_or_else(|| {
+        CacheError::Authentication("family batch is missing its write session".to_owned())
+    })?;
+    session.require_write_for(principal, &authorized)?;
+    verify_bootstrap_registry_route(&remote, owner, &first.family, destination, &cancellation)?;
+    // A clean bootstrap shard has no ledger or index yet. Initialize those
+    // sidecars before planning the first repository batch; subsequent runs
+    // simply reuse the verified sidecars.
+    let (head, mut ledger) = ensure_managed_shard_sidecars(
+        &remote,
+        session,
+        &repository_url,
+        &authorized,
+        "main",
+        &shard,
+        &first.family,
+        &first.manifest.semantic_digest.0[..2],
+        &staging_root,
+        resources,
+        &cancellation,
+    )?;
+    if ledger.shard_id != shard {
+        return Err(CacheError::InvalidManifest(
+            "family batch capacity ledger belongs to a different shard".to_owned(),
+        ));
+    }
+    let context = ManagedPublicationPlanningContext {
+        owner: owner.to_owned(),
+        principal: principal.to_owned(),
+        target: if destination == PublicationDestination::Private {
+            PublicationTarget::Private
+        } else {
+            PublicationTarget::Public
+        },
+        target_heads: BTreeMap::from([(destination, head.clone())]),
+        capacity_ledgers: BTreeMap::from([(destination, ledger.clone())]),
+        event_unix_seconds,
+    };
+    let mut prepared = Vec::with_capacity(drafts.len());
+    for draft in drafts {
+        preflight_producer_monotonicity(
+            &remote,
+            &repository_url,
+            &head,
+            &first.family,
+            &draft.manifest.semantic_digest,
+            &draft.manifest.producer_toolkit_version,
+            &cancellation,
+        )?;
+        let sessions_for_target = BTreeMap::from([(destination, sessions[&destination].clone())]);
+        let artifact = prepare_managed_artifact_publication(draft, &context, &sessions_for_target)?;
+        crate::publication_staging::validate_public_documents(
+            artifact
+                .coordinated
+                .journal
+                .as_ref()
+                .expect("authorized journal"),
+            destination,
+            &artifact.bundles[&destination],
+            if destination == PublicationDestination::Public {
+                Some(&artifact.policy.sanitizer)
+            } else {
+                None
+            },
+        )?;
+        prepared.push(artifact);
+    }
+
+    let mut files = BTreeMap::<String, TransportPart>::new();
+    let mut artifacts = Vec::with_capacity(prepared.len());
+    for (index, artifact) in prepared.iter().enumerate() {
+        let bundle = &artifact.bundles[&destination];
+        let journal = artifact
+            .coordinated
+            .journal
+            .as_ref()
+            .expect("authorized journal");
+        let manifest_digest = bundle.manifest.digest()?;
+        let transport_digest = bundle.encoding.digest()?;
+        let manifest_path = format!(
+            "manifests/{}/{}.json",
+            &journal.semantic_digest.0[..2],
+            manifest_digest.0
+        );
+        let encoding_path = format!(
+            "encodings/{}/{}.json",
+            &journal.payload_digest.0[..2],
+            transport_digest.0
+        );
+        let add_document = |path: String,
+                            bytes: Vec<u8>,
+                            files: &mut BTreeMap<String, TransportPart>|
+         -> Result<(), CacheError> {
+            let digest = ContentDigest::sha256(&bytes);
+            let target = staging_root.join(&path);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if target.exists() {
+                let existing = std::fs::read(&target)?;
+                if ContentDigest::sha256(&existing) != digest {
+                    return Err(CacheError::DigestMismatch {
+                        expected: digest.to_string(),
+                        actual: ContentDigest::sha256(&existing).to_string(),
+                    });
+                }
+            } else {
+                std::fs::write(&target, &bytes)?;
+            }
+            files.entry(path.clone()).or_insert(TransportPart {
+                sequence: 0,
+                repository_path: path.clone(),
+                size_bytes: bytes.len() as u64,
+                content_digest: digest,
+            });
+            Ok(())
+        };
+        let manifest_bytes = crate::protocol::canonical_json_bytes(&bundle.manifest)?;
+        let encoding_bytes = crate::protocol::canonical_json_bytes(&bundle.encoding)?;
+        add_document(manifest_path.clone(), manifest_bytes, &mut files)?;
+        add_document(encoding_path, encoding_bytes, &mut files)?;
+        for (attestation, digest) in bundle.validation_attestations.iter().zip(
+            bundle
+                .validation_attestations
+                .iter()
+                .map(|item| item.digest())
+                .collect::<Result<Vec<_>, _>>()?,
+        ) {
+            let path = format!("attestations/validation/{}.json", digest.0);
+            add_document(
+                path,
+                crate::protocol::canonical_json_bytes(attestation)?,
+                &mut files,
+            )?;
+        }
+        for part in &bundle.encoding.ordered_parts {
+            let source = part.repository_path.split('/').fold(
+                drafts[index].staged_parts_root.to_path_buf(),
+                |path, component| path.join(component),
+            );
+            let target = part
+                .repository_path
+                .split('/')
+                .fold(staging_root.clone(), |path, component| path.join(component));
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if !target.exists() {
+                std::fs::copy(&source, &target)?;
+            }
+            files
+                .entry(part.repository_path.clone())
+                .or_insert_with(|| part.clone());
+        }
+        let mut provenance_evidence_digests = bundle
+            .validation_attestations
+            .iter()
+            .map(|attestation| attestation.digest())
+            .collect::<Result<Vec<_>, _>>()?;
+        provenance_evidence_digests.sort();
+        artifacts.push(crate::RepositoryBatchArtifact {
+            semantic_digest: journal.semantic_digest.clone(),
+            canonical_payload_digest: journal.payload_digest.clone(),
+            manifest_digest,
+            transport_digest,
+            manifest_path,
+            achieved_assurance: bundle.achieved_assurance,
+            producer_toolkit_version: bundle.manifest.producer_toolkit_version.clone(),
+            provenance_evidence_digests,
+        });
+        let _ = index;
+    }
+    let policy_digest = prepared[0].policy.digest()?;
+    let batch = crate::RepositoryPublicationBatch::new(
+        destination,
+        first.family.clone(),
+        principal,
+        authorized.clone(),
+        "main",
+        policy_digest,
+        artifacts,
+        event_unix_seconds,
+    )?;
+    match crate::RemoteShardReader::new(&remote, 16 * 1024 * 1024)?
+        .read_json::<crate::RepositoryPublicationBatch>(
+            &repository_url,
+            &head,
+            &batch.repository_path(),
+            &cancellation,
+        ) {
+        Ok(existing) => {
+            existing.value.validate()?;
+            if existing.value.batch_id != batch.batch_id {
+                return Err(CacheError::InvalidManifest(
+                    "remote batch path contains a different immutable batch identity".to_owned(),
+                ));
+            }
+            return Ok(drafts
+                .iter()
+                .map(|_| ManagedPublicationExecutionReport {
+                    transaction_id: batch.batch_id.0.clone(),
+                    completed: true,
+                    steps_executed: 0,
+                    final_journal_digest: batch.batch_id.clone(),
+                })
+                .collect());
+        }
+        Err(CacheError::NotFound(_)) => {}
+        Err(error) => return Err(error),
+    }
+    let batch_bytes = crate::protocol::canonical_json_bytes(&batch)?;
+    let batch_path = batch.repository_path();
+    files.insert(
+        batch_path.clone(),
+        TransportPart {
+            sequence: 0,
+            repository_path: batch_path,
+            size_bytes: batch_bytes.len() as u64,
+            content_digest: ContentDigest::sha256(&batch_bytes),
+        },
+    );
+    let batch_file_path = staging_root.join(batch.repository_path());
+    if let Some(parent) = batch_file_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(batch_file_path, batch_bytes)?;
+
+    let semantic_prefixes = prepared
+        .iter()
+        .map(|artifact| {
+            artifact
+                .coordinated
+                .journal
+                .as_ref()
+                .unwrap()
+                .semantic_digest
+                .0[..2]
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    for prefix in semantic_prefixes {
+        let path = format!("indexes/{}/{prefix}.json", first.family);
+        let mut entries = match crate::RemoteShardReader::new(&remote, 16 * 1024 * 1024)?
+            .read_json::<crate::ShardIndexPartition>(
+            &repository_url,
+            &head,
+            &path,
+            &cancellation,
+        ) {
+            Ok(current) => current.value.entries,
+            Err(CacheError::NotFound(_)) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        for artifact in &prepared {
+            let journal = artifact.coordinated.journal.as_ref().unwrap();
+            if journal.semantic_digest.0.get(..2) != Some(prefix.as_str()) {
+                continue;
+            }
+            let bundle = &artifact.bundles[&destination];
+            let manifest_digest = bundle.manifest.digest()?;
+            let transport_digest = bundle.encoding.digest()?;
+            entries.retain(|entry| entry.semantic_digest != journal.semantic_digest);
+            entries.push(crate::ShardIndexEntry {
+                semantic_digest: journal.semantic_digest.clone(),
+                canonical_payload_digest: journal.payload_digest.clone(),
+                manifest_digest,
+                achieved_assurance: bundle.achieved_assurance,
+                disposition: bundle.disposition,
+                producer_toolkit_version: bundle.manifest.producer_toolkit_version.clone(),
+                minimum_reader_version: bundle.manifest.minimum_reader_version.clone(),
+                transport_digests: vec![transport_digest],
+                publication_transaction_id: batch.batch_id.0.clone(),
+            });
+        }
+        let index = crate::ShardIndexPartition::rebuild(first.family.clone(), prefix, entries)?;
+        let bytes = crate::protocol::canonical_json_bytes(&index)?;
+        files.insert(
+            path.clone(),
+            TransportPart {
+                sequence: 0,
+                repository_path: path.clone(),
+                size_bytes: bytes.len() as u64,
+                content_digest: ContentDigest::sha256(&bytes),
+            },
+        );
+        let target = staging_root.join(&path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(target, bytes)?;
+    }
+    let ledger_path = crate::DEFAULT_CAPACITY_LEDGER_PATH.to_owned();
+    let payload_bytes_added = files
+        .values()
+        .filter(|part| part.repository_path.starts_with("objects/"))
+        .map(|part| part.size_bytes)
+        .sum::<u64>();
+    let metadata_bytes_added = files
+        .values()
+        .filter(|part| !part.repository_path.starts_with("objects/"))
+        .map(|part| part.size_bytes)
+        .sum::<u64>();
+    ledger.first_seen_immutable_payload_bytes = ledger
+        .first_seen_immutable_payload_bytes
+        .saturating_add(payload_bytes_added);
+    ledger.manifest_index_receipt_bytes = ledger
+        .manifest_index_receipt_bytes
+        .saturating_add(metadata_bytes_added);
+    ledger.reconciliation_digest = batch.batch_id.clone();
+    ledger.validate()?;
+    let ledger_bytes = crate::protocol::canonical_json_bytes(&ledger)?;
+    files.insert(
+        ledger_path.clone(),
+        TransportPart {
+            sequence: 0,
+            repository_path: ledger_path,
+            size_bytes: ledger_bytes.len() as u64,
+            content_digest: ContentDigest::sha256(&ledger_bytes),
+        },
+    );
+    let target = staging_root.join(crate::DEFAULT_CAPACITY_LEDGER_PATH);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(target, ledger_bytes)?;
+    let parts = files
+        .into_values()
+        .enumerate()
+        .map(|(sequence, mut part)| {
+            part.sequence = sequence as u64;
+            part
+        })
+        .collect::<Vec<_>>();
+    let batches = crate::plan_publication_batches(&parts, &crate::TransportPolicy::default())?;
+    let mut current_head = head;
+    let mut steps = 0;
+    for batch_plan in batches {
+        let request = crate::RemoteCommitRequest {
+            repository: repository_url.clone(),
+            branch: "main".to_owned(),
+            expected_head: current_head.clone(),
+            message: format!("batch publish {} artifacts", drafts.len()),
+            parts: batch_plan.parts,
+            delete_paths: Vec::new(),
+        };
+        match remote.compare_and_swap_commit(&request)? {
+            crate::CompareAndSwapResult::Committed { commit_id } => {
+                current_head = commit_id;
+                steps += 1;
+            }
+            crate::CompareAndSwapResult::RefConflict {
+                current_head: remote_head,
+            } => {
+                return Err(CacheError::InvalidTransition(format!(
+                    "family batch publication conflicted at {remote_head}"
+                )))
+            }
+        }
+    }
+    Ok(prepared
+        .into_iter()
+        .map(|_artifact| ManagedPublicationExecutionReport {
+            transaction_id: batch.batch_id.0.clone(),
+            completed: true,
+            steps_executed: steps,
+            final_journal_digest: batch.batch_id.clone(),
+        })
+        .collect())
 }
 
 fn bounded_prefix_bytes(
@@ -390,8 +908,8 @@ fn ensure_managed_shard_sidecars(
     authorized_repository: &str,
     branch: &str,
     shard_id: &str,
-    family: &str,
-    semantic_prefix: &str,
+    _family: &str,
+    _semantic_prefix: &str,
     staging_root: &Path,
     resources: &xc_core::ResourcePolicy,
     cancellation: &xc_core::CancellationToken,
@@ -401,9 +919,7 @@ fn ensure_managed_shard_sidecars(
         let head = remote.read_ref(repository, branch)?;
         let ledger_digest =
             remote.immutable_path_digest(repository, &head, crate::DEFAULT_CAPACITY_LEDGER_PATH)?;
-        let index_path = format!("indexes/{family}/{semantic_prefix}.json");
-        let index_digest = remote.immutable_path_digest(repository, &head, &index_path)?;
-        if ledger_digest.is_some() && index_digest.is_some() {
+        if ledger_digest.is_some() {
             let ledger = read_capacity_ledger(remote, repository, &head, cancellation)?;
             if ledger.shard_id != shard_id {
                 return Err(CacheError::InvalidManifest(format!(
@@ -416,81 +932,64 @@ fn ensure_managed_shard_sidecars(
 
         let mut parts = Vec::new();
         let mut staged_bytes = 0u64;
-        if ledger_digest.is_none() {
-            let payload_bytes =
-                bounded_prefix_bytes(remote, repository, &head, "objects", true, cancellation)?;
-            let metadata_bytes = [
-                "manifests",
-                "encodings",
-                "transactions",
-                "indexes",
-                "attestations",
-                "revocations",
-            ]
-            .into_iter()
-            .try_fold(0u64, |total, prefix| {
-                total
-                    .checked_add(bounded_prefix_bytes(
-                        remote,
-                        repository,
-                        &head,
-                        prefix,
-                        false,
-                        cancellation,
-                    )?)
-                    .ok_or_else(|| {
-                        CacheError::ResourceLimit(
-                            "bootstrap metadata accounting exceeds u64".to_owned(),
-                        )
-                    })
-            })?;
-            let reconciliation_digest = canonical_digest(&BootstrapReconciliation {
-                schema_version: 1,
-                shard_id,
-                revision: &head,
-                observed_payload_bytes: payload_bytes,
-                observed_metadata_bytes: metadata_bytes,
-            })?;
-            let ledger = CapacityLedger {
-                schema_version: 1,
-                shard_id: shard_id.to_owned(),
-                hard_capacity_bytes: crate::GITHUB_SAFE_REPOSITORY_PAYLOAD_BYTES,
-                warning_reserve_bytes: 5_000_000_000,
-                first_seen_immutable_payload_bytes: payload_bytes,
-                manifest_index_receipt_bytes: metadata_bytes,
-                // Conservatively reserve another full reachable snapshot for
-                // pre-ledger history rather than claiming exact old history.
-                estimated_history_bytes: payload_bytes.saturating_add(metadata_bytes),
-                emergency_reserve_bytes: 0,
-                abandoned_reachable_bytes: 0,
-                last_reconciled_commit: head.clone(),
-                reconciliation_digest,
-            };
-            ledger.validate()?;
-            parts.push(crate::publication_staging::stage_publication_bytes(
-                staging_root,
-                crate::DEFAULT_CAPACITY_LEDGER_PATH,
-                &crate::protocol::canonical_json_bytes(&ledger)?,
-                resources,
-                cancellation,
-                &mut staged_bytes,
-            )?);
-        }
-        if index_digest.is_none() {
-            let index = crate::ShardIndexPartition::rebuild(
-                family.to_owned(),
-                semantic_prefix.to_owned(),
-                Vec::new(),
-            )?;
-            parts.push(crate::publication_staging::stage_publication_bytes(
-                staging_root,
-                &index_path,
-                &crate::protocol::canonical_json_bytes(&index)?,
-                resources,
-                cancellation,
-                &mut staged_bytes,
-            )?);
-        }
+        let payload_bytes =
+            bounded_prefix_bytes(remote, repository, &head, "objects", true, cancellation)?;
+        let metadata_bytes = [
+            "manifests",
+            "encodings",
+            "transactions",
+            "indexes",
+            "attestations",
+            "revocations",
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, prefix| {
+            total
+                .checked_add(bounded_prefix_bytes(
+                    remote,
+                    repository,
+                    &head,
+                    prefix,
+                    false,
+                    cancellation,
+                )?)
+                .ok_or_else(|| {
+                    CacheError::ResourceLimit(
+                        "bootstrap metadata accounting exceeds u64".to_owned(),
+                    )
+                })
+        })?;
+        let reconciliation_digest = canonical_digest(&BootstrapReconciliation {
+            schema_version: 1,
+            shard_id,
+            revision: &head,
+            observed_payload_bytes: payload_bytes,
+            observed_metadata_bytes: metadata_bytes,
+        })?;
+        let ledger = CapacityLedger {
+            schema_version: 1,
+            shard_id: shard_id.to_owned(),
+            hard_capacity_bytes: crate::GITHUB_SAFE_REPOSITORY_PAYLOAD_BYTES,
+            warning_reserve_bytes: 5_000_000_000,
+            first_seen_immutable_payload_bytes: payload_bytes,
+            manifest_index_receipt_bytes: metadata_bytes,
+            // Conservatively reserve another full reachable snapshot for
+            // pre-ledger history rather than claiming exact old history.
+            estimated_history_bytes: payload_bytes.saturating_add(metadata_bytes),
+            emergency_reserve_bytes: 0,
+            abandoned_reachable_bytes: 0,
+            last_reconciled_commit: head.clone(),
+            reconciliation_digest,
+        };
+        ledger.validate()?;
+        parts.push(crate::publication_staging::stage_publication_bytes(
+            staging_root,
+            crate::DEFAULT_CAPACITY_LEDGER_PATH,
+            &crate::protocol::canonical_json_bytes(&ledger)?,
+            resources,
+            cancellation,
+            &mut staged_bytes,
+        )?);
         parts.sort_by(|left, right| left.repository_path.cmp(&right.repository_path));
         for (sequence, part) in parts.iter_mut().enumerate() {
             part.sequence = sequence as u64;
@@ -510,7 +1009,7 @@ fn ensure_managed_shard_sidecars(
             repository: repository.to_owned(),
             branch: branch.to_owned(),
             expected_head: head,
-            message: format!("initialize Xcelerator v0.13.0 shard metadata for {family}"),
+            message: "initialize Xcelerator v0.13.0 shard capacity ledger".to_owned(),
             parts,
             delete_paths: Vec::new(),
         })?;
@@ -938,7 +1437,28 @@ pub fn prepare_managed_artifact_publication(
             .target_reports
             .iter()
             .filter(|(_, report)| !report.accepted())
-            .map(|(destination, report)| format!("{destination:?}: {}", report.reasons.join("; ")))
+            .map(|(destination, report)| {
+                let mut reasons = report
+                    .authorization
+                    .reasons
+                    .iter()
+                    .chain(&report.reasons)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                reasons.sort();
+                reasons.dedup();
+                let reasons = if reasons.is_empty() {
+                    format!(
+                        "authorization denied for principal {:?} with {:?} permission on {:?}",
+                        report.authorization.repository_permission.principal,
+                        report.authorization.repository_permission.permission,
+                        report.authorization.repository_permission.repository
+                    )
+                } else {
+                    reasons.join("; ")
+                };
+                format!("{destination:?}: {reasons}")
+            })
             .collect::<Vec<_>>()
             .join(" | ");
         return Err(CacheError::PermissionDenied(format!(
@@ -1088,6 +1608,7 @@ pub fn execute_prepared_managed_artifact_publication(
     })
 }
 
+#[allow(unreachable_code, unused_variables, unused_mut)]
 fn execute_managed_family_drafts_on_github(
     drafts: &[&CanonicalProductionDraft],
     target: PublicationTarget,
@@ -1106,6 +1627,7 @@ fn execute_managed_family_drafts_on_github(
     let probe = crate::GitHubCredentialApiProbe::default();
     let checkpoints = crate::PublicationJournalStore::new(journal_root);
     let mut reports = Vec::new();
+    let mut remotely_completed = 0usize;
     let mut replacement_families = BTreeSet::new();
     let first_draft = drafts.first().ok_or_else(|| {
         CacheError::InvalidTransition("managed family publication received no drafts".to_owned())
@@ -1118,7 +1640,6 @@ fn execute_managed_family_drafts_on_github(
             "managed family publication requires exactly one artifact family".to_owned(),
         ));
     }
-
     // Authenticate and initialize each destination once for the complete
     // family. Every artifact retains its own transaction journal and audit
     // receipt, but no longer pays for a fresh bare repository and fetch.
@@ -1141,6 +1662,31 @@ fn execute_managed_family_drafts_on_github(
         .next()
         .expect("target has a session")
         .to_owned();
+    // Repository batches are the sole managed publication format. A one-
+    // artifact family uses the same path so publication never regresses to
+    // the obsolete per-artifact receipt/commit transaction.
+    let mut batch_reports = Vec::new();
+    for destination in destinations.iter().copied() {
+        batch_reports.extend(execute_family_batch_publication(
+            drafts,
+            destination,
+            owner,
+            &principal,
+            &sessions,
+            journal_root,
+            resources,
+            replace_existing_semantic,
+            event_unix_seconds,
+        )?);
+    }
+    return Ok(ManagedRunPublicationReport {
+        schema_version: 1,
+        all_completed: batch_reports.iter().all(|report| report.completed),
+        artifacts: batch_reports,
+        current_tree_paths_removed: 0,
+    });
+
+    #[allow(unreachable_code)]
     let mut remotes = BTreeMap::new();
     for destination in destinations.iter().copied() {
         let target_roots = drafts
@@ -1164,6 +1710,21 @@ fn execute_managed_family_drafts_on_github(
     }
 
     for draft in drafts {
+        // Refresh before any per-artifact remote access. Without this check a
+        // large family can reach its next artifact with evidence that expired
+        // while the previous artifact was being committed.
+        for destination in destinations.iter().copied() {
+            if sessions[&destination].requires_refresh(60)? {
+                let authorized_repository = repository(owner, &draft.family, destination);
+                let refreshed = probe.probe_repository(&authorized_repository)?;
+                if refreshed.evidence().principal != principal {
+                    return Err(CacheError::Authentication(
+                        "refreshed GitHub permission resolved a different principal".to_owned(),
+                    ));
+                }
+                sessions.insert(destination, refreshed);
+            }
+        }
         let semantic_prefix = &draft.manifest.semantic_digest.0[..2];
         let mut heads = BTreeMap::new();
         let mut ledgers = BTreeMap::new();
@@ -1204,6 +1765,23 @@ fn execute_managed_family_drafts_on_github(
             heads.insert(destination, head);
             ledgers.insert(destination, ledger);
         }
+
+        // A family can contain many artifacts. Refresh the live permission
+        // evidence before planning the next artifact rather than allowing the
+        // family-wide session to expire merely because earlier artifacts took
+        // longer than the five-minute freshness window.
+        for destination in destinations.iter().copied() {
+            if sessions[&destination].requires_refresh(60)? {
+                let authorized_repository = repository(owner, &draft.family, destination);
+                let refreshed = probe.probe_repository(&authorized_repository)?;
+                if refreshed.evidence().principal != principal {
+                    return Err(CacheError::Authentication(
+                        "refreshed GitHub permission resolved a different principal".to_owned(),
+                    ));
+                }
+                sessions.insert(destination, refreshed);
+            }
+        }
         let context = ManagedPublicationPlanningContext {
             owner: owner.to_owned(),
             principal: principal.clone(),
@@ -1213,6 +1791,16 @@ fn execute_managed_family_drafts_on_github(
             event_unix_seconds,
         };
         let mut prepared = prepare_managed_artifact_publication(draft, &context, &sessions)?;
+        let remote_refs: BTreeMap<PublicationDestination, &dyn crate::RemoteGitStore> = remotes
+            .iter()
+            .map(|(destination, remote)| (*destination, remote as &dyn crate::RemoteGitStore))
+            .collect();
+        if let Some(report) = completed_remote_publication(&prepared, &remote_refs, &cancellation)?
+        {
+            reports.push(report);
+            remotely_completed += 1;
+            continue;
+        }
         let planned = prepared
             .coordinated
             .journal
@@ -1223,32 +1811,63 @@ fn execute_managed_family_drafts_on_github(
         } else {
             checkpoints.save(planned)?;
         }
-        let remote_refs: BTreeMap<PublicationDestination, &dyn crate::RemoteGitStore> = remotes
-            .iter()
-            .map(|(destination, remote)| (*destination, remote as &dyn crate::RemoteGitStore))
-            .collect();
         let maximum_steps = draft
             .encoding
             .ordered_parts
             .len()
             .saturating_mul(4)
             .saturating_add(32);
-        let report = execute_prepared_managed_artifact_publication(
-            &mut prepared,
-            &remote_refs,
-            &checkpoints,
-            &cancellation,
-            &sessions,
-            &draft.staged_parts_root,
-            resources,
-            maximum_steps,
-            event_unix_seconds,
-            replace_existing_semantic,
-        )?;
+        let mut refresh_attempts = 0usize;
+        let report = loop {
+            match execute_prepared_managed_artifact_publication(
+                &mut prepared,
+                &remote_refs,
+                &checkpoints,
+                &cancellation,
+                &sessions,
+                &draft.staged_parts_root,
+                resources,
+                maximum_steps,
+                event_unix_seconds,
+                replace_existing_semantic,
+            ) {
+                Ok(report) => break report,
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains(crate::STALE_AUTHORITY_PROBE_MESSAGE)
+                        && refresh_attempts < 16 =>
+                {
+                    refresh_attempts += 1;
+                    for destination in destinations.iter().copied() {
+                        let authorized_repository = repository(owner, &draft.family, destination);
+                        let refreshed = probe.probe_repository(&authorized_repository)?;
+                        if refreshed.evidence().principal != principal {
+                            return Err(CacheError::Authentication(
+                                "refreshed GitHub permission resolved a different principal"
+                                    .to_owned(),
+                            ));
+                        }
+                        sessions.insert(destination, refreshed);
+                    }
+                    eprintln!(
+                        "publication authorization refreshed for family {} after a long-running artifact step",
+                        draft.family
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        };
         reports.push(report);
         if replace_existing_semantic {
             replacement_families.insert(draft.family.clone());
         }
+    }
+    if remotely_completed > 0 {
+        eprintln!(
+            "publication family {}: reused {remotely_completed} completed remote transaction(s)",
+            first_draft.family
+        );
     }
     for destination in destinations.iter().copied() {
         remotes[&destination].cleanup_session(&repository_url(
@@ -1320,6 +1939,35 @@ pub fn execute_managed_drafts_on_github(
             .push(draft);
     }
     let groups = by_family.into_values().collect::<Vec<_>>();
+
+    // Fail the complete multi-family run before the first remote mutation if
+    // any destination repository is absent from the PAT or lacks write access.
+    // Per-family probes are repeated immediately before mutation so their
+    // evidence remains fresh during long publication runs.
+    let probe = crate::GitHubCredentialApiProbe::default();
+    let destinations = destinations(target)?;
+    let mut principals = BTreeSet::new();
+    for family_drafts in &groups {
+        let family = family_drafts
+            .first()
+            .map(|draft| draft.family.as_str())
+            .ok_or_else(|| {
+                CacheError::InvalidTransition(
+                    "managed publication received an empty artifact family".to_owned(),
+                )
+            })?;
+        for destination in destinations.iter().copied() {
+            let authorized_repository = repository(owner, family, destination);
+            let session = probe.probe_repository(&authorized_repository)?;
+            principals.insert(session.evidence().principal.clone());
+        }
+    }
+    if principals.len() != 1 {
+        return Err(CacheError::Authentication(
+            "managed multi-family publication resolved different GitHub principals".to_owned(),
+        ));
+    }
+
     let started = std::time::Instant::now();
     let reports = groups
         .par_iter()
@@ -1748,10 +2396,13 @@ mod tests {
             .immutable_path_digest(repository, &head, crate::DEFAULT_CAPACITY_LEDGER_PATH)
             .unwrap()
             .is_some());
+        // Index partitions are created by the first family batch that uses a
+        // prefix; ledger bootstrap must not create empty prefixes or replay
+        // an initialization commit on every later family.
         assert!(remote
             .immutable_path_digest(repository, &head, "indexes/quadrature/ab.json")
             .unwrap()
-            .is_some());
+            .is_none());
         assert!(!staging
             .join("managed-targets/private")
             .join(crate::DEFAULT_CAPACITY_LEDGER_PATH)
@@ -1919,6 +2570,27 @@ mod tests {
                 .unwrap()
                 .is_some());
         }
+        // A later author session has fresh authorization evidence, but the
+        // artifact and its stable publication identity are unchanged. The
+        // completed remote receipt must win over regenerated local plan bytes.
+        for target in prepared
+            .coordinated
+            .journal
+            .as_mut()
+            .unwrap()
+            .targets
+            .values_mut()
+        {
+            target.permission_evidence.evidence_digest =
+                ContentDigest::sha256(b"refreshed authorization evidence");
+        }
+        let resumed =
+            completed_remote_publication(&prepared, &remote_map, &CancellationToken::new())
+                .unwrap()
+                .expect("the completed remote transaction should be reusable");
+        assert!(resumed.completed);
+        assert_eq!(resumed.transaction_id, transaction_id);
+        assert_eq!(resumed.steps_executed, 0);
         let _ = fs::remove_dir_all(root);
     }
 

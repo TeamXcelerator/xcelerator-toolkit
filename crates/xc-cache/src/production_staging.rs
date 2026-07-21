@@ -626,13 +626,18 @@ pub fn stage_produced_artifact_with_dependencies(
         .join(&record.manifest.content_digest.0);
     if draft_root.exists() {
         let draft_path = draft_root.join("draft.json");
-        let draft: CanonicalProductionDraft =
-            serde_json::from_slice(&fs::read(&draft_path).map_err(|_| {
-                CacheError::InvalidManifest(format!(
-                    "existing canonical production draft is incomplete: {}",
-                    draft_root.display()
-                ))
-            })?)?;
+        // draft.json is written only after the archive and every split part
+        // have completed.  Its absence therefore identifies an interrupted
+        // staging attempt, not a reusable canonical draft.  Rebuild it from
+        // the still-validated produced artifact instead of permanently
+        // wedging subsequent author runs after a reboot or process kill.
+        if !draft_path.is_file() {
+            fs::remove_dir_all(&draft_root)?;
+        }
+    }
+    if draft_root.exists() {
+        let draft_path = draft_root.join("draft.json");
+        let draft: CanonicalProductionDraft = serde_json::from_slice(&fs::read(&draft_path)?)?;
         draft.manifest.validate()?;
         draft.encoding.validate()?;
         crate::ArtifactProductionAssessment {
@@ -949,6 +954,39 @@ mod tests {
         }
         let _ = fs::remove_dir_all(first_root);
         let _ = fs::remove_dir_all(second_root);
+    }
+
+    #[test]
+    fn interrupted_canonical_draft_is_rebuilt_from_validated_record() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-production-interrupted-stage-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let record = record();
+        let draft_root = root
+            .join("drafts")
+            .join(record.semantic_key.digest().unwrap().0)
+            .join(&record.manifest.content_digest.0);
+        fs::create_dir_all(draft_root.join("parts")).unwrap();
+        fs::write(draft_root.join("interrupted.part"), b"partial").unwrap();
+
+        let rebuilt = stage_produced_artifact(
+            &record,
+            &root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        assert!(draft_root.join("draft.json").is_file());
+        assert!(!draft_root.join("interrupted.part").exists());
+        assert_eq!(
+            rebuilt.source_content_digest,
+            record.manifest.content_digest
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

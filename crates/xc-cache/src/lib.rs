@@ -9,6 +9,7 @@
 //! chunked payloads, and deterministic GitHub repository capacity planning.
 
 mod artifact_validation;
+mod batch_publication;
 mod bootstrap_remote_store;
 mod bundle;
 mod cache_provenance;
@@ -46,6 +47,7 @@ mod shard_repair;
 mod trust;
 
 pub use artifact_validation::*;
+pub use batch_publication::*;
 pub use bootstrap_remote_store::*;
 pub use bundle::*;
 pub use cache_provenance::*;

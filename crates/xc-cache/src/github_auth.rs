@@ -1,9 +1,10 @@
 //! Live GitHub principal and repository-permission preflight.
 //!
-//! Credentials remain in the external Git credential provider. They are used
-//! only long enough to query GitHub's allowlisted API endpoints and are never
-//! placed in evidence, diagnostics, command-line arguments, or child-process
-//! environment variables.
+//! Environment PATs are preferred for ephemeral compute hosts and are passed
+//! to the configured Git credential provider over stdin so the API probe and
+//! later Git transport use the same secret. Credentials are never placed in
+//! evidence, diagnostics, command-line arguments, or child-process environment
+//! variables.
 
 use crate::{canonical_digest, CacheError, ContentDigest};
 use serde::{Deserialize, Serialize};
@@ -11,12 +12,18 @@ use serde_json::Value;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const GITHUB_API_ORIGIN: &str = "https://api.github.com";
 const GITHUB_CREDENTIAL_HOST: &str = "github.com";
+const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
+const GH_TOKEN_ENV: &str = "GH_TOKEN";
 const PROVIDER_ID: &str = "git-credential+github-api-curl-v1";
 pub const AUTHORITY_PROBE_MAX_AGE_SECONDS: u64 = 300;
+pub const STALE_AUTHORITY_PROBE_MESSAGE: &str =
+    "GitHub permission probe is stale and must be repeated before mutation";
+static CREDENTIAL_PROVIDER_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,7 +133,7 @@ impl RepositoryPermissionEvidence {
 
 /// Opaque in-process proof that authentication was performed by the live
 /// provider. This type cannot be deserialized or constructed by callers.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct AuthenticatedGitHubSession {
     evidence: RepositoryPermissionEvidence,
 }
@@ -144,7 +151,7 @@ impl AuthenticatedGitHubSession {
                 > AUTHORITY_PROBE_MAX_AGE_SECONDS
         {
             return Err(CacheError::Authentication(
-                "GitHub permission probe is stale and must be repeated before mutation".to_owned(),
+                STALE_AUTHORITY_PROBE_MESSAGE.to_owned(),
             ));
         }
         if self.evidence.principal != principal {
@@ -166,6 +173,18 @@ impl AuthenticatedGitHubSession {
             )));
         }
         Ok(())
+    }
+
+    /// Whether this permission evidence should be refreshed before beginning
+    /// another potentially long publication unit.
+    pub fn requires_refresh(&self, safety_margin_seconds: u64) -> Result<bool, CacheError> {
+        self.evidence.validate()?;
+        let now = unix_time_now()?;
+        if self.evidence.verified_at_unix_seconds > now.saturating_add(30) {
+            return Ok(true);
+        }
+        let age = now.saturating_sub(self.evidence.verified_at_unix_seconds);
+        Ok(age.saturating_add(safety_margin_seconds) >= AUTHORITY_PROBE_MAX_AGE_SECONDS)
     }
 
     #[cfg(test)]
@@ -212,6 +231,18 @@ impl GitHubCredentialApiProbe {
         self
     }
 
+    /// Make the resolved GitHub credential available to non-interactive Git
+    /// transport before any private repository read.
+    ///
+    /// An environment PAT is authoritative and is approved through the
+    /// configured credential provider over stdin. This must run before the
+    /// bootstrap cache performs its first `git` read; publication permission
+    /// probes happen too late for a cold private-cache fetch after a machine
+    /// restart has cleared an in-memory credential helper.
+    pub fn prepare_git_transport(&self) -> Result<(), CacheError> {
+        self.resolved_credential().map(|_| ())
+    }
+
     /// Resolve the current GitHub principal and its effective permission for
     /// exactly one owner/repository target.
     pub fn probe_repository(
@@ -223,7 +254,7 @@ impl GitHubCredentialApiProbe {
                 "GitHub repository must be an owner/name pair".to_owned(),
             ));
         }
-        let credential = self.git_credential()?;
+        let credential = self.resolved_credential()?;
         let user = self.github_get("/user", &credential.secret)?;
         let principal = required_string(&user, "login", "authenticated GitHub user")?;
         let repository_response =
@@ -249,6 +280,57 @@ impl GitHubCredentialApiProbe {
         let session = AuthenticatedGitHubSession { evidence };
         session.require_write_for(session.evidence().principal.as_str(), repository)?;
         Ok(session)
+    }
+
+    fn resolved_credential(&self) -> Result<GitCredential, CacheError> {
+        let _guard = CREDENTIAL_PROVIDER_LOCK.lock().map_err(|_| {
+            CacheError::Authentication("Git credential provider lock is poisoned".to_owned())
+        })?;
+        if let Some(mut credential) = environment_credential()? {
+            // Reuse the provider's existing username key when present so an
+            // explicit environment PAT replaces a stale host credential
+            // instead of creating an ambiguous second entry.
+            if let Ok(existing) = self.git_credential() {
+                credential.username = existing.username;
+            }
+            self.approve_git_credential(&credential)?;
+            let retained = self.git_credential().map_err(|_| {
+                CacheError::Authentication(
+                    "the configured Git credential provider did not retain the environment PAT for Git transport"
+                        .to_owned(),
+                )
+            })?;
+            if retained.secret != credential.secret {
+                return Err(CacheError::Authentication(
+                    "the configured Git credential provider returned a different credential after accepting the environment PAT"
+                        .to_owned(),
+                ));
+            }
+            return Ok(credential);
+        }
+        self.git_credential()
+    }
+
+    fn approve_git_credential(&self, credential: &GitCredential) -> Result<(), CacheError> {
+        let input = format!(
+            "protocol=https\nhost={GITHUB_CREDENTIAL_HOST}\nusername={}\npassword={}\n\n",
+            credential.username, credential.secret
+        );
+        let output = run_with_input(
+            &self.git_executable,
+            [OsString::from("credential"), OsString::from("approve")],
+            input.as_bytes(),
+            &[
+                (OsStr::new("GIT_TERMINAL_PROMPT"), OsStr::new("0")),
+                (OsStr::new("GCM_INTERACTIVE"), OsStr::new("Never")),
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(CacheError::Authentication(
+                "the configured Git credential provider rejected the environment PAT".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn git_credential(&self) -> Result<GitCredential, CacheError> {
@@ -334,6 +416,41 @@ struct GitCredential {
     #[allow(dead_code)]
     username: String,
     secret: String,
+}
+
+fn environment_credential() -> Result<Option<GitCredential>, CacheError> {
+    environment_credential_from_values(
+        std::env::var_os(GITHUB_TOKEN_ENV),
+        std::env::var_os(GH_TOKEN_ENV),
+    )
+}
+
+fn environment_credential_from_values(
+    github_token: Option<OsString>,
+    gh_token: Option<OsString>,
+) -> Result<Option<GitCredential>, CacheError> {
+    for (name, value) in [(GITHUB_TOKEN_ENV, github_token), (GH_TOKEN_ENV, gh_token)] {
+        let Some(value) = value else { continue };
+        let secret = value.into_string().map_err(|_| {
+            CacheError::Authentication(format!("{name} contains non-Unicode credential data"))
+        })?;
+        if secret.is_empty() {
+            continue;
+        }
+        if secret
+            .bytes()
+            .any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'"' | b'\\'))
+        {
+            return Err(CacheError::Authentication(format!(
+                "{name} contains an unsupported credential format"
+            )));
+        }
+        return Ok(Some(GitCredential {
+            username: "x-access-token".to_owned(),
+            secret,
+        }));
+    }
+    Ok(None)
 }
 
 fn parse_git_credential(bytes: &[u8]) -> Result<GitCredential, CacheError> {
@@ -477,6 +594,39 @@ mod tests {
     }
 
     #[test]
+    fn environment_pat_precedence_is_github_then_gh() {
+        let credential = environment_credential_from_values(
+            Some(OsString::from("github-secret")),
+            Some(OsString::from("gh-secret")),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(credential.username, "x-access-token");
+        assert_eq!(credential.secret, "github-secret");
+
+        let fallback = environment_credential_from_values(
+            Some(OsString::from("")),
+            Some(OsString::from("gh-secret")),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fallback.secret, "gh-secret");
+    }
+
+    #[test]
+    fn environment_pat_rejects_control_characters_before_credential_approval() {
+        let error = match environment_credential_from_values(
+            Some(OsString::from("secret\nsecond-line")),
+            None,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("control characters must be rejected"),
+        };
+        assert!(matches!(error, CacheError::Authentication(_)));
+        assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
     fn permission_parser_uses_effective_write_capability() {
         let response = json!({
             "permissions": {
@@ -513,5 +663,18 @@ mod tests {
             writable.require_write_for("someone-else", "example-org/restricted-cache"),
             Err(CacheError::Authentication(_))
         ));
+    }
+
+    #[test]
+    fn refresh_margin_marks_a_session_before_its_hard_expiry() {
+        let session = AuthenticatedGitHubSession::verified_for_test(
+            "owner",
+            "example-org/cache",
+            RepositoryPermission::Write,
+        );
+        assert!(!session.requires_refresh(0).unwrap());
+        assert!(session
+            .requires_refresh(AUTHORITY_PROBE_MAX_AGE_SECONDS)
+            .unwrap());
     }
 }

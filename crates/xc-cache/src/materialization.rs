@@ -179,9 +179,14 @@ pub fn materialize_resolved_remote_artifact(
             .manifest
             .transport_digests
             .contains(&transport_digest)
-        || artifact.receipt.manifest_digest != manifest_digest
-        || artifact.receipt.transport_digest != transport_digest
-        || artifact.receipt.canonical_payload_digest != artifact.manifest.payload_digest
+        || artifact
+            .receipt
+            .artifact(&artifact.semantic_digest, &manifest_digest)
+            .is_none_or(|proof| {
+                proof.manifest_digest != manifest_digest
+                    || proof.transport_digest != transport_digest
+                    || proof.canonical_payload_digest != artifact.manifest.payload_digest
+            })
     {
         return Err(CacheError::InvalidManifest(
             "resolved artifact identities are inconsistent before materialization".to_owned(),
@@ -578,7 +583,7 @@ mod tests {
             index,
             manifest,
             encoding,
-            receipt,
+            receipt: crate::RemotePublicationEvidence::ArtifactReceipt(Box::new(receipt)),
             index_source: source.clone(),
             manifest_source: source.clone(),
             encoding_source: source.clone(),

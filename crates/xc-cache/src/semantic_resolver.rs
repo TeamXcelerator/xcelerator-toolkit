@@ -3,9 +3,10 @@
 use crate::{
     ArtifactAssuranceState, ArtifactDisposition, CacheError, CacheNetworkRegistry, CacheVisibility,
     CanonicalArtifactManifest, ContentDigest, PublicationDestination, PublicationReceipt,
-    RemoteDocument, RemoteFabricTrustPolicy, RemoteGitStore, RemoteReadReport, RemoteShardReader,
-    RemoteTopologySource, RevocationIndexPartition, RevocationRecord, RevocationScope,
-    SemanticKeyEnvelope, ShardIndexEntry, ToolkitVersion, TopologyShardStatus, TopologyTrustPolicy,
+    RemoteDocument, RemoteFabricTrustPolicy, RemoteGitStore, RemotePublicationEvidence,
+    RemoteReadReport, RemoteShardReader, RemoteTopologySource, RepositoryPublicationBatch,
+    RevocationIndexPartition, RevocationRecord, RevocationScope, SemanticKeyEnvelope,
+    ShardIndexEntry, ToolkitVersion, TopologyShardStatus, TopologyTrustPolicy,
     TransportEncodingRecord, TrustedRepositoryRole,
 };
 use serde::{Deserialize, Serialize};
@@ -130,7 +131,7 @@ pub struct ResolvedRemoteArtifact {
     pub index: ShardIndexEntry,
     pub manifest: CanonicalArtifactManifest,
     pub encoding: TransportEncodingRecord,
-    pub receipt: PublicationReceipt,
+    pub receipt: RemotePublicationEvidence,
     pub index_source: RemoteReadReport,
     pub manifest_source: RemoteReadReport,
     pub encoding_source: RemoteReadReport,
@@ -626,7 +627,7 @@ fn resolve_candidate(
     repository: &str,
     branch: &str,
     revision: &str,
-    index_path: &str,
+    _index_path: &str,
     index: &RemoteDocument<crate::ShardIndexPartition>,
     entry: &ShardIndexEntry,
 ) -> Result<ResolvedRemoteArtifact, CacheError> {
@@ -752,58 +753,148 @@ fn resolve_candidate(
             PublicationDestination::Public => "public",
         }
     );
-    let receipt: RemoteDocument<PublicationReceipt> = RemoteShardReader::new(
-        context.remote,
-        context.query.maximum_receipt_bytes,
-    )?
-    .read_json(repository, revision, &receipt_path, context.cancellation)?;
-    receipt.value.validate()?;
-    if receipt.source.content_digest != receipt.value.digest()? {
-        return Err(CacheError::InvalidManifest(
-            "publication receipt bytes are not canonical".to_owned(),
-        ));
-    }
-    if receipt.value.transaction_id != entry.publication_transaction_id
-        || receipt.value.destination != expected_destination
-        || receipt.value.authorized_repository != authorized_repository
-        || receipt.value.shard_id != shard_id
-        || receipt.value.branch != branch
-        || receipt.value.semantic_digest != *semantic_digest
-        || receipt.value.canonical_payload_digest != entry.canonical_payload_digest
-        || receipt.value.manifest_digest != entry.manifest_digest
-        || !context
-            .query
-            .accepted_publication_policy_digests
-            .contains(&receipt.value.policy_digest)
-        || receipt
-            .value
-            .discoverability_subject_digests
-            .get(index_path)
-            != Some(&index.source.content_digest)
-        || receipt.value.metadata_file_digests.get(&manifest_path) != Some(&entry.manifest_digest)
+    let reader = RemoteShardReader::new(context.remote, context.query.maximum_receipt_bytes)?;
+    let (
+        publication_evidence,
+        receipt_source,
+        policy_digest,
+        transport_digest,
+        legacy_metadata,
+        batch_evidence,
+    ) = match reader.read_json::<PublicationReceipt>(
+        repository,
+        revision,
+        &receipt_path,
+        context.cancellation,
+    ) {
+        Ok(receipt) => {
+            receipt.value.validate()?;
+            if receipt.source.content_digest != receipt.value.digest()?
+                || receipt.value.transaction_id != entry.publication_transaction_id
+                || receipt.value.destination != expected_destination
+                || receipt.value.authorized_repository != authorized_repository
+                || receipt.value.shard_id != shard_id
+                || receipt.value.branch != branch
+                || receipt.value.semantic_digest != *semantic_digest
+                || receipt.value.canonical_payload_digest != entry.canonical_payload_digest
+                || receipt.value.manifest_digest != entry.manifest_digest
+                || receipt.value.metadata_file_digests.get(&manifest_path)
+                    != Some(&entry.manifest_digest)
+            {
+                return Err(CacheError::InvalidManifest(
+                    "publication receipt does not prove this discoverable index entry".to_owned(),
+                ));
+            }
+            let metadata = Some(receipt.value.metadata_file_digests.clone());
+            let policy = receipt.value.policy_digest.clone();
+            let transport = receipt.value.transport_digest.clone();
+            (
+                RemotePublicationEvidence::ArtifactReceipt(Box::new(receipt.value)),
+                receipt.source,
+                policy,
+                transport,
+                metadata,
+                None,
+            )
+        }
+        Err(CacheError::NotFound(_)) => {
+            let batch_path = format!(
+                "transactions/batches/{}/{}.json",
+                entry.publication_transaction_id,
+                match expected_destination {
+                    PublicationDestination::Private => "private",
+                    PublicationDestination::Public => "public",
+                }
+            );
+            let batch: RemoteDocument<RepositoryPublicationBatch> =
+                reader.read_json(repository, revision, &batch_path, context.cancellation)?;
+            batch.value.validate()?;
+            if batch.source.content_digest != batch.value.digest()? {
+                return Err(CacheError::InvalidManifest(
+                    "repository batch bytes are not canonical".to_owned(),
+                ));
+            }
+            let artifact = batch
+                .value
+                .artifacts
+                .iter()
+                .find(|artifact| {
+                    artifact.semantic_digest == *semantic_digest
+                        && artifact.manifest_digest == entry.manifest_digest
+                })
+                .ok_or_else(|| {
+                    CacheError::InvalidManifest(
+                        "repository batch does not contain the selected artifact".to_owned(),
+                    )
+                })?;
+            if batch.value.batch_id.0 != entry.publication_transaction_id
+                || batch.value.destination != expected_destination
+                || batch.value.family != family
+                || batch.value.authorized_repository != authorized_repository
+                || batch.value.branch != branch
+                || artifact.canonical_payload_digest != entry.canonical_payload_digest
+                || artifact.transport_digest
+                    != *entry.transport_digests.first().ok_or_else(|| {
+                        CacheError::InvalidManifest(
+                            "repository batch index has no transport".to_owned(),
+                        )
+                    })?
+                || artifact.manifest_path != manifest_path
+            {
+                return Err(CacheError::InvalidManifest(
+                    "repository batch does not prove this discoverable index entry".to_owned(),
+                ));
+            }
+            let policy = batch.value.policy_digest.clone();
+            let transport = artifact.transport_digest.clone();
+            let evidence = artifact.provenance_evidence_digests.clone();
+            (
+                RemotePublicationEvidence::RepositoryBatch(Box::new(batch.value)),
+                batch.source,
+                policy,
+                transport,
+                None,
+                Some(evidence),
+            )
+        }
+        Err(error) => return Err(error),
+    };
+    if !context
+        .query
+        .accepted_publication_policy_digests
+        .contains(&policy_digest)
     {
         return Err(CacheError::InvalidManifest(
-            "publication receipt does not prove this discoverable index entry".to_owned(),
+            "publication policy is not accepted".to_owned(),
         ));
     }
-    let receipt_evidence = receipt
-        .value
-        .metadata_file_digests
-        .values()
-        .collect::<BTreeSet<_>>();
     if !context
         .query
         .required_provenance_evidence_digests
-        .iter()
-        .all(|required| receipt_evidence.contains(required))
+        .is_empty()
+        && match (legacy_metadata.as_ref(), batch_evidence.as_ref()) {
+            (Some(metadata), _) => {
+                let evidence = metadata.values().collect::<BTreeSet<_>>();
+                !context
+                    .query
+                    .required_provenance_evidence_digests
+                    .iter()
+                    .all(|required| evidence.contains(required))
+            }
+            (None, Some(evidence)) => !context
+                .query
+                .required_provenance_evidence_digests
+                .iter()
+                .all(|required| evidence.contains(required)),
+            (None, None) => true,
+        }
     {
         return Err(CacheError::InvalidManifest(
-            "candidate receipt lacks required provenance evidence".to_owned(),
+            "publication evidence lacks required provenance evidence".to_owned(),
         ));
     }
-    let transport_digest = &receipt.value.transport_digest;
-    if !entry.transport_digests.contains(transport_digest)
-        || !manifest.value.transport_digests.contains(transport_digest)
+    if !entry.transport_digests.contains(&transport_digest)
+        || !manifest.value.transport_digests.contains(&transport_digest)
     {
         return Err(CacheError::InvalidManifest(
             "receipt transport is absent from the index or manifest".to_owned(),
@@ -814,7 +905,7 @@ fn resolve_candidate(
         repository,
         revision,
         RevocationScope::Transport,
-        transport_digest,
+        &transport_digest,
     )? {
         return Err(CacheError::InvalidManifest(format!(
             "transport is revoked: {}",
@@ -826,7 +917,7 @@ fn resolve_candidate(
         repository,
         revision,
         RevocationScope::Policy,
-        &receipt.value.policy_digest,
+        &policy_digest,
     )? {
         return Err(CacheError::InvalidManifest(format!(
             "publication policy is revoked: {}",
@@ -851,7 +942,10 @@ fn resolve_candidate(
         &entry.canonical_payload_digest.0[..2],
         transport_digest.0
     );
-    if receipt.value.metadata_file_digests.get(&encoding_path) != Some(transport_digest) {
+    if legacy_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.get(&encoding_path) != Some(&transport_digest))
+    {
         return Err(CacheError::InvalidManifest(
             "receipt does not bind the selected transport record".to_owned(),
         ));
@@ -861,10 +955,10 @@ fn resolve_candidate(
             repository,
             revision,
             &encoding_path,
-            transport_digest,
+            &transport_digest,
             context.cancellation,
         )?;
-    if encoding.source.content_digest != *transport_digest
+    if encoding.source.content_digest != transport_digest
         || encoding.value.canonical_payload_digest != entry.canonical_payload_digest
     {
         return Err(CacheError::InvalidManifest(
@@ -924,11 +1018,11 @@ fn resolve_candidate(
         index: entry.clone(),
         manifest: manifest.value,
         encoding: encoding.value,
-        receipt: receipt.value,
+        receipt: publication_evidence,
         index_source: index.source.clone(),
         manifest_source: manifest.source,
         encoding_source: encoding.source,
-        receipt_source: receipt.source,
+        receipt_source,
         dependencies,
     })
 }
@@ -1536,10 +1630,11 @@ mod tests {
         let selected = report.selected.unwrap();
         assert_eq!(selected.semantic_digest, fixture.semantic_digest);
         assert_eq!(selected.manifest.digest().unwrap(), fixture.manifest_digest);
-        assert_eq!(
-            selected.receipt.transaction_id,
-            selected.index.publication_transaction_id
-        );
+        assert!(matches!(
+            &selected.receipt,
+            crate::RemotePublicationEvidence::ArtifactReceipt(receipt)
+                if receipt.transaction_id == selected.index.publication_transaction_id
+        ));
         assert!(selected.dependencies.is_empty());
         assert!(fixture
             .remote

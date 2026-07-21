@@ -282,6 +282,64 @@ pub fn plan_publication_batches(
     Ok(batches)
 }
 
+/// Plan repository commits across every artifact in one family publication.
+///
+/// Logical artifacts retain independent manifests and semantic identities, but
+/// their physical files share the same one-gigabyte Git commit budget. A path
+/// reused by multiple artifacts is transferred once. Conflicting bytes at one
+/// repository path fail closed before any remote mutation.
+pub fn plan_family_publication_batches(
+    artifact_parts: &[Vec<TransportPart>],
+    policy: &TransportPolicy,
+) -> Result<Vec<PublicationBatchPlan>, CacheError> {
+    policy.validate()?;
+    let mut unique = BTreeMap::<String, TransportPart>::new();
+    for parts in artifact_parts {
+        for part in parts {
+            if !normalized_relative_path(&part.repository_path)
+                || part.size_bytes == 0
+                || part.size_bytes >= policy.maximum_file_bytes_exclusive
+                || part.size_bytes > policy.maximum_batch_payload_bytes
+                || !part.content_digest.validate()
+            {
+                return Err(CacheError::InvalidManifest(format!(
+                    "family publication part {:?} violates publication limits",
+                    part.repository_path
+                )));
+            }
+            match unique.get(&part.repository_path) {
+                Some(existing)
+                    if existing.size_bytes != part.size_bytes
+                        || existing.content_digest != part.content_digest =>
+                {
+                    return Err(CacheError::DigestMismatch {
+                        expected: existing.content_digest.to_string(),
+                        actual: part.content_digest.to_string(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    unique.insert(part.repository_path.clone(), part.clone());
+                }
+            }
+        }
+    }
+    if unique.is_empty() {
+        return Err(CacheError::InvalidManifest(
+            "family publication requires at least one transport part".to_owned(),
+        ));
+    }
+    let ordered = unique
+        .into_values()
+        .enumerate()
+        .map(|(sequence, mut part)| {
+            part.sequence = sequence as u64;
+            part
+        })
+        .collect::<Vec<_>>();
+    plan_publication_batches(&ordered, policy)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublicationBatchState {
@@ -775,6 +833,43 @@ pub(crate) fn attach_test_owner_audit_evidence(
 }
 
 impl TargetPublicationJournal {
+    /// Record that every payload part for this logical artifact was verified
+    /// in a repository-wide family commit. Multiple logical artifacts may
+    /// therefore share one physical Git commit without inventing per-artifact
+    /// commits or batch-record commits.
+    pub fn mark_payload_verified_by_family_commit(
+        &mut self,
+        parent_head: &str,
+        commit_id: &str,
+    ) -> Result<(), CacheError> {
+        if !matches!(
+            self.state,
+            PublicationTargetState::Planned | PublicationTargetState::Uploading
+        ) || self.expected_head != parent_head
+            || parent_head.trim().is_empty()
+            || commit_id.trim().is_empty()
+            || self.batches.is_empty()
+            || self
+                .batches
+                .iter()
+                .any(|batch| batch.state != PublicationBatchState::Planned)
+        {
+            return Err(CacheError::InvalidTransition(
+                "family payload verification requires an untouched planned target".to_owned(),
+            ));
+        }
+        for batch in &mut self.batches {
+            batch.state = PublicationBatchState::RemoteVerified;
+            batch.parent_head = Some(parent_head.to_owned());
+            batch.commit_id = Some(commit_id.to_owned());
+            batch.newly_committed_digests.clear();
+            batch.record_commit = None;
+        }
+        self.expected_head = commit_id.to_owned();
+        self.state = PublicationTargetState::BatchVerified;
+        Ok(())
+    }
+
     pub fn plan_metadata_commit(&mut self, files: Vec<TransportPart>) -> Result<(), CacheError> {
         if self.state != PublicationTargetState::BatchVerified
             || self
@@ -1861,6 +1956,48 @@ mod tests {
         let batches = plan_publication_batches(&parts, &policy).unwrap();
         assert_eq!(batches[0].payload_bytes, GITHUB_MAX_PUBLICATION_BATCH_BYTES);
         assert_eq!(batches[1].payload_bytes, 1);
+    }
+
+    #[test]
+    fn family_batching_does_not_create_one_commit_per_artifact() {
+        let artifacts = (0..863)
+            .map(|artifact| {
+                vec![TransportPart {
+                    sequence: 0,
+                    repository_path: format!("objects/{artifact:04}.part"),
+                    size_bytes: 1_000_000,
+                    content_digest: ContentDigest::sha256(
+                        format!("quadrature-artifact-{artifact}").as_bytes(),
+                    ),
+                }]
+            })
+            .collect::<Vec<_>>();
+        let batches = plan_family_publication_batches(&artifacts, &TransportPolicy::default())
+            .expect("863 small artifacts must share repository batches");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].parts.len(), 863);
+        assert_eq!(batches[0].payload_bytes, 863_000_000);
+    }
+
+    #[test]
+    fn family_batching_uses_payload_bytes_not_artifact_count() {
+        let artifacts = (0..1_001)
+            .map(|artifact| {
+                vec![TransportPart {
+                    sequence: 0,
+                    repository_path: format!("objects/{artifact:04}.part"),
+                    size_bytes: 1_000_000,
+                    content_digest: ContentDigest::sha256(
+                        format!("quadrature-artifact-{artifact}").as_bytes(),
+                    ),
+                }]
+            })
+            .collect::<Vec<_>>();
+        let batches = plan_family_publication_batches(&artifacts, &TransportPolicy::default())
+            .expect("the aggregate payload should cross one commit boundary");
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].payload_bytes, 1_000_000_000);
+        assert_eq!(batches[1].payload_bytes, 1_000_000);
     }
 
     #[test]

@@ -344,6 +344,15 @@ fn managed_publication_key(
 impl ManagedArtifactCacheSession {
     pub fn new(config: ManagedArtifactCacheConfig) -> Result<Self, CacheError> {
         let remote_cache_mode = config.remote_cache_mode;
+        if matches!(
+            remote_cache_mode,
+            ManagedRemoteCacheMode::Private | ManagedRemoteCacheMode::PrivateThenPublic
+        ) {
+            // Private bootstrap reads are non-interactive. Prime Git's
+            // credential provider from GITHUB_TOKEN/GH_TOKEN before the first
+            // registry read, including immediately after a machine restart.
+            crate::GitHubCredentialApiProbe::default().prepare_git_transport()?;
+        }
         let mut layers = vec![crate::CacheLayer {
             precedence: 0,
             store: Box::new(crate::ZipJsonFilesystemCacheStore::new(
@@ -1781,6 +1790,11 @@ fn report_managed_cache_decision(
     source: &str,
     outcome: &str,
 ) {
+    // CCM summarizes large quadrature precompute batches once; printing one
+    // line per rule can produce hundreds of low-value lines.
+    if request.semantic_key.artifact_kind == "gauss_legendre_rule" {
+        return;
+    }
     if request
         .ordered_overlays
         .iter()

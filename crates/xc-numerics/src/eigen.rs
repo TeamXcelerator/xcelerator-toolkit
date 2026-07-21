@@ -41,13 +41,20 @@ fn qr_tolerance(prec: u32) -> Float {
     two.pow(exponent)
 }
 
-/// Maximum QR sweep iterations allowed per deflating eigenvalue before
-/// `tridiag_eigenvalues_hp` gives up with an error. Default 100.
+/// Sweep count at which QR reports slow convergence without changing the
+/// arithmetic sequence or stopping the solve.
+pub const TRIDIAG_QR_SLOW_SWEEP_WARNING: usize = 100;
+
+/// Default hard QR sweep limit per deflating eigenvalue.
 ///
-/// Some inputs (observed: large-N tridiagonal matrices at certain λ²
-/// configurations) converge correctly but slowly, needing more than 100
-/// sweeps per eigenvalue. Callers with slow-but-real convergence can pass a
-/// larger typed limit to `tridiag_eigenvalues_hp_with_options`.
+/// Large high-precision tridiagonal matrices can converge correctly but need
+/// more than 100 sweeps. One hundred is therefore only a diagnostic threshold;
+/// the default hard safety limit is deliberately aligned with the toolkit's
+/// other slow-but-accurate high-precision iterative routes.
+pub const DEFAULT_TRIDIAG_QR_MAX_ITERATIONS: usize = 2_000;
+
+/// Maximum QR sweep iterations allowed per deflating eigenvalue before
+/// `tridiag_eigenvalues_hp` gives up with an error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TridiagQrOptions {
     /// Maximum QR sweeps allowed per deflating eigenvalue.
@@ -57,7 +64,7 @@ pub struct TridiagQrOptions {
 impl Default for TridiagQrOptions {
     fn default() -> Self {
         Self {
-            max_iterations_per_eigenvalue: 100,
+            max_iterations_per_eigenvalue: DEFAULT_TRIDIAG_QR_MAX_ITERATIONS,
         }
     }
 }
@@ -193,10 +200,17 @@ pub fn tridiag_eigenvalues_hp_with_options(
             iter_count += 1;
             if iter_count > max_iter {
                 return Err(anyhow!(
-                    "tridiag QR failed to converge for eigenvalue at l={} after {} iterations",
+                    "tridiag QR failed to converge for eigenvalue at l={} after the hard limit of {} sweeps; no incomplete eigenvalue was returned",
                     l,
                     max_iter
                 ));
+            }
+            if iter_count == TRIDIAG_QR_SLOW_SWEEP_WARNING + 1
+                && max_iter > TRIDIAG_QR_SLOW_SWEEP_WARNING
+            {
+                eprintln!(
+                    "[HP] tridiagonal QR slow convergence at eigenvalue l={l}: continuing beyond {TRIDIAG_QR_SLOW_SWEEP_WARNING} sweeps (hard limit={max_iter})"
+                );
             }
 
             // Wilkinson shift, computed implicitly per NumRec §11.3.
@@ -3811,6 +3825,35 @@ mod tests {
         assert!(d0 < tol, "zero off-diag evals[0] should be 1; diff={}", d0);
         assert!(d1 < tol, "zero off-diag evals[1] should be 3; diff={}", d1);
         assert!(d2 < tol, "zero off-diag evals[2] should be 5; diff={}", d2);
+    }
+
+    #[test]
+    fn tridiag_qr_default_uses_slow_but_accurate_hard_limit() {
+        let options = TridiagQrOptions::default();
+        assert_eq!(
+            options.max_iterations_per_eigenvalue,
+            DEFAULT_TRIDIAG_QR_MAX_ITERATIONS
+        );
+        assert_eq!(DEFAULT_TRIDIAG_QR_MAX_ITERATIONS, 2_000);
+        assert!(DEFAULT_TRIDIAG_QR_MAX_ITERATIONS > TRIDIAG_QR_SLOW_SWEEP_WARNING);
+    }
+
+    #[test]
+    fn larger_qr_budget_is_bit_identical_when_legacy_budget_already_converges() {
+        let prec = 256;
+        let n = 20;
+        let (diag, off_diag, _) = strang_tridiag(prec, n);
+        let legacy_budget = tridiag_eigenvalues_hp_with_options(
+            &diag,
+            &off_diag,
+            prec,
+            TridiagQrOptions {
+                max_iterations_per_eigenvalue: 100,
+            },
+        )
+        .unwrap();
+        let accurate_default = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
+        assert_eq!(accurate_default, legacy_budget);
     }
 
     /// `tridiag_eigenvalues_hp` with off_diag wrong length should return Err.

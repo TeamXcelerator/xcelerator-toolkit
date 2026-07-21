@@ -2970,6 +2970,22 @@ fn selected_sector_tolerance(precision_bits: u32) -> Float {
     Float::with_val(precision_bits, 2).pow(-((precision_bits.saturating_sub(32)) as i32))
 }
 
+fn complete_sector_eigenvalues_qr(
+    tridiagonal: &SectorTridiagonalHp,
+    precision_bits: u32,
+) -> Result<Vec<Float>> {
+    // Keep CCM's slow-but-accurate policy explicit instead of relying solely
+    // on a library default that could later regress independently.
+    xc_numerics::eigen::tridiag_eigenvalues_hp_with_options(
+        &tridiagonal.diagonal,
+        &tridiagonal.off_diagonal,
+        precision_bits,
+        xc_numerics::eigen::TridiagQrOptions {
+            max_iterations_per_eigenvalue: xc_numerics::eigen::DEFAULT_TRIDIAG_QR_MAX_ITERATIONS,
+        },
+    )
+}
+
 fn compute_sector_eigenvalues(
     tridiagonal: &SectorTridiagonalHp,
     dimension: usize,
@@ -3011,19 +3027,11 @@ fn compute_sector_eigenvalues(
         CcmSectorEigenvalueRoute::CompleteQr => Ok(SectorEigenvaluesHp {
             route,
             complete: true,
-            values: xc_numerics::eigen::tridiag_eigenvalues_hp(
-                &tridiagonal.diagonal,
-                &tridiagonal.off_diagonal,
-                precision_bits,
-            )?,
+            values: complete_sector_eigenvalues_qr(tridiagonal, precision_bits)?,
             selected_enclosures: Vec::new(),
         }),
         CcmSectorEigenvalueRoute::CrossChecked => {
-            let values = xc_numerics::eigen::tridiag_eigenvalues_hp(
-                &tridiagonal.diagonal,
-                &tridiagonal.off_diagonal,
-                precision_bits,
-            )?;
+            let values = complete_sector_eigenvalues_qr(tridiagonal, precision_bits)?;
             if values.len() != dimension {
                 bail!("complete QR sector spectrum has the wrong dimension");
             }
@@ -3120,12 +3128,30 @@ fn decode_sector_eigenvalues(
         ));
     }
     let values = parse_hp_vector(&artifact.eigenvalues, cfg.precision_bits)?;
-    if values.iter().any(|value| !value.is_finite())
-        || values.windows(2).any(|pair| pair[0] >= pair[1])
-    {
+    if values.iter().any(|value| !value.is_finite()) {
         return Err(CacheError::InvalidManifest(
-            "CCM sector eigenvalues are non-finite or not strictly ordered".to_owned(),
+            "CCM sector eigenvalues contain a non-finite value".to_owned(),
         ));
+    }
+    if let Some(index) = values.windows(2).position(|pair| pair[0] >= pair[1]) {
+        let enclosure_detail = artifact
+            .selected_enclosures
+            .get(index)
+            .zip(artifact.selected_enclosures.get(index + 1))
+            .map(|(left, right)| {
+                format!(
+                    "; adjacent Sturm endpoint counts are [{}, {}] and [{}, {}]",
+                    left.lower_count, left.upper_count, right.lower_count, right.upper_count
+                )
+            })
+            .unwrap_or_default();
+        return Err(CacheError::InvalidManifest(format!(
+            "CCM sector resolution limit: algebraic indices {} and {} are not strictly separated at {} working bits{}; retain the sector matrix and rerun sector analysis at higher precision",
+            index,
+            index + 1,
+            cfg.precision_bits,
+            enclosure_detail
+        )));
     }
     let mut selected_enclosures = Vec::with_capacity(expected_enclosure_count);
     for (expected_index, enclosure) in artifact.selected_enclosures.iter().enumerate() {
@@ -4163,37 +4189,79 @@ pub fn analyze_sector_gap_with_options_via_cache(
     xc_numerics::hp_runtime::run_hp(|| analyze_sector_gap_inner(params, cfg, options, Some(cache)))
 }
 
-fn factorization_residual_ok(
+fn factorization_backward_error(
     matrix: &[Float],
     factors: &xc_numerics::linalg::LuFactors,
     dimension: usize,
     precision_bits: u32,
-) -> bool {
+) -> Option<Float> {
     if matrix.len() != dimension * dimension
         || factors.lu.len() != dimension * dimension
         || factors.perm.len() != dimension
     {
-        return false;
+        return None;
+    }
+    let mut seen = vec![false; dimension];
+    for &index in &factors.perm {
+        if index >= dimension || seen[index] {
+            return None;
+        }
+        seen[index] = true;
+    }
+    if matrix.iter().any(|value| !value.is_finite())
+        || factors.lu.iter().any(|value| !value.is_finite())
+    {
+        return None;
     }
     let rhs: Vec<Float> = (0..dimension)
         .map(|index| Float::with_val(precision_bits, index + 1))
         .collect();
     let solution = xc_numerics::linalg::lu_solve(factors, &rhs, dimension, precision_bits);
-    let mut maximum = Float::with_val(precision_bits, 0);
+    if solution.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let mut maximum_residual = Float::with_val(precision_bits, 0);
+    let mut matrix_norm = Float::with_val(precision_bits, 0);
     for row in 0..dimension {
         let mut value = Float::with_val(precision_bits, 0);
+        let mut row_sum = Float::with_val(precision_bits, 0);
         for column in 0..dimension {
             let mut term = matrix[row * dimension + column].clone();
+            row_sum += term.clone().abs();
             term *= &solution[column];
             value += term;
         }
+        if row_sum > matrix_norm {
+            matrix_norm = row_sum;
+        }
         value -= &rhs[row];
         let residual = value.abs();
-        if residual > maximum {
-            maximum = residual;
+        if residual > maximum_residual {
+            maximum_residual = residual;
         }
     }
-    maximum < Float::with_val(precision_bits, 2).pow(-((precision_bits / 4) as i32))
+    let mut solution_norm = Float::with_val(precision_bits, 0);
+    for value in &solution {
+        let magnitude = value.clone().abs();
+        if magnitude > solution_norm {
+            solution_norm = magnitude;
+        }
+    }
+    let mut rhs_norm = Float::with_val(precision_bits, 0);
+    for value in &rhs {
+        let magnitude = value.clone().abs();
+        if magnitude > rhs_norm {
+            rhs_norm = magnitude;
+        }
+    }
+    let mut scale = matrix_norm;
+    scale *= solution_norm;
+    scale += rhs_norm;
+    if scale.is_zero() || !scale.is_finite() {
+        return None;
+    }
+    maximum_residual /= scale;
+    Some(maximum_residual)
 }
 
 fn resolve_factorization_via_cache(
@@ -4301,12 +4369,26 @@ fn resolve_factorization_via_cache(
                 lu: parse_hp_vector(&artifact.lu, cfg.precision_bits)?,
                 perm: artifact.permutation.clone(),
             };
-            if factorization_residual_ok(matrix, &factors, dimension, cfg.precision_bits) {
+            let tolerance =
+                Float::with_val(cfg.precision_bits, 2).pow(-((cfg.precision_bits / 4) as i32));
+            let backward_error =
+                factorization_backward_error(matrix, &factors, dimension, cfg.precision_bits)
+                    .ok_or_else(|| {
+                        CacheError::InvalidManifest(
+                    "CCM factorization has invalid dimensions, permutation, or finite values"
+                        .to_owned(),
+                )
+                    })?;
+            if backward_error < tolerance {
                 validated_factors.replace(Some(factors));
                 Ok(())
             } else {
                 Err(CacheError::InvalidManifest(
-                    "CCM factorization failed its deterministic solve residual".to_owned(),
+                    format!(
+                        "CCM factorization failed its normwise backward-error check: error={}, tolerance={}",
+                        xc_numerics::fmt::display_hp(&backward_error, 8),
+                        xc_numerics::fmt::display_hp(&tolerance, 8)
+                    ),
                 ))
             }
         },
@@ -5272,31 +5354,36 @@ pub fn run_independent_with_research_capture(
         // expensive natural-state calculation than repeating full dense
         // inverse iteration. The winning sector vector is lifted to the full
         // reflection basis and passed through the same evenness calculation.
-        let (sector_gap, retained_source) = match options.sector_analysis {
-            Some(sector_options) => (
-                Some(analyze_sector_gap_from_retained_source(
-                    params,
-                    cfg,
-                    sector_options,
-                    cache,
-                    retained_source,
-                )?),
-                None,
-            ),
-            None => (None, Some(retained_source)),
+        let (sector_gap, retained_source, sector_resolution_limit) = match options.sector_analysis {
+            Some(sector_options) => match analyze_sector_gap_from_retained_source(
+                params,
+                cfg,
+                sector_options,
+                cache,
+                retained_source,
+            ) {
+                Ok(gap) => (Some(gap), None, None),
+                Err(error) if is_sector_resolution_limit(&error) => {
+                    (None, None, Some(error.to_string()))
+                }
+                Err(error) => return Err(error),
+            },
+            None => (None, Some(retained_source), None),
+        };
+        if let Some(limitation) = &sector_resolution_limit {
+            eprintln!(
+                "[HP] sector research capture is precision-limited and was retained without individual eigenpairs or GapLog: {limitation}"
+            );
         };
         let evenness = if options.capture_evenness {
             if let Some(gap) = &sector_gap {
                 Some(evenness_from_sector_gap(params, cfg.precision_bits, gap)?)
-            } else if cache.is_none() {
-                Some(measure_evenness_from_tau(
-                    params,
-                    cfg,
-                    retained_source
-                        .expect("source is retained when sector analysis is disabled")
-                        .tau,
-                )?)
-            } else {
+            } else if sector_resolution_limit.is_some() {
+                eprintln!(
+                    "[HP] natural-evenness evidence was not derived from an unresolved sector cluster"
+                );
+                None
+            } else if let Some(cache) = cache {
                 let mut source =
                     retained_source.expect("source is retained when sector analysis is disabled");
                 let tau_manifest = source.tau_manifest.take().ok_or_else(|| {
@@ -5307,7 +5394,15 @@ pub fn run_independent_with_research_capture(
                     cfg,
                     source.tau,
                     tau_manifest,
-                    cache.expect("managed branch has a cache context"),
+                    cache,
+                )?)
+            } else {
+                Some(measure_evenness_from_tau(
+                    params,
+                    cfg,
+                    retained_source
+                        .expect("source is retained when sector analysis is disabled")
+                        .tau,
                 )?)
             }
         } else {
@@ -5341,6 +5436,12 @@ pub fn run_independent_with_research_capture(
     } else {
         xc_numerics::hp_runtime::run_hp(|| execute(None))
     }
+}
+
+fn is_sector_resolution_limit(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("CCM sector resolution limit:"))
 }
 
 /// Refine a caller-supplied, explicitly indexed root window while reusing the
@@ -6784,6 +6885,32 @@ fn build_tau_hp_compute_exact(
     Ok(assemble_tau_components(&components, cfg.precision_bits))
 }
 
+fn report_quadrature_precompute_summary(total: usize, accesses: &[xc_core::CacheAccessProvenance]) {
+    if accesses.is_empty() {
+        eprintln!("[HP] GL tables ready: {total} total (standalone cache/computation)");
+        return;
+    }
+    let mut counts = BTreeMap::<String, usize>::new();
+    for access in accesses {
+        let label = match access.reuse_disposition {
+            xc_core::CacheReuseDisposition::Recomputed => "computed".to_owned(),
+            xc_core::CacheReuseDisposition::Reused => access
+                .selected_source
+                .as_ref()
+                .map(|source| format!("reused from {}", source.overlay))
+                .unwrap_or_else(|| "reused".to_owned()),
+            xc_core::CacheReuseDisposition::InspectedOnly => "inspected only".to_owned(),
+        };
+        *counts.entry(label).or_default() += 1;
+    }
+    let detail = counts
+        .into_iter()
+        .map(|(label, count)| format!("{count} {label}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!("[HP] GL tables ready: {total} total ({detail})");
+}
+
 fn compute_archimedean_integrals_tracked(
     n_modes: usize,
     l: &Float,
@@ -6816,43 +6943,57 @@ fn compute_archimedean_integrals_tracked(
         prec
     );
     type GlTable = (Vec<Float>, Vec<Float>);
-    let (gl_cache, quadrature_manifests): (HashMap<usize, GlTable>, Vec<ArtifactManifest>) =
-        if let Some(cache) = fabric_cache {
-            let resolved = xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
-                let request = ArtifactCacheContext {
-                    resolver: cache.resolver,
-                    acceptance: cache.acceptance,
-                    ordered_overlays: cache.ordered_overlays.clone(),
-                    mode: cache.mode,
-                    write_on_miss: cache.write_on_miss,
-                    write_visibility: cache.write_visibility,
-                    requested_assurance: cache.requested_assurance,
-                    certification_failure_policy: cache.certification_failure_policy,
-                    production_sink: cache.production_sink,
-                };
-                xc_numerics::quadrature::gauss_legendre_nodes_via_cache(npts, prec, request)
-                    .map(|rule| (npts, (rule.nodes, rule.weights), rule.artifact_manifest))
-            });
-            let mut tables = HashMap::new();
-            let mut manifests = Vec::new();
-            for result in resolved {
-                let (npts, table, manifest) = result.map_err(anyhow::Error::from)?;
-                tables.insert(npts, table);
-                manifests.push(manifest);
-            }
-            manifests.sort_by(|left, right| left.key.logical_key.cmp(&right.key.logical_key));
-            (tables, manifests)
-        } else {
-            let pairs: Vec<(usize, GlTable)> =
-                xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
+    let (gl_cache, quadrature_manifests, quadrature_accesses): (
+        HashMap<usize, GlTable>,
+        Vec<ArtifactManifest>,
+        Vec<xc_core::CacheAccessProvenance>,
+    ) = if let Some(cache) = fabric_cache {
+        let resolved = xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
+            let request = ArtifactCacheContext {
+                resolver: cache.resolver,
+                acceptance: cache.acceptance,
+                ordered_overlays: cache.ordered_overlays.clone(),
+                mode: cache.mode,
+                write_on_miss: cache.write_on_miss,
+                write_visibility: cache.write_visibility,
+                requested_assurance: cache.requested_assurance,
+                certification_failure_policy: cache.certification_failure_policy,
+                production_sink: cache.production_sink,
+            };
+            xc_numerics::quadrature::gauss_legendre_nodes_via_cache(npts, prec, request).map(
+                |rule| {
                     (
                         npts,
-                        xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode),
+                        (rule.nodes, rule.weights),
+                        rule.artifact_manifest,
+                        rule.cache_access,
                     )
-                });
-            (pairs.into_iter().collect(), Vec::new())
-        };
-    eprintln!("[HP] GL tables ready. Computing alpha_L, beta_L, gamma_L integrals...");
+                },
+            )
+        });
+        let mut tables = HashMap::new();
+        let mut manifests = Vec::new();
+        let mut accesses = Vec::new();
+        for result in resolved {
+            let (npts, table, manifest, access) = result.map_err(anyhow::Error::from)?;
+            tables.insert(npts, table);
+            manifests.push(manifest);
+            accesses.push(access);
+        }
+        manifests.sort_by(|left, right| left.key.logical_key.cmp(&right.key.logical_key));
+        (tables, manifests, accesses)
+    } else {
+        let pairs: Vec<(usize, GlTable)> =
+            xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
+                (
+                    npts,
+                    xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode),
+                )
+            });
+        (pairs.into_iter().collect(), Vec::new(), Vec::new())
+    };
+    report_quadrature_precompute_summary(unique_pts.len(), &quadrature_accesses);
+    eprintln!("[HP] Computing alpha_L, beta_L, gamma_L integrals...");
 
     let indices: Vec<usize> = (0..=n_modes).collect();
     let kappa_half = compute_kappa_half(l, prec);
@@ -7184,44 +7325,57 @@ fn build_tau_components_exact_tracked(
     // reproduces with plain std::thread too). GL tables are cached to
     // disk after first compute, so this only costs time on a cold cache.
     type GlTable = (Vec<Float>, Vec<Float>);
-    let (gl_cache, quadrature_manifests): (HashMap<usize, GlTable>, Vec<ArtifactManifest>) =
-        if let Some(cache) = fabric_cache {
-            let resolved = xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
-                let request = ArtifactCacheContext {
-                    resolver: cache.resolver,
-                    acceptance: cache.acceptance,
-                    ordered_overlays: cache.ordered_overlays.clone(),
-                    mode: cache.mode,
-                    write_on_miss: cache.write_on_miss,
-                    write_visibility: cache.write_visibility,
-                    requested_assurance: cache.requested_assurance,
-                    certification_failure_policy: cache.certification_failure_policy,
-                    production_sink: cache.production_sink,
-                };
-                xc_numerics::quadrature::gauss_legendre_nodes_via_cache(npts, prec, request)
-                    .map(|rule| (npts, (rule.nodes, rule.weights), rule.artifact_manifest))
-            });
-            let mut tables = HashMap::new();
-            let mut manifests = Vec::new();
-            for result in resolved {
-                let (npts, table, manifest) = result.map_err(anyhow::Error::from)?;
-                tables.insert(npts, table);
-                manifests.push(manifest);
-            }
-            manifests.sort_by(|left, right| left.key.logical_key.cmp(&right.key.logical_key));
-            (tables, manifests)
-        } else {
-            let gl_pairs: Vec<(usize, GlTable)> =
-                xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
+    let (gl_cache, quadrature_manifests, quadrature_accesses): (
+        HashMap<usize, GlTable>,
+        Vec<ArtifactManifest>,
+        Vec<xc_core::CacheAccessProvenance>,
+    ) = if let Some(cache) = fabric_cache {
+        let resolved = xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
+            let request = ArtifactCacheContext {
+                resolver: cache.resolver,
+                acceptance: cache.acceptance,
+                ordered_overlays: cache.ordered_overlays.clone(),
+                mode: cache.mode,
+                write_on_miss: cache.write_on_miss,
+                write_visibility: cache.write_visibility,
+                requested_assurance: cache.requested_assurance,
+                certification_failure_policy: cache.certification_failure_policy,
+                production_sink: cache.production_sink,
+            };
+            xc_numerics::quadrature::gauss_legendre_nodes_via_cache(npts, prec, request).map(
+                |rule| {
                     (
                         npts,
-                        xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode),
+                        (rule.nodes, rule.weights),
+                        rule.artifact_manifest,
+                        rule.cache_access,
                     )
-                });
-            (gl_pairs.into_iter().collect(), Vec::new())
-        };
-    eprintln!("[HP] GL tables ready. Computing α_L, β_L, γ_L integrals...");
-
+                },
+            )
+        });
+        let mut tables = HashMap::new();
+        let mut manifests = Vec::new();
+        let mut accesses = Vec::new();
+        for result in resolved {
+            let (npts, table, manifest, access) = result.map_err(anyhow::Error::from)?;
+            tables.insert(npts, table);
+            manifests.push(manifest);
+            accesses.push(access);
+        }
+        manifests.sort_by(|left, right| left.key.logical_key.cmp(&right.key.logical_key));
+        (tables, manifests, accesses)
+    } else {
+        let gl_pairs: Vec<(usize, GlTable)> =
+            xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
+                (
+                    npts,
+                    xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode),
+                )
+            });
+        (gl_pairs.into_iter().collect(), Vec::new(), Vec::new())
+    };
+    report_quadrature_precompute_summary(unique_pts.len(), &quadrature_accesses);
+    eprintln!("[HP] Computing alpha_L, beta_L, gamma_L integrals...");
     let indices: Vec<usize> = (0..=n_max).collect();
     let kappa_half = compute_kappa_half(l, prec);
     let fused_integrals: Vec<(Float, Float, Float)> = indices
@@ -9304,6 +9458,35 @@ mod weil_eigvec_cache {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn ill_conditioned_lu_is_validated_by_backward_error() {
+        let precision = 256;
+        let one = Float::with_val(precision, 1);
+        let mut one_plus_delta = one.clone();
+        one_plus_delta += Float::with_val(
+            precision,
+            Float::parse("1e-70").expect("near-singular perturbation"),
+        );
+        let matrix = vec![one.clone(), one.clone(), one, one_plus_delta];
+        let factors = xc_numerics::linalg::lu_factor(&matrix, 2).unwrap();
+        let backward_error = factorization_backward_error(&matrix, &factors, 2, precision).unwrap();
+        let tolerance = Float::with_val(precision, 2).pow(-((precision / 4) as i32));
+        assert!(
+            backward_error < tolerance,
+            "backward-stable LU was rejected: error={}, tolerance={}",
+            xc_numerics::fmt::display_hp(&backward_error, 8),
+            xc_numerics::fmt::display_hp(&tolerance, 8)
+        );
+
+        let invalid_permutation = xc_numerics::linalg::LuFactors {
+            lu: factors.lu,
+            perm: vec![0, 0],
+        };
+        assert!(
+            factorization_backward_error(&matrix, &invalid_permutation, 2, precision).is_none()
+        );
+    }
 
     #[test]
     fn independent_starting_points_are_default_seed_source() {
