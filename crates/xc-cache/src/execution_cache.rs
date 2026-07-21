@@ -366,12 +366,17 @@ impl ManagedArtifactCacheSession {
             remote_cache_mode,
             ManagedRemoteCacheMode::Private | ManagedRemoteCacheMode::PrivateThenPublic
         ) {
+            let private_store = crate::GitHubBootstrapCacheStore::private(
+                &config.repository_owner,
+                config.cache_root.join("remote-private"),
+            )?;
+            // Fail before HP setup if the PAT, credential helper, or private
+            // registry access is not usable.  This is intentionally before
+            // any artifact resolution or numerical computation.
+            private_store.preflight()?;
             layers.push(crate::CacheLayer {
                 precedence: 1,
-                store: Box::new(crate::GitHubBootstrapCacheStore::private(
-                    &config.repository_owner,
-                    config.cache_root.join("remote-private"),
-                )?),
+                store: Box::new(private_store),
             });
         }
         if matches!(
@@ -635,18 +640,19 @@ impl ManagedArtifactCacheSession {
                 format_publication_completion(
                     self.requested_assurance,
                     self.publication_target,
-                    report.artifacts.len(),
+                    pending_drafts.len(),
                     pending_inventory.entries.len(),
                     pending_inventory.total_target_package_bytes,
                     report
-                        .artifacts
+                        .transactions
                         .iter()
                         .filter(|item| item.completed)
                         .count(),
+                    report.transactions.len(),
                     report.current_tree_paths_removed,
                     &persisted.phase_path,
                     &persisted.cumulative_path,
-                    persisted.cumulative.artifacts.len(),
+                    persisted.cumulative.transactions.len(),
                     persisted.cumulative.phases.len(),
                 )
             );
@@ -717,7 +723,7 @@ fn persist_publication_execution_report(
     phase_paths.sort();
 
     let mut phases = Vec::with_capacity(phase_paths.len());
-    let mut artifacts = BTreeMap::<String, crate::ManagedPublicationExecutionReport>::new();
+    let mut transactions = BTreeMap::<String, crate::ManagedPublicationExecutionReport>::new();
     let mut current_tree_paths_removed = 0usize;
     for path in phase_paths {
         let bytes = fs::read(&path)?;
@@ -758,30 +764,30 @@ fn persist_publication_execution_report(
                     "cumulative publication cleanup count overflow".to_owned(),
                 )
             })?;
-        for artifact in &phase.artifacts {
-            match artifacts.get(&artifact.transaction_id) {
+        for transaction in &phase.transactions {
+            match transactions.get(&transaction.transaction_id) {
                 None => {
-                    artifacts.insert(artifact.transaction_id.clone(), artifact.clone());
+                    transactions.insert(transaction.transaction_id.clone(), transaction.clone());
                 }
                 Some(existing)
-                    if existing.final_journal_digest == artifact.final_journal_digest
-                        && existing.completed == artifact.completed => {}
-                Some(existing) if !existing.completed && artifact.completed => {
-                    artifacts.insert(artifact.transaction_id.clone(), artifact.clone());
+                    if existing.final_journal_digest == transaction.final_journal_digest
+                        && existing.completed == transaction.completed => {}
+                Some(existing) if !existing.completed && transaction.completed => {
+                    transactions.insert(transaction.transaction_id.clone(), transaction.clone());
                 }
-                Some(existing) if existing.completed && !artifact.completed => {}
+                Some(existing) if existing.completed && !transaction.completed => {}
                 Some(_) => {
                     return Err(CacheError::InvalidTransition(format!(
                         "conflicting publication reports for transaction {}",
-                        artifact.transaction_id
+                        transaction.transaction_id
                     )));
                 }
             }
         }
-        let completed_artifact_count = phase
-            .artifacts
+        let completed_transaction_count = phase
+            .transactions
             .iter()
-            .filter(|artifact| artifact.completed)
+            .filter(|transaction| transaction.completed)
             .count();
         let relative_report_path = path
             .strip_prefix(staging_root)
@@ -792,18 +798,18 @@ fn persist_publication_execution_report(
             phase_index,
             phase_digest: digest,
             relative_report_path,
-            artifact_count: phase.artifacts.len(),
-            completed_artifact_count,
+            transaction_count: phase.transactions.len(),
+            completed_transaction_count,
             all_completed: phase.all_completed,
             current_tree_paths_removed: phase.current_tree_paths_removed,
         });
     }
-    let artifacts = artifacts.into_values().collect::<Vec<_>>();
+    let transactions = transactions.into_values().collect::<Vec<_>>();
     let cumulative = crate::ManagedCumulativePublicationExecutionReport {
         schema_version: 1,
-        all_completed: artifacts.iter().all(|artifact| artifact.completed),
+        all_completed: transactions.iter().all(|transaction| transaction.completed),
         phases,
-        artifacts,
+        transactions,
         current_tree_paths_removed,
     };
     let cumulative_path = staging_root.join("publication-execution-report.json");
@@ -823,10 +829,11 @@ fn format_publication_completion(
     target_copy_count: usize,
     total_bytes: u64,
     completed_transactions: usize,
+    transaction_count: usize,
     current_tree_paths_removed: usize,
     phase_report_path: &Path,
     cumulative_report_path: &Path,
-    cumulative_artifact_count: usize,
+    cumulative_transaction_count: usize,
     phase_count: usize,
 ) -> String {
     let assurance = match assurance {
@@ -844,9 +851,9 @@ fn format_publication_completion(
         "Publication complete:\n  artifacts: {artifact_count}\n  target copies: \
          {target_copy_count}\n  targets: {target}\n  assurance: {assurance}\n  total packaged: \
          {total_bytes} bytes ({:.1} MB)\n  completed transactions: \
-         {completed_transactions}/{artifact_count}\n  old current-tree paths removed: \
+         {completed_transactions}/{transaction_count}\n  old current-tree paths removed: \
          {current_tree_paths_removed}\n  phase report: {}\n  cumulative report: {} \
-         ({cumulative_artifact_count} artifacts across {phase_count} phases)",
+         ({cumulative_transaction_count} transactions across {phase_count} phases)",
         total_bytes as f64 / 1_000_000.0,
         phase_report_path.display(),
         cumulative_report_path.display()
@@ -1684,24 +1691,12 @@ where
                             store.put(&draft, &resolved.payload)?;
                         }
                     }
-                    if let Some(sink) = request.production_sink {
-                        emit_dependency_closure(
-                            resolver,
-                            acceptance,
-                            sink,
-                            &resolved.manifest,
-                            &mut BTreeSet::new(),
-                        )?;
-                        sink.record(ProducedArtifactRecord {
-                            operation: request.operation.to_owned(),
-                            semantic_key: request.semantic_key.clone(),
-                            logical_key: request.logical_key.to_owned(),
-                            manifest: resolved.manifest.clone(),
-                            achieved_assurance: crate::ArtifactAssuranceState::Computed,
-                            assurance_evidence_digests: Vec::new(),
-                            payload: resolved.payload,
-                        })?;
-                    }
+                    // Publication is a boundary for newly computed artifacts,
+                    // not a replay mechanism for cache hits. Re-authoring a
+                    // validated remote hit changes its provenance envelope and
+                    // creates redundant Git history despite identical logical
+                    // payload bytes. Explicit promotion remains a separate
+                    // workflow.
                     return Ok(ArtifactExecutionCacheResult {
                         value,
                         access,
@@ -1761,6 +1756,12 @@ where
         };
         let manifest = store.put(&draft, &payload)?;
         if let Some(sink) = request.production_sink {
+            let acceptance = request.acceptance.ok_or_else(|| {
+                CacheError::InvalidManifest(
+                    "publication dependency closure lacks an acceptance policy".to_owned(),
+                )
+            })?;
+            emit_dependency_closure(resolver, acceptance, sink, &manifest, &mut BTreeSet::new())?;
             sink.record(ProducedArtifactRecord {
                 operation: request.operation.to_owned(),
                 semantic_key: request.semantic_key.clone(),
@@ -1840,7 +1841,8 @@ mod tests {
             3,
             6,
             61_082_844,
-            3,
+            2,
+            2,
             7,
             Path::new("staging/publication-execution-reports/phase.json"),
             Path::new("staging/publication-execution-report.json"),
@@ -1856,11 +1858,11 @@ mod tests {
                 "  targets: public + private\n",
                 "  assurance: computed\n",
                 "  total packaged: 61082844 bytes (61.1 MB)\n",
-                "  completed transactions: 3/3\n",
+                "  completed transactions: 2/2\n",
                 "  old current-tree paths removed: 7\n",
                 "  phase report: staging/publication-execution-reports/phase.json\n",
                 "  cumulative report: staging/publication-execution-report.json ",
-                "(10 artifacts across 3 phases)"
+                "(10 transactions across 3 phases)"
             )
         );
         assert!(summary.is_ascii());
@@ -1871,7 +1873,7 @@ mod tests {
         fn phase(ids: &[&str], removed: usize) -> crate::ManagedRunPublicationReport {
             crate::ManagedRunPublicationReport {
                 schema_version: 1,
-                artifacts: ids
+                transactions: ids
                     .iter()
                     .map(|id| crate::ManagedPublicationExecutionReport {
                         transaction_id: (*id).to_owned(),
@@ -1893,7 +1895,7 @@ mod tests {
         let first_persisted = persist_publication_execution_report(&root, &first).unwrap();
         assert!(first_persisted.phase_path.exists());
         assert_eq!(first_persisted.cumulative.phases.len(), 1);
-        assert_eq!(first_persisted.cumulative.artifacts.len(), 2);
+        assert_eq!(first_persisted.cumulative.transactions.len(), 2);
         assert_eq!(first_persisted.cumulative.current_tree_paths_removed, 2);
 
         let second_persisted = persist_publication_execution_report(&root, &second).unwrap();
@@ -1901,13 +1903,13 @@ mod tests {
         assert_eq!(second_persisted.cumulative.phases.len(), 2);
         assert_eq!(second_persisted.cumulative.phases[0].phase_index, 1);
         assert_eq!(second_persisted.cumulative.phases[1].phase_index, 2);
-        assert_eq!(second_persisted.cumulative.artifacts.len(), 3);
+        assert_eq!(second_persisted.cumulative.transactions.len(), 3);
         assert_eq!(second_persisted.cumulative.current_tree_paths_removed, 5);
         assert!(second_persisted.cumulative.all_completed);
 
         let repeated = persist_publication_execution_report(&root, &first).unwrap();
         assert_eq!(repeated.cumulative.phases.len(), 2);
-        assert_eq!(repeated.cumulative.artifacts.len(), 3);
+        assert_eq!(repeated.cumulative.transactions.len(), 3);
         let durable: crate::ManagedCumulativePublicationExecutionReport =
             serde_json::from_slice(&fs::read(&repeated.cumulative_path).unwrap()).unwrap();
         assert_eq!(durable, repeated.cumulative);
@@ -2265,6 +2267,14 @@ mod tests {
             ArtifactExecutionCacheMode::PreferReuse,
         );
         parent_request.logical_key = "ccm/tau/fixture";
+        let sink = crate::CanonicalStagingProductionSink::new(
+            root.join("fresh-staging"),
+            crate::TransportPolicy::default(),
+            xc_core::ResourcePolicy::default(),
+            xc_core::CancellationToken::new(),
+        )
+        .unwrap();
+        parent_request.production_sink = Some(&sink);
         resolve_or_compute_json_artifact_with_dependencies(
             &parent_request,
             || {
@@ -2280,23 +2290,6 @@ mod tests {
             |_| Ok(()),
         )
         .unwrap();
-
-        let sink = crate::CanonicalStagingProductionSink::new(
-            root.join("fresh-staging"),
-            crate::TransportPolicy::default(),
-            xc_core::ResourcePolicy::default(),
-            xc_core::CancellationToken::new(),
-        )
-        .unwrap();
-        parent_request.production_sink = Some(&sink);
-        resolve_or_compute_json_artifact_with_dependencies(
-            &parent_request,
-            || -> Result<(Vec<String>, Vec<DependencyRef>), CacheError> {
-                panic!("cached parent and dependency must not recompute")
-            },
-            |_| Ok(()),
-        )
-        .unwrap();
         let drafts = sink.drafts().unwrap();
         assert_eq!(drafts.len(), 2);
         assert!(drafts.iter().any(|draft| draft.family == "quadrature"));
@@ -2305,7 +2298,7 @@ mod tests {
     }
 
     #[test]
-    fn production_sink_receives_fresh_and_reused_validated_artifacts() {
+    fn production_sink_records_fresh_but_not_reused_artifacts() {
         let root = root("execution-cache-production-sink");
         let _ = fs::remove_dir_all(&root);
         let resolver = CacheResolver::new(vec![CacheLayer {
@@ -2346,9 +2339,8 @@ mod tests {
         .unwrap();
 
         let records = sink.0.lock().unwrap();
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 1);
         assert_eq!(records[0].semantic_key, key);
-        assert_eq!(records[1].semantic_key, key);
         assert_eq!(records[0].logical_key, "gauss-legendre/4/128");
         assert_eq!(records[0].payload, serde_json::to_vec(&expected).unwrap());
         assert_eq!(

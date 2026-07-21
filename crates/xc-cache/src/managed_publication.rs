@@ -70,7 +70,7 @@ pub struct ManagedPublicationExecutionReport {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ManagedRunPublicationReport {
     pub schema_version: u32,
-    pub artifacts: Vec<ManagedPublicationExecutionReport>,
+    pub transactions: Vec<ManagedPublicationExecutionReport>,
     pub all_completed: bool,
     #[serde(default)]
     pub current_tree_paths_removed: usize,
@@ -81,8 +81,8 @@ pub struct ManagedPublicationExecutionPhaseSummary {
     pub phase_index: usize,
     pub phase_digest: ContentDigest,
     pub relative_report_path: String,
-    pub artifact_count: usize,
-    pub completed_artifact_count: usize,
+    pub transaction_count: usize,
+    pub completed_transaction_count: usize,
     pub all_completed: bool,
     pub current_tree_paths_removed: usize,
 }
@@ -91,7 +91,7 @@ pub struct ManagedPublicationExecutionPhaseSummary {
 pub struct ManagedCumulativePublicationExecutionReport {
     pub schema_version: u32,
     pub phases: Vec<ManagedPublicationExecutionPhaseSummary>,
-    pub artifacts: Vec<ManagedPublicationExecutionReport>,
+    pub transactions: Vec<ManagedPublicationExecutionReport>,
     pub all_completed: bool,
     pub current_tree_paths_removed: usize,
 }
@@ -579,15 +579,12 @@ fn execute_family_batch_publication(
                     "remote batch path contains a different immutable batch identity".to_owned(),
                 ));
             }
-            return Ok(drafts
-                .iter()
-                .map(|_| ManagedPublicationExecutionReport {
-                    transaction_id: batch.batch_id.0.clone(),
-                    completed: true,
-                    steps_executed: 0,
-                    final_journal_digest: batch.batch_id.clone(),
-                })
-                .collect());
+            return Ok(vec![ManagedPublicationExecutionReport {
+                transaction_id: batch.batch_id.0.clone(),
+                completed: true,
+                steps_executed: 0,
+                final_journal_digest: batch.batch_id.clone(),
+            }]);
         }
         Err(CacheError::NotFound(_)) => {}
         Err(error) => return Err(error),
@@ -741,15 +738,12 @@ fn execute_family_batch_publication(
             }
         }
     }
-    Ok(prepared
-        .into_iter()
-        .map(|_artifact| ManagedPublicationExecutionReport {
-            transaction_id: batch.batch_id.0.clone(),
-            completed: true,
-            steps_executed: steps,
-            final_journal_digest: batch.batch_id.clone(),
-        })
-        .collect())
+    Ok(vec![ManagedPublicationExecutionReport {
+        transaction_id: batch.batch_id.0.clone(),
+        completed: true,
+        steps_executed: steps,
+        final_journal_digest: batch.batch_id.clone(),
+    }])
 }
 
 fn bounded_prefix_bytes(
@@ -1682,7 +1676,7 @@ fn execute_managed_family_drafts_on_github(
     return Ok(ManagedRunPublicationReport {
         schema_version: 1,
         all_completed: batch_reports.iter().all(|report| report.completed),
-        artifacts: batch_reports,
+        transactions: batch_reports,
         current_tree_paths_removed: 0,
     });
 
@@ -1918,7 +1912,7 @@ fn execute_managed_family_drafts_on_github(
     Ok(ManagedRunPublicationReport {
         schema_version: 1,
         all_completed: reports.iter().all(|report| report.completed),
-        artifacts: reports,
+        transactions: reports,
         current_tree_paths_removed,
     })
 }
@@ -1987,30 +1981,31 @@ pub fn execute_managed_drafts_on_github(
             )?;
             eprintln!(
                 "publication family {family}: {} artifacts in {:.3}s",
-                report.artifacts.len(),
+                family_drafts.len(),
                 family_started.elapsed().as_secs_f64()
             );
             Ok(report)
         })
         .collect::<Result<Vec<_>, CacheError>>()?;
 
-    let artifacts = reports
+    let transactions = reports
         .iter()
-        .flat_map(|report| report.artifacts.iter().cloned())
+        .flat_map(|report| report.transactions.iter().cloned())
         .collect::<Vec<_>>();
     let current_tree_paths_removed = reports.iter().fold(0usize, |total, report| {
         total.saturating_add(report.current_tree_paths_removed)
     });
     eprintln!(
-        "publication execution: {} artifacts across {} shard families in {:.3}s",
-        artifacts.len(),
+        "publication execution: {} artifacts in {} transactions across {} shard families in {:.3}s",
+        drafts.len(),
+        transactions.len(),
         reports.len(),
         started.elapsed().as_secs_f64()
     );
     Ok(ManagedRunPublicationReport {
         schema_version: 1,
         all_completed: reports.iter().all(|report| report.all_completed),
-        artifacts,
+        transactions,
         current_tree_paths_removed,
     })
 }

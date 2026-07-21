@@ -11,6 +11,8 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 use xc_core::{CancellationToken, ResourcePolicy};
 
 #[derive(Debug)]
@@ -167,7 +169,7 @@ impl GitCliRemoteStore {
         if local.status.success() {
             return Ok(session);
         }
-        run_git(
+        run_git_network(
             &self.git_executable,
             Some(&session),
             [
@@ -338,7 +340,7 @@ impl RemoteGitStore for GitCliRemoteStore {
     fn read_ref(&self, repository: &str, branch: &str) -> Result<String, CacheError> {
         validate_repository(repository)?;
         validate_branch(branch)?;
-        let output = run_git(
+        let output = run_git_network(
             &self.git_executable,
             None,
             [
@@ -742,6 +744,58 @@ where
     } else {
         Err(command_failure("git", &output))
     }
+}
+
+fn run_git_network<I>(
+    executable: &OsStr,
+    directory: Option<&Path>,
+    arguments: I,
+    environment: &[(&OsStr, &OsStr)],
+) -> Result<Output, CacheError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    const MAX_ATTEMPTS: u32 = 5;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let output = run_git_allow_failure(
+            executable,
+            directory,
+            arguments.iter().cloned(),
+            environment,
+        )?;
+        if output.status.success() {
+            return Ok(output);
+        }
+        if attempt == MAX_ATTEMPTS || !transient_git_failure(&output) {
+            return Err(command_failure("git", &output));
+        }
+        thread::sleep(Duration::from_secs(1 << (attempt - 1)));
+    }
+    unreachable!("bounded Git retry loop always returns")
+}
+
+fn transient_git_failure(output: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    [
+        "connection reset",
+        "connection was reset",
+        "connection timed out",
+        "operation timed out",
+        "the remote end hung up unexpectedly",
+        "unexpected disconnect",
+        "early eof",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "requested url returned error: 500",
+        "requested url returned error: 502",
+        "requested url returned error: 503",
+        "requested url returned error: 504",
+    ]
+    .iter()
+    .any(|pattern| stderr.contains(pattern))
 }
 
 fn run_git_allow_failure<I>(

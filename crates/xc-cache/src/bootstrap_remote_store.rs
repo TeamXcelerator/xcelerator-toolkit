@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use xc_core::{CancellationToken, ResourcePolicy};
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BootstrapRegistry {
     schema_version: u32,
@@ -22,7 +22,7 @@ struct BootstrapRegistry {
     visibility: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BootstrapFamily {
     family: String,
@@ -39,6 +39,8 @@ pub struct GitHubBootstrapCacheStore {
     required: bool,
     remote: GitCliRemoteStore,
     resolved: Mutex<HashMap<ContentDigest, ResolvedRemoteArtifact>>,
+    registry_snapshot: Mutex<Option<BootstrapRegistry>>,
+    shard_revisions: Mutex<HashMap<String, String>>,
 }
 
 impl GitHubBootstrapCacheStore {
@@ -72,7 +74,73 @@ impl GitHubBootstrapCacheStore {
             )?,
             root,
             resolved: Mutex::new(HashMap::new()),
+            registry_snapshot: Mutex::new(None),
+            shard_revisions: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Verify that the bootstrap registry can be reached before a numerical
+    /// run starts.  Remote cache reads are otherwise lazy: a cold high
+    /// precision run can spend hours computing before its first Git fetch
+    /// discovers an expired PAT or a repository permission problem.
+    pub fn preflight(&self) -> Result<(), CacheError> {
+        self.registry_snapshot().map(|_| ())
+    }
+
+    fn registry_snapshot(&self) -> Result<BootstrapRegistry, CacheError> {
+        if let Some(registry) = self
+            .registry_snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            return Ok(registry);
+        }
+        let visibility_name = visibility_name(self.visibility);
+        let registry_id = format!("{}/xcelerator-cache-{visibility_name}-registry", self.owner);
+        let repository = format!("https://github.com/{registry_id}.git");
+        let revision = self.remote.read_ref(&repository, "main")?;
+        let (registry, _): (BootstrapRegistry, _) =
+            self.read_json(&repository, &revision, "registry.json")?;
+        if registry.schema_version != 1
+            || registry.repository != registry_id
+            || registry.default_branch != "main"
+            || registry
+                .visibility
+                .as_deref()
+                .is_some_and(|declared| declared != visibility_name)
+            || registry
+                .separate_visibility_inventory
+                .is_some_and(|separate| !separate)
+        {
+            return Err(CacheError::InvalidManifest(format!(
+                "{visibility_name} bootstrap registry identity is invalid"
+            )));
+        }
+        *self
+            .registry_snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(registry.clone());
+        Ok(registry)
+    }
+
+    fn shard_revision(&self, repository: &str) -> Result<String, CacheError> {
+        if let Some(revision) = self
+            .shard_revisions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(repository)
+            .cloned()
+        {
+            return Ok(revision);
+        }
+        let revision = self.remote.read_ref(repository, "main")?;
+        self.shard_revisions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(repository.to_owned(), revision.clone());
+        Ok(revision)
     }
 
     fn read_json<T: serde::de::DeserializeOwned>(
@@ -98,26 +166,7 @@ impl GitHubBootstrapCacheStore {
             return Ok(None);
         };
         let visibility_name = visibility_name(self.visibility);
-        let registry_id = format!("{}/xcelerator-cache-{visibility_name}-registry", self.owner);
-        let registry_repository = format!("https://github.com/{registry_id}.git");
-        let registry_revision = self.remote.read_ref(&registry_repository, "main")?;
-        let (registry, _): (BootstrapRegistry, _) =
-            self.read_json(&registry_repository, &registry_revision, "registry.json")?;
-        if registry.schema_version != 1
-            || registry.repository != registry_id
-            || registry.default_branch != "main"
-            || registry
-                .visibility
-                .as_deref()
-                .is_some_and(|declared| declared != visibility_name)
-            || registry
-                .separate_visibility_inventory
-                .is_some_and(|separate| !separate)
-        {
-            return Err(CacheError::InvalidManifest(format!(
-                "{visibility_name} bootstrap registry identity is invalid"
-            )));
-        }
+        let registry = self.registry_snapshot()?;
         let route = registry
             .families
             .iter()
@@ -134,7 +183,7 @@ impl GitHubBootstrapCacheStore {
             )));
         }
         let repository = format!("https://github.com/{}.git", route.current_writable_shard);
-        let revision = self.remote.read_ref(&repository, "main")?;
+        let revision = self.shard_revision(&repository)?;
         let prefix = &key.parameters_digest.0[..2];
         let index_path = format!("indexes/{family}/{prefix}.json");
         let (index, index_source): (ShardIndexPartition, _) =
@@ -169,13 +218,28 @@ impl GitHubBootstrapCacheStore {
         let (encoding, encoding_source): (TransportEncodingRecord, _) =
             self.read_json(&repository, &revision, &encoding_path)?;
         encoding.validate()?;
-        let receipt_path = format!(
-            "transactions/{}/{visibility_name}/receipt.json",
+        let expected_destination = match self.visibility {
+            CacheVisibility::Private => PublicationDestination::Private,
+            CacheVisibility::Public => PublicationDestination::Public,
+            _ => unreachable!("GitHub bootstrap stores are private or public"),
+        };
+        let batch_path = format!(
+            "transactions/batches/{}/{visibility_name}.json",
             entry.publication_transaction_id,
         );
-        let (receipt, receipt_source): (PublicationReceipt, _) =
-            self.read_json(&repository, &revision, &receipt_path)?;
-        receipt.validate()?;
+        let (batch, receipt_source): (RepositoryPublicationBatch, _) =
+            self.read_json(&repository, &revision, &batch_path)?;
+        validate_bootstrap_batch(
+            &batch,
+            &receipt_source,
+            expected_destination,
+            family,
+            &route.current_writable_shard,
+            &key.parameters_digest,
+            &entry,
+            &manifest_path,
+            transport_digest,
+        )?;
         let resolved = ResolvedRemoteArtifact {
             family: family.to_owned(),
             semantic_digest: key.parameters_digest.clone(),
@@ -188,7 +252,7 @@ impl GitHubBootstrapCacheStore {
             index: entry,
             manifest,
             encoding,
-            receipt: crate::RemotePublicationEvidence::ArtifactReceipt(Box::new(receipt)),
+            receipt: crate::RemotePublicationEvidence::RepositoryBatch(Box::new(batch)),
             index_source,
             manifest_source,
             encoding_source,
@@ -198,6 +262,54 @@ impl GitHubBootstrapCacheStore {
         // The materializer repeats all payload/manifest/receipt identity checks.
         Ok(Some(resolved))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_bootstrap_batch(
+    batch: &RepositoryPublicationBatch,
+    source: &RemoteReadReport,
+    expected_destination: PublicationDestination,
+    family: &str,
+    authorized_repository: &str,
+    semantic_digest: &ContentDigest,
+    entry: &ShardIndexEntry,
+    manifest_path: &str,
+    transport_digest: &ContentDigest,
+) -> Result<(), CacheError> {
+    batch.validate()?;
+    if source.content_digest != batch.digest()? {
+        return Err(CacheError::InvalidManifest(
+            "repository batch bytes are not canonical".to_owned(),
+        ));
+    }
+    let artifact = batch
+        .artifacts
+        .iter()
+        .find(|artifact| {
+            &artifact.semantic_digest == semantic_digest
+                && artifact.manifest_digest == entry.manifest_digest
+        })
+        .ok_or_else(|| {
+            CacheError::InvalidManifest(
+                "repository batch does not contain the selected bootstrap artifact".to_owned(),
+            )
+        })?;
+    if batch.batch_id.0 != entry.publication_transaction_id
+        || batch.destination != expected_destination
+        || batch.family != family
+        || batch.authorized_repository != authorized_repository
+        || batch.branch != "main"
+        || artifact.canonical_payload_digest != entry.canonical_payload_digest
+        || artifact.transport_digest != *transport_digest
+        || artifact.manifest_path != manifest_path
+        || artifact.achieved_assurance != entry.achieved_assurance
+        || artifact.producer_toolkit_version != entry.producer_toolkit_version
+    {
+        return Err(CacheError::InvalidManifest(
+            "repository batch does not prove this bootstrap index entry".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 impl CacheStore for GitHubBootstrapCacheStore {
@@ -330,6 +442,111 @@ fn visibility_name(visibility: CacheVisibility) -> &'static str {
 mod tests {
     use super::*;
 
+    struct BootstrapBatchFixture {
+        batch: RepositoryPublicationBatch,
+        entry: ShardIndexEntry,
+        source: RemoteReadReport,
+        semantic_digest: ContentDigest,
+        manifest_path: String,
+        transport_digest: ContentDigest,
+    }
+
+    fn bootstrap_batch_fixture() -> BootstrapBatchFixture {
+        let semantic_digest = ContentDigest::sha256(b"bootstrap-semantic");
+        let payload_digest = ContentDigest::sha256(b"bootstrap-payload");
+        let manifest_digest = ContentDigest::sha256(b"bootstrap-manifest");
+        let transport_digest = ContentDigest::sha256(b"bootstrap-transport");
+        let manifest_path = format!(
+            "manifests/{}/{}.json",
+            &semantic_digest.0[..2],
+            manifest_digest.0
+        );
+        let version = ToolkitVersion::parse("0.13.0").unwrap();
+        let batch = RepositoryPublicationBatch::new(
+            PublicationDestination::Private,
+            "ccm-matrices",
+            "fixture-author",
+            "TeamXcelerator/xcelerator-cache-private-ccm-matrices-0001",
+            "main",
+            ContentDigest::sha256(b"bootstrap-policy"),
+            vec![RepositoryBatchArtifact {
+                semantic_digest: semantic_digest.clone(),
+                canonical_payload_digest: payload_digest.clone(),
+                manifest_digest: manifest_digest.clone(),
+                transport_digest: transport_digest.clone(),
+                manifest_path: manifest_path.clone(),
+                achieved_assurance: ArtifactAssuranceState::Computed,
+                producer_toolkit_version: version.clone(),
+                provenance_evidence_digests: vec![ContentDigest::sha256(b"bootstrap-provenance")],
+            }],
+            1,
+        )
+        .unwrap();
+        let entry = ShardIndexEntry {
+            semantic_digest: semantic_digest.clone(),
+            canonical_payload_digest: payload_digest,
+            manifest_digest,
+            achieved_assurance: ArtifactAssuranceState::Computed,
+            disposition: ArtifactDisposition::Active,
+            producer_toolkit_version: version.clone(),
+            minimum_reader_version: version,
+            transport_digests: vec![transport_digest.clone()],
+            publication_transaction_id: batch.batch_id.0.clone(),
+        };
+        let source = RemoteReadReport {
+            repository_path: batch.repository_path(),
+            revision: "a".repeat(40),
+            size_bytes: 1,
+            content_digest: batch.digest().unwrap(),
+        };
+        BootstrapBatchFixture {
+            batch,
+            entry,
+            source,
+            semantic_digest,
+            manifest_path,
+            transport_digest,
+        }
+    }
+
+    #[test]
+    fn current_repository_batch_proves_bootstrap_index_entry() {
+        let fixture = bootstrap_batch_fixture();
+        validate_bootstrap_batch(
+            &fixture.batch,
+            &fixture.source,
+            PublicationDestination::Private,
+            "ccm-matrices",
+            "TeamXcelerator/xcelerator-cache-private-ccm-matrices-0001",
+            &fixture.semantic_digest,
+            &fixture.entry,
+            &fixture.manifest_path,
+            &fixture.transport_digest,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bootstrap_batch_rejects_unproven_index_entry() {
+        let mut fixture = bootstrap_batch_fixture();
+        fixture.entry.canonical_payload_digest = ContentDigest::sha256(b"wrong-payload");
+        let error = validate_bootstrap_batch(
+            &fixture.batch,
+            &fixture.source,
+            PublicationDestination::Private,
+            "ccm-matrices",
+            "TeamXcelerator/xcelerator-cache-private-ccm-matrices-0001",
+            &fixture.semantic_digest,
+            &fixture.entry,
+            &fixture.manifest_path,
+            &fixture.transport_digest,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not prove this bootstrap index entry"));
+    }
+
     #[test]
     #[ignore = "read-only live GitHub consumer acceptance"]
     fn claim_1a_artifacts_resolve_from_the_public_bootstrap_fabric() {
@@ -353,15 +570,15 @@ mod tests {
         for (kind, digest) in [
             (
                 "gauss_legendre_rule",
-                "67e1ed84a3f813fee4cbb7b1b69931d61e0a98c8ebb050c8ccfba9bd77e47650",
+                "a23310358f5f5e1f83db0cef44bd27d2a26ff1bdbffd94f02292bdba64f8b3fa",
             ),
             (
                 "ccm_tau_matrix",
-                "8b6c9bacb85a971541dc029a08912cb7b19e1a67fbc9c5bea5b725b59e8e6442",
+                "a1e6432315f7e7a3af1d85c03957c5ce641cd9e00599dffec0d692e1d29a1408",
             ),
             (
                 "ccm_weil_eigenpair",
-                "81115ac35d4a59ad70ac4982a03ea4024a01e22f5ed8b0d8e625cfd5b7a12b6e",
+                "861e1a56ba4c38b9046d9a49b903b9bf98878c6d2a3b6f9ad7ce8a23c8ce3c63",
             ),
         ] {
             let key = ArtifactKey {
