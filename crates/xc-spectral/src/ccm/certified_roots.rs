@@ -765,6 +765,145 @@ impl ProductionIndependentCcmRootCertificate {
     }
 }
 
+/// Canonical digest used to bind a certificate to the exact retained MPFR
+/// secular weights that produced it.
+pub fn production_ccm_source_weights_digest(
+    weights: &[Float],
+    precision_bits: u32,
+) -> Result<ContentDigest> {
+    let serialized = weights
+        .iter()
+        .map(|weight| serialize_float(&Float::with_val(precision_bits, weight), precision_bits))
+        .collect::<Vec<_>>();
+    weights_digest(&serialized)
+}
+
+/// Validate the identity, source binding, target accounting, and isolated-root
+/// structure of a persisted independent CCM certificate without repeating the
+/// expensive FLINT root census. This is the cache-read validation boundary;
+/// [`verify_production_independent_ccm_root_certificate`] remains the explicit
+/// full numerical replay operation.
+pub fn validate_production_independent_ccm_root_certificate_structure(
+    certificate: &ProductionIndependentCcmRootCertificate,
+) -> Result<()> {
+    if certificate.schema_version != 1
+        || certificate.integer_cutoff_c <= 1
+        || certificate.modes == 0
+        || certificate.precision_bits <= 64
+        || certificate.isolation_bits < 16
+        || certificate.isolation_bits >= certificate.precision_bits
+        || certificate.reference_seeds_used
+        || certificate.source_weights.len() != 2 * certificate.modes + 1
+        || !certificate.source_weights_digest.validate()
+        || certificate.source_weights_digest != weights_digest(&certificate.source_weights)?
+        || certificate.source_certification_scope
+            != FiniteSourceCertificationScope::ExactStoredPointSource
+        || certificate.discovery_method
+            != "exact_cumulative_finite_source_counts_then_flint_arb_isolation_and_interval_newton"
+        || certificate.count_method
+            != "flint_arb_complete_complex_root_isolation_with_real_window_classification"
+        || certificate.selected_root_count == 0
+        || !certificate.window.reconciliation.complete
+        || certificate.window.count.certified_root_count != certificate.window.roots.len()
+        || certificate.window.reconciliation.isolated_root_count != certificate.window.roots.len()
+        || certificate
+            .window
+            .reconciliation
+            .independently_counted_roots
+            != certificate.window.roots.len()
+        || !certificate.window.reconciliation.ordered_and_disjoint
+    {
+        bail!("production independent CCM certificate structure is invalid");
+    }
+    certificate
+        .interval_newton
+        .validate(certificate.precision_bits)
+        .map_err(anyhow::Error::from)?;
+    let selected_end = certificate
+        .selected_root_offset
+        .checked_add(certificate.selected_root_count)
+        .context("independent CCM selected certificate range overflows")?;
+    if selected_end > certificate.window.roots.len() {
+        bail!("independent CCM selected certificate range leaves its certified window");
+    }
+    let expected_indices = match &certificate.target {
+        IndependentCcmRootTarget::Prefix { count } => {
+            if *count != certificate.selected_root_count {
+                bail!("independent CCM prefix certificate count is inconsistent");
+            }
+            Some((1, *count))
+        }
+        IndependentCcmRootTarget::IndexRange { first, last } => {
+            if *first == 0 || first > last || *last - *first + 1 != certificate.selected_root_count
+            {
+                bail!("independent CCM indexed certificate target is inconsistent");
+            }
+            Some((*first, *last))
+        }
+        IndependentCcmRootTarget::PositiveHeightWindow { lower, upper } => {
+            let lower = parse_endpoint(lower, certificate.precision_bits)?;
+            let upper = parse_endpoint(upper, certificate.precision_bits)?;
+            if lower <= 0 || lower >= upper {
+                bail!("independent CCM height certificate target is invalid");
+            }
+            match certificate.first_selected_positive_index {
+                Some(first) => Some((
+                    first,
+                    first
+                        .checked_add(certificate.selected_root_count - 1)
+                        .context("independent CCM height certificate ordinal range overflows")?,
+                )),
+                None => None,
+            }
+        }
+    };
+    if expected_indices
+        != certificate
+            .first_selected_positive_index
+            .zip(certificate.last_selected_positive_index)
+    {
+        bail!("independent CCM certificate ordinal assignment is inconsistent");
+    }
+    let lower_bound = Rational::from(
+        Rational::parse(&certificate.lower_bound)
+            .context("parse independent CCM exact lower discovery bound")?,
+    );
+    let upper_bound = Rational::from(
+        Rational::parse(&certificate.upper_bound)
+            .context("parse independent CCM exact upper discovery bound")?,
+    );
+    if lower_bound < 0 || lower_bound >= upper_bound {
+        bail!("independent CCM certificate discovery bounds are invalid");
+    }
+    for root in &certificate.window.roots {
+        if root.precision_bits != certificate.precision_bits
+            || root.status != IntervalRootStatus::CertifiedUnique
+            || !root.uniqueness_witnessed
+        {
+            bail!("independent CCM certificate contains a non-unique root enclosure");
+        }
+        let lower = parse_endpoint(&root.lower, root.precision_bits)?;
+        let upper = parse_endpoint(&root.upper, root.precision_bits)?;
+        let lower_exact = lower
+            .to_rational()
+            .context("convert certified CCM root lower endpoint to an exact rational")?;
+        let upper_exact = upper
+            .to_rational()
+            .context("convert certified CCM root upper endpoint to an exact rational")?;
+        if lower_exact <= lower_bound || lower_exact >= upper_exact || upper_exact >= upper_bound {
+            bail!("independent CCM root enclosure leaves its certified bounds");
+        }
+    }
+    for pair in certificate.window.roots.windows(2) {
+        let precision = pair[0].precision_bits.max(pair[1].precision_bits);
+        if parse_endpoint(&pair[0].upper, precision)? >= parse_endpoint(&pair[1].lower, precision)?
+        {
+            bail!("independent CCM root enclosures are not strictly ordered and disjoint");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReferenceZeroDataset {
@@ -1967,7 +2106,14 @@ mod tests {
         assert_eq!(certificate.first_selected_positive_index, Some(2));
         assert_eq!(certificate.last_selected_positive_index, Some(4));
         assert_eq!(certificate.selected_roots().len(), 3);
+        validate_production_independent_ccm_root_certificate_structure(&certificate).unwrap();
         verify_production_independent_ccm_root_certificate(&certificate).unwrap();
+
+        let mut wrong_target = certificate.clone();
+        wrong_target.target = IndependentCcmRootTarget::IndexRange { first: 1, last: 3 };
+        assert!(
+            validate_production_independent_ccm_root_certificate_structure(&wrong_target).is_err()
+        );
 
         let prefix = certify_production_independent_ccm_roots(
             &weights,
@@ -1982,6 +2128,7 @@ mod tests {
         assert_eq!(prefix.first_selected_positive_index, Some(1));
         assert_eq!(prefix.last_selected_positive_index, Some(4));
         assert_eq!(prefix.selected_roots().len(), 4);
+        validate_production_independent_ccm_root_certificate_structure(&prefix).unwrap();
     }
 
     #[cfg(feature = "arb")]
@@ -1999,14 +2146,20 @@ mod tests {
             width_tolerance: DecimalLiteral::new("1e-30").unwrap(),
             maximum_iterations: 30,
         };
-        let certificate = certify_production_first_positive_ccm_roots(
-            &result.xi, 13, modes, 1, precision, 64, &options,
+        let certificate = certify_production_independent_ccm_roots(
+            &result.xi,
+            13,
+            modes,
+            &IndependentCcmRootTarget::Prefix { count: 1 },
+            precision,
+            64,
+            &options,
         )
         .unwrap();
-        verify_production_first_positive_ccm_root_certificate(&certificate).unwrap();
+        verify_production_independent_ccm_root_certificate(&certificate).unwrap();
         assert_eq!(certificate.window.roots.len(), 1);
-        assert!(certificate.preceding_window_count.certified_root_count < 1);
-        let root = &certificate.window.roots[0];
+        assert_eq!(certificate.positive_roots_before_window, 0);
+        let root = &certificate.selected_roots()[0];
         let mut midpoint = parse_endpoint(&root.lower, precision).unwrap();
         midpoint += parse_endpoint(&root.upper, precision).unwrap();
         midpoint /= 2;
@@ -2019,9 +2172,8 @@ mod tests {
         )
         .unwrap();
         let comparison =
-            compare_production_first_positive_roots_to_references(&certificate, &references)
-                .unwrap();
-        verify_production_post_discovery_reference_comparison(
+            compare_production_independent_roots_to_references(&certificate, &references).unwrap();
+        verify_production_independent_post_discovery_comparison(
             &comparison,
             &certificate,
             &references,
@@ -2029,7 +2181,7 @@ mod tests {
         .unwrap();
         let mut tampered = comparison;
         tampered.reference_influenced_discovery = true;
-        assert!(verify_production_post_discovery_reference_comparison(
+        assert!(verify_production_independent_post_discovery_comparison(
             &tampered,
             &certificate,
             &references,

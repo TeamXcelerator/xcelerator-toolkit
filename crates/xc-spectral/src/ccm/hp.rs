@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::Instant;
+#[cfg(feature = "arb")]
+use xc_cache::{resolve_or_compute_json_artifact_with_assessment, ContentDigest};
 use xc_cache::{
     resolve_or_compute_json_artifact_with_dependencies, ArtifactAssuranceAttestation,
     ArtifactCacheContext, ArtifactExecutionCacheRequest, ArtifactManifest,
@@ -33,6 +35,7 @@ enum CcmCacheRoute<'a> {
 struct RetainedCcmSource {
     tau: Vec<Float>,
     tau_manifest: Option<ArtifactManifest>,
+    secular_manifest: Option<ArtifactManifest>,
 }
 
 #[derive(Clone, Copy)]
@@ -1232,10 +1235,14 @@ pub struct CcmSectorGapHp {
     pub even_simplicity_margin: Float,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CcmResearchCaptureOptions {
     pub capture_evenness: bool,
     pub sector_analysis: Option<CcmSectorAnalysisOptions>,
+    /// Optional root-only interval certification. This certifies the exact
+    /// retained finite secular point source; it does not request the much
+    /// more expensive interval reconstruction of Tau.
+    pub root_certification: Option<CcmRootCertificationOptions>,
 }
 
 impl CcmResearchCaptureOptions {
@@ -1245,7 +1252,38 @@ impl CcmResearchCaptureOptions {
             sector_analysis: Some(CcmSectorAnalysisOptions::maximum(
                 requested_sector_eigenpairs,
             )),
+            root_certification: None,
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CcmRootCertificationOptions {
+    pub target: super::certified_roots::IndependentCcmRootTarget,
+    pub isolation_bits: u32,
+    pub interval_newton: xc_root::IntervalNewtonOptions,
+}
+
+impl CcmRootCertificationOptions {
+    /// Configure certification of an independently indexed root target.
+    /// The interval width follows the claim's requested decimal precision;
+    /// the working-precision guard digits remain controlled by
+    /// [`HighPrecConfig`].
+    pub fn for_decimal_digits(
+        target: super::certified_roots::IndependentCcmRootTarget,
+        decimal_digits: u32,
+    ) -> Result<Self> {
+        if decimal_digits == 0 {
+            bail!("CCM root certification requires positive decimal digits");
+        }
+        Ok(Self {
+            target,
+            isolation_bits: 96,
+            interval_newton: xc_root::IntervalNewtonOptions {
+                width_tolerance: xc_core::DecimalLiteral::new(format!("1e-{decimal_digits}"))?,
+                maximum_iterations: 2_000,
+            },
+        })
     }
 }
 
@@ -1253,6 +1291,9 @@ pub struct CcmResearchCaptureResult {
     pub primary: HighPrecResult,
     pub evenness: Option<EvennessResult>,
     pub sector_gap: Option<CcmSectorGapHp>,
+    /// Separate, source-bound certificate artifact when root-only
+    /// certification was requested.
+    pub root_certificate: Option<super::certified_roots::ProductionIndependentCcmRootCertificate>,
 }
 
 fn evenness_from_sector_gap(
@@ -4028,11 +4069,13 @@ fn analyze_sector_gap_inner(
         RetainedCcmSource {
             tau,
             tau_manifest: Some(tau_manifest),
+            secular_manifest: None,
         }
     } else {
         RetainedCcmSource {
             tau: build_tau_hp(params, &l, cfg)?,
             tau_manifest: None,
+            secular_manifest: None,
         }
     };
     analyze_sector_gap_from_retained_source(params, cfg, options, cache, source)
@@ -4664,6 +4707,205 @@ fn resolve_secular_source_via_cache(
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("secular-source execution returned no manifest"))
+}
+
+#[cfg(feature = "arb")]
+fn certify_roots_from_retained_source(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    weights: &[Float],
+    secular_manifest: Option<&ArtifactManifest>,
+    options: &CcmRootCertificationOptions,
+    cache: Option<&ArtifactCacheContext<'_>>,
+) -> Result<super::certified_roots::ProductionIndependentCcmRootCertificate> {
+    use super::certified_roots::{
+        certify_production_independent_ccm_roots, production_ccm_source_weights_digest,
+        validate_production_independent_ccm_root_certificate_structure,
+    };
+
+    if !params.lambda_sq.is_integer {
+        bail!("root-only CCM certification currently requires exact integer lambda_squared");
+    }
+    let expected_weights_digest =
+        production_ccm_source_weights_digest(weights, cfg.precision_bits)?;
+    let compute = || {
+        certify_production_independent_ccm_roots(
+            weights,
+            params.lambda_sq_int(),
+            params.n_modes,
+            &options.target,
+            cfg.precision_bits,
+            options.isolation_bits,
+            &options.interval_newton,
+        )
+    };
+    let Some(cache) = cache else {
+        return compute();
+    };
+    let secular_manifest = secular_manifest.ok_or_else(|| {
+        anyhow::anyhow!("managed CCM root certification is missing its secular-source manifest")
+    })?;
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_certificate_bundle".to_owned(),
+        mathematical_semantics_version: "ccm-exact-point-source-root-certificate-v0.13.0-v1"
+            .to_owned(),
+        resolved_mathematical_parameters: serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": cfg.precision_bits,
+            "force_even": cfg.force_even,
+            "secular_source_content_digest": secular_manifest.content_digest.0,
+            "source_weights_digest": expected_weights_digest.0,
+            "certification_scope": "exact_stored_point_source",
+            "target": options.target,
+            "isolation_bits": options.isolation_bits,
+            "interval_newton": options.interval_newton,
+        }),
+        normalization: Some("sum_xi_equals_sqrt_log_lambda_squared".to_owned()),
+        target: Some("independently_indexed_positive_ccm_roots".to_owned()),
+        subspace: cfg.force_even.then(|| "even".to_owned()),
+        source_data_identities: BTreeMap::from([(
+            "ccm_secular_source".to_owned(),
+            secular_manifest.content_digest.clone(),
+        )]),
+        algorithm_semantics: Some("flint_exact_count_arb_isolation_interval_newton_v1".to_owned()),
+    };
+    let semantic_digest = semantic_key.digest()?;
+    let logical_key = format!(
+        "ccm/certificate-bundle/{}/{}/{}/{}",
+        lambda_squared_cache_identity(params),
+        params.n_modes,
+        cfg.precision_bits,
+        semantic_digest.0
+    );
+    let request = ArtifactExecutionCacheRequest {
+        operation: "ccm.root_certificate.resolve_or_compute",
+        semantic_key: &semantic_key,
+        logical_key: &logical_key,
+        resolver: cache.resolver,
+        acceptance: cache.acceptance,
+        ordered_overlays: cache.ordered_overlays.clone(),
+        mode: cache.mode,
+        write_on_miss: cache.write_on_miss,
+        write_visibility: cache.write_visibility,
+        produced_quality: CacheQuality::Certified,
+        producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        maximum_reader_version: None,
+        tags: BTreeMap::from([
+            ("domain".to_owned(), "ccm".to_owned()),
+            ("artifact".to_owned(), "root_certificate".to_owned()),
+            (
+                "certification_scope".to_owned(),
+                "exact_stored_point_source".to_owned(),
+            ),
+        ]),
+        provenance_digest: Some(secular_manifest.content_digest.clone()),
+        production_sink: cache.production_sink,
+    };
+    let resolved = resolve_or_compute_json_artifact_with_assessment(
+        &request,
+        || {
+            let certificate = compute().map_err(|error| {
+                CacheError::InvalidManifest(format!("CCM root certification failed: {error:#}"))
+            })?;
+            let evidence_bytes = serde_json::to_vec(&certificate)?;
+            let evidence_digest = if let Some(sink) = cache.production_sink {
+                sink.record_evidence("ccm-root-interval-certificate", &evidence_bytes)?
+            } else {
+                ContentDigest::sha256(&evidence_bytes)
+            };
+            Ok((
+                certificate,
+                vec![DependencyRef {
+                    key: secular_manifest.key.clone(),
+                    content_digest: secular_manifest.content_digest.clone(),
+                    required_quality: CacheQuality::Validated,
+                }],
+                ArtifactProductionAssessment {
+                    achieved_assurance: xc_cache::ArtifactAssuranceState::Certified,
+                    evidence_digests: vec![evidence_digest],
+                },
+            ))
+        },
+        |certificate| {
+            validate_production_independent_ccm_root_certificate_structure(certificate)
+                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            if certificate.integer_cutoff_c != params.lambda_sq_int()
+                || certificate.modes != params.n_modes
+                || certificate.precision_bits != cfg.precision_bits
+                || certificate.isolation_bits != options.isolation_bits
+                || certificate.interval_newton != options.interval_newton
+                || certificate.target != options.target
+                || certificate.source_weights_digest != expected_weights_digest
+            {
+                return Err(CacheError::InvalidManifest(
+                    "CCM root certificate does not match its exact semantic identity".to_owned(),
+                ));
+            }
+            Ok(())
+        },
+    )?;
+    Ok(resolved.value)
+}
+
+fn reconcile_computed_roots_with_certificate(
+    result: &HighPrecResult,
+    certificate: &super::certified_roots::ProductionIndependentCcmRootCertificate,
+) -> Result<()> {
+    let first = certificate
+        .first_selected_positive_index
+        .ok_or_else(|| anyhow::anyhow!("CCM root certificate does not assign positive ordinals"))?;
+    for (offset, enclosure) in certificate.selected_roots().iter().enumerate() {
+        let positive_index = first
+            .checked_add(offset)
+            .ok_or_else(|| anyhow::anyhow!("certified CCM root ordinal overflows"))?;
+        let result_offset = positive_index
+            .checked_sub(result.first_positive_root_index)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "computed CCM root window begins after certified ordinal {positive_index}"
+                )
+            })?;
+        let computed = result
+            .eigenvalues_pos
+            .get(result_offset)
+            .and_then(EigenvalueResult::value)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "computed CCM root window has no value for certified ordinal {positive_index}"
+                )
+            })?;
+        let lower = Float::with_val(
+            result.precision_bits,
+            Float::parse(&enclosure.lower)
+                .map_err(|error| anyhow::anyhow!("parse certified CCM lower endpoint: {error}"))?,
+        );
+        let upper = Float::with_val(
+            result.precision_bits,
+            Float::parse(&enclosure.upper)
+                .map_err(|error| anyhow::anyhow!("parse certified CCM upper endpoint: {error}"))?,
+        );
+        if computed < &lower || computed > &upper {
+            bail!(
+                "computed CCM root ordinal {positive_index} is outside its certified interval; independent discovery ordering or refinement does not reconcile"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "arb"))]
+fn certify_roots_from_retained_source(
+    _params: &CcmParams,
+    _cfg: &HighPrecConfig,
+    _weights: &[Float],
+    _secular_manifest: Option<&ArtifactManifest>,
+    _options: &CcmRootCertificationOptions,
+    _cache: Option<&ArtifactCacheContext<'_>>,
+) -> Result<super::certified_roots::ProductionIndependentCcmRootCertificate> {
+    bail!("root-only CCM certification requires the xc-spectral arb feature")
 }
 
 fn compute_root_range(
@@ -5349,6 +5591,26 @@ pub fn run_independent_with_research_capture(
                 .map(CcmCacheRoute::Fabric)
                 .unwrap_or(CcmCacheRoute::Standalone),
         )?;
+        let root_certificate = if let Some(certification) = &options.root_certification {
+            let certification_started = Instant::now();
+            let certificate = certify_roots_from_retained_source(
+                params,
+                cfg,
+                &primary.xi,
+                retained_source.secular_manifest.as_ref(),
+                certification,
+                cache,
+            )?;
+            reconcile_computed_roots_with_certificate(&primary, &certificate)?;
+            eprintln!(
+                "[HP] root-only certification: {} roots, exact stored point source, computed ordinals reconciled, {:.3}s",
+                certificate.selected_root_count,
+                certification_started.elapsed().as_secs_f64()
+            );
+            Some(certificate)
+        } else {
+            None
+        };
         let supplemental_started = Instant::now();
         // A parity-sector decomposition is a stronger and substantially less
         // expensive natural-state calculation than repeating full dense
@@ -5416,6 +5678,7 @@ pub fn run_independent_with_research_capture(
             primary,
             evenness,
             sector_gap,
+            root_certificate,
         })
     };
 
@@ -6076,45 +6339,50 @@ fn run_inner_retaining_source(
         params.n_modes
     );
 
-    let (eigenvalues_pos, root_manifest): (Vec<EigenvalueResult>, Option<ArtifactManifest>) =
-        if hp_seeds.is_empty() {
-            if let CcmCacheRoute::Fabric(cache) = &cache_route {
-                resolve_secular_source_via_cache(
-                    params,
-                    cfg,
-                    eigenpair_manifest
-                        .as_ref()
-                        .expect("fabric eigenpair route retains its exact manifest"),
-                    cache,
-                )?;
-            }
-            (Vec::new(), None)
-        } else if let CcmCacheRoute::Fabric(cache) = &cache_route {
-            let secular_manifest = resolve_secular_source_via_cache(
+    let (eigenvalues_pos, root_manifest, secular_manifest): (
+        Vec<EigenvalueResult>,
+        Option<ArtifactManifest>,
+        Option<ArtifactManifest>,
+    ) = if hp_seeds.is_empty() {
+        let secular_manifest = if let CcmCacheRoute::Fabric(cache) = &cache_route {
+            Some(resolve_secular_source_via_cache(
                 params,
                 cfg,
                 eigenpair_manifest
                     .as_ref()
                     .expect("fabric eigenpair route retains its exact manifest"),
                 cache,
-            )?;
-            let (roots, manifest) = resolve_root_range_via_cache(
-                params,
-                cfg,
-                &l,
-                &xi,
-                first_root_index,
-                &hp_seeds,
-                &secular_manifest,
-                cache,
-                artifact_mode,
-            )?;
-            (roots, Some(manifest))
+            )?)
         } else {
-            let roots = compute_root_range(&xi, params, &l, cfg, &hp_seeds);
-            ensure_root_window_usable(&roots, hp_seeds.len(), false)?;
-            (roots, None)
+            None
         };
+        (Vec::new(), None, secular_manifest)
+    } else if let CcmCacheRoute::Fabric(cache) = &cache_route {
+        let secular_manifest = resolve_secular_source_via_cache(
+            params,
+            cfg,
+            eigenpair_manifest
+                .as_ref()
+                .expect("fabric eigenpair route retains its exact manifest"),
+            cache,
+        )?;
+        let (roots, manifest) = resolve_root_range_via_cache(
+            params,
+            cfg,
+            &l,
+            &xi,
+            first_root_index,
+            &hp_seeds,
+            &secular_manifest,
+            cache,
+            artifact_mode,
+        )?;
+        (roots, Some(manifest), Some(secular_manifest))
+    } else {
+        let roots = compute_root_range(&xi, params, &l, cfg, &hp_seeds);
+        ensure_root_window_usable(&roots, hp_seeds.len(), false)?;
+        (roots, None, None)
+    };
     report_root_status_summary(&eigenvalues_pos, first_root_index);
     eprintln!(
         "[HP] phase timing: root discovery/refinement={:.3}s",
@@ -6183,7 +6451,11 @@ fn run_inner_retaining_source(
             elapsed_seconds: start.elapsed().as_secs_f64(),
             precision_bits: prec,
         },
-        RetainedCcmSource { tau, tau_manifest },
+        RetainedCcmSource {
+            tau,
+            tau_manifest,
+            secular_manifest,
+        },
     ))
 }
 
@@ -10458,6 +10730,163 @@ mod tests {
             2
         );
         assert!(root.join("staging/evidence").is_dir());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "arb")]
+    #[test]
+    fn root_certificate_is_separate_source_bound_and_reusable() {
+        use xc_cache::{
+            ArtifactExecutionCacheMode, ArtifactKey, CacheLayer, CacheObjectRef, CachePolicy,
+            CacheResolver, CacheVisibility, FilesystemCacheStore,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "xc-spectral-ccm-root-certificate-cache-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "workstation",
+                root.join("cache"),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let params = CcmParams::from_lambda_sq_integer(13, 10);
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.precision_bits = 192;
+        cfg.quad_points = MIN_QUAD_POINTS;
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let (mut source, _) = run_inner_retaining_source(
+            &params,
+            &cfg,
+            RootAcquisition::SourceOnly,
+            CcmCacheRoute::Standalone,
+        )
+        .unwrap();
+        let source_digest = ContentDigest::sha256(b"exact-test-secular-source");
+        let source_manifest = ArtifactManifest {
+            schema_version: 1,
+            key: ArtifactKey::new(
+                "ccm_secular_source",
+                "ccm/test/secular-source",
+                b"exact-test-secular-source-parameters",
+            )
+            .unwrap(),
+            content_digest: source_digest.clone(),
+            size_bytes: 1,
+            objects: vec![CacheObjectRef {
+                content_digest: source_digest,
+                size_bytes: 1,
+            }],
+            created_unix_seconds: 0,
+            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            maximum_reader_version: None,
+            quality: CacheQuality::Validated,
+            visibility: CacheVisibility::Local,
+            immutable: true,
+            dependencies: Vec::new(),
+            tags: BTreeMap::new(),
+            provenance_digest: None,
+        };
+        let context = |mode, write_on_miss| ArtifactCacheContext {
+            resolver: Some(&resolver),
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["workstation".to_owned()],
+            mode,
+            write_on_miss,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy:
+                xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let options = CcmRootCertificationOptions::for_decimal_digits(
+            super::super::certified_roots::IndependentCcmRootTarget::Prefix { count: 1 },
+            30,
+        )
+        .unwrap();
+        let first = certify_roots_from_retained_source(
+            &params,
+            &cfg,
+            &source.xi,
+            Some(&source_manifest),
+            &options,
+            Some(&context(ArtifactExecutionCacheMode::PreferReuse, true)),
+        )
+        .unwrap();
+        let enclosure = &first.selected_roots()[0];
+        let mut certified_midpoint =
+            Float::with_val(cfg.precision_bits, Float::parse(&enclosure.lower).unwrap());
+        certified_midpoint +=
+            Float::with_val(cfg.precision_bits, Float::parse(&enclosure.upper).unwrap());
+        certified_midpoint /= 2;
+        source.first_positive_root_index = 1;
+        source.eigenvalues_pos = vec![EigenvalueResult::Converged(RootRefinement {
+            value: certified_midpoint,
+            diagnostics: RootRefinementDiagnostics {
+                iterations: 1,
+                final_correction: Float::with_val(cfg.precision_bits, 0),
+                residual: Float::with_val(cfg.precision_bits, 0),
+                achieved_decimal_digits: Float::with_val(cfg.precision_bits, 30),
+            },
+        })];
+        reconcile_computed_roots_with_certificate(&source, &first).unwrap();
+        let reused = certify_roots_from_retained_source(
+            &params,
+            &cfg,
+            &source.xi,
+            Some(&source_manifest),
+            &options,
+            Some(&context(ArtifactExecutionCacheMode::RequireReuse, false)),
+        )
+        .unwrap();
+        assert_eq!(first, reused);
+
+        let different_target = CcmRootCertificationOptions::for_decimal_digits(
+            super::super::certified_roots::IndependentCcmRootTarget::IndexRange {
+                first: 2,
+                last: 2,
+            },
+            30,
+        )
+        .unwrap();
+        assert!(certify_roots_from_retained_source(
+            &params,
+            &cfg,
+            &source.xi,
+            Some(&source_manifest),
+            &different_target,
+            Some(&context(ArtifactExecutionCacheMode::RequireReuse, false)),
+        )
+        .is_err());
+        let mut different_source = source_manifest.clone();
+        different_source.content_digest = ContentDigest::sha256(b"different-secular-source");
+        assert!(certify_roots_from_retained_source(
+            &params,
+            &cfg,
+            &source.xi,
+            Some(&different_source),
+            &options,
+            Some(&context(ArtifactExecutionCacheMode::RequireReuse, false)),
+        )
+        .is_err());
+        if let EigenvalueResult::Converged(root) = &mut source.eigenvalues_pos[0] {
+            root.value += 1;
+        }
+        assert!(reconcile_computed_roots_with_certificate(&source, &first).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -106,6 +106,8 @@ Assurance is selected per result:
 
 Certification may take far longer than the underlying computation. It is intended for selected claims that require rigorous finite bounds, not as a routine prerequisite for computing, caching, or using most artifacts.
 
+Certificates are separate content-addressed evidence artifacts bound to the exact digest of the computed source they certify. They do not overwrite or relabel computed matrices, eigenstates, or root windows. The same source, target, and certification policy reuses one certificate; a different source digest, target range, precision, or method produces a distinct certificate.
+
 ## Caching
 
 Caching is automatic for ordinary consumers. The toolkit checks compatible local and public artifacts, validates a candidate before reuse, and computes on a miss. No credentials or cache configuration are required for that normal workflow.
