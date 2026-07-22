@@ -13,6 +13,8 @@
 //! research-project repository layout.
 
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
@@ -26,6 +28,53 @@ pub const BUNDLED_ZETA_ZEROS_RESOURCE: &str = "xc-zeta/data/zeta_zeros_1000x2500
 /// standard tabulation; that tabulation is validation evidence, not the source
 /// of these 2,500-digit values.
 pub const BUNDLED_ZETA_ZEROS_JSON: &[u8] = include_bytes!("../data/zeta_zeros_1000x2500.json");
+
+/// Stable provenance for a reference-zero dataset used as an explicit solver
+/// input.  Comparison-only callers need not construct this record; seeded
+/// numerical APIs require it so the seed source participates in artifact
+/// identity rather than being inferred from a filename or repository.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceZeroDatasetIdentity {
+    pub schema_version: u32,
+    pub resource_id: String,
+    pub content_sha256: String,
+    pub record_count: usize,
+    pub decimal_digits: u32,
+}
+
+impl ReferenceZeroDatasetIdentity {
+    pub fn validate(&self) -> bool {
+        self.schema_version == 1
+            && !self.resource_id.trim().is_empty()
+            && self.content_sha256.len() == 64
+            && self
+                .content_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && self.record_count > 0
+            && self.decimal_digits > 0
+    }
+}
+
+/// Returns content-bound provenance for the toolkit-owned zero table.
+pub fn bundled_dataset_identity() -> Result<ReferenceZeroDatasetIdentity> {
+    let records: Vec<String> = serde_json::from_slice(BUNDLED_ZETA_ZEROS_JSON)?;
+    let content_sha256 = format!("{:x}", Sha256::digest(BUNDLED_ZETA_ZEROS_JSON));
+    let identity = ReferenceZeroDatasetIdentity {
+        schema_version: 1,
+        resource_id: BUNDLED_ZETA_ZEROS_RESOURCE.to_owned(),
+        content_sha256,
+        record_count: records.len(),
+        decimal_digits: 2_500,
+    };
+    if !identity.validate() {
+        return Err(anyhow!(
+            "bundled reference-zero dataset identity is invalid"
+        ));
+    }
+    Ok(identity)
+}
 
 /// Loads the first `n` decimal strings from the toolkit-owned reference table.
 pub fn bundled_first_n_strings(n: usize) -> Result<Vec<String>> {
@@ -149,6 +198,10 @@ mod tests {
         assert_eq!(zeros.len(), 1_000);
         assert!(zeros.iter().all(|zero| zero.len() == 2_501));
         assert!(zeros[0].starts_with("14.134725141734693790457251983562"));
+        let identity = bundled_dataset_identity().unwrap();
+        assert!(identity.validate());
+        assert_eq!(identity.record_count, 1_000);
+        assert_eq!(identity.decimal_digits, 2_500);
     }
 
     /// `first_n_hp` loads zeros as rug::Float at high precision.

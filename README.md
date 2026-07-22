@@ -108,6 +108,14 @@ Certification may take far longer than the underlying computation. It is intende
 
 Certificates are separate content-addressed evidence artifacts bound to the exact digest of the computed source they certify. They do not overwrite or relabel computed matrices, eigenstates, or root windows. The same source, target, and certification policy reuses one certificate; a different source digest, target range, precision, or method produces a distinct certificate.
 
+The general CCM API discovers roots independently by default. Explicit
+reference-seeded refinement is available for reproduction workflows and must
+carry a content-bound reference-dataset identity. Seeded refinements and
+independent discovery windows use different artifact kinds and semantic keys;
+they may share Tau, eigenstate, and secular-source dependencies but can never
+satisfy each other's cache requests. Finite-source root certificates remain
+independent of either acquisition policy.
+
 ## Caching
 
 Caching is automatic for ordinary consumers. The toolkit checks compatible local and public artifacts, validates a candidate before reuse, and computes on a miss. No credentials or cache configuration are required for that normal workflow.

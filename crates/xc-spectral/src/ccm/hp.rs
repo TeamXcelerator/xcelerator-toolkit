@@ -17,13 +17,14 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::Instant;
 #[cfg(feature = "arb")]
-use xc_cache::{resolve_or_compute_json_artifact_with_assessment, ContentDigest};
+use xc_cache::resolve_or_compute_json_artifact_with_assessment;
 use xc_cache::{
     resolve_or_compute_json_artifact_with_dependencies, ArtifactAssuranceAttestation,
     ArtifactCacheContext, ArtifactExecutionCacheRequest, ArtifactManifest,
-    ArtifactProductionAssessment, CacheError, CacheQuality, DependencyRef, SemanticKeyEnvelope,
-    ToolkitVersion,
+    ArtifactProductionAssessment, CacheError, CacheQuality, ContentDigest, DependencyRef,
+    SemanticKeyEnvelope, ToolkitVersion,
 };
+use xc_zeta::zeros::ReferenceZeroDatasetIdentity;
 
 use super::{prime_powers_up_to, window::ZeroTarget, CcmParams, CcmResult};
 
@@ -45,6 +46,7 @@ enum RootAcquisition<'a> {
     ReferenceSeeded {
         first_root_index: usize,
         seeds: &'a [Float],
+        dataset: &'a ReferenceZeroDatasetIdentity,
     },
 }
 
@@ -441,6 +443,8 @@ struct PortableRootRange {
     first_root_index: usize,
     discovery_mode: String,
     reference_seeds_used: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reference_dataset: Option<ReferenceZeroDatasetIdentity>,
     completeness: String,
     starting_points: Vec<String>,
     outcomes: Vec<PortableRootOutcome>,
@@ -5074,6 +5078,37 @@ fn report_root_status_summary(outcomes: &[EigenvalueResult], first_root_index: u
     report_precision_limited_category("iteration-limited", &approximate);
 }
 
+fn validate_reference_seed_dataset(
+    artifact_mode: RootArtifactMode,
+    reference_dataset: Option<&ReferenceZeroDatasetIdentity>,
+    first_root_index: usize,
+    root_count: usize,
+) -> Result<()> {
+    match (artifact_mode, reference_dataset) {
+        (RootArtifactMode::Independent, None) => Ok(()),
+        (RootArtifactMode::Independent, Some(_)) => {
+            bail!("independent CCM discovery cannot carry reference-seed provenance")
+        }
+        (RootArtifactMode::ReferenceSeededRefinement, None) => {
+            bail!("reference-seeded CCM refinement requires dataset provenance")
+        }
+        (RootArtifactMode::ReferenceSeededRefinement, Some(dataset)) => {
+            let last_root_index = first_root_index
+                .checked_add(root_count.saturating_sub(1))
+                .ok_or_else(|| anyhow::anyhow!("reference-seed ordinal range overflows"))?;
+            if !dataset.validate()
+                || !ContentDigest(dataset.content_sha256.clone()).validate()
+                || root_count == 0
+                || first_root_index == 0
+                || last_root_index > dataset.record_count
+            {
+                bail!("reference-seeded CCM dataset provenance or ordinal coverage is invalid");
+            }
+            Ok(())
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_root_range(
     artifact: &PortableRootRange,
@@ -5082,6 +5117,7 @@ fn decode_root_range(
     first_root_index: usize,
     seeds: &[Float],
     artifact_mode: RootArtifactMode,
+    reference_dataset: Option<&ReferenceZeroDatasetIdentity>,
     xi: &[Float],
     l: &Float,
     require_converged: bool,
@@ -5097,6 +5133,7 @@ fn decode_root_range(
         || artifact.discovery_mode != artifact_mode.as_str()
         || artifact.reference_seeds_used
             != (artifact_mode == RootArtifactMode::ReferenceSeededRefinement)
+        || artifact.reference_dataset.as_ref() != reference_dataset
         || artifact.completeness
             != match artifact_mode {
                 RootArtifactMode::Independent => "unverified_computed_discovery",
@@ -5189,6 +5226,77 @@ fn decode_root_range(
     Ok(decoded)
 }
 
+fn root_range_semantic_key(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    first_root_index: usize,
+    seeds: &[Float],
+    artifact_mode: RootArtifactMode,
+    reference_dataset: Option<&ReferenceZeroDatasetIdentity>,
+) -> Result<SemanticKeyEnvelope> {
+    validate_reference_seed_dataset(
+        artifact_mode,
+        reference_dataset,
+        first_root_index,
+        seeds.len(),
+    )?;
+    let seed_strings: Vec<String> = seeds.iter().map(Float::to_string).collect();
+    let mut resolved_parameters = serde_json::json!({
+        "lambda_squared": lambda_squared_cache_identity(params),
+        "n_modes": params.n_modes,
+        "precision_bits": cfg.precision_bits,
+        "force_even": cfg.force_even,
+        "first_root_index": first_root_index,
+        "root_count": seeds.len(),
+        "discovery_mode": artifact_mode.as_str(),
+        "starting_points": seed_strings,
+        "reference_seeds_used": artifact_mode == RootArtifactMode::ReferenceSeededRefinement,
+        "completeness": match artifact_mode {
+            RootArtifactMode::Independent => "unverified_computed_discovery",
+            RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
+        },
+        "solver": cfg.root_solver.display_name().to_ascii_lowercase(),
+        "solver_steps": cfg.solver_steps,
+        "accuracy_guard_bits": GUARD_BITS
+    });
+    if let Some(dataset) = reference_dataset {
+        resolved_parameters
+            .as_object_mut()
+            .expect("CCM root semantic parameters are an object")
+            .insert(
+                "reference_dataset".to_owned(),
+                serde_json::to_value(dataset)?,
+            );
+    }
+    let source_data_identities = reference_dataset
+        .map(|dataset| {
+            BTreeMap::from([(
+                "reference_zero_dataset".to_owned(),
+                ContentDigest(dataset.content_sha256.clone()),
+            )])
+        })
+        .unwrap_or_default();
+    Ok(SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: match artifact_mode {
+            RootArtifactMode::Independent => "ccm_root_discovery_window",
+            RootArtifactMode::ReferenceSeededRefinement => "ccm_root_refinement",
+        }
+        .to_owned(),
+        mathematical_semantics_version: match artifact_mode {
+            RootArtifactMode::Independent => "ccm-root-range-v0.13.0-v6",
+            RootArtifactMode::ReferenceSeededRefinement => "ccm-root-range-v0.13.0-v6",
+        }
+        .to_owned(),
+        resolved_mathematical_parameters: resolved_parameters,
+        normalization: None,
+        target: Some("positive_ccm_spectral_roots".to_owned()),
+        subspace: cfg.force_even.then(|| "even".to_owned()),
+        source_data_identities,
+        algorithm_semantics: Some(cfg.root_solver.display_name().to_ascii_lowercase()),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_root_range_via_cache(
     params: &CcmParams,
@@ -5200,6 +5308,7 @@ fn resolve_root_range_via_cache(
     secular_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
     artifact_mode: RootArtifactMode,
+    reference_dataset: Option<&ReferenceZeroDatasetIdentity>,
 ) -> Result<(Vec<EigenvalueResult>, ArtifactManifest)> {
     if first_root_index == 0 || seeds.is_empty() {
         bail!("CCM indexed root refinement requires a positive index and nonempty seed window");
@@ -5207,44 +5316,15 @@ fn resolve_root_range_via_cache(
     let last_root_index = first_root_index
         .checked_add(seeds.len() - 1)
         .ok_or_else(|| anyhow::anyhow!("CCM indexed root window overflows usize"))?;
-    let seed_strings: Vec<String> = seeds.iter().map(Float::to_string).collect();
     let require_converged = cache.requested_assurance != xc_core::AssuranceLevel::Computed;
-    let semantic_key = SemanticKeyEnvelope {
-        schema_version: 1,
-        artifact_kind: match artifact_mode {
-            RootArtifactMode::Independent => "ccm_root_discovery_window",
-            RootArtifactMode::ReferenceSeededRefinement => "ccm_root_refinement",
-        }
-        .to_owned(),
-        mathematical_semantics_version: match artifact_mode {
-            RootArtifactMode::Independent => "ccm-root-range-v0.13.0-v6",
-            RootArtifactMode::ReferenceSeededRefinement => "ccm-root-range-v0.13.0-v5",
-        }
-        .to_owned(),
-        resolved_mathematical_parameters: serde_json::json!({
-            "lambda_squared": lambda_squared_cache_identity(params),
-            "n_modes": params.n_modes,
-            "precision_bits": cfg.precision_bits,
-            "force_even": cfg.force_even,
-            "first_root_index": first_root_index,
-            "root_count": seeds.len(),
-            "discovery_mode": artifact_mode.as_str(),
-            "starting_points": seed_strings,
-            "reference_seeds_used": artifact_mode == RootArtifactMode::ReferenceSeededRefinement,
-            "completeness": match artifact_mode {
-                RootArtifactMode::Independent => "unverified_computed_discovery",
-                RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
-            },
-            "solver": cfg.root_solver.display_name().to_ascii_lowercase(),
-            "solver_steps": cfg.solver_steps,
-            "accuracy_guard_bits": GUARD_BITS
-        }),
-        normalization: None,
-        target: Some("positive_ccm_spectral_roots".to_owned()),
-        subspace: cfg.force_even.then(|| "even".to_owned()),
-        source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some(cfg.root_solver.display_name().to_ascii_lowercase()),
-    };
+    let semantic_key = root_range_semantic_key(
+        params,
+        cfg,
+        first_root_index,
+        seeds,
+        artifact_mode,
+        reference_dataset,
+    )?;
     let logical_key = format!(
         "ccm/{}/{}/{}/{}/{}/{}-{}",
         match artifact_mode {
@@ -5326,6 +5406,7 @@ fn resolve_root_range_via_cache(
                     discovery_mode: artifact_mode.as_str().to_owned(),
                     reference_seeds_used: artifact_mode
                         == RootArtifactMode::ReferenceSeededRefinement,
+                    reference_dataset: reference_dataset.cloned(),
                     completeness: match artifact_mode {
                         RootArtifactMode::Independent => "unverified_computed_discovery",
                         RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
@@ -5352,6 +5433,7 @@ fn resolve_root_range_via_cache(
                 first_root_index,
                 seeds,
                 artifact_mode,
+                reference_dataset,
                 xi,
                 l,
                 require_converged,
@@ -5371,6 +5453,7 @@ fn resolve_root_range_via_cache(
             first_root_index,
             seeds,
             artifact_mode,
+            reference_dataset,
             xi,
             l,
             require_converged,
@@ -5580,13 +5663,22 @@ pub fn run_independent_with_research_capture(
     target: &ZeroTarget,
     options: CcmResearchCaptureOptions,
 ) -> Result<CcmResearchCaptureResult> {
+    run_with_research_capture(params, cfg, RootAcquisition::Independent(target), options)
+}
+
+fn run_with_research_capture(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    acquisition: RootAcquisition<'_>,
+    options: CcmResearchCaptureOptions,
+) -> Result<CcmResearchCaptureResult> {
     let managed =
         xc_cache::ManagedArtifactCacheSession::from_environment().map_err(anyhow::Error::from)?;
     let execute = |cache: Option<&ArtifactCacheContext<'_>>| {
         let (primary, retained_source) = run_inner_retaining_source(
             params,
             cfg,
-            RootAcquisition::Independent(target),
+            acquisition,
             cache
                 .map(CcmCacheRoute::Fabric)
                 .unwrap_or(CcmCacheRoute::Standalone),
@@ -5718,17 +5810,51 @@ pub fn run_indexed_seeded(
     cfg: &HighPrecConfig,
     first_root_index: usize,
     zero_seeds: &[Float],
+    dataset: &ReferenceZeroDatasetIdentity,
 ) -> Result<HighPrecResult> {
-    if first_root_index == 0 || zero_seeds.is_empty() {
-        bail!("indexed CCM refinement requires a positive first index and nonempty seed window");
-    }
+    validate_reference_seed_dataset(
+        RootArtifactMode::ReferenceSeededRefinement,
+        Some(dataset),
+        first_root_index,
+        zero_seeds.len(),
+    )?;
     run_with_acquisition(
         params,
         cfg,
         RootAcquisition::ReferenceSeeded {
             first_root_index,
             seeds: zero_seeds,
+            dataset,
         },
+    )
+}
+
+/// Refine an explicitly indexed reference-seeded window and capture optional
+/// sector diagnostics or an independent finite-source root certificate in the
+/// same managed cache/publication session.
+pub fn run_indexed_seeded_with_research_capture(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    first_root_index: usize,
+    zero_seeds: &[Float],
+    dataset: &ReferenceZeroDatasetIdentity,
+    options: CcmResearchCaptureOptions,
+) -> Result<CcmResearchCaptureResult> {
+    validate_reference_seed_dataset(
+        RootArtifactMode::ReferenceSeededRefinement,
+        Some(dataset),
+        first_root_index,
+        zero_seeds.len(),
+    )?;
+    run_with_research_capture(
+        params,
+        cfg,
+        RootAcquisition::ReferenceSeeded {
+            first_root_index,
+            seeds: zero_seeds,
+            dataset,
+        },
+        options,
     )
 }
 
@@ -5820,11 +5946,15 @@ pub fn run_indexed_seeded_via_cache(
     cfg: &HighPrecConfig,
     first_root_index: usize,
     zero_seeds: &[Float],
+    dataset: &ReferenceZeroDatasetIdentity,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<HighPrecResult> {
-    if first_root_index == 0 || zero_seeds.is_empty() {
-        bail!("indexed CCM refinement requires a positive first index and nonempty seed window");
-    }
+    validate_reference_seed_dataset(
+        RootArtifactMode::ReferenceSeededRefinement,
+        Some(dataset),
+        first_root_index,
+        zero_seeds.len(),
+    )?;
     xc_numerics::hp_runtime::run_hp(|| {
         run_inner(
             params,
@@ -5832,6 +5962,7 @@ pub fn run_indexed_seeded_via_cache(
             RootAcquisition::ReferenceSeeded {
                 first_root_index,
                 seeds: zero_seeds,
+                dataset,
             },
             CcmCacheRoute::Fabric(cache),
         )
@@ -6304,20 +6435,24 @@ fn run_inner_retaining_source(
     // source; the explicitly seeded API is retained for post-discovery
     // comparison and refinement.
     let roots_started = Instant::now();
-    let (first_root_index, hp_seeds, artifact_mode) = match acquisition {
-        RootAcquisition::SourceOnly => (1, Vec::new(), RootArtifactMode::Independent),
+    let (first_root_index, hp_seeds, artifact_mode, reference_dataset) = match acquisition {
+        RootAcquisition::SourceOnly => (1, Vec::new(), RootArtifactMode::Independent, None),
         RootAcquisition::Independent(target) => {
             let (first, points) =
                 independently_discovered_starting_points(params, &l, &xi, target, prec)?;
-            (first, points, RootArtifactMode::Independent)
+            (first, points, RootArtifactMode::Independent, None)
         }
         RootAcquisition::ReferenceSeeded {
             first_root_index,
             seeds,
+            dataset,
         } => {
-            if first_root_index == 0 || seeds.is_empty() {
-                bail!("reference-seeded CCM refinement requires a nonempty one-based range");
-            }
+            validate_reference_seed_dataset(
+                RootArtifactMode::ReferenceSeededRefinement,
+                Some(dataset),
+                first_root_index,
+                seeds.len(),
+            )?;
             (
                 first_root_index,
                 seeds
@@ -6325,6 +6460,7 @@ fn run_inner_retaining_source(
                     .map(|seed| Float::with_val(prec, seed))
                     .collect(),
                 RootArtifactMode::ReferenceSeededRefinement,
+                Some(dataset),
             )
         }
     };
@@ -6376,6 +6512,7 @@ fn run_inner_retaining_source(
             &secular_manifest,
             cache,
             artifact_mode,
+            reference_dataset,
         )?;
         (roots, Some(manifest), Some(secular_manifest))
     } else {
@@ -9731,6 +9868,81 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    fn test_reference_dataset() -> ReferenceZeroDatasetIdentity {
+        ReferenceZeroDatasetIdentity {
+            schema_version: 1,
+            resource_id: "test/reference-zeros.json".to_owned(),
+            content_sha256: ContentDigest::sha256(b"test reference zeros").0,
+            record_count: 1_000,
+            decimal_digits: 100,
+        }
+    }
+
+    #[test]
+    fn seeded_and_independent_root_artifacts_have_disjoint_semantic_identity() {
+        let params = CcmParams::from_lambda_sq_integer(13, 4);
+        let cfg = HighPrecConfig::for_decimal_digits(40);
+        let seeds = vec![Float::with_val(cfg.precision_bits, 14)];
+        let dataset = test_reference_dataset();
+        let independent = root_range_semantic_key(
+            &params,
+            &cfg,
+            1,
+            &seeds,
+            RootArtifactMode::Independent,
+            None,
+        )
+        .unwrap();
+        let seeded = root_range_semantic_key(
+            &params,
+            &cfg,
+            1,
+            &seeds,
+            RootArtifactMode::ReferenceSeededRefinement,
+            Some(&dataset),
+        )
+        .unwrap();
+        assert_eq!(independent.artifact_kind, "ccm_root_discovery_window");
+        assert_eq!(seeded.artifact_kind, "ccm_root_refinement");
+        assert!(independent.source_data_identities.is_empty());
+        assert_eq!(
+            seeded.source_data_identities.get("reference_zero_dataset"),
+            Some(&ContentDigest(dataset.content_sha256.clone()))
+        );
+        assert_ne!(independent.digest().unwrap(), seeded.digest().unwrap());
+
+        let mut other_dataset = dataset.clone();
+        other_dataset.content_sha256 = ContentDigest::sha256(b"other reference zeros").0;
+        let other_seeded = root_range_semantic_key(
+            &params,
+            &cfg,
+            1,
+            &seeds,
+            RootArtifactMode::ReferenceSeededRefinement,
+            Some(&other_dataset),
+        )
+        .unwrap();
+        assert_ne!(seeded.digest().unwrap(), other_seeded.digest().unwrap());
+        assert!(root_range_semantic_key(
+            &params,
+            &cfg,
+            1,
+            &seeds,
+            RootArtifactMode::Independent,
+            Some(&dataset),
+        )
+        .is_err());
+        assert!(root_range_semantic_key(
+            &params,
+            &cfg,
+            1,
+            &seeds,
+            RootArtifactMode::ReferenceSeededRefinement,
+            None,
+        )
+        .is_err());
+    }
+
     #[test]
     fn ill_conditioned_lu_is_validated_by_backward_error() {
         let precision = 256;
@@ -9998,6 +10210,7 @@ mod tests {
             first_root_index: 1,
             discovery_mode: RootArtifactMode::Independent.as_str().to_owned(),
             reference_seeds_used: false,
+            reference_dataset: None,
             completeness: "unverified_computed_discovery".to_owned(),
             starting_points: vec![value.to_string()],
             outcomes: vec![PortableRootOutcome::Stagnated(
@@ -10014,6 +10227,7 @@ mod tests {
             1,
             std::slice::from_ref(&value),
             RootArtifactMode::Independent,
+            None,
             &xi,
             &l,
             false,
@@ -10026,6 +10240,7 @@ mod tests {
             1,
             &[value],
             RootArtifactMode::Independent,
+            None,
             &xi,
             &l,
             true,
@@ -10151,8 +10366,11 @@ mod tests {
             .iter()
             .any(|dependency| dependency.key.kind == "ccm_prime_component"));
         let seeds = vec![Float::with_val(cfg.precision_bits, 14)];
-        let first_run = run_indexed_seeded_via_cache(&params, &cfg, 1, &seeds, &context).unwrap();
-        let second_run = run_indexed_seeded_via_cache(&params, &cfg, 1, &seeds, &context).unwrap();
+        let dataset = test_reference_dataset();
+        let first_run =
+            run_indexed_seeded_via_cache(&params, &cfg, 1, &seeds, &dataset, &context).unwrap();
+        let second_run =
+            run_indexed_seeded_via_cache(&params, &cfg, 1, &seeds, &dataset, &context).unwrap();
         assert_eq!(
             first_run.weil_min_eigenvalue,
             second_run.weil_min_eigenvalue
@@ -10161,9 +10379,9 @@ mod tests {
         assert_eq!(first_run.eigenvalues_pos.len(), 1);
         assert_eq!(first_run.spectral_root_index_range(), Some(1..=1));
         let first_indexed =
-            run_indexed_seeded_via_cache(&params, &cfg, 17, &seeds, &context).unwrap();
+            run_indexed_seeded_via_cache(&params, &cfg, 17, &seeds, &dataset, &context).unwrap();
         let second_indexed =
-            run_indexed_seeded_via_cache(&params, &cfg, 17, &seeds, &context).unwrap();
+            run_indexed_seeded_via_cache(&params, &cfg, 17, &seeds, &dataset, &context).unwrap();
         assert_eq!(first_indexed.spectral_root_index_range(), Some(17..=17));
         assert_eq!(
             first_indexed.eigenvalues_pos[0].value(),
@@ -11518,7 +11736,8 @@ mod tests {
             .map(|s| Float::with_val(prec, Float::parse(s).unwrap()))
             .collect();
 
-        let result = run_indexed_seeded(&params, &cfg, 1, &zero_seeds).unwrap();
+        let result =
+            run_indexed_seeded(&params, &cfg, 1, &zero_seeds, &test_reference_dataset()).unwrap();
 
         // At N=10, the f64 solver finds however many eigenvalues exist
         // in the standard brackets. Just verify we got at least 1.
@@ -11657,14 +11876,16 @@ mod tests {
 
         // Newton result
         cfg.root_solver = RootSolver::Newton;
-        let result_n = run_indexed_seeded(&params, &cfg, 1, &zero_seeds).unwrap();
+        let result_n =
+            run_indexed_seeded(&params, &cfg, 1, &zero_seeds, &test_reference_dataset()).unwrap();
         let ev_newton = result_n.eigenvalues_pos[0]
             .value()
             .expect("Newton should converge");
 
         // Halley result
         cfg.root_solver = RootSolver::Halley;
-        let result_h = run_indexed_seeded(&params, &cfg, 1, &zero_seeds).unwrap();
+        let result_h =
+            run_indexed_seeded(&params, &cfg, 1, &zero_seeds, &test_reference_dataset()).unwrap();
         let ev_halley = result_h.eigenvalues_pos[0]
             .value()
             .expect("Halley should converge");
@@ -11694,7 +11915,8 @@ mod tests {
             .iter()
             .map(|s| Float::with_val(prec, Float::parse(s).unwrap()))
             .collect();
-        let result = run_indexed_seeded(&params, &cfg, 1, &zero_seeds).unwrap();
+        let result =
+            run_indexed_seeded(&params, &cfg, 1, &zero_seeds, &test_reference_dataset()).unwrap();
         // Should produce 1 eigenvalue (Some or None — just check no panic)
         assert_eq!(
             result.eigenvalues_pos.len(),
