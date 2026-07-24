@@ -1754,6 +1754,84 @@ pub enum CompareAndSwapResult {
     RefConflict { current_head: String },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteRefCreationRequest {
+    pub repository: String,
+    pub branch: String,
+    pub message: String,
+    pub parts: Vec<TransportPart>,
+}
+
+impl RemoteRefCreationRequest {
+    pub fn validate_limits(&self) -> Result<u64, CacheError> {
+        if self.repository.trim().is_empty()
+            || self.branch.trim().is_empty()
+            || self.message.trim().is_empty()
+            || self.parts.is_empty()
+        {
+            return Err(CacheError::InvalidManifest(
+                "remote ref creation request is incomplete".to_owned(),
+            ));
+        }
+        let request = RemoteCommitRequest {
+            repository: self.repository.clone(),
+            branch: self.branch.clone(),
+            // Limit validation does not interpret the revision. A syntactically
+            // valid sentinel keeps creation requests subject to exactly the
+            // same path and byte bounds as ordinary commits.
+            expected_head: "0000000000000000000000000000000000000000".to_owned(),
+            message: self.message.clone(),
+            parts: self.parts.clone(),
+            delete_paths: Vec::new(),
+        };
+        request.validate_limits()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CreateRefResult {
+    Created { commit_id: String },
+    RefExists { current_head: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AtomicRemoteCommitRequest {
+    pub repository: String,
+    pub commits: Vec<RemoteCommitRequest>,
+}
+
+impl AtomicRemoteCommitRequest {
+    pub fn validate_limits(&self) -> Result<(), CacheError> {
+        if self.repository.trim().is_empty() || self.commits.len() < 2 {
+            return Err(CacheError::InvalidManifest(
+                "atomic remote commit requires one repository and at least two refs".to_owned(),
+            ));
+        }
+        let mut branches = std::collections::BTreeSet::new();
+        for commit in &self.commits {
+            if commit.repository != self.repository || !branches.insert(commit.branch.as_str()) {
+                return Err(CacheError::InvalidManifest(
+                    "atomic remote commits must target distinct refs in one repository".to_owned(),
+                ));
+            }
+            commit.validate_limits()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AtomicCompareAndSwapResult {
+    Committed {
+        commit_ids: std::collections::BTreeMap<String, String>,
+    },
+    RefConflict {
+        current_heads: std::collections::BTreeMap<String, String>,
+    },
+}
+
 /// Minimal no-checkout transport boundary. Implementations own a verified
 /// local part source keyed by each descriptor's SHA-256 digest and may use a
 /// bounded temporary bare object database or an API for small metadata.
@@ -1791,6 +1869,22 @@ pub trait RemoteGitStore: Send + Sync {
         &self,
         request: &RemoteCommitRequest,
     ) -> Result<CompareAndSwapResult, CacheError>;
+    fn create_ref_commit_if_absent(
+        &self,
+        _request: &RemoteRefCreationRequest,
+    ) -> Result<CreateRefResult, CacheError> {
+        Err(CacheError::ReadOnlyLayer(
+            "remote transport does not support atomic ref creation".to_owned(),
+        ))
+    }
+    fn compare_and_swap_commits_atomically(
+        &self,
+        _request: &AtomicRemoteCommitRequest,
+    ) -> Result<AtomicCompareAndSwapResult, CacheError> {
+        Err(CacheError::ReadOnlyLayer(
+            "remote transport does not support atomic multi-ref commits".to_owned(),
+        ))
+    }
     fn verify_committed_part(
         &self,
         repository: &str,

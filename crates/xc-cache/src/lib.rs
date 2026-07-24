@@ -30,6 +30,7 @@ mod managed_publication;
 mod materialization;
 mod packaging;
 mod planner;
+mod private_coordination;
 mod production_staging;
 mod protocol;
 mod publication;
@@ -68,6 +69,7 @@ pub use managed_publication::*;
 pub use materialization::*;
 pub use packaging::*;
 pub use planner::*;
+pub use private_coordination::*;
 pub use production_staging::*;
 pub use protocol::*;
 pub use publication::*;
@@ -674,12 +676,43 @@ pub trait CacheStore: Send + Sync {
         writer: &mut dyn Write,
     ) -> Result<(), CacheError>;
 
+    /// Return an already verified encoded representation of the logical
+    /// payload, when the store retains one. This lets a writable cache adopt a
+    /// remote deterministic ZIP without decoding and recompressing it.
+    fn verified_encoded_payload(
+        &self,
+        _manifest: &ArtifactManifest,
+    ) -> Result<Option<VerifiedEncodedPayload>, CacheError> {
+        Ok(None)
+    }
+
+    /// Adopt an already verified encoded payload without changing its logical
+    /// identity. Stores that do not support this representation return
+    /// `Ok(None)` and callers fall back to `put`.
+    fn put_verified_encoded_payload(
+        &self,
+        _draft: &ArtifactDraft,
+        _logical_digest: &ContentDigest,
+        _logical_size_bytes: u64,
+        _encoded: &VerifiedEncodedPayload,
+    ) -> Result<Option<ArtifactManifest>, CacheError> {
+        Ok(None)
+    }
+
     fn read_payload(&self, manifest: &ArtifactManifest) -> Result<Vec<u8>, CacheError> {
         let capacity = usize::try_from(manifest.size_bytes).unwrap_or(0);
         let mut payload = Vec::with_capacity(capacity);
         self.read_payload_to(manifest, &mut payload)?;
         Ok(payload)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedEncodedPayload {
+    pub path: PathBuf,
+    pub encoding: String,
+    pub content_digest: ContentDigest,
+    pub size_bytes: u64,
 }
 
 /// Local filesystem implementation used for working caches and checked-out
@@ -799,6 +832,68 @@ impl FilesystemCacheStore {
             self.verify_object(&object)?;
         } else {
             atomic_write(&path, payload)?;
+        }
+        Ok(object)
+    }
+
+    fn ensure_verified_object(
+        &self,
+        encoded: &VerifiedEncodedPayload,
+    ) -> Result<CacheObjectRef, CacheError> {
+        let metadata = fs::symlink_metadata(&encoded.path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() != encoded.size_bytes
+            || !encoded.content_digest.validate()
+        {
+            return Err(CacheError::InvalidManifest(
+                "verified encoded cache object has invalid filesystem metadata".to_owned(),
+            ));
+        }
+        let object = CacheObjectRef {
+            content_digest: encoded.content_digest.clone(),
+            size_bytes: encoded.size_bytes,
+        };
+        let path = self.object_path(&object.content_digest);
+        if path.exists() {
+            self.verify_object(&object)?;
+            return Ok(object);
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match fs::hard_link(&encoded.path, &path) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::CrossesDevices
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                let temporary = path.with_extension(format!(
+                    "xc-copy-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|error| CacheError::Io(error.to_string()))?
+                        .as_nanos()
+                ));
+                let result = (|| {
+                    fs::copy(&encoded.path, &temporary)?;
+                    fs::rename(&temporary, &path)?;
+                    Ok::<(), CacheError>(())
+                })();
+                if result.is_err() {
+                    let _ = fs::remove_file(&temporary);
+                }
+                result?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.verify_object(&object)?;
+            }
+            Err(error) => return Err(error.into()),
         }
         Ok(object)
     }
@@ -1190,6 +1285,56 @@ impl CacheStore for ZipJsonFilesystemCacheStore {
         }
         Ok(())
     }
+
+    fn verified_encoded_payload(
+        &self,
+        manifest: &ArtifactManifest,
+    ) -> Result<Option<VerifiedEncodedPayload>, CacheError> {
+        manifest.validate()?;
+        if manifest
+            .tags
+            .get("xc_storage_encoding")
+            .is_none_or(|value| value != "zip-json-entry-v1")
+            || manifest.objects.len() != 1
+        {
+            return Ok(None);
+        }
+        let object = &manifest.objects[0];
+        self.inner.verify_object(object)?;
+        Ok(Some(VerifiedEncodedPayload {
+            path: self.inner.object_path(&object.content_digest),
+            encoding: "zip-json-entry-v1".to_owned(),
+            content_digest: object.content_digest.clone(),
+            size_bytes: object.size_bytes,
+        }))
+    }
+
+    fn put_verified_encoded_payload(
+        &self,
+        draft: &ArtifactDraft,
+        logical_digest: &ContentDigest,
+        logical_size_bytes: u64,
+        encoded: &VerifiedEncodedPayload,
+    ) -> Result<Option<ArtifactManifest>, CacheError> {
+        if !self.inner.writable {
+            return Err(CacheError::ReadOnlyLayer(self.inner.name.clone()));
+        }
+        if encoded.encoding != "zip-json-entry-v1" {
+            return Ok(None);
+        }
+        let object = self.inner.ensure_verified_object(encoded)?;
+        let mut encoded_draft = draft.clone();
+        encoded_draft.tags.insert(
+            "xc_storage_encoding".to_owned(),
+            "zip-json-entry-v1".to_owned(),
+        );
+        Ok(Some(self.inner.publish_manifest(
+            &encoded_draft,
+            vec![object],
+            logical_digest.clone(),
+            logical_size_bytes,
+        )?))
+    }
 }
 
 pub struct CacheLayer {
@@ -1201,6 +1346,7 @@ pub struct ResolvedArtifact {
     pub layer_name: String,
     pub manifest: ArtifactManifest,
     pub payload: Vec<u8>,
+    pub encoded_payload: Option<VerifiedEncodedPayload>,
 }
 
 pub struct CacheResolver {
@@ -1323,10 +1469,12 @@ impl CacheResolver {
                     continue;
                 }
                 let payload = layer.store.read_payload(&manifest)?;
+                let encoded_payload = layer.store.verified_encoded_payload(&manifest)?;
                 return Ok(ResolvedArtifact {
                     layer_name: layer.store.name().to_owned(),
                     manifest,
                     payload,
+                    encoded_payload,
                 });
             }
         }
@@ -1662,6 +1810,49 @@ mod tests {
         let object_path = store.inner.object_path(&manifest.objects[0].content_digest);
         let archive = zip::ZipArchive::new(fs::File::open(object_path).unwrap()).unwrap();
         assert_eq!(archive.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn zip_json_store_adopts_a_verified_archive_without_recompression() {
+        let root = temporary_root("xc-cache-zip-json-adopt");
+        let _ = fs::remove_dir_all(&root);
+        let source = ZipJsonFilesystemCacheStore::new(
+            "source",
+            root.join("source"),
+            true,
+            CacheVisibility::Local,
+        );
+        let destination = ZipJsonFilesystemCacheStore::new(
+            "destination",
+            root.join("destination"),
+            true,
+            CacheVisibility::Local,
+        );
+        let key = ArtifactKey::new("matrix", "zip-adopt", br#"{"n":8}"#).unwrap();
+        let payload = br#"{"entries":["1.0","0.0","0.0","1.0"]}"#;
+        let source_manifest = source
+            .put(
+                &draft(key.clone(), CacheQuality::Validated, CacheVisibility::Local),
+                payload,
+            )
+            .unwrap();
+        let encoded = source
+            .verified_encoded_payload(&source_manifest)
+            .unwrap()
+            .unwrap();
+        let adopted = destination
+            .put_verified_encoded_payload(
+                &draft(key, CacheQuality::Validated, CacheVisibility::Local),
+                &source_manifest.content_digest,
+                source_manifest.size_bytes,
+                &encoded,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(adopted.content_digest, source_manifest.content_digest);
+        assert_eq!(adopted.objects, source_manifest.objects);
+        assert_eq!(destination.read_payload(&adopted).unwrap(), payload);
         let _ = fs::remove_dir_all(root);
     }
 

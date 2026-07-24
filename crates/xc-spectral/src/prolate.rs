@@ -25,7 +25,7 @@
 //! Eisenstein-like sum map.
 //!
 //! Public usage examples and assurance boundaries are documented in
-//! `docs/v0.13.0/RESEARCH_WORKFLOWS.md`.
+//! `docs/v0.13.1/RESEARCH_WORKFLOWS.md`.
 //!
 //! ## Status: complete (HP version available below)
 //!

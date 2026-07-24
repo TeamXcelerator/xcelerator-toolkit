@@ -19,6 +19,7 @@ use xc_core::{
 };
 
 pub const SEMANTIC_KEY_MANIFEST_TAG: &str = "xc.semantic_key.v1";
+pub const REMOTE_CANONICAL_MANIFEST_TAG: &str = "xc.remote_canonical_manifest.v1";
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
@@ -1688,7 +1689,22 @@ where
                             draft
                                 .tags
                                 .insert("xc.cached_from".to_owned(), resolved.layer_name.clone());
-                            store.put(&draft, &resolved.payload)?;
+                            let adopted = resolved
+                                .encoded_payload
+                                .as_ref()
+                                .map(|encoded| {
+                                    store.put_verified_encoded_payload(
+                                        &draft,
+                                        &resolved.manifest.content_digest,
+                                        resolved.manifest.size_bytes,
+                                        encoded,
+                                    )
+                                })
+                                .transpose()?
+                                .flatten();
+                            if adopted.is_none() {
+                                store.put(&draft, &resolved.payload)?;
+                            }
                         }
                     }
                     // Publication is a boundary for newly computed artifacts,

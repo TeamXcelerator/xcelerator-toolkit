@@ -2,13 +2,15 @@
 
 use crate::protocol::normalized_relative_path;
 use crate::{
-    reconstruct_transport_package, verify_canonical_payload_zip64, CacheError, ContentDigest,
+    reconstruct_transport_package_from_verified_parts, verify_canonical_payload_zip64,
+    verify_canonical_payload_zip64_to_writer, CacheError, ContentDigest,
     DeterministicPackageReport, PartFetchReport, RemoteGitStore, RemoteShardReader,
     ResolvedRemoteArtifact, VerifiedPackageReport,
 };
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use xc_core::{CancellationToken, ResourcePolicy};
 
@@ -157,6 +159,47 @@ pub fn materialize_resolved_remote_artifact(
     resources: &ResourcePolicy,
     cancellation: &CancellationToken,
 ) -> Result<RemoteArtifactMaterializationReport, CacheError> {
+    materialize_resolved_remote_artifact_inner(
+        remote,
+        artifact,
+        parts_root,
+        package_path,
+        resources,
+        cancellation,
+        None,
+    )
+}
+
+pub(crate) fn materialize_resolved_remote_artifact_to_writer(
+    remote: &dyn RemoteGitStore,
+    artifact: &ResolvedRemoteArtifact,
+    parts_root: &Path,
+    package_path: &Path,
+    resources: &ResourcePolicy,
+    cancellation: &CancellationToken,
+    writer: &mut dyn Write,
+) -> Result<RemoteArtifactMaterializationReport, CacheError> {
+    materialize_resolved_remote_artifact_inner(
+        remote,
+        artifact,
+        parts_root,
+        package_path,
+        resources,
+        cancellation,
+        Some(writer),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_resolved_remote_artifact_inner(
+    remote: &dyn RemoteGitStore,
+    artifact: &ResolvedRemoteArtifact,
+    parts_root: &Path,
+    package_path: &Path,
+    resources: &ResourcePolicy,
+    cancellation: &CancellationToken,
+    decoded_writer: Option<&mut dyn Write>,
+) -> Result<RemoteArtifactMaterializationReport, CacheError> {
     cancellation
         .check()
         .map_err(|error| CacheError::Cancelled(error.to_string()))?;
@@ -213,12 +256,22 @@ pub fn materialize_resolved_remote_artifact(
     }
 
     if package_exists {
-        let verification = verify_canonical_payload_zip64(
-            &artifact.manifest.canonical_payload,
-            &artifact.encoding,
-            package_path,
-            cancellation,
-        )?;
+        let verification = match decoded_writer {
+            Some(writer) => verify_canonical_payload_zip64_to_writer(
+                &artifact.manifest.canonical_payload,
+                &artifact.encoding,
+                package_path,
+                cancellation,
+                false,
+                writer,
+            )?,
+            None => verify_canonical_payload_zip64(
+                &artifact.manifest.canonical_payload,
+                &artifact.encoding,
+                package_path,
+                cancellation,
+            )?,
+        };
         return report(
             artifact,
             projected_new_local_bytes,
@@ -245,19 +298,35 @@ pub fn materialize_resolved_remote_artifact(
         resources,
         cancellation,
     )?;
-    let package = reconstruct_transport_package(
+    let package = reconstruct_transport_package_from_verified_parts(
         &artifact.encoding,
         parts_root,
         package_path,
         resources,
         cancellation,
     )?;
-    let verification = match verify_canonical_payload_zip64(
-        &artifact.manifest.canonical_payload,
-        &artifact.encoding,
-        package_path,
-        cancellation,
-    ) {
+    let verified = match decoded_writer {
+        Some(writer) => verify_canonical_payload_zip64_to_writer(
+            &artifact.manifest.canonical_payload,
+            &artifact.encoding,
+            package_path,
+            cancellation,
+            true,
+            writer,
+        ),
+        None => {
+            let mut sink = std::io::sink();
+            verify_canonical_payload_zip64_to_writer(
+                &artifact.manifest.canonical_payload,
+                &artifact.encoding,
+                package_path,
+                cancellation,
+                true,
+                &mut sink,
+            )
+        }
+    };
+    let verification = match verified {
         Ok(verification) => verification,
         Err(error) => {
             let _ = fs::remove_file(package_path);

@@ -16,7 +16,7 @@ members = [
 exclude = ["tests/external-consumer"]
 
 [workspace.package]
-version = "0.13.0"
+version = "0.13.1"
 edition = "2021"
 authors = ["Ronnie Andrews, Jr. <5178942+TeamXceleratorDev@users.noreply.github.com>"]
 license-file = "LICENSE"
@@ -33,16 +33,16 @@ nalgebra = "0.33"
 rayon = "1.10"
 rug = { version = "1.30", default-features = false, features = ["std", "float", "integer", "rational"] }
 zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
-xc-core = { version = "0.13.0", path = "crates/xc-core" }
-xc-numerics = { version = "0.13.0", path = "crates/xc-numerics" }
-xc-operator = { version = "0.13.0", path = "crates/xc-operator" }
-xc-solver = { version = "0.13.0", path = "crates/xc-solver" }
-xc-root = { version = "0.13.0", path = "crates/xc-root" }
-xc-cache = { version = "0.13.0", path = "crates/xc-cache" }
-xc-certify = { version = "0.13.0", path = "crates/xc-certify" }
-xc-variational = { version = "0.13.0", path = "crates/xc-variational" }
-xc-zeta = { version = "0.13.0", path = "crates/xc-zeta" }
-xc-spectral = { version = "0.13.0", path = "crates/xc-spectral" }
+xc-core = { version = "0.13.1", path = "crates/xc-core" }
+xc-numerics = { version = "0.13.1", path = "crates/xc-numerics" }
+xc-operator = { version = "0.13.1", path = "crates/xc-operator" }
+xc-solver = { version = "0.13.1", path = "crates/xc-solver" }
+xc-root = { version = "0.13.1", path = "crates/xc-root" }
+xc-cache = { version = "0.13.1", path = "crates/xc-cache" }
+xc-certify = { version = "0.13.1", path = "crates/xc-certify" }
+xc-variational = { version = "0.13.1", path = "crates/xc-variational" }
+xc-zeta = { version = "0.13.1", path = "crates/xc-zeta" }
+xc-spectral = { version = "0.13.1", path = "crates/xc-spectral" }
 
 [profile.release]
 opt-level = 3

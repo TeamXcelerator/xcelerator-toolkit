@@ -1,10 +1,12 @@
 //! Direct Git smart-protocol transport using bounded temporary bare state.
 
 use crate::{
-    CacheError, CompareAndSwapResult, ContentDigest, RemoteCommitRequest, RemoteGitStore,
+    AtomicCompareAndSwapResult, AtomicRemoteCommitRequest, CacheError, CompareAndSwapResult,
+    ContentDigest, CreateRefResult, RemoteCommitRequest, RemoteGitStore, RemoteRefCreationRequest,
     TransportPart,
 };
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
@@ -244,7 +246,11 @@ impl GitCliRemoteStore {
         let index_name = format!(
             "publication-index-{}",
             ContentDigest::sha256(
-                format!("{}:{}", request.expected_head, request.message).as_bytes()
+                format!(
+                    "{}:{}:{}",
+                    request.branch, request.expected_head, request.message
+                )
+                .as_bytes()
             )
         );
         let index_path = session.parent().unwrap_or(session).join(index_name);
@@ -334,6 +340,79 @@ impl GitCliRemoteStore {
         let _ = fs::remove_file(index_path);
         result
     }
+
+    fn commit_root_tree(
+        &self,
+        session: &Path,
+        request: &RemoteRefCreationRequest,
+    ) -> Result<String, CacheError> {
+        let index_name = format!(
+            "publication-root-index-{}",
+            ContentDigest::sha256(format!("{}:{}", request.branch, request.message).as_bytes())
+        );
+        let index_path = session.parent().unwrap_or(session).join(index_name);
+        let index_environment = [(OsStr::new("GIT_INDEX_FILE"), index_path.as_os_str())];
+        let result = (|| {
+            run_git(
+                &self.git_executable,
+                Some(session),
+                [OsString::from("read-tree"), OsString::from("--empty")],
+                &index_environment,
+            )?;
+            for part in &request.parts {
+                let oid = self.hash_staged_blob(session, part)?;
+                run_git(
+                    &self.git_executable,
+                    Some(session),
+                    [
+                        OsString::from("update-index"),
+                        OsString::from("--add"),
+                        OsString::from("--cacheinfo"),
+                        OsString::from("100644"),
+                        OsString::from(oid),
+                        OsString::from(&part.repository_path),
+                    ],
+                    &index_environment,
+                )?;
+            }
+            let tree = run_git(
+                &self.git_executable,
+                Some(session),
+                [OsString::from("write-tree")],
+                &index_environment,
+            )?;
+            let tree = parse_single_line(&tree.stdout, "git write-tree")?;
+            let author_environment = [
+                (OsStr::new("GIT_AUTHOR_NAME"), OsStr::new(&self.author_name)),
+                (
+                    OsStr::new("GIT_AUTHOR_EMAIL"),
+                    OsStr::new(&self.author_email),
+                ),
+                (
+                    OsStr::new("GIT_COMMITTER_NAME"),
+                    OsStr::new(&self.author_name),
+                ),
+                (
+                    OsStr::new("GIT_COMMITTER_EMAIL"),
+                    OsStr::new(&self.author_email),
+                ),
+            ];
+            let commit = run_git(
+                &self.git_executable,
+                Some(session),
+                [
+                    OsString::from("commit-tree"),
+                    OsString::from(tree),
+                    OsString::from("-m"),
+                    OsString::from(&request.message),
+                ],
+                &author_environment,
+            )?;
+            parse_single_line(&commit.stdout, "git commit-tree")
+        })();
+        let _ = fs::remove_file(index_path);
+        result
+    }
 }
 
 impl RemoteGitStore for GitCliRemoteStore {
@@ -366,12 +445,18 @@ impl RemoteGitStore for GitCliRemoteStore {
         revision: &str,
         path: &str,
     ) -> Result<Option<ContentDigest>, CacheError> {
-        let _guard = self
-            .operation_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         validate_relative_git_path(path)?;
-        let session = self.fetch_revision(repository, revision)?;
+        // Session initialization and revision fetch mutate the shared bare
+        // repository and remain serialized. Once the commit is present, blob
+        // reads are immutable and may proceed concurrently so split transport
+        // parts do not download one after another.
+        let session = {
+            let _guard = self
+                .operation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.fetch_revision(repository, revision)?
+        };
         let listing = run_git(
             &self.git_executable,
             Some(&session),
@@ -434,12 +519,14 @@ impl RemoteGitStore for GitCliRemoteStore {
         cancellation
             .check()
             .map_err(|error| CacheError::Cancelled(error.to_string()))?;
-        let _guard = self
-            .operation_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         validate_relative_git_path(path)?;
-        let session = self.fetch_revision(repository, revision)?;
+        let session = {
+            let _guard = self
+                .operation_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.fetch_revision(repository, revision)?
+        };
         let listing = run_git(
             &self.git_executable,
             Some(&session),
@@ -706,6 +793,158 @@ impl RemoteGitStore for GitCliRemoteStore {
             } else {
                 Err(command_failure("git push", &push))
             }
+        }
+    }
+
+    fn create_ref_commit_if_absent(
+        &self,
+        request: &RemoteRefCreationRequest,
+    ) -> Result<CreateRefResult, CacheError> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        validate_repository(&request.repository)?;
+        validate_branch(&request.branch)?;
+        let batch_bytes = request.validate_limits()?;
+        if self
+            .resources
+            .maximum_temporary_disk_bytes
+            .is_some_and(|maximum| batch_bytes > maximum)
+            || self
+                .resources
+                .maximum_transfer_bytes
+                .is_some_and(|maximum| batch_bytes > maximum)
+        {
+            return Err(CacheError::ResourceLimit(
+                "coordination ref creation exceeds the configured resource budget".to_owned(),
+            ));
+        }
+        for part in &request.parts {
+            validate_relative_git_path(&part.repository_path)?;
+        }
+        match self.read_ref(&request.repository, &request.branch) {
+            Ok(current_head) => return Ok(CreateRefResult::RefExists { current_head }),
+            Err(CacheError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        let session = self.ensure_session(&request.repository)?;
+        let commit_id = self.commit_root_tree(&session, request)?;
+        let push = run_git_allow_failure(
+            &self.git_executable,
+            Some(&session),
+            [
+                OsString::from("push"),
+                OsString::from("origin"),
+                OsString::from(format!("{commit_id}:refs/heads/{}", request.branch)),
+            ],
+            &[],
+        )?;
+        if push.status.success() {
+            Ok(CreateRefResult::Created { commit_id })
+        } else {
+            match self.read_ref(&request.repository, &request.branch) {
+                Ok(current_head) => Ok(CreateRefResult::RefExists { current_head }),
+                Err(CacheError::NotFound(_)) => Err(command_failure("git push", &push)),
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    fn compare_and_swap_commits_atomically(
+        &self,
+        request: &AtomicRemoteCommitRequest,
+    ) -> Result<AtomicCompareAndSwapResult, CacheError> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        request.validate_limits()?;
+        validate_repository(&request.repository)?;
+        let transfer_bytes = request.commits.iter().try_fold(0u64, |total, commit| {
+            total.checked_add(commit.validate_limits()?).ok_or_else(|| {
+                CacheError::ResourceLimit("atomic publication transfer exceeds u64".to_owned())
+            })
+        })?;
+        if self
+            .resources
+            .maximum_temporary_disk_bytes
+            .is_some_and(|maximum| transfer_bytes > maximum)
+        {
+            return Err(CacheError::ResourceLimit(format!(
+                "atomic publication {transfer_bytes} exceeds temporary-disk budget"
+            )));
+        }
+        if self
+            .resources
+            .maximum_transfer_bytes
+            .is_some_and(|maximum| transfer_bytes > maximum)
+        {
+            return Err(CacheError::ResourceLimit(format!(
+                "atomic publication {transfer_bytes} exceeds transfer budget"
+            )));
+        }
+        for commit in &request.commits {
+            validate_branch(&commit.branch)?;
+            validate_revision(&commit.expected_head)?;
+            for part in &commit.parts {
+                validate_relative_git_path(&part.repository_path)?;
+            }
+            for path in &commit.delete_paths {
+                validate_relative_git_path(path)?;
+            }
+        }
+        let mut current_heads = BTreeMap::new();
+        for commit in &request.commits {
+            let current = self.read_ref(&request.repository, &commit.branch)?;
+            current_heads.insert(commit.branch.clone(), current);
+        }
+        if request.commits.iter().any(|commit| {
+            current_heads
+                .get(&commit.branch)
+                .is_none_or(|head| head != &commit.expected_head)
+        }) {
+            return Ok(AtomicCompareAndSwapResult::RefConflict { current_heads });
+        }
+        let session = self.ensure_session(&request.repository)?;
+        let mut commit_ids = BTreeMap::new();
+        for commit in &request.commits {
+            self.fetch_revision(&request.repository, &commit.expected_head)?;
+            let commit_id = self.commit_tree(&session, commit)?;
+            commit_ids.insert(commit.branch.clone(), commit_id);
+        }
+        let mut arguments = vec![
+            OsString::from("push"),
+            OsString::from("--atomic"),
+            OsString::from("origin"),
+        ];
+        arguments.extend(request.commits.iter().map(|commit| {
+            OsString::from(format!(
+                "{}:refs/heads/{}",
+                commit_ids[&commit.branch], commit.branch
+            ))
+        }));
+        let push = run_git_allow_failure(&self.git_executable, Some(&session), arguments, &[])?;
+        if push.status.success() {
+            return Ok(AtomicCompareAndSwapResult::Committed { commit_ids });
+        }
+        let mut observed = BTreeMap::new();
+        for commit in &request.commits {
+            observed.insert(
+                commit.branch.clone(),
+                self.read_ref(&request.repository, &commit.branch)?,
+            );
+        }
+        if request.commits.iter().any(|commit| {
+            observed
+                .get(&commit.branch)
+                .is_none_or(|head| head != &commit.expected_head)
+        }) {
+            Ok(AtomicCompareAndSwapResult::RefConflict {
+                current_heads: observed,
+            })
+        } else {
+            Err(command_failure("git push --atomic", &push))
         }
     }
 
@@ -1132,6 +1371,180 @@ mod tests {
             .is_none());
         assert!(!temporary.join("working-tree").exists());
         store.cleanup_session(&repository).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn private_batch_and_coordination_ref_advance_atomically() {
+        if !test_git(None, &["--version"]) {
+            return;
+        }
+        let root = temporary_root("git-cli-atomic-private-publication");
+        let _ = fs::remove_dir_all(&root);
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let staging = root.join("staging");
+        fs::create_dir_all(&root).unwrap();
+        assert!(test_git(
+            None,
+            &["init", "--bare", remote.to_str().unwrap()]
+        ));
+        assert!(test_git(None, &["init", seed.to_str().unwrap()]));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.name", "Test Publisher"]
+        ));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.email", "test@example.invalid"]
+        ));
+        fs::write(seed.join("README.md"), b"seed\n").unwrap();
+        assert!(test_git(Some(&seed), &["add", "README.md"]));
+        assert!(test_git(Some(&seed), &["commit", "-m", "seed"]));
+        assert!(test_git(
+            Some(&seed),
+            &["remote", "add", "origin", remote.to_str().unwrap()]
+        ));
+        assert!(test_git(
+            Some(&seed),
+            &["push", "origin", "HEAD:refs/heads/main"]
+        ));
+
+        let repository = remote.to_string_lossy().to_string();
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            &staging,
+            "Test Publisher",
+            "test@example.invalid",
+        )
+        .unwrap();
+        let stage = |path: &str, bytes: &[u8]| {
+            let target = path
+                .split('/')
+                .fold(staging.clone(), |current, part| current.join(part));
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, bytes).unwrap();
+            TransportPart {
+                sequence: 0,
+                repository_path: path.to_owned(),
+                size_bytes: bytes.len() as u64,
+                content_digest: ContentDigest::sha256(bytes),
+            }
+        };
+        let state = stage("coordination/state.json", b"{\"generation\":1}\n");
+        let lock = stage("coordination/publication-lock.json", b"{\"owner\":\"a\"}\n");
+        let created = store
+            .create_ref_commit_if_absent(&RemoteRefCreationRequest {
+                repository: repository.clone(),
+                branch: "xcelerator-coordination".to_owned(),
+                message: "initialize coordination".to_owned(),
+                parts: vec![state, lock],
+            })
+            .unwrap();
+        let CreateRefResult::Created {
+            commit_id: coordination_head,
+        } = created
+        else {
+            panic!("coordination branch unexpectedly existed");
+        };
+        assert!(matches!(
+            store
+                .create_ref_commit_if_absent(&RemoteRefCreationRequest {
+                    repository: repository.clone(),
+                    branch: "xcelerator-coordination".to_owned(),
+                    message: "competing initialization".to_owned(),
+                    parts: vec![stage("coordination/state.json", b"other\n")],
+                })
+                .unwrap(),
+            CreateRefResult::RefExists { .. }
+        ));
+
+        let main_head = store.read_ref(&repository, "main").unwrap();
+        let payload = stage("objects/test.part", b"private payload");
+        let renewed_lock = stage(
+            "coordination/publication-lock.json",
+            b"{\"owner\":\"a\",\"heartbeat\":2}\n",
+        );
+        let atomic = store
+            .compare_and_swap_commits_atomically(&AtomicRemoteCommitRequest {
+                repository: repository.clone(),
+                commits: vec![
+                    RemoteCommitRequest {
+                        repository: repository.clone(),
+                        branch: "main".to_owned(),
+                        expected_head: main_head.clone(),
+                        message: "publish private batch".to_owned(),
+                        parts: vec![payload.clone()],
+                        delete_paths: Vec::new(),
+                    },
+                    RemoteCommitRequest {
+                        repository: repository.clone(),
+                        branch: "xcelerator-coordination".to_owned(),
+                        expected_head: coordination_head,
+                        message: "renew private lease".to_owned(),
+                        parts: vec![renewed_lock],
+                        delete_paths: Vec::new(),
+                    },
+                ],
+            })
+            .unwrap();
+        let AtomicCompareAndSwapResult::Committed { commit_ids } = atomic else {
+            panic!("atomic private publication unexpectedly conflicted");
+        };
+        let new_main = commit_ids["main"].clone();
+        let new_coordination = commit_ids["xcelerator-coordination"].clone();
+        store
+            .verify_committed_part(&repository, &new_main, &payload)
+            .unwrap();
+
+        let contender_lock = stage(
+            "coordination/publication-lock.json",
+            b"{\"owner\":\"b\",\"generation\":2}\n",
+        );
+        let takeover = store
+            .compare_and_swap_commit(&RemoteCommitRequest {
+                repository: repository.clone(),
+                branch: "xcelerator-coordination".to_owned(),
+                expected_head: new_coordination.clone(),
+                message: "take over expired lease".to_owned(),
+                parts: vec![contender_lock],
+                delete_paths: Vec::new(),
+            })
+            .unwrap();
+        assert!(matches!(takeover, CompareAndSwapResult::Committed { .. }));
+        let late_payload = stage("objects/late.part", b"stale writer");
+        let stale_renewal = stage(
+            "coordination/publication-lock.json",
+            b"{\"owner\":\"a\",\"heartbeat\":3}\n",
+        );
+        let stale = store
+            .compare_and_swap_commits_atomically(&AtomicRemoteCommitRequest {
+                repository: repository.clone(),
+                commits: vec![
+                    RemoteCommitRequest {
+                        repository: repository.clone(),
+                        branch: "main".to_owned(),
+                        expected_head: new_main.clone(),
+                        message: "stale private batch".to_owned(),
+                        parts: vec![late_payload],
+                        delete_paths: Vec::new(),
+                    },
+                    RemoteCommitRequest {
+                        repository: repository.clone(),
+                        branch: "xcelerator-coordination".to_owned(),
+                        expected_head: new_coordination,
+                        message: "stale lease renewal".to_owned(),
+                        parts: vec![stale_renewal],
+                        delete_paths: Vec::new(),
+                    },
+                ],
+            })
+            .unwrap();
+        assert!(matches!(
+            stale,
+            AtomicCompareAndSwapResult::RefConflict { .. }
+        ));
+        assert_eq!(store.read_ref(&repository, "main").unwrap(), new_main);
         let _ = fs::remove_dir_all(root);
     }
 

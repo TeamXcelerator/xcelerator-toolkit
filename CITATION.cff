@@ -9,8 +9,8 @@ authors:
     orcid: "https://orcid.org/0009-0003-9724-3104"
 repository-code: "https://github.com/TeamXcelerator/xcelerator-toolkit"
 url: "https://github.com/TeamXcelerator/xcelerator-toolkit"
-version: "0.13.0"
-date-released: "2026-07-19"
+version: "0.13.1"
+date-released: "2026-07-24"
 license: other
 keywords:
   - high-precision arithmetic

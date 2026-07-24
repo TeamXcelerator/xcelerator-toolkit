@@ -1,4 +1,4 @@
-# Headless GitHub authentication
+# Headless GitHub authentication (v0.13.1)
 
 The toolkit supports GitHub personal access tokens on ephemeral Linux systems, including Vast.ai instances. Git Credential Manager is not required. Both the permission probe and direct no-checkout Git transport obtain credentials through Git's standard credential-provider protocol.
 
@@ -33,7 +33,7 @@ The secret file should be readable only by the job user. Delete or unmount the p
 
 ## Required access
 
-Use a fine-grained PAT scoped to the `TeamXcelerator` organization and only the registry and shard repositories required by the run. Publishing needs repository contents read/write access; routing and permission preflight also need repository metadata read access. Private publication requires access to the private registry and selected private shards.
+Use a fine-grained PAT scoped to the `TeamXcelerator` organization and only the registry and shard repositories required by the run. Publishing needs repository contents read/write access; routing and permission preflight also need repository metadata read access. Private publication requires access to the private registry and selected private shards. The toolkit automatically creates and updates the private shard's isolated `xcelerator-coordination` branch with the same contents permission; no separate locking repository, workflow permission, or additional secret is required.
 
 Authenticated private cache reads use the same credential provider. Set
 `XC_CACHE_REMOTE=private` for a private-only lookup ordered as workstation

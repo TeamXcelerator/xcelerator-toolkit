@@ -4,6 +4,7 @@ use crate::protocol::normalized_relative_path;
 use crate::{
     CacheError, CacheVisibility, ContentDigest, RemoteGitStore, RemoteReadReport,
     ShardIndexPartition, TopologyRegistry, TopologyTrustPolicy, TransportEncodingRecord,
+    TransportPart,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
@@ -158,6 +159,7 @@ impl<'a> RemoteShardReader<'a> {
             downloaded_bytes: 0,
             verified_bytes: 0,
         };
+        let mut missing = Vec::new();
         for part in &record.ordered_parts {
             cancellation
                 .check()
@@ -175,7 +177,12 @@ impl<'a> RemoteShardReader<'a> {
                 report.verified_bytes = report.verified_bytes.saturating_add(part.size_bytes);
                 continue;
             }
-            let projected = report.downloaded_bytes.saturating_add(part.size_bytes);
+            let projected = missing
+                .iter()
+                .fold(0u64, |total, (part, _): &(&TransportPart, PathBuf)| {
+                    total.saturating_add(part.size_bytes)
+                })
+                .saturating_add(part.size_bytes);
             for (description, maximum) in [
                 ("transfer", resources.maximum_transfer_bytes),
                 ("permanent-disk", resources.maximum_permanent_disk_bytes),
@@ -197,61 +204,115 @@ impl<'a> RemoteShardReader<'a> {
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let (temporary_path, mut temporary) = create_download_file(&destination)?;
-            let download = self.remote.read_committed_path(
-                repository,
-                revision,
-                &part.repository_path,
-                part.size_bytes,
-                cancellation,
-                &mut temporary,
-            );
-            let source = match download {
-                Ok(source) => source,
-                Err(error) => {
-                    drop(temporary);
-                    let _ = fs::remove_file(&temporary_path);
-                    return Err(error);
-                }
-            };
-            temporary.sync_all()?;
-            drop(temporary);
-            if source.size_bytes != part.size_bytes
-                || source.content_digest != part.content_digest
-                || source.repository_path != part.repository_path
-                || source.revision != revision
-            {
-                let _ = fs::remove_file(&temporary_path);
-                return Err(CacheError::DigestMismatch {
-                    expected: format!("{} ({} bytes)", part.content_digest, part.size_bytes),
-                    actual: format!("{} ({} bytes)", source.content_digest, source.size_bytes),
-                });
-            }
-            match fs::hard_link(&temporary_path, &destination) {
-                Ok(()) => {
-                    let _ = fs::remove_file(&temporary_path);
-                    report.downloaded_sequences.push(part.sequence);
-                    report.downloaded_bytes = projected;
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    let _ = fs::remove_file(&temporary_path);
-                    verify_local_part(
-                        &destination,
-                        part.size_bytes,
-                        &part.content_digest,
-                        resources,
-                        cancellation,
-                    )?;
-                    report.reused_sequences.push(part.sequence);
-                }
-                Err(error) => {
-                    let _ = fs::remove_file(&temporary_path);
-                    return Err(error.into());
-                }
-            }
-            report.verified_bytes = report.verified_bytes.saturating_add(part.size_bytes);
+            missing.push((part, destination));
         }
+        let concurrency = std::env::var("XC_CACHE_DOWNLOAD_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 8);
+        for batch in missing.chunks(concurrency) {
+            let results = std::thread::scope(|scope| {
+                batch
+                    .iter()
+                    .map(|(part, destination)| {
+                        scope.spawn(move || {
+                            download_transport_part(
+                                self.remote,
+                                repository,
+                                revision,
+                                part,
+                                destination,
+                                resources,
+                                cancellation,
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|thread| {
+                        thread.join().map_err(|_| {
+                            CacheError::Io("transport part download worker panicked".to_owned())
+                        })?
+                    })
+                    .collect::<Result<Vec<_>, CacheError>>()
+            })?;
+            for (sequence, size_bytes, downloaded) in results {
+                if downloaded {
+                    report.downloaded_sequences.push(sequence);
+                    report.downloaded_bytes = report.downloaded_bytes.saturating_add(size_bytes);
+                } else {
+                    report.reused_sequences.push(sequence);
+                }
+                report.verified_bytes = report.verified_bytes.saturating_add(size_bytes);
+            }
+        }
+        report.downloaded_sequences.sort_unstable();
+        report.reused_sequences.sort_unstable();
         Ok(report)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn download_transport_part(
+    remote: &dyn RemoteGitStore,
+    repository: &str,
+    revision: &str,
+    part: &TransportPart,
+    destination: &Path,
+    resources: &ResourcePolicy,
+    cancellation: &CancellationToken,
+) -> Result<(u64, u64, bool), CacheError> {
+    let (temporary_path, mut temporary) = create_download_file(destination)?;
+    let download = remote.read_committed_path(
+        repository,
+        revision,
+        &part.repository_path,
+        part.size_bytes,
+        cancellation,
+        &mut temporary,
+    );
+    let source = match download {
+        Ok(source) => source,
+        Err(error) => {
+            drop(temporary);
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+    };
+    temporary.sync_all()?;
+    drop(temporary);
+    if source.size_bytes != part.size_bytes
+        || source.content_digest != part.content_digest
+        || source.repository_path != part.repository_path
+        || source.revision != revision
+    {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(CacheError::DigestMismatch {
+            expected: format!("{} ({} bytes)", part.content_digest, part.size_bytes),
+            actual: format!("{} ({} bytes)", source.content_digest, source.size_bytes),
+        });
+    }
+    match fs::hard_link(&temporary_path, destination) {
+        Ok(()) => {
+            let _ = fs::remove_file(&temporary_path);
+            Ok((part.sequence, part.size_bytes, true))
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temporary_path);
+            verify_local_part(
+                destination,
+                part.size_bytes,
+                &part.content_digest,
+                resources,
+                cancellation,
+            )?;
+            Ok((part.sequence, part.size_bytes, false))
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary_path);
+            Err(error.into())
+        }
     }
 }
 
@@ -360,6 +421,9 @@ mod tests {
         revision: String,
         paths: BTreeMap<String, Vec<u8>>,
         reads: AtomicUsize,
+        current_reads: AtomicUsize,
+        maximum_concurrent_reads: AtomicUsize,
+        delay_millis: u64,
     }
 
     impl RemoteGitStore for MemoryRemote {
@@ -402,7 +466,14 @@ mod tests {
                 return Err(CacheError::ResourceLimit(path.to_owned()));
             }
             self.reads.fetch_add(1, AtomicOrdering::Relaxed);
+            let current = self.current_reads.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.maximum_concurrent_reads
+                .fetch_max(current, AtomicOrdering::SeqCst);
+            if self.delay_millis > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(self.delay_millis));
+            }
             writer.write_all(bytes)?;
+            self.current_reads.fetch_sub(1, AtomicOrdering::SeqCst);
             Ok(RemoteReadReport {
                 repository_path: path.to_owned(),
                 revision: revision.to_owned(),
@@ -460,6 +531,9 @@ mod tests {
             revision: "a".repeat(40),
             paths: BTreeMap::from([("registry.json".to_owned(), bytes)]),
             reads: AtomicUsize::new(0),
+            current_reads: AtomicUsize::new(0),
+            maximum_concurrent_reads: AtomicUsize::new(0),
+            delay_millis: 0,
         };
         let reader = RemoteShardReader::new(&remote, 1024 * 1024).unwrap();
         let document = reader
@@ -515,6 +589,9 @@ mod tests {
                 .map(|(part, bytes)| (part.repository_path.clone(), bytes.to_vec()))
                 .collect(),
             reads: AtomicUsize::new(0),
+            current_reads: AtomicUsize::new(0),
+            maximum_concurrent_reads: AtomicUsize::new(0),
+            delay_millis: 0,
         };
         let root = temporary_root("resume");
         let _ = fs::remove_dir_all(&root);
@@ -546,6 +623,59 @@ mod tests {
             remote.reads.load(AtomicOrdering::Relaxed),
             reads_after_first
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_transport_parts_download_with_bounded_parallelism() {
+        let revision = "c".repeat(40);
+        let values = [b"one".as_slice(), b"two", b"three", b"four"];
+        let parts = values
+            .iter()
+            .enumerate()
+            .map(|(sequence, bytes)| TransportPart {
+                sequence: sequence as u64,
+                repository_path: format!("objects/{sequence}.part"),
+                size_bytes: bytes.len() as u64,
+                content_digest: ContentDigest::sha256(bytes),
+            })
+            .collect::<Vec<_>>();
+        let record = TransportEncodingRecord {
+            schema_version: 1,
+            canonical_payload_digest: ContentDigest::sha256(b"payload"),
+            encoder_profile: "fixture-v1".to_owned(),
+            package_size_bytes: values.iter().map(|bytes| bytes.len() as u64).sum(),
+            package_digest: ContentDigest::sha256_chunks(values),
+            ordered_parts: parts.clone(),
+            reconstruction: "concatenate".to_owned(),
+        };
+        let remote = MemoryRemote {
+            revision: revision.clone(),
+            paths: parts
+                .iter()
+                .zip(values)
+                .map(|(part, bytes)| (part.repository_path.clone(), bytes.to_vec()))
+                .collect(),
+            reads: AtomicUsize::new(0),
+            current_reads: AtomicUsize::new(0),
+            maximum_concurrent_reads: AtomicUsize::new(0),
+            delay_millis: 25,
+        };
+        let root = temporary_root("parallel-parts");
+        let _ = fs::remove_dir_all(&root);
+        let reader = RemoteShardReader::new(&remote, 1024).unwrap();
+        let report = reader
+            .fetch_transport_parts(
+                "team/cache",
+                &revision,
+                &record,
+                &root,
+                &ResourcePolicy::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(report.downloaded_sequences, vec![0, 1, 2, 3]);
+        assert!(remote.maximum_concurrent_reads.load(AtomicOrdering::SeqCst) > 1);
         let _ = fs::remove_dir_all(root);
     }
 }

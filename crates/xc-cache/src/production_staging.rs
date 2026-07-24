@@ -6,7 +6,7 @@ use crate::{
     canonical_digest, package_canonical_payload_bytes_zip64, stream_split_encoded,
     ArtifactAssuranceState, CacheError, CanonicalArtifactManifest, CanonicalPayloadEnvelope,
     ContentDigest, LogicalPayloadItem, ProducedArtifactRecord, TransportEncodingRecord,
-    TransportPolicy,
+    TransportPolicy, REMOTE_CANONICAL_MANIFEST_TAG,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -686,55 +686,80 @@ pub fn stage_produced_artifact_with_dependencies(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("canonical_json")
         .to_owned();
-    let mut dependencies = Vec::new();
-    for dependency in &record.manifest.dependencies {
-        let draft = dependency_drafts
-            .iter()
-            .find(|draft| {
-                draft.source_artifact_key == dependency.key
-                    && draft.source_content_digest == dependency.content_digest
-            })
-            .ok_or_else(|| {
-                CacheError::NotFound(format!(
-                    "canonical dependency draft is missing for {} / {} / {}",
-                    dependency.key.kind, dependency.key.logical_key, dependency.content_digest
+    let retained_remote_manifest = record
+        .manifest
+        .tags
+        .get(REMOTE_CANONICAL_MANIFEST_TAG)
+        .map(|encoded| serde_json::from_str::<CanonicalArtifactManifest>(encoded))
+        .transpose()?;
+    let canonical_payload = if let Some(remote) = &retained_remote_manifest {
+        remote.validate()?;
+        if remote.artifact_family != family
+            || remote.semantic_key != record.semantic_key
+            || remote.semantic_digest != semantic_digest
+            || remote.canonical_payload.ordered_items.len() != 1
+            || remote.canonical_payload.ordered_items[0].normalized_path != "payload.json"
+            || remote.canonical_payload.ordered_items[0].content_digest
+                != ContentDigest::sha256(&record.payload)
+            || remote.canonical_payload.ordered_items[0].size_bytes != record.payload.len() as u64
+        {
+            return Err(CacheError::InvalidManifest(
+                "retained remote canonical manifest disagrees with its validated payload"
+                    .to_owned(),
+            ));
+        }
+        remote.canonical_payload.clone()
+    } else {
+        let mut dependencies = Vec::new();
+        for dependency in &record.manifest.dependencies {
+            let draft = dependency_drafts
+                .iter()
+                .find(|draft| {
+                    draft.source_artifact_key == dependency.key
+                        && draft.source_content_digest == dependency.content_digest
+                })
+                .ok_or_else(|| {
+                    CacheError::NotFound(format!(
+                        "canonical dependency draft is missing for {} / {} / {}",
+                        dependency.key.kind, dependency.key.logical_key, dependency.content_digest
+                    ))
+                })?;
+            dependencies.push(crate::PayloadDependencyIdentity {
+                artifact_family: draft.family.clone(),
+                semantic_digest: draft.manifest.semantic_digest.clone(),
+                manifest_digest: draft.manifest.digest()?,
+                payload_digest: draft.manifest.payload_digest.clone(),
+            });
+        }
+        dependencies.sort_by(|left, right| {
+            (
+                &left.artifact_family,
+                &left.semantic_digest,
+                &left.manifest_digest,
+                &left.payload_digest,
+            )
+                .cmp(&(
+                    &right.artifact_family,
+                    &right.semantic_digest,
+                    &right.manifest_digest,
+                    &right.payload_digest,
                 ))
-            })?;
-        dependencies.push(crate::PayloadDependencyIdentity {
-            artifact_family: draft.family.clone(),
-            semantic_digest: draft.manifest.semantic_digest.clone(),
-            manifest_digest: draft.manifest.digest()?,
-            payload_digest: draft.manifest.payload_digest.clone(),
         });
-    }
-    dependencies.sort_by(|left, right| {
-        (
-            &left.artifact_family,
-            &left.semantic_digest,
-            &left.manifest_digest,
-            &left.payload_digest,
-        )
-            .cmp(&(
-                &right.artifact_family,
-                &right.semantic_digest,
-                &right.manifest_digest,
-                &right.payload_digest,
-            ))
-    });
-    let canonical_payload = CanonicalPayloadEnvelope {
-        schema_version: 1,
-        scalar_backend,
-        precision_bits,
-        scalar_representation: "canonical-json-utf8-v1".to_owned(),
-        dimensions: Vec::new(),
-        endianness: "not-applicable".to_owned(),
-        special_value_encoding: "decimal-string-or-json-number-v1".to_owned(),
-        ordered_items: vec![LogicalPayloadItem {
-            normalized_path: "payload.json".to_owned(),
-            content_digest: ContentDigest::sha256(&record.payload),
-            size_bytes: record.payload.len() as u64,
-        }],
-        dependencies,
+        CanonicalPayloadEnvelope {
+            schema_version: 1,
+            scalar_backend,
+            precision_bits,
+            scalar_representation: "canonical-json-utf8-v1".to_owned(),
+            dimensions: Vec::new(),
+            endianness: "not-applicable".to_owned(),
+            special_value_encoding: "decimal-string-or-json-number-v1".to_owned(),
+            ordered_items: vec![LogicalPayloadItem {
+                normalized_path: "payload.json".to_owned(),
+                content_digest: ContentDigest::sha256(&record.payload),
+                size_bytes: record.payload.len() as u64,
+            }],
+            dependencies,
+        }
     };
     let payload_digest = canonical_payload.digest()?;
     let parts_root = draft_root.join("parts");
@@ -771,23 +796,35 @@ pub fn stage_produced_artifact_with_dependencies(
     drop(archive);
     fs::remove_file(&archive_path)?;
     let transport_digest = encoding.digest()?;
-    let manifest = CanonicalArtifactManifest {
-        schema_version: 1,
-        artifact_family: family.to_owned(),
-        semantic_key: record.semantic_key.clone(),
-        semantic_digest,
-        canonical_payload,
-        payload_digest,
-        transport_digests: vec![transport_digest],
-        resolved_mathematical_configuration_digest: canonical_digest(
-            &record.semantic_key.resolved_mathematical_parameters,
-        )?,
-        producer_toolkit_version: record.manifest.producer_toolkit_version.clone(),
-        minimum_reader_version: record.manifest.minimum_reader_version.clone(),
-        maximum_reader_version: record.manifest.maximum_reader_version.clone(),
-        requested_assurance: AssuranceLevel::Computed,
-        claim_scope: "validated typed numerical cache artifact".to_owned(),
-        assumptions: Vec::new(),
+    let manifest = if let Some(remote) = retained_remote_manifest {
+        if remote.payload_digest != payload_digest
+            || !remote.transport_digests.contains(&transport_digest)
+        {
+            return Err(CacheError::InvalidManifest(
+                "retained remote manifest cannot be reproduced by the deterministic transport"
+                    .to_owned(),
+            ));
+        }
+        remote
+    } else {
+        CanonicalArtifactManifest {
+            schema_version: 1,
+            artifact_family: family.to_owned(),
+            semantic_key: record.semantic_key.clone(),
+            semantic_digest,
+            canonical_payload,
+            payload_digest,
+            transport_digests: vec![transport_digest],
+            resolved_mathematical_configuration_digest: canonical_digest(
+                &record.semantic_key.resolved_mathematical_parameters,
+            )?,
+            producer_toolkit_version: record.manifest.producer_toolkit_version.clone(),
+            minimum_reader_version: record.manifest.minimum_reader_version.clone(),
+            maximum_reader_version: record.manifest.maximum_reader_version.clone(),
+            requested_assurance: AssuranceLevel::Computed,
+            claim_scope: "validated typed numerical cache artifact".to_owned(),
+            assumptions: Vec::new(),
+        }
     };
     manifest.validate()?;
     let draft = CanonicalProductionDraft {
@@ -954,6 +991,85 @@ mod tests {
         }
         let _ = fs::remove_dir_all(first_root);
         let _ = fs::remove_dir_all(second_root);
+    }
+
+    #[test]
+    fn remotely_reused_record_preserves_its_canonical_dependency_identity() {
+        let source_root = std::env::temp_dir().join(format!(
+            "xc-production-remote-source-{}",
+            std::process::id()
+        ));
+        let replay_root = std::env::temp_dir().join(format!(
+            "xc-production-remote-replay-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&source_root);
+        let _ = fs::remove_dir_all(&replay_root);
+        let base_record = record();
+        let mut source = stage_produced_artifact(
+            &base_record,
+            &source_root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        source
+            .manifest
+            .canonical_payload
+            .dependencies
+            .push(crate::PayloadDependencyIdentity {
+                artifact_family: "ccm-components".to_owned(),
+                semantic_digest: ContentDigest::sha256(b"dependency-semantic"),
+                manifest_digest: ContentDigest::sha256(b"dependency-manifest"),
+                payload_digest: ContentDigest::sha256(b"dependency-payload"),
+            });
+        source.manifest.payload_digest = source.manifest.canonical_payload.digest().unwrap();
+        source.encoding.canonical_payload_digest = source.manifest.payload_digest.clone();
+        let archive = replay_root.join("expected.zip");
+        let package = package_canonical_payload_bytes_zip64(
+            &source.manifest.canonical_payload,
+            "payload.json",
+            &base_record.payload,
+            &archive,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut encoded_bytes = BufReader::new(File::open(&archive).unwrap());
+        source.encoding = stream_split_encoded(
+            &mut encoded_bytes,
+            package.canonical_payload_digest,
+            package.encoder_profile,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+            |_part, _bytes| Ok(()),
+        )
+        .unwrap();
+        source.manifest.transport_digests = vec![source.encoding.digest().unwrap()];
+        source.manifest.validate().unwrap();
+
+        let mut reused = base_record;
+        reused.manifest.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&source.manifest).unwrap(),
+        );
+        let staged = stage_produced_artifact(
+            &reused,
+            &replay_root.join("staging"),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(staged.manifest, source.manifest);
+        assert_eq!(
+            staged.manifest.canonical_payload.dependencies,
+            source.manifest.canonical_payload.dependencies
+        );
+        let _ = fs::remove_dir_all(source_root);
+        let _ = fs::remove_dir_all(replay_root);
     }
 
     #[test]

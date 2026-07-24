@@ -2087,6 +2087,10 @@ fn build_tau_hp_via_cache(
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
+    // Decoding and structural validation parse every high-precision matrix
+    // entry. Retain that exact validated matrix so a cache hit performs this
+    // expensive MPFR conversion only once.
+    let validated_tau = RefCell::new(None);
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
@@ -2116,13 +2120,19 @@ fn build_tau_hp_via_cache(
                 dependencies,
             ))
         },
-        |artifact| decode_tau_artifact(artifact, params, prec).map(|_| ()),
+        |artifact| {
+            let tau = decode_tau_artifact(artifact, params, prec)?;
+            validated_tau.replace(Some(tau));
+            Ok(())
+        },
     )?;
     let manifest = resolved
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("typed tau execution returned no artifact manifest"))?;
-    let tau = decode_tau_artifact(&resolved.value, params, prec)?;
+    let tau = validated_tau.into_inner().ok_or_else(|| {
+        anyhow::anyhow!("typed tau execution did not retain its validated runtime matrix")
+    })?;
     if cache.requested_assurance != xc_core::AssuranceLevel::Computed {
         let required_assurance = match cache.requested_assurance {
             xc_core::AssuranceLevel::Computed => unreachable!(),
@@ -5309,7 +5319,7 @@ fn resolve_root_range_via_cache(
     cache: &ArtifactCacheContext<'_>,
     artifact_mode: RootArtifactMode,
     reference_dataset: Option<&ReferenceZeroDatasetIdentity>,
-) -> Result<(Vec<EigenvalueResult>, ArtifactManifest)> {
+) -> Result<(Vec<EigenvalueResult>, ArtifactManifest, bool)> {
     if first_root_index == 0 || seeds.is_empty() {
         bail!("CCM indexed root refinement requires a positive index and nonempty seed window");
     }
@@ -5317,6 +5327,118 @@ fn resolve_root_range_via_cache(
         .checked_add(seeds.len() - 1)
         .ok_or_else(|| anyhow::anyhow!("CCM indexed root window overflows usize"))?;
     let require_converged = cache.requested_assurance != xc_core::AssuranceLevel::Computed;
+
+    // A reference-seeded result for a larger prefix contains exactly the same
+    // indexed mathematical requests as a shorter prefix. Probe common
+    // canonical prefix windows before creating a narrower artifact. This
+    // preserves the larger artifact's provenance and prevents one-root claim
+    // runs from publishing redundant refinements and diagnostics.
+    if artifact_mode == RootArtifactMode::ReferenceSeededRefinement
+        && cache.mode != xc_cache::ArtifactExecutionCacheMode::Refresh
+        && reference_dataset.is_some()
+        && reference_dataset == Some(&xc_zeta::zeros::bundled_dataset_identity()?)
+    {
+        let requested_last = last_root_index;
+        for candidate_count in [50usize, 25, 134, 100, 116, 250, 460, 500, 1_000] {
+            if candidate_count < requested_last
+                || (first_root_index == 1 && candidate_count == seeds.len())
+            {
+                continue;
+            }
+            let candidate_strings = xc_zeta::zeros::bundled_first_n_strings(candidate_count)?;
+            let candidate_seeds = candidate_strings
+                .iter()
+                .map(|seed| {
+                    Float::parse(seed)
+                        .map(|parsed| Float::with_val(cfg.precision_bits, parsed))
+                        .map_err(|error| anyhow::anyhow!("invalid bundled root seed: {error}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let candidate_semantic = root_range_semantic_key(
+                params,
+                cfg,
+                1,
+                &candidate_seeds,
+                artifact_mode,
+                reference_dataset,
+            )?;
+            let candidate_logical = format!(
+                "ccm/root-refinement/{}/{}/{}/{}/1-{}",
+                lambda_squared_cache_identity(params),
+                params.n_modes,
+                cfg.precision_bits,
+                if cfg.force_even { "even" } else { "natural" },
+                candidate_count
+            );
+            let candidate_request = ArtifactExecutionCacheRequest {
+                operation: "ccm.root_refinement.resolve_compatible",
+                semantic_key: &candidate_semantic,
+                logical_key: &candidate_logical,
+                resolver: cache.resolver,
+                acceptance: cache.acceptance,
+                ordered_overlays: cache.ordered_overlays.clone(),
+                mode: xc_cache::ArtifactExecutionCacheMode::RequireReuse,
+                write_on_miss: false,
+                write_visibility: cache.write_visibility,
+                produced_quality: CacheQuality::Validated,
+                producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+                minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+                maximum_reader_version: None,
+                tags: BTreeMap::new(),
+                provenance_digest: None,
+                production_sink: None,
+            };
+            let candidate = resolve_or_compute_json_artifact_with_dependencies(
+                &candidate_request,
+                || {
+                    Err(CacheError::NotFound(
+                        "compatible root-window probe does not compute".to_owned(),
+                    ))
+                },
+                |artifact| {
+                    decode_root_range(
+                        artifact,
+                        params,
+                        cfg,
+                        1,
+                        &candidate_seeds,
+                        artifact_mode,
+                        reference_dataset,
+                        xi,
+                        l,
+                        require_converged,
+                    )
+                    .map(|_| ())
+                },
+            );
+            let candidate = match candidate {
+                Ok(candidate) => candidate,
+                Err(CacheError::NotFound(_)) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let manifest = candidate
+                .reused_manifest
+                .ok_or_else(|| anyhow::anyhow!("compatible root-window probe computed"))?;
+            let decoded = decode_root_range(
+                &candidate.value,
+                params,
+                cfg,
+                1,
+                &candidate_seeds,
+                artifact_mode,
+                reference_dataset,
+                xi,
+                l,
+                require_converged,
+            )?;
+            let start = first_root_index - 1;
+            let projected = decoded[start..start + seeds.len()].to_vec();
+            eprintln!(
+                "  cache root window: reused indices 1..={candidate_count} for contained request {first_root_index}..={last_root_index}"
+            );
+            return Ok((projected, manifest, true));
+        }
+    }
     let semantic_key = root_range_semantic_key(
         params,
         cfg,
@@ -5459,6 +5581,7 @@ fn resolve_root_range_via_cache(
             require_converged,
         )?,
         manifest,
+        false,
     ))
 }
 
@@ -6475,10 +6598,11 @@ fn run_inner_retaining_source(
         params.n_modes
     );
 
-    let (eigenvalues_pos, root_manifest, secular_manifest): (
+    let (eigenvalues_pos, root_manifest, secular_manifest, projected_root_window): (
         Vec<EigenvalueResult>,
         Option<ArtifactManifest>,
         Option<ArtifactManifest>,
+        bool,
     ) = if hp_seeds.is_empty() {
         let secular_manifest = if let CcmCacheRoute::Fabric(cache) = &cache_route {
             Some(resolve_secular_source_via_cache(
@@ -6492,7 +6616,7 @@ fn run_inner_retaining_source(
         } else {
             None
         };
-        (Vec::new(), None, secular_manifest)
+        (Vec::new(), None, secular_manifest, false)
     } else if let CcmCacheRoute::Fabric(cache) = &cache_route {
         let secular_manifest = resolve_secular_source_via_cache(
             params,
@@ -6502,7 +6626,7 @@ fn run_inner_retaining_source(
                 .expect("fabric eigenpair route retains its exact manifest"),
             cache,
         )?;
-        let (roots, manifest) = resolve_root_range_via_cache(
+        let (roots, manifest, projected) = resolve_root_range_via_cache(
             params,
             cfg,
             &l,
@@ -6514,32 +6638,35 @@ fn run_inner_retaining_source(
             artifact_mode,
             reference_dataset,
         )?;
-        (roots, Some(manifest), Some(secular_manifest))
+        (roots, Some(manifest), Some(secular_manifest), projected)
     } else {
         let roots = compute_root_range(&xi, params, &l, cfg, &hp_seeds);
         ensure_root_window_usable(&roots, hp_seeds.len(), false)?;
-        (roots, None, None)
+        (roots, None, None, false)
     };
     report_root_status_summary(&eigenvalues_pos, first_root_index);
     eprintln!(
         "[HP] phase timing: root discovery/refinement={:.3}s",
         roots_started.elapsed().as_secs_f64()
     );
-    if let (CcmCacheRoute::Fabric(cache), Some(root_manifest)) = (&cache_route, &root_manifest) {
-        record_run_evidence_via_cache(
-            params,
-            cfg,
-            &eps_n,
-            &inverse_iteration_diagnostics,
-            &eigenvalues_pos,
-            first_root_index,
-            eigenpair_manifest
-                .as_ref()
-                .expect("fabric eigenpair route retains its exact manifest"),
-            root_manifest,
-            cache,
-            artifact_mode,
-        )?;
+    if !projected_root_window {
+        if let (CcmCacheRoute::Fabric(cache), Some(root_manifest)) = (&cache_route, &root_manifest)
+        {
+            record_run_evidence_via_cache(
+                params,
+                cfg,
+                &eps_n,
+                &inverse_iteration_diagnostics,
+                &eigenvalues_pos,
+                first_root_index,
+                eigenpair_manifest
+                    .as_ref()
+                    .expect("fabric eigenpair route retains its exact manifest"),
+                root_manifest,
+                cache,
+                artifact_mode,
+            )?;
+        }
     }
     // After all solves, verify each computed eigenvalue is closest
     // to its assigned seed (detect cross-overs). Log warnings for any

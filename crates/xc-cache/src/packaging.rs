@@ -282,6 +282,41 @@ pub fn reconstruct_transport_package(
     resources: &ResourcePolicy,
     cancellation: &CancellationToken,
 ) -> Result<DeterministicPackageReport, CacheError> {
+    reconstruct_transport_package_inner(
+        record,
+        parts_root,
+        destination,
+        resources,
+        cancellation,
+        false,
+    )
+}
+
+pub(crate) fn reconstruct_transport_package_from_verified_parts(
+    record: &crate::TransportEncodingRecord,
+    parts_root: &Path,
+    destination: &Path,
+    resources: &ResourcePolicy,
+    cancellation: &CancellationToken,
+) -> Result<DeterministicPackageReport, CacheError> {
+    reconstruct_transport_package_inner(
+        record,
+        parts_root,
+        destination,
+        resources,
+        cancellation,
+        true,
+    )
+}
+
+fn reconstruct_transport_package_inner(
+    record: &crate::TransportEncodingRecord,
+    parts_root: &Path,
+    destination: &Path,
+    resources: &ResourcePolicy,
+    cancellation: &CancellationToken,
+    parts_preverified: bool,
+) -> Result<DeterministicPackageReport, CacheError> {
     record.validate()?;
     cancellation
         .check()
@@ -314,6 +349,7 @@ pub fn reconstruct_transport_package(
         output,
         resources,
         cancellation,
+        parts_preverified,
     );
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);
@@ -330,6 +366,7 @@ fn reconstruct_inner(
     output: File,
     resources: &ResourcePolicy,
     cancellation: &CancellationToken,
+    parts_preverified: bool,
 ) -> Result<DeterministicPackageReport, CacheError> {
     let buffer_bytes = resources
         .maximum_memory_bytes
@@ -368,7 +405,7 @@ fn reconstruct_inner(
             });
         }
         let mut input = BufReader::new(File::open(&path)?);
-        let mut part_hasher = Sha256::new();
+        let mut part_hasher = (!parts_preverified).then(Sha256::new);
         let mut part_size = 0u64;
         loop {
             cancellation
@@ -379,13 +416,17 @@ fn reconstruct_inner(
                 break;
             }
             part_size = part_size.saturating_add(read as u64);
-            part_hasher.update(&buffer[..read]);
+            if let Some(hasher) = &mut part_hasher {
+                hasher.update(&buffer[..read]);
+            }
             package_hasher.update(&buffer[..read]);
             output
                 .write_all(&buffer[..read])
                 .map_err(|error| map_io_error(error, cancellation))?;
         }
-        let part_digest = ContentDigest(format!("{:x}", part_hasher.finalize()));
+        let part_digest = part_hasher
+            .map(|hasher| ContentDigest(format!("{:x}", hasher.finalize())))
+            .unwrap_or_else(|| part.content_digest.clone());
         if part_size != part.size_bytes || part_digest != part.content_digest {
             return Err(CacheError::DigestMismatch {
                 expected: format!("{} ({} bytes)", part.content_digest, part.size_bytes),
@@ -425,6 +466,35 @@ pub fn verify_canonical_payload_zip64(
     package_path: &Path,
     cancellation: &CancellationToken,
 ) -> Result<VerifiedPackageReport, CacheError> {
+    verify_canonical_payload_zip64_inner(envelope, record, package_path, cancellation, false, None)
+}
+
+pub(crate) fn verify_canonical_payload_zip64_to_writer(
+    envelope: &CanonicalPayloadEnvelope,
+    record: &crate::TransportEncodingRecord,
+    package_path: &Path,
+    cancellation: &CancellationToken,
+    package_digest_preverified: bool,
+    writer: &mut dyn Write,
+) -> Result<VerifiedPackageReport, CacheError> {
+    verify_canonical_payload_zip64_inner(
+        envelope,
+        record,
+        package_path,
+        cancellation,
+        package_digest_preverified,
+        Some(writer),
+    )
+}
+
+fn verify_canonical_payload_zip64_inner(
+    envelope: &CanonicalPayloadEnvelope,
+    record: &crate::TransportEncodingRecord,
+    package_path: &Path,
+    cancellation: &CancellationToken,
+    package_digest_preverified: bool,
+    mut decoded_writer: Option<&mut dyn Write>,
+) -> Result<VerifiedPackageReport, CacheError> {
     envelope.validate()?;
     record.validate()?;
     if record.encoder_profile != DETERMINISTIC_ZIP64_PROFILE_V1 {
@@ -450,13 +520,18 @@ pub fn verify_canonical_payload_zip64(
         ));
     }
     let mut digest_buffer = vec![0u8; COPY_BUFFER_BYTES as usize];
-    let package_digest = digest_file(package_path, cancellation, &mut digest_buffer)?;
-    if package_digest != record.package_digest {
-        return Err(CacheError::DigestMismatch {
-            expected: record.package_digest.to_string(),
-            actual: package_digest.to_string(),
-        });
-    }
+    let package_digest = if package_digest_preverified {
+        record.package_digest.clone()
+    } else {
+        let digest = digest_file(package_path, cancellation, &mut digest_buffer)?;
+        if digest != record.package_digest {
+            return Err(CacheError::DigestMismatch {
+                expected: record.package_digest.to_string(),
+                actual: digest.to_string(),
+            });
+        }
+        digest
+    };
 
     let input = File::open(package_path)?;
     let mut archive =
@@ -499,6 +574,9 @@ pub fn verify_canonical_payload_zip64(
             }
             size = size.saturating_add(read as u64);
             hasher.update(&digest_buffer[..read]);
+            if let Some(writer) = decoded_writer.as_deref_mut() {
+                writer.write_all(&digest_buffer[..read])?;
+            }
         }
         let digest = ContentDigest(format!("{:x}", hasher.finalize()));
         if size != item.size_bytes || digest != item.content_digest {

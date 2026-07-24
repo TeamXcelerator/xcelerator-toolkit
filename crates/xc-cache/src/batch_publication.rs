@@ -76,6 +76,11 @@ pub struct RepositoryPublicationBatch {
     pub authorized_repository: String,
     pub branch: String,
     pub policy_digest: ContentDigest,
+    /// Private repository lease generation that fenced this publication.
+    /// Excluded from `batch_id` so an idempotent retry under a later lease
+    /// generation retains the same logical transaction identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_fencing_generation: Option<u64>,
     pub artifacts: Vec<RepositoryBatchArtifact>,
     pub created_unix_seconds: u64,
 }
@@ -151,9 +156,18 @@ impl RepositoryPublicationBatch {
         authorized_repository: impl Into<String>,
         branch: impl Into<String>,
         policy_digest: ContentDigest,
+        publication_fencing_generation: Option<u64>,
         mut artifacts: Vec<RepositoryBatchArtifact>,
         created_unix_seconds: u64,
     ) -> Result<Self, CacheError> {
+        if destination == PublicationDestination::Private
+            && publication_fencing_generation.is_none_or(|value| value == 0)
+        {
+            return Err(CacheError::InvalidManifest(
+                "new private repository publication batch requires a positive fencing generation"
+                    .to_owned(),
+            ));
+        }
         artifacts.sort_by(|left, right| {
             left.semantic_digest
                 .cmp(&right.semantic_digest)
@@ -180,6 +194,7 @@ impl RepositoryPublicationBatch {
             authorized_repository,
             branch,
             policy_digest,
+            publication_fencing_generation,
             artifacts,
             created_unix_seconds,
         };
@@ -194,6 +209,14 @@ impl RepositoryPublicationBatch {
             || self.authorized_repository.trim().is_empty()
             || self.branch.trim().is_empty()
             || !self.policy_digest.validate()
+            // A missing generation is valid only for private batches written
+            // before publication fencing was introduced. New private batches
+            // are required to supply one by `new` above. Keeping the field
+            // absent during serialization also preserves the canonical digest
+            // of those existing repository records.
+            || self.publication_fencing_generation == Some(0)
+            || (self.destination == PublicationDestination::Public
+                && self.publication_fencing_generation.is_some())
             || self.artifacts.is_empty()
             || self.created_unix_seconds == 0
         {
@@ -277,6 +300,7 @@ mod tests {
             "owner/private-quadrature-0001",
             "main",
             ContentDigest::sha256(b"policy"),
+            Some(1),
             vec![artifact.clone()],
             10,
         )
@@ -288,6 +312,7 @@ mod tests {
             "owner/private-quadrature-0001",
             "main",
             ContentDigest::sha256(b"policy"),
+            Some(2),
             vec![artifact],
             20,
         )
@@ -314,6 +339,7 @@ mod tests {
             "owner/public-ccm-matrices-0001",
             "main",
             ContentDigest::sha256(b"policy"),
+            None,
             vec![artifact.clone()],
             10,
         )
@@ -328,5 +354,77 @@ mod tests {
         assert!(evidence
             .artifact(&ContentDigest::sha256(b"other"), &artifact.manifest_digest)
             .is_none());
+    }
+
+    #[test]
+    fn new_private_batch_requires_a_positive_fencing_generation() {
+        let artifact = RepositoryBatchArtifact {
+            semantic_digest: ContentDigest::sha256(b"semantic"),
+            canonical_payload_digest: ContentDigest::sha256(b"payload"),
+            manifest_digest: ContentDigest::sha256(b"manifest"),
+            transport_digest: ContentDigest::sha256(b"transport"),
+            manifest_path: "manifests/aa/manifest.json".to_owned(),
+            achieved_assurance: ArtifactAssuranceState::Computed,
+            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            provenance_evidence_digests: Vec::new(),
+        };
+        for generation in [None, Some(0)] {
+            assert!(RepositoryPublicationBatch::new(
+                PublicationDestination::Private,
+                "quadrature",
+                "author",
+                "owner/private-quadrature-0001",
+                "main",
+                ContentDigest::sha256(b"policy"),
+                generation,
+                vec![artifact.clone()],
+                10,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_private_batch_without_fencing_generation_remains_canonical() {
+        let artifact = RepositoryBatchArtifact {
+            semantic_digest: ContentDigest::sha256(b"semantic"),
+            canonical_payload_digest: ContentDigest::sha256(b"payload"),
+            manifest_digest: ContentDigest::sha256(b"manifest"),
+            transport_digest: ContentDigest::sha256(b"transport"),
+            manifest_path: "manifests/aa/manifest.json".to_owned(),
+            achieved_assurance: ArtifactAssuranceState::Computed,
+            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            provenance_evidence_digests: Vec::new(),
+        };
+        let current = RepositoryPublicationBatch::new(
+            PublicationDestination::Private,
+            "quadrature",
+            "author",
+            "owner/private-quadrature-0001",
+            "main",
+            ContentDigest::sha256(b"policy"),
+            Some(1),
+            vec![artifact],
+            10,
+        )
+        .unwrap();
+        let mut legacy_value = serde_json::to_value(current).unwrap();
+        legacy_value
+            .as_object_mut()
+            .unwrap()
+            .remove("publication_fencing_generation");
+        let legacy_bytes = crate::protocol::canonical_json_bytes(&legacy_value).unwrap();
+        let legacy: RepositoryPublicationBatch = serde_json::from_slice(&legacy_bytes).unwrap();
+
+        assert_eq!(legacy.publication_fencing_generation, None);
+        legacy.validate().unwrap();
+        assert_eq!(
+            legacy.digest().unwrap(),
+            ContentDigest::sha256(&legacy_bytes)
+        );
+        assert!(!crate::protocol::canonical_json_bytes(&legacy)
+            .unwrap()
+            .windows(b"publication_fencing_generation".len())
+            .any(|window| window == b"publication_fencing_generation"));
     }
 }

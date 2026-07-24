@@ -7,7 +7,7 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-Version 0.13.0 is a breaking release and supports only the current APIs and cache format.
+Version 0.13.1 is a breaking release and supports only the current APIs and cache format.
 
 ---
 
@@ -42,7 +42,7 @@ If you use Xcelerator Toolkit in research, please cite the exact version or Git 
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.13.0},
+  version = {0.13.1},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }
@@ -83,7 +83,7 @@ cargo run -p xc-root --example bracketed_root --locked
 cargo run -p xc-spectral --example ccm_window_plan --locked
 ```
 
-See [Research Workflows](docs/v0.13.0/RESEARCH_WORKFLOWS.md) for additional examples and their numerical scope.
+See [Research Workflows](docs/v0.13.1/RESEARCH_WORKFLOWS.md) for additional examples and their numerical scope.
 
 ## High precision
 
@@ -120,7 +120,9 @@ independent of either acquisition policy.
 
 Caching is automatic for ordinary consumers. The toolkit checks compatible local and public artifacts, validates a candidate before reuse, and computes on a miss. No credentials or cache configuration are required for that normal workflow.
 
-Authenticated publication to private or public cache storage is an optional author operation and is disabled by default. See [Cache Schema](docs/v0.13.0/CACHE_SCHEMA.md) for the artifact model.
+Authenticated publication to private or public cache storage is an optional author operation and is disabled by default. See [Cache Schema](docs/v0.13.1/CACHE_SCHEMA.md) for the artifact model.
+
+Version 0.13.1 adds generation-fenced publication leases for private shards. Concurrent authors serialize publication per shard, while each content batch and its coordination heartbeat advance atomically.
 
 ## Validation
 
@@ -142,9 +144,9 @@ Saved results record the toolkit version, source revision, numerical backend, pr
 
 ## Documentation
 
-- [v0.13.0 documentation](docs/v0.13.0/README.md)
-- [Research workflows](docs/v0.13.0/RESEARCH_WORKFLOWS.md)
-- [CLI reference](docs/v0.13.0/CLI.md)
+- [v0.13.1 documentation](docs/v0.13.1/README.md)
+- [Research workflows](docs/v0.13.1/RESEARCH_WORKFLOWS.md)
+- [CLI reference](docs/v0.13.1/CLI.md)
 - [Security policy](SECURITY.md)
 
 ## License

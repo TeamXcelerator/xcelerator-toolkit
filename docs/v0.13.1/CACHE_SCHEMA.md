@@ -1,4 +1,4 @@
-# v0.13.0 Cache Schema Principles
+# v0.13.1 Cache Schema Principles
 
 This document is the concise schema contract used by manifests and validators. TD-04 defines the complete resolver, transport, transaction, trust, durability, and recovery design.
 
@@ -162,15 +162,25 @@ The transaction protocol is:
 1. resolve policy and authority;
 2. freeze semantic manifests and dependency closure;
 3. validate, sanitize, encode, split, and hash locally;
-4. reserve projected capacity against the observed shard ref;
-5. upload immutable payload objects in batches containing no more than 1,000,000,000 new payload bytes;
-6. verify every payload part at the accepted commit;
-7. commit and verify a separate canonical `transactions/<transaction-id>/batches/<sequence>.json` record containing the payload commit identity and exact object paths, digests, sizes, and first-introduction flags;
-8. publish the immutable manifest, transport record, validation attestations, and transaction record;
-9. update the shard index, capacity ledger, and immutable per-target receipt with compare-and-swap on the expected ref;
-10. verify receipt-complete end-to-end resolution from the new ref and release temporary state according to durability policy.
+4. for a private destination, atomically acquire that physical shard's renewable publication lease;
+5. re-read the exact shard head, live indexes, and capacity ledger after lease acquisition, then reserve projected capacity against that state;
+6. upload immutable payload objects in batches containing no more than 1,000,000,000 new payload bytes, updating the ledger to the exact committed batch boundary;
+7. publish the immutable manifest, transport record, validation attestations, repository-level transaction record, and live index only after every referenced object is reachable;
+8. for a private destination, atomically update the cache branch and renew the lease in the same Git push; for a public destination, retain expected-head compare-and-swap;
+9. verify the committed files and end-to-end resolution from the accepted ref;
+10. release the private lease and temporary state according to durability policy.
 
 Transaction IDs and batch digests make retry idempotent. Existing identical objects are reused. Concurrent ref changes cause re-read, revalidation, and retry; conflicting semantic publication fails visibly. For dual publication, private and public have separate journals and receipts. One target may succeed while the other remains resumable or failed, and that partial outcome is never collapsed into success.
+
+### Private-shard publication coordination
+
+Every writable private shard owns an orphan `xcelerator-coordination` branch. It contains only `coordination/state.json` and, while a publisher holds the shard, `coordination/publication-lock.json`; it does not share history with or add lock commits to `main`. The first private publisher initializes this branch automatically with an atomic create-if-absent operation.
+
+One lease covers one physical private repository. Different private shards therefore publish concurrently, while configurations targeting the same shard wait with bounded exponential backoff and visible owner, generation, and remaining-lease status. The lock records a non-secret run identity, authenticated principal, toolkit version, hashed instance identity, process ID, observed cache head, acquisition/heartbeat/expiry times, and a monotonically increasing fencing generation. It never records credentials, local paths, or raw machine account names.
+
+Acquisition, renewal, takeover, and release are compare-and-swap state transitions on the coordination branch. A crashed publisher's lease becomes eligible for takeover only after its expiry and clock-skew grace period. Every private repository batch uses one atomic two-ref push: `main` advances to the batch commit and `xcelerator-coordination` advances to the renewed lease commit. If either expected head changed, Git accepts neither update. A stale publisher therefore cannot advance the cache or ledger after another server takes over.
+
+The capacity ledger is committed with every cache batch and represents exactly the new immutable and metadata bytes reachable at that boundary. Identical existing paths are omitted from retries, a different payload at an immutable object path fails closed, and live metadata is ordered after payload objects so an interrupted transfer cannot expose an index entry whose objects are absent. Release removes the active lock document but preserves the generation and last completed transaction in the coordination state. Private coordination needs no additional repository, PAT, workflow, or consumer configuration.
 
 ## Capacity, rollover, and rebuild
 
@@ -193,6 +203,8 @@ Local cleanup planning removes the candidate copy from the evidence set before a
 Trust policy verifies principal, authority scope, signature, attested identity, repository/ref binding, toolkit and schema policy, and revocation state. Clients pin or monotonically advance signed registry and shard state to resist rollback. Revocation is an immutable signed overlay; objects are not rewritten. Emergency repair publishes corrected manifests or indexes plus an audit attestation.
 
 Author refresh and replacement are explicit operations. `XC_CACHE_MODE=refresh` bypasses every local and remote candidate but retains normal validation, local storage, dependency recording, packaging, and publication. When `XC_PUBLISH_REPLACE=true` is combined with author mode and enabled publication, each discoverability commit removes prior entries for the affected semantic identity and installs the fresh entry as its sole current selection. After all artifacts are published, the toolkit audits each exact affected shard revision and issues a separate compare-and-swap cleanup commit removing only unreferenced current-tree manifests, transport encodings, and payload objects. Shared objects and historical receipts remain. Capacity is never decremented because the removed blobs remain in Git history.
+
+Ordinary author publication is destination-aware. Before obtaining a private publication lease or staging repository files, the publisher reads each required destination index partition once and confirms exact active artifacts against their canonical repository-batch records. Confirmed artifacts are excluded from the new batch without reading their manifests, encodings, attestations, ZIP parts, or payload objects. Their index entries and original publication transaction identifiers remain unchanged. Only missing or no-longer-proven artifacts enter the new transaction; a destination for which every candidate is already proven produces no shard commit and no coordination-branch lock activity. `XC_PUBLISH_REPLACE=true` deliberately bypasses this no-replay behavior.
 
 ## Domain reuse
 

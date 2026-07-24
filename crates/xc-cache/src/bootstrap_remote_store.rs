@@ -4,9 +4,10 @@ use crate::*;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Instant;
 use xc_core::{CancellationToken, ResourcePolicy};
 
 #[derive(Clone, Deserialize)]
@@ -337,15 +338,13 @@ impl CacheStore for GitHubBootstrapCacheStore {
         let Some(resolved) = resolved else {
             return Ok(Vec::new());
         };
-        let item = resolved
-            .manifest
-            .canonical_payload
-            .ordered_items
-            .iter()
-            .find(|item| item.normalized_path == "payload.json")
-            .ok_or_else(|| {
-                CacheError::InvalidManifest("managed JSON artifact has no payload.json".to_owned())
-            })?;
+        let ordered_items = &resolved.manifest.canonical_payload.ordered_items;
+        if ordered_items.len() != 1 || ordered_items[0].normalized_path != "payload.json" {
+            return Err(CacheError::InvalidManifest(
+                "managed JSON artifact must contain exactly one payload.json item".to_owned(),
+            ));
+        }
+        let item = &ordered_items[0];
         let assurance = resolved.index.achieved_assurance;
         let quality = match assurance {
             ArtifactAssuranceState::Certified => CacheQuality::Certified,
@@ -357,6 +356,10 @@ impl CacheStore for GitHubBootstrapCacheStore {
             SEMANTIC_KEY_MANIFEST_TAG.to_owned(),
             serde_json::to_string(&resolved.manifest.semantic_key)?,
         );
+        tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&resolved.manifest)?,
+        );
         let adapter_manifest = ArtifactManifest {
             schema_version: 1,
             key: key.clone(),
@@ -367,7 +370,7 @@ impl CacheStore for GitHubBootstrapCacheStore {
                 size_bytes: item.size_bytes,
             }],
             created_unix_seconds: resolved.receipt.verified_at_unix_seconds(),
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0")?,
+            producer_toolkit_version: resolved.manifest.producer_toolkit_version.clone(),
             minimum_reader_version: resolved.manifest.minimum_reader_version.clone(),
             maximum_reader_version: resolved.manifest.maximum_reader_version.clone(),
             quality,
@@ -402,31 +405,62 @@ impl CacheStore for GitHubBootstrapCacheStore {
         if let Some(parent) = package.parent() {
             fs::create_dir_all(parent)?;
         }
-        materialize_resolved_remote_artifact(
+        let started = Instant::now();
+        let report = materialize_resolved_remote_artifact_to_writer(
             &self.remote,
             &resolved,
             &self.root.join("parts"),
             &package,
             &ResourcePolicy::default(),
             &CancellationToken::new(),
+            writer,
         )?;
-        let file = fs::File::open(package)?;
-        let mut archive =
-            zip::ZipArchive::new(file).map_err(|error| CacheError::Io(error.to_string()))?;
-        let mut payload = archive
-            .by_name("payload.json")
-            .map_err(|error| CacheError::Io(error.to_string()))?;
-        let mut bytes = Vec::new();
-        payload.read_to_end(&mut bytes)?;
-        let actual = ContentDigest::sha256(&bytes);
-        if actual != manifest.content_digest || bytes.len() as u64 != manifest.size_bytes {
-            return Err(CacheError::DigestMismatch {
-                expected: manifest.content_digest.to_string(),
-                actual: actual.to_string(),
-            });
+        if resolved.encoding.package_size_bytes >= 64 * 1024 * 1024 {
+            eprintln!(
+                "  cache transport: {} {:.1} MB, {} parts ({} downloaded, {} reused), verified and decoded once in {:.3}s",
+                resolved.family,
+                resolved.encoding.package_size_bytes as f64 / 1_000_000.0,
+                resolved.encoding.ordered_parts.len(),
+                report
+                    .part_fetch
+                    .as_ref()
+                    .map_or(0, |parts| parts.downloaded_sequences.len()),
+                report
+                    .part_fetch
+                    .as_ref()
+                    .map_or(resolved.encoding.ordered_parts.len(), |parts| {
+                        parts.reused_sequences.len()
+                    }),
+                started.elapsed().as_secs_f64()
+            );
         }
-        writer.write_all(&bytes)?;
         Ok(())
+    }
+
+    fn verified_encoded_payload(
+        &self,
+        manifest: &ArtifactManifest,
+    ) -> Result<Option<VerifiedEncodedPayload>, CacheError> {
+        let resolved = self
+            .resolved
+            .lock()
+            .map_err(|_| CacheError::Io("public cache lock poisoned".to_owned()))?
+            .get(&manifest.content_digest)
+            .cloned()
+            .ok_or_else(|| CacheError::NotFound(manifest.content_digest.to_string()))?;
+        let path = self
+            .root
+            .join("packages")
+            .join(format!("{}.zip", resolved.encoding.digest()?.0));
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(VerifiedEncodedPayload {
+            path,
+            encoding: "zip-json-entry-v1".to_owned(),
+            content_digest: resolved.encoding.package_digest,
+            size_bytes: resolved.encoding.package_size_bytes,
+        }))
     }
 }
 
@@ -469,6 +503,7 @@ mod tests {
             "TeamXcelerator/xcelerator-cache-private-ccm-matrices-0001",
             "main",
             ContentDigest::sha256(b"bootstrap-policy"),
+            Some(1),
             vec![RepositoryBatchArtifact {
                 semantic_digest: semantic_digest.clone(),
                 canonical_payload_digest: payload_digest.clone(),
