@@ -1,9 +1,10 @@
 //! Bounded, read-only remote shard inventory and projection reconciliation.
 
 use crate::{
-    CacheError, CanonicalArtifactManifest, CapacityLedger, ContentDigest, PayloadBatchRecord,
-    PublicationReceipt, RemoteDocument, RemoteGitStore, RemotePathListReport, RemoteShardReader,
-    ShardIndexEntry, ShardIndexPartition, TransportEncodingRecord, DEFAULT_CAPACITY_LEDGER_PATH,
+    AttestationEnvelope, CacheError, CanonicalArtifactManifest, CapacityLedger, ContentDigest,
+    PayloadBatchRecord, PublicationDestination, PublicationReceipt, RemoteDocument, RemoteGitStore,
+    RemotePathListReport, RemoteShardReader, RepositoryPublicationBatch, ShardIndexEntry,
+    ShardIndexPartition, TransportEncodingRecord, DEFAULT_CAPACITY_LEDGER_PATH,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -318,7 +319,15 @@ pub fn audit_remote_shard(
             }
             verified_metadata.insert(manifest_path.clone(), entry.manifest_digest.clone());
 
-            let receipt_candidates = [
+            let evidence_candidates = [
+                format!(
+                    "transactions/batches/{}/private.json",
+                    entry.publication_transaction_id
+                ),
+                format!(
+                    "transactions/batches/{}/public.json",
+                    entry.publication_transaction_id
+                ),
                 format!(
                     "transactions/{}/private/receipt.json",
                     entry.publication_transaction_id
@@ -334,94 +343,172 @@ pub fn audit_remote_shard(
                     entry.publication_transaction_id
                 ),
             ];
-            let matching_receipts = receipt_candidates
+            let matching_evidence = evidence_candidates
                 .into_iter()
                 .filter(|path| all_paths.contains(path))
                 .collect::<Vec<_>>();
-            if matching_receipts.len() != 1 {
+            if matching_evidence.len() != 1 {
                 issue(
                     &mut issues,
                     ShardAuditSeverity::Error,
                     ShardAuditIssueKind::MissingReceipt,
                     None,
                     Some(entry.manifest_digest.clone()),
-                    "index entry does not resolve to exactly one target-specific receipt",
+                    "index entry does not resolve to exactly one publication evidence record",
                 );
                 continue;
             }
-            let receipt_path = matching_receipts[0].clone();
-            referenced_paths.insert(receipt_path.clone());
-            let receipt = match read_json::<PublicationReceipt>(
-                remote,
-                repository,
-                revision,
-                &receipt_path,
-                policy,
-                cancellation,
-                &mut metadata_bytes,
-            ) {
-                Ok(document) => document,
-                Err(error) if recoverable_document_error(&error) => {
+            let evidence_path = matching_evidence[0].clone();
+            referenced_paths.insert(evidence_path.clone());
+            let mut receipt = None;
+            let mut batch_artifact = None;
+            if evidence_path.starts_with("transactions/batches/") {
+                let batch = match read_json::<RepositoryPublicationBatch>(
+                    remote,
+                    repository,
+                    revision,
+                    &evidence_path,
+                    policy,
+                    cancellation,
+                    &mut metadata_bytes,
+                ) {
+                    Ok(document) => document,
+                    Err(error) if recoverable_document_error(&error) => {
+                        issue(
+                            &mut issues,
+                            ShardAuditSeverity::Error,
+                            if matches!(error, CacheError::NotFound(_)) {
+                                ShardAuditIssueKind::MissingReceipt
+                            } else {
+                                ShardAuditIssueKind::InvalidReceipt
+                            },
+                            Some(&evidence_path),
+                            None,
+                            &error.to_string(),
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let expected_destination = if evidence_path.ends_with("/private.json") {
+                    PublicationDestination::Private
+                } else {
+                    PublicationDestination::Public
+                };
+                let artifact = batch
+                    .value
+                    .artifacts
+                    .iter()
+                    .find(|artifact| {
+                        artifact.semantic_digest == entry.semantic_digest
+                            && artifact.manifest_digest == entry.manifest_digest
+                    })
+                    .cloned();
+                if batch.value.validate().is_err()
+                    || batch.value.digest().as_ref() != Ok(&batch.source.content_digest)
+                    || batch.value.batch_id.0 != entry.publication_transaction_id
+                    || batch.value.destination != expected_destination
+                    || batch.value.family != *family
+                    || batch.value.branch != branch
+                    || !repository_matches_authorized(
+                        repository,
+                        &batch.value.authorized_repository,
+                    )
+                    || artifact.as_ref().is_none_or(|artifact| {
+                        artifact.canonical_payload_digest != entry.canonical_payload_digest
+                            || !entry.transport_digests.contains(&artifact.transport_digest)
+                            || artifact.manifest_path != manifest_path
+                            || artifact.achieved_assurance != entry.achieved_assurance
+                            || artifact.producer_toolkit_version != entry.producer_toolkit_version
+                    })
+                {
                     issue(
                         &mut issues,
                         ShardAuditSeverity::Error,
-                        if matches!(error, CacheError::NotFound(_)) {
-                            ShardAuditIssueKind::MissingReceipt
-                        } else {
-                            ShardAuditIssueKind::InvalidReceipt
-                        },
-                        Some(&receipt_path),
+                        ShardAuditIssueKind::InvalidReceipt,
+                        Some(&evidence_path),
                         None,
-                        &error.to_string(),
+                        "repository publication batch does not prove its index entry",
                     );
                     continue;
                 }
-                Err(error) => return Err(error),
-            };
-            let index_digest = &index_sources[&index_path];
-            if receipt.value.validate().is_err()
-                || receipt.value.digest().as_ref() != Ok(&receipt.source.content_digest)
-                || receipt.value.transaction_id != entry.publication_transaction_id
-                || receipt.value.shard_id != shard_id
-                || receipt.value.branch != branch
-                || receipt.value.semantic_digest != entry.semantic_digest
-                || receipt.value.canonical_payload_digest != entry.canonical_payload_digest
-                || receipt.value.manifest_digest != entry.manifest_digest
-                || !entry
-                    .transport_digests
-                    .contains(&receipt.value.transport_digest)
-                || receipt
-                    .value
-                    .discoverability_subject_digests
-                    .get(&index_path)
-                    != Some(index_digest)
-                || receipt.value.metadata_file_digests.get(&manifest_path)
-                    != Some(&entry.manifest_digest)
-            {
-                issue(
-                    &mut issues,
-                    ShardAuditSeverity::Error,
-                    ShardAuditIssueKind::InvalidReceipt,
-                    Some(&receipt_path),
-                    None,
-                    "receipt does not prove its index entry and immutable metadata",
-                );
-                continue;
-            }
-
-            let mut complete = true;
-            for (path, expected_digest) in &receipt.value.payload_batch_record_digests {
-                referenced_paths.insert(path.clone());
-                if payload_history.record_digests.get(path) != Some(expected_digest) {
+                batch_artifact = artifact;
+            } else {
+                let document = match read_json::<PublicationReceipt>(
+                    remote,
+                    repository,
+                    revision,
+                    &evidence_path,
+                    policy,
+                    cancellation,
+                    &mut metadata_bytes,
+                ) {
+                    Ok(document) => document,
+                    Err(error) if recoverable_document_error(&error) => {
+                        issue(
+                            &mut issues,
+                            ShardAuditSeverity::Error,
+                            if matches!(error, CacheError::NotFound(_)) {
+                                ShardAuditIssueKind::MissingReceipt
+                            } else {
+                                ShardAuditIssueKind::InvalidReceipt
+                            },
+                            Some(&evidence_path),
+                            None,
+                            &error.to_string(),
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                let index_digest = &index_sources[&index_path];
+                if document.value.validate().is_err()
+                    || document.value.digest().as_ref() != Ok(&document.source.content_digest)
+                    || document.value.transaction_id != entry.publication_transaction_id
+                    || document.value.shard_id != shard_id
+                    || document.value.branch != branch
+                    || document.value.semantic_digest != entry.semantic_digest
+                    || document.value.canonical_payload_digest != entry.canonical_payload_digest
+                    || document.value.manifest_digest != entry.manifest_digest
+                    || !entry
+                        .transport_digests
+                        .contains(&document.value.transport_digest)
+                    || document
+                        .value
+                        .discoverability_subject_digests
+                        .get(&index_path)
+                        != Some(index_digest)
+                    || document.value.metadata_file_digests.get(&manifest_path)
+                        != Some(&entry.manifest_digest)
+                {
                     issue(
                         &mut issues,
                         ShardAuditSeverity::Error,
-                        ShardAuditIssueKind::InvalidPayloadBatchRecord,
-                        Some(path),
-                        Some(expected_digest.clone()),
-                        "receipt payload-batch record is absent or has a different digest",
+                        ShardAuditIssueKind::InvalidReceipt,
+                        Some(&evidence_path),
+                        None,
+                        "receipt does not prove its index entry and immutable metadata",
                     );
-                    complete = false;
+                    continue;
+                }
+                receipt = Some(document.value);
+            }
+
+            let mut complete = true;
+            if let Some(receipt) = &receipt {
+                for (path, expected_digest) in &receipt.payload_batch_record_digests {
+                    referenced_paths.insert(path.clone());
+                    if payload_history.record_digests.get(path) != Some(expected_digest) {
+                        issue(
+                            &mut issues,
+                            ShardAuditSeverity::Error,
+                            ShardAuditIssueKind::InvalidPayloadBatchRecord,
+                            Some(path),
+                            Some(expected_digest.clone()),
+                            "receipt payload-batch record is absent or has a different digest",
+                        );
+                        complete = false;
+                    }
                 }
             }
             for transport_digest in &entry.transport_digests {
@@ -462,8 +549,9 @@ pub fn audit_remote_shard(
                 if encoding.value.digest().as_ref() != Ok(transport_digest)
                     || encoding.source.content_digest != *transport_digest
                     || encoding.value.canonical_payload_digest != entry.canonical_payload_digest
-                    || receipt.value.metadata_file_digests.get(&encoding_path)
-                        != Some(transport_digest)
+                    || receipt.as_ref().is_some_and(|receipt| {
+                        receipt.metadata_file_digests.get(&encoding_path) != Some(transport_digest)
+                    })
                 {
                     issue(
                         &mut issues,
@@ -515,49 +603,97 @@ pub fn audit_remote_shard(
                 }
             }
 
-            for (path, expected_digest) in &receipt.value.metadata_file_digests {
-                referenced_paths.insert(path.clone());
-                if let Some(actual_digest) = verified_metadata.get(path) {
-                    if actual_digest != expected_digest {
-                        complete = false;
+            if let Some(artifact) = &batch_artifact {
+                for digest in &artifact.provenance_evidence_digests {
+                    let path = format!("attestations/validation/{digest}.json");
+                    referenced_paths.insert(path.clone());
+                    match read_json::<AttestationEnvelope>(
+                        remote,
+                        repository,
+                        revision,
+                        &path,
+                        policy,
+                        cancellation,
+                        &mut metadata_bytes,
+                    ) {
+                        Ok(document)
+                            if document.value.digest().as_ref() == Ok(digest)
+                                && document.source.content_digest == *digest =>
+                        {
+                            verified_metadata.insert(path, digest.clone());
+                        }
+                        Ok(_) => {
+                            issue(
+                                &mut issues,
+                                ShardAuditSeverity::Error,
+                                ShardAuditIssueKind::MissingMetadata,
+                                Some(&path),
+                                Some(digest.clone()),
+                                "validation attestation does not match repository batch evidence",
+                            );
+                            complete = false;
+                        }
+                        Err(error) if recoverable_document_error(&error) => {
+                            issue(
+                                &mut issues,
+                                ShardAuditSeverity::Error,
+                                ShardAuditIssueKind::MissingMetadata,
+                                Some(&path),
+                                Some(digest.clone()),
+                                &error.to_string(),
+                            );
+                            complete = false;
+                        }
+                        Err(error) => return Err(error),
                     }
-                    continue;
                 }
-                match read_bytes(
-                    remote,
-                    repository,
-                    revision,
-                    path,
-                    policy,
-                    cancellation,
-                    &mut metadata_bytes,
-                ) {
-                    Ok(actual_digest) if &actual_digest == expected_digest => {
-                        verified_metadata.insert(path.clone(), actual_digest);
+            }
+
+            if let Some(receipt) = &receipt {
+                for (path, expected_digest) in &receipt.metadata_file_digests {
+                    referenced_paths.insert(path.clone());
+                    if let Some(actual_digest) = verified_metadata.get(path) {
+                        if actual_digest != expected_digest {
+                            complete = false;
+                        }
+                        continue;
                     }
-                    Ok(actual_digest) => {
-                        issue(
-                            &mut issues,
-                            ShardAuditSeverity::Error,
-                            ShardAuditIssueKind::MissingMetadata,
-                            Some(path),
-                            Some(expected_digest.clone()),
-                            &format!("metadata digest is {actual_digest}"),
-                        );
-                        complete = false;
+                    match read_bytes(
+                        remote,
+                        repository,
+                        revision,
+                        path,
+                        policy,
+                        cancellation,
+                        &mut metadata_bytes,
+                    ) {
+                        Ok(actual_digest) if &actual_digest == expected_digest => {
+                            verified_metadata.insert(path.clone(), actual_digest);
+                        }
+                        Ok(actual_digest) => {
+                            issue(
+                                &mut issues,
+                                ShardAuditSeverity::Error,
+                                ShardAuditIssueKind::MissingMetadata,
+                                Some(path),
+                                Some(expected_digest.clone()),
+                                &format!("metadata digest is {actual_digest}"),
+                            );
+                            complete = false;
+                        }
+                        Err(error) if recoverable_document_error(&error) => {
+                            issue(
+                                &mut issues,
+                                ShardAuditSeverity::Error,
+                                ShardAuditIssueKind::MissingMetadata,
+                                Some(path),
+                                Some(expected_digest.clone()),
+                                &error.to_string(),
+                            );
+                            complete = false;
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) if recoverable_document_error(&error) => {
-                        issue(
-                            &mut issues,
-                            ShardAuditSeverity::Error,
-                            ShardAuditIssueKind::MissingMetadata,
-                            Some(path),
-                            Some(expected_digest.clone()),
-                            &error.to_string(),
-                        );
-                        complete = false;
-                    }
-                    Err(error) => return Err(error),
                 }
             }
             if !complete {
@@ -674,7 +810,7 @@ pub fn audit_remote_shard(
     let receipt_paths = listings["transactions"]
         .paths
         .iter()
-        .filter(|path| path.ends_with("/receipt.json"))
+        .filter(|path| path.ends_with("/receipt.json") || repository_publication_batch_path(path))
         .cloned()
         .collect::<Vec<_>>();
     let unreferenced_receipt_count = receipt_paths
@@ -691,7 +827,7 @@ pub fn audit_remote_shard(
             ShardAuditIssueKind::UnreferencedReceipt,
             Some(path),
             None,
-            "receipt is not referenced by a current index entry",
+            "publication evidence is not referenced by a current index entry",
         );
     }
     for path in listings["transactions"]
@@ -820,13 +956,21 @@ fn audit_payload_batch_records(
     metadata_bytes: &mut u64,
     issues: &mut Vec<ShardAuditIssue>,
 ) -> Result<PayloadHistoryAudit, CacheError> {
+    let repository_batches_present = transaction_listing
+        .paths
+        .iter()
+        .any(|path| repository_publication_batch_path(path));
     let record_paths = transaction_listing
         .paths
         .iter()
-        .filter(|path| path.contains("/batches/") && path.ends_with(".json"))
+        .filter(|path| payload_batch_record_path(path))
         .collect::<Vec<_>>();
     let mut valid_record_count = 0u64;
-    let mut coverage_complete = true;
+    // Current repository-batch evidence deliberately omits per-object
+    // first-seen history. The capacity ledger and active encodings still prove
+    // the reachable-byte lower bound, but an exact historical rebuild is not
+    // available and should be reported as such without one warning per object.
+    let mut coverage_complete = !repository_batches_present;
     let mut record_digests = BTreeMap::new();
     let mut declared_by_path = BTreeMap::<String, (ContentDigest, u64)>::new();
     let mut declared_by_digest = BTreeMap::<ContentDigest, (String, u64)>::new();
@@ -947,21 +1091,23 @@ fn audit_payload_batch_records(
         record_digests.insert(path.clone(), document.source.content_digest);
     }
 
-    for path in object_listing
-        .paths
-        .iter()
-        .filter(|path| canonical_payload_object_path(path))
-    {
-        if !declared_by_path.contains_key(path) {
-            issue(
-                issues,
-                ShardAuditSeverity::Warning,
-                ShardAuditIssueKind::PayloadHistoryGap,
-                Some(path),
-                None,
-                "reachable payload object has no durable size-bearing batch record",
-            );
-            coverage_complete = false;
+    if !repository_batches_present {
+        for path in object_listing
+            .paths
+            .iter()
+            .filter(|path| canonical_payload_object_path(path))
+        {
+            if !declared_by_path.contains_key(path) {
+                issue(
+                    issues,
+                    ShardAuditSeverity::Warning,
+                    ShardAuditIssueKind::PayloadHistoryGap,
+                    Some(path),
+                    None,
+                    "reachable payload object has no durable size-bearing batch record",
+                );
+                coverage_complete = false;
+            }
         }
     }
     for (digest, (path, _)) in &declared_by_digest {
@@ -990,6 +1136,27 @@ fn audit_payload_batch_records(
         coverage_complete,
         record_digests,
     })
+}
+
+fn payload_batch_record_path(path: &str) -> bool {
+    let components = path.split('/').collect::<Vec<_>>();
+    components.len() == 5
+        && components[0] == "transactions"
+        && matches!(components[2], "private" | "public")
+        && components[3] == "batches"
+        && components[4].strip_suffix(".json").is_some_and(|sequence| {
+            sequence.len() == 20 && sequence.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn repository_publication_batch_path(path: &str) -> bool {
+    let components = path.split('/').collect::<Vec<_>>();
+    components.len() == 4
+        && components[0] == "transactions"
+        && components[1] == "batches"
+        && components[2].len() == 64
+        && components[2].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && matches!(components[3], "private.json" | "public.json")
 }
 
 fn validate_listing(
@@ -1092,6 +1259,13 @@ fn recoverable_document_error(error: &CacheError) -> bool {
             | CacheError::DigestMismatch { .. }
             | CacheError::NotFound(_)
     )
+}
+
+fn repository_matches_authorized(repository: &str, authorized_repository: &str) -> bool {
+    let repository = repository.trim_end_matches('/');
+    repository == authorized_repository
+        || repository == format!("https://github.com/{authorized_repository}")
+        || repository == format!("https://github.com/{authorized_repository}.git")
 }
 
 fn canonical_payload_object_path(path: &str) -> bool {
@@ -1473,6 +1647,57 @@ mod tests {
         MemoryRemote { revision, paths }
     }
 
+    fn repository_batch_fixture() -> MemoryRemote {
+        let mut remote = fixture();
+        let index_path = remote
+            .paths
+            .keys()
+            .find(|path| path.starts_with("indexes/"))
+            .cloned()
+            .unwrap();
+        let mut index: ShardIndexPartition =
+            serde_json::from_slice(&remote.paths[&index_path]).unwrap();
+        let entry = index.entries.first().unwrap().clone();
+        let manifest_path = format!(
+            "manifests/{}/{}.json",
+            &entry.semantic_digest.0[..2],
+            entry.manifest_digest
+        );
+        let batch = RepositoryPublicationBatch::new(
+            PublicationDestination::Public,
+            "fixture",
+            "auditor",
+            "team/shard",
+            "main",
+            ContentDigest::sha256(b"policy"),
+            None,
+            vec![crate::RepositoryBatchArtifact {
+                semantic_digest: entry.semantic_digest.clone(),
+                canonical_payload_digest: entry.canonical_payload_digest.clone(),
+                manifest_digest: entry.manifest_digest.clone(),
+                transport_digest: entry.transport_digests[0].clone(),
+                manifest_path,
+                achieved_assurance: entry.achieved_assurance,
+                producer_toolkit_version: entry.producer_toolkit_version.clone(),
+                provenance_evidence_digests: Vec::new(),
+            }],
+            1,
+        )
+        .unwrap();
+        index.entries[0].publication_transaction_id = batch.batch_id.0.clone();
+        remote
+            .paths
+            .insert(index_path, canonical_json_bytes(&index).unwrap());
+        remote
+            .paths
+            .retain(|path, _| !path.ends_with("/receipt.json"));
+        remote.paths.insert(
+            batch.repository_path(),
+            canonical_json_bytes(&batch).unwrap(),
+        );
+        remote
+    }
+
     fn policy() -> ShardAuditPolicy {
         ShardAuditPolicy {
             maximum_paths_per_prefix: 1_000,
@@ -1499,11 +1724,29 @@ mod tests {
         assert_eq!(report.logical_payload_bytes, 7);
         assert_eq!(report.unique_transport_object_bytes, 7);
         assert_eq!(report.reconstructed_partitions.len(), 1);
-        assert!(report.issues.is_empty());
+        assert!(report.issues.is_empty(), "{:#?}", report.issues);
         assert!(report.capacity.ledger_covers_referenced_transport);
         assert!(report.capacity.exact_history_rebuild_available);
         assert!(report.capacity.ledger_matches_durable_payload_history);
         assert_eq!(report.capacity.durable_recorded_new_payload_bytes, 7);
+    }
+
+    #[test]
+    fn audit_accepts_current_repository_batch_evidence() {
+        let remote = repository_batch_fixture();
+        let report = audit_remote_shard(
+            &remote,
+            "team/shard",
+            "main",
+            &remote.revision,
+            "fixture-001",
+            &policy(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(report.complete_artifact_count, 1);
+        assert_eq!(report.unreferenced_receipt_count, 0);
+        assert!(report.issues.is_empty(), "{:#?}", report.issues);
     }
 
     #[test]

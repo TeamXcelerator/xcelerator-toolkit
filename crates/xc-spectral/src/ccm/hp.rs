@@ -20,9 +20,14 @@ use std::time::Instant;
 use xc_cache::resolve_or_compute_json_artifact_with_assessment;
 use xc_cache::{
     resolve_or_compute_json_artifact_with_dependencies, ArtifactAssuranceAttestation,
-    ArtifactCacheContext, ArtifactExecutionCacheRequest, ArtifactManifest,
+    ArtifactCacheContext, ArtifactExecutionCacheRequest, ArtifactKey, ArtifactManifest,
     ArtifactProductionAssessment, CacheError, CacheQuality, ContentDigest, DependencyRef,
     SemanticKeyEnvelope, ToolkitVersion,
+};
+use xc_core::{DecimalLiteral, EigenTarget, ResultStatus};
+use xc_operator::{
+    ApplicationErrorBound, LinearOperator, MatrixStructure, OperatorError, OperatorMetadata,
+    SymmetricOperator,
 };
 use xc_zeta::zeros::ReferenceZeroDatasetIdentity;
 
@@ -36,6 +41,7 @@ enum CcmCacheRoute<'a> {
 struct RetainedCcmSource {
     tau: Vec<Float>,
     tau_manifest: Option<ArtifactManifest>,
+    eigenpair_manifest: Option<ArtifactManifest>,
     secular_manifest: Option<ArtifactManifest>,
 }
 
@@ -258,9 +264,43 @@ struct PortableWeilEigenpair {
     n_modes: usize,
     precision_bits: u32,
     force_even: bool,
+    #[serde(
+        default = "legacy_eigenstate_route_name",
+        skip_serializing_if = "is_legacy_eigenstate_route"
+    )]
+    eigenstate_route: String,
     eigenvalue: String,
     eigenvector: Vec<String>,
     inverse_iteration: PortableInverseIterationDiagnostics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shift_invert_krylov: Option<PortableShiftInvertKrylovDiagnostics>,
+}
+
+fn legacy_eigenstate_route_name() -> String {
+    "legacy_inverse_iteration".to_owned()
+}
+
+fn is_legacy_eigenstate_route(value: &String) -> bool {
+    value == "legacy_inverse_iteration"
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PortableShiftInvertKrylovDiagnostics {
+    algorithm_semantics: String,
+    factorization_id: String,
+    requested_eigenpairs: usize,
+    guard_eigenpairs: usize,
+    maximum_subspace_dimension: usize,
+    maximum_restarts: usize,
+    restarts: usize,
+    shifted_solves: usize,
+    operator_applications: usize,
+    status: String,
+    maximum_ritz_value_stability: String,
+    final_scaled_backward_error: String,
+    final_relative_tau_residual: String,
+    seed_identity: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -392,6 +432,23 @@ impl PortableRootRefinement {
             final_correction: result.diagnostics.final_correction.to_string(),
             residual: result.diagnostics.residual.to_string(),
             achieved_decimal_digits: result.diagnostics.achieved_decimal_digits.to_string(),
+        }
+    }
+
+    fn from_runtime_lossless(result: &RootRefinement) -> Self {
+        let encode = |value: &Float| {
+            let digits = u64::from(value.prec())
+                .saturating_mul(30_103)
+                .div_ceil(100_000)
+                .saturating_add(4) as usize;
+            value.to_string_radix(10, Some(digits))
+        };
+        Self {
+            value: encode(&result.value),
+            iterations: result.diagnostics.iterations,
+            final_correction: encode(&result.diagnostics.final_correction),
+            residual: encode(&result.diagnostics.residual),
+            achieved_decimal_digits: encode(&result.diagnostics.achieved_decimal_digits),
         }
     }
 
@@ -716,6 +773,43 @@ pub struct HighPrecConfig {
     /// |prec' - target_prec| ≤ warm_start_tolerance_bits.
     /// Default 500 bits (~150 decimal digits) — spans a full HP-level step.
     pub warm_start_tolerance_bits: u32,
+    /// Algorithm used for the smallest Weil eigenstate.
+    ///
+    /// The default is [`CcmEigenstateSolver::Auto`]. It reuses an exact
+    /// current-N eigenstate when available; otherwise it can embed the nearest
+    /// compatible lower-N cached state as a Krylov starting hint. The
+    /// shift-invert route has a distinct cache identity and can reuse the same
+    /// matrix and LU artifacts without relabeling legacy eigenpairs.
+    pub eigenstate_solver: CcmEigenstateSolver,
+    /// Maximum retained Krylov/Rayleigh-Ritz basis dimension.
+    pub krylov_subspace_dimension: usize,
+    /// Maximum number of thick-restart cycles for the Krylov route.
+    pub krylov_maximum_restarts: usize,
+    /// Number of non-requested Ritz guards retained at the target boundary.
+    pub krylov_guard_eigenpairs: usize,
+}
+
+/// CCM eigenstate algorithm policy. This is deliberately explicit because the
+/// two routes can differ in low-order bits and therefore never share an
+/// eigenpair cache identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CcmEigenstateSolver {
+    LegacyInverseIteration,
+    ShiftInvertKrylov,
+    /// Prefer an exact Krylov artifact, then an exact legacy artifact. On a
+    /// miss, discover the nearest compatible lower-N state across configured
+    /// cache layers and use it as a starting hint before computing Krylov.
+    Auto,
+}
+
+impl CcmEigenstateSolver {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyInverseIteration => "legacy_inverse_iteration",
+            Self::ShiftInvertKrylov => "shift_invert_krylov",
+            Self::Auto => "auto",
+        }
+    }
 }
 
 /// Root-finding method for the CCM high-precision Riemann-zero refinement.
@@ -815,6 +909,10 @@ impl HighPrecConfig {
             warm_start: true,
             // Tolerance in bits for warm-start lookup, default 500.
             warm_start_tolerance_bits: 500,
+            eigenstate_solver: CcmEigenstateSolver::Auto,
+            krylov_subspace_dimension: 32,
+            krylov_maximum_restarts: 64,
+            krylov_guard_eigenpairs: 2,
         }
     }
 }
@@ -2201,11 +2299,19 @@ fn decode_weil_eigenpair(
     CacheError,
 > {
     let prec = cfg.precision_bits;
-    if artifact.schema_version != 2
+    let expected_schema = match cfg.eigenstate_solver {
+        CcmEigenstateSolver::LegacyInverseIteration => 2,
+        CcmEigenstateSolver::ShiftInvertKrylov => 3,
+        CcmEigenstateSolver::Auto => {
+            unreachable!("automatic eigenstate policy is resolved before payload decoding")
+        }
+    };
+    if artifact.schema_version != expected_schema
         || artifact.lambda_squared != lambda_squared_cache_identity(params)
         || artifact.n_modes != params.n_modes
         || artifact.precision_bits != prec
         || artifact.force_even != cfg.force_even
+        || artifact.eigenstate_route != cfg.eigenstate_solver.as_str()
         || artifact.eigenvector.len() != params.matrix_size()
     {
         return Err(CacheError::InvalidManifest(
@@ -2228,10 +2334,61 @@ fn decode_weil_eigenpair(
         .map(|entry| parse(entry))
         .collect::<std::result::Result<_, _>>()?;
     let diagnostics = artifact.inverse_iteration.to_runtime(prec)?;
-    if diagnostics.configured_step_limit != cfg.inverse_iter_steps {
-        return Err(CacheError::InvalidManifest(
-            "CCM Weil eigenpair uses a different inverse-iteration limit".to_owned(),
-        ));
+    match cfg.eigenstate_solver {
+        CcmEigenstateSolver::LegacyInverseIteration => {
+            if diagnostics.configured_step_limit != cfg.inverse_iter_steps
+                || artifact.shift_invert_krylov.is_some()
+            {
+                return Err(CacheError::InvalidManifest(
+                    "CCM Weil eigenpair uses incompatible inverse-iteration evidence".to_owned(),
+                ));
+            }
+        }
+        CcmEigenstateSolver::ShiftInvertKrylov => {
+            let krylov = artifact.shift_invert_krylov.as_ref().ok_or_else(|| {
+                CacheError::InvalidManifest(
+                    "CCM Krylov eigenpair omits its route-specific stopping evidence".to_owned(),
+                )
+            })?;
+            let parse_metric = |value: &str, name: &str| {
+                Float::parse(value)
+                    .map(|parsed| Float::with_val(prec, parsed))
+                    .map_err(|error| {
+                        CacheError::InvalidManifest(format!(
+                            "CCM Krylov {name} is not a valid HP scalar: {error}"
+                        ))
+                    })
+            };
+            let tau_residual = parse_metric(&krylov.final_relative_tau_residual, "Tau residual")?;
+            let backward = parse_metric(&krylov.final_scaled_backward_error, "backward error")?;
+            let stability = parse_metric(&krylov.maximum_ritz_value_stability, "Ritz stability")?;
+            if krylov.algorithm_semantics
+                != "ccm_even_zero_shift_thick_restart_shift_invert_krylov_rayleigh_ritz_v1"
+                || krylov.status != "converged"
+                || krylov.requested_eigenpairs != 1
+                || krylov.guard_eigenpairs != cfg.krylov_guard_eigenpairs
+                || krylov.maximum_subspace_dimension
+                    != cfg.krylov_subspace_dimension.min(params.n_modes + 1)
+                || krylov.maximum_restarts != cfg.krylov_maximum_restarts
+                || krylov.restarts == 0
+                || krylov.restarts > krylov.maximum_restarts
+                || krylov.shifted_solves == 0
+                || krylov.operator_applications == 0
+                || !tau_residual.is_finite()
+                || !backward.is_finite()
+                || !stability.is_finite()
+                || tau_residual < 0
+                || backward < 0
+                || stability < 0
+            {
+                return Err(CacheError::InvalidManifest(
+                    "CCM Krylov eigenpair has invalid or mismatched stopping evidence".to_owned(),
+                ));
+            }
+        }
+        CcmEigenstateSolver::Auto => {
+            unreachable!("automatic eigenstate policy is resolved before payload decoding")
+        }
     }
     if !weil_eigvec_cache::residual_ok(tau, params.matrix_size(), &xi, &eps_n, prec) {
         return Err(CacheError::InvalidManifest(
@@ -2250,6 +2407,13 @@ fn decode_weil_eigenpair(
             "CCM Weil eigenpair stopping evidence does not match its replayed Tau residual"
                 .to_owned(),
         ));
+    }
+    if let Some(krylov) = &artifact.shift_invert_krylov {
+        if replayed_residual.to_string() != krylov.final_relative_tau_residual {
+            return Err(CacheError::InvalidManifest(
+                "CCM Krylov full-Tau replay does not match its stored stopping evidence".to_owned(),
+            ));
+        }
     }
     Ok((eps_n, xi, diagnostics))
 }
@@ -4083,12 +4247,14 @@ fn analyze_sector_gap_inner(
         RetainedCcmSource {
             tau,
             tau_manifest: Some(tau_manifest),
+            eigenpair_manifest: None,
             secular_manifest: None,
         }
     } else {
         RetainedCcmSource {
             tau: build_tau_hp(params, &l, cfg)?,
             tau_manifest: None,
+            eigenpair_manifest: None,
             secular_manifest: None,
         }
     };
@@ -4466,6 +4632,139 @@ fn resolve_factorization_via_cache(
     Ok((factors, manifest))
 }
 
+struct BorrowedDenseSymmetricHp<'a> {
+    name: &'static str,
+    dimension: usize,
+    entries: &'a [Float],
+    precision_bits: u32,
+}
+
+impl LinearOperator<Float> for BorrowedDenseSymmetricHp<'_> {
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    fn apply(&self, x: &[Float], y: &mut [Float]) -> std::result::Result<(), OperatorError> {
+        if x.len() != self.dimension {
+            return Err(OperatorError::DimensionMismatch {
+                expected: self.dimension,
+                actual: x.len(),
+            });
+        }
+        if y.len() != self.dimension {
+            return Err(OperatorError::DimensionMismatch {
+                expected: self.dimension,
+                actual: y.len(),
+            });
+        }
+        for (row, output) in self.entries.chunks_exact(self.dimension).zip(y.iter_mut()) {
+            let mut sum = Float::with_val(self.precision_bits, 0);
+            for (entry, component) in row.iter().zip(x) {
+                let mut term = Float::with_val(self.precision_bits, entry);
+                term *= component;
+                sum += term;
+            }
+            *output = sum;
+        }
+        Ok(())
+    }
+
+    fn metadata(&self) -> OperatorMetadata {
+        let mut metadata = OperatorMetadata::new(
+            self.name,
+            self.dimension,
+            MatrixStructure::Dense,
+            "rug_mpfr",
+        );
+        metadata.symmetric = true;
+        metadata
+    }
+
+    fn application_error_bound(&self) -> ApplicationErrorBound<Float> {
+        ApplicationErrorBound::Exact
+    }
+}
+
+impl SymmetricOperator<Float> for BorrowedDenseSymmetricHp<'_> {}
+
+struct RetainedCcmLuShiftInvert<'a> {
+    factors: &'a xc_numerics::linalg::LuFactors,
+    dimension: usize,
+    precision_bits: u32,
+    id: String,
+}
+
+impl xc_solver::ShiftInvertSolveHp for RetainedCcmLuShiftInvert<'_> {
+    fn descriptor(&self) -> xc_solver::ShiftInvertFactorizationDescriptorHp {
+        xc_solver::ShiftInvertFactorizationDescriptorHp {
+            id: self.id.clone(),
+            dimension: self.dimension,
+            shift: DecimalLiteral::new("0").expect("zero is a valid decimal literal"),
+            factorization_precision_bits: self.precision_bits,
+            exact_shifted_solve: true,
+            approximation_error_bound: None,
+        }
+    }
+
+    fn solve_shifted(
+        &self,
+        right_hand_side: &[Float],
+        output: &mut [Float],
+        working_precision_bits: u32,
+    ) -> std::result::Result<(), xc_solver::SolverError> {
+        if working_precision_bits != self.precision_bits
+            || right_hand_side.len() != self.dimension
+            || output.len() != self.dimension
+        {
+            return Err(xc_solver::SolverError::InvalidConfiguration(
+                "retained CCM LU solve has incompatible precision or dimensions".to_owned(),
+            ));
+        }
+        let solution = xc_numerics::linalg::lu_solve(
+            self.factors,
+            right_hand_side,
+            self.dimension,
+            working_precision_bits,
+        );
+        output.clone_from_slice(&solution);
+        Ok(())
+    }
+}
+
+fn krylov_tolerance(precision_bits: u32) -> DecimalLiteral {
+    // Make the projected stopping threshold slightly stricter than the
+    // established full-Tau replay floor 2^-(precision_bits-32). The replay
+    // remains authoritative, but the Krylov route should reach it before
+    // declaring convergence rather than failing only during serialization.
+    let decimal_digits =
+        u64::from(precision_bits.saturating_sub(24)).saturating_mul(30_103) / 100_000;
+    DecimalLiteral::new(format!("1e-{}", decimal_digits.max(12)))
+        .expect("generated Krylov tolerance is a valid decimal literal")
+}
+
+fn krylov_inverse_compatibility_diagnostics(
+    report: &xc_solver::ShiftInvertKrylovReportHp,
+) -> xc_numerics::linalg::InverseIterationDiagnostics {
+    use xc_numerics::linalg::ShiftedRefinementOutcome;
+    let configured_step_limit = report
+        .maximum_subspace_dimension
+        .saturating_mul(report.restarts.max(1));
+    xc_numerics::linalg::InverseIterationDiagnostics {
+        configured_step_limit,
+        unshifted_steps: report.shifted_solves.min(configured_step_limit),
+        unshifted_converged: report.status == ResultStatus::Converged,
+        final_relative_rayleigh_change: Some(report.maximum_ritz_value_stability.clone()),
+        shifted_refinement: ShiftedRefinementOutcome::Accepted,
+        final_relative_residual_norm: report
+            .retained_eigenpairs
+            .first()
+            .map(|pair| pair.scaled_backward_error.clone())
+            .unwrap_or_else(|| {
+                Float::with_val(report.factorization.factorization_precision_bits, 0)
+            }),
+    }
+}
+
 fn weil_eigenpair_via_cache(
     params: &CcmParams,
     cfg: &HighPrecConfig,
@@ -4479,12 +4778,17 @@ fn weil_eigenpair_via_cache(
     xc_numerics::linalg::InverseIterationDiagnostics,
     ArtifactManifest,
 )> {
+    weil_eigenpair_via_cache_with_seed(params, cfg, l, tau, tau_manifest, cache, None, None)
+}
+
+fn weil_eigenpair_cache_identity(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+) -> Result<(SemanticKeyEnvelope, String)> {
     let prec = cfg.precision_bits;
-    let semantic_key = SemanticKeyEnvelope {
-        schema_version: 1,
-        artifact_kind: "ccm_weil_eigenpair".to_owned(),
-        mathematical_semantics_version: "ccm-smallest-weil-eigenpair-v0.13.0-v3".to_owned(),
-        resolved_mathematical_parameters: serde_json::json!({
+    let route = cfg.eigenstate_solver.as_str();
+    let resolved_mathematical_parameters = match cfg.eigenstate_solver {
+        CcmEigenstateSolver::LegacyInverseIteration => serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
             "precision_bits": prec,
@@ -4493,22 +4797,393 @@ fn weil_eigenpair_via_cache(
             "normalization": "sum_xi_equals_sqrt_log_lambda_squared",
             "inverse_iteration_step_limit": cfg.inverse_iter_steps
         }),
+        CcmEigenstateSolver::ShiftInvertKrylov => serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": prec,
+            "scalar_backend": "rug_mpfr",
+            "force_even": cfg.force_even,
+            "normalization": "sum_xi_equals_sqrt_log_lambda_squared",
+            "eigenstate_route": route,
+            "krylov_subspace_dimension": cfg.krylov_subspace_dimension,
+            "krylov_maximum_restarts": cfg.krylov_maximum_restarts,
+            "krylov_guard_eigenpairs": cfg.krylov_guard_eigenpairs
+        }),
+        CcmEigenstateSolver::Auto => {
+            bail!("automatic CCM eigenstate selection must be resolved before key construction")
+        }
+    };
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_weil_eigenpair".to_owned(),
+        mathematical_semantics_version: match cfg.eigenstate_solver {
+            CcmEigenstateSolver::LegacyInverseIteration => {
+                "ccm-smallest-weil-eigenpair-v0.13.0-v3"
+            }
+            CcmEigenstateSolver::ShiftInvertKrylov => {
+                "ccm-smallest-weil-eigenpair-shift-invert-krylov-v1"
+            }
+            CcmEigenstateSolver::Auto => unreachable!(),
+        }
+        .to_owned(),
+        resolved_mathematical_parameters,
         normalization: Some("sum_xi_equals_sqrt_log_lambda_squared".to_owned()),
         target: Some("smallest_weil_form_eigenpair".to_owned()),
         subspace: cfg.force_even.then(|| "even".to_owned()),
         source_data_identities: BTreeMap::new(),
         algorithm_semantics: Some(
-            "dense_inverse_iteration_with_half_precision_basin_shifted_rescue_and_full_tau_residual_gate_v1"
-                .to_owned(),
+            match cfg.eigenstate_solver {
+                CcmEigenstateSolver::LegacyInverseIteration =>
+                    "dense_inverse_iteration_with_half_precision_basin_shifted_rescue_and_full_tau_residual_gate_v1",
+                CcmEigenstateSolver::ShiftInvertKrylov =>
+                    "ccm_even_zero_shift_thick_restart_shift_invert_krylov_rayleigh_ritz_v1",
+                CcmEigenstateSolver::Auto => unreachable!(),
+            }
+            .to_owned(),
         ),
     };
-    let logical_key = format!(
-        "ccm/weil-eigenpair/{}/{}/{}/{}",
-        lambda_squared_cache_identity(params),
-        params.n_modes,
-        prec,
-        if cfg.force_even { "even" } else { "natural" }
+    let logical_key = match cfg.eigenstate_solver {
+        CcmEigenstateSolver::LegacyInverseIteration => format!(
+            "ccm/weil-eigenpair/{}/{}/{}/{}",
+            lambda_squared_cache_identity(params),
+            params.n_modes,
+            prec,
+            if cfg.force_even { "even" } else { "natural" }
+        ),
+        CcmEigenstateSolver::ShiftInvertKrylov => format!(
+            "ccm/weil-eigenpair/{}/{}/{}/{}/{}",
+            lambda_squared_cache_identity(params),
+            params.n_modes,
+            prec,
+            if cfg.force_even { "even" } else { "natural" },
+            route
+        ),
+        CcmEigenstateSolver::Auto => unreachable!(),
+    };
+    Ok((semantic_key, logical_key))
+}
+
+fn accepted_identity_exists(
+    semantic_key: &SemanticKeyEnvelope,
+    logical_key: &str,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<bool> {
+    let (Some(resolver), Some(policy)) = (cache.resolver, cache.acceptance) else {
+        return Ok(false);
+    };
+    let key = ArtifactKey {
+        kind: semantic_key.artifact_kind.clone(),
+        logical_key: logical_key.to_owned(),
+        parameters_digest: semantic_key.digest()?,
+    };
+    match resolver.resolve_manifest(&key, policy) {
+        Ok(_) => Ok(true),
+        Err(CacheError::NotFound(_)) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn continuation_key_n_modes(
+    key: &ArtifactKey,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+) -> Option<usize> {
+    let fields: Vec<_> = key.logical_key.split('/').collect();
+    if fields.len() < 6
+        || fields[0] != "ccm"
+        || fields[1] != "weil-eigenpair"
+        || fields[2] != lambda_squared_cache_identity(params)
+        || fields[4] != cfg.precision_bits.to_string()
+        || fields[5] != "even"
+    {
+        return None;
+    }
+    fields[3].parse().ok()
+}
+
+fn discover_lower_n_continuation_seed(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<Option<(Vec<Float>, ArtifactManifest)>> {
+    let (Some(resolver), Some(policy)) = (cache.resolver, cache.acceptance) else {
+        return Ok(None);
+    };
+    let discovery_started = Instant::now();
+    let mut keys = resolver
+        .ccm_eigenpair_continuation_keys(
+            &xc_cache::CcmEigenpairContinuationQuery {
+                lambda_squared: lambda_squared_cache_identity(params),
+                maximum_n_modes: params.n_modes,
+                precision_bits: cfg.precision_bits,
+                force_even: cfg.force_even,
+            },
+            32,
+        )
+        .map_err(anyhow::Error::from)?;
+    keys.retain(|key| {
+        continuation_key_n_modes(key, params, cfg).is_some_and(|n_modes| n_modes < params.n_modes)
+    });
+    keys.sort_by(|left, right| {
+        continuation_key_n_modes(right, params, cfg)
+            .cmp(&continuation_key_n_modes(left, params, cfg))
+            .then_with(|| left.parameters_digest.cmp(&right.parameters_digest))
+    });
+    for key in keys {
+        let source_n =
+            continuation_key_n_modes(&key, params, cfg).expect("filtered continuation key has N");
+        let resolved = match resolver.resolve(&key, policy) {
+            Ok(resolved) => resolved,
+            Err(CacheError::NotFound(_)) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let artifact: PortableWeilEigenpair = serde_json::from_slice(&resolved.payload)
+            .map_err(CacheError::from)
+            .map_err(anyhow::Error::from)?;
+        if artifact.lambda_squared != lambda_squared_cache_identity(params)
+            || artifact.n_modes != source_n
+            || artifact.precision_bits != cfg.precision_bits
+            || !artifact.force_even
+            || artifact.eigenvector.len() != 2 * source_n + 1
+            || !matches!(
+                artifact.eigenstate_route.as_str(),
+                "legacy_inverse_iteration" | "shift_invert_krylov"
+            )
+        {
+            continue;
+        }
+        let mut full_state = Vec::with_capacity(artifact.eigenvector.len());
+        let mut valid = true;
+        for scalar in &artifact.eigenvector {
+            match Float::parse(scalar) {
+                Ok(parsed) => {
+                    let value = Float::with_val(cfg.precision_bits, parsed);
+                    valid &= value.is_finite();
+                    full_state.push(value);
+                }
+                Err(_) => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if !valid {
+            continue;
+        }
+        let seed = embedded_even_continuation_seed(
+            &full_state,
+            source_n,
+            params.n_modes,
+            cfg.precision_bits,
+        )?;
+        eprintln!(
+            "[HP] Auto eigenstate seed: reused compatible N={} state from {} (digest={}); indexed lookup={:.3}s",
+            source_n,
+            resolved.layer_name,
+            &resolved.manifest.content_digest.0[..12],
+            discovery_started.elapsed().as_secs_f64(),
+        );
+        return Ok(Some((seed, resolved.manifest)));
+    }
+    eprintln!(
+        "[HP] Auto eigenstate seed: no indexed lower-N state found in {:.3}s",
+        discovery_started.elapsed().as_secs_f64()
     );
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn weil_eigenpair_via_cache_with_seed(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    tau: &[Float],
+    tau_manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+    continuation_seed: Option<&[Float]>,
+    continuation_manifest: Option<&ArtifactManifest>,
+) -> Result<(
+    Float,
+    Vec<Float>,
+    xc_numerics::linalg::InverseIterationDiagnostics,
+    ArtifactManifest,
+)> {
+    if cfg.eigenstate_solver == CcmEigenstateSolver::Auto {
+        let mut selected = cfg.clone();
+        let consult_exact_cache = matches!(
+            cache.mode,
+            xc_cache::ArtifactExecutionCacheMode::PreferReuse
+                | xc_cache::ArtifactExecutionCacheMode::RequireReuse
+        );
+        let discover_automatic_seed =
+            cache.mode == xc_cache::ArtifactExecutionCacheMode::PreferReuse;
+        if !cfg.force_even {
+            selected.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
+            return weil_eigenpair_via_cache_with_seed(
+                params,
+                &selected,
+                l,
+                tau,
+                tau_manifest,
+                cache,
+                None,
+                None,
+            );
+        }
+        selected.eigenstate_solver = CcmEigenstateSolver::ShiftInvertKrylov;
+        let (semantic_key, logical_key) = weil_eigenpair_cache_identity(params, &selected)?;
+        if consult_exact_cache && accepted_identity_exists(&semantic_key, &logical_key, cache)? {
+            return weil_eigenpair_via_cache_with_seed(
+                params,
+                &selected,
+                l,
+                tau,
+                tau_manifest,
+                cache,
+                continuation_seed,
+                continuation_manifest,
+            );
+        }
+        selected.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
+        let (semantic_key, logical_key) = weil_eigenpair_cache_identity(params, &selected)?;
+        if consult_exact_cache && accepted_identity_exists(&semantic_key, &logical_key, cache)? {
+            return weil_eigenpair_via_cache_with_seed(
+                params,
+                &selected,
+                l,
+                tau,
+                tau_manifest,
+                cache,
+                None,
+                None,
+            );
+        }
+        if params.n_modes <= cfg.krylov_guard_eigenpairs {
+            return weil_eigenpair_via_cache_with_seed(
+                params,
+                &selected,
+                l,
+                tau,
+                tau_manifest,
+                cache,
+                None,
+                None,
+            );
+        }
+        let discovered_seed;
+        let discovered_manifest;
+        let (seed, seed_manifest) = if continuation_seed.is_some() {
+            (continuation_seed, continuation_manifest)
+        } else if discover_automatic_seed {
+            if let Some((seed, manifest)) =
+                discover_lower_n_continuation_seed(params, &selected, cache)?
+            {
+                discovered_seed = seed;
+                discovered_manifest = manifest;
+                (Some(discovered_seed.as_slice()), Some(&discovered_manifest))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+        selected.eigenstate_solver = CcmEigenstateSolver::ShiftInvertKrylov;
+        return weil_eigenpair_via_cache_with_seed(
+            params,
+            &selected,
+            l,
+            tau,
+            tau_manifest,
+            cache,
+            seed,
+            seed_manifest,
+        );
+    }
+    let prec = cfg.precision_bits;
+    if cfg.eigenstate_solver == CcmEigenstateSolver::ShiftInvertKrylov && !cfg.force_even {
+        bail!("shift-invert Krylov CCM currently requires force_even=true");
+    }
+    let route = cfg.eigenstate_solver.as_str();
+    let seed_identity = continuation_manifest.map_or_else(
+        || "canonical".to_owned(),
+        |manifest| format!("from-eigenpair-{}", manifest.content_digest.0),
+    );
+    let resolved_mathematical_parameters = match cfg.eigenstate_solver {
+        CcmEigenstateSolver::LegacyInverseIteration => serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": prec,
+            "scalar_backend": "rug_mpfr",
+            "force_even": cfg.force_even,
+            "normalization": "sum_xi_equals_sqrt_log_lambda_squared",
+            "inverse_iteration_step_limit": cfg.inverse_iter_steps
+        }),
+        CcmEigenstateSolver::ShiftInvertKrylov => serde_json::json!({
+            "lambda_squared": lambda_squared_cache_identity(params),
+            "n_modes": params.n_modes,
+            "precision_bits": prec,
+            "scalar_backend": "rug_mpfr",
+            "force_even": cfg.force_even,
+            "normalization": "sum_xi_equals_sqrt_log_lambda_squared",
+            "eigenstate_route": route,
+            "krylov_subspace_dimension": cfg.krylov_subspace_dimension,
+            "krylov_maximum_restarts": cfg.krylov_maximum_restarts,
+            "krylov_guard_eigenpairs": cfg.krylov_guard_eigenpairs
+        }),
+        CcmEigenstateSolver::Auto => {
+            unreachable!("automatic eigenstate policy is resolved before key construction")
+        }
+    };
+    let semantic_key = SemanticKeyEnvelope {
+        schema_version: 1,
+        artifact_kind: "ccm_weil_eigenpair".to_owned(),
+        mathematical_semantics_version: match cfg.eigenstate_solver {
+            CcmEigenstateSolver::LegacyInverseIteration => {
+                "ccm-smallest-weil-eigenpair-v0.13.0-v3"
+            }
+            CcmEigenstateSolver::ShiftInvertKrylov => {
+                "ccm-smallest-weil-eigenpair-shift-invert-krylov-v1"
+            }
+            CcmEigenstateSolver::Auto => unreachable!(
+                "automatic eigenstate policy is resolved before key construction"
+            ),
+        }
+        .to_owned(),
+        resolved_mathematical_parameters,
+        normalization: Some("sum_xi_equals_sqrt_log_lambda_squared".to_owned()),
+        target: Some("smallest_weil_form_eigenpair".to_owned()),
+        subspace: cfg.force_even.then(|| "even".to_owned()),
+        source_data_identities: BTreeMap::new(),
+        algorithm_semantics: Some(match cfg.eigenstate_solver {
+            CcmEigenstateSolver::LegacyInverseIteration =>
+                "dense_inverse_iteration_with_half_precision_basin_shifted_rescue_and_full_tau_residual_gate_v1",
+            CcmEigenstateSolver::ShiftInvertKrylov =>
+                "ccm_even_zero_shift_thick_restart_shift_invert_krylov_rayleigh_ritz_v1",
+            CcmEigenstateSolver::Auto => unreachable!(
+                "automatic eigenstate policy is resolved before key construction"
+            ),
+        }.to_owned()),
+    };
+    let logical_key = match cfg.eigenstate_solver {
+        CcmEigenstateSolver::LegacyInverseIteration => format!(
+            "ccm/weil-eigenpair/{}/{}/{}/{}",
+            lambda_squared_cache_identity(params),
+            params.n_modes,
+            prec,
+            if cfg.force_even { "even" } else { "natural" }
+        ),
+        CcmEigenstateSolver::ShiftInvertKrylov => format!(
+            "ccm/weil-eigenpair/{}/{}/{}/{}/{}",
+            lambda_squared_cache_identity(params),
+            params.n_modes,
+            prec,
+            if cfg.force_even { "even" } else { "natural" },
+            route
+        ),
+        CcmEigenstateSolver::Auto => {
+            unreachable!("automatic eigenstate policy is resolved before key construction")
+        }
+    };
     let request = ArtifactExecutionCacheRequest {
         operation: "ccm.weil_eigenpair.resolve_or_compute",
         semantic_key: &semantic_key,
@@ -4533,7 +5208,7 @@ fn weil_eigenpair_via_cache(
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            let (eps_n, xi, diagnostics, factor_manifest) = if cfg.force_even {
+            let (eps_n, xi, diagnostics, factor_manifest, krylov_diagnostics) = if cfg.force_even {
                 let (sector, sector_manifest) =
                     resolve_even_sector_matrix_via_cache(params, cfg, tau, tau_manifest, cache)
                         .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
@@ -4546,23 +5221,126 @@ fn weil_eigenpair_via_cache(
                     cache,
                 )
                 .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
-                let output = xc_numerics::linalg::inverse_iteration_from_factors_detailed(
-                    &sector,
-                    &factors,
-                    params.n_modes + 1,
-                    prec,
-                    cfg.inverse_iter_steps,
-                    false,
-                    None,
-                )
-                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
-                let expanded = expand_even_sector_vector(&output.eigenvector, params.n_modes, prec);
-                (
-                    output.eigenvalue,
-                    normalize_eigenvector(&expanded, l, prec),
-                    output.diagnostics,
-                    factor_manifest,
-                )
+                match cfg.eigenstate_solver {
+                    CcmEigenstateSolver::LegacyInverseIteration => {
+                        let output = xc_numerics::linalg::inverse_iteration_from_factors_detailed(
+                            &sector,
+                            &factors,
+                            params.n_modes + 1,
+                            prec,
+                            cfg.inverse_iter_steps,
+                            false,
+                            None,
+                        )
+                        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                        let expanded =
+                            expand_even_sector_vector(&output.eigenvector, params.n_modes, prec);
+                        (
+                            output.eigenvalue,
+                            normalize_eigenvector(&expanded, l, prec),
+                            output.diagnostics,
+                            factor_manifest,
+                            None,
+                        )
+                    }
+                    CcmEigenstateSolver::ShiftInvertKrylov => {
+                        let dimension = params.n_modes + 1;
+                        let maximum_subspace_dimension =
+                            cfg.krylov_subspace_dimension.min(dimension);
+                        if maximum_subspace_dimension
+                            <= 1usize.saturating_add(cfg.krylov_guard_eigenpairs)
+                        {
+                            return Err(CacheError::InvalidManifest(
+                                "CCM Krylov subspace must exceed the requested plus guard block"
+                                    .to_owned(),
+                            ));
+                        }
+                        let operator = BorrowedDenseSymmetricHp {
+                            name: "ccm-even-sector",
+                            dimension,
+                            entries: &sector,
+                            precision_bits: prec,
+                        };
+                        let shifted = RetainedCcmLuShiftInvert {
+                            factors: &factors,
+                            dimension,
+                            precision_bits: prec,
+                            id: format!("ccm-even-lu:{}", factor_manifest.content_digest.0),
+                        };
+                        let tolerance = krylov_tolerance(prec);
+                        let solver_config = xc_solver::ShiftInvertKrylovConfigHp {
+                            target: EigenTarget::SmallestMagnitude,
+                            precision_bits: prec,
+                            requested_eigenpairs: 1,
+                            guard_eigenpairs: cfg.krylov_guard_eigenpairs,
+                            maximum_subspace_dimension,
+                            maximum_restarts: cfg.krylov_maximum_restarts,
+                            minimum_restarts: 2,
+                            maximum_projected_sweeps: 256,
+                            absolute_residual_tolerance: tolerance.clone(),
+                            scaled_backward_error_tolerance: tolerance.clone(),
+                            ritz_value_stability_tolerance: tolerance.clone(),
+                            boundary_cluster_tolerance: tolerance,
+                        };
+                        let initial_basis = continuation_seed
+                            .map(|seed| vec![seed.to_vec()])
+                            .unwrap_or_default();
+                        let report = xc_solver::ShiftInvertKrylovSolverHp
+                            .solve_with_initial_basis(
+                                &operator,
+                                &shifted,
+                                &solver_config,
+                                &initial_basis,
+                            )
+                            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                        if report.status != ResultStatus::Converged
+                            || report.boundary_cluster.is_some()
+                            || report.retained_eigenpairs.is_empty()
+                        {
+                            return Err(CacheError::InvalidManifest(format!(
+                                "CCM shift-invert Krylov did not produce an unambiguous converged target: status={:?}, boundary_cluster={}",
+                                report.status,
+                                report.boundary_cluster.is_some()
+                            )));
+                        }
+                        let pair = &report.retained_eigenpairs[0];
+                        let expanded =
+                            expand_even_sector_vector(&pair.eigenvector, params.n_modes, prec);
+                        let diagnostics = krylov_inverse_compatibility_diagnostics(&report);
+                        let portable = PortableShiftInvertKrylovDiagnostics {
+                            algorithm_semantics:
+                                "ccm_even_zero_shift_thick_restart_shift_invert_krylov_rayleigh_ritz_v1"
+                                    .to_owned(),
+                            factorization_id: report.factorization.id.clone(),
+                            requested_eigenpairs: report.requested_eigenpairs,
+                            guard_eigenpairs: cfg.krylov_guard_eigenpairs,
+                            maximum_subspace_dimension: report.maximum_subspace_dimension,
+                            maximum_restarts: cfg.krylov_maximum_restarts,
+                            restarts: report.restarts,
+                            shifted_solves: report.shifted_solves,
+                            operator_applications: report.operator_applications,
+                            status: "converged".to_owned(),
+                            maximum_ritz_value_stability: report
+                                .maximum_ritz_value_stability
+                                .to_string(),
+                            final_scaled_backward_error: pair
+                                .scaled_backward_error
+                                .to_string(),
+                            final_relative_tau_residual: "pending_full_tau_replay".to_owned(),
+                            seed_identity: seed_identity.clone(),
+                        };
+                        (
+                            pair.eigenvalue.clone(),
+                            normalize_eigenvector(&expanded, l, prec),
+                            diagnostics,
+                            factor_manifest,
+                            Some(portable),
+                        )
+                    }
+                    CcmEigenstateSolver::Auto => {
+                        unreachable!("automatic eigenstate policy is resolved before computation")
+                    }
+                }
             } else {
                 let (factors, factor_manifest) =
                     resolve_factorization_via_cache(params, cfg, tau, tau_manifest, "full", cache)
@@ -4582,6 +5360,7 @@ fn weil_eigenpair_via_cache(
                     normalize_eigenvector(&output.eigenvector, l, prec),
                     output.diagnostics,
                     factor_manifest,
+                    None,
                 )
             };
             let mut diagnostics = diagnostics;
@@ -4597,24 +5376,27 @@ fn weil_eigenpair_via_cache(
                     "CCM inverse iteration produced an invalid eigenvector".to_owned(),
                 )
             })?;
+            let krylov_diagnostics = krylov_diagnostics.map(|mut value| {
+                value.final_relative_tau_residual =
+                    diagnostics.final_relative_residual_norm.to_string();
+                value
+            });
             Ok((
                 PortableWeilEigenpair {
-                    schema_version: 2,
+                    schema_version: if krylov_diagnostics.is_some() { 3 } else { 2 },
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
                     precision_bits: prec,
                     force_even: cfg.force_even,
+                    eigenstate_route: route.to_owned(),
                     eigenvalue: eps_n.to_string(),
                     eigenvector: xi.iter().map(Float::to_string).collect(),
                     inverse_iteration: PortableInverseIterationDiagnostics::from_runtime(
                         &diagnostics,
                     ),
+                    shift_invert_krylov: krylov_diagnostics,
                 },
-                vec![DependencyRef {
-                    key: factor_manifest.key,
-                    content_digest: factor_manifest.content_digest,
-                    required_quality: CacheQuality::Validated,
-                }],
+                canonical_dependency_refs(vec![factor_manifest]),
             ))
         },
         |artifact| decode_weil_eigenpair(artifact, params, cfg, tau).map(|_| ()),
@@ -5119,6 +5901,49 @@ fn validate_reference_seed_dataset(
     }
 }
 
+fn residual_replay_matches(
+    stored: &Float,
+    replayed: Option<&Float>,
+    replay_term_scale: Option<&Float>,
+    term_count: usize,
+    precision_bits: u32,
+) -> bool {
+    let Some(replayed) = replayed else {
+        return false;
+    };
+    if !stored.is_finite() || !replayed.is_finite() || stored < &0 || replayed < &0 {
+        return false;
+    }
+    if stored == replayed {
+        return true;
+    }
+    let Some(replay_term_scale) = replay_term_scale else {
+        return false;
+    };
+    if !replay_term_scale.is_finite() || replay_term_scale < &0 || term_count == 0 {
+        return false;
+    }
+    let mut difference = Float::with_val(precision_bits, stored);
+    difference -= replayed;
+    difference.abs_mut();
+    // Portable decimal round-tripping can change cancellation-dominated
+    // residuals in their low-order bits. Compare the replay to the stored
+    // residual itself, not to the unrelated Halley correction tolerance.
+    //
+    // Each term performs a pole multiply, subtraction, division, and ordered
+    // addition. Bound their aggregate roundoff by the absolute term sum,
+    // operation count, and the MPFR working unit. This remains meaningful
+    // under severe cancellation; a relative comparison to the tiny final
+    // residual does not.
+    let unit_bits = precision_bits.saturating_sub(4).max(1);
+    let mut tolerance = Float::with_val(precision_bits, 2).pow(-(unit_bits as i32));
+    tolerance *= replay_term_scale;
+    tolerance *= u32::try_from(term_count)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(8);
+    difference <= tolerance
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_root_range(
     artifact: &PortableRootRange,
@@ -5201,28 +6026,43 @@ fn decode_root_range(
         let value = &result.value;
         let correction_meets_target = result.diagnostics.final_correction
             < root_correction_tolerance(value, cfg.precision_bits);
-        if result.diagnostics.iterations > cfg.solver_steps
-            || (status == "converged" && !correction_meets_target)
+        let replayed_digits = achieved_decimal_digits(
+            value,
+            &result.diagnostics.final_correction,
+            cfg.precision_bits,
+        );
+        let replayed = secular_residual_and_scale_at(
+            xi,
+            params.n_modes,
+            &two_pi_over_l,
+            value,
+            cfg.precision_bits,
+        );
+        let replayed_residual = replayed.as_ref().map(|(residual, _)| residual);
+        let replay_term_scale = replayed.as_ref().map(|(_, scale)| scale);
+        let invalid_iterations = result.diagnostics.iterations > cfg.solver_steps;
+        let invalid_status = (status == "converged" && !correction_meets_target)
             || (status != "converged" && correction_meets_target)
-            || (status == "approximate" && result.diagnostics.iterations != cfg.solver_steps)
-            || achieved_decimal_digits(
-                value,
-                &result.diagnostics.final_correction,
-                cfg.precision_bits,
-            ) != result.diagnostics.achieved_decimal_digits
-            || secular_residual_at(
-                xi,
-                params.n_modes,
-                &two_pi_over_l,
-                value,
-                cfg.precision_bits,
-            )
-            .is_none_or(|residual| residual != result.diagnostics.residual)
-        {
-            return Err(CacheError::InvalidManifest(
-                "validated CCM root-range payload has inconsistent convergence diagnostics"
-                    .to_owned(),
-            ));
+            || (status == "approximate" && result.diagnostics.iterations != cfg.solver_steps);
+        let digits_mismatch = replayed_digits != result.diagnostics.achieved_decimal_digits;
+        let residual_mismatch = !residual_replay_matches(
+            &result.diagnostics.residual,
+            replayed_residual,
+            replay_term_scale,
+            params.matrix_size(),
+            cfg.precision_bits,
+        );
+        if invalid_iterations || invalid_status || digits_mismatch || residual_mismatch {
+            return Err(CacheError::InvalidManifest(format!(
+                "validated CCM root-range payload has inconsistent convergence diagnostics: status={status}, iterations={}/{}, correction_meets_target={}, digits_mismatch={}, residual_mismatch={}, stored_residual={}, replayed_residual={}",
+                result.diagnostics.iterations,
+                cfg.solver_steps,
+                correction_meets_target,
+                digits_mismatch,
+                residual_mismatch,
+                result.diagnostics.residual,
+                replayed_residual.map_or_else(|| "none".to_owned(), Float::to_string)
+            )));
         }
         if value <= &Float::with_val(cfg.precision_bits, 0)
             || previous.is_some_and(|prior| value <= prior)
@@ -5504,13 +6344,25 @@ fn resolve_root_range_via_cache(
                 .into_iter()
                 .map(|outcome| match outcome {
                     EigenvalueResult::Converged(result) => PortableRootOutcome::Converged(
-                        PortableRootRefinement::from_runtime(&result),
+                        if cfg.eigenstate_solver == CcmEigenstateSolver::LegacyInverseIteration {
+                            PortableRootRefinement::from_runtime(&result)
+                        } else {
+                            PortableRootRefinement::from_runtime_lossless(&result)
+                        },
                     ),
                     EigenvalueResult::Stagnated(result) => PortableRootOutcome::Stagnated(
-                        PortableRootRefinement::from_runtime(&result),
+                        if cfg.eigenstate_solver == CcmEigenstateSolver::LegacyInverseIteration {
+                            PortableRootRefinement::from_runtime(&result)
+                        } else {
+                            PortableRootRefinement::from_runtime_lossless(&result)
+                        },
                     ),
                     EigenvalueResult::Approximate(result) => PortableRootOutcome::Approximate(
-                        PortableRootRefinement::from_runtime(&result),
+                        if cfg.eigenstate_solver == CcmEigenstateSolver::LegacyInverseIteration {
+                            PortableRootRefinement::from_runtime(&result)
+                        } else {
+                            PortableRootRefinement::from_runtime_lossless(&result)
+                        },
                     ),
                     EigenvalueResult::Failed { iterations, reason } => {
                         PortableRootOutcome::Failed { iterations, reason }
@@ -5805,6 +6657,7 @@ fn run_with_research_capture(
             cache
                 .map(CcmCacheRoute::Fabric)
                 .unwrap_or(CcmCacheRoute::Standalone),
+            None,
         )?;
         let root_certificate = if let Some(certification) = &options.root_certification {
             let certification_started = Instant::now();
@@ -6092,6 +6945,137 @@ pub fn run_indexed_seeded_via_cache(
     })
 }
 
+/// One member of a strictly increasing cross-N CCM continuation sweep.
+#[derive(Debug, Clone)]
+pub struct CcmIndexedSeededSweepPoint {
+    pub params: CcmParams,
+    pub first_root_index: usize,
+    pub zero_seeds: Vec<Float>,
+}
+
+fn embedded_even_continuation_seed(
+    full_state: &[Float],
+    source_n: usize,
+    target_n: usize,
+    precision_bits: u32,
+) -> Result<Vec<Float>> {
+    if target_n <= source_n || full_state.len() != 2 * source_n + 1 {
+        bail!("cross-N continuation requires a valid full state and strictly increasing N");
+    }
+    let mut seed = vec![Float::with_val(precision_bits, 0); target_n + 1];
+    seed[0] = Float::with_val(precision_bits, &full_state[source_n]);
+    let sqrt_two = Float::with_val(precision_bits, 2).sqrt();
+    for mode in 1..=source_n {
+        let mut component = Float::with_val(precision_bits, &full_state[source_n - mode]);
+        component += &full_state[source_n + mode];
+        component /= &sqrt_two;
+        seed[mode] = component;
+    }
+    Ok(seed)
+}
+
+fn validate_continuation_sweep(
+    points: &[CcmIndexedSeededSweepPoint],
+    cfg: &HighPrecConfig,
+    dataset: &ReferenceZeroDatasetIdentity,
+) -> Result<()> {
+    if points.is_empty() {
+        bail!("cross-N continuation sweep requires at least one point");
+    }
+    if cfg.eigenstate_solver != CcmEigenstateSolver::ShiftInvertKrylov || !cfg.force_even {
+        bail!("cross-N continuation requires the forced-even shift-invert Krylov route");
+    }
+    for point in points {
+        validate_reference_seed_dataset(
+            RootArtifactMode::ReferenceSeededRefinement,
+            Some(dataset),
+            point.first_root_index,
+            point.zero_seeds.len(),
+        )?;
+    }
+    for pair in points.windows(2) {
+        if pair[0].params.lambda_sq != pair[1].params.lambda_sq
+            || pair[0].params.n_modes >= pair[1].params.n_modes
+        {
+            bail!(
+                "cross-N continuation requires one lambda-squared value and strictly increasing N"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Execute a seeded, strictly increasing N sweep in one caller-owned cache
+/// session. The accepted full eigenstate at N is deterministically embedded
+/// into the even sector at the next N. Its exact eigenpair content digest is
+/// part of the successor cache identity.
+pub fn run_indexed_seeded_n_sweep_via_cache(
+    points: &[CcmIndexedSeededSweepPoint],
+    cfg: &HighPrecConfig,
+    dataset: &ReferenceZeroDatasetIdentity,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<Vec<HighPrecResult>> {
+    validate_continuation_sweep(points, cfg, dataset)?;
+    xc_numerics::hp_runtime::run_hp(|| {
+        let mut results = Vec::with_capacity(points.len());
+        let mut continuation_seed: Option<Vec<Float>> = None;
+        let mut continuation_manifest: Option<ArtifactManifest> = None;
+        for (position, point) in points.iter().enumerate() {
+            let acquisition = RootAcquisition::ReferenceSeeded {
+                first_root_index: point.first_root_index,
+                seeds: &point.zero_seeds,
+                dataset,
+            };
+            let (result, retained) = run_inner_retaining_source(
+                &point.params,
+                cfg,
+                acquisition,
+                CcmCacheRoute::Fabric(cache),
+                continuation_seed
+                    .as_deref()
+                    .zip(continuation_manifest.as_ref()),
+            )?;
+            let eigenpair_manifest = retained.eigenpair_manifest.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("cross-N continuation did not retain its eigenpair manifest")
+            })?;
+            if let Some(next) = points.get(position + 1) {
+                continuation_seed = Some(embedded_even_continuation_seed(
+                    &result.xi,
+                    point.params.n_modes,
+                    next.params.n_modes,
+                    cfg.precision_bits,
+                )?);
+                continuation_manifest = Some(eigenpair_manifest.clone());
+            }
+            results.push(result);
+        }
+        Ok(results)
+    })
+}
+
+/// Managed-session wrapper for [`run_indexed_seeded_n_sweep_via_cache`].
+/// Publication inventory is finalized once after the complete sweep.
+pub fn run_indexed_seeded_n_sweep(
+    points: &[CcmIndexedSeededSweepPoint],
+    cfg: &HighPrecConfig,
+    dataset: &ReferenceZeroDatasetIdentity,
+) -> Result<Vec<HighPrecResult>> {
+    validate_continuation_sweep(points, cfg, dataset)?;
+    let managed = xc_cache::ManagedArtifactCacheSession::from_environment()
+        .map_err(anyhow::Error::from)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cross-N continuation requires a managed cache session so retained LU and seed provenance are explicit"
+            )
+        })?;
+    let cache = managed.context();
+    let results = run_indexed_seeded_n_sweep_via_cache(points, cfg, dataset, &cache)?;
+    managed
+        .finalize_publication_inventory()
+        .map_err(anyhow::Error::from)?;
+    Ok(results)
+}
+
 fn independently_discovered_starting_points(
     params: &CcmParams,
     l: &Float,
@@ -6359,7 +7343,8 @@ fn run_inner(
     acquisition: RootAcquisition<'_>,
     cache_route: CcmCacheRoute<'_>,
 ) -> Result<HighPrecResult> {
-    run_inner_retaining_source(params, cfg, acquisition, cache_route).map(|(result, _)| result)
+    run_inner_retaining_source(params, cfg, acquisition, cache_route, None)
+        .map(|(result, _)| result)
 }
 
 fn run_inner_retaining_source(
@@ -6367,10 +7352,18 @@ fn run_inner_retaining_source(
     cfg: &HighPrecConfig,
     acquisition: RootAcquisition<'_>,
     cache_route: CcmCacheRoute<'_>,
+    continuation: Option<(&[Float], &ArtifactManifest)>,
 ) -> Result<(HighPrecResult, RetainedCcmSource)> {
     let start = Instant::now();
     let prec = cfg.precision_bits;
     let dim = params.matrix_size();
+    if cfg.eigenstate_solver == CcmEigenstateSolver::ShiftInvertKrylov
+        && matches!(&cache_route, CcmCacheRoute::Standalone)
+    {
+        bail!(
+            "CCM shift-invert Krylov requires a managed cache context so its retained LU dependency and route-specific artifact identity are explicit"
+        );
+    }
 
     let l = log_lambda_sq_hp(params, prec);
     let tau_started = Instant::now();
@@ -6402,7 +7395,10 @@ fn run_inner_retaining_source(
     let eigenstate_started = Instant::now();
     let (eps_n, xi, inverse_iteration_diagnostics, eigenpair_manifest) =
         if let CcmCacheRoute::Fabric(cache) = &cache_route {
-            let (eps_n, xi, diagnostics, manifest) = weil_eigenpair_via_cache(
+            let (seed, seed_manifest) = continuation
+                .map(|(seed, manifest)| (Some(seed), Some(manifest)))
+                .unwrap_or((None, None));
+            let (eps_n, xi, diagnostics, manifest) = weil_eigenpair_via_cache_with_seed(
                 params,
                 cfg,
                 &l,
@@ -6411,6 +7407,8 @@ fn run_inner_retaining_source(
                     .as_ref()
                     .expect("fabric tau route retains its exact manifest"),
                 cache,
+                seed,
+                seed_manifest,
             )?;
             (eps_n, xi, diagnostics, Some(manifest))
         } else {
@@ -6718,6 +7716,7 @@ fn run_inner_retaining_source(
         RetainedCcmSource {
             tau,
             tau_manifest,
+            eigenpair_manifest,
             secular_manifest,
         },
     ))
@@ -8356,7 +9355,18 @@ fn secular_residual_at(
     z: &Float,
     prec: u32,
 ) -> Option<Float> {
+    secular_residual_and_scale_at(xi, n_max, two_pi_over_l, z, prec).map(|(residual, _)| residual)
+}
+
+fn secular_residual_and_scale_at(
+    xi: &[Float],
+    n_max: usize,
+    two_pi_over_l: &Float,
+    z: &Float,
+    prec: u32,
+) -> Option<(Float, Float)> {
     let mut residual = Float::with_val(prec, 0);
+    let mut term_scale = Float::with_val(prec, 0);
     for j in -(n_max as i64)..=(n_max as i64) {
         let idx = (j + n_max as i64) as usize;
         let mut pole = two_pi_over_l.clone();
@@ -8368,9 +9378,10 @@ fn secular_residual_at(
         }
         let mut term = xi[idx].clone();
         term /= denominator;
+        term_scale += Float::with_val(prec, &term).abs();
         residual += term;
     }
-    Some(residual.abs())
+    Some((residual.abs(), term_scale))
 }
 
 fn achieved_decimal_digits(value: &Float, correction: &Float, prec: u32) -> Float {
@@ -9995,6 +11006,104 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    #[test]
+    fn legacy_eigenstate_payload_keeps_its_established_json_shape() {
+        let artifact = PortableWeilEigenpair {
+            schema_version: 2,
+            lambda_squared: "13".to_owned(),
+            n_modes: 1,
+            precision_bits: 192,
+            force_even: true,
+            eigenstate_route: legacy_eigenstate_route_name(),
+            eigenvalue: "1".to_owned(),
+            eigenvector: vec!["0".to_owned(), "1".to_owned(), "0".to_owned()],
+            inverse_iteration: PortableInverseIterationDiagnostics {
+                configured_step_limit: 2_000,
+                unshifted_steps: 2_000,
+                unshifted_converged: false,
+                final_relative_rayleigh_change: Some("1e-40".to_owned()),
+                shifted_refinement: "accepted".to_owned(),
+                final_relative_residual_norm: "1e-50".to_owned(),
+            },
+            shift_invert_krylov: None,
+        };
+        let value = serde_json::to_value(artifact).unwrap();
+        assert!(value.get("eigenstate_route").is_none());
+        assert!(value.get("shift_invert_krylov").is_none());
+        assert_eq!(
+            HighPrecConfig::for_decimal_digits(100).eigenstate_solver,
+            CcmEigenstateSolver::Auto
+        );
+    }
+
+    #[test]
+    fn legacy_and_krylov_eigenstate_cache_identities_are_disjoint() {
+        let params = CcmParams::from_lambda_sq_integer(13, 120);
+        let mut legacy = HighPrecConfig::for_decimal_digits(1_000);
+        legacy.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
+        let (legacy_semantic, legacy_logical) =
+            weil_eigenpair_cache_identity(&params, &legacy).unwrap();
+        assert_eq!(
+            legacy_logical,
+            format!("ccm/weil-eigenpair/13/120/{}/even", legacy.precision_bits)
+        );
+        assert_eq!(
+            legacy_semantic.mathematical_semantics_version,
+            "ccm-smallest-weil-eigenpair-v0.13.0-v3"
+        );
+        assert_eq!(
+            legacy_semantic.resolved_mathematical_parameters,
+            serde_json::json!({
+                "lambda_squared": "13",
+                "n_modes": 120,
+                "precision_bits": legacy.precision_bits,
+                "scalar_backend": "rug_mpfr",
+                "force_even": true,
+                "normalization": "sum_xi_equals_sqrt_log_lambda_squared",
+                "inverse_iteration_step_limit": 2_000
+            })
+        );
+
+        let mut krylov = legacy.clone();
+        krylov.eigenstate_solver = CcmEigenstateSolver::ShiftInvertKrylov;
+        let (krylov_semantic, krylov_logical) =
+            weil_eigenpair_cache_identity(&params, &krylov).unwrap();
+        assert_eq!(
+            krylov_logical,
+            format!(
+                "ccm/weil-eigenpair/13/120/{}/even/shift_invert_krylov",
+                krylov.precision_bits
+            )
+        );
+        assert_ne!(
+            legacy_semantic.digest().unwrap(),
+            krylov_semantic.digest().unwrap()
+        );
+        assert_ne!(legacy_logical, krylov_logical);
+    }
+
+    #[test]
+    fn cross_n_seed_preserves_the_even_basis_coordinates() {
+        let precision = 192;
+        // Full centered coordinates for N=2: [a2, a1, a0, a1, a2].
+        let full: Vec<Float> = [3, 2, 1, 2, 3]
+            .into_iter()
+            .map(|value| Float::with_val(precision, value))
+            .collect();
+        let seed = embedded_even_continuation_seed(&full, 2, 4, precision).unwrap();
+        assert_eq!(seed.len(), 5);
+        assert_eq!(seed[0], 1);
+        let sqrt_two = Float::with_val(precision, 2).sqrt();
+        let mut expected_one = Float::with_val(precision, 2);
+        expected_one *= &sqrt_two;
+        let mut expected_two = Float::with_val(precision, 3);
+        expected_two *= sqrt_two;
+        assert_eq!(seed[1], expected_one);
+        assert_eq!(seed[2], expected_two);
+        assert!(seed[3].is_zero());
+        assert!(seed[4].is_zero());
+    }
+
     fn test_reference_dataset() -> ReferenceZeroDatasetIdentity {
         ReferenceZeroDatasetIdentity {
             schema_version: 1,
@@ -10296,9 +11405,33 @@ mod tests {
     }
 
     #[test]
+    fn residual_replay_is_compared_to_the_stored_residual_not_correction_floor() {
+        let precision_bits = 729;
+        let residual = Float::with_val(precision_bits, Float::parse("1.17184766e-198").unwrap());
+        // This residual is intentionally much larger than a roughly 1e-200
+        // correction target. Identical replay is nevertheless valid evidence.
+        assert!(residual_replay_matches(
+            &residual,
+            Some(&residual),
+            Some(&Float::with_val(precision_bits, 1)),
+            61,
+            precision_bits
+        ));
+        let changed = Float::with_val(precision_bits, Float::parse("1.27184766e-198").unwrap());
+        assert!(!residual_replay_matches(
+            &residual,
+            Some(&changed),
+            Some(&Float::with_val(precision_bits, 1)),
+            61,
+            precision_bits
+        ));
+    }
+
+    #[test]
     fn computed_cache_replays_stagnated_root_evidence_without_claiming_convergence() {
         let mut cfg = HighPrecConfig::for_decimal_digits(60);
         cfg.precision_bits = 256;
+        cfg.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
         let params = CcmParams::from_lambda_sq_integer(13, 1);
         let l = Float::with_val(cfg.precision_bits, 13).ln();
         let xi = vec![Float::with_val(cfg.precision_bits, 1); params.matrix_size()];
@@ -10503,6 +11636,72 @@ mod tests {
             second_run.weil_min_eigenvalue
         );
         assert_eq!(first_run.xi, second_run.xi);
+        let auto_next_params = CcmParams::from_lambda_sq_integer(5, 3);
+        let auto_next =
+            run_indexed_seeded_via_cache(&auto_next_params, &cfg, 1, &seeds, &dataset, &context)
+                .unwrap();
+        assert_eq!(auto_next.xi.len(), 7);
+        let mut resolved_auto_cfg = cfg.clone();
+        resolved_auto_cfg.eigenstate_solver = CcmEigenstateSolver::ShiftInvertKrylov;
+        let (auto_next_semantic, auto_next_logical) =
+            weil_eigenpair_cache_identity(&auto_next_params, &resolved_auto_cfg).unwrap();
+        let auto_next_key = ArtifactKey {
+            kind: auto_next_semantic.artifact_kind.clone(),
+            logical_key: auto_next_logical,
+            parameters_digest: auto_next_semantic.digest().unwrap(),
+        };
+        let auto_next_artifact = resolver.resolve(&auto_next_key, &policy).unwrap();
+        let auto_next_payload: PortableWeilEigenpair =
+            serde_json::from_slice(&auto_next_artifact.payload).unwrap();
+        assert!(auto_next_payload
+            .shift_invert_krylov
+            .as_ref()
+            .unwrap()
+            .seed_identity
+            .starts_with("from-eigenpair-"));
+        let mut krylov_cfg = cfg.clone();
+        krylov_cfg.eigenstate_solver = CcmEigenstateSolver::ShiftInvertKrylov;
+        krylov_cfg.krylov_guard_eigenpairs = 1;
+        krylov_cfg.krylov_subspace_dimension = 4;
+        krylov_cfg.krylov_maximum_restarts = 16;
+        let krylov_run =
+            run_indexed_seeded_via_cache(&params, &krylov_cfg, 1, &seeds, &dataset, &context)
+                .unwrap();
+        let mut route_difference = krylov_run.weil_min_eigenvalue.clone();
+        route_difference -= &first_run.weil_min_eigenvalue;
+        route_difference.abs_mut();
+        assert!(
+            route_difference
+                < Float::with_val(cfg.precision_bits, 2).pow(-((cfg.precision_bits as i32) - 48))
+        );
+        assert!(weil_eigvec_cache::residual_ok(
+            &first.0,
+            params.matrix_size(),
+            &krylov_run.xi,
+            &krylov_run.weil_min_eigenvalue,
+            cfg.precision_bits
+        ));
+        let sweep = run_indexed_seeded_n_sweep_via_cache(
+            &[
+                CcmIndexedSeededSweepPoint {
+                    params: params.clone(),
+                    first_root_index: 1,
+                    zero_seeds: seeds.clone(),
+                },
+                CcmIndexedSeededSweepPoint {
+                    params: CcmParams::from_lambda_sq_integer(5, 3),
+                    first_root_index: 1,
+                    zero_seeds: seeds.clone(),
+                },
+            ],
+            &krylov_cfg,
+            &dataset,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(sweep.len(), 2);
+        assert_eq!(sweep[0].xi.len(), 5);
+        assert_eq!(sweep[1].xi.len(), 7);
         assert_eq!(first_run.eigenvalues_pos.len(), 1);
         assert_eq!(first_run.spectral_root_index_range(), Some(1..=1));
         let first_indexed =
@@ -11118,6 +12317,7 @@ mod tests {
             &cfg,
             RootAcquisition::SourceOnly,
             CcmCacheRoute::Standalone,
+            None,
         )
         .unwrap();
         let source_digest = ContentDigest::sha256(b"exact-test-secular-source");

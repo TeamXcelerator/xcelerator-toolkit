@@ -2,10 +2,286 @@
 
 use crate::{
     canonical_digest, ArtifactAssuranceState, ArtifactDisposition, CacheError, CacheVisibility,
-    ContentDigest, ToolkitVersion, GITHUB_SAFE_REPOSITORY_PAYLOAD_BYTES,
+    ContentDigest, SemanticKeyEnvelope, ToolkitVersion, GITHUB_SAFE_REPOSITORY_PAYLOAD_BYTES,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+
+pub const CCM_EIGENPAIR_CONTINUATION_ARTIFACT_KIND: &str = "ccm_weil_eigenpair";
+
+/// Compatibility coordinates for locating a lower-N CCM eigenstate without
+/// enumerating hash-partitioned manifests.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CcmEigenpairContinuationQuery {
+    pub lambda_squared: String,
+    pub maximum_n_modes: usize,
+    pub precision_bits: u32,
+    pub force_even: bool,
+}
+
+impl CcmEigenpairContinuationQuery {
+    pub fn validate(&self) -> Result<(), CacheError> {
+        if self.lambda_squared.trim().is_empty()
+            || self.maximum_n_modes == 0
+            || self.precision_bits == 0
+        {
+            return Err(CacheError::InvalidManifest(
+                "CCM eigenpair continuation query is incomplete".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn index_identity(&self) -> CcmEigenpairContinuationIndexIdentity {
+        CcmEigenpairContinuationIndexIdentity {
+            schema_version: 1,
+            lambda_squared: self.lambda_squared.clone(),
+            precision_bits: self.precision_bits,
+            force_even: self.force_even,
+        }
+    }
+
+    pub fn repository_path(&self) -> Result<String, CacheError> {
+        self.validate()?;
+        let digest = canonical_digest(&self.index_identity())?;
+        Ok(format!("inventories/ccm-weil-eigenpair/{}.json", digest.0))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CcmEigenpairContinuationIndexIdentity {
+    schema_version: u32,
+    lambda_squared: String,
+    precision_bits: u32,
+    force_even: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CcmEigenpairContinuationEntry {
+    pub n_modes: usize,
+    pub eigenstate_route: String,
+    pub logical_key: String,
+    pub semantic_digest: ContentDigest,
+    pub manifest_digest: ContentDigest,
+    pub achieved_assurance: ArtifactAssuranceState,
+    pub disposition: ArtifactDisposition,
+    pub producer_toolkit_version: ToolkitVersion,
+    pub minimum_reader_version: ToolkitVersion,
+}
+
+impl CcmEigenpairContinuationEntry {
+    pub fn validate(&self) -> Result<(), CacheError> {
+        if self.n_modes == 0
+            || !matches!(
+                self.eigenstate_route.as_str(),
+                "legacy_inverse_iteration" | "shift_invert_krylov"
+            )
+            || self.logical_key.trim().is_empty()
+            || !self.semantic_digest.validate()
+            || !self.manifest_digest.validate()
+        {
+            return Err(CacheError::InvalidManifest(
+                "CCM eigenpair continuation entry is invalid".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Small derived index stored once per (lambda-squared, precision, sector).
+/// It is mutable shard metadata; immutable artifact identities remain in the
+/// canonical manifest and primary semantic-digest index.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CcmEigenpairContinuationIndex {
+    pub schema_version: u32,
+    pub lambda_squared: String,
+    pub precision_bits: u32,
+    pub force_even: bool,
+    pub entries: Vec<CcmEigenpairContinuationEntry>,
+}
+
+impl CcmEigenpairContinuationIndex {
+    pub fn rebuild(
+        query: &CcmEigenpairContinuationQuery,
+        mut entries: Vec<CcmEigenpairContinuationEntry>,
+    ) -> Result<Self, CacheError> {
+        query.validate()?;
+        entries.sort_by(|left, right| {
+            left.n_modes
+                .cmp(&right.n_modes)
+                .then_with(|| left.eigenstate_route.cmp(&right.eigenstate_route))
+                .then_with(|| left.semantic_digest.cmp(&right.semantic_digest))
+        });
+        let index = Self {
+            schema_version: 1,
+            lambda_squared: query.lambda_squared.clone(),
+            precision_bits: query.precision_bits,
+            force_even: query.force_even,
+            entries,
+        };
+        index.validate()?;
+        Ok(index)
+    }
+
+    pub fn validate(&self) -> Result<(), CacheError> {
+        let query = CcmEigenpairContinuationQuery {
+            lambda_squared: self.lambda_squared.clone(),
+            maximum_n_modes: usize::MAX,
+            precision_bits: self.precision_bits,
+            force_even: self.force_even,
+        };
+        if self.schema_version != 1 {
+            return Err(CacheError::InvalidManifest(
+                "unsupported CCM eigenpair continuation index schema".to_owned(),
+            ));
+        }
+        query.validate()?;
+        let mut previous = None;
+        for entry in &self.entries {
+            entry.validate()?;
+            let identity = (
+                entry.n_modes,
+                entry.eigenstate_route.as_str(),
+                &entry.semantic_digest,
+            );
+            if previous.is_some_and(|previous| previous >= identity) {
+                return Err(CacheError::InvalidManifest(
+                    "CCM eigenpair continuation entries are duplicated or unordered".to_owned(),
+                ));
+            }
+            previous = Some(identity);
+        }
+        Ok(())
+    }
+
+    pub fn query(
+        &self,
+        query: &CcmEigenpairContinuationQuery,
+        current_toolkit_version: &ToolkitVersion,
+        maximum_keys: usize,
+    ) -> Result<Vec<crate::ArtifactKey>, CacheError> {
+        self.validate()?;
+        query.validate()?;
+        if self.lambda_squared != query.lambda_squared
+            || self.precision_bits != query.precision_bits
+            || self.force_even != query.force_even
+        {
+            return Err(CacheError::InvalidManifest(
+                "CCM eigenpair continuation index has the wrong compatibility identity".to_owned(),
+            ));
+        }
+        let mut entries = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.n_modes < query.maximum_n_modes
+                    && entry.disposition == ArtifactDisposition::Active
+                    && entry.achieved_assurance.mathematical().is_some()
+                    && &entry.minimum_reader_version <= current_toolkit_version
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            right
+                .n_modes
+                .cmp(&left.n_modes)
+                .then_with(|| left.eigenstate_route.cmp(&right.eigenstate_route))
+                .then_with(|| left.semantic_digest.cmp(&right.semantic_digest))
+        });
+        entries.truncate(maximum_keys);
+        Ok(entries
+            .into_iter()
+            .map(|entry| crate::ArtifactKey {
+                kind: CCM_EIGENPAIR_CONTINUATION_ARTIFACT_KIND.to_owned(),
+                logical_key: entry.logical_key.clone(),
+                parameters_digest: entry.semantic_digest.clone(),
+            })
+            .collect())
+    }
+}
+
+pub fn ccm_eigenpair_continuation_entry(
+    semantic_key: &SemanticKeyEnvelope,
+    logical_key: &str,
+    manifest_digest: ContentDigest,
+    achieved_assurance: ArtifactAssuranceState,
+    disposition: ArtifactDisposition,
+    producer_toolkit_version: ToolkitVersion,
+    minimum_reader_version: ToolkitVersion,
+) -> Result<Option<(CcmEigenpairContinuationQuery, CcmEigenpairContinuationEntry)>, CacheError> {
+    if semantic_key.artifact_kind != CCM_EIGENPAIR_CONTINUATION_ARTIFACT_KIND {
+        return Ok(None);
+    }
+    semantic_key.validate()?;
+    let parameters = semantic_key
+        .resolved_mathematical_parameters
+        .as_object()
+        .ok_or_else(|| {
+            CacheError::InvalidManifest(
+                "CCM eigenpair semantic parameters must be an object".to_owned(),
+            )
+        })?;
+    let lambda_squared = parameters
+        .get("lambda_squared")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CacheError::InvalidManifest(
+                "CCM eigenpair semantic key lacks lambda-squared".to_owned(),
+            )
+        })?
+        .to_owned();
+    let n_modes = parameters
+        .get("n_modes")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| {
+            CacheError::InvalidManifest("CCM eigenpair semantic key lacks N".to_owned())
+        })?;
+    let precision_bits = parameters
+        .get("precision_bits")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            CacheError::InvalidManifest("CCM eigenpair semantic key lacks precision".to_owned())
+        })?;
+    let force_even = parameters
+        .get("force_even")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            CacheError::InvalidManifest(
+                "CCM eigenpair semantic key lacks sector identity".to_owned(),
+            )
+        })?;
+    let eigenstate_route = parameters
+        .get("eigenstate_route")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("legacy_inverse_iteration")
+        .to_owned();
+    let semantic_digest = semantic_key.digest()?;
+    let query = CcmEigenpairContinuationQuery {
+        lambda_squared,
+        maximum_n_modes: n_modes.saturating_add(1),
+        precision_bits,
+        force_even,
+    };
+    let entry = CcmEigenpairContinuationEntry {
+        n_modes,
+        eigenstate_route,
+        logical_key: logical_key.to_owned(),
+        semantic_digest,
+        manifest_digest,
+        achieved_assurance,
+        disposition,
+        producer_toolkit_version,
+        minimum_reader_version,
+    };
+    query.validate()?;
+    entry.validate()?;
+    Ok(Some((query, entry)))
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -691,5 +967,91 @@ mod tests {
             (&pair[0].semantic_digest, &pair[0].manifest_digest)
                 <= (&pair[1].semantic_digest, &pair[1].manifest_digest)
         }));
+    }
+
+    #[test]
+    fn continuation_inventory_returns_nearest_compatible_lower_n() {
+        let query = CcmEigenpairContinuationQuery {
+            lambda_squared: "13".to_owned(),
+            maximum_n_modes: 30,
+            precision_bits: 729,
+            force_even: true,
+        };
+        let make_entry = |n_modes: usize, route: &str| CcmEigenpairContinuationEntry {
+            n_modes,
+            eigenstate_route: route.to_owned(),
+            logical_key: format!("ccm/weil-eigenpair/13/{n_modes}/729/even/{route}"),
+            semantic_digest: ContentDigest::sha256(
+                format!("semantic-{n_modes}-{route}").as_bytes(),
+            ),
+            manifest_digest: ContentDigest::sha256(
+                format!("manifest-{n_modes}-{route}").as_bytes(),
+            ),
+            achieved_assurance: ArtifactAssuranceState::Computed,
+            disposition: ArtifactDisposition::Active,
+            producer_toolkit_version: ToolkitVersion::parse("0.13.2").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+        };
+        let index = CcmEigenpairContinuationIndex::rebuild(
+            &query,
+            vec![
+                make_entry(10, "shift_invert_krylov"),
+                make_entry(20, "shift_invert_krylov"),
+                make_entry(30, "shift_invert_krylov"),
+            ],
+        )
+        .unwrap();
+        let keys = index
+            .query(&query, &ToolkitVersion::parse("0.13.2").unwrap(), 8)
+            .unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].logical_key.contains("/20/"));
+        assert!(keys[1].logical_key.contains("/10/"));
+        assert_eq!(
+            query.repository_path().unwrap(),
+            CcmEigenpairContinuationQuery {
+                maximum_n_modes: 999,
+                ..query
+            }
+            .repository_path()
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn continuation_entry_is_derived_without_reopening_a_manifest() {
+        let semantic_key = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: CCM_EIGENPAIR_CONTINUATION_ARTIFACT_KIND.to_owned(),
+            mathematical_semantics_version: "fixture".to_owned(),
+            resolved_mathematical_parameters: serde_json::json!({
+                "lambda_squared": "13",
+                "n_modes": 20,
+                "precision_bits": 729,
+                "force_even": true,
+                "eigenstate_route": "shift_invert_krylov"
+            }),
+            normalization: Some("fixture".to_owned()),
+            target: Some("smallest_weil_form_eigenpair".to_owned()),
+            subspace: Some("even".to_owned()),
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: Some("fixture".to_owned()),
+        };
+        let semantic_digest = semantic_key.digest().unwrap();
+        let (query, entry) = ccm_eigenpair_continuation_entry(
+            &semantic_key,
+            "ccm/weil-eigenpair/13/20/729/even/shift_invert_krylov",
+            ContentDigest::sha256(b"manifest"),
+            ArtifactAssuranceState::Computed,
+            ArtifactDisposition::Active,
+            ToolkitVersion::parse("0.13.2").unwrap(),
+            ToolkitVersion::parse("0.13.0").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(query.lambda_squared, "13");
+        assert_eq!(query.precision_bits, 729);
+        assert_eq!(entry.n_modes, 20);
+        assert_eq!(entry.semantic_digest, semantic_digest);
     }
 }

@@ -826,9 +826,9 @@ fn persist_publication_execution_report(
 fn format_publication_completion(
     assurance: xc_core::AssuranceLevel,
     target: xc_core::PublicationTarget,
-    artifact_count: usize,
-    target_copy_count: usize,
-    total_bytes: u64,
+    staged_candidate_count: usize,
+    eligible_target_candidate_count: usize,
+    eligible_target_candidate_bytes: u64,
     completed_transactions: usize,
     transaction_count: usize,
     current_tree_paths_removed: usize,
@@ -849,13 +849,15 @@ fn format_publication_completion(
         xc_core::PublicationTarget::Both => "public + private",
     };
     format!(
-        "Publication complete:\n  artifacts: {artifact_count}\n  target copies: \
-         {target_copy_count}\n  targets: {target}\n  assurance: {assurance}\n  total packaged: \
-         {total_bytes} bytes ({:.1} MB)\n  completed transactions: \
+        "Publication complete:\n  staged candidates evaluated: {staged_candidate_count}\n  \
+         eligible target candidates before destination deduplication: \
+         {eligible_target_candidate_count}\n  targets: {target}\n  assurance: {assurance}\n  \
+         eligible packaged bytes before destination deduplication: \
+         {eligible_target_candidate_bytes} bytes ({:.1} MB)\n  completed transactions: \
          {completed_transactions}/{transaction_count}\n  old current-tree paths removed: \
          {current_tree_paths_removed}\n  phase report: {}\n  cumulative report: {} \
          ({cumulative_transaction_count} transactions across {phase_count} phases)",
-        total_bytes as f64 / 1_000_000.0,
+        eligible_target_candidate_bytes as f64 / 1_000_000.0,
         phase_report_path.display(),
         cumulative_report_path.display()
     )
@@ -1869,11 +1871,12 @@ mod tests {
             summary,
             concat!(
                 "Publication complete:\n",
-                "  artifacts: 3\n",
-                "  target copies: 6\n",
+                "  staged candidates evaluated: 3\n",
+                "  eligible target candidates before destination deduplication: 6\n",
                 "  targets: public + private\n",
                 "  assurance: computed\n",
-                "  total packaged: 61082844 bytes (61.1 MB)\n",
+                "  eligible packaged bytes before destination deduplication: ",
+                "61082844 bytes (61.1 MB)\n",
                 "  completed transactions: 2/2\n",
                 "  old current-tree paths removed: 7\n",
                 "  phase report: staging/publication-execution-reports/phase.json\n",

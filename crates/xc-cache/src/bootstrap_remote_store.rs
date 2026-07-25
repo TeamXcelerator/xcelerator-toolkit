@@ -40,6 +40,8 @@ pub struct GitHubBootstrapCacheStore {
     required: bool,
     remote: GitCliRemoteStore,
     resolved: Mutex<HashMap<ContentDigest, ResolvedRemoteArtifact>>,
+    discovered_keys: Mutex<HashMap<(String, String), Vec<ArtifactKey>>>,
+    continuation_inventory_lock: Mutex<()>,
     registry_snapshot: Mutex<Option<BootstrapRegistry>>,
     shard_revisions: Mutex<HashMap<String, String>>,
 }
@@ -75,6 +77,8 @@ impl GitHubBootstrapCacheStore {
             )?,
             root,
             resolved: Mutex::new(HashMap::new()),
+            discovered_keys: Mutex::new(HashMap::new()),
+            continuation_inventory_lock: Mutex::new(()),
             registry_snapshot: Mutex::new(None),
             shard_revisions: Mutex::new(HashMap::new()),
         })
@@ -205,7 +209,7 @@ impl GitHubBootstrapCacheStore {
         else {
             return Ok(None);
         };
-        let manifest_path = format!("manifests/{prefix}/{}.json", entry.manifest_digest.0);
+        let manifest_path = bootstrap_manifest_path(&key.parameters_digest, &entry.manifest_digest);
         let (manifest, manifest_source): (CanonicalArtifactManifest, _) =
             self.read_json(&repository, &revision, &manifest_path)?;
         manifest.validate()?;
@@ -263,6 +267,68 @@ impl GitHubBootstrapCacheStore {
         // The materializer repeats all payload/manifest/receipt identity checks.
         Ok(Some(resolved))
     }
+
+    fn local_continuation_inventory_path(
+        &self,
+        query: &CcmEigenpairContinuationQuery,
+    ) -> Result<PathBuf, CacheError> {
+        Ok(query
+            .repository_path()?
+            .split('/')
+            .fold(self.root.join("derived"), |path, component| {
+                path.join(component)
+            }))
+    }
+
+    fn record_local_continuation_entry(
+        &self,
+        logical_key: &str,
+        manifest: &CanonicalArtifactManifest,
+        manifest_digest: ContentDigest,
+        assurance: ArtifactAssuranceState,
+        disposition: ArtifactDisposition,
+    ) -> Result<(), CacheError> {
+        let Some((query, addition)) = ccm_eigenpair_continuation_entry(
+            &manifest.semantic_key,
+            logical_key,
+            manifest_digest,
+            assurance,
+            disposition,
+            manifest.producer_toolkit_version.clone(),
+            manifest.minimum_reader_version.clone(),
+        )?
+        else {
+            return Ok(());
+        };
+        let path = self.local_continuation_inventory_path(&query)?;
+        let _guard = self
+            .continuation_inventory_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut entries = if path.exists() {
+            let existing: CcmEigenpairContinuationIndex =
+                serde_json::from_slice(&fs::read(&path)?)?;
+            existing.validate()?;
+            existing.entries
+        } else {
+            Vec::new()
+        };
+        entries.retain(|entry| entry.semantic_digest != addition.semantic_digest);
+        entries.push(addition);
+        let inventory = CcmEigenpairContinuationIndex::rebuild(&query, entries)?;
+        crate::atomic_replace(&path, &serde_json::to_vec_pretty(&inventory)?)
+    }
+}
+
+fn bootstrap_manifest_path(
+    semantic_digest: &ContentDigest,
+    manifest_digest: &ContentDigest,
+) -> String {
+    format!(
+        "manifests/{}/{}.json",
+        &semantic_digest.0[..2],
+        manifest_digest.0
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -380,12 +446,112 @@ impl CacheStore for GitHubBootstrapCacheStore {
             tags,
             provenance_digest: Some(resolved.manifest.digest()?),
         };
+        self.record_local_continuation_entry(
+            &key.logical_key,
+            &resolved.manifest,
+            adapter_manifest
+                .provenance_digest
+                .clone()
+                .expect("remote adapter records canonical manifest identity"),
+            assurance,
+            resolved.index.disposition,
+        )?;
         self.resolved
             .lock()
             .map_err(|_| CacheError::Io("public cache lock poisoned".to_owned()))?
             .insert(adapter_manifest.content_digest.clone(), resolved);
         Ok(vec![adapter_manifest])
     }
+
+    fn matching_keys(
+        &self,
+        _kind: &str,
+        _logical_key_prefix: &str,
+        _maximum_keys: usize,
+    ) -> Result<Vec<ArtifactKey>, CacheError> {
+        // Hash-partitioned shard indexes do not contain logical keys. A
+        // generic prefix search would therefore require opening every
+        // canonical manifest and is intentionally unsupported for remote
+        // stores. Purpose-built secondary indexes provide bounded discovery.
+        Ok(Vec::new())
+    }
+
+    fn ccm_eigenpair_continuation_keys(
+        &self,
+        query: &CcmEigenpairContinuationQuery,
+        maximum_keys: usize,
+    ) -> Result<Vec<ArtifactKey>, CacheError> {
+        if maximum_keys == 0 {
+            return Ok(Vec::new());
+        }
+        query.validate()?;
+        let family = family_for_artifact_kind(CCM_EIGENPAIR_CONTINUATION_ARTIFACT_KIND)
+            .expect("CCM eigenpairs have a managed shard family");
+        let inventory_path = query.repository_path()?;
+        let cache_identity = (
+            CCM_EIGENPAIR_CONTINUATION_ARTIFACT_KIND.to_owned(),
+            format!("{inventory_path}#lt-{}", query.maximum_n_modes),
+        );
+        if let Some(cached) = self
+            .discovered_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&cache_identity)
+            .cloned()
+        {
+            return Ok(cached.into_iter().take(maximum_keys).collect());
+        }
+        let result = (|| {
+            let visibility_name = visibility_name(self.visibility);
+            let registry = self.registry_snapshot()?;
+            let route = registry
+                .families
+                .iter()
+                .find(|route| route.family == family)
+                .ok_or_else(|| {
+                    CacheError::NotFound(format!("{visibility_name} family {family}"))
+                })?;
+            let repository = format!("https://github.com/{}.git", route.current_writable_shard);
+            let revision = self.shard_revision(&repository)?;
+            let current = crate::current_toolkit_version()?;
+            let mut entries =
+                if let Ok(bytes) = fs::read(self.local_continuation_inventory_path(query)?) {
+                    let inventory: CcmEigenpairContinuationIndex = serde_json::from_slice(&bytes)?;
+                    inventory.validate()?;
+                    inventory.entries
+                } else {
+                    Vec::new()
+                };
+            match self.read_json::<CcmEigenpairContinuationIndex>(
+                &repository,
+                &revision,
+                &inventory_path,
+            ) {
+                Ok((inventory, _)) => {
+                    inventory.validate()?;
+                    for entry in inventory.entries {
+                        entries.retain(|current| current.semantic_digest != entry.semantic_digest);
+                        entries.push(entry);
+                    }
+                }
+                Err(CacheError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+            let inventory = CcmEigenpairContinuationIndex::rebuild(query, entries)?;
+            let keys = inventory.query(query, &current, maximum_keys)?;
+            self.discovered_keys
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(cache_identity, keys.clone());
+            Ok(keys)
+        })();
+        if self.required {
+            result
+        } else {
+            Ok(result.unwrap_or_default())
+        }
+    }
+
     fn read_payload_to(
         &self,
         manifest: &ArtifactManifest,
@@ -475,6 +641,16 @@ fn visibility_name(visibility: CacheVisibility) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_manifest_paths_are_partitioned_by_semantic_digest() {
+        let semantic_digest = ContentDigest(format!("01{}", "a".repeat(62)));
+        let manifest_digest = ContentDigest(format!("78{}", "b".repeat(62)));
+        assert_eq!(
+            bootstrap_manifest_path(&semantic_digest, &manifest_digest),
+            format!("manifests/01/{}.json", manifest_digest.0)
+        );
+    }
 
     struct BootstrapBatchFixture {
         batch: RepositoryPublicationBatch,

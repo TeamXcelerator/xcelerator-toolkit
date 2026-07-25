@@ -468,29 +468,30 @@ fn select_missing_destination_drafts<'a>(
                     && entry.producer_toolkit_version >= manifest.producer_toolkit_version
                     && entry.minimum_reader_version == manifest.minimum_reader_version
             }) {
+                let path = format!(
+                    "manifests/{}/{}.json",
+                    &entry.semantic_digest.0[..2],
+                    entry.manifest_digest
+                );
+                let document = reader.read_json::<crate::CanonicalArtifactManifest>(
+                    repository,
+                    revision,
+                    &path,
+                    cancellation,
+                )?;
+                document.value.validate()?;
+                if document.source.content_digest != entry.manifest_digest
+                    || document.value.digest()? != entry.manifest_digest
+                    || document.value.payload_digest != entry.canonical_payload_digest
+                {
+                    return Err(CacheError::InvalidManifest(format!(
+                        "destination index entry points to a non-canonical manifest {path:?}"
+                    )));
+                }
                 let exact = entry.manifest_digest == manifest_digest
                     && entry.canonical_payload_digest == manifest.payload_digest
                     && entry.transport_digests.contains(&transport_digest);
-                let dominates = if exact {
-                    true
-                } else {
-                    let path = format!(
-                        "manifests/{}/{}.json",
-                        &entry.semantic_digest.0[..2],
-                        entry.manifest_digest
-                    );
-                    let document = reader.read_json::<crate::CanonicalArtifactManifest>(
-                        repository,
-                        revision,
-                        &path,
-                        cancellation,
-                    )?;
-                    document.value.validate()?;
-                    document.source.content_digest == entry.manifest_digest
-                        && document.value.digest()? == entry.manifest_digest
-                        && document.value.payload_digest == entry.canonical_payload_digest
-                        && destination_manifest_dominates(&document.value, &manifest)
-                };
+                let dominates = exact || destination_manifest_dominates(&document.value, &manifest);
                 if dominates {
                     existing_candidates.push(entry);
                 }
@@ -976,6 +977,76 @@ fn execute_family_batch_publication(
             }
             let index = crate::ShardIndexPartition::rebuild(first.family.clone(), prefix, entries)?;
             let bytes = crate::protocol::canonical_json_bytes(&index)?;
+            files.insert(
+                path.clone(),
+                TransportPart {
+                    sequence: 0,
+                    repository_path: path.clone(),
+                    size_bytes: bytes.len() as u64,
+                    content_digest: ContentDigest::sha256(&bytes),
+                },
+            );
+            let target = staging_root.join(&path);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(target, bytes)?;
+        }
+        // Maintain a compact compatibility inventory for cross-N CCM
+        // continuation. The primary shard index is hash-partitioned and
+        // deliberately does not support semantic range queries; without this
+        // derived inventory a reader would have to open every eigenpair
+        // manifest merely to find the nearest lower N.
+        let mut continuation_updates = BTreeMap::<
+            String,
+            (
+                crate::CcmEigenpairContinuationQuery,
+                Vec<crate::CcmEigenpairContinuationEntry>,
+            ),
+        >::new();
+        for (draft, artifact) in pending_drafts.iter().zip(&prepared) {
+            let bundle = &artifact.bundles[&destination];
+            let manifest_digest = bundle.manifest.digest()?;
+            let Some((query, entry)) = crate::ccm_eigenpair_continuation_entry(
+                &bundle.manifest.semantic_key,
+                &draft.source_logical_key,
+                manifest_digest,
+                bundle.achieved_assurance,
+                bundle.disposition,
+                bundle.manifest.producer_toolkit_version.clone(),
+                bundle.manifest.minimum_reader_version.clone(),
+            )?
+            else {
+                continue;
+            };
+            let path = query.repository_path()?;
+            continuation_updates
+                .entry(path)
+                .or_insert_with(|| (query, Vec::new()))
+                .1
+                .push(entry);
+        }
+        for (path, (query, additions)) in continuation_updates {
+            let mut entries = match crate::RemoteShardReader::new(&remote, 16 * 1024 * 1024)?
+                .read_json::<crate::CcmEigenpairContinuationIndex>(
+                &repository_url,
+                &head,
+                &path,
+                &cancellation,
+            ) {
+                Ok(current) => {
+                    current.value.validate()?;
+                    current.value.entries
+                }
+                Err(CacheError::NotFound(_)) => Vec::new(),
+                Err(error) => return Err(error),
+            };
+            for addition in additions {
+                entries.retain(|entry| entry.semantic_digest != addition.semantic_digest);
+                entries.push(addition);
+            }
+            let inventory = crate::CcmEigenpairContinuationIndex::rebuild(&query, entries)?;
+            let bytes = crate::protocol::canonical_json_bytes(&inventory)?;
             files.insert(
                 path.clone(),
                 TransportPart {
@@ -1493,7 +1564,7 @@ fn target_manifest(
     draft: &CanonicalProductionDraft,
     destination: PublicationDestination,
 ) -> Result<crate::CanonicalArtifactManifest, CacheError> {
-    let mut manifest = draft.manifest.clone();
+    let mut manifest = destination_neutral_manifest(draft)?;
     manifest.assumptions.push(format!(
         "publication_visibility={}",
         visibility_name(destination)
@@ -1502,6 +1573,237 @@ fn target_manifest(
     manifest.assumptions.dedup();
     manifest.validate()?;
     Ok(manifest)
+}
+
+fn destination_neutral_manifest(
+    draft: &CanonicalProductionDraft,
+) -> Result<crate::CanonicalArtifactManifest, CacheError> {
+    let mut manifest = draft.manifest.clone();
+    manifest
+        .assumptions
+        .retain(|assumption| !assumption.starts_with("publication_visibility="));
+    manifest.assumptions.sort();
+    manifest.assumptions.dedup();
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+fn remap_destination_drafts_with_existing(
+    drafts: &[CanonicalProductionDraft],
+    destination: PublicationDestination,
+    mut existing_dependency: impl FnMut(&crate::PayloadDependencyIdentity) -> Result<bool, CacheError>,
+) -> Result<Vec<CanonicalProductionDraft>, CacheError> {
+    type Identity = (String, ContentDigest, ContentDigest, ContentDigest);
+
+    let mut source_identities = BTreeMap::<Identity, usize>::new();
+    for (index, draft) in drafts.iter().enumerate() {
+        draft.manifest.validate()?;
+        let mut manifests = vec![draft.manifest.clone()];
+        let neutral = destination_neutral_manifest(draft)?;
+        if neutral != draft.manifest {
+            manifests.push(neutral);
+        }
+        for manifest in manifests {
+            let identity = (
+                manifest.artifact_family.clone(),
+                manifest.semantic_digest.clone(),
+                manifest.digest()?,
+                manifest.payload_digest.clone(),
+            );
+            if let Some(previous) = source_identities.insert(identity, index) {
+                if previous != index {
+                    return Err(CacheError::InvalidManifest(
+                        "managed publication closure contains an ambiguous exact or destination-neutral artifact identity"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut remapped = vec![None::<CanonicalProductionDraft>; drafts.len()];
+    let mut external_identities = BTreeSet::<Identity>::new();
+    let mut remaining = (0..drafts.len()).collect::<BTreeSet<_>>();
+    while !remaining.is_empty() {
+        let mut progressed = false;
+        for index in remaining.iter().copied().collect::<Vec<_>>() {
+            let draft = &drafts[index];
+            let mut dependencies =
+                Vec::with_capacity(draft.manifest.canonical_payload.dependencies.len());
+            let mut ready = true;
+            for dependency in &draft.manifest.canonical_payload.dependencies {
+                let identity = (
+                    dependency.artifact_family.clone(),
+                    dependency.semantic_digest.clone(),
+                    dependency.manifest_digest.clone(),
+                    dependency.payload_digest.clone(),
+                );
+                if let Some(dependency_index) = source_identities.get(&identity) {
+                    let Some(destination_dependency) = remapped[*dependency_index].as_ref() else {
+                        ready = false;
+                        break;
+                    };
+                    dependencies.push(crate::PayloadDependencyIdentity {
+                        artifact_family: destination_dependency.manifest.artifact_family.clone(),
+                        semantic_digest: destination_dependency.manifest.semantic_digest.clone(),
+                        manifest_digest: destination_dependency.manifest.digest()?,
+                        payload_digest: destination_dependency.manifest.payload_digest.clone(),
+                    });
+                } else if existing_dependency(dependency)? {
+                    external_identities.insert(identity);
+                    dependencies.push(dependency.clone());
+                } else {
+                    return Err(CacheError::InvalidManifest(format!(
+                        "managed publication closure is missing exact dependency {}/{}",
+                        dependency.artifact_family, dependency.semantic_digest.0
+                    )));
+                }
+            }
+            if !ready {
+                continue;
+            }
+
+            let mut destination_draft = draft.clone();
+            destination_draft.manifest.canonical_payload.dependencies = dependencies;
+            destination_draft.manifest.payload_digest =
+                destination_draft.manifest.canonical_payload.digest()?;
+            destination_draft.encoding.canonical_payload_digest =
+                destination_draft.manifest.payload_digest.clone();
+            destination_draft.manifest.transport_digests =
+                vec![destination_draft.encoding.digest()?];
+            destination_draft.manifest = target_manifest(&destination_draft, destination)?;
+            destination_draft.manifest.validate()?;
+            remapped[index] = Some(destination_draft);
+            remaining.remove(&index);
+            progressed = true;
+        }
+        if !progressed {
+            return Err(CacheError::InvalidManifest(
+                "managed publication dependency closure contains a cycle".to_owned(),
+            ));
+        }
+    }
+
+    let remapped = remapped
+        .into_iter()
+        .map(|draft| draft.expect("all destination drafts were remapped"))
+        .collect::<Vec<_>>();
+    let identities = remapped
+        .iter()
+        .map(|draft| {
+            Ok((
+                draft.manifest.artifact_family.clone(),
+                draft.manifest.semantic_digest.clone(),
+                draft.manifest.digest()?,
+                draft.manifest.payload_digest.clone(),
+            ))
+        })
+        .collect::<Result<BTreeSet<_>, CacheError>>()?
+        .union(&external_identities)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for draft in &remapped {
+        for dependency in &draft.manifest.canonical_payload.dependencies {
+            let identity = (
+                dependency.artifact_family.clone(),
+                dependency.semantic_digest.clone(),
+                dependency.manifest_digest.clone(),
+                dependency.payload_digest.clone(),
+            );
+            if !identities.contains(&identity) {
+                return Err(CacheError::InvalidManifest(format!(
+                    "destination publication closure has a dangling dependency {}/{}",
+                    dependency.artifact_family, dependency.semantic_digest.0
+                )));
+            }
+        }
+    }
+    Ok(remapped)
+}
+
+#[cfg(test)]
+fn remap_destination_drafts(
+    drafts: &[CanonicalProductionDraft],
+    destination: PublicationDestination,
+) -> Result<Vec<CanonicalProductionDraft>, CacheError> {
+    remap_destination_drafts_with_existing(drafts, destination, |_| Ok(false))
+}
+
+fn exact_destination_dependency_exists(
+    remote: &dyn crate::RemoteGitStore,
+    owner: &str,
+    destination: PublicationDestination,
+    dependency: &crate::PayloadDependencyIdentity,
+    revisions: &mut BTreeMap<String, String>,
+    resources: &xc_core::ResourcePolicy,
+) -> Result<bool, CacheError> {
+    let repository = repository_url(owner, &dependency.artifact_family, destination);
+    let revision = if let Some(revision) = revisions.get(&repository) {
+        revision.clone()
+    } else {
+        let revision = remote.read_ref(&repository, "main")?;
+        revisions.insert(repository.clone(), revision.clone());
+        revision
+    };
+    let cancellation = xc_core::CancellationToken::for_policy(resources);
+    let reader = crate::RemoteShardReader::new(remote, 16 * 1024 * 1024)?;
+    let manifest_path = format!(
+        "manifests/{}/{}.json",
+        &dependency.semantic_digest.0[..2],
+        dependency.manifest_digest
+    );
+    let manifest = match reader.read_json::<crate::CanonicalArtifactManifest>(
+        &repository,
+        &revision,
+        &manifest_path,
+        &cancellation,
+    ) {
+        Ok(document) => document,
+        Err(CacheError::NotFound(_)) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    manifest.value.validate()?;
+    if manifest.source.content_digest != dependency.manifest_digest
+        || manifest.value.digest()? != dependency.manifest_digest
+        || manifest.value.artifact_family != dependency.artifact_family
+        || manifest.value.semantic_digest != dependency.semantic_digest
+        || manifest.value.payload_digest != dependency.payload_digest
+    {
+        return Err(CacheError::InvalidManifest(format!(
+            "destination dependency manifest {manifest_path:?} does not match its exact identity"
+        )));
+    }
+
+    let index_path = format!(
+        "indexes/{}/{}.json",
+        dependency.artifact_family,
+        &dependency.semantic_digest.0[..2]
+    );
+    let index = match reader.read_json::<crate::ShardIndexPartition>(
+        &repository,
+        &revision,
+        &index_path,
+        &cancellation,
+    ) {
+        Ok(document) => document,
+        Err(CacheError::NotFound(_)) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    index.value.validate()?;
+    if index.value.family != dependency.artifact_family {
+        return Err(CacheError::InvalidManifest(format!(
+            "destination dependency index {index_path:?} belongs to the wrong family"
+        )));
+    }
+    let exists = index
+        .value
+        .lookup(&dependency.semantic_digest)
+        .any(|entry| {
+            entry.disposition == ArtifactDisposition::Active
+                && entry.manifest_digest == dependency.manifest_digest
+                && entry.canonical_payload_digest == dependency.payload_digest
+        });
+    Ok(exists)
 }
 
 fn collect_leaf_paths(prefix: &str, value: &Value, paths: &mut BTreeSet<String>) {
@@ -2340,23 +2642,70 @@ pub fn execute_managed_drafts_on_github(
     resources: &xc_core::ResourcePolicy,
     replace_existing_semantic: bool,
 ) -> Result<ManagedRunPublicationReport, CacheError> {
-    let mut by_family = BTreeMap::<String, Vec<&CanonicalProductionDraft>>::new();
-    for draft in drafts {
-        by_family
-            .entry(draft.family.clone())
-            .or_default()
-            .push(draft);
+    let requested_destinations = destinations(target)?;
+    let mut groups = Vec::<(PublicationTarget, Vec<CanonicalProductionDraft>)>::new();
+    for destination in requested_destinations.iter().copied() {
+        let destination_target = match destination {
+            PublicationDestination::Private => PublicationTarget::Private,
+            PublicationDestination::Public => PublicationTarget::Public,
+        };
+        let dependency_remote = crate::GitCliRemoteStore::new(
+            journal_root
+                .join("git-transport")
+                .join("dependency-preflight")
+                .join(visibility_name(destination)),
+            journal_root
+                .join("dependency-preflight-staging")
+                .join(visibility_name(destination)),
+            "Xcelerator Toolkit",
+            "xcelerator-toolkit@users.noreply.github.com",
+        )?
+        .with_resource_policy(resources.clone());
+        let mut dependency_revisions = BTreeMap::new();
+        let mut dependency_results =
+            BTreeMap::<(String, ContentDigest, ContentDigest, ContentDigest), bool>::new();
+        let remapped = remap_destination_drafts_with_existing(drafts, destination, |dependency| {
+            let identity = (
+                dependency.artifact_family.clone(),
+                dependency.semantic_digest.clone(),
+                dependency.manifest_digest.clone(),
+                dependency.payload_digest.clone(),
+            );
+            if let Some(exists) = dependency_results.get(&identity) {
+                return Ok(*exists);
+            }
+            let exists = exact_destination_dependency_exists(
+                &dependency_remote,
+                owner,
+                destination,
+                dependency,
+                &mut dependency_revisions,
+                resources,
+            )?;
+            dependency_results.insert(identity, exists);
+            Ok(exists)
+        })?;
+        let mut by_family = BTreeMap::<String, Vec<CanonicalProductionDraft>>::new();
+        for draft in remapped {
+            by_family
+                .entry(draft.family.clone())
+                .or_default()
+                .push(draft);
+        }
+        groups.extend(
+            by_family
+                .into_values()
+                .map(|family_drafts| (destination_target, family_drafts)),
+        );
     }
-    let groups = by_family.into_values().collect::<Vec<_>>();
 
     // Fail the complete multi-family run before the first remote mutation if
     // any destination repository is absent from the PAT or lacks write access.
     // Per-family probes are repeated immediately before mutation so their
     // evidence remains fresh during long publication runs.
     let probe = crate::GitHubCredentialApiProbe::default();
-    let destinations = destinations(target)?;
     let mut principals = BTreeSet::new();
-    for family_drafts in &groups {
+    for (group_target, family_drafts) in &groups {
         let family = family_drafts
             .first()
             .map(|draft| draft.family.as_str())
@@ -2365,7 +2714,7 @@ pub fn execute_managed_drafts_on_github(
                     "managed publication received an empty artifact family".to_owned(),
                 )
             })?;
-        for destination in destinations.iter().copied() {
+        for destination in destinations(*group_target)? {
             let authorized_repository = repository(owner, family, destination);
             let session = probe.probe_repository(&authorized_repository)?;
             principals.insert(session.evidence().principal.clone());
@@ -2380,15 +2729,16 @@ pub fn execute_managed_drafts_on_github(
     let started = std::time::Instant::now();
     let reports = groups
         .par_iter()
-        .map(|family_drafts| {
+        .map(|(group_target, family_drafts)| {
             let family = family_drafts
                 .first()
                 .map(|draft| draft.family.as_str())
                 .unwrap_or("empty");
             let family_started = std::time::Instant::now();
+            let family_draft_refs = family_drafts.iter().collect::<Vec<_>>();
             let report = execute_managed_family_drafts_on_github(
-                family_drafts,
-                target,
+                &family_draft_refs,
+                *group_target,
                 owner,
                 journal_root,
                 resources,
@@ -2411,8 +2761,8 @@ pub fn execute_managed_drafts_on_github(
         total.saturating_add(report.current_tree_paths_removed)
     });
     eprintln!(
-        "publication execution: evaluated {} staged candidate(s), created {} transaction(s) across {} shard families in {:.3}s",
-        drafts.len(),
+        "publication execution: evaluated {} destination candidate(s), created {} transaction(s) across {} destination shard groups in {:.3}s",
+        drafts.len().saturating_mul(requested_destinations.len()),
         transactions.len(),
         reports.len(),
         started.elapsed().as_secs_f64()
@@ -2738,6 +3088,302 @@ mod tests {
         draft
     }
 
+    fn fixture_draft_with_dependency(
+        mut draft: CanonicalProductionDraft,
+        dependency: &CanonicalProductionDraft,
+    ) -> CanonicalProductionDraft {
+        draft
+            .manifest
+            .canonical_payload
+            .dependencies
+            .push(crate::PayloadDependencyIdentity {
+                artifact_family: dependency.manifest.artifact_family.clone(),
+                semantic_digest: dependency.manifest.semantic_digest.clone(),
+                manifest_digest: dependency.manifest.digest().unwrap(),
+                payload_digest: dependency.manifest.payload_digest.clone(),
+            });
+        draft.manifest.payload_digest = draft.manifest.canonical_payload.digest().unwrap();
+        draft.encoding.canonical_payload_digest = draft.manifest.payload_digest.clone();
+        draft.manifest.transport_digests = vec![draft.encoding.digest().unwrap()];
+        draft
+    }
+
+    fn fixture_draft_family(
+        mut draft: CanonicalProductionDraft,
+        family: &str,
+    ) -> CanonicalProductionDraft {
+        draft.family = family.to_owned();
+        draft.manifest.artifact_family = family.to_owned();
+        draft
+    }
+
+    #[test]
+    fn destination_remapping_rewrites_the_complete_dependency_closure() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target/test-tmp")
+            .join(format!(
+                "managed-destination-dependency-remap-{}",
+                std::process::id()
+            ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let mut leaf = fixture_draft_family(fixture_draft_with_n(&root, 2), "ccm-components");
+        leaf.manifest
+            .assumptions
+            .push("publication_visibility=public".to_owned());
+        let middle = fixture_draft_family(
+            fixture_draft_with_dependency(fixture_draft_with_n(&root, 3), &leaf),
+            "ccm-matrices",
+        );
+        let root_draft = fixture_draft_family(
+            fixture_draft_with_dependency(fixture_draft_with_n(&root, 4), &middle),
+            "ccm-roots",
+        );
+
+        let remapped = remap_destination_drafts(
+            &[root_draft.clone(), leaf.clone(), middle.clone()],
+            PublicationDestination::Private,
+        )
+        .unwrap();
+        let destination_leaf = remapped
+            .iter()
+            .find(|draft| draft.family == "ccm-components")
+            .unwrap();
+        let destination_middle = remapped
+            .iter()
+            .find(|draft| draft.family == "ccm-matrices")
+            .unwrap();
+        let destination_root = remapped
+            .iter()
+            .find(|draft| draft.family == "ccm-roots")
+            .unwrap();
+
+        let middle_dependency = &destination_middle.manifest.canonical_payload.dependencies[0];
+        assert_eq!(
+            middle_dependency.manifest_digest,
+            destination_leaf.manifest.digest().unwrap()
+        );
+        assert_eq!(
+            middle_dependency.payload_digest,
+            destination_leaf.manifest.payload_digest
+        );
+        let root_dependency = &destination_root.manifest.canonical_payload.dependencies[0];
+        assert_eq!(
+            root_dependency.manifest_digest,
+            destination_middle.manifest.digest().unwrap()
+        );
+        assert_eq!(
+            root_dependency.payload_digest,
+            destination_middle.manifest.payload_digest
+        );
+        assert_ne!(
+            root_dependency.manifest_digest,
+            middle.manifest.digest().unwrap()
+        );
+        for draft in &remapped {
+            assert!(draft
+                .manifest
+                .assumptions
+                .contains(&"publication_visibility=private".to_owned()));
+            assert!(!draft
+                .manifest
+                .assumptions
+                .contains(&"publication_visibility=public".to_owned()));
+            assert_eq!(
+                draft.encoding.canonical_payload_digest,
+                draft.manifest.payload_digest
+            );
+            assert_eq!(
+                draft.manifest.transport_digests,
+                vec![draft.encoding.digest().unwrap()]
+            );
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn destination_remapping_rejects_an_incomplete_dependency_closure() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target/test-tmp")
+            .join(format!(
+                "managed-destination-incomplete-closure-{}",
+                std::process::id()
+            ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let dependency = fixture_draft_with_n(&root, 2);
+        let root_draft = fixture_draft_with_dependency(fixture_draft_with_n(&root, 3), &dependency);
+
+        let error =
+            remap_destination_drafts(&[root_draft], PublicationDestination::Private).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("closure is missing exact dependency"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn destination_remapping_accepts_an_exact_indexed_destination_dependency() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target/test-tmp")
+            .join(format!(
+                "managed-destination-external-dependency-{}",
+                std::process::id()
+            ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let dependency = fixture_draft_family(fixture_draft_with_n(&root, 2), "weil-states");
+        let root_draft = fixture_draft_family(
+            fixture_draft_with_dependency(fixture_draft_with_n(&root, 3), &dependency),
+            "ccm-roots",
+        );
+        let expected = root_draft.manifest.canonical_payload.dependencies[0].clone();
+        let mut resolutions = 0usize;
+
+        let remapped = remap_destination_drafts_with_existing(
+            &[root_draft],
+            PublicationDestination::Private,
+            |candidate| {
+                resolutions = resolutions.saturating_add(1);
+                Ok(candidate == &expected)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolutions, 1);
+        assert_eq!(
+            remapped[0].manifest.canonical_payload.dependencies,
+            vec![expected]
+        );
+        assert!(remapped[0]
+            .manifest
+            .assumptions
+            .contains(&"publication_visibility=private".to_owned()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn destination_remapping_resolves_a_neutral_alias_to_its_staged_private_manifest() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target/test-tmp")
+            .join(format!(
+                "managed-destination-neutral-alias-{}",
+                std::process::id()
+            ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut dependency = fixture_draft_family(fixture_draft_with_n(&root, 2), "weil-states");
+        dependency
+            .manifest
+            .assumptions
+            .push("publication_visibility=private".to_owned());
+        dependency.manifest.validate().unwrap();
+        let neutral = destination_neutral_manifest(&dependency).unwrap();
+        assert_ne!(
+            neutral.digest().unwrap(),
+            dependency.manifest.digest().unwrap()
+        );
+
+        let mut root_draft = fixture_draft_family(
+            fixture_draft_with_dependency(fixture_draft_with_n(&root, 3), &dependency),
+            "ccm-roots",
+        );
+        root_draft.manifest.canonical_payload.dependencies[0].manifest_digest =
+            neutral.digest().unwrap();
+        root_draft.manifest.payload_digest =
+            root_draft.manifest.canonical_payload.digest().unwrap();
+        root_draft.encoding.canonical_payload_digest = root_draft.manifest.payload_digest.clone();
+        root_draft.manifest.transport_digests = vec![root_draft.encoding.digest().unwrap()];
+
+        let remapped = remap_destination_drafts_with_existing(
+            &[root_draft, dependency.clone()],
+            PublicationDestination::Private,
+            |_| panic!("a staged neutral alias must not require remote resolution"),
+        )
+        .unwrap();
+        let remapped_root = remapped
+            .iter()
+            .find(|draft| draft.family == "ccm-roots")
+            .unwrap();
+        let remapped_dependency = remapped
+            .iter()
+            .find(|draft| draft.family == "weil-states")
+            .unwrap();
+        assert_eq!(
+            remapped_root.manifest.canonical_payload.dependencies[0].manifest_digest,
+            remapped_dependency.manifest.digest().unwrap()
+        );
+        assert_eq!(
+            remapped_dependency.manifest.digest().unwrap(),
+            dependency.manifest.digest().unwrap()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_destination_dependency_requires_canonical_manifest_and_active_index() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target/test-tmp")
+            .join(format!(
+                "managed-exact-destination-dependency-{}",
+                std::process::id()
+            ));
+        let _ = fs::remove_dir_all(&root);
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let draft = fixture_draft_with_n(&staging, 2);
+        let manifest = target_manifest(&draft, PublicationDestination::Private).unwrap();
+        let dependency = crate::PayloadDependencyIdentity {
+            artifact_family: manifest.artifact_family.clone(),
+            semantic_digest: manifest.semantic_digest.clone(),
+            manifest_digest: manifest.digest().unwrap(),
+            payload_digest: manifest.payload_digest.clone(),
+        };
+        let repository =
+            "https://github.com/example-org/xcelerator-cache-private-ccm-matrices-0001.git";
+        let head = "existing-head";
+        let remote = FilesystemMemoryRemote::new(staging);
+        remote.insert_repository(
+            repository.to_owned(),
+            head.to_owned(),
+            published_destination_tree(&[&draft], PublicationDestination::Private),
+        );
+
+        assert!(exact_destination_dependency_exists(
+            &remote,
+            "example-org",
+            PublicationDestination::Private,
+            &dependency,
+            &mut BTreeMap::new(),
+            &ResourcePolicy::default(),
+        )
+        .unwrap());
+
+        let mut missing = dependency;
+        missing.manifest_digest = ContentDigest::sha256(b"not-published");
+        assert!(!exact_destination_dependency_exists(
+            &remote,
+            "example-org",
+            PublicationDestination::Private,
+            &missing,
+            &mut BTreeMap::new(),
+            &ResourcePolicy::default(),
+        )
+        .unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn active_index_entry(
         draft: &CanonicalProductionDraft,
         destination: PublicationDestination,
@@ -2813,6 +3459,18 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        for draft in drafts {
+            let manifest = target_manifest(draft, destination).unwrap();
+            let manifest_digest = manifest.digest().unwrap();
+            tree.insert(
+                format!(
+                    "manifests/{}/{}.json",
+                    &manifest.semantic_digest.0[..2],
+                    manifest_digest
+                ),
+                canonical_json_bytes(&manifest).unwrap(),
+            );
+        }
         tree.insert(
             batch.repository_path(),
             canonical_json_bytes(&batch).unwrap(),
@@ -2935,14 +3593,23 @@ mod tests {
         );
         let prefix = entry.semantic_digest.0[..2].to_owned();
         let partition = ShardIndexPartition::rebuild("ccm-matrices", &prefix, vec![entry]).unwrap();
+        let manifest = target_manifest(&draft, PublicationDestination::Private).unwrap();
+        let manifest_path = format!(
+            "manifests/{}/{}.json",
+            &manifest.semantic_digest.0[..2],
+            manifest.digest().unwrap()
+        );
         let remote = FilesystemMemoryRemote::new(staging);
         remote.insert_repository(
             repository.to_owned(),
             head.to_owned(),
-            BTreeMap::from([(
-                format!("indexes/ccm-matrices/{prefix}.json"),
-                canonical_json_bytes(&partition).unwrap(),
-            )]),
+            BTreeMap::from([
+                (
+                    format!("indexes/ccm-matrices/{prefix}.json"),
+                    canonical_json_bytes(&partition).unwrap(),
+                ),
+                (manifest_path, canonical_json_bytes(&manifest).unwrap()),
+            ]),
         );
 
         let selection = select_missing_destination_drafts(

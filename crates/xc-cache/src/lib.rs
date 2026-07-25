@@ -95,6 +95,7 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Approved safe reachable-payload threshold for a GitHub cache repository.
@@ -670,6 +671,27 @@ pub trait CacheStore: Send + Sync {
     fn visibility(&self) -> CacheVisibility;
     fn put(&self, draft: &ArtifactDraft, payload: &[u8]) -> Result<ArtifactManifest, CacheError>;
     fn candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError>;
+    /// Enumerate artifact keys whose kind and logical key match a bounded
+    /// semantic prefix. Implementations may return an empty set when their
+    /// backing format predates searchable logical-key metadata.
+    fn matching_keys(
+        &self,
+        _kind: &str,
+        _logical_key_prefix: &str,
+        _maximum_keys: usize,
+    ) -> Result<Vec<ArtifactKey>, CacheError> {
+        Ok(Vec::new())
+    }
+    /// Return nearest compatible CCM eigenpair keys through a purpose-built
+    /// secondary index. Remote implementations must not emulate this by
+    /// crawling canonical manifests.
+    fn ccm_eigenpair_continuation_keys(
+        &self,
+        _query: &CcmEigenpairContinuationQuery,
+        _maximum_keys: usize,
+    ) -> Result<Vec<ArtifactKey>, CacheError> {
+        Ok(Vec::new())
+    }
     fn read_payload_to(
         &self,
         manifest: &ArtifactManifest,
@@ -959,7 +981,66 @@ impl FilesystemCacheStore {
         }
         let index_bytes = serde_json::to_vec_pretty(&index)?;
         atomic_replace(&self.index_path(&manifest.key), &index_bytes)?;
+        self.update_ccm_eigenpair_continuation_inventory(&manifest, manifest_record_digest)?;
         Ok(manifest)
+    }
+
+    fn update_ccm_eigenpair_continuation_inventory(
+        &self,
+        manifest: &ArtifactManifest,
+        manifest_record_digest: ContentDigest,
+    ) -> Result<(), CacheError> {
+        if manifest.key.kind != CCM_EIGENPAIR_CONTINUATION_ARTIFACT_KIND {
+            return Ok(());
+        }
+        let Some(encoded) = manifest.tags.get(SEMANTIC_KEY_MANIFEST_TAG) else {
+            // Compatibility-only stores may contain opaque test or imported
+            // records. They remain exactly addressable but are not eligible
+            // for semantic continuation discovery.
+            return Ok(());
+        };
+        let semantic_key: SemanticKeyEnvelope = serde_json::from_str(encoded)?;
+        let assurance = match manifest.quality {
+            CacheQuality::Certified => ArtifactAssuranceState::Certified,
+            CacheQuality::CrossChecked => ArtifactAssuranceState::CrossChecked,
+            CacheQuality::Quarantined | CacheQuality::Deprecated => return Ok(()),
+            _ => ArtifactAssuranceState::Computed,
+        };
+        let Some((query, addition)) = ccm_eigenpair_continuation_entry(
+            &semantic_key,
+            &manifest.key.logical_key,
+            manifest_record_digest,
+            assurance,
+            ArtifactDisposition::Active,
+            manifest.producer_toolkit_version.clone(),
+            manifest.minimum_reader_version.clone(),
+        )?
+        else {
+            return Ok(());
+        };
+        static INVENTORY_UPDATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = INVENTORY_UPDATE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| {
+                CacheError::Io("local continuation inventory lock was poisoned".to_owned())
+            })?;
+        let path = query
+            .repository_path()?
+            .split('/')
+            .fold(self.root.clone(), |path, component| path.join(component));
+        let mut entries = if path.exists() {
+            let existing: CcmEigenpairContinuationIndex =
+                serde_json::from_slice(&fs::read(&path)?)?;
+            existing.validate()?;
+            existing.entries
+        } else {
+            Vec::new()
+        };
+        entries.retain(|entry| entry.semantic_digest != addition.semantic_digest);
+        entries.push(addition);
+        let inventory = CcmEigenpairContinuationIndex::rebuild(&query, entries)?;
+        atomic_replace(&path, &serde_json::to_vec_pretty(&inventory)?)
     }
 
     /// Store an artifact as multiple immutable content-addressed objects.
@@ -1088,6 +1169,127 @@ impl CacheStore for FilesystemCacheStore {
                 .then_with(|| right.content_digest.0.cmp(&left.content_digest.0))
         });
         Ok(manifests)
+    }
+
+    fn matching_keys(
+        &self,
+        kind: &str,
+        logical_key_prefix: &str,
+        maximum_keys: usize,
+    ) -> Result<Vec<ArtifactKey>, CacheError> {
+        if maximum_keys == 0 {
+            return Ok(Vec::new());
+        }
+        let kind_root = self.root.join("artifacts").join(encode_component(kind));
+        if !kind_root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut keys = BTreeSet::new();
+        for logical_entry in fs::read_dir(kind_root)? {
+            let logical_entry = logical_entry?;
+            if !logical_entry.file_type()?.is_dir() {
+                continue;
+            }
+            for parameter_entry in fs::read_dir(logical_entry.path())? {
+                let parameter_entry = parameter_entry?;
+                if !parameter_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let manifest_root = parameter_entry.path().join("manifests");
+                if !manifest_root.exists() {
+                    continue;
+                }
+                let Some(manifest_entry) = fs::read_dir(manifest_root)?
+                    .filter_map(Result::ok)
+                    .find(|entry| {
+                        entry.file_type().is_ok_and(|kind| kind.is_file())
+                            && entry
+                                .path()
+                                .extension()
+                                .is_some_and(|value| value == "json")
+                    })
+                else {
+                    continue;
+                };
+                let manifest: ArtifactManifest =
+                    serde_json::from_slice(&fs::read(manifest_entry.path())?)?;
+                manifest.validate()?;
+                if manifest.key.kind == kind
+                    && manifest.key.logical_key.starts_with(logical_key_prefix)
+                {
+                    keys.insert((
+                        manifest.key.logical_key.clone(),
+                        manifest.key.parameters_digest.clone(),
+                    ));
+                    if keys.len() >= maximum_keys {
+                        break;
+                    }
+                }
+            }
+            if keys.len() >= maximum_keys {
+                break;
+            }
+        }
+        Ok(keys
+            .into_iter()
+            .map(|(logical_key, parameters_digest)| ArtifactKey {
+                kind: kind.to_owned(),
+                logical_key,
+                parameters_digest,
+            })
+            .collect())
+    }
+
+    fn ccm_eigenpair_continuation_keys(
+        &self,
+        query: &CcmEigenpairContinuationQuery,
+        maximum_keys: usize,
+    ) -> Result<Vec<ArtifactKey>, CacheError> {
+        query.validate()?;
+        if maximum_keys == 0 {
+            return Ok(Vec::new());
+        }
+        let inventory_path = query
+            .repository_path()?
+            .split('/')
+            .fold(self.root.clone(), |path, component| path.join(component));
+        if inventory_path.exists() {
+            let inventory: CcmEigenpairContinuationIndex =
+                serde_json::from_slice(&fs::read(inventory_path)?)?;
+            return inventory.query(query, &current_toolkit_version()?, maximum_keys);
+        }
+        // One bounded legacy fallback permits reuse of workstation artifacts
+        // written before the secondary inventory existed. New writes maintain
+        // the inventory directly and never take this path.
+        let prefix = format!("ccm/weil-eigenpair/{}/", query.lambda_squared);
+        let mut keys = self.matching_keys(
+            CCM_EIGENPAIR_CONTINUATION_ARTIFACT_KIND,
+            &prefix,
+            usize::MAX,
+        )?;
+        keys.retain(|key| {
+            let fields = key.logical_key.split('/').collect::<Vec<_>>();
+            fields.len() >= 6
+                && fields[3]
+                    .parse::<usize>()
+                    .is_ok_and(|n_modes| n_modes < query.maximum_n_modes)
+                && fields[4] == query.precision_bits.to_string()
+                && fields[5] == if query.force_even { "even" } else { "natural" }
+        });
+        keys.sort_by(|left, right| {
+            let n = |key: &ArtifactKey| {
+                key.logical_key
+                    .split('/')
+                    .nth(3)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0)
+            };
+            n(right)
+                .cmp(&n(left))
+                .then_with(|| left.parameters_digest.cmp(&right.parameters_digest))
+        });
+        keys.truncate(maximum_keys);
+        Ok(keys)
     }
 
     fn read_payload_to(
@@ -1233,6 +1435,25 @@ impl CacheStore for ZipJsonFilesystemCacheStore {
 
     fn candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
         self.inner.candidates(key)
+    }
+
+    fn matching_keys(
+        &self,
+        kind: &str,
+        logical_key_prefix: &str,
+        maximum_keys: usize,
+    ) -> Result<Vec<ArtifactKey>, CacheError> {
+        self.inner
+            .matching_keys(kind, logical_key_prefix, maximum_keys)
+    }
+
+    fn ccm_eigenpair_continuation_keys(
+        &self,
+        query: &CcmEigenpairContinuationQuery,
+        maximum_keys: usize,
+    ) -> Result<Vec<ArtifactKey>, CacheError> {
+        self.inner
+            .ccm_eigenpair_continuation_keys(query, maximum_keys)
     }
 
     fn read_payload_to(
@@ -1484,6 +1705,76 @@ impl CacheResolver {
             key.logical_key,
             rejected.join(", ")
         )))
+    }
+
+    /// Return distinct keys visible through all configured layers. Layer
+    /// precedence is preserved, while duplicate semantic identities are
+    /// collapsed.
+    pub fn matching_keys(
+        &self,
+        kind: &str,
+        logical_key_prefix: &str,
+        maximum_keys: usize,
+    ) -> Result<Vec<ArtifactKey>, CacheError> {
+        let mut seen = BTreeSet::new();
+        let mut keys = Vec::new();
+        for layer in &self.layers {
+            for key in layer
+                .store
+                .matching_keys(kind, logical_key_prefix, maximum_keys)?
+            {
+                let identity = (
+                    key.kind.clone(),
+                    key.logical_key.clone(),
+                    key.parameters_digest.clone(),
+                );
+                if seen.insert(identity) {
+                    keys.push(key);
+                    if keys.len() >= maximum_keys {
+                        return Ok(keys);
+                    }
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    pub fn ccm_eigenpair_continuation_keys(
+        &self,
+        query: &CcmEigenpairContinuationQuery,
+        maximum_keys: usize,
+    ) -> Result<Vec<ArtifactKey>, CacheError> {
+        let mut seen = BTreeSet::new();
+        let mut keys = Vec::new();
+        for layer in &self.layers {
+            for key in layer
+                .store
+                .ccm_eigenpair_continuation_keys(query, maximum_keys)?
+            {
+                let identity = (
+                    key.kind.clone(),
+                    key.logical_key.clone(),
+                    key.parameters_digest.clone(),
+                );
+                if seen.insert(identity) {
+                    keys.push(key);
+                }
+            }
+        }
+        keys.sort_by(|left, right| {
+            let n = |key: &ArtifactKey| {
+                key.logical_key
+                    .split('/')
+                    .nth(3)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0)
+            };
+            n(right)
+                .cmp(&n(left))
+                .then_with(|| left.parameters_digest.cmp(&right.parameters_digest))
+        });
+        keys.truncate(maximum_keys);
+        Ok(keys)
     }
 
     pub fn first_writable(&self, visibility: CacheVisibility) -> Option<&dyn CacheStore> {
@@ -1766,6 +2057,87 @@ mod tests {
         assert_eq!(store.read_payload(&manifest_b).unwrap(), b"shared-b");
         let object_path = store.object_path(&manifest_a.objects[0].content_digest);
         assert!(object_path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn filesystem_store_discovers_bounded_logical_key_prefixes() {
+        let root = temporary_root("xc-cache-prefix-discovery");
+        let _ = fs::remove_dir_all(&root);
+        let store = FilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        for n_modes in [10, 20, 30] {
+            let logical_key =
+                format!("ccm/weil-eigenpair/13/{n_modes}/256/even/shift_invert_krylov");
+            let key = ArtifactKey::new(
+                "ccm_weil_eigenpair",
+                logical_key,
+                format!("N={n_modes}").as_bytes(),
+            )
+            .unwrap();
+            store
+                .put(
+                    &draft(key, CacheQuality::Validated, CacheVisibility::Local),
+                    b"{}",
+                )
+                .unwrap();
+        }
+        let keys = store
+            .matching_keys("ccm_weil_eigenpair", "ccm/weil-eigenpair/13/", 2)
+            .unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys
+            .iter()
+            .all(|key| key.logical_key.starts_with("ccm/weil-eigenpair/13/")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn filesystem_store_maintains_a_direct_continuation_inventory() {
+        let root = temporary_root("xc-cache-continuation-inventory");
+        let _ = fs::remove_dir_all(&root);
+        let store = FilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        for n_modes in [10, 20] {
+            let logical_key =
+                format!("ccm/weil-eigenpair/13/{n_modes}/729/even/shift_invert_krylov");
+            let semantic_key = SemanticKeyEnvelope {
+                schema_version: 1,
+                artifact_kind: "ccm_weil_eigenpair".to_owned(),
+                mathematical_semantics_version: "fixture".to_owned(),
+                resolved_mathematical_parameters: serde_json::json!({
+                    "lambda_squared": "13",
+                    "n_modes": n_modes,
+                    "precision_bits": 729,
+                    "force_even": true,
+                    "eigenstate_route": "shift_invert_krylov"
+                }),
+                normalization: Some("fixture".to_owned()),
+                target: Some("smallest_weil_form_eigenpair".to_owned()),
+                subspace: Some("even".to_owned()),
+                source_data_identities: BTreeMap::new(),
+                algorithm_semantics: Some("fixture".to_owned()),
+            };
+            let key = ArtifactKey {
+                kind: "ccm_weil_eigenpair".to_owned(),
+                logical_key,
+                parameters_digest: semantic_key.digest().unwrap(),
+            };
+            let mut artifact = draft(key, CacheQuality::Validated, CacheVisibility::Local);
+            artifact.tags.insert(
+                SEMANTIC_KEY_MANIFEST_TAG.to_owned(),
+                serde_json::to_string(&semantic_key).unwrap(),
+            );
+            store.put(&artifact, b"{}").unwrap();
+        }
+        let query = CcmEigenpairContinuationQuery {
+            lambda_squared: "13".to_owned(),
+            maximum_n_modes: 30,
+            precision_bits: 729,
+            force_even: true,
+        };
+        let keys = store.ccm_eigenpair_continuation_keys(&query, 1).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].logical_key.contains("/20/"));
+        assert!(root.join(query.repository_path().unwrap()).exists());
         let _ = fs::remove_dir_all(root);
     }
 

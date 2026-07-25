@@ -43,6 +43,10 @@ pub use hp_shift_invert::*;
 mod hp_thick_restart;
 #[cfg(feature = "hp-reference")]
 pub use hp_thick_restart::*;
+#[cfg(feature = "hp-reference")]
+mod hp_shift_invert_krylov;
+#[cfg(feature = "hp-reference")]
+pub use hp_shift_invert_krylov::*;
 
 #[derive(Clone, Debug)]
 pub enum SolverError {

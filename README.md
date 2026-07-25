@@ -7,7 +7,7 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-Version 0.13.1 is a breaking release and supports only the current APIs and cache format.
+Version 0.13.2 is a breaking release and supports only the current APIs and cache format.
 
 ---
 
@@ -42,7 +42,7 @@ If you use Xcelerator Toolkit in research, please cite the exact version or Git 
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.13.1},
+  version = {0.13.2},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }
@@ -123,6 +123,8 @@ Caching is automatic for ordinary consumers. The toolkit checks compatible local
 Authenticated publication to private or public cache storage is an optional author operation and is disabled by default. See [Cache Schema](docs/v0.13.1/CACHE_SCHEMA.md) for the artifact model.
 
 Version 0.13.1 adds generation-fenced publication leases for private shards. Concurrent authors serialize publication per shard, while each content batch and its coordination heartbeat advance atomically.
+
+Version 0.13.2 adds an automatic high-precision CCM eigenstate policy. It reuses an exact current-\(N\) state when available and can use the nearest compatible lower-\(N\) cached state as a shift-invert Krylov starting point without changing claim scripts.
 
 ## Validation
 
