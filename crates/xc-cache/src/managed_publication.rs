@@ -559,6 +559,158 @@ fn select_missing_destination_drafts<'a>(
     })
 }
 
+#[derive(Clone, Debug)]
+struct PreparedFamilyCandidate<'a> {
+    draft: &'a CanonicalProductionDraft,
+    artifact: ManagedPreparedArtifactPublication,
+    immutable_files: Vec<TransportPart>,
+}
+
+fn stage_family_document(
+    staging_root: &Path,
+    path: String,
+    bytes: Vec<u8>,
+    files: &mut BTreeMap<String, TransportPart>,
+) -> Result<(), CacheError> {
+    let digest = ContentDigest::sha256(&bytes);
+    let target = staging_root.join(&path);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if target.exists() {
+        let existing = std::fs::read(&target)?;
+        let actual = ContentDigest::sha256(&existing);
+        if actual != digest {
+            return Err(CacheError::DigestMismatch {
+                expected: digest.to_string(),
+                actual: actual.to_string(),
+            });
+        }
+    } else {
+        std::fs::write(&target, &bytes)?;
+    }
+    files.entry(path.clone()).or_insert(TransportPart {
+        sequence: 0,
+        repository_path: path,
+        size_bytes: bytes.len() as u64,
+        content_digest: digest,
+    });
+    Ok(())
+}
+
+fn prepare_family_candidates<'a>(
+    pending_drafts: &[&'a CanonicalProductionDraft],
+    destination: PublicationDestination,
+    context: &ManagedPublicationPlanningContext,
+    sessions: &BTreeMap<PublicationDestination, AuthenticatedGitHubSession>,
+    staging_root: &Path,
+) -> Result<Vec<PreparedFamilyCandidate<'a>>, CacheError> {
+    let mut candidates = Vec::with_capacity(pending_drafts.len());
+    for draft in pending_drafts {
+        let sessions_for_target = BTreeMap::from([(destination, sessions[&destination].clone())]);
+        let artifact = prepare_managed_artifact_publication(draft, context, &sessions_for_target)?;
+        crate::publication_staging::validate_public_documents(
+            artifact
+                .coordinated
+                .journal
+                .as_ref()
+                .expect("authorized journal"),
+            destination,
+            &artifact.bundles[&destination],
+            if destination == PublicationDestination::Public {
+                Some(&artifact.policy.sanitizer)
+            } else {
+                None
+            },
+        )?;
+
+        let bundle = &artifact.bundles[&destination];
+        let journal = artifact
+            .coordinated
+            .journal
+            .as_ref()
+            .expect("authorized journal");
+        let manifest_digest = bundle.manifest.digest()?;
+        let transport_digest = bundle.encoding.digest()?;
+        let manifest_path = format!(
+            "manifests/{}/{}.json",
+            &journal.semantic_digest.0[..2],
+            manifest_digest.0
+        );
+        let encoding_path = format!(
+            "encodings/{}/{}.json",
+            &journal.payload_digest.0[..2],
+            transport_digest.0
+        );
+        let mut files = BTreeMap::new();
+        stage_family_document(
+            staging_root,
+            manifest_path,
+            crate::protocol::canonical_json_bytes(&bundle.manifest)?,
+            &mut files,
+        )?;
+        stage_family_document(
+            staging_root,
+            encoding_path,
+            crate::protocol::canonical_json_bytes(&bundle.encoding)?,
+            &mut files,
+        )?;
+        for (attestation, digest) in bundle.validation_attestations.iter().zip(
+            bundle
+                .validation_attestations
+                .iter()
+                .map(|item| item.digest())
+                .collect::<Result<Vec<_>, _>>()?,
+        ) {
+            stage_family_document(
+                staging_root,
+                format!("attestations/validation/{}.json", digest.0),
+                crate::protocol::canonical_json_bytes(attestation)?,
+                &mut files,
+            )?;
+        }
+        for part in &bundle.encoding.ordered_parts {
+            let source = part
+                .repository_path
+                .split('/')
+                .fold(draft.staged_parts_root.to_path_buf(), |path, component| {
+                    path.join(component)
+                });
+            let target = part
+                .repository_path
+                .split('/')
+                .fold(staging_root.to_path_buf(), |path, component| {
+                    path.join(component)
+                });
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if !target.exists() {
+                std::fs::copy(&source, &target)?;
+            }
+            files
+                .entry(part.repository_path.clone())
+                .or_insert_with(|| part.clone());
+        }
+        candidates.push(PreparedFamilyCandidate {
+            draft,
+            artifact,
+            immutable_files: files.into_values().collect(),
+        });
+    }
+    Ok(candidates)
+}
+
+fn prepared_candidate_files(candidates: &[PreparedFamilyCandidate<'_>]) -> Vec<TransportPart> {
+    candidates
+        .iter()
+        .flat_map(|candidate| candidate.immutable_files.iter().cloned())
+        .map(|part| (part.repository_path.clone(), part))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect()
+}
+
 /// Publish a family as repository-level byte batches. Logical manifests and
 /// index entries remain one-per-artifact; only the Git transport transaction is
 /// shared. This is the normal path for families containing more than one
@@ -631,6 +783,76 @@ fn execute_family_batch_publication(
         }
     }
     let private_lease_policy = crate::PrivatePublicationLeasePolicy::default();
+    let preparation_started = std::time::Instant::now();
+    let preparation_ledger = if remote
+        .immutable_path_digest(
+            &repository_url,
+            &observed_head,
+            crate::DEFAULT_CAPACITY_LEDGER_PATH,
+        )?
+        .is_some()
+    {
+        read_capacity_ledger(&remote, &repository_url, &observed_head, &cancellation)?
+    } else {
+        // Derive the same conservative ledger that shard initialization will
+        // commit later, but do so read-only. This lets all immutable artifact
+        // preparation and Git object hashing finish before the one private
+        // publication lease is acquired, even for a brand-new shard.
+        reconciled_capacity_ledger(
+            &remote,
+            &repository_url,
+            &observed_head,
+            &shard,
+            &cancellation,
+        )?
+    };
+    if preparation_ledger.shard_id != shard {
+        return Err(CacheError::InvalidManifest(
+            "family batch capacity ledger belongs to another shard".to_owned(),
+        ));
+    }
+    if replace_existing_semantic {
+        for draft in &pending_drafts {
+            preflight_producer_monotonicity(
+                &remote,
+                &repository_url,
+                &observed_head,
+                &first.family,
+                &draft.manifest.semantic_digest,
+                &draft.manifest.producer_toolkit_version,
+                &cancellation,
+            )?;
+        }
+    }
+    let preparation_context = ManagedPublicationPlanningContext {
+        owner: owner.to_owned(),
+        principal: principal.to_owned(),
+        target: if destination == PublicationDestination::Private {
+            PublicationTarget::Private
+        } else {
+            PublicationTarget::Public
+        },
+        target_heads: BTreeMap::from([(destination, observed_head.clone())]),
+        capacity_ledgers: BTreeMap::from([(destination, preparation_ledger)]),
+        event_unix_seconds,
+    };
+    let mut prepared_candidates = prepare_family_candidates(
+        &pending_drafts,
+        destination,
+        &preparation_context,
+        sessions,
+        &staging_root,
+    )?;
+    let prepared_files = prepared_candidate_files(&prepared_candidates);
+    remote.prepare_staged_parts(&repository_url, &prepared_files)?;
+    eprintln!(
+        "publication family {}: prepared {} candidate(s) and {} immutable file(s) before lock in {:.3}s",
+        first.family,
+        prepared_candidates.len(),
+        prepared_files.len(),
+        preparation_started.elapsed().as_secs_f64()
+    );
+
     let mut private_lease = if destination == PublicationDestination::Private {
         let lease_owner = crate::PrivatePublicationLeaseOwner::for_current_process(
             &repository_url,
@@ -704,6 +926,12 @@ fn execute_family_batch_publication(
             if pending_drafts.is_empty() {
                 return Ok(Vec::new());
             }
+            let retained = pending_drafts
+                .iter()
+                .map(|draft| draft.manifest.semantic_digest.clone())
+                .collect::<BTreeSet<_>>();
+            prepared_candidates
+                .retain(|candidate| retained.contains(&candidate.draft.manifest.semantic_digest));
         }
         if let Some(lease) = private_lease.as_mut() {
             crate::renew_private_publication_lease(
@@ -714,26 +942,8 @@ fn execute_family_batch_publication(
                 &private_lease_policy,
             )?;
         }
-        if ledger.shard_id != shard {
-            return Err(CacheError::InvalidManifest(
-                "family batch capacity ledger belongs to a different shard".to_owned(),
-            ));
-        }
-        let context = ManagedPublicationPlanningContext {
-            owner: owner.to_owned(),
-            principal: principal.to_owned(),
-            target: if destination == PublicationDestination::Private {
-                PublicationTarget::Private
-            } else {
-                PublicationTarget::Public
-            },
-            target_heads: BTreeMap::from([(destination, head.clone())]),
-            capacity_ledgers: BTreeMap::from([(destination, ledger.clone())]),
-            event_unix_seconds,
-        };
-        let mut prepared = Vec::with_capacity(pending_drafts.len());
-        for draft in &pending_drafts {
-            if replace_existing_semantic {
+        if replace_existing_semantic {
+            for draft in &pending_drafts {
                 preflight_producer_monotonicity(
                     &remote,
                     &repository_url,
@@ -744,30 +954,28 @@ fn execute_family_batch_publication(
                     &cancellation,
                 )?;
             }
-            let sessions_for_target =
-                BTreeMap::from([(destination, sessions[&destination].clone())]);
-            let artifact =
-                prepare_managed_artifact_publication(draft, &context, &sessions_for_target)?;
-            crate::publication_staging::validate_public_documents(
-                artifact
-                    .coordinated
-                    .journal
-                    .as_ref()
-                    .expect("authorized journal"),
-                destination,
-                &artifact.bundles[&destination],
-                if destination == PublicationDestination::Public {
-                    Some(&artifact.policy.sanitizer)
-                } else {
-                    None
-                },
-            )?;
-            prepared.push(artifact);
         }
-
-        let mut files = BTreeMap::<String, TransportPart>::new();
+        if ledger.shard_id != shard {
+            return Err(CacheError::InvalidManifest(
+                "family batch capacity ledger belongs to a different shard".to_owned(),
+            ));
+        }
+        if prepared_candidates.len() != pending_drafts.len() {
+            return Err(CacheError::InvalidTransition(
+                "destination recheck did not retain one prepared candidate per pending draft"
+                    .to_owned(),
+            ));
+        }
+        let prepared = prepared_candidates
+            .iter()
+            .map(|candidate| &candidate.artifact)
+            .collect::<Vec<_>>();
+        let mut files = prepared_candidate_files(&prepared_candidates)
+            .into_iter()
+            .map(|part| (part.repository_path.clone(), part))
+            .collect::<BTreeMap<_, _>>();
         let mut artifacts = Vec::with_capacity(prepared.len());
-        for (index, artifact) in prepared.iter().enumerate() {
+        for artifact in &prepared {
             let bundle = &artifact.bundles[&destination];
             let journal = artifact
                 .coordinated
@@ -781,76 +989,6 @@ fn execute_family_batch_publication(
                 &journal.semantic_digest.0[..2],
                 manifest_digest.0
             );
-            let encoding_path = format!(
-                "encodings/{}/{}.json",
-                &journal.payload_digest.0[..2],
-                transport_digest.0
-            );
-            let add_document = |path: String,
-                                bytes: Vec<u8>,
-                                files: &mut BTreeMap<String, TransportPart>|
-             -> Result<(), CacheError> {
-                let digest = ContentDigest::sha256(&bytes);
-                let target = staging_root.join(&path);
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                if target.exists() {
-                    let existing = std::fs::read(&target)?;
-                    if ContentDigest::sha256(&existing) != digest {
-                        return Err(CacheError::DigestMismatch {
-                            expected: digest.to_string(),
-                            actual: ContentDigest::sha256(&existing).to_string(),
-                        });
-                    }
-                } else {
-                    std::fs::write(&target, &bytes)?;
-                }
-                files.entry(path.clone()).or_insert(TransportPart {
-                    sequence: 0,
-                    repository_path: path.clone(),
-                    size_bytes: bytes.len() as u64,
-                    content_digest: digest,
-                });
-                Ok(())
-            };
-            let manifest_bytes = crate::protocol::canonical_json_bytes(&bundle.manifest)?;
-            let encoding_bytes = crate::protocol::canonical_json_bytes(&bundle.encoding)?;
-            add_document(manifest_path.clone(), manifest_bytes, &mut files)?;
-            add_document(encoding_path, encoding_bytes, &mut files)?;
-            for (attestation, digest) in bundle.validation_attestations.iter().zip(
-                bundle
-                    .validation_attestations
-                    .iter()
-                    .map(|item| item.digest())
-                    .collect::<Result<Vec<_>, _>>()?,
-            ) {
-                let path = format!("attestations/validation/{}.json", digest.0);
-                add_document(
-                    path,
-                    crate::protocol::canonical_json_bytes(attestation)?,
-                    &mut files,
-                )?;
-            }
-            for part in &bundle.encoding.ordered_parts {
-                let source = part.repository_path.split('/').fold(
-                    pending_drafts[index].staged_parts_root.to_path_buf(),
-                    |path, component| path.join(component),
-                );
-                let target = part
-                    .repository_path
-                    .split('/')
-                    .fold(staging_root.clone(), |path, component| path.join(component));
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                if !target.exists() {
-                    std::fs::copy(&source, &target)?;
-                }
-                files
-                    .entry(part.repository_path.clone())
-                    .or_insert_with(|| part.clone());
-            }
             let mut provenance_evidence_digests = bundle
                 .validation_attestations
                 .iter()
@@ -867,7 +1005,6 @@ fn execute_family_batch_publication(
                 producer_toolkit_version: bundle.manifest.producer_toolkit_version.clone(),
                 provenance_evidence_digests,
             });
-            let _ = index;
         }
         let policy_digest = prepared[0].policy.digest()?;
         let batch = crate::RepositoryPublicationBatch::new(
@@ -1395,58 +1532,9 @@ fn ensure_managed_shard_sidecars(
             return Ok((head, ledger));
         }
 
+        let ledger = reconciled_capacity_ledger(remote, repository, &head, shard_id, cancellation)?;
         let mut parts = Vec::new();
         let mut staged_bytes = 0u64;
-        let payload_bytes =
-            bounded_prefix_bytes(remote, repository, &head, "objects", true, cancellation)?;
-        let metadata_bytes = [
-            "manifests",
-            "encodings",
-            "transactions",
-            "indexes",
-            "attestations",
-            "revocations",
-        ]
-        .into_iter()
-        .try_fold(0u64, |total, prefix| {
-            total
-                .checked_add(bounded_prefix_bytes(
-                    remote,
-                    repository,
-                    &head,
-                    prefix,
-                    false,
-                    cancellation,
-                )?)
-                .ok_or_else(|| {
-                    CacheError::ResourceLimit(
-                        "bootstrap metadata accounting exceeds u64".to_owned(),
-                    )
-                })
-        })?;
-        let reconciliation_digest = canonical_digest(&BootstrapReconciliation {
-            schema_version: 1,
-            shard_id,
-            revision: &head,
-            observed_payload_bytes: payload_bytes,
-            observed_metadata_bytes: metadata_bytes,
-        })?;
-        let ledger = CapacityLedger {
-            schema_version: 1,
-            shard_id: shard_id.to_owned(),
-            hard_capacity_bytes: crate::GITHUB_SAFE_REPOSITORY_PAYLOAD_BYTES,
-            warning_reserve_bytes: 5_000_000_000,
-            first_seen_immutable_payload_bytes: payload_bytes,
-            manifest_index_receipt_bytes: metadata_bytes,
-            // Conservatively reserve another full reachable snapshot for
-            // pre-ledger history rather than claiming exact old history.
-            estimated_history_bytes: payload_bytes.saturating_add(metadata_bytes),
-            emergency_reserve_bytes: 0,
-            abandoned_reachable_bytes: 0,
-            last_reconciled_commit: head.clone(),
-            reconciliation_digest,
-        };
-        ledger.validate()?;
         parts.push(crate::publication_staging::stage_publication_bytes(
             staging_root,
             crate::DEFAULT_CAPACITY_LEDGER_PATH,
@@ -1510,6 +1598,64 @@ fn ensure_managed_shard_sidecars(
     Err(CacheError::InvalidTransition(format!(
         "could not initialize shard {authorized_repository} after repeated ref conflicts"
     )))
+}
+
+fn reconciled_capacity_ledger(
+    remote: &dyn crate::RemoteGitStore,
+    repository: &str,
+    revision: &str,
+    shard_id: &str,
+    cancellation: &xc_core::CancellationToken,
+) -> Result<CapacityLedger, CacheError> {
+    let payload_bytes =
+        bounded_prefix_bytes(remote, repository, revision, "objects", true, cancellation)?;
+    let metadata_bytes = [
+        "manifests",
+        "encodings",
+        "transactions",
+        "indexes",
+        "attestations",
+        "revocations",
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, prefix| {
+        total
+            .checked_add(bounded_prefix_bytes(
+                remote,
+                repository,
+                revision,
+                prefix,
+                false,
+                cancellation,
+            )?)
+            .ok_or_else(|| {
+                CacheError::ResourceLimit("bootstrap metadata accounting exceeds u64".to_owned())
+            })
+    })?;
+    let reconciliation_digest = canonical_digest(&BootstrapReconciliation {
+        schema_version: 1,
+        shard_id,
+        revision,
+        observed_payload_bytes: payload_bytes,
+        observed_metadata_bytes: metadata_bytes,
+    })?;
+    let ledger = CapacityLedger {
+        schema_version: 1,
+        shard_id: shard_id.to_owned(),
+        hard_capacity_bytes: crate::GITHUB_SAFE_REPOSITORY_PAYLOAD_BYTES,
+        warning_reserve_bytes: 5_000_000_000,
+        first_seen_immutable_payload_bytes: payload_bytes,
+        manifest_index_receipt_bytes: metadata_bytes,
+        // Conservatively reserve another full reachable snapshot for
+        // pre-ledger history rather than claiming exact old history.
+        estimated_history_bytes: payload_bytes.saturating_add(metadata_bytes),
+        emergency_reserve_bytes: 0,
+        abandoned_reachable_bytes: 0,
+        last_reconciled_commit: revision.to_owned(),
+        reconciliation_digest,
+    };
+    ledger.validate()?;
+    Ok(ledger)
 }
 
 #[derive(Serialize)]

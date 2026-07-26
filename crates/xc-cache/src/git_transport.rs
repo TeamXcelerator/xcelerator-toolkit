@@ -26,6 +26,7 @@ pub struct GitCliRemoteStore {
     author_email: String,
     resources: ResourcePolicy,
     operation_lock: Mutex<()>,
+    prepared_blob_oids: Mutex<BTreeMap<(PathBuf, ContentDigest, u64), String>>,
 }
 
 impl GitCliRemoteStore {
@@ -43,6 +44,7 @@ impl GitCliRemoteStore {
             author_email: author_email.into(),
             resources: ResourcePolicy::default(),
             operation_lock: Mutex::new(()),
+            prepared_blob_oids: Mutex::new(BTreeMap::new()),
         };
         if store.author_name.trim().is_empty() || store.author_email.trim().is_empty() {
             return Err(CacheError::InvalidManifest(
@@ -87,8 +89,31 @@ impl GitCliRemoteStore {
         validate_repository(repository)?;
         let session = self.session_path(repository);
         if session.exists() {
-            fs::remove_dir_all(session)?;
+            fs::remove_dir_all(&session)?;
         }
+        self.prepared_blob_oids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(prepared_session, _, _), _| prepared_session != &session);
+        Ok(())
+    }
+
+    /// Validate and insert staged blobs into the local Git object database
+    /// before a remote publication lease is acquired. Commit construction can
+    /// then reuse the prepared object IDs without rereading large payload
+    /// parts while the destination repository is locked.
+    pub fn prepare_staged_parts(
+        &self,
+        repository: &str,
+        parts: &[TransportPart],
+    ) -> Result<(), CacheError> {
+        validate_repository(repository)?;
+        let _guard = self
+            .operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = self.ensure_session(repository)?;
+        self.hash_staged_blobs(&session, parts)?;
         Ok(())
     }
 
@@ -223,19 +248,148 @@ impl GitCliRemoteStore {
         )))
     }
 
-    fn hash_staged_blob(&self, session: &Path, part: &TransportPart) -> Result<String, CacheError> {
-        let path = self.staged_part_path(part)?;
-        let output = run_git(
+    fn hash_staged_blobs(
+        &self,
+        session: &Path,
+        parts: &[TransportPart],
+    ) -> Result<Vec<String>, CacheError> {
+        const MAXIMUM_PATHS_PER_INVOCATION: usize = 256;
+        const MAXIMUM_ARGUMENT_BYTES_PER_INVOCATION: usize = 24 * 1024;
+
+        let session = session.to_path_buf();
+        let keys = parts
+            .iter()
+            .map(|part| {
+                validate_relative_git_path(&part.repository_path)?;
+                Ok((
+                    session.clone(),
+                    part.content_digest.clone(),
+                    part.size_bytes,
+                ))
+            })
+            .collect::<Result<Vec<_>, CacheError>>()?;
+        let mut resolved = BTreeMap::new();
+        {
+            let cache = self
+                .prepared_blob_oids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for key in &keys {
+                if let Some(object_id) = cache.get(key) {
+                    resolved.insert(key.clone(), object_id.clone());
+                }
+            }
+        }
+        let mut missing = BTreeMap::new();
+        for (part, key) in parts.iter().zip(&keys) {
+            if resolved.contains_key(key) || missing.contains_key(key) {
+                continue;
+            }
+            // Resolving the staged path performs the required SHA-256 and
+            // length validation before Git is allowed to ingest the bytes.
+            missing.insert(key.clone(), self.staged_part_path(part)?);
+        }
+
+        let missing = missing.into_iter().collect::<Vec<_>>();
+        let mut start = 0;
+        while start < missing.len() {
+            let mut end = start;
+            let mut argument_bytes = 0usize;
+            while end < missing.len() && end - start < MAXIMUM_PATHS_PER_INVOCATION {
+                let path_bytes = missing[end].1.as_os_str().to_string_lossy().len();
+                if end > start
+                    && argument_bytes.saturating_add(path_bytes)
+                        > MAXIMUM_ARGUMENT_BYTES_PER_INVOCATION
+                {
+                    break;
+                }
+                argument_bytes = argument_bytes.saturating_add(path_bytes);
+                end += 1;
+            }
+            let mut arguments = vec![
+                OsString::from("hash-object"),
+                OsString::from("-w"),
+                OsString::from("--"),
+            ];
+            arguments.extend(
+                missing[start..end]
+                    .iter()
+                    .map(|(_, path)| path.as_os_str().to_owned()),
+            );
+            let output = run_git(&self.git_executable, Some(&session), arguments, &[])?;
+            let object_ids = parse_object_id_lines(
+                &output.stdout,
+                "git hash-object",
+                missing[start..end].len(),
+            )?;
+            for ((key, _), object_id) in missing[start..end].iter().zip(object_ids) {
+                resolved.insert(key.clone(), object_id);
+            }
+            start = end;
+        }
+        let object_ids = keys
+            .iter()
+            .map(|key| {
+                resolved.get(key).cloned().ok_or_else(|| {
+                    CacheError::InvalidTransition(
+                        "prepared Git blob object identity was not recorded".to_owned(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut cache = self
+            .prepared_blob_oids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in keys {
+            if let Some(object_id) = resolved.get(&key) {
+                cache.insert(key, object_id.clone());
+            }
+        }
+        Ok(object_ids)
+    }
+
+    fn update_index_parts(
+        &self,
+        session: &Path,
+        parts: &[TransportPart],
+        object_ids: &[String],
+        delete_paths: &[String],
+        environment: &[(&OsStr, &OsStr)],
+    ) -> Result<(), CacheError> {
+        if parts.len() != object_ids.len() {
+            return Err(CacheError::InvalidTransition(
+                "Git index update has a different number of parts and object identities".to_owned(),
+            ));
+        }
+        if parts.is_empty() && delete_paths.is_empty() {
+            return Ok(());
+        }
+        let mut input = Vec::new();
+        for (part, object_id) in parts.iter().zip(object_ids) {
+            validate_relative_git_path(&part.repository_path)?;
+            input.extend_from_slice(format!("100644 {object_id}\t").as_bytes());
+            input.extend_from_slice(part.repository_path.as_bytes());
+            input.push(0);
+        }
+        for path in delete_paths {
+            validate_relative_git_path(path)?;
+            input.extend_from_slice(b"0 0000000000000000000000000000000000000000\t");
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
+        run_git_with_input(
             &self.git_executable,
             Some(session),
             [
-                OsString::from("hash-object"),
-                OsString::from("-w"),
-                path.as_os_str().to_owned(),
+                OsString::from("update-index"),
+                OsString::from("-z"),
+                OsString::from("--index-info"),
             ],
-            &[],
+            environment,
+            &input,
         )?;
-        parse_single_line(&output.stdout, "git hash-object")
+        Ok(())
     }
 
     fn commit_tree(
@@ -265,41 +419,14 @@ impl GitCliRemoteStore {
                 ],
                 &index_environment,
             )?;
-            for part in &request.parts {
-                let oid = self.hash_staged_blob(session, part)?;
-                run_git(
-                    &self.git_executable,
-                    Some(session),
-                    [
-                        OsString::from("update-index"),
-                        OsString::from("--add"),
-                        OsString::from("--cacheinfo"),
-                        OsString::from("100644"),
-                        OsString::from(oid),
-                        OsString::from(&part.repository_path),
-                    ],
-                    &index_environment,
-                )?;
-            }
-            if !request.delete_paths.is_empty() {
-                let mut removals = Vec::new();
-                for path in &request.delete_paths {
-                    removals.extend_from_slice(
-                        format!("0 0000000000000000000000000000000000000000\t{path}\0").as_bytes(),
-                    );
-                }
-                run_git_with_input(
-                    &self.git_executable,
-                    Some(session),
-                    [
-                        OsString::from("update-index"),
-                        OsString::from("-z"),
-                        OsString::from("--index-info"),
-                    ],
-                    &index_environment,
-                    &removals,
-                )?;
-            }
+            let object_ids = self.hash_staged_blobs(session, &request.parts)?;
+            self.update_index_parts(
+                session,
+                &request.parts,
+                &object_ids,
+                &request.delete_paths,
+                &index_environment,
+            )?;
             let tree = run_git(
                 &self.git_executable,
                 Some(session),
@@ -359,22 +486,14 @@ impl GitCliRemoteStore {
                 [OsString::from("read-tree"), OsString::from("--empty")],
                 &index_environment,
             )?;
-            for part in &request.parts {
-                let oid = self.hash_staged_blob(session, part)?;
-                run_git(
-                    &self.git_executable,
-                    Some(session),
-                    [
-                        OsString::from("update-index"),
-                        OsString::from("--add"),
-                        OsString::from("--cacheinfo"),
-                        OsString::from("100644"),
-                        OsString::from(oid),
-                        OsString::from(&part.repository_path),
-                    ],
-                    &index_environment,
-                )?;
-            }
+            let object_ids = self.hash_staged_blobs(session, &request.parts)?;
+            self.update_index_parts(
+                session,
+                &request.parts,
+                &object_ids,
+                &[],
+                &index_environment,
+            )?;
             let tree = run_git(
                 &self.git_executable,
                 Some(session),
@@ -1122,6 +1241,34 @@ fn parse_single_line(bytes: &[u8], operation: &str) -> Result<String, CacheError
     Ok(value.to_owned())
 }
 
+fn parse_object_id_lines(
+    bytes: &[u8],
+    operation: &str,
+    expected_count: usize,
+) -> Result<Vec<String>, CacheError> {
+    let output = std::str::from_utf8(bytes)
+        .map_err(|error| CacheError::Io(format!("{operation} returned non-UTF8: {error}")))?;
+    let values = output
+        .lines()
+        .map(|line| {
+            let value = line.trim();
+            if value.is_empty() || value.chars().any(char::is_whitespace) {
+                return Err(CacheError::Io(format!(
+                    "{operation} returned an invalid object identity"
+                )));
+            }
+            Ok(value.to_owned())
+        })
+        .collect::<Result<Vec<_>, CacheError>>()?;
+    if values.len() != expected_count {
+        return Err(CacheError::Io(format!(
+            "{operation} returned {} object identities for {expected_count} paths",
+            values.len()
+        )));
+    }
+    Ok(values)
+}
+
 fn validate_repository(repository: &str) -> Result<(), CacheError> {
     if repository.trim().is_empty()
         || repository.starts_with('-')
@@ -1370,6 +1517,101 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(!temporary.join("working-tree").exists());
+        store.cleanup_session(&repository).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepared_blobs_are_not_reread_during_commit_construction() {
+        if !test_git(None, &["--version"]) {
+            return;
+        }
+        let root = temporary_root("git-cli-prepared-blobs");
+        let _ = fs::remove_dir_all(&root);
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let temporary = root.join("transport");
+        let staging = root.join("staging");
+        fs::create_dir_all(&root).unwrap();
+        assert!(test_git(
+            None,
+            &["init", "--bare", remote.to_str().unwrap()]
+        ));
+        assert!(test_git(None, &["init", seed.to_str().unwrap()]));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.name", "Test Publisher"]
+        ));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.email", "test@example.invalid"]
+        ));
+        fs::write(seed.join("README.md"), b"seed\n").unwrap();
+        assert!(test_git(Some(&seed), &["add", "README.md"]));
+        assert!(test_git(Some(&seed), &["commit", "-m", "seed"]));
+        assert!(test_git(
+            Some(&seed),
+            &["remote", "add", "origin", remote.to_str().unwrap()]
+        ));
+        assert!(test_git(
+            Some(&seed),
+            &["push", "origin", "HEAD:refs/heads/main"]
+        ));
+
+        let payloads = [
+            b"payload prepared before publication lock".as_slice(),
+            b"second payload in the same hash-object batch".as_slice(),
+            b"third payload in the same index-info stream".as_slice(),
+        ];
+        let mut parts = Vec::new();
+        let mut local_paths = Vec::new();
+        for (sequence, payload) in payloads.iter().enumerate() {
+            let digest = ContentDigest::sha256(payload);
+            let repository_path = format!("objects/sha256/{}/{}.part", &digest.0[..2], digest.0);
+            let local_path = staging.join(Path::new(&repository_path));
+            fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+            fs::write(&local_path, payload).unwrap();
+            parts.push(TransportPart {
+                sequence: sequence as u64,
+                repository_path,
+                size_bytes: payload.len() as u64,
+                content_digest: digest,
+            });
+            local_paths.push(local_path);
+        }
+        let store = GitCliRemoteStore::new(
+            &temporary,
+            &staging,
+            "Test Publisher",
+            "test@example.invalid",
+        )
+        .unwrap();
+        let repository = remote.to_string_lossy().to_string();
+
+        store.prepare_staged_parts(&repository, &parts).unwrap();
+        for local_path in &local_paths {
+            fs::remove_file(local_path).unwrap();
+        }
+
+        let expected_head = store.read_ref(&repository, "main").unwrap();
+        let result = store
+            .compare_and_swap_commit(&RemoteCommitRequest {
+                repository: repository.clone(),
+                branch: "main".to_owned(),
+                expected_head,
+                message: "publish prehashed part".to_owned(),
+                parts: parts.clone(),
+                delete_paths: Vec::new(),
+            })
+            .unwrap();
+        let CompareAndSwapResult::Committed { commit_id } = result else {
+            panic!("local test publication unexpectedly conflicted");
+        };
+        for part in &parts {
+            store
+                .verify_committed_part(&repository, &commit_id, part)
+                .unwrap();
+        }
         store.cleanup_session(&repository).unwrap();
         let _ = fs::remove_dir_all(root);
     }
