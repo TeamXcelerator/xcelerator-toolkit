@@ -711,6 +711,42 @@ fn prepared_candidate_files(candidates: &[PreparedFamilyCandidate<'_>]) -> Vec<T
         .collect()
 }
 
+fn refresh_github_write_session_with<F>(
+    session: &mut AuthenticatedGitHubSession,
+    principal: &str,
+    authorized_repository: &str,
+    safety_margin_seconds: u64,
+    mut refresh: F,
+) -> Result<(), CacheError>
+where
+    F: FnMut(&str) -> Result<AuthenticatedGitHubSession, CacheError>,
+{
+    if session.requires_refresh(safety_margin_seconds)? {
+        let refreshed = refresh(authorized_repository)?;
+        if refreshed.evidence().principal != principal {
+            return Err(CacheError::Authentication(
+                "refreshed GitHub permission resolved a different principal".to_owned(),
+            ));
+        }
+        *session = refreshed;
+    }
+    session.require_write_for(principal, authorized_repository)
+}
+
+fn refresh_github_write_session(
+    session: &mut AuthenticatedGitHubSession,
+    principal: &str,
+    authorized_repository: &str,
+) -> Result<(), CacheError> {
+    refresh_github_write_session_with(
+        session,
+        principal,
+        authorized_repository,
+        60,
+        |repository| crate::GitHubCredentialApiProbe::default().probe_repository(repository),
+    )
+}
+
 /// Publish a family as repository-level byte batches. Logical manifests and
 /// index entries remain one-per-artifact; only the Git transport transaction is
 /// shared. This is the normal path for families containing more than one
@@ -753,7 +789,11 @@ fn execute_family_batch_publication(
     let session = sessions.get(&destination).ok_or_else(|| {
         CacheError::Authentication("family batch is missing its write session".to_owned())
     })?;
-    session.require_write_for(principal, &authorized)?;
+    // A previous family may spend hours preparing and publishing large HP
+    // artifacts. Refresh the family-wide authorization before the first
+    // repository access instead of rejecting the original five-minute probe.
+    let mut active_session = session.clone();
+    refresh_github_write_session(&mut active_session, principal, &authorized)?;
     verify_bootstrap_registry_route(&remote, owner, &first.family, destination, &cancellation)?;
     let observed_head = remote.read_ref(&repository_url, "main")?;
     let mut pending_drafts = drafts.to_vec();
@@ -872,19 +912,8 @@ fn execute_family_batch_publication(
     } else {
         None
     };
-    let mut active_session = session.clone();
     let publication_result = (|| -> Result<Vec<ManagedPublicationExecutionReport>, CacheError> {
-        if active_session.requires_refresh(60)? {
-            let refreshed =
-                crate::GitHubCredentialApiProbe::default().probe_repository(&authorized)?;
-            if refreshed.evidence().principal != principal {
-                return Err(CacheError::Authentication(
-                    "post-lock GitHub permission resolved a different principal".to_owned(),
-                ));
-            }
-            active_session = refreshed;
-        }
-        active_session.require_write_for(principal, &authorized)?;
+        refresh_github_write_session(&mut active_session, principal, &authorized)?;
         // A clean bootstrap shard has no ledger or index yet. Initialize those
         // sidecars before planning the first repository batch; subsequent runs
         // simply reuse the verified sidecars.
@@ -1278,18 +1307,7 @@ fn execute_family_batch_publication(
             for (sequence, part) in commit_parts.iter_mut().enumerate() {
                 part.sequence = sequence as u64;
             }
-            if active_session.requires_refresh(60)? {
-                let refreshed =
-                    crate::GitHubCredentialApiProbe::default().probe_repository(&authorized)?;
-                if refreshed.evidence().principal != principal {
-                    return Err(CacheError::Authentication(
-                        "publication batch permission refresh resolved a different principal"
-                            .to_owned(),
-                    ));
-                }
-                active_session = refreshed;
-            }
-            active_session.require_write_for(principal, &authorized)?;
+            refresh_github_write_session(&mut active_session, principal, &authorized)?;
             let request = crate::RemoteCommitRequest {
                 repository: repository_url.clone(),
                 branch: "main".to_owned(),
@@ -2931,11 +2949,44 @@ mod tests {
         SemanticKeyEnvelope, ShardIndexPartition, TransportEncodingRecord, TransportPart,
         GITHUB_SAFE_REPOSITORY_PAYLOAD_BYTES,
     };
+    use std::cell::Cell;
     use std::fs;
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use xc_core::{AssuranceLevel, CancellationToken, ResourcePolicy};
+
+    #[test]
+    fn expired_family_session_is_refreshed_before_repository_access() {
+        let repository = "example-org/xcelerator-cache-private-ccm-matrices-0001";
+        let mut session = AuthenticatedGitHubSession::verified_for_test_with_age(
+            "test-owner",
+            repository,
+            RepositoryPermission::Write,
+            crate::AUTHORITY_PROBE_MAX_AGE_SECONDS + 1,
+        );
+        let refresh_count = Cell::new(0usize);
+
+        refresh_github_write_session_with(
+            &mut session,
+            "test-owner",
+            repository,
+            60,
+            |requested_repository| {
+                assert_eq!(requested_repository, repository);
+                refresh_count.set(refresh_count.get() + 1);
+                Ok(AuthenticatedGitHubSession::verified_for_test(
+                    "test-owner",
+                    repository,
+                    RepositoryPermission::Write,
+                ))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(refresh_count.get(), 1);
+        session.require_write_for("test-owner", repository).unwrap();
+    }
 
     struct RepositoryState {
         head: String,

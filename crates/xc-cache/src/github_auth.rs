@@ -203,6 +203,35 @@ impl AuthenticatedGitHubSession {
             .unwrap(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn verified_for_test_with_age(
+        principal: &str,
+        repository: &str,
+        permission: RepositoryPermission,
+        age_seconds: u64,
+    ) -> Self {
+        let mut evidence = RepositoryPermissionEvidence::new(
+            principal.to_owned(),
+            repository.to_owned(),
+            RepositoryVisibility::Private,
+            permission,
+        )
+        .unwrap();
+        evidence.verified_at_unix_seconds = evidence
+            .verified_at_unix_seconds
+            .saturating_sub(age_seconds);
+        evidence.evidence_digest = canonical_digest(&PermissionEvidenceMaterial {
+            provider_id: &evidence.provider_id,
+            principal: &evidence.principal,
+            repository: &evidence.repository,
+            visibility: evidence.visibility,
+            permission: evidence.permission,
+            verified_at_unix_seconds: evidence.verified_at_unix_seconds,
+        })
+        .unwrap();
+        Self { evidence }
+    }
 }
 
 #[derive(Clone, Debug)]
