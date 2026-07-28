@@ -1,4 +1,4 @@
-# Headless GitHub authentication (v0.13.1)
+# Headless GitHub authentication (v0.13.3)
 
 The toolkit supports GitHub personal access tokens on ephemeral Linux systems, including Vast.ai instances. Git Credential Manager is not required. Both the permission probe and direct no-checkout Git transport obtain credentials through Git's standard credential-provider protocol.
 

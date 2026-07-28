@@ -1,4 +1,4 @@
-# v0.13.1 Third-Party Review Record
+# v0.13.3 Third-Party Review Record
 
 ## Cutoff-free CCM mathematics
 
@@ -20,7 +20,7 @@
 
 The owner maintains a machine-readable review record for every direct external
 Rust dependency, separately installed native dependency, external validation
-tool, and named published algorithm source used in v0.13.1. Records bind exact
+tool, and named published algorithm source used in v0.13.3. Records bind exact
 manifest requirements, license expressions, authoritative package pages,
 incorporation decisions, and implementation paths. Public contributions must
 submit the same evidence through the owner-managed review process described in

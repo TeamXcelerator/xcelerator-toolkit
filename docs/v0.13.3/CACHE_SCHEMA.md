@@ -1,4 +1,4 @@
-# v0.13.1 Cache Schema Principles
+# v0.13.3 Cache Schema Principles
 
 This document is the concise schema contract used by manifests and validators. TD-04 defines the complete resolver, transport, transaction, trust, durability, and recovery design.
 
@@ -235,6 +235,18 @@ The concrete CCM execution graph and shard placement are:
 Cheap prime enumeration and the analytic pole formula are embedded in the semantic identity or payload metadata of their consumers. They are deliberately not fetched as separate objects. Every matrix or state cache hit is checked against its exact dependency: parity matrices are reconstructed from tau, factorizations pass a deterministic solve residual, and eigenpairs replay the tau residual and their structured inverse-iteration stopping evidence. That evidence records the configured limit, steps used, unshifted convergence, final Rayleigh change, shifted-refinement outcome, and final relative residual. Root ranges must be finite, positive, ordered, and identity-bound, and evidence values must equal the results produced by their dependencies.
 
 Roots are stored as bounded ordered windows, not one remote object per scalar root. Independent discovery and reference-seeded refinement are different artifact kinds and cannot satisfy one another's semantic requests. An independent range records its one-based bounds assigned by cumulative finite-source counts, discovery/count methods, `reference_seeds_used=false`, each value's explicit convergence status, per-root iterations, final MPFR correction, residual, achieved-digit estimate, the 64-bit requested-accuracy guard policy, and exact secular-source dependency. A refinement range records its exact supplied starting points and `reference_seeds_used=true`. Cache replay recomputes the achieved-digit estimate and secular residual and rejects inconsistent status claims. Computed assurance retains finite, ordered `stagnated` and iteration-limited `approximate` values without relabeling them as converged; a failed outcome with no value invalidates the window. Cross-checked or certified assurance requires every root to be fully converged. The run-evidence artifact carries the same mode, index bounds, exact root dependency, and separate outcome counts. This keeps research data directly accessible without allowing child-object counts or remote lookup overhead to dominate the numerical calculation.
+
+Ordinary positive independent windows retain the v6 semantic identity, JSON
+shape, and reader floor established by earlier v0.13.x releases. Advanced
+signed or finite-shortfall requests use v7 numerical artifacts with a
+v0.13.3 reader floor. A v7 numerical artifact is identified by its actual
+finite-source root domain and complete discovered window, never by the
+caller's requested count or permission to accept a shortfall. The requested
+count, returned projection, selected canonical ordinals, and shortfall policy
+are stored in a separate compact convergence-evidence artifact. A larger
+canonical advanced window can therefore satisfy a contained request without
+duplicating numerical payloads, while an older reader continues to resolve
+only the unchanged v6 artifacts it understands.
 
 The exact FLINT numerator certificate proves the roots of the stored point-valued finite secular source. It must not be relabeled as an end-to-end interval certificate for the mathematical finite CCM operator unless Tau uncertainty, selected-eigenvalue simplicity and gap, eigenvector error, normalization, and residue intervals have all been propagated. Artifact claim scope records this distinction; an exact stored-point surrogate remains valuable rigorous software evidence but is not the stronger finite-operator claim.
 

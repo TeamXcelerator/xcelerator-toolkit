@@ -1,7 +1,7 @@
-# Xcelerator Toolkit v0.13.1 documentation
+# Xcelerator Toolkit v0.13.3 documentation
 
 This directory contains the public documentation needed to build, use,
-and validate Xcelerator Toolkit v0.13.1. Internal requirements,
+and validate Xcelerator Toolkit v0.13.3. Internal requirements,
 technical designs, planning records, traceability, and owner release evidence
 are maintained outside the public source distribution.
 

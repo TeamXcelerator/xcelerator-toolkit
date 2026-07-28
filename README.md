@@ -7,7 +7,8 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-Version 0.13.2 is a breaking release and supports only the current APIs and cache format.
+Version 0.13.3 preserves the v0.13.x APIs and existing cache artifacts while
+adding explicitly opt-in advanced CCM root-discovery controls.
 
 ---
 
@@ -42,7 +43,7 @@ If you use Xcelerator Toolkit in research, please cite the exact version or Git 
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.13.2},
+  version = {0.13.3},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }
@@ -83,7 +84,7 @@ cargo run -p xc-root --example bracketed_root --locked
 cargo run -p xc-spectral --example ccm_window_plan --locked
 ```
 
-See [Research Workflows](docs/v0.13.1/RESEARCH_WORKFLOWS.md) for additional examples and their numerical scope.
+See [Research Workflows](docs/v0.13.3/RESEARCH_WORKFLOWS.md) for additional examples and their numerical scope.
 
 ## High precision
 
@@ -116,15 +117,28 @@ they may share Tau, eigenstate, and secular-source dependencies but can never
 satisfy each other's cache requests. Finite-source root certificates remain
 independent of either acquisition policy.
 
+Advanced independent discovery can explicitly retain a signed root window and
+can return the finite roots actually found when a request exceeds the positive
+finite-source reach. These controls are opt-in; ordinary positive, complete
+requests retain their established behavior, semantic keys, payload bytes, and
+minimum reader version.
+
 ## Caching
 
 Caching is automatic for ordinary consumers. The toolkit checks compatible local and public artifacts, validates a candidate before reuse, and computes on a miss. No credentials or cache configuration are required for that normal workflow.
 
-Authenticated publication to private or public cache storage is an optional author operation and is disabled by default. See [Cache Schema](docs/v0.13.1/CACHE_SCHEMA.md) for the artifact model.
+Authenticated publication to private or public cache storage is an optional author operation and is disabled by default. See [Cache Schema](docs/v0.13.3/CACHE_SCHEMA.md) for the artifact model.
 
 Version 0.13.1 adds generation-fenced publication leases for private shards. Concurrent authors serialize publication per shard, while each content batch and its coordination heartbeat advance atomically.
 
 Version 0.13.2 adds an automatic high-precision CCM eigenstate policy. It reuses an exact current-\(N\) state when available and can use the nearest compatible lower-\(N\) cached state as a shift-invert Krylov starting point without changing claim scripts.
+
+Version 0.13.3 adds opt-in signed and incomplete independent-root discovery.
+The numerical v7 artifact stores one canonical complete finite window per
+mathematical domain; requested counts, projections, and shortfall policy are
+stored separately in compact evidence. Equivalent advanced requests therefore
+reuse one numerical artifact, while all existing positive v6 artifacts remain
+readable and retain their original identities.
 
 ## Validation
 
@@ -146,9 +160,9 @@ Saved results record the toolkit version, source revision, numerical backend, pr
 
 ## Documentation
 
-- [v0.13.1 documentation](docs/v0.13.1/README.md)
-- [Research workflows](docs/v0.13.1/RESEARCH_WORKFLOWS.md)
-- [CLI reference](docs/v0.13.1/CLI.md)
+- [v0.13.3 documentation](docs/v0.13.3/README.md)
+- [Research workflows](docs/v0.13.3/RESEARCH_WORKFLOWS.md)
+- [CLI reference](docs/v0.13.3/CLI.md)
 - [Security policy](SECURITY.md)
 
 ## License

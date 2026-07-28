@@ -48,7 +48,10 @@ struct RetainedCcmSource {
 #[derive(Clone, Copy)]
 enum RootAcquisition<'a> {
     SourceOnly,
-    Independent(&'a ZeroTarget),
+    Independent {
+        target: &'a ZeroTarget,
+        options: IndependentRootDiscoveryOptions,
+    },
     ReferenceSeeded {
         first_root_index: usize,
         seeds: &'a [Float],
@@ -69,6 +72,105 @@ impl RootArtifactMode {
             Self::ReferenceSeededRefinement => "reference_seeded_refinement",
         }
     }
+}
+
+/// Sign domain used by independent finite-source root discovery.
+///
+/// Positive-only discovery remains the production default. `Signed` is an
+/// explicit research mode that searches both sides of the finite CCM source
+/// window and orders the selected roots numerically.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndependentRootDomain {
+    #[default]
+    Positive,
+    Signed,
+}
+
+impl IndependentRootDomain {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Positive => "positive",
+            Self::Signed => "signed",
+        }
+    }
+}
+
+/// Advanced policy for independent root discovery.
+///
+/// The default retains the strict production contract: positive roots only
+/// and an error if the finite source cannot supply the complete target.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndependentRootDiscoveryOptions {
+    pub domain: IndependentRootDomain,
+    /// Return the complete available finite window when it cannot fill the
+    /// requested target. The returned root list may be empty.
+    pub allow_incomplete: bool,
+}
+
+impl IndependentRootDiscoveryOptions {
+    pub fn advanced(include_negative_roots: bool, allow_incomplete: bool) -> Self {
+        Self {
+            domain: if include_negative_roots {
+                IndependentRootDomain::Signed
+            } else {
+                IndependentRootDomain::Positive
+            },
+            allow_incomplete,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RootWindowSemantics {
+    domain: IndependentRootDomain,
+    requested_count: usize,
+    allow_incomplete: bool,
+    artifact_format: RootArtifactFormat,
+}
+
+impl RootWindowSemantics {
+    fn strict_positive(count: usize) -> Self {
+        Self {
+            domain: IndependentRootDomain::Positive,
+            requested_count: count,
+            allow_incomplete: false,
+            artifact_format: RootArtifactFormat::LegacyV6,
+        }
+    }
+
+    fn advanced(
+        domain: IndependentRootDomain,
+        requested_count: usize,
+        allow_incomplete: bool,
+    ) -> Self {
+        Self {
+            domain,
+            requested_count,
+            allow_incomplete,
+            artifact_format: RootArtifactFormat::AdvancedV7,
+        }
+    }
+
+    fn is_advanced(self) -> bool {
+        self.artifact_format == RootArtifactFormat::AdvancedV7
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootArtifactFormat {
+    LegacyV6,
+    AdvancedV7,
+}
+
+#[derive(Debug)]
+struct IndependentRootDiscoveryPlan {
+    artifact_first_root_index: usize,
+    artifact_seeds: Vec<Float>,
+    selected_positions: Vec<usize>,
+    result_first_root_index: usize,
+    request_semantics: RootWindowSemantics,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -498,6 +600,8 @@ struct PortableRootRange {
     precision_bits: u32,
     force_even: bool,
     first_root_index: usize,
+    #[serde(default, skip_serializing_if = "is_positive_root_domain")]
+    root_domain: IndependentRootDomain,
     discovery_mode: String,
     reference_seeds_used: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -508,6 +612,14 @@ struct PortableRootRange {
     solver: String,
     solver_steps: usize,
     accuracy_guard_bits: u32,
+}
+
+fn is_positive_root_domain(value: &IndependentRootDomain) -> bool {
+    *value == IndependentRootDomain::Positive
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -534,6 +646,14 @@ struct PortableRunEvidence {
     first_root_index: usize,
     last_root_index: usize,
     root_count: usize,
+    #[serde(default, skip_serializing_if = "is_positive_root_domain")]
+    root_domain: IndependentRootDomain,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_root_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_incomplete: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    selected_root_ordinals: Vec<usize>,
     weil_min_eigenvalue: String,
     converged_roots: usize,
     stagnated_roots: usize,
@@ -976,14 +1096,19 @@ impl EigenvalueResult {
 /// All HP fields stay in `rug::Float` at the working precision specified
 /// in the config; lossy f64 views are exposed via `to_f64_result`.
 pub struct HighPrecResult {
-    /// Solver results for positive roots of the eigenpair-derived CCM secular
-    /// equation (equivalently, the finite `D_log` spectrum).
+    /// Solver results for roots of the eigenpair-derived CCM secular equation
+    /// (equivalently, the finite `D_log` spectrum).
+    ///
+    /// Ordinary APIs retain positive roots. An explicit advanced independent
+    /// discovery request may retain a numerically ordered signed window.
     ///
     /// Each entry is one of:
     /// Only `Converged` entries are returned by the ordinary production APIs.
     /// Other variants retain diagnostics for explicit low-level inspection.
     pub eigenvalues_pos: Vec<EigenvalueResult>,
     /// One-based index assigned to the first entry in `eigenvalues_pos`.
+    /// In advanced signed mode this is the ordinal within the returned signed
+    /// window; the historical field name is retained for API compatibility.
     /// Empty source-only runs retain the requested start for provenance.
     pub first_positive_root_index: usize,
     /// Smallest eigenvalue of the Weil quadratic form (the spectral
@@ -1073,7 +1198,7 @@ impl PortableHighPrecResult {
                 .checked_add(result.eigenvalues_pos.len().saturating_sub(1))
                 .is_none()
         {
-            bail!("CCM positive-root index range is invalid");
+            bail!("CCM root index range is invalid");
         }
         let eigenvalues_pos = result
             .eigenvalues_pos
@@ -1125,7 +1250,7 @@ impl PortableHighPrecResult {
                 .checked_add(self.eigenvalues_pos.len().saturating_sub(1))
                 .is_none()
         {
-            bail!("portable CCM result has an invalid positive-root index range");
+            bail!("portable CCM result has an invalid root index range");
         }
         let eigenvalues_pos = self
             .eigenvalues_pos
@@ -1168,7 +1293,7 @@ impl PortableHighPrecResult {
 }
 
 impl HighPrecResult {
-    /// Positive CCM secular roots in the requested window.
+    /// CCM secular roots in the requested window.
     ///
     /// This terminology avoids confusing these values with the distinct Tau
     /// or Weil-form eigenvalues. The `eigenvalues_pos` field remains the
@@ -1178,6 +1303,7 @@ impl HighPrecResult {
     }
 
     /// Inclusive one-based root-index range represented by this result.
+    /// In advanced signed mode these are signed-window ordinals.
     pub fn spectral_root_index_range(&self) -> Option<std::ops::RangeInclusive<usize>> {
         if self.eigenvalues_pos.is_empty() || self.first_positive_root_index == 0 {
             return None;
@@ -4992,6 +5118,20 @@ fn discover_lower_n_continuation_seed(
     Ok(None)
 }
 
+fn is_retryable_auto_krylov_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<CacheError>().is_some_and(|error| {
+            matches!(
+                error,
+                CacheError::InvalidTransition(message)
+                    if message.starts_with(
+                        "CCM shift-invert Krylov did not produce an unambiguous converged target:"
+                    )
+            )
+        })
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn weil_eigenpair_via_cache_with_seed(
     params: &CcmParams,
@@ -5088,7 +5228,7 @@ fn weil_eigenpair_via_cache_with_seed(
             (None, None)
         };
         selected.eigenstate_solver = CcmEigenstateSolver::ShiftInvertKrylov;
-        return weil_eigenpair_via_cache_with_seed(
+        let krylov = weil_eigenpair_via_cache_with_seed(
             params,
             &selected,
             l,
@@ -5098,6 +5238,26 @@ fn weil_eigenpair_via_cache_with_seed(
             seed,
             seed_manifest,
         );
+        return match krylov {
+            Ok(result) => Ok(result),
+            Err(error) if is_retryable_auto_krylov_failure(&error) => {
+                eprintln!(
+                    "[HP] Auto eigenstate solver: shift-invert Krylov did not converge unambiguously; falling back to legacy inverse iteration"
+                );
+                selected.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
+                weil_eigenpair_via_cache_with_seed(
+                    params,
+                    &selected,
+                    l,
+                    tau,
+                    tau_manifest,
+                    cache,
+                    None,
+                    None,
+                )
+            }
+            Err(error) => Err(error),
+        };
     }
     let prec = cfg.precision_bits;
     if cfg.eigenstate_solver == CcmEigenstateSolver::ShiftInvertKrylov && !cfg.force_even {
@@ -5297,7 +5457,7 @@ fn weil_eigenpair_via_cache_with_seed(
                             || report.boundary_cluster.is_some()
                             || report.retained_eigenpairs.is_empty()
                         {
-                            return Err(CacheError::InvalidManifest(format!(
+                            return Err(CacheError::InvalidTransition(format!(
                                 "CCM shift-invert Krylov did not produce an unambiguous converged target: status={:?}, boundary_cluster={}",
                                 report.status,
                                 report.boundary_cluster.is_some()
@@ -5741,6 +5901,7 @@ fn ensure_root_window_usable(
     outcomes: &[EigenvalueResult],
     expected_count: usize,
     require_converged: bool,
+    domain: IndependentRootDomain,
 ) -> Result<()> {
     if outcomes.len() != expected_count {
         bail!(
@@ -5788,8 +5949,14 @@ fn ensure_root_window_usable(
                 )
             }
         };
-        if result.value <= 0 || previous.is_some_and(|value| &result.value <= value) {
-            bail!("CCM root values are not a strictly increasing positive sequence");
+        if (domain == IndependentRootDomain::Positive && result.value <= 0)
+            || result.value.is_zero()
+            || previous.is_some_and(|value| &result.value <= value)
+        {
+            bail!(
+                "CCM root values are not a strictly increasing nonzero {} sequence",
+                domain.as_str()
+            );
         }
         previous = Some(&result.value);
     }
@@ -5955,6 +6122,7 @@ fn decode_root_range(
     reference_dataset: Option<&ReferenceZeroDatasetIdentity>,
     xi: &[Float],
     l: &Float,
+    semantics: RootWindowSemantics,
     require_converged: bool,
 ) -> std::result::Result<Vec<EigenvalueResult>, CacheError> {
     let expected_seeds: Vec<String> = seeds.iter().map(Float::to_string).collect();
@@ -5965,6 +6133,7 @@ fn decode_root_range(
         || artifact.force_even != cfg.force_even
         || first_root_index == 0
         || artifact.first_root_index != first_root_index
+        || artifact.root_domain != semantics.domain
         || artifact.discovery_mode != artifact_mode.as_str()
         || artifact.reference_seeds_used
             != (artifact_mode == RootArtifactMode::ReferenceSeededRefinement)
@@ -6064,12 +6233,15 @@ fn decode_root_range(
                 replayed_residual.map_or_else(|| "none".to_owned(), Float::to_string)
             )));
         }
-        if value <= &Float::with_val(cfg.precision_bits, 0)
+        if (semantics.domain == IndependentRootDomain::Positive
+            && value <= &Float::with_val(cfg.precision_bits, 0))
+            || value.is_zero()
             || previous.is_some_and(|prior| value <= prior)
         {
-            return Err(CacheError::InvalidManifest(
-                "CCM root-range payload is not a strictly increasing positive sequence".to_owned(),
-            ));
+            return Err(CacheError::InvalidManifest(format!(
+                "CCM root-range payload is not a strictly increasing nonzero {} sequence",
+                semantics.domain.as_str()
+            )));
         }
         previous = Some(value);
     }
@@ -6083,6 +6255,7 @@ fn root_range_semantic_key(
     seeds: &[Float],
     artifact_mode: RootArtifactMode,
     reference_dataset: Option<&ReferenceZeroDatasetIdentity>,
+    semantics: RootWindowSemantics,
 ) -> Result<SemanticKeyEnvelope> {
     validate_reference_seed_dataset(
         artifact_mode,
@@ -6118,6 +6291,15 @@ fn root_range_semantic_key(
                 serde_json::to_value(dataset)?,
             );
     }
+    if semantics.is_advanced() {
+        let parameters = resolved_parameters
+            .as_object_mut()
+            .expect("CCM root semantic parameters are an object");
+        parameters.insert(
+            "root_domain".to_owned(),
+            serde_json::json!(semantics.domain.as_str()),
+        );
+    }
     let source_data_identities = reference_dataset
         .map(|dataset| {
             BTreeMap::from([(
@@ -6133,14 +6315,21 @@ fn root_range_semantic_key(
             RootArtifactMode::ReferenceSeededRefinement => "ccm_root_refinement",
         }
         .to_owned(),
-        mathematical_semantics_version: match artifact_mode {
-            RootArtifactMode::Independent => "ccm-root-range-v0.13.0-v6",
-            RootArtifactMode::ReferenceSeededRefinement => "ccm-root-range-v0.13.0-v6",
+        mathematical_semantics_version: if semantics.is_advanced() {
+            "ccm-root-range-v0.13.3-v7"
+        } else {
+            "ccm-root-range-v0.13.0-v6"
         }
         .to_owned(),
         resolved_mathematical_parameters: resolved_parameters,
         normalization: None,
-        target: Some("positive_ccm_spectral_roots".to_owned()),
+        target: Some(
+            match semantics.domain {
+                IndependentRootDomain::Positive => "positive_ccm_spectral_roots",
+                IndependentRootDomain::Signed => "signed_ccm_spectral_roots",
+            }
+            .to_owned(),
+        ),
         subspace: cfg.force_even.then(|| "even".to_owned()),
         source_data_identities,
         algorithm_semantics: Some(cfg.root_solver.display_name().to_ascii_lowercase()),
@@ -6159,6 +6348,7 @@ fn resolve_root_range_via_cache(
     cache: &ArtifactCacheContext<'_>,
     artifact_mode: RootArtifactMode,
     reference_dataset: Option<&ReferenceZeroDatasetIdentity>,
+    semantics: RootWindowSemantics,
 ) -> Result<(Vec<EigenvalueResult>, ArtifactManifest, bool)> {
     if first_root_index == 0 || seeds.is_empty() {
         bail!("CCM indexed root refinement requires a positive index and nonempty seed window");
@@ -6201,6 +6391,7 @@ fn resolve_root_range_via_cache(
                 &candidate_seeds,
                 artifact_mode,
                 reference_dataset,
+                RootWindowSemantics::strict_positive(candidate_seeds.len()),
             )?;
             let candidate_logical = format!(
                 "ccm/root-refinement/{}/{}/{}/{}/1-{}",
@@ -6246,6 +6437,7 @@ fn resolve_root_range_via_cache(
                         reference_dataset,
                         xi,
                         l,
+                        RootWindowSemantics::strict_positive(candidate_seeds.len()),
                         require_converged,
                     )
                     .map(|_| ())
@@ -6269,6 +6461,7 @@ fn resolve_root_range_via_cache(
                 reference_dataset,
                 xi,
                 l,
+                RootWindowSemantics::strict_positive(candidate_seeds.len()),
                 require_converged,
             )?;
             let start = first_root_index - 1;
@@ -6286,20 +6479,34 @@ fn resolve_root_range_via_cache(
         seeds,
         artifact_mode,
         reference_dataset,
+        semantics,
     )?;
-    let logical_key = format!(
-        "ccm/{}/{}/{}/{}/{}/{}-{}",
-        match artifact_mode {
-            RootArtifactMode::Independent => "root-discovery",
-            RootArtifactMode::ReferenceSeededRefinement => "root-refinement",
-        },
-        lambda_squared_cache_identity(params),
-        params.n_modes,
-        cfg.precision_bits,
-        if cfg.force_even { "even" } else { "natural" },
-        first_root_index,
-        last_root_index
-    );
+    let logical_key = if semantics.is_advanced() {
+        format!(
+            "ccm/root-discovery/advanced/{}/{}/{}/{}/{}/{}-{}",
+            semantics.domain.as_str(),
+            lambda_squared_cache_identity(params),
+            params.n_modes,
+            cfg.precision_bits,
+            if cfg.force_even { "even" } else { "natural" },
+            first_root_index,
+            last_root_index
+        )
+    } else {
+        format!(
+            "ccm/{}/{}/{}/{}/{}/{}-{}",
+            match artifact_mode {
+                RootArtifactMode::Independent => "root-discovery",
+                RootArtifactMode::ReferenceSeededRefinement => "root-refinement",
+            },
+            lambda_squared_cache_identity(params),
+            params.n_modes,
+            cfg.precision_bits,
+            if cfg.force_even { "even" } else { "natural" },
+            first_root_index,
+            last_root_index
+        )
+    };
     let request = ArtifactExecutionCacheRequest {
         operation: match artifact_mode {
             RootArtifactMode::Independent => "ccm.root_discovery.resolve_or_compute",
@@ -6315,9 +6522,10 @@ fn resolve_root_range_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(match artifact_mode {
-            RootArtifactMode::Independent => "0.13.0",
-            RootArtifactMode::ReferenceSeededRefinement => "0.13.0",
+        minimum_reader_version: ToolkitVersion::parse(if semantics.is_advanced() {
+            "0.13.3"
+        } else {
+            "0.13.0"
         })?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
@@ -6338,7 +6546,7 @@ fn resolve_root_range_via_cache(
         &request,
         || {
             let computed = compute_root_range(xi, params, l, cfg, seeds);
-            ensure_root_window_usable(&computed, seeds.len(), require_converged)
+            ensure_root_window_usable(&computed, seeds.len(), require_converged, semantics.domain)
                 .map_err(|error| CacheError::InvalidTransition(error.to_string()))?;
             let outcomes = computed
                 .into_iter()
@@ -6377,6 +6585,7 @@ fn resolve_root_range_via_cache(
                     precision_bits: cfg.precision_bits,
                     force_even: cfg.force_even,
                     first_root_index,
+                    root_domain: semantics.domain,
                     discovery_mode: artifact_mode.as_str().to_owned(),
                     reference_seeds_used: artifact_mode
                         == RootArtifactMode::ReferenceSeededRefinement,
@@ -6410,6 +6619,7 @@ fn resolve_root_range_via_cache(
                 reference_dataset,
                 xi,
                 l,
+                semantics,
                 require_converged,
             )
             .map(|_| ())
@@ -6430,6 +6640,7 @@ fn resolve_root_range_via_cache(
             reference_dataset,
             xi,
             l,
+            semantics,
             require_converged,
         )?,
         manifest,
@@ -6449,6 +6660,8 @@ fn record_run_evidence_via_cache(
     root_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
     artifact_mode: RootArtifactMode,
+    semantics: RootWindowSemantics,
+    selected_root_ordinals: &[usize],
 ) -> Result<ArtifactManifest> {
     if first_root_index == 0 || roots.is_empty() {
         bail!("CCM run evidence requires a nonempty one-based root range");
@@ -6467,38 +6680,79 @@ fn record_run_evidence_via_cache(
             }
             counts
         });
+    let mut resolved_parameters = serde_json::json!({
+        "lambda_squared": lambda_squared_cache_identity(params),
+        "n_modes": params.n_modes,
+        "precision_bits": cfg.precision_bits,
+        "force_even": cfg.force_even,
+        "discovery_mode": artifact_mode.as_str(),
+        "first_root_index": first_root_index,
+        "last_root_index": last_root_index,
+        "root_count": roots.len(),
+        "eigenpair_content_digest": eigenpair_manifest.content_digest.0,
+        "root_range_content_digest": root_manifest.content_digest.0
+    });
+    if semantics.is_advanced() {
+        let parameters = resolved_parameters
+            .as_object_mut()
+            .expect("CCM run evidence parameters are an object");
+        parameters.insert(
+            "root_domain".to_owned(),
+            serde_json::json!(semantics.domain.as_str()),
+        );
+        parameters.insert(
+            "requested_root_count".to_owned(),
+            serde_json::json!(semantics.requested_count),
+        );
+        parameters.insert(
+            "allow_incomplete".to_owned(),
+            serde_json::json!(semantics.allow_incomplete),
+        );
+        parameters.insert(
+            "selected_root_ordinals".to_owned(),
+            serde_json::json!(selected_root_ordinals),
+        );
+    }
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_convergence_diagnostics".to_owned(),
-        mathematical_semantics_version: "ccm-run-evidence-v0.13.0-v3".to_owned(),
-        resolved_mathematical_parameters: serde_json::json!({
-            "lambda_squared": lambda_squared_cache_identity(params),
-            "n_modes": params.n_modes,
-            "precision_bits": cfg.precision_bits,
-            "force_even": cfg.force_even,
-            "discovery_mode": artifact_mode.as_str(),
-            "first_root_index": first_root_index,
-            "last_root_index": last_root_index,
-            "root_count": roots.len(),
-            "eigenpair_content_digest": eigenpair_manifest.content_digest.0,
-            "root_range_content_digest": root_manifest.content_digest.0
-        }),
+        mathematical_semantics_version: if semantics.is_advanced() {
+            "ccm-run-evidence-v0.13.3-v4"
+        } else {
+            "ccm-run-evidence-v0.13.0-v3"
+        }
+        .to_owned(),
+        resolved_mathematical_parameters: resolved_parameters,
         normalization: None,
         target: Some("ccm_configuration_run_summary".to_owned()),
         subspace: cfg.force_even.then(|| "even".to_owned()),
         source_data_identities: BTreeMap::new(),
         algorithm_semantics: None,
     };
-    let logical_key = format!(
-        "ccm/run-evidence/{}/{}/{}/{}/{}/{}-{}",
-        artifact_mode.as_str(),
-        lambda_squared_cache_identity(params),
-        params.n_modes,
-        cfg.precision_bits,
-        if cfg.force_even { "even" } else { "natural" },
-        first_root_index,
-        last_root_index
-    );
+    let logical_key = if semantics.is_advanced() {
+        format!(
+            "ccm/run-evidence/advanced/{}/{}/{}/{}/{}/{}/requested-{}/returned-{}",
+            semantics.domain.as_str(),
+            artifact_mode.as_str(),
+            lambda_squared_cache_identity(params),
+            params.n_modes,
+            cfg.precision_bits,
+            if cfg.force_even { "even" } else { "natural" },
+            semantics.requested_count,
+            roots.len()
+        )
+    } else {
+        format!(
+            "ccm/run-evidence/{}/{}/{}/{}/{}/{}-{}",
+            artifact_mode.as_str(),
+            lambda_squared_cache_identity(params),
+            params.n_modes,
+            cfg.precision_bits,
+            if cfg.force_even { "even" } else { "natural" },
+            first_root_index,
+            last_root_index
+        )
+    };
     let request = ArtifactExecutionCacheRequest {
         operation: "ccm.run_evidence.resolve_or_compute",
         semantic_key: &semantic_key,
@@ -6511,7 +6765,11 @@ fn record_run_evidence_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse(if semantics.is_advanced() {
+            "0.13.3"
+        } else {
+            "0.13.0"
+        })?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -6534,6 +6792,16 @@ fn record_run_evidence_via_cache(
                     first_root_index,
                     last_root_index,
                     root_count: roots.len(),
+                    root_domain: semantics.domain,
+                    requested_root_count: semantics
+                        .is_advanced()
+                        .then_some(semantics.requested_count),
+                    allow_incomplete: semantics.is_advanced() && semantics.allow_incomplete,
+                    selected_root_ordinals: if semantics.is_advanced() {
+                        selected_root_ordinals.to_vec()
+                    } else {
+                        Vec::new()
+                    },
                     weil_min_eigenvalue: eps_n.to_string(),
                     converged_roots: counts.0,
                     stagnated_roots: counts.1,
@@ -6556,6 +6824,17 @@ fn record_run_evidence_via_cache(
                 || artifact.first_root_index != first_root_index
                 || artifact.last_root_index != last_root_index
                 || artifact.root_count != roots.len()
+                || artifact.root_domain != semantics.domain
+                || artifact.requested_root_count
+                    != semantics.is_advanced().then_some(semantics.requested_count)
+                || artifact.allow_incomplete
+                    != (semantics.is_advanced() && semantics.allow_incomplete)
+                || artifact.selected_root_ordinals
+                    != if semantics.is_advanced() {
+                        selected_root_ordinals
+                    } else {
+                        &[]
+                    }
                 || artifact.weil_min_eigenvalue != eps_n.to_string()
                 || artifact.converged_roots != counts.0
                 || artifact.stagnated_roots != counts.1
@@ -6626,7 +6905,30 @@ pub fn run_independent(
     cfg: &HighPrecConfig,
     target: &ZeroTarget,
 ) -> Result<HighPrecResult> {
-    run_with_acquisition(params, cfg, RootAcquisition::Independent(target))
+    run_independent_with_options(
+        params,
+        cfg,
+        target,
+        IndependentRootDiscoveryOptions::default(),
+    )
+}
+
+/// Independently discover and refine a finite-source window with explicit
+/// advanced sign-domain and shortfall policy.
+pub fn run_independent_with_options(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    target: &ZeroTarget,
+    discovery: IndependentRootDiscoveryOptions,
+) -> Result<HighPrecResult> {
+    run_with_acquisition(
+        params,
+        cfg,
+        RootAcquisition::Independent {
+            target,
+            options: discovery,
+        },
+    )
 }
 
 /// Run independent root discovery and all requested research diagnostics in
@@ -6638,7 +6940,38 @@ pub fn run_independent_with_research_capture(
     target: &ZeroTarget,
     options: CcmResearchCaptureOptions,
 ) -> Result<CcmResearchCaptureResult> {
-    run_with_research_capture(params, cfg, RootAcquisition::Independent(target), options)
+    run_independent_with_options_and_research_capture(
+        params,
+        cfg,
+        target,
+        IndependentRootDiscoveryOptions::default(),
+        options,
+    )
+}
+
+/// Advanced independent discovery plus optional research capture in one
+/// toolkit-owned cache/publication session.
+pub fn run_independent_with_options_and_research_capture(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    target: &ZeroTarget,
+    discovery: IndependentRootDiscoveryOptions,
+    options: CcmResearchCaptureOptions,
+) -> Result<CcmResearchCaptureResult> {
+    if options.root_certification.is_some()
+        && (discovery.domain != IndependentRootDomain::Positive || discovery.allow_incomplete)
+    {
+        bail!("root-only certification requires a complete positive independent-discovery window");
+    }
+    run_with_research_capture(
+        params,
+        cfg,
+        RootAcquisition::Independent {
+            target,
+            options: discovery,
+        },
+        options,
+    )
 }
 
 fn run_with_research_capture(
@@ -6911,7 +7244,10 @@ pub fn run_via_cache(
         run_inner(
             params,
             cfg,
-            RootAcquisition::Independent(&target),
+            RootAcquisition::Independent {
+                target: &target,
+                options: IndependentRootDiscoveryOptions::default(),
+            },
             CcmCacheRoute::Fabric(cache),
         )
     })
@@ -7081,8 +7417,9 @@ fn independently_discovered_starting_points(
     l: &Float,
     xi: &[Float],
     target: &ZeroTarget,
+    options: IndependentRootDiscoveryOptions,
     precision_bits: u32,
-) -> Result<(usize, Vec<Float>)> {
+) -> Result<IndependentRootDiscoveryPlan> {
     if xi.len() != params.matrix_size() {
         bail!("independent HP discovery requires one weight per CCM pole");
     }
@@ -7092,6 +7429,16 @@ fn independently_discovered_starting_points(
     let mut maximum = spacing.clone();
     maximum *= params.n_modes;
     let zero = Float::with_val(precision_bits, 0);
+    if options.domain == IndependentRootDomain::Signed
+        && !matches!(
+            target,
+            ZeroTarget::FirstK { .. } | ZeroTarget::SymmetricHeightWindow { .. }
+        )
+    {
+        bail!(
+            "signed independent discovery supports FirstK and SymmetricHeightWindow targets only"
+        );
+    }
     let (scan_upper, lower_filter) = match target {
         ZeroTarget::FirstK { count } => {
             if *count == 0 {
@@ -7121,37 +7468,156 @@ fn independently_discovered_starting_points(
             (upper, zero.clone())
         }
     };
-    let values =
-        discover_secular_roots_hp(xi, params.n_modes, &spacing, &scan_upper, precision_bits)?;
-    let (first_index, selected): (usize, &[Float]) = match target {
+    let values = if options.domain == IndependentRootDomain::Signed {
+        discover_secular_roots_hp_signed(xi, params.n_modes, &spacing, &scan_upper, precision_bits)?
+    } else {
+        discover_secular_roots_hp(xi, params.n_modes, &spacing, &scan_upper, precision_bits)?
+    };
+    let requested_count = match target {
+        ZeroTarget::FirstK { count } => *count,
+        ZeroTarget::IndexRange { first, last } => last - first + 1,
+        ZeroTarget::HeightWindow { .. } | ZeroTarget::SymmetricHeightWindow { .. } => values.len(),
+    };
+    let advanced = options != IndependentRootDiscoveryOptions::default();
+
+    // Preserve the exact v6 request-shaped artifact path for every ordinary
+    // caller. Advanced requests instead cache the complete discovered finite
+    // window and record the request/projection only in the small evidence
+    // artifact. This lets a later contained request reuse the same numerical
+    // root payload without duplicating it under a policy-shaped cache key.
+    if !advanced {
+        let (first_index, selected): (usize, &[Float]) = match target {
+            ZeroTarget::FirstK { count } => {
+                if values.len() < *count {
+                    bail!(
+                        "independent HP discovery found only {} positive roots, but target requests {count}; enable the explicit incomplete-window policy or increase finite reach",
+                        values.len()
+                    );
+                }
+                (1, &values[..*count])
+            }
+            ZeroTarget::IndexRange { first, last } => {
+                if values.len() < *last {
+                    bail!(
+                        "independent HP discovery found only {} positive roots, but target requires index {last}; enable the explicit incomplete-window policy or increase finite reach",
+                        values.len()
+                    );
+                }
+                (*first, &values[*first - 1..*last])
+            }
+            ZeroTarget::HeightWindow { .. } | ZeroTarget::SymmetricHeightWindow { .. } => {
+                let first_offset = values.partition_point(|value| value <= &lower_filter);
+                let selected = &values[first_offset..];
+                if selected.is_empty() {
+                    bail!("independent computed height window contains no discovered roots");
+                }
+                (first_offset + 1, selected)
+            }
+        };
+        let artifact_seeds = selected.to_vec();
+        return Ok(IndependentRootDiscoveryPlan {
+            artifact_first_root_index: first_index,
+            selected_positions: (0..artifact_seeds.len()).collect(),
+            artifact_seeds,
+            result_first_root_index: first_index,
+            request_semantics: RootWindowSemantics::strict_positive(requested_count),
+        });
+    }
+
+    let selected_positions = match target {
         ZeroTarget::FirstK { count } => {
             if values.len() < *count {
-                bail!(
-                    "independent HP discovery found only {} positive roots, but target requires index {count}; use certified FLINT discovery or increase finite reach",
+                if !options.allow_incomplete {
+                    bail!(
+                        "independent HP discovery found only {} {} roots, but target requests {count}; enable the explicit incomplete-window policy or increase finite reach",
+                        values.len(),
+                        options.domain.as_str()
+                    );
+                }
+                eprintln!(
+                    "[HP] advanced root discovery exhausted the finite {} window: requested {}, returning {}",
+                    options.domain.as_str(),
+                    count,
                     values.len()
                 );
             }
-            (1, &values[..*count])
+            if options.domain == IndependentRootDomain::Signed {
+                let mut positions: Vec<usize> = (0..values.len()).collect();
+                positions.sort_by(|left, right| {
+                    values[*left]
+                        .clone()
+                        .abs()
+                        .partial_cmp(&values[*right].clone().abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            values[*left]
+                                .partial_cmp(&values[*right])
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                });
+                positions.truncate((*count).min(positions.len()));
+                positions.sort_unstable();
+                positions
+            } else {
+                (0..(*count).min(values.len())).collect()
+            }
         }
         ZeroTarget::IndexRange { first, last } => {
             if values.len() < *last {
-                bail!(
-                    "independent HP discovery found only {} positive roots, but target requires index {last}; use certified FLINT discovery or increase finite reach",
-                    values.len()
-                );
+                if !options.allow_incomplete {
+                    bail!(
+                        "independent HP discovery found only {} positive roots, but target requires index {last}; enable the explicit incomplete-window policy or increase finite reach",
+                        values.len()
+                    );
+                }
+                if values.len() < *first {
+                    eprintln!(
+                        "[HP] advanced root discovery exhausted the finite positive window: requested indices {}..={}, returning no roots",
+                        first, last
+                    );
+                } else {
+                    eprintln!(
+                        "[HP] advanced root discovery exhausted the finite positive window: requested indices {}..={}, returning {}..={}",
+                        first,
+                        last,
+                        first,
+                        values.len()
+                    );
+                }
             }
-            (*first, &values[*first - 1..*last])
+            ((*first - 1).min(values.len())..(*last).min(values.len())).collect()
         }
         ZeroTarget::HeightWindow { .. } | ZeroTarget::SymmetricHeightWindow { .. } => {
             let first_offset = values.partition_point(|value| value <= &lower_filter);
-            let selected = &values[first_offset..];
-            if selected.is_empty() {
+            if first_offset == values.len() && !options.allow_incomplete {
                 bail!("independent computed height window contains no discovered roots");
             }
-            (first_offset + 1, selected)
+            (first_offset..values.len()).collect()
         }
     };
-    Ok((first_index, selected.to_vec()))
+    if selected_positions.is_empty() && !options.allow_incomplete {
+        bail!("independent HP discovery found no roots in the finite source window");
+    }
+    let result_first_root_index = match target {
+        ZeroTarget::IndexRange { first, .. } => *first,
+        ZeroTarget::HeightWindow { .. } if options.domain == IndependentRootDomain::Positive => {
+            selected_positions
+                .first()
+                .map_or(1, |position| position + 1)
+        }
+        _ => 1,
+    };
+    Ok(IndependentRootDiscoveryPlan {
+        artifact_first_root_index: 1,
+        artifact_seeds: values,
+        selected_positions,
+        result_first_root_index,
+        request_semantics: RootWindowSemantics::advanced(
+            options.domain,
+            requested_count,
+            options.allow_incomplete,
+        ),
+    })
 }
 
 fn evaluate_secular_hp(
@@ -7190,11 +7656,44 @@ fn discover_secular_roots_hp(
     scan_upper: &Float,
     precision_bits: u32,
 ) -> Result<Vec<Float>> {
-    let mut boundaries = vec![Float::with_val(precision_bits, 0)];
-    for mode in 1..=n_modes {
+    discover_secular_roots_hp_range(
+        xi,
+        n_modes,
+        spacing,
+        &Float::with_val(precision_bits, 0),
+        scan_upper,
+        precision_bits,
+    )
+}
+
+fn discover_secular_roots_hp_signed(
+    xi: &[Float],
+    n_modes: usize,
+    spacing: &Float,
+    scan_height: &Float,
+    precision_bits: u32,
+) -> Result<Vec<Float>> {
+    let mut lower = Float::with_val(precision_bits, scan_height);
+    lower *= -1;
+    discover_secular_roots_hp_range(xi, n_modes, spacing, &lower, scan_height, precision_bits)
+}
+
+fn discover_secular_roots_hp_range(
+    xi: &[Float],
+    n_modes: usize,
+    spacing: &Float,
+    scan_lower: &Float,
+    scan_upper: &Float,
+    precision_bits: u32,
+) -> Result<Vec<Float>> {
+    if scan_lower >= scan_upper {
+        bail!("independent HP discovery requires a nonempty scan interval");
+    }
+    let mut boundaries = vec![scan_lower.clone()];
+    for mode in -(n_modes as i64)..=(n_modes as i64) {
         let mut pole = spacing.clone();
-        pole *= mode;
-        if pole < *scan_upper {
+        pole *= fl_i(precision_bits, mode);
+        if pole > *scan_lower && pole < *scan_upper {
             boundaries.push(pole);
         }
     }
@@ -7219,7 +7718,10 @@ fn discover_secular_roots_hp(
         .collect::<Result<Vec<_>>>()?;
     let mut roots = Vec::new();
     for root in interval_roots.into_iter().flatten() {
-        if root > 0 && roots.last().is_none_or(|previous| &root > previous) {
+        if root > *scan_lower
+            && root < *scan_upper
+            && roots.last().is_none_or(|previous| &root > previous)
+        {
             roots.push(root);
         }
     }
@@ -7254,7 +7756,7 @@ fn discover_secular_roots_hp_sequential_reference(
             &margin_fraction,
             precision_bits,
         )? {
-            if root > 0 && roots.last().is_none_or(|previous| &root > previous) {
+            if roots.last().is_none_or(|previous| &root > previous) {
                 roots.push(root);
             }
         }
@@ -7327,7 +7829,7 @@ fn discover_secular_roots_in_interval_hp(
             let mut root = bracket_left;
             root += bracket_right;
             root /= 2u32;
-            if root > 0 && roots.last().is_none_or(|previous| &root > previous) {
+            if roots.last().is_none_or(|previous| &root > previous) {
                 roots.push(root);
             }
         }
@@ -7556,12 +8058,36 @@ fn run_inner_retaining_source(
     // source; the explicitly seeded API is retained for post-discovery
     // comparison and refinement.
     let roots_started = Instant::now();
-    let (first_root_index, hp_seeds, artifact_mode, reference_dataset) = match acquisition {
-        RootAcquisition::SourceOnly => (1, Vec::new(), RootArtifactMode::Independent, None),
-        RootAcquisition::Independent(target) => {
-            let (first, points) =
-                independently_discovered_starting_points(params, &l, &xi, target, prec)?;
-            (first, points, RootArtifactMode::Independent, None)
+    let (
+        artifact_first_root_index,
+        artifact_seeds,
+        selected_root_positions,
+        first_root_index,
+        artifact_mode,
+        reference_dataset,
+        root_semantics,
+    ) = match acquisition {
+        RootAcquisition::SourceOnly => (
+            1,
+            Vec::new(),
+            Vec::new(),
+            1,
+            RootArtifactMode::Independent,
+            None,
+            RootWindowSemantics::strict_positive(0),
+        ),
+        RootAcquisition::Independent { target, options } => {
+            let plan =
+                independently_discovered_starting_points(params, &l, &xi, target, options, prec)?;
+            (
+                plan.artifact_first_root_index,
+                plan.artifact_seeds,
+                plan.selected_positions,
+                plan.result_first_root_index,
+                RootArtifactMode::Independent,
+                None,
+                plan.request_semantics,
+            )
         }
         RootAcquisition::ReferenceSeeded {
             first_root_index,
@@ -7579,9 +8105,12 @@ fn run_inner_retaining_source(
                 seeds
                     .iter()
                     .map(|seed| Float::with_val(prec, seed))
-                    .collect(),
+                    .collect::<Vec<_>>(),
+                (0..seeds.len()).collect(),
+                first_root_index,
                 RootArtifactMode::ReferenceSeededRefinement,
                 Some(dataset),
+                RootWindowSemantics::strict_positive(seeds.len()),
             )
         }
     };
@@ -7590,18 +8119,18 @@ fn run_inner_retaining_source(
     // from the explicitly named reference-refinement API.
     crate::hp_debug!(
         "[HP] using {} {} starting points for HP {} refinement (N={})",
-        hp_seeds.len(),
+        artifact_seeds.len(),
         artifact_mode.as_str(),
         cfg.root_solver.display_name(),
         params.n_modes
     );
 
-    let (eigenvalues_pos, root_manifest, secular_manifest, projected_root_window): (
+    let (canonical_roots, root_manifest, secular_manifest, projected_root_window): (
         Vec<EigenvalueResult>,
         Option<ArtifactManifest>,
         Option<ArtifactManifest>,
         bool,
-    ) = if hp_seeds.is_empty() {
+    ) = if artifact_seeds.is_empty() {
         let secular_manifest = if let CcmCacheRoute::Fabric(cache) = &cache_route {
             Some(resolve_secular_source_via_cache(
                 params,
@@ -7629,19 +8158,44 @@ fn run_inner_retaining_source(
             cfg,
             &l,
             &xi,
-            first_root_index,
-            &hp_seeds,
+            artifact_first_root_index,
+            &artifact_seeds,
             &secular_manifest,
             cache,
             artifact_mode,
             reference_dataset,
+            root_semantics,
         )?;
         (roots, Some(manifest), Some(secular_manifest), projected)
     } else {
-        let roots = compute_root_range(&xi, params, &l, cfg, &hp_seeds);
-        ensure_root_window_usable(&roots, hp_seeds.len(), false)?;
+        let roots = compute_root_range(&xi, params, &l, cfg, &artifact_seeds);
+        ensure_root_window_usable(&roots, artifact_seeds.len(), false, root_semantics.domain)?;
         (roots, None, None, false)
     };
+    let eigenvalues_pos = selected_root_positions
+        .iter()
+        .map(|position| {
+            canonical_roots.get(*position).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "advanced CCM root projection ordinal {} lies outside the canonical window of {} roots",
+                    position + 1,
+                    canonical_roots.len()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let hp_seeds = selected_root_positions
+        .iter()
+        .map(|position| {
+            artifact_seeds.get(*position).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "advanced CCM seed projection ordinal {} lies outside the canonical window of {} roots",
+                    position + 1,
+                    artifact_seeds.len()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     report_root_status_summary(&eigenvalues_pos, first_root_index);
     eprintln!(
         "[HP] phase timing: root discovery/refinement={:.3}s",
@@ -7663,6 +8217,11 @@ fn run_inner_retaining_source(
                 root_manifest,
                 cache,
                 artifact_mode,
+                root_semantics,
+                &selected_root_positions
+                    .iter()
+                    .map(|position| position + 1)
+                    .collect::<Vec<_>>(),
             )?;
         }
     }
@@ -11037,6 +11596,25 @@ mod tests {
     }
 
     #[test]
+    fn auto_retries_only_explicit_krylov_nonconvergence() {
+        let retryable = anyhow::Error::new(CacheError::InvalidTransition(
+            "CCM shift-invert Krylov did not produce an unambiguous converged target: status=Approximate, boundary_cluster=false"
+                .to_owned(),
+        ));
+        assert!(is_retryable_auto_krylov_failure(&retryable));
+
+        let corruption = anyhow::Error::new(CacheError::InvalidManifest(
+            "CCM eigenpair payload failed residual replay".to_owned(),
+        ));
+        assert!(!is_retryable_auto_krylov_failure(&corruption));
+
+        let unrelated_transition = anyhow::Error::new(CacheError::InvalidTransition(
+            "repository publication batch is incomplete".to_owned(),
+        ));
+        assert!(!is_retryable_auto_krylov_failure(&unrelated_transition));
+    }
+
+    #[test]
     fn legacy_and_krylov_eigenstate_cache_identities_are_disjoint() {
         let params = CcmParams::from_lambda_sq_integer(13, 120);
         let mut legacy = HighPrecConfig::for_decimal_digits(1_000);
@@ -11127,6 +11705,7 @@ mod tests {
             &seeds,
             RootArtifactMode::Independent,
             None,
+            RootWindowSemantics::strict_positive(seeds.len()),
         )
         .unwrap();
         let seeded = root_range_semantic_key(
@@ -11136,9 +11715,26 @@ mod tests {
             &seeds,
             RootArtifactMode::ReferenceSeededRefinement,
             Some(&dataset),
+            RootWindowSemantics::strict_positive(seeds.len()),
         )
         .unwrap();
         assert_eq!(independent.artifact_kind, "ccm_root_discovery_window");
+        assert_eq!(
+            independent.mathematical_semantics_version,
+            "ccm-root-range-v0.13.0-v6"
+        );
+        assert!(independent
+            .resolved_mathematical_parameters
+            .get("root_domain")
+            .is_none());
+        assert!(independent
+            .resolved_mathematical_parameters
+            .get("requested_root_count")
+            .is_none());
+        assert!(independent
+            .resolved_mathematical_parameters
+            .get("allow_incomplete")
+            .is_none());
         assert_eq!(seeded.artifact_kind, "ccm_root_refinement");
         assert!(independent.source_data_identities.is_empty());
         assert_eq!(
@@ -11146,6 +11742,37 @@ mod tests {
             Some(&ContentDigest(dataset.content_sha256.clone()))
         );
         assert_ne!(independent.digest().unwrap(), seeded.digest().unwrap());
+        let signed = root_range_semantic_key(
+            &params,
+            &cfg,
+            1,
+            &seeds,
+            RootArtifactMode::Independent,
+            None,
+            RootWindowSemantics::advanced(IndependentRootDomain::Signed, 200, true),
+        )
+        .unwrap();
+        assert_eq!(signed.target.as_deref(), Some("signed_ccm_spectral_roots"));
+        assert_eq!(
+            signed.mathematical_semantics_version,
+            "ccm-root-range-v0.13.3-v7"
+        );
+        assert_ne!(independent.digest().unwrap(), signed.digest().unwrap());
+        let same_signed_window_for_another_request = root_range_semantic_key(
+            &params,
+            &cfg,
+            1,
+            &seeds,
+            RootArtifactMode::Independent,
+            None,
+            RootWindowSemantics::advanced(IndependentRootDomain::Signed, 8, false),
+        )
+        .unwrap();
+        assert_eq!(
+            signed.digest().unwrap(),
+            same_signed_window_for_another_request.digest().unwrap(),
+            "request policy must not duplicate an identical numerical root window"
+        );
 
         let mut other_dataset = dataset.clone();
         other_dataset.content_sha256 = ContentDigest::sha256(b"other reference zeros").0;
@@ -11156,6 +11783,7 @@ mod tests {
             &seeds,
             RootArtifactMode::ReferenceSeededRefinement,
             Some(&other_dataset),
+            RootWindowSemantics::strict_positive(seeds.len()),
         )
         .unwrap();
         assert_ne!(seeded.digest().unwrap(), other_seeded.digest().unwrap());
@@ -11166,6 +11794,7 @@ mod tests {
             &seeds,
             RootArtifactMode::Independent,
             Some(&dataset),
+            RootWindowSemantics::strict_positive(seeds.len()),
         )
         .is_err());
         assert!(root_range_semantic_key(
@@ -11175,6 +11804,7 @@ mod tests {
             &seeds,
             RootArtifactMode::ReferenceSeededRefinement,
             None,
+            RootWindowSemantics::strict_positive(seeds.len()),
         )
         .is_err());
     }
@@ -11214,17 +11844,18 @@ mod tests {
         let params = CcmParams::from_lambda_sq_integer(13, 4);
         let l = Float::with_val(precision, 13).ln();
         let xi = vec![Float::with_val(precision, 1); params.matrix_size()];
-        let (first, points) = independently_discovered_starting_points(
+        let plan = independently_discovered_starting_points(
             &params,
             &l,
             &xi,
             &ZeroTarget::IndexRange { first: 2, last: 3 },
+            IndependentRootDiscoveryOptions::default(),
             precision,
         )
         .unwrap();
-        assert_eq!(first, 2);
-        assert_eq!(points.len(), 2);
-        assert!(points[0] > 0 && points[0] < points[1]);
+        assert_eq!(plan.result_first_root_index, 2);
+        assert_eq!(plan.artifact_seeds.len(), 2);
+        assert!(plan.artifact_seeds[0] > 0 && plan.artifact_seeds[0] < plan.artifact_seeds[1]);
     }
 
     #[test]
@@ -11235,17 +11866,125 @@ mod tests {
         let tiny = Float::with_val(precision, Float::parse("1e-400").unwrap());
         assert_eq!(tiny.to_f64(), 0.0, "fixture must underflow in binary64");
         let xi = vec![tiny; params.matrix_size()];
-        let (first, points) = independently_discovered_starting_points(
+        let plan = independently_discovered_starting_points(
             &params,
             &l,
             &xi,
             &ZeroTarget::IndexRange { first: 1, last: 3 },
+            IndependentRootDiscoveryOptions::default(),
             precision,
         )
         .unwrap();
-        assert_eq!(first, 1);
-        assert_eq!(points.len(), 3);
-        assert!(points.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(plan.result_first_root_index, 1);
+        assert_eq!(plan.artifact_seeds.len(), 3);
+        assert!(plan.artifact_seeds.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn signed_independent_discovery_returns_the_available_finite_window() {
+        let precision = 192;
+        let params = CcmParams::from_lambda_sq_integer(13, 4);
+        let l = Float::with_val(precision, 13).ln();
+        let xi = vec![Float::with_val(precision, 1); params.matrix_size()];
+        let options = IndependentRootDiscoveryOptions::advanced(true, true);
+        let plan = independently_discovered_starting_points(
+            &params,
+            &l,
+            &xi,
+            &ZeroTarget::FirstK { count: 20 },
+            options,
+            precision,
+        )
+        .unwrap();
+        assert_eq!(plan.result_first_root_index, 1);
+        assert_eq!(plan.artifact_seeds.len(), 8);
+        assert!(plan.artifact_seeds.first().unwrap() < &0);
+        assert!(plan.artifact_seeds.last().unwrap() > &0);
+        assert!(plan.artifact_seeds.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(plan.request_semantics.domain, IndependentRootDomain::Signed);
+        assert_eq!(plan.request_semantics.requested_count, 20);
+        assert!(plan.request_semantics.allow_incomplete);
+        assert_eq!(plan.selected_positions, (0..8).collect::<Vec<_>>());
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.precision_bits = precision;
+        let refined = compute_root_range(&xi, &params, &l, &cfg, &plan.artifact_seeds);
+        ensure_root_window_usable(
+            &refined,
+            plan.artifact_seeds.len(),
+            false,
+            IndependentRootDomain::Signed,
+        )
+        .unwrap();
+        assert!(ensure_root_window_usable(
+            &refined,
+            plan.artifact_seeds.len(),
+            false,
+            IndependentRootDomain::Positive,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn advanced_incomplete_discovery_accepts_an_empty_finite_window() {
+        let precision = 192;
+        let params = CcmParams::from_lambda_sq_integer(250, 10);
+        let l = Float::with_val(precision, 250).ln();
+        let mut xi = vec![Float::with_val(precision, 0); params.matrix_size()];
+        xi[params.n_modes] = Float::with_val(precision, 1);
+        let plan = independently_discovered_starting_points(
+            &params,
+            &l,
+            &xi,
+            &ZeroTarget::FirstK { count: 200 },
+            IndependentRootDiscoveryOptions::advanced(true, true),
+            precision,
+        )
+        .unwrap();
+        assert!(plan.artifact_seeds.is_empty());
+        assert!(plan.selected_positions.is_empty());
+        assert_eq!(plan.result_first_root_index, 1);
+        assert_eq!(plan.request_semantics.domain, IndependentRootDomain::Signed);
+        assert_eq!(plan.request_semantics.requested_count, 200);
+        assert!(plan.request_semantics.allow_incomplete);
+    }
+
+    #[test]
+    fn advanced_signed_requests_project_one_canonical_window() {
+        let precision = 192;
+        let params = CcmParams::from_lambda_sq_integer(13, 4);
+        let l = Float::with_val(precision, 13).ln();
+        let xi = vec![Float::with_val(precision, 1); params.matrix_size()];
+        let plan = independently_discovered_starting_points(
+            &params,
+            &l,
+            &xi,
+            &ZeroTarget::FirstK { count: 4 },
+            IndependentRootDiscoveryOptions::advanced(true, true),
+            precision,
+        )
+        .unwrap();
+        assert_eq!(plan.artifact_seeds.len(), 8);
+        assert_eq!(plan.selected_positions.len(), 4);
+        assert_eq!(plan.selected_positions, vec![2, 3, 4, 5]);
+        assert_eq!(plan.request_semantics.requested_count, 4);
+    }
+
+    #[test]
+    fn strict_independent_discovery_rejects_a_finite_window_shortfall() {
+        let precision = 192;
+        let params = CcmParams::from_lambda_sq_integer(13, 4);
+        let l = Float::with_val(precision, 13).ln();
+        let xi = vec![Float::with_val(precision, 1); params.matrix_size()];
+        let error = independently_discovered_starting_points(
+            &params,
+            &l,
+            &xi,
+            &ZeroTarget::FirstK { count: 20 },
+            IndependentRootDiscoveryOptions::advanced(true, false),
+            precision,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("target requests 20"));
     }
 
     #[test]
@@ -11279,14 +12018,16 @@ mod tests {
         let mut cfg = HighPrecConfig::for_decimal_digits(60);
         cfg.precision_bits = precision;
         cfg.solver_steps = 24;
-        let (_, seeds) = independently_discovered_starting_points(
+        let plan = independently_discovered_starting_points(
             &params,
             &l,
             &xi,
             &ZeroTarget::FirstK { count: 3 },
+            IndependentRootDiscoveryOptions::default(),
             precision,
         )
         .unwrap();
+        let seeds = plan.artifact_seeds;
         let parallel = compute_root_range(&xi, &params, &l, &cfg, &seeds);
         let sequential = seeds
             .iter()
@@ -11357,6 +12098,7 @@ mod tests {
             ],
             2,
             true,
+            IndependentRootDomain::Positive,
         )
         .is_ok());
         assert!(ensure_root_window_usable(
@@ -11366,18 +12108,23 @@ mod tests {
             ],
             2,
             false,
+            IndependentRootDomain::Positive,
         )
         .is_ok());
-        assert!(
-            ensure_root_window_usable(&[EigenvalueResult::Stagnated(diagnostic(1))], 1, true,)
-                .unwrap_err()
-                .to_string()
-                .contains("stagnated")
-        );
+        assert!(ensure_root_window_usable(
+            &[EigenvalueResult::Stagnated(diagnostic(1))],
+            1,
+            true,
+            IndependentRootDomain::Positive,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("stagnated"));
         assert!(ensure_root_window_usable(
             &[EigenvalueResult::Approximate(diagnostic(1))],
             1,
             true,
+            IndependentRootDomain::Positive,
         )
         .unwrap_err()
         .to_string()
@@ -11389,6 +12136,7 @@ mod tests {
             }],
             1,
             false,
+            IndependentRootDomain::Positive,
         )
         .unwrap_err()
         .to_string()
@@ -11468,6 +12216,7 @@ mod tests {
             precision_bits: cfg.precision_bits,
             force_even: cfg.force_even,
             first_root_index: 1,
+            root_domain: IndependentRootDomain::Positive,
             discovery_mode: RootArtifactMode::Independent.as_str().to_owned(),
             reference_seeds_used: false,
             reference_dataset: None,
@@ -11480,6 +12229,10 @@ mod tests {
             solver_steps: cfg.solver_steps,
             accuracy_guard_bits: GUARD_BITS,
         };
+        let legacy_json = serde_json::to_value(&artifact).unwrap();
+        assert!(legacy_json.get("root_domain").is_none());
+        assert!(legacy_json.get("requested_root_count").is_none());
+        assert!(legacy_json.get("allow_incomplete").is_none());
         assert!(decode_root_range(
             &artifact,
             &params,
@@ -11490,6 +12243,7 @@ mod tests {
             None,
             &xi,
             &l,
+            RootWindowSemantics::strict_positive(1),
             false,
         )
         .is_ok());
@@ -11503,6 +12257,7 @@ mod tests {
             None,
             &xi,
             &l,
+            RootWindowSemantics::strict_positive(1),
             true,
         )
         .unwrap_err()
