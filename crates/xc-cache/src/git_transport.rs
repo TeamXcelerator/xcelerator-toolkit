@@ -5,6 +5,7 @@ use crate::{
     ContentDigest, CreateRefResult, RemoteCommitRequest, RemoteGitStore, RemoteRefCreationRequest,
     TransportPart,
 };
+use fs2::{available_space, total_space};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -16,6 +17,19 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 use xc_core::{CancellationToken, ResourcePolicy};
+
+#[derive(Clone, Debug)]
+struct GitTreeLeaf {
+    mode: String,
+    object_type: String,
+    object_id: String,
+}
+
+#[derive(Default)]
+struct FlatGitTreeNode {
+    children: BTreeMap<String, String>,
+    leaves: BTreeMap<String, GitTreeLeaf>,
+}
 
 #[derive(Debug)]
 pub struct GitCliRemoteStore {
@@ -98,6 +112,21 @@ impl GitCliRemoteStore {
         Ok(())
     }
 
+    /// Remove every ephemeral bare repository owned by this transport store.
+    ///
+    /// A store's temporary root is never shared with durable artifact staging.
+    /// This is therefore safe after success, failure, or an abandoned preflight.
+    pub fn cleanup_all_sessions(&self) -> Result<(), CacheError> {
+        if self.temporary_root.exists() {
+            fs::remove_dir_all(&self.temporary_root)?;
+        }
+        self.prepared_blob_oids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        Ok(())
+    }
+
     /// Validate and insert staged blobs into the local Git object database
     /// before a remote publication lease is acquired. Commit construction can
     /// then reuse the prepared object IDs without rereading large payload
@@ -108,6 +137,14 @@ impl GitCliRemoteStore {
         parts: &[TransportPart],
     ) -> Result<(), CacheError> {
         validate_repository(repository)?;
+        let additional_bytes = parts.iter().try_fold(0u64, |total, part| {
+            total.checked_add(part.size_bytes).ok_or_else(|| {
+                CacheError::ResourceLimit(
+                    "prepared Git transport parts exceed the u64 byte range".to_owned(),
+                )
+            })
+        })?;
+        self.enforce_transport_disk_budget(additional_bytes)?;
         let _guard = self
             .operation_lock
             .lock()
@@ -151,28 +188,39 @@ impl GitCliRemoteStore {
                 ],
                 &[],
             )?;
-            run_git(
-                &self.git_executable,
-                Some(&session),
-                [
-                    OsString::from("config"),
-                    OsString::from("remote.origin.promisor"),
-                    OsString::from("true"),
-                ],
-                &[],
-            )?;
-            run_git(
-                &self.git_executable,
-                Some(&session),
-                [
-                    OsString::from("config"),
-                    OsString::from("remote.origin.partialclonefilter"),
-                    OsString::from("blob:none"),
-                ],
-                &[],
-            )?;
         }
         Ok(session)
+    }
+
+    fn enforce_transport_disk_budget(&self, additional_bytes: u64) -> Result<(), CacheError> {
+        fs::create_dir_all(&self.temporary_root)?;
+        let current_bytes = directory_size_bytes(&self.temporary_root)?;
+        let projected_bytes = current_bytes.checked_add(additional_bytes).ok_or_else(|| {
+            CacheError::ResourceLimit("Git transport disk projection exceeds u64".to_owned())
+        })?;
+        if self
+            .resources
+            .maximum_temporary_disk_bytes
+            .is_some_and(|maximum| projected_bytes > maximum)
+        {
+            return Err(CacheError::ResourceLimit(format!(
+                "Git transport requires at least {projected_bytes} temporary bytes \
+                 ({current_bytes} existing + {additional_bytes} pending), exceeding the configured limit"
+            )));
+        }
+        let available = available_space(&self.temporary_root)?;
+        let total = total_space(&self.temporary_root)?;
+        let reserve = (total / 20).clamp(2 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024);
+        let required = additional_bytes.checked_add(reserve).ok_or_else(|| {
+            CacheError::ResourceLimit("Git transport free-space requirement exceeds u64".to_owned())
+        })?;
+        if available < required {
+            return Err(CacheError::ResourceLimit(format!(
+                "Git transport requires {additional_bytes} additional bytes plus a {reserve}-byte \
+                 filesystem reserve, but only {available} bytes are available"
+            )));
+        }
+        Ok(())
     }
 
     fn fetch_revision(&self, repository: &str, revision: &str) -> Result<PathBuf, CacheError> {
@@ -196,20 +244,106 @@ impl GitCliRemoteStore {
         if local.status.success() {
             return Ok(session);
         }
+        self.enforce_transport_disk_budget(0)?;
         run_git_network(
             &self.git_executable,
             Some(&session),
             [
                 OsString::from("fetch"),
                 OsString::from("--no-tags"),
-                OsString::from("--depth=1"),
                 OsString::from("--filter=blob:none"),
                 OsString::from("origin"),
                 OsString::from(revision),
             ],
             &[],
         )?;
+        self.disable_implicit_lazy_fetch(&session)?;
         Ok(session)
+    }
+
+    fn disable_implicit_lazy_fetch(&self, session: &Path) -> Result<(), CacheError> {
+        for key in ["remote.origin.promisor", "remote.origin.partialclonefilter"] {
+            let output = run_git_allow_failure(
+                &self.git_executable,
+                Some(session),
+                [
+                    OsString::from("config"),
+                    OsString::from("--unset-all"),
+                    OsString::from(key),
+                ],
+                &[],
+            )?;
+            // Git config returns 5 when the requested key was already absent.
+            if !output.status.success() && output.status.code() != Some(5) {
+                return Err(CacheError::Io(format!(
+                    "git config could not disable implicit lazy fetch for {key}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_blob_available(
+        &self,
+        session: &Path,
+        _repository: &str,
+        object_id: &str,
+        maximum_bytes: Option<u64>,
+    ) -> Result<(), CacheError> {
+        validate_revision(object_id)?;
+        let _guard = self
+            .operation_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let local = run_git_allow_failure(
+            &self.git_executable,
+            Some(session),
+            [
+                OsString::from("cat-file"),
+                OsString::from("-e"),
+                OsString::from(format!("{object_id}^{{blob}}")),
+            ],
+            &[],
+        )?;
+        if local.status.success() {
+            return Ok(());
+        }
+        if let Some(maximum) = maximum_bytes {
+            self.enforce_transport_disk_budget(maximum)?;
+        } else {
+            self.enforce_transport_disk_budget(0)?;
+        }
+        // Fetch exactly the missing blob object. A blob has no referenced
+        // children, so this cannot recursively hydrate historical payloads.
+        run_git_network(
+            &self.git_executable,
+            Some(session),
+            [
+                OsString::from("fetch"),
+                OsString::from("--no-tags"),
+                OsString::from("origin"),
+                OsString::from(object_id),
+            ],
+            &[],
+        )?;
+        let verified = run_git_allow_failure(
+            &self.git_executable,
+            Some(session),
+            [
+                OsString::from("cat-file"),
+                OsString::from("-e"),
+                OsString::from(format!("{object_id}^{{blob}}")),
+            ],
+            &[],
+        )?;
+        if !verified.status.success() {
+            return Err(command_failure(
+                "git cat-file after explicit blob fetch",
+                &verified,
+            ));
+        }
+        Ok(())
     }
 
     fn staged_part_path(&self, part: &TransportPart) -> Result<PathBuf, CacheError> {
@@ -392,80 +526,262 @@ impl GitCliRemoteStore {
         Ok(())
     }
 
+    fn read_tree_leaves(
+        &self,
+        session: &Path,
+        revision: &str,
+    ) -> Result<BTreeMap<String, GitTreeLeaf>, CacheError> {
+        let output = run_git(
+            &self.git_executable,
+            Some(session),
+            [
+                OsString::from("ls-tree"),
+                OsString::from("-r"),
+                OsString::from("-z"),
+                OsString::from(revision),
+            ],
+            &[],
+        )?;
+        let mut leaves = BTreeMap::new();
+        for record in output.stdout.split(|byte| *byte == 0) {
+            if record.is_empty() {
+                continue;
+            }
+            let record = std::str::from_utf8(record).map_err(|error| {
+                CacheError::InvalidManifest(format!(
+                    "Git tree contains a non-UTF-8 repository path: {error}"
+                ))
+            })?;
+            let (metadata, path) = record.split_once('\t').ok_or_else(|| {
+                CacheError::InvalidManifest(
+                    "git ls-tree returned a malformed tree entry".to_owned(),
+                )
+            })?;
+            let mut metadata = metadata.split_whitespace();
+            let mode = metadata.next().ok_or_else(|| {
+                CacheError::InvalidManifest("Git tree entry is missing its mode".to_owned())
+            })?;
+            let object_type = metadata.next().ok_or_else(|| {
+                CacheError::InvalidManifest("Git tree entry is missing its object type".to_owned())
+            })?;
+            let object_id = metadata.next().ok_or_else(|| {
+                CacheError::InvalidManifest("Git tree entry is missing its object id".to_owned())
+            })?;
+            if metadata.next().is_some() {
+                return Err(CacheError::InvalidManifest(
+                    "Git tree entry contains unexpected metadata".to_owned(),
+                ));
+            }
+            validate_revision(object_id)?;
+            validate_relative_git_path(path)?;
+            leaves.insert(
+                path.to_owned(),
+                GitTreeLeaf {
+                    mode: mode.to_owned(),
+                    object_type: object_type.to_owned(),
+                    object_id: object_id.to_owned(),
+                },
+            );
+        }
+        Ok(leaves)
+    }
+
+    fn write_tree_from_leaves(
+        &self,
+        session: &Path,
+        leaves: BTreeMap<String, GitTreeLeaf>,
+    ) -> Result<String, CacheError> {
+        let mut nodes = BTreeMap::<String, FlatGitTreeNode>::new();
+        nodes.entry(String::new()).or_default();
+        for (path, leaf) in leaves {
+            let components = path.split('/').collect::<Vec<_>>();
+            let (name, directories) = components.split_last().ok_or_else(|| {
+                CacheError::InvalidManifest("Git tree leaf has an empty path".to_owned())
+            })?;
+            let mut parent = String::new();
+            for directory in directories {
+                if nodes
+                    .get(&parent)
+                    .is_some_and(|node| node.leaves.contains_key(*directory))
+                {
+                    return Err(CacheError::InvalidManifest(format!(
+                        "Git tree path {path:?} conflicts with a file ancestor"
+                    )));
+                }
+                let child = if parent.is_empty() {
+                    (*directory).to_owned()
+                } else {
+                    format!("{parent}/{directory}")
+                };
+                nodes
+                    .entry(parent.clone())
+                    .or_default()
+                    .children
+                    .insert((*directory).to_owned(), child.clone());
+                nodes.entry(child.clone()).or_default();
+                parent = child;
+            }
+            if nodes
+                .get(&parent)
+                .is_some_and(|node| node.children.contains_key(*name))
+            {
+                return Err(CacheError::InvalidManifest(format!(
+                    "Git tree path {path:?} conflicts with a directory"
+                )));
+            }
+            nodes
+                .entry(parent)
+                .or_default()
+                .leaves
+                .insert((*name).to_owned(), leaf);
+        }
+
+        let maximum_depth = nodes
+            .keys()
+            .map(|path| {
+                if path.is_empty() {
+                    0
+                } else {
+                    path.bytes().filter(|byte| *byte == b'/').count() + 1
+                }
+            })
+            .max()
+            .unwrap_or(0);
+        let mut tree_ids = BTreeMap::<String, String>::new();
+        for depth in (0..=maximum_depth).rev() {
+            let paths = nodes
+                .keys()
+                .filter(|path| {
+                    let path_depth = if path.is_empty() {
+                        0
+                    } else {
+                        path.bytes().filter(|byte| *byte == b'/').count() + 1
+                    };
+                    path_depth == depth
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut trees = Vec::with_capacity(paths.len());
+            for path in &paths {
+                let node = nodes.get(path).ok_or_else(|| {
+                    CacheError::InvalidTransition(
+                        "flattened Git tree node disappeared during construction".to_owned(),
+                    )
+                })?;
+                let mut entries = node.leaves.clone();
+                for (name, child_path) in &node.children {
+                    let object_id = tree_ids.get(child_path).ok_or_else(|| {
+                        CacheError::InvalidTransition(format!(
+                            "child Git tree {child_path:?} was not constructed before {path:?}"
+                        ))
+                    })?;
+                    entries.insert(
+                        name.clone(),
+                        GitTreeLeaf {
+                            mode: "040000".to_owned(),
+                            object_type: "tree".to_owned(),
+                            object_id: object_id.clone(),
+                        },
+                    );
+                }
+                trees.push(entries);
+            }
+            let object_ids = self.write_tree_batch(session, &trees)?;
+            for (path, object_id) in paths.into_iter().zip(object_ids) {
+                tree_ids.insert(path, object_id);
+            }
+        }
+        tree_ids.remove("").ok_or_else(|| {
+            CacheError::InvalidTransition("root Git tree was not constructed".to_owned())
+        })
+    }
+
+    fn write_tree_batch(
+        &self,
+        session: &Path,
+        trees: &[BTreeMap<String, GitTreeLeaf>],
+    ) -> Result<Vec<String>, CacheError> {
+        if trees.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut input = Vec::new();
+        for (tree_index, tree) in trees.iter().enumerate() {
+            for (name, entry) in tree {
+                input.extend_from_slice(
+                    format!("{} {} {}\t", entry.mode, entry.object_type, entry.object_id)
+                        .as_bytes(),
+                );
+                input.extend_from_slice(name.as_bytes());
+                input.push(0);
+            }
+            if tree_index + 1 < trees.len() {
+                input.push(0);
+            }
+        }
+        let mut arguments = vec![
+            OsString::from("mktree"),
+            OsString::from("--missing"),
+            OsString::from("-z"),
+        ];
+        if trees.len() > 1 {
+            arguments.push(OsString::from("--batch"));
+        }
+        let output =
+            run_git_with_input(&self.git_executable, Some(session), arguments, &[], &input)?;
+        parse_object_id_lines(&output.stdout, "git mktree", trees.len())
+    }
+
     fn commit_tree(
         &self,
         session: &Path,
         request: &RemoteCommitRequest,
     ) -> Result<String, CacheError> {
-        let index_name = format!(
-            "publication-index-{}",
-            ContentDigest::sha256(
-                format!(
-                    "{}:{}:{}",
-                    request.branch, request.expected_head, request.message
-                )
-                .as_bytes()
-            )
-        );
-        let index_path = session.parent().unwrap_or(session).join(index_name);
-        let index_environment = [(OsStr::new("GIT_INDEX_FILE"), index_path.as_os_str())];
-        let result = (|| {
-            run_git(
-                &self.git_executable,
-                Some(session),
-                [
-                    OsString::from("read-tree"),
-                    OsString::from(&request.expected_head),
-                ],
-                &index_environment,
-            )?;
-            let object_ids = self.hash_staged_blobs(session, &request.parts)?;
-            self.update_index_parts(
-                session,
-                &request.parts,
-                &object_ids,
-                &request.delete_paths,
-                &index_environment,
-            )?;
-            let tree = run_git(
-                &self.git_executable,
-                Some(session),
-                [OsString::from("write-tree")],
-                &index_environment,
-            )?;
-            let tree = parse_single_line(&tree.stdout, "git write-tree")?;
-            let author_environment = [
-                (OsStr::new("GIT_AUTHOR_NAME"), OsStr::new(&self.author_name)),
-                (
-                    OsStr::new("GIT_AUTHOR_EMAIL"),
-                    OsStr::new(&self.author_email),
-                ),
-                (
-                    OsStr::new("GIT_COMMITTER_NAME"),
-                    OsStr::new(&self.author_name),
-                ),
-                (
-                    OsStr::new("GIT_COMMITTER_EMAIL"),
-                    OsStr::new(&self.author_email),
-                ),
-            ];
-            let commit = run_git(
-                &self.git_executable,
-                Some(session),
-                [
-                    OsString::from("commit-tree"),
-                    OsString::from(tree),
-                    OsString::from("-p"),
-                    OsString::from(&request.expected_head),
-                    OsString::from("-m"),
-                    OsString::from(&request.message),
-                ],
-                &author_environment,
-            )?;
-            parse_single_line(&commit.stdout, "git commit-tree")
-        })();
-        let _ = fs::remove_file(index_path);
-        result
+        let mut leaves = self.read_tree_leaves(session, &request.expected_head)?;
+        for path in &request.delete_paths {
+            validate_relative_git_path(path)?;
+            leaves.remove(path);
+        }
+        let object_ids = self.hash_staged_blobs(session, &request.parts)?;
+        for (part, object_id) in request.parts.iter().zip(object_ids) {
+            leaves.insert(
+                part.repository_path.clone(),
+                GitTreeLeaf {
+                    mode: "100644".to_owned(),
+                    object_type: "blob".to_owned(),
+                    object_id,
+                },
+            );
+        }
+        let tree = self.write_tree_from_leaves(session, leaves)?;
+        let author_environment = [
+            (OsStr::new("GIT_AUTHOR_NAME"), OsStr::new(&self.author_name)),
+            (
+                OsStr::new("GIT_AUTHOR_EMAIL"),
+                OsStr::new(&self.author_email),
+            ),
+            (
+                OsStr::new("GIT_COMMITTER_NAME"),
+                OsStr::new(&self.author_name),
+            ),
+            (
+                OsStr::new("GIT_COMMITTER_EMAIL"),
+                OsStr::new(&self.author_email),
+            ),
+        ];
+        let commit = run_git(
+            &self.git_executable,
+            Some(session),
+            [
+                OsString::from("commit-tree"),
+                OsString::from(tree),
+                OsString::from("-p"),
+                OsString::from(&request.expected_head),
+                OsString::from("-m"),
+                OsString::from(&request.message),
+            ],
+            &author_environment,
+        )?;
+        parse_single_line(&commit.stdout, "git commit-tree")
     }
 
     fn commit_root_tree(
@@ -590,18 +906,19 @@ impl RemoteGitStore for GitCliRemoteStore {
         if listing.stdout.is_empty() {
             return Ok(None);
         }
-        let specification = format!("{revision}:{path}");
+        let object_id = parse_ls_tree_blob_object(&listing.stdout, path)?;
+        self.ensure_blob_available(&session, repository, &object_id, None)?;
         let mut child = Command::new(&self.git_executable)
             .arg("-C")
             .arg(&session)
-            .arg("show")
-            .arg(&specification)
+            .args(["cat-file", "blob"])
+            .arg(&object_id)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|error| CacheError::Io(format!("failed to launch git show: {error}")))?;
+            .map_err(|error| CacheError::Io(format!("failed to launch git cat-file: {error}")))?;
         let mut stdout = child.stdout.take().ok_or_else(|| {
-            CacheError::Io("git show did not provide a readable stream".to_owned())
+            CacheError::Io("git cat-file did not provide a readable stream".to_owned())
         })?;
         let mut hasher = Sha256::new();
         let mut buffer = vec![0u8; 1024 * 1024];
@@ -615,7 +932,7 @@ impl RemoteGitStore for GitCliRemoteStore {
         let status = child.wait()?;
         if !status.success() {
             return Err(CacheError::Io(format!(
-                "git show failed with status {status} for {path:?}"
+                "git cat-file failed with status {status} for {path:?}"
             )));
         }
         Ok(Some(ContentDigest(format!("{:x}", hasher.finalize()))))
@@ -673,19 +990,20 @@ impl RemoteGitStore for GitCliRemoteStore {
                 "remote path read exceeds the zero transfer budget".to_owned(),
             ));
         }
-        let specification = format!("{revision}:{path}");
+        let object_id = parse_ls_tree_blob_object(&listing.stdout, path)?;
+        self.ensure_blob_available(&session, repository, &object_id, Some(effective_maximum))?;
         let mut child = Command::new(&self.git_executable)
             .arg("-C")
             .arg(&session)
-            .arg("show")
-            .arg(&specification)
+            .args(["cat-file", "blob"])
+            .arg(&object_id)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|error| CacheError::Io(format!("failed to launch git show: {error}")))?;
+            .map_err(|error| CacheError::Io(format!("failed to launch git cat-file: {error}")))?;
         let result = (|| {
             let mut stdout = child.stdout.take().ok_or_else(|| {
-                CacheError::Io("git show did not provide a readable stream".to_owned())
+                CacheError::Io("git cat-file did not provide a readable stream".to_owned())
             })?;
             let buffer_size = effective_maximum.saturating_add(1).min(1024 * 1024) as usize;
             let mut buffer = vec![0u8; buffer_size];
@@ -720,7 +1038,7 @@ impl RemoteGitStore for GitCliRemoteStore {
         let (size_bytes, content_digest) = result?;
         if !status.success() {
             return Err(CacheError::Io(format!(
-                "git show failed with status {status} for {path:?}"
+                "git cat-file failed with status {status} for {path:?}"
             )));
         }
         Ok(crate::RemoteReadReport {
@@ -1269,6 +1587,36 @@ fn parse_object_id_lines(
     Ok(values)
 }
 
+fn parse_ls_tree_blob_object(bytes: &[u8], expected_path: &str) -> Result<String, CacheError> {
+    let output = std::str::from_utf8(bytes)
+        .map_err(|error| CacheError::Io(format!("git ls-tree returned non-UTF8: {error}")))?;
+    let mut lines = output.lines();
+    let line = lines.next().ok_or_else(|| {
+        CacheError::NotFound(format!("git ls-tree did not return {expected_path:?}"))
+    })?;
+    if lines.next().is_some() {
+        return Err(CacheError::InvalidManifest(format!(
+            "git ls-tree returned multiple entries for exact path {expected_path:?}"
+        )));
+    }
+    let (identity, path) = line.split_once('\t').ok_or_else(|| {
+        CacheError::InvalidManifest("git ls-tree entry has no path separator".to_owned())
+    })?;
+    if path != expected_path {
+        return Err(CacheError::InvalidManifest(format!(
+            "git ls-tree returned path {path:?} instead of {expected_path:?}"
+        )));
+    }
+    let fields = identity.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 3 || fields[1] != "blob" {
+        return Err(CacheError::InvalidManifest(format!(
+            "git ls-tree path {expected_path:?} is not a regular blob"
+        )));
+    }
+    validate_revision(fields[2])?;
+    Ok(fields[2].to_owned())
+}
+
 fn validate_repository(repository: &str) -> Result<(), CacheError> {
     if repository.trim().is_empty()
         || repository.starts_with('-')
@@ -1344,6 +1692,29 @@ fn digest_file(path: &Path) -> Result<(ContentDigest, u64), CacheError> {
     Ok((ContentDigest(format!("{:x}", hasher.finalize())), size))
 }
 
+fn directory_size_bytes(path: &Path) -> Result<u64, CacheError> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        total = total
+            .checked_add(directory_size_bytes(&entry.path())?)
+            .ok_or_else(|| {
+                CacheError::ResourceLimit("Git transport directory size exceeds u64".to_owned())
+            })?;
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1365,6 +1736,34 @@ mod tests {
         command.args(arguments);
         command.stdout(Stdio::null()).stderr(Stdio::null());
         command.status().is_ok_and(|status| status.success())
+    }
+
+    fn test_git_stdout(directory: Option<&Path>, arguments: &[&str]) -> String {
+        let mut command = Command::new("git");
+        if let Some(directory) = directory {
+            command.arg("-C").arg(directory);
+        }
+        let output = command.args(arguments).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            arguments,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn local_file_url(path: &Path) -> String {
+        let canonical = fs::canonicalize(path)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let canonical = canonical.strip_prefix("//?/").unwrap_or(&canonical);
+        if cfg!(windows) {
+            format!("file:///{canonical}")
+        } else {
+            format!("file://{canonical}")
+        }
     }
 
     #[test]
@@ -1518,6 +1917,135 @@ mod tests {
             .is_none());
         assert!(!temporary.join("working-tree").exists());
         store.cleanup_session(&repository).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn filtered_transport_does_not_hydrate_unchanged_historical_blobs() {
+        if !test_git(None, &["--version"]) {
+            return;
+        }
+        let root = temporary_root("git-cli-no-historical-hydration");
+        let _ = fs::remove_dir_all(&root);
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let temporary = root.join("transport");
+        let staging = root.join("staging");
+        fs::create_dir_all(&root).unwrap();
+        assert!(test_git(
+            None,
+            &["init", "--bare", remote.to_str().unwrap()]
+        ));
+        assert!(test_git(
+            Some(&remote),
+            &["config", "uploadpack.allowFilter", "true"]
+        ));
+        assert!(test_git(None, &["init", seed.to_str().unwrap()]));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.name", "Test Publisher"]
+        ));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.email", "test@example.invalid"]
+        ));
+
+        // Use deterministic high-entropy bytes so Git cannot compress this
+        // into a deceptively small pack if the blob is accidentally hydrated.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut historical = vec![0u8; 8 * 1024 * 1024];
+        for byte in &mut historical {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        fs::write(seed.join("historical-large.bin"), &historical).unwrap();
+        fs::write(seed.join("README.md"), b"seed\n").unwrap();
+        assert!(test_git(Some(&seed), &["add", "."]));
+        assert!(test_git(Some(&seed), &["commit", "-m", "seed"]));
+        let historical_blob =
+            test_git_stdout(Some(&seed), &["rev-parse", "HEAD:historical-large.bin"]);
+        assert!(test_git(
+            Some(&seed),
+            &["remote", "add", "origin", remote.to_str().unwrap()]
+        ));
+        assert!(test_git(
+            Some(&seed),
+            &["push", "origin", "HEAD:refs/heads/main"]
+        ));
+
+        let payload = b"new small cache payload";
+        let digest = ContentDigest::sha256(payload);
+        let repository_path = format!("objects/sha256/{}/{}.part", &digest.0[..2], digest.0);
+        let local_path = staging.join(Path::new(&repository_path));
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, payload).unwrap();
+        let part = TransportPart {
+            sequence: 0,
+            repository_path,
+            size_bytes: payload.len() as u64,
+            content_digest: digest,
+        };
+        let store = GitCliRemoteStore::new(
+            &temporary,
+            &staging,
+            "Test Publisher",
+            "test@example.invalid",
+        )
+        .unwrap();
+        let repository = local_file_url(&remote);
+        let expected_head = store.read_ref(&repository, "main").unwrap();
+        let result = store
+            .compare_and_swap_commit(&RemoteCommitRequest {
+                repository: repository.clone(),
+                branch: "main".to_owned(),
+                expected_head,
+                message: "publish without hydrating history".to_owned(),
+                parts: vec![part],
+                delete_paths: Vec::new(),
+            })
+            .unwrap();
+        let CompareAndSwapResult::Committed { commit_id } = result else {
+            panic!("local test publication unexpectedly conflicted");
+        };
+
+        let session = store.session_path(&repository);
+        let mut readme = Vec::new();
+        store
+            .read_committed_path(
+                &repository,
+                &commit_id,
+                "README.md",
+                1024,
+                &CancellationToken::new(),
+                &mut readme,
+            )
+            .unwrap();
+        assert_eq!(readme, b"seed\n");
+        assert!(
+            !test_git(
+                Some(&session),
+                &["cat-file", "-e", &format!("{historical_blob}^{{blob}}")]
+            ),
+            "unchanged historical payload was hydrated into the transport workspace"
+        );
+        assert!(
+            !test_git(
+                Some(&session),
+                &["config", "--get", "remote.origin.promisor"]
+            ),
+            "transport session was incorrectly configured for implicit lazy fetch"
+        );
+        let tree = test_git_stdout(
+            Some(&session),
+            &["ls-tree", "-r", "--name-only", &commit_id],
+        );
+        assert!(tree.lines().any(|path| path == "historical-large.bin"));
+        assert!(tree.lines().any(|path| path.ends_with(".part")));
+
+        store.cleanup_session(&repository).unwrap();
+        assert!(!session.exists());
         let _ = fs::remove_dir_all(root);
     }
 

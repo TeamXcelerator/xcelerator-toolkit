@@ -140,6 +140,15 @@ stored separately in compact evidence. Equivalent advanced requests therefore
 reuse one numerical artifact, while all existing positive v6 artifacts remain
 readable and retain their original identities.
 
+High-precision CCM eigenstates expose three explicit parity policies.
+`even-sector` remains the default and preserves every established v0.13
+artifact identity. `natural` performs an unrestricted full-space solve.
+`adaptive-even` restores the original full-space inverse iteration with an
+even projection applied only when the iterate materially drifts away from
+even symmetry. Adaptive artifacts use distinct state, secular-source, root,
+and evidence identities; they cannot overwrite or satisfy natural or
+even-sector requests.
+
 ## Validation
 
 Release checks run locally; the repository does not require a hosted GitHub Actions workflow. The core public checks use standard Cargo commands:

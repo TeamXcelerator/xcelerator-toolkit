@@ -366,6 +366,8 @@ struct PortableWeilEigenpair {
     n_modes: usize,
     precision_bits: u32,
     force_even: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parity_policy: Option<CcmParityPolicy>,
     #[serde(
         default = "legacy_eigenstate_route_name",
         skip_serializing_if = "is_legacy_eigenstate_route"
@@ -512,6 +514,8 @@ struct PortableSecularSource {
     n_modes: usize,
     precision_bits: u32,
     force_even: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parity_policy: Option<CcmParityPolicy>,
     eigenpair_content_digest: String,
     normalization: String,
 }
@@ -599,6 +603,8 @@ struct PortableRootRange {
     n_modes: usize,
     precision_bits: u32,
     force_even: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parity_policy: Option<CcmParityPolicy>,
     first_root_index: usize,
     #[serde(default, skip_serializing_if = "is_positive_root_domain")]
     root_domain: IndependentRootDomain,
@@ -642,6 +648,8 @@ struct PortableRunEvidence {
     n_modes: usize,
     precision_bits: u32,
     force_even: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parity_policy: Option<CcmParityPolicy>,
     discovery_mode: String,
     first_root_index: usize,
     last_root_index: usize,
@@ -876,11 +884,16 @@ pub struct HighPrecConfig {
     /// uses local compressed caches; managed remote resolution uses `run_via_cache`.
     /// (local compressed cache → compute).
     pub cache_mode: xc_numerics::quadrature::CacheMode,
-    /// Whether to project onto the even subspace at each inverse-iteration
-    /// step. Default `true` (forced-even, the standard CCM path). Set to
-    /// `false` to test whether the natural (unprojected) smallest
-    /// eigenvector is even without forcing.
+    /// Legacy compatibility switch for natural-versus-forced callers.
+    ///
+    /// New code should use [`Self::set_parity_policy`]. Setting this field to
+    /// `false` while [`Self::parity_policy`] remains
+    /// [`CcmParityPolicy::EvenSector`] selects the historical natural route.
+    /// The default remains `true`.
     pub force_even: bool,
+    /// Parity treatment for the selected CCM eigenstate. The default is the
+    /// optimized reduced even-sector solve used by existing v0.13 artifacts.
+    pub parity_policy: CcmParityPolicy,
     /// Enable warm-start from a nearby-precision cached eigenvector.
     /// When `true` and a cached ξ exists for the same (λ², N) within
     /// `warm_start_tolerance_bits` of the target precision, that cached ξ
@@ -907,6 +920,84 @@ pub struct HighPrecConfig {
     pub krylov_maximum_restarts: usize,
     /// Number of non-requested Ritz guards retained at the target boundary.
     pub krylov_guard_eigenpairs: usize,
+}
+
+/// CCM parity policy for the selected smallest Weil eigenstate.
+///
+/// The policies are deliberately separate cache semantics:
+///
+/// - [`Self::Natural`] solves the unrestricted full matrix without projection.
+/// - [`Self::AdaptiveEven`] reproduces the original full-space inverse
+///   iteration and applies the even projection only when the iterate drifts
+///   materially away from even symmetry.
+/// - [`Self::EvenSector`] solves the reduced even-sector matrix directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CcmParityPolicy {
+    Natural,
+    AdaptiveEven,
+    #[default]
+    EvenSector,
+}
+
+impl CcmParityPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Natural => "natural",
+            Self::AdaptiveEven => "adaptive-even",
+            Self::EvenSector => "even-sector",
+        }
+    }
+
+    fn cache_label(self) -> &'static str {
+        match self {
+            Self::Natural => "natural",
+            Self::AdaptiveEven => "adaptive-even",
+            // Preserve every existing v0.13 logical key.
+            Self::EvenSector => "even",
+        }
+    }
+
+    fn legacy_force_even(self) -> bool {
+        self != Self::Natural
+    }
+
+    fn semantic_subspace(self) -> Option<String> {
+        match self {
+            Self::EvenSector => Some("even".to_owned()),
+            Self::Natural | Self::AdaptiveEven => None,
+        }
+    }
+
+    fn portable_marker(self) -> Option<Self> {
+        (self == Self::AdaptiveEven).then_some(self)
+    }
+}
+
+fn payload_parity_matches(
+    force_even: bool,
+    marker: Option<CcmParityPolicy>,
+    expected: CcmParityPolicy,
+) -> bool {
+    let decoded = match marker {
+        Some(CcmParityPolicy::AdaptiveEven) if force_even => CcmParityPolicy::AdaptiveEven,
+        Some(_) => return false,
+        None if force_even => CcmParityPolicy::EvenSector,
+        None => CcmParityPolicy::Natural,
+    };
+    decoded == expected
+}
+
+fn add_adaptive_parity_parameter(parameters: &mut serde_json::Value, policy: CcmParityPolicy) {
+    if policy == CcmParityPolicy::AdaptiveEven {
+        parameters
+            .as_object_mut()
+            .expect("CCM semantic parameters are an object")
+            .insert(
+                "parity_policy".to_owned(),
+                serde_json::json!(policy.as_str()),
+            );
+    }
 }
 
 /// CCM eigenstate algorithm policy. This is deliberately explicit because the
@@ -1022,6 +1113,7 @@ impl HighPrecConfig {
             n_eigenvalues: 50,
             cache_mode: xc_numerics::quadrature::CacheMode::default(),
             force_even: true,
+            parity_policy: CcmParityPolicy::EvenSector,
             // Warm-start on by default. Uses a cached ξ at a nearby
             // precision as the starting vector for inverse iteration
             // instead of the Gaussian guess. Falls back to the Gaussian
@@ -1033,6 +1125,25 @@ impl HighPrecConfig {
             krylov_subspace_dimension: 32,
             krylov_maximum_restarts: 64,
             krylov_guard_eigenpairs: 2,
+        }
+    }
+
+    /// Set an explicit parity policy and keep the legacy compatibility flag
+    /// synchronized for callers that still inspect it.
+    pub fn set_parity_policy(&mut self, policy: CcmParityPolicy) {
+        self.parity_policy = policy;
+        self.force_even = policy.legacy_force_even();
+    }
+
+    /// Return the effective parity policy.
+    ///
+    /// `force_even=false` continues to select the natural route when older
+    /// callers have not changed the new policy field.
+    pub fn effective_parity_policy(&self) -> CcmParityPolicy {
+        if !self.force_even && self.parity_policy == CcmParityPolicy::EvenSector {
+            CcmParityPolicy::Natural
+        } else {
+            self.parity_policy
         }
     }
 }
@@ -2425,6 +2536,7 @@ fn decode_weil_eigenpair(
     CacheError,
 > {
     let prec = cfg.precision_bits;
+    let parity_policy = cfg.effective_parity_policy();
     let expected_schema = match cfg.eigenstate_solver {
         CcmEigenstateSolver::LegacyInverseIteration => 2,
         CcmEigenstateSolver::ShiftInvertKrylov => 3,
@@ -2436,7 +2548,7 @@ fn decode_weil_eigenpair(
         || artifact.lambda_squared != lambda_squared_cache_identity(params)
         || artifact.n_modes != params.n_modes
         || artifact.precision_bits != prec
-        || artifact.force_even != cfg.force_even
+        || !payload_parity_matches(artifact.force_even, artifact.parity_policy, parity_policy)
         || artifact.eigenstate_route != cfg.eigenstate_solver.as_str()
         || artifact.eigenvector.len() != params.matrix_size()
     {
@@ -4913,13 +5025,14 @@ fn weil_eigenpair_cache_identity(
 ) -> Result<(SemanticKeyEnvelope, String)> {
     let prec = cfg.precision_bits;
     let route = cfg.eigenstate_solver.as_str();
-    let resolved_mathematical_parameters = match cfg.eigenstate_solver {
+    let parity_policy = cfg.effective_parity_policy();
+    let mut resolved_mathematical_parameters = match cfg.eigenstate_solver {
         CcmEigenstateSolver::LegacyInverseIteration => serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
             "precision_bits": prec,
             "scalar_backend": "rug_mpfr",
-            "force_even": cfg.force_even,
+            "force_even": parity_policy.legacy_force_even(),
             "normalization": "sum_xi_equals_sqrt_log_lambda_squared",
             "inverse_iteration_step_limit": cfg.inverse_iter_steps
         }),
@@ -4928,7 +5041,7 @@ fn weil_eigenpair_cache_identity(
             "n_modes": params.n_modes,
             "precision_bits": prec,
             "scalar_backend": "rug_mpfr",
-            "force_even": cfg.force_even,
+            "force_even": parity_policy.legacy_force_even(),
             "normalization": "sum_xi_equals_sqrt_log_lambda_squared",
             "eigenstate_route": route,
             "krylov_subspace_dimension": cfg.krylov_subspace_dimension,
@@ -4939,31 +5052,39 @@ fn weil_eigenpair_cache_identity(
             bail!("automatic CCM eigenstate selection must be resolved before key construction")
         }
     };
+    add_adaptive_parity_parameter(&mut resolved_mathematical_parameters, parity_policy);
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_weil_eigenpair".to_owned(),
-        mathematical_semantics_version: match cfg.eigenstate_solver {
-            CcmEigenstateSolver::LegacyInverseIteration => {
+        mathematical_semantics_version: match (cfg.eigenstate_solver, parity_policy) {
+            (CcmEigenstateSolver::LegacyInverseIteration, CcmParityPolicy::AdaptiveEven) => {
+                "ccm-smallest-weil-eigenpair-adaptive-even-v1"
+            }
+            (CcmEigenstateSolver::LegacyInverseIteration, _) => {
                 "ccm-smallest-weil-eigenpair-v0.13.0-v3"
             }
-            CcmEigenstateSolver::ShiftInvertKrylov => {
+            (CcmEigenstateSolver::ShiftInvertKrylov, _) => {
                 "ccm-smallest-weil-eigenpair-shift-invert-krylov-v1"
             }
-            CcmEigenstateSolver::Auto => unreachable!(),
+            (CcmEigenstateSolver::Auto, _) => unreachable!(),
         }
         .to_owned(),
         resolved_mathematical_parameters,
         normalization: Some("sum_xi_equals_sqrt_log_lambda_squared".to_owned()),
         target: Some("smallest_weil_form_eigenpair".to_owned()),
-        subspace: cfg.force_even.then(|| "even".to_owned()),
+        subspace: parity_policy.semantic_subspace(),
         source_data_identities: BTreeMap::new(),
         algorithm_semantics: Some(
-            match cfg.eigenstate_solver {
-                CcmEigenstateSolver::LegacyInverseIteration =>
+            match (cfg.eigenstate_solver, parity_policy) {
+                (
+                    CcmEigenstateSolver::LegacyInverseIteration,
+                    CcmParityPolicy::AdaptiveEven,
+                ) => "dense_full_space_inverse_iteration_with_conditional_even_projection_and_full_tau_residual_gate_v1",
+                (CcmEigenstateSolver::LegacyInverseIteration, _) =>
                     "dense_inverse_iteration_with_half_precision_basin_shifted_rescue_and_full_tau_residual_gate_v1",
-                CcmEigenstateSolver::ShiftInvertKrylov =>
+                (CcmEigenstateSolver::ShiftInvertKrylov, _) =>
                     "ccm_even_zero_shift_thick_restart_shift_invert_krylov_rayleigh_ritz_v1",
-                CcmEigenstateSolver::Auto => unreachable!(),
+                (CcmEigenstateSolver::Auto, _) => unreachable!(),
             }
             .to_owned(),
         ),
@@ -4974,14 +5095,14 @@ fn weil_eigenpair_cache_identity(
             lambda_squared_cache_identity(params),
             params.n_modes,
             prec,
-            if cfg.force_even { "even" } else { "natural" }
+            parity_policy.cache_label()
         ),
         CcmEigenstateSolver::ShiftInvertKrylov => format!(
             "ccm/weil-eigenpair/{}/{}/{}/{}/{}",
             lambda_squared_cache_identity(params),
             params.n_modes,
             prec,
-            if cfg.force_even { "even" } else { "natural" },
+            parity_policy.cache_label(),
             route
         ),
         CcmEigenstateSolver::Auto => unreachable!(),
@@ -5042,7 +5163,7 @@ fn discover_lower_n_continuation_seed(
                 lambda_squared: lambda_squared_cache_identity(params),
                 maximum_n_modes: params.n_modes,
                 precision_bits: cfg.precision_bits,
-                force_even: cfg.force_even,
+                force_even: cfg.effective_parity_policy().legacy_force_even(),
             },
             32,
         )
@@ -5070,6 +5191,7 @@ fn discover_lower_n_continuation_seed(
             || artifact.n_modes != source_n
             || artifact.precision_bits != cfg.precision_bits
             || !artifact.force_even
+            || artifact.parity_policy.is_some()
             || artifact.eigenvector.len() != 2 * source_n + 1
             || !matches!(
                 artifact.eigenstate_route.as_str(),
@@ -5148,6 +5270,7 @@ fn weil_eigenpair_via_cache_with_seed(
     xc_numerics::linalg::InverseIterationDiagnostics,
     ArtifactManifest,
 )> {
+    let parity_policy = cfg.effective_parity_policy();
     if cfg.eigenstate_solver == CcmEigenstateSolver::Auto {
         let mut selected = cfg.clone();
         let consult_exact_cache = matches!(
@@ -5157,7 +5280,7 @@ fn weil_eigenpair_via_cache_with_seed(
         );
         let discover_automatic_seed =
             cache.mode == xc_cache::ArtifactExecutionCacheMode::PreferReuse;
-        if !cfg.force_even {
+        if parity_policy != CcmParityPolicy::EvenSector {
             selected.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
             return weil_eigenpair_via_cache_with_seed(
                 params,
@@ -5260,90 +5383,17 @@ fn weil_eigenpair_via_cache_with_seed(
         };
     }
     let prec = cfg.precision_bits;
-    if cfg.eigenstate_solver == CcmEigenstateSolver::ShiftInvertKrylov && !cfg.force_even {
-        bail!("shift-invert Krylov CCM currently requires force_even=true");
+    if cfg.eigenstate_solver == CcmEigenstateSolver::ShiftInvertKrylov
+        && parity_policy != CcmParityPolicy::EvenSector
+    {
+        bail!("shift-invert Krylov CCM currently requires parity_policy=even-sector");
     }
     let route = cfg.eigenstate_solver.as_str();
     let seed_identity = continuation_manifest.map_or_else(
         || "canonical".to_owned(),
         |manifest| format!("from-eigenpair-{}", manifest.content_digest.0),
     );
-    let resolved_mathematical_parameters = match cfg.eigenstate_solver {
-        CcmEigenstateSolver::LegacyInverseIteration => serde_json::json!({
-            "lambda_squared": lambda_squared_cache_identity(params),
-            "n_modes": params.n_modes,
-            "precision_bits": prec,
-            "scalar_backend": "rug_mpfr",
-            "force_even": cfg.force_even,
-            "normalization": "sum_xi_equals_sqrt_log_lambda_squared",
-            "inverse_iteration_step_limit": cfg.inverse_iter_steps
-        }),
-        CcmEigenstateSolver::ShiftInvertKrylov => serde_json::json!({
-            "lambda_squared": lambda_squared_cache_identity(params),
-            "n_modes": params.n_modes,
-            "precision_bits": prec,
-            "scalar_backend": "rug_mpfr",
-            "force_even": cfg.force_even,
-            "normalization": "sum_xi_equals_sqrt_log_lambda_squared",
-            "eigenstate_route": route,
-            "krylov_subspace_dimension": cfg.krylov_subspace_dimension,
-            "krylov_maximum_restarts": cfg.krylov_maximum_restarts,
-            "krylov_guard_eigenpairs": cfg.krylov_guard_eigenpairs
-        }),
-        CcmEigenstateSolver::Auto => {
-            unreachable!("automatic eigenstate policy is resolved before key construction")
-        }
-    };
-    let semantic_key = SemanticKeyEnvelope {
-        schema_version: 1,
-        artifact_kind: "ccm_weil_eigenpair".to_owned(),
-        mathematical_semantics_version: match cfg.eigenstate_solver {
-            CcmEigenstateSolver::LegacyInverseIteration => {
-                "ccm-smallest-weil-eigenpair-v0.13.0-v3"
-            }
-            CcmEigenstateSolver::ShiftInvertKrylov => {
-                "ccm-smallest-weil-eigenpair-shift-invert-krylov-v1"
-            }
-            CcmEigenstateSolver::Auto => unreachable!(
-                "automatic eigenstate policy is resolved before key construction"
-            ),
-        }
-        .to_owned(),
-        resolved_mathematical_parameters,
-        normalization: Some("sum_xi_equals_sqrt_log_lambda_squared".to_owned()),
-        target: Some("smallest_weil_form_eigenpair".to_owned()),
-        subspace: cfg.force_even.then(|| "even".to_owned()),
-        source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some(match cfg.eigenstate_solver {
-            CcmEigenstateSolver::LegacyInverseIteration =>
-                "dense_inverse_iteration_with_half_precision_basin_shifted_rescue_and_full_tau_residual_gate_v1",
-            CcmEigenstateSolver::ShiftInvertKrylov =>
-                "ccm_even_zero_shift_thick_restart_shift_invert_krylov_rayleigh_ritz_v1",
-            CcmEigenstateSolver::Auto => unreachable!(
-                "automatic eigenstate policy is resolved before key construction"
-            ),
-        }.to_owned()),
-    };
-    let logical_key = match cfg.eigenstate_solver {
-        CcmEigenstateSolver::LegacyInverseIteration => format!(
-            "ccm/weil-eigenpair/{}/{}/{}/{}",
-            lambda_squared_cache_identity(params),
-            params.n_modes,
-            prec,
-            if cfg.force_even { "even" } else { "natural" }
-        ),
-        CcmEigenstateSolver::ShiftInvertKrylov => format!(
-            "ccm/weil-eigenpair/{}/{}/{}/{}/{}",
-            lambda_squared_cache_identity(params),
-            params.n_modes,
-            prec,
-            if cfg.force_even { "even" } else { "natural" },
-            route
-        ),
-        CcmEigenstateSolver::Auto => {
-            unreachable!("automatic eigenstate policy is resolved before key construction")
-        }
-    };
+    let (semantic_key, logical_key) = weil_eigenpair_cache_identity(params, cfg)?;
     let request = ArtifactExecutionCacheRequest {
         operation: "ccm.weil_eigenpair.resolve_or_compute",
         semantic_key: &semantic_key,
@@ -5368,7 +5418,9 @@ fn weil_eigenpair_via_cache_with_seed(
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            let (eps_n, xi, diagnostics, factor_manifest, krylov_diagnostics) = if cfg.force_even {
+            let (eps_n, xi, diagnostics, factor_manifest, krylov_diagnostics) = if parity_policy
+                == CcmParityPolicy::EvenSector
+            {
                 let (sector, sector_manifest) =
                     resolve_even_sector_matrix_via_cache(params, cfg, tau, tau_manifest, cache)
                         .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
@@ -5511,7 +5563,7 @@ fn weil_eigenpair_via_cache_with_seed(
                     params.matrix_size(),
                     prec,
                     cfg.inverse_iter_steps,
-                    false,
+                    parity_policy == CcmParityPolicy::AdaptiveEven,
                     None,
                 )
                 .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
@@ -5547,7 +5599,8 @@ fn weil_eigenpair_via_cache_with_seed(
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
                     precision_bits: prec,
-                    force_even: cfg.force_even,
+                    force_even: parity_policy.legacy_force_even(),
+                    parity_policy: parity_policy.portable_marker(),
                     eigenstate_route: route.to_owned(),
                     eigenvalue: eps_n.to_string(),
                     eigenvector: xi.iter().map(Float::to_string).collect(),
@@ -5576,20 +5629,23 @@ fn resolve_secular_source_via_cache(
     eigenpair_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<ArtifactManifest> {
+    let parity_policy = cfg.effective_parity_policy();
+    let mut resolved_parameters = serde_json::json!({
+        "lambda_squared": lambda_squared_cache_identity(params),
+        "n_modes": params.n_modes,
+        "precision_bits": cfg.precision_bits,
+        "force_even": parity_policy.legacy_force_even(),
+        "eigenpair_content_digest": eigenpair_manifest.content_digest.0
+    });
+    add_adaptive_parity_parameter(&mut resolved_parameters, parity_policy);
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_secular_source".to_owned(),
         mathematical_semantics_version: "ccm-secular-source-v0.13.0-v1".to_owned(),
-        resolved_mathematical_parameters: serde_json::json!({
-            "lambda_squared": lambda_squared_cache_identity(params),
-            "n_modes": params.n_modes,
-            "precision_bits": cfg.precision_bits,
-            "force_even": cfg.force_even,
-            "eigenpair_content_digest": eigenpair_manifest.content_digest.0
-        }),
+        resolved_mathematical_parameters: resolved_parameters,
         normalization: Some("sum_xi_equals_sqrt_log_lambda_squared".to_owned()),
         target: Some("ccm_secular_function".to_owned()),
-        subspace: cfg.force_even.then(|| "even".to_owned()),
+        subspace: parity_policy.semantic_subspace(),
         source_data_identities: BTreeMap::new(),
         algorithm_semantics: Some("xi_hat_exponential_sum".to_owned()),
     };
@@ -5598,7 +5654,7 @@ fn resolve_secular_source_via_cache(
         lambda_squared_cache_identity(params),
         params.n_modes,
         cfg.precision_bits,
-        if cfg.force_even { "even" } else { "natural" }
+        parity_policy.cache_label()
     );
     let request = ArtifactExecutionCacheRequest {
         operation: "ccm.secular_source.resolve_or_compute",
@@ -5631,7 +5687,8 @@ fn resolve_secular_source_via_cache(
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
                     precision_bits: cfg.precision_bits,
-                    force_even: cfg.force_even,
+                    force_even: parity_policy.legacy_force_even(),
+                    parity_policy: parity_policy.portable_marker(),
                     eigenpair_content_digest: expected_digest.clone(),
                     normalization: "sum_xi_equals_sqrt_log_lambda_squared".to_owned(),
                 },
@@ -5647,7 +5704,11 @@ fn resolve_secular_source_via_cache(
                 || artifact.lambda_squared != lambda_squared_cache_identity(params)
                 || artifact.n_modes != params.n_modes
                 || artifact.precision_bits != cfg.precision_bits
-                || artifact.force_even != cfg.force_even
+                || !payload_parity_matches(
+                    artifact.force_even,
+                    artifact.parity_policy,
+                    parity_policy,
+                )
                 || artifact.eigenpair_content_digest != expected_digest
                 || artifact.normalization != "sum_xi_equals_sqrt_log_lambda_squared"
             {
@@ -5701,26 +5762,29 @@ fn certify_roots_from_retained_source(
     let secular_manifest = secular_manifest.ok_or_else(|| {
         anyhow::anyhow!("managed CCM root certification is missing its secular-source manifest")
     })?;
+    let parity_policy = cfg.effective_parity_policy();
+    let mut resolved_parameters = serde_json::json!({
+        "lambda_squared": lambda_squared_cache_identity(params),
+        "n_modes": params.n_modes,
+        "precision_bits": cfg.precision_bits,
+        "force_even": parity_policy.legacy_force_even(),
+        "secular_source_content_digest": secular_manifest.content_digest.0,
+        "source_weights_digest": expected_weights_digest.0,
+        "certification_scope": "exact_stored_point_source",
+        "target": options.target,
+        "isolation_bits": options.isolation_bits,
+        "interval_newton": options.interval_newton,
+    });
+    add_adaptive_parity_parameter(&mut resolved_parameters, parity_policy);
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_certificate_bundle".to_owned(),
         mathematical_semantics_version: "ccm-exact-point-source-root-certificate-v0.13.0-v1"
             .to_owned(),
-        resolved_mathematical_parameters: serde_json::json!({
-            "lambda_squared": lambda_squared_cache_identity(params),
-            "n_modes": params.n_modes,
-            "precision_bits": cfg.precision_bits,
-            "force_even": cfg.force_even,
-            "secular_source_content_digest": secular_manifest.content_digest.0,
-            "source_weights_digest": expected_weights_digest.0,
-            "certification_scope": "exact_stored_point_source",
-            "target": options.target,
-            "isolation_bits": options.isolation_bits,
-            "interval_newton": options.interval_newton,
-        }),
+        resolved_mathematical_parameters: resolved_parameters,
         normalization: Some("sum_xi_equals_sqrt_log_lambda_squared".to_owned()),
         target: Some("independently_indexed_positive_ccm_roots".to_owned()),
-        subspace: cfg.force_even.then(|| "even".to_owned()),
+        subspace: parity_policy.semantic_subspace(),
         source_data_identities: BTreeMap::from([(
             "ccm_secular_source".to_owned(),
             secular_manifest.content_digest.clone(),
@@ -6125,12 +6189,13 @@ fn decode_root_range(
     semantics: RootWindowSemantics,
     require_converged: bool,
 ) -> std::result::Result<Vec<EigenvalueResult>, CacheError> {
+    let parity_policy = cfg.effective_parity_policy();
     let expected_seeds: Vec<String> = seeds.iter().map(Float::to_string).collect();
     if artifact.schema_version != 3
         || artifact.lambda_squared != lambda_squared_cache_identity(params)
         || artifact.n_modes != params.n_modes
         || artifact.precision_bits != cfg.precision_bits
-        || artifact.force_even != cfg.force_even
+        || !payload_parity_matches(artifact.force_even, artifact.parity_policy, parity_policy)
         || first_root_index == 0
         || artifact.first_root_index != first_root_index
         || artifact.root_domain != semantics.domain
@@ -6264,11 +6329,12 @@ fn root_range_semantic_key(
         seeds.len(),
     )?;
     let seed_strings: Vec<String> = seeds.iter().map(Float::to_string).collect();
+    let parity_policy = cfg.effective_parity_policy();
     let mut resolved_parameters = serde_json::json!({
         "lambda_squared": lambda_squared_cache_identity(params),
         "n_modes": params.n_modes,
         "precision_bits": cfg.precision_bits,
-        "force_even": cfg.force_even,
+        "force_even": parity_policy.legacy_force_even(),
         "first_root_index": first_root_index,
         "root_count": seeds.len(),
         "discovery_mode": artifact_mode.as_str(),
@@ -6282,6 +6348,7 @@ fn root_range_semantic_key(
         "solver_steps": cfg.solver_steps,
         "accuracy_guard_bits": GUARD_BITS
     });
+    add_adaptive_parity_parameter(&mut resolved_parameters, parity_policy);
     if let Some(dataset) = reference_dataset {
         resolved_parameters
             .as_object_mut()
@@ -6330,7 +6397,7 @@ fn root_range_semantic_key(
             }
             .to_owned(),
         ),
-        subspace: cfg.force_even.then(|| "even".to_owned()),
+        subspace: parity_policy.semantic_subspace(),
         source_data_identities,
         algorithm_semantics: Some(cfg.root_solver.display_name().to_ascii_lowercase()),
     })
@@ -6357,6 +6424,7 @@ fn resolve_root_range_via_cache(
         .checked_add(seeds.len() - 1)
         .ok_or_else(|| anyhow::anyhow!("CCM indexed root window overflows usize"))?;
     let require_converged = cache.requested_assurance != xc_core::AssuranceLevel::Computed;
+    let parity_policy = cfg.effective_parity_policy();
 
     // A reference-seeded result for a larger prefix contains exactly the same
     // indexed mathematical requests as a shorter prefix. Probe common
@@ -6398,7 +6466,7 @@ fn resolve_root_range_via_cache(
                 lambda_squared_cache_identity(params),
                 params.n_modes,
                 cfg.precision_bits,
-                if cfg.force_even { "even" } else { "natural" },
+                parity_policy.cache_label(),
                 candidate_count
             );
             let candidate_request = ArtifactExecutionCacheRequest {
@@ -6488,7 +6556,7 @@ fn resolve_root_range_via_cache(
             lambda_squared_cache_identity(params),
             params.n_modes,
             cfg.precision_bits,
-            if cfg.force_even { "even" } else { "natural" },
+            parity_policy.cache_label(),
             first_root_index,
             last_root_index
         )
@@ -6502,7 +6570,7 @@ fn resolve_root_range_via_cache(
             lambda_squared_cache_identity(params),
             params.n_modes,
             cfg.precision_bits,
-            if cfg.force_even { "even" } else { "natural" },
+            parity_policy.cache_label(),
             first_root_index,
             last_root_index
         )
@@ -6583,7 +6651,8 @@ fn resolve_root_range_via_cache(
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
                     precision_bits: cfg.precision_bits,
-                    force_even: cfg.force_even,
+                    force_even: parity_policy.legacy_force_even(),
+                    parity_policy: parity_policy.portable_marker(),
                     first_root_index,
                     root_domain: semantics.domain,
                     discovery_mode: artifact_mode.as_str().to_owned(),
@@ -6680,11 +6749,12 @@ fn record_run_evidence_via_cache(
             }
             counts
         });
+    let parity_policy = cfg.effective_parity_policy();
     let mut resolved_parameters = serde_json::json!({
         "lambda_squared": lambda_squared_cache_identity(params),
         "n_modes": params.n_modes,
         "precision_bits": cfg.precision_bits,
-        "force_even": cfg.force_even,
+        "force_even": parity_policy.legacy_force_even(),
         "discovery_mode": artifact_mode.as_str(),
         "first_root_index": first_root_index,
         "last_root_index": last_root_index,
@@ -6692,6 +6762,7 @@ fn record_run_evidence_via_cache(
         "eigenpair_content_digest": eigenpair_manifest.content_digest.0,
         "root_range_content_digest": root_manifest.content_digest.0
     });
+    add_adaptive_parity_parameter(&mut resolved_parameters, parity_policy);
     if semantics.is_advanced() {
         let parameters = resolved_parameters
             .as_object_mut()
@@ -6725,7 +6796,7 @@ fn record_run_evidence_via_cache(
         resolved_mathematical_parameters: resolved_parameters,
         normalization: None,
         target: Some("ccm_configuration_run_summary".to_owned()),
-        subspace: cfg.force_even.then(|| "even".to_owned()),
+        subspace: parity_policy.semantic_subspace(),
         source_data_identities: BTreeMap::new(),
         algorithm_semantics: None,
     };
@@ -6737,7 +6808,7 @@ fn record_run_evidence_via_cache(
             lambda_squared_cache_identity(params),
             params.n_modes,
             cfg.precision_bits,
-            if cfg.force_even { "even" } else { "natural" },
+            parity_policy.cache_label(),
             semantics.requested_count,
             roots.len()
         )
@@ -6748,7 +6819,7 @@ fn record_run_evidence_via_cache(
             lambda_squared_cache_identity(params),
             params.n_modes,
             cfg.precision_bits,
-            if cfg.force_even { "even" } else { "natural" },
+            parity_policy.cache_label(),
             first_root_index,
             last_root_index
         )
@@ -6787,7 +6858,8 @@ fn record_run_evidence_via_cache(
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
                     precision_bits: cfg.precision_bits,
-                    force_even: cfg.force_even,
+                    force_even: parity_policy.legacy_force_even(),
+                    parity_policy: parity_policy.portable_marker(),
                     discovery_mode: artifact_mode.as_str().to_owned(),
                     first_root_index,
                     last_root_index,
@@ -6819,7 +6891,11 @@ fn record_run_evidence_via_cache(
                 || artifact.lambda_squared != lambda_squared_cache_identity(params)
                 || artifact.n_modes != params.n_modes
                 || artifact.precision_bits != cfg.precision_bits
-                || artifact.force_even != cfg.force_even
+                || !payload_parity_matches(
+                    artifact.force_even,
+                    artifact.parity_policy,
+                    parity_policy,
+                )
                 || artifact.discovery_mode != artifact_mode.as_str()
                 || artifact.first_root_index != first_root_index
                 || artifact.last_root_index != last_root_index
@@ -7318,7 +7394,9 @@ fn validate_continuation_sweep(
     if points.is_empty() {
         bail!("cross-N continuation sweep requires at least one point");
     }
-    if cfg.eigenstate_solver != CcmEigenstateSolver::ShiftInvertKrylov || !cfg.force_even {
+    if cfg.eigenstate_solver != CcmEigenstateSolver::ShiftInvertKrylov
+        || cfg.effective_parity_policy() != CcmParityPolicy::EvenSector
+    {
         bail!("cross-N continuation requires the forced-even shift-invert Krylov route");
     }
     for point in points {
@@ -7895,6 +7973,7 @@ fn run_inner_retaining_source(
     // residual validation (the strongest integrity test for ξ).
     //
     let eigenstate_started = Instant::now();
+    let parity_policy = cfg.effective_parity_policy();
     let (eps_n, xi, inverse_iteration_diagnostics, eigenpair_manifest) =
         if let CcmCacheRoute::Fabric(cache) = &cache_route {
             let (seed, seed_manifest) = continuation
@@ -7921,13 +8000,9 @@ fn run_inner_retaining_source(
                 Vec<Float>,
                 xc_numerics::linalg::InverseIterationDiagnostics,
             )> = None;
-            if let Some(c) = weil_eigvec_cache::load(
-                lambda_sq,
-                n_modes_key,
-                prec,
-                cfg.cache_mode,
-                cfg.force_even,
-            ) {
+            if let Some(c) =
+                weil_eigvec_cache::load(lambda_sq, n_modes_key, prec, cfg.cache_mode, parity_policy)
+            {
                 let replayed_residual =
                     weil_eigvec_cache::relative_residual_norm(&tau, dim, &c.xi, &c.eps_n, prec);
                 if c.diagnostics.configured_step_limit == cfg.inverse_iter_steps
@@ -7957,47 +8032,76 @@ fn run_inner_retaining_source(
                     // Warm-start from nearby-precision cache if enabled.
                     // Scan for a cached ξ at a nearby precision to use as the
                     // starting vector for inverse iteration instead of the Gaussian.
-                    let warm_xi: Option<Vec<Float>> = if cfg.warm_start {
-                        weil_eigvec_cache::find_warm_start(
-                            lambda_sq,
-                            n_modes_key,
+                    let warm_xi: Option<Vec<Float>> =
+                        if cfg.warm_start && parity_policy != CcmParityPolicy::EvenSector {
+                            weil_eigvec_cache::find_warm_start(
+                                lambda_sq,
+                                n_modes_key,
+                                prec,
+                                cfg.warm_start_tolerance_bits,
+                                parity_policy,
+                            )
+                        } else {
+                            None
+                        };
+
+                    // Find the selected smallest eigenpair under the explicit
+                    // parity policy.
+                    let (raw_eigenvalue, raw_eigenvector, mut diagnostics) = if parity_policy
+                        == CcmParityPolicy::EvenSector
+                    {
+                        let sector =
+                            build_even_sector_matrix(&tau, params.n_modes, cfg.precision_bits);
+                        let sector_dimension = params.n_modes + 1;
+                        eprintln!(
+                            "[HP] LU factoring {}×{} even-sector matrix (one-time cost)...",
+                            sector_dimension, sector_dimension
+                        );
+                        let output = xc_numerics::linalg::inverse_iteration_detailed(
+                            &sector,
+                            sector_dimension,
                             prec,
-                            cfg.warm_start_tolerance_bits,
-                            cfg.force_even,
+                            cfg.inverse_iter_steps,
+                            false,
+                        )?;
+                        (
+                            output.eigenvalue,
+                            expand_even_sector_vector(&output.eigenvector, params.n_modes, prec),
+                            output.diagnostics,
                         )
                     } else {
-                        None
-                    };
-
-                    // Find smallest eigenpair by inverse iteration.
-                    eprintln!(
-                        "[HP] LU factoring {}×{} matrix (one-time cost)...",
-                        dim, dim
-                    );
-                    let output = if let Some(warm) = warm_xi {
-                        crate::hp_debug!("[HP] starting inverse iteration from warm-start vector");
-                        xc_numerics::linalg::inverse_iteration_from_detailed(
-                            &tau,
-                            dim,
-                            prec,
-                            cfg.inverse_iter_steps,
-                            cfg.force_even,
-                            Some(warm),
-                        )?
-                    } else {
-                        xc_numerics::linalg::inverse_iteration_detailed(
-                            &tau,
-                            dim,
-                            prec,
-                            cfg.inverse_iter_steps,
-                            cfg.force_even,
-                        )?
+                        eprintln!(
+                            "[HP] LU factoring {}×{} full matrix (one-time cost)...",
+                            dim, dim
+                        );
+                        let project_adaptively = parity_policy == CcmParityPolicy::AdaptiveEven;
+                        let output = if let Some(warm) = warm_xi {
+                            crate::hp_debug!(
+                                "[HP] starting inverse iteration from warm-start vector"
+                            );
+                            xc_numerics::linalg::inverse_iteration_from_detailed(
+                                &tau,
+                                dim,
+                                prec,
+                                cfg.inverse_iter_steps,
+                                project_adaptively,
+                                Some(warm),
+                            )?
+                        } else {
+                            xc_numerics::linalg::inverse_iteration_detailed(
+                                &tau,
+                                dim,
+                                prec,
+                                cfg.inverse_iter_steps,
+                                project_adaptively,
+                            )?
+                        };
+                        (output.eigenvalue, output.eigenvector, output.diagnostics)
                     };
                     crate::hp_debug!("[HP] LU factorization done.");
                     // Normalize: Σ ξ_j = √L.
-                    let eps_n = output.eigenvalue;
-                    let xi = normalize_eigenvector(&output.eigenvector, &l, prec);
-                    let mut diagnostics = output.diagnostics;
+                    let eps_n = raw_eigenvalue;
+                    let xi = normalize_eigenvector(&raw_eigenvector, &l, prec);
                     diagnostics.final_relative_residual_norm =
                         weil_eigvec_cache::relative_residual_norm(&tau, dim, &xi, &eps_n, prec)
                             .ok_or_else(|| {
@@ -8014,7 +8118,7 @@ fn run_inner_retaining_source(
                         &xi,
                         &diagnostics,
                         cfg.cache_mode,
-                        cfg.force_even,
+                        parity_policy,
                     );
                     (eps_n, xi, diagnostics)
                 }
@@ -8367,11 +8471,11 @@ fn measure_evenness_from_retained_source_via_cache(
     force_symmetric(&mut tau, params.matrix_size());
 
     let mut natural_cfg = cfg.clone();
-    natural_cfg.force_even = false;
+    natural_cfg.set_parity_policy(CcmParityPolicy::Natural);
     let (natural_eval, natural_xi, _natural_diagnostics, natural_manifest) =
         weil_eigenpair_via_cache(params, &natural_cfg, &l, &tau, &tau_manifest, cache)?;
     let mut forced_cfg = cfg.clone();
-    forced_cfg.force_even = true;
+    forced_cfg.set_parity_policy(CcmParityPolicy::EvenSector);
     let (forced_eval, _forced_xi, _forced_diagnostics, forced_manifest) =
         weil_eigenpair_via_cache(params, &forced_cfg, &l, &tau, &tau_manifest, cache)?;
     let calculated = evenness_from_natural_state(
@@ -11036,7 +11140,7 @@ mod weil_eigvec_cache {
     use xc_numerics::quadrature::CacheMode;
 
     use super::super::LambdaSq;
-    use super::PortableInverseIterationDiagnostics;
+    use super::{CcmParityPolicy, PortableInverseIterationDiagnostics};
 
     /// Toolkit version string embedded in every weil eigvec cache file
     /// written by this build.
@@ -11093,10 +11197,10 @@ mod weil_eigvec_cache {
         n_modes: usize,
         target_prec: u32,
         tolerance_bits: u32,
-        force_even: bool,
+        parity_policy: CcmParityPolicy,
     ) -> Option<Vec<Float>> {
         let dir = cache_dir()?;
-        let variant = if force_even { "" } else { "_natural" };
+        let variant = cache_variant(parity_policy);
         let prefix = format!(
             "weil_eigvec_lambda_sq{}_nmodes{}_prec",
             lambda_sq.filename_str(),
@@ -11137,7 +11241,7 @@ mod weil_eigvec_cache {
             n_modes,
             nearby_prec,
             CacheMode::JsonZip,
-            force_even,
+            parity_policy,
         )?;
 
         // Promote ξ to target precision by re-parsing each entry.
@@ -11168,13 +11272,9 @@ mod weil_eigvec_cache {
         lambda_sq: LambdaSq,
         n_modes: usize,
         prec: u32,
-        force_even: bool,
+        parity_policy: CcmParityPolicy,
     ) -> String {
-        // Forced-even (the default CCM path) keeps the historical name with
-        // NO suffix, so every pre-existing public fixture stays valid. The
-        // natural (unprojected) variant gets a `_natural` marker so the two
-        // never collide in the cache.
-        let variant = if force_even { "" } else { "_natural" };
+        let variant = cache_variant(parity_policy);
         format!(
             "weil_eigvec_lambda_sq{}_nmodes{}_prec{}{}.json",
             lambda_sq.filename_str(),
@@ -11184,23 +11284,36 @@ mod weil_eigvec_cache {
         )
     }
 
+    fn cache_variant(parity_policy: CcmParityPolicy) -> &'static str {
+        match parity_policy {
+            // The historical unsuffixed standalone cache used full-space
+            // inverse iteration with conditional even projection.
+            CcmParityPolicy::AdaptiveEven => "",
+            CcmParityPolicy::Natural => "_natural",
+            // The reduced even-sector route was introduced through the
+            // managed artifact fabric, so it must not consume a historical
+            // adaptive standalone result.
+            CcmParityPolicy::EvenSector => "_even_sector",
+        }
+    }
+
     fn json_path(
         lambda_sq: LambdaSq,
         n_modes: usize,
         prec: u32,
-        force_even: bool,
+        parity_policy: CcmParityPolicy,
     ) -> Option<std::path::PathBuf> {
-        cache_dir().map(|d| d.join(cache_filename(lambda_sq, n_modes, prec, force_even)))
+        cache_dir().map(|d| d.join(cache_filename(lambda_sq, n_modes, prec, parity_policy)))
     }
 
     fn zip_path(
         lambda_sq: LambdaSq,
         n_modes: usize,
         prec: u32,
-        force_even: bool,
+        parity_policy: CcmParityPolicy,
     ) -> Option<std::path::PathBuf> {
         cache_dir().map(|d| {
-            let f = cache_filename(lambda_sq, n_modes, prec, force_even);
+            let f = cache_filename(lambda_sq, n_modes, prec, parity_policy);
             d.join(format!("{}.zip", f))
         })
     }
@@ -11385,11 +11498,11 @@ mod weil_eigvec_cache {
         lambda_sq: LambdaSq,
         n_modes: usize,
         prec: u32,
-        force_even: bool,
+        parity_policy: CcmParityPolicy,
     ) -> Option<(CachedXi, String)> {
         let file = std::fs::File::open(zip_path).ok()?;
         let mut archive = zip::ZipArchive::new(file).ok()?;
-        let entry_name = cache_filename(lambda_sq, n_modes, prec, force_even);
+        let entry_name = cache_filename(lambda_sq, n_modes, prec, parity_policy);
         let mut entry = archive.by_name(&entry_name).ok()?;
         let mut data = String::new();
         entry.read_to_string(&mut data).ok()?;
@@ -11402,7 +11515,7 @@ mod weil_eigvec_cache {
         n_modes: usize,
         prec: u32,
         mode: CacheMode,
-        force_even: bool,
+        parity_policy: CcmParityPolicy,
     ) -> Option<CachedXi> {
         if mode == CacheMode::Off {
             return None;
@@ -11416,7 +11529,7 @@ mod weil_eigvec_cache {
         }
 
         // Local single zip — in memory.
-        if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec, force_even) {
+        if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec, parity_policy) {
             return Some(c);
         }
 
@@ -11429,13 +11542,13 @@ mod weil_eigvec_cache {
         lambda_sq: LambdaSq,
         n_modes: usize,
         prec: u32,
-        force_even: bool,
+        parity_policy: CcmParityPolicy,
     ) -> Option<CachedXi> {
-        let zp = zip_path(lambda_sq, n_modes, prec, force_even)?;
+        let zp = zip_path(lambda_sq, n_modes, prec, parity_policy)?;
         if !zp.exists() {
             return None;
         }
-        match read_single_zip(&zp, lambda_sq, n_modes, prec, force_even) {
+        match read_single_zip(&zp, lambda_sq, n_modes, prec, parity_policy) {
             Some((parsed, _json_string)) => Some(parsed),
             None => {
                 warn_skip(&zp, "zip open / decompress / shape parse failed");
@@ -11491,13 +11604,18 @@ mod weil_eigvec_cache {
         buf
     }
 
-    fn cleanup_previous(lambda_sq: LambdaSq, n_modes: usize, prec: u32, force_even: bool) {
-        if let Some(p) = json_path(lambda_sq, n_modes, prec, force_even) {
+    fn cleanup_previous(
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
+        parity_policy: CcmParityPolicy,
+    ) {
+        if let Some(p) = json_path(lambda_sq, n_modes, prec, parity_policy) {
             if p.exists() {
                 let _ = std::fs::remove_file(&p);
             }
         }
-        if let Some(p) = zip_path(lambda_sq, n_modes, prec, force_even) {
+        if let Some(p) = zip_path(lambda_sq, n_modes, prec, parity_policy) {
             if p.exists() {
                 let _ = std::fs::remove_file(&p);
             }
@@ -11513,7 +11631,7 @@ mod weil_eigvec_cache {
         xi: &[Float],
         diagnostics: &xc_numerics::linalg::InverseIterationDiagnostics,
         mode: CacheMode,
-        force_even: bool,
+        parity_policy: CcmParityPolicy,
     ) {
         // Off and JsonOnly write nothing: the cache is zip-only.
         if matches!(mode, CacheMode::Off | CacheMode::JsonOnly) {
@@ -11525,12 +11643,12 @@ mod weil_eigvec_cache {
             return;
         }
 
-        cleanup_previous(lambda_sq, n_modes, prec, force_even);
+        cleanup_previous(lambda_sq, n_modes, prec, parity_policy);
 
         // Write ONLY the compressed copy. Readers decompress from the zip
         // on demand — no uncompressed .json is persisted. ξ is small, so
         // this is always a single zip (no byte-split tier — unlike τ).
-        let entry_name = cache_filename(lambda_sq, n_modes, prec, force_even);
+        let entry_name = cache_filename(lambda_sq, n_modes, prec, parity_policy);
         let zip_bytes = compress_to_zip(&json_bytes, &entry_name);
         if zip_bytes.is_empty() {
             eprintln!(
@@ -11544,7 +11662,7 @@ mod weil_eigvec_cache {
             );
             return;
         }
-        if let Some(zp) = zip_path(lambda_sq, n_modes, prec, force_even) {
+        if let Some(zp) = zip_path(lambda_sq, n_modes, prec, parity_policy) {
             if let Err(e) = std::fs::write(&zp, &zip_bytes) {
                 crate::hp_debug!(
                     "[weil_eigvec_cache] WARNING: could not write {}: {}",
@@ -11573,6 +11691,7 @@ mod tests {
             n_modes: 1,
             precision_bits: 192,
             force_even: true,
+            parity_policy: None,
             eigenstate_route: legacy_eigenstate_route_name(),
             eigenvalue: "1".to_owned(),
             eigenvector: vec!["0".to_owned(), "1".to_owned(), "0".to_owned()],
@@ -11587,6 +11706,7 @@ mod tests {
             shift_invert_krylov: None,
         };
         let value = serde_json::to_value(artifact).unwrap();
+        assert!(value.get("parity_policy").is_none());
         assert!(value.get("eigenstate_route").is_none());
         assert!(value.get("shift_invert_krylov").is_none());
         assert_eq!(
@@ -11658,6 +11778,52 @@ mod tests {
             krylov_semantic.digest().unwrap()
         );
         assert_ne!(legacy_logical, krylov_logical);
+
+        let mut natural = legacy.clone();
+        natural.set_parity_policy(CcmParityPolicy::Natural);
+        let (natural_semantic, natural_logical) =
+            weil_eigenpair_cache_identity(&params, &natural).unwrap();
+        assert_eq!(
+            natural_logical,
+            format!(
+                "ccm/weil-eigenpair/13/120/{}/natural",
+                natural.precision_bits
+            )
+        );
+
+        let mut adaptive = legacy.clone();
+        adaptive.set_parity_policy(CcmParityPolicy::AdaptiveEven);
+        let (adaptive_semantic, adaptive_logical) =
+            weil_eigenpair_cache_identity(&params, &adaptive).unwrap();
+        assert_eq!(
+            adaptive_logical,
+            format!(
+                "ccm/weil-eigenpair/13/120/{}/adaptive-even",
+                adaptive.precision_bits
+            )
+        );
+        assert_eq!(
+            adaptive_semantic
+                .resolved_mathematical_parameters
+                .get("parity_policy"),
+            Some(&serde_json::json!("adaptive-even"))
+        );
+        assert_eq!(
+            adaptive_semantic.mathematical_semantics_version,
+            "ccm-smallest-weil-eigenpair-adaptive-even-v1"
+        );
+        assert_ne!(
+            legacy_semantic.digest().unwrap(),
+            natural_semantic.digest().unwrap()
+        );
+        assert_ne!(
+            legacy_semantic.digest().unwrap(),
+            adaptive_semantic.digest().unwrap()
+        );
+        assert_ne!(
+            natural_semantic.digest().unwrap(),
+            adaptive_semantic.digest().unwrap()
+        );
     }
 
     #[test]
@@ -12214,7 +12380,8 @@ mod tests {
             lambda_squared: lambda_squared_cache_identity(&params),
             n_modes: params.n_modes,
             precision_bits: cfg.precision_bits,
-            force_even: cfg.force_even,
+            force_even: cfg.effective_parity_policy().legacy_force_even(),
+            parity_policy: None,
             first_root_index: 1,
             root_domain: IndependentRootDomain::Positive,
             discovery_mode: RootArtifactMode::Independent.as_str().to_owned(),
@@ -13679,35 +13846,62 @@ mod tests {
         assert_eq!(cfg.quad_points, 1500);
     }
 
-    /// force_even defaults to true and is settable.
+    /// Even-sector remains the default, while the legacy boolean override
+    /// continues to select the natural path.
     #[test]
     fn config_force_even_default_and_override() {
         let cfg = HighPrecConfig::for_decimal_digits(200);
         assert!(cfg.force_even, "force_even should default to true");
+        assert_eq!(cfg.effective_parity_policy(), CcmParityPolicy::EvenSector);
 
         let mut cfg2 = HighPrecConfig::for_decimal_digits(200);
         cfg2.force_even = false;
         assert!(!cfg2.force_even, "force_even should be settable to false");
+        assert_eq!(cfg2.effective_parity_policy(), CcmParityPolicy::Natural);
+
+        cfg2.set_parity_policy(CcmParityPolicy::AdaptiveEven);
+        assert!(cfg2.force_even);
+        assert_eq!(
+            cfg2.effective_parity_policy(),
+            CcmParityPolicy::AdaptiveEven
+        );
     }
 
-    /// Weil-eigenvector cache filename keying: the forced-even variant
-    /// keeps the historical (suffix-free) name so all pre-existing public
-    /// fixtures stay valid; the natural variant gets a `_natural` marker
-    /// so the two never collide.
+    /// Weil-eigenvector cache filenames preserve the two historical
+    /// standalone routes and isolate the newer reduced even-sector route.
     #[test]
     fn weil_eigvec_cache_filename_keys_on_force_even() {
         use super::super::LambdaSq;
         use super::weil_eigvec_cache::cache_filename;
-        let forced = cache_filename(LambdaSq::integer(1000), 800, 6660, true);
-        let natural = cache_filename(LambdaSq::integer(1000), 800, 6660, false);
-        // Forced-even identifies the even-subspace representation.
-        assert_eq!(forced, "weil_eigvec_lambda_sq1000_nmodes800_prec6660.json");
+        let forced = cache_filename(
+            LambdaSq::integer(1000),
+            800,
+            6660,
+            CcmParityPolicy::EvenSector,
+        );
+        let natural = cache_filename(LambdaSq::integer(1000), 800, 6660, CcmParityPolicy::Natural);
+        let adaptive = cache_filename(
+            LambdaSq::integer(1000),
+            800,
+            6660,
+            CcmParityPolicy::AdaptiveEven,
+        );
+        assert_eq!(
+            forced,
+            "weil_eigvec_lambda_sq1000_nmodes800_prec6660_even_sector.json"
+        );
         // Natural is distinct.
         assert_eq!(
             natural,
             "weil_eigvec_lambda_sq1000_nmodes800_prec6660_natural.json"
         );
+        assert_eq!(
+            adaptive,
+            "weil_eigvec_lambda_sq1000_nmodes800_prec6660.json"
+        );
         assert_ne!(forced, natural);
+        assert_ne!(forced, adaptive);
+        assert_ne!(natural, adaptive);
     }
 
     /// `weil_spectrum_hp`: the FULL Weil form is positive (smallest
@@ -14631,14 +14825,28 @@ mod tests {
             &xi,
             &diagnostics,
             CacheMode::Off,
-            true,
+            CcmParityPolicy::EvenSector,
         );
         assert!(
-            load(lambda_sq, n_modes, prec, CacheMode::Off, true).is_none(),
+            load(
+                lambda_sq,
+                n_modes,
+                prec,
+                CacheMode::Off,
+                CcmParityPolicy::EvenSector,
+            )
+            .is_none(),
             "Off should never read"
         );
         assert!(
-            load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true).is_none(),
+            load(
+                lambda_sq,
+                n_modes,
+                prec,
+                CacheMode::JsonZip,
+                CcmParityPolicy::EvenSector,
+            )
+            .is_none(),
             "Off save should have written nothing"
         );
 
@@ -14652,20 +14860,31 @@ mod tests {
             &xi,
             &diagnostics,
             CacheMode::JsonZip,
-            true,
+            CcmParityPolicy::EvenSector,
         );
 
         // No uncompressed .json should be written.
         let jp = temp.join("data").join("weil_eigvec_cache").join(
-            super::weil_eigvec_cache::cache_filename(lambda_sq, n_modes, prec, true),
+            super::weil_eigvec_cache::cache_filename(
+                lambda_sq,
+                n_modes,
+                prec,
+                CcmParityPolicy::EvenSector,
+            ),
         );
         assert!(
             !jp.exists(),
             "zip-only: save must not write an uncompressed .json"
         );
 
-        let got = load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true)
-            .expect("JsonZip round-trip should load from the zip");
+        let got = load(
+            lambda_sq,
+            n_modes,
+            prec,
+            CacheMode::JsonZip,
+            CcmParityPolicy::EvenSector,
+        )
+        .expect("JsonZip round-trip should load from the zip");
         assert_eq!(got.xi.len(), dim);
         for (a, b) in xi.iter().zip(got.xi.iter()) {
             assert_eq!(
@@ -14683,7 +14902,14 @@ mod tests {
 
         // JsonOnly is now a read no-op (no uncompressed .json exists).
         assert!(
-            load(lambda_sq, n_modes, prec, CacheMode::JsonOnly, true).is_none(),
+            load(
+                lambda_sq,
+                n_modes,
+                prec,
+                CacheMode::JsonOnly,
+                CcmParityPolicy::EvenSector,
+            )
+            .is_none(),
             "zip-only: JsonOnly must not read the zip"
         );
 
@@ -14709,7 +14935,7 @@ mod tests {
 
         let dir = temp.join("data").join("weil_eigvec_cache");
         std::fs::create_dir_all(&dir).unwrap();
-        let entry_name = cache_filename(lambda_sq, n_modes, prec, true);
+        let entry_name = cache_filename(lambda_sq, n_modes, prec, CcmParityPolicy::EvenSector);
         let zip_path = dir.join(format!("{}.zip", entry_name));
 
         // Shape-parseable JSON, but xi has the WRONG length (3 ≠ 9)
@@ -14739,11 +14965,25 @@ mod tests {
 
         // load must skip (None) — never returns a malformed entry.
         assert!(
-            load(lambda_sq, n_modes, prec, CacheMode::JsonOnly, true).is_none(),
+            load(
+                lambda_sq,
+                n_modes,
+                prec,
+                CacheMode::JsonOnly,
+                CcmParityPolicy::EvenSector,
+            )
+            .is_none(),
             "JsonOnly is a read no-op under the zip-only contract"
         );
         assert!(
-            load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true).is_none(),
+            load(
+                lambda_sq,
+                n_modes,
+                prec,
+                CacheMode::JsonZip,
+                CcmParityPolicy::EvenSector,
+            )
+            .is_none(),
             "structurally-invalid ξ entry in the zip must be skipped"
         );
 
@@ -14786,7 +15026,14 @@ mod tests {
         std::fs::write(&zip_path, b"not a zip file at all -- random bytes").unwrap();
 
         assert!(
-            load(lambda_sq, n_modes, prec, CacheMode::JsonZip, true).is_none(),
+            load(
+                lambda_sq,
+                n_modes,
+                prec,
+                CacheMode::JsonZip,
+                CcmParityPolicy::EvenSector,
+            )
+            .is_none(),
             "corrupt .json.zip must be skipped, not loaded"
         );
 

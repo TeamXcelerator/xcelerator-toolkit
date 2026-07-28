@@ -12,10 +12,11 @@ use crate::{
     TopologyRegistry, TopologyShardRoute, TopologyShardStatus, TopologyTrustPolicy, TransportPart,
     TransportPolicy, ValidatorEvidence,
 };
-use rayon::prelude::*;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use xc_core::{PublicationAuthority, PublicationAuthorityMode, PublicationTarget};
 
@@ -747,6 +748,52 @@ fn refresh_github_write_session(
     )
 }
 
+struct RemoteSessionCleanup<'a> {
+    remote: &'a crate::GitCliRemoteStore,
+    repository: &'a str,
+    finished: bool,
+}
+
+impl<'a> RemoteSessionCleanup<'a> {
+    fn new(remote: &'a crate::GitCliRemoteStore, repository: &'a str) -> Self {
+        Self {
+            remote,
+            repository,
+            finished: false,
+        }
+    }
+
+    fn finish<T>(mut self, result: Result<T, CacheError>) -> Result<T, CacheError> {
+        let cleanup = self.remote.cleanup_session(self.repository);
+        self.finished = true;
+        match (result, cleanup) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(cleanup_error)) => {
+                eprintln!(
+                    "family publication failed and its Git transport cleanup also failed: \
+                     {cleanup_error}"
+                );
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for RemoteSessionCleanup<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Err(error) = self.remote.cleanup_session(self.repository) {
+                eprintln!(
+                    "family publication Git transport cleanup failed for {}: {error}",
+                    self.repository
+                );
+            }
+        }
+    }
+}
+
 /// Publish a family as repository-level byte batches. Logical manifests and
 /// index entries remain one-per-artifact; only the Git transport transaction is
 /// shared. This is the normal path for families containing more than one
@@ -786,6 +833,7 @@ fn execute_family_batch_publication(
         "xcelerator-toolkit@users.noreply.github.com",
     )?
     .with_resource_policy(resources.clone());
+    let session_cleanup = RemoteSessionCleanup::new(&remote, &repository_url);
     let session = sessions.get(&destination).ok_or_else(|| {
         CacheError::Authentication("family batch is missing its write session".to_owned())
     })?;
@@ -818,7 +866,6 @@ fn execute_family_batch_publication(
         }
         pending_drafts = selection.pending;
         if pending_drafts.is_empty() {
-            remote.cleanup_session(&repository_url)?;
             return Ok(Vec::new());
         }
     }
@@ -1357,7 +1404,7 @@ fn execute_family_batch_publication(
     let release_result = private_lease.as_ref().map(|lease| {
         crate::release_private_publication_lease(&remote, lease, &staging_root, completed)
     });
-    match (publication_result, release_result) {
+    let result = match (publication_result, release_result) {
         (Ok(report), None | Some(Ok(()))) => Ok(report),
         (Ok(_), Some(Err(error))) => Err(error),
         (Err(error), None | Some(Ok(()))) => Err(error),
@@ -1367,7 +1414,8 @@ fn execute_family_batch_publication(
             );
             Err(error)
         }
-    }
+    };
+    session_cleanup.finish(result)
 }
 
 fn bounded_prefix_bytes(
@@ -2798,7 +2846,129 @@ fn execute_managed_family_drafts_on_github(
     })
 }
 
+struct ManagedTransportWorkspace {
+    root: PathBuf,
+    lock: File,
+    finished: bool,
+}
+
+impl ManagedTransportWorkspace {
+    fn acquire(journal_root: &Path) -> Result<Self, CacheError> {
+        fs::create_dir_all(journal_root)?;
+        let lock_path = journal_root.join("git-transport.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        lock.try_lock_exclusive().map_err(|error| {
+            CacheError::InvalidTransition(format!(
+                "another publication finalizer is using staging root {}: {error}",
+                journal_root.display()
+            ))
+        })?;
+        let root = journal_root.join("git-transport");
+        if root.exists() {
+            let stale_bytes = transport_tree_size_bytes(&root)?;
+            fs::remove_dir_all(&root)?;
+            eprintln!(
+                "publication transport recovery: removed {stale_bytes} stale temporary bytes"
+            );
+        }
+        Ok(Self {
+            root,
+            lock,
+            finished: false,
+        })
+    }
+
+    fn finish(&mut self) -> Result<(), CacheError> {
+        let bytes = transport_tree_size_bytes(&self.root)?;
+        if self.root.exists() {
+            fs::remove_dir_all(&self.root)?;
+        }
+        self.finished = true;
+        FileExt::unlock(&self.lock)?;
+        if bytes > 0 {
+            eprintln!("publication transport cleanup: removed {bytes} temporary bytes");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ManagedTransportWorkspace {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Err(error) = fs::remove_dir_all(&self.root) {
+                if self.root.exists() {
+                    eprintln!(
+                        "publication transport emergency cleanup failed for {}: {error}",
+                        self.root.display()
+                    );
+                }
+            }
+            let _ = FileExt::unlock(&self.lock);
+        }
+    }
+}
+
+fn transport_tree_size_bytes(path: &Path) -> Result<u64, CacheError> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(0);
+    }
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        total = total
+            .checked_add(transport_tree_size_bytes(&entry?.path())?)
+            .ok_or_else(|| {
+                CacheError::ResourceLimit(
+                    "publication transport directory size exceeds u64".to_owned(),
+                )
+            })?;
+    }
+    Ok(total)
+}
+
 pub fn execute_managed_drafts_on_github(
+    drafts: &[CanonicalProductionDraft],
+    target: PublicationTarget,
+    owner: &str,
+    journal_root: &Path,
+    resources: &xc_core::ResourcePolicy,
+    replace_existing_semantic: bool,
+) -> Result<ManagedRunPublicationReport, CacheError> {
+    let mut workspace = ManagedTransportWorkspace::acquire(journal_root)?;
+    let result = execute_managed_drafts_on_github_inner(
+        drafts,
+        target,
+        owner,
+        journal_root,
+        resources,
+        replace_existing_semantic,
+    );
+    let cleanup = workspace.finish();
+    match (result, cleanup) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup_error)) => {
+            eprintln!(
+                "publication failed and final Git transport cleanup also failed: {cleanup_error}"
+            );
+            Err(error)
+        }
+    }
+}
+
+fn execute_managed_drafts_on_github_inner(
     drafts: &[CanonicalProductionDraft],
     target: PublicationTarget,
     owner: &str,
@@ -2828,27 +2998,40 @@ pub fn execute_managed_drafts_on_github(
         let mut dependency_revisions = BTreeMap::new();
         let mut dependency_results =
             BTreeMap::<(String, ContentDigest, ContentDigest, ContentDigest), bool>::new();
-        let remapped = remap_destination_drafts_with_existing(drafts, destination, |dependency| {
-            let identity = (
-                dependency.artifact_family.clone(),
-                dependency.semantic_digest.clone(),
-                dependency.manifest_digest.clone(),
-                dependency.payload_digest.clone(),
-            );
-            if let Some(exists) = dependency_results.get(&identity) {
-                return Ok(*exists);
+        let remapped_result =
+            remap_destination_drafts_with_existing(drafts, destination, |dependency| {
+                let identity = (
+                    dependency.artifact_family.clone(),
+                    dependency.semantic_digest.clone(),
+                    dependency.manifest_digest.clone(),
+                    dependency.payload_digest.clone(),
+                );
+                if let Some(exists) = dependency_results.get(&identity) {
+                    return Ok(*exists);
+                }
+                let exists = exact_destination_dependency_exists(
+                    &dependency_remote,
+                    owner,
+                    destination,
+                    dependency,
+                    &mut dependency_revisions,
+                    resources,
+                )?;
+                dependency_results.insert(identity, exists);
+                Ok(exists)
+            });
+        let cleanup_result = dependency_remote.cleanup_all_sessions();
+        let remapped = match (remapped_result, cleanup_result) {
+            (Ok(remapped), Ok(())) => remapped,
+            (Ok(_), Err(error)) => return Err(error),
+            (Err(error), Ok(())) => return Err(error),
+            (Err(error), Err(cleanup_error)) => {
+                eprintln!(
+                    "dependency preflight failed and its Git transport cleanup also failed: {cleanup_error}"
+                );
+                return Err(error);
             }
-            let exists = exact_destination_dependency_exists(
-                &dependency_remote,
-                owner,
-                destination,
-                dependency,
-                &mut dependency_revisions,
-                resources,
-            )?;
-            dependency_results.insert(identity, exists);
-            Ok(exists)
-        })?;
+        };
         let mut by_family = BTreeMap::<String, Vec<CanonicalProductionDraft>>::new();
         for draft in remapped {
             by_family
@@ -2892,7 +3075,7 @@ pub fn execute_managed_drafts_on_github(
 
     let started = std::time::Instant::now();
     let reports = groups
-        .par_iter()
+        .iter()
         .map(|(group_target, family_drafts)| {
             let family = family_drafts
                 .first()
@@ -2955,6 +3138,57 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use xc_core::{AssuranceLevel, CancellationToken, ResourcePolicy};
+
+    #[test]
+    fn managed_transport_workspace_removes_stale_and_completed_sessions() {
+        let root = std::env::temp_dir().join(format!(
+            "xcelerator-managed-transport-cleanup-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let transport_root = root.join("git-transport");
+        fs::create_dir_all(&transport_root).unwrap();
+        fs::write(transport_root.join("stale.pack"), b"interrupted transport").unwrap();
+
+        let mut workspace = ManagedTransportWorkspace::acquire(&root).unwrap();
+        assert!(
+            !transport_root.exists(),
+            "stale transport tree survived workspace acquisition"
+        );
+        fs::create_dir_all(&transport_root).unwrap();
+        fs::write(transport_root.join("active.pack"), b"active transport").unwrap();
+        workspace.finish().unwrap();
+
+        assert!(
+            !transport_root.exists(),
+            "completed transport tree survived workspace cleanup"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_transport_workspace_rejects_overlapping_local_publishers() {
+        let root = std::env::temp_dir().join(format!(
+            "xcelerator-managed-transport-lock-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        let first = ManagedTransportWorkspace::acquire(&root).unwrap();
+        let error = match ManagedTransportWorkspace::acquire(&root) {
+            Ok(_) => panic!("overlapping local publisher unexpectedly acquired the workspace"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("another publication finalizer"),
+            "unexpected overlapping-publisher error: {error}"
+        );
+        drop(first);
+
+        let mut retry = ManagedTransportWorkspace::acquire(&root).unwrap();
+        retry.finish().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn expired_family_session_is_refreshed_before_repository_access() {

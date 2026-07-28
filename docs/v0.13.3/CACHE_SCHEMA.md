@@ -208,7 +208,7 @@ Ordinary author publication is destination-aware. Before obtaining a private pub
 
 ## Domain reuse
 
-CCM preserves the full assembled tau matrix as the first and fastest ordinary cache hit. On a full-matrix miss it independently resolves compact alpha/beta/gamma archimedean integrals and the expensive prime-component matrix, reconstructs the analytic pole and archimedean matrices, assembles and validates tau, and records the exact component dependencies. The default reproduction path then reuses an orthonormal even-sector matrix and its solver-specific LU factorization; natural-state work uses the full matrix and a separate factorization. Explicit sector research additionally derives the historical odd basis `(e_k-e_-k)/sqrt(2)`, computes independently addressable low even and odd spectra, and derives GapLog from those exact spectrum artifacts. Selected natural and forced-even ground states, parity spectra, secular sources, configuration evidence, and optional certificates remain independent artifacts.
+CCM preserves the full assembled tau matrix as the first and fastest ordinary cache hit. On a full-matrix miss it independently resolves compact alpha/beta/gamma archimedean integrals and the expensive prime-component matrix, reconstructs the analytic pole and archimedean matrices, assembles and validates tau, and records the exact component dependencies. The default `even-sector` policy retains every established v0.13 identity and reuses an orthonormal even-sector matrix plus its solver-specific LU factorization. The `natural` policy uses the full matrix without projection. The `adaptive-even` policy also uses the full matrix but applies the historical conditional even projection during inverse iteration. Natural and adaptive work may share the same full-matrix factorization, but their selected eigenpairs and all eigenpair-derived artifacts are semantically disjoint. Explicit sector research additionally derives the historical odd basis `(e_k-e_-k)/sqrt(2)`, computes independently addressable low even and odd spectra, and derives GapLog from those exact spectrum artifacts. Selected natural, adaptive-even, and even-sector ground states, parity spectra, secular sources, configuration evidence, and optional certificates remain independent artifacts.
 
 The concrete CCM execution graph and shard placement are:
 
@@ -220,7 +220,7 @@ The concrete CCM execution graph and shard placement are:
 | `ccm_even_sector_matrix` | `ccm-matrices` | Orthonormal parity reduction used by forced-even solves |
 | `ccm_odd_sector_matrix` | `ccm-matrices` | Historical orthonormal odd-parity reduction used by sector research |
 | `ccm_factorization` | `ccm-matrices` | Full or even LU factors used directly by inverse iteration |
-| `ccm_weil_eigenpair` | `weil-states` | Natural or forced-even selected state |
+| `ccm_weil_eigenpair` | `weil-states` | Natural, adaptive-even, or even-sector selected state |
 | `ccm_sector_spectrum` | `weil-states` | Ordered low eigenpairs for one explicitly named even or odd sector |
 | `ccm_secular_source` | `ccm-roots` | Stable identity for the normalized eigenpair-derived secular equation |
 | `ccm_root_count_window` | `ccm-roots` | Exact finite-source root count for one rational height window |

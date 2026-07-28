@@ -31,6 +31,7 @@ serde_json = { version = "1.0", features = ["float_roundtrip"] }
 sha2 = "0.10"
 nalgebra = "0.33"
 rayon = "1.10"
+fs2 = "0.4"
 rug = { version = "1.30", default-features = false, features = ["std", "float", "integer", "rational"] }
 zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
 xc-core = { version = "0.13.3", path = "crates/xc-core" }
