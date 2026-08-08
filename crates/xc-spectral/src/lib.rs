@@ -34,6 +34,8 @@ pub mod prolate;
 pub mod screw;
 pub mod yakaboylu;
 
+pub use xc_cache::OutputValidationClaim;
+
 /// Debug logging macro controlled by [`set_hp_debug_logging`].
 ///
 /// Use this instead of bare `eprintln!` for diagnostic/progress messages.

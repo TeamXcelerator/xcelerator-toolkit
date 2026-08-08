@@ -7,8 +7,9 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-Version 0.13.3 preserves the v0.13.x APIs and existing cache artifacts while
-adding explicitly opt-in advanced CCM root-discovery controls.
+Version 0.13.4 preserves the v0.13.x APIs and existing cache artifacts while
+adding an isolated cache-output validation mode for regression testing toolkit
+changes against current cached artifacts.
 
 ---
 
@@ -43,7 +44,7 @@ If you use Xcelerator Toolkit in research, please cite the exact version or Git 
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.13.3},
+  version = {0.13.4},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }
@@ -84,7 +85,7 @@ cargo run -p xc-root --example bracketed_root --locked
 cargo run -p xc-spectral --example ccm_window_plan --locked
 ```
 
-See [Research Workflows](docs/v0.13.3/RESEARCH_WORKFLOWS.md) for additional examples and their numerical scope.
+See [Research Workflows](docs/RESEARCH_WORKFLOWS.md) for additional examples and their numerical scope.
 
 ## High precision
 
@@ -127,7 +128,7 @@ minimum reader version.
 
 Caching is automatic for ordinary consumers. The toolkit checks compatible local and public artifacts, validates a candidate before reuse, and computes on a miss. No credentials or cache configuration are required for that normal workflow.
 
-Authenticated publication to private or public cache storage is an optional author operation and is disabled by default. See [Cache Schema](docs/v0.13.3/CACHE_SCHEMA.md) for the artifact model.
+Authenticated publication to private or public cache storage is an optional author operation and is disabled by default. See [Cache Schema](docs/CACHE_SCHEMA.md) for the artifact model. Toolkit changes can be checked against current cached outputs with [cache output validation](docs/OUTPUT_VALIDATION.md).
 
 Version 0.13.1 adds generation-fenced publication leases for private shards. Concurrent authors serialize publication per shard, while each content batch and its coordination heartbeat advance atomically.
 
@@ -149,6 +150,13 @@ even symmetry. Adaptive artifacts use distinct state, secular-source, root,
 and evidence identities; they cannot overwrite or satisfy natural or
 even-sector requests.
 
+Version 0.13.4 adds `XC_CACHE_MODE=verify`. Verification recomputes each
+requested artifact into an isolated cache, follows reference-cache routes and
+continuation seeds, compares exact payload bytes, and writes a claim-wide
+report. Missing references, mismatches, nondeterministic recomputation, and
+zero-comparison runs fail the validation without publishing or modifying the
+production cache.
+
 ## Validation
 
 Release checks run locally; the repository does not require a hosted GitHub Actions workflow. The core public checks use standard Cargo commands:
@@ -169,9 +177,10 @@ Saved results record the toolkit version, source revision, numerical backend, pr
 
 ## Documentation
 
-- [v0.13.3 documentation](docs/v0.13.3/README.md)
-- [Research workflows](docs/v0.13.3/RESEARCH_WORKFLOWS.md)
-- [CLI reference](docs/v0.13.3/CLI.md)
+- [Toolkit documentation](docs/README.md)
+- [Research workflows](docs/RESEARCH_WORKFLOWS.md)
+- [Cache output validation](docs/OUTPUT_VALIDATION.md)
+- [CLI reference](docs/CLI.md)
 - [Security policy](SECURITY.md)
 
 ## License

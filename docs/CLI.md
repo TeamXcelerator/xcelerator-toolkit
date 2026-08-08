@@ -1,4 +1,4 @@
-# Xcelerator Toolkit v0.13.3 Command Line
+# Xcelerator Toolkit command line
 
 The workspace now builds a real `xc` binary from `xc-cli`:
 

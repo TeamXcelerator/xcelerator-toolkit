@@ -20,6 +20,7 @@ use xc_core::{
 
 pub const SEMANTIC_KEY_MANIFEST_TAG: &str = "xc.semantic_key.v1";
 pub const REMOTE_CANONICAL_MANIFEST_TAG: &str = "xc.remote_canonical_manifest.v1";
+pub const OUTPUT_VALIDATION_SEED_TAG: &str = "xc.output_validation.seed_source.v1";
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
@@ -32,6 +33,82 @@ pub enum ArtifactExecutionCacheMode {
     RequireReuse,
     /// Skip every cache lookup, compute a fresh value, then write and stage it.
     Refresh,
+    /// Recompute into an isolated writable cache and compare every logical
+    /// payload with the same identity in read-only reference overlays.
+    VerifyAgainstReference,
+}
+
+impl ArtifactExecutionCacheMode {
+    pub fn fabric_enabled(self) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::PreferReuse
+            | Self::RequireReuse
+            | Self::Refresh
+            | Self::VerifyAgainstReference => true,
+        }
+    }
+
+    pub fn consults_cache_for_result_reuse(self) -> bool {
+        match self {
+            Self::PreferReuse | Self::RequireReuse => true,
+            Self::Disabled | Self::Refresh | Self::VerifyAgainstReference => false,
+        }
+    }
+
+    pub fn consults_overlays_for_route_selection(self) -> bool {
+        match self {
+            Self::PreferReuse | Self::RequireReuse | Self::VerifyAgainstReference => true,
+            Self::Disabled | Self::Refresh => false,
+        }
+    }
+
+    pub fn may_use_cached_seed(self) -> bool {
+        match self {
+            Self::PreferReuse | Self::VerifyAgainstReference => true,
+            Self::Disabled | Self::RequireReuse | Self::Refresh => false,
+        }
+    }
+
+    pub fn writes_computed_artifacts(self) -> bool {
+        match self {
+            Self::PreferReuse | Self::Refresh | Self::VerifyAgainstReference => true,
+            Self::Disabled | Self::RequireReuse => false,
+        }
+    }
+
+    pub fn compares_against_reference(self) -> bool {
+        match self {
+            Self::VerifyAgainstReference => true,
+            Self::Disabled | Self::PreferReuse | Self::RequireReuse | Self::Refresh => false,
+        }
+    }
+
+    pub fn may_stage_for_publication(self) -> bool {
+        match self {
+            Self::PreferReuse | Self::Refresh => true,
+            Self::Disabled | Self::RequireReuse | Self::VerifyAgainstReference => false,
+        }
+    }
+
+    pub fn requires_reuse(self) -> bool {
+        match self {
+            Self::RequireReuse => true,
+            Self::Disabled | Self::PreferReuse | Self::Refresh | Self::VerifyAgainstReference => {
+                false
+            }
+        }
+    }
+
+    pub fn is_refresh(self) -> bool {
+        match self {
+            Self::Refresh => true,
+            Self::Disabled
+            | Self::PreferReuse
+            | Self::RequireReuse
+            | Self::VerifyAgainstReference => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -48,6 +125,40 @@ pub enum ManagedRemoteCacheMode {
     Public,
     Private,
     PrivateThenPublic,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutputValidationConfig {
+    pub validation_root: PathBuf,
+    pub report_root: PathBuf,
+    pub reference_mode: ManagedRemoteCacheMode,
+}
+
+fn parse_cache_mode(value: Option<&str>) -> Result<ArtifactExecutionCacheMode, CacheError> {
+    match value.unwrap_or("reuse") {
+        "reuse" | "prefer_reuse" | "prefer-reuse" => Ok(ArtifactExecutionCacheMode::PreferReuse),
+        "refresh" => Ok(ArtifactExecutionCacheMode::Refresh),
+        "require_reuse" | "require-reuse" => Ok(ArtifactExecutionCacheMode::RequireReuse),
+        "verify" | "verify_against_reference" | "verify-against-reference" => {
+            Ok(ArtifactExecutionCacheMode::VerifyAgainstReference)
+        }
+        other => Err(CacheError::InvalidManifest(format!(
+            "unsupported XC_CACHE_MODE {other:?}; expected reuse, refresh, require_reuse, or verify"
+        ))),
+    }
+}
+
+fn parse_validation_reference_mode(
+    value: Option<&str>,
+) -> Result<ManagedRemoteCacheMode, CacheError> {
+    match value.unwrap_or("private_public") {
+        "public" => Ok(ManagedRemoteCacheMode::Public),
+        "private" => Ok(ManagedRemoteCacheMode::Private),
+        "private_public" | "private-public" => Ok(ManagedRemoteCacheMode::PrivateThenPublic),
+        other => Err(CacheError::InvalidManifest(format!(
+            "unsupported XC_VALIDATION_REFERENCE {other:?}; expected public, private, or private_public"
+        ))),
+    }
 }
 
 fn parse_requested_assurance(value: Option<&str>) -> Result<xc_core::AssuranceLevel, CacheError> {
@@ -75,6 +186,9 @@ pub enum CertificationFailurePolicy {
 /// describe the requested computation.
 pub struct ArtifactCacheContext<'a> {
     pub resolver: Option<&'a CacheResolver>,
+    /// Reference-only resolver used by output-preservation validation. It
+    /// never contains the writable validation-computed layer.
+    pub reference_resolver: Option<&'a CacheResolver>,
     pub acceptance: Option<&'a CachePolicy>,
     pub ordered_overlays: Vec<String>,
     pub mode: ArtifactExecutionCacheMode,
@@ -105,6 +219,7 @@ pub struct ManagedArtifactCacheConfig {
     pub cache_mode: ArtifactExecutionCacheMode,
     pub replace_existing_publication: bool,
     pub execute_remote_mutations: bool,
+    pub output_validation: Option<OutputValidationConfig>,
 }
 
 impl ManagedArtifactCacheConfig {
@@ -137,6 +252,8 @@ impl ManagedArtifactCacheConfig {
         };
         let assurance_value = std::env::var("XC_ASSURANCE").ok();
         let requested_assurance = parse_requested_assurance(assurance_value.as_deref())?;
+        let cache_mode_value = std::env::var("XC_CACHE_MODE").ok();
+        let cache_mode = parse_cache_mode(cache_mode_value.as_deref())?;
         let certification_failure_policy = match std::env::var("XC_CERTIFICATION_FAILURE_POLICY")
             .unwrap_or_else(|_| "retain_computed_fail_run".to_owned())
             .as_str()
@@ -151,9 +268,10 @@ impl ManagedArtifactCacheConfig {
                 )))
             }
         };
-        let mut staging_root = std::env::var_os("XC_PUBLISH_STAGING_ROOT")
+        let explicit_staging_root = std::env::var_os("XC_PUBLISH_STAGING_ROOT")
             .or_else(|| std::env::var_os("XC_PUBLICATION_QUEUE"))
             .map(PathBuf::from);
+        let mut staging_root = explicit_staging_root.clone();
         if staging_root
             .as_ref()
             .is_some_and(|path| path.as_os_str().is_empty())
@@ -177,6 +295,7 @@ impl ManagedArtifactCacheConfig {
             }
         };
         if staging_root.is_none()
+            && !cache_mode.compares_against_reference()
             && (profile == ManagedRunProfile::Author
                 || requested_assurance != xc_core::AssuranceLevel::Computed)
         {
@@ -195,19 +314,6 @@ impl ManagedArtifactCacheConfig {
             other => {
                 return Err(CacheError::InvalidManifest(format!(
                     "unsupported XC_CACHE_REMOTE {other:?}; expected none, public, private, or private_public"
-                )))
-            }
-        };
-        let cache_mode = match std::env::var("XC_CACHE_MODE")
-            .unwrap_or_else(|_| "reuse".to_owned())
-            .as_str()
-        {
-            "reuse" | "prefer_reuse" | "prefer-reuse" => ArtifactExecutionCacheMode::PreferReuse,
-            "refresh" => ArtifactExecutionCacheMode::Refresh,
-            "require_reuse" | "require-reuse" => ArtifactExecutionCacheMode::RequireReuse,
-            other => {
-                return Err(CacheError::InvalidManifest(format!(
-                    "unsupported XC_CACHE_MODE {other:?}; expected reuse, refresh, or require_reuse"
                 )))
             }
         };
@@ -238,7 +344,7 @@ impl ManagedArtifactCacheConfig {
         if profile == ManagedRunProfile::Normal
             && (publication_target != xc_core::PublicationTarget::None
                 || execute_remote_mutations
-                || cache_mode == ArtifactExecutionCacheMode::Refresh
+                || cache_mode.is_refresh()
                 || replace_existing_publication)
         {
             return Err(CacheError::InvalidManifest(
@@ -253,13 +359,41 @@ impl ManagedArtifactCacheConfig {
         if replace_existing_publication
             && (!execute_remote_mutations
                 || publication_target == xc_core::PublicationTarget::None
-                || cache_mode != ArtifactExecutionCacheMode::Refresh)
+                || !cache_mode.is_refresh())
         {
             return Err(CacheError::InvalidManifest(
                 "XC_PUBLISH_REPLACE=true requires author refresh mode, remote execution, and a publication target"
                     .to_owned(),
             ));
         }
+        let output_validation = if cache_mode.compares_against_reference() {
+            if publication_target != xc_core::PublicationTarget::None
+                || execute_remote_mutations
+                || replace_existing_publication
+                || explicit_staging_root.is_some()
+                || staging_root.is_some()
+            {
+                return Err(CacheError::InvalidManifest(
+                    "XC_CACHE_MODE=verify cannot stage, publish, replace, or execute remote mutations"
+                        .to_owned(),
+                ));
+            }
+            let validation_root = std::env::var_os("XC_VALIDATION_CACHE_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_validation_cache_root(Path::new(&cache_root)));
+            let report_root = std::env::var_os("XC_VALIDATION_REPORT_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| validation_root.join("reports"));
+            validate_separate_cache_roots(Path::new(&cache_root), &validation_root)?;
+            let reference_value = std::env::var("XC_VALIDATION_REFERENCE").ok();
+            Some(OutputValidationConfig {
+                validation_root,
+                report_root,
+                reference_mode: parse_validation_reference_mode(reference_value.as_deref())?,
+            })
+        } else {
+            None
+        };
         Ok(Some(Self {
             profile,
             requested_assurance,
@@ -272,6 +406,7 @@ impl ManagedArtifactCacheConfig {
             cache_mode,
             replace_existing_publication,
             execute_remote_mutations,
+            output_validation,
         }))
     }
 }
@@ -297,6 +432,84 @@ fn default_managed_cache_root() -> std::ffi::OsString {
     PathBuf::from(".xcelerator-cache").into_os_string()
 }
 
+fn default_validation_cache_root(cache_root: &Path) -> PathBuf {
+    let file_name = cache_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("cache");
+    cache_root.with_file_name(format!("{file_name}-validation"))
+}
+
+fn absolute_lexical_path(path: &Path) -> Result<PathBuf, CacheError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn physical_lexical_path(path: &Path) -> Result<PathBuf, CacheError> {
+    let normalized = absolute_lexical_path(path)?;
+    let mut existing = normalized.clone();
+    let mut missing_suffix = Vec::new();
+    while !existing.exists() {
+        let component = existing.file_name().ok_or_else(|| {
+            CacheError::InvalidManifest(format!(
+                "cache root {} has no existing filesystem ancestor",
+                normalized.display()
+            ))
+        })?;
+        missing_suffix.push(component.to_os_string());
+        if !existing.pop() {
+            return Err(CacheError::InvalidManifest(format!(
+                "cache root {} has no existing filesystem ancestor",
+                normalized.display()
+            )));
+        }
+    }
+    let mut physical = fs::canonicalize(existing)?;
+    for component in missing_suffix.into_iter().rev() {
+        physical.push(component);
+    }
+    Ok(physical)
+}
+
+fn validate_separate_cache_roots(
+    production_root: &Path,
+    validation_root: &Path,
+) -> Result<(), CacheError> {
+    if production_root.as_os_str().is_empty() || validation_root.as_os_str().is_empty() {
+        return Err(CacheError::InvalidManifest(
+            "production and validation cache roots must be nonempty".to_owned(),
+        ));
+    }
+    let production = physical_lexical_path(production_root)?;
+    let validation = physical_lexical_path(validation_root)?;
+    if production == validation
+        || production.starts_with(&validation)
+        || validation.starts_with(&production)
+    {
+        return Err(CacheError::InvalidManifest(format!(
+            "production cache {} and validation cache {} must be separate, non-nested roots",
+            production.display(),
+            validation.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Owns the resolver, acceptance policy, and optional integrated production
 /// sink for one numerical run.
 pub struct ManagedArtifactCacheSession {
@@ -304,6 +517,7 @@ pub struct ManagedArtifactCacheSession {
     requested_assurance: xc_core::AssuranceLevel,
     certification_failure_policy: CertificationFailurePolicy,
     resolver: CacheResolver,
+    reference_resolver: Option<CacheResolver>,
     policy: CachePolicy,
     production_sink: Option<crate::CanonicalStagingProductionSink>,
     publication_target: xc_core::PublicationTarget,
@@ -311,6 +525,7 @@ pub struct ManagedArtifactCacheSession {
     execute_remote_mutations: bool,
     cache_mode: ArtifactExecutionCacheMode,
     replace_existing_publication: bool,
+    output_validation: Option<OutputValidationConfig>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -342,9 +557,65 @@ fn managed_publication_key(
     })
 }
 
+fn build_required_reference_layers(
+    repository_owner: &str,
+    validation_root: &Path,
+    mode: ManagedRemoteCacheMode,
+) -> Result<Vec<crate::CacheLayer>, CacheError> {
+    let mut layers = Vec::new();
+    let mut precedence = 0;
+    if matches!(
+        mode,
+        ManagedRemoteCacheMode::Private | ManagedRemoteCacheMode::PrivateThenPublic
+    ) {
+        let private = crate::GitHubBootstrapCacheStore::private(
+            repository_owner,
+            validation_root.join("reference-private"),
+        )?;
+        private.preflight()?;
+        layers.push(crate::CacheLayer {
+            precedence,
+            store: Box::new(private),
+        });
+        precedence += 1;
+    }
+    if matches!(
+        mode,
+        ManagedRemoteCacheMode::Public | ManagedRemoteCacheMode::PrivateThenPublic
+    ) {
+        let public = crate::GitHubBootstrapCacheStore::public_required(
+            repository_owner,
+            validation_root.join("reference-public"),
+        )?;
+        public.preflight()?;
+        layers.push(crate::CacheLayer {
+            precedence,
+            store: Box::new(public),
+        });
+    }
+    Ok(layers)
+}
+
+fn reference_overlay_names(mode: ManagedRemoteCacheMode) -> Vec<String> {
+    match mode {
+        ManagedRemoteCacheMode::None => Vec::new(),
+        ManagedRemoteCacheMode::Public => vec!["github-public".to_owned()],
+        ManagedRemoteCacheMode::Private => vec!["github-private".to_owned()],
+        ManagedRemoteCacheMode::PrivateThenPublic => {
+            vec!["github-private".to_owned(), "github-public".to_owned()]
+        }
+    }
+}
+
 impl ManagedArtifactCacheSession {
     pub fn new(config: ManagedArtifactCacheConfig) -> Result<Self, CacheError> {
-        let remote_cache_mode = config.remote_cache_mode;
+        let output_validation = config.output_validation.clone();
+        let production_cache_installed = output_validation.is_none();
+        let remote_cache_mode = output_validation
+            .as_ref()
+            .map_or(config.remote_cache_mode, |validation| {
+                validation.reference_mode
+            });
         if matches!(
             remote_cache_mode,
             ManagedRemoteCacheMode::Private | ManagedRemoteCacheMode::PrivateThenPublic
@@ -354,44 +625,61 @@ impl ManagedArtifactCacheSession {
             // registry read, including immediately after a machine restart.
             crate::GitHubCredentialApiProbe::default().prepare_git_transport()?;
         }
-        let mut layers = vec![crate::CacheLayer {
-            precedence: 0,
-            store: Box::new(crate::ZipJsonFilesystemCacheStore::new(
-                "workstation",
-                &config.cache_root,
-                true,
-                CacheVisibility::Local,
-            )),
-        }];
-        if matches!(
-            remote_cache_mode,
-            ManagedRemoteCacheMode::Private | ManagedRemoteCacheMode::PrivateThenPublic
-        ) {
-            let private_store = crate::GitHubBootstrapCacheStore::private(
+        let (layers, reference_resolver) = if let Some(validation) = &output_validation {
+            validate_separate_cache_roots(&config.cache_root, &validation.validation_root)?;
+            let execution_layers = vec![crate::CacheLayer {
+                precedence: 0,
+                store: Box::new(crate::ZipJsonFilesystemCacheStore::new(
+                    "validation-computed",
+                    validation.validation_root.join("computed"),
+                    true,
+                    CacheVisibility::Local,
+                )),
+            }];
+            let reference_layers = build_required_reference_layers(
                 &config.repository_owner,
-                config.cache_root.join("remote-private"),
+                &validation.validation_root,
+                validation.reference_mode,
             )?;
-            // Fail before HP setup if the PAT, credential helper, or private
-            // registry access is not usable.  This is intentionally before
-            // any artifact resolution or numerical computation.
-            private_store.preflight()?;
-            layers.push(crate::CacheLayer {
-                precedence: 1,
-                store: Box::new(private_store),
-            });
-        }
-        if matches!(
-            remote_cache_mode,
-            ManagedRemoteCacheMode::Public | ManagedRemoteCacheMode::PrivateThenPublic
-        ) {
-            layers.push(crate::CacheLayer {
-                precedence: 2,
-                store: Box::new(crate::GitHubBootstrapCacheStore::public(
+            (execution_layers, Some(CacheResolver::new(reference_layers)))
+        } else {
+            let mut ordinary_layers = vec![crate::CacheLayer {
+                precedence: 0,
+                store: Box::new(crate::ZipJsonFilesystemCacheStore::new(
+                    "workstation",
+                    &config.cache_root,
+                    true,
+                    CacheVisibility::Local,
+                )),
+            }];
+            if matches!(
+                remote_cache_mode,
+                ManagedRemoteCacheMode::Private | ManagedRemoteCacheMode::PrivateThenPublic
+            ) {
+                let private_store = crate::GitHubBootstrapCacheStore::private(
                     &config.repository_owner,
-                    config.cache_root.join("remote-public"),
-                )?),
-            });
-        }
+                    config.cache_root.join("remote-private"),
+                )?;
+                private_store.preflight()?;
+                ordinary_layers.push(crate::CacheLayer {
+                    precedence: 1,
+                    store: Box::new(private_store),
+                });
+            }
+            if matches!(
+                remote_cache_mode,
+                ManagedRemoteCacheMode::Public | ManagedRemoteCacheMode::PrivateThenPublic
+            ) {
+                ordinary_layers.push(crate::CacheLayer {
+                    precedence: 2,
+                    store: Box::new(crate::GitHubBootstrapCacheStore::public(
+                        &config.repository_owner,
+                        config.cache_root.join("remote-public"),
+                    )?),
+                });
+            }
+            (ordinary_layers, None)
+        };
         let resolver = CacheResolver::new(layers);
         let policy = CachePolicy {
             current_toolkit_version: crate::current_toolkit_version()?,
@@ -415,7 +703,10 @@ impl ManagedArtifactCacheSession {
             },
         };
         let production_sink = config
-            .staging_root
+            .cache_mode
+            .may_stage_for_publication()
+            .then_some(config.staging_root)
+            .flatten()
             .map(|root| {
                 crate::CanonicalStagingProductionSink::new(
                     root,
@@ -425,11 +716,31 @@ impl ManagedArtifactCacheSession {
                 )
             })
             .transpose()?;
+        if let Some(validation) = &output_validation {
+            crate::begin_output_validation_run(crate::OutputValidationRunConfig {
+                validation_root: validation.validation_root.clone(),
+                report_root: validation.report_root.clone(),
+                toolkit_version: crate::current_toolkit_version()?,
+                reference_mode: match validation.reference_mode {
+                    ManagedRemoteCacheMode::Public => "public",
+                    ManagedRemoteCacheMode::Private => "private",
+                    ManagedRemoteCacheMode::PrivateThenPublic => "private_public",
+                    ManagedRemoteCacheMode::None => "none",
+                }
+                .to_owned(),
+                ordered_reference_overlays: reference_overlay_names(validation.reference_mode),
+                production_cache_installed,
+                remote_publication_enabled: production_sink.is_some()
+                    || config.execute_remote_mutations
+                    || config.publication_target != xc_core::PublicationTarget::None,
+            })?;
+        }
         Ok(Self {
             profile: config.profile,
             requested_assurance: config.requested_assurance,
             certification_failure_policy: config.certification_failure_policy,
             resolver,
+            reference_resolver,
             policy,
             production_sink,
             publication_target: config.publication_target,
@@ -437,6 +748,7 @@ impl ManagedArtifactCacheSession {
             execute_remote_mutations: config.execute_remote_mutations,
             cache_mode: config.cache_mode,
             replace_existing_publication: config.replace_existing_publication,
+            output_validation,
         })
     }
 
@@ -449,9 +761,14 @@ impl ManagedArtifactCacheSession {
     pub fn context(&self) -> ArtifactCacheContext<'_> {
         ArtifactCacheContext {
             resolver: Some(&self.resolver),
+            reference_resolver: self.reference_resolver.as_ref(),
             acceptance: Some(&self.policy),
             ordered_overlays: {
-                let mut overlays = vec!["workstation".to_owned()];
+                let mut overlays = vec![if self.cache_mode.compares_against_reference() {
+                    "validation-computed".to_owned()
+                } else {
+                    "workstation".to_owned()
+                }];
                 if self
                     .policy
                     .allowed_visibilities
@@ -469,7 +786,7 @@ impl ManagedArtifactCacheSession {
                 overlays
             },
             mode: self.cache_mode,
-            write_on_miss: self.cache_mode != ArtifactExecutionCacheMode::RequireReuse,
+            write_on_miss: self.cache_mode.writes_computed_artifacts(),
             write_visibility: CacheVisibility::Local,
             requested_assurance: self.requested_assurance,
             certification_failure_policy: self.certification_failure_policy,
@@ -570,6 +887,13 @@ impl ManagedArtifactCacheSession {
     /// enabled remote mutation, executes every eligible draft through the
     /// toolkit-owned resumable GitHub publisher before returning.
     pub fn finalize_publication_inventory(&self) -> Result<Option<PathBuf>, CacheError> {
+        if self.output_validation.is_some() {
+            return if crate::output_validation_claim_scope_is_active()? {
+                crate::checkpoint_output_validation_run().map(Some)
+            } else {
+                crate::finalize_output_validation_run().map(Some)
+            };
+        }
         let Some(sink) = &self.production_sink else {
             return Ok(None);
         };
@@ -1345,6 +1669,7 @@ pub struct ArtifactExecutionCacheRequest<'a> {
     pub semantic_key: &'a SemanticKeyEnvelope,
     pub logical_key: &'a str,
     pub resolver: Option<&'a CacheResolver>,
+    pub reference_resolver: Option<&'a CacheResolver>,
     pub acceptance: Option<&'a CachePolicy>,
     pub ordered_overlays: Vec<String>,
     pub mode: ArtifactExecutionCacheMode,
@@ -1381,7 +1706,7 @@ fn validate_request(request: &ArtifactExecutionCacheRequest<'_>) -> Result<(), C
             "artifact execution cache request has an empty identity or overlay".to_owned(),
         ));
     }
-    let fabric_enabled = request.mode != ArtifactExecutionCacheMode::Disabled;
+    let fabric_enabled = request.mode.fabric_enabled();
     if fabric_enabled != request.resolver.is_some()
         || fabric_enabled != request.acceptance.is_some()
     {
@@ -1390,14 +1715,29 @@ fn validate_request(request: &ArtifactExecutionCacheRequest<'_>) -> Result<(), C
                 .to_owned(),
         ));
     }
-    if request.mode == ArtifactExecutionCacheMode::Disabled && request.write_on_miss {
+    if !request.mode.fabric_enabled() && request.write_on_miss {
         return Err(CacheError::InvalidManifest(
             "disabled cache execution cannot request a write".to_owned(),
         ));
     }
-    if request.mode == ArtifactExecutionCacheMode::RequireReuse && request.write_on_miss {
+    if request.mode.requires_reuse() && request.write_on_miss {
         return Err(CacheError::InvalidManifest(
             "require-reuse execution cannot compute and write on a miss".to_owned(),
+        ));
+    }
+    if request.mode.compares_against_reference()
+        && (!request.write_on_miss
+            || request.reference_resolver.is_none()
+            || request.production_sink.is_some())
+    {
+        return Err(CacheError::InvalidManifest(
+            "verify execution requires a writable isolated cache, a reference-only resolver, and no production sink"
+                .to_owned(),
+        ));
+    }
+    if !request.mode.compares_against_reference() && request.reference_resolver.is_some() {
+        return Err(CacheError::InvalidManifest(
+            "a reference-only resolver is valid only for verify execution".to_owned(),
         ));
     }
     if let Some(digest) = &request.provenance_digest {
@@ -1414,6 +1754,14 @@ fn semantic_value(
     request: &ArtifactExecutionCacheRequest<'_>,
 ) -> Result<serde_json::Value, CacheError> {
     serde_json::to_value(request.semantic_key).map_err(CacheError::from)
+}
+
+fn validation_seed_source(
+    tags: &BTreeMap<String, String>,
+) -> Result<Option<crate::DependencyRef>, CacheError> {
+    tags.get(OUTPUT_VALIDATION_SEED_TAG)
+        .map(|encoded| serde_json::from_str(encoded).map_err(CacheError::from))
+        .transpose()
 }
 
 fn manifest_digest(manifest: &ArtifactManifest) -> Result<ContentDigest, CacheError> {
@@ -1641,7 +1989,7 @@ where
         parameters_digest: semantic_digest.clone(),
     };
     let mut miss_reason = None;
-    if request.mode != ArtifactExecutionCacheMode::Refresh {
+    if request.mode.consults_cache_for_result_reuse() {
         if let (Some(resolver), Some(acceptance)) = (request.resolver, request.acceptance) {
             match resolver.resolve(&key, acceptance) {
                 Ok(resolved) => {
@@ -1723,7 +2071,7 @@ where
                     });
                 }
                 Err(CacheError::NotFound(reason)) => {
-                    if request.mode == ArtifactExecutionCacheMode::RequireReuse {
+                    if request.mode.requires_reuse() {
                         return Err(CacheError::NotFound(reason));
                     }
                     miss_reason = Some(reason);
@@ -1731,11 +2079,16 @@ where
                 Err(error) => return Err(error),
             }
         }
-    } else {
+    } else if request.mode.is_refresh() {
         miss_reason = Some("author refresh explicitly bypassed all cache overlays".to_owned());
+    } else if request.mode.compares_against_reference() {
+        miss_reason =
+            Some("output validation explicitly bypassed completed-result reuse".to_owned());
     }
 
+    let compute_started = std::time::Instant::now();
     let (value, dependencies, assessment) = compute()?;
+    let compute_duration_millis = compute_started.elapsed().as_millis() as u64;
     assessment.validate()?;
     for dependency in &dependencies {
         if !dependency.key.parameters_digest.validate() || !dependency.content_digest.validate() {
@@ -1746,6 +2099,7 @@ where
     }
     validate(&value)?;
     let payload = serde_json::to_vec(&value)?;
+    let computed_dependencies = dependencies.clone();
     let produced_manifest = if request.write_on_miss {
         let resolver = request.resolver.ok_or_else(|| {
             CacheError::InvalidManifest("cache write lacks a resolver".to_owned())
@@ -1794,8 +2148,107 @@ where
     } else {
         None
     };
-    let access = access_record(request, &semantic_digest, None, false, miss_reason)?;
-    report_managed_cache_decision(request, "workstation", "computed");
+    let access = if request.mode.compares_against_reference() {
+        let computed_manifest = produced_manifest.as_ref().ok_or_else(|| {
+            CacheError::InvalidTransition(
+                "verify execution did not produce a real isolated manifest".to_owned(),
+            )
+        })?;
+        let reference_resolver = request.reference_resolver.ok_or_else(|| {
+            CacheError::InvalidManifest(
+                "verify execution lacks its reference-only resolver".to_owned(),
+            )
+        })?;
+        let acceptance = request.acceptance.ok_or_else(|| {
+            CacheError::InvalidManifest("verify execution lacks cache policy".to_owned())
+        })?;
+        let fetch_started = std::time::Instant::now();
+        let resolved_reference =
+            match reference_resolver.resolve(&computed_manifest.key, acceptance) {
+                Ok(reference) => Some(reference),
+                Err(CacheError::NotFound(reason)) => {
+                    let status = crate::record_output_comparison(crate::OutputComparisonInput {
+                        operation: request.operation,
+                        semantic_key: request.semantic_key,
+                        computed_manifest,
+                        computed_payload: &payload,
+                        computed_dependencies: &computed_dependencies,
+                        reference: None,
+                        reference_absence_reason: Some(reason.clone()),
+                        seed_source: validation_seed_source(&request.tags)?,
+                        compute_duration_millis,
+                        reference_fetch_duration_millis: fetch_started.elapsed().as_millis() as u64,
+                    })?;
+                    debug_assert_eq!(
+                        status,
+                        crate::ArtifactOutputComparisonStatus::ReferenceAbsent
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+        let (selected, status, rejection) = if let Some(reference) = &resolved_reference {
+            let status = crate::record_output_comparison(crate::OutputComparisonInput {
+                operation: request.operation,
+                semantic_key: request.semantic_key,
+                computed_manifest,
+                computed_payload: &payload,
+                computed_dependencies: &computed_dependencies,
+                reference: Some((
+                    &reference.layer_name,
+                    &reference.manifest,
+                    &reference.payload,
+                )),
+                reference_absence_reason: None,
+                seed_source: validation_seed_source(&request.tags)?,
+                compute_duration_millis,
+                reference_fetch_duration_millis: fetch_started.elapsed().as_millis() as u64,
+            })?;
+            (
+                Some((reference.layer_name.as_str(), &reference.manifest)),
+                status,
+                None,
+            )
+        } else {
+            (
+                None,
+                crate::ArtifactOutputComparisonStatus::ReferenceAbsent,
+                Some("reference artifact was absent".to_owned()),
+            )
+        };
+        let mut access = access_record(request, &semantic_digest, selected, false, rejection)?;
+        if selected.is_some() {
+            access.reuse_disposition = CacheReuseDisposition::InspectedOnly;
+        }
+        access.validation_outcome = if status == crate::ArtifactOutputComparisonStatus::Match {
+            CacheValidationOutcome::Passed
+        } else {
+            CacheValidationOutcome::Failed
+        };
+        access.validation_detail = Some(match status {
+            crate::ArtifactOutputComparisonStatus::Match => {
+                "fresh logical payload is byte-identical to the inspected reference".to_owned()
+            }
+            crate::ArtifactOutputComparisonStatus::Mismatch => {
+                "fresh logical payload differs from the inspected reference".to_owned()
+            }
+            crate::ArtifactOutputComparisonStatus::ReferenceAbsent => {
+                "fresh logical payload has no reference artifact at the same identity".to_owned()
+            }
+        });
+        access
+            .validate()
+            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+        access
+    } else {
+        access_record(request, &semantic_digest, None, false, miss_reason)?
+    };
+    let report_source = if request.mode.compares_against_reference() {
+        "validation-computed"
+    } else {
+        "workstation"
+    };
+    report_managed_cache_decision(request, report_source, "computed");
     Ok(ArtifactExecutionCacheResult {
         value,
         access,
@@ -1835,6 +2288,46 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
+    struct FaultingReferenceStore;
+
+    impl crate::CacheStore for FaultingReferenceStore {
+        fn name(&self) -> &str {
+            "faulting-reference"
+        }
+
+        fn writable(&self) -> bool {
+            false
+        }
+
+        fn visibility(&self) -> CacheVisibility {
+            CacheVisibility::Local
+        }
+
+        fn put(
+            &self,
+            _draft: &ArtifactDraft,
+            _payload: &[u8],
+        ) -> Result<ArtifactManifest, CacheError> {
+            Err(CacheError::ReadOnlyLayer(self.name().to_owned()))
+        }
+
+        fn candidates(&self, _key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
+            Err(CacheError::Io(
+                "simulated reference transport failure".to_owned(),
+            ))
+        }
+
+        fn read_payload_to(
+            &self,
+            _manifest: &ArtifactManifest,
+            _writer: &mut dyn Write,
+        ) -> Result<(), CacheError> {
+            Err(CacheError::Io(
+                "simulated reference transport failure".to_owned(),
+            ))
+        }
+    }
+
     #[test]
     fn computed_assurance_is_the_managed_workflow_default() {
         assert_eq!(
@@ -1849,6 +2342,60 @@ mod tests {
             parse_requested_assurance(Some("certified")).unwrap(),
             xc_core::AssuranceLevel::Certified
         );
+    }
+
+    #[test]
+    fn cache_mode_predicates_keep_verify_compute_compare_and_seed_semantics() {
+        let verify = ArtifactExecutionCacheMode::VerifyAgainstReference;
+        assert!(verify.fabric_enabled());
+        assert!(!verify.consults_cache_for_result_reuse());
+        assert!(verify.consults_overlays_for_route_selection());
+        assert!(verify.may_use_cached_seed());
+        assert!(verify.writes_computed_artifacts());
+        assert!(verify.compares_against_reference());
+        assert!(!verify.may_stage_for_publication());
+        assert!(!verify.requires_reuse());
+        assert!(!verify.is_refresh());
+
+        assert_eq!(parse_cache_mode(Some("verify")).unwrap(), verify);
+        assert_eq!(
+            parse_validation_reference_mode(None).unwrap(),
+            ManagedRemoteCacheMode::PrivateThenPublic
+        );
+        assert!(parse_validation_reference_mode(Some("none")).is_err());
+    }
+
+    #[test]
+    fn validation_cache_root_cannot_overlap_the_production_cache() {
+        let production = root("production-cache-root");
+        assert!(validate_separate_cache_roots(&production, &production).is_err());
+        assert!(
+            validate_separate_cache_roots(&production, &production.join("validation")).is_err()
+        );
+        assert!(
+            validate_separate_cache_roots(&production.join("nested-production"), &production)
+                .is_err()
+        );
+        assert!(validate_separate_cache_roots(
+            &production,
+            &production.with_file_name("validation-cache-root")
+        )
+        .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_cache_root_rejects_a_symlink_alias_of_production() {
+        use std::os::unix::fs::symlink;
+
+        let root = root("validation-cache-symlink-alias");
+        let _ = fs::remove_dir_all(&root);
+        let production = root.join("production");
+        let alias = root.join("validation-alias");
+        fs::create_dir_all(&production).unwrap();
+        symlink(&production, &alias).unwrap();
+        assert!(validate_separate_cache_roots(&production, &alias).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2017,13 +2564,11 @@ mod tests {
             semantic_key: key,
             logical_key: "gauss-legendre/4/128",
             resolver: Some(resolver),
+            reference_resolver: None,
             acceptance: Some(policy),
             ordered_overlays: vec!["workstation".to_owned()],
             mode,
-            write_on_miss: matches!(
-                mode,
-                ArtifactExecutionCacheMode::PreferReuse | ArtifactExecutionCacheMode::Refresh
-            ),
+            write_on_miss: mode.writes_computed_artifacts(),
             write_visibility: CacheVisibility::Local,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
@@ -2534,6 +3079,7 @@ mod tests {
             cache_mode: ArtifactExecutionCacheMode::PreferReuse,
             replace_existing_publication: false,
             execute_remote_mutations: false,
+            output_validation: None,
         })
         .unwrap();
         let key = semantic_key();
@@ -2543,6 +3089,7 @@ mod tests {
             semantic_key: &key,
             logical_key: "gauss-legendre/4/128",
             resolver: cache.resolver,
+            reference_resolver: cache.reference_resolver,
             acceptance: cache.acceptance,
             ordered_overlays: cache.ordered_overlays,
             mode: cache.mode,
@@ -2590,6 +3137,7 @@ mod tests {
                 semantic_key: &key,
                 logical_key: "gauss-legendre/4/128",
                 resolver: cache.resolver,
+                reference_resolver: cache.reference_resolver,
                 acceptance: cache.acceptance,
                 ordered_overlays: cache.ordered_overlays,
                 mode: cache.mode,
@@ -2641,6 +3189,7 @@ mod tests {
                 cache_mode: ArtifactExecutionCacheMode::PreferReuse,
                 replace_existing_publication: false,
                 execute_remote_mutations: true,
+                output_validation: None,
             })
             .unwrap();
             let manifest = stage_computed_quadrature(&session).unwrap();
@@ -2669,5 +3218,234 @@ mod tests {
             assert!(staging_root.join("drafts").is_dir());
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn verify_mode_writes_real_artifacts_compares_and_rejects_empty_runs() {
+        let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
+        let root = root("execution-cache-output-validation");
+        let _ = fs::remove_dir_all(&root);
+        let reference_root = root.join("reference");
+        let reference_writer = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "reference-writer",
+                &reference_root,
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let semantic = semantic_key();
+        let policy = policy();
+        let expected = vec!["node-a".to_owned(), "node-b".to_owned()];
+        resolve_or_compute_json_artifact(
+            &request(
+                &semantic,
+                &reference_writer,
+                &policy,
+                ArtifactExecutionCacheMode::PreferReuse,
+            ),
+            || Ok(expected.clone()),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        let run_once = |name: &str,
+                        run_semantic: &SemanticKeyEnvelope,
+                        computed_value: Vec<String>| {
+            let validation_root = root.join(name);
+            let report_root = validation_root.join("reports");
+            crate::begin_output_validation_run(crate::OutputValidationRunConfig {
+                validation_root: validation_root.clone(),
+                report_root: report_root.clone(),
+                toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                reference_mode: "local_fixture".to_owned(),
+                ordered_reference_overlays: vec!["reference".to_owned()],
+                production_cache_installed: false,
+                remote_publication_enabled: false,
+            })
+            .unwrap();
+            let computed_resolver = CacheResolver::new(vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(crate::ZipJsonFilesystemCacheStore::new(
+                    "validation-computed",
+                    validation_root.join("computed"),
+                    true,
+                    CacheVisibility::Local,
+                )),
+            }]);
+            let reference_resolver = CacheResolver::new(vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(FilesystemCacheStore::new(
+                    "reference",
+                    &reference_root,
+                    false,
+                    CacheVisibility::Local,
+                )),
+            }]);
+            let calls = AtomicUsize::new(0);
+            let verify_request = ArtifactExecutionCacheRequest {
+                operation: "quadrature.load_or_compute",
+                semantic_key: run_semantic,
+                logical_key: "gauss-legendre/4/128",
+                resolver: Some(&computed_resolver),
+                reference_resolver: Some(&reference_resolver),
+                acceptance: Some(&policy),
+                ordered_overlays: vec!["validation-computed".to_owned(), "reference".to_owned()],
+                mode: ArtifactExecutionCacheMode::VerifyAgainstReference,
+                write_on_miss: true,
+                write_visibility: CacheVisibility::Local,
+                produced_quality: CacheQuality::Validated,
+                producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                maximum_reader_version: None,
+                tags: BTreeMap::new(),
+                provenance_digest: None,
+                production_sink: None,
+            };
+            let result = resolve_or_compute_json_artifact(
+                &verify_request,
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(computed_value)
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(result.reused_manifest.is_none());
+            let manifest = result.produced_manifest.unwrap();
+            assert_eq!(manifest.visibility, CacheVisibility::Local);
+            let computed = computed_resolver.resolve(&manifest.key, &policy).unwrap();
+            assert_eq!(computed.manifest.content_digest, manifest.content_digest);
+            assert_eq!(
+                result.access.reuse_disposition,
+                if run_semantic == &semantic {
+                    CacheReuseDisposition::InspectedOnly
+                } else {
+                    CacheReuseDisposition::Recomputed
+                }
+            );
+            (report_root, crate::finalize_output_validation_run())
+        };
+
+        let (matching_report_root, matching_result) =
+            run_once("matching", &semantic, expected.clone());
+        assert!(matching_result.is_ok());
+        let matching: crate::OutputPreservationValidationReport =
+            serde_json::from_slice(&fs::read(matching_report_root.join("latest.json")).unwrap())
+                .unwrap();
+        assert!(matching.output_preserving);
+        assert_eq!(matching.totals.matched, 1);
+
+        let (mismatch_report_root, mismatch_result) =
+            run_once("mismatch", &semantic, vec!["different".to_owned()]);
+        assert!(mismatch_result.is_err());
+        let mismatch: crate::OutputPreservationValidationReport =
+            serde_json::from_slice(&fs::read(mismatch_report_root.join("latest.json")).unwrap())
+                .unwrap();
+        assert!(!mismatch.output_preserving);
+        assert_eq!(mismatch.totals.mismatched, 1);
+        assert_eq!(mismatch.totals.first_divergences, 1);
+
+        let mut absent_semantic = semantic.clone();
+        absent_semantic.resolved_mathematical_parameters =
+            json!({"order": 8, "precision_bits": 128});
+        let (absent_report_root, absent_result) =
+            run_once("absent", &absent_semantic, vec!["new-node".to_owned()]);
+        assert!(absent_result.is_err());
+        let absent: crate::OutputPreservationValidationReport =
+            serde_json::from_slice(&fs::read(absent_report_root.join("latest.json")).unwrap())
+                .unwrap();
+        assert_eq!(absent.totals.reference_absent, 1);
+        assert!(!absent.output_preserving);
+
+        let empty_root = root.join("empty");
+        crate::begin_output_validation_run(crate::OutputValidationRunConfig {
+            validation_root: empty_root.clone(),
+            report_root: empty_root.join("reports"),
+            toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            reference_mode: "local_fixture".to_owned(),
+            ordered_reference_overlays: vec!["reference".to_owned()],
+            production_cache_installed: false,
+            remote_publication_enabled: false,
+        })
+        .unwrap();
+        assert!(crate::finalize_output_validation_run().is_err());
+        let empty: crate::OutputPreservationValidationReport =
+            serde_json::from_slice(&fs::read(empty_root.join("reports/latest.json")).unwrap())
+                .unwrap();
+        assert_eq!(empty.totals.compared, 0);
+        assert!(!empty.output_preserving);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verify_mode_never_reports_operational_reference_errors_as_absence() {
+        let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
+        let root = root("execution-cache-output-validation-operational-error");
+        let _ = fs::remove_dir_all(&root);
+        crate::begin_output_validation_run(crate::OutputValidationRunConfig {
+            validation_root: root.clone(),
+            report_root: root.join("reports"),
+            toolkit_version: ToolkitVersion::parse("0.13.3").unwrap(),
+            reference_mode: "faulting_fixture".to_owned(),
+            ordered_reference_overlays: vec!["faulting-reference".to_owned()],
+            production_cache_installed: false,
+            remote_publication_enabled: false,
+        })
+        .unwrap();
+        let computed_resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(crate::ZipJsonFilesystemCacheStore::new(
+                "validation-computed",
+                root.join("computed"),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let reference_resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FaultingReferenceStore),
+        }]);
+        let semantic = semantic_key();
+        let policy = policy();
+        let request = ArtifactExecutionCacheRequest {
+            operation: "quadrature.load_or_compute",
+            semantic_key: &semantic,
+            logical_key: "gauss-legendre/4/128",
+            resolver: Some(&computed_resolver),
+            reference_resolver: Some(&reference_resolver),
+            acceptance: Some(&policy),
+            ordered_overlays: vec![
+                "validation-computed".to_owned(),
+                "faulting-reference".to_owned(),
+            ],
+            mode: ArtifactExecutionCacheMode::VerifyAgainstReference,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            produced_quality: CacheQuality::Validated,
+            producer_toolkit_version: ToolkitVersion::parse("0.13.3").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            maximum_reader_version: None,
+            tags: BTreeMap::new(),
+            provenance_digest: None,
+            production_sink: None,
+        };
+        let error = match resolve_or_compute_json_artifact(
+            &request,
+            || Ok(vec!["computed".to_owned()]),
+            |_| Ok(()),
+        ) {
+            Ok(_) => panic!("operational reference failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, CacheError::Io(_)));
+        assert!(crate::finalize_output_validation_run().is_err());
+        let report: crate::OutputPreservationValidationReport =
+            serde_json::from_slice(&fs::read(root.join("reports/latest.json")).unwrap()).unwrap();
+        assert_eq!(report.totals.compared, 0);
+        assert_eq!(report.totals.reference_absent, 0);
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -1,6 +1,8 @@
-# v0.13.3 Cache Schema Principles
+# Cache schema principles
 
-This document is the concise schema contract used by manifests and validators. TD-04 defines the complete resolver, transport, transaction, trust, durability, and recovery design.
+This document is the public schema contract implemented by manifests,
+validators, resolvers, transport, transactions, trust policy, durability, and
+recovery behavior.
 
 ## Artifact granularity
 

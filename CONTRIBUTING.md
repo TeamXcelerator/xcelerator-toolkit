@@ -12,7 +12,7 @@ The repository is source-available under the license in `LICENSE`. The project o
 
 Every contribution must identify its human authors and disclose generated-code assistance. The contributor must state whether each material implementation is original, independently implemented from a published algorithm, generated, adapted, or copied. Algorithm references, datasets, fixtures, and derived formulas must name their source and revision where available.
 
-Record every new dependency, imported code fragment, external tool, native library, published algorithm, or external dataset through the owner-managed process summarized in [Third-Party Review](docs/v0.13.3/THIRD_PARTY_REVIEW.md). Copied or adapted code requires exact source-file provenance, applicable copyright and license text, compatibility analysis against the project's source-available license, and explicit owner approval. A citation alone is not redistribution permission.
+Record every new dependency, imported code fragment, external tool, native library, published algorithm, or external dataset through the owner-managed process summarized in [Third-Party Review](docs/THIRD_PARTY_REVIEW.md). Copied or adapted code requires exact source-file provenance, applicable copyright and license text, compatibility analysis against the project's source-available license, and explicit owner approval. A citation alone is not redistribution permission.
 
 By submitting an authorized contribution, each identified author represents that they have the right to submit the material under the owner-approved contribution terms and that the authorship/provenance declaration is complete. The owner may require a separate contributor agreement before acceptance.
 

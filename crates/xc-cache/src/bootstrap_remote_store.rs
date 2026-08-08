@@ -51,6 +51,13 @@ impl GitHubBootstrapCacheStore {
         Self::new(owner, root, CacheVisibility::Public, false)
     }
 
+    pub fn public_required(
+        owner: impl Into<String>,
+        root: impl Into<PathBuf>,
+    ) -> Result<Self, CacheError> {
+        Self::new(owner, root, CacheVisibility::Public, true)
+    }
+
     pub fn private(owner: impl Into<String>, root: impl Into<PathBuf>) -> Result<Self, CacheError> {
         Self::new(owner, root, CacheVisibility::Private, true)
     }

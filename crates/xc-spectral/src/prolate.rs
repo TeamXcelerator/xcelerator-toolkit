@@ -25,7 +25,7 @@
 //! Eisenstein-like sum map.
 //!
 //! Public usage examples and assurance boundaries are documented in
-//! `docs/v0.13.3/RESEARCH_WORKFLOWS.md`.
+//! `docs/RESEARCH_WORKFLOWS.md`.
 //!
 //! ## Status: complete (HP version available below)
 //!
@@ -816,6 +816,7 @@ pub mod hp {
             semantic_key: &semantic_key,
             logical_key: &logical_key,
             resolver: cache.resolver,
+            reference_resolver: cache.reference_resolver,
             acceptance: cache.acceptance,
             ordered_overlays: cache.ordered_overlays.clone(),
             mode: cache.mode,
@@ -2464,6 +2465,7 @@ pub mod hp {
             };
             let context = ArtifactCacheContext {
                 resolver: Some(&resolver),
+                reference_resolver: None,
                 acceptance: Some(&policy),
                 ordered_overlays: vec!["workstation".to_owned()],
                 mode: ArtifactExecutionCacheMode::PreferReuse,

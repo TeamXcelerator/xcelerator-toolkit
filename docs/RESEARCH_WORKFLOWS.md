@@ -1,6 +1,6 @@
 # Research workflow entry points
 
-Version target: `0.13.3`
+Version target: `0.13.4`
 
 These examples are stable, nonmutating entry points for the three release-required research workflows. Run them from the repository root. Successful commands write machine-readable JSON to standard output and return status 0; failures write Rust error context to standard error and return nonzero. None reads credentials, publishes cache data, or mutates a remote repository.
 
@@ -17,8 +17,6 @@ Halley's method is the ordinary HP refinement route; Newton remains an explicit 
 `run_indexed_seeded` and `run_indexed_seeded_via_cache` are explicit comparison/refinement APIs. Their supplied values are reference seeds, their artifacts are `ccm_root_refinement`, and they cannot satisfy an independent-discovery request. Reference datasets may be attached only through a separate post-discovery comparison artifact after the independent root window has been frozen. The lowest Tau eigenpair remains the standard CCM secular source; higher Tau eigenpairs must not be treated as later zeta zeros.
 
 Independent and seeded refinement have the same final HP refinement and normally converge to the same finite-source roots when the computed discovery finds the complete requested sequence. Refinement is faster because it skips discovery and begins close to each root, but it is circular evidence and cannot establish that CCM found the roots. Computed independent discovery adds a pole-aware MPFR scan whose cost remains small relative to Tau construction. Certified independent discovery is substantially more expensive because it builds the exact finite numerator and proves count, completeness, existence, and uniqueness. Certification remains selective rather than the default assurance.
-
-For intentional replacement, author mode may set `XC_CACHE_MODE=refresh`, `XC_CACHE_REMOTE=none`, and `XC_PUBLISH_REPLACE=true` together with its explicit publication target and execution flag. This recomputes once without reading cache data, replaces the selected semantic entries, and prunes only current-tree objects proven unreferenced by a bounded post-publication shard audit. Historical Git storage is retained and remains capacity-accounted.
 
 ```powershell
 cargo run -p xc-spectral --example ccm_window_plan --locked

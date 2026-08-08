@@ -558,6 +558,21 @@ impl PortableRootRefinement {
         }
     }
 
+    fn from_runtime_for_eigenstate_solver(
+        result: &RootRefinement,
+        resolved_eigenstate_solver: CcmEigenstateSolver,
+    ) -> Self {
+        match resolved_eigenstate_solver {
+            CcmEigenstateSolver::LegacyInverseIteration => Self::from_runtime(result),
+            CcmEigenstateSolver::ShiftInvertKrylov => Self::from_runtime_lossless(result),
+            CcmEigenstateSolver::Auto => {
+                unreachable!(
+                    "automatic CCM eigenstate selection must be resolved before root serialization"
+                )
+            }
+        }
+    }
+
     fn to_runtime(&self, precision_bits: u32) -> std::result::Result<RootRefinement, CacheError> {
         let values = parse_hp_vector(
             &[
@@ -2221,6 +2236,7 @@ fn resolve_archimedean_integrals_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -2311,6 +2327,7 @@ fn resolve_prime_component_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -2406,6 +2423,7 @@ fn build_tau_hp_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -2779,6 +2797,7 @@ fn resolve_even_sector_matrix_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -2883,6 +2902,7 @@ fn resolve_odd_sector_matrix_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -3094,6 +3114,7 @@ fn resolve_sector_tridiagonal_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -3322,6 +3343,7 @@ fn resolve_sector_transform_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -3770,6 +3792,7 @@ fn resolve_sector_eigenvalues_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -4141,6 +4164,7 @@ fn resolve_sector_spectrum_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -4338,6 +4362,7 @@ fn resolve_sector_gap_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -4769,6 +4794,7 @@ fn resolve_factorization_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -5016,7 +5042,11 @@ fn weil_eigenpair_via_cache(
     xc_numerics::linalg::InverseIterationDiagnostics,
     ArtifactManifest,
 )> {
-    weil_eigenpair_via_cache_with_seed(params, cfg, l, tau, tau_manifest, cache, None, None)
+    weil_eigenpair_via_cache_with_seed(params, cfg, l, tau, tau_manifest, cache, None, None).map(
+        |(eigenvalue, eigenvector, diagnostics, manifest, _)| {
+            (eigenvalue, eigenvector, diagnostics, manifest)
+        },
+    )
 }
 
 fn weil_eigenpair_cache_identity(
@@ -5115,7 +5145,12 @@ fn accepted_identity_exists(
     logical_key: &str,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<bool> {
-    let (Some(resolver), Some(policy)) = (cache.resolver, cache.acceptance) else {
+    let route_resolver = if cache.mode.compares_against_reference() {
+        cache.reference_resolver
+    } else {
+        cache.resolver
+    };
+    let (Some(resolver), Some(policy)) = (route_resolver, cache.acceptance) else {
         return Ok(false);
     };
     let key = ArtifactKey {
@@ -5153,7 +5188,12 @@ fn discover_lower_n_continuation_seed(
     cfg: &HighPrecConfig,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<Option<(Vec<Float>, ArtifactManifest)>> {
-    let (Some(resolver), Some(policy)) = (cache.resolver, cache.acceptance) else {
+    let route_resolver = if cache.mode.compares_against_reference() {
+        cache.reference_resolver
+    } else {
+        cache.resolver
+    };
+    let (Some(resolver), Some(policy)) = (route_resolver, cache.acceptance) else {
         return Ok(None);
     };
     let discovery_started = Instant::now();
@@ -5269,17 +5309,13 @@ fn weil_eigenpair_via_cache_with_seed(
     Vec<Float>,
     xc_numerics::linalg::InverseIterationDiagnostics,
     ArtifactManifest,
+    CcmEigenstateSolver,
 )> {
     let parity_policy = cfg.effective_parity_policy();
     if cfg.eigenstate_solver == CcmEigenstateSolver::Auto {
         let mut selected = cfg.clone();
-        let consult_exact_cache = matches!(
-            cache.mode,
-            xc_cache::ArtifactExecutionCacheMode::PreferReuse
-                | xc_cache::ArtifactExecutionCacheMode::RequireReuse
-        );
-        let discover_automatic_seed =
-            cache.mode == xc_cache::ArtifactExecutionCacheMode::PreferReuse;
+        let consult_exact_cache = cache.mode.consults_overlays_for_route_selection();
+        let discover_automatic_seed = cache.mode.may_use_cached_seed();
         if parity_policy != CcmParityPolicy::EvenSector {
             selected.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
             return weil_eigenpair_via_cache_with_seed(
@@ -5296,6 +5332,25 @@ fn weil_eigenpair_via_cache_with_seed(
         selected.eigenstate_solver = CcmEigenstateSolver::ShiftInvertKrylov;
         let (semantic_key, logical_key) = weil_eigenpair_cache_identity(params, &selected)?;
         if consult_exact_cache && accepted_identity_exists(&semantic_key, &logical_key, cache)? {
+            if cache.mode.compares_against_reference()
+                && continuation_seed.is_none()
+                && discover_automatic_seed
+            {
+                if let Some((discovered_seed, discovered_manifest)) =
+                    discover_lower_n_continuation_seed(params, &selected, cache)?
+                {
+                    return weil_eigenpair_via_cache_with_seed(
+                        params,
+                        &selected,
+                        l,
+                        tau,
+                        tau_manifest,
+                        cache,
+                        Some(&discovered_seed),
+                        Some(&discovered_manifest),
+                    );
+                }
+            }
             return weil_eigenpair_via_cache_with_seed(
                 params,
                 &selected,
@@ -5394,11 +5449,26 @@ fn weil_eigenpair_via_cache_with_seed(
         |manifest| format!("from-eigenpair-{}", manifest.content_digest.0),
     );
     let (semantic_key, logical_key) = weil_eigenpair_cache_identity(params, cfg)?;
+    let mut tags = BTreeMap::from([
+        ("domain".to_owned(), "ccm".to_owned()),
+        ("artifact".to_owned(), "weil_eigenpair".to_owned()),
+    ]);
+    if let Some(seed_manifest) = continuation_manifest {
+        tags.insert(
+            xc_cache::OUTPUT_VALIDATION_SEED_TAG.to_owned(),
+            serde_json::to_string(&xc_cache::DependencyRef {
+                key: seed_manifest.key.clone(),
+                content_digest: seed_manifest.content_digest.clone(),
+                required_quality: seed_manifest.quality,
+            })?,
+        );
+    }
     let request = ArtifactExecutionCacheRequest {
         operation: "ccm.weil_eigenpair.resolve_or_compute",
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -5408,10 +5478,7 @@ fn weil_eigenpair_via_cache_with_seed(
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
         minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
         maximum_reader_version: None,
-        tags: BTreeMap::from([
-            ("domain".to_owned(), "ccm".to_owned()),
-            ("artifact".to_owned(), "weil_eigenpair".to_owned()),
-        ]),
+        tags,
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
@@ -5620,7 +5687,13 @@ fn weil_eigenpair_via_cache_with_seed(
         .ok_or_else(|| anyhow::anyhow!("Weil eigenpair execution returned no manifest"))?;
     let (eigenvalue, eigenvector, diagnostics) =
         decode_weil_eigenpair(&resolved.value, params, cfg, tau)?;
-    Ok((eigenvalue, eigenvector, diagnostics, manifest))
+    Ok((
+        eigenvalue,
+        eigenvector,
+        diagnostics,
+        manifest,
+        cfg.eigenstate_solver,
+    ))
 }
 
 fn resolve_secular_source_via_cache(
@@ -5661,6 +5734,7 @@ fn resolve_secular_source_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -5804,6 +5878,7 @@ fn certify_roots_from_retained_source(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -6407,6 +6482,7 @@ fn root_range_semantic_key(
 fn resolve_root_range_via_cache(
     params: &CcmParams,
     cfg: &HighPrecConfig,
+    resolved_eigenstate_solver: CcmEigenstateSolver,
     l: &Float,
     xi: &[Float],
     first_root_index: usize,
@@ -6432,7 +6508,7 @@ fn resolve_root_range_via_cache(
     // preserves the larger artifact's provenance and prevents one-root claim
     // runs from publishing redundant refinements and diagnostics.
     if artifact_mode == RootArtifactMode::ReferenceSeededRefinement
-        && cache.mode != xc_cache::ArtifactExecutionCacheMode::Refresh
+        && cache.mode.consults_cache_for_result_reuse()
         && reference_dataset.is_some()
         && reference_dataset == Some(&xc_zeta::zeros::bundled_dataset_identity()?)
     {
@@ -6474,6 +6550,7 @@ fn resolve_root_range_via_cache(
                 semantic_key: &candidate_semantic,
                 logical_key: &candidate_logical,
                 resolver: cache.resolver,
+                reference_resolver: None,
                 acceptance: cache.acceptance,
                 ordered_overlays: cache.ordered_overlays.clone(),
                 mode: xc_cache::ArtifactExecutionCacheMode::RequireReuse,
@@ -6583,6 +6660,7 @@ fn resolve_root_range_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -6620,25 +6698,22 @@ fn resolve_root_range_via_cache(
                 .into_iter()
                 .map(|outcome| match outcome {
                     EigenvalueResult::Converged(result) => PortableRootOutcome::Converged(
-                        if cfg.eigenstate_solver == CcmEigenstateSolver::LegacyInverseIteration {
-                            PortableRootRefinement::from_runtime(&result)
-                        } else {
-                            PortableRootRefinement::from_runtime_lossless(&result)
-                        },
+                        PortableRootRefinement::from_runtime_for_eigenstate_solver(
+                            &result,
+                            resolved_eigenstate_solver,
+                        ),
                     ),
                     EigenvalueResult::Stagnated(result) => PortableRootOutcome::Stagnated(
-                        if cfg.eigenstate_solver == CcmEigenstateSolver::LegacyInverseIteration {
-                            PortableRootRefinement::from_runtime(&result)
-                        } else {
-                            PortableRootRefinement::from_runtime_lossless(&result)
-                        },
+                        PortableRootRefinement::from_runtime_for_eigenstate_solver(
+                            &result,
+                            resolved_eigenstate_solver,
+                        ),
                     ),
                     EigenvalueResult::Approximate(result) => PortableRootOutcome::Approximate(
-                        if cfg.eigenstate_solver == CcmEigenstateSolver::LegacyInverseIteration {
-                            PortableRootRefinement::from_runtime(&result)
-                        } else {
-                            PortableRootRefinement::from_runtime_lossless(&result)
-                        },
+                        PortableRootRefinement::from_runtime_for_eigenstate_solver(
+                            &result,
+                            resolved_eigenstate_solver,
+                        ),
                     ),
                     EigenvalueResult::Failed { iterations, reason } => {
                         PortableRootOutcome::Failed { iterations, reason }
@@ -6829,6 +6904,7 @@ fn record_run_evidence_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -7974,24 +8050,31 @@ fn run_inner_retaining_source(
     //
     let eigenstate_started = Instant::now();
     let parity_policy = cfg.effective_parity_policy();
-    let (eps_n, xi, inverse_iteration_diagnostics, eigenpair_manifest) =
+    let (eps_n, xi, inverse_iteration_diagnostics, eigenpair_manifest, resolved_eigenstate_solver) =
         if let CcmCacheRoute::Fabric(cache) = &cache_route {
             let (seed, seed_manifest) = continuation
                 .map(|(seed, manifest)| (Some(seed), Some(manifest)))
                 .unwrap_or((None, None));
-            let (eps_n, xi, diagnostics, manifest) = weil_eigenpair_via_cache_with_seed(
-                params,
-                cfg,
-                &l,
-                &tau,
-                tau_manifest
-                    .as_ref()
-                    .expect("fabric tau route retains its exact manifest"),
-                cache,
-                seed,
-                seed_manifest,
-            )?;
-            (eps_n, xi, diagnostics, Some(manifest))
+            let (eps_n, xi, diagnostics, manifest, resolved_eigenstate_solver) =
+                weil_eigenpair_via_cache_with_seed(
+                    params,
+                    cfg,
+                    &l,
+                    &tau,
+                    tau_manifest
+                        .as_ref()
+                        .expect("fabric tau route retains its exact manifest"),
+                    cache,
+                    seed,
+                    seed_manifest,
+                )?;
+            (
+                eps_n,
+                xi,
+                diagnostics,
+                Some(manifest),
+                resolved_eigenstate_solver,
+            )
         } else {
             let lambda_sq = params.lambda_sq;
             let n_modes_key = params.n_modes;
@@ -8123,7 +8206,13 @@ fn run_inner_retaining_source(
                     (eps_n, xi, diagnostics)
                 }
             };
-            (pair.0, pair.1, pair.2, None)
+            (
+                pair.0,
+                pair.1,
+                pair.2,
+                None,
+                CcmEigenstateSolver::LegacyInverseIteration,
+            )
         };
     eprintln!(
         "[HP] phase timing: Weil eigenstate construction/reuse={:.3}s",
@@ -8260,6 +8349,7 @@ fn run_inner_retaining_source(
         let (roots, manifest, projected) = resolve_root_range_via_cache(
             params,
             cfg,
+            resolved_eigenstate_solver,
             &l,
             &xi,
             artifact_first_root_index,
@@ -8514,6 +8604,7 @@ fn measure_evenness_from_retained_source_via_cache(
         semantic_key: &semantic_key,
         logical_key: &logical_key,
         resolver: cache.resolver,
+        reference_resolver: cache.reference_resolver,
         acceptance: cache.acceptance,
         ordered_overlays: cache.ordered_overlays.clone(),
         mode: cache.mode,
@@ -9149,6 +9240,7 @@ fn compute_archimedean_integrals_tracked(
         let resolved = xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
             let request = ArtifactCacheContext {
                 resolver: cache.resolver,
+                reference_resolver: cache.reference_resolver,
                 acceptance: cache.acceptance,
                 ordered_overlays: cache.ordered_overlays.clone(),
                 mode: cache.mode,
@@ -9531,6 +9623,7 @@ fn build_tau_components_exact_tracked(
         let resolved = xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
             let request = ArtifactCacheContext {
                 resolver: cache.resolver,
+                reference_resolver: cache.reference_resolver,
                 acceptance: cache.acceptance,
                 ordered_overlays: cache.ordered_overlays.clone(),
                 mode: cache.mode,
@@ -11716,6 +11809,38 @@ mod tests {
     }
 
     #[test]
+    fn resolved_legacy_route_preserves_established_root_encoding() {
+        let precision_bits = 192;
+        let mut third = Float::with_val(precision_bits, 1);
+        third /= 3;
+        let result = RootRefinement {
+            value: third.clone(),
+            diagnostics: RootRefinementDiagnostics {
+                iterations: 7,
+                final_correction: third.clone(),
+                residual: third.clone(),
+                achieved_decimal_digits: third,
+            },
+        };
+
+        let legacy = PortableRootRefinement::from_runtime_for_eigenstate_solver(
+            &result,
+            CcmEigenstateSolver::LegacyInverseIteration,
+        );
+        let krylov = PortableRootRefinement::from_runtime_for_eigenstate_solver(
+            &result,
+            CcmEigenstateSolver::ShiftInvertKrylov,
+        );
+
+        assert_eq!(legacy, PortableRootRefinement::from_runtime(&result));
+        assert_eq!(
+            krylov,
+            PortableRootRefinement::from_runtime_lossless(&result)
+        );
+        assert_ne!(legacy, krylov);
+    }
+
+    #[test]
     fn auto_retries_only_explicit_krylov_nonconvergence() {
         let retryable = anyhow::Error::new(CacheError::InvalidTransition(
             "CCM shift-invert Krylov did not produce an unambiguous converged target: status=Approximate, boundary_cluster=false"
@@ -12520,6 +12645,7 @@ mod tests {
         };
         let context = ArtifactCacheContext {
             resolver: Some(&resolver),
+            reference_resolver: None,
             acceptance: Some(&policy),
             ordered_overlays: vec!["workstation".to_owned()],
             mode: ArtifactExecutionCacheMode::PreferReuse,
@@ -12558,6 +12684,14 @@ mod tests {
             second_run.weil_min_eigenvalue
         );
         assert_eq!(first_run.xi, second_run.xi);
+        let (_, _, _, _, resolved_eigenstate_solver) = weil_eigenpair_via_cache_with_seed(
+            &params, &cfg, &l, &first.0, &first.1, &context, None, None,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved_eigenstate_solver,
+            CcmEigenstateSolver::LegacyInverseIteration
+        );
         let auto_next_params = CcmParams::from_lambda_sq_integer(5, 3);
         let auto_next =
             run_indexed_seeded_via_cache(&auto_next_params, &cfg, 1, &seeds, &dataset, &context)
@@ -13119,6 +13253,7 @@ mod tests {
         .unwrap();
         let context = ArtifactCacheContext {
             resolver: Some(&resolver),
+            reference_resolver: None,
             acceptance: Some(&policy),
             ordered_overlays: vec!["workstation".to_owned()],
             mode: ArtifactExecutionCacheMode::PreferReuse,
@@ -13270,6 +13405,7 @@ mod tests {
         };
         let context = |mode, write_on_miss| ArtifactCacheContext {
             resolver: Some(&resolver),
+            reference_resolver: None,
             acceptance: Some(&policy),
             ordered_overlays: vec!["workstation".to_owned()],
             mode,

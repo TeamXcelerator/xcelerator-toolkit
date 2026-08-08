@@ -287,6 +287,7 @@ mod hp {
             semantic_key: &semantic_key,
             logical_key: &logical_key,
             resolver: cache.resolver,
+            reference_resolver: cache.reference_resolver,
             acceptance: cache.acceptance,
             ordered_overlays: cache.ordered_overlays,
             mode: cache.mode,
@@ -1099,6 +1100,7 @@ mod tests {
         };
         let request = || QuadratureCacheRequest {
             resolver: Some(&resolver),
+            reference_resolver: None,
             acceptance: Some(&policy),
             ordered_overlays: vec!["workstation".to_owned()],
             mode: ArtifactExecutionCacheMode::PreferReuse,

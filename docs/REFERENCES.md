@@ -1,4 +1,4 @@
-# References for v0.13.3
+# References
 
 - Xcelerator Toolkit public repository and source-available license.
 - Connes, Consani, and Moscovici, *Zeta Spectral Triples*.

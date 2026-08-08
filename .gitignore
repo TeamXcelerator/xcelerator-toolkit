@@ -23,6 +23,12 @@ Thumbs.db
 /data/
 **/data/*_cache/
 
+# Local cache-output validation artifacts and comparison reports.
+cache-validation/
+xcelerator-validation/
+.xcelerator-cache-validation/
+.xcelerator-validation/
+
 # Editor swap
 *.swp
 *~

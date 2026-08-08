@@ -1,7 +1,7 @@
-# Xcelerator Toolkit v0.13.3 documentation
+# Xcelerator Toolkit documentation
 
-This directory contains the public documentation needed to build, use,
-and validate Xcelerator Toolkit v0.13.3. Internal requirements,
+This directory contains the public documentation for the toolkit version in
+the current source tree. It covers how to build, use, and validate the code. Internal requirements,
 technical designs, planning records, traceability, and owner release evidence
 are maintained outside the public source distribution.
 
@@ -14,7 +14,7 @@ are maintained outside the public source distribution.
 ## Cache and publication
 
 - [Cache schema and behavior](CACHE_SCHEMA.md)
-- [Headless GitHub authentication](HEADLESS_GITHUB_AUTH.md)
+- [Cache output validation](OUTPUT_VALIDATION.md)
 
 ## Distribution and provenance
 
