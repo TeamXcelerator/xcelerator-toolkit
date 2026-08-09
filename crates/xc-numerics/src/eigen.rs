@@ -3835,7 +3835,7 @@ mod tests {
             DEFAULT_TRIDIAG_QR_MAX_ITERATIONS
         );
         assert_eq!(DEFAULT_TRIDIAG_QR_MAX_ITERATIONS, 2_000);
-        assert!(DEFAULT_TRIDIAG_QR_MAX_ITERATIONS > TRIDIAG_QR_SLOW_SWEEP_WARNING);
+        assert!(options.max_iterations_per_eigenvalue > TRIDIAG_QR_SLOW_SWEEP_WARNING);
     }
 
     #[test]

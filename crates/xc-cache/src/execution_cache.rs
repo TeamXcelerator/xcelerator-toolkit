@@ -557,43 +557,166 @@ fn managed_publication_key(
     })
 }
 
-fn build_required_reference_layers(
-    repository_owner: &str,
-    validation_root: &Path,
-    mode: ManagedRemoteCacheMode,
-) -> Result<Vec<crate::CacheLayer>, CacheError> {
-    let mut layers = Vec::new();
-    let mut precedence = 0;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedLayerBackend {
+    ZipJson,
+    GitHubPrivateRequired,
+    GitHubPublicRequired,
+    GitHubPublicOptional,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedLayerDescriptor {
+    precedence: u32,
+    name: &'static str,
+    root: PathBuf,
+    visibility: CacheVisibility,
+    writable: bool,
+    backend: ManagedLayerBackend,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedLayerPlan {
+    execution: Vec<ManagedLayerDescriptor>,
+    reference: Vec<ManagedLayerDescriptor>,
+}
+
+fn managed_layer_plan(
+    cache_root: &Path,
+    output_validation: Option<&OutputValidationConfig>,
+    remote_cache_mode: ManagedRemoteCacheMode,
+) -> Result<ManagedLayerPlan, CacheError> {
+    if let Some(validation) = output_validation {
+        validate_separate_cache_roots(cache_root, &validation.validation_root)?;
+        let execution = vec![ManagedLayerDescriptor {
+            precedence: 0,
+            name: "validation-computed",
+            root: validation.validation_root.join("computed"),
+            visibility: CacheVisibility::Local,
+            writable: true,
+            backend: ManagedLayerBackend::ZipJson,
+        }];
+        let mut reference = Vec::new();
+        let mut precedence = 0;
+        if matches!(
+            validation.reference_mode,
+            ManagedRemoteCacheMode::Private | ManagedRemoteCacheMode::PrivateThenPublic
+        ) {
+            reference.push(ManagedLayerDescriptor {
+                precedence,
+                name: "github-private",
+                root: validation.validation_root.join("reference-private"),
+                visibility: CacheVisibility::Private,
+                writable: false,
+                backend: ManagedLayerBackend::GitHubPrivateRequired,
+            });
+            precedence += 1;
+        }
+        if matches!(
+            validation.reference_mode,
+            ManagedRemoteCacheMode::Public | ManagedRemoteCacheMode::PrivateThenPublic
+        ) {
+            reference.push(ManagedLayerDescriptor {
+                precedence,
+                name: "github-public",
+                root: validation.validation_root.join("reference-public"),
+                visibility: CacheVisibility::Public,
+                writable: false,
+                backend: ManagedLayerBackend::GitHubPublicRequired,
+            });
+        }
+        return Ok(ManagedLayerPlan {
+            execution,
+            reference,
+        });
+    }
+
+    let mut execution = vec![ManagedLayerDescriptor {
+        precedence: 0,
+        name: "workstation",
+        root: cache_root.to_path_buf(),
+        visibility: CacheVisibility::Local,
+        writable: true,
+        backend: ManagedLayerBackend::ZipJson,
+    }];
     if matches!(
-        mode,
+        remote_cache_mode,
         ManagedRemoteCacheMode::Private | ManagedRemoteCacheMode::PrivateThenPublic
     ) {
-        let private = crate::GitHubBootstrapCacheStore::private(
-            repository_owner,
-            validation_root.join("reference-private"),
-        )?;
-        private.preflight()?;
-        layers.push(crate::CacheLayer {
-            precedence,
-            store: Box::new(private),
+        execution.push(ManagedLayerDescriptor {
+            precedence: 1,
+            name: "github-private",
+            root: cache_root.join("remote-private"),
+            visibility: CacheVisibility::Private,
+            writable: false,
+            backend: ManagedLayerBackend::GitHubPrivateRequired,
         });
-        precedence += 1;
     }
     if matches!(
-        mode,
+        remote_cache_mode,
         ManagedRemoteCacheMode::Public | ManagedRemoteCacheMode::PrivateThenPublic
     ) {
-        let public = crate::GitHubBootstrapCacheStore::public_required(
-            repository_owner,
-            validation_root.join("reference-public"),
-        )?;
-        public.preflight()?;
-        layers.push(crate::CacheLayer {
-            precedence,
-            store: Box::new(public),
+        execution.push(ManagedLayerDescriptor {
+            precedence: 2,
+            name: "github-public",
+            root: cache_root.join("remote-public"),
+            visibility: CacheVisibility::Public,
+            writable: false,
+            backend: ManagedLayerBackend::GitHubPublicOptional,
         });
     }
-    Ok(layers)
+    Ok(ManagedLayerPlan {
+        execution,
+        reference: Vec::new(),
+    })
+}
+
+fn instantiate_managed_layer(
+    descriptor: ManagedLayerDescriptor,
+    repository_owner: &str,
+) -> Result<crate::CacheLayer, CacheError> {
+    let store: Box<dyn crate::CacheStore> = match descriptor.backend {
+        ManagedLayerBackend::ZipJson => Box::new(crate::ZipJsonFilesystemCacheStore::new(
+            descriptor.name,
+            &descriptor.root,
+            descriptor.writable,
+            descriptor.visibility,
+        )),
+        ManagedLayerBackend::GitHubPrivateRequired => {
+            let store =
+                crate::GitHubBootstrapCacheStore::private(repository_owner, &descriptor.root)?;
+            store.preflight()?;
+            Box::new(store)
+        }
+        ManagedLayerBackend::GitHubPublicRequired => {
+            let store = crate::GitHubBootstrapCacheStore::public_required(
+                repository_owner,
+                &descriptor.root,
+            )?;
+            store.preflight()?;
+            Box::new(store)
+        }
+        ManagedLayerBackend::GitHubPublicOptional => Box::new(
+            crate::GitHubBootstrapCacheStore::public(repository_owner, &descriptor.root)?,
+        ),
+    };
+    debug_assert_eq!(store.name(), descriptor.name);
+    debug_assert_eq!(store.visibility(), descriptor.visibility);
+    debug_assert_eq!(store.writable(), descriptor.writable);
+    Ok(crate::CacheLayer {
+        precedence: descriptor.precedence,
+        store,
+    })
+}
+
+fn instantiate_managed_layers(
+    descriptors: Vec<ManagedLayerDescriptor>,
+    repository_owner: &str,
+) -> Result<Vec<crate::CacheLayer>, CacheError> {
+    descriptors
+        .into_iter()
+        .map(|descriptor| instantiate_managed_layer(descriptor, repository_owner))
+        .collect()
 }
 
 fn reference_overlay_names(mode: ManagedRemoteCacheMode) -> Vec<String> {
@@ -610,7 +733,6 @@ fn reference_overlay_names(mode: ManagedRemoteCacheMode) -> Vec<String> {
 impl ManagedArtifactCacheSession {
     pub fn new(config: ManagedArtifactCacheConfig) -> Result<Self, CacheError> {
         let output_validation = config.output_validation.clone();
-        let production_cache_installed = output_validation.is_none();
         let remote_cache_mode = output_validation
             .as_ref()
             .map_or(config.remote_cache_mode, |validation| {
@@ -625,62 +747,36 @@ impl ManagedArtifactCacheSession {
             // registry read, including immediately after a machine restart.
             crate::GitHubCredentialApiProbe::default().prepare_git_transport()?;
         }
-        let (layers, reference_resolver) = if let Some(validation) = &output_validation {
-            validate_separate_cache_roots(&config.cache_root, &validation.validation_root)?;
-            let execution_layers = vec![crate::CacheLayer {
-                precedence: 0,
-                store: Box::new(crate::ZipJsonFilesystemCacheStore::new(
-                    "validation-computed",
-                    validation.validation_root.join("computed"),
-                    true,
-                    CacheVisibility::Local,
-                )),
-            }];
-            let reference_layers = build_required_reference_layers(
-                &config.repository_owner,
-                &validation.validation_root,
-                validation.reference_mode,
-            )?;
-            (execution_layers, Some(CacheResolver::new(reference_layers)))
-        } else {
-            let mut ordinary_layers = vec![crate::CacheLayer {
-                precedence: 0,
-                store: Box::new(crate::ZipJsonFilesystemCacheStore::new(
-                    "workstation",
-                    &config.cache_root,
-                    true,
-                    CacheVisibility::Local,
-                )),
-            }];
-            if matches!(
-                remote_cache_mode,
-                ManagedRemoteCacheMode::Private | ManagedRemoteCacheMode::PrivateThenPublic
-            ) {
-                let private_store = crate::GitHubBootstrapCacheStore::private(
-                    &config.repository_owner,
-                    config.cache_root.join("remote-private"),
-                )?;
-                private_store.preflight()?;
-                ordinary_layers.push(crate::CacheLayer {
-                    precedence: 1,
-                    store: Box::new(private_store),
-                });
-            }
-            if matches!(
-                remote_cache_mode,
-                ManagedRemoteCacheMode::Public | ManagedRemoteCacheMode::PrivateThenPublic
-            ) {
-                ordinary_layers.push(crate::CacheLayer {
-                    precedence: 2,
-                    store: Box::new(crate::GitHubBootstrapCacheStore::public(
-                        &config.repository_owner,
-                        config.cache_root.join("remote-public"),
-                    )?),
-                });
-            }
-            (ordinary_layers, None)
-        };
-        let resolver = CacheResolver::new(layers);
+        let plan = managed_layer_plan(
+            &config.cache_root,
+            output_validation.as_ref(),
+            remote_cache_mode,
+        )?;
+        let execution_layers =
+            instantiate_managed_layers(plan.execution, &config.repository_owner)?;
+        let reference_layers =
+            instantiate_managed_layers(plan.reference, &config.repository_owner)?;
+        Self::from_layer_sets(
+            config,
+            output_validation,
+            remote_cache_mode,
+            execution_layers,
+            reference_layers,
+        )
+    }
+
+    fn from_layer_sets(
+        config: ManagedArtifactCacheConfig,
+        output_validation: Option<OutputValidationConfig>,
+        remote_cache_mode: ManagedRemoteCacheMode,
+        execution_layers: Vec<crate::CacheLayer>,
+        reference_layers: Vec<crate::CacheLayer>,
+    ) -> Result<Self, CacheError> {
+        let production_cache_installed = output_validation.is_none();
+        let resolver = CacheResolver::new(execution_layers);
+        let reference_resolver = output_validation
+            .as_ref()
+            .map(|_| CacheResolver::new(reference_layers));
         let policy = CachePolicy {
             current_toolkit_version: crate::current_toolkit_version()?,
             minimum_quality: CacheQuality::Validated,
@@ -750,6 +846,28 @@ impl ManagedArtifactCacheSession {
             replace_existing_publication: config.replace_existing_publication,
             output_validation,
         })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_layers_for_test(
+        config: ManagedArtifactCacheConfig,
+        execution_layers: Vec<crate::CacheLayer>,
+        reference_layers: Vec<crate::CacheLayer>,
+    ) -> Result<Self, CacheError> {
+        let output_validation = config.output_validation.clone();
+        let remote_cache_mode = output_validation
+            .as_ref()
+            .map_or(config.remote_cache_mode, |validation| {
+                validation.reference_mode
+            });
+        Self::from_layer_sets(
+            config,
+            output_validation,
+            remote_cache_mode,
+            execution_layers,
+            reference_layers,
+        )
     }
 
     pub fn from_environment() -> Result<Option<Self>, CacheError> {
@@ -2580,6 +2698,68 @@ mod tests {
         }
     }
 
+    fn managed_verify_config(root: &Path, validation_name: &str) -> ManagedArtifactCacheConfig {
+        let validation_root = root.join(validation_name);
+        ManagedArtifactCacheConfig {
+            profile: ManagedRunProfile::Normal,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            cache_root: root.join("production"),
+            staging_root: None,
+            publication_target: xc_core::PublicationTarget::None,
+            repository_owner: "local-fixture".to_owned(),
+            remote_cache_mode: ManagedRemoteCacheMode::None,
+            cache_mode: ArtifactExecutionCacheMode::VerifyAgainstReference,
+            replace_existing_publication: false,
+            execute_remote_mutations: false,
+            output_validation: Some(OutputValidationConfig {
+                validation_root: validation_root.clone(),
+                report_root: validation_root.join("reports"),
+                reference_mode: ManagedRemoteCacheMode::Public,
+            }),
+        }
+    }
+
+    fn cache_context_request<'a>(
+        semantic_key: &'a SemanticKeyEnvelope,
+        logical_key: &'a str,
+        context: &'a ArtifactCacheContext<'a>,
+    ) -> ArtifactExecutionCacheRequest<'a> {
+        ArtifactExecutionCacheRequest {
+            operation: "output_validation.fixture",
+            semantic_key,
+            logical_key,
+            resolver: context.resolver,
+            reference_resolver: context.reference_resolver,
+            acceptance: context.acceptance,
+            ordered_overlays: context.ordered_overlays.clone(),
+            mode: context.mode,
+            write_on_miss: context.write_on_miss,
+            write_visibility: context.write_visibility,
+            produced_quality: CacheQuality::Validated,
+            producer_toolkit_version: crate::current_toolkit_version().unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            maximum_reader_version: None,
+            tags: BTreeMap::new(),
+            provenance_digest: None,
+            production_sink: context.production_sink,
+        }
+    }
+
+    fn semantic_fixture(kind: &str, parameters: serde_json::Value) -> SemanticKeyEnvelope {
+        SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: kind.to_owned(),
+            mathematical_semantics_version: "output-validation-fixture-v1".to_owned(),
+            resolved_mathematical_parameters: parameters,
+            normalization: Some("fixture".to_owned()),
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        }
+    }
+
     #[test]
     fn one_contract_computes_writes_reuses_and_records_provenance() {
         let root = root("execution-cache-roundtrip");
@@ -3218,6 +3398,389 @@ mod tests {
             assert!(staging_root.join("drafts").is_dir());
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn managed_layer_plans_isolate_validation_from_production_cache() {
+        let root = root("managed-layer-plan-isolation");
+        let validation = OutputValidationConfig {
+            validation_root: root.join("validation"),
+            report_root: root.join("reports"),
+            reference_mode: ManagedRemoteCacheMode::PrivateThenPublic,
+        };
+        let verify = managed_layer_plan(
+            &root.join("production"),
+            Some(&validation),
+            ManagedRemoteCacheMode::PrivateThenPublic,
+        )
+        .unwrap();
+        assert_eq!(
+            verify
+                .execution
+                .iter()
+                .map(|layer| layer.name)
+                .collect::<Vec<_>>(),
+            vec!["validation-computed"]
+        );
+        assert!(verify.execution.iter().all(|layer| layer.writable));
+        assert_eq!(
+            verify
+                .reference
+                .iter()
+                .map(|layer| layer.name)
+                .collect::<Vec<_>>(),
+            vec!["github-private", "github-public"]
+        );
+        assert!(verify.reference.iter().all(|layer| !layer.writable));
+        assert!(verify
+            .reference
+            .iter()
+            .all(|layer| { layer.name != "validation-computed" && layer.name != "workstation" }));
+
+        let ordinary = managed_layer_plan(
+            &root.join("production"),
+            None,
+            ManagedRemoteCacheMode::PrivateThenPublic,
+        )
+        .unwrap();
+        assert_eq!(
+            ordinary
+                .execution
+                .iter()
+                .map(|layer| layer.name)
+                .collect::<Vec<_>>(),
+            vec!["workstation", "github-private", "github-public"]
+        );
+        assert!(ordinary.reference.is_empty());
+    }
+
+    #[test]
+    #[ignore = "credentialed read-only GitHub validation-layer preflight"]
+    fn managed_verify_production_constructor_preflights_private_reference_layers() {
+        let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
+        let root = root("managed-verify-live-private-preflight");
+        let _ = fs::remove_dir_all(&root);
+        let mut config = managed_verify_config(&root, "validation");
+        config.repository_owner = "TeamXcelerator".to_owned();
+        config.output_validation.as_mut().unwrap().reference_mode = ManagedRemoteCacheMode::Private;
+        let session = ManagedArtifactCacheSession::new(config).unwrap();
+        let context = session.context();
+        assert_eq!(
+            context.ordered_overlays,
+            vec!["validation-computed", "github-private"]
+        );
+        assert!(context.reference_resolver.is_some());
+        assert!(session.finalize_publication_inventory().is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_verify_session_isolates_layers_and_classifies_fixed_key_cascade() {
+        let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
+        let root = root("managed-verify-fixed-key-cascade");
+        let _ = fs::remove_dir_all(&root);
+        let reference_root = root.join("reference");
+        let computed_root = root.join("computed");
+        let reference_writer = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "reference-writer",
+                &reference_root,
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let computed_writer = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "computed-writer",
+                &computed_root,
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let fixture_policy = policy();
+
+        let isolated_semantic = semantic_fixture("quadrature_rule", json!({"case": "isolated"}));
+        let isolated_manifest = resolve_or_compute_json_artifact(
+            &request(
+                &isolated_semantic,
+                &computed_writer,
+                &fixture_policy,
+                ArtifactExecutionCacheMode::PreferReuse,
+            ),
+            || Ok(vec!["computed-only".to_owned()]),
+            |_| Ok(()),
+        )
+        .unwrap()
+        .produced_manifest
+        .unwrap();
+        let leaf_semantic = semantic_fixture("quadrature_rule", json!({"case": "leaf"}));
+        let old_leaf = resolve_or_compute_json_artifact(
+            &request(
+                &leaf_semantic,
+                &reference_writer,
+                &fixture_policy,
+                ArtifactExecutionCacheMode::PreferReuse,
+            ),
+            || Ok(vec!["old-leaf".to_owned()]),
+            |_| Ok(()),
+        )
+        .unwrap()
+        .produced_manifest
+        .unwrap();
+        let parent_semantic = semantic_fixture("ccm_tau_matrix", json!({"case": "fixed-parent"}));
+        let mut parent_reference_request = request(
+            &parent_semantic,
+            &reference_writer,
+            &fixture_policy,
+            ArtifactExecutionCacheMode::PreferReuse,
+        );
+        parent_reference_request.logical_key = "fixture/fixed-parent";
+        resolve_or_compute_json_artifact_with_dependencies(
+            &parent_reference_request,
+            || {
+                Ok((
+                    vec!["old-parent".to_owned()],
+                    vec![DependencyRef {
+                        key: old_leaf.key.clone(),
+                        content_digest: old_leaf.content_digest.clone(),
+                        required_quality: CacheQuality::Validated,
+                    }],
+                ))
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        let tail_semantic = semantic_fixture("ccm_eigenpair", json!({"case": "tail"}));
+        let mut tail_reference_request = request(
+            &tail_semantic,
+            &reference_writer,
+            &fixture_policy,
+            ArtifactExecutionCacheMode::PreferReuse,
+        );
+        tail_reference_request.logical_key = "fixture/tail";
+        resolve_or_compute_json_artifact(
+            &tail_reference_request,
+            || Ok(vec!["same-tail".to_owned()]),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        let session = ManagedArtifactCacheSession::with_layers_for_test(
+            managed_verify_config(&root, "validation"),
+            vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(FilesystemCacheStore::new(
+                    "validation-computed",
+                    &computed_root,
+                    true,
+                    CacheVisibility::Local,
+                )),
+            }],
+            vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(FilesystemCacheStore::new(
+                    "reference",
+                    &reference_root,
+                    false,
+                    CacheVisibility::Local,
+                )),
+            }],
+        )
+        .unwrap();
+        let context = session.context();
+        let reference_resolver = context.reference_resolver.unwrap();
+        assert!(matches!(
+            reference_resolver.resolve(&isolated_manifest.key, context.acceptance.unwrap()),
+            Err(CacheError::NotFound(_))
+        ));
+        let resolved_old_leaf = reference_resolver
+            .resolve(&old_leaf.key, context.acceptance.unwrap())
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Vec<String>>(&resolved_old_leaf.payload).unwrap(),
+            vec!["old-leaf"]
+        );
+
+        let new_leaf = resolve_or_compute_json_artifact(
+            &cache_context_request(&leaf_semantic, "gauss-legendre/4/128", &context),
+            || Ok(vec!["new-leaf".to_owned()]),
+            |_| Ok(()),
+        )
+        .unwrap()
+        .produced_manifest
+        .unwrap();
+        resolve_or_compute_json_artifact_with_dependencies(
+            &cache_context_request(&parent_semantic, "fixture/fixed-parent", &context),
+            || {
+                Ok((
+                    vec!["new-parent".to_owned()],
+                    vec![DependencyRef {
+                        key: new_leaf.key.clone(),
+                        content_digest: new_leaf.content_digest.clone(),
+                        required_quality: CacheQuality::Validated,
+                    }],
+                ))
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        resolve_or_compute_json_artifact(
+            &cache_context_request(&tail_semantic, "fixture/tail", &context),
+            || Ok(vec!["same-tail".to_owned()]),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(session.finalize_publication_inventory().is_err());
+        let report: crate::OutputPreservationValidationReport =
+            serde_json::from_slice(&fs::read(root.join("validation/reports/latest.json")).unwrap())
+                .unwrap();
+        assert_eq!(report.totals.compared, 3);
+        assert_eq!(report.totals.matched, 1);
+        assert_eq!(report.totals.mismatched, 2);
+        assert_eq!(report.totals.first_divergences, 1);
+        assert_eq!(report.totals.inherited_divergences, 1);
+        let parent = report
+            .comparisons
+            .iter()
+            .find(|comparison| comparison.semantic_key.artifact_kind == "ccm_tau_matrix")
+            .unwrap();
+        assert_eq!(
+            parent.divergence_origin,
+            crate::ArtifactDivergenceOrigin::InheritedFromDependency
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reference_absent_rekeyed_parent_is_classified_as_inherited() {
+        let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
+        let root = root("managed-verify-rekey-cascade");
+        let _ = fs::remove_dir_all(&root);
+        let reference_root = root.join("reference");
+        let computed_root = root.join("computed");
+        let reference_writer = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "reference-writer",
+                &reference_root,
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let fixture_policy = policy();
+        let leaf_semantic = semantic_fixture("quadrature_rule", json!({"case": "rekey-leaf"}));
+        let old_leaf = resolve_or_compute_json_artifact(
+            &request(
+                &leaf_semantic,
+                &reference_writer,
+                &fixture_policy,
+                ArtifactExecutionCacheMode::PreferReuse,
+            ),
+            || Ok(vec!["old-leaf".to_owned()]),
+            |_| Ok(()),
+        )
+        .unwrap()
+        .produced_manifest
+        .unwrap();
+        let old_parent_semantic = semantic_fixture(
+            "ccm_tau_matrix",
+            json!({"leaf_digest": old_leaf.content_digest.0}),
+        );
+        let mut old_parent_request = request(
+            &old_parent_semantic,
+            &reference_writer,
+            &fixture_policy,
+            ArtifactExecutionCacheMode::PreferReuse,
+        );
+        old_parent_request.logical_key = "fixture/rekey-parent";
+        resolve_or_compute_json_artifact_with_dependencies(
+            &old_parent_request,
+            || {
+                Ok((
+                    vec!["old-parent".to_owned()],
+                    vec![DependencyRef {
+                        key: old_leaf.key.clone(),
+                        content_digest: old_leaf.content_digest.clone(),
+                        required_quality: CacheQuality::Validated,
+                    }],
+                ))
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        let session = ManagedArtifactCacheSession::with_layers_for_test(
+            managed_verify_config(&root, "validation"),
+            vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(FilesystemCacheStore::new(
+                    "validation-computed",
+                    &computed_root,
+                    true,
+                    CacheVisibility::Local,
+                )),
+            }],
+            vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(FilesystemCacheStore::new(
+                    "reference",
+                    &reference_root,
+                    false,
+                    CacheVisibility::Local,
+                )),
+            }],
+        )
+        .unwrap();
+        let context = session.context();
+        let new_leaf = resolve_or_compute_json_artifact(
+            &cache_context_request(&leaf_semantic, "gauss-legendre/4/128", &context),
+            || Ok(vec!["new-leaf".to_owned()]),
+            |_| Ok(()),
+        )
+        .unwrap()
+        .produced_manifest
+        .unwrap();
+        let new_parent_semantic = semantic_fixture(
+            "ccm_tau_matrix",
+            json!({"leaf_digest": new_leaf.content_digest.0}),
+        );
+        resolve_or_compute_json_artifact_with_dependencies(
+            &cache_context_request(&new_parent_semantic, "fixture/rekey-parent", &context),
+            || {
+                Ok((
+                    vec!["new-parent".to_owned()],
+                    vec![DependencyRef {
+                        key: new_leaf.key.clone(),
+                        content_digest: new_leaf.content_digest.clone(),
+                        required_quality: CacheQuality::Validated,
+                    }],
+                ))
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(session.finalize_publication_inventory().is_err());
+        let report: crate::OutputPreservationValidationReport =
+            serde_json::from_slice(&fs::read(root.join("validation/reports/latest.json")).unwrap())
+                .unwrap();
+        let parent = report
+            .comparisons
+            .iter()
+            .find(|comparison| comparison.semantic_key.artifact_kind == "ccm_tau_matrix")
+            .unwrap();
+        assert_eq!(
+            parent.status,
+            crate::ArtifactOutputComparisonStatus::ReferenceAbsent
+        );
+        assert_eq!(
+            parent.divergence_origin,
+            crate::ArtifactDivergenceOrigin::InheritedFromDependency
+        );
+        assert_eq!(report.totals.first_divergences, 1);
+        assert_eq!(report.totals.inherited_divergences, 1);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

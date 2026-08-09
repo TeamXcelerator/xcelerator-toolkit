@@ -8,8 +8,8 @@
 - **Contact:** randrewsmath@gmail.com
 
 Version 0.13.4 preserves the v0.13.x APIs and existing cache artifacts while
-adding an isolated cache-output validation mode for regression testing toolkit
-changes against current cached artifacts.
+adding isolated cache-output validation and payload-preserving high-precision
+CCM performance improvements.
 
 ---
 
@@ -20,6 +20,7 @@ changes against current cached artifacts.
 - **High-precision numerics** — GMP/MPFR-based arithmetic, deterministic reductions, structured linear algebra, root finding, and eigensolvers.
 - **Research mathematics** — Connes–Consani–Moscovici finite Weil forms, prolate and Mellin methods, Suzuki screw functions, Yakaboylu operators, Dirichlet L-functions, zeta utilities, and Maynard–Tao variational calculations.
 - **Reusable artifacts** — versioned, content-addressed local and remote caching with validation before reuse.
+- **Output-preserving optimization** — cache verification compares recomputed payload bytes with current references, while deterministic HP parallelism and retained validated values reduce avoidable work without changing artifact identities.
 - **Optional stronger assurance** — independent cross-checks and replayable finite certificates are available for claims that need them.
 
 Finite computations are always reported with their finite scope. They are not presented as proofs of infinite-dimensional conjectures.
@@ -156,6 +157,36 @@ continuation seeds, compares exact payload bytes, and writes a claim-wide
 report. Missing references, mismatches, nondeterministic recomputation, and
 zero-comparison runs fail the validation without publishing or modifying the
 production cache.
+
+The v0.13.4 verification path also isolates execution and reference layer sets
+through one tested construction boundary. Claim-wide reports preserve
+dependency-cascade diagnostics when an upstream payload changes a downstream
+semantic key, including `ReferenceAbsent` descendants inherited from the first
+divergence. Hermetic CCM, quadrature, and prolate tests exercise the same
+managed-session wiring used by production consumers.
+
+High-precision CCM execution in v0.13.4 removes several sources of redundant
+work while preserving the established arithmetic order and exact portable
+payloads:
+
+- bounded, indexed parallel decimal encoding and decoding retains input order,
+  precision, deterministic lowest-error reporting, and bounded scratch memory;
+- cache validators retain their decoded runtime matrices, eigenpairs,
+  factorizations, spectra, and root windows instead of decoding them again;
+- eigenpair validation reuses its already computed residual, and secular
+  evaluation reuses one per-run pole table without changing ordered sums;
+- the production borrowed dense HP operator computes independent rows in
+  parallel while each row retains its original left-to-right MPFR fold; and
+- ordinary positive-prefix and index-range root discovery stops once the exact
+  required scan extent is satisfied, while unsatisfied and advanced requests
+  still exhaust their established finite domain and preserve existing errors.
+
+These are Category A optimizations: semantic keys, schemas, solver selection,
+precision, convergence rules, and computed artifact payload bytes remain
+unchanged. Performance comparisons should use identical release builds, claim
+arguments, cache modes, and Rayon worker counts; `HighPrecResult::elapsed_seconds`
+reports the primary toolkit duration, and `XC_CACHE_MODE=verify` remains the
+acceptance authority for payload identity.
 
 ## Validation
 

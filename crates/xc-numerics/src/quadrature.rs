@@ -1072,7 +1072,10 @@ mod tests {
     fn hp_quadrature_uses_common_cache_fabric_for_round_trip() {
         use xc_cache::{
             ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheQuality, CacheResolver,
-            CacheVisibility, FilesystemCacheStore, ToolkitVersion,
+            CacheVisibility, CertificationFailurePolicy, FilesystemCacheStore,
+            ManagedArtifactCacheConfig, ManagedArtifactCacheSession, ManagedRemoteCacheMode,
+            ManagedRunProfile, OutputPreservationValidationReport, OutputValidationConfig,
+            ToolkitVersion,
         };
         use xc_core::{CacheLookupOutcome, CacheReuseDisposition};
 
@@ -1081,11 +1084,12 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
+        let reference_root = root.join("reference");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
                 "workstation",
-                &root,
+                &reference_root,
                 true,
                 CacheVisibility::Local,
             )),
@@ -1121,6 +1125,57 @@ mod tests {
         );
         assert_eq!(first.nodes, second.nodes);
         assert_eq!(first.weights, second.weights);
+
+        let validation_root = root.join("validation");
+        let session = ManagedArtifactCacheSession::with_layers_for_test(
+            ManagedArtifactCacheConfig {
+                profile: ManagedRunProfile::Normal,
+                requested_assurance: xc_core::AssuranceLevel::Computed,
+                certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+                cache_root: root.join("production"),
+                staging_root: None,
+                publication_target: xc_core::PublicationTarget::None,
+                repository_owner: "local-fixture".to_owned(),
+                remote_cache_mode: ManagedRemoteCacheMode::None,
+                cache_mode: ArtifactExecutionCacheMode::VerifyAgainstReference,
+                replace_existing_publication: false,
+                execute_remote_mutations: false,
+                output_validation: Some(OutputValidationConfig {
+                    validation_root: validation_root.clone(),
+                    report_root: validation_root.join("reports"),
+                    reference_mode: ManagedRemoteCacheMode::Public,
+                }),
+            },
+            vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(FilesystemCacheStore::new(
+                    "validation-computed",
+                    validation_root.join("computed"),
+                    true,
+                    CacheVisibility::Local,
+                )),
+            }],
+            vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(FilesystemCacheStore::new(
+                    "reference",
+                    &reference_root,
+                    false,
+                    CacheVisibility::Local,
+                )),
+            }],
+        )
+        .unwrap();
+        let verified = gauss_legendre_nodes_via_cache(4, 128, session.context()).unwrap();
+        assert_eq!(verified.nodes, first.nodes);
+        assert_eq!(verified.weights, first.weights);
+        session.finalize_publication_inventory().unwrap();
+        let report: OutputPreservationValidationReport = serde_json::from_slice(
+            &std::fs::read(validation_root.join("reports/latest.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(report.output_preserving);
+        assert_eq!(report.totals.matched, 1);
         let _ = std::fs::remove_dir_all(root);
     }
 

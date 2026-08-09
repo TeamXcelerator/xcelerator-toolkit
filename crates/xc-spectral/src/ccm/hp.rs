@@ -15,6 +15,7 @@ use rug::{ops::Pow, Float};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::time::Instant;
 #[cfg(feature = "arb")]
 use xc_cache::resolve_or_compute_json_artifact_with_assessment;
@@ -32,6 +33,46 @@ use xc_operator::{
 use xc_zeta::zeros::ReferenceZeroDatasetIdentity;
 
 use super::{prime_powers_up_to, window::ZeroTarget, CcmParams, CcmResult};
+
+// Conservative crossovers from the ignored release-mode benchmark below.
+// Decimal conversion becomes worthwhile at fewer entries as MPFR precision
+// rises; low-precision decoding uses larger batches to amortize Rayon barriers.
+const HP_VECTOR_HIGH_PRECISION_BITS: u32 = 384;
+const HP_VECTOR_PARALLEL_ENCODE_MIN_LOW_PRECISION: usize = 16_384;
+const HP_VECTOR_PARALLEL_ENCODE_MIN_HIGH_PRECISION: usize = 8_192;
+const HP_VECTOR_PARALLEL_DECODE_MIN_LOW_PRECISION: usize = 32_768;
+const HP_VECTOR_PARALLEL_DECODE_MIN_HIGH_PRECISION: usize = 4_096;
+const HP_VECTOR_DECODE_BATCH_LOW_PRECISION: usize = 32_768;
+const HP_VECTOR_DECODE_BATCH_HIGH_PRECISION: usize = 4_096;
+// Both 128- and 512-bit release measurements crossed over by dimension 256.
+const BORROWED_DENSE_PARALLEL_MIN_DIMENSION: usize = 256;
+
+fn hp_vector_parallel_encode_min_entries(values: &[Float]) -> usize {
+    if values
+        .first()
+        .is_some_and(|value| value.prec() >= HP_VECTOR_HIGH_PRECISION_BITS)
+    {
+        HP_VECTOR_PARALLEL_ENCODE_MIN_HIGH_PRECISION
+    } else {
+        HP_VECTOR_PARALLEL_ENCODE_MIN_LOW_PRECISION
+    }
+}
+
+fn hp_vector_parallel_decode_min_entries(precision_bits: u32) -> usize {
+    if precision_bits >= HP_VECTOR_HIGH_PRECISION_BITS {
+        HP_VECTOR_PARALLEL_DECODE_MIN_HIGH_PRECISION
+    } else {
+        HP_VECTOR_PARALLEL_DECODE_MIN_LOW_PRECISION
+    }
+}
+
+fn hp_vector_decode_batch_entries(precision_bits: u32) -> usize {
+    if precision_bits >= HP_VECTOR_HIGH_PRECISION_BITS {
+        HP_VECTOR_DECODE_BATCH_HIGH_PRECISION
+    } else {
+        HP_VECTOR_DECODE_BATCH_LOW_PRECISION
+    }
+}
 
 enum CcmCacheRoute<'a> {
     Standalone,
@@ -63,6 +104,14 @@ enum RootAcquisition<'a> {
 enum RootArtifactMode {
     Independent,
     ReferenceSeededRefinement,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootScanExtent {
+    Complete,
+    PositivePrefix {
+        minimum_discovered_roots: NonZeroUsize,
+    },
 }
 
 impl RootArtifactMode {
@@ -1971,15 +2020,35 @@ fn decode_tau_artifact(
             "CCM tau payload does not match its semantic identity".to_owned(),
         ));
     }
-    let mut tau = Vec::with_capacity(expected);
-    for entry in &artifact.entries {
-        let parsed = Float::parse(entry).map_err(|error| {
-            CacheError::InvalidManifest(format!(
-                "CCM tau payload contains an invalid HP scalar: {error}"
-            ))
-        })?;
-        tau.push(Float::with_val(prec, parsed));
-    }
+    let parse = |entry: &String| {
+        Float::parse(entry)
+            .map(|parsed| Float::with_val(prec, parsed))
+            .map_err(|error| {
+                CacheError::InvalidManifest(format!(
+                    "CCM tau payload contains an invalid HP scalar: {error}"
+                ))
+            })
+    };
+    let tau = if artifact.entries.len() < hp_vector_parallel_decode_min_entries(prec) {
+        artifact
+            .entries
+            .iter()
+            .map(parse)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    } else {
+        let mut decoded = Vec::with_capacity(expected);
+        for batch in artifact
+            .entries
+            .chunks(hp_vector_decode_batch_entries(prec))
+        {
+            let results: Vec<std::result::Result<Float, CacheError>> =
+                batch.par_iter().map(parse).collect();
+            for result in results {
+                decoded.push(result?);
+            }
+        }
+        decoded
+    };
     if let Some(reason) = tau_cache::structural_check(&tau, params.n_modes, prec) {
         return Err(CacheError::InvalidManifest(format!(
             "CCM tau payload failed structural validation: {reason}"
@@ -2104,10 +2173,31 @@ fn parse_hp_vector(
     values: &[String],
     precision_bits: u32,
 ) -> std::result::Result<Vec<Float>, CacheError> {
-    values
-        .iter()
-        .map(|value| parse_hp_scalar(value, precision_bits))
-        .collect()
+    if values.len() < hp_vector_parallel_decode_min_entries(precision_bits) {
+        return values
+            .iter()
+            .map(|value| parse_hp_scalar(value, precision_bits))
+            .collect();
+    }
+    let mut decoded = Vec::with_capacity(values.len());
+    for batch in values.chunks(hp_vector_decode_batch_entries(precision_bits)) {
+        let results: Vec<std::result::Result<Float, CacheError>> = batch
+            .par_iter()
+            .map(|value| parse_hp_scalar(value, precision_bits))
+            .collect();
+        for result in results {
+            decoded.push(result?);
+        }
+    }
+    Ok(decoded)
+}
+
+fn encode_hp_vector(values: &[Float]) -> Vec<String> {
+    if values.len() < hp_vector_parallel_encode_min_entries(values) {
+        values.iter().map(Float::to_string).collect()
+    } else {
+        values.par_iter().map(Float::to_string).collect()
+    }
 }
 
 fn canonical_dependency_refs(manifests: Vec<ArtifactManifest>) -> Vec<DependencyRef> {
@@ -2253,6 +2343,7 @@ fn resolve_archimedean_integrals_via_cache(
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
+    let validated_integrals = RefCell::new(None);
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
@@ -2280,16 +2371,20 @@ fn resolve_archimedean_integrals_via_cache(
                 dependencies,
             ))
         },
-        |artifact| decode_archimedean_integrals(artifact, params, precision_bits).map(|_| ()),
+        |artifact| {
+            let integrals = decode_archimedean_integrals(artifact, params, precision_bits)?;
+            validated_integrals.replace(Some(integrals));
+            Ok(())
+        },
     )?;
     let manifest = resolved
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("archimedean-integral execution returned no manifest"))?;
-    Ok((
-        decode_archimedean_integrals(&resolved.value, params, precision_bits)?,
-        manifest,
-    ))
+    let integrals = validated_integrals.into_inner().ok_or_else(|| {
+        anyhow::anyhow!("archimedean-integral execution did not retain its validated runtime value")
+    })?;
+    Ok((integrals, manifest))
 }
 
 fn resolve_prime_component_via_cache(
@@ -2344,6 +2439,7 @@ fn resolve_prime_component_via_cache(
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
+    let validated_prime = RefCell::new(None);
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
@@ -2369,21 +2465,25 @@ fn resolve_prime_component_via_cache(
                             exponent,
                         })
                         .collect(),
-                    entries: entries.iter().map(Float::to_string).collect(),
+                    entries: encode_hp_vector(&entries),
                 },
                 Vec::new(),
             ))
         },
-        |artifact| decode_prime_component(artifact, params, precision_bits).map(|_| ()),
+        |artifact| {
+            let prime = decode_prime_component(artifact, params, precision_bits)?;
+            validated_prime.replace(Some(prime));
+            Ok(())
+        },
     )?;
     let manifest = resolved
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("prime-component execution returned no manifest"))?;
-    Ok((
-        decode_prime_component(&resolved.value, params, precision_bits)?,
-        manifest,
-    ))
+    let prime = validated_prime.into_inner().ok_or_else(|| {
+        anyhow::anyhow!("prime-component execution did not retain its validated runtime matrix")
+    })?;
+    Ok((prime, manifest))
 }
 
 fn build_tau_hp_via_cache(
@@ -2468,7 +2568,7 @@ fn build_tau_hp_via_cache(
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
                     precision_bits: prec,
-                    entries: tau.iter().map(Float::to_string).collect(),
+                    entries: encode_hp_vector(&tau),
                 },
                 dependencies,
             ))
@@ -2646,18 +2746,18 @@ fn decode_weil_eigenpair(
             unreachable!("automatic eigenstate policy is resolved before payload decoding")
         }
     }
-    if !weil_eigvec_cache::residual_ok(tau, params.matrix_size(), &xi, &eps_n, prec) {
+    let Some(replayed_residual) =
+        weil_eigvec_cache::relative_residual_norm(tau, params.matrix_size(), &xi, &eps_n, prec)
+    else {
+        return Err(CacheError::InvalidManifest(
+            "CCM Weil eigenpair failed its tau residual validation".to_owned(),
+        ));
+    };
+    if !weil_eigvec_cache::residual_within_precision_floor(&replayed_residual, prec) {
         return Err(CacheError::InvalidManifest(
             "CCM Weil eigenpair failed its tau residual validation".to_owned(),
         ));
     }
-    let replayed_residual =
-        weil_eigvec_cache::relative_residual_norm(tau, params.matrix_size(), &xi, &eps_n, prec)
-            .ok_or_else(|| {
-                CacheError::InvalidManifest(
-                    "CCM Weil eigenpair has no finite relative Tau residual".to_owned(),
-                )
-            })?;
     if replayed_residual != diagnostics.final_relative_residual_norm {
         return Err(CacheError::InvalidManifest(
             "CCM Weil eigenpair stopping evidence does not match its replayed Tau residual"
@@ -2814,6 +2914,7 @@ fn resolve_even_sector_matrix_via_cache(
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
+    let validated_sector = RefCell::new(None);
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
@@ -2825,7 +2926,7 @@ fn resolve_even_sector_matrix_via_cache(
                     n_modes: params.n_modes,
                     precision_bits: cfg.precision_bits,
                     dimension,
-                    entries: sector.iter().map(Float::to_string).collect(),
+                    entries: encode_hp_vector(&sector),
                 },
                 vec![DependencyRef {
                     key: tau_manifest.key.clone(),
@@ -2854,6 +2955,7 @@ fn resolve_even_sector_matrix_via_cache(
                         .to_owned(),
                 ));
             }
+            validated_sector.replace(Some(decoded));
             Ok(())
         },
     )?;
@@ -2861,10 +2963,10 @@ fn resolve_even_sector_matrix_via_cache(
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("even-sector execution returned no manifest"))?;
-    Ok((
-        parse_hp_vector(&resolved.value.entries, cfg.precision_bits)?,
-        manifest,
-    ))
+    let sector = validated_sector.into_inner().ok_or_else(|| {
+        anyhow::anyhow!("even-sector execution did not retain its validated runtime matrix")
+    })?;
+    Ok((sector, manifest))
 }
 
 fn resolve_odd_sector_matrix_via_cache(
@@ -2919,6 +3021,7 @@ fn resolve_odd_sector_matrix_via_cache(
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
+    let validated_sector = RefCell::new(None);
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
@@ -2935,7 +3038,7 @@ fn resolve_odd_sector_matrix_via_cache(
                     n_modes: params.n_modes,
                     precision_bits: cfg.precision_bits,
                     dimension,
-                    entries: sector.iter().map(Float::to_string).collect(),
+                    entries: encode_hp_vector(&sector),
                 },
                 vec![DependencyRef {
                     key: tau_manifest.key.clone(),
@@ -2963,6 +3066,7 @@ fn resolve_odd_sector_matrix_via_cache(
                     "CCM odd-sector matrix is inconsistent with its full tau dependency".to_owned(),
                 ));
             }
+            validated_sector.replace(Some(decoded));
             Ok(())
         },
     )?;
@@ -2970,10 +3074,10 @@ fn resolve_odd_sector_matrix_via_cache(
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("odd-sector execution returned no artifact manifest"))?;
-    Ok((
-        parse_hp_vector(&resolved.value.entries, cfg.precision_bits)?,
-        manifest,
-    ))
+    let sector = validated_sector.into_inner().ok_or_else(|| {
+        anyhow::anyhow!("odd-sector execution did not retain its validated runtime matrix")
+    })?;
+    Ok((sector, manifest))
 }
 
 fn decode_sector_tridiagonal(
@@ -3390,7 +3494,7 @@ fn resolve_sector_transform_via_cache(
                     precision_bits: cfg.precision_bits,
                     parity,
                     dimension,
-                    basis: basis.iter().map(Float::to_string).collect(),
+                    basis: encode_hp_vector(&basis),
                 },
                 canonical_dependency_refs(vec![
                     matrix_manifest.clone(),
@@ -4828,7 +4932,7 @@ fn resolve_factorization_via_cache(
                     precision_bits: cfg.precision_bits,
                     subspace: subspace.to_owned(),
                     dimension,
-                    lu: factors.lu.iter().map(Float::to_string).collect(),
+                    lu: encode_hp_vector(&factors.lu),
                     permutation: factors.perm,
                 },
                 vec![DependencyRef {
@@ -4921,14 +5025,24 @@ impl LinearOperator<Float> for BorrowedDenseSymmetricHp<'_> {
                 actual: y.len(),
             });
         }
-        for (row, output) in self.entries.chunks_exact(self.dimension).zip(y.iter_mut()) {
+        let apply_row = |row: &[Float]| {
             let mut sum = Float::with_val(self.precision_bits, 0);
             for (entry, component) in row.iter().zip(x) {
                 let mut term = Float::with_val(self.precision_bits, entry);
                 term *= component;
                 sum += term;
             }
-            *output = sum;
+            sum
+        };
+        if self.dimension < BORROWED_DENSE_PARALLEL_MIN_DIMENSION {
+            for (row, output) in self.entries.chunks_exact(self.dimension).zip(y.iter_mut()) {
+                *output = apply_row(row);
+            }
+        } else {
+            self.entries
+                .par_chunks_exact(self.dimension)
+                .zip(y.par_iter_mut())
+                .for_each(|(row, output)| *output = apply_row(row));
         }
         Ok(())
     }
@@ -5482,6 +5596,7 @@ fn weil_eigenpair_via_cache_with_seed(
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
+    let validated_eigenpair = RefCell::new(None);
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
@@ -5679,14 +5794,20 @@ fn weil_eigenpair_via_cache_with_seed(
                 canonical_dependency_refs(vec![factor_manifest]),
             ))
         },
-        |artifact| decode_weil_eigenpair(artifact, params, cfg, tau).map(|_| ()),
+        |artifact| {
+            let eigenpair = decode_weil_eigenpair(artifact, params, cfg, tau)?;
+            validated_eigenpair.replace(Some(eigenpair));
+            Ok(())
+        },
     )?;
     let manifest = resolved
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("Weil eigenpair execution returned no manifest"))?;
     let (eigenvalue, eigenvector, diagnostics) =
-        decode_weil_eigenpair(&resolved.value, params, cfg, tau)?;
+        validated_eigenpair.into_inner().ok_or_else(|| {
+            anyhow::anyhow!("Weil eigenpair execution did not retain its validated runtime value")
+        })?;
     Ok((
         eigenvalue,
         eigenvector,
@@ -6315,6 +6436,7 @@ fn decode_root_range(
     let mut two_pi_over_l = pi(cfg.precision_bits);
     two_pi_over_l *= 2u32;
     two_pi_over_l /= l;
+    let poles = secular_poles(&two_pi_over_l, params.n_modes, cfg.precision_bits);
     let mut previous: Option<&Float> = None;
     for outcome in &decoded {
         let (result, status) = match outcome {
@@ -6340,13 +6462,7 @@ fn decode_root_range(
             &result.diagnostics.final_correction,
             cfg.precision_bits,
         );
-        let replayed = secular_residual_and_scale_at(
-            xi,
-            params.n_modes,
-            &two_pi_over_l,
-            value,
-            cfg.precision_bits,
-        );
+        let replayed = secular_residual_and_scale_at(xi, &poles, value, cfg.precision_bits);
         let replayed_residual = replayed.as_ref().map(|(residual, _)| residual);
         let replay_term_scale = replayed.as_ref().map(|(_, scale)| scale);
         let invalid_iterations = result.diagnostics.iterations > cfg.solver_steps;
@@ -6564,6 +6680,7 @@ fn resolve_root_range_via_cache(
                 provenance_digest: None,
                 production_sink: None,
             };
+            let validated_candidate = RefCell::new(None);
             let candidate = resolve_or_compute_json_artifact_with_dependencies(
                 &candidate_request,
                 || {
@@ -6572,7 +6689,7 @@ fn resolve_root_range_via_cache(
                     ))
                 },
                 |artifact| {
-                    decode_root_range(
+                    let roots = decode_root_range(
                         artifact,
                         params,
                         cfg,
@@ -6584,8 +6701,9 @@ fn resolve_root_range_via_cache(
                         l,
                         RootWindowSemantics::strict_positive(candidate_seeds.len()),
                         require_converged,
-                    )
-                    .map(|_| ())
+                    )?;
+                    validated_candidate.replace(Some(roots));
+                    Ok(())
                 },
             );
             let candidate = match candidate {
@@ -6596,19 +6714,11 @@ fn resolve_root_range_via_cache(
             let manifest = candidate
                 .reused_manifest
                 .ok_or_else(|| anyhow::anyhow!("compatible root-window probe computed"))?;
-            let decoded = decode_root_range(
-                &candidate.value,
-                params,
-                cfg,
-                1,
-                &candidate_seeds,
-                artifact_mode,
-                reference_dataset,
-                xi,
-                l,
-                RootWindowSemantics::strict_positive(candidate_seeds.len()),
-                require_converged,
-            )?;
+            let decoded = validated_candidate.into_inner().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "compatible root-window probe did not retain its validated runtime roots"
+                )
+            })?;
             let start = first_root_index - 1;
             let projected = decoded[start..start + seeds.len()].to_vec();
             eprintln!(
@@ -6688,6 +6798,7 @@ fn resolve_root_range_via_cache(
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
+    let validated_roots = RefCell::new(None);
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
@@ -6753,7 +6864,7 @@ fn resolve_root_range_via_cache(
             ))
         },
         |artifact| {
-            decode_root_range(
+            let roots = decode_root_range(
                 artifact,
                 params,
                 cfg,
@@ -6765,31 +6876,19 @@ fn resolve_root_range_via_cache(
                 l,
                 semantics,
                 require_converged,
-            )
-            .map(|_| ())
+            )?;
+            validated_roots.replace(Some(roots));
+            Ok(())
         },
     )?;
     let manifest = resolved
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("root-range execution returned no manifest"))?;
-    Ok((
-        decode_root_range(
-            &resolved.value,
-            params,
-            cfg,
-            first_root_index,
-            seeds,
-            artifact_mode,
-            reference_dataset,
-            xi,
-            l,
-            semantics,
-            require_converged,
-        )?,
-        manifest,
-        false,
-    ))
+    let roots = validated_roots.into_inner().ok_or_else(|| {
+        anyhow::anyhow!("root-range execution did not retain its validated runtime roots")
+    })?;
+    Ok((roots, manifest, false))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7622,18 +7721,41 @@ fn independently_discovered_starting_points(
             (upper, zero.clone())
         }
     };
+    let advanced = options != IndependentRootDiscoveryOptions::default();
+    let scan_extent = if !advanced && options.domain == IndependentRootDomain::Positive {
+        match target {
+            ZeroTarget::FirstK { count } => RootScanExtent::PositivePrefix {
+                minimum_discovered_roots: NonZeroUsize::new(*count)
+                    .expect("positive prefix count was validated above"),
+            },
+            ZeroTarget::IndexRange { last, .. } => RootScanExtent::PositivePrefix {
+                minimum_discovered_roots: NonZeroUsize::new(*last)
+                    .expect("positive range bound was validated above"),
+            },
+            ZeroTarget::HeightWindow { .. } | ZeroTarget::SymmetricHeightWindow { .. } => {
+                RootScanExtent::Complete
+            }
+        }
+    } else {
+        RootScanExtent::Complete
+    };
     let values = if options.domain == IndependentRootDomain::Signed {
         discover_secular_roots_hp_signed(xi, params.n_modes, &spacing, &scan_upper, precision_bits)?
     } else {
-        discover_secular_roots_hp(xi, params.n_modes, &spacing, &scan_upper, precision_bits)?
+        discover_secular_roots_hp_with_extent(
+            xi,
+            params.n_modes,
+            &spacing,
+            &scan_upper,
+            precision_bits,
+            scan_extent,
+        )?
     };
     let requested_count = match target {
         ZeroTarget::FirstK { count } => *count,
         ZeroTarget::IndexRange { first, last } => last - first + 1,
         ZeroTarget::HeightWindow { .. } | ZeroTarget::SymmetricHeightWindow { .. } => values.len(),
     };
-    let advanced = options != IndependentRootDiscoveryOptions::default();
-
     // Preserve the exact v6 request-shaped artifact path for every ordinary
     // caller. Advanced requests instead cache the complete discovered finite
     // window and record the request/projection only in the small evidence
@@ -7774,24 +7896,30 @@ fn independently_discovered_starting_points(
     })
 }
 
+fn secular_poles(spacing: &Float, n_modes: usize, precision_bits: u32) -> Vec<Float> {
+    (-(n_modes as i64)..=(n_modes as i64))
+        .map(|mode| {
+            let mut pole = spacing.clone();
+            pole *= fl_i(precision_bits, mode);
+            pole
+        })
+        .collect()
+}
+
 fn evaluate_secular_hp(
     xi: &[Float],
-    n_modes: usize,
-    spacing: &Float,
+    poles: &[Float],
     point: &Float,
     precision_bits: u32,
 ) -> Result<Float> {
     let mut value = Float::with_val(precision_bits, 0);
-    for mode in -(n_modes as i64)..=(n_modes as i64) {
-        let index = (mode + n_modes as i64) as usize;
-        let mut pole = spacing.clone();
-        pole *= fl_i(precision_bits, mode);
+    for (weight, pole) in xi.iter().zip(poles) {
         let mut denominator = point.clone();
         denominator -= pole;
         if denominator.is_zero() {
             bail!("independent HP discovery evaluated a secular pole");
         }
-        let mut term = xi[index].clone();
+        let mut term = weight.clone();
         term /= denominator;
         value += term;
     }
@@ -7803,12 +7931,31 @@ fn evaluate_secular_hp(
 /// 128 bits before the configured HP point solver runs. This prevents the
 /// severe loss of source information caused by converting a deep CCM state to
 /// binary64 and makes pole crossing by the subsequent point solver unlikely.
+#[cfg(test)]
 fn discover_secular_roots_hp(
     xi: &[Float],
     n_modes: usize,
     spacing: &Float,
     scan_upper: &Float,
     precision_bits: u32,
+) -> Result<Vec<Float>> {
+    discover_secular_roots_hp_with_extent(
+        xi,
+        n_modes,
+        spacing,
+        scan_upper,
+        precision_bits,
+        RootScanExtent::Complete,
+    )
+}
+
+fn discover_secular_roots_hp_with_extent(
+    xi: &[Float],
+    n_modes: usize,
+    spacing: &Float,
+    scan_upper: &Float,
+    precision_bits: u32,
+    extent: RootScanExtent,
 ) -> Result<Vec<Float>> {
     discover_secular_roots_hp_range(
         xi,
@@ -7817,6 +7964,7 @@ fn discover_secular_roots_hp(
         &Float::with_val(precision_bits, 0),
         scan_upper,
         precision_bits,
+        extent,
     )
 }
 
@@ -7829,7 +7977,15 @@ fn discover_secular_roots_hp_signed(
 ) -> Result<Vec<Float>> {
     let mut lower = Float::with_val(precision_bits, scan_height);
     lower *= -1;
-    discover_secular_roots_hp_range(xi, n_modes, spacing, &lower, scan_height, precision_bits)
+    discover_secular_roots_hp_range(
+        xi,
+        n_modes,
+        spacing,
+        &lower,
+        scan_height,
+        precision_bits,
+        RootScanExtent::Complete,
+    )
 }
 
 fn discover_secular_roots_hp_range(
@@ -7839,44 +7995,60 @@ fn discover_secular_roots_hp_range(
     scan_lower: &Float,
     scan_upper: &Float,
     precision_bits: u32,
+    extent: RootScanExtent,
 ) -> Result<Vec<Float>> {
     if scan_lower >= scan_upper {
         bail!("independent HP discovery requires a nonempty scan interval");
     }
+    let poles = secular_poles(spacing, n_modes, precision_bits);
     let mut boundaries = vec![scan_lower.clone()];
-    for mode in -(n_modes as i64)..=(n_modes as i64) {
-        let mut pole = spacing.clone();
-        pole *= fl_i(precision_bits, mode);
-        if pole > *scan_lower && pole < *scan_upper {
-            boundaries.push(pole);
+    for pole in &poles {
+        if pole > scan_lower && pole < scan_upper {
+            boundaries.push(pole.clone());
         }
     }
     boundaries.push(scan_upper.clone());
 
     let margin_fraction = Float::with_val(precision_bits, 2).pow(-64i32);
-    // Pole intervals do not share state. Parallel indexed collection retains
-    // interval order, while each interval keeps its established sequential
-    // subdivision and bisection arithmetic exactly unchanged.
-    let interval_roots = boundaries
-        .par_windows(2)
-        .map(|interval| {
-            discover_secular_roots_in_interval_hp(
-                xi,
-                n_modes,
-                spacing,
-                interval,
-                &margin_fraction,
-                precision_bits,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+    // Pole intervals do not share state. Scan bounded consecutive chunks so
+    // an ordinary positive prefix can stop once its requested extent exists.
+    // Indexed collection plus sequential Result resolution preserves interval
+    // order and deterministic failure precedence inside every scanned chunk.
+    const INTERVAL_CHUNK_SIZE: usize = 32;
     let mut roots = Vec::new();
-    for root in interval_roots.into_iter().flatten() {
-        if root > *scan_lower
-            && root < *scan_upper
-            && roots.last().is_none_or(|previous| &root > previous)
+    for chunk_start in (0..boundaries.len() - 1).step_by(INTERVAL_CHUNK_SIZE) {
+        let chunk_end = (chunk_start + INTERVAL_CHUNK_SIZE).min(boundaries.len() - 1);
+        let interval_results: Vec<Result<Vec<Float>>> = boundaries[chunk_start..=chunk_end]
+            .par_windows(2)
+            .map(|interval| {
+                discover_secular_roots_in_interval_hp(
+                    xi,
+                    &poles,
+                    interval,
+                    &margin_fraction,
+                    precision_bits,
+                )
+            })
+            .collect();
+        for interval_result in interval_results {
+            for root in interval_result? {
+                if root > *scan_lower
+                    && root < *scan_upper
+                    && roots.last().is_none_or(|previous| &root > previous)
+                {
+                    roots.push(root);
+                }
+            }
+        }
+        if let RootScanExtent::PositivePrefix {
+            minimum_discovered_roots,
+        } = extent
         {
-            roots.push(root);
+            let minimum = minimum_discovered_roots.get();
+            if roots.len() >= minimum {
+                roots.truncate(minimum);
+                break;
+            }
         }
     }
     Ok(roots)
@@ -7891,11 +8063,10 @@ fn discover_secular_roots_hp_sequential_reference(
     precision_bits: u32,
 ) -> Result<Vec<Float>> {
     let mut boundaries = vec![Float::with_val(precision_bits, 0)];
-    for mode in 1..=n_modes {
-        let mut pole = spacing.clone();
-        pole *= mode;
-        if pole < *scan_upper {
-            boundaries.push(pole);
+    let poles = secular_poles(spacing, n_modes, precision_bits);
+    for pole in poles.iter().skip(n_modes + 1) {
+        if pole < scan_upper {
+            boundaries.push(pole.clone());
         }
     }
     boundaries.push(scan_upper.clone());
@@ -7904,8 +8075,7 @@ fn discover_secular_roots_hp_sequential_reference(
     for interval in boundaries.windows(2) {
         for root in discover_secular_roots_in_interval_hp(
             xi,
-            n_modes,
-            spacing,
+            &poles,
             interval,
             &margin_fraction,
             precision_bits,
@@ -7920,8 +8090,7 @@ fn discover_secular_roots_hp_sequential_reference(
 
 fn discover_secular_roots_in_interval_hp(
     xi: &[Float],
-    n_modes: usize,
-    spacing: &Float,
+    poles: &[Float],
     interval: &[Float],
     margin_fraction: &Float,
     precision_bits: u32,
@@ -7946,15 +8115,14 @@ fn discover_secular_roots_in_interval_hp(
 
     let mut roots = Vec::new();
     let mut previous_point = left.clone();
-    let mut previous_value =
-        evaluate_secular_hp(xi, n_modes, spacing, &previous_point, precision_bits)?;
+    let mut previous_value = evaluate_secular_hp(xi, poles, &previous_point, precision_bits)?;
     for subdivision in 1..=SUBDIVISIONS {
         let mut point = right.clone();
         point -= &left;
         point *= subdivision;
         point /= SUBDIVISIONS;
         point += &left;
-        let value = evaluate_secular_hp(xi, n_modes, spacing, &point, precision_bits)?;
+        let value = evaluate_secular_hp(xi, poles, &point, precision_bits)?;
         let changes_sign = previous_value.is_zero()
             || value.is_zero()
             || previous_value.is_sign_positive() != value.is_sign_positive();
@@ -7966,8 +8134,7 @@ fn discover_secular_roots_in_interval_hp(
                 let mut midpoint = bracket_left.clone();
                 midpoint += &bracket_right;
                 midpoint /= 2u32;
-                let midpoint_value =
-                    evaluate_secular_hp(xi, n_modes, spacing, &midpoint, precision_bits)?;
+                let midpoint_value = evaluate_secular_hp(xi, poles, &midpoint, precision_bits)?;
                 if midpoint_value.is_zero() {
                     bracket_left = midpoint.clone();
                     bracket_right = midpoint;
@@ -8621,7 +8788,8 @@ fn measure_evenness_from_retained_source_via_cache(
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
-    let resolved = resolve_or_compute_json_artifact_with_dependencies(
+    let validated_evenness = RefCell::new(None);
+    let _resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
             Ok((
@@ -8650,29 +8818,24 @@ fn measure_evenness_from_retained_source_via_cache(
                     "CCM evenness evidence does not match its semantic identity".to_owned(),
                 ));
             }
-            parse_hp_vector(
+            let values = parse_hp_vector(
                 &[
                     artifact.evenness_deviation.clone(),
                     artifact.natural_eigenvalue.clone(),
                     artifact.forced_eigenvalue.clone(),
                 ],
                 cfg.precision_bits,
-            )
-            .map(|_| ())
+            )?;
+            validated_evenness.replace(Some(EvennessResult {
+                evenness_deviation: values[0].clone(),
+                natural_eigenvalue: values[1].clone(),
+                forced_eigenvalue: values[2].clone(),
+            }));
+            Ok(())
         },
     )?;
-    let values = parse_hp_vector(
-        &[
-            resolved.value.evenness_deviation,
-            resolved.value.natural_eigenvalue,
-            resolved.value.forced_eigenvalue,
-        ],
-        cfg.precision_bits,
-    )?;
-    Ok(EvennessResult {
-        evenness_deviation: values[0].clone(),
-        natural_eigenvalue: values[1].clone(),
-        forced_eigenvalue: values[2].clone(),
+    validated_evenness.into_inner().ok_or_else(|| {
+        anyhow::anyhow!("evenness execution did not retain its validated runtime evidence")
     })
 }
 
@@ -10104,35 +10267,25 @@ fn solve_r_zero(
     }
 }
 
-fn secular_residual_at(
-    xi: &[Float],
-    n_max: usize,
-    two_pi_over_l: &Float,
-    z: &Float,
-    prec: u32,
-) -> Option<Float> {
-    secular_residual_and_scale_at(xi, n_max, two_pi_over_l, z, prec).map(|(residual, _)| residual)
+fn secular_residual_at(xi: &[Float], poles: &[Float], z: &Float, prec: u32) -> Option<Float> {
+    secular_residual_and_scale_at(xi, poles, z, prec).map(|(residual, _)| residual)
 }
 
 fn secular_residual_and_scale_at(
     xi: &[Float],
-    n_max: usize,
-    two_pi_over_l: &Float,
+    poles: &[Float],
     z: &Float,
     prec: u32,
 ) -> Option<(Float, Float)> {
     let mut residual = Float::with_val(prec, 0);
     let mut term_scale = Float::with_val(prec, 0);
-    for j in -(n_max as i64)..=(n_max as i64) {
-        let idx = (j + n_max as i64) as usize;
-        let mut pole = two_pi_over_l.clone();
-        pole *= fl_i(prec, j);
+    for (weight, pole) in xi.iter().zip(poles) {
         let mut denominator = z.clone();
         denominator -= pole;
         if denominator.is_zero() {
             return None;
         }
-        let mut term = xi[idx].clone();
+        let mut term = weight.clone();
         term /= denominator;
         term_scale += Float::with_val(prec, &term).abs();
         residual += term;
@@ -10181,14 +10334,13 @@ fn root_correction_tolerance(value: &Float, prec: u32) -> Float {
 
 fn root_refinement(
     xi: &[Float],
-    n_max: usize,
-    two_pi_over_l: &Float,
+    poles: &[Float],
     value: Float,
     iterations: usize,
     final_correction: Float,
     prec: u32,
 ) -> Option<RootRefinement> {
-    let residual = secular_residual_at(xi, n_max, two_pi_over_l, &value, prec)?;
+    let residual = secular_residual_at(xi, poles, &value, prec)?;
     let achieved_decimal_digits = achieved_decimal_digits(&value, &final_correction, prec);
     Some(RootRefinement {
         value,
@@ -10224,6 +10376,7 @@ fn newton_xi_hat_zero(
         v /= l;
         v
     };
+    let poles = secular_poles(&two_pi_over_l, n_max, prec);
     let mut z = seed.clone();
     if n_steps == 0 {
         return EigenvalueResult::Failed {
@@ -10239,18 +10392,15 @@ fn newton_xi_hat_zero(
         let previous_point = z.clone();
         let mut r = Float::with_val(prec, 0);
         let mut r_prime = Float::with_val(prec, 0);
-        for j in -(n_max as i64)..=(n_max as i64) {
-            let idx = (j + n_max as i64) as usize;
-            let mut pole = two_pi_over_l.clone();
-            pole *= fl_i(prec, j);
+        for (weight, pole) in xi.iter().zip(&poles) {
             let mut den = z.clone();
-            den -= &pole;
-            let mut term = xi[idx].clone();
+            den -= pole;
+            let mut term = weight.clone();
             term /= &den;
             r += &term;
             let mut den_sq = den.clone();
             den_sq.square_mut();
-            let mut dterm = xi[idx].clone();
+            let mut dterm = weight.clone();
             dterm /= &den_sq;
             r_prime -= &dterm;
         }
@@ -10272,7 +10422,7 @@ fn newton_xi_hat_zero(
             .map(|o| o.is_lt())
             .unwrap_or(false)
         {
-            return match root_refinement(xi, n_max, &two_pi_over_l, z, iteration, abs_dz, prec) {
+            return match root_refinement(xi, &poles, z, iteration, abs_dz, prec) {
                 Some(result) => EigenvalueResult::Converged(result),
                 None => EigenvalueResult::Failed {
                     iterations: iteration,
@@ -10292,7 +10442,7 @@ fn newton_xi_hat_zero(
                 .is_some_and(|point| point == &z)
             || nonimproving_steps >= ROOT_STAGNATION_WINDOW
         {
-            return match root_refinement(xi, n_max, &two_pi_over_l, z, iteration, abs_dz, prec) {
+            return match root_refinement(xi, &poles, z, iteration, abs_dz, prec) {
                 Some(result) => EigenvalueResult::Stagnated(result),
                 None => EigenvalueResult::Failed {
                     iterations: iteration,
@@ -10302,7 +10452,7 @@ fn newton_xi_hat_zero(
         }
         point_before_previous = Some(previous_point);
     }
-    match root_refinement(xi, n_max, &two_pi_over_l, z, n_steps, last_correction, prec) {
+    match root_refinement(xi, &poles, z, n_steps, last_correction, prec) {
         Some(result) => EigenvalueResult::Approximate(result),
         None => EigenvalueResult::Failed {
             iterations: n_steps,
@@ -10334,6 +10484,7 @@ fn halley_xi_hat_zero(
         v /= l;
         v
     };
+    let poles = secular_poles(&two_pi_over_l, n_max, prec);
     let mut z = seed.clone();
     if n_steps == 0 {
         return EigenvalueResult::Failed {
@@ -10350,26 +10501,23 @@ fn halley_xi_hat_zero(
         let mut r = Float::with_val(prec, 0);
         let mut r_prime = Float::with_val(prec, 0);
         let mut r_dprime = Float::with_val(prec, 0);
-        for j in -(n_max as i64)..=(n_max as i64) {
-            let idx = (j + n_max as i64) as usize;
-            let mut pole = two_pi_over_l.clone();
-            pole *= fl_i(prec, j);
+        for (weight, pole) in xi.iter().zip(&poles) {
             let mut den = z.clone();
-            den -= &pole;
+            den -= pole;
 
-            let mut term = xi[idx].clone();
+            let mut term = weight.clone();
             term /= &den;
             r += &term;
 
             let mut den2 = den.clone();
             den2.square_mut();
-            let mut dt = xi[idx].clone();
+            let mut dt = weight.clone();
             dt /= &den2;
             r_prime -= &dt;
 
             let mut den3 = den2.clone();
             den3 *= &den;
-            let mut ddt = xi[idx].clone();
+            let mut ddt = weight.clone();
             ddt /= &den3;
             ddt *= 2u32;
             r_dprime += &ddt;
@@ -10403,7 +10551,7 @@ fn halley_xi_hat_zero(
             .map(|o| o.is_lt())
             .unwrap_or(false)
         {
-            return match root_refinement(xi, n_max, &two_pi_over_l, z, iteration, abs_dz, prec) {
+            return match root_refinement(xi, &poles, z, iteration, abs_dz, prec) {
                 Some(result) => EigenvalueResult::Converged(result),
                 None => EigenvalueResult::Failed {
                     iterations: iteration,
@@ -10423,7 +10571,7 @@ fn halley_xi_hat_zero(
                 .is_some_and(|point| point == &z)
             || nonimproving_steps >= ROOT_STAGNATION_WINDOW
         {
-            return match root_refinement(xi, n_max, &two_pi_over_l, z, iteration, abs_dz, prec) {
+            return match root_refinement(xi, &poles, z, iteration, abs_dz, prec) {
                 Some(result) => EigenvalueResult::Stagnated(result),
                 None => EigenvalueResult::Failed {
                     iterations: iteration,
@@ -10433,7 +10581,7 @@ fn halley_xi_hat_zero(
         }
         point_before_previous = Some(previous_point);
     }
-    match root_refinement(xi, n_max, &two_pi_over_l, z, n_steps, last_correction, prec) {
+    match root_refinement(xi, &poles, z, n_steps, last_correction, prec) {
         Some(result) => EigenvalueResult::Approximate(result),
         None => EigenvalueResult::Failed {
             iterations: n_steps,
@@ -11017,10 +11165,8 @@ mod tau_cache {
             (s, FileKind::Part)
         } else if let Some(s) = name.strip_suffix(".json.zip") {
             (s, FileKind::Zip)
-        } else if let Some(s) = name.strip_suffix(".json") {
-            (s, FileKind::Json)
         } else {
-            return None;
+            (name.strip_suffix(".json")?, FileKind::Json)
         };
         let after_lsq = stem.strip_prefix("lambda_sq")?;
         let (lsq_str, rest) = after_lsq.split_once("_nmodes")?;
@@ -11549,6 +11695,14 @@ mod weil_eigvec_cache {
         Some(rel)
     }
 
+    pub(super) fn residual_within_precision_floor(residual: &Float, prec: u32) -> bool {
+        let floor = Float::with_val(prec, 2).pow(-((prec as i32) - 32));
+        residual
+            .cmp_abs(&floor)
+            .map(|ordering| ordering.is_lt())
+            .unwrap_or(false)
+    }
+
     pub(super) fn residual_ok(
         tau: &[Float],
         dim: usize,
@@ -11559,8 +11713,7 @@ mod weil_eigvec_cache {
         let Some(rel) = relative_residual_norm(tau, dim, xi, eps_n, prec) else {
             return false;
         };
-        let floor = Float::with_val(prec, 2).pow(-((prec as i32) - 32));
-        rel.cmp_abs(&floor).map(|o| o.is_lt()).unwrap_or(false)
+        residual_within_precision_floor(&rel, prec)
     }
 
     /// Test-only accessor for `parse_json` (lets version-rejection tests
@@ -11775,6 +11928,256 @@ mod weil_eigvec_cache {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn parallel_hp_codecs_preserve_order_precision_and_lowest_error() {
+        for precision_bits in [128, 512] {
+            let decode_threshold = hp_vector_parallel_decode_min_entries(precision_bits);
+            let encode_threshold = if precision_bits >= HP_VECTOR_HIGH_PRECISION_BITS {
+                HP_VECTOR_PARALLEL_ENCODE_MIN_HIGH_PRECISION
+            } else {
+                HP_VECTOR_PARALLEL_ENCODE_MIN_LOW_PRECISION
+            };
+            let mut lengths = vec![
+                decode_threshold - 1,
+                decode_threshold,
+                decode_threshold + 1,
+                encode_threshold - 1,
+                encode_threshold,
+                encode_threshold + 1,
+            ];
+            lengths.sort_unstable();
+            lengths.dedup();
+            for length in lengths {
+                let values = (0..length)
+                    .map(|index| {
+                        let mut value = Float::with_val(precision_bits, index + 1);
+                        value /= length + 1;
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                let serial_encoded = values.iter().map(Float::to_string).collect::<Vec<_>>();
+                let encoded = encode_hp_vector(&values);
+                assert_eq!(encoded, serial_encoded);
+                let decoded = parse_hp_vector(&encoded, precision_bits).unwrap();
+                assert_eq!(decoded, values);
+                assert!(decoded.iter().all(|value| value.prec() == precision_bits));
+            }
+        }
+
+        let precision_bits = 512;
+        let batch_entries = hp_vector_decode_batch_entries(precision_bits);
+        let first_bad = hp_vector_parallel_decode_min_entries(precision_bits);
+        let mut malformed = vec!["1.25".to_owned(); 2 * batch_entries + 32];
+        malformed[first_bad] = "not-a-number".to_owned();
+        malformed[2 * batch_entries] = "also-not-a-number".to_owned();
+        let expected = parse_hp_scalar(&malformed[first_bad], precision_bits)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            parse_hp_vector(&malformed, precision_bits)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn parallel_hp_codecs_match_in_single_and_multi_thread_pools() {
+        let precision_bits = 384;
+        let values = (0..(HP_VECTOR_PARALLEL_ENCODE_MIN_HIGH_PRECISION + 37))
+            .map(|index| {
+                let mut value = Float::with_val(precision_bits, index + 1);
+                value /= 7u32;
+                value
+            })
+            .collect::<Vec<_>>();
+        let run = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let encoded = encode_hp_vector(&values);
+                    let decoded = parse_hp_vector(&encoded, precision_bits).unwrap();
+                    (encoded, decoded)
+                })
+        };
+        let single = run(1);
+        let parallel = run(4);
+        assert_eq!(single, parallel);
+    }
+
+    #[test]
+    fn borrowed_dense_parallel_rows_match_the_serial_oracle() {
+        for precision_bits in [128, 384] {
+            for dimension in [
+                BORROWED_DENSE_PARALLEL_MIN_DIMENSION - 1,
+                BORROWED_DENSE_PARALLEL_MIN_DIMENSION,
+                BORROWED_DENSE_PARALLEL_MIN_DIMENSION + 1,
+            ] {
+                let entries = (0..dimension * dimension)
+                    .map(|index| {
+                        let mut value = Float::with_val(precision_bits, index + 1);
+                        value /= dimension * dimension + 1;
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                let x = (0..dimension)
+                    .map(|index| Float::with_val(precision_bits, index + 2))
+                    .collect::<Vec<_>>();
+                let serial = entries
+                    .chunks_exact(dimension)
+                    .map(|row| {
+                        let mut sum = Float::with_val(precision_bits, 0);
+                        for (entry, component) in row.iter().zip(&x) {
+                            let mut term = Float::with_val(precision_bits, entry);
+                            term *= component;
+                            sum += term;
+                        }
+                        sum
+                    })
+                    .collect::<Vec<_>>();
+                let operator = BorrowedDenseSymmetricHp {
+                    name: "test",
+                    dimension,
+                    entries: &entries,
+                    precision_bits,
+                };
+                for threads in [1, 4] {
+                    let mut actual = vec![Float::with_val(precision_bits, 0); dimension];
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap()
+                        .install(|| operator.apply(&x, &mut actual))
+                        .unwrap();
+                    assert_eq!(actual, serial);
+                }
+
+                let mut output = vec![Float::with_val(precision_bits, 0); dimension];
+                assert!(matches!(
+                    operator.apply(&x[..dimension - 1], &mut output),
+                    Err(OperatorError::DimensionMismatch { .. })
+                ));
+                assert!(matches!(
+                    operator.apply(&x, &mut output[..dimension - 1]),
+                    Err(OperatorError::DimensionMismatch { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode threshold benchmark"]
+    fn benchmark_parallel_hp_threshold_candidates() {
+        use std::hint::black_box;
+
+        for precision_bits in [128, 512] {
+            for length in [1_024, 4_096, 16_384, 65_536] {
+                let values = (0..length)
+                    .map(|index| {
+                        let mut value = Float::with_val(precision_bits, index + 1);
+                        value /= 7u32;
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                let strings = values.iter().map(Float::to_string).collect::<Vec<_>>();
+                let measure = |operation: &mut dyn FnMut()| {
+                    let mut samples = Vec::new();
+                    operation();
+                    for _ in 0..3 {
+                        let started = Instant::now();
+                        operation();
+                        samples.push(started.elapsed().as_nanos());
+                    }
+                    samples.sort_unstable();
+                    samples[1]
+                };
+                let serial_encode = measure(&mut || {
+                    black_box(values.iter().map(Float::to_string).collect::<Vec<_>>());
+                });
+                let parallel_encode = measure(&mut || {
+                    black_box(values.par_iter().map(Float::to_string).collect::<Vec<_>>());
+                });
+                let serial_decode = measure(&mut || {
+                    black_box(
+                        strings
+                            .iter()
+                            .map(|value| parse_hp_scalar(value, precision_bits))
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                            .unwrap(),
+                    );
+                });
+                let parallel_decode = measure(&mut || {
+                    black_box(
+                        strings
+                            .par_iter()
+                            .map(|value| parse_hp_scalar(value, precision_bits))
+                            .collect::<Vec<_>>(),
+                    );
+                });
+                eprintln!(
+                    "codec precision={precision_bits} length={length} encode_ns={serial_encode}/{parallel_encode} decode_ns={serial_decode}/{parallel_decode}"
+                );
+            }
+        }
+
+        for precision_bits in [128, 512] {
+            for dimension in [64, 128, 256, 512] {
+                let entries = (0..dimension * dimension)
+                    .map(|index| Float::with_val(precision_bits, index + 1))
+                    .collect::<Vec<_>>();
+                let x = vec![Float::with_val(precision_bits, 1); dimension];
+                let measure = |operation: &mut dyn FnMut()| {
+                    let mut samples = Vec::new();
+                    operation();
+                    for _ in 0..3 {
+                        let started = Instant::now();
+                        operation();
+                        samples.push(started.elapsed().as_nanos());
+                    }
+                    samples.sort_unstable();
+                    samples[1]
+                };
+                let serial = measure(&mut || {
+                    black_box(
+                        entries
+                            .chunks_exact(dimension)
+                            .map(|row| {
+                                let mut sum = Float::with_val(precision_bits, 0);
+                                for (entry, component) in row.iter().zip(&x) {
+                                    let mut term = Float::with_val(precision_bits, entry);
+                                    term *= component;
+                                    sum += term;
+                                }
+                                sum
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                });
+                let parallel = measure(&mut || {
+                    black_box(
+                        entries
+                            .par_chunks_exact(dimension)
+                            .map(|row| {
+                                let mut sum = Float::with_val(precision_bits, 0);
+                                for (entry, component) in row.iter().zip(&x) {
+                                    let mut term = Float::with_val(precision_bits, entry);
+                                    term *= component;
+                                    sum += term;
+                                }
+                                sum
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                });
+                eprintln!(
+                    "operator precision={precision_bits} dimension={dimension} apply_ns={serial}/{parallel}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn legacy_eigenstate_payload_keeps_its_established_json_shape() {
@@ -12301,6 +12704,272 @@ mod tests {
     }
 
     #[test]
+    fn retained_secular_poles_preserve_local_construction_and_accumulators() {
+        let precision = 256;
+        let n_modes = 4;
+        let spacing = Float::with_val(precision, Float::parse("1.75").unwrap());
+        let poles = secular_poles(&spacing, n_modes, precision);
+        for (index, mode) in (-(n_modes as i64)..=(n_modes as i64)).enumerate() {
+            let mut expected = spacing.clone();
+            expected *= fl_i(precision, mode);
+            assert_eq!(poles[index], expected);
+        }
+        let xi = (0..poles.len())
+            .map(|index| Float::with_val(precision, index + 1))
+            .collect::<Vec<_>>();
+        let point = Float::with_val(precision, Float::parse("0.625").unwrap());
+
+        let mut old_value = Float::with_val(precision, 0);
+        let mut old_residual = Float::with_val(precision, 0);
+        let mut old_scale = Float::with_val(precision, 0);
+        let mut old_first_derivative = Float::with_val(precision, 0);
+        let mut old_second_derivative = Float::with_val(precision, 0);
+        for (index, mode) in (-(n_modes as i64)..=(n_modes as i64)).enumerate() {
+            let mut pole = spacing.clone();
+            pole *= fl_i(precision, mode);
+            let mut denominator = point.clone();
+            denominator -= pole;
+            let mut term = xi[index].clone();
+            term /= &denominator;
+            old_value += &term;
+            old_residual += &term;
+            old_scale += Float::with_val(precision, &term).abs();
+            let mut denominator_squared = denominator.clone();
+            denominator_squared.square_mut();
+            let mut first = xi[index].clone();
+            first /= &denominator_squared;
+            old_first_derivative -= first;
+            let mut denominator_cubed = denominator_squared;
+            denominator_cubed *= denominator;
+            let mut second = xi[index].clone();
+            second /= denominator_cubed;
+            second *= 2u32;
+            old_second_derivative += second;
+        }
+        assert_eq!(
+            evaluate_secular_hp(&xi, &poles, &point, precision).unwrap(),
+            old_value
+        );
+        assert_eq!(
+            secular_residual_and_scale_at(&xi, &poles, &point, precision).unwrap(),
+            (old_residual.abs(), old_scale)
+        );
+
+        let mut retained_first = Float::with_val(precision, 0);
+        let mut retained_second = Float::with_val(precision, 0);
+        for (weight, pole) in xi.iter().zip(&poles) {
+            let mut denominator = point.clone();
+            denominator -= pole;
+            let mut denominator_squared = denominator.clone();
+            denominator_squared.square_mut();
+            let mut first = weight.clone();
+            first /= &denominator_squared;
+            retained_first -= first;
+            let mut denominator_cubed = denominator_squared;
+            denominator_cubed *= denominator;
+            let mut second = weight.clone();
+            second /= denominator_cubed;
+            second *= 2u32;
+            retained_second += second;
+        }
+        assert_eq!(retained_first, old_first_derivative);
+        assert_eq!(retained_second, old_second_derivative);
+        assert_eq!(
+            evaluate_secular_hp(&xi, &poles, &poles[n_modes], precision)
+                .unwrap_err()
+                .to_string(),
+            "independent HP discovery evaluated a secular pole"
+        );
+        assert!(secular_residual_and_scale_at(&xi, &poles, &poles[n_modes], precision).is_none());
+    }
+
+    #[test]
+    fn bounded_positive_discovery_is_the_exact_complete_prefix_across_thread_counts() {
+        let precision = 192;
+        let n_modes = 40;
+        let spacing = Float::with_val(precision, Float::parse("1.75").unwrap());
+        let mut scan_upper = spacing.clone();
+        scan_upper *= n_modes;
+        let xi = (0..(2 * n_modes + 1))
+            .map(|index| {
+                let mut value = Float::with_val(precision, index + 1);
+                if index % 3 == 0 {
+                    value *= -1;
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        let complete = discover_secular_roots_hp_with_extent(
+            &xi,
+            n_modes,
+            &spacing,
+            &scan_upper,
+            precision,
+            RootScanExtent::Complete,
+        )
+        .unwrap();
+        assert!(complete.len() > 4);
+        for limit in [1, 4, complete.len().min(35)] {
+            for threads in [1, 4] {
+                let bounded = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        discover_secular_roots_hp_with_extent(
+                            &xi,
+                            n_modes,
+                            &spacing,
+                            &scan_upper,
+                            precision,
+                            RootScanExtent::PositivePrefix {
+                                minimum_discovered_roots: NonZeroUsize::new(limit).unwrap(),
+                            },
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(bounded, complete[..limit]);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_sign_discovery_does_not_assume_one_root_per_interval() {
+        let precision = 192;
+        let n_modes = 8;
+        let spacing = Float::with_val(precision, 1);
+        let xi = [
+            "0.0838428758044778",
+            "-11.060912332378521",
+            "50.81904449531687",
+            "22.40329526161649",
+            "-0.05541470984448846",
+            "0.03044807489627278",
+            "38.220958898886906",
+            "1.0736655095381538",
+            "-0.16348354397905962",
+            "24.254351864780162",
+            "2.269912058272475",
+            "-0.8335043909722005",
+            "0.45420927384009574",
+            "-0.29410020397065056",
+            "0.022175343656176506",
+            "-12.994825739790933",
+            "0.30345246282590554",
+        ]
+        .iter()
+        .map(|value| Float::with_val(precision, Float::parse(value).unwrap()))
+        .collect::<Vec<_>>();
+        let poles = secular_poles(&spacing, n_modes, precision);
+        let zero = Float::with_val(precision, 0);
+        let scan_upper = Float::with_val(precision, n_modes);
+        let mut boundaries = vec![zero.clone()];
+        boundaries.extend(
+            poles
+                .iter()
+                .filter(|pole| *pole > &zero && *pole < &scan_upper)
+                .cloned(),
+        );
+        boundaries.push(scan_upper.clone());
+        let margin_fraction = Float::with_val(precision, 2).pow(-64i32);
+        let interval_counts = boundaries
+            .windows(2)
+            .map(|interval| {
+                discover_secular_roots_in_interval_hp(
+                    &xi,
+                    &poles,
+                    interval,
+                    &margin_fraction,
+                    precision,
+                )
+                .unwrap()
+                .len()
+            })
+            .collect::<Vec<_>>();
+        assert!(interval_counts.contains(&0));
+        assert!(interval_counts.contains(&1));
+        assert!(interval_counts.iter().any(|count| *count > 1));
+
+        let complete = discover_secular_roots_hp_with_extent(
+            &xi,
+            n_modes,
+            &spacing,
+            &scan_upper,
+            precision,
+            RootScanExtent::Complete,
+        )
+        .unwrap();
+        let bounded = discover_secular_roots_hp_with_extent(
+            &xi,
+            n_modes,
+            &spacing,
+            &scan_upper,
+            precision,
+            RootScanExtent::PositivePrefix {
+                minimum_discovered_roots: NonZeroUsize::new(3).unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(bounded, complete[..3]);
+    }
+
+    #[test]
+    fn ordinary_index_range_scans_through_last_but_stores_only_requested_slice() {
+        let precision = 192;
+        let params = CcmParams::from_lambda_sq_integer(13, 8);
+        let l = Float::with_val(precision, 13).ln();
+        let xi = vec![Float::with_val(precision, 1); params.matrix_size()];
+        let mut spacing = pi(precision);
+        spacing *= 2u32;
+        spacing /= &l;
+        let mut maximum = spacing.clone();
+        maximum *= params.n_modes;
+        let complete =
+            discover_secular_roots_hp(&xi, params.n_modes, &spacing, &maximum, precision).unwrap();
+        let plan = independently_discovered_starting_points(
+            &params,
+            &l,
+            &xi,
+            &ZeroTarget::IndexRange { first: 3, last: 6 },
+            IndependentRootDiscoveryOptions::default(),
+            precision,
+        )
+        .unwrap();
+        assert_eq!(plan.result_first_root_index, 3);
+        assert_eq!(plan.artifact_seeds, complete[2..6]);
+        assert_eq!(plan.artifact_seeds.len(), 4);
+
+        let error = independently_discovered_starting_points(
+            &params,
+            &l,
+            &xi,
+            &ZeroTarget::FirstK { count: 20 },
+            IndependentRootDiscoveryOptions::default(),
+            precision,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "independent HP discovery found only {} positive roots, but target requests 20; enable the explicit incomplete-window policy or increase finite reach",
+                complete.len()
+            )
+        );
+
+        let advanced = independently_discovered_starting_points(
+            &params,
+            &l,
+            &xi,
+            &ZeroTarget::FirstK { count: 2 },
+            IndependentRootDiscoveryOptions::advanced(false, true),
+            precision,
+        )
+        .unwrap();
+        assert_eq!(advanced.artifact_seeds, complete);
+        assert_eq!(advanced.selected_positions, vec![0, 1]);
+    }
+
+    #[test]
     fn parallel_root_refinement_is_bit_identical_to_seed_order_reference() {
         let precision = 256;
         let params = CcmParams::from_lambda_sq_integer(13, 5);
@@ -12480,19 +13149,13 @@ mod tests {
         let mut two_pi_over_l = pi(cfg.precision_bits);
         two_pi_over_l *= 2u32;
         two_pi_over_l /= &l;
+        let poles = secular_poles(&two_pi_over_l, params.n_modes, cfg.precision_bits);
         let result = RootRefinement {
             value: value.clone(),
             diagnostics: RootRefinementDiagnostics {
                 iterations: 17,
                 final_correction: correction.clone(),
-                residual: secular_residual_at(
-                    &xi,
-                    params.n_modes,
-                    &two_pi_over_l,
-                    &value,
-                    cfg.precision_bits,
-                )
-                .unwrap(),
+                residual: secular_residual_at(&xi, &poles, &value, cfg.precision_bits).unwrap(),
                 achieved_decimal_digits: achieved_decimal_digits(
                     &value,
                     &correction,

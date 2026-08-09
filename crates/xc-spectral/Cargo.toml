@@ -31,6 +31,9 @@ xc-cache = { workspace = true }
 xc-operator = { workspace = true, optional = true, features = ["hp"] }
 xc-solver = { workspace = true, optional = true }
 
+[dev-dependencies]
+xc-cache = { workspace = true, features = ["test-support"] }
+
 [build-dependencies]
 cc = "1.2"
 

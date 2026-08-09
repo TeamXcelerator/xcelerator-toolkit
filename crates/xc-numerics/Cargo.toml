@@ -25,3 +25,6 @@ serde_json = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
 xc-core = { workspace = true }
 xc-cache = { workspace = true, optional = true }
+
+[dev-dependencies]
+xc-cache = { workspace = true, features = ["test-support"] }
