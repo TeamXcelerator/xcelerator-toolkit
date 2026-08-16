@@ -143,7 +143,7 @@ fn run() -> Result<(), CliError> {
     }
 }
 
-const USAGE: &str = r#"Xcelerator Toolkit v0.13.4
+const USAGE: &str = r#"Xcelerator Toolkit v0.13.5
 
 Usage:
   xc cache auth-probe OWNER/REPOSITORY

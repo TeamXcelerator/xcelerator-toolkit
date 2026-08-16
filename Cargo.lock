@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "xc-cache"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "fs2",
  "rayon",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "xc-certify"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "rug",
  "serde",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "xc-cli"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "xc-core"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "xc-numerics"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "anyhow",
  "rayon",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "xc-operator"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "rayon",
  "rug",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "xc-root"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "rayon",
  "rug",
@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "xc-solver"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "nalgebra",
  "rug",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "xc-spectral"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "anyhow",
  "cc",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "xc-variational"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "rug",
  "serde",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "xc-zeta"
-version = "0.13.4"
+version = "0.13.5"
 dependencies = [
  "anyhow",
  "rug",

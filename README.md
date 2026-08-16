@@ -7,9 +7,10 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-Version 0.13.4 preserves the v0.13.x APIs and existing cache artifacts while
-adding isolated cache-output validation and payload-preserving high-precision
-CCM performance improvements.
+Version 0.13.5 preserves existing cache artifacts and mathematical behavior
+while reducing high-precision CCM construction overhead, adding opt-in
+performance evidence, and introducing a guarded experimental Gauss--Legendre
+schedule. Established scheduling remains the default.
 
 ---
 
@@ -45,7 +46,7 @@ If you use Xcelerator Toolkit in research, please cite the exact version or Git 
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.13.4},
+  version = {0.13.5},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }
@@ -188,6 +189,53 @@ arguments, cache modes, and Rayon worker counts; `HighPrecResult::elapsed_second
 reports the primary toolkit duration, and `XC_CACHE_MODE=verify` remains the
 acceptance authority for payload identity.
 
+Version 0.13.5 extends this payload-preserving work in three areas:
+
+- CCM pole, archimedean, prime, and fused component matrices are written
+  directly into their final row slots, eliminating full-size coordinate and
+  result collections while retaining each entry's established MPFR statement
+  order;
+- an opt-in process-wide performance sidecar separates cache resolution,
+  high-precision construction, validation, encoding, and storage without
+  entering artifacts or provenance; and
+- an experimental native-Linux Gauss--Legendre schedule can occupy otherwise
+  idle Rayon workers inside a single large table without nesting it beneath
+  table-level parallelism.
+
+The release does not change mathematical semantic keys, artifact schemas,
+precision targets, solver selection, convergence rules, or default scheduling.
+Existing compatible artifacts remain reusable. The new scheduling field is
+default-false and omitted from serialized runtime policy at that value, so the
+established provenance representation is also preserved.
+
+Set `XC_PERF_REPORT` to an ignored `*.performance.json` path to capture a
+process-wide stage breakdown for controlled before-and-after measurements. The
+sidecar separates high-precision CCM, Gauss-Legendre construction and codecs,
+component assembly, artifact computation, encoding, validation, and local
+storage without changing cache or artifact identity. See
+[performance reporting](docs/PERFORMANCE_REPORTING.md).
+
+Cold CCM runs whose Gauss--Legendre batch contains too few distinct tables to
+occupy Rayon can opt into root-level parallelism through
+`HpRuntimePolicy::parallel_gl_roots`. The default is `false`. The owning batch
+planner selects table parallelism or root parallelism, never both, and records
+the selected schedule in performance output and the requested policy in the
+execution fingerprint. The default `false` value is omitted from serialized
+runtime policy, preserving the established provenance representation and cache
+semantics; the opt-in schedule therefore needs a cold cache for a meaningful
+construction benchmark. This option requires native-Linux qualification and
+is not supported for WSL, where concurrent GMP allocation has exhibited
+non-deterministic allocator failures. The numerical runtime fails closed when
+this policy is requested on WSL, Windows, or macOS:
+
+```rust
+let mut policy = xc_core::HpRuntimePolicy::default();
+policy.parallel_gl_roots = true;
+xc_numerics::hp_runtime::run_hp_with_policy(&policy, || {
+    // Invoke the high-precision workflow here.
+})?;
+```
+
 ## Validation
 
 Release checks run locally; the repository does not require a hosted GitHub Actions workflow. The core public checks use standard Cargo commands:
@@ -209,8 +257,10 @@ Saved results record the toolkit version, source revision, numerical backend, pr
 ## Documentation
 
 - [Toolkit documentation](docs/README.md)
+- [Release notes](docs/RELEASE_NOTES.md)
 - [Research workflows](docs/RESEARCH_WORKFLOWS.md)
 - [Cache output validation](docs/OUTPUT_VALIDATION.md)
+- [Performance reporting](docs/PERFORMANCE_REPORTING.md)
 - [CLI reference](docs/CLI.md)
 - [Security policy](SECURITY.md)
 

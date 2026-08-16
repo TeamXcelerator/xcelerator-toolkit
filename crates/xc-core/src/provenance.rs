@@ -361,7 +361,19 @@ pub struct HpRuntimePolicy {
     pub worker_threads: Option<usize>,
     pub stack_bytes: Option<usize>,
     pub sequential_precompute: bool,
+    /// Opt in to root-level Gauss--Legendre parallelism when a precompute
+    /// batch does not contain enough independent tables to occupy Rayon.
+    ///
+    /// The default remains the v0.13.4 table-parallel, root-serial schedule.
+    /// Callers must qualify this mode on their native-Linux production host.
+    /// The numerical runtime rejects it on WSL, Windows, and macOS.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub parallel_gl_roots: bool,
     pub issue_reference: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Default for HpRuntimePolicy {
@@ -371,6 +383,7 @@ impl Default for HpRuntimePolicy {
             worker_threads: None,
             stack_bytes: None,
             sequential_precompute: false,
+            parallel_gl_roots: false,
             issue_reference: None,
         }
     }
@@ -387,6 +400,7 @@ impl HpRuntimePolicy {
             worker_threads: Some(worker_threads),
             stack_bytes: Some(stack_bytes),
             sequential_precompute: true,
+            parallel_gl_roots: false,
             issue_reference: Some(issue_reference.into()),
         };
         policy.validate()?;
@@ -405,6 +419,7 @@ impl HpRuntimePolicy {
                 self.worker_threads.is_some_and(|value| value > 0)
                     && self.stack_bytes.is_some_and(|value| value >= 1024 * 1024)
                     && self.sequential_precompute
+                    && !self.parallel_gl_roots
                     && self
                         .issue_reference
                         .as_deref()
@@ -423,7 +438,11 @@ impl HpRuntimePolicy {
         match self.mode {
             HpRuntimeMode::FullParallel => ThreadPolicyFingerprint {
                 thread_count: full_parallel_threads,
-                scheduling_policy: "hp_full_parallel".to_owned(),
+                scheduling_policy: if self.parallel_gl_roots {
+                    "hp_full_parallel_planned_gl_roots".to_owned()
+                } else {
+                    "hp_full_parallel".to_owned()
+                },
                 reduction_policy: "deterministic_indexed".to_owned(),
             },
             HpRuntimeMode::SafeCapped => ThreadPolicyFingerprint {
@@ -1143,6 +1162,47 @@ mod tests {
             .unwrap()
             .thread_policy = HpRuntimePolicy::default().thread_policy(8);
         assert!(mismatched.validate_saved_result().is_err());
+    }
+
+    #[test]
+    fn older_hp_runtime_policy_json_defaults_parallel_gl_roots_to_false() {
+        let policy: HpRuntimePolicy = serde_json::from_value(serde_json::json!({
+            "mode": "full_parallel",
+            "worker_threads": null,
+            "stack_bytes": null,
+            "sequential_precompute": false,
+            "issue_reference": null
+        }))
+        .unwrap();
+        assert!(!policy.parallel_gl_roots);
+        assert_eq!(
+            policy.thread_policy(8).scheduling_policy,
+            "hp_full_parallel"
+        );
+        let encoded = serde_json::to_value(&policy).unwrap();
+        assert!(encoded.get("parallel_gl_roots").is_none());
+    }
+
+    #[test]
+    fn parallel_gl_roots_is_fingerprint_visible_and_safe_mode_forbids_it() {
+        let full = HpRuntimePolicy {
+            parallel_gl_roots: true,
+            ..HpRuntimePolicy::default()
+        };
+        full.validate().unwrap();
+        assert_eq!(
+            full.thread_policy(8).scheduling_policy,
+            "hp_full_parallel_planned_gl_roots"
+        );
+        assert_eq!(
+            serde_json::to_value(&full).unwrap()["parallel_gl_roots"],
+            serde_json::json!(true)
+        );
+
+        let mut safe =
+            HpRuntimePolicy::safe_capped(2, 64 * 1024 * 1024, "test-instability").unwrap();
+        safe.parallel_gl_roots = true;
+        assert!(safe.validate().is_err());
     }
 
     #[test]

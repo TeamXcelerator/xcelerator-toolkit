@@ -27,4 +27,5 @@ xc-core = { workspace = true }
 xc-cache = { workspace = true, optional = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 xc-cache = { workspace = true, features = ["test-support"] }

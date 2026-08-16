@@ -47,6 +47,39 @@ const HP_VECTOR_DECODE_BATCH_HIGH_PRECISION: usize = 4_096;
 // Both 128- and 512-bit release measurements crossed over by dimension 256.
 const BORROWED_DENSE_PARALLEL_MIN_DIMENSION: usize = 256;
 
+fn ccm_performance_metadata(
+    operation: &str,
+    dimension: usize,
+    precision_bits: u32,
+) -> xc_core::PerformanceStageMetadata {
+    let mut metadata = xc_core::PerformanceStageMetadata::matrix(
+        dimension,
+        precision_bits,
+        rayon::current_num_threads(),
+    );
+    metadata.operation = Some(operation.to_owned());
+    metadata.hp_runtime_mode =
+        Some(xc_numerics::hp_runtime::active_runtime_mode_label().to_owned());
+    metadata
+}
+
+fn gl_batch_performance_metadata(
+    table_orders: &[usize],
+    precision_bits: u32,
+    plan: xc_numerics::hp_runtime::GlPrecomputePlan,
+) -> xc_core::PerformanceStageMetadata {
+    let mut metadata = xc_core::PerformanceStageMetadata::gl_batch(
+        table_orders.to_vec(),
+        precision_bits,
+        rayon::current_num_threads(),
+        plan.label(),
+    );
+    metadata.operation = Some("ccm.gauss_legendre_precompute".to_owned());
+    metadata.hp_runtime_mode =
+        Some(xc_numerics::hp_runtime::active_runtime_mode_label().to_owned());
+    metadata
+}
+
 fn hp_vector_parallel_encode_min_entries(values: &[Float]) -> usize {
     if values
         .first()
@@ -393,7 +426,11 @@ struct ComputedCcmMatrixComponents {
 }
 
 fn assemble_tau_components(components: &ComputedCcmMatrixComponents, prec: u32) -> Vec<Float> {
-    components
+    let dimension = components.pole.len().isqrt();
+    let performance = xc_core::performance_stage_with("ccm.tau.assemble", || {
+        ccm_performance_metadata("ccm.tau.assemble", dimension, prec)
+    });
+    let tau = components
         .pole
         .iter()
         .zip(&components.archimedean)
@@ -404,7 +441,9 @@ fn assemble_tau_components(components: &ComputedCcmMatrixComponents, prec: u32) 
             value -= prime;
             value
         })
-        .collect()
+        .collect();
+    drop(performance);
+    tau
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -8180,6 +8219,9 @@ fn run_inner_retaining_source(
     let start = Instant::now();
     let prec = cfg.precision_bits;
     let dim = params.matrix_size();
+    let _performance_primary = xc_core::performance_top_level_stage_with("ccm.hp.primary", || {
+        ccm_performance_metadata("ccm.hp.primary", dim, prec)
+    });
     if cfg.eigenstate_solver == CcmEigenstateSolver::ShiftInvertKrylov
         && matches!(&cache_route, CcmCacheRoute::Standalone)
     {
@@ -8190,6 +8232,9 @@ fn run_inner_retaining_source(
 
     let l = log_lambda_sq_hp(params, prec);
     let tau_started = Instant::now();
+    let performance_tau = xc_core::performance_stage_with("ccm.hp.tau", || {
+        ccm_performance_metadata("ccm.hp.tau", dim, prec)
+    });
     let (mut tau, tau_manifest) = match &cache_route {
         CcmCacheRoute::Standalone => (build_tau_hp(params, &l, cfg)?, None),
         CcmCacheRoute::Fabric(cache) => {
@@ -8201,6 +8246,7 @@ fn run_inner_retaining_source(
         "[HP] phase timing: tau construction/reuse={:.3}s",
         tau_started.elapsed().as_secs_f64()
     );
+    drop(performance_tau);
 
     // Force exact symmetry of the τ-matrix (parallel compute, sequential write).
     force_symmetric(&mut tau, dim);
@@ -8216,6 +8262,9 @@ fn run_inner_retaining_source(
     // residual validation (the strongest integrity test for ξ).
     //
     let eigenstate_started = Instant::now();
+    let performance_eigenstate = xc_core::performance_stage_with("ccm.hp.eigenstate", || {
+        ccm_performance_metadata("ccm.hp.eigenstate", dim, prec)
+    });
     let parity_policy = cfg.effective_parity_policy();
     let (eps_n, xi, inverse_iteration_diagnostics, eigenpair_manifest, resolved_eigenstate_solver) =
         if let CcmCacheRoute::Fabric(cache) = &cache_route {
@@ -8385,6 +8434,7 @@ fn run_inner_retaining_source(
         "[HP] phase timing: Weil eigenstate construction/reuse={:.3}s",
         eigenstate_started.elapsed().as_secs_f64()
     );
+    drop(performance_eigenstate);
 
     if !weil_eigvec_cache::residual_ok(&tau, dim, &xi, &eps_n, prec) {
         bail!(
@@ -8418,6 +8468,9 @@ fn run_inner_retaining_source(
     // source; the explicitly seeded API is retained for post-discovery
     // comparison and refinement.
     let roots_started = Instant::now();
+    let performance_roots = xc_core::performance_stage_with("ccm.hp.roots", || {
+        ccm_performance_metadata("ccm.hp.roots", dim, prec)
+    });
     let (
         artifact_first_root_index,
         artifact_seeds,
@@ -8562,6 +8615,7 @@ fn run_inner_retaining_source(
         "[HP] phase timing: root discovery/refinement={:.3}s",
         roots_started.elapsed().as_secs_f64()
     );
+    drop(performance_roots);
     if !projected_root_window {
         if let (CcmCacheRoute::Fabric(cache), Some(root_manifest)) = (&cache_route, &root_manifest)
         {
@@ -9337,10 +9391,13 @@ fn build_tau_hp_compute_exact(
     Ok(assemble_tau_components(&components, cfg.precision_bits))
 }
 
-fn report_quadrature_precompute_summary(total: usize, accesses: &[xc_core::CacheAccessProvenance]) {
+fn report_quadrature_precompute_summary(
+    total: usize,
+    accesses: &[xc_core::CacheAccessProvenance],
+) -> String {
     if accesses.is_empty() {
         eprintln!("[HP] GL tables ready: {total} total (standalone cache/computation)");
-        return;
+        return "standalone".to_owned();
     }
     let mut counts = BTreeMap::<String, usize>::new();
     for access in accesses {
@@ -9361,6 +9418,7 @@ fn report_quadrature_precompute_summary(total: usize, accesses: &[xc_core::Cache
         .collect::<Vec<_>>()
         .join(", ");
     eprintln!("[HP] GL tables ready: {total} total ({detail})");
+    detail
 }
 
 fn compute_archimedean_integrals_tracked(
@@ -9395,35 +9453,47 @@ fn compute_archimedean_integrals_tracked(
         prec
     );
     type GlTable = (Vec<Float>, Vec<Float>);
+    let gl_plan = xc_numerics::hp_runtime::plan_gl_precompute(&unique_pts, prec);
+    let mut performance_gl = xc_core::performance_stage_with("ccm.tau.gl_precompute", || {
+        gl_batch_performance_metadata(&unique_pts, prec, gl_plan)
+    });
     let (gl_cache, quadrature_manifests, quadrature_accesses): (
         HashMap<usize, GlTable>,
         Vec<ArtifactManifest>,
         Vec<xc_core::CacheAccessProvenance>,
     ) = if let Some(cache) = fabric_cache {
-        let resolved = xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
-            let request = ArtifactCacheContext {
-                resolver: cache.resolver,
-                reference_resolver: cache.reference_resolver,
-                acceptance: cache.acceptance,
-                ordered_overlays: cache.ordered_overlays.clone(),
-                mode: cache.mode,
-                write_on_miss: cache.write_on_miss,
-                write_visibility: cache.write_visibility,
-                requested_assurance: cache.requested_assurance,
-                certification_failure_policy: cache.certification_failure_policy,
-                production_sink: cache.production_sink,
-            };
-            xc_numerics::quadrature::gauss_legendre_nodes_via_cache(npts, prec, request).map(
-                |rule| {
+        let resolved = xc_numerics::hp_runtime::map_gl_precompute_planned(
+            &unique_pts,
+            gl_plan,
+            |npts, root_schedule| {
+                let request = ArtifactCacheContext {
+                    resolver: cache.resolver,
+                    reference_resolver: cache.reference_resolver,
+                    acceptance: cache.acceptance,
+                    ordered_overlays: cache.ordered_overlays.clone(),
+                    mode: cache.mode,
+                    write_on_miss: cache.write_on_miss,
+                    write_visibility: cache.write_visibility,
+                    requested_assurance: cache.requested_assurance,
+                    certification_failure_policy: cache.certification_failure_policy,
+                    production_sink: cache.production_sink,
+                };
+                xc_numerics::quadrature::gauss_legendre_nodes_via_cache_scheduled(
+                    npts,
+                    prec,
+                    request,
+                    root_schedule,
+                )
+                .map(|rule| {
                     (
                         npts,
                         (rule.nodes, rule.weights),
                         rule.artifact_manifest,
                         rule.cache_access,
                     )
-                },
-            )
-        });
+                })
+            },
+        );
         let mut tables = HashMap::new();
         let mut manifests = Vec::new();
         let mut accesses = Vec::new();
@@ -9436,18 +9506,32 @@ fn compute_archimedean_integrals_tracked(
         manifests.sort_by(|left, right| left.key.logical_key.cmp(&right.key.logical_key));
         (tables, manifests, accesses)
     } else {
-        let pairs: Vec<(usize, GlTable)> =
-            xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
+        let pairs: Vec<(usize, GlTable)> = xc_numerics::hp_runtime::map_gl_precompute_planned(
+            &unique_pts,
+            gl_plan,
+            |npts, root_schedule| {
                 (
                     npts,
-                    xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode),
+                    xc_numerics::quadrature::gauss_legendre_nodes_scheduled(
+                        npts,
+                        prec,
+                        cfg.cache_mode,
+                        root_schedule,
+                    ),
                 )
-            });
+            },
+        );
         (pairs.into_iter().collect(), Vec::new(), Vec::new())
     };
-    report_quadrature_precompute_summary(unique_pts.len(), &quadrature_accesses);
+    let disposition = report_quadrature_precompute_summary(unique_pts.len(), &quadrature_accesses);
+    performance_gl.set_cache_disposition(disposition);
+    drop(performance_gl);
     eprintln!("[HP] Computing alpha_L, beta_L, gamma_L integrals...");
 
+    let performance_integrals =
+        xc_core::performance_stage_with("ccm.tau.archimedean_integrals", || {
+            ccm_performance_metadata("ccm.tau.archimedean_integrals", n_modes + 1, prec)
+        });
     let indices: Vec<usize> = (0..=n_modes).collect();
     let kappa_half = compute_kappa_half(l, prec);
     let fused: Vec<(Float, Float, Float)> = indices
@@ -9465,6 +9549,7 @@ fn compute_archimedean_integrals_tracked(
         beta.push(beta_value);
         gamma.push(gamma_value);
     }
+    drop(performance_integrals);
     Ok((
         ComputedArchimedeanIntegrals { alpha, beta, gamma },
         quadrature_manifests,
@@ -9472,6 +9557,82 @@ fn compute_archimedean_integrals_tracked(
 }
 
 fn assemble_pole_and_archimedean_components(
+    n_modes: usize,
+    l: &Float,
+    prec: u32,
+    integrals: &ComputedArchimedeanIntegrals,
+) -> (Vec<Float>, Vec<Float>) {
+    let dim = 2 * n_modes + 1;
+    let _performance =
+        xc_core::performance_stage_with("ccm.tau.pole_archimedean_components", || {
+            let mut metadata =
+                ccm_performance_metadata("ccm.tau.pole_archimedean_components", dim, prec);
+            metadata.retained_hp_entries = Some(2usize.saturating_mul(dim.saturating_mul(dim)));
+            metadata
+        });
+    let pi_v = pi(prec);
+    let mut sixteen_pi2 = pi_v.square();
+    sixteen_pi2 *= 16u32;
+    let l_sq = l.clone().square();
+    let sinh2_l_over_4 = {
+        let mut value = l.clone();
+        value /= 4u32;
+        value.sinh().square()
+    };
+    let mut pole = vec![Float::with_val(prec, 0); dim * dim];
+    let mut archimedean = vec![Float::with_val(prec, 0); dim * dim];
+    pole.par_chunks_mut(dim)
+        .zip(archimedean.par_chunks_mut(dim))
+        .enumerate()
+        .for_each(|(row, (pole_row, archimedean_row))| {
+            let n = row as i64 - n_modes as i64;
+            for column in 0..dim {
+                let m = column as i64 - n_modes as i64;
+                let nf = fl_i(prec, n);
+                let mf = fl_i(prec, m);
+                let pole_value = {
+                    let mut mn = sixteen_pi2.clone();
+                    mn *= &mf;
+                    mn *= &nf;
+                    let mut numerator = l_sq.clone();
+                    numerator -= &mn;
+                    let mut left = sixteen_pi2.clone();
+                    left *= &mf;
+                    left *= &mf;
+                    left += &l_sq;
+                    let mut right = sixteen_pi2.clone();
+                    right *= &nf;
+                    right *= &nf;
+                    right += &l_sq;
+                    left *= right;
+                    let mut value = sinh2_l_over_4.clone();
+                    value *= 32u32;
+                    value *= l;
+                    value *= numerator;
+                    value /= left;
+                    value
+                };
+                let archimedean_value = if n == m {
+                    let index = n.unsigned_abs() as usize;
+                    let mut value = integrals.gamma[index].clone();
+                    value -= &integrals.beta[index];
+                    value *= 2u32;
+                    value
+                } else {
+                    let mut value = signed_alpha(&integrals.alpha, m, prec);
+                    value -= signed_alpha(&integrals.alpha, n, prec);
+                    value /= fl_i(prec, n - m);
+                    value
+                };
+                pole_row[column] = pole_value;
+                archimedean_row[column] = archimedean_value;
+            }
+        });
+    (pole, archimedean)
+}
+
+#[cfg(test)]
+fn assemble_pole_and_archimedean_components_reference(
     n_modes: usize,
     l: &Float,
     prec: u32,
@@ -9550,6 +9711,11 @@ fn compute_prime_component_matrix(
     prec: u32,
 ) -> Vec<Float> {
     let dim = 2 * n_modes + 1;
+    let _performance = xc_core::performance_stage_with("ccm.tau.prime_component", || {
+        let mut metadata = ccm_performance_metadata("ccm.tau.prime_component", dim, prec);
+        metadata.retained_hp_entries = Some(dim.saturating_mul(dim));
+        metadata
+    });
     let pi_v = pi(prec);
     let mut two_pi = pi_v.clone();
     two_pi *= 2u32;
@@ -9609,40 +9775,37 @@ fn compute_prime_component_matrix(
             }
         })
         .collect();
-    let cells: Vec<(i64, i64)> = (-(n_modes as i64)..=(n_modes as i64))
-        .flat_map(|n| (-(n_modes as i64)..=(n_modes as i64)).map(move |m| (n, m)))
-        .collect();
-    let values: Vec<Float> = cells
-        .par_iter()
-        .map(|&(n, m)| {
-            let n_index = (n + n_modes as i64) as usize;
-            let m_index = (m + n_modes as i64) as usize;
-            let mut sum = Float::with_val(prec, 0);
-            for data in &prime_data {
-                let kernel = if n == m {
-                    let mut factor = data.diagonal_factor.clone();
-                    factor *= &data.cosines[n_index];
-                    factor
-                } else {
-                    let mut difference = data.sines[m_index].clone();
-                    difference -= &data.sines[n_index];
-                    difference /= &difference_denominators[(n - m + 2 * n_modes as i64) as usize];
-                    difference
-                };
-                let mut term = kernel;
-                term *= &data.log_prime;
-                term /= &data.sqrt_power;
-                sum += term;
-            }
-            sum
-        })
-        .collect();
     let mut matrix = vec![Float::with_val(prec, 0); dim * dim];
-    for (index, &(n, m)) in cells.iter().enumerate() {
-        let row = (n + n_modes as i64) as usize;
-        let column = (m + n_modes as i64) as usize;
-        matrix[row * dim + column] = values[index].clone();
-    }
+    matrix
+        .par_chunks_mut(dim)
+        .enumerate()
+        .for_each(|(row, matrix_row)| {
+            let n = row as i64 - n_modes as i64;
+            let n_index = (n + n_modes as i64) as usize;
+            for (column, matrix_cell) in matrix_row.iter_mut().enumerate() {
+                let m = column as i64 - n_modes as i64;
+                let m_index = (m + n_modes as i64) as usize;
+                let mut sum = Float::with_val(prec, 0);
+                for data in &prime_data {
+                    let kernel = if n == m {
+                        let mut factor = data.diagonal_factor.clone();
+                        factor *= &data.cosines[n_index];
+                        factor
+                    } else {
+                        let mut difference = data.sines[m_index].clone();
+                        difference -= &data.sines[n_index];
+                        difference /=
+                            &difference_denominators[(n - m + 2 * n_modes as i64) as usize];
+                        difference
+                    };
+                    let mut term = kernel;
+                    term *= &data.log_prime;
+                    term /= &data.sqrt_power;
+                    sum += term;
+                }
+                *matrix_cell = sum;
+            }
+        });
     matrix
 }
 
@@ -9771,42 +9934,53 @@ fn build_tau_components_exact_tracked(
         unique_pts.last().copied().unwrap_or(0),
         prec
     );
-    // xc_numerics::hp_runtime::map_gl_precompute: parallel on Vast/native
-    // Linux (unchanged); sequential on WSL2, where sustained concurrent
-    // GMP allocation across many back-to-back GL computes triggers a
-    // non-deterministic glibc abort (confirmed independent of rayon —
-    // reproduces with plain std::thread too). GL tables are cached to
-    // disk after first compute, so this only costs time on a cold cache.
+    // The owning thread resolves exactly one parallel level for this batch.
+    // Root parallelism is opt-in for underfilled native-Linux batches; the
+    // default remains table-parallel/root-serial. WSL remains excluded from
+    // supported root-parallel qualification because concurrent GMP allocation
+    // has caused non-deterministic glibc aborts even with plain OS threads.
     type GlTable = (Vec<Float>, Vec<Float>);
+    let gl_plan = xc_numerics::hp_runtime::plan_gl_precompute(&unique_pts, prec);
+    let mut performance_gl = xc_core::performance_stage_with("ccm.tau.gl_precompute", || {
+        gl_batch_performance_metadata(&unique_pts, prec, gl_plan)
+    });
     let (gl_cache, quadrature_manifests, quadrature_accesses): (
         HashMap<usize, GlTable>,
         Vec<ArtifactManifest>,
         Vec<xc_core::CacheAccessProvenance>,
     ) = if let Some(cache) = fabric_cache {
-        let resolved = xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
-            let request = ArtifactCacheContext {
-                resolver: cache.resolver,
-                reference_resolver: cache.reference_resolver,
-                acceptance: cache.acceptance,
-                ordered_overlays: cache.ordered_overlays.clone(),
-                mode: cache.mode,
-                write_on_miss: cache.write_on_miss,
-                write_visibility: cache.write_visibility,
-                requested_assurance: cache.requested_assurance,
-                certification_failure_policy: cache.certification_failure_policy,
-                production_sink: cache.production_sink,
-            };
-            xc_numerics::quadrature::gauss_legendre_nodes_via_cache(npts, prec, request).map(
-                |rule| {
+        let resolved = xc_numerics::hp_runtime::map_gl_precompute_planned(
+            &unique_pts,
+            gl_plan,
+            |npts, root_schedule| {
+                let request = ArtifactCacheContext {
+                    resolver: cache.resolver,
+                    reference_resolver: cache.reference_resolver,
+                    acceptance: cache.acceptance,
+                    ordered_overlays: cache.ordered_overlays.clone(),
+                    mode: cache.mode,
+                    write_on_miss: cache.write_on_miss,
+                    write_visibility: cache.write_visibility,
+                    requested_assurance: cache.requested_assurance,
+                    certification_failure_policy: cache.certification_failure_policy,
+                    production_sink: cache.production_sink,
+                };
+                xc_numerics::quadrature::gauss_legendre_nodes_via_cache_scheduled(
+                    npts,
+                    prec,
+                    request,
+                    root_schedule,
+                )
+                .map(|rule| {
                     (
                         npts,
                         (rule.nodes, rule.weights),
                         rule.artifact_manifest,
                         rule.cache_access,
                     )
-                },
-            )
-        });
+                })
+            },
+        );
         let mut tables = HashMap::new();
         let mut manifests = Vec::new();
         let mut accesses = Vec::new();
@@ -9819,17 +9993,31 @@ fn build_tau_components_exact_tracked(
         manifests.sort_by(|left, right| left.key.logical_key.cmp(&right.key.logical_key));
         (tables, manifests, accesses)
     } else {
-        let gl_pairs: Vec<(usize, GlTable)> =
-            xc_numerics::hp_runtime::map_gl_precompute(&unique_pts, |&npts| {
+        let gl_pairs: Vec<(usize, GlTable)> = xc_numerics::hp_runtime::map_gl_precompute_planned(
+            &unique_pts,
+            gl_plan,
+            |npts, root_schedule| {
                 (
                     npts,
-                    xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode),
+                    xc_numerics::quadrature::gauss_legendre_nodes_scheduled(
+                        npts,
+                        prec,
+                        cfg.cache_mode,
+                        root_schedule,
+                    ),
                 )
-            });
+            },
+        );
         (gl_pairs.into_iter().collect(), Vec::new(), Vec::new())
     };
-    report_quadrature_precompute_summary(unique_pts.len(), &quadrature_accesses);
+    let disposition = report_quadrature_precompute_summary(unique_pts.len(), &quadrature_accesses);
+    performance_gl.set_cache_disposition(disposition);
+    drop(performance_gl);
     eprintln!("[HP] Computing alpha_L, beta_L, gamma_L integrals...");
+    let performance_integrals =
+        xc_core::performance_stage_with("ccm.tau.archimedean_integrals", || {
+            ccm_performance_metadata("ccm.tau.archimedean_integrals", n_max + 1, prec)
+        });
     let indices: Vec<usize> = (0..=n_max).collect();
     let kappa_half = compute_kappa_half(l, prec);
     let fused_integrals: Vec<(Float, Float, Float)> = indices
@@ -9848,10 +10036,18 @@ fn build_tau_components_exact_tracked(
         beta_l.push(beta_value);
         gamma_l.push(gamma_value);
     }
+    drop(performance_integrals);
     eprintln!(
         "[HP] Integrals done. Assembling {}×{} τ-matrix...",
         dim, dim
     );
+
+    let _performance_components =
+        xc_core::performance_stage_with("ccm.tau.fused_components", || {
+            let mut metadata = ccm_performance_metadata("ccm.tau.fused_components", dim, prec);
+            metadata.retained_hp_entries = Some(3usize.saturating_mul(dim.saturating_mul(dim)));
+            metadata
+        });
 
     let prime_powers = prime_powers_up_to(lambda_sq_int);
     // Pure HP path: compute log_p in HP from the exposed prime, do not
@@ -9866,115 +10062,110 @@ fn build_tau_components_exact_tracked(
         })
         .collect();
 
-    let cells: Vec<(i64, i64)> = (-(n_max as i64)..=(n_max as i64))
-        .flat_map(|n| (-(n_max as i64)..=(n_max as i64)).map(move |m| (n, m)))
-        .collect();
-
-    let computed: Vec<(Float, Float, Float)> = cells
-        .par_iter()
-        .map(|&(n, m)| {
-            let nf = fl_i(prec, n);
-            let mf = fl_i(prec, m);
-
-            let w02 = {
-                let mut mn = sixteen_pi2.clone();
-                mn *= &mf;
-                mn *= &nf;
-                let mut num = l_sq.clone();
-                num -= &mn;
-                let mut a = sixteen_pi2.clone();
-                a *= &mf;
-                a *= &mf;
-                a += &l_sq;
-                let mut b = sixteen_pi2.clone();
-                b *= &nf;
-                b *= &nf;
-                b += &l_sq;
-                let mut den = a;
-                den *= &b;
-                let mut v = sinh2_l_over_4.clone();
-                v *= 32u32;
-                v *= l;
-                v *= &num;
-                v /= &den;
-                v
-            };
-
-            let wr = if n == m {
-                let k = n.unsigned_abs() as usize;
-                let mut v = gamma_l[k].clone();
-                v -= &beta_l[k];
-                v *= 2u32;
-                v
-            } else {
-                let an = signed_alpha(&alpha_l, n, prec);
-                let am = signed_alpha(&alpha_l, m, prec);
-                let mut v = am;
-                v -= &an;
-                v /= fl_i(prec, n - m);
-                v
-            };
-
-            let two_pi_n_over_l = {
-                let mut v = two_pi.clone();
-                v *= &nf;
-                v /= l;
-                v
-            };
-            let two_pi_m_over_l = {
-                let mut v = two_pi.clone();
-                v *= &mf;
-                v /= l;
-                v
-            };
-            let mut wp = Float::with_val(prec, 0);
-            if include_primes {
-                for (log_k, log_p, sqrt_k) in &pp_data {
-                    let q = if n == m {
-                        let mut ph = two_pi_n_over_l.clone();
-                        ph *= log_k;
-                        let c = ph.cos();
-                        let mut t = log_k.clone();
-                        t /= l;
-                        let mut f = Float::with_val(prec, 1);
-                        f -= &t;
-                        f *= 2u32;
-                        f *= &c;
-                        f
-                    } else {
-                        let mut sm = two_pi_m_over_l.clone();
-                        sm *= log_k;
-                        let sm_s = sm.sin();
-                        let mut sn = two_pi_n_over_l.clone();
-                        sn *= log_k;
-                        let sn_s = sn.sin();
-                        let mut d = sm_s;
-                        d -= &sn_s;
-                        let mut dn = pi_v.clone();
-                        dn *= fl_i(prec, n - m);
-                        d /= &dn;
-                        d
-                    };
-                    let mut term = q;
-                    term *= log_p;
-                    term /= sqrt_k;
-                    wp += &term;
-                }
-            }
-            (w02, wr, wp)
-        })
-        .collect();
-
     let mut pole = vec![Float::with_val(prec, 0); dim * dim];
     let mut archimedean = vec![Float::with_val(prec, 0); dim * dim];
     let mut prime = vec![Float::with_val(prec, 0); dim * dim];
-    for (i, &(n, m)) in cells.iter().enumerate() {
-        let row = (n + n_modes as i64) as usize;
-        let column = (m + n_modes as i64) as usize;
-        pole[row * dim + column] = computed[i].0.clone();
-        archimedean[row * dim + column] = computed[i].1.clone();
-        prime[row * dim + column] = computed[i].2.clone();
-    }
+    pole.par_chunks_mut(dim)
+        .zip(archimedean.par_chunks_mut(dim))
+        .zip(prime.par_chunks_mut(dim))
+        .enumerate()
+        .for_each(|(row, ((pole_row, archimedean_row), prime_row))| {
+            let n = row as i64 - n_max as i64;
+            for column in 0..dim {
+                let m = column as i64 - n_max as i64;
+                let nf = fl_i(prec, n);
+                let mf = fl_i(prec, m);
+
+                let w02 = {
+                    let mut mn = sixteen_pi2.clone();
+                    mn *= &mf;
+                    mn *= &nf;
+                    let mut num = l_sq.clone();
+                    num -= &mn;
+                    let mut a = sixteen_pi2.clone();
+                    a *= &mf;
+                    a *= &mf;
+                    a += &l_sq;
+                    let mut b = sixteen_pi2.clone();
+                    b *= &nf;
+                    b *= &nf;
+                    b += &l_sq;
+                    let mut den = a;
+                    den *= &b;
+                    let mut v = sinh2_l_over_4.clone();
+                    v *= 32u32;
+                    v *= l;
+                    v *= &num;
+                    v /= &den;
+                    v
+                };
+
+                let wr = if n == m {
+                    let k = n.unsigned_abs() as usize;
+                    let mut v = gamma_l[k].clone();
+                    v -= &beta_l[k];
+                    v *= 2u32;
+                    v
+                } else {
+                    let an = signed_alpha(&alpha_l, n, prec);
+                    let am = signed_alpha(&alpha_l, m, prec);
+                    let mut v = am;
+                    v -= &an;
+                    v /= fl_i(prec, n - m);
+                    v
+                };
+
+                let two_pi_n_over_l = {
+                    let mut v = two_pi.clone();
+                    v *= &nf;
+                    v /= l;
+                    v
+                };
+                let two_pi_m_over_l = {
+                    let mut v = two_pi.clone();
+                    v *= &mf;
+                    v /= l;
+                    v
+                };
+                let mut wp = Float::with_val(prec, 0);
+                if include_primes {
+                    for (log_k, log_p, sqrt_k) in &pp_data {
+                        let q = if n == m {
+                            let mut ph = two_pi_n_over_l.clone();
+                            ph *= log_k;
+                            let c = ph.cos();
+                            let mut t = log_k.clone();
+                            t /= l;
+                            let mut f = Float::with_val(prec, 1);
+                            f -= &t;
+                            f *= 2u32;
+                            f *= &c;
+                            f
+                        } else {
+                            let mut sm = two_pi_m_over_l.clone();
+                            sm *= log_k;
+                            let sm_s = sm.sin();
+                            let mut sn = two_pi_n_over_l.clone();
+                            sn *= log_k;
+                            let sn_s = sn.sin();
+                            let mut d = sm_s;
+                            d -= &sn_s;
+                            let mut dn = pi_v.clone();
+                            dn *= fl_i(prec, n - m);
+                            d /= &dn;
+                            d
+                        };
+                        let mut term = q;
+                        term *= log_p;
+                        term /= sqrt_k;
+                        wp += &term;
+                    }
+                }
+                pole_row[column] = w02;
+                archimedean_row[column] = wr;
+                prime_row[column] = wp;
+            }
+        });
     Ok((
         ComputedCcmMatrixComponents {
             pole,
@@ -13277,6 +13468,154 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn direct_write_pole_and_archimedean_components_match_materialized_reference() {
+        let one_worker = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let four_workers = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for precision in [128, 257] {
+            let l = Float::with_val(precision, 13).ln();
+            for n_modes in 0..=5 {
+                let make_table = |offset: u32| {
+                    (0..=n_modes)
+                        .map(|index| {
+                            let mut value = Float::with_val(precision, index as u32 + offset);
+                            value /= (n_modes + 2) as u32;
+                            value
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let integrals = ComputedArchimedeanIntegrals {
+                    alpha: make_table(1),
+                    beta: make_table(3),
+                    gamma: make_table(7),
+                };
+                let one = one_worker.install(|| {
+                    assemble_pole_and_archimedean_components(n_modes, &l, precision, &integrals)
+                });
+                let four = four_workers.install(|| {
+                    assemble_pole_and_archimedean_components(n_modes, &l, precision, &integrals)
+                });
+                let expected = assemble_pole_and_archimedean_components_reference(
+                    n_modes, &l, precision, &integrals,
+                );
+                assert_eq!(
+                    one, expected,
+                    "one-worker component payload changed at precision={precision}, N={n_modes}"
+                );
+                assert_eq!(
+                    four, expected,
+                    "four-worker component payload changed at precision={precision}, N={n_modes}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn direct_write_fused_components_match_separate_exact_paths() {
+        let precision = 128;
+        let n_modes = 2;
+        let lambda_sq = 13;
+        let l = Float::with_val(precision, lambda_sq).ln();
+        let mut cfg = HighPrecConfig::for_decimal_digits(30);
+        cfg.precision_bits = precision;
+        cfg.quad_points = 24;
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+
+        let one_worker = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let four_workers = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let (fused_one, _) = one_worker
+            .install(|| {
+                build_tau_components_exact_tracked(n_modes, lambda_sq, &l, &cfg, true, None)
+            })
+            .unwrap();
+        let (fused_four, _) = four_workers
+            .install(|| {
+                build_tau_components_exact_tracked(n_modes, lambda_sq, &l, &cfg, true, None)
+            })
+            .unwrap();
+        let (integrals, _) =
+            compute_archimedean_integrals_tracked(n_modes, &l, &cfg, None).unwrap();
+        let (pole, archimedean) =
+            assemble_pole_and_archimedean_components(n_modes, &l, precision, &integrals);
+        let prime = compute_prime_component_matrix(n_modes, lambda_sq, &l, precision);
+
+        assert_eq!(fused_one.pole, pole);
+        assert_eq!(fused_one.archimedean, archimedean);
+        assert_eq!(fused_one.prime, prime);
+        assert_eq!(fused_four.pole, fused_one.pole);
+        assert_eq!(fused_four.archimedean, fused_one.archimedean);
+        assert_eq!(fused_four.prime, fused_one.prime);
+    }
+
+    /// Run this ignored test as a standalone process under `/usr/bin/time -v`
+    /// so the direct and frozen materializing routes have independent peak-RSS
+    /// measurements. Example:
+    ///
+    /// `XC_COMPONENT_RSS_ROUTE=direct <test-binary> --ignored --exact
+    /// ccm::hp::tests::large_n_component_rss_probe --nocapture`
+    #[test]
+    #[ignore = "manual isolated peak-RSS qualification probe"]
+    fn large_n_component_rss_probe() {
+        let route = std::env::var("XC_COMPONENT_RSS_ROUTE")
+            .expect("XC_COMPONENT_RSS_ROUTE must be direct or reference");
+        let n_modes = std::env::var("XC_COMPONENT_RSS_N")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("valid XC_COMPONENT_RSS_N"))
+            .unwrap_or(800);
+        let precision = std::env::var("XC_COMPONENT_RSS_PRECISION_BITS")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .expect("valid XC_COMPONENT_RSS_PRECISION_BITS")
+            })
+            .unwrap_or(729);
+        let l = Float::with_val(precision, 13).ln();
+        let make_table = |offset: u32| {
+            (0..=n_modes)
+                .map(|index| {
+                    let mut value = Float::with_val(precision, index as u32 + offset);
+                    value /= (n_modes + 2) as u32;
+                    value
+                })
+                .collect::<Vec<_>>()
+        };
+        let integrals = ComputedArchimedeanIntegrals {
+            alpha: make_table(1),
+            beta: make_table(3),
+            gamma: make_table(7),
+        };
+        let started = std::time::Instant::now();
+        let result = match route.as_str() {
+            "direct" => {
+                assemble_pole_and_archimedean_components(n_modes, &l, precision, &integrals)
+            }
+            "reference" => assemble_pole_and_archimedean_components_reference(
+                n_modes, &l, precision, &integrals,
+            ),
+            _ => panic!("XC_COMPONENT_RSS_ROUTE must be direct or reference"),
+        };
+        std::hint::black_box(&result);
+        eprintln!(
+            "component RSS probe: route={route}, N={n_modes}, dimension={}, precision_bits={precision}, elapsed_seconds={:.6}, retained_entries={}",
+            2 * n_modes + 1,
+            started.elapsed().as_secs_f64(),
+            result.0.len() + result.1.len()
+        );
     }
 
     #[test]

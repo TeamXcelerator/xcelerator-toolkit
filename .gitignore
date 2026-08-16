@@ -29,6 +29,10 @@ xcelerator-validation/
 .xcelerator-cache-validation/
 .xcelerator-validation/
 
+# Local process performance reports.
+performance-reports/
+*.performance.json
+
 # Editor swap
 *.swp
 *~

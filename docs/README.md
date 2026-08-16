@@ -7,6 +7,7 @@ are maintained outside the public source distribution.
 
 ## Use
 
+- [Release notes](RELEASE_NOTES.md)
 - [Research workflows](RESEARCH_WORKFLOWS.md)
 - [CLI reference](CLI.md)
 - [External consumer guide](EXTERNAL_CONSUMER.md)
@@ -15,6 +16,7 @@ are maintained outside the public source distribution.
 
 - [Cache schema and behavior](CACHE_SCHEMA.md)
 - [Cache output validation](OUTPUT_VALIDATION.md)
+- [Performance reporting](PERFORMANCE_REPORTING.md)
 
 ## Distribution and provenance
 

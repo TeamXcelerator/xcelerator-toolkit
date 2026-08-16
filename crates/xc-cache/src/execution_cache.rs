@@ -2100,6 +2100,14 @@ where
     Validate: Fn(&T) -> Result<(), CacheError>,
 {
     validate_request(request)?;
+    let performance_metadata = || xc_core::PerformanceStageMetadata {
+        operation: Some(request.operation.to_owned()),
+        ..xc_core::PerformanceStageMetadata::default()
+    };
+    let _performance_operation =
+        xc_core::performance_top_level_stage_with("cache.artifact.resolve_or_compute", || {
+            performance_metadata()
+        });
     let semantic_digest = request.semantic_key.digest()?;
     let key = ArtifactKey {
         kind: request.semantic_key.artifact_kind.clone(),
@@ -2111,12 +2119,21 @@ where
         if let (Some(resolver), Some(acceptance)) = (request.resolver, request.acceptance) {
             match resolver.resolve(&key, acceptance) {
                 Ok(resolved) => {
+                    let performance_decode = xc_core::performance_stage_with(
+                        "cache.artifact.reuse_decode_validate",
+                        || {
+                            let mut metadata = performance_metadata();
+                            metadata.cache_disposition = Some("reused".to_owned());
+                            metadata
+                        },
+                    );
                     let value: T = serde_json::from_slice(&resolved.payload).map_err(|error| {
                         CacheError::InvalidManifest(format!(
                             "cached typed payload failed JSON decoding: {error}"
                         ))
                     })?;
                     validate(&value)?;
+                    drop(performance_decode);
                     let access = access_record(
                         request,
                         &semantic_digest,
@@ -2132,6 +2149,14 @@ where
                         && request.write_on_miss
                     {
                         if let Some(store) = resolver.first_writable(request.write_visibility) {
+                            let _performance_store = xc_core::performance_stage_with(
+                                "cache.artifact.local_store",
+                                || {
+                                    let mut metadata = performance_metadata();
+                                    metadata.cache_disposition = Some("remote_adoption".to_owned());
+                                    metadata
+                                },
+                            );
                             let mut draft = ArtifactDraft {
                                 schema_version: resolved.manifest.schema_version,
                                 key: resolved.manifest.key.clone(),
@@ -2205,7 +2230,13 @@ where
     }
 
     let compute_started = std::time::Instant::now();
+    let performance_compute = xc_core::performance_stage_with("cache.artifact.compute", || {
+        let mut metadata = performance_metadata();
+        metadata.cache_disposition = Some("computed".to_owned());
+        metadata
+    });
     let (value, dependencies, assessment) = compute()?;
+    drop(performance_compute);
     let compute_duration_millis = compute_started.elapsed().as_millis() as u64;
     assessment.validate()?;
     for dependency in &dependencies {
@@ -2216,7 +2247,13 @@ where
         }
     }
     validate(&value)?;
+    let performance_encode = xc_core::performance_stage_with("cache.artifact.encode", || {
+        let mut metadata = performance_metadata();
+        metadata.cache_disposition = Some("computed".to_owned());
+        metadata
+    });
     let payload = serde_json::to_vec(&value)?;
+    drop(performance_encode);
     let computed_dependencies = dependencies.clone();
     let produced_manifest = if request.write_on_miss {
         let resolver = request.resolver.ok_or_else(|| {
@@ -2244,7 +2281,14 @@ where
             tags,
             provenance_digest: request.provenance_digest.clone(),
         };
+        let performance_store =
+            xc_core::performance_stage_with("cache.artifact.local_store", || {
+                let mut metadata = performance_metadata();
+                metadata.cache_disposition = Some("computed".to_owned());
+                metadata
+            });
         let manifest = store.put(&draft, &payload)?;
+        drop(performance_store);
         if let Some(sink) = request.production_sink {
             let acceptance = request.acceptance.ok_or_else(|| {
                 CacheError::InvalidManifest(
@@ -2281,6 +2325,12 @@ where
             CacheError::InvalidManifest("verify execution lacks cache policy".to_owned())
         })?;
         let fetch_started = std::time::Instant::now();
+        let performance_reference =
+            xc_core::performance_stage_with("cache.artifact.reference_fetch_compare", || {
+                let mut metadata = performance_metadata();
+                metadata.cache_disposition = Some("validation_reference".to_owned());
+                metadata
+            });
         let resolved_reference =
             match reference_resolver.resolve(&computed_manifest.key, acceptance) {
                 Ok(reference) => Some(reference),
@@ -2357,6 +2407,7 @@ where
         access
             .validate()
             .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+        drop(performance_reference);
         access
     } else {
         access_record(request, &semantic_digest, None, false, miss_reason)?

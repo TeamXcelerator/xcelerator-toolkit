@@ -259,6 +259,44 @@ mod hp {
         precision_bits: u32,
         cache: QuadratureCacheRequest<'_>,
     ) -> Result<CachedQuadratureRule, CacheError> {
+        gauss_legendre_nodes_via_cache_impl(
+            n,
+            precision_bits,
+            cache,
+            crate::hp_runtime::GlRootSchedule::serial(),
+            true,
+        )
+    }
+
+    /// Schedule-aware managed resolver used by an owning HP batch planner.
+    /// Existing public GL entry points remain root-serial compatibility
+    /// wrappers; callers must not infer scheduling inside this function.
+    #[doc(hidden)]
+    pub fn gauss_legendre_nodes_via_cache_scheduled(
+        n: usize,
+        precision_bits: u32,
+        cache: QuadratureCacheRequest<'_>,
+        root_schedule: crate::hp_runtime::GlRootSchedule,
+    ) -> Result<CachedQuadratureRule, CacheError> {
+        gauss_legendre_nodes_via_cache_impl(n, precision_bits, cache, root_schedule, false)
+    }
+
+    fn gauss_legendre_nodes_via_cache_impl(
+        n: usize,
+        precision_bits: u32,
+        cache: QuadratureCacheRequest<'_>,
+        root_schedule: crate::hp_runtime::GlRootSchedule,
+        top_level: bool,
+    ) -> Result<CachedQuadratureRule, CacheError> {
+        let mut performance_resolve = if top_level {
+            xc_core::performance_top_level_stage_with("quadrature.gl.resolve", || {
+                gl_performance_metadata_scheduled(n, precision_bits, root_schedule)
+            })
+        } else {
+            xc_core::performance_stage_with("quadrature.gl.resolve", || {
+                gl_performance_metadata_scheduled(n, precision_bits, root_schedule)
+            })
+        };
         if n == 0 || precision_bits < 16 {
             return Err(CacheError::InvalidManifest(
                 "quadrature order must be positive and precision must be at least 16 bits"
@@ -307,15 +345,39 @@ mod hp {
         let resolved = resolve_or_compute_json_artifact(
             &execution_request,
             || {
-                Ok(portable_table(
-                    n,
-                    precision_bits,
-                    gauss_legendre_compute(n, precision_bits),
-                ))
+                let performance_construct =
+                    xc_core::performance_stage_with("quadrature.gl.construct", || {
+                        gl_performance_metadata_scheduled(n, precision_bits, root_schedule)
+                    });
+                let table = gauss_legendre_compute_scheduled(n, precision_bits, root_schedule);
+                drop(performance_construct);
+                let performance_encode =
+                    xc_core::performance_stage_with("quadrature.gl.portable_encode", || {
+                        gl_performance_metadata(n, precision_bits)
+                    });
+                let portable = portable_table(n, precision_bits, table);
+                drop(performance_encode);
+                Ok(portable)
             },
-            |table| decode_portable_table(table, n, precision_bits).map(|_| ()),
+            |table| {
+                let _performance_decode =
+                    xc_core::performance_stage_with("quadrature.gl.validation_decode", || {
+                        gl_performance_metadata(n, precision_bits)
+                    });
+                decode_portable_table(table, n, precision_bits).map(|_| ())
+            },
         )?;
+        performance_resolve.set_cache_disposition(match resolved.access.reuse_disposition {
+            xc_core::CacheReuseDisposition::Recomputed => "computed",
+            xc_core::CacheReuseDisposition::Reused => "reused",
+            xc_core::CacheReuseDisposition::InspectedOnly => "verified",
+        });
+        let performance_decode =
+            xc_core::performance_stage_with("quadrature.gl.return_decode", || {
+                gl_performance_metadata(n, precision_bits)
+            });
         let (nodes, weights) = decode_portable_table(&resolved.value, n, precision_bits)?;
+        drop(performance_decode);
         let artifact_manifest = resolved
             .produced_manifest
             .or(resolved.reused_manifest)
@@ -493,16 +555,88 @@ mod hp {
     /// for the standard local behavior. Use `gauss_legendre_nodes_via_cache`
     /// when managed local/private/public resolution is required.
     pub fn gauss_legendre_nodes(n: usize, prec: u32, mode: CacheMode) -> (Vec<Float>, Vec<Float>) {
+        gauss_legendre_nodes_impl(
+            n,
+            prec,
+            mode,
+            crate::hp_runtime::GlRootSchedule::serial(),
+            true,
+        )
+    }
+
+    /// Schedule-aware compatibility-cache entry point used by the CCM batch
+    /// planner. The scheduling decision has already been made by the owner.
+    #[doc(hidden)]
+    pub fn gauss_legendre_nodes_scheduled(
+        n: usize,
+        prec: u32,
+        mode: CacheMode,
+        root_schedule: crate::hp_runtime::GlRootSchedule,
+    ) -> (Vec<Float>, Vec<Float>) {
+        gauss_legendre_nodes_impl(n, prec, mode, root_schedule, false)
+    }
+
+    fn gauss_legendre_nodes_impl(
+        n: usize,
+        prec: u32,
+        mode: CacheMode,
+        root_schedule: crate::hp_runtime::GlRootSchedule,
+        top_level: bool,
+    ) -> (Vec<Float>, Vec<Float>) {
+        let mut performance_resolve = if top_level {
+            xc_core::performance_top_level_stage_with("quadrature.gl.resolve_compatibility", || {
+                gl_performance_metadata_scheduled(n, prec, root_schedule)
+            })
+        } else {
+            xc_core::performance_stage_with("quadrature.gl.resolve_compatibility", || {
+                gl_performance_metadata_scheduled(n, prec, root_schedule)
+            })
+        };
         if mode != CacheMode::Off {
             if let Some(cached) = load_gl_cache(n, prec, mode) {
+                performance_resolve.set_cache_disposition("reused");
                 return cached;
             }
         }
-        let result = gauss_legendre_compute(n, prec);
+        performance_resolve.set_cache_disposition("computed");
+        let performance_construct =
+            xc_core::performance_stage_with("quadrature.gl.construct", || {
+                gl_performance_metadata_scheduled(n, prec, root_schedule)
+            });
+        let result = gauss_legendre_compute_scheduled(n, prec, root_schedule);
+        drop(performance_construct);
         if mode != CacheMode::Off {
+            let performance_store =
+                xc_core::performance_stage_with("quadrature.gl.compatibility_store", || {
+                    gl_performance_metadata(n, prec)
+                });
             save_gl_cache(n, prec, &result.0, &result.1, mode);
+            drop(performance_store);
         }
         result
+    }
+
+    fn gl_performance_metadata(n: usize, precision_bits: u32) -> xc_core::PerformanceStageMetadata {
+        gl_performance_metadata_scheduled(
+            n,
+            precision_bits,
+            crate::hp_runtime::GlRootSchedule::serial(),
+        )
+    }
+
+    fn gl_performance_metadata_scheduled(
+        n: usize,
+        precision_bits: u32,
+        root_schedule: crate::hp_runtime::GlRootSchedule,
+    ) -> xc_core::PerformanceStageMetadata {
+        xc_core::PerformanceStageMetadata {
+            operation: Some("quadrature.gauss_legendre".to_owned()),
+            requested_table_order: Some(n),
+            precision_bits: Some(precision_bits),
+            rayon_workers: Some(rayon::current_num_threads()),
+            scheduling: Some(root_schedule.label().to_owned()),
+            ..xc_core::PerformanceStageMetadata::default()
+        }
     }
 
     /// Cache directory: `<cwd>/data/gl_cache`. Created on demand so
@@ -720,18 +854,48 @@ mod hp {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn gauss_legendre_compute(n: usize, prec: u32) -> (Vec<Float>, Vec<Float>) {
+        gauss_legendre_compute_scheduled(n, prec, crate::hp_runtime::GlRootSchedule::serial())
+    }
+
+    fn gauss_legendre_compute_scheduled(
+        n: usize,
+        prec: u32,
+        root_schedule: crate::hp_runtime::GlRootSchedule,
+    ) -> (Vec<Float>, Vec<Float>) {
         let pi_v = pi(prec);
         let one = Float::with_val(prec, 1);
         let four_n_plus_two = fl_i(prec, (4 * n + 2) as i64);
         let eps_threshold = Float::with_val(prec, 2).pow(-((prec as i32) - 8));
-        // Root construction deliberately remains serial. Callers already
-        // parallelize across distinct GL table sizes; another Rayon layer
-        // here adds nested scheduling and concurrent GMP allocation without
-        // improving the common CCM precomputation path.
-        let mut combined = (1..=n)
-            .map(|k| gauss_legendre_root(n, k, prec, &pi_v, &one, &four_n_plus_two, &eps_threshold))
-            .collect::<Vec<_>>();
+        // Root construction remains serial by default. An owning HP batch may
+        // opt into this single-table exception after selecting exactly one
+        // parallel level. WSL remains excluded from supported qualification
+        // because concurrent GMP allocation has failed there nondeterministically.
+        let mut combined = if let Some(min_task_len) = root_schedule.parallel_min_task_len() {
+            use rayon::prelude::*;
+            (0..n)
+                .into_par_iter()
+                .with_min_len(min_task_len)
+                .map(|offset| {
+                    gauss_legendre_root(
+                        n,
+                        offset + 1,
+                        prec,
+                        &pi_v,
+                        &one,
+                        &four_n_plus_two,
+                        &eps_threshold,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            (1..=n)
+                .map(|k| {
+                    gauss_legendre_root(n, k, prec, &pi_v, &one, &four_n_plus_two, &eps_threshold)
+                })
+                .collect::<Vec<_>>()
+        };
         combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         combined.into_iter().unzip()
     }
@@ -1059,8 +1223,9 @@ mod hp {
 
 #[cfg(feature = "hp")]
 pub use hp::{
-    gauss_legendre_nodes, gauss_legendre_nodes_via_cache, verify_gl_cache_dir, CacheFileStatus,
-    CacheMode, CacheVerifyReport, CachedQuadratureRule, QuadratureCacheRequest,
+    gauss_legendre_nodes, gauss_legendre_nodes_scheduled, gauss_legendre_nodes_via_cache,
+    gauss_legendre_nodes_via_cache_scheduled, verify_gl_cache_dir, CacheFileStatus, CacheMode,
+    CacheVerifyReport, CachedQuadratureRule, QuadratureCacheRequest,
 };
 
 #[cfg(test)]
@@ -1286,6 +1451,57 @@ mod tests {
             "GL-4 ∫x⁸ should have appreciable error (degree exceeds 2N-1); got {:.2e}",
             abs_err
         );
+    }
+
+    #[cfg(feature = "hp")]
+    #[test]
+    fn scheduled_gl_roots_are_exactly_identical_across_worker_counts() {
+        use crate::hp_runtime::GlRootSchedule;
+
+        let one_worker = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let four_workers = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for (order, precision) in [(8, 256), (8, 3386), (8, 6708)] {
+            let serial = gauss_legendre_nodes(order, precision, CacheMode::Off);
+            let one = one_worker.install(|| {
+                gauss_legendre_nodes_scheduled(
+                    order,
+                    precision,
+                    CacheMode::Off,
+                    GlRootSchedule::parallel_for_test(1),
+                )
+            });
+            let four = four_workers.install(|| {
+                gauss_legendre_nodes_scheduled(
+                    order,
+                    precision,
+                    CacheMode::Off,
+                    GlRootSchedule::parallel_for_test(1),
+                )
+            });
+
+            let serialize = |table: &(Vec<rug::Float>, Vec<rug::Float>)| {
+                (
+                    table
+                        .0
+                        .iter()
+                        .map(rug::Float::to_string)
+                        .collect::<Vec<_>>(),
+                    table
+                        .1
+                        .iter()
+                        .map(rug::Float::to_string)
+                        .collect::<Vec<_>>(),
+                )
+            };
+            assert_eq!(serialize(&one), serialize(&serial));
+            assert_eq!(serialize(&four), serialize(&serial));
+        }
     }
 }
 
