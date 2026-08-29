@@ -95,7 +95,7 @@ impl OperatorConstructionCheckpointF64 {
         }
         if self.completed_rows == 0
             || self.completed_rows >= self.dimension
-            || self.completed_rows % self.block_rows != 0
+            || !self.completed_rows.is_multiple_of(self.block_rows)
             || self.assembled_rows.len() != self.completed_rows.saturating_mul(self.dimension)
             || self.assembled_rows.iter().any(|value| !value.is_finite())
         {

@@ -744,9 +744,11 @@ fn parse_hp_decimal(
 
 #[cfg(feature = "hp")]
 fn hp_string(value: &rug::Float, precision_bits: u32) -> String {
-    let digits = ((precision_bits as f64) * std::f64::consts::LOG10_2)
-        .ceil()
-        .max(32.0) as usize;
+    // Exact-round-trip width. The bare ceiling of bits*log10(2) used before
+    // v0.14.0 was one digit short, so a persisted root decoded up to one ulp
+    // away from the computed root and replay validation of the residual
+    // failed on every reuse.
+    let digits = xc_numerics::reduction::roundtrip_decimal_digits(precision_bits).max(32);
     value.to_string_radix(10, Some(digits))
 }
 
@@ -1307,6 +1309,51 @@ pub fn interval_newton_hp(
 mod hp_tests {
     use super::*;
     use rug::{Float, Rational};
+
+    /// Every persisted decimal scalar must decode to the exact bits it was
+    /// printed from. The pre-v0.14.0 width, `ceil(bits * log10(2))` with no
+    /// guard digit, is one digit short of unique recovery: a stored root
+    /// decoded up to one ulp away from the computed root, and cancellation-
+    /// dominated replay validation then failed on every cache reuse.
+    #[test]
+    fn hp_string_round_trips_exactly_at_claim_precision() {
+        let prec = 3386_u32; // HP-1000: the precision of the paper's claims
+        let old_width = ((f64::from(prec)) * std::f64::consts::LOG10_2).ceil() as usize;
+
+        let mut old_width_failures = 0_usize;
+        for k in 2_u32..202 {
+            // Deterministic full-mantissa values across wildly different
+            // scales, including the e-994 residual regime where the defect
+            // was observed.
+            let base = Float::with_val(prec, k).sqrt();
+            for scale in [-994_i32, -59, 0, 300] {
+                let value = base.clone() * Float::with_val(prec, Float::i_exp(1, scale * 10 / 3));
+                let encoded = hp_string(&value, prec);
+                let decoded = Float::with_val(
+                    prec,
+                    Float::parse(&encoded).expect("hp_string output must parse"),
+                );
+                assert_eq!(
+                    decoded,
+                    value,
+                    "hp_string lost bits for sqrt({k}) at scale 2^{}",
+                    scale * 10 / 3
+                );
+
+                let truncated = value.to_string_radix(10, Some(old_width));
+                let decoded_old = Float::with_val(prec, Float::parse(&truncated).expect("parses"));
+                if decoded_old != value {
+                    old_width_failures += 1;
+                }
+            }
+        }
+        // The old width must demonstrably lose values, or this test would
+        // not have caught the defect it documents.
+        assert!(
+            old_width_failures > 0,
+            "the pre-fix width unexpectedly round-tripped every sample"
+        );
+    }
 
     struct SqrtTwo;
 

@@ -277,7 +277,15 @@ impl ProlateWeilComparison {
 }
 
 /// The large-`lambda` predictor
-/// `(2^14/3)*sqrt(2*pi)*exp(-4*pi*exp(L) + 9L/2)`, `L=log(lambda^2)`.
+/// `(2^14/3)*sqrt(2)*pi^5*exp(-4*pi*exp(L) + 9L/2)`, `L=log(lambda^2)`.
+///
+/// Fuchs' constant `4*sqrt(pi)*8^4/4!*(2*pi)^(9/2)` equals `2^15*sqrt(2)*pi^5/3`
+/// and governs the concentration deficiency `1 - lambda_4`. The predictor here
+/// is for `1 - chi_2`, and `chi_2^2 = lambda_4` gives `1 - chi_2 ~
+/// (1 - lambda_4)/2`, so the retained prefactor is half of Fuchs' constant,
+/// `2^14*sqrt(2)*pi^5/3`, whose base-ten logarithm is the published
+/// `C_0 = 6.373563`. An earlier form carried `sqrt(2*pi)` in place of
+/// `sqrt(2)*pi^5` and was low by `pi^(9/2) = 172.65`.
 ///
 /// This is intentionally labeled as an asymptotic predictor, never a finite
 /// certificate.
@@ -292,9 +300,11 @@ pub fn prolate_chi2_deficiency_asymptotic(lambda_squared: u64, precision_bits: u
     nine_l_over_two /= 2u32;
     exponent += nine_l_over_two;
 
-    let mut prefactor = pi;
-    prefactor *= 2u32;
+    let mut prefactor = Float::with_val(precision_bits, 2u32);
     prefactor.sqrt_mut();
+    let pi_fourth = pi.clone().square().square();
+    prefactor *= &pi_fourth;
+    prefactor *= &pi;
     prefactor *= 2u32.pow(14);
     prefactor /= 3u32;
     prefactor * exponent.exp()
@@ -355,7 +365,7 @@ pub struct ActiveTruncationBound {
     pub source: String,
 }
 
-/// Direct finite-dimensional comparison of Connes's prolate candidate and a
+/// Direct finite-dimensional comparison of the reference prolate candidate and a
 /// computed Weil state. Both inputs are normalized internally, and the
 /// prolate sign is aligned to the Weil state before differences are formed.
 #[derive(Clone, Debug)]
@@ -571,6 +581,26 @@ mod tests {
         assert_eq!(
             finite_cutoff_decision(&shallow_negative, &budget),
             FiniteCutoffDecision::InconclusiveTailBand
+        );
+    }
+
+    /// The prefactor is half of Fuchs' constant -- Fuchs governs `1 - lambda_4`
+    /// and `chi_2^2 = lambda_4` halves it -- and its base-ten logarithm is the
+    /// published `C_0`. Pinning it here keeps the predictor tied to the
+    /// literature rather than to whatever the code happened to contain.
+    #[test]
+    fn prolate_asymptotic_prefactor_matches_the_published_c0() {
+        let prec = 192;
+        // Strip the exponential: at lambda^2 = 1 the exponent is -4*pi.
+        let predictor = prolate_chi2_deficiency_asymptotic(1, prec);
+        let restored =
+            predictor * Float::with_val(prec, Float::with_val(prec, Constant::Pi) * 4u32).exp();
+        let log10 = restored.ln() / Float::with_val(prec, 10u32).ln();
+        let expected = Float::with_val(prec, Float::parse("6.373563046").unwrap());
+        let error = Float::with_val(prec, &log10 - &expected).abs();
+        assert!(
+            error < Float::with_val(prec, Float::parse("1e-9").unwrap()),
+            "log10 prefactor {log10:?} does not match the published C_0"
         );
     }
 

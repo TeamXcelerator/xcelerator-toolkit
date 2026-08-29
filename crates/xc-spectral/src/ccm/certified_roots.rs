@@ -781,8 +781,10 @@ pub fn production_ccm_source_weights_digest(
 /// Validate the identity, source binding, target accounting, and isolated-root
 /// structure of a persisted independent CCM certificate without repeating the
 /// expensive FLINT root census. This is the cache-read validation boundary;
-/// [`verify_production_independent_ccm_root_certificate`] remains the explicit
-/// full numerical replay operation.
+/// `verify_production_independent_ccm_root_certificate` remains the explicit
+/// full numerical replay operation. That function is `arb`-gated, so this is
+/// deliberately not an intra-doc link: it would not resolve in an `hp`-only
+/// documentation build.
 pub fn validate_production_independent_ccm_root_certificate_structure(
     certificate: &ProductionIndependentCcmRootCertificate,
 ) -> Result<()> {

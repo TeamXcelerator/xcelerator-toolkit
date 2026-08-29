@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.®)
 // All rights reserved. See LICENSE in the repository root.
 
-//! Connes-Consani-Moscovici "Zeta Spectral Triples" construction.
+//! CCM "Zeta Spectral Triples" construction.
 //!
 //! Implements the CCM operator family `D_log(λ, N)`.
 //! (27 Nov 2025), whose eigenvalues converge to the imaginary parts
@@ -27,6 +27,9 @@ pub mod evidence;
 
 #[cfg(feature = "hp")]
 pub mod certified_roots;
+
+#[cfg(feature = "hp")]
+pub mod sector_gap_certificate;
 
 #[cfg(feature = "arb")]
 mod arb_bridge;

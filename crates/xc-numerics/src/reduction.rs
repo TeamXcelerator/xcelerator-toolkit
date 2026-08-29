@@ -28,9 +28,17 @@ pub struct HpReductionComparison {
     pub accepted: bool,
 }
 
-fn roundtrip_decimal_digits(precision_bits: u32) -> usize {
-    // ceil(bits * log10(2)) + two guard digits, with 30103/100000 an
-    // upward rational bound for log10(2).
+/// Decimal digits sufficient for exact round-trip of a binary float at the
+/// given precision.
+///
+/// `ceil(bits * log10(2)) + two guard digits`, with 30103/100000 an upward
+/// rational bound for log10(2). The `+1` beyond the ceiling is what makes
+/// re-reading the printed value recover the original bit for bit (the same
+/// reason binary64 needs 17 digits, not 16); the second guard digit is
+/// margin. Every persisted decimal scalar must use this width: printing at
+/// the bare ceiling loses up to one ulp on decode, which cancellation-
+/// dominated replay checks then amplify by hundreds of orders of magnitude.
+pub fn roundtrip_decimal_digits(precision_bits: u32) -> usize {
     (u64::from(precision_bits)
         .saturating_mul(30_103)
         .div_ceil(100_000)
@@ -214,6 +222,24 @@ pub fn compare_hp_reduction_artifacts(
 mod tests {
     use super::*;
     use rug::ops::Pow;
+
+    /// Unique decimal recovery of a P-bit float needs ceil(P*log10(2)) + 1
+    /// digits; this helper carries one more as margin. Binary64 is the
+    /// canonical reference point: 17 digits required, so the helper must
+    /// return at least 18 for 53 bits, and at least 1022 for the paper's
+    /// 3386-bit tier where the one-short width corrupted persisted roots.
+    #[test]
+    fn roundtrip_digit_width_exceeds_unique_recovery_minimum() {
+        assert_eq!(roundtrip_decimal_digits(53), 18);
+        assert_eq!(roundtrip_decimal_digits(3386), 1022);
+        for bits in [24_u32, 53, 113, 729, 3386, 6708, 16384] {
+            let minimum = (f64::from(bits) * std::f64::consts::LOG10_2).ceil() as usize + 1;
+            assert!(
+                roundtrip_decimal_digits(bits) >= minimum,
+                "width for {bits} bits is below the unique-recovery minimum"
+            );
+        }
+    }
     use std::collections::{BTreeMap, BTreeSet};
     use xc_core::{
         ConfigDigest, PrecisionFingerprint, Reproducibility, ThreadPolicyFingerprint,

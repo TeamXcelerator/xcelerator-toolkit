@@ -51,11 +51,13 @@ recomputed and written through the normal artifact-writing path into
 `<validation-cache>/computed`. These are real payload and manifest files, not
 synthetic report records.
 
-Reference artifacts may still control the computational route. In particular,
-CCM continuation seeds may be reused from the reference cache so a validation
-run takes the same seeded route as the baseline run. Route probes and seed
-discovery consult the reference cache only; previously computed validation
-artifacts cannot influence a later run.
+Reference artifacts may still control the computational route selection.
+Persisted CCM eigenpairs are always computed from the canonical initial
+state - cached states are never reused as continuation seeds, so a
+validation recompute cannot take a different iteration path than any other
+compute of the same identity. Route probes consult the reference cache
+only; previously computed validation artifacts cannot influence a later
+run.
 
 After each computation, the toolkit resolves the same semantic identity in the
 reference-only resolver and compares the exact payload bytes. Semantic keys and

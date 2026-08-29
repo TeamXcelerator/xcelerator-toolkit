@@ -542,17 +542,13 @@ impl CachePolicy {
                 manifest.quality, self.minimum_quality
             ));
         }
-        if manifest.producer_toolkit_version.major != self.current_toolkit_version.major
-            || manifest.producer_toolkit_version.minor != self.current_toolkit_version.minor
-        {
-            reasons.push(format!(
-                "artifact producer line {}.{} is not the current {}.{} release line",
-                manifest.producer_toolkit_version.major,
-                manifest.producer_toolkit_version.minor,
-                self.current_toolkit_version.major,
-                self.current_toolkit_version.minor
-            ));
-        }
+        // Producer age is not judged here against the running toolkit's
+        // release line. The explicit compatibility floors are the authority:
+        // canonical manifest validation enforces the per-family
+        // `minimum_producer_version`, and the reader-range checks above
+        // enforce the artifact's own declared reader window. This matches the
+        // original floor-based contract (a 0.12.0 artifact remained valid
+        // under every later toolkit until a floor was deliberately raised).
         CacheAcceptanceDecision {
             accepted: reasons.is_empty(),
             reasons,
@@ -684,6 +680,23 @@ pub trait CacheStore: Send + Sync {
     ) -> Result<Vec<ArtifactKey>, CacheError> {
         Ok(Vec::new())
     }
+    /// Return manifests matching an exact published dependency identity
+    /// (family, semantic digest, canonical manifest digest, payload digest),
+    /// regardless of logical key.
+    ///
+    /// Publication closures reference dependencies by identity, and a
+    /// dependency reused from a published shard carries no key-based
+    /// dependency list of its own, so staging its transitive closure requires
+    /// looking artifacts up by identity rather than by key. Implementations
+    /// that cannot search by identity return an empty set and the resolver
+    /// consults other layers.
+    fn identity_candidates(
+        &self,
+        _identity: &crate::PayloadDependencyIdentity,
+    ) -> Result<Vec<ArtifactManifest>, CacheError> {
+        Ok(Vec::new())
+    }
+
     /// Return nearest compatible CCM eigenpair keys through a purpose-built
     /// secondary index. Remote implementations must not emulate this by
     /// crawling canonical manifests.
@@ -1126,7 +1139,88 @@ impl FilesystemCacheStore {
     }
 }
 
+/// Whether a locally retained manifest is the artifact a published
+/// dependency identity names.
+///
+/// Only manifests adopted from a published shard carry the retained canonical
+/// manifest tag; a manifest without it cannot prove identity equality and is
+/// never matched. The canonical manifest digest is recomputed rather than
+/// trusted from any index.
+fn manifest_matches_dependency_identity(
+    manifest: &ArtifactManifest,
+    identity: &crate::PayloadDependencyIdentity,
+) -> Result<bool, CacheError> {
+    let Some(encoded) = manifest.tags.get(crate::REMOTE_CANONICAL_MANIFEST_TAG) else {
+        return Ok(false);
+    };
+    let Ok(canonical) = serde_json::from_str::<crate::CanonicalArtifactManifest>(encoded) else {
+        return Ok(false);
+    };
+    Ok(canonical.artifact_family == identity.artifact_family
+        && canonical.semantic_digest == identity.semantic_digest
+        && canonical.digest()? == identity.manifest_digest
+        && canonical.payload_digest == identity.payload_digest)
+}
+
 impl CacheStore for FilesystemCacheStore {
+    fn identity_candidates(
+        &self,
+        identity: &crate::PayloadDependencyIdentity,
+    ) -> Result<Vec<ArtifactManifest>, CacheError> {
+        identity.validate()?;
+        // Enumerate kind and logical-key directories, entering only those
+        // whose parameters-digest child matches the identity's semantic
+        // digest. Manifests are read directly and carry their own authoritative
+        // keys, so no directory-name decoding is needed (the component
+        // encoding is not invertible: a literal underscore collides with its
+        // own escape prefix). The scan is bounded by the number of retained
+        // artifacts, not by payload sizes.
+        let artifacts_root = self.root.join("artifacts");
+        if !artifacts_root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut matches = Vec::new();
+        for kind_entry in fs::read_dir(&artifacts_root)? {
+            let kind_path = kind_entry?.path();
+            if !kind_path.is_dir() {
+                continue;
+            }
+            for logical_entry in fs::read_dir(&kind_path)? {
+                let logical_path = logical_entry?.path();
+                if !logical_path.is_dir() {
+                    continue;
+                }
+                let manifest_directory = logical_path
+                    .join(&identity.semantic_digest.0)
+                    .join("manifests");
+                if !manifest_directory.is_dir() {
+                    continue;
+                }
+                for entry in fs::read_dir(&manifest_directory)? {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file()
+                        || entry
+                            .path()
+                            .extension()
+                            .is_none_or(|extension| extension != "json")
+                    {
+                        continue;
+                    }
+                    let manifest: ArtifactManifest =
+                        serde_json::from_slice(&fs::read(entry.path())?)?;
+                    manifest.validate()?;
+                    if manifest.key.parameters_digest != identity.semantic_digest {
+                        continue;
+                    }
+                    if manifest_matches_dependency_identity(&manifest, identity)? {
+                        matches.push(manifest);
+                    }
+                }
+            }
+        }
+        Ok(matches)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -1712,6 +1806,48 @@ impl CacheResolver {
     /// Return distinct keys visible through all configured layers. Layer
     /// precedence is preserved, while duplicate semantic identities are
     /// collapsed.
+    /// Resolve an artifact by its exact published dependency identity.
+    ///
+    /// Layers are consulted in precedence order, so a copy already adopted
+    /// into the local working cache wins over a remote fetch. Returns
+    /// `Ok(None)` when no layer can produce the identity, leaving the caller
+    /// to report which closure member is unreachable.
+    pub fn resolve_dependency_identity(
+        &self,
+        identity: &crate::PayloadDependencyIdentity,
+        policy: &CachePolicy,
+    ) -> Result<Option<ResolvedArtifact>, CacheError> {
+        identity.validate()?;
+        for layer in &self.layers {
+            for manifest in layer.store.identity_candidates(identity)? {
+                if !policy.accepts(&manifest) {
+                    continue;
+                }
+                // Stores are not trusted to have matched the identity: the
+                // resolver re-verifies every candidate against the retained
+                // canonical manifest before returning it.
+                if !manifest_matches_dependency_identity(&manifest, identity)? {
+                    return Err(CacheError::InvalidManifest(format!(
+                        "cache layer {} returned a candidate that does not match dependency \
+                         identity {}/{}",
+                        layer.store.name(),
+                        identity.artifact_family,
+                        identity.semantic_digest.0
+                    )));
+                }
+                let payload = layer.store.read_payload(&manifest)?;
+                let encoded_payload = layer.store.verified_encoded_payload(&manifest)?;
+                return Ok(Some(ResolvedArtifact {
+                    layer_name: layer.store.name().to_owned(),
+                    manifest,
+                    payload,
+                    encoded_payload,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn matching_keys(
         &self,
         kind: &str,
@@ -2570,6 +2706,11 @@ pub fn plan_github_publication(
     estimated_history_bytes: u64,
     requires_pull_request: bool,
 ) -> Result<GitHubPublicationPlan, CacheError> {
+    if visibility == CacheVisibility::Public && artifact_kind_is_private_only(artifact_kind) {
+        return Err(CacheError::PermissionDenied(format!(
+            "artifact kind {artifact_kind:?} is private-only"
+        )));
+    }
     capacity_registry.shards.iter().try_for_each(|shard| {
         if shard.safe_payload_limit_bytes > GITHUB_SAFE_REPOSITORY_PAYLOAD_BYTES {
             return Err(CacheError::InvalidManifest(format!(
@@ -2669,6 +2810,18 @@ mod github_registry_tests {
         assert_eq!(plan.shard_id, "tau-public-001");
         assert!(plan.projected_repository_bytes < GITHUB_SAFE_REPOSITORY_PAYLOAD_BYTES);
         assert!(plan.requires_pull_request);
+
+        let error = plan_github_publication(
+            &capacity,
+            &network,
+            "ccm_target_distance",
+            CacheVisibility::Public,
+            1,
+            0,
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::PermissionDenied(_)));
     }
 
     #[test]

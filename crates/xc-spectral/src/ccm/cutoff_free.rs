@@ -74,7 +74,10 @@ impl CutoffFreeMatrix {
         interval_symmetric_ldlt_inertia(&self.tau, self.dimension()).map_err(anyhow::Error::from)
     }
 
-    pub fn portable_inertia_certificate(&self) -> Result<PortableIntervalInertiaCertificate> {
+    /// Digest of the exact `W02`, `WR`, and `Wp` interval records used to
+    /// assemble this matrix.  Derived certificates can bind the same
+    /// component evidence without first running a full inertia proof.
+    pub fn component_evidence_digest(&self) -> Result<ContentDigest> {
         let component_evidence = (
             self.config.integer_cutoff_c,
             self.config.modes,
@@ -87,12 +90,16 @@ impl CutoffFreeMatrix {
         );
         let evidence_bytes = serde_json::to_vec(&component_evidence)
             .context("serialize cutoff-free component evidence")?;
+        Ok(ContentDigest(sha256_hex(&evidence_bytes)))
+    }
+
+    pub fn portable_inertia_certificate(&self) -> Result<PortableIntervalInertiaCertificate> {
         build_portable_interval_inertia_certificate(
             &self.tau,
             self.dimension(),
             self.config.precision_bits,
             self.scalar_backend.clone(),
-            ContentDigest(sha256_hex(&evidence_bytes)),
+            self.component_evidence_digest()?,
             std::collections::BTreeMap::from([
                 (
                     "integer_cutoff_c".to_owned(),

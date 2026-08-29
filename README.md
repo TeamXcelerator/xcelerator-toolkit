@@ -7,10 +7,36 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-Version 0.13.5 preserves existing cache artifacts and mathematical behavior
-while reducing high-precision CCM construction overhead, adding opt-in
-performance evidence, and introducing a guarded experimental Gauss--Legendre
-schedule. Established scheduling remains the default.
+Version 0.14.1 is an amended maintenance release for CCM capture and managed
+cache publication. Publishing children of shard-reused artifacts to a new
+destination now stages the full dependency closure without recomputation,
+including identity-first dependencies later referenced by their real cache
+keys. Author publication also accounts for validated workstation and remote
+reuse hits, including strict `require_reuse` runs; destination verification
+suppresses redundant commits, while an execution that observed no artifacts
+fails instead of reporting a vacuous success. Historical exact dependencies
+may be added to immutable repository closure without displacing an
+equal-or-newer live semantic-index entry; ordinary producer downgrades remain
+forbidden. Publication preflight recognizes those superseded exact identities
+only when the retained manifest has a canonical batch proof, matching the
+reader's historical-resolution rule. Long destination scans refresh GitHub write evidence before both
+candidate authorization and remote mutation, so the five-minute authority
+window cannot expire merely while a large existing family is inspected.
+Warm distance/profile hits avoid fresh eigensolves, quadrature, and sampling
+work; distance capture reuses the exact managed `ccm_weil_eigenpair`, binds
+its content digest and dependency closure into every affected artifact
+identity, and reuses exact managed Gauss--Legendre artifacts across
+configurations and exact eigenfunction values
+across nested refinement grids; root refinements share their secular-pole
+vector; and invalid capture resolutions or semantically mismatched retained
+payloads fail early. Maximum capture adds separate numerical-analysis
+artifacts. Target-dependent work reads its definition from the private runtime
+path named by `XC_TARGET_SPEC_FILE`; only the specification digest enters cache
+identity, and those derived artifacts are private-only. Explicit finite sector certification can additionally retain exact
+cutoff-free parity, ordering, simplicity, and positivity evidence. The
+corrected distance/profile semantic identities supersede legacy artifacts that
+were not bound to their canonical eigenpair; unrelated artifact payloads,
+schemas, and numerical definitions are unchanged.
 
 ---
 
@@ -19,7 +45,7 @@ schedule. Established scheduling remains the default.
 - **Compute-first workflow** — request a result and use it. The toolkit reuses a compatible cache entry when available and computes the result when it is not.
 - **Computed assurance by default** — ordinary calculations run their normal validation and diagnostics without the substantial additional cost of rigorous certification.
 - **High-precision numerics** — GMP/MPFR-based arithmetic, deterministic reductions, structured linear algebra, root finding, and eigensolvers.
-- **Research mathematics** — Connes–Consani–Moscovici finite Weil forms, prolate and Mellin methods, Suzuki screw functions, Yakaboylu operators, Dirichlet L-functions, zeta utilities, and Maynard–Tao variational calculations.
+- **Research mathematics** — CCM finite Weil forms, the CCM target function and weighted eigenfunction distances, prolate and Mellin methods, Suzuki screw functions, Yakaboylu operators, Dirichlet L-functions, zeta utilities, and Maynard–Tao variational calculations.
 - **Reusable artifacts** — versioned, content-addressed local and remote caching with validation before reuse.
 - **Output-preserving optimization** — cache verification compares recomputed payload bytes with current references, while deterministic HP parallelism and retained validated values reduce avoidable work without changing artifact identities.
 - **Optional stronger assurance** — independent cross-checks and replayable finite certificates are available for claims that need them.
@@ -46,7 +72,7 @@ If you use Xcelerator Toolkit in research, please cite the exact version or Git 
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.13.5},
+  version = {0.14.1},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }
@@ -153,9 +179,10 @@ and evidence identities; they cannot overwrite or satisfy natural or
 even-sector requests.
 
 Version 0.13.4 adds `XC_CACHE_MODE=verify`. Verification recomputes each
-requested artifact into an isolated cache, follows reference-cache routes and
-continuation seeds, compares exact payload bytes, and writes a claim-wide
-report. Missing references, mismatches, nondeterministic recomputation, and
+requested artifact into an isolated cache, follows reference-cache route
+selection, compares exact payload bytes, and writes a claim-wide report.
+Persisted eigenstates are always computed from the canonical initial state,
+never from cached continuation seeds. Missing references, mismatches, nondeterministic recomputation, and
 zero-comparison runs fail the validation without publishing or modifying the
 production cache.
 
@@ -235,6 +262,175 @@ xc_numerics::hp_runtime::run_hp_with_policy(&policy, || {
     // Invoke the high-precision workflow here.
 })?;
 ```
+
+## Target-distance measurement
+
+Version 0.14.1 includes the measurement layer for runtime target-distance work:
+
+- `xc_spectral::target` evaluates a generic Gaussian-polynomial lattice-series
+  specification at binary64 and arbitrary MPFR precision. The research
+  definition is supplied at runtime through `XC_TARGET_SPEC_FILE`; the public
+  source contains no target coefficients or research-specific formula.
+- `xc_numerics::grid_integral` provides deterministic uniform-grid integration
+  (left/right Riemann, midpoint, trapezoid) on grids uniform in `u` or `ln u`,
+  at binary64 and HP. `xc_spectral::distance::WeightedIntegrationRule` selects
+  between that family and Gauss--Legendre for every weighted norm and distance,
+  so a collaborator's rule can be reproduced exactly rather than approximated.
+  Neither family is privileged: Gauss--Legendre converges spectrally on smooth
+  integrands but loses that advantage at the derivative kinks introduced by
+  absolute residuals at interior sign changes.
+- `xc_spectral::distance` reconstructs the normalized even CCM eigenfunction
+  `f(1) = 1` from its Fourier coefficients and measures the weighted norm,
+  the inter-discretization distance `D_alpha(N, M; lambda)`, and the distance
+  to target `d(N, lambda)`. Every result records the quadrature scheme, grid
+  variable, resolution, `alpha`, and precision that produced it; a value
+  separated from its convention is not comparable and should not be reported.
+- Every retained profile, target-distance diagnostic, and inter-discretization
+  distance names the exact canonical `ccm_weil_eigenpair` content digest in
+  its semantic identity and carries that eigenpair as a manifest dependency.
+  The target-distance eigenvalue must replay exactly from that parent; an
+  independently approximated sector midpoint is never accepted as the state.
+- `xc_spectral::distance::hp::ccm_distance_to_target_hp` measures `d(N, lambda)`
+  end to end for one CCM configuration, resolving the even ground state through
+  the ordinary reuse-first cache routes; the distance computation itself writes
+  nothing.
+
+Measurements can be retained as reusable artifacts. The `ccm-distance` family
+holds eigenfunction profiles (`ccm_eigenfunction_profile`), target distances
+(`ccm_target_distance`), inter-discretization distances
+(`ccm_discretization_distance`), numerical resolution evidence
+(`ccm_distance_resolution_evidence`), signed/crossing residual diagnostics
+(`ccm_target_residual_analysis`), and projection onto a runtime-supplied
+auxiliary profile (`ccm_deviation_decomposition`). Retention of the first four is
+opt-in — absent at the ordinary capture levels, requested through
+`CcmDistanceCaptureOptions`, and included by
+`CcmResearchCaptureOptions::maximum`. The deviation decomposition is opt-in
+separately and is excluded from every named capture level, including `maximum`,
+because adding a new artifact kind to a named level would break `require_reuse`
+reproduction of shards that predate it; request it with
+`.with_deviation_decomposition()`. Maximum capture records fixed
+coefficient-tail diagnostics and same-rule Q/2Q refinement for each uniform
+grid, continuing to 4Q only when the `1e-8` relative tolerance is missed. It
+also retains signed, positive, and negative residual mass under every requested
+rule, together with sampled extrema, signs, and sign-change brackets.
+Gauss--Legendre remains the independent-family cross-check in the target-distance
+artifact. The quadrature convention is part of artifact identity, so a
+measurement cannot be confused with one taken under a different rule, grid,
+resolution, or `alpha`. Retained profiles allow norms and inter-discretization
+distances to be recomputed downstream without repeating the spectral solve.
+They also allow the three diagnostic kinds to be backfilled after the current
+canonical profile/distance pair exists. Legacy unbound profile and distance
+identities are superseded rather than reused; their canonical eigenpair parent
+can still avoid a fresh eigensolve. Managed target-distance capture resolves Gauss--Legendre nodes and
+weights through the existing `gauss_legendre_rule` artifact family, so
+configurations with the same order and working precision reuse one exact
+table. For left/right/trapezoid resolution evidence, Q/2Q/4Q also reuse an
+eigenfunction value only when the refined MPFR abscissa is binary-identical;
+midpoint grids remain independent.
+
+The four runtime-target-derived kinds -- `ccm_target_distance`,
+`ccm_distance_resolution_evidence`, `ccm_target_residual_analysis`, and
+`ccm_deviation_decomposition` -- are private-only. Managed publication routes
+them to the private leg: under `Both` they are withheld from the public
+destination while public-eligible kinds publish to both, and an explicit
+`Public`-only request fails when nothing staged is public-eligible. Public
+bootstrap layers will not resolve them. The target-independent `ccm_eigenfunction_profile` and
+`ccm_discretization_distance` kinds remain eligible for public publication.
+
+Maximum capture also retains `ccm_root_conditioning_analysis` in the existing
+`ccm-evidence` family. For every returned root it records the signed secular
+derivative, the absolute secular-term sum, its reciprocal and magnitude
+condition estimate, and exact geometry relative to the retained uniform pole
+grid. The term sum is the measured cancellation scale needed to study the
+root-precision floor. This is a direct MPFR replay from the retained root range
+and eigenstate, not interval certification; a later maximum run can create a
+missing analysis child without repeating the matrix or root solve.
+
+Secular-root refinement continues to default to
+`RootPrecisionPolicy::FixedGuard`, retaining the historical v6/v7 arithmetic,
+payload, and cache identity exactly. Adaptive v9 refinement is an explicit
+opt-in through `HighPrecConfig::with_adaptive_root_precision()`. It holds the
+requested target fixed and widens only the inexpensive root layer when the
+initial 64-bit reserve cannot support that target. Every converged v9 root is
+checked again at a wider precision at the exact stored root. Its artifact
+records the evaluation and verification precisions, escalation count,
+correction, stopping reason, and the explicit `exact_stored_point_source`
+scope. Adaptive keys bind the exact secular-source content digest. Historical
+v6/v7 root artifacts are not promoted or used as adaptive starting points;
+every v9 miss follows the same canonical computation path, so reuse, refresh,
+and verification cannot produce different payload bytes for one semantic key.
+
+Prime-power response is a separate, potentially expensive opt-in and is **not**
+implied by `maximum`. Set
+`CcmResearchCaptureOptions::capture_prime_power_response = true`, or call
+`.with_prime_power_response()`, to retain
+`ccm_prime_power_response_analysis` in `ccm-evidence`. At the observation
+cutoff the artifact isolates every active prime power's contribution to
+`dQ/du`, `u = log(lambda_squared)`, and transports it through the selected
+eigenvalue, the full L2 eigenvector, and every retained root. At a prime-power
+edge this is Groskin's rank-one right-minus-left derivative jump. Dense event
+matrices are not duplicated: each direction is reconstructed analytically, one
+reduced-even-sector bordered factorization is shared by every event, and the
+retained full response vectors preserve the data needed for later
+coefficient-tail research. Response schema v2 first binds independently
+indexed HP Sturm enclosures for the lowest two even-sector eigenvalues,
+requires a positive same-sector gap and a selected-state residual small enough
+relative to that gap, and records the resulting isolation evidence. An
+unresolved crossing fails the capture explicitly instead of emitting a
+misleading individual eigenvector derivative. Natural and adaptive-even state
+routes are likewise rejected because they do not bind the response to one
+parity branch. Existing unguarded v1 response artifacts cannot satisfy v2.
+
+Complete CCM flow is a second, independent opt-in and is also **not** implied
+by `maximum`. Set `CcmResearchCaptureOptions::capture_u_flow_response = true`,
+or call `.with_u_flow_response()`, to retain
+`ccm_u_flow_response_analysis` in `ccm-evidence`. It analytically differentiates
+the toolkit's full Tau construction with respect to
+`u = log(lambda_squared)`, retaining separate pole, archimedean, aggregate
+active-prime, and total channels. Each channel carries its action on the
+selected state, eigenvalue response, complete eigenvector response, and
+fixed-pole root response. The total root response additionally includes motion
+of every secular pole `2*pi*n/u`. This decomposition supports convergence,
+cancellation, and dominance studies without treating any one prime-event
+formula as the research target. It uses the same v2 even-sector isolation gate
+and reduced solve as prime-power response capture; near-crossing ambiguity is a
+hard capture error, never a residual-passing response payload.
+
+Finite sector-gap certification is a third explicit opt-in and is likewise
+**not** implied by `maximum`. It requires an Arb-enabled build and retained
+sector analysis with at least two eigenpairs:
+
+```rust
+use xc_spectral::ccm::hp::CcmResearchCaptureOptions;
+use xc_spectral::ccm::sector_gap_certificate::CcmSectorGapCertificationOptions;
+
+let options = CcmResearchCaptureOptions::maximum(8)
+    .with_sector_gap_certification(CcmSectorGapCertificationOptions::default());
+```
+
+The resulting `ccm_sector_gap_certificate` stays in the existing
+`ccm-evidence` family. It stores the raw exact cutoff-free Tau intervals and an
+assumption-free full-matrix interval-LDLT inertia certificate. Positive
+definiteness is derived only from that full-matrix proof. The artifact also
+stores exact shifted-inertia enclosures for the lowest two even eigenvalues and
+lowest odd eigenvalue, the even-sector gap, signed even-versus-odd separation
+bounds, and the finite outcome (`even`, `odd`, or `unresolved`). Those parity,
+ordering, and sector-simplicity conclusions explicitly depend on the recorded
+premise that the exact closed-form CCM matrix is centrosymmetric; the verifier
+derives their canonical parity matrix from the raw inertia-certified matrix.
+Numerical sector spectra and native cutoff-free midpoint values are retained
+only as discovery guides. A later opt-in run can reuse existing numerical
+sector parents and create this child, but a cache miss must still perform the
+cutoff-free interval assembly and certification. Its scope is one finite
+`(c, N)` matrix, not continuum parity or convergence.
+
+```bash
+cargo run -p xc-spectral --example target_distance
+```
+
+prints the opaque target-definition digest, a normalized runtime-target table,
+the weighted target norm, and the same distance under several quadrature
+schemes for line-by-line comparison with an authorized private implementation.
 
 ## Validation
 

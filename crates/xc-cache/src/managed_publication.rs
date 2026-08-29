@@ -385,6 +385,53 @@ struct DestinationDraftSelection<'a> {
     already_present: usize,
 }
 
+fn order_family_publication_drafts(drafts: &mut Vec<&CanonicalProductionDraft>) {
+    drafts.sort_by(|left, right| {
+        (
+            &left.manifest.semantic_digest,
+            left.source_operation != "cache.dependency.closure",
+            &left.manifest.producer_toolkit_version,
+            left.manifest.canonical_payload.dependencies.len(),
+            &left.manifest.payload_digest,
+        )
+            .cmp(&(
+                &right.manifest.semantic_digest,
+                right.source_operation != "cache.dependency.closure",
+                &right.manifest.producer_toolkit_version,
+                right.manifest.canonical_payload.dependencies.len(),
+                &right.manifest.payload_digest,
+            ))
+    });
+}
+
+/// Decide whether a family-batch member should replace the live semantic
+/// index entry. Historical closure members are immutable publication inputs,
+/// not candidates for live selection: when an equal-or-newer discoverable
+/// producer is already indexed, retain that entry while still committing the
+/// historical manifest, encoding, objects, and batch proof.
+fn family_draft_advances_live_index(
+    partition: &crate::ShardIndexPartition,
+    draft: &CanonicalProductionDraft,
+    manifest: &crate::CanonicalArtifactManifest,
+) -> Result<bool, CacheError> {
+    if draft.source_operation == "cache.dependency.closure"
+        && partition.lookup(&manifest.semantic_digest).any(|entry| {
+            entry.producer_toolkit_version >= manifest.producer_toolkit_version
+                && !matches!(
+                    entry.disposition,
+                    ArtifactDisposition::Revoked | ArtifactDisposition::Quarantined
+                )
+        })
+    {
+        return Ok(false);
+    }
+    partition.ensure_monotonic_producer(
+        &manifest.semantic_digest,
+        &manifest.producer_toolkit_version,
+    )?;
+    Ok(true)
+}
+
 fn destination_manifest_dominates(
     existing: &crate::CanonicalArtifactManifest,
     staged: &crate::CanonicalArtifactManifest,
@@ -456,10 +503,10 @@ fn select_missing_destination_drafts<'a>(
         let transport_digest = draft.encoding.digest()?;
         let prefix = &manifest.semantic_digest.0[..2];
         if let Some(partition) = partitions.get(prefix) {
-            partition.ensure_monotonic_producer(
-                &manifest.semantic_digest,
-                &manifest.producer_toolkit_version,
-            )?;
+            // Fail ordinary downgrades before expensive preparation, while
+            // allowing an historical dependency to proceed as a closure-only
+            // batch member whose live-index treatment is decided at commit.
+            family_draft_advances_live_index(partition, draft, &manifest)?;
         }
         let mut existing_candidates = Vec::new();
         if let Some(partition) = partitions.get(prefix) {
@@ -492,7 +539,13 @@ fn select_missing_destination_drafts<'a>(
                 let exact = entry.manifest_digest == manifest_digest
                     && entry.canonical_payload_digest == manifest.payload_digest
                     && entry.transport_digests.contains(&transport_digest);
-                let dominates = exact || destination_manifest_dominates(&document.value, &manifest);
+                // An exact dependency closure member is named by manifest and
+                // payload digest. A newer dependency-complete wrapper may
+                // dominate it for ordinary semantic reuse, but cannot stand
+                // in for that exact identity in a published child's closure.
+                let dominates = exact
+                    || (draft.source_operation != "cache.dependency.closure"
+                        && destination_manifest_dominates(&document.value, &manifest));
                 if dominates {
                     existing_candidates.push(entry);
                 }
@@ -603,12 +656,12 @@ fn prepare_family_candidates<'a>(
     pending_drafts: &[&'a CanonicalProductionDraft],
     destination: PublicationDestination,
     context: &ManagedPublicationPlanningContext,
-    sessions: &BTreeMap<PublicationDestination, AuthenticatedGitHubSession>,
+    active_session: &AuthenticatedGitHubSession,
     staging_root: &Path,
 ) -> Result<Vec<PreparedFamilyCandidate<'a>>, CacheError> {
     let mut candidates = Vec::with_capacity(pending_drafts.len());
     for draft in pending_drafts {
-        let sessions_for_target = BTreeMap::from([(destination, sessions[&destination].clone())]);
+        let sessions_for_target = BTreeMap::from([(destination, active_session.clone())]);
         let artifact = prepare_managed_artifact_publication(draft, context, &sessions_for_target)?;
         crate::publication_staging::validate_public_documents(
             artifact
@@ -794,6 +847,33 @@ impl Drop for RemoteSessionCleanup<'_> {
     }
 }
 
+/// Commit author name recorded on published cache batches.
+///
+/// Defaults to the authenticated principal so published commits carry the same
+/// identity as that account's other work. `XC_PUBLISH_AUTHOR_NAME` overrides
+/// it for an installation that wants published batches attributed to a
+/// distinct name.
+fn publication_author_name(principal: &str) -> String {
+    std::env::var("XC_PUBLISH_AUTHOR_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| principal.to_owned())
+}
+
+/// Commit author email recorded on published cache batches.
+///
+/// Defaults to the principal's GitHub no-reply address, which GitHub resolves
+/// to that account so published commits are attributed rather than shown as an
+/// unlinked author. An account whose no-reply address carries a numeric user
+/// prefix should set `XC_PUBLISH_AUTHOR_EMAIL` to that exact address so
+/// published commits match its other commits byte for byte.
+fn publication_author_email(principal: &str) -> String {
+    std::env::var("XC_PUBLISH_AUTHOR_EMAIL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("{principal}@users.noreply.github.com"))
+}
+
 /// Publish a family as repository-level byte batches. Logical manifests and
 /// index entries remain one-per-artifact; only the Git transport transaction is
 /// shared. This is the normal path for families containing more than one
@@ -829,8 +909,8 @@ fn execute_family_batch_publication(
             .join(&first.family)
             .join(visibility_name(destination)),
         staging_root.clone(),
-        format!("Xcelerator Toolkit ({principal})"),
-        "xcelerator-toolkit@users.noreply.github.com",
+        publication_author_name(principal),
+        publication_author_email(principal),
     )?
     .with_resource_policy(resources.clone());
     let session_cleanup = RemoteSessionCleanup::new(&remote, &repository_url);
@@ -845,6 +925,11 @@ fn execute_family_batch_publication(
     verify_bootstrap_registry_route(&remote, owner, &first.family, destination, &cancellation)?;
     let observed_head = remote.read_ref(&repository_url, "main")?;
     let mut pending_drafts = drafts.to_vec();
+    // A destination can be missing both an historical closure member and its
+    // active replacement. Publish every immutable identity in one family
+    // batch, but apply closure-only/older variants first so the final live
+    // index entry is the key-addressable, newest, dependency-complete draft.
+    order_family_publication_drafts(&mut pending_drafts);
     if !replace_existing_semantic {
         let selection = select_missing_destination_drafts(
             &remote,
@@ -923,11 +1008,16 @@ fn execute_family_batch_publication(
         capacity_ledgers: BTreeMap::from([(destination, preparation_ledger)]),
         event_unix_seconds,
     };
+    // Candidate authorization must use the refreshed family session. The
+    // family-wide session map was created before destination/dependency scans
+    // and can legitimately be older than the five-minute mutation window by
+    // the time a large family reaches this point.
+    refresh_github_write_session(&mut active_session, principal, &authorized)?;
     let mut prepared_candidates = prepare_family_candidates(
         &pending_drafts,
         destination,
         &preparation_context,
-        sessions,
+        &active_session,
         &staging_root,
     )?;
     let prepared_files = prepared_candidate_files(&prepared_candidates);
@@ -1002,12 +1092,14 @@ fn execute_family_batch_publication(
             if pending_drafts.is_empty() {
                 return Ok(Vec::new());
             }
-            let retained = pending_drafts
-                .iter()
-                .map(|draft| draft.manifest.semantic_digest.clone())
-                .collect::<BTreeSet<_>>();
-            prepared_candidates
-                .retain(|candidate| retained.contains(&candidate.draft.manifest.semantic_digest));
+            // Several immutable variants may intentionally share one semantic
+            // digest. Retain the exact drafts selected after the head change,
+            // not every prepared candidate with the same semantic identity.
+            prepared_candidates.retain(|candidate| {
+                pending_drafts
+                    .iter()
+                    .any(|draft| std::ptr::eq(candidate.draft, *draft))
+            });
         }
         if let Some(lease) = private_lease.as_mut() {
             crate::renew_private_publication_lease(
@@ -1167,12 +1259,20 @@ fn execute_family_batch_publication(
                 Err(CacheError::NotFound(_)) => Vec::new(),
                 Err(error) => return Err(error),
             };
-            for artifact in &prepared {
+            for (draft, artifact) in pending_drafts.iter().zip(&prepared) {
                 let journal = artifact.coordinated.journal.as_ref().unwrap();
                 if journal.semantic_digest.0.get(..2) != Some(prefix.as_str()) {
                     continue;
                 }
                 let bundle = &artifact.bundles[&destination];
+                let current_partition = crate::ShardIndexPartition::rebuild(
+                    first.family.clone(),
+                    prefix.clone(),
+                    entries.clone(),
+                )?;
+                if !family_draft_advances_live_index(&current_partition, draft, &bundle.manifest)? {
+                    continue;
+                }
                 let manifest_digest = bundle.manifest.digest()?;
                 let transport_digest = bundle.encoding.digest()?;
                 entries.retain(|entry| entry.semantic_digest != journal.semantic_digest);
@@ -1941,20 +2041,25 @@ fn remap_destination_drafts(
     remap_destination_drafts_with_existing(drafts, destination, |_| Ok(false))
 }
 
+type ExactDependencyIdentity = (String, ContentDigest, ContentDigest, ContentDigest);
+type HistoricalDependencyInventories =
+    BTreeMap<(String, String), BTreeSet<ExactDependencyIdentity>>;
+
 fn exact_destination_dependency_exists(
     remote: &dyn crate::RemoteGitStore,
     owner: &str,
     destination: PublicationDestination,
     dependency: &crate::PayloadDependencyIdentity,
     revisions: &mut BTreeMap<String, String>,
+    historical_inventories: &mut HistoricalDependencyInventories,
     resources: &xc_core::ResourcePolicy,
 ) -> Result<bool, CacheError> {
-    let repository = repository_url(owner, &dependency.artifact_family, destination);
-    let revision = if let Some(revision) = revisions.get(&repository) {
+    let repository_endpoint = repository_url(owner, &dependency.artifact_family, destination);
+    let revision = if let Some(revision) = revisions.get(&repository_endpoint) {
         revision.clone()
     } else {
-        let revision = remote.read_ref(&repository, "main")?;
-        revisions.insert(repository.clone(), revision.clone());
+        let revision = remote.read_ref(&repository_endpoint, "main")?;
+        revisions.insert(repository_endpoint.clone(), revision.clone());
         revision
     };
     let cancellation = xc_core::CancellationToken::for_policy(resources);
@@ -1965,7 +2070,7 @@ fn exact_destination_dependency_exists(
         dependency.manifest_digest
     );
     let manifest = match reader.read_json::<crate::CanonicalArtifactManifest>(
-        &repository,
+        &repository_endpoint,
         &revision,
         &manifest_path,
         &cancellation,
@@ -1992,30 +2097,115 @@ fn exact_destination_dependency_exists(
         &dependency.semantic_digest.0[..2]
     );
     let index = match reader.read_json::<crate::ShardIndexPartition>(
-        &repository,
+        &repository_endpoint,
         &revision,
         &index_path,
         &cancellation,
     ) {
-        Ok(document) => document,
-        Err(CacheError::NotFound(_)) => return Ok(false),
+        Ok(document) => Some(document),
+        Err(CacheError::NotFound(_)) => None,
         Err(error) => return Err(error),
     };
-    index.value.validate()?;
-    if index.value.family != dependency.artifact_family {
-        return Err(CacheError::InvalidManifest(format!(
-            "destination dependency index {index_path:?} belongs to the wrong family"
-        )));
+    let active = if let Some(index) = index {
+        index.value.validate()?;
+        if index.value.family != dependency.artifact_family {
+            return Err(CacheError::InvalidManifest(format!(
+                "destination dependency index {index_path:?} belongs to the wrong family"
+            )));
+        }
+        index
+            .value
+            .lookup(&dependency.semantic_digest)
+            .any(|entry| {
+                entry.disposition == ArtifactDisposition::Active
+                    && entry.manifest_digest == dependency.manifest_digest
+                    && entry.canonical_payload_digest == dependency.payload_digest
+            })
+    } else {
+        false
+    };
+    if active {
+        return Ok(true);
     }
-    let exists = index
-        .value
-        .lookup(&dependency.semantic_digest)
-        .any(|entry| {
-            entry.disposition == ArtifactDisposition::Active
-                && entry.manifest_digest == dependency.manifest_digest
-                && entry.canonical_payload_digest == dependency.payload_digest
-        });
-    Ok(exists)
+
+    // A live semantic index intentionally retains only the preferred entry.
+    // Exact dependency identities named by already-published artifacts remain
+    // valid after a newer wrapper supersedes them, provided the immutable
+    // manifest still has a canonical publication-batch proof. Mirror the
+    // historical identity rule used by the GitHub bootstrap reader rather
+    // than treating "not active" as "never published".
+    let inventory_key = (repository_endpoint.clone(), revision.clone());
+    if !historical_inventories.contains_key(&inventory_key) {
+        let listing = remote.list_committed_paths(
+            &repository_endpoint,
+            &revision,
+            "transactions/batches",
+            100_000,
+            16 * 1024 * 1024,
+            &cancellation,
+        )?;
+        let suffix = format!("/{}.json", visibility_name(destination));
+        let authorized_repository = repository(owner, &dependency.artifact_family, destination);
+        let mut identities = BTreeSet::new();
+        let mut total_batch_bytes = 0u64;
+        for path in listing.paths.iter().filter(|path| path.ends_with(&suffix)) {
+            let document = reader.read_json::<crate::RepositoryPublicationBatch>(
+                &repository_endpoint,
+                &revision,
+                path,
+                &cancellation,
+            )?;
+            total_batch_bytes = total_batch_bytes
+                .checked_add(document.source.size_bytes)
+                .ok_or_else(|| {
+                    CacheError::ResourceLimit(
+                        "historical repository-batch bytes exceed u64".to_owned(),
+                    )
+                })?;
+            if total_batch_bytes > 256 * 1024 * 1024 {
+                return Err(CacheError::ResourceLimit(
+                    "historical repository-batch inventory exceeds 256 MiB".to_owned(),
+                ));
+            }
+            document.value.validate()?;
+            if document.source.repository_path != *path
+                || document.source.content_digest != document.value.digest()?
+            {
+                return Err(CacheError::InvalidManifest(format!(
+                    "historical repository batch {path:?} is not canonical"
+                )));
+            }
+            if document.value.destination != destination
+                || document.value.family != dependency.artifact_family
+                || document.value.authorized_repository != authorized_repository
+                || document.value.branch != "main"
+            {
+                continue;
+            }
+            for artifact in document.value.artifacts {
+                let expected_manifest_path = format!(
+                    "manifests/{}/{}.json",
+                    &artifact.semantic_digest.0[..2],
+                    artifact.manifest_digest
+                );
+                if artifact.manifest_path == expected_manifest_path {
+                    identities.insert((
+                        dependency.artifact_family.clone(),
+                        artifact.semantic_digest,
+                        artifact.manifest_digest,
+                        artifact.canonical_payload_digest,
+                    ));
+                }
+            }
+        }
+        historical_inventories.insert(inventory_key.clone(), identities);
+    }
+    Ok(historical_inventories[&inventory_key].contains(&(
+        dependency.artifact_family.clone(),
+        dependency.semantic_digest.clone(),
+        dependency.manifest_digest.clone(),
+        dependency.payload_digest.clone(),
+    )))
 }
 
 fn collect_leaf_paths(prefix: &str, value: &Value, paths: &mut BTreeSet<String>) {
@@ -2622,8 +2812,8 @@ fn execute_managed_family_drafts_on_github(
         let remote = crate::GitCliRemoteStore::new(
             temporary_root,
             target_roots[0].clone(),
-            format!("Xcelerator Toolkit ({principal})"),
-            "xcelerator-toolkit@users.noreply.github.com",
+            publication_author_name(principal.as_str()),
+            publication_author_email(principal.as_str()),
         )?
         .with_additional_staged_parts_roots(target_roots.into_iter().skip(1))?
         .with_resource_policy(resources.clone());
@@ -2822,8 +3012,8 @@ fn execute_managed_family_drafts_on_github(
                         .join(&family)
                         .join(visibility_name(destination)),
                     &cleanup_staging,
-                    format!("Xcelerator Toolkit ({})", session.evidence().principal),
-                    "xcelerator-toolkit@users.noreply.github.com",
+                    publication_author_name(session.evidence().principal.as_str()),
+                    publication_author_email(session.evidence().principal.as_str()),
                 )?
                 .with_resource_policy(resources.clone());
                 current_tree_paths_removed =
@@ -2979,6 +3169,25 @@ fn execute_managed_drafts_on_github_inner(
     let requested_destinations = destinations(target)?;
     let mut groups = Vec::<(PublicationTarget, Vec<CanonicalProductionDraft>)>::new();
     for destination in requested_destinations.iter().copied() {
+        // Mirror the inventory's routing: private-only kinds ride the private
+        // leg and are withheld from the public one, so a mixed draft set
+        // publishes gracefully instead of failing after all computation. An
+        // empty leg is skipped; the explicit public-only misconfiguration is
+        // already rejected at inventory construction.
+        let destination_drafts: Vec<CanonicalProductionDraft> = drafts
+            .iter()
+            .filter(|draft| {
+                crate::artifact_kind_admitted_to_destination(
+                    draft.manifest.semantic_key.artifact_kind.as_str(),
+                    destination,
+                )
+            })
+            .cloned()
+            .collect();
+        if destination_drafts.is_empty() {
+            continue;
+        }
+        let drafts = destination_drafts.as_slice();
         let destination_target = match destination {
             PublicationDestination::Private => PublicationTarget::Private,
             PublicationDestination::Public => PublicationTarget::Public,
@@ -2991,11 +3200,14 @@ fn execute_managed_drafts_on_github_inner(
             journal_root
                 .join("dependency-preflight-staging")
                 .join(visibility_name(destination)),
-            "Xcelerator Toolkit",
-            "xcelerator-toolkit@users.noreply.github.com",
+            // Dependency preflight only reads refs; it must never be able to
+            // mint a commit that looks like a published one.
+            "Xcelerator dependency preflight",
+            "preflight@invalid",
         )?
         .with_resource_policy(resources.clone());
         let mut dependency_revisions = BTreeMap::new();
+        let mut historical_dependency_inventories = BTreeMap::new();
         let mut dependency_results =
             BTreeMap::<(String, ContentDigest, ContentDigest, ContentDigest), bool>::new();
         let remapped_result =
@@ -3015,6 +3227,7 @@ fn execute_managed_drafts_on_github_inner(
                     destination,
                     dependency,
                     &mut dependency_revisions,
+                    &mut historical_dependency_inventories,
                     resources,
                 )?;
                 dependency_results.insert(identity, exists);
@@ -3124,6 +3337,32 @@ fn execute_managed_drafts_on_github_inner(
 
 #[cfg(test)]
 mod tests {
+    /// Publishing code must resolve its commit identity through
+    /// [`publication_author_name`] and [`publication_author_email`], never a
+    /// literal address. A hardcoded identity silently produces commits that
+    /// resolve to no GitHub account, and the defect is invisible until someone
+    /// audits the published history.
+    #[test]
+    fn no_publishing_site_hardcodes_a_commit_identity() {
+        // Checked against the whole file rather than a production prefix: this
+        // module is not the only `#[cfg(test)]` block, so any attempt to split
+        // production from test code here silently stops scanning early. Test
+        // fixtures use `@invalid` addresses so the rule can stay absolute.
+        let source = include_str!("managed_publication.rs");
+        // Both needles are assembled at runtime so this assertion never
+        // matches itself.
+        let email = format!("{}@{}", "xcelerator-toolkit", "users.noreply.github.com");
+        let name = format!("{} {} (", "Xcelerator", "Toolkit");
+        assert!(
+            !source.contains(&email),
+            "{email} is hardcoded; call publication_author_email instead"
+        );
+        assert!(
+            !source.contains(&name),
+            "an author name is hardcoded; call publication_author_name instead"
+        );
+    }
+
     use super::*;
     use crate::{
         protocol::canonical_json_bytes, CanonicalArtifactManifest, CanonicalPayloadEnvelope,
@@ -3220,6 +3459,56 @@ mod tests {
 
         assert_eq!(refresh_count.get(), 1);
         session.require_write_for("test-owner", repository).unwrap();
+    }
+
+    #[test]
+    fn family_candidate_preflight_uses_the_refreshed_active_session() {
+        let root = std::env::temp_dir().join(format!(
+            "xcelerator-managed-active-session-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let prepared = root.join("prepared");
+        let draft = fixture_draft(&source);
+        let destination = PublicationDestination::Private;
+        let authorized = repository("example-org", &draft.family, destination);
+        let head = "private-head".to_owned();
+        let shard = shard_id(&draft.family, destination);
+        let context = ManagedPublicationPlanningContext {
+            owner: "example-org".to_owned(),
+            principal: "test-owner".to_owned(),
+            target: PublicationTarget::Private,
+            target_heads: BTreeMap::from([(destination, head.clone())]),
+            capacity_ledgers: BTreeMap::from([(destination, ledger(&shard, &head))]),
+            event_unix_seconds: 123,
+        };
+        let stale = AuthenticatedGitHubSession::verified_for_test_with_age(
+            "test-owner",
+            &authorized,
+            RepositoryPermission::Write,
+            crate::AUTHORITY_PROBE_MAX_AGE_SECONDS + 1,
+        );
+        let error = prepare_family_candidates(&[&draft], destination, &context, &stale, &prepared)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::STALE_AUTHORITY_PROBE_MESSAGE),
+            "unexpected stale-session error: {error}"
+        );
+
+        let active = AuthenticatedGitHubSession::verified_for_test(
+            "test-owner",
+            &authorized,
+            RepositoryPermission::Write,
+        );
+        let candidates =
+            prepare_family_candidates(&[&draft], destination, &context, &active, &prepared)
+                .unwrap();
+        assert_eq!(candidates.len(), 1);
+        active.require_write_for("test-owner", &authorized).unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     struct RepositoryState {
@@ -3505,6 +3794,144 @@ mod tests {
             required_assurance: Some(ArtifactAssuranceState::Certified),
             assurance_evidence_digests: vec![ContentDigest::sha256(b"interval-certificate")],
         }
+    }
+
+    #[test]
+    fn family_batch_leaves_active_replacement_last_for_shared_semantic_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-managed-publication-order-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut historical = fixture_draft(&root.join("historical"));
+        historical.source_operation = "cache.dependency.closure".to_owned();
+        let mut active = historical.clone();
+        active.source_operation = "ccm.tau.resolve_or_compute".to_owned();
+        active.manifest.producer_toolkit_version = ToolkitVersion::parse("0.14.1").unwrap();
+        active
+            .manifest
+            .canonical_payload
+            .dependencies
+            .push(crate::PayloadDependencyIdentity {
+                artifact_family: "ccm-components".to_owned(),
+                semantic_digest: ContentDigest::sha256(b"parent-semantic"),
+                manifest_digest: ContentDigest::sha256(b"parent-manifest"),
+                payload_digest: ContentDigest::sha256(b"parent-payload"),
+            });
+        active.manifest.payload_digest = active.manifest.canonical_payload.digest().unwrap();
+
+        let mut drafts = vec![&active, &historical];
+        order_family_publication_drafts(&mut drafts);
+        assert_eq!(drafts[0].source_operation, "cache.dependency.closure");
+        assert_eq!(drafts[1].source_operation, "ccm.tau.resolve_or_compute");
+        assert_eq!(
+            drafts[1].manifest.producer_toolkit_version,
+            ToolkitVersion::parse("0.14.1").unwrap()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn historical_closure_member_does_not_downgrade_live_index() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-managed-publication-live-index-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut historical = fixture_draft(&root);
+        historical.source_operation = "cache.dependency.closure".to_owned();
+        let manifest = historical.manifest.clone();
+        let live = crate::ShardIndexEntry {
+            semantic_digest: manifest.semantic_digest.clone(),
+            canonical_payload_digest: ContentDigest::sha256(b"live-payload"),
+            manifest_digest: ContentDigest::sha256(b"live-manifest"),
+            achieved_assurance: ArtifactAssuranceState::Certified,
+            disposition: ArtifactDisposition::Active,
+            producer_toolkit_version: ToolkitVersion::parse("0.13.4").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            transport_digests: vec![ContentDigest::sha256(b"live-transport")],
+            publication_transaction_id: ContentDigest::sha256(b"live-batch").0,
+        };
+        let partition = crate::ShardIndexPartition::rebuild(
+            manifest.artifact_family.clone(),
+            manifest.semantic_digest.0[..2].to_owned(),
+            vec![live],
+        )
+        .unwrap();
+
+        assert!(!family_draft_advances_live_index(&partition, &historical, &manifest).unwrap());
+
+        historical.source_operation = "ccm.tau.resolve_or_compute".to_owned();
+        let error = family_draft_advances_live_index(&partition, &historical, &historical.manifest)
+            .unwrap_err();
+        assert!(matches!(error, CacheError::PermissionDenied(_)));
+
+        let empty = crate::ShardIndexPartition::rebuild(
+            manifest.artifact_family.clone(),
+            manifest.semantic_digest.0[..2].to_owned(),
+            Vec::new(),
+        )
+        .unwrap();
+        historical.source_operation = "cache.dependency.closure".to_owned();
+        assert!(
+            family_draft_advances_live_index(&empty, &historical, &historical.manifest).unwrap()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn destination_selection_accepts_historical_closure_beside_newer_live_entry() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target/test-tmp")
+            .join(format!(
+                "managed-historical-beside-live-{}",
+                std::process::id()
+            ));
+        let _ = fs::remove_dir_all(&root);
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let mut historical = fixture_draft(&staging);
+        historical.source_operation = "cache.dependency.closure".to_owned();
+        let mut live = historical.clone();
+        live.source_operation = "ccm.tau.resolve_or_compute".to_owned();
+        live.manifest.producer_toolkit_version = ToolkitVersion::parse("0.13.4").unwrap();
+        live.manifest
+            .canonical_payload
+            .dependencies
+            .push(crate::PayloadDependencyIdentity {
+                artifact_family: "ccm-components".to_owned(),
+                semantic_digest: ContentDigest::sha256(b"live-parent-semantic"),
+                manifest_digest: ContentDigest::sha256(b"live-parent-manifest"),
+                payload_digest: ContentDigest::sha256(b"live-parent-payload"),
+            });
+        live.manifest.payload_digest = live.manifest.canonical_payload.digest().unwrap();
+        live.encoding.canonical_payload_digest = live.manifest.payload_digest.clone();
+        live.manifest.transport_digests = vec![live.encoding.digest().unwrap()];
+
+        let repository = "https://github.com/example-org/restricted-ccm-matrices-0001.git";
+        let head = "existing-head";
+        let remote = FilesystemMemoryRemote::new(staging);
+        remote.insert_repository(
+            repository.to_owned(),
+            head.to_owned(),
+            published_destination_tree(&[&live], PublicationDestination::Private),
+        );
+
+        let selection = select_missing_destination_drafts(
+            &remote,
+            repository,
+            head,
+            "ccm-matrices",
+            PublicationDestination::Private,
+            &[&historical],
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(selection.already_present, 0);
+        assert_eq!(selection.pending, vec![&historical]);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn fixture_draft_with_n(root: &Path, n_modes: u64) -> CanonicalProductionDraft {
@@ -3797,6 +4224,7 @@ mod tests {
             PublicationDestination::Private,
             &dependency,
             &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
             &ResourcePolicy::default(),
         )
         .unwrap());
@@ -3808,6 +4236,95 @@ mod tests {
             "example-org",
             PublicationDestination::Private,
             &missing,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &ResourcePolicy::default(),
+        )
+        .unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_destination_dependency_accepts_superseded_manifest_with_batch_proof() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target/test-tmp")
+            .join(format!(
+                "managed-historical-destination-dependency-{}",
+                std::process::id()
+            ));
+        let _ = fs::remove_dir_all(&root);
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+
+        let historical = fixture_draft_with_n(&staging, 2);
+        let historical_manifest =
+            target_manifest(&historical, PublicationDestination::Private).unwrap();
+        let dependency = crate::PayloadDependencyIdentity {
+            artifact_family: historical_manifest.artifact_family.clone(),
+            semantic_digest: historical_manifest.semantic_digest.clone(),
+            manifest_digest: historical_manifest.digest().unwrap(),
+            payload_digest: historical_manifest.payload_digest.clone(),
+        };
+
+        let mut live = historical.clone();
+        live.manifest.producer_toolkit_version = ToolkitVersion::parse("0.13.4").unwrap();
+        let live_manifest = target_manifest(&live, PublicationDestination::Private).unwrap();
+        assert_eq!(live_manifest.semantic_digest, dependency.semantic_digest);
+        assert_eq!(live_manifest.payload_digest, dependency.payload_digest);
+        assert_ne!(live_manifest.digest().unwrap(), dependency.manifest_digest);
+
+        let mut tree = published_destination_tree(&[&historical], PublicationDestination::Private);
+        let live_transaction = ContentDigest::sha256(b"newer-live-transaction").0;
+        let live_entry =
+            active_index_entry(&live, PublicationDestination::Private, live_transaction);
+        let prefix = &dependency.semantic_digest.0[..2];
+        let live_index = ShardIndexPartition::rebuild(
+            dependency.artifact_family.clone(),
+            prefix.to_owned(),
+            vec![live_entry],
+        )
+        .unwrap();
+        tree.insert(
+            format!("indexes/{}/{prefix}.json", dependency.artifact_family),
+            canonical_json_bytes(&live_index).unwrap(),
+        );
+        tree.insert(
+            format!(
+                "manifests/{prefix}/{}.json",
+                live_manifest.digest().unwrap()
+            ),
+            canonical_json_bytes(&live_manifest).unwrap(),
+        );
+
+        let repository =
+            "https://github.com/example-org/xcelerator-cache-private-ccm-matrices-0001.git";
+        let remote = FilesystemMemoryRemote::new(staging);
+        remote.insert_repository(
+            repository.to_owned(),
+            "superseded-head".to_owned(),
+            tree.clone(),
+        );
+        assert!(exact_destination_dependency_exists(
+            &remote,
+            "example-org",
+            PublicationDestination::Private,
+            &dependency,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &ResourcePolicy::default(),
+        )
+        .unwrap());
+
+        tree.retain(|path, _| !path.starts_with("transactions/batches/"));
+        remote.insert_repository(repository.to_owned(), "unproven-head".to_owned(), tree);
+        assert!(!exact_destination_dependency_exists(
+            &remote,
+            "example-org",
+            PublicationDestination::Private,
+            &dependency,
+            &mut BTreeMap::new(),
             &mut BTreeMap::new(),
             &ResourcePolicy::default(),
         )
@@ -3862,7 +4379,7 @@ mod tests {
             destination,
             "ccm-matrices",
             "test-owner",
-            "example-org/restricted-ccm-matrices-0001",
+            "example-org/xcelerator-cache-private-ccm-matrices-0001",
             "main",
             ContentDigest::sha256(b"policy"),
             (destination == PublicationDestination::Private).then_some(1),
@@ -4426,7 +4943,7 @@ mod tests {
                 root.join(visibility_name(destination)).join("transport"),
                 root.join(visibility_name(destination)).join("staging"),
                 "Xcelerator live preflight",
-                "xcelerator-toolkit@users.noreply.github.com",
+                "preflight@invalid",
             )
             .unwrap();
             verify_bootstrap_registry_route(

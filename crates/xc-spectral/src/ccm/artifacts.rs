@@ -215,6 +215,10 @@ pub enum CcmArtifactKind {
     SpectralWindow,
     PostDiscoveryComparison,
     ConvergenceDiagnostics,
+    RootConditioningAnalysis,
+    PrimePowerResponseAnalysis,
+    UFlowResponseAnalysis,
+    SectorGapCertificate,
     CertificateBundle,
 }
 
@@ -243,6 +247,10 @@ impl CcmArtifactKind {
             Self::SpectralWindow => "ccm_spectral_window",
             Self::PostDiscoveryComparison => "ccm_post_discovery_comparison",
             Self::ConvergenceDiagnostics => "ccm_convergence_diagnostics",
+            Self::RootConditioningAnalysis => "ccm_root_conditioning_analysis",
+            Self::PrimePowerResponseAnalysis => "ccm_prime_power_response_analysis",
+            Self::UFlowResponseAnalysis => "ccm_u_flow_response_analysis",
+            Self::SectorGapCertificate => "ccm_sector_gap_certificate",
             Self::CertificateBundle => "ccm_certificate_bundle",
         }
     }

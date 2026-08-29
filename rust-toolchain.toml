@@ -1,0 +1,13 @@
+# Build with current stable, never a pinned old release and never nightly.
+#
+# `channel = "stable"` makes rustup select the installed stable toolchain, and
+# installs it if absent. It does not by itself pull a newer stable, so keep the
+# build host current with `rustup update stable` -- the toolkit has already hit
+# one compiler bug that a stale stable would have left in place.
+#
+# There are no external consumers of these crates, so `rust-version` in
+# Cargo.toml tracks the current toolchain rather than advertising support for
+# an older one. Move both together when stable moves.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

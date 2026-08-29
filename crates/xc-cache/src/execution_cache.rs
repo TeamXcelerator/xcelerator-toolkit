@@ -86,8 +86,8 @@ impl ArtifactExecutionCacheMode {
 
     pub fn may_stage_for_publication(self) -> bool {
         match self {
-            Self::PreferReuse | Self::Refresh => true,
-            Self::Disabled | Self::RequireReuse | Self::VerifyAgainstReference => false,
+            Self::PreferReuse | Self::RequireReuse | Self::Refresh => true,
+            Self::Disabled | Self::VerifyAgainstReference => false,
         }
     }
 
@@ -1015,6 +1015,13 @@ impl ManagedArtifactCacheSession {
         let Some(sink) = &self.production_sink else {
             return Ok(None);
         };
+        let observed_artifact_count = sink.observed_artifact_count()?;
+        if self.execute_remote_mutations && observed_artifact_count == 0 {
+            return Err(CacheError::InvalidTransition(format!(
+                "publication execution observed no artifacts in this process; refusing a vacuous success from staging root {}",
+                sink.staging_root().display()
+            )));
+        }
         // A CCM run creates several managed sessions over one staging root.
         // Keep every draft on disk for dependency resolution and crash resume,
         // but do not repeat successful GitHub orchestration later in the same
@@ -1075,9 +1082,13 @@ impl ManagedArtifactCacheSession {
                 self.replace_existing_publication,
             )?;
             let persisted = persist_publication_execution_report(sink.staging_root(), &report)?;
-            if report.all_completed {
-                self.mark_staged_drafts_completed(&pending_drafts)?;
+            if !report.all_completed {
+                return Err(CacheError::InvalidTransition(format!(
+                    "publication execution did not complete every transaction; retained resumable report at {}",
+                    persisted.phase_path.display()
+                )));
             }
+            self.mark_staged_drafts_completed(&pending_drafts)?;
             eprintln!(
                 "{}",
                 format_publication_completion(
@@ -1296,7 +1307,8 @@ fn format_publication_completion(
          {eligible_target_candidate_count}\n  targets: {target}\n  assurance: {assurance}\n  \
          eligible packaged bytes before destination deduplication: \
          {eligible_target_candidate_bytes} bytes ({:.1} MB)\n  completed transactions: \
-         {completed_transactions}/{transaction_count}\n  old current-tree paths removed: \
+         {completed_transactions}/{transaction_count}\n  destination coverage: verified for every \
+         eligible candidate\n  old current-tree paths removed: \
          {current_tree_paths_removed}\n  phase report: {}\n  cumulative report: {} \
          ({cumulative_transaction_count} transactions across {phase_count} phases)",
         eligible_target_candidate_bytes as f64 / 1_000_000.0,
@@ -1479,6 +1491,17 @@ pub fn load_queued_produced_artifact(path: &Path) -> Result<ProducedArtifactReco
 }
 
 pub trait ArtifactProductionSink: Send + Sync {
+    /// Whether an artifact with this exact published identity is already
+    /// staged, regardless of the key it was recorded under. Sinks that do not
+    /// track canonical identities may return `false`; recording the same
+    /// artifact twice under one key is already suppressed by [`Self::record`].
+    fn contains_dependency_identity(
+        &self,
+        _identity: &crate::PayloadDependencyIdentity,
+    ) -> Result<bool, CacheError> {
+        Ok(false)
+    }
+
     fn record(&self, artifact: ProducedArtifactRecord) -> Result<(), CacheError>;
 
     fn contains_artifact(
@@ -1921,9 +1944,6 @@ fn emit_dependency_closure(
     visiting: &mut BTreeSet<String>,
 ) -> Result<(), CacheError> {
     for dependency in &manifest.dependencies {
-        if sink.contains_artifact(&dependency.key, &dependency.content_digest)? {
-            continue;
-        }
         let identity = format!(
             "{}\n{}\n{}\n{}",
             dependency.key.kind,
@@ -1946,18 +1966,166 @@ fn emit_dependency_closure(
                 dependency.key.kind, dependency.key.logical_key
             )));
         }
+        // A node that is already staged still gets its dependencies walked:
+        // a reopened staging directory may hold drafts from a run that failed
+        // before this walk completed, or that predates canonical-closure
+        // staging entirely. Being staged suppresses only re-recording.
         emit_dependency_closure(resolver, acceptance, sink, &resolved.manifest, visiting)?;
-        let semantic_key = manifest_semantic_key(&resolved.manifest)?;
-        sink.record(ProducedArtifactRecord {
-            operation: "cache.dependency.resolve".to_owned(),
-            semantic_key,
-            logical_key: resolved.manifest.key.logical_key.clone(),
-            manifest: resolved.manifest,
-            achieved_assurance: crate::ArtifactAssuranceState::Computed,
-            assurance_evidence_digests: Vec::new(),
-            payload: resolved.payload,
-        })?;
+        emit_retained_canonical_closure(resolver, acceptance, sink, &resolved.manifest, visiting)?;
+        if !sink.contains_artifact(&dependency.key, &dependency.content_digest)? {
+            let semantic_key = manifest_semantic_key(&resolved.manifest)?;
+            sink.record(ProducedArtifactRecord {
+                operation: "cache.dependency.resolve".to_owned(),
+                semantic_key,
+                logical_key: resolved.manifest.key.logical_key.clone(),
+                manifest: resolved.manifest,
+                achieved_assurance: crate::ArtifactAssuranceState::Computed,
+                assurance_evidence_digests: Vec::new(),
+                payload: resolved.payload,
+            })?;
+        }
         visiting.remove(&identity);
+    }
+    Ok(())
+}
+
+/// Verify that a retained canonical manifest really describes the adapter
+/// manifest it rides on, before anything trusts its contents.
+///
+/// Shared by publication staging and the closure walker: staging must not
+/// canonicalize a payload under a manifest that disagrees with it, and the
+/// walker must not traverse a dependency list taken from a manifest that does
+/// not belong to the artifact in hand. `provenance_digest` is enforced when
+/// the adapter carries one, which every shard adoption does.
+pub(crate) fn validate_retained_canonical_binding(
+    canonical: &crate::CanonicalArtifactManifest,
+    semantic_key: &SemanticKeyEnvelope,
+    family: &str,
+    content_digest: &ContentDigest,
+    size_bytes: u64,
+    provenance_digest: Option<&ContentDigest>,
+) -> Result<(), CacheError> {
+    canonical.validate()?;
+    if canonical.artifact_family != family
+        || canonical.semantic_key != *semantic_key
+        || canonical.semantic_digest != semantic_key.digest()?
+        || canonical.canonical_payload.ordered_items.len() != 1
+        || canonical.canonical_payload.ordered_items[0].normalized_path != "payload.json"
+        || canonical.canonical_payload.ordered_items[0].content_digest != *content_digest
+        || canonical.canonical_payload.ordered_items[0].size_bytes != size_bytes
+    {
+        return Err(CacheError::InvalidManifest(
+            "retained remote canonical manifest disagrees with its validated payload".to_owned(),
+        ));
+    }
+    if let Some(provenance) = provenance_digest {
+        if *provenance != canonical.digest()? {
+            return Err(CacheError::InvalidManifest(
+                "retained remote canonical manifest disagrees with the adapter provenance digest"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Stage the identity-referenced dependencies of an artifact adopted from a
+/// published shard.
+///
+/// A dependency reused from a shard carries no key-based dependency list of
+/// its own -- its remote adapter manifest is built with empty `dependencies`
+/// -- so the key-based walk above stops at the first reused level. Its
+/// retained canonical manifest, however, names every dependency by published
+/// identity, and the publication preflight validates exactly that list per
+/// destination. Walking it here stages the full transitive closure, resolving
+/// each member from the local cache first and any configured shard layer
+/// otherwise, so publishing to a destination that lacks the parents never
+/// requires recomputing them.
+fn emit_retained_canonical_closure(
+    resolver: &CacheResolver,
+    acceptance: &CachePolicy,
+    sink: &dyn ArtifactProductionSink,
+    manifest: &ArtifactManifest,
+    visiting: &mut BTreeSet<String>,
+) -> Result<(), CacheError> {
+    let Some(encoded) = manifest.tags.get(REMOTE_CANONICAL_MANIFEST_TAG) else {
+        return Ok(());
+    };
+    let canonical: crate::CanonicalArtifactManifest =
+        serde_json::from_str(encoded).map_err(|error| {
+            CacheError::InvalidManifest(format!(
+                "retained canonical manifest for {} / {} failed decoding: {error}",
+                manifest.key.kind, manifest.key.logical_key
+            ))
+        })?;
+    let semantic_key = manifest_semantic_key(manifest)?;
+    let family = crate::production_staging::family_for_artifact_kind(&semantic_key.artifact_kind)
+        .ok_or_else(|| {
+        CacheError::InvalidManifest(format!(
+            "artifact kind {:?} has no publication family mapping",
+            semantic_key.artifact_kind
+        ))
+    })?;
+    validate_retained_canonical_binding(
+        &canonical,
+        &semantic_key,
+        family,
+        &manifest.content_digest,
+        manifest.size_bytes,
+        manifest.provenance_digest.as_ref(),
+    )
+    .map_err(|error| {
+        CacheError::InvalidManifest(format!(
+            "retained canonical manifest for {} / {} is not bound to its adapter: {error}",
+            manifest.key.kind, manifest.key.logical_key
+        ))
+    })?;
+    if canonical.semantic_digest != manifest.key.parameters_digest {
+        return Err(CacheError::InvalidManifest(format!(
+            "retained canonical manifest for {} / {} does not match its adapter manifest",
+            manifest.key.kind, manifest.key.logical_key
+        )));
+    }
+    for dependency in &canonical.canonical_payload.dependencies {
+        dependency.validate()?;
+        let visit_key = format!(
+            "identity\n{}\n{}\n{}\n{}",
+            dependency.artifact_family,
+            dependency.semantic_digest,
+            dependency.manifest_digest,
+            dependency.payload_digest
+        );
+        if !visiting.insert(visit_key.clone()) {
+            return Err(CacheError::InvalidManifest(format!(
+                "publication dependency closure cycle reaches {}/{}",
+                dependency.artifact_family, dependency.semantic_digest.0
+            )));
+        }
+        let resolved = resolver
+            .resolve_dependency_identity(dependency, acceptance)?
+            .ok_or_else(|| {
+                CacheError::InvalidManifest(format!(
+                    "publication closure requires published dependency {}/{} (manifest {}), \
+                     which no configured cache layer can resolve by identity",
+                    dependency.artifact_family,
+                    dependency.semantic_digest.0,
+                    dependency.manifest_digest.0
+                ))
+            })?;
+        emit_retained_canonical_closure(resolver, acceptance, sink, &resolved.manifest, visiting)?;
+        if !sink.contains_dependency_identity(dependency)? {
+            let semantic_key = manifest_semantic_key(&resolved.manifest)?;
+            sink.record(ProducedArtifactRecord {
+                operation: "cache.dependency.closure".to_owned(),
+                semantic_key,
+                logical_key: resolved.manifest.key.logical_key.clone(),
+                manifest: resolved.manifest,
+                achieved_assurance: crate::ArtifactAssuranceState::Computed,
+                assurance_evidence_digests: Vec::new(),
+                payload: resolved.payload,
+            })?;
+        }
+        visiting.remove(&visit_key);
     }
     Ok(())
 }
@@ -2200,12 +2368,40 @@ where
                             }
                         }
                     }
-                    // Publication is a boundary for newly computed artifacts,
-                    // not a replay mechanism for cache hits. Re-authoring a
-                    // validated remote hit changes its provenance envelope and
-                    // creates redundant Git history despite identical logical
-                    // payload bytes. Explicit promotion remains a separate
-                    // workflow.
+                    // Publication accounts for every validated artifact used
+                    // by an author run, including reuse hits. The staging sink
+                    // preserves the existing manifest and payload identities;
+                    // managed publication checks the requested destination
+                    // before mutating Git, so an artifact already present
+                    // there remains a verified no-op rather than redundant
+                    // history. A workstation-only hit is staged and can no
+                    // longer disappear from an otherwise successful
+                    // publication run.
+                    if let Some(sink) = request.production_sink {
+                        emit_dependency_closure(
+                            resolver,
+                            acceptance,
+                            sink,
+                            &resolved.manifest,
+                            &mut BTreeSet::new(),
+                        )?;
+                        emit_retained_canonical_closure(
+                            resolver,
+                            acceptance,
+                            sink,
+                            &resolved.manifest,
+                            &mut BTreeSet::new(),
+                        )?;
+                        sink.record(ProducedArtifactRecord {
+                            operation: request.operation.to_owned(),
+                            semantic_key: request.semantic_key.clone(),
+                            logical_key: request.logical_key.to_owned(),
+                            manifest: resolved.manifest.clone(),
+                            achieved_assurance: crate::ArtifactAssuranceState::Computed,
+                            assurance_evidence_digests: Vec::new(),
+                            payload: resolved.payload.clone(),
+                        })?;
+                    }
                     return Ok(ArtifactExecutionCacheResult {
                         value,
                         access,
@@ -2532,6 +2728,11 @@ mod tests {
             ManagedRemoteCacheMode::PrivateThenPublic
         );
         assert!(parse_validation_reference_mode(Some("none")).is_err());
+
+        let require_reuse = ArtifactExecutionCacheMode::RequireReuse;
+        assert!(require_reuse.consults_cache_for_result_reuse());
+        assert!(require_reuse.may_stage_for_publication());
+        assert!(require_reuse.requires_reuse());
     }
 
     #[test]
@@ -2594,6 +2795,7 @@ mod tests {
                 "  eligible packaged bytes before destination deduplication: ",
                 "61082844 bytes (61.1 MB)\n",
                 "  completed transactions: 2/2\n",
+                "  destination coverage: verified for every eligible candidate\n",
                 "  old current-tree paths removed: 7\n",
                 "  phase report: staging/publication-execution-reports/phase.json\n",
                 "  cumulative report: staging/publication-execution-report.json ",
@@ -3014,6 +3216,541 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Author-side fixture for the reused-artifact closure scenarios: a
+    /// grandparent and a parent that depends on it, both staged canonically so
+    /// the parent's retained manifest names the grandparent by published
+    /// identity, then both adopted into a consumer store the way the remote
+    /// adapter does -- empty key-based dependency lists, canonical manifest
+    /// and semantic key retained as tags.
+    struct AdoptedPairFixture {
+        root: std::path::PathBuf,
+        consumer_resolver: CacheResolver,
+        parent: ArtifactManifest,
+        grandparent: ArtifactManifest,
+        parent_canonical: crate::CanonicalArtifactManifest,
+        parent_payload: Vec<u8>,
+    }
+
+    fn adopted_pair_fixture(name: &str) -> AdoptedPairFixture {
+        adopted_pair_fixture_with_kinds(name, "ccm_even_sector_matrix", "ccm_tau_matrix")
+    }
+
+    fn adopted_pair_fixture_with_kinds(
+        name: &str,
+        parent_kind: &str,
+        grandparent_kind: &str,
+    ) -> AdoptedPairFixture {
+        let root = root(name);
+        let _ = fs::remove_dir_all(&root);
+        let policy = policy();
+
+        let author_resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "author",
+                root.join("author-cache"),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let author_sink = crate::CanonicalStagingProductionSink::new(
+            root.join("author-staging"),
+            crate::TransportPolicy::default(),
+            xc_core::ResourcePolicy::default(),
+            xc_core::CancellationToken::new(),
+        )
+        .unwrap();
+
+        let grandparent_key = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: grandparent_kind.to_owned(),
+            mathematical_semantics_version: "ccm-fixture-v1".to_owned(),
+            resolved_mathematical_parameters: json!({"role": "grandparent"}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        let mut grandparent_request = request(
+            &grandparent_key,
+            &author_resolver,
+            &policy,
+            ArtifactExecutionCacheMode::PreferReuse,
+        );
+        grandparent_request.logical_key = "ccm/fixture/grandparent";
+        grandparent_request.production_sink = Some(&author_sink);
+        let grandparent = resolve_or_compute_json_artifact(
+            &grandparent_request,
+            || Ok(vec!["grandparent".to_owned()]),
+            |_| Ok(()),
+        )
+        .unwrap()
+        .produced_manifest
+        .unwrap();
+
+        let parent_key = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: parent_kind.to_owned(),
+            mathematical_semantics_version: "ccm-fixture-v1".to_owned(),
+            resolved_mathematical_parameters: json!({"role": "parent"}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        let mut parent_request = request(
+            &parent_key,
+            &author_resolver,
+            &policy,
+            ArtifactExecutionCacheMode::PreferReuse,
+        );
+        parent_request.logical_key = "ccm/fixture/parent";
+        parent_request.production_sink = Some(&author_sink);
+        let parent = resolve_or_compute_json_artifact_with_dependencies(
+            &parent_request,
+            || {
+                Ok((
+                    vec!["parent".to_owned()],
+                    vec![DependencyRef {
+                        key: grandparent.key.clone(),
+                        content_digest: grandparent.content_digest.clone(),
+                        required_quality: CacheQuality::Validated,
+                    }],
+                ))
+            },
+            |_| Ok(()),
+        )
+        .unwrap()
+        .produced_manifest
+        .unwrap();
+
+        let author_drafts = author_sink.drafts().unwrap();
+        let canonical_of = |kind: &str| {
+            author_drafts
+                .iter()
+                .find(|draft| draft.source_artifact_key.kind == kind)
+                .expect("author draft present")
+                .manifest
+                .clone()
+        };
+        let parent_canonical = canonical_of(parent_kind);
+        let grandparent_canonical = canonical_of(grandparent_kind);
+        assert_eq!(
+            parent_canonical.canonical_payload.dependencies.len(),
+            1,
+            "fixture parent must reference the grandparent by identity"
+        );
+
+        let consumer_store = FilesystemCacheStore::new(
+            "consumer",
+            root.join("consumer-cache"),
+            true,
+            CacheVisibility::Local,
+        );
+        let adopt = |canonical: &crate::CanonicalArtifactManifest,
+                     manifest: &ArtifactManifest,
+                     payload: &[u8]| {
+            let mut tags = BTreeMap::new();
+            tags.insert(
+                SEMANTIC_KEY_MANIFEST_TAG.to_owned(),
+                serde_json::to_string(&canonical.semantic_key).unwrap(),
+            );
+            tags.insert(
+                REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+                serde_json::to_string(canonical).unwrap(),
+            );
+            let draft = ArtifactDraft {
+                schema_version: 1,
+                key: manifest.key.clone(),
+                producer_toolkit_version: manifest.producer_toolkit_version.clone(),
+                minimum_reader_version: manifest.minimum_reader_version.clone(),
+                maximum_reader_version: manifest.maximum_reader_version.clone(),
+                quality: CacheQuality::Validated,
+                visibility: CacheVisibility::Local,
+                immutable: true,
+                dependencies: Vec::new(),
+                tags,
+                provenance_digest: None,
+            };
+            crate::CacheStore::put(&consumer_store, &draft, payload).unwrap()
+        };
+        let grandparent_payload = serde_json::to_vec(&vec!["grandparent".to_owned()]).unwrap();
+        let parent_payload = serde_json::to_vec(&vec!["parent".to_owned()]).unwrap();
+        let adopted_grandparent = adopt(&grandparent_canonical, &grandparent, &grandparent_payload);
+        let adopted_parent = adopt(&parent_canonical, &parent, &parent_payload);
+
+        AdoptedPairFixture {
+            root,
+            consumer_resolver: CacheResolver::new(vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(consumer_store),
+            }]),
+            parent: adopted_parent,
+            grandparent: adopted_grandparent,
+            parent_canonical,
+            parent_payload,
+        }
+    }
+
+    fn child_semantic_key() -> SemanticKeyEnvelope {
+        SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "ccm_factorization".to_owned(),
+            mathematical_semantics_version: "ccm-fixture-v1".to_owned(),
+            resolved_mathematical_parameters: json!({"role": "child"}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        }
+    }
+
+    fn assert_closure_covered(drafts: &[crate::CanonicalProductionDraft]) {
+        for draft in drafts {
+            for dependency in &draft.manifest.canonical_payload.dependencies {
+                let covered = drafts.iter().any(|candidate| {
+                    candidate.family == dependency.artifact_family
+                        && candidate.manifest.semantic_digest == dependency.semantic_digest
+                        && candidate.manifest.payload_digest == dependency.payload_digest
+                        && candidate.manifest.digest().unwrap() == dependency.manifest_digest
+                });
+                assert!(
+                    covered,
+                    "staged closure is missing {}/{}",
+                    dependency.artifact_family, dependency.semantic_digest.0
+                );
+            }
+        }
+    }
+
+    /// Regression: publishing children of artifacts reused from a shard must
+    /// stage the reused artifacts' own dependencies, which are named only by
+    /// published identity inside their retained canonical manifests.
+    #[test]
+    fn staging_closure_includes_identity_dependencies_of_reused_artifacts() {
+        let fixture = adopted_pair_fixture("execution-cache-identity-closure");
+        let policy = policy();
+        let consumer_sink = crate::CanonicalStagingProductionSink::new(
+            fixture.root.join("consumer-staging"),
+            crate::TransportPolicy::default(),
+            xc_core::ResourcePolicy::default(),
+            xc_core::CancellationToken::new(),
+        )
+        .unwrap();
+        let child_key = child_semantic_key();
+        let mut child_request = request(
+            &child_key,
+            &fixture.consumer_resolver,
+            &policy,
+            ArtifactExecutionCacheMode::PreferReuse,
+        );
+        child_request.logical_key = "ccm/fixture/child";
+        child_request.production_sink = Some(&consumer_sink);
+        resolve_or_compute_json_artifact_with_dependencies(
+            &child_request,
+            || {
+                Ok((
+                    vec!["child".to_owned()],
+                    vec![DependencyRef {
+                        key: fixture.parent.key.clone(),
+                        content_digest: fixture.parent.content_digest.clone(),
+                        required_quality: CacheQuality::Validated,
+                    }],
+                ))
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        let drafts = consumer_sink.drafts().unwrap();
+        assert_eq!(
+            drafts.len(),
+            3,
+            "child, parent, and identity-resolved grandparent must all stage"
+        );
+        assert!(
+            drafts
+                .iter()
+                .any(|draft| draft.source_artifact_key.kind == "ccm_tau_matrix"),
+            "grandparent reachable only by identity was not staged"
+        );
+        assert_closure_covered(&drafts);
+        let _ = fs::remove_dir_all(fixture.root);
+    }
+
+    /// Regression: a staging directory reopened from an interrupted or pre-fix
+    /// run holds the parent but not its identity-referenced grandparents.
+    /// "Already staged" must suppress only re-recording, never dependency
+    /// traversal, or the incomplete closure survives every retry.
+    #[test]
+    fn reopened_incomplete_staging_gains_missing_closure_members() {
+        let fixture = adopted_pair_fixture("execution-cache-staging-resume");
+        let policy = policy();
+        let staging_root = fixture.root.join("consumer-staging");
+
+        // Simulate the pre-fix run: the parent staged, its grandparent not.
+        {
+            let seed_sink = crate::CanonicalStagingProductionSink::new(
+                &staging_root,
+                crate::TransportPolicy::default(),
+                xc_core::ResourcePolicy::default(),
+                xc_core::CancellationToken::new(),
+            )
+            .unwrap();
+            seed_sink
+                .record(ProducedArtifactRecord {
+                    operation: "test.seed".to_owned(),
+                    semantic_key: fixture.parent_canonical.semantic_key.clone(),
+                    logical_key: fixture.parent.key.logical_key.clone(),
+                    manifest: fixture.parent.clone(),
+                    achieved_assurance: crate::ArtifactAssuranceState::Computed,
+                    assurance_evidence_digests: Vec::new(),
+                    payload: fixture.parent_payload.clone(),
+                })
+                .unwrap();
+            assert_eq!(seed_sink.drafts().unwrap().len(), 1);
+        }
+
+        // The retry reopens the same staging root and computes the child.
+        let consumer_sink = crate::CanonicalStagingProductionSink::new(
+            &staging_root,
+            crate::TransportPolicy::default(),
+            xc_core::ResourcePolicy::default(),
+            xc_core::CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            consumer_sink.drafts().unwrap().len(),
+            1,
+            "reopened staging must reload the previously staged parent"
+        );
+        let child_key = child_semantic_key();
+        let mut child_request = request(
+            &child_key,
+            &fixture.consumer_resolver,
+            &policy,
+            ArtifactExecutionCacheMode::PreferReuse,
+        );
+        child_request.logical_key = "ccm/fixture/child";
+        child_request.production_sink = Some(&consumer_sink);
+        resolve_or_compute_json_artifact_with_dependencies(
+            &child_request,
+            || {
+                Ok((
+                    vec!["child".to_owned()],
+                    vec![DependencyRef {
+                        key: fixture.parent.key.clone(),
+                        content_digest: fixture.parent.content_digest.clone(),
+                        required_quality: CacheQuality::Validated,
+                    }],
+                ))
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        let drafts = consumer_sink.drafts().unwrap();
+        assert_eq!(
+            drafts.len(),
+            3,
+            "the reopened staging must gain the missing grandparent"
+        );
+        assert_closure_covered(&drafts);
+        let _ = fs::remove_dir_all(fixture.root);
+    }
+
+    /// Regression: the key-based and identity-based walks meet on a diamond.
+    /// Whichever stages the shared artifact first, the other must recognize it
+    /// as the same published identity rather than rejecting the draft
+    /// directory as disagreeing.
+    ///
+    /// Dependency lists are canonically ordered, so walk order is controlled
+    /// through the fixture kinds: with the parent kind sorting first the
+    /// identity walk stages the grandparent before its own key entry is
+    /// reached; with the grandparent kind sorting first the key walk stages it
+    /// and the later identity reference must dedup.
+    #[test]
+    fn diamond_dependencies_stage_once_in_either_order() {
+        for (name, parent_kind, grandparent_kind) in [
+            (
+                "execution-cache-diamond-identity-first",
+                "ccm_even_sector_matrix",
+                "ccm_tau_matrix",
+            ),
+            (
+                "execution-cache-diamond-key-first",
+                "ccm_tau_matrix",
+                "ccm_even_sector_matrix",
+            ),
+        ] {
+            let fixture = adopted_pair_fixture_with_kinds(name, parent_kind, grandparent_kind);
+            let policy = policy();
+            let consumer_sink = crate::CanonicalStagingProductionSink::new(
+                fixture.root.join("consumer-staging"),
+                crate::TransportPolicy::default(),
+                xc_core::ResourcePolicy::default(),
+                xc_core::CancellationToken::new(),
+            )
+            .unwrap();
+            let mut dependencies = vec![
+                DependencyRef {
+                    key: fixture.parent.key.clone(),
+                    content_digest: fixture.parent.content_digest.clone(),
+                    required_quality: CacheQuality::Validated,
+                },
+                DependencyRef {
+                    key: fixture.grandparent.key.clone(),
+                    content_digest: fixture.grandparent.content_digest.clone(),
+                    required_quality: CacheQuality::Validated,
+                },
+            ];
+            dependencies.sort_by(|left, right| {
+                (
+                    left.key.kind.as_str(),
+                    left.key.logical_key.as_str(),
+                    &left.key.parameters_digest,
+                    &left.content_digest,
+                )
+                    .cmp(&(
+                        right.key.kind.as_str(),
+                        right.key.logical_key.as_str(),
+                        &right.key.parameters_digest,
+                        &right.content_digest,
+                    ))
+            });
+            let child_key = child_semantic_key();
+            let mut child_request = request(
+                &child_key,
+                &fixture.consumer_resolver,
+                &policy,
+                ArtifactExecutionCacheMode::PreferReuse,
+            );
+            child_request.logical_key = "ccm/fixture/child";
+            child_request.production_sink = Some(&consumer_sink);
+            resolve_or_compute_json_artifact_with_dependencies(
+                &child_request,
+                || Ok((vec!["child".to_owned()], dependencies.clone())),
+                |_| Ok(()),
+            )
+            .unwrap();
+
+            let drafts = consumer_sink.drafts().unwrap();
+            assert_eq!(
+                drafts.len(),
+                3,
+                "diamond must stage each artifact exactly once ({name})"
+            );
+            let mut digests: Vec<_> = drafts
+                .iter()
+                .map(|draft| draft.manifest.semantic_digest.0.clone())
+                .collect();
+            digests.sort();
+            digests.dedup();
+            assert_eq!(digests.len(), 3, "no duplicate published identities");
+            assert_closure_covered(&drafts);
+            let _ = fs::remove_dir_all(fixture.root);
+        }
+    }
+
+    /// Negative: identity dedup must compare the FULL published identity.
+    /// Two records sharing a semantic key and raw payload but disagreeing in
+    /// their canonical dependency lists are different published artifacts;
+    /// silently keeping only the first would leave the staged closure
+    /// incomplete. The second must be refused loudly, never absorbed.
+    #[test]
+    fn differing_canonical_identities_are_not_silently_deduplicated() {
+        let fixture = adopted_pair_fixture("execution-cache-dedup-negative");
+        let sink = crate::CanonicalStagingProductionSink::new(
+            fixture.root.join("consumer-staging"),
+            crate::TransportPolicy::default(),
+            xc_core::ResourcePolicy::default(),
+            xc_core::CancellationToken::new(),
+        )
+        .unwrap();
+        // First: the parent as adopted, canonical manifest intact.
+        sink.record(ProducedArtifactRecord {
+            operation: "test.first".to_owned(),
+            semantic_key: fixture.parent_canonical.semantic_key.clone(),
+            logical_key: fixture.parent.key.logical_key.clone(),
+            manifest: fixture.parent.clone(),
+            achieved_assurance: crate::ArtifactAssuranceState::Computed,
+            assurance_evidence_digests: Vec::new(),
+            payload: fixture.parent_payload.clone(),
+        })
+        .unwrap();
+        assert_eq!(sink.drafts().unwrap().len(), 1);
+
+        // Second: same semantic key and payload under a different source key,
+        // with a canonical manifest whose dependency list was emptied -- a
+        // different published identity.
+        let mut variant_canonical = fixture.parent_canonical.clone();
+        variant_canonical.canonical_payload.dependencies.clear();
+        // Dependencies are covered by the canonical payload digest, so the
+        // variant must recompute it to stay internally valid -- which also
+        // demonstrates why any dedup key weaker than the full identity tuple
+        // is unsound only when it omits these digests.
+        variant_canonical.payload_digest = variant_canonical.canonical_payload.digest().unwrap();
+        assert_ne!(
+            variant_canonical.digest().unwrap(),
+            fixture.parent_canonical.digest().unwrap(),
+            "the variant must be a genuinely different published identity"
+        );
+        let mut variant_manifest = fixture.parent.clone();
+        variant_manifest.key.logical_key = "ccm/fixture/parent-variant".to_owned();
+        variant_manifest.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&variant_canonical).unwrap(),
+        );
+        variant_manifest.provenance_digest = Some(variant_canonical.digest().unwrap());
+        let result = sink.record(ProducedArtifactRecord {
+            operation: "test.second".to_owned(),
+            semantic_key: fixture.parent_canonical.semantic_key.clone(),
+            logical_key: variant_manifest.key.logical_key.clone(),
+            manifest: variant_manifest,
+            achieved_assurance: crate::ArtifactAssuranceState::Computed,
+            assurance_evidence_digests: Vec::new(),
+            payload: fixture.parent_payload.clone(),
+        });
+        assert!(
+            result.is_err(),
+            "a second artifact with a different canonical identity must not be              silently absorbed"
+        );
+        assert_eq!(
+            sink.drafts().unwrap().len(),
+            1,
+            "the disagreeing artifact must not have produced a draft either"
+        );
+        let _ = fs::remove_dir_all(fixture.root);
+    }
+
+    /// A malformed dependency identity must surface as an invalid manifest,
+    /// never as a panic inside digest slicing or path construction.
+    #[test]
+    fn malformed_dependency_identity_is_rejected_not_panicked() {
+        let fixture = adopted_pair_fixture("execution-cache-malformed-identity");
+        let policy = policy();
+        let bad = crate::PayloadDependencyIdentity {
+            artifact_family: "ccm-matrices".to_owned(),
+            semantic_digest: ContentDigest("x".to_owned()),
+            manifest_digest: ContentDigest("y".to_owned()),
+            payload_digest: ContentDigest("z".to_owned()),
+        };
+        let result = fixture
+            .consumer_resolver
+            .resolve_dependency_identity(&bad, &policy);
+        let Err(error) = result else {
+            panic!("malformed identity resolved instead of failing");
+        };
+        assert!(
+            matches!(error, CacheError::InvalidManifest(_)),
+            "expected InvalidManifest, got {error:?}"
+        );
+        let _ = fs::remove_dir_all(fixture.root);
+    }
+
     #[test]
     fn fresh_publication_staging_reconstructs_cached_dependency_closure() {
         let root = root("execution-cache-fresh-staging-closure");
@@ -3089,11 +3826,44 @@ mod tests {
         assert_eq!(drafts.len(), 2);
         assert!(drafts.iter().any(|draft| draft.family == "quadrature"));
         assert!(drafts.iter().any(|draft| draft.family == "ccm-matrices"));
+
+        let reuse_sink = crate::CanonicalStagingProductionSink::new(
+            root.join("reuse-staging"),
+            crate::TransportPolicy::default(),
+            xc_core::ResourcePolicy::default(),
+            xc_core::CancellationToken::new(),
+        )
+        .unwrap();
+        let mut reuse_request = request(
+            &parent_key,
+            &resolver,
+            &policy,
+            ArtifactExecutionCacheMode::RequireReuse,
+        );
+        reuse_request.logical_key = "ccm/tau/fixture";
+        reuse_request.production_sink = Some(&reuse_sink);
+        resolve_or_compute_json_artifact_with_dependencies(
+            &reuse_request,
+            || -> Result<(Vec<String>, Vec<DependencyRef>), CacheError> {
+                panic!("publication reuse must not recompute the parent")
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        let reused_drafts = reuse_sink.drafts().unwrap();
+        assert_eq!(reused_drafts.len(), 2);
+        assert!(reused_drafts
+            .iter()
+            .any(|draft| draft.family == "quadrature"));
+        assert!(reused_drafts
+            .iter()
+            .any(|draft| draft.family == "ccm-matrices"));
+        assert_closure_covered(&reused_drafts);
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn production_sink_records_fresh_but_not_reused_artifacts() {
+    fn production_sink_records_fresh_and_reused_artifacts() {
         let root = root("execution-cache-production-sink");
         let _ = fs::remove_dir_all(&root);
         let resolver = CacheResolver::new(vec![CacheLayer {
@@ -3133,8 +3903,24 @@ mod tests {
         )
         .unwrap();
 
+        let mut required_request = request(
+            &key,
+            &resolver,
+            &policy,
+            ArtifactExecutionCacheMode::RequireReuse,
+        );
+        required_request.production_sink = Some(&sink);
+        resolve_or_compute_json_artifact(
+            &required_request,
+            || -> Result<Vec<String>, CacheError> {
+                panic!("required reuse hit must not recompute")
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
         let records = sink.0.lock().unwrap();
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 3);
         assert_eq!(records[0].semantic_key, key);
         assert_eq!(records[0].logical_key, "gauss-legendre/4/128");
         assert_eq!(records[0].payload, serde_json::to_vec(&expected).unwrap());
@@ -3142,6 +3928,8 @@ mod tests {
             records[0].manifest.content_digest,
             ContentDigest::sha256(&records[0].payload)
         );
+        assert_eq!(records[1], records[0]);
+        assert_eq!(records[2], records[0]);
         drop(records);
         let _ = fs::remove_dir_all(root);
     }
@@ -3353,6 +4141,123 @@ mod tests {
         )
         .unwrap();
         assert_eq!(durable_inventory.entries.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn executed_publication_rejects_vacuous_success_without_observed_artifacts() {
+        let root = root("managed-publication-vacuous-success");
+        let _ = fs::remove_dir_all(&root);
+        let session = ManagedArtifactCacheSession::new(ManagedArtifactCacheConfig {
+            profile: ManagedRunProfile::Author,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            cache_root: root.join("cache"),
+            staging_root: Some(root.join("staging")),
+            publication_target: xc_core::PublicationTarget::Private,
+            repository_owner: "TeamXcelerator".to_owned(),
+            remote_cache_mode: ManagedRemoteCacheMode::None,
+            cache_mode: ArtifactExecutionCacheMode::PreferReuse,
+            replace_existing_publication: false,
+            execute_remote_mutations: true,
+            output_validation: None,
+        })
+        .unwrap();
+
+        let error = session.finalize_publication_inventory().unwrap_err();
+        assert!(error.to_string().contains("observed no artifacts"));
+        assert!(!root.join("staging/publication-inventory.json").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_require_reuse_stages_workstation_hit_for_publication() {
+        let root = root("managed-require-reuse-publication");
+        let _ = fs::remove_dir_all(&root);
+        let config = |cache_mode, staging: &str| ManagedArtifactCacheConfig {
+            profile: ManagedRunProfile::Author,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            cache_root: root.join("cache"),
+            staging_root: Some(root.join(staging)),
+            publication_target: xc_core::PublicationTarget::Private,
+            repository_owner: "TeamXcelerator".to_owned(),
+            remote_cache_mode: ManagedRemoteCacheMode::None,
+            cache_mode,
+            replace_existing_publication: false,
+            execute_remote_mutations: false,
+            output_validation: None,
+        };
+        let key = semantic_key();
+        let producer = ManagedArtifactCacheSession::new(config(
+            ArtifactExecutionCacheMode::PreferReuse,
+            "producer-staging",
+        ))
+        .unwrap();
+        let producer_cache = producer.context();
+        let producer_request = ArtifactExecutionCacheRequest {
+            operation: "quadrature.load_or_compute",
+            semantic_key: &key,
+            logical_key: "gauss-legendre/4/128",
+            resolver: producer_cache.resolver,
+            reference_resolver: producer_cache.reference_resolver,
+            acceptance: producer_cache.acceptance,
+            ordered_overlays: producer_cache.ordered_overlays,
+            mode: producer_cache.mode,
+            write_on_miss: producer_cache.write_on_miss,
+            write_visibility: producer_cache.write_visibility,
+            produced_quality: CacheQuality::Validated,
+            producer_toolkit_version: crate::current_toolkit_version().unwrap(),
+            minimum_reader_version: crate::current_toolkit_version().unwrap(),
+            maximum_reader_version: None,
+            tags: BTreeMap::new(),
+            provenance_digest: None,
+            production_sink: producer_cache.production_sink,
+        };
+        resolve_or_compute_json_artifact(
+            &producer_request,
+            || Ok(vec!["node-a".to_owned(), "node-b".to_owned()]),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        let publisher = ManagedArtifactCacheSession::new(config(
+            ArtifactExecutionCacheMode::RequireReuse,
+            "publisher-staging",
+        ))
+        .unwrap();
+        let publisher_cache = publisher.context();
+        let publisher_request = ArtifactExecutionCacheRequest {
+            operation: "quadrature.load_or_compute",
+            semantic_key: &key,
+            logical_key: "gauss-legendre/4/128",
+            resolver: publisher_cache.resolver,
+            reference_resolver: publisher_cache.reference_resolver,
+            acceptance: publisher_cache.acceptance,
+            ordered_overlays: publisher_cache.ordered_overlays,
+            mode: publisher_cache.mode,
+            write_on_miss: publisher_cache.write_on_miss,
+            write_visibility: publisher_cache.write_visibility,
+            produced_quality: CacheQuality::Validated,
+            producer_toolkit_version: crate::current_toolkit_version().unwrap(),
+            minimum_reader_version: crate::current_toolkit_version().unwrap(),
+            maximum_reader_version: None,
+            tags: BTreeMap::new(),
+            provenance_digest: None,
+            production_sink: publisher_cache.production_sink,
+        };
+        let result = resolve_or_compute_json_artifact(
+            &publisher_request,
+            || -> Result<Vec<String>, CacheError> {
+                panic!("require_reuse publication must not recompute")
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(result.reused_manifest.is_some());
+        assert_eq!(publisher.staged_drafts().unwrap().len(), 1);
+        assert_eq!(publisher.publication_inventory().unwrap().entries.len(), 1);
+        publisher.finalize_publication_inventory().unwrap();
         let _ = fs::remove_dir_all(root);
     }
 

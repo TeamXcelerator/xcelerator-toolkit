@@ -338,8 +338,9 @@ impl VectorReadF64 for FileBackedVectorF64 {
             file.seek(SeekFrom::Start((start as u64) * 8))?;
             file.read_exact(&mut bytes)
         })?;
-        for (value, encoded) in output.iter_mut().zip(bytes.chunks_exact(8)) {
-            *value = f64::from_le_bytes(encoded.try_into().expect("eight-byte chunk"));
+        let (encoded_values, _) = bytes.as_chunks::<8>();
+        for (value, encoded) in output.iter_mut().zip(encoded_values) {
+            *value = f64::from_le_bytes(*encoded);
         }
         Ok(())
     }

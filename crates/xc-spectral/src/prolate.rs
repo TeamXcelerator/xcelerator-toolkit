@@ -74,13 +74,13 @@ pub fn prolate_artifact_reuse_plan() -> xc_core::ArtifactReusePlan {
                 &["target", "solver_semantics", "normalization"],
             ),
             node(
-                "connes_candidate",
+                "reference_candidate",
                 &["eigensystem"],
                 &["candidate_semantics", "sampling_grid"],
             ),
             node(
                 "weil_comparison",
-                &["connes_candidate"],
+                &["reference_candidate"],
                 &["weil_state_digest", "form_digest", "truncation_bounds"],
             ),
             node(
@@ -489,6 +489,14 @@ pub struct ComparisonResult {
     pub l2_error: f64,
     /// L∞ norm of ξ_λ on the grid (for relative-error reporting).
     pub xi_linf: f64,
+    /// Discrete ℓ² norm of ξ_λ on the grid, matching `l2_error`'s
+    /// unweighted convention.
+    ///
+    /// Because `optimal_scalar` minimizes `‖ξ_λ − c·k_λ‖₂`, the residual is
+    /// orthogonal to `k_λ` and `l2_error / xi_l2` is exactly `sin θ`, the
+    /// scale-free angle between the educated guess and its target. Reported
+    /// so that relative distance is recoverable from the result alone.
+    pub xi_l2: f64,
     /// Index of the maximum residual on the sampling grid.
     pub linf_index: usize,
 }
@@ -570,12 +578,14 @@ pub fn compare_xi_to_k_lambda_f64(
         }
     }
     let xi_linf = xi_values.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
+    let xi_l2 = xi_values.iter().map(|x| x * x).sum::<f64>().sqrt();
 
     Ok(ComparisonResult {
         optimal_scalar: c,
         linf_error,
         l2_error: l2_sq.sqrt(),
         xi_linf,
+        xi_l2,
         linf_index,
     })
 }
@@ -600,6 +610,7 @@ mod tests {
             linf_error: 1.0e-14,
             l2_error: 2.0e-14,
             xi_linf: 0.75,
+            xi_l2: 0.875,
             linf_index: 1,
         };
         let result_json = serde_json::to_vec(&result).unwrap();
@@ -614,6 +625,48 @@ mod tests {
         );
     }
 
+    /// Optimal scaling makes the residual orthogonal to `k_λ`, so
+    /// `‖ξ‖² = ‖c·k‖² + ‖ξ − c·k‖²` and `l2_error / xi_l2` is exactly `sin θ`.
+    ///
+    /// This is what makes the reported distance scale-free and therefore
+    /// comparable across `λ²`.
+    #[test]
+    fn optimal_scaling_makes_relative_l2_distance_a_sine() {
+        let lambda = 5.0;
+        let cfg = ProlateConfig::new(lambda, 401).with_n_sample(64);
+        let res = compute_k_lambda_f64(&cfg).unwrap();
+
+        // A ξ with several active modes, so the residual is not degenerate.
+        let n_modes = 20;
+        let mut xi = vec![0.0_f64; 2 * n_modes + 1];
+        xi[n_modes] = (lambda * lambda).ln().sqrt();
+        for k in 1..=4 {
+            let v = 0.35_f64 / (k as f64);
+            xi[n_modes + k] = v;
+            xi[n_modes - k] = v;
+        }
+        let cmp = compare_xi_to_k_lambda_f64(&xi, n_modes, lambda, &res.u_grid, &res.k_values)
+            .expect("comparison should succeed");
+
+        assert!(cmp.xi_l2 > 0.0, "ξ must be nonzero on the grid");
+        let k_norm: f64 = res.k_values.iter().map(|k| k * k).sum::<f64>().sqrt();
+        let projected = cmp.optimal_scalar * k_norm;
+        let pythagoras = projected * projected + cmp.l2_error * cmp.l2_error;
+        assert!(
+            (pythagoras - cmp.xi_l2 * cmp.xi_l2).abs() <= 1e-12 * cmp.xi_l2 * cmp.xi_l2,
+            "residual is not orthogonal to k: {pythagoras} vs {}",
+            cmp.xi_l2 * cmp.xi_l2
+        );
+
+        let sine = cmp.l2_error / cmp.xi_l2;
+        assert!(
+            (0.0..=1.0).contains(&sine),
+            "relative distance must be a sine, got {sine}"
+        );
+        // L∞ of the residual cannot exceed the ℓ² norm on the same grid.
+        assert!(cmp.linf_error <= cmp.l2_error * (1.0 + 1e-12));
+    }
+
     #[test]
     fn prolate_reuse_plan_separates_candidate_and_certificate() {
         let plan = prolate_artifact_reuse_plan();
@@ -621,7 +674,7 @@ mod tests {
         assert!(plan
             .artifacts
             .iter()
-            .any(|node| node.kind == "connes_candidate"));
+            .any(|node| node.kind == "reference_candidate"));
         assert!(plan
             .artifacts
             .iter()
@@ -2271,6 +2324,13 @@ pub mod hp {
         pub l2_error: Float,
         /// L∞ norm of `ξ_λ` on the grid, used for relative-error reporting (HP).
         pub xi_linf: Float,
+        /// Discrete ℓ² norm of `ξ_λ` on the grid, matching `l2_error`'s
+        /// unweighted convention (HP).
+        ///
+        /// Because `optimal_scalar` minimizes `‖ξ_λ − c·k_λ‖₂`, the residual is
+        /// orthogonal to `k_λ` and `l2_error / xi_l2` is exactly `sin θ`, the
+        /// scale-free angle between the educated guess and its target.
+        pub xi_l2: Float,
         /// Index of the maximum residual on the sampling grid.
         pub linf_index: usize,
     }
@@ -2407,12 +2467,15 @@ pub mod hp {
         let l2_error = l2_sq.sqrt();
 
         let mut xi_linf = Float::with_val(prec, 0);
+        let mut xi_l2_sq = Float::with_val(prec, 0);
         for x in &xi_values {
             let abs_x = x.clone().abs();
             if abs_x > xi_linf {
                 xi_linf = abs_x;
             }
+            xi_l2_sq += x.clone().square();
         }
+        let xi_l2 = xi_l2_sq.sqrt();
 
         eprintln!(
             "[HP prolate] compare done in {:.1}s",
@@ -2423,6 +2486,7 @@ pub mod hp {
             linf_error,
             l2_error,
             xi_linf,
+            xi_l2,
             linf_index,
         })
     }
@@ -2430,6 +2494,99 @@ pub mod hp {
     // -----------------------------------------------------------------------
     // HP unit tests
     // -----------------------------------------------------------------------
+
+    /// End-to-end CCM -> prolate accuracy measurement.
+    ///
+    /// This is the CCM Lemma 7.2 / Step 2 quantity: how closely the prolate
+    /// educated guess `k_λ` approximates the true smallest-eigenvalue Weil
+    /// eigenvector `ξ_λ` at mode cutoff `N`.
+    #[derive(Clone, Debug)]
+    pub struct CcmProlateDistanceHp {
+        /// `λ²` the measurement was taken at.
+        pub lambda_squared: f64,
+        /// Mode cutoff `N`. The expanded `ξ_λ` has `2N+1` coefficients.
+        pub n_modes: usize,
+        /// Smallest even-sector Weil eigenvalue at this `(λ², N)`.
+        pub eigenvalue: Float,
+        /// Norms of the residual `ξ_λ − c·k_λ` on the prolate sample grid.
+        pub comparison: HpComparisonResult,
+        /// `‖ξ_λ − c·k_λ‖₂ / ‖ξ_λ‖₂`, that is `sin θ` between guess and target.
+        ///
+        /// Scale-free, so it is comparable across `λ²` and independent of the
+        /// normalization the sector eigensolver happened to return.
+        pub relative_l2_distance: Float,
+    }
+
+    /// Measure how accurately the prolate educated guess `k_λ` approximates the
+    /// CCM Weil ground state `ξ_λ`, end to end.
+    ///
+    /// Computes the even-parity Weil sector ground state for `params`, expands
+    /// it out of the sector basis into the full `2N+1` `V_n` layout via
+    /// [`crate::ccm::hp::expand_even_sector_vector`], builds `k_λ` on the
+    /// prolate grid, and compares the two.
+    ///
+    /// The even sector is the relevant one: `k_λ = ℰ(h_λ)` is assembled from the
+    /// even prolate modes `h_0` and `h_4`, and the comparison reconstructs
+    /// `ξ_λ` through an even cosine sum.
+    ///
+    /// This is a finite-`N`, finite-precision measurement. It does not on its
+    /// own establish anything about the `N → ∞` limit.
+    pub fn ccm_prolate_distance_hp(
+        params: &crate::ccm::CcmParams,
+        cfg: &crate::ccm::hp::HighPrecConfig,
+        n_grid: usize,
+        n_sample: usize,
+        mode: CacheMode,
+    ) -> Result<CcmProlateDistanceHp> {
+        let prec = cfg.precision_bits;
+        // Follow the documented LambdaSq promotion rule so an integer λ² stays
+        // exact instead of round-tripping through f64.
+        let lambda_sq = if params.lambda_sq.is_integer {
+            Float::with_val(prec, params.lambda_sq.value_u64)
+        } else {
+            Float::with_val(prec, params.lambda_sq.value_f64)
+        };
+        if lambda_sq <= 1u32 {
+            anyhow::bail!(
+                "prolate comparison needs λ² > 1 so the ℰ-map interval [λ⁻¹, λ] is nondegenerate; got λ² = {}",
+                params.lambda_squared()
+            );
+        }
+        let lambda = lambda_sq.sqrt();
+
+        let gap = crate::ccm::hp::analyze_sector_gap(params, cfg, 1)?;
+        let ground = gap
+            .even
+            .eigenpairs
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("CCM even sector returned no eigenpairs"))?;
+        let expected = params.n_modes + 1;
+        if ground.eigenvector.len() != expected {
+            anyhow::bail!(
+                "CCM even sector eigenvector has dimension {}, expected N+1 = {expected}",
+                ground.eigenvector.len(),
+            );
+        }
+        let xi =
+            crate::ccm::hp::expand_even_sector_vector(&ground.eigenvector, params.n_modes, prec);
+
+        let k = compute_k_lambda(&lambda, n_grid, n_sample, prec, mode)?;
+        let comparison =
+            compare_xi_to_k_lambda(&xi, params.n_modes, &lambda, &k.u_grid, &k.k_values, prec)?;
+
+        if comparison.xi_l2 == 0u32 {
+            anyhow::bail!("ξ_λ vanishes on the prolate sample grid; relative distance undefined");
+        }
+        let relative_l2_distance = comparison.l2_error.clone() / comparison.xi_l2.clone();
+
+        Ok(CcmProlateDistanceHp {
+            lambda_squared: params.lambda_squared(),
+            n_modes: params.n_modes,
+            eigenvalue: ground.eigenvalue.clone(),
+            comparison,
+            relative_l2_distance,
+        })
+    }
 
     #[cfg(test)]
     mod tests {

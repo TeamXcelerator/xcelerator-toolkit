@@ -6,7 +6,7 @@
 //! Building blocks for spectral approaches to the Riemann Hypothesis
 //! and related problems:
 //!
-//! - **`ccm`**: Connes-Consani-Moscovici 2025 construction. Weil
+//! - **`ccm`**: 2025 CCM construction. Weil
 //!   quadratic form on the V_n basis, smallest-eigenvector computation,
 //!   rational-function root extraction. f64 + HP tiers.
 //! - **`prolate`**: Prolate-wave operator PW_λ on `[-λ, λ]`,
@@ -27,11 +27,14 @@
 //! The HP tier is gated behind the `hp` feature.
 
 pub mod ccm;
+pub mod deviation;
+pub mod distance;
 pub mod lfunction;
 pub mod mellin;
 pub mod prolate;
 #[cfg(feature = "hp")]
 pub mod screw;
+pub mod target;
 pub mod yakaboylu;
 
 pub use xc_cache::OutputValidationClaim;

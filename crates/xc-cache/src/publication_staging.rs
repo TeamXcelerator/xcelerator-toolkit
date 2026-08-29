@@ -157,6 +157,14 @@ pub fn stage_immutable_publication_metadata(
     cancellation
         .check()
         .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+    if destination == PublicationDestination::Public
+        && crate::artifact_kind_is_private_only(&bundle.manifest.semantic_key.artifact_kind)
+    {
+        return Err(CacheError::PermissionDenied(format!(
+            "artifact kind {:?} is private-only",
+            bundle.manifest.semantic_key.artifact_kind
+        )));
+    }
     journal.validate()?;
     validate_bundle(journal, destination, bundle)?;
     validate_public_documents(journal, destination, bundle, public_sanitizer)?;
@@ -1339,6 +1347,26 @@ mod tests {
             PublicationDestination::Public,
             &bundle,
             None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::PermissionDenied(_)));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn public_staging_rejects_private_only_artifact_kinds_before_serialization() {
+        let (mut journal, mut bundle) = fixture(PublicationDestination::Public);
+        bundle.manifest.semantic_key.artifact_kind = "ccm_target_distance".to_owned();
+        let root = temporary_root("public-private-only");
+        let _ = fs::remove_dir_all(&root);
+        let error = stage_immutable_publication_metadata(
+            &root,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+            &mut journal,
+            PublicationDestination::Public,
+            &bundle,
+            Some(&PublicSanitizerProfile::default()),
         )
         .unwrap_err();
         assert!(matches!(error, CacheError::PermissionDenied(_)));

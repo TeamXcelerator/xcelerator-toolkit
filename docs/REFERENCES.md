@@ -1,8 +1,8 @@
 # References
 
 - Xcelerator Toolkit public repository and source-available license.
-- Connes, Consani, and Moscovici, *Zeta Spectral Triples*.
-- Andrews, *A Quantitative Convergence Law for the Connes-Consani-Moscovici Zeta Spectral Triple*, working draft.
+- *Zeta Spectral Triples*, source manuscript.
+- Andrews, *A Quantitative Convergence Law for the CCM Zeta Spectral Triple*, working draft.
 - Sliwinski, *High-Performance Computation of M_k*.
 - Groskin, *A finite Guinand-Weil dictionary and archimedean tail order for the truncated Weil quadratic form*.
 - Groskin, *High-Precision Approximation of Riemann Zeros via the Truncated Weil Form*.

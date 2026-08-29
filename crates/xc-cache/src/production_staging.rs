@@ -9,6 +9,7 @@ use crate::{
     TransportPolicy, REMOTE_CANONICAL_MANIFEST_TAG,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::fs::File;
 use std::io::BufReader;
@@ -95,11 +96,38 @@ pub fn build_managed_publication_inventory(
             crate::PublicationDestination::Public,
         ],
     };
+    // Private-only kinds are routed rather than rejected: they keep their
+    // private destination and are withheld from the public one, so a mixed
+    // draft set publishes gracefully under `Both`. The only hard failure is
+    // an explicit public-only request in which nothing at all is
+    // public-eligible -- publishing nothing under an explicit request would
+    // be a silent no-op.
+    if target == xc_core::PublicationTarget::Public
+        && !drafts.is_empty()
+        && drafts.iter().all(|draft| {
+            artifact_kind_is_private_only(draft.manifest.semantic_key.artifact_kind.as_str())
+        })
+    {
+        let restricted = drafts
+            .iter()
+            .map(|draft| draft.manifest.semantic_key.artifact_kind.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        return Err(CacheError::PermissionDenied(format!(
+            "runtime-target-derived artifacts are private-only and cannot be published to a public destination: {}",
+            restricted.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
     let mut entries = Vec::new();
     for draft in drafts {
         draft.manifest.validate()?;
         draft.encoding.validate()?;
         for destination in &destinations {
+            if !artifact_kind_admitted_to_destination(
+                draft.manifest.semantic_key.artifact_kind.as_str(),
+                *destination,
+            ) {
+                continue;
+            }
             let visibility = match destination {
                 crate::PublicationDestination::Private => "private",
                 crate::PublicationDestination::Public => "public",
@@ -176,6 +204,10 @@ pub struct CanonicalStagingProductionSink {
     resources: ResourcePolicy,
     cancellation: CancellationToken,
     drafts: Mutex<Vec<CanonicalProductionDraft>>,
+    /// Exact artifacts touched by this process. Existing drafts loaded from a
+    /// prior process are deliberately not counted: remote execution must not
+    /// succeed merely because stale staging happens to be nonempty.
+    observed_artifacts: Mutex<BTreeSet<String>>,
 }
 
 impl CanonicalStagingProductionSink {
@@ -239,6 +271,7 @@ impl CanonicalStagingProductionSink {
             resources,
             cancellation,
             drafts: Mutex::new(drafts),
+            observed_artifacts: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -252,6 +285,31 @@ impl CanonicalStagingProductionSink {
             .map(|drafts| drafts.clone())
             .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))
     }
+
+    pub fn observed_artifact_count(&self) -> Result<usize, CacheError> {
+        self.observed_artifacts
+            .lock()
+            .map(|observed| observed.len())
+            .map_err(|_| {
+                CacheError::Io("canonical staging observation lock is poisoned".to_owned())
+            })
+    }
+
+    fn mark_observed(&self, artifact: &ProducedArtifactRecord) -> Result<(), CacheError> {
+        self.observed_artifacts
+            .lock()
+            .map_err(|_| {
+                CacheError::Io("canonical staging observation lock is poisoned".to_owned())
+            })?
+            .insert(format!(
+                "{}\n{}\n{}\n{}",
+                artifact.manifest.key.kind,
+                artifact.manifest.key.logical_key,
+                artifact.manifest.key.parameters_digest,
+                artifact.manifest.content_digest
+            ));
+        Ok(())
+    }
 }
 
 impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
@@ -264,7 +322,85 @@ impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
             draft.source_artifact_key == artifact.manifest.key
                 && draft.source_content_digest == artifact.manifest.content_digest
         }) {
+            self.mark_observed(&artifact)?;
             return Ok(());
+        }
+        // Deduplicate by exact published identity as well as by source key.
+        // The key-based and identity-based closure walks can meet on a
+        // diamond: the same artifact staged first through an identity
+        // resolution carries a synthetic logical key, and a later key-based
+        // reference must be recognized as the same draft rather than rejected
+        // as a disagreeing one. The comparison uses the full identity tuple
+        // -- family, semantic digest, canonical manifest digest, canonical
+        // payload digest -- which is computable up front only for records
+        // that carry a retained canonical manifest; those are exactly the
+        // records both walks can produce for the same artifact. Anything
+        // weaker (for example semantic digest plus raw payload digest) would
+        // silently discard a second artifact whose canonical dependencies
+        // differ, leaving the staged closure incomplete.
+        if let Some(encoded) = artifact.manifest.tags.get(REMOTE_CANONICAL_MANIFEST_TAG) {
+            let canonical: CanonicalArtifactManifest = serde_json::from_str(encoded)?;
+            let family = family_for_artifact_kind(&artifact.semantic_key.artifact_kind)
+                .ok_or_else(|| {
+                    CacheError::InvalidManifest(format!(
+                        "artifact kind {:?} has no publication family mapping",
+                        artifact.semantic_key.artifact_kind
+                    ))
+                })?;
+            crate::validate_retained_canonical_binding(
+                &canonical,
+                &artifact.semantic_key,
+                family,
+                &artifact.manifest.content_digest,
+                artifact.manifest.size_bytes,
+                artifact.manifest.provenance_digest.as_ref(),
+            )?;
+            let manifest_digest = canonical.digest()?;
+            if let Some(existing) = drafts.iter_mut().find(|draft| {
+                draft.family == canonical.artifact_family
+                    && draft.manifest.semantic_digest == canonical.semantic_digest
+                    && draft.manifest.payload_digest == canonical.payload_digest
+                    && draft
+                        .manifest
+                        .digest()
+                        .map(|digest| digest == manifest_digest)
+                        .unwrap_or(false)
+            }) {
+                // An identity-addressed GitHub closure lookup necessarily
+                // creates a local-only `closure/...` adapter key because a
+                // canonical shard manifest carries no logical key. If the
+                // key-based walk later reaches the same published artifact,
+                // retain its real adapter provenance on the existing draft.
+                // A freshly produced child names dependencies by that real
+                // key, so merely deduplicating here would leave the child
+                // unable to match its already-staged dependency.
+                //
+                // Promote only the explicit identity-closure provenance. Two
+                // genuinely different non-synthetic keys remain deduplicated
+                // by their full published identity without silently choosing
+                // one as canonical.
+                if existing.source_operation == "cache.dependency.closure"
+                    && artifact.operation != "cache.dependency.closure"
+                    && existing.source_artifact_key != artifact.manifest.key
+                {
+                    let mut promoted = existing.clone();
+                    promoted.source_operation = artifact.operation.clone();
+                    promoted.source_logical_key = artifact.logical_key.clone();
+                    promoted.source_artifact_key = artifact.manifest.key.clone();
+                    promoted.source_content_digest = artifact.manifest.content_digest.clone();
+                    promoted.source_manifest_digest = canonical_digest(&artifact.manifest)?;
+                    let draft_path = self
+                        .staging_root
+                        .join("drafts")
+                        .join(&promoted.manifest.semantic_digest.0)
+                        .join(&promoted.manifest.payload_digest.0)
+                        .join("draft.json");
+                    crate::atomic_replace(&draft_path, &serde_json::to_vec_pretty(&promoted)?)?;
+                    *existing = promoted;
+                }
+                self.mark_observed(&artifact)?;
+                return Ok(());
+            }
         }
         let draft = stage_produced_artifact_with_dependencies(
             &artifact,
@@ -275,7 +411,28 @@ impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
             &self.cancellation,
         )?;
         drafts.push(draft);
+        self.mark_observed(&artifact)?;
         Ok(())
+    }
+
+    fn contains_dependency_identity(
+        &self,
+        identity: &crate::PayloadDependencyIdentity,
+    ) -> Result<bool, CacheError> {
+        let drafts = self
+            .drafts
+            .lock()
+            .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))?;
+        for draft in drafts.iter() {
+            if draft.family == identity.artifact_family
+                && draft.manifest.semantic_digest == identity.semantic_digest
+                && draft.manifest.payload_digest == identity.payload_digest
+                && draft.manifest.digest()? == identity.manifest_digest
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn contains_artifact(
@@ -400,7 +557,7 @@ impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
             .staging_root
             .join("drafts")
             .join(&draft.manifest.semantic_digest.0)
-            .join(&draft.source_content_digest.0)
+            .join(&draft.manifest.payload_digest.0)
             .join("draft.json");
         crate::atomic_replace(&draft_path, &serde_json::to_vec_pretty(draft)?)
     }
@@ -439,7 +596,7 @@ impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
             .staging_root
             .join("drafts")
             .join(&draft.manifest.semantic_digest.0)
-            .join(&draft.source_content_digest.0)
+            .join(&draft.manifest.payload_digest.0)
             .join("draft.json");
         crate::atomic_replace(&path, &serde_json::to_vec_pretty(draft)?)
     }
@@ -525,12 +682,61 @@ const CCM_ROOT_KINDS: &[&str] = &[
 ];
 const CCM_EVIDENCE_KINDS: &[&str] = &[
     "ccm_convergence_diagnostics",
+    "ccm_root_conditioning_analysis",
+    "ccm_prime_power_response_analysis",
+    "ccm_u_flow_response_analysis",
     "ccm_sector_gap",
+    "ccm_sector_gap_certificate",
     "ccm_post_discovery_comparison",
     "ccm_cross_check_record",
     "ccm_validation_record",
     "ccm_certificate_bundle",
 ];
+/// Eigenfunction profiles and target-distance measurements. These are
+/// derived measurement products: they are reproducible from a retained
+/// eigenstate plus a stated quadrature convention, and are published so that
+/// downstream analysis does not have to repeat the spectral solve.
+const CCM_DISTANCE_KINDS: &[&str] = &[
+    "ccm_deviation_decomposition",
+    "ccm_discretization_distance",
+    "ccm_distance_resolution_evidence",
+    "ccm_eigenfunction_profile",
+    "ccm_target_distance",
+    "ccm_target_residual_analysis",
+];
+
+/// Artifact kinds whose values depend on a private runtime target definition.
+///
+/// This is a hard confidentiality boundary, not a configurable publication
+/// preference. Public reads ignore these kinds. Managed publication withholds
+/// them from every public leg: under `Both` they ride only the private leg,
+/// and an explicit public-only request fails when nothing staged is
+/// public-eligible.
+const PRIVATE_ONLY_ARTIFACT_KINDS: &[&str] = &[
+    "ccm_deviation_decomposition",
+    "ccm_distance_resolution_evidence",
+    "ccm_target_distance",
+    "ccm_target_residual_analysis",
+];
+
+pub fn artifact_kind_is_private_only(kind: &str) -> bool {
+    PRIVATE_ONLY_ARTIFACT_KINDS.contains(&kind)
+}
+
+/// Whether an artifact kind may be published to a destination.
+///
+/// Private-only kinds are admitted to the private destination and silently
+/// withheld from the public one; every other kind is admitted everywhere.
+/// Routing callers use this to split a mixed draft set across destinations
+/// instead of failing the whole publication, while the staging, planning, and
+/// bootstrap guards remain hard backstops should a private-only artifact ever
+/// reach a public surface anyway.
+pub fn artifact_kind_admitted_to_destination(
+    kind: &str,
+    destination: crate::PublicationDestination,
+) -> bool {
+    destination == crate::PublicationDestination::Private || !artifact_kind_is_private_only(kind)
+}
 const MAYNARD_TAO_KINDS: &[&str] = &[
     "maynard_basis",
     "maynard_moment_table",
@@ -549,6 +755,7 @@ pub fn artifact_kinds_for_family(family: &str) -> Option<&'static [&'static str]
         "prolate" => Some(PROLATE_KINDS),
         "ccm-roots" => Some(CCM_ROOT_KINDS),
         "ccm-evidence" => Some(CCM_EVIDENCE_KINDS),
+        "ccm-distance" => Some(CCM_DISTANCE_KINDS),
         "maynard-tao" => Some(MAYNARD_TAO_KINDS),
         _ => None,
     }
@@ -563,6 +770,7 @@ pub fn family_for_artifact_kind(kind: &str) -> Option<&'static str> {
         "prolate",
         "ccm-roots",
         "ccm-evidence",
+        "ccm-distance",
         "maynard-tao",
     ]
     .into_iter()
@@ -620,60 +828,6 @@ pub fn stage_produced_artifact_with_dependencies(
     }
     transport_policy.validate()?;
     let semantic_digest = record.semantic_key.digest()?;
-    let draft_root = staging_root
-        .join("drafts")
-        .join(&semantic_digest.0)
-        .join(&record.manifest.content_digest.0);
-    if draft_root.exists() {
-        let draft_path = draft_root.join("draft.json");
-        // draft.json is written only after the archive and every split part
-        // have completed.  Its absence therefore identifies an interrupted
-        // staging attempt, not a reusable canonical draft.  Rebuild it from
-        // the still-validated produced artifact instead of permanently
-        // wedging subsequent author runs after a reboot or process kill.
-        if !draft_path.is_file() {
-            fs::remove_dir_all(&draft_root)?;
-        }
-    }
-    if draft_root.exists() {
-        let draft_path = draft_root.join("draft.json");
-        let draft: CanonicalProductionDraft = serde_json::from_slice(&fs::read(&draft_path)?)?;
-        draft.manifest.validate()?;
-        draft.encoding.validate()?;
-        crate::ArtifactProductionAssessment {
-            achieved_assurance: draft.achieved_assurance,
-            evidence_digests: draft.assurance_evidence_digests.clone(),
-        }
-        .validate()?;
-        if draft.source_artifact_key != record.manifest.key
-            || draft.source_content_digest != record.manifest.content_digest
-            || draft.source_manifest_digest != canonical_digest(&record.manifest)?
-            || draft.family != family
-            || draft.manifest.semantic_digest != semantic_digest
-        {
-            return Err(CacheError::InvalidManifest(format!(
-                "existing canonical production draft disagrees with produced artifact: {}",
-                draft_root.display()
-            )));
-        }
-        for part in &draft.encoding.ordered_parts {
-            cancellation
-                .check()
-                .map_err(|error| CacheError::Cancelled(error.to_string()))?;
-            let path = draft.staged_parts_root.join(&part.repository_path);
-            let bytes = fs::read(&path)?;
-            if bytes.len() as u64 != part.size_bytes
-                || ContentDigest::sha256(&bytes) != part.content_digest
-            {
-                return Err(CacheError::InvalidManifest(format!(
-                    "existing canonical production part failed verification: {}",
-                    path.display()
-                )));
-            }
-        }
-        return Ok(draft);
-    }
-    fs::create_dir_all(&draft_root)?;
     let precision_bits = record
         .semantic_key
         .resolved_mathematical_parameters
@@ -693,16 +847,15 @@ pub fn stage_produced_artifact_with_dependencies(
         .map(|encoded| serde_json::from_str::<CanonicalArtifactManifest>(encoded))
         .transpose()?;
     let canonical_payload = if let Some(remote) = &retained_remote_manifest {
-        remote.validate()?;
-        if remote.artifact_family != family
-            || remote.semantic_key != record.semantic_key
-            || remote.semantic_digest != semantic_digest
-            || remote.canonical_payload.ordered_items.len() != 1
-            || remote.canonical_payload.ordered_items[0].normalized_path != "payload.json"
-            || remote.canonical_payload.ordered_items[0].content_digest
-                != ContentDigest::sha256(&record.payload)
-            || remote.canonical_payload.ordered_items[0].size_bytes != record.payload.len() as u64
-        {
+        crate::validate_retained_canonical_binding(
+            remote,
+            &record.semantic_key,
+            family,
+            &ContentDigest::sha256(&record.payload),
+            record.payload.len() as u64,
+            record.manifest.provenance_digest.as_ref(),
+        )?;
+        if remote.semantic_digest != semantic_digest {
             return Err(CacheError::InvalidManifest(
                 "retained remote canonical manifest disagrees with its validated payload"
                     .to_owned(),
@@ -762,6 +915,61 @@ pub fn stage_produced_artifact_with_dependencies(
         }
     };
     let payload_digest = canonical_payload.digest()?;
+    let draft_root = staging_root
+        .join("drafts")
+        .join(&semantic_digest.0)
+        .join(&payload_digest.0);
+    if draft_root.exists() {
+        let draft_path = draft_root.join("draft.json");
+        // draft.json is written only after the archive and every split part
+        // have completed.  Its absence therefore identifies an interrupted
+        // staging attempt, not a reusable canonical draft.  Rebuild it from
+        // the still-validated produced artifact instead of permanently
+        // wedging subsequent author runs after a reboot or process kill.
+        if !draft_path.is_file() {
+            fs::remove_dir_all(&draft_root)?;
+        }
+    }
+    if draft_root.exists() {
+        let draft_path = draft_root.join("draft.json");
+        let draft: CanonicalProductionDraft = serde_json::from_slice(&fs::read(&draft_path)?)?;
+        draft.manifest.validate()?;
+        draft.encoding.validate()?;
+        crate::ArtifactProductionAssessment {
+            achieved_assurance: draft.achieved_assurance,
+            evidence_digests: draft.assurance_evidence_digests.clone(),
+        }
+        .validate()?;
+        if draft.source_artifact_key != record.manifest.key
+            || draft.source_content_digest != record.manifest.content_digest
+            || draft.source_manifest_digest != canonical_digest(&record.manifest)?
+            || draft.family != family
+            || draft.manifest.semantic_digest != semantic_digest
+            || draft.manifest.payload_digest != payload_digest
+        {
+            return Err(CacheError::InvalidManifest(format!(
+                "existing canonical production draft disagrees with produced artifact: {}",
+                draft_root.display()
+            )));
+        }
+        for part in &draft.encoding.ordered_parts {
+            cancellation
+                .check()
+                .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+            let path = draft.staged_parts_root.join(&part.repository_path);
+            let bytes = fs::read(&path)?;
+            if bytes.len() as u64 != part.size_bytes
+                || ContentDigest::sha256(&bytes) != part.content_digest
+            {
+                return Err(CacheError::InvalidManifest(format!(
+                    "existing canonical production part failed verification: {}",
+                    path.display()
+                )));
+            }
+        }
+        return Ok(draft);
+    }
+    fs::create_dir_all(&draft_root)?;
     let parts_root = draft_root.join("parts");
     let archive_path = draft_root.join("payload.zip");
     let package = package_canonical_payload_bytes_zip64(
@@ -874,6 +1082,41 @@ mod tests {
             family_for_artifact_kind("ccm_sector_spectrum"),
             Some("weil-states")
         );
+        assert_eq!(
+            family_for_artifact_kind("ccm_prime_power_response_analysis"),
+            Some("ccm-evidence")
+        );
+        assert_eq!(
+            family_for_artifact_kind("ccm_u_flow_response_analysis"),
+            Some("ccm-evidence")
+        );
+    }
+
+    /// Every artifact kind a family declares must have a compatibility floor.
+    ///
+    /// A kind can otherwise be declared, routed, and published to a registry
+    /// while no code path is able to admit it -- the declaration and the
+    /// implementation drift apart silently, and the failure only appears when
+    /// a consumer tries to resolve an artifact that was never producible.
+    #[test]
+    fn every_declared_kind_has_a_compatibility_floor() {
+        for family in [
+            "quadrature",
+            "ccm-components",
+            "ccm-matrices",
+            "weil-states",
+            "prolate",
+            "ccm-roots",
+            "ccm-evidence",
+            "ccm-distance",
+        ] {
+            for kind in artifact_kinds_for_family(family).unwrap() {
+                assert!(
+                    crate::artifact_compatibility_policy(family, kind).is_ok(),
+                    "family {family} declares {kind} with no compatibility floor"
+                );
+            }
+        }
     }
 
     #[test]
@@ -886,6 +1129,7 @@ mod tests {
             "prolate",
             "ccm-roots",
             "ccm-evidence",
+            "ccm-distance",
             "maynard-tao",
         ];
         let mut seen = std::collections::BTreeSet::new();
@@ -897,6 +1141,22 @@ mod tests {
                 assert_eq!(family_for_artifact_kind(kind), Some(family));
             }
         }
+    }
+
+    #[test]
+    fn runtime_target_artifacts_are_private_only() {
+        for kind in [
+            "ccm_target_distance",
+            "ccm_distance_resolution_evidence",
+            "ccm_target_residual_analysis",
+            "ccm_deviation_decomposition",
+        ] {
+            assert!(artifact_kind_is_private_only(kind));
+        }
+        assert!(!artifact_kind_is_private_only("ccm_eigenfunction_profile"));
+        assert!(!artifact_kind_is_private_only(
+            "ccm_discretization_distance"
+        ));
     }
 
     fn record() -> ProducedArtifactRecord {
@@ -994,6 +1254,158 @@ mod tests {
     }
 
     #[test]
+    fn managed_inventory_rejects_public_target_derived_artifacts() {
+        let root =
+            std::env::temp_dir().join(format!("xc-production-private-only-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut restricted = record();
+        restricted.operation = "ccm.target_distance.resolve_or_compute".to_owned();
+        restricted.logical_key = "ccm/target-distance/fixture".to_owned();
+        restricted.semantic_key.artifact_kind = "ccm_target_distance".to_owned();
+        restricted.semantic_key.mathematical_semantics_version =
+            "ccm-runtime-target-distance-v0.14.1-v2".to_owned();
+        restricted.manifest.key.kind = restricted.semantic_key.artifact_kind.clone();
+        restricted.manifest.key.logical_key = restricted.logical_key.clone();
+        restricted.manifest.key.parameters_digest = restricted.semantic_key.digest().unwrap();
+        restricted.manifest.producer_toolkit_version = ToolkitVersion::parse("0.14.1").unwrap();
+        restricted.manifest.minimum_reader_version = ToolkitVersion::parse("0.14.1").unwrap();
+        let draft = stage_produced_artifact(
+            &restricted,
+            &root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        let private = build_managed_publication_inventory(
+            std::slice::from_ref(&draft),
+            xc_core::PublicationTarget::Private,
+            "example-org",
+            crate::ManagedRunProfile::Author,
+            xc_core::AssuranceLevel::Computed,
+            crate::CertificationFailurePolicy::RetainComputedFailRun,
+            false,
+        )
+        .unwrap();
+        assert_eq!(private.entries.len(), 1);
+        assert_eq!(
+            private.entries[0].destination,
+            crate::PublicationDestination::Private
+        );
+
+        // An explicit public-only request in which nothing is public-eligible
+        // still fails loudly rather than publishing nothing.
+        let error = build_managed_publication_inventory(
+            std::slice::from_ref(&draft),
+            xc_core::PublicationTarget::Public,
+            "example-org",
+            crate::ManagedRunProfile::Author,
+            xc_core::AssuranceLevel::Computed,
+            crate::CertificationFailurePolicy::RetainComputedFailRun,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::PermissionDenied(_)));
+
+        // Under `Both`, the private-only draft is routed to the private
+        // destination and withheld from the public one instead of failing the
+        // publication.
+        let both = build_managed_publication_inventory(
+            std::slice::from_ref(&draft),
+            xc_core::PublicationTarget::Both,
+            "example-org",
+            crate::ManagedRunProfile::Author,
+            xc_core::AssuranceLevel::Computed,
+            crate::CertificationFailurePolicy::RetainComputedFailRun,
+            false,
+        )
+        .unwrap();
+        assert_eq!(both.entries.len(), 1);
+        assert_eq!(
+            both.entries[0].destination,
+            crate::PublicationDestination::Private
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A mixed draft set under `Both` splits by destination: public-eligible
+    /// kinds go everywhere, private-only kinds go private, and the run
+    /// proceeds.
+    #[test]
+    fn managed_inventory_routes_mixed_drafts_across_destinations() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-production-mixed-routing-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut restricted = record();
+        restricted.operation = "ccm.target_distance.resolve_or_compute".to_owned();
+        restricted.logical_key = "ccm/target-distance/fixture".to_owned();
+        restricted.semantic_key.artifact_kind = "ccm_target_distance".to_owned();
+        restricted.semantic_key.mathematical_semantics_version =
+            "ccm-runtime-target-distance-v0.14.1-v2".to_owned();
+        restricted.manifest.key.kind = restricted.semantic_key.artifact_kind.clone();
+        restricted.manifest.key.logical_key = restricted.logical_key.clone();
+        restricted.manifest.key.parameters_digest = restricted.semantic_key.digest().unwrap();
+        restricted.manifest.producer_toolkit_version = ToolkitVersion::parse("0.14.1").unwrap();
+        restricted.manifest.minimum_reader_version = ToolkitVersion::parse("0.14.1").unwrap();
+        let restricted_draft = stage_produced_artifact(
+            &restricted,
+            &root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        let mut eligible = record();
+        eligible.operation = "ccm.eigenfunction_profile.resolve_or_compute".to_owned();
+        eligible.logical_key = "ccm/profile/fixture".to_owned();
+        eligible.semantic_key.artifact_kind = "ccm_eigenfunction_profile".to_owned();
+        eligible.manifest.key.kind = eligible.semantic_key.artifact_kind.clone();
+        eligible.manifest.key.logical_key = eligible.logical_key.clone();
+        eligible.manifest.key.parameters_digest = eligible.semantic_key.digest().unwrap();
+        eligible.manifest.producer_toolkit_version = ToolkitVersion::parse("0.14.1").unwrap();
+        eligible.manifest.minimum_reader_version = ToolkitVersion::parse("0.14.0").unwrap();
+        let eligible_draft = stage_produced_artifact(
+            &eligible,
+            &root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        let inventory = build_managed_publication_inventory(
+            &[restricted_draft, eligible_draft],
+            xc_core::PublicationTarget::Both,
+            "example-org",
+            crate::ManagedRunProfile::Author,
+            xc_core::AssuranceLevel::Computed,
+            crate::CertificationFailurePolicy::RetainComputedFailRun,
+            false,
+        )
+        .unwrap();
+        // restricted: private only. eligible: private and public.
+        assert_eq!(inventory.entries.len(), 3);
+        let public: Vec<_> = inventory
+            .entries
+            .iter()
+            .filter(|entry| entry.destination == crate::PublicationDestination::Public)
+            .collect();
+        assert_eq!(public.len(), 1);
+        assert_eq!(public[0].family, "ccm-distance");
+        let private_kinds = inventory
+            .entries
+            .iter()
+            .filter(|entry| entry.destination == crate::PublicationDestination::Private)
+            .count();
+        assert_eq!(private_kinds, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn remotely_reused_record_preserves_its_canonical_dependency_identity() {
         let source_root = std::env::temp_dir().join(format!(
             "xc-production-remote-source-{}",
@@ -1073,6 +1485,233 @@ mod tests {
     }
 
     #[test]
+    fn historical_and_active_manifests_with_same_semantic_and_item_coexist() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-production-same-item-distinct-closure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let base = record();
+        let historical = stage_produced_artifact(
+            &base,
+            &root.join("historical-source"),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        // Reproduce the production-corpus shape: a later manifest retains the
+        // exact same semantic key and payload.json bytes but adds a canonical
+        // dependency, so its canonical payload and manifest identities differ.
+        let mut active = historical.clone();
+        active
+            .manifest
+            .canonical_payload
+            .dependencies
+            .push(crate::PayloadDependencyIdentity {
+                artifact_family: "ccm-matrices".to_owned(),
+                semantic_digest: ContentDigest::sha256(b"active-parent-semantic"),
+                manifest_digest: ContentDigest::sha256(b"active-parent-manifest"),
+                payload_digest: ContentDigest::sha256(b"active-parent-payload"),
+            });
+        active.manifest.payload_digest = active.manifest.canonical_payload.digest().unwrap();
+        let archive = root.join("active-source.zip");
+        let package = package_canonical_payload_bytes_zip64(
+            &active.manifest.canonical_payload,
+            "payload.json",
+            &base.payload,
+            &archive,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut encoded_bytes = BufReader::new(File::open(&archive).unwrap());
+        active.encoding = stream_split_encoded(
+            &mut encoded_bytes,
+            package.canonical_payload_digest,
+            package.encoder_profile,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+            |_part, _bytes| Ok(()),
+        )
+        .unwrap();
+        active.manifest.transport_digests = vec![active.encoding.digest().unwrap()];
+        active.manifest.validate().unwrap();
+        assert_eq!(
+            historical.manifest.semantic_digest,
+            active.manifest.semantic_digest
+        );
+        assert_eq!(
+            historical.manifest.canonical_payload.ordered_items,
+            active.manifest.canonical_payload.ordered_items
+        );
+        assert_ne!(
+            historical.manifest.payload_digest,
+            active.manifest.payload_digest
+        );
+        assert_ne!(
+            historical.manifest.digest().unwrap(),
+            active.manifest.digest().unwrap()
+        );
+
+        let mut historical_adapter = base.clone();
+        historical_adapter.operation = "cache.dependency.closure".to_owned();
+        historical_adapter.logical_key = "closure/historical-matrix".to_owned();
+        historical_adapter.manifest.key.logical_key = historical_adapter.logical_key.clone();
+        historical_adapter.manifest.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&historical.manifest).unwrap(),
+        );
+        historical_adapter.manifest.provenance_digest = Some(historical.manifest.digest().unwrap());
+
+        let mut active_adapter = base;
+        active_adapter.operation = "ccm.even-sector.resolve".to_owned();
+        active_adapter.manifest.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&active.manifest).unwrap(),
+        );
+        active_adapter.manifest.provenance_digest = Some(active.manifest.digest().unwrap());
+
+        let staging_root = root.join("staging");
+        let sink = CanonicalStagingProductionSink::new(
+            &staging_root,
+            TransportPolicy::default(),
+            ResourcePolicy::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        crate::ArtifactProductionSink::record(&sink, historical_adapter).unwrap();
+        crate::ArtifactProductionSink::record(&sink, active_adapter).unwrap();
+        let drafts = sink.drafts().unwrap();
+        assert_eq!(drafts.len(), 2);
+        for draft in drafts {
+            assert!(staging_root
+                .join("drafts")
+                .join(&draft.manifest.semantic_digest.0)
+                .join(&draft.manifest.payload_digest.0)
+                .join("draft.json")
+                .is_file());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn identity_first_dedup_persists_real_key_for_fresh_child() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-production-identity-first-key-promotion-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source_root = root.join("source");
+        let staging_root = root.join("staging");
+
+        let dependency = record();
+        let published = stage_produced_artifact(
+            &dependency,
+            &source_root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let published_manifest_digest = published.manifest.digest().unwrap();
+        let retained = serde_json::to_string(&published.manifest).unwrap();
+
+        let mut synthetic = dependency.clone();
+        synthetic.operation = "cache.dependency.closure".to_owned();
+        synthetic.logical_key = "closure/synthetic-identity".to_owned();
+        synthetic.manifest.key.logical_key = synthetic.logical_key.clone();
+        synthetic
+            .manifest
+            .tags
+            .insert(REMOTE_CANONICAL_MANIFEST_TAG.to_owned(), retained.clone());
+        synthetic.manifest.provenance_digest = Some(published_manifest_digest.clone());
+
+        let mut real = dependency.clone();
+        real.operation = "cache.dependency.resolve".to_owned();
+        real.manifest
+            .tags
+            .insert(REMOTE_CANONICAL_MANIFEST_TAG.to_owned(), retained);
+        real.manifest.provenance_digest = Some(published_manifest_digest);
+
+        let sink = CanonicalStagingProductionSink::new(
+            &staging_root,
+            TransportPolicy::default(),
+            ResourcePolicy::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        crate::ArtifactProductionSink::record(&sink, synthetic).unwrap();
+        crate::ArtifactProductionSink::record(&sink, real.clone()).unwrap();
+        let promoted = sink.drafts().unwrap();
+        assert_eq!(promoted.len(), 1, "published identity remains deduplicated");
+        assert_eq!(
+            promoted[0].source_artifact_key, real.manifest.key,
+            "the key-based adapter must replace synthetic closure provenance"
+        );
+        drop(sink);
+
+        // Reopen the staging directory to prove the promotion was persisted,
+        // then stage a newly computed child that names the dependency by its
+        // real adapter key -- the production failure this regression covers.
+        let sink = CanonicalStagingProductionSink::new(
+            &staging_root,
+            TransportPolicy::default(),
+            ResourcePolicy::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            sink.drafts().unwrap()[0].source_artifact_key,
+            real.manifest.key
+        );
+
+        let mut child = record();
+        child.operation = "ccm.factorization.resolve_or_compute".to_owned();
+        child.logical_key = "ccm/factorization/fixture".to_owned();
+        child.semantic_key.artifact_kind = "ccm_factorization".to_owned();
+        child.semantic_key.resolved_mathematical_parameters = json!({"role": "child"});
+        child.manifest.key.kind = child.semantic_key.artifact_kind.clone();
+        child.manifest.key.logical_key = child.logical_key.clone();
+        child.manifest.key.parameters_digest = child.semantic_key.digest().unwrap();
+        child.payload = br#"{"child":"fresh"}"#.to_vec();
+        child.manifest.content_digest = ContentDigest::sha256(&child.payload);
+        child.manifest.size_bytes = child.payload.len() as u64;
+        child.manifest.objects = vec![crate::CacheObjectRef {
+            content_digest: child.manifest.content_digest.clone(),
+            size_bytes: child.manifest.size_bytes,
+        }];
+        child.manifest.dependencies = vec![crate::DependencyRef {
+            key: real.manifest.key.clone(),
+            content_digest: real.manifest.content_digest.clone(),
+            required_quality: CacheQuality::Validated,
+        }];
+        child.manifest.tags.clear();
+        child.manifest.provenance_digest = None;
+
+        crate::ArtifactProductionSink::record(&sink, child).unwrap();
+        let drafts = sink.drafts().unwrap();
+        assert_eq!(drafts.len(), 2);
+        let child = drafts
+            .iter()
+            .find(|draft| draft.source_artifact_key.kind == "ccm_factorization")
+            .unwrap();
+        assert_eq!(child.manifest.canonical_payload.dependencies.len(), 1);
+        assert_eq!(
+            child.manifest.canonical_payload.dependencies[0],
+            crate::PayloadDependencyIdentity {
+                artifact_family: promoted[0].family.clone(),
+                semantic_digest: promoted[0].manifest.semantic_digest.clone(),
+                manifest_digest: promoted[0].manifest.digest().unwrap(),
+                payload_digest: promoted[0].manifest.payload_digest.clone(),
+            }
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn interrupted_canonical_draft_is_rebuilt_from_validated_record() {
         let root = std::env::temp_dir().join(format!(
             "xc-production-interrupted-stage-{}",
@@ -1080,10 +1719,20 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         let record = record();
+        let reference_root = root.with_extension("reference");
+        let _ = fs::remove_dir_all(&reference_root);
+        let reference = stage_produced_artifact(
+            &record,
+            &reference_root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
         let draft_root = root
             .join("drafts")
             .join(record.semantic_key.digest().unwrap().0)
-            .join(&record.manifest.content_digest.0);
+            .join(&reference.manifest.payload_digest.0);
         fs::create_dir_all(draft_root.join("parts")).unwrap();
         fs::write(draft_root.join("interrupted.part"), b"partial").unwrap();
 
@@ -1103,6 +1752,7 @@ mod tests {
             record.manifest.content_digest
         );
         let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(reference_root);
     }
 
     #[test]

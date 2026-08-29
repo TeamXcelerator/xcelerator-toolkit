@@ -38,6 +38,9 @@ pub fn artifact_family_compatibility_policy(
         "prolate" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
         "ccm-roots" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
         "ccm-evidence" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
+        // Eigenfunction profiles and target-distance measurements. Introduced
+        // in 0.14.0, so its producer floor starts there rather than at 0.13.0.
+        "ccm-distance" => ("0.14.0", "0.13.0", None, SCHEMA_V1),
         // Canonical protocol fixtures exercise backend-neutral mechanics with
         // synthetic families. They remain explicit rather than receiving a
         // permissive unknown-family fallback.
@@ -86,6 +89,12 @@ pub fn artifact_compatibility_policy(
         "ccm_sector_eigenvalues" => "0.13.0",
         "ccm_sector_spectrum" => "0.13.0",
         "ccm_sector_gap" => "0.13.0",
+        // ccm-distance family, introduced in 0.14.0.
+        "ccm_discretization_distance" => "0.14.0",
+        "ccm_distance_resolution_evidence" => "0.14.1",
+        "ccm_eigenfunction_profile" => "0.14.0",
+        "ccm_target_distance" => "0.14.0",
+        "ccm_target_residual_analysis" => "0.14.1",
         "ccm_weil_eigenpair" => "0.13.0",
         "ccm_weil_plunge_state" => "0.13.0",
         "ccm_weil_sonin_state" => "0.13.0",
@@ -102,6 +111,11 @@ pub fn artifact_compatibility_policy(
         "ccm_spectral_window" => "0.13.0",
         "ccm_post_discovery_comparison" => "0.13.0",
         "ccm_convergence_diagnostics" => "0.13.0",
+        "ccm_root_conditioning_analysis" => "0.14.1",
+        "ccm_deviation_decomposition" => "0.14.1",
+        "ccm_prime_power_response_analysis" => "0.14.1",
+        "ccm_u_flow_response_analysis" => "0.14.1",
+        "ccm_sector_gap_certificate" => "0.14.1",
         "ccm_cross_check_record" => "0.13.0",
         "ccm_validation_record" => "0.13.0",
         "ccm_certificate_bundle" => "0.13.0",
@@ -115,6 +129,18 @@ pub fn artifact_compatibility_policy(
     let mut policy = artifact_family_compatibility_policy(family)?;
     policy.artifact_kind = Some(artifact_kind.to_owned());
     policy.minimum_producer_version = ToolkitVersion::parse(minimum_producer)?;
+    if matches!(
+        artifact_kind,
+        "ccm_distance_resolution_evidence"
+            | "ccm_target_residual_analysis"
+            | "ccm_root_conditioning_analysis"
+            | "ccm_deviation_decomposition"
+            | "ccm_prime_power_response_analysis"
+            | "ccm_u_flow_response_analysis"
+            | "ccm_sector_gap_certificate"
+    ) {
+        policy.minimum_reader_version = ToolkitVersion::parse("0.14.1")?;
+    }
     Ok(policy)
 }
 
@@ -171,6 +197,7 @@ mod tests {
             "prolate",
             "ccm-roots",
             "ccm-evidence",
+            "ccm-distance",
         ] {
             assert_eq!(
                 artifact_family_compatibility_policy(family).unwrap().family,
@@ -178,6 +205,113 @@ mod tests {
             );
         }
         assert!(artifact_family_compatibility_policy("unregistered").is_err());
+    }
+
+    /// The `ccm-distance` family is new in 0.14.0, so its producer floor
+    /// starts there: a 0.13.x toolkit never produced these kinds, and an
+    /// artifact claiming otherwise is not admissible. Its reader floor stays
+    /// at 0.13.0 so the family carries no reader restriction of its own.
+    #[test]
+    fn ccm_distance_family_floors_start_at_its_introducing_release() {
+        let policy = artifact_family_compatibility_policy("ccm-distance").unwrap();
+        assert_eq!(
+            policy.minimum_producer_version,
+            ToolkitVersion::parse("0.14.0").unwrap()
+        );
+        assert_eq!(
+            policy.minimum_reader_version,
+            ToolkitVersion::parse("0.13.0").unwrap()
+        );
+        for kind in [
+            "ccm_discretization_distance",
+            "ccm_eigenfunction_profile",
+            "ccm_target_distance",
+        ] {
+            let kind_policy = artifact_compatibility_policy("ccm-distance", kind).unwrap();
+            assert_eq!(
+                kind_policy.minimum_producer_version,
+                ToolkitVersion::parse("0.14.0").unwrap()
+            );
+            assert!(kind_policy
+                .validate_manifest_versions(
+                    1,
+                    &ToolkitVersion::parse("0.13.5").unwrap(),
+                    &ToolkitVersion::parse("0.13.0").unwrap(),
+                    None,
+                )
+                .is_err());
+        }
+        let evidence =
+            artifact_compatibility_policy("ccm-distance", "ccm_distance_resolution_evidence")
+                .unwrap();
+        assert_eq!(
+            evidence.minimum_producer_version,
+            ToolkitVersion::parse("0.14.1").unwrap()
+        );
+        assert_eq!(
+            evidence.minimum_reader_version,
+            ToolkitVersion::parse("0.14.1").unwrap()
+        );
+        assert!(evidence
+            .validate_manifest_versions(
+                1,
+                &ToolkitVersion::parse("0.14.0").unwrap(),
+                &ToolkitVersion::parse("0.14.1").unwrap(),
+                None,
+            )
+            .is_err());
+        let residual =
+            artifact_compatibility_policy("ccm-distance", "ccm_target_residual_analysis").unwrap();
+        assert_eq!(
+            residual.minimum_producer_version,
+            ToolkitVersion::parse("0.14.1").unwrap()
+        );
+        assert_eq!(
+            residual.minimum_reader_version,
+            ToolkitVersion::parse("0.14.1").unwrap()
+        );
+        let root_conditioning =
+            artifact_compatibility_policy("ccm-evidence", "ccm_root_conditioning_analysis")
+                .unwrap();
+        assert_eq!(
+            root_conditioning.minimum_producer_version,
+            ToolkitVersion::parse("0.14.1").unwrap()
+        );
+        assert_eq!(
+            root_conditioning.minimum_reader_version,
+            ToolkitVersion::parse("0.14.1").unwrap()
+        );
+        let prime_response =
+            artifact_compatibility_policy("ccm-evidence", "ccm_prime_power_response_analysis")
+                .unwrap();
+        assert_eq!(
+            prime_response.minimum_producer_version,
+            ToolkitVersion::parse("0.14.1").unwrap()
+        );
+        assert_eq!(
+            prime_response.minimum_reader_version,
+            ToolkitVersion::parse("0.14.1").unwrap()
+        );
+        let u_flow_response =
+            artifact_compatibility_policy("ccm-evidence", "ccm_u_flow_response_analysis").unwrap();
+        assert_eq!(
+            u_flow_response.minimum_producer_version,
+            ToolkitVersion::parse("0.14.1").unwrap()
+        );
+        assert_eq!(
+            u_flow_response.minimum_reader_version,
+            ToolkitVersion::parse("0.14.1").unwrap()
+        );
+        let sector_gap_certificate =
+            artifact_compatibility_policy("ccm-evidence", "ccm_sector_gap_certificate").unwrap();
+        assert_eq!(
+            sector_gap_certificate.minimum_producer_version,
+            ToolkitVersion::parse("0.14.1").unwrap()
+        );
+        assert_eq!(
+            sector_gap_certificate.minimum_reader_version,
+            ToolkitVersion::parse("0.14.1").unwrap()
+        );
     }
 
     #[test]

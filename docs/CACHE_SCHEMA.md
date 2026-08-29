@@ -208,6 +208,14 @@ Author refresh and replacement are explicit operations. `XC_CACHE_MODE=refresh` 
 
 Ordinary author publication is destination-aware. Before obtaining a private publication lease or staging repository files, the publisher reads each required destination index partition once and confirms exact active artifacts against their canonical repository-batch records. Confirmed artifacts are excluded from the new batch without reading their manifests, encodings, attestations, ZIP parts, or payload objects. Their index entries and original publication transaction identifiers remain unchanged. Only missing or no-longer-proven artifacts enter the new transaction; a destination for which every candidate is already proven produces no shard commit and no coordination-branch lock activity. `XC_PUBLISH_REPLACE=true` deliberately bypasses this no-replay behavior.
 
+Repository-permission evidence is time-bounded. A family batch refreshes its live GitHub write session after destination inspection and uses that exact refreshed session when authorizing prepared candidates; it refreshes again immediately before sidecar creation and every remote commit. A long existing-family scan therefore cannot feed stale family-wide evidence into a later authorization bundle, while every mutation retains an independent freshness check.
+
+Live semantic indexes govern ordinary reuse and name only the current admissible selection. Published dependency closure is different: it names an exact semantic, manifest, and payload identity that remains immutable when a later author replacement advances the live index. Identity resolution first uses an exact live-index entry; if that entry has been superseded, it reads the exact retained canonical manifest and requires a matching canonical repository-batch proof from the same authorized shard revision before materialization. Historical entries never participate in key-based selection, and a missing or mismatched manifest, payload, transport, destination, repository, or batch proof fails closed.
+
+Destination publication preflight applies the same historical-identity rule. An exact dependency need not remain the active semantic-index selection, but its retained manifest must reproduce the requested family, semantic, manifest, and payload digests and a bounded scan of canonical batches must prove publication to the exact destination, family, repository, branch, and manifest path. The validated historical inventory is cached per immutable shard revision for the duration of the publication run. This prevents a legitimate superseded parent from being reported missing while keeping unproven orphan manifests ineligible.
+
+Local publication staging namespaces drafts by semantic digest and canonical-payload digest. The raw logical-item digest is insufficient: two canonical manifests can intentionally carry identical `payload.json` bytes while retaining different exact dependency envelopes. Distinct closure identities coexist as distinct drafts; exact manifest/payload identity still deduplicates the identity-based and key-based walks of the same published artifact. When several variants for one semantic identity are absent from a destination, one family batch commits every immutable manifest and transport, orders closure-only and older variants first, and leaves the newest key-addressable dependency-complete variant as the live index selection. If an equal-or-newer discoverable entry is already live, an older closure-only variant is still committed with its immutable manifest, encoding, objects, and repository-batch proof but does not mutate the live semantic index. This exception applies only to exact dependency closure; an ordinary publication cannot downgrade a discoverable producer.
+
 ## Domain reuse
 
 CCM preserves the full assembled tau matrix as the first and fastest ordinary cache hit. On a full-matrix miss it independently resolves compact alpha/beta/gamma archimedean integrals and the expensive prime-component matrix, reconstructs the analytic pole and archimedean matrices, assembles and validates tau, and records the exact component dependencies. The default `even-sector` policy retains every established v0.13 identity and reuses an orthonormal even-sector matrix plus its solver-specific LU factorization. The `natural` policy uses the full matrix without projection. The `adaptive-even` policy also uses the full matrix but applies the historical conditional even projection during inverse iteration. Natural and adaptive work may share the same full-matrix factorization, but their selected eigenpairs and all eigenpair-derived artifacts are semantically disjoint. Explicit sector research additionally derives the historical odd basis `(e_k-e_-k)/sqrt(2)`, computes independently addressable low even and odd spectra, and derives GapLog from those exact spectrum artifacts. Selected natural, adaptive-even, and even-sector ground states, parity spectra, secular sources, configuration evidence, and optional certificates remain independent artifacts.
@@ -230,13 +238,35 @@ The concrete CCM execution graph and shard placement are:
 | `ccm_root_refinement` | `ccm-roots` | Bounded, one-based indexed root range with exact seeds and solver policy |
 | `ccm_spectral_window` | `ccm-roots` | Reference-free discovered window with count reconciliation and optional root certificates |
 | `ccm_convergence_diagnostics` | `ccm-evidence` | Per-configuration result and convergence summary |
+| `ccm_root_conditioning_analysis` | `ccm-evidence` | Per-root secular term scale, derivative conditioning, and retained-pole geometry |
+| `ccm_prime_power_response_analysis` | `ccm-evidence` | Opt-in per-event `dQ/du` transport through an isolated lowest-even eigenvalue, full eigenvector, and retained roots; v2 binds same-sector Sturm-gap evidence |
+| `ccm_u_flow_response_analysis` | `ccm-evidence` | Opt-in decomposed pole/archimedean/prime/total `u`-flow through an isolated lowest-even state and moving secular roots; v2 binds same-sector Sturm-gap evidence |
+| `ccm_target_distance` | `ccm-distance` | Private-only weighted distance to a runtime-supplied target; schema v2 binds the opaque definition digest |
+| `ccm_distance_resolution_evidence` | `ccm-distance` | Private-only tail and same-rule refinement evidence for runtime target distance |
+| `ccm_target_residual_analysis` | `ccm-distance` | Private-only signed and crossing diagnostics for a runtime target residual |
+| `ccm_deviation_decomposition` | `ccm-distance` | Private-only opt-in projection onto a runtime-supplied auxiliary profile, with residuals under both readings of the distance weight; schema v3 binds the opaque definition digest |
+| `ccm_eigenfunction_profile` | `ccm-distance` | Target-independent sampled CCM eigenfunction and normalized coefficients; public-eligible |
+| `ccm_discretization_distance` | `ccm-distance` | Target-independent distance between two discretizations; public-eligible |
 | `ccm_validation_record` | `ccm-evidence` | Natural-versus-forced evenness evidence |
 | `ccm_sector_gap` | `ccm-evidence` | Even/odd ground-state depths, `GapLog=D_even-D_odd`, direct difference, ordering, and simplicity margin |
+| `ccm_sector_gap_certificate` | `ccm-evidence` | Opt-in exact cutoff-free finite-sector enclosures, parity outcome, simplicity gap, and positivity result |
 | `ccm_post_discovery_comparison` | `ccm-evidence` | External-reference comparison attached only after independent discovery is complete |
 
 Cheap prime enumeration and the analytic pole formula are embedded in the semantic identity or payload metadata of their consumers. They are deliberately not fetched as separate objects. Every matrix or state cache hit is checked against its exact dependency: parity matrices are reconstructed from tau, factorizations pass a deterministic solve residual, and eigenpairs replay the tau residual and their structured inverse-iteration stopping evidence. That evidence records the configured limit, steps used, unshifted convergence, final Rayleigh change, shifted-refinement outcome, and final relative residual. Root ranges must be finite, positive, ordered, and identity-bound, and evidence values must equal the results produced by their dependencies.
 
-Roots are stored as bounded ordered windows, not one remote object per scalar root. Independent discovery and reference-seeded refinement are different artifact kinds and cannot satisfy one another's semantic requests. An independent range records its one-based bounds assigned by cumulative finite-source counts, discovery/count methods, `reference_seeds_used=false`, each value's explicit convergence status, per-root iterations, final MPFR correction, residual, achieved-digit estimate, the 64-bit requested-accuracy guard policy, and exact secular-source dependency. A refinement range records its exact supplied starting points and `reference_seeds_used=true`. Cache replay recomputes the achieved-digit estimate and secular residual and rejects inconsistent status claims. Computed assurance retains finite, ordered `stagnated` and iteration-limited `approximate` values without relabeling them as converged; a failed outcome with no value invalidates the window. Cross-checked or certified assurance requires every root to be fully converged. The run-evidence artifact carries the same mode, index bounds, exact root dependency, and separate outcome counts. This keeps research data directly accessible without allowing child-object counts or remote lookup overhead to dominate the numerical calculation.
+Response payload schema v2 is fail-closed. Both response kinds require the
+`even-sector` state route, depend on the even-sector matrix and indexed
+even-sector eigenvalues, and retain the disjoint HP Sturm enclosures for
+indices zero and one, their positive gap lower bound, and the selected state's
+absolute and relative residual plus residual-to-gap bound. The bordered solve
+is performed in the reduced even sector and lifted back to the full coefficient
+layout for retained root transport. If the same-sector gap cannot be resolved,
+or the selected state cannot be associated with the isolated lowest branch,
+capture stops with `unresolved_near_crossing`; a small bordered residual alone
+cannot admit the artifact. The v2 semantic key and dependencies prevent reuse
+of unguarded v1 response payloads.
+
+Roots are stored as bounded ordered windows, not one remote object per scalar root. Independent discovery and reference-seeded refinement are different artifact kinds and cannot satisfy one another's semantic requests. An independent range records its one-based bounds assigned by cumulative finite-source counts, discovery/count methods, `reference_seeds_used=false`, each value's explicit convergence status, per-root iterations, final MPFR correction, residual, achieved-digit estimate, root-precision policy, and exact secular-source dependency. A refinement range records its exact supplied starting points and `reference_seeds_used=true`. Fixed-guard v6/v7 windows remain the default and preserve the historical 64-bit requested-accuracy reserve, payload, and identity. Adaptive v9 is opt-in, binds the exact secular-source content digest, and retains the target, resource ceiling, evaluation and verification precisions, escalation count, wider stored-point correction, and stopping reason under the explicit `exact_stored_point_source` scope. Cache replay recomputes the achieved-digit estimate and secular residual; v9 additionally recomputes the wider correction from the exact stored source and root. Computed assurance retains finite, ordered `stagnated` and iteration-limited `approximate` values without relabeling them as converged; a failed outcome with no value invalidates the window. Cross-checked or certified assurance requires every root to be fully converged. A v9 miss always starts from the identity-bound request seeds; it never promotes or warm-starts from v6/v7, because path-dependent iterations and escalation evidence are part of the payload. `RequireReuse` never computes a missing v9 child. The run-evidence artifact carries the same mode, index bounds, exact root dependency, and separate outcome counts. This keeps research data directly accessible without allowing child-object counts or remote lookup overhead to dominate the numerical calculation.
 
 Ordinary positive independent windows retain the v6 semantic identity, JSON
 shape, and reader floor established by earlier v0.13.x releases. Advanced
@@ -255,5 +285,25 @@ The exact FLINT numerator certificate proves the roots of the stored point-value
 The Tau/Weil spectrum and the roots of the eigenpair-derived secular equation are separate mathematical objects. The ordinary CCM reproduction route uses the lowest even Tau eigenpair as the secular source; higher Tau eigenpairs are not interpreted as successive zeta zeros. Extending a finite calculation beyond the first root prefix therefore means requesting additional indexed secular-root windows while increasing `N`, precision, and cutoff according to convergence evidence. No finite artifact is labeled as containing “all zeros.”
 
 Sector GapLog is also separate from a secular-root gap. For the lowest algebraic eigenvalue in each parity block, the stored definition is `D_even=-log10(abs(lambda_even))`, `D_odd=-log10(abs(lambda_odd))`, and `GapLog=D_even-D_odd=log10(abs(lambda_odd)/abs(lambda_even))`. The raw difference `lambda_odd-lambda_even`, its sign, and `-log10(abs(lambda_odd-lambda_even))` are retained as distinct fields so downstream research cannot silently substitute one definition for another. At least the first two eigenpairs per sector are retained so the even ground-state simplicity margin is independently available.
+
+`ccm_sector_gap_certificate` is a separate schema-2 certified child and never
+relabels `ccm_sector_gap`. Its semantic identity binds the even-spectrum,
+odd-spectrum, and numerical gap parent digests, the Arb backend, precision,
+cutoff-free assembly policy, and bracket policy. The payload retains the full
+raw exact-rational Tau interval matrix, its assumption-free interval-LDLT
+inertia certificate, a derived reflection-orbit canonical matrix, and the
+component-evidence digest. Positive definiteness is true only when the raw
+full-matrix inertia proof is conclusive and all pivots are positive. Separately,
+replay intersects transpose/reflection symmetry orbits, rebuilds the
+orthonormal parity blocks, replays exact shifted-inertia boundaries for the
+lowest two even eigenvalues and lowest odd eigenvalue, and recomputes the
+even-sector simplicity gap. Those parity, ordering, and sector-simplicity
+claims explicitly record the premise that the exact closed-form CCM matrix is
+centrosymmetric; positivity does not depend on it. Signed lower and upper bounds for
+`lambda_odd-lambda_even` determine a finite parity outcome of `even`, `odd`, or
+`unresolved`; no outcome is assumed in advance. Ordinary retained
+sector values and cutoff-free midpoint values are recorded as search guides,
+not proof inputs. This artifact is routed to the existing `ccm-evidence`
+public/private shards and has a 0.14.1 producer and reader floor.
 
 Mk assigns separate artifacts to exact moments, basis and symmetry data, transformations, dense fixtures, matrix-free or structured operators, approximation bounds, adaptive-space histories, checkpoints, candidates, and quotient certificates. Corrected construction semantics invalidate only their dependent closure.

@@ -143,7 +143,10 @@ fn run() -> Result<(), CliError> {
     }
 }
 
-const USAGE: &str = r#"Xcelerator Toolkit v0.13.5
+const USAGE: &str = concat!(
+    "Xcelerator Toolkit v",
+    env!("CARGO_PKG_VERSION"),
+    r#"
 
 Usage:
   xc cache auth-probe OWNER/REPOSITORY
@@ -178,7 +181,8 @@ it contains execute_remote_mutations=true and a complete execution block.
 Index repair is read-only unless execute_remote_mutations=true and
 confirm_repair=true; stale plans stop on ref conflict without automatic retry.
 Abandonment requires confirm_abandon=true, fresh write permission, and proof
-that no receipt is visible at the current remote head."#;
+that no receipt is visible at the current remote head."#
+);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Command {

@@ -4,8 +4,9 @@
 //! Gauss-Legendre quadrature at f64 and high precision.
 //!
 //! The HP nodes/weights are computed via Newton iteration on Legendre
-//! polynomials and cached to disk under `<cwd>/data/gl_cache/` so they're
-//! reused across runs at the same `(n_pts, precision_bits)`.
+//! polynomials and cached to disk under `$XC_CACHE_ROOT/gl_cache/`, or
+//! `<cwd>/data/gl_cache/` when that variable is unset, so they're reused
+//! across runs at the same `(n_pts, precision_bits)`.
 //!
 //! The standalone HP API reads a local deterministic `.json.zip`, directly
 //! in memory, and computes and stores that representation on a miss.
@@ -639,11 +640,20 @@ mod hp {
         }
     }
 
-    /// Cache directory: `<cwd>/data/gl_cache`. Created on demand so
-    /// fresh checkouts work without manual setup.
+    /// Cache directory: `$XC_CACHE_ROOT/gl_cache` when that is set, else
+    /// `<cwd>/data/gl_cache`. Created on demand so fresh checkouts work
+    /// without manual setup.
+    ///
+    /// Honouring `XC_CACHE_ROOT` matters because the fallback is relative to
+    /// the *working directory*: a run started from inside a checkout drops
+    /// binary cache files into that checkout, where they are neither the
+    /// operator's chosen cache volume nor necessarily ignored by git.
     fn gl_cache_dir() -> Option<std::path::PathBuf> {
-        let cwd = std::env::current_dir().ok()?;
-        let dir = cwd.join("data").join("gl_cache");
+        let root = match std::env::var_os("XC_CACHE_ROOT") {
+            Some(root) if !root.is_empty() => std::path::PathBuf::from(root),
+            _ => std::env::current_dir().ok()?.join("data"),
+        };
+        let dir = root.join("gl_cache");
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
     }

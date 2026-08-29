@@ -25,6 +25,7 @@
 //!
 //! The HP tier is gated behind the `hp` feature.
 
+pub mod grid_integral;
 pub mod primes;
 pub mod quadrature;
 pub mod root_finding;

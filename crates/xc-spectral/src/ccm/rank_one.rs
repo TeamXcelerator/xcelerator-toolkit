@@ -55,7 +55,7 @@ pub struct FiniteRankOneOperatorF64 {
 
 impl FiniteRankOneOperatorF64 {
     pub fn from_state(state: &[f64]) -> Result<Self, RankOneError> {
-        if state.len() < 3 || state.len() % 2 == 0 {
+        if state.len() < 3 || state.len().is_multiple_of(2) {
             return Err(RankOneError::InvalidState(
                 "state length must be odd and at least three".to_owned(),
             ));
@@ -472,7 +472,7 @@ pub mod hp {
     ) -> Result<HpRankOneSpectrum, RankOneError> {
         let dimension = state.len();
         if dimension < 3
-            || dimension % 2 == 0
+            || dimension.is_multiple_of(2)
             || weil_matrix.len() != dimension.saturating_mul(dimension)
         {
             return Err(hp_invalid(

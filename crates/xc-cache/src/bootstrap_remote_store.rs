@@ -10,6 +10,9 @@ use std::sync::Mutex;
 use std::time::Instant;
 use xc_core::{CancellationToken, ResourcePolicy};
 
+type HistoricalBatchInventory = Vec<(RepositoryPublicationBatch, RemoteReadReport)>;
+type HistoricalBatchCache = HashMap<(String, String), HistoricalBatchInventory>;
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BootstrapRegistry {
@@ -44,6 +47,7 @@ pub struct GitHubBootstrapCacheStore {
     continuation_inventory_lock: Mutex<()>,
     registry_snapshot: Mutex<Option<BootstrapRegistry>>,
     shard_revisions: Mutex<HashMap<String, String>>,
+    historical_batches: Mutex<HistoricalBatchCache>,
 }
 
 impl GitHubBootstrapCacheStore {
@@ -88,6 +92,7 @@ impl GitHubBootstrapCacheStore {
             continuation_inventory_lock: Mutex::new(()),
             registry_snapshot: Mutex::new(None),
             shard_revisions: Mutex::new(HashMap::new()),
+            historical_batches: Mutex::new(HashMap::new()),
         })
     }
 
@@ -173,7 +178,78 @@ impl GitHubBootstrapCacheStore {
         Ok((serde_json::from_slice(&bytes)?, report))
     }
 
+    /// Read and validate the immutable publication-batch inventory once for a
+    /// particular shard revision. Historical dependency identities cannot be
+    /// recovered from the active semantic index after a newer artifact has
+    /// superseded them, but their canonical manifests and publication proofs
+    /// remain committed in the shard.
+    fn historical_batches(
+        &self,
+        repository: &str,
+        revision: &str,
+    ) -> Result<HistoricalBatchInventory, CacheError> {
+        let cache_key = (repository.to_owned(), revision.to_owned());
+        if let Some(batches) = self
+            .historical_batches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(batches);
+        }
+
+        let visibility_name = visibility_name(self.visibility);
+        let listing = self.remote.list_committed_paths(
+            repository,
+            revision,
+            "transactions/batches",
+            100_000,
+            16 * 1024 * 1024,
+            &CancellationToken::new(),
+        )?;
+        let suffix = format!("/{visibility_name}.json");
+        let mut batches = Vec::new();
+        let mut total_batch_bytes = 0u64;
+        for path in listing.paths.iter().filter(|path| path.ends_with(&suffix)) {
+            let (batch, source): (RepositoryPublicationBatch, _) =
+                self.read_json(repository, revision, path)?;
+            total_batch_bytes = total_batch_bytes
+                .checked_add(source.size_bytes)
+                .ok_or_else(|| {
+                    CacheError::ResourceLimit(
+                        "historical repository-batch bytes exceed u64".to_owned(),
+                    )
+                })?;
+            if total_batch_bytes > 256 * 1024 * 1024 {
+                return Err(CacheError::ResourceLimit(
+                    "historical repository-batch inventory exceeds 256 MiB".to_owned(),
+                ));
+            }
+            batch.validate()?;
+            if source.repository_path != *path || source.content_digest != batch.digest()? {
+                return Err(CacheError::InvalidManifest(format!(
+                    "historical repository batch {path:?} is not canonical"
+                )));
+            }
+            batches.push((batch, source));
+        }
+        if batches.is_empty() {
+            return Err(CacheError::InvalidManifest(format!(
+                "shard {repository} has no {visibility_name} publication batches"
+            )));
+        }
+        self.historical_batches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(cache_key, batches.clone());
+        Ok(batches)
+    }
+
     fn resolve(&self, key: &ArtifactKey) -> Result<Option<ResolvedRemoteArtifact>, CacheError> {
+        if self.visibility == CacheVisibility::Public && artifact_kind_is_private_only(&key.kind) {
+            return Ok(None);
+        }
         let Some(family) = family_for_artifact_kind(&key.kind) else {
             return Ok(None);
         };
@@ -216,10 +292,190 @@ impl GitHubBootstrapCacheStore {
         else {
             return Ok(None);
         };
-        let manifest_path = bootstrap_manifest_path(&key.parameters_digest, &entry.manifest_digest);
+        let semantic_digest = &key.parameters_digest;
+        self.materialize_indexed_entry(
+            repository,
+            revision,
+            family,
+            route,
+            semantic_digest,
+            entry,
+            index_source,
+        )
+    }
+
+    /// Resolve an artifact by its exact published dependency identity.
+    ///
+    /// The lookup mirrors [`Self::resolve`]: the family route comes from the
+    /// registry snapshot and the shard index partition is addressed by the
+    /// identity's semantic digest. Where key-based resolution selects the best
+    /// admissible entry, this selects the one whose canonical manifest digest
+    /// equals the identity's, then verifies the fetched manifest against every
+    /// identity field.
+    fn resolve_identity(
+        &self,
+        identity: &crate::PayloadDependencyIdentity,
+    ) -> Result<Option<ResolvedRemoteArtifact>, CacheError> {
+        identity.validate()?;
+        let family = identity.artifact_family.as_str();
+        let visibility_name = visibility_name(self.visibility);
+        let registry = self.registry_snapshot()?;
+        let Some(route) = registry
+            .families
+            .iter()
+            .find(|route| route.family == family)
+        else {
+            return Ok(None);
+        };
+        if route.metadata.trim().is_empty()
+            || !route.current_writable_shard.starts_with(&format!(
+                "{}/xcelerator-cache-{visibility_name}-{family}-",
+                self.owner
+            ))
+        {
+            return Err(CacheError::InvalidManifest(format!(
+                "{visibility_name} route for {family} is invalid"
+            )));
+        }
+        let repository = format!("https://github.com/{}.git", route.current_writable_shard);
+        let revision = self.shard_revision(&repository)?;
+        let Some(prefix) = identity.semantic_digest.0.get(..2) else {
+            return Err(CacheError::InvalidManifest(
+                "dependency identity semantic digest is too short to address an index".to_owned(),
+            ));
+        };
+        let index_path = format!("indexes/{family}/{prefix}.json");
+        let indexed =
+            match self.read_json::<ShardIndexPartition>(&repository, &revision, &index_path) {
+                Ok((index, source)) => {
+                    index.validate()?;
+                    Some((index, source))
+                }
+                Err(CacheError::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            };
+        let current = crate::current_toolkit_version()?;
+        let active_entry = indexed.as_ref().and_then(|(index, source)| {
+            index
+                .lookup(&identity.semantic_digest)
+                .find(|entry| {
+                    entry.disposition == ArtifactDisposition::Active
+                        && entry.manifest_digest == identity.manifest_digest
+                        && entry.minimum_reader_version <= current
+                })
+                .cloned()
+                .map(|entry| (entry, source.clone()))
+        });
+        let (entry, index_source) = if let Some(active_entry) = active_entry {
+            active_entry
+        } else {
+            let manifest_path =
+                bootstrap_manifest_path(&identity.semantic_digest, &identity.manifest_digest);
+            let (manifest, manifest_source): (CanonicalArtifactManifest, _) =
+                match self.read_json(&repository, &revision, &manifest_path) {
+                    Ok(value) => value,
+                    Err(CacheError::NotFound(_)) => return Ok(None),
+                    Err(error) => return Err(error),
+                };
+            manifest.validate()?;
+            if manifest_source.content_digest != identity.manifest_digest
+                || manifest.digest()? != identity.manifest_digest
+                || manifest.artifact_family != family
+                || manifest.semantic_digest != identity.semantic_digest
+                || manifest.payload_digest != identity.payload_digest
+                || manifest.minimum_reader_version > current
+            {
+                return Err(CacheError::InvalidManifest(format!(
+                    "historical manifest for {family}/{} does not reproduce the requested dependency identity",
+                    identity.semantic_digest.0
+                )));
+            }
+            let expected_destination = match self.visibility {
+                CacheVisibility::Private => PublicationDestination::Private,
+                CacheVisibility::Public => PublicationDestination::Public,
+                _ => unreachable!("GitHub bootstrap stores are private or public"),
+            };
+            let batches = self.historical_batches(&repository, &revision)?;
+            let Some((batch, batch_source, artifact)) = historical_publication_for_identity(
+                &batches,
+                expected_destination,
+                family,
+                &route.current_writable_shard,
+                identity,
+                &manifest_path,
+            ) else {
+                return Err(CacheError::InvalidManifest(format!(
+                    "historical manifest for {family}/{} has no canonical publication-batch proof",
+                    identity.semantic_digest.0
+                )));
+            };
+            (
+                ShardIndexEntry {
+                    semantic_digest: identity.semantic_digest.clone(),
+                    canonical_payload_digest: identity.payload_digest.clone(),
+                    manifest_digest: identity.manifest_digest.clone(),
+                    achieved_assurance: artifact.achieved_assurance,
+                    disposition: ArtifactDisposition::Active,
+                    producer_toolkit_version: artifact.producer_toolkit_version.clone(),
+                    minimum_reader_version: manifest.minimum_reader_version,
+                    transport_digests: vec![artifact.transport_digest.clone()],
+                    publication_transaction_id: batch.batch_id.0.clone(),
+                },
+                batch_source.clone(),
+            )
+        };
+        let resolved = self.materialize_indexed_entry(
+            repository,
+            revision,
+            family,
+            route,
+            &identity.semantic_digest,
+            entry,
+            index_source,
+        )?;
+        let Some(resolved) = resolved else {
+            return Ok(None);
+        };
+        if resolved.manifest.semantic_digest != identity.semantic_digest
+            || resolved.manifest.digest()? != identity.manifest_digest
+            || resolved.manifest.payload_digest != identity.payload_digest
+        {
+            return Err(CacheError::InvalidManifest(format!(
+                "shard entry for {}/{} does not reproduce the requested dependency identity",
+                family, identity.semantic_digest.0
+            )));
+        }
+        Ok(Some(resolved))
+    }
+
+    /// Fetch, validate, and assemble one indexed shard entry. Shared by the
+    /// key-based and identity-based resolution paths; every payload, manifest,
+    /// and receipt identity check is common to both.
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_indexed_entry(
+        &self,
+        repository: String,
+        revision: String,
+        family: &str,
+        route: &BootstrapFamily,
+        semantic_digest: &ContentDigest,
+        entry: ShardIndexEntry,
+        index_source: RemoteReadReport,
+    ) -> Result<Option<ResolvedRemoteArtifact>, CacheError> {
+        let visibility_name = visibility_name(self.visibility);
+        let manifest_path = bootstrap_manifest_path(semantic_digest, &entry.manifest_digest);
         let (manifest, manifest_source): (CanonicalArtifactManifest, _) =
             self.read_json(&repository, &revision, &manifest_path)?;
         manifest.validate()?;
+        // Identity-based closure resolution does not know the artifact kind
+        // until the canonical manifest is opened. Apply the same hard public
+        // boundary here as the key-based path, including for historical shard
+        // entries that predate the restriction.
+        if self.visibility == CacheVisibility::Public
+            && artifact_kind_is_private_only(&manifest.semantic_key.artifact_kind)
+        {
+            return Ok(None);
+        }
         let transport_digest = entry.transport_digests.first().ok_or_else(|| {
             CacheError::InvalidManifest(format!(
                 "{visibility_name} index has no transport encoding"
@@ -247,14 +503,14 @@ impl GitHubBootstrapCacheStore {
             expected_destination,
             family,
             &route.current_writable_shard,
-            &key.parameters_digest,
+            semantic_digest,
             &entry,
             &manifest_path,
             transport_digest,
         )?;
         let resolved = ResolvedRemoteArtifact {
             family: family.to_owned(),
-            semantic_digest: key.parameters_digest.clone(),
+            semantic_digest: semantic_digest.clone(),
             overlay: self.name.clone(),
             visibility: self.visibility,
             shard_id: route.current_writable_shard.clone(),
@@ -271,7 +527,6 @@ impl GitHubBootstrapCacheStore {
             receipt_source,
             dependencies: Vec::new(),
         };
-        // The materializer repeats all payload/manifest/receipt identity checks.
         Ok(Some(resolved))
     }
 
@@ -325,6 +580,39 @@ impl GitHubBootstrapCacheStore {
         let inventory = CcmEigenpairContinuationIndex::rebuild(&query, entries)?;
         crate::atomic_replace(&path, &serde_json::to_vec_pretty(&inventory)?)
     }
+}
+
+fn historical_publication_for_identity<'a>(
+    batches: &'a [(RepositoryPublicationBatch, RemoteReadReport)],
+    expected_destination: PublicationDestination,
+    family: &str,
+    authorized_repository: &str,
+    identity: &crate::PayloadDependencyIdentity,
+    manifest_path: &str,
+) -> Option<(
+    &'a RepositoryPublicationBatch,
+    &'a RemoteReadReport,
+    &'a RepositoryBatchArtifact,
+)> {
+    batches.iter().find_map(|(batch, source)| {
+        if batch.destination != expected_destination
+            || batch.family != family
+            || batch.authorized_repository != authorized_repository
+            || batch.branch != "main"
+        {
+            return None;
+        }
+        batch
+            .artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.semantic_digest == identity.semantic_digest
+                    && artifact.manifest_digest == identity.manifest_digest
+                    && artifact.canonical_payload_digest == identity.payload_digest
+                    && artifact.manifest_path == manifest_path
+            })
+            .map(|artifact| (batch, source, artifact))
+    })
 }
 
 fn bootstrap_manifest_path(
@@ -386,31 +674,19 @@ fn validate_bootstrap_batch(
     Ok(())
 }
 
-impl CacheStore for GitHubBootstrapCacheStore {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn writable(&self) -> bool {
-        false
-    }
-    fn visibility(&self) -> CacheVisibility {
-        self.visibility
-    }
-    fn put(&self, _draft: &ArtifactDraft, _payload: &[u8]) -> Result<ArtifactManifest, CacheError> {
-        Err(CacheError::ReadOnlyLayer(self.name.clone()))
-    }
-    fn candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
-        // Remote reuse is an optimization for normal consumers. An offline,
-        // unavailable, or invalid public source must safely degrade to a fresh
-        // local computation rather than make the research script unusable.
-        let resolved = if self.required {
-            self.resolve(key)?
-        } else {
-            self.resolve(key).unwrap_or(None)
-        };
-        let Some(resolved) = resolved else {
-            return Ok(Vec::new());
-        };
+impl GitHubBootstrapCacheStore {
+    /// Build the local adapter manifest for a resolved shard artifact.
+    ///
+    /// Shared by key-based and identity-based candidate construction. The
+    /// full canonical manifest rides along in a tag so publication staging
+    /// and closure walks can recover identity dependencies; the adapter's own
+    /// key-based dependency list is deliberately empty because canonical
+    /// manifests reference dependencies by identity, not by key.
+    fn adapter_manifest_for(
+        &self,
+        key: ArtifactKey,
+        resolved: &ResolvedRemoteArtifact,
+    ) -> Result<ArtifactManifest, CacheError> {
         let ordered_items = &resolved.manifest.canonical_payload.ordered_items;
         if ordered_items.len() != 1 || ordered_items[0].normalized_path != "payload.json" {
             return Err(CacheError::InvalidManifest(
@@ -418,8 +694,7 @@ impl CacheStore for GitHubBootstrapCacheStore {
             ));
         }
         let item = &ordered_items[0];
-        let assurance = resolved.index.achieved_assurance;
-        let quality = match assurance {
+        let quality = match resolved.index.achieved_assurance {
             ArtifactAssuranceState::Certified => CacheQuality::Certified,
             ArtifactAssuranceState::CrossChecked => CacheQuality::CrossChecked,
             _ => CacheQuality::Validated,
@@ -433,9 +708,9 @@ impl CacheStore for GitHubBootstrapCacheStore {
             REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
             serde_json::to_string(&resolved.manifest)?,
         );
-        let adapter_manifest = ArtifactManifest {
+        Ok(ArtifactManifest {
             schema_version: 1,
-            key: key.clone(),
+            key,
             content_digest: item.content_digest.clone(),
             size_bytes: item.size_bytes,
             objects: vec![CacheObjectRef {
@@ -452,7 +727,76 @@ impl CacheStore for GitHubBootstrapCacheStore {
             dependencies: Vec::new(),
             tags,
             provenance_digest: Some(resolved.manifest.digest()?),
+        })
+    }
+}
+
+impl CacheStore for GitHubBootstrapCacheStore {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+    fn visibility(&self) -> CacheVisibility {
+        self.visibility
+    }
+    fn put(&self, _draft: &ArtifactDraft, _payload: &[u8]) -> Result<ArtifactManifest, CacheError> {
+        Err(CacheError::ReadOnlyLayer(self.name.clone()))
+    }
+    fn identity_candidates(
+        &self,
+        identity: &crate::PayloadDependencyIdentity,
+    ) -> Result<Vec<ArtifactManifest>, CacheError> {
+        // Same degradation contract as key-based candidates: an optional
+        // remote that is offline or invalid yields no candidates rather than
+        // failing the run.
+        let resolved = if self.required {
+            self.resolve_identity(identity)?
+        } else {
+            self.resolve_identity(identity).unwrap_or(None)
         };
+        let Some(resolved) = resolved else {
+            return Ok(Vec::new());
+        };
+        // Canonical manifests carry no logical key, and none is recoverable
+        // from an identity-addressed shard. The synthetic key is local-only
+        // provenance: publication addresses artifacts by identity, so it never
+        // reaches a destination path.
+        let key = ArtifactKey {
+            kind: resolved.manifest.semantic_key.artifact_kind.clone(),
+            logical_key: format!(
+                "closure/{}",
+                identity
+                    .semantic_digest
+                    .0
+                    .get(..16)
+                    .unwrap_or(&identity.semantic_digest.0)
+            ),
+            parameters_digest: identity.semantic_digest.clone(),
+        };
+        let adapter_manifest = self.adapter_manifest_for(key, &resolved)?;
+        self.resolved
+            .lock()
+            .map_err(|_| CacheError::Io("public cache lock poisoned".to_owned()))?
+            .insert(adapter_manifest.content_digest.clone(), resolved);
+        Ok(vec![adapter_manifest])
+    }
+
+    fn candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
+        // Remote reuse is an optimization for normal consumers. An offline,
+        // unavailable, or invalid public source must safely degrade to a fresh
+        // local computation rather than make the research script unusable.
+        let resolved = if self.required {
+            self.resolve(key)?
+        } else {
+            self.resolve(key).unwrap_or(None)
+        };
+        let Some(resolved) = resolved else {
+            return Ok(Vec::new());
+        };
+        let adapter_manifest = self.adapter_manifest_for(key.clone(), &resolved)?;
+        let assurance = resolved.index.achieved_assurance;
         self.record_local_continuation_entry(
             &key.logical_key,
             &resolved.manifest,
@@ -766,6 +1110,42 @@ mod tests {
     }
 
     #[test]
+    fn historical_batch_resolves_identity_no_longer_named_by_active_index() {
+        let fixture = bootstrap_batch_fixture();
+        let identity = PayloadDependencyIdentity {
+            artifact_family: "ccm-matrices".to_owned(),
+            semantic_digest: fixture.semantic_digest.clone(),
+            manifest_digest: fixture.entry.manifest_digest.clone(),
+            payload_digest: fixture.entry.canonical_payload_digest.clone(),
+        };
+        let batches = vec![(fixture.batch.clone(), fixture.source.clone())];
+        let (batch, source, artifact) = historical_publication_for_identity(
+            &batches,
+            PublicationDestination::Private,
+            "ccm-matrices",
+            "TeamXcelerator/xcelerator-cache-private-ccm-matrices-0001",
+            &identity,
+            &fixture.manifest_path,
+        )
+        .expect("the immutable publication proof remains usable after index replacement");
+        assert_eq!(batch.batch_id.0, fixture.entry.publication_transaction_id);
+        assert_eq!(source, &fixture.source);
+        assert_eq!(artifact.manifest_digest, identity.manifest_digest);
+
+        let mut wrong_identity = identity;
+        wrong_identity.payload_digest = ContentDigest::sha256(b"replacement-payload");
+        assert!(historical_publication_for_identity(
+            &batches,
+            PublicationDestination::Private,
+            "ccm-matrices",
+            "TeamXcelerator/xcelerator-cache-private-ccm-matrices-0001",
+            &wrong_identity,
+            &fixture.manifest_path,
+        )
+        .is_none());
+    }
+
+    #[test]
     #[ignore = "read-only live GitHub consumer acceptance"]
     fn claim_1a_artifacts_resolve_from_the_public_bootstrap_fabric() {
         let root = std::env::temp_dir().join("xc-public-consumer-acceptance");
@@ -779,6 +1159,42 @@ mod tests {
         let root = std::env::temp_dir().join("xc-private-consumer-acceptance");
         let store = GitHubBootstrapCacheStore::private("TeamXcelerator", root).unwrap();
         assert_claim_1a_resolves(&store, CacheVisibility::Private);
+    }
+
+    #[test]
+    #[ignore = "authenticated historical-identity acceptance against the private shard"]
+    fn superseded_claim_1a_matrix_resolves_by_exact_historical_identity() {
+        let root = std::env::temp_dir().join("xc-private-historical-identity-acceptance");
+        let store = GitHubBootstrapCacheStore::private("TeamXcelerator", root).unwrap();
+        let identity = PayloadDependencyIdentity {
+            artifact_family: "ccm-matrices".to_owned(),
+            semantic_digest: ContentDigest(
+                "c08e50d3f8af0b8e6c782f0c5d0b92391790a6603196b06e9fa3edc402f0e2dd".to_owned(),
+            ),
+            manifest_digest: ContentDigest(
+                "3e5e36a0eaff6d81fd6122d3467b3e7b8c1a286160b48c5341fcf49c5b026ce8".to_owned(),
+            ),
+            payload_digest: ContentDigest(
+                "cdcdd08618047bcccf4667800d6dbc3eb6cffe41e34fd4cc5fd3029f9a1e2175".to_owned(),
+            ),
+        };
+        let resolved = store
+            .resolve_identity(&identity)
+            .unwrap()
+            .expect("historical matrix remains published");
+        assert_eq!(
+            resolved.manifest.digest().unwrap(),
+            identity.manifest_digest
+        );
+        assert_eq!(resolved.manifest.payload_digest, identity.payload_digest);
+
+        let candidates = store.identity_candidates(&identity).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let payload = store.read_payload(&candidates[0]).unwrap();
+        assert_eq!(
+            ContentDigest::sha256(&payload),
+            candidates[0].content_digest
+        );
     }
 
     fn assert_claim_1a_resolves(

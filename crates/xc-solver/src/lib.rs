@@ -2694,9 +2694,8 @@ pub fn solve_dense_reference_hp_controlled(
         )
     };
 
-    let decimal_digits = ((precision_bits as f64) * std::f64::consts::LOG10_2)
-        .ceil()
-        .max(32.0) as usize;
+    // Exact-round-trip width; the bare ceiling loses one ulp on decode.
+    let decimal_digits = xc_numerics::reduction::roundtrip_decimal_digits(precision_bits).max(32);
     let mut provenance = SolverProvenance::current_package("rug_mpfr");
     provenance.precision_bits = Some(precision_bits);
     let diagnostics = EigenpairDiagnostics {
@@ -5485,9 +5484,8 @@ pub fn cross_check_hp_reports(
         )));
     }
 
-    let digits = ((precision_bits as f64) * std::f64::consts::LOG10_2)
-        .ceil()
-        .max(32.0) as usize;
+    // Exact-round-trip width; the bare ceiling loses one ulp on decode.
+    let digits = xc_numerics::reduction::roundtrip_decimal_digits(precision_bits).max(32);
     let mut accepted = primary.clone();
     accepted.assurance = AssuranceLevel::CrossChecked;
     Ok(CrossCheckedEigenpairHp {

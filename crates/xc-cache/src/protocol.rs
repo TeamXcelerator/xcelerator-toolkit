@@ -58,6 +58,32 @@ pub struct PayloadDependencyIdentity {
     pub payload_digest: ContentDigest,
 }
 
+impl PayloadDependencyIdentity {
+    /// Reject degenerate identities before any path construction or digest
+    /// slicing. Identities cross trust boundaries (they arrive inside retained
+    /// canonical manifests), so a malformed digest must surface as an invalid
+    /// manifest, never as a panic in a slice or a strange repository path.
+    pub fn validate(&self) -> Result<(), CacheError> {
+        if self.artifact_family.trim().is_empty() {
+            return Err(CacheError::InvalidManifest(
+                "dependency identity requires a nonempty artifact family".to_owned(),
+            ));
+        }
+        for (field, digest) in [
+            ("semantic", &self.semantic_digest),
+            ("manifest", &self.manifest_digest),
+            ("payload", &self.payload_digest),
+        ] {
+            if !digest.validate() {
+                return Err(CacheError::InvalidManifest(format!(
+                    "dependency identity {field} digest is not a canonical sha-256 digest"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CanonicalPayloadEnvelope {
