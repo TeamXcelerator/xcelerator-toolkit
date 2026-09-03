@@ -3756,7 +3756,7 @@ mod tests {
         let encoding = TransportEncodingRecord {
             schema_version: 1,
             canonical_payload_digest: payload_digest.clone(),
-            encoder_profile: "managed-fixture-v1".to_owned(),
+            encoder_profile: crate::DETERMINISTIC_ZIP64_PROFILE_V1.to_owned(),
             package_size_bytes: payload.len() as u64,
             package_digest: part_digest,
             ordered_parts: vec![part],
@@ -3787,6 +3787,7 @@ mod tests {
                 .unwrap(),
             source_content_digest: ContentDigest::sha256(payload),
             source_manifest_digest: ContentDigest::sha256(b"source-manifest"),
+            source_quality: Some(crate::CacheQuality::Certified),
             manifest,
             encoding,
             staged_parts_root: root.to_owned(),

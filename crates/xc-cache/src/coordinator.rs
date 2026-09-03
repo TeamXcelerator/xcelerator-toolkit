@@ -895,7 +895,7 @@ mod tests {
         TransportEncodingRecord {
             schema_version: 1,
             canonical_payload_digest: ContentDigest::sha256(b"payload"),
-            encoder_profile: "fixture-v1".to_owned(),
+            encoder_profile: crate::DETERMINISTIC_ZIP64_PROFILE_V1.to_owned(),
             package_size_bytes: bytes.len() as u64,
             package_digest: digest.clone(),
             ordered_parts: vec![TransportPart {

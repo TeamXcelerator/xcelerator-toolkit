@@ -2,9 +2,9 @@
 
 use crate::protocol::normalized_relative_path;
 use crate::{
-    CacheError, CacheVisibility, ContentDigest, RemoteGitStore, RemoteReadReport,
-    ShardIndexPartition, TopologyRegistry, TopologyTrustPolicy, TransportEncodingRecord,
-    TransportPart,
+    CacheError, CacheVisibility, ContentDigest, RemoteGitStore, RemotePathPrefetch,
+    RemoteReadReport, ShardIndexPartition, TopologyRegistry, TopologyTrustPolicy,
+    TransportEncodingRecord, TransportPart,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,6 +15,60 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use xc_core::{CancellationToken, ResourcePolicy};
 
 static DOWNLOAD_TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Corrupt retained files are moved out of the authoritative content path
+/// before replacement. The quarantine is process-local scratch: remove it on
+/// success, failure, or unwind so corrupt bytes do not accumulate outside
+/// resource accounting.
+#[derive(Default)]
+pub(crate) struct QuarantineCleanup {
+    paths: Vec<PathBuf>,
+}
+
+impl QuarantineCleanup {
+    pub(crate) fn track(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    pub(crate) fn cleanup(&mut self) {
+        let paths = std::mem::take(&mut self.paths);
+        let mut retry = Vec::new();
+        for path in paths {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    eprintln!(
+                        "  cache transport warning: could not remove quarantine scratch {}: {error}",
+                        path.display()
+                    );
+                    retry.push(path);
+                }
+            }
+        }
+        self.paths = retry;
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    pub(crate) fn absorb(&mut self, mut other: Self) {
+        self.paths.append(&mut other.paths);
+    }
+}
+
+impl Drop for QuarantineCleanup {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RemoteDocument<T> {
@@ -148,6 +202,52 @@ impl<'a> RemoteShardReader<'a> {
         resources: &ResourcePolicy,
         cancellation: &CancellationToken,
     ) -> Result<PartFetchReport, CacheError> {
+        self.fetch_transport_parts_inner(
+            repository,
+            revision,
+            record,
+            destination_root,
+            resources,
+            cancellation,
+            true,
+        )
+    }
+
+    /// Fetch parts for immediate package reconstruction. Existing regular
+    /// files are size-checked here and digest-checked during the reconstruction
+    /// copy, eliminating a redundant full read of every reused part.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fetch_transport_parts_for_reconstruction(
+        &self,
+        repository: &str,
+        revision: &str,
+        record: &TransportEncodingRecord,
+        destination_root: &Path,
+        resources: &ResourcePolicy,
+        cancellation: &CancellationToken,
+    ) -> Result<PartFetchReport, CacheError> {
+        self.fetch_transport_parts_inner(
+            repository,
+            revision,
+            record,
+            destination_root,
+            resources,
+            cancellation,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_transport_parts_inner(
+        &self,
+        repository: &str,
+        revision: &str,
+        record: &TransportEncodingRecord,
+        destination_root: &Path,
+        resources: &ResourcePolicy,
+        cancellation: &CancellationToken,
+        verify_reused_parts: bool,
+    ) -> Result<PartFetchReport, CacheError> {
         record.validate()?;
         cancellation
             .check()
@@ -160,22 +260,61 @@ impl<'a> RemoteShardReader<'a> {
             verified_bytes: 0,
         };
         let mut missing = Vec::new();
+        let mut quarantined_files = QuarantineCleanup::default();
         for part in &record.ordered_parts {
             cancellation
                 .check()
                 .map_err(|error| CacheError::Cancelled(error.to_string()))?;
             let destination = resolve_part_path(destination_root, &part.repository_path)?;
-            if destination.exists() {
-                verify_local_part(
-                    &destination,
-                    part.size_bytes,
-                    &part.content_digest,
-                    resources,
-                    cancellation,
-                )?;
-                report.reused_sequences.push(part.sequence);
-                report.verified_bytes = report.verified_bytes.saturating_add(part.size_bytes);
-                continue;
+            match fs::symlink_metadata(&destination) {
+                Ok(_) => {
+                    if verify_reused_parts {
+                        match verify_local_part(
+                            &destination,
+                            part.size_bytes,
+                            &part.content_digest,
+                            resources,
+                            cancellation,
+                        ) {
+                            Ok(()) => {
+                                report.verified_bytes =
+                                    report.verified_bytes.saturating_add(part.size_bytes);
+                                report.reused_sequences.push(part.sequence);
+                                continue;
+                            }
+                            Err(CacheError::DigestMismatch { .. }) => {
+                                let quarantine = quarantine_path(&destination);
+                                fs::rename(&destination, &quarantine)?;
+                                quarantined_files.track(quarantine);
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        match verify_local_part_metadata(&destination, part.size_bytes) {
+                            Ok(()) => {
+                                report.reused_sequences.push(part.sequence);
+                                continue;
+                            }
+                            // A regular file of the wrong size is corruption,
+                            // exactly like wrong bytes at the right size:
+                            // quarantine it and download the part again.
+                            // Symlinks and non-regular files remain hard
+                            // failures.
+                            Err(CacheError::DigestMismatch { .. }) => {
+                                let quarantine = quarantine_path(&destination);
+                                fs::rename(&destination, &quarantine)?;
+                                quarantined_files.track(quarantine);
+                                eprintln!(
+                                    "  cache transport: retained part {} has the wrong size and was quarantined; fetching it again",
+                                    part.repository_path
+                                );
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
             let projected = missing
                 .iter()
@@ -211,6 +350,18 @@ impl<'a> RemoteShardReader<'a> {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(4)
             .clamp(1, 8);
+        self.remote.prefetch_committed_paths(
+            repository,
+            revision,
+            &missing
+                .iter()
+                .map(|(part, _)| RemotePathPrefetch {
+                    repository_path: part.repository_path.clone(),
+                    maximum_bytes: part.size_bytes,
+                })
+                .collect::<Vec<_>>(),
+            cancellation,
+        )?;
         for batch in missing.chunks(concurrency) {
             let results = std::thread::scope(|scope| {
                 batch
@@ -249,6 +400,7 @@ impl<'a> RemoteShardReader<'a> {
         }
         report.downloaded_sequences.sort_unstable();
         report.reused_sequences.sort_unstable();
+        quarantined_files.cleanup();
         Ok(report)
     }
 }
@@ -280,7 +432,11 @@ fn download_transport_part(
             return Err(error);
         }
     };
-    temporary.sync_all()?;
+    if let Err(error) = temporary.sync_all() {
+        drop(temporary);
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error.into());
+    }
     drop(temporary);
     if source.size_bytes != part.size_bytes
         || source.content_digest != part.content_digest
@@ -347,13 +503,7 @@ fn verify_local_part(
     resources: &ResourcePolicy,
     cancellation: &CancellationToken,
 ) -> Result<(), CacheError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(CacheError::InvalidManifest(format!(
-            "local part {} is not a regular file",
-            path.display()
-        )));
-    }
+    verify_local_part_metadata(path, expected_size)?;
     let buffer_size = resources
         .maximum_memory_bytes
         .unwrap_or(1024 * 1024)
@@ -378,6 +528,85 @@ fn verify_local_part(
         return Err(CacheError::DigestMismatch {
             expected: format!("{expected_digest} ({expected_size} bytes)"),
             actual: format!("{digest} ({size} bytes)"),
+        });
+    }
+    Ok(())
+}
+
+/// Hash the reused parts of a record and move every corrupt one aside so the
+/// next fetch downloads it again. Returns a cleanup guard for the quarantined
+/// destinations. A
+/// part that verifies is left untouched, and a part that is already absent
+/// is not an error here.
+pub(crate) fn quarantine_corrupt_reused_parts(
+    record: &TransportEncodingRecord,
+    destination_root: &Path,
+    reused_sequences: &[u64],
+    resources: &ResourcePolicy,
+    cancellation: &CancellationToken,
+) -> Result<QuarantineCleanup, CacheError> {
+    let mut quarantined = QuarantineCleanup::default();
+    for part in record
+        .ordered_parts
+        .iter()
+        .filter(|part| reused_sequences.contains(&part.sequence))
+    {
+        cancellation
+            .check()
+            .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+        let destination = resolve_part_path(destination_root, &part.repository_path)?;
+        if !destination.exists() {
+            continue;
+        }
+        match verify_local_part(
+            &destination,
+            part.size_bytes,
+            &part.content_digest,
+            resources,
+            cancellation,
+        ) {
+            Ok(()) => {}
+            Err(CacheError::DigestMismatch { .. }) => {
+                let quarantine = quarantine_path(&destination);
+                fs::rename(&destination, &quarantine)?;
+                quarantined.track(quarantine);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(quarantined)
+}
+
+/// Sibling path a corrupt retained part is moved to until replacement has
+/// finished or the current operation exits; the name never collides with a
+/// part.
+fn quarantine_path(destination: &Path) -> PathBuf {
+    destination.with_file_name(format!(
+        "{}.corrupt-{}-{}",
+        destination
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default()
+    ))
+}
+
+fn verify_local_part_metadata(path: &Path, expected_size: u64) -> Result<(), CacheError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CacheError::InvalidManifest(format!(
+            "local part {} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() != expected_size {
+        return Err(CacheError::DigestMismatch {
+            expected: format!("{expected_size} bytes"),
+            actual: format!("{} bytes", metadata.len()),
         });
     }
     Ok(())
@@ -507,6 +736,22 @@ mod tests {
     }
 
     #[test]
+    fn quarantine_cleanup_is_best_effort_after_success() {
+        let root = temporary_root("quarantine-cleanup-best-effort");
+        let _ = fs::remove_dir_all(&root);
+        let blocked = root.join("held-as-directory");
+        fs::create_dir_all(&blocked).unwrap();
+        let mut cleanup = QuarantineCleanup::default();
+        cleanup.track(blocked.clone());
+        cleanup.cleanup();
+        assert!(!cleanup.is_empty());
+        fs::remove_dir(&blocked).unwrap();
+        cleanup.cleanup();
+        assert!(cleanup.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn trusted_topology_is_fetched_as_one_bounded_document() {
         let topology = TopologyRegistry {
             schema_version: 1,
@@ -575,7 +820,7 @@ mod tests {
         let record = TransportEncodingRecord {
             schema_version: 1,
             canonical_payload_digest: ContentDigest::sha256(b"payload"),
-            encoder_profile: "fixture-v1".to_owned(),
+            encoder_profile: crate::DETERMINISTIC_ZIP64_PROFILE_V1.to_owned(),
             package_size_bytes: values.iter().map(|value| value.len() as u64).sum(),
             package_digest: ContentDigest::sha256_chunks(values),
             ordered_parts: parts.clone(),
@@ -623,6 +868,30 @@ mod tests {
             remote.reads.load(AtomicOrdering::Relaxed),
             reads_after_first
         );
+
+        let corrupt_part = &parts[0];
+        let corrupt_path = resolve_part_path(&root, &corrupt_part.repository_path).unwrap();
+        fs::write(&corrupt_path, vec![b'x'; corrupt_part.size_bytes as usize]).unwrap();
+        let repaired = reader
+            .fetch_transport_parts(
+                "team/shard",
+                &revision,
+                &record,
+                &root,
+                &ResourcePolicy::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(repaired.downloaded_sequences, vec![0]);
+        assert_eq!(fs::read(&corrupt_path).unwrap(), values[0]);
+        assert_eq!(
+            fs::read_dir(corrupt_path.parent().unwrap())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+                .count(),
+            0
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -643,7 +912,7 @@ mod tests {
         let record = TransportEncodingRecord {
             schema_version: 1,
             canonical_payload_digest: ContentDigest::sha256(b"payload"),
-            encoder_profile: "fixture-v1".to_owned(),
+            encoder_profile: crate::DETERMINISTIC_ZIP64_PROFILE_V1.to_owned(),
             package_size_bytes: values.iter().map(|bytes| bytes.len() as u64).sum(),
             package_digest: ContentDigest::sha256_chunks(values),
             ordered_parts: parts.clone(),
@@ -676,6 +945,59 @@ mod tests {
             .unwrap();
         assert_eq!(report.downloaded_sequences, vec![0, 1, 2, 3]);
         assert!(remote.maximum_concurrent_reads.load(AtomicOrdering::SeqCst) > 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlink_in_the_part_store_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let revision = "d".repeat(40);
+        let bytes = b"part bytes";
+        let digest = ContentDigest::sha256(bytes);
+        let part = TransportPart {
+            sequence: 0,
+            repository_path: format!("objects/{digest}.part"),
+            size_bytes: bytes.len() as u64,
+            content_digest: digest.clone(),
+        };
+        let record = TransportEncodingRecord {
+            schema_version: 1,
+            canonical_payload_digest: ContentDigest::sha256(b"payload"),
+            encoder_profile: crate::DETERMINISTIC_ZIP64_PROFILE_V1.to_owned(),
+            package_size_bytes: bytes.len() as u64,
+            package_digest: digest,
+            ordered_parts: vec![part.clone()],
+            reconstruction: "concatenate".to_owned(),
+        };
+        let remote = MemoryRemote {
+            revision: revision.clone(),
+            paths: BTreeMap::from([(part.repository_path.clone(), bytes.to_vec())]),
+            reads: AtomicUsize::new(0),
+            current_reads: AtomicUsize::new(0),
+            maximum_concurrent_reads: AtomicUsize::new(0),
+            delay_millis: 0,
+        };
+        let root = temporary_root("broken-symlink");
+        let _ = fs::remove_dir_all(&root);
+        let destination = resolve_part_path(&root, &part.repository_path).unwrap();
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        symlink(root.join("absent-target"), &destination).unwrap();
+
+        let reader = RemoteShardReader::new(&remote, 1024).unwrap();
+        assert!(matches!(
+            reader.fetch_transport_parts_for_reconstruction(
+                "team/cache",
+                &revision,
+                &record,
+                &root,
+                &ResourcePolicy::default(),
+                &CancellationToken::new(),
+            ),
+            Err(CacheError::InvalidManifest(_))
+        ));
+        assert_eq!(remote.reads.load(AtomicOrdering::Relaxed), 0);
         let _ = fs::remove_dir_all(root);
     }
 }

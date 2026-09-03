@@ -1,6 +1,6 @@
 # Standalone public-API consumer
 
-Version target: `0.14.1`
+Version target: `0.14.2`
 
 `tests/external-consumer` is intentionally excluded from the toolkit workspace and has its own manifest and dependency lock. It models an adjacent mathematical application rather than a toolkit crate. Its direct toolkit dependencies are `xc-core`, `xc-operator`, `xc-solver`, and `xc-certify` (plus supporting public cache/numerics types); it does not depend on `xc-spectral` and its source contains no CCM implementation or import.
 

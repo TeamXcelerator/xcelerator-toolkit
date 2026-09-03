@@ -4,15 +4,19 @@
 
 use crate::{
     canonical_digest, package_canonical_payload_bytes_zip64, stream_split_encoded,
-    ArtifactAssuranceState, CacheError, CanonicalArtifactManifest, CanonicalPayloadEnvelope,
-    ContentDigest, LogicalPayloadItem, ProducedArtifactRecord, TransportEncodingRecord,
-    TransportPolicy, REMOTE_CANONICAL_MANIFEST_TAG,
+    verify_canonical_payload_zip64, ArtifactAssuranceState, ArtifactKey, ArtifactManifest,
+    CacheError, CanonicalArtifactManifest, CanonicalPayloadEnvelope, ContentDigest,
+    EncodedArtifactRecord, LogicalPayloadItem, ProducedArtifactRecord, SemanticKeyEnvelope,
+    TransportEncodingRecord, TransportPolicy, VerifiedEncodedPayload,
+    CURRENT_DETERMINISTIC_ZIP64_PROFILE, DETERMINISTIC_ZIP64_PROFILE_V1,
+    DETERMINISTIC_ZIP64_PROFILE_V2, REMOTE_CANONICAL_MANIFEST_TAG,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use xc_core::{AssuranceLevel, CancellationToken, ResourcePolicy};
@@ -27,6 +31,11 @@ pub struct CanonicalProductionDraft {
     pub source_artifact_key: crate::ArtifactKey,
     pub source_content_digest: ContentDigest,
     pub source_manifest_digest: ContentDigest,
+    /// Operational cache quality used to enforce every key-based dependency
+    /// edge even after a draft has already been staged. Older staging roots
+    /// lack this field and are conservatively resolved again.
+    #[serde(default)]
+    pub source_quality: Option<crate::CacheQuality>,
     pub manifest: CanonicalArtifactManifest,
     pub encoding: TransportEncodingRecord,
     pub staged_parts_root: PathBuf,
@@ -203,11 +212,535 @@ pub struct CanonicalStagingProductionSink {
     transport_policy: TransportPolicy,
     resources: ResourcePolicy,
     cancellation: CancellationToken,
-    drafts: Mutex<Vec<CanonicalProductionDraft>>,
+    drafts: Mutex<DraftInventory>,
     /// Exact artifacts touched by this process. Existing drafts loaded from a
     /// prior process are deliberately not counted: remote execution must not
     /// succeed merely because stale staging happens to be nonempty.
     observed_artifacts: Mutex<BTreeSet<String>>,
+    /// Deliberately process-local. A reopened staging directory must walk its
+    /// closure once so an interrupted predecessor cannot masquerade as a
+    /// complete staging run.
+    completed_closures: Mutex<BTreeSet<String>>,
+}
+
+/// Retained drafts plus constant-time lookups by published identity and by
+/// source artifact. Every closure query used to canonicalize and hash each
+/// draft's manifest, which made a closure of n artifacts cost n^2 digests.
+#[derive(Default)]
+struct DraftInventory {
+    drafts: Vec<CanonicalProductionDraft>,
+    by_identity: HashMap<String, usize>,
+    // A source (key, content) tuple is not a published identity: distinct
+    // canonical dependency closures can legitimately share it. Retain every
+    // matching index and select deterministically by quality then source
+    // manifest identity when an older key-based API cannot name the closure.
+    by_source: HashMap<String, BTreeSet<usize>>,
+}
+
+impl DraftInventory {
+    fn identity_key(
+        family: &str,
+        semantic_digest: &ContentDigest,
+        manifest_digest: &ContentDigest,
+        payload_digest: &ContentDigest,
+    ) -> String {
+        format!("{family}\n{semantic_digest}\n{manifest_digest}\n{payload_digest}")
+    }
+
+    fn source_key(key: &ArtifactKey, content_digest: &ContentDigest) -> String {
+        format!(
+            "{}\n{}\n{}\n{}",
+            key.kind, key.logical_key, key.parameters_digest, content_digest
+        )
+    }
+
+    fn push(&mut self, draft: CanonicalProductionDraft) -> Result<(), CacheError> {
+        let index = self.drafts.len();
+        let identity = Self::identity_key(
+            &draft.family,
+            &draft.manifest.semantic_digest,
+            &draft.manifest.digest()?,
+            &draft.manifest.payload_digest,
+        );
+        self.by_identity.entry(identity).or_insert(index);
+        self.by_source
+            .entry(Self::source_key(
+                &draft.source_artifact_key,
+                &draft.source_content_digest,
+            ))
+            .or_default()
+            .insert(index);
+        self.drafts.push(draft);
+        Ok(())
+    }
+
+    /// Replace a draft in place. Only its source provenance may differ from
+    /// the previous draft; its published identity is unchanged.
+    fn replace(&mut self, index: usize, draft: CanonicalProductionDraft) {
+        let previous_source = Self::source_key(
+            &self.drafts[index].source_artifact_key,
+            &self.drafts[index].source_content_digest,
+        );
+        if let Some(indices) = self.by_source.get_mut(&previous_source) {
+            indices.remove(&index);
+            if indices.is_empty() {
+                self.by_source.remove(&previous_source);
+            }
+        }
+        self.by_source
+            .entry(Self::source_key(
+                &draft.source_artifact_key,
+                &draft.source_content_digest,
+            ))
+            .or_default()
+            .insert(index);
+        self.drafts[index] = draft;
+    }
+
+    fn find_by_source(
+        &self,
+        key: &ArtifactKey,
+        content_digest: &ContentDigest,
+    ) -> Option<&CanonicalProductionDraft> {
+        self.find_by_source_with_quality(key, content_digest, None)
+    }
+
+    fn find_by_source_with_quality(
+        &self,
+        key: &ArtifactKey,
+        content_digest: &ContentDigest,
+        minimum_quality: Option<crate::CacheQuality>,
+    ) -> Option<&CanonicalProductionDraft> {
+        self.preferred_source_index(key, content_digest, minimum_quality)
+            .map(|index| &self.drafts[index])
+    }
+
+    fn preferred_source_index(
+        &self,
+        key: &ArtifactKey,
+        content_digest: &ContentDigest,
+        minimum_quality: Option<crate::CacheQuality>,
+    ) -> Option<usize> {
+        let indices = self.by_source.get(&Self::source_key(key, content_digest))?;
+        indices
+            .iter()
+            .filter(|index| {
+                minimum_quality.is_none_or(|minimum| {
+                    self.drafts[**index].source_quality.is_some_and(|quality| {
+                        quality.admissible_rank() >= minimum.admissible_rank()
+                    })
+                })
+            })
+            .min_by(|left, right| {
+                let left = &self.drafts[**left];
+                let right = &self.drafts[**right];
+                right
+                    .source_quality
+                    .map(crate::CacheQuality::admissible_rank)
+                    .cmp(
+                        &left
+                            .source_quality
+                            .map(crate::CacheQuality::admissible_rank),
+                    )
+                    .then_with(|| {
+                        left.source_manifest_digest
+                            .0
+                            .cmp(&right.source_manifest_digest.0)
+                    })
+            })
+            .copied()
+    }
+
+    fn source_indices(&self, key: &ArtifactKey, content_digest: &ContentDigest) -> Vec<usize> {
+        self.by_source
+            .get(&Self::source_key(key, content_digest))
+            .map(|indices| indices.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn find_identity_index(
+        &self,
+        family: &str,
+        semantic_digest: &ContentDigest,
+        manifest_digest: &ContentDigest,
+        payload_digest: &ContentDigest,
+    ) -> Option<usize> {
+        self.by_identity
+            .get(&Self::identity_key(
+                family,
+                semantic_digest,
+                manifest_digest,
+                payload_digest,
+            ))
+            .copied()
+    }
+
+    fn find_by_identity(
+        &self,
+        identity: &crate::PayloadDependencyIdentity,
+    ) -> Option<&CanonicalProductionDraft> {
+        self.find_identity_index(
+            &identity.artifact_family,
+            &identity.semantic_digest,
+            &identity.manifest_digest,
+            &identity.payload_digest,
+        )
+        .map(|index| &self.drafts[index])
+    }
+}
+
+/// Source of the dependency drafts a freshly computed artifact names by key.
+trait DependencyDraftLookup {
+    fn dependency_draft(
+        &self,
+        key: &ArtifactKey,
+        content_digest: &ContentDigest,
+    ) -> Option<&CanonicalProductionDraft>;
+}
+
+impl DependencyDraftLookup for &[CanonicalProductionDraft] {
+    fn dependency_draft(
+        &self,
+        key: &ArtifactKey,
+        content_digest: &ContentDigest,
+    ) -> Option<&CanonicalProductionDraft> {
+        self.iter().find(|draft| {
+            &draft.source_artifact_key == key && &draft.source_content_digest == content_digest
+        })
+    }
+}
+
+impl DependencyDraftLookup for DraftInventory {
+    fn dependency_draft(
+        &self,
+        key: &ArtifactKey,
+        content_digest: &ContentDigest,
+    ) -> Option<&CanonicalProductionDraft> {
+        self.find_by_source(key, content_digest)
+    }
+}
+
+/// Where the logical payload bytes of a staging record come from.
+#[derive(Clone, Copy)]
+enum PayloadSource<'a> {
+    /// The bytes are in memory. Staging hashes them and, absent a verified
+    /// encoded object, packages them.
+    Bytes(&'a [u8]),
+    /// Only the manifest's logical digest and size are known. The record
+    /// must carry a verified encoded object: staging proves that object
+    /// decodes to exactly that digest (new artifact) or binds it through the
+    /// retained canonical manifest's transport digest (reused artifact).
+    Verified,
+}
+
+/// Borrowed view of one artifact to stage, shared by the payload-carrying and
+/// metadata-only entry points.
+#[derive(Clone, Copy)]
+struct StagingRecord<'a> {
+    operation: &'a str,
+    semantic_key: &'a SemanticKeyEnvelope,
+    logical_key: &'a str,
+    manifest: &'a ArtifactManifest,
+    achieved_assurance: ArtifactAssuranceState,
+    assurance_evidence_digests: &'a [ContentDigest],
+    payload: PayloadSource<'a>,
+}
+
+impl<'a> StagingRecord<'a> {
+    fn from_produced(record: &'a ProducedArtifactRecord) -> Self {
+        Self {
+            operation: &record.operation,
+            semantic_key: &record.semantic_key,
+            logical_key: &record.logical_key,
+            manifest: &record.manifest,
+            achieved_assurance: record.achieved_assurance,
+            assurance_evidence_digests: &record.assurance_evidence_digests,
+            payload: PayloadSource::Bytes(&record.payload),
+        }
+    }
+
+    fn from_encoded(record: &'a EncodedArtifactRecord) -> Self {
+        Self {
+            operation: &record.operation,
+            semantic_key: &record.semantic_key,
+            logical_key: &record.logical_key,
+            manifest: &record.manifest,
+            achieved_assurance: record.achieved_assurance,
+            assurance_evidence_digests: &record.assurance_evidence_digests,
+            payload: PayloadSource::Verified,
+        }
+    }
+
+    /// The logical item digest and size, checked against the manifest when
+    /// the bytes are present.
+    fn logical_item(&self) -> Result<(ContentDigest, u64), CacheError> {
+        match self.payload {
+            PayloadSource::Bytes(bytes) => {
+                let digest = ContentDigest::sha256(bytes);
+                if self.manifest.content_digest != digest
+                    || self.manifest.size_bytes != bytes.len() as u64
+                {
+                    return Err(CacheError::InvalidManifest(
+                        "produced artifact cannot be canonically staged because its identities disagree"
+                            .to_owned(),
+                    ));
+                }
+                Ok((digest, bytes.len() as u64))
+            }
+            PayloadSource::Verified => Ok((
+                self.manifest.content_digest.clone(),
+                self.manifest.size_bytes,
+            )),
+        }
+    }
+}
+
+/// Cheap structural check for a staged part. Digest verification of every
+/// staged part happens in the publisher immediately before a blob enters
+/// Git, so reopening a staging directory or resuming a draft does not hash
+/// the whole staging tree again.
+fn verify_staged_part_metadata(path: &Path, expected_size: u64) -> Result<(), CacheError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != expected_size {
+        return Err(CacheError::InvalidManifest(format!(
+            "existing canonical production part has invalid type or size: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn verify_staged_part(
+    path: &Path,
+    expected_size: u64,
+    expected_digest: &ContentDigest,
+    cancellation: &CancellationToken,
+) -> Result<(), CacheError> {
+    verify_staged_part_metadata(path, expected_size)?;
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        cancellation
+            .check()
+            .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual = ContentDigest(format!("{:x}", hasher.finalize()));
+    if &actual != expected_digest {
+        return Err(CacheError::DigestMismatch {
+            expected: expected_digest.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn stage_verified_transport_parts(
+    verified: &crate::VerifiedTransportParts,
+    encoded: &VerifiedEncodedPayload,
+    canonical_payload_digest: &ContentDigest,
+    staged_parts_root: &Path,
+    cancellation: &CancellationToken,
+) -> Result<Option<TransportEncodingRecord>, CacheError> {
+    verified.encoding.validate()?;
+    let Some(encoder_profile) = encoded.encoder_profile.as_deref() else {
+        return Err(CacheError::InvalidManifest(
+            "verified encoded payload has no encoder-profile provenance".to_owned(),
+        ));
+    };
+    if &verified.encoding.canonical_payload_digest != canonical_payload_digest
+        || verified.encoding.encoder_profile != encoder_profile
+        || verified.encoding.package_size_bytes != encoded.size_bytes
+    {
+        return Err(CacheError::InvalidManifest(
+            "verified transport parts disagree with their encoded payload".to_owned(),
+        ));
+    }
+    if verified.encoding.package_digest != encoded.content_digest {
+        return Err(CacheError::DigestMismatch {
+            expected: encoded.content_digest.to_string(),
+            actual: verified.encoding.package_digest.to_string(),
+        });
+    }
+
+    // Establish that the complete source set is still present before writing
+    // any destination. A pruned part store is a normal fallback condition;
+    // malformed or changed content-addressed files fail closed. Parts that
+    // this process did not verify (they sit next to an already verified
+    // package) are hashed here, before anything is linked, and a mismatch
+    // falls back to splitting the verified package.
+    for part in &verified.encoding.ordered_parts {
+        cancellation
+            .check()
+            .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+        let source = verified.parts_root.join(&part.repository_path);
+        let metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(CacheError::InvalidManifest(format!(
+                "verified transport source is not a regular file: {}",
+                source.display()
+            )));
+        }
+        if metadata.len() != part.size_bytes {
+            // A truncated or overlong regular file is corruption, like a
+            // digest mismatch: the verified package is split instead.
+            return Ok(None);
+        }
+        if !verified.parts_verified {
+            match verify_staged_part(&source, part.size_bytes, &part.content_digest, cancellation) {
+                Ok(()) => {}
+                Err(CacheError::DigestMismatch { .. }) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    for part in &verified.encoding.ordered_parts {
+        cancellation
+            .check()
+            .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+        let source = verified.parts_root.join(&part.repository_path);
+        let destination = staged_parts_root.join(&part.repository_path);
+        if destination.exists() {
+            return Err(CacheError::InvalidManifest(format!(
+                "staged part already exists: {}",
+                destination.display()
+            )));
+        }
+        fs::create_dir_all(destination.parent().unwrap())?;
+        if fs::hard_link(&source, &destination).is_err() {
+            let copied = fs::copy(&source, &destination)?;
+            if copied != part.size_bytes {
+                return Err(CacheError::InvalidManifest(format!(
+                    "copied transport part has size {copied}, expected {}",
+                    part.size_bytes
+                )));
+            }
+            verify_staged_part(
+                &destination,
+                part.size_bytes,
+                &part.content_digest,
+                cancellation,
+            )?;
+        }
+    }
+    Ok(Some(verified.encoding.clone()))
+}
+
+fn canonical_identity_key(identity: &crate::PayloadDependencyIdentity) -> String {
+    format!(
+        "{}\n{}\n{}\n{}",
+        identity.artifact_family,
+        identity.semantic_digest,
+        identity.manifest_digest,
+        identity.payload_digest
+    )
+}
+
+fn canonical_draft_root(
+    staging_root: &Path,
+    semantic_digest: &ContentDigest,
+    payload_digest: &ContentDigest,
+    source_manifest_digest: &ContentDigest,
+) -> Result<PathBuf, CacheError> {
+    if !semantic_digest.validate()
+        || !payload_digest.validate()
+        || !source_manifest_digest.validate()
+    {
+        return Err(CacheError::InvalidManifest(
+            "canonical draft path digests are invalid".to_owned(),
+        ));
+    }
+    Ok(staging_root
+        .join("drafts")
+        .join(&semantic_digest.0)
+        .join(&payload_digest.0)
+        .join(&source_manifest_digest.0))
+}
+
+fn validate_reopened_draft_location(
+    staging_root: &Path,
+    draft_path: &Path,
+    draft: &CanonicalProductionDraft,
+) -> Result<(), CacheError> {
+    if !draft.source_content_digest.validate() || !draft.source_manifest_digest.validate() {
+        return Err(CacheError::InvalidManifest(
+            "canonical draft source digests are invalid".to_owned(),
+        ));
+    }
+    let expected_parent = staging_root
+        .join("drafts")
+        .join(&draft.manifest.semantic_digest.0)
+        .join(&draft.manifest.payload_digest.0);
+    let draft_root = draft_path.parent().ok_or_else(|| {
+        CacheError::InvalidManifest("canonical draft file has no parent".to_owned())
+    })?;
+    let storage_identity = draft_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| ContentDigest(name.to_owned()));
+    let current_layout = draft_root.parent() == Some(expected_parent.as_path())
+        && storage_identity.is_some_and(|digest| digest.validate());
+    // v0.14.1 placed draft.json and parts directly below the semantic/payload
+    // pair. Its contents are still fully identity-validated; accept that
+    // bounded legacy location so persistent author staging roots remain
+    // resumable after upgrading.
+    let legacy_layout = draft_root == expected_parent;
+    if draft_path.file_name().and_then(|name| name.to_str()) != Some("draft.json")
+        || !(current_layout || legacy_layout)
+        || draft.staged_parts_root != draft_root.join("parts")
+        || draft.family != draft.manifest.artifact_family
+        || draft.encoding.canonical_payload_digest != draft.manifest.payload_digest
+        || !draft
+            .manifest
+            .transport_digests
+            .contains(&draft.encoding.digest()?)
+    {
+        return Err(CacheError::InvalidManifest(format!(
+            "canonical draft paths or retained identities are not bound below {}",
+            expected_parent.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Select the transport identity already authorized by a retained manifest.
+/// The short-lived first v0.14.2 build tagged unchanged single-entry ZIP bytes
+/// as V2. If those exact bytes and parts reproduce a published V1 transport
+/// digest, retain the published label instead of creating a duplicate identity.
+fn bind_retained_transport_encoding(
+    canonical_payload: &CanonicalPayloadEnvelope,
+    retained: &CanonicalArtifactManifest,
+    mut encoding: TransportEncodingRecord,
+) -> Result<TransportEncodingRecord, CacheError> {
+    if retained.transport_digests.contains(&encoding.digest()?) {
+        return Ok(encoding);
+    }
+    if canonical_payload.ordered_items.len() == 1 {
+        let alternate_profile = match encoding.encoder_profile.as_str() {
+            DETERMINISTIC_ZIP64_PROFILE_V1 => Some(DETERMINISTIC_ZIP64_PROFILE_V2),
+            DETERMINISTIC_ZIP64_PROFILE_V2 => Some(DETERMINISTIC_ZIP64_PROFILE_V1),
+            _ => None,
+        };
+        if let Some(alternate_profile) = alternate_profile {
+            encoding.encoder_profile = alternate_profile.to_owned();
+            if retained.transport_digests.contains(&encoding.digest()?) {
+                return Ok(encoding);
+            }
+        }
+    }
+    Err(CacheError::InvalidManifest(
+        "retained remote manifest cannot be reproduced by the deterministic transport".to_owned(),
+    ))
 }
 
 impl CanonicalStagingProductionSink {
@@ -235,26 +768,29 @@ impl CanonicalStagingProductionSink {
                     if entry.file_type()?.is_dir() {
                         pending.push(entry.path());
                     } else if entry.file_name() == "draft.json" {
+                        cancellation
+                            .check()
+                            .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+                        let draft_path = entry.path();
                         let draft: CanonicalProductionDraft =
-                            serde_json::from_slice(&fs::read(entry.path())?)?;
+                            serde_json::from_slice(&fs::read(&draft_path)?)?;
                         draft.manifest.validate()?;
                         draft.encoding.validate()?;
+                        validate_reopened_draft_location(&staging_root, &draft_path, &draft)?;
                         crate::ArtifactProductionAssessment {
                             achieved_assurance: draft.achieved_assurance,
                             evidence_digests: draft.assurance_evidence_digests.clone(),
                         }
                         .validate()?;
+                        // draft.json is written only after every part has
+                        // been completely written, so structure and size are
+                        // the reopen invariant. The publisher hashes each
+                        // part before it enters Git.
                         for part in &draft.encoding.ordered_parts {
-                            let bytes =
-                                fs::read(draft.staged_parts_root.join(&part.repository_path))?;
-                            if bytes.len() as u64 != part.size_bytes
-                                || ContentDigest::sha256(&bytes) != part.content_digest
-                            {
-                                return Err(CacheError::InvalidManifest(format!(
-                                    "existing canonical staging part failed verification for {}",
-                                    entry.path().display()
-                                )));
-                            }
+                            verify_staged_part_metadata(
+                                &draft.staged_parts_root.join(&part.repository_path),
+                                part.size_bytes,
+                            )?;
                         }
                         drafts.push(draft);
                     }
@@ -265,13 +801,18 @@ impl CanonicalStagingProductionSink {
                     .cmp(&(&right.family, &right.manifest.semantic_digest))
             });
         }
+        let mut inventory = DraftInventory::default();
+        for draft in drafts {
+            inventory.push(draft)?;
+        }
         Ok(Self {
             staging_root,
             transport_policy,
             resources,
             cancellation,
-            drafts: Mutex::new(drafts),
+            drafts: Mutex::new(inventory),
             observed_artifacts: Mutex::new(BTreeSet::new()),
+            completed_closures: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -282,7 +823,7 @@ impl CanonicalStagingProductionSink {
     pub fn drafts(&self) -> Result<Vec<CanonicalProductionDraft>, CacheError> {
         self.drafts
             .lock()
-            .map(|drafts| drafts.clone())
+            .map(|inventory| inventory.drafts.clone())
             .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))
     }
 
@@ -295,144 +836,257 @@ impl CanonicalStagingProductionSink {
             })
     }
 
-    fn mark_observed(&self, artifact: &ProducedArtifactRecord) -> Result<(), CacheError> {
+    fn mark_observed(&self, manifest: &ArtifactManifest) -> Result<(), CacheError> {
         self.observed_artifacts
             .lock()
             .map_err(|_| {
                 CacheError::Io("canonical staging observation lock is poisoned".to_owned())
             })?
-            .insert(format!(
-                "{}\n{}\n{}\n{}",
-                artifact.manifest.key.kind,
-                artifact.manifest.key.logical_key,
-                artifact.manifest.key.parameters_digest,
-                artifact.manifest.content_digest
+            .insert(DraftInventory::source_key(
+                &manifest.key,
+                &manifest.content_digest,
             ));
+        Ok(())
+    }
+
+    fn validate_encoded_descriptor(encoded: &VerifiedEncodedPayload) -> Result<(), CacheError> {
+        if encoded.encoding != "zip-json-entry-v1"
+            || !encoded.content_digest.validate()
+            || encoded.size_bytes == 0
+        {
+            return Err(CacheError::InvalidManifest(
+                "verified encoded production payload descriptor is invalid".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_internal(
+        &self,
+        record: StagingRecord<'_>,
+        verified_encoded: Option<&VerifiedEncodedPayload>,
+        verified_transport: Option<&crate::VerifiedTransportParts>,
+    ) -> Result<(), CacheError> {
+        let mut inventory = self
+            .drafts
+            .lock()
+            .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))?;
+        // Deduplicate by exact published identity as well as by source key.
+        // The key-based and identity-based closure walks can meet on a
+        // diamond: the same artifact staged first through an identity
+        // resolution carries a synthetic logical key, and a later key-based
+        // reference must be recognized as the same draft rather than rejected
+        // as a disagreeing one. The comparison uses the full identity tuple.
+        if let Some(encoded) = record.manifest.tags.get(REMOTE_CANONICAL_MANIFEST_TAG) {
+            let canonical: CanonicalArtifactManifest = serde_json::from_str(encoded)?;
+            let family =
+                family_for_artifact_kind(&record.semantic_key.artifact_kind).ok_or_else(|| {
+                    CacheError::InvalidManifest(format!(
+                        "artifact kind {:?} has no publication family mapping",
+                        record.semantic_key.artifact_kind
+                    ))
+                })?;
+            crate::validate_retained_canonical_binding(
+                &canonical,
+                record.semantic_key,
+                family,
+                &record.manifest.content_digest,
+                record.manifest.size_bytes,
+                record.manifest.provenance_digest.as_ref(),
+            )?;
+            let manifest_digest = canonical.digest()?;
+            if let Some(index) = inventory.find_identity_index(
+                &canonical.artifact_family,
+                &canonical.semantic_digest,
+                &manifest_digest,
+                &canonical.payload_digest,
+            ) {
+                let existing = &inventory.drafts[index];
+                // Prefer real adapter provenance over a synthetic identity
+                // closure key when the key-based walk later reaches it.
+                if existing.source_operation == "cache.dependency.closure"
+                    && record.operation != "cache.dependency.closure"
+                    && existing.source_artifact_key != record.manifest.key
+                {
+                    let mut promoted = existing.clone();
+                    promoted.source_operation = record.operation.to_owned();
+                    promoted.source_logical_key = record.logical_key.to_owned();
+                    promoted.source_artifact_key = record.manifest.key.clone();
+                    promoted.source_content_digest = record.manifest.content_digest.clone();
+                    promoted.source_manifest_digest = canonical_digest(record.manifest)?;
+                    promoted.source_quality = Some(record.manifest.quality);
+                    let draft_path = existing
+                        .staged_parts_root
+                        .parent()
+                        .ok_or_else(|| {
+                            CacheError::InvalidManifest(
+                                "staged parts root has no draft directory".to_owned(),
+                            )
+                        })?
+                        .join("draft.json");
+                    crate::atomic_replace(&draft_path, &serde_json::to_vec_pretty(&promoted)?)?;
+                    inventory.replace(index, promoted);
+                }
+                self.mark_observed(record.manifest)?;
+                return Ok(());
+            }
+        }
+        // A retained canonical identity is stronger than the adapter's local
+        // source key. Two published artifacts may intentionally have the same
+        // semantic key and payload.json bytes while carrying different exact
+        // dependency closures. Their adapter manifests then share one source
+        // key/content pair, but their canonical payload and manifest digests
+        // differ. Only use the source shortcut for artifacts that do not
+        // carry a retained published identity; the identity block above has
+        // already handled every legitimate duplicate on the remote route.
+        if !record
+            .manifest
+            .tags
+            .contains_key(REMOTE_CANONICAL_MANIFEST_TAG)
+            && inventory
+                .find_by_source(&record.manifest.key, &record.manifest.content_digest)
+                .is_some()
+        {
+            self.mark_observed(record.manifest)?;
+            return Ok(());
+        }
+        let draft = stage_record(
+            record,
+            &*inventory,
+            VerifiedStagingSources {
+                encoded: verified_encoded,
+                transport: verified_transport,
+            },
+            &self.staging_root,
+            &self.transport_policy,
+            &self.resources,
+            &self.cancellation,
+        )?;
+        inventory.push(draft)?;
+        self.mark_observed(record.manifest)?;
         Ok(())
     }
 }
 
 impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
     fn record(&self, artifact: ProducedArtifactRecord) -> Result<(), CacheError> {
-        let mut drafts = self
-            .drafts
-            .lock()
-            .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))?;
-        if drafts.iter().any(|draft| {
-            draft.source_artifact_key == artifact.manifest.key
-                && draft.source_content_digest == artifact.manifest.content_digest
-        }) {
-            self.mark_observed(&artifact)?;
-            return Ok(());
+        self.record_internal(StagingRecord::from_produced(&artifact), None, None)
+    }
+
+    fn record_with_verified_encoded(
+        &self,
+        artifact: ProducedArtifactRecord,
+        encoded: &VerifiedEncodedPayload,
+    ) -> Result<(), CacheError> {
+        Self::validate_encoded_descriptor(encoded)?;
+        self.record_internal(StagingRecord::from_produced(&artifact), Some(encoded), None)
+    }
+
+    fn record_with_verified_transport(
+        &self,
+        artifact: ProducedArtifactRecord,
+        encoded: &VerifiedEncodedPayload,
+        transport: &crate::VerifiedTransportParts,
+    ) -> Result<(), CacheError> {
+        Self::validate_encoded_descriptor(encoded)?;
+        transport.encoding.validate()?;
+        self.record_internal(
+            StagingRecord::from_produced(&artifact),
+            Some(encoded),
+            Some(transport),
+        )
+    }
+
+    fn supports_encoded_records(&self) -> bool {
+        true
+    }
+
+    fn record_encoded(
+        &self,
+        artifact: EncodedArtifactRecord,
+        encoded: &VerifiedEncodedPayload,
+        transport: Option<&crate::VerifiedTransportParts>,
+    ) -> Result<(), CacheError> {
+        Self::validate_encoded_descriptor(encoded)?;
+        if let Some(transport) = transport {
+            transport.encoding.validate()?;
         }
-        // Deduplicate by exact published identity as well as by source key.
-        // The key-based and identity-based closure walks can meet on a
-        // diamond: the same artifact staged first through an identity
-        // resolution carries a synthetic logical key, and a later key-based
-        // reference must be recognized as the same draft rather than rejected
-        // as a disagreeing one. The comparison uses the full identity tuple
-        // -- family, semantic digest, canonical manifest digest, canonical
-        // payload digest -- which is computable up front only for records
-        // that carry a retained canonical manifest; those are exactly the
-        // records both walks can produce for the same artifact. Anything
-        // weaker (for example semantic digest plus raw payload digest) would
-        // silently discard a second artifact whose canonical dependencies
-        // differ, leaving the staged closure incomplete.
-        if let Some(encoded) = artifact.manifest.tags.get(REMOTE_CANONICAL_MANIFEST_TAG) {
-            let canonical: CanonicalArtifactManifest = serde_json::from_str(encoded)?;
-            let family = family_for_artifact_kind(&artifact.semantic_key.artifact_kind)
-                .ok_or_else(|| {
-                    CacheError::InvalidManifest(format!(
-                        "artifact kind {:?} has no publication family mapping",
-                        artifact.semantic_key.artifact_kind
-                    ))
-                })?;
-            crate::validate_retained_canonical_binding(
-                &canonical,
-                &artifact.semantic_key,
-                family,
-                &artifact.manifest.content_digest,
-                artifact.manifest.size_bytes,
-                artifact.manifest.provenance_digest.as_ref(),
-            )?;
-            let manifest_digest = canonical.digest()?;
-            if let Some(existing) = drafts.iter_mut().find(|draft| {
-                draft.family == canonical.artifact_family
-                    && draft.manifest.semantic_digest == canonical.semantic_digest
-                    && draft.manifest.payload_digest == canonical.payload_digest
-                    && draft
-                        .manifest
-                        .digest()
-                        .map(|digest| digest == manifest_digest)
-                        .unwrap_or(false)
-            }) {
-                // An identity-addressed GitHub closure lookup necessarily
-                // creates a local-only `closure/...` adapter key because a
-                // canonical shard manifest carries no logical key. If the
-                // key-based walk later reaches the same published artifact,
-                // retain its real adapter provenance on the existing draft.
-                // A freshly produced child names dependencies by that real
-                // key, so merely deduplicating here would leave the child
-                // unable to match its already-staged dependency.
-                //
-                // Promote only the explicit identity-closure provenance. Two
-                // genuinely different non-synthetic keys remain deduplicated
-                // by their full published identity without silently choosing
-                // one as canonical.
-                if existing.source_operation == "cache.dependency.closure"
-                    && artifact.operation != "cache.dependency.closure"
-                    && existing.source_artifact_key != artifact.manifest.key
-                {
-                    let mut promoted = existing.clone();
-                    promoted.source_operation = artifact.operation.clone();
-                    promoted.source_logical_key = artifact.logical_key.clone();
-                    promoted.source_artifact_key = artifact.manifest.key.clone();
-                    promoted.source_content_digest = artifact.manifest.content_digest.clone();
-                    promoted.source_manifest_digest = canonical_digest(&artifact.manifest)?;
-                    let draft_path = self
-                        .staging_root
-                        .join("drafts")
-                        .join(&promoted.manifest.semantic_digest.0)
-                        .join(&promoted.manifest.payload_digest.0)
-                        .join("draft.json");
-                    crate::atomic_replace(&draft_path, &serde_json::to_vec_pretty(&promoted)?)?;
-                    *existing = promoted;
-                }
-                self.mark_observed(&artifact)?;
-                return Ok(());
-            }
-        }
-        let draft = stage_produced_artifact_with_dependencies(
-            &artifact,
-            &drafts,
-            &self.staging_root,
-            &self.transport_policy,
-            &self.resources,
-            &self.cancellation,
-        )?;
-        drafts.push(draft);
-        self.mark_observed(&artifact)?;
-        Ok(())
+        self.record_internal(
+            StagingRecord::from_encoded(&artifact),
+            Some(encoded),
+            transport,
+        )
     }
 
     fn contains_dependency_identity(
         &self,
         identity: &crate::PayloadDependencyIdentity,
     ) -> Result<bool, CacheError> {
-        let drafts = self
+        Ok(self
+            .drafts
+            .lock()
+            .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))?
+            .find_by_identity(identity)
+            .is_some())
+    }
+
+    fn retained_canonical_manifest(
+        &self,
+        identity: &crate::PayloadDependencyIdentity,
+    ) -> Result<Option<CanonicalArtifactManifest>, CacheError> {
+        identity.validate()?;
+        let inventory = self
             .drafts
             .lock()
             .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))?;
-        for draft in drafts.iter() {
-            if draft.family == identity.artifact_family
-                && draft.manifest.semantic_digest == identity.semantic_digest
-                && draft.manifest.payload_digest == identity.payload_digest
-                && draft.manifest.digest()? == identity.manifest_digest
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let Some(draft) = inventory.find_by_identity(identity) else {
+            return Ok(None);
+        };
+        draft.manifest.validate()?;
+        Ok(Some(draft.manifest.clone()))
+    }
+
+    fn retained_canonical_manifest_for_artifact(
+        &self,
+        key: &crate::ArtifactKey,
+        content_digest: &ContentDigest,
+        minimum_quality: crate::CacheQuality,
+    ) -> Result<Option<CanonicalArtifactManifest>, CacheError> {
+        let inventory = self
+            .drafts
+            .lock()
+            .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))?;
+        let Some(draft) =
+            inventory.find_by_source_with_quality(key, content_digest, Some(minimum_quality))
+        else {
+            return Ok(None);
+        };
+        draft.manifest.validate()?;
+        Ok(Some(draft.manifest.clone()))
+    }
+
+    fn canonical_closure_complete(
+        &self,
+        identity: &crate::PayloadDependencyIdentity,
+    ) -> Result<bool, CacheError> {
+        identity.validate()?;
+        Ok(self
+            .completed_closures
+            .lock()
+            .map_err(|_| CacheError::Io("completed closure lock is poisoned".to_owned()))?
+            .contains(&canonical_identity_key(identity)))
+    }
+
+    fn mark_canonical_closure_complete(
+        &self,
+        identity: &crate::PayloadDependencyIdentity,
+    ) -> Result<(), CacheError> {
+        identity.validate()?;
+        self.completed_closures
+            .lock()
+            .map_err(|_| CacheError::Io("completed closure lock is poisoned".to_owned()))?
+            .insert(canonical_identity_key(identity));
+        Ok(())
     }
 
     fn contains_artifact(
@@ -444,10 +1098,8 @@ impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
             .drafts
             .lock()
             .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))?
-            .iter()
-            .any(|draft| {
-                &draft.source_artifact_key == key && &draft.source_content_digest == content_digest
-            }))
+            .find_by_source(key, content_digest)
+            .is_some())
     }
 
     fn retained_assurance(
@@ -456,18 +1108,29 @@ impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
         content_digest: &ContentDigest,
     ) -> Result<Option<crate::ArtifactProductionAssessment>, CacheError> {
         let assessment = {
-            let drafts = self.drafts.lock().map_err(|_| {
+            let inventory = self.drafts.lock().map_err(|_| {
                 CacheError::Io("canonical staging sink lock is poisoned".to_owned())
             })?;
-            let Some(draft) = drafts.iter().find(|draft| {
-                &draft.source_artifact_key == key && &draft.source_content_digest == content_digest
-            }) else {
+            let indices = inventory.source_indices(key, content_digest);
+            let Some(first_index) = indices.first() else {
                 return Ok(None);
             };
-            crate::ArtifactProductionAssessment {
-                achieved_assurance: draft.achieved_assurance,
-                evidence_digests: draft.assurance_evidence_digests.clone(),
+            let first = &inventory.drafts[*first_index];
+            let assessment = crate::ArtifactProductionAssessment {
+                achieved_assurance: first.achieved_assurance,
+                evidence_digests: first.assurance_evidence_digests.clone(),
+            };
+            if indices.iter().skip(1).any(|index| {
+                let draft = &inventory.drafts[*index];
+                draft.achieved_assurance != assessment.achieved_assurance
+                    || draft.assurance_evidence_digests != assessment.evidence_digests
+            }) {
+                // A source key cannot distinguish canonical dependency
+                // closures. Never report one variant's stronger assurance as
+                // though it applied to every colliding staged identity.
+                return Ok(None);
             }
+            assessment
         };
         assessment.validate()?;
         if assessment.achieved_assurance == crate::ArtifactAssuranceState::Computed {
@@ -510,25 +1173,21 @@ impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
             .drafts
             .lock()
             .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))?;
-        let draft = drafts
-            .iter_mut()
-            .find(|draft| {
-                draft.source_artifact_key == attestation.artifact_key
-                    && draft.source_content_digest == attestation.content_digest
-            })
-            .ok_or_else(|| {
-                CacheError::NotFound(format!(
-                    "canonical staging draft is missing for assurance promotion {} / {}",
-                    attestation.artifact_key.logical_key, attestation.content_digest
-                ))
-            })?;
-        if attestation.achieved_assurance < draft.achieved_assurance {
+        let indices = drafts.source_indices(&attestation.artifact_key, &attestation.content_digest);
+        if indices.is_empty() {
+            return Err(CacheError::NotFound(format!(
+                "canonical staging draft is missing for assurance promotion {} / {}",
+                attestation.artifact_key.logical_key, attestation.content_digest
+            )));
+        }
+        if indices
+            .iter()
+            .any(|index| attestation.achieved_assurance < drafts.drafts[*index].achieved_assurance)
+        {
             return Err(CacheError::InvalidTransition(
                 "artifact assurance cannot be downgraded".to_owned(),
             ));
         }
-        draft.achieved_assurance = attestation.achieved_assurance;
-        draft.assurance_evidence_digests = attestation.evidence_digests.clone();
         let attestation_digest = canonical_digest(&attestation)?;
         let attestation_path = self
             .staging_root
@@ -553,13 +1212,26 @@ impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
             fs::create_dir_all(parent)?;
             fs::write(&attestation_path, bytes)?;
         }
-        let draft_path = self
-            .staging_root
-            .join("drafts")
-            .join(&draft.manifest.semantic_digest.0)
-            .join(&draft.manifest.payload_digest.0)
-            .join("draft.json");
-        crate::atomic_replace(&draft_path, &serde_json::to_vec_pretty(draft)?)
+        // The attestation identity is the source key plus logical content;
+        // apply it to every staged canonical closure carrying that exact
+        // source identity. Selecting one would publish the others with stale
+        // assurance while still reporting success.
+        for index in indices {
+            let draft = &mut drafts.drafts[index];
+            draft.achieved_assurance = attestation.achieved_assurance;
+            draft.assurance_evidence_digests = attestation.evidence_digests.clone();
+            let draft_path = draft
+                .staged_parts_root
+                .parent()
+                .ok_or_else(|| {
+                    CacheError::InvalidManifest(
+                        "staged parts root has no draft directory".to_owned(),
+                    )
+                })?
+                .join("draft.json");
+            crate::atomic_replace(&draft_path, &serde_json::to_vec_pretty(draft)?)?;
+        }
+        Ok(())
     }
 
     fn record_assurance_requirement(
@@ -571,34 +1243,37 @@ impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
             .drafts
             .lock()
             .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))?;
-        let draft = drafts
-            .iter_mut()
-            .find(|draft| {
-                draft.source_artifact_key == requirement.artifact_key
-                    && draft.source_content_digest == requirement.content_digest
-            })
-            .ok_or_else(|| {
-                CacheError::NotFound(format!(
-                    "canonical staging draft is missing for assurance requirement {} / {}",
-                    requirement.artifact_key.logical_key, requirement.content_digest
-                ))
-            })?;
-        if draft
-            .required_assurance
-            .is_some_and(|current| current != requirement.required_assurance)
-        {
+        let indices = drafts.source_indices(&requirement.artifact_key, &requirement.content_digest);
+        if indices.is_empty() {
+            return Err(CacheError::NotFound(format!(
+                "canonical staging draft is missing for assurance requirement {} / {}",
+                requirement.artifact_key.logical_key, requirement.content_digest
+            )));
+        }
+        if indices.iter().any(|index| {
+            drafts.drafts[*index]
+                .required_assurance
+                .is_some_and(|current| current != requirement.required_assurance)
+        }) {
             return Err(CacheError::InvalidTransition(
                 "artifact assurance requirement cannot change within a run".to_owned(),
             ));
         }
-        draft.required_assurance = Some(requirement.required_assurance);
-        let path = self
-            .staging_root
-            .join("drafts")
-            .join(&draft.manifest.semantic_digest.0)
-            .join(&draft.manifest.payload_digest.0)
-            .join("draft.json");
-        crate::atomic_replace(&path, &serde_json::to_vec_pretty(draft)?)
+        for index in indices {
+            let draft = &mut drafts.drafts[index];
+            draft.required_assurance = Some(requirement.required_assurance);
+            let path = draft
+                .staged_parts_root
+                .parent()
+                .ok_or_else(|| {
+                    CacheError::InvalidManifest(
+                        "staged parts root has no draft directory".to_owned(),
+                    )
+                })?
+                .join("draft.json");
+            crate::atomic_replace(&path, &serde_json::to_vec_pretty(draft)?)?;
+        }
+        Ok(())
     }
 
     fn record_evidence(&self, kind: &str, bytes: &[u8]) -> Result<ContentDigest, CacheError> {
@@ -802,11 +1477,62 @@ pub fn stage_produced_artifact_with_dependencies(
     resources: &ResourcePolicy,
     cancellation: &CancellationToken,
 ) -> Result<CanonicalProductionDraft, CacheError> {
+    stage_record(
+        StagingRecord::from_produced(record),
+        &dependency_drafts,
+        VerifiedStagingSources::default(),
+        staging_root,
+        transport_policy,
+        resources,
+        cancellation,
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct VerifiedStagingSources<'a> {
+    encoded: Option<&'a VerifiedEncodedPayload>,
+    transport: Option<&'a crate::VerifiedTransportParts>,
+}
+
+#[cfg(test)]
+fn stage_produced_artifact_with_dependencies_and_encoded(
+    record: &ProducedArtifactRecord,
+    dependency_drafts: &[CanonicalProductionDraft],
+    verified_sources: VerifiedStagingSources<'_>,
+    staging_root: &Path,
+    transport_policy: &TransportPolicy,
+    resources: &ResourcePolicy,
+    cancellation: &CancellationToken,
+) -> Result<CanonicalProductionDraft, CacheError> {
+    stage_record(
+        StagingRecord::from_produced(record),
+        &dependency_drafts,
+        verified_sources,
+        staging_root,
+        transport_policy,
+        resources,
+        cancellation,
+    )
+}
+
+fn stage_record(
+    record: StagingRecord<'_>,
+    dependency_drafts: &dyn DependencyDraftLookup,
+    verified_sources: VerifiedStagingSources<'_>,
+    staging_root: &Path,
+    transport_policy: &TransportPolicy,
+    resources: &ResourcePolicy,
+    cancellation: &CancellationToken,
+) -> Result<CanonicalProductionDraft, CacheError> {
+    let VerifiedStagingSources {
+        encoded: verified_encoded,
+        transport: verified_transport,
+    } = verified_sources;
     record.semantic_key.validate()?;
     record.manifest.validate()?;
     crate::ArtifactProductionAssessment {
         achieved_assurance: record.achieved_assurance,
-        evidence_digests: record.assurance_evidence_digests.clone(),
+        evidence_digests: record.assurance_evidence_digests.to_vec(),
     }
     .validate()?;
     let family = family_for_artifact_kind(&record.semantic_key.artifact_kind).ok_or_else(|| {
@@ -818,12 +1544,16 @@ pub fn stage_produced_artifact_with_dependencies(
     if record.operation.trim().is_empty()
         || record.logical_key.trim().is_empty()
         || record.manifest.key.parameters_digest != record.semantic_key.digest()?
-        || record.manifest.content_digest != ContentDigest::sha256(&record.payload)
-        || record.manifest.size_bytes != record.payload.len() as u64
     {
         return Err(CacheError::InvalidManifest(
             "produced artifact cannot be canonically staged because its identities disagree"
                 .to_owned(),
+        ));
+    }
+    let (logical_digest, logical_size_bytes) = record.logical_item()?;
+    if matches!(record.payload, PayloadSource::Verified) && verified_encoded.is_none() {
+        return Err(CacheError::InvalidManifest(
+            "metadata-only staging requires a verified encoded payload".to_owned(),
         ));
     }
     transport_policy.validate()?;
@@ -849,10 +1579,10 @@ pub fn stage_produced_artifact_with_dependencies(
     let canonical_payload = if let Some(remote) = &retained_remote_manifest {
         crate::validate_retained_canonical_binding(
             remote,
-            &record.semantic_key,
+            record.semantic_key,
             family,
-            &ContentDigest::sha256(&record.payload),
-            record.payload.len() as u64,
+            &logical_digest,
+            logical_size_bytes,
             record.manifest.provenance_digest.as_ref(),
         )?;
         if remote.semantic_digest != semantic_digest {
@@ -866,11 +1596,7 @@ pub fn stage_produced_artifact_with_dependencies(
         let mut dependencies = Vec::new();
         for dependency in &record.manifest.dependencies {
             let draft = dependency_drafts
-                .iter()
-                .find(|draft| {
-                    draft.source_artifact_key == dependency.key
-                        && draft.source_content_digest == dependency.content_digest
-                })
+                .dependency_draft(&dependency.key, &dependency.content_digest)
                 .ok_or_else(|| {
                     CacheError::NotFound(format!(
                         "canonical dependency draft is missing for {} / {} / {}",
@@ -908,17 +1634,20 @@ pub fn stage_produced_artifact_with_dependencies(
             special_value_encoding: "decimal-string-or-json-number-v1".to_owned(),
             ordered_items: vec![LogicalPayloadItem {
                 normalized_path: "payload.json".to_owned(),
-                content_digest: ContentDigest::sha256(&record.payload),
-                size_bytes: record.payload.len() as u64,
+                content_digest: logical_digest.clone(),
+                size_bytes: logical_size_bytes,
             }],
             dependencies,
         }
     };
     let payload_digest = canonical_payload.digest()?;
-    let draft_root = staging_root
-        .join("drafts")
-        .join(&semantic_digest.0)
-        .join(&payload_digest.0);
+    let source_manifest_digest = canonical_digest(record.manifest)?;
+    let draft_root = canonical_draft_root(
+        staging_root,
+        &semantic_digest,
+        &payload_digest,
+        &source_manifest_digest,
+    )?;
     if draft_root.exists() {
         let draft_path = draft_root.join("draft.json");
         // draft.json is written only after the archive and every split part
@@ -935,6 +1664,7 @@ pub fn stage_produced_artifact_with_dependencies(
         let draft: CanonicalProductionDraft = serde_json::from_slice(&fs::read(&draft_path)?)?;
         draft.manifest.validate()?;
         draft.encoding.validate()?;
+        validate_reopened_draft_location(staging_root, &draft_path, &draft)?;
         crate::ArtifactProductionAssessment {
             achieved_assurance: draft.achieved_assurance,
             evidence_digests: draft.assurance_evidence_digests.clone(),
@@ -942,7 +1672,7 @@ pub fn stage_produced_artifact_with_dependencies(
         .validate()?;
         if draft.source_artifact_key != record.manifest.key
             || draft.source_content_digest != record.manifest.content_digest
-            || draft.source_manifest_digest != canonical_digest(&record.manifest)?
+            || draft.source_manifest_digest != source_manifest_digest
             || draft.family != family
             || draft.manifest.semantic_digest != semantic_digest
             || draft.manifest.payload_digest != payload_digest
@@ -953,64 +1683,184 @@ pub fn stage_produced_artifact_with_dependencies(
             )));
         }
         for part in &draft.encoding.ordered_parts {
-            cancellation
-                .check()
-                .map_err(|error| CacheError::Cancelled(error.to_string()))?;
             let path = draft.staged_parts_root.join(&part.repository_path);
-            let bytes = fs::read(&path)?;
-            if bytes.len() as u64 != part.size_bytes
-                || ContentDigest::sha256(&bytes) != part.content_digest
-            {
-                return Err(CacheError::InvalidManifest(format!(
-                    "existing canonical production part failed verification: {}",
-                    path.display()
-                )));
-            }
+            verify_staged_part_metadata(&path, part.size_bytes)?;
         }
         return Ok(draft);
     }
     fs::create_dir_all(&draft_root)?;
     let parts_root = draft_root.join("parts");
-    let archive_path = draft_root.join("payload.zip");
-    let package = package_canonical_payload_bytes_zip64(
-        &canonical_payload,
-        "payload.json",
-        &record.payload,
-        &archive_path,
-        resources,
-        cancellation,
-    )?;
-    let mut archive = BufReader::new(File::open(&archive_path)?);
-    let encoding = stream_split_encoded(
-        &mut archive,
-        package.canonical_payload_digest,
-        package.encoder_profile,
-        transport_policy,
-        resources,
-        cancellation,
-        |part, bytes| {
-            let path = parts_root.join(&part.repository_path);
-            if path.exists() {
+    let split_to_parts = |archive: &mut BufReader<File>, encoder_profile: &str| {
+        stream_split_encoded(
+            archive,
+            payload_digest.clone(),
+            encoder_profile,
+            transport_policy,
+            resources,
+            cancellation,
+            |part, bytes| {
+                let path = parts_root.join(&part.repository_path);
+                if path.exists() {
+                    return Err(CacheError::InvalidManifest(format!(
+                        "staged part already exists: {}",
+                        path.display()
+                    )));
+                }
+                fs::create_dir_all(path.parent().unwrap())?;
+                fs::write(path, bytes)?;
+                Ok(())
+            },
+        )
+    };
+    let verified_encoded = match verified_encoded {
+        Some(encoded) => {
+            let supported_profile = encoded.encoder_profile.as_deref().is_some_and(|profile| {
+                matches!(
+                    profile,
+                    DETERMINISTIC_ZIP64_PROFILE_V1 | DETERMINISTIC_ZIP64_PROFILE_V2
+                )
+            });
+            let adoptable = supported_profile
+                && (retained_remote_manifest.is_some()
+                    || encoded.encoder_profile.as_deref()
+                        == Some(CURRENT_DETERMINISTIC_ZIP64_PROFILE));
+            if adoptable {
+                Some(encoded)
+            } else if matches!(record.payload, PayloadSource::Bytes(_)) {
+                // An unprofiled legacy workstation object is still a valid
+                // logical cache hit. Re-encode its decoded payload under the
+                // current profile instead of inventing provenance for bytes.
+                None
+            } else {
+                return Err(CacheError::InvalidManifest(
+                    "metadata-only staging requires a supported, provenance-bound encoder profile"
+                        .to_owned(),
+                ));
+            }
+        }
+        None => None,
+    };
+    let encoding = if let Some(encoded) = verified_encoded {
+        let _performance =
+            xc_core::performance_stage_with("cache.publication.stage_verified_encoded", || {
+                xc_core::PerformanceStageMetadata {
+                    operation: Some(record.operation.to_owned()),
+                    cache_disposition: Some("encoded-reuse".to_owned()),
+                    ..xc_core::PerformanceStageMetadata::default()
+                }
+            });
+        if encoded.encoding != "zip-json-entry-v1" {
+            return Err(CacheError::InvalidManifest(format!(
+                "unsupported verified encoded payload {:?}",
+                encoded.encoding
+            )));
+        }
+        let direct_transport = if retained_remote_manifest.is_some() {
+            verified_transport
+        } else {
+            None
+        };
+        let direct_transport = if let Some(verified) = direct_transport {
+            let _performance =
+                xc_core::performance_stage_with("cache.publication.stage_verified_parts", || {
+                    xc_core::PerformanceStageMetadata {
+                        operation: Some(record.operation.to_owned()),
+                        cache_disposition: Some("verified-parts-reuse".to_owned()),
+                        ..xc_core::PerformanceStageMetadata::default()
+                    }
+                });
+            stage_verified_transport_parts(
+                verified,
+                encoded,
+                &payload_digest,
+                &parts_root,
+                cancellation,
+            )?
+        } else {
+            None
+        };
+        if let Some(encoding) = direct_transport {
+            encoding
+        } else {
+            let metadata = fs::symlink_metadata(&encoded.path)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() != encoded.size_bytes
+            {
                 return Err(CacheError::InvalidManifest(format!(
-                    "staged part already exists: {}",
-                    path.display()
+                    "verified encoded payload has invalid type or size: {}",
+                    encoded.path.display()
                 )));
             }
-            fs::create_dir_all(path.parent().unwrap())?;
-            fs::write(path, bytes)?;
-            Ok(())
-        },
-    )?;
-    drop(archive);
-    fs::remove_file(&archive_path)?;
+            let encoder_profile = encoded
+                .encoder_profile
+                .as_deref()
+                .expect("profile eligibility was checked above");
+            let mut archive = BufReader::new(File::open(&encoded.path)?);
+            let encoding = split_to_parts(&mut archive, encoder_profile)?;
+            if encoding.package_digest != encoded.content_digest
+                || encoding.package_size_bytes != encoded.size_bytes
+            {
+                return Err(CacheError::DigestMismatch {
+                    expected: encoded.content_digest.to_string(),
+                    actual: encoding.package_digest.to_string(),
+                });
+            }
+            // For newly computed artifacts there is no published transport
+            // digest to bind the package bytes. Decode once to prove that the
+            // adopted ZIP contains exactly the canonical logical payload.
+            // Reused shard artifacts are bound below by their retained
+            // canonical manifest and transport digest, so their earlier
+            // materialization verification is sufficient.
+            if retained_remote_manifest.is_none() {
+                verify_canonical_payload_zip64(
+                    &canonical_payload,
+                    &encoding,
+                    &encoded.path,
+                    cancellation,
+                )?;
+            }
+            encoding
+        }
+    } else {
+        let PayloadSource::Bytes(payload_bytes) = record.payload else {
+            return Err(CacheError::InvalidManifest(
+                "metadata-only staging requires a verified encoded payload".to_owned(),
+            ));
+        };
+        let _performance =
+            xc_core::performance_stage_with("cache.publication.stage_encode", || {
+                xc_core::PerformanceStageMetadata {
+                    operation: Some(record.operation.to_owned()),
+                    cache_disposition: Some("encoded".to_owned()),
+                    ..xc_core::PerformanceStageMetadata::default()
+                }
+            });
+        let archive_path = draft_root.join("payload.zip");
+        let package = package_canonical_payload_bytes_zip64(
+            &canonical_payload,
+            "payload.json",
+            payload_bytes,
+            &archive_path,
+            resources,
+            cancellation,
+        )?;
+        let mut archive = BufReader::new(File::open(&archive_path)?);
+        let encoding = split_to_parts(&mut archive, &package.encoder_profile)?;
+        drop(archive);
+        fs::remove_file(&archive_path)?;
+        encoding
+    };
+    let encoding = if let Some(remote) = retained_remote_manifest.as_ref() {
+        bind_retained_transport_encoding(&canonical_payload, remote, encoding)?
+    } else {
+        encoding
+    };
     let transport_digest = encoding.digest()?;
     let manifest = if let Some(remote) = retained_remote_manifest {
-        if remote.payload_digest != payload_digest
-            || !remote.transport_digests.contains(&transport_digest)
-        {
+        if remote.payload_digest != payload_digest {
             return Err(CacheError::InvalidManifest(
-                "retained remote manifest cannot be reproduced by the deterministic transport"
-                    .to_owned(),
+                "retained remote manifest disagrees with the canonical payload".to_owned(),
             ));
         }
         remote
@@ -1038,17 +1888,18 @@ pub fn stage_produced_artifact_with_dependencies(
     let draft = CanonicalProductionDraft {
         schema_version: 1,
         family: family.to_owned(),
-        source_operation: record.operation.clone(),
-        source_logical_key: record.logical_key.clone(),
+        source_operation: record.operation.to_owned(),
+        source_logical_key: record.logical_key.to_owned(),
         source_artifact_key: record.manifest.key.clone(),
         source_content_digest: record.manifest.content_digest.clone(),
-        source_manifest_digest: canonical_digest(&record.manifest)?,
+        source_manifest_digest,
+        source_quality: Some(record.manifest.quality),
         manifest,
         encoding,
         staged_parts_root: parts_root,
         achieved_assurance: record.achieved_assurance,
         required_assurance: None,
-        assurance_evidence_digests: record.assurance_evidence_digests.clone(),
+        assurance_evidence_digests: record.assurance_evidence_digests.to_vec(),
     };
     fs::write(
         draft_root.join("draft.json"),
@@ -1251,6 +2102,655 @@ mod tests {
         }
         let _ = fs::remove_dir_all(first_root);
         let _ = fs::remove_dir_all(second_root);
+    }
+
+    #[test]
+    fn staging_adopts_verified_encoded_payload_without_changing_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-production-stage-encoded-adoption-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let record = record();
+        let reference = stage_produced_artifact(
+            &record,
+            &root.join("reference"),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let encoded_path = root.join("source").join("payload.zip");
+        let package = package_canonical_payload_bytes_zip64(
+            &reference.manifest.canonical_payload,
+            "payload.json",
+            &record.payload,
+            &encoded_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut adopted_record = record.clone();
+        adopted_record.manifest.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&reference.manifest).unwrap(),
+        );
+        adopted_record.manifest.provenance_digest = Some(reference.manifest.digest().unwrap());
+        let encoded = VerifiedEncodedPayload {
+            path: encoded_path.clone(),
+            encoding: "zip-json-entry-v1".to_owned(),
+            encoder_profile: Some(reference.encoding.encoder_profile.clone()),
+            content_digest: package.package_digest,
+            size_bytes: package.package_size_bytes,
+        };
+        let verified_transport = crate::VerifiedTransportParts {
+            encoding: reference.encoding.clone(),
+            parts_root: reference.staged_parts_root.clone(),
+            parts_verified: true,
+        };
+        fs::remove_file(&encoded_path).unwrap();
+        let adopted = stage_produced_artifact_with_dependencies_and_encoded(
+            &adopted_record,
+            &[],
+            VerifiedStagingSources {
+                encoded: Some(&encoded),
+                transport: Some(&verified_transport),
+            },
+            &root.join("adopted"),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        assert_eq!(adopted.manifest, reference.manifest);
+        assert_eq!(adopted.encoding, reference.encoding);
+        assert!(
+            !encoded_path.exists(),
+            "verified source parts must make the complete ZIP unnecessary"
+        );
+        for part in &adopted.encoding.ordered_parts {
+            let adopted_bytes =
+                fs::read(adopted.staged_parts_root.join(&part.repository_path)).unwrap();
+            let reference_bytes =
+                fs::read(reference.staged_parts_root.join(&part.repository_path)).unwrap();
+            assert_eq!(adopted_bytes, reference_bytes);
+        }
+        let mut tampered = encoded.clone();
+        tampered.content_digest = ContentDigest::sha256(b"wrong encoded package");
+        let error = stage_produced_artifact_with_dependencies_and_encoded(
+            &adopted_record,
+            &[],
+            VerifiedStagingSources {
+                encoded: Some(&tampered),
+                transport: Some(&verified_transport),
+            },
+            &root.join("tampered"),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::DigestMismatch { .. }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unprofiled_local_zip_is_reencoded_instead_of_adopted() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-production-stage-unprofiled-reencode-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let record = record();
+        let unprofiled = VerifiedEncodedPayload {
+            // A rejected descriptor must not even be opened: the typed
+            // payload is the only trusted source for this fallback.
+            path: root.join("must-not-be-read.zip"),
+            encoding: "zip-json-entry-v1".to_owned(),
+            encoder_profile: None,
+            content_digest: ContentDigest::sha256(b"untrusted legacy encoding"),
+            size_bytes: 1,
+        };
+        let staged = stage_produced_artifact_with_dependencies_and_encoded(
+            &record,
+            &[],
+            VerifiedStagingSources {
+                encoded: Some(&unprofiled),
+                transport: None,
+            },
+            &root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            staged.encoding.encoder_profile,
+            CURRENT_DETERMINISTIC_ZIP64_PROFILE
+        );
+        assert!(!unprofiled.path.exists());
+
+        // Existing workstation caches are unprofiled, while their retained
+        // shard manifests name V1. Re-encoding must preserve that published
+        // transport identity rather than fail or mint a duplicate manifest.
+        let retained_reference = stage_produced_artifact(
+            &record,
+            &root.join("retained-reference"),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut retained_record = record.clone();
+        retained_record.manifest.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&retained_reference.manifest).unwrap(),
+        );
+        retained_record.manifest.provenance_digest =
+            Some(retained_reference.manifest.digest().unwrap());
+        let retained = stage_produced_artifact_with_dependencies_and_encoded(
+            &retained_record,
+            &[],
+            VerifiedStagingSources {
+                encoded: Some(&unprofiled),
+                transport: None,
+            },
+            &root.join("retained-unprofiled"),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(retained.manifest, retained_reference.manifest);
+        assert_eq!(retained.encoding, retained_reference.encoding);
+
+        // Also recover objects tagged by the superseded first v0.14.2 build.
+        // The package and part bytes are unchanged; only its V2 label was
+        // wrong. Matching the relabeled record to the retained V1 digest is
+        // the proof that the downgrade is exact.
+        let encoded_path = root.join("interim-v2").join("payload.zip");
+        let package = package_canonical_payload_bytes_zip64(
+            &retained_reference.manifest.canonical_payload,
+            "payload.json",
+            &record.payload,
+            &encoded_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let interim_encoded = VerifiedEncodedPayload {
+            path: encoded_path,
+            encoding: "zip-json-entry-v1".to_owned(),
+            encoder_profile: Some(DETERMINISTIC_ZIP64_PROFILE_V2.to_owned()),
+            content_digest: package.package_digest,
+            size_bytes: package.package_size_bytes,
+        };
+        let mut interim_transport = retained_reference.encoding.clone();
+        interim_transport.encoder_profile = DETERMINISTIC_ZIP64_PROFILE_V2.to_owned();
+        let interim_parts = crate::VerifiedTransportParts {
+            encoding: interim_transport,
+            parts_root: retained_reference.staged_parts_root.clone(),
+            parts_verified: true,
+        };
+        let recovered = stage_produced_artifact_with_dependencies_and_encoded(
+            &retained_record,
+            &[],
+            VerifiedStagingSources {
+                encoded: Some(&interim_encoded),
+                transport: Some(&interim_parts),
+            },
+            &root.join("retained-interim-v2"),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(recovered.manifest, retained_reference.manifest);
+        assert_eq!(recovered.encoding, retained_reference.encoding);
+
+        // The recovery rule is symmetric for a retained manifest produced by
+        // the superseded interim build: relabel an otherwise identical V1
+        // record only when the retained manifest explicitly authorizes the
+        // corresponding V2 transport digest.
+        let mut retained_v2 = retained_reference.manifest.clone();
+        let mut expected_v2 = retained_reference.encoding.clone();
+        expected_v2.encoder_profile = DETERMINISTIC_ZIP64_PROFILE_V2.to_owned();
+        retained_v2.transport_digests = vec![expected_v2.digest().unwrap()];
+        assert_eq!(
+            bind_retained_transport_encoding(
+                &retained_reference.manifest.canonical_payload,
+                &retained_v2,
+                retained_reference.encoding.clone(),
+            )
+            .unwrap(),
+            expected_v2
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_payload_from_distinct_source_manifests_gets_distinct_draft_roots() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-production-stage-source-manifest-identity-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let first_record = record();
+        let first = stage_produced_artifact(
+            &first_record,
+            &root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut second_record = first_record;
+        second_record.manifest.producer_toolkit_version = ToolkitVersion::parse("0.14.2").unwrap();
+        let second = stage_produced_artifact(
+            &second_record,
+            &root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            first.manifest.semantic_digest,
+            second.manifest.semantic_digest
+        );
+        assert_eq!(
+            first.manifest.payload_digest,
+            second.manifest.payload_digest
+        );
+        assert_ne!(first.source_manifest_digest, second.source_manifest_digest);
+        assert_ne!(first.staged_parts_root, second.staged_parts_root);
+        for draft in [&first, &second] {
+            assert!(draft
+                .staged_parts_root
+                .parent()
+                .unwrap()
+                .join("draft.json")
+                .is_file());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staged_dependency_lookup_enforces_quality_and_source_collisions_are_stable() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-production-stage-quality-source-index-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source = record();
+        let first = stage_produced_artifact(
+            &source,
+            &root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+
+        let sink = CanonicalStagingProductionSink::new(
+            root.join("sink"),
+            TransportPolicy::default(),
+            ResourcePolicy::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        crate::ArtifactProductionSink::record(&sink, source.clone()).unwrap();
+        assert!(
+            crate::ArtifactProductionSink::retained_canonical_manifest_for_artifact(
+                &sink,
+                &source.manifest.key,
+                &source.manifest.content_digest,
+                CacheQuality::Validated,
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            crate::ArtifactProductionSink::retained_canonical_manifest_for_artifact(
+                &sink,
+                &source.manifest.key,
+                &source.manifest.content_digest,
+                CacheQuality::Certified,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        // Two source manifests may legitimately retain the same source key
+        // and payload while producing distinct canonical closure identities.
+        // Insert the second fully staged draft directly because ordinary
+        // source-key recording intentionally deduplicates non-remote records.
+        let mut alternate_source = source.clone();
+        alternate_source.manifest.producer_toolkit_version =
+            ToolkitVersion::parse("0.14.2").unwrap();
+        alternate_source.manifest.validate().unwrap();
+        let alternate_draft = stage_produced_artifact(
+            &alternate_source,
+            sink.staging_root(),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        sink.drafts.lock().unwrap().push(alternate_draft).unwrap();
+        assert_eq!(sink.drafts().unwrap().len(), 2);
+        crate::ArtifactProductionSink::record_assurance_requirement(
+            &sink,
+            crate::ArtifactAssuranceRequirement {
+                schema_version: 1,
+                artifact_key: source.manifest.key.clone(),
+                content_digest: source.manifest.content_digest.clone(),
+                required_assurance: ArtifactAssuranceState::Certified,
+            },
+        )
+        .unwrap();
+        assert!(sink
+            .drafts()
+            .unwrap()
+            .into_iter()
+            .all(|draft| draft.required_assurance == Some(ArtifactAssuranceState::Certified)));
+        let evidence = crate::ArtifactProductionSink::record_evidence(
+            &sink,
+            "source-collision-certificate",
+            b"source collision assurance evidence",
+        )
+        .unwrap();
+        crate::ArtifactProductionSink::record_assurance(
+            &sink,
+            crate::ArtifactAssuranceAttestation {
+                schema_version: 1,
+                artifact_key: source.manifest.key.clone(),
+                content_digest: source.manifest.content_digest.clone(),
+                achieved_assurance: ArtifactAssuranceState::Certified,
+                evidence_digests: vec![evidence.clone()],
+            },
+        )
+        .unwrap();
+        let promoted = sink
+            .drafts()
+            .unwrap()
+            .into_iter()
+            .filter(|draft| draft.achieved_assurance == ArtifactAssuranceState::Certified)
+            .collect::<Vec<_>>();
+        assert_eq!(promoted.len(), 2);
+        assert!(promoted
+            .iter()
+            .all(|draft| draft.assurance_evidence_digests == vec![evidence.clone()]));
+        assert_eq!(
+            crate::ArtifactProductionSink::retained_assurance(
+                &sink,
+                &source.manifest.key,
+                &source.manifest.content_digest,
+            )
+            .unwrap()
+            .unwrap()
+            .achieved_assurance,
+            ArtifactAssuranceState::Certified
+        );
+
+        let mut second = first.clone();
+        second.manifest.producer_toolkit_version = ToolkitVersion::parse("0.14.2").unwrap();
+        second.manifest.validate().unwrap();
+        let mut inventory = DraftInventory::default();
+        inventory.push(first.clone()).unwrap();
+        inventory.push(second.clone()).unwrap();
+        let expected = [&first, &second]
+            .into_iter()
+            .min_by_key(|draft| &draft.source_manifest_digest.0)
+            .unwrap();
+        assert_eq!(
+            inventory
+                .find_by_source(&first.source_artifact_key, &first.source_content_digest)
+                .unwrap()
+                .source_manifest_digest,
+            expected.source_manifest_digest
+        );
+
+        let mut promoted = first.clone();
+        promoted.source_artifact_key.logical_key = "closure/promoted-source".to_owned();
+        inventory.replace(0, promoted.clone());
+        assert_eq!(
+            inventory
+                .find_by_source(&second.source_artifact_key, &second.source_content_digest)
+                .unwrap()
+                .manifest
+                .producer_toolkit_version,
+            second.manifest.producer_toolkit_version
+        );
+        assert_eq!(
+            inventory
+                .find_by_source(
+                    &promoted.source_artifact_key,
+                    &promoted.source_content_digest
+                )
+                .unwrap()
+                .source_artifact_key,
+            promoted.source_artifact_key
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn wrong_sized_retained_part_falls_back_to_the_verified_package() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-production-stage-wrong-size-part-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let record = record();
+        let reference = stage_produced_artifact(
+            &record,
+            &root.join("reference"),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let encoded_path = root.join("source").join("payload.zip");
+        let package = package_canonical_payload_bytes_zip64(
+            &reference.manifest.canonical_payload,
+            "payload.json",
+            &record.payload,
+            &encoded_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut adopted_record = record.clone();
+        adopted_record.manifest.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&reference.manifest).unwrap(),
+        );
+        adopted_record.manifest.provenance_digest = Some(reference.manifest.digest().unwrap());
+        let encoded = VerifiedEncodedPayload {
+            path: encoded_path.clone(),
+            encoding: "zip-json-entry-v1".to_owned(),
+            encoder_profile: Some(reference.encoding.encoder_profile.clone()),
+            content_digest: package.package_digest,
+            size_bytes: package.package_size_bytes,
+        };
+        let verified_transport = crate::VerifiedTransportParts {
+            encoding: reference.encoding.clone(),
+            parts_root: reference.staged_parts_root.clone(),
+            parts_verified: true,
+        };
+
+        // Truncate one retained part. Direct linking is refused, the verified
+        // package is split instead, and the result is byte-identical.
+        let first_part = &reference.encoding.ordered_parts[0];
+        let first_part_path = reference
+            .staged_parts_root
+            .join(&first_part.repository_path);
+        let intact = fs::read(&first_part_path).unwrap();
+        fs::write(&first_part_path, &intact[..intact.len() - 1]).unwrap();
+        let adopted = stage_produced_artifact_with_dependencies_and_encoded(
+            &adopted_record,
+            &[],
+            VerifiedStagingSources {
+                encoded: Some(&encoded),
+                transport: Some(&verified_transport),
+            },
+            &root.join("adopted"),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(adopted.manifest, reference.manifest);
+        assert_eq!(adopted.encoding, reference.encoding);
+        for part in &adopted.encoding.ordered_parts {
+            let bytes = fs::read(adopted.staged_parts_root.join(&part.repository_path)).unwrap();
+            assert_eq!(bytes.len() as u64, part.size_bytes);
+            assert_eq!(ContentDigest::sha256(&bytes), part.content_digest);
+        }
+        assert_eq!(
+            fs::read(adopted.staged_parts_root.join(&first_part.repository_path)).unwrap(),
+            intact,
+            "the adopted part is rebuilt from the package, not linked to the truncated file"
+        );
+
+        // A non-regular file where a part should be is not corruption to
+        // recover from; it fails closed.
+        fs::remove_file(&first_part_path).unwrap();
+        fs::create_dir_all(&first_part_path).unwrap();
+        let error = stage_produced_artifact_with_dependencies_and_encoded(
+            &adopted_record,
+            &[],
+            VerifiedStagingSources {
+                encoded: Some(&encoded),
+                transport: Some(&verified_transport),
+            },
+            &root.join("non-regular"),
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::InvalidManifest(_)));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metadata_only_record_stages_identically_to_the_payload_record() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-production-stage-metadata-only-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let record = record();
+
+        // The payload-carrying path is the reference.
+        let payload_sink = CanonicalStagingProductionSink::new(
+            root.join("payload-staging"),
+            TransportPolicy::default(),
+            ResourcePolicy::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        crate::ArtifactProductionSink::record(&payload_sink, record.clone()).unwrap();
+        let reference = payload_sink.drafts().unwrap().remove(0);
+
+        // The metadata-only path starts from the workstation ZIP object the
+        // store already holds and never sees the logical bytes.
+        let store = crate::ZipJsonFilesystemCacheStore::new(
+            "workstation",
+            root.join("cache"),
+            true,
+            CacheVisibility::Local,
+        );
+        let stored = crate::CacheStore::put(
+            &store,
+            &crate::ArtifactDraft {
+                schema_version: 1,
+                key: record.manifest.key.clone(),
+                producer_toolkit_version: record.manifest.producer_toolkit_version.clone(),
+                minimum_reader_version: record.manifest.minimum_reader_version.clone(),
+                maximum_reader_version: None,
+                quality: CacheQuality::Validated,
+                visibility: CacheVisibility::Local,
+                immutable: true,
+                dependencies: Vec::new(),
+                tags: BTreeMap::new(),
+                provenance_digest: None,
+            },
+            &record.payload,
+        )
+        .unwrap();
+        let encoded = crate::CacheStore::verified_encoded_payload(&store, &stored)
+            .unwrap()
+            .unwrap();
+        let encoded_sink = CanonicalStagingProductionSink::new(
+            root.join("encoded-staging"),
+            TransportPolicy::default(),
+            ResourcePolicy::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(crate::ArtifactProductionSink::supports_encoded_records(
+            &encoded_sink
+        ));
+        let manifest = stored.clone();
+        crate::ArtifactProductionSink::record_encoded(
+            &encoded_sink,
+            EncodedArtifactRecord {
+                operation: record.operation.clone(),
+                semantic_key: record.semantic_key.clone(),
+                logical_key: record.logical_key.clone(),
+                manifest: manifest.clone(),
+                achieved_assurance: record.achieved_assurance,
+                assurance_evidence_digests: Vec::new(),
+            },
+            &encoded,
+            None,
+        )
+        .unwrap();
+        let adopted = encoded_sink.drafts().unwrap().remove(0);
+        assert_eq!(adopted.manifest, reference.manifest);
+        assert_eq!(adopted.encoding, reference.encoding);
+        for part in &adopted.encoding.ordered_parts {
+            assert_eq!(
+                fs::read(adopted.staged_parts_root.join(&part.repository_path)).unwrap(),
+                fs::read(reference.staged_parts_root.join(&part.repository_path)).unwrap()
+            );
+        }
+
+        // A manifest whose logical digest is not what the ZIP decodes to is
+        // refused: the decode proof is what stands in for the payload bytes.
+        let mut forged = manifest.clone();
+        forged.content_digest = ContentDigest::sha256(b"not the encoded payload");
+        let forged_sink = CanonicalStagingProductionSink::new(
+            root.join("forged-staging"),
+            TransportPolicy::default(),
+            ResourcePolicy::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let error = crate::ArtifactProductionSink::record_encoded(
+            &forged_sink,
+            EncodedArtifactRecord {
+                operation: record.operation.clone(),
+                semantic_key: record.semantic_key.clone(),
+                logical_key: record.logical_key.clone(),
+                manifest: forged,
+                achieved_assurance: record.achieved_assurance,
+                assurance_evidence_digests: Vec::new(),
+            },
+            &encoded,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CacheError::DigestMismatch { .. } | CacheError::InvalidManifest(_)
+        ));
+        assert!(forged_sink.drafts().unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1574,6 +3074,33 @@ mod tests {
         );
         active_adapter.manifest.provenance_digest = Some(active.manifest.digest().unwrap());
 
+        // Identity-addressed shard adapters synthesize the logical key from
+        // the semantic digest. Historical and active manifests with the same
+        // semantic key and item bytes therefore also have the same local
+        // source key/content pair. That weaker pair must not suppress either
+        // canonical closure identity.
+        let same_source_root = root.join("same-source-staging");
+        let same_source_sink = CanonicalStagingProductionSink::new(
+            &same_source_root,
+            TransportPolicy::default(),
+            ResourcePolicy::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let historical_same_source = historical_adapter.clone();
+        let mut active_same_source = active_adapter.clone();
+        active_same_source.operation = historical_same_source.operation.clone();
+        active_same_source.logical_key = historical_same_source.logical_key.clone();
+        active_same_source.manifest.key = historical_same_source.manifest.key.clone();
+        crate::ArtifactProductionSink::record(&same_source_sink, historical_same_source).unwrap();
+        crate::ArtifactProductionSink::record(&same_source_sink, active_same_source).unwrap();
+        let same_source_drafts = same_source_sink.drafts().unwrap();
+        assert_eq!(same_source_drafts.len(), 2);
+        assert_ne!(
+            same_source_drafts[0].manifest.digest().unwrap(),
+            same_source_drafts[1].manifest.digest().unwrap()
+        );
+
         let staging_root = root.join("staging");
         let sink = CanonicalStagingProductionSink::new(
             &staging_root,
@@ -1587,10 +3114,10 @@ mod tests {
         let drafts = sink.drafts().unwrap();
         assert_eq!(drafts.len(), 2);
         for draft in drafts {
-            assert!(staging_root
-                .join("drafts")
-                .join(&draft.manifest.semantic_digest.0)
-                .join(&draft.manifest.payload_digest.0)
+            assert!(draft
+                .staged_parts_root
+                .parent()
+                .unwrap()
                 .join("draft.json")
                 .is_file());
         }
@@ -1732,7 +3259,8 @@ mod tests {
         let draft_root = root
             .join("drafts")
             .join(record.semantic_key.digest().unwrap().0)
-            .join(&reference.manifest.payload_digest.0);
+            .join(&reference.manifest.payload_digest.0)
+            .join(canonical_digest(&record.manifest).unwrap().0);
         fs::create_dir_all(draft_root.join("parts")).unwrap();
         fs::write(draft_root.join("interrupted.part"), b"partial").unwrap();
 
@@ -1753,6 +3281,105 @@ mod tests {
         );
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(reference_root);
+    }
+
+    #[test]
+    fn reopened_draft_rejects_deserialized_path_substitution() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-production-reopened-path-binding-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let staged = stage_produced_artifact(
+            &record(),
+            &root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let draft_path = staged
+            .staged_parts_root
+            .parent()
+            .unwrap()
+            .join("draft.json");
+        let mut draft: CanonicalProductionDraft =
+            serde_json::from_slice(&fs::read(&draft_path).unwrap()).unwrap();
+        draft.staged_parts_root = root.join("outside-canonical-draft");
+        fs::write(&draft_path, serde_json::to_vec_pretty(&draft).unwrap()).unwrap();
+        assert!(matches!(
+            CanonicalStagingProductionSink::new(
+                &root,
+                TransportPolicy::default(),
+                ResourcePolicy::default(),
+                CancellationToken::new(),
+            ),
+            Err(CacheError::InvalidManifest(_))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reopened_v0141_two_level_draft_layout_remains_resumable() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-production-reopened-v0141-layout-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let staged = stage_produced_artifact(
+            &record(),
+            &root,
+            &TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let current_root = staged.staged_parts_root.parent().unwrap().to_path_buf();
+        let legacy_root = current_root.parent().unwrap().to_path_buf();
+        let legacy_parts = legacy_root.join("parts");
+        fs::rename(&staged.staged_parts_root, &legacy_parts).unwrap();
+        let mut legacy = staged;
+        legacy.staged_parts_root = legacy_parts;
+        fs::write(
+            legacy_root.join("draft.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(current_root.join("draft.json")).unwrap();
+        fs::remove_dir(&current_root).unwrap();
+
+        let reopened = CanonicalStagingProductionSink::new(
+            &root,
+            TransportPolicy::default(),
+            ResourcePolicy::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(reopened.drafts().unwrap(), vec![legacy.clone()]);
+        crate::ArtifactProductionSink::record_assurance_requirement(
+            &reopened,
+            crate::ArtifactAssuranceRequirement {
+                schema_version: 1,
+                artifact_key: legacy.source_artifact_key.clone(),
+                content_digest: legacy.source_content_digest.clone(),
+                required_assurance: ArtifactAssuranceState::CrossChecked,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            CanonicalStagingProductionSink::new(
+                &root,
+                TransportPolicy::default(),
+                ResourcePolicy::default(),
+                CancellationToken::new(),
+            )
+            .unwrap()
+            .drafts()
+            .unwrap()[0]
+                .required_assurance,
+            Some(ArtifactAssuranceState::CrossChecked)
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

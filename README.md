@@ -7,8 +7,9 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-Version 0.14.1 is an amended maintenance release for CCM capture and managed
-cache publication. Publishing children of shard-reused artifacts to a new
+Version 0.14.2 is a cache-reuse performance and correctness release built on
+the CCM capture and managed-publication functionality delivered in 0.14.1.
+Publishing children of shard-reused artifacts to a new
 destination now stages the full dependency closure without recomputation,
 including identity-first dependencies later referenced by their real cache
 keys. Author publication also accounts for validated workstation and remote
@@ -22,6 +23,39 @@ only when the retained manifest has a canonical batch proof, matching the
 reader's historical-resolution rule. Long destination scans refresh GitHub write evidence before both
 candidate authorization and remote mutation, so the five-minute authority
 window cannot expire merely while a large existing family is inspected.
+Cold multipart reuse batches missing Git blobs before concurrent verified
+streaming, verifies reused parts during the reconstruction copy, quarantines
+and re-downloads a corrupt reused part once with best-effort quarantine
+cleanup, removes a corrupt complete package so it can be rebuilt, and reports fetch,
+reconstruction, and decode time separately. Workstation ZIP hits read a
+compressed object up to the split part size once, within a bounded
+process-wide in-memory allowance, and avoid a redundant second hash. Exact published
+identities are looked up through a persistent per-semantic-digest inventory
+rather than a directory walk. Exact dependency sets are prepared
+progressively in bounded repository batches, with independent shard sessions
+allowed to proceed concurrently; complete local packages and retained parts
+are excluded from remote preparation, and each filtered blob reserves the
+caller's exact retained-part bound rather than a generic 100 MB allowance.
+Publication staging reuses verified
+encoded packages, stages dependencies from those packages without inflating
+their payloads, and directly links their verified split parts when available,
+instead of recompressing, recopying, or repeatedly decoding artifacts that are
+already present. Direct encoded adoption requires the exact persisted encoder
+profile; unprofiled legacy objects remain readable but are re-encoded before
+publication. The unchanged single-entry route retains its published V1
+transport identity; V2 is reserved for packages that actually contain
+multiple items on the corrected ZIP64 route.
+Dependency closure resolves each member by exact content
+digest, so a newer artifact under the same semantic key no longer blocks
+publication of children that name the older one.
+
+Cache transport tuning is explicit and bounded. `XC_CACHE_PREFETCH_CONCURRENCY`
+controls independent repository preparation and `XC_CACHE_DOWNLOAD_CONCURRENCY`
+controls verified part-download workers (both default to 4 and clamp to 1--8).
+`XC_CACHE_SINGLE_PASS_ZIP_BYTES` sets the per-object in-memory ZIP threshold
+(default 90 MiB), while `XC_CACHE_IN_MEMORY_ZIP_BYTES` sets the process-wide
+allowance shared by all such reads (default 256 MiB). Memory overrides must be
+between 1 byte and 16 GiB; invalid or zero values retain the defaults.
 Warm distance/profile hits avoid fresh eigensolves, quadrature, and sampling
 work; distance capture reuses the exact managed `ccm_weil_eigenpair`, binds
 its content digest and dependency closure into every affected artifact
@@ -72,7 +106,7 @@ If you use Xcelerator Toolkit in research, please cite the exact version or Git 
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.14.1},
+  version = {0.14.2},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }

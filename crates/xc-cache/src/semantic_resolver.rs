@@ -1287,7 +1287,7 @@ mod tests {
         let encoding = TransportEncodingRecord {
             schema_version: 1,
             canonical_payload_digest: payload_digest.clone(),
-            encoder_profile: "deterministic-zip64-v1".to_owned(),
+            encoder_profile: crate::DETERMINISTIC_ZIP64_PROFILE_V1.to_owned(),
             package_size_bytes: 15,
             package_digest: part_digest.clone(),
             ordered_parts: vec![TransportPart {

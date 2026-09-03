@@ -88,16 +88,17 @@ pub use shard_audit::*;
 pub use shard_repair::*;
 pub use trust::*;
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Approved safe reachable-payload threshold for a GitHub cache repository.
@@ -697,6 +698,13 @@ pub trait CacheStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Prepare the encoded transports for already selected manifests without
+    /// decoding their logical payloads. Remote stores use this bounded hook to
+    /// batch exact dependency downloads; local stores need no preparation.
+    fn prefetch_manifests(&self, _manifests: &[ArtifactManifest]) -> Result<(), CacheError> {
+        Ok(())
+    }
+
     /// Return nearest compatible CCM eigenpair keys through a purpose-built
     /// secondary index. Remote implementations must not emulate this by
     /// crawling canonical manifests.
@@ -723,6 +731,16 @@ pub trait CacheStore: Send + Sync {
         Ok(None)
     }
 
+    /// Return exact split parts verified during materialization, when still
+    /// available. This is an optional staging accelerator; the encoded package
+    /// remains the portable fallback.
+    fn verified_transport_parts(
+        &self,
+        _manifest: &ArtifactManifest,
+    ) -> Result<Option<VerifiedTransportParts>, CacheError> {
+        Ok(None)
+    }
+
     /// Adopt an already verified encoded payload without changing its logical
     /// identity. Stores that do not support this representation return
     /// `Ok(None)` and callers fall back to `put`.
@@ -742,14 +760,86 @@ pub trait CacheStore: Send + Sync {
         self.read_payload_to(manifest, &mut payload)?;
         Ok(payload)
     }
+
+    /// Read and verify the logical payload while returning any already
+    /// verified encoded representation from the same pass. Stores with no
+    /// combined path retain the conservative two-operation default.
+    fn read_payload_and_encoded(
+        &self,
+        manifest: &ArtifactManifest,
+    ) -> Result<(Vec<u8>, Option<VerifiedEncodedPayload>), CacheError> {
+        let payload = self.read_payload(manifest)?;
+        let encoded = self.verified_encoded_payload(manifest)?;
+        Ok((payload, encoded))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedEncodedPayload {
     pub path: PathBuf,
     pub encoding: String,
+    /// Exact byte-affecting encoder profile. Legacy objects that predate this
+    /// provenance field are reusable as logical payloads but are not eligible
+    /// for direct publication adoption.
+    pub encoder_profile: Option<String>,
     pub content_digest: ContentDigest,
     pub size_bytes: u64,
+}
+
+pub const STORAGE_ENCODER_PROFILE_TAG: &str = "xc_storage_encoder_profile";
+
+fn supported_storage_encoder_profile(profile: &str) -> bool {
+    matches!(
+        profile,
+        DETERMINISTIC_ZIP64_PROFILE_V1 | DETERMINISTIC_ZIP64_PROFILE_V2
+    )
+}
+
+/// Split transport parts retained by a cache layer for one exact artifact.
+///
+/// `parts_verified` is true only when this process verified every part's
+/// digest (a download or a reconstruction from parts). A layer that merely
+/// finds size-matching part files next to an already verified package reports
+/// false, and staging then hashes each part before linking it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedTransportParts {
+    pub encoding: TransportEncodingRecord,
+    pub parts_root: PathBuf,
+    pub parts_verified: bool,
+}
+
+/// Process-local memo of one exact identity query. It is reused only while
+/// the on-disk identity inventory for that semantic digest is byte-for-byte
+/// the file it was computed against, so a manifest written by another process
+/// becomes visible without a restart.
+#[derive(Clone)]
+struct IdentityQueryMemo {
+    inventory_signature: Option<(u64, SystemTime)>,
+    manifests: Vec<ArtifactManifest>,
+}
+
+/// Persistent secondary index from one semantic digest to every retained
+/// manifest that carries a canonical publication identity. Maintained by
+/// every write; repaired once per process per semantic digest from the
+/// artifact directory when an entry is absent.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityInventory {
+    schema_version: u32,
+    entries: Vec<IdentityInventoryEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityInventoryEntry {
+    artifact_family: String,
+    manifest_digest: ContentDigest,
+    payload_digest: ContentDigest,
+    kind: String,
+    logical_key: String,
+    content_digest: ContentDigest,
+    /// Manifest record path relative to the store root, `/`-separated.
+    manifest_path: String,
 }
 
 /// Local filesystem implementation used for working caches and checked-out
@@ -759,6 +849,8 @@ pub struct FilesystemCacheStore {
     root: PathBuf,
     writable: bool,
     visibility: CacheVisibility,
+    identity_query_cache: Mutex<HashMap<String, IdentityQueryMemo>>,
+    scanned_semantic_digests: Mutex<HashSet<ContentDigest>>,
 }
 
 impl FilesystemCacheStore {
@@ -773,6 +865,8 @@ impl FilesystemCacheStore {
             root: root.into(),
             writable,
             visibility,
+            identity_query_cache: Mutex::new(HashMap::new()),
+            scanned_semantic_digests: Mutex::new(HashSet::new()),
         }
     }
 
@@ -838,6 +932,37 @@ impl FilesystemCacheStore {
         Ok(index)
     }
 
+    fn identity_inventory_key(identity: &crate::PayloadDependencyIdentity) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            identity.artifact_family,
+            identity.semantic_digest,
+            identity.manifest_digest,
+            identity.payload_digest
+        )
+    }
+
+    fn manifest_dependency_identity(
+        manifest: &ArtifactManifest,
+    ) -> Option<crate::PayloadDependencyIdentity> {
+        let encoded = manifest.tags.get(crate::REMOTE_CANONICAL_MANIFEST_TAG)?;
+        let Ok(canonical) = serde_json::from_str::<crate::CanonicalArtifactManifest>(encoded)
+        else {
+            return None;
+        };
+        let identity = crate::PayloadDependencyIdentity {
+            artifact_family: canonical.artifact_family.clone(),
+            semantic_digest: canonical.semantic_digest.clone(),
+            manifest_digest: canonical.digest().ok()?,
+            payload_digest: canonical.payload_digest.clone(),
+        };
+        identity.validate().ok()?;
+        if !manifest_matches_dependency_identity(manifest, &identity).ok()? {
+            return None;
+        }
+        Some(identity)
+    }
+
     fn verify_object(&self, object: &CacheObjectRef) -> Result<(), CacheError> {
         let path = self.object_path(&object.content_digest);
         if !path.exists() {
@@ -899,39 +1024,50 @@ impl FilesystemCacheStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        match fs::hard_link(&encoded.path, &path) {
-            Ok(()) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::CrossesDevices
-                        | std::io::ErrorKind::PermissionDenied
-                        | std::io::ErrorKind::Unsupported
-                ) =>
-            {
-                let temporary = path.with_extension(format!(
-                    "xc-copy-{}-{}",
-                    std::process::id(),
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map_err(|error| CacheError::Io(error.to_string()))?
-                        .as_nanos()
-                ));
-                let result = (|| {
+        // Verify under a private sibling name before exposing the canonical
+        // content-addressed path. A same-filesystem source remains zero-copy;
+        // other filesystems fall back to one verified copy.
+        let temporary = path.with_extension(format!(
+            "xc-adopt-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| CacheError::Io(error.to_string()))?
+                .as_nanos()
+        ));
+        let result = (|| {
+            match fs::hard_link(&encoded.path, &temporary) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::CrossesDevices
+                            | std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::Unsupported
+                    ) =>
+                {
                     fs::copy(&encoded.path, &temporary)?;
-                    fs::rename(&temporary, &path)?;
-                    Ok::<(), CacheError>(())
-                })();
-                if result.is_err() {
-                    let _ = fs::remove_file(&temporary);
                 }
-                result?;
+                Err(error) => return Err(error.into()),
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                self.verify_object(&object)?;
+
+            let (adopted_digest, adopted_size) = digest_file(&temporary)?;
+            if adopted_digest != object.content_digest || adopted_size != object.size_bytes {
+                return Err(CacheError::DigestMismatch {
+                    expected: format!("{} ({} bytes)", object.content_digest, object.size_bytes),
+                    actual: format!("{adopted_digest} ({adopted_size} bytes)"),
+                });
             }
-            Err(error) => return Err(error.into()),
-        }
+            match fs::hard_link(&temporary, &path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    self.verify_object(&object)
+                }
+                Err(error) => Err(error.into()),
+            }
+        })();
+        let _ = fs::remove_file(&temporary);
+        result?;
         Ok(object)
     }
 
@@ -997,7 +1133,234 @@ impl FilesystemCacheStore {
         let index_bytes = serde_json::to_vec_pretty(&index)?;
         atomic_replace(&self.index_path(&manifest.key), &index_bytes)?;
         self.update_ccm_eigenpair_continuation_inventory(&manifest, manifest_record_digest)?;
+        let root_relative_manifest = self.root_relative_path(&manifest_path)?;
+        if let Some(entry) = Self::identity_inventory_entry(&manifest, &root_relative_manifest) {
+            self.record_identity_inventory_entries(&manifest.key.parameters_digest, vec![entry])?;
+        }
         Ok(manifest)
+    }
+
+    fn root_relative_path(&self, path: &Path) -> Result<String, CacheError> {
+        let relative = path.strip_prefix(&self.root).map_err(|_| {
+            CacheError::Io(format!(
+                "path {} is outside cache root {}",
+                path.display(),
+                self.root.display()
+            ))
+        })?;
+        Ok(relative.to_string_lossy().replace('\\', "/"))
+    }
+
+    fn identity_inventory_path(&self, semantic_digest: &ContentDigest) -> PathBuf {
+        let prefix = semantic_digest.0.get(0..2).unwrap_or("00");
+        self.root
+            .join("identities")
+            .join(prefix)
+            .join(format!("{}.json", semantic_digest.0))
+    }
+
+    fn identity_inventory_signature(path: &Path) -> Result<Option<(u64, SystemTime)>, CacheError> {
+        match fs::metadata(path) {
+            Ok(metadata) => Ok(Some((metadata.len(), metadata.modified()?))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn load_identity_inventory(path: &Path) -> Result<IdentityInventory, CacheError> {
+        match fs::read(path) {
+            Ok(bytes) => {
+                let inventory: IdentityInventory = serde_json::from_slice(&bytes)?;
+                if inventory.schema_version != 1 {
+                    return Err(CacheError::InvalidManifest(format!(
+                        "unsupported identity inventory schema {} at {}",
+                        inventory.schema_version,
+                        path.display()
+                    )));
+                }
+                Ok(inventory)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(IdentityInventory {
+                schema_version: 1,
+                entries: Vec::new(),
+            }),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn identity_inventory_entry(
+        manifest: &ArtifactManifest,
+        root_relative_manifest_path: &str,
+    ) -> Option<IdentityInventoryEntry> {
+        let identity = Self::manifest_dependency_identity(manifest)?;
+        if identity.semantic_digest != manifest.key.parameters_digest {
+            return None;
+        }
+        Some(IdentityInventoryEntry {
+            artifact_family: identity.artifact_family,
+            manifest_digest: identity.manifest_digest,
+            payload_digest: identity.payload_digest,
+            kind: manifest.key.kind.clone(),
+            logical_key: manifest.key.logical_key.clone(),
+            content_digest: manifest.content_digest.clone(),
+            manifest_path: root_relative_manifest_path.to_owned(),
+        })
+    }
+
+    /// Append entries to the semantic digest's identity inventory. The
+    /// read-modify-write is serialized within the process and across
+    /// processes (advisory file lock), and the inventory only ever grows, so
+    /// its byte length is a monotone change signature.
+    fn record_identity_inventory_entries(
+        &self,
+        semantic_digest: &ContentDigest,
+        additions: Vec<IdentityInventoryEntry>,
+    ) -> Result<(), CacheError> {
+        if additions.is_empty() {
+            return Ok(());
+        }
+        static IDENTITY_INVENTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = IDENTITY_INVENTORY_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| CacheError::Io("local identity inventory lock was poisoned".to_owned()))?;
+        let path = self.identity_inventory_path(semantic_digest);
+        let parent = path
+            .parent()
+            .ok_or_else(|| CacheError::Io(format!("path has no parent: {}", path.display())))?;
+        fs::create_dir_all(parent)?;
+        // Windows requires read or write access on the handle for LockFileEx;
+        // append-only access is refused. Nothing is ever written to the lock
+        // file itself, and it is never truncated.
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))?;
+        lock_file.lock_exclusive()?;
+        let result = (|| {
+            let mut inventory = Self::load_identity_inventory(&path)?;
+            let mut changed = false;
+            for addition in additions {
+                if !inventory
+                    .entries
+                    .iter()
+                    .any(|entry| entry.manifest_path == addition.manifest_path)
+                {
+                    inventory.entries.push(addition);
+                    changed = true;
+                }
+            }
+            if changed {
+                inventory
+                    .entries
+                    .sort_by(|left, right| left.manifest_path.cmp(&right.manifest_path));
+                atomic_replace(&path, &serde_json::to_vec_pretty(&inventory)?)?;
+            }
+            Ok(())
+        })();
+        let _ = FileExt::unlock(&lock_file);
+        result
+    }
+
+    fn identity_matches_from_inventory(
+        &self,
+        identity: &crate::PayloadDependencyIdentity,
+        inventory_path: &Path,
+    ) -> Result<Vec<ArtifactManifest>, CacheError> {
+        let inventory = Self::load_identity_inventory(inventory_path)?;
+        let mut matches = Vec::new();
+        for entry in inventory.entries.iter().filter(|entry| {
+            entry.artifact_family == identity.artifact_family
+                && entry.manifest_digest == identity.manifest_digest
+                && entry.payload_digest == identity.payload_digest
+        }) {
+            if entry.manifest_path.contains(['\\', ':'])
+                || entry
+                    .manifest_path
+                    .split('/')
+                    .any(|component| component.is_empty() || component == "." || component == "..")
+                || Path::new(&entry.manifest_path)
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err(CacheError::InvalidManifest(format!(
+                    "identity inventory entry has an unsafe manifest path {:?}",
+                    entry.manifest_path
+                )));
+            }
+            let manifest_path = entry
+                .manifest_path
+                .split('/')
+                .fold(self.root.clone(), |path, component| path.join(component));
+            let bytes = match fs::read(&manifest_path) {
+                Ok(bytes) => bytes,
+                // A pruned manifest leaves a dangling inventory entry; it is
+                // simply not a candidate.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let manifest: ArtifactManifest = serde_json::from_slice(&bytes)?;
+            manifest.validate()?;
+            if manifest.key.parameters_digest == identity.semantic_digest
+                && manifest_matches_dependency_identity(&manifest, identity)?
+            {
+                matches.push(manifest);
+            }
+        }
+        Ok(matches)
+    }
+
+    /// Enumerate every retained manifest under one semantic digest by
+    /// entering only the matching `<logical-key>/<semantic-digest>/manifests`
+    /// directories. This is the bounded legacy path for caches written before
+    /// the identity inventory existed or by an older writer.
+    fn scan_semantic_digest_manifests(
+        &self,
+        semantic_digest: &ContentDigest,
+    ) -> Result<Vec<(ArtifactManifest, String)>, CacheError> {
+        let artifacts_root = self.root.join("artifacts");
+        let mut discovered = Vec::new();
+        if !artifacts_root.is_dir() {
+            return Ok(discovered);
+        }
+        for kind_entry in fs::read_dir(&artifacts_root)? {
+            let kind_path = kind_entry?.path();
+            if !kind_path.is_dir() {
+                continue;
+            }
+            for logical_entry in fs::read_dir(&kind_path)? {
+                let logical_path = logical_entry?.path();
+                if !logical_path.is_dir() {
+                    continue;
+                }
+                let manifest_directory = logical_path.join(&semantic_digest.0).join("manifests");
+                if !manifest_directory.is_dir() {
+                    continue;
+                }
+                for entry in fs::read_dir(&manifest_directory)? {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file()
+                        || entry
+                            .path()
+                            .extension()
+                            .is_none_or(|extension| extension != "json")
+                    {
+                        continue;
+                    }
+                    let manifest: ArtifactManifest =
+                        serde_json::from_slice(&fs::read(entry.path())?)?;
+                    manifest.validate()?;
+                    if manifest.key.parameters_digest != *semantic_digest {
+                        continue;
+                    }
+                    let relative = self.root_relative_path(&entry.path())?;
+                    discovered.push((manifest, relative));
+                }
+            }
+        }
+        Ok(discovered)
     }
 
     fn update_ccm_eigenpair_continuation_inventory(
@@ -1156,6 +1519,34 @@ fn manifest_matches_dependency_identity(
     let Ok(canonical) = serde_json::from_str::<crate::CanonicalArtifactManifest>(encoded) else {
         return Ok(false);
     };
+    let Some(encoded_semantic_key) = manifest.tags.get(SEMANTIC_KEY_MANIFEST_TAG) else {
+        return Ok(false);
+    };
+    let Ok(semantic_key) = serde_json::from_str::<SemanticKeyEnvelope>(encoded_semantic_key) else {
+        return Ok(false);
+    };
+    if semantic_key.validate().is_err()
+        || semantic_key.artifact_kind != manifest.key.kind
+        || semantic_key.digest()? != manifest.key.parameters_digest
+    {
+        return Ok(false);
+    }
+    let Some(family) = production_staging::family_for_artifact_kind(&semantic_key.artifact_kind)
+    else {
+        return Ok(false);
+    };
+    if validate_retained_canonical_binding(
+        &canonical,
+        &semantic_key,
+        family,
+        &manifest.content_digest,
+        manifest.size_bytes,
+        manifest.provenance_digest.as_ref(),
+    )
+    .is_err()
+    {
+        return Ok(false);
+    }
     Ok(canonical.artifact_family == identity.artifact_family
         && canonical.semantic_digest == identity.semantic_digest
         && canonical.digest()? == identity.manifest_digest
@@ -1168,55 +1559,79 @@ impl CacheStore for FilesystemCacheStore {
         identity: &crate::PayloadDependencyIdentity,
     ) -> Result<Vec<ArtifactManifest>, CacheError> {
         identity.validate()?;
-        // Enumerate kind and logical-key directories, entering only those
-        // whose parameters-digest child matches the identity's semantic
-        // digest. Manifests are read directly and carry their own authoritative
-        // keys, so no directory-name decoding is needed (the component
-        // encoding is not invertible: a literal underscore collides with its
-        // own escape prefix). The scan is bounded by the number of retained
-        // artifacts, not by payload sizes.
-        let artifacts_root = self.root.join("artifacts");
-        if !artifacts_root.is_dir() {
-            return Ok(Vec::new());
-        }
-        let mut matches = Vec::new();
-        for kind_entry in fs::read_dir(&artifacts_root)? {
-            let kind_path = kind_entry?.path();
-            if !kind_path.is_dir() {
-                continue;
+        let key = Self::identity_inventory_key(identity);
+        let inventory_path = self.identity_inventory_path(&identity.semantic_digest);
+        let signature = Self::identity_inventory_signature(&inventory_path)?;
+        if let Some(memo) = self
+            .identity_query_cache
+            .lock()
+            .map_err(|_| CacheError::Io("cache identity query lock poisoned".to_owned()))?
+            .get(&key)
+        {
+            if memo.inventory_signature == signature {
+                return Ok(memo.manifests.clone());
             }
-            for logical_entry in fs::read_dir(&kind_path)? {
-                let logical_path = logical_entry?.path();
-                if !logical_path.is_dir() {
-                    continue;
+        }
+
+        // The persistent inventory answers exact identity queries without
+        // touching the artifact directory tree. An absent entry triggers at
+        // most one bounded directory scan per semantic digest per process,
+        // which also repairs the inventory for manifests written before it
+        // existed or by an older toolkit.
+        let mut matches = self.identity_matches_from_inventory(identity, &inventory_path)?;
+        if matches.is_empty() {
+            // A read-only store cannot persist the rebuilt inventory. Scan on
+            // every inventory miss so a first query for one retained identity
+            // cannot hide a second identity under the same semantic digest.
+            let first_scan = if self.writable {
+                self.scanned_semantic_digests
+                    .lock()
+                    .map_err(|_| CacheError::Io("cache identity scan lock poisoned".to_owned()))?
+                    .insert(identity.semantic_digest.clone())
+            } else {
+                true
+            };
+            if first_scan {
+                let discovered = self.scan_semantic_digest_manifests(&identity.semantic_digest)?;
+                let additions = discovered
+                    .iter()
+                    .filter_map(|(manifest, relative)| {
+                        Self::identity_inventory_entry(manifest, relative)
+                    })
+                    .collect::<Vec<_>>();
+                if !additions.is_empty() && self.writable {
+                    self.record_identity_inventory_entries(&identity.semantic_digest, additions)?;
                 }
-                let manifest_directory = logical_path
-                    .join(&identity.semantic_digest.0)
-                    .join("manifests");
-                if !manifest_directory.is_dir() {
-                    continue;
-                }
-                for entry in fs::read_dir(&manifest_directory)? {
-                    let entry = entry?;
-                    if !entry.file_type()?.is_file()
-                        || entry
-                            .path()
-                            .extension()
-                            .is_none_or(|extension| extension != "json")
-                    {
-                        continue;
-                    }
-                    let manifest: ArtifactManifest =
-                        serde_json::from_slice(&fs::read(entry.path())?)?;
-                    manifest.validate()?;
-                    if manifest.key.parameters_digest != identity.semantic_digest {
-                        continue;
-                    }
+                for (manifest, _) in discovered {
                     if manifest_matches_dependency_identity(&manifest, identity)? {
                         matches.push(manifest);
                     }
                 }
             }
+        }
+        let mut final_signature = Self::identity_inventory_signature(&inventory_path)?;
+        let mut stable = final_signature == signature;
+        if !stable && self.writable {
+            // A different process changed the inventory while this query was
+            // running. Re-read it once; never stamp pre-change results with a
+            // post-change signature, which would turn the race into a durable
+            // false cache hit.
+            matches = self.identity_matches_from_inventory(identity, &inventory_path)?;
+            let after_retry = Self::identity_inventory_signature(&inventory_path)?;
+            stable = after_retry == final_signature;
+            final_signature = after_retry;
+        }
+        if stable {
+            self.identity_query_cache
+                .lock()
+                .map_err(|_| CacheError::Io("cache identity query lock poisoned".to_owned()))?
+                .insert(
+                    key,
+                    IdentityQueryMemo {
+                        inventory_signature: final_signature,
+                        manifests: matches.clone(),
+                    },
+                );
         }
         Ok(matches)
     }
@@ -1459,6 +1874,8 @@ impl CacheStore for FilesystemCacheStore {
 /// reuse streams the entry directly from the archive without extracting it.
 pub struct ZipJsonFilesystemCacheStore {
     inner: FilesystemCacheStore,
+    in_memory_zip_budget: Arc<InMemoryZipBudget>,
+    single_pass_object_limit: u64,
 }
 
 impl ZipJsonFilesystemCacheStore {
@@ -1470,31 +1887,290 @@ impl ZipJsonFilesystemCacheStore {
     ) -> Self {
         Self {
             inner: FilesystemCacheStore::new(name, root, writable, visibility),
+            in_memory_zip_budget: InMemoryZipBudget::global(),
+            single_pass_object_limit: single_pass_zip_object_limit(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_in_memory_zip_limits(
+        mut self,
+        budget: Arc<InMemoryZipBudget>,
+        single_pass_object_limit: u64,
+    ) -> Self {
+        self.in_memory_zip_budget = budget;
+        self.single_pass_object_limit = single_pass_object_limit;
+        self
     }
 
     pub fn root(&self) -> &Path {
         self.inner.root()
     }
 
+    /// Workstation objects are encoded by the same deterministic encoder as
+    /// publication packages, so a verified local object can be published
+    /// byte-for-byte without recompression. `zip_store_and_publication_encoder_agree_byte_for_byte`
+    /// guards that equality.
     fn encode(payload: &[u8]) -> Result<Vec<u8>, CacheError> {
-        let cursor = std::io::Cursor::new(Vec::new());
-        let mut writer = zip::ZipWriter::new(cursor);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated)
-            .compression_level(Some(6))
-            .last_modified_time(zip::DateTime::default())
-            .unix_permissions(0o644)
-            .large_file(true);
-        writer
-            .start_file("payload.json", options)
-            .map_err(|error| CacheError::Io(error.to_string()))?;
-        writer.write_all(payload)?;
-        Ok(writer
-            .finish()
-            .map_err(|error| CacheError::Io(error.to_string()))?
-            .into_inner())
+        Ok(write_deterministic_zip_entry(
+            std::io::Cursor::new(Vec::new()),
+            "payload.json",
+            payload,
+        )?
+        .into_inner())
     }
+
+    /// Verify and decode one ZIP JSON object, reporting which read strategy
+    /// was used. A single pass is taken only when the object fits the
+    /// per-object limit and a reservation against the aggregate in-memory
+    /// allowance succeeds immediately; otherwise the object streams.
+    fn read_zip_object(
+        &self,
+        manifest: &ArtifactManifest,
+        writer: &mut dyn Write,
+    ) -> Result<ZipReadStrategy, CacheError> {
+        manifest.validate()?;
+        if manifest
+            .tags
+            .get("xc_storage_encoding")
+            .is_none_or(|value| value != "zip-json-entry-v1")
+            || manifest.objects.len() != 1
+        {
+            return Err(CacheError::InvalidManifest(
+                "ZIP JSON cache manifest lacks its exact storage encoding".to_owned(),
+            ));
+        }
+        let object = &manifest.objects[0];
+        let object_path = self.inner.object_path(&object.content_digest);
+        if object.size_bytes <= self.single_pass_object_limit {
+            if let Some(_reservation) = self.in_memory_zip_budget.try_reserve(object.size_bytes) {
+                let metadata = match fs::symlink_metadata(&object_path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(CacheError::NotFound(object_path.display().to_string()));
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_file()
+                    || metadata.len() != object.size_bytes
+                {
+                    return Err(CacheError::InvalidManifest(format!(
+                        "object {} has invalid type or size at {}",
+                        object.content_digest,
+                        object_path.display()
+                    )));
+                }
+                let capacity = usize::try_from(object.size_bytes).map_err(|_| {
+                    CacheError::ResourceLimit(
+                        "single-pass ZIP object size does not fit this platform".to_owned(),
+                    )
+                })?;
+                let mut input = fs::File::open(&object_path)?;
+                let mut bytes = Vec::with_capacity(capacity);
+                (&mut input)
+                    .take(object.size_bytes)
+                    .read_to_end(&mut bytes)?;
+                let mut trailing = [0u8; 1];
+                let trailing_bytes = input.read(&mut trailing)?;
+                let digest = ContentDigest::sha256(&bytes);
+                if digest != object.content_digest {
+                    return Err(CacheError::DigestMismatch {
+                        expected: object.content_digest.to_string(),
+                        actual: digest.to_string(),
+                    });
+                }
+                if bytes.len() as u64 != object.size_bytes || trailing_bytes != 0 {
+                    return Err(CacheError::InvalidManifest(format!(
+                        "object {} changed size while being read; observed at least {}, expected {}",
+                        object.content_digest,
+                        bytes.len() + trailing_bytes,
+                        object.size_bytes
+                    )));
+                }
+                let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+                    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                Self::decode_zip_json_entry(archive, manifest, writer)?;
+                return Ok(ZipReadStrategy::SinglePass);
+            }
+        }
+        self.inner.verify_object(object)?;
+        let file = fs::File::open(&object_path)?;
+        let archive = zip::ZipArchive::new(file)
+            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+        Self::decode_zip_json_entry(archive, manifest, writer)?;
+        Ok(ZipReadStrategy::Streamed)
+    }
+
+    fn decode_zip_json_entry<R: Read + Seek>(
+        mut archive: zip::ZipArchive<R>,
+        manifest: &ArtifactManifest,
+        writer: &mut dyn Write,
+    ) -> Result<(), CacheError> {
+        if archive.len() != 1 {
+            return Err(CacheError::InvalidManifest(
+                "ZIP JSON cache object must contain exactly one entry".to_owned(),
+            ));
+        }
+        let mut entry = archive
+            .by_name("payload.json")
+            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+        if entry.size() != manifest.size_bytes {
+            return Err(CacheError::InvalidManifest(format!(
+                "ZIP payload declares {} decoded bytes, expected {}",
+                entry.size(),
+                manifest.size_bytes
+            )));
+        }
+        let mut hasher = Sha256::new();
+        let mut size = 0u64;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let count = entry.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            size = size.checked_add(count as u64).ok_or_else(|| {
+                CacheError::ResourceLimit("decoded ZIP payload exceeds u64".to_owned())
+            })?;
+            if size > manifest.size_bytes {
+                return Err(CacheError::ResourceLimit(format!(
+                    "decoded ZIP payload exceeds declared {}-byte limit",
+                    manifest.size_bytes
+                )));
+            }
+            hasher.update(&buffer[..count]);
+            writer.write_all(&buffer[..count])?;
+        }
+        let digest = ContentDigest(hex_digest(hasher.finalize().as_slice()));
+        if digest != manifest.content_digest || size != manifest.size_bytes {
+            return Err(CacheError::DigestMismatch {
+                expected: manifest.content_digest.to_string(),
+                actual: digest.to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Default size up to which one compressed ZIP object is read in a single
+/// pass: read once into a bounded buffer, hashed from that buffer, then
+/// inflated from memory instead of a second seeking pass over the file. It
+/// matches the split part size, so a
+/// single-pass buffer is never larger than a part the toolkit already holds
+/// in memory while splitting. Override with `XC_CACHE_SINGLE_PASS_ZIP_BYTES`.
+pub const DEFAULT_SINGLE_PASS_ZIP_OBJECT_BYTES: u64 = 90 * 1024 * 1024;
+
+/// Default aggregate bytes that single-pass reads may hold in memory at the
+/// same time, shared by every ZIP store in the process. Override with
+/// `XC_CACHE_IN_MEMORY_ZIP_BYTES`.
+pub const DEFAULT_IN_MEMORY_ZIP_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Hard ceiling for process-local ZIP memory overrides. Values above this are
+/// treated as invalid rather than becoming effectively unbounded.
+pub const MAXIMUM_IN_MEMORY_ZIP_OVERRIDE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+pub const SINGLE_PASS_ZIP_OBJECT_BYTES_ENV: &str = "XC_CACHE_SINGLE_PASS_ZIP_BYTES";
+pub const IN_MEMORY_ZIP_BYTES_ENV: &str = "XC_CACHE_IN_MEMORY_ZIP_BYTES";
+
+/// Parse a byte-limit override. Anything that is not a positive integer,
+/// including an empty, negative, overflowing, or unparsable value, yields
+/// the default deterministically. An override can therefore never fail a
+/// run and never produce an unbounded limit.
+fn parse_byte_limit(value: Option<&str>, default: u64) -> u64 {
+    value
+        .map(str::trim)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|limit| *limit > 0 && *limit <= MAXIMUM_IN_MEMORY_ZIP_OVERRIDE_BYTES)
+        .unwrap_or(default)
+}
+
+fn single_pass_zip_object_limit() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        parse_byte_limit(
+            std::env::var(SINGLE_PASS_ZIP_OBJECT_BYTES_ENV)
+                .ok()
+                .as_deref(),
+            DEFAULT_SINGLE_PASS_ZIP_OBJECT_BYTES,
+        )
+    })
+}
+
+/// Aggregate allowance for compressed ZIP objects that single-pass reads hold
+/// in memory. Reservation never waits: a read that does not fit streams
+/// through the two-pass path instead, so a saturated allowance costs disk
+/// reads, never latency or memory.
+pub struct InMemoryZipBudget {
+    limit: u64,
+    in_use: Mutex<u64>,
+}
+
+impl InMemoryZipBudget {
+    fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            in_use: Mutex::new(0),
+        }
+    }
+
+    /// The process-wide allowance every store created with `new` shares.
+    pub fn global() -> Arc<Self> {
+        static GLOBAL: OnceLock<Arc<InMemoryZipBudget>> = OnceLock::new();
+        Arc::clone(GLOBAL.get_or_init(|| {
+            Arc::new(Self::new(parse_byte_limit(
+                std::env::var(IN_MEMORY_ZIP_BYTES_ENV).ok().as_deref(),
+                DEFAULT_IN_MEMORY_ZIP_BYTES,
+            )))
+        }))
+    }
+
+    fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<InMemoryZipReservation> {
+        let mut in_use = self
+            .in_use
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let projected = in_use.checked_add(bytes)?;
+        if projected > self.limit {
+            return None;
+        }
+        *in_use = projected;
+        Some(InMemoryZipReservation {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn in_use(&self) -> u64 {
+        *self
+            .in_use
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Bytes of one compressed object held in memory; released on drop.
+struct InMemoryZipReservation {
+    budget: Arc<InMemoryZipBudget>,
+    bytes: u64,
+}
+
+impl Drop for InMemoryZipReservation {
+    fn drop(&mut self) {
+        let mut in_use = self
+            .budget
+            .in_use
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *in_use = in_use.saturating_sub(self.bytes);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ZipReadStrategy {
+    SinglePass,
+    Streamed,
 }
 
 impl CacheStore for ZipJsonFilesystemCacheStore {
@@ -1521,6 +2197,10 @@ impl CacheStore for ZipJsonFilesystemCacheStore {
             "xc_storage_encoding".to_owned(),
             "zip-json-entry-v1".to_owned(),
         );
+        encoded_draft.tags.insert(
+            STORAGE_ENCODER_PROFILE_TAG.to_owned(),
+            CURRENT_DETERMINISTIC_ZIP64_PROFILE.to_owned(),
+        );
         self.inner.publish_manifest(
             &encoded_draft,
             vec![object],
@@ -1543,6 +2223,13 @@ impl CacheStore for ZipJsonFilesystemCacheStore {
             .matching_keys(kind, logical_key_prefix, maximum_keys)
     }
 
+    fn identity_candidates(
+        &self,
+        identity: &crate::PayloadDependencyIdentity,
+    ) -> Result<Vec<ArtifactManifest>, CacheError> {
+        self.inner.identity_candidates(identity)
+    }
+
     fn ccm_eigenpair_continuation_keys(
         &self,
         query: &CcmEigenpairContinuationQuery,
@@ -1557,50 +2244,35 @@ impl CacheStore for ZipJsonFilesystemCacheStore {
         manifest: &ArtifactManifest,
         writer: &mut dyn Write,
     ) -> Result<(), CacheError> {
-        manifest.validate()?;
-        if manifest
-            .tags
-            .get("xc_storage_encoding")
-            .is_none_or(|value| value != "zip-json-entry-v1")
-            || manifest.objects.len() != 1
-        {
-            return Err(CacheError::InvalidManifest(
-                "ZIP JSON cache manifest lacks its exact storage encoding".to_owned(),
-            ));
-        }
+        self.read_zip_object(manifest, writer).map(|_| ())
+    }
+
+    fn read_payload_and_encoded(
+        &self,
+        manifest: &ArtifactManifest,
+    ) -> Result<(Vec<u8>, Option<VerifiedEncodedPayload>), CacheError> {
+        let capacity = usize::try_from(manifest.size_bytes).unwrap_or(0);
+        let mut payload = Vec::with_capacity(capacity);
+        // `read_payload_to` verifies the compressed object before opening it
+        // and then verifies the logical JSON while decoding. Constructing the
+        // descriptor from that same verified object avoids hashing the full
+        // ZIP a second time on every local reuse hit.
+        self.read_payload_to(manifest, &mut payload)?;
         let object = &manifest.objects[0];
-        self.inner.verify_object(object)?;
-        let file = fs::File::open(self.inner.object_path(&object.content_digest))?;
-        let mut archive = zip::ZipArchive::new(file)
-            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
-        if archive.len() != 1 {
-            return Err(CacheError::InvalidManifest(
-                "ZIP JSON cache object must contain exactly one entry".to_owned(),
-            ));
-        }
-        let mut entry = archive
-            .by_name("payload.json")
-            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
-        let mut hasher = Sha256::new();
-        let mut size = 0u64;
-        let mut buffer = vec![0u8; 1024 * 1024];
-        loop {
-            let count = entry.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            hasher.update(&buffer[..count]);
-            writer.write_all(&buffer[..count])?;
-            size = size.saturating_add(count as u64);
-        }
-        let digest = ContentDigest(hex_digest(hasher.finalize().as_slice()));
-        if digest != manifest.content_digest || size != manifest.size_bytes {
-            return Err(CacheError::DigestMismatch {
-                expected: manifest.content_digest.to_string(),
-                actual: digest.to_string(),
-            });
-        }
-        Ok(())
+        Ok((
+            payload,
+            manifest
+                .tags
+                .get(STORAGE_ENCODER_PROFILE_TAG)
+                .filter(|profile| supported_storage_encoder_profile(profile))
+                .map(|profile| VerifiedEncodedPayload {
+                    path: self.inner.object_path(&object.content_digest),
+                    encoding: "zip-json-entry-v1".to_owned(),
+                    encoder_profile: Some(profile.clone()),
+                    content_digest: object.content_digest.clone(),
+                    size_bytes: object.size_bytes,
+                }),
+        ))
     }
 
     fn verified_encoded_payload(
@@ -1616,11 +2288,21 @@ impl CacheStore for ZipJsonFilesystemCacheStore {
         {
             return Ok(None);
         }
+        let Some(encoder_profile) = manifest.tags.get(STORAGE_ENCODER_PROFILE_TAG) else {
+            // Legacy local ZIP objects remain valid logical cache entries, but
+            // their writer profile was not persisted and must not be asserted
+            // when adopting their bytes for publication.
+            return Ok(None);
+        };
+        if !supported_storage_encoder_profile(encoder_profile) {
+            return Ok(None);
+        }
         let object = &manifest.objects[0];
         self.inner.verify_object(object)?;
         Ok(Some(VerifiedEncodedPayload {
             path: self.inner.object_path(&object.content_digest),
             encoding: "zip-json-entry-v1".to_owned(),
+            encoder_profile: Some(encoder_profile.clone()),
             content_digest: object.content_digest.clone(),
             size_bytes: object.size_bytes,
         }))
@@ -1636,7 +2318,12 @@ impl CacheStore for ZipJsonFilesystemCacheStore {
         if !self.inner.writable {
             return Err(CacheError::ReadOnlyLayer(self.inner.name.clone()));
         }
-        if encoded.encoding != "zip-json-entry-v1" {
+        let Some(encoder_profile) = encoded.encoder_profile.as_deref() else {
+            return Ok(None);
+        };
+        if encoded.encoding != "zip-json-entry-v1"
+            || !supported_storage_encoder_profile(encoder_profile)
+        {
             return Ok(None);
         }
         let object = self.inner.ensure_verified_object(encoded)?;
@@ -1644,6 +2331,10 @@ impl CacheStore for ZipJsonFilesystemCacheStore {
         encoded_draft.tags.insert(
             "xc_storage_encoding".to_owned(),
             "zip-json-entry-v1".to_owned(),
+        );
+        encoded_draft.tags.insert(
+            STORAGE_ENCODER_PROFILE_TAG.to_owned(),
+            encoder_profile.to_owned(),
         );
         Ok(Some(self.inner.publish_manifest(
             &encoded_draft,
@@ -1666,6 +2357,17 @@ pub struct ResolvedArtifact {
     pub encoded_payload: Option<VerifiedEncodedPayload>,
 }
 
+/// An exact artifact resolved as metadata plus its verified encoded
+/// representation. No logical payload was read: publication staging can
+/// split the encoded object and, when parts are retained, link them
+/// directly.
+pub struct ResolvedEncodedArtifact {
+    pub layer_name: String,
+    pub manifest: ArtifactManifest,
+    pub encoded: VerifiedEncodedPayload,
+    pub transport: Option<VerifiedTransportParts>,
+}
+
 pub struct CacheResolver {
     layers: Vec<CacheLayer>,
 }
@@ -1674,6 +2376,117 @@ impl CacheResolver {
     pub fn new(mut layers: Vec<CacheLayer>) -> Self {
         layers.sort_by_key(|layer| layer.precedence);
         Self { layers }
+    }
+
+    pub fn verified_transport_parts(
+        &self,
+        layer_name: &str,
+        manifest: &ArtifactManifest,
+    ) -> Result<Option<VerifiedTransportParts>, CacheError> {
+        let layer = self
+            .layers
+            .iter()
+            .find(|layer| layer.store.name() == layer_name)
+            .ok_or_else(|| CacheError::NotFound(format!("cache layer {layer_name:?}")))?;
+        layer.store.verified_transport_parts(manifest)
+    }
+
+    /// Resolve exact key-based dependency metadata in precedence order, then
+    /// ask each selected layer to prepare all of its transports as one batch.
+    /// No logical payload is decoded here.
+    pub fn prefetch_exact_dependencies(
+        &self,
+        dependencies: &[DependencyRef],
+        policy: &CachePolicy,
+    ) -> Result<(), CacheError> {
+        let mut selected = (0..self.layers.len())
+            .map(|_| Vec::<ArtifactManifest>::new())
+            .collect::<Vec<_>>();
+        for dependency in dependencies {
+            let mut found = false;
+            for (index, layer) in self.layers.iter().enumerate() {
+                if let Some(manifest) =
+                    layer
+                        .store
+                        .candidates(&dependency.key)?
+                        .into_iter()
+                        .find(|manifest| {
+                            manifest.content_digest == dependency.content_digest
+                                && manifest.quality.admissible_rank()
+                                    >= dependency.required_quality.admissible_rank()
+                                && policy.accepts(manifest)
+                        })
+                {
+                    selected[index].push(manifest);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(CacheError::NotFound(format!(
+                    "{} / {} with digest {}",
+                    dependency.key.kind, dependency.key.logical_key, dependency.content_digest
+                )));
+            }
+        }
+        for (layer, manifests) in self.layers.iter().zip(selected) {
+            if !manifests.is_empty() {
+                layer.store.prefetch_manifests(&manifests)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve exact canonical dependency metadata in precedence order, then
+    /// prepare sibling transports together. This forms a bounded progressive
+    /// wavefront: each verified canonical manifest reveals the next exact set.
+    pub fn prefetch_dependency_identities(
+        &self,
+        identities: &[crate::PayloadDependencyIdentity],
+        policy: &CachePolicy,
+    ) -> Result<(), CacheError> {
+        let mut selected = (0..self.layers.len())
+            .map(|_| Vec::<ArtifactManifest>::new())
+            .collect::<Vec<_>>();
+        for identity in identities {
+            identity.validate()?;
+            let mut found = false;
+            for (index, layer) in self.layers.iter().enumerate() {
+                for manifest in layer.store.identity_candidates(identity)? {
+                    if !policy.accepts(&manifest) {
+                        continue;
+                    }
+                    if !manifest_matches_dependency_identity(&manifest, identity)? {
+                        return Err(CacheError::InvalidManifest(format!(
+                            "cache layer {} returned a candidate that does not match dependency identity {}/{}",
+                            layer.store.name(),
+                            identity.artifact_family,
+                            identity.semantic_digest.0
+                        )));
+                    }
+                    selected[index].push(manifest);
+                    found = true;
+                    break;
+                }
+                if found {
+                    break;
+                }
+            }
+            if !found {
+                return Err(CacheError::NotFound(format!(
+                    "published dependency {}/{} (manifest {})",
+                    identity.artifact_family,
+                    identity.semantic_digest.0,
+                    identity.manifest_digest.0
+                )));
+            }
+        }
+        for (layer, manifests) in self.layers.iter().zip(selected) {
+            if !manifests.is_empty() {
+                layer.store.prefetch_manifests(&manifests)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn resolve_manifest(
@@ -1785,8 +2598,7 @@ impl CacheResolver {
                     ));
                     continue;
                 }
-                let payload = layer.store.read_payload(&manifest)?;
-                let encoded_payload = layer.store.verified_encoded_payload(&manifest)?;
+                let (payload, encoded_payload) = layer.store.read_payload_and_encoded(&manifest)?;
                 return Ok(ResolvedArtifact {
                     layer_name: layer.store.name().to_owned(),
                     manifest,
@@ -1801,6 +2613,128 @@ impl CacheResolver {
             key.logical_key,
             rejected.join(", ")
         )))
+    }
+
+    /// Resolve and load one exact key/content pair. Dependency closure must
+    /// not accidentally select a newer candidate for the same semantic key,
+    /// and it selects the same candidate `prefetch_exact_dependencies`
+    /// prepared: the first layer whose copy has the exact digest and at least
+    /// the required quality.
+    pub fn resolve_exact(
+        &self,
+        key: &ArtifactKey,
+        content_digest: &ContentDigest,
+        required_quality: CacheQuality,
+        policy: &CachePolicy,
+    ) -> Result<ResolvedArtifact, CacheError> {
+        for layer in &self.layers {
+            for manifest in layer.store.candidates(key)? {
+                if !Self::exact_candidate_accepted(
+                    &manifest,
+                    content_digest,
+                    required_quality,
+                    policy,
+                ) {
+                    continue;
+                }
+                let (payload, encoded_payload) = layer.store.read_payload_and_encoded(&manifest)?;
+                return Ok(ResolvedArtifact {
+                    layer_name: layer.store.name().to_owned(),
+                    manifest,
+                    payload,
+                    encoded_payload,
+                });
+            }
+        }
+        Err(CacheError::NotFound(format!(
+            "{} / {} with digest {}",
+            key.kind, key.logical_key, content_digest
+        )))
+    }
+
+    fn exact_candidate_accepted(
+        manifest: &ArtifactManifest,
+        content_digest: &ContentDigest,
+        required_quality: CacheQuality,
+        policy: &CachePolicy,
+    ) -> bool {
+        &manifest.content_digest == content_digest
+            && manifest.quality.admissible_rank() >= required_quality.admissible_rank()
+            && policy.accepts(manifest)
+    }
+
+    /// Resolve one exact key/content pair as metadata plus its verified
+    /// encoded representation, without reading the logical payload. Returns
+    /// `Ok(None)` when the selected layer retains no encoded form, in which
+    /// case `resolve_exact` selects the same layer and loads the payload.
+    pub fn resolve_exact_encoded(
+        &self,
+        key: &ArtifactKey,
+        content_digest: &ContentDigest,
+        required_quality: CacheQuality,
+        policy: &CachePolicy,
+    ) -> Result<Option<ResolvedEncodedArtifact>, CacheError> {
+        for layer in &self.layers {
+            for manifest in layer.store.candidates(key)? {
+                if !Self::exact_candidate_accepted(
+                    &manifest,
+                    content_digest,
+                    required_quality,
+                    policy,
+                ) {
+                    continue;
+                }
+                let Some(encoded) = layer.store.verified_encoded_payload(&manifest)? else {
+                    return Ok(None);
+                };
+                let transport = layer.store.verified_transport_parts(&manifest)?;
+                return Ok(Some(ResolvedEncodedArtifact {
+                    layer_name: layer.store.name().to_owned(),
+                    manifest,
+                    encoded,
+                    transport,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Identity-addressed counterpart of `resolve_exact_encoded`. Candidates
+    /// are re-verified against the requested identity exactly as in
+    /// `resolve_dependency_identity`.
+    pub fn resolve_dependency_identity_encoded(
+        &self,
+        identity: &crate::PayloadDependencyIdentity,
+        policy: &CachePolicy,
+    ) -> Result<Option<ResolvedEncodedArtifact>, CacheError> {
+        identity.validate()?;
+        for layer in &self.layers {
+            for manifest in layer.store.identity_candidates(identity)? {
+                if !policy.accepts(&manifest) {
+                    continue;
+                }
+                if !manifest_matches_dependency_identity(&manifest, identity)? {
+                    return Err(CacheError::InvalidManifest(format!(
+                        "cache layer {} returned a candidate that does not match dependency \
+                         identity {}/{}",
+                        layer.store.name(),
+                        identity.artifact_family,
+                        identity.semantic_digest.0
+                    )));
+                }
+                let Some(encoded) = layer.store.verified_encoded_payload(&manifest)? else {
+                    return Ok(None);
+                };
+                let transport = layer.store.verified_transport_parts(&manifest)?;
+                return Ok(Some(ResolvedEncodedArtifact {
+                    layer_name: layer.store.name().to_owned(),
+                    manifest,
+                    encoded,
+                    transport,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     /// Return distinct keys visible through all configured layers. Layer
@@ -1835,8 +2769,7 @@ impl CacheResolver {
                         identity.semantic_digest.0
                     )));
                 }
-                let payload = layer.store.read_payload(&manifest)?;
-                let encoded_payload = layer.store.verified_encoded_payload(&manifest)?;
+                let (payload, encoded_payload) = layer.store.read_payload_and_encoded(&manifest)?;
                 return Ok(Some(ResolvedArtifact {
                     layer_name: layer.store.name().to_owned(),
                     manifest,
@@ -2226,6 +3159,720 @@ mod tests {
         assert!(keys
             .iter()
             .all(|key| key.logical_key.starts_with("ccm/weil-eigenpair/13/")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn zip_store_memoizes_exact_identity_queries_without_scanning_unrelated_manifests() {
+        let root = temporary_root("xc-cache-zip-identity-inventory");
+        let _ = fs::remove_dir_all(&root);
+        let store = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let payload = br#"{"fixture":true}"#;
+        let semantic_key = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "ccm_tau_matrix".to_owned(),
+            mathematical_semantics_version: "fixture-v1".to_owned(),
+            resolved_mathematical_parameters: serde_json::json!({"case": "identity-index"}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        let semantic_digest = semantic_key.digest().unwrap();
+        let canonical_payload = CanonicalPayloadEnvelope {
+            schema_version: 1,
+            scalar_backend: "json".to_owned(),
+            precision_bits: None,
+            scalar_representation: "json".to_owned(),
+            dimensions: vec![payload.len() as u64],
+            endianness: "not-applicable".to_owned(),
+            special_value_encoding: "not-applicable".to_owned(),
+            ordered_items: vec![LogicalPayloadItem {
+                normalized_path: "payload.json".to_owned(),
+                content_digest: ContentDigest::sha256(payload),
+                size_bytes: payload.len() as u64,
+            }],
+            dependencies: Vec::new(),
+        };
+        let payload_digest = canonical_payload.digest().unwrap();
+        let canonical = CanonicalArtifactManifest {
+            schema_version: 1,
+            artifact_family: "ccm-matrices".to_owned(),
+            semantic_key: semantic_key.clone(),
+            semantic_digest: semantic_digest.clone(),
+            canonical_payload,
+            payload_digest: payload_digest.clone(),
+            transport_digests: vec![ContentDigest::sha256(b"transport")],
+            resolved_mathematical_configuration_digest: ContentDigest::sha256(b"configuration"),
+            producer_toolkit_version: version("0.14.1"),
+            minimum_reader_version: version("0.14.1"),
+            maximum_reader_version: None,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            claim_scope: "identity inventory fixture".to_owned(),
+            assumptions: Vec::new(),
+        };
+        let identity = PayloadDependencyIdentity {
+            artifact_family: canonical.artifact_family.clone(),
+            semantic_digest: semantic_digest.clone(),
+            manifest_digest: canonical.digest().unwrap(),
+            payload_digest,
+        };
+
+        let unrelated = root
+            .join("artifacts")
+            .join("unrelated")
+            .join("logical")
+            .join(ContentDigest::sha256(b"unrelated-semantic").0)
+            .join("manifests")
+            .join("invalid.json");
+        fs::create_dir_all(unrelated.parent().unwrap()).unwrap();
+        fs::write(&unrelated, b"not json").unwrap();
+
+        // Cache the empty exact query first. The unrelated corrupt manifest
+        // must not be parsed, and a later same-process write must update the
+        // memoized result rather than remaining invisible until restart.
+        assert!(store.identity_candidates(&identity).unwrap().is_empty());
+        let key = ArtifactKey {
+            kind: semantic_key.artifact_kind.clone(),
+            logical_key: "ccm/fixture/identity-index".to_owned(),
+            parameters_digest: semantic_digest,
+        };
+        let mut artifact = draft(key, CacheQuality::Validated, CacheVisibility::Local);
+        artifact.tags.insert(
+            SEMANTIC_KEY_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&semantic_key).unwrap(),
+        );
+        artifact.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&canonical).unwrap(),
+        );
+        let honest = store.put(&artifact, payload).unwrap();
+        assert_eq!(store.identity_candidates(&identity).unwrap().len(), 1);
+
+        // A local adapter cannot claim the honest published identity while
+        // carrying different payload bytes. The inventory is only a lookup
+        // accelerator; every candidate is rebound to its semantic envelope,
+        // payload digest/size, and canonical-manifest provenance before use.
+        let tampered = store
+            .put(&artifact, br#"{"fixture":"different bytes"}"#)
+            .unwrap();
+        assert_ne!(tampered.content_digest, honest.content_digest);
+        let found = store.identity_candidates(&identity).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].content_digest, honest.content_digest);
+
+        let reopened =
+            ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        assert_eq!(reopened.identity_candidates(&identity).unwrap().len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn zip_store_and_publication_encoder_agree_byte_for_byte() {
+        // Staging publishes a workstation ZIP object directly, so the store
+        // encoder and the deterministic packager must never diverge.
+        let root = temporary_root("xc-cache-encoder-agreement");
+        let _ = fs::remove_dir_all(&root);
+        let payload = br#"{"entries":["1.0","0.0","0.0","1.0"],"note":"encoder agreement"}"#;
+        let envelope = CanonicalPayloadEnvelope {
+            schema_version: 1,
+            scalar_backend: "json".to_owned(),
+            precision_bits: None,
+            scalar_representation: "json".to_owned(),
+            dimensions: vec![payload.len() as u64],
+            endianness: "not-applicable".to_owned(),
+            special_value_encoding: "not-applicable".to_owned(),
+            ordered_items: vec![LogicalPayloadItem {
+                normalized_path: "payload.json".to_owned(),
+                content_digest: ContentDigest::sha256(payload),
+                size_bytes: payload.len() as u64,
+            }],
+            dependencies: Vec::new(),
+        };
+        let package_path = root.join("package.zip");
+        let package = package_canonical_payload_bytes_zip64(
+            &envelope,
+            "payload.json",
+            payload,
+            &package_path,
+            &xc_core::ResourcePolicy::default(),
+            &xc_core::CancellationToken::new(),
+        )
+        .unwrap();
+        let store_bytes = ZipJsonFilesystemCacheStore::encode(payload).unwrap();
+        assert_eq!(store_bytes, fs::read(&package_path).unwrap());
+        assert_eq!(ContentDigest::sha256(&store_bytes), package.package_digest);
+        assert_eq!(package.encoder_profile, CURRENT_DETERMINISTIC_ZIP64_PROFILE);
+        let source_path = root.join("payload.json");
+        fs::write(&source_path, payload).unwrap();
+        let file_package_path = root.join("file-package.zip");
+        let file_package = package_canonical_payload_zip64(
+            &envelope,
+            &[PayloadFileSource {
+                normalized_path: "payload.json".to_owned(),
+                source_path,
+            }],
+            &file_package_path,
+            &xc_core::ResourcePolicy::default(),
+            &xc_core::CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            file_package.encoder_profile,
+            CURRENT_DETERMINISTIC_ZIP64_PROFILE
+        );
+        assert_eq!(package.encoder_profile, DETERMINISTIC_ZIP64_PROFILE_V1);
+        assert_eq!(fs::read(file_package_path).unwrap(), store_bytes);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn zip_store_persists_encoder_provenance_and_legacy_objects_are_decode_only() {
+        let root = temporary_root("xc-cache-encoder-provenance");
+        let _ = fs::remove_dir_all(&root);
+        let store = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let key = ArtifactKey::new("ccm_tau_matrix", "ccm/fixture/profile", b"profile").unwrap();
+        let payload = br#"{"profile":"bound"}"#;
+        let manifest = store
+            .put(
+                &draft(key, CacheQuality::Validated, CacheVisibility::Local),
+                payload,
+            )
+            .unwrap();
+        assert_eq!(
+            manifest
+                .tags
+                .get(STORAGE_ENCODER_PROFILE_TAG)
+                .map(String::as_str),
+            Some(CURRENT_DETERMINISTIC_ZIP64_PROFILE)
+        );
+        assert_eq!(
+            store
+                .verified_encoded_payload(&manifest)
+                .unwrap()
+                .unwrap()
+                .encoder_profile
+                .as_deref(),
+            Some(CURRENT_DETERMINISTIC_ZIP64_PROFILE)
+        );
+
+        let mut unknown = manifest.clone();
+        unknown.tags.insert(
+            STORAGE_ENCODER_PROFILE_TAG.to_owned(),
+            "unrecognized-test-encoder".to_owned(),
+        );
+        assert!(store.verified_encoded_payload(&unknown).unwrap().is_none());
+        let (decoded, encoded) = store.read_payload_and_encoded(&unknown).unwrap();
+        assert_eq!(decoded, payload);
+        assert!(
+            encoded.is_none(),
+            "an unrecognized encoder profile may be decoded but not adopted"
+        );
+
+        let mut legacy = manifest;
+        legacy.tags.remove(STORAGE_ENCODER_PROFILE_TAG);
+        assert!(store.verified_encoded_payload(&legacy).unwrap().is_none());
+        let (decoded, encoded) = store.read_payload_and_encoded(&legacy).unwrap();
+        assert_eq!(decoded, payload);
+        assert!(
+            encoded.is_none(),
+            "an unprofiled legacy object may be decoded but not adopted for publication"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verified_object_adoption_hashes_the_source_before_exposing_it() {
+        let root = temporary_root("xc-cache-verified-object-source-hash");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let store = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let source = root.join("offered.zip");
+        fs::write(&source, b"bytes that do not match the offered digest").unwrap();
+        let offered_digest = ContentDigest::sha256(b"different bytes");
+        let offered = VerifiedEncodedPayload {
+            path: source,
+            encoding: "zip-json-entry-v1".to_owned(),
+            encoder_profile: Some(CURRENT_DETERMINISTIC_ZIP64_PROFILE.to_owned()),
+            content_digest: offered_digest.clone(),
+            size_bytes: b"bytes that do not match the offered digest".len() as u64,
+        };
+        let key = ArtifactKey::new("ccm_tau_matrix", "ccm/fixture/adopt", b"adopt").unwrap();
+        let mut unsupported = offered.clone();
+        unsupported.encoder_profile = Some("unrecognized-test-encoder".to_owned());
+        assert!(store
+            .put_verified_encoded_payload(
+                &draft(key.clone(), CacheQuality::Validated, CacheVisibility::Local,),
+                &ContentDigest::sha256(b"logical"),
+                b"logical".len() as u64,
+                &unsupported,
+            )
+            .unwrap()
+            .is_none());
+        let result = store.put_verified_encoded_payload(
+            &draft(key, CacheQuality::Validated, CacheVisibility::Local),
+            &ContentDigest::sha256(b"logical"),
+            b"logical".len() as u64,
+            &offered,
+        );
+        assert!(matches!(result, Err(CacheError::DigestMismatch { .. })));
+        assert!(
+            !store.inner.object_path(&offered_digest).exists(),
+            "unverified bytes must never become visible at a content-addressed destination"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn zip_decode_rejects_declared_logical_size_before_inflating() {
+        let budget = Arc::new(InMemoryZipBudget::new(1024 * 1024));
+        let (store, manifest, root) =
+            zip_store_with_object("xc-cache-zip-logical-bound", budget, 1024 * 1024);
+        let mut inconsistent = manifest;
+        inconsistent.size_bytes -= 1;
+        let mut output = Vec::new();
+        assert!(matches!(
+            store.read_zip_object(&inconsistent, &mut output),
+            Err(CacheError::InvalidManifest(_))
+        ));
+        assert!(
+            output.is_empty(),
+            "declared-size disagreement must be rejected before decompression writes bytes"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_exact_selects_the_exact_digest_not_the_newest_candidate() {
+        let root = temporary_root("xc-cache-resolve-exact");
+        let _ = fs::remove_dir_all(&root);
+        let store = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let key = ArtifactKey::new("ccm_tau_matrix", "ccm/fixture/exact", b"exact").unwrap();
+        let older = store
+            .put(
+                &draft(key.clone(), CacheQuality::Validated, CacheVisibility::Local),
+                br#"{"generation":1}"#,
+            )
+            .unwrap();
+        let newer = store
+            .put(
+                &draft(key.clone(), CacheQuality::Validated, CacheVisibility::Local),
+                br#"{"generation":2}"#,
+            )
+            .unwrap();
+        assert_ne!(older.content_digest, newer.content_digest);
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(store),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: version("0.13.0"),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        // A child that recorded the older generation as its dependency must
+        // resolve exactly that generation even though a newer one is live.
+        let resolved = resolver
+            .resolve_exact(
+                &key,
+                &older.content_digest,
+                CacheQuality::Validated,
+                &policy,
+            )
+            .unwrap();
+        assert_eq!(resolved.manifest.content_digest, older.content_digest);
+        assert_eq!(resolved.payload, br#"{"generation":1}"#);
+        let resolved = resolver
+            .resolve_exact(
+                &key,
+                &newer.content_digest,
+                CacheQuality::Validated,
+                &policy,
+            )
+            .unwrap();
+        assert_eq!(resolved.manifest.content_digest, newer.content_digest);
+        // The metadata-only route selects the same candidate and never reads
+        // the logical payload.
+        let encoded = resolver
+            .resolve_exact_encoded(
+                &key,
+                &older.content_digest,
+                CacheQuality::Validated,
+                &policy,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(encoded.manifest.content_digest, older.content_digest);
+        assert_eq!(
+            encoded.encoded.content_digest,
+            older.objects[0].content_digest
+        );
+        // A quality floor above the candidate's quality is a miss, matching
+        // the prefetch selection rule.
+        assert!(matches!(
+            resolver.resolve_exact(
+                &key,
+                &older.content_digest,
+                CacheQuality::Certified,
+                &policy
+            ),
+            Err(CacheError::NotFound(_))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn identity_inventory_persists_and_sees_writes_from_another_store_instance() {
+        let root = temporary_root("xc-cache-identity-inventory-cross-instance");
+        let _ = fs::remove_dir_all(&root);
+        let payload = br#"{"fixture":"cross-instance"}"#;
+        let semantic_key = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "ccm_tau_matrix".to_owned(),
+            mathematical_semantics_version: "fixture-v1".to_owned(),
+            resolved_mathematical_parameters: serde_json::json!({"case": "cross-instance"}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        let semantic_digest = semantic_key.digest().unwrap();
+        let canonical_payload = CanonicalPayloadEnvelope {
+            schema_version: 1,
+            scalar_backend: "json".to_owned(),
+            precision_bits: None,
+            scalar_representation: "json".to_owned(),
+            dimensions: vec![payload.len() as u64],
+            endianness: "not-applicable".to_owned(),
+            special_value_encoding: "not-applicable".to_owned(),
+            ordered_items: vec![LogicalPayloadItem {
+                normalized_path: "payload.json".to_owned(),
+                content_digest: ContentDigest::sha256(payload),
+                size_bytes: payload.len() as u64,
+            }],
+            dependencies: Vec::new(),
+        };
+        let payload_digest = canonical_payload.digest().unwrap();
+        let canonical = CanonicalArtifactManifest {
+            schema_version: 1,
+            artifact_family: "ccm-matrices".to_owned(),
+            semantic_key: semantic_key.clone(),
+            semantic_digest: semantic_digest.clone(),
+            canonical_payload,
+            payload_digest: payload_digest.clone(),
+            transport_digests: vec![ContentDigest::sha256(b"transport")],
+            resolved_mathematical_configuration_digest: ContentDigest::sha256(b"configuration"),
+            producer_toolkit_version: version("0.14.1"),
+            minimum_reader_version: version("0.14.1"),
+            maximum_reader_version: None,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            claim_scope: "identity inventory fixture".to_owned(),
+            assumptions: Vec::new(),
+        };
+        let identity = PayloadDependencyIdentity {
+            artifact_family: canonical.artifact_family.clone(),
+            semantic_digest: semantic_digest.clone(),
+            manifest_digest: canonical.digest().unwrap(),
+            payload_digest,
+        };
+        let key = ArtifactKey {
+            kind: semantic_key.artifact_kind.clone(),
+            logical_key: "ccm/fixture/cross-instance".to_owned(),
+            parameters_digest: semantic_digest.clone(),
+        };
+        let mut artifact = draft(key, CacheQuality::Validated, CacheVisibility::Local);
+        artifact.tags.insert(
+            SEMANTIC_KEY_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&semantic_key).unwrap(),
+        );
+        artifact.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&canonical).unwrap(),
+        );
+
+        // Instance A memoizes a miss. Instance B (another process in
+        // practice) writes the artifact. A's next query must see it without
+        // a restart because the inventory file changed under its memo.
+        let reader = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        assert!(reader.identity_candidates(&identity).unwrap().is_empty());
+        let writer = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let manifest = writer.put(&artifact, payload).unwrap();
+        let mut second_canonical = canonical.clone();
+        second_canonical.producer_toolkit_version = version("0.14.2");
+        let second_identity = PayloadDependencyIdentity {
+            artifact_family: second_canonical.artifact_family.clone(),
+            semantic_digest: semantic_digest.clone(),
+            manifest_digest: second_canonical.digest().unwrap(),
+            payload_digest: second_canonical.payload_digest.clone(),
+        };
+        let mut second_artifact = artifact.clone();
+        second_artifact.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&second_canonical).unwrap(),
+        );
+        writer.put(&second_artifact, payload).unwrap();
+        let inventory_path = writer
+            .inner
+            .identity_inventory_path(&identity.semantic_digest);
+        assert!(inventory_path.is_file(), "writes maintain the inventory");
+        let found = reader.identity_candidates(&identity).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].content_digest, manifest.content_digest);
+
+        // A cache written before the inventory existed (or by an older
+        // writer) is repaired by one bounded scan of the semantic digest.
+        fs::remove_dir_all(root.join("identities")).unwrap();
+        let legacy = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let found = legacy.identity_candidates(&identity).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(
+            inventory_path.is_file(),
+            "the legacy scan rebuilds the inventory for later queries"
+        );
+        let inventory: IdentityInventory =
+            serde_json::from_slice(&fs::read(&inventory_path).unwrap()).unwrap();
+        assert_eq!(inventory.entries.len(), 2);
+        assert!(inventory
+            .entries
+            .iter()
+            .any(|entry| entry.content_digest == manifest.content_digest));
+
+        // Read-only stores cannot repair the persistent inventory. They must
+        // therefore rescan after an inventory miss: finding one identity may
+        // not mark the shared semantic digest as exhausted and hide a second
+        // retained manifest under that digest.
+        fs::remove_dir_all(root.join("identities")).unwrap();
+        let read_only =
+            ZipJsonFilesystemCacheStore::new("local", &root, false, CacheVisibility::Local);
+        assert_eq!(read_only.identity_candidates(&identity).unwrap().len(), 1);
+        assert_eq!(
+            read_only
+                .identity_candidates(&second_identity)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!inventory_path.exists());
+
+        // A drive-qualified path is absolute on Windows even though it does
+        // not begin with a slash. Inventory data is untrusted and may never
+        // escape the cache root on any platform.
+        fs::create_dir_all(inventory_path.parent().unwrap()).unwrap();
+        fs::write(
+            &inventory_path,
+            serde_json::to_vec_pretty(&IdentityInventory {
+                schema_version: 1,
+                entries: vec![IdentityInventoryEntry {
+                    artifact_family: identity.artifact_family.clone(),
+                    manifest_digest: identity.manifest_digest.clone(),
+                    payload_digest: identity.payload_digest.clone(),
+                    kind: semantic_key.artifact_kind.clone(),
+                    logical_key: "ccm/fixture/cross-instance".to_owned(),
+                    content_digest: manifest.content_digest.clone(),
+                    manifest_path: "C:/outside-cache/manifest.json".to_owned(),
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let unsafe_reader =
+            ZipJsonFilesystemCacheStore::new("local", &root, false, CacheVisibility::Local);
+        assert!(matches!(
+            unsafe_reader.identity_candidates(&identity),
+            Err(CacheError::InvalidManifest(_))
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn zip_store_with_object(
+        name: &str,
+        budget: Arc<InMemoryZipBudget>,
+        single_pass_object_limit: u64,
+    ) -> (ZipJsonFilesystemCacheStore, ArtifactManifest, PathBuf) {
+        let root = temporary_root(name);
+        let _ = fs::remove_dir_all(&root);
+        let store = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local)
+            .with_in_memory_zip_limits(budget, single_pass_object_limit);
+        let key = ArtifactKey::new("ccm_tau_matrix", "ccm/fixture/zip-memory", b"zip").unwrap();
+        let manifest = store
+            .put(
+                &draft(key, CacheQuality::Validated, CacheVisibility::Local),
+                br#"{"zip":"memory budget fixture"}"#,
+            )
+            .unwrap();
+        (store, manifest, root)
+    }
+
+    #[test]
+    fn zip_objects_above_the_single_pass_limit_stream() {
+        let budget = Arc::new(InMemoryZipBudget::new(1024 * 1024));
+        let (store, manifest, root) = zip_store_with_object(
+            "xc-cache-zip-single-pass-limit",
+            budget.clone(),
+            1024 * 1024,
+        );
+        let object_bytes = manifest.objects[0].size_bytes;
+        let mut payload = Vec::new();
+        assert_eq!(
+            store.read_zip_object(&manifest, &mut payload).unwrap(),
+            ZipReadStrategy::SinglePass
+        );
+        assert_eq!(payload, br#"{"zip":"memory budget fixture"}"#);
+        assert_eq!(
+            budget.in_use(),
+            0,
+            "the reservation is released after the read"
+        );
+
+        let store = store.with_in_memory_zip_limits(budget.clone(), object_bytes - 1);
+        let mut streamed = Vec::new();
+        assert_eq!(
+            store.read_zip_object(&manifest, &mut streamed).unwrap(),
+            ZipReadStrategy::Streamed
+        );
+        assert_eq!(streamed, payload, "both strategies decode the same bytes");
+        assert_eq!(budget.in_use(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn single_pass_zip_read_is_bounded_by_the_declared_object_size() {
+        let budget = Arc::new(InMemoryZipBudget::new(1024 * 1024));
+        let (store, manifest, root) =
+            zip_store_with_object("xc-cache-zip-bounded-read", budget.clone(), 1024 * 1024);
+        let object = &manifest.objects[0];
+        let object_path = store.inner.object_path(&object.content_digest);
+        let mut enlarged = fs::read(&object_path).unwrap();
+        enlarged.extend(std::iter::repeat_n(0u8, 1024 * 1024));
+        fs::write(&object_path, enlarged).unwrap();
+
+        assert!(matches!(
+            store.read_zip_object(&manifest, &mut Vec::new()),
+            Err(CacheError::InvalidManifest(_))
+        ));
+        assert_eq!(budget.in_use(), 0, "failed reads release their allowance");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_single_pass_reads_never_exceed_the_aggregate_allowance() {
+        let budget = Arc::new(InMemoryZipBudget::new(350));
+        let attempts = 8;
+        let barrier = std::sync::Barrier::new(attempts);
+        let granted = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..attempts {
+                scope.spawn(|| {
+                    barrier.wait();
+                    let reservation = budget.try_reserve(100);
+                    if reservation.is_some() {
+                        granted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    peak.fetch_max(budget.in_use(), std::sync::atomic::Ordering::SeqCst);
+                    // Hold every successful reservation until all attempts
+                    // have been made, so the grants really overlap.
+                    barrier.wait();
+                    drop(reservation);
+                });
+            }
+        });
+        let granted = granted.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((1..=3).contains(&granted), "granted {granted} of 8");
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= 350);
+        assert_eq!(budget.in_use(), 0);
+    }
+
+    #[test]
+    fn aggregate_allowance_is_shared_across_store_instances() {
+        // Default construction shares the one process-wide allowance.
+        let default_store = ZipJsonFilesystemCacheStore::new(
+            "local",
+            temporary_root("xc-cache-zip-global-budget"),
+            false,
+            CacheVisibility::Local,
+        );
+        assert!(Arc::ptr_eq(
+            &default_store.in_memory_zip_budget,
+            &InMemoryZipBudget::global()
+        ));
+
+        // Two instances over one private allowance: a reservation held on
+        // behalf of the first forces the second to stream.
+        let budget = Arc::new(InMemoryZipBudget::new(4096));
+        let (first, manifest, root) =
+            zip_store_with_object("xc-cache-zip-shared-budget", budget.clone(), 4096);
+        let second =
+            ZipJsonFilesystemCacheStore::new("local", &root, false, CacheVisibility::Local)
+                .with_in_memory_zip_limits(budget.clone(), 4096);
+        assert!(Arc::ptr_eq(
+            &first.in_memory_zip_budget,
+            &second.in_memory_zip_budget
+        ));
+        let held = budget.try_reserve(4096 - 1).unwrap();
+        let mut payload = Vec::new();
+        assert_eq!(
+            second.read_zip_object(&manifest, &mut payload).unwrap(),
+            ZipReadStrategy::Streamed
+        );
+        drop(held);
+        assert_eq!(
+            second.read_zip_object(&manifest, &mut Vec::new()).unwrap(),
+            ZipReadStrategy::SinglePass
+        );
+        assert_eq!(budget.in_use(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_byte_limit_overrides_fall_back_to_the_default_deterministically() {
+        assert_eq!(parse_byte_limit(None, 7), 7);
+        assert_eq!(parse_byte_limit(Some(""), 7), 7);
+        assert_eq!(parse_byte_limit(Some("   "), 7), 7);
+        assert_eq!(parse_byte_limit(Some("abc"), 7), 7);
+        assert_eq!(parse_byte_limit(Some("0"), 7), 7);
+        assert_eq!(parse_byte_limit(Some("-1"), 7), 7);
+        assert_eq!(parse_byte_limit(Some("1.5"), 7), 7);
+        assert_eq!(parse_byte_limit(Some("18446744073709551616"), 7), 7);
+        assert_eq!(parse_byte_limit(Some(" 4096 "), 7), 4096);
+        assert_eq!(parse_byte_limit(Some("18446744073709551615"), 7), 7);
+        assert_eq!(
+            DEFAULT_SINGLE_PASS_ZIP_OBJECT_BYTES,
+            90 * 1024 * 1024,
+            "the single-pass limit tracks the split part size"
+        );
+    }
+
+    #[test]
+    fn a_failed_reservation_streams_immediately_instead_of_waiting() {
+        let budget = Arc::new(InMemoryZipBudget::new(10));
+        let held = budget.try_reserve(10).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let probe = budget.clone();
+        std::thread::spawn(move || {
+            let outcome = probe.try_reserve(1).is_some();
+            let _ = sender.send(outcome);
+        });
+        let outcome = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reservation must return at once, never block");
+        assert!(!outcome, "a saturated allowance refuses rather than waits");
+
+        let (store, manifest, root) =
+            zip_store_with_object("xc-cache-zip-no-wait", budget.clone(), 1024 * 1024);
+        let mut payload = Vec::new();
+        assert_eq!(
+            store.read_zip_object(&manifest, &mut payload).unwrap(),
+            ZipReadStrategy::Streamed
+        );
+        assert_eq!(payload, br#"{"zip":"memory budget fixture"}"#);
+        drop(held);
+        assert_eq!(budget.in_use(), 0);
         let _ = fs::remove_dir_all(root);
     }
 

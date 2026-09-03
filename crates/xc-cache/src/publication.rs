@@ -100,7 +100,10 @@ impl TransportEncodingRecord {
 
     pub fn validate(&self) -> Result<(), CacheError> {
         if self.schema_version == 0
-            || self.encoder_profile.trim().is_empty()
+            || !matches!(
+                self.encoder_profile.as_str(),
+                crate::DETERMINISTIC_ZIP64_PROFILE_V1 | crate::DETERMINISTIC_ZIP64_PROFILE_V2
+            )
             || self.reconstruction.trim().is_empty()
             || !self.canonical_payload_digest.validate()
             || !self.package_digest.validate()
@@ -111,6 +114,7 @@ impl TransportEncodingRecord {
             ));
         }
         let mut total = 0u64;
+        let mut paths = std::collections::BTreeSet::new();
         for (index, part) in self.ordered_parts.iter().enumerate() {
             if part.sequence != index as u64
                 || part.repository_path.trim().is_empty()
@@ -118,6 +122,7 @@ impl TransportEncodingRecord {
                 || part.size_bytes == 0
                 || part.size_bytes >= GITHUB_HARD_FILE_BOUNDARY_BYTES
                 || !part.content_digest.validate()
+                || !paths.insert(&part.repository_path)
             {
                 return Err(CacheError::InvalidManifest(format!(
                     "transport part {index} is invalid"
@@ -1852,6 +1857,22 @@ pub trait RemoteGitStore: Send + Sync {
         cancellation: &CancellationToken,
         writer: &mut dyn Write,
     ) -> Result<RemoteReadReport, CacheError>;
+    /// Hydrate a bounded set of immutable paths before callers read them.
+    ///
+    /// The default is deliberately a no-op: transports that cannot batch
+    /// reads retain the existing `read_committed_path` behavior. Git-backed
+    /// stores use this hook to resolve all requested blobs and fetch the
+    /// missing objects in one protocol negotiation. Every subsequent read
+    /// still hashes and size-checks the bytes independently.
+    fn prefetch_committed_paths(
+        &self,
+        _repository: &str,
+        _revision: &str,
+        _paths: &[RemotePathPrefetch],
+        _cancellation: &CancellationToken,
+    ) -> Result<(), CacheError> {
+        Ok(())
+    }
     fn list_committed_paths(
         &self,
         _repository: &str,
@@ -1891,6 +1912,12 @@ pub trait RemoteGitStore: Send + Sync {
         revision: &str,
         part: &TransportPart,
     ) -> Result<(), CacheError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemotePathPrefetch {
+    pub repository_path: String,
+    pub maximum_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1949,7 +1976,7 @@ mod tests {
         let record = stream_split_encoded(
             &mut input,
             ContentDigest::sha256(b"logical payload"),
-            "test-encoder-v1",
+            crate::DETERMINISTIC_ZIP64_PROFILE_V1,
             &test_policy(),
             &resources,
             &CancellationToken::new(),
@@ -1975,7 +2002,7 @@ mod tests {
         let record = stream_split_encoded(
             &mut input,
             canonical_payload_digest.clone(),
-            "deterministic-encoder-v1",
+            crate::DETERMINISTIC_ZIP64_PROFILE_V1,
             &test_policy(),
             &ResourcePolicy::default(),
             &CancellationToken::new(),
@@ -1985,7 +2012,7 @@ mod tests {
         let first_transport_digest = record.digest().unwrap();
 
         let mut alternate_transport = record.clone();
-        alternate_transport.encoder_profile = "deterministic-encoder-v2".to_owned();
+        alternate_transport.encoder_profile = crate::DETERMINISTIC_ZIP64_PROFILE_V2.to_owned();
         assert_eq!(
             alternate_transport.canonical_payload_digest,
             canonical_payload_digest
@@ -2001,6 +2028,33 @@ mod tests {
     }
 
     #[test]
+    fn transport_record_rejects_duplicate_repository_paths() {
+        let mut input = &b"abcdefgh"[..];
+        let mut record = stream_split_encoded(
+            &mut input,
+            ContentDigest::sha256(b"logical payload"),
+            crate::DETERMINISTIC_ZIP64_PROFILE_V1,
+            &test_policy(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(record.ordered_parts.len(), 2);
+        record.ordered_parts[1].repository_path = record.ordered_parts[0].repository_path.clone();
+        assert!(matches!(
+            record.validate(),
+            Err(CacheError::InvalidManifest(_))
+        ));
+        record.ordered_parts[1].repository_path = "objects/restored.part".to_owned();
+        record.encoder_profile = "unrecognized-encoder".to_owned();
+        assert!(matches!(
+            record.validate(),
+            Err(CacheError::InvalidManifest(_))
+        ));
+    }
+
+    #[test]
     fn cancellation_stops_before_emitting_parts() {
         let token = CancellationToken::new();
         token.cancel(CancellationReason::UserRequested);
@@ -2008,7 +2062,7 @@ mod tests {
         let result = stream_split_encoded(
             &mut input,
             ContentDigest::sha256(b"logical payload"),
-            "test-encoder-v1",
+            crate::DETERMINISTIC_ZIP64_PROFILE_V1,
             &test_policy(),
             &ResourcePolicy::default(),
             &token,

@@ -17,11 +17,31 @@ use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipWriter};
 
-/// This identifier changes whenever any byte-affecting encoder choice changes.
+/// Deterministic profile used by the historical and current single-entry
+/// canonical-payload encoder. That encoder has always requested ZIP64 metadata
+/// for its one entry, so retaining V1 preserves every published artifact
+/// transport identity. Historical multi-item writers also used this label but
+/// were entry-size-aware; those already-published transports remain readable.
 pub const DETERMINISTIC_ZIP64_PROFILE_V1: &str = concat!(
     "xc-zip64-deflate-v1;zip-rs=2.4.2;flate2=1.1.9;miniz_oxide=0.8.9;",
     "level=6;mtime=1980-01-01T00:00:00;mode=0644;order=utf8-bytewise"
 );
+
+/// Deterministic profile for newly created multi-item packages. Every entry
+/// uses ZIP64 metadata, including small entries, removing the historical
+/// multi-item writer ambiguity without relabeling unchanged single-entry
+/// artifact packages.
+pub const DETERMINISTIC_ZIP64_PROFILE_V2: &str = concat!(
+    "xc-zip64-deflate-v2;zip-rs=2.4.2;flate2=1.1.9;miniz_oxide=0.8.9;",
+    "level=6;mtime=1980-01-01T00:00:00;mode=0644;order=utf8-bytewise;zip64=always"
+);
+
+/// Current profile for the single-entry canonical artifact and workstation
+/// object encoders. Kept as the original public name for API compatibility.
+pub const CURRENT_DETERMINISTIC_ZIP64_PROFILE: &str = DETERMINISTIC_ZIP64_PROFILE_V1;
+
+/// Current profile for file-backed, potentially multi-item packages.
+pub const CURRENT_MULTI_ITEM_ZIP64_PROFILE: &str = DETERMINISTIC_ZIP64_PROFILE_V2;
 
 const COPY_BUFFER_BYTES: u64 = 1024 * 1024;
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -199,6 +219,29 @@ pub fn package_canonical_payload_zip64(
     result
 }
 
+/// The one single-entry ZIP encoder behind every byte that can be published.
+///
+/// The workstation ZIP object store and the deterministic publication
+/// packager both call this, so a verified local object is byte-for-byte the
+/// package that publication would otherwise re-encode, and staging may split
+/// it directly. Any byte-affecting change here must also change
+/// `CURRENT_DETERMINISTIC_ZIP64_PROFILE`.
+pub(crate) fn write_deterministic_zip_entry<W: Write + Seek>(
+    output: W,
+    normalized_path: &str,
+    bytes: &[u8],
+) -> Result<W, CacheError> {
+    let mut writer = ZipWriter::new(output);
+    let options = deterministic_options();
+    writer
+        .start_file(normalized_path, options)
+        .map_err(|error| CacheError::Io(error.to_string()))?;
+    writer.write_all(bytes)?;
+    writer
+        .finish()
+        .map_err(|error| CacheError::Io(error.to_string()))
+}
+
 /// Deterministically package one already-canonical logical byte stream without
 /// first materializing it as an uncompressed filesystem file.
 pub fn package_canonical_payload_bytes_zip64(
@@ -237,30 +280,23 @@ pub fn package_canonical_payload_bytes_zip64(
     fs::create_dir_all(parent)?;
     let (temporary_path, output) = create_temporary_file(destination)?;
     let result = (|| {
-        let mut writer = ZipWriter::new(output);
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Deflated)
-            .compression_level(Some(6))
-            .last_modified_time(DateTime::default())
-            .unix_permissions(0o644)
-            .large_file(true);
-        writer
-            .start_file(normalized_path, options)
-            .map_err(|error| CacheError::Io(error.to_string()))?;
-        writer.write_all(bytes)?;
-        let mut output = writer
-            .finish()
-            .map_err(|error| CacheError::Io(error.to_string()))?;
+        let mut output = write_deterministic_zip_entry(output, normalized_path, bytes)?;
         output.flush()?;
         output.sync_all()?;
         drop(output);
         let package_size_bytes = fs::metadata(&temporary_path)?.len();
         let mut digest_buffer = vec![0u8; COPY_BUFFER_BYTES as usize];
         let package_digest = digest_file(&temporary_path, cancellation, &mut digest_buffer)?;
-        fs::rename(&temporary_path, destination)?;
+        publish_immutable_package(
+            &temporary_path,
+            destination,
+            &package_digest,
+            package_size_bytes,
+            cancellation,
+        )?;
         Ok(DeterministicPackageReport {
             canonical_payload_digest: envelope.digest()?,
-            encoder_profile: DETERMINISTIC_ZIP64_PROFILE_V1.to_owned(),
+            encoder_profile: CURRENT_DETERMINISTIC_ZIP64_PROFILE.to_owned(),
             package_size_bytes,
             package_digest,
             package_path: destination.to_path_buf(),
@@ -282,31 +318,7 @@ pub fn reconstruct_transport_package(
     resources: &ResourcePolicy,
     cancellation: &CancellationToken,
 ) -> Result<DeterministicPackageReport, CacheError> {
-    reconstruct_transport_package_inner(
-        record,
-        parts_root,
-        destination,
-        resources,
-        cancellation,
-        false,
-    )
-}
-
-pub(crate) fn reconstruct_transport_package_from_verified_parts(
-    record: &crate::TransportEncodingRecord,
-    parts_root: &Path,
-    destination: &Path,
-    resources: &ResourcePolicy,
-    cancellation: &CancellationToken,
-) -> Result<DeterministicPackageReport, CacheError> {
-    reconstruct_transport_package_inner(
-        record,
-        parts_root,
-        destination,
-        resources,
-        cancellation,
-        true,
-    )
+    reconstruct_transport_package_inner(record, parts_root, destination, resources, cancellation)
 }
 
 fn reconstruct_transport_package_inner(
@@ -315,16 +327,20 @@ fn reconstruct_transport_package_inner(
     destination: &Path,
     resources: &ResourcePolicy,
     cancellation: &CancellationToken,
-    parts_preverified: bool,
 ) -> Result<DeterministicPackageReport, CacheError> {
     record.validate()?;
     cancellation
         .check()
         .map_err(|error| CacheError::Cancelled(error.to_string()))?;
-    if destination.as_os_str().is_empty() || destination.exists() {
+    if destination.as_os_str().is_empty() {
         return Err(CacheError::InvalidManifest(
-            "reconstructed package destination must be explicit and absent".to_owned(),
+            "reconstructed package destination must be explicit".to_owned(),
         ));
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(_) => return verified_existing_transport_package(record, destination, cancellation),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     for (description, maximum) in [
         ("temporary-disk", resources.maximum_temporary_disk_bytes),
@@ -349,7 +365,6 @@ fn reconstruct_transport_package_inner(
         output,
         resources,
         cancellation,
-        parts_preverified,
     );
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);
@@ -366,7 +381,6 @@ fn reconstruct_inner(
     output: File,
     resources: &ResourcePolicy,
     cancellation: &CancellationToken,
-    parts_preverified: bool,
 ) -> Result<DeterministicPackageReport, CacheError> {
     let buffer_bytes = resources
         .maximum_memory_bytes
@@ -405,7 +419,7 @@ fn reconstruct_inner(
             });
         }
         let mut input = BufReader::new(File::open(&path)?);
-        let mut part_hasher = (!parts_preverified).then(Sha256::new);
+        let mut part_hasher = Sha256::new();
         let mut part_size = 0u64;
         loop {
             cancellation
@@ -416,17 +430,13 @@ fn reconstruct_inner(
                 break;
             }
             part_size = part_size.saturating_add(read as u64);
-            if let Some(hasher) = &mut part_hasher {
-                hasher.update(&buffer[..read]);
-            }
+            part_hasher.update(&buffer[..read]);
             package_hasher.update(&buffer[..read]);
             output
                 .write_all(&buffer[..read])
                 .map_err(|error| map_io_error(error, cancellation))?;
         }
-        let part_digest = part_hasher
-            .map(|hasher| ContentDigest(format!("{:x}", hasher.finalize())))
-            .unwrap_or_else(|| part.content_digest.clone());
+        let part_digest = ContentDigest(format!("{:x}", part_hasher.finalize()));
         if part_size != part.size_bytes || part_digest != part.content_digest {
             return Err(CacheError::DigestMismatch {
                 expected: format!("{} ({} bytes)", part.content_digest, part.size_bytes),
@@ -448,8 +458,16 @@ fn reconstruct_inner(
             actual: format!("{package_digest} ({package_size} bytes)"),
         });
     }
-    fs::hard_link(temporary_path, destination)?;
-    let _ = fs::remove_file(temporary_path);
+    match fs::hard_link(temporary_path, destination) {
+        Ok(()) => {
+            let _ = fs::remove_file(temporary_path);
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(temporary_path);
+            return verified_existing_transport_package(record, destination, cancellation);
+        }
+        Err(error) => return Err(error.into()),
+    }
     Ok(DeterministicPackageReport {
         canonical_payload_digest: record.canonical_payload_digest.clone(),
         encoder_profile: record.encoder_profile.clone(),
@@ -497,7 +515,10 @@ fn verify_canonical_payload_zip64_inner(
 ) -> Result<VerifiedPackageReport, CacheError> {
     envelope.validate()?;
     record.validate()?;
-    if record.encoder_profile != DETERMINISTIC_ZIP64_PROFILE_V1 {
+    if !matches!(
+        record.encoder_profile.as_str(),
+        DETERMINISTIC_ZIP64_PROFILE_V1 | DETERMINISTIC_ZIP64_PROFILE_V2
+    ) {
         return Err(CacheError::InvalidManifest(format!(
             "unsupported deterministic ZIP profile {:?}",
             record.encoder_profile
@@ -557,6 +578,8 @@ fn verify_canonical_payload_zip64_inner(
             || entry.compression() != CompressionMethod::Deflated
             || entry.last_modified() != Some(fixed_time)
             || entry.unix_mode() != Some(0o100644)
+            || (record.encoder_profile == DETERMINISTIC_ZIP64_PROFILE_V2
+                && !zip_local_header_uses_zip64(package_path, entry.header_start())?)
         {
             return Err(CacheError::InvalidManifest(format!(
                 "ZIP entry {index} metadata does not match canonical profile"
@@ -593,6 +616,40 @@ fn verify_canonical_payload_zip64_inner(
         logical_size_bytes: envelope.logical_size_bytes(),
         item_count: envelope.ordered_items.len(),
     })
+}
+
+fn zip_local_header_uses_zip64(path: &Path, header_start: u64) -> Result<bool, CacheError> {
+    let mut input = File::open(path)?;
+    input.seek(SeekFrom::Start(header_start))?;
+    let mut header = [0u8; 30];
+    input.read_exact(&mut header)?;
+    if header[0..4] != [0x50, 0x4b, 0x03, 0x04] {
+        return Ok(false);
+    }
+    let version_needed = u16::from_le_bytes([header[4], header[5]]);
+    let compressed_size = u32::from_le_bytes([header[18], header[19], header[20], header[21]]);
+    let uncompressed_size = u32::from_le_bytes([header[22], header[23], header[24], header[25]]);
+    let name_size = u16::from_le_bytes([header[26], header[27]]);
+    let extra_size = u16::from_le_bytes([header[28], header[29]]) as usize;
+    input.seek(SeekFrom::Current(i64::from(name_size)))?;
+    let mut extra = vec![0u8; extra_size];
+    input.read_exact(&mut extra)?;
+    let mut raw = extra.as_slice();
+    while raw.len() >= 4 {
+        let id = u16::from_le_bytes([raw[0], raw[1]]);
+        let size = u16::from_le_bytes([raw[2], raw[3]]) as usize;
+        raw = &raw[4..];
+        if size > raw.len() {
+            return Ok(false);
+        }
+        if id == 0x0001 {
+            return Ok(version_needed >= 45
+                && compressed_size == u32::MAX
+                && uncompressed_size == u32::MAX);
+        }
+        raw = &raw[size..];
+    }
+    Ok(false)
 }
 
 fn resolve_part_path(root: &Path, repository_path: &str) -> Result<PathBuf, CacheError> {
@@ -678,7 +735,7 @@ fn package_inner(
         cancellation
             .check()
             .map_err(|error| CacheError::Cancelled(error.to_string()))?;
-        let options = deterministic_options(item.size_bytes);
+        let options = deterministic_options();
         archive
             .start_file(&item.normalized_path, options)
             .map_err(|error| map_zip_error(error, cancellation))?;
@@ -722,21 +779,29 @@ fn package_inner(
     // Hard linking creates the immutable destination only if it is still
     // absent, avoiding a concurrent overwrite. The temporary name is in the
     // same directory so this is an atomic same-filesystem operation.
-    fs::hard_link(temporary_path, destination)?;
-    // Failure to unlink the now-redundant temporary name does not invalidate
-    // the atomically published, content-verified package.
-    let _ = fs::remove_file(temporary_path);
+    publish_immutable_package(
+        temporary_path,
+        destination,
+        &package_digest,
+        package_size_bytes,
+        cancellation,
+    )?;
 
+    let encoder_profile = if envelope.ordered_items.len() == 1 {
+        CURRENT_DETERMINISTIC_ZIP64_PROFILE
+    } else {
+        CURRENT_MULTI_ITEM_ZIP64_PROFILE
+    };
     Ok(DeterministicPackageReport {
         canonical_payload_digest: envelope.digest()?,
-        encoder_profile: DETERMINISTIC_ZIP64_PROFILE_V1.to_owned(),
+        encoder_profile: encoder_profile.to_owned(),
         package_size_bytes,
         package_digest,
         package_path: destination.to_owned(),
     })
 }
 
-fn deterministic_options(uncompressed_size: u64) -> SimpleFileOptions {
+fn deterministic_options() -> SimpleFileOptions {
     SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .compression_level(Some(6))
@@ -745,7 +810,81 @@ fn deterministic_options(uncompressed_size: u64) -> SimpleFileOptions {
                 .expect("the fixed ZIP epoch is valid"),
         )
         .unix_permissions(0o644)
-        .large_file(uncompressed_size >= u64::from(u32::MAX))
+        .large_file(true)
+}
+
+fn publish_immutable_package(
+    temporary_path: &Path,
+    destination: &Path,
+    expected_digest: &ContentDigest,
+    expected_size: u64,
+    cancellation: &CancellationToken,
+) -> Result<(), CacheError> {
+    match fs::hard_link(temporary_path, destination) {
+        Ok(()) => {
+            let _ = fs::remove_file(temporary_path);
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(destination)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() != expected_size
+            {
+                let _ = fs::remove_file(temporary_path);
+                return Err(CacheError::InvalidManifest(
+                    "existing immutable package has invalid filesystem metadata".to_owned(),
+                ));
+            }
+            let mut buffer = vec![0u8; COPY_BUFFER_BYTES as usize];
+            let digest = digest_file(destination, cancellation, &mut buffer)?;
+            let size = fs::symlink_metadata(destination)?.len();
+            let _ = fs::remove_file(temporary_path);
+            if &digest != expected_digest || size != expected_size {
+                return Err(CacheError::DigestMismatch {
+                    expected: format!("{expected_digest} ({expected_size} bytes)"),
+                    actual: format!("{digest} ({size} bytes)"),
+                });
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn verified_existing_transport_package(
+    record: &TransportEncodingRecord,
+    destination: &Path,
+    cancellation: &CancellationToken,
+) -> Result<DeterministicPackageReport, CacheError> {
+    let metadata = fs::symlink_metadata(destination)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() != record.package_size_bytes
+    {
+        return Err(CacheError::InvalidManifest(
+            "existing reconstructed package has invalid filesystem metadata".to_owned(),
+        ));
+    }
+    let mut buffer = vec![0u8; COPY_BUFFER_BYTES as usize];
+    let digest = digest_file(destination, cancellation, &mut buffer)?;
+    let size = metadata.len();
+    if digest != record.package_digest || size != record.package_size_bytes {
+        return Err(CacheError::DigestMismatch {
+            expected: format!(
+                "{} ({} bytes)",
+                record.package_digest, record.package_size_bytes
+            ),
+            actual: format!("{digest} ({size} bytes)"),
+        });
+    }
+    Ok(DeterministicPackageReport {
+        canonical_payload_digest: record.canonical_payload_digest.clone(),
+        encoder_profile: record.encoder_profile.clone(),
+        package_size_bytes: size,
+        package_digest: digest,
+        package_path: destination.to_owned(),
+    })
 }
 
 fn conservative_zip_upper_bound(envelope: &CanonicalPayloadEnvelope) -> Result<u64, CacheError> {
@@ -979,6 +1118,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first_report.package_digest, second_report.package_digest);
+        assert_eq!(
+            first_report.encoder_profile,
+            CURRENT_MULTI_ITEM_ZIP64_PROFILE
+        );
         assert_eq!(fs::read(&first).unwrap(), fs::read(&second).unwrap());
 
         let bytes = fs::read(&first).unwrap();
@@ -990,6 +1133,48 @@ mod tests {
         assert_eq!(alpha.last_modified().unwrap().year(), 1980);
         drop(alpha);
         assert_eq!(archive.by_index(1).unwrap().name(), "data/beta.bin");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn v2_profile_requires_zip64_metadata_on_every_entry() {
+        let root = test_root("v2-requires-zip64");
+        let (envelope, sources) = fixture(&root);
+        let package = root.join("legacy-multi.zip");
+        let output = File::create(&package).unwrap();
+        let mut archive = ZipWriter::new(output);
+        for item in &envelope.ordered_items {
+            let source = sources
+                .iter()
+                .find(|source| source.normalized_path == item.normalized_path)
+                .unwrap();
+            archive
+                .start_file(
+                    &item.normalized_path,
+                    deterministic_options().large_file(false),
+                )
+                .unwrap();
+            archive
+                .write_all(&fs::read(&source.source_path).unwrap())
+                .unwrap();
+        }
+        archive.finish().unwrap();
+
+        let mut input = File::open(&package).unwrap();
+        let record = crate::stream_split_encoded(
+            &mut input,
+            envelope.digest().unwrap(),
+            DETERMINISTIC_ZIP64_PROFILE_V2,
+            &crate::TransportPolicy::default(),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_canonical_payload_zip64(&envelope, &record, &package, &CancellationToken::new()),
+            Err(CacheError::InvalidManifest(_))
+        ));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1125,6 +1310,41 @@ mod tests {
                 .unwrap();
         assert_eq!(verified.item_count, 2);
         assert_eq!(verified.logical_size_bytes, envelope.logical_size_bytes());
+
+        // Two processes can finish the same content-addressed reconstruction
+        // together. The hard-link loser verifies and reuses the winner rather
+        // than treating the already-visible immutable package as an error.
+        fs::remove_file(&reconstructed).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                reconstruct_transport_package(
+                    &record,
+                    &parts_root,
+                    &reconstructed,
+                    &ResourcePolicy::default(),
+                    &CancellationToken::new(),
+                )
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                reconstruct_transport_package(
+                    &record,
+                    &parts_root,
+                    &reconstructed,
+                    &ResourcePolicy::default(),
+                    &CancellationToken::new(),
+                )
+            });
+            (
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap(),
+            )
+        });
+        assert_eq!(first.package_digest, report.package_digest);
+        assert_eq!(second.package_digest, report.package_digest);
+        verify_canonical_payload_zip64(&envelope, &record, &reconstructed, &cancellation).unwrap();
 
         let corrupt_part =
             resolve_part_path(&parts_root, &record.ordered_parts[0].repository_path).unwrap();

@@ -1,10 +1,147 @@
 # Release notes
 
+## 0.14.2
+
+Version 0.14.2 is a cache-reuse performance and correctness release. It removes
+the remaining avoidable overhead of runs that reuse already cached artifacts
+and hardens the new fast paths against identity ambiguity, corrupt local state,
+concurrent resource overcommit, and interrupted staging. Existing 0.14.1
+artifacts remain readable. No semantic or payload schema version is raised by
+these cache changes. Newly produced canonical manifests record producer
+version 0.14.2, so their manifest identities change in the normal release-bound
+way even when their logical payload and transport bytes are unchanged. Every
+fast path remains closed by a digest check before anything becomes visible
+locally or enters Git.
+
+- Cold multipart GitHub reuse now resolves all missing part blobs up front and
+  hydrates them in bounded batches before the existing download workers stream
+  the immutable objects concurrently. This removes the hidden one-network-
+  fetch-per-part serialization that made a 14-part matrix package appear
+  parallel in the in-memory test while remaining serial on a cold Git shard.
+  Complete local packages and already retained local parts are removed from
+  the prefetch set before Git preparation begins. Bulk blob-presence checks
+  use one `git cat-file --batch-check` process per batch. Its input is now
+  written concurrently with output draining, preventing the pipe deadlock
+  that large (roughly 300-or-more-object) batches could trigger; individual
+  object reads retain their separate exact-type check.
+  Reused local parts are SHA-256 checked during the reconstruction copy instead
+  of in a separate preliminary full-file pass; the package and decoded logical
+  payload checks are unchanged. A reused regular file whose size or bytes no
+  longer match is moved aside within the part store and downloaded again
+  exactly once, instead of failing the run identically on every attempt. The
+  quarantine scratch file is removed on a best-effort basis when the operation
+  exits; an operating-system cleanup lock produces a warning and a later drop
+  retry rather than invalidating an otherwise verified result. Symlinks and
+  non-regular files remain hard failures. A corrupt
+  retained complete package is removed after its failed verification so the
+  next attempt can rebuild it from verified parts, and concurrent processes
+  completing the same immutable package verify and reuse the winner.
+  Temporary-disk accounting is shared by every in-flight repository operation
+  of one transport, does not double-count bytes after they land, takes
+  repository/session locks before reserving, and releases reservations on
+  success, error, or unwind. Metadata-only Git fetches now reserve a bounded
+  allowance. Immutable-path digest reads reserve the exact blob size when Git
+  can expose it and otherwise the 100 MB GitHub hard-file boundary, never the
+  20 GiB--2 TiB transfer ceiling; hydrated and read sizes are checked exactly.
+  Batched part prefetch uses each caller's exact retained-part size as the
+  fallback when a filtered tree cannot expose the size, so closure-scale
+  preparation does not multiply a 100 MB reservation across small objects.
+  Large-artifact logs split fetch, reconstruction, and verification/decode
+  time.
+- Local ZIP reuse returns the verified encoded object from the same pass that
+  verifies and decodes its logical payload, avoiding a second complete hash of
+  the compressed ZIP before workstation adoption. Compressed objects up to
+  90 MiB (the split part size) are read from disk once, hashed from that
+  bounded buffer, and then inflated from memory, within an aggregate 256 MiB allowance shared
+  by every concurrent read in the process; a read that does not fit streams
+  as before, without waiting. `XC_CACHE_SINGLE_PASS_ZIP_BYTES` and
+  `XC_CACHE_IN_MEMORY_ZIP_BYTES` override the two limits. Valid overrides are
+  1 byte through 16 GiB; zero, overflow, and larger values keep the default.
+  The single-pass reader also checks the regular-file type
+  and exact declared size before reading, bounds the read to that size, and
+  rejects a trailing byte, so a corrupt or concurrently enlarged file cannot
+  exceed the reservation. Immutable remote metadata is retained by repository
+  revision for the process. Resolved remote state is keyed by the exact
+  canonical manifest digest rather than the logical payload digest, so two
+  published artifacts with identical payload bytes and different dependency
+  closures can never exchange encodings or parts.
+- The workstation cache maintains a persistent identity inventory
+  (`identities/<prefix>/<semantic-digest>.json`) on every write. Exact
+  published-identity lookups read that inventory instead of walking the
+  artifact directory tree. A cache written before the inventory existed, or
+  by an older toolkit, is repaired by one bounded scan per semantic digest per
+  process. The in-process memo revalidates against the inventory file, so an
+  artifact written by another process into the same cache is visible without
+  a restart, and a signature change during a query is reread before the result
+  can be memoized. Writable legacy stores scan once per semantic digest and
+  repair the inventory; read-only legacy stores rescan on each inventory miss
+  so one identity cannot hide another under the same digest. Inventory paths
+  reject drive-qualified and non-normal components. Every inventory candidate revalidates the retained canonical
+  manifest against the adapter's semantic key, logical payload bytes and
+  provenance before it may satisfy an exact identity lookup.
+- The unchanged single-entry workstation/publication encoder retains the V1
+  profile and therefore preserves every existing transport identity. The
+  file-backed packager uses V2 only for envelopes with multiple items, because
+  that is the route whose bytes changed to require ZIP64 metadata on every
+  entry. Verification checks
+  the claimed V2 local-header property. The exact profile is persisted with
+  each workstation object and must match before staging adopts its encoded
+  bytes. Legacy unprofiled objects remain valid logical cache hits but are
+  decoded and re-encoded as V1 for publication. A retained single-entry object
+  from the superseded interim V2 build is relabeled V1 only when doing so
+  exactly reproduces a transport digest authorized by the retained V1 manifest.
+- Publication closure traversal can continue from the validated canonical
+  manifest of an already staged draft without resolving and decoding that
+  payload again. It still traverses every parent, including after reopening an
+  incomplete staging directory, so the resume correctness guarantee is
+  preserved. Completed closure subtrees are memoized for the current process,
+  exact sibling dependencies are progressively prepared in bounded batches,
+  and per-repository Git locks permit independent shards to hydrate
+  concurrently. A dependency whose verified encoded object a cache layer
+  already holds is staged from that object and its retained parts without
+  inflating the logical payload at all; parts this process did not itself
+  verify are hashed before they are linked, and a regular file of the wrong
+  size or with the wrong digest falls back to splitting the verified package
+  (a symlink or non-regular file fails closed). Staging adopts an already
+  verified deterministic ZIP when one is available and hard-links verified
+  content-addressed parts directly (or performs a verified copy across
+  filesystems). Reopening a staging directory and resuming an existing draft
+  check part structure and size only; every staged part is still hashed by the
+  publisher immediately before it enters Git. A resumed run answers an already
+  staged identity dependency from the staging directory before consulting any
+  cache layer, but only when its recorded source quality satisfies the current
+  dependency edge; older drafts without that quality field are resolved again.
+  Draft lookups by identity are constant time. Source lookups retain every
+  match and deterministically select the strongest source quality, then the
+  lexicographically smallest source-manifest digest. Assurance requirements
+  and attestations name the shared source key and bytes, so they update every
+  colliding canonical closure rather than silently promoting only one. Draft directories include the source-manifest digest
+  in addition to semantic and canonical-payload digests, so manifests that
+  differ only in producer identity coexist. On the canonical staging route the reuse path hands its payload to
+  staging instead of copying it, and a freshly computed artifact is staged
+  from its verified store object; the payload-carrying queue sink still
+  receives its own copy. An adopted hard link is hash-verified before its
+  descriptor is exposed, decoded ZIP output is bounded by its declared logical size, and
+  transport records reject duplicate repository paths. Retained canonical identity is evaluated
+  before the local source-key shortcut, so artifacts with identical source
+  keys and logical bytes but different dependency closures remain distinct.
+  Reopening accepts both the current source-manifest-namespaced layout and the
+  fully bounded two-level layout written by v0.14.1, so persistent author
+  staging roots remain resumable after the upgrade.
+- Fixed the closure walk selecting the newest candidate under a dependency's
+  semantic key and then rejecting it because the content digest differed. Any
+  newer artifact under the same key in a higher-precedence layer broke
+  publication of every child that named the older one. Dependencies now
+  resolve by exact key, content digest, and required quality, selecting the
+  same candidate that dependency prefetch prepares.
+
 ## 0.14.1
 
 Version 0.14.1 is an amended maintenance release for CCM research capture,
-root refinement, finite-sector evidence, and managed cache publication. It
-also moves research-target definitions out of the public toolkit: target-
+root refinement, finite-sector evidence, and managed cache publication.
+
+This release also moves research-target definitions out of the public toolkit:
+target-
 dependent work now consumes a private runtime specification, binds only its
 opaque SHA-256 identity into artifacts, and is restricted to private cache
 publication.

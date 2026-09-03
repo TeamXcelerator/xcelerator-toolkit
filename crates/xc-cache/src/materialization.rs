@@ -1,8 +1,9 @@
 //! End-to-end selective remote retrieval and decoded payload verification.
 
 use crate::protocol::normalized_relative_path;
+use crate::remote_reader::{quarantine_corrupt_reused_parts, QuarantineCleanup};
 use crate::{
-    reconstruct_transport_package_from_verified_parts, verify_canonical_payload_zip64,
+    reconstruct_transport_package, verify_canonical_payload_zip64,
     verify_canonical_payload_zip64_to_writer, CacheError, ContentDigest,
     DeterministicPackageReport, PartFetchReport, RemoteGitStore, RemoteShardReader,
     ResolvedRemoteArtifact, VerifiedPackageReport,
@@ -12,6 +13,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use xc_core::{CancellationToken, ResourcePolicy};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -30,6 +32,34 @@ pub struct RemoteArtifactMaterializationReport {
     pub part_fetch: Option<PartFetchReport>,
     pub package: DeterministicPackageReport,
     pub verification: VerifiedPackageReport,
+    #[serde(skip)]
+    pub part_fetch_elapsed_millis: u64,
+    #[serde(skip)]
+    pub package_reconstruction_elapsed_millis: u64,
+    #[serde(skip)]
+    pub payload_verification_elapsed_millis: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MaterializationTimings {
+    part_fetch_millis: u64,
+    package_reconstruction_millis: u64,
+    payload_verification_millis: u64,
+}
+
+fn elapsed_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn performance_metadata(
+    artifact: &ResolvedRemoteArtifact,
+    cache_disposition: &str,
+) -> xc_core::PerformanceStageMetadata {
+    xc_core::PerformanceStageMetadata {
+        operation: Some(artifact.family.clone()),
+        cache_disposition: Some(cache_disposition.to_owned()),
+        ..xc_core::PerformanceStageMetadata::default()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -236,7 +266,12 @@ fn materialize_resolved_remote_artifact_inner(
         ));
     }
 
-    let package_exists = package_path.exists();
+    let package_metadata = match fs::symlink_metadata(package_path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let package_exists = package_metadata.is_some();
     let projected_new_local_bytes = if package_exists {
         0
     } else {
@@ -256,6 +291,11 @@ fn materialize_resolved_remote_artifact_inner(
     }
 
     if package_exists {
+        let _performance =
+            xc_core::performance_stage_with("cache.remote.payload_verification", || {
+                performance_metadata(artifact, "package-reuse")
+            });
+        let verification_started = Instant::now();
         let verification = match decoded_writer {
             Some(writer) => verify_canonical_payload_zip64_to_writer(
                 &artifact.manifest.canonical_payload,
@@ -264,13 +304,35 @@ fn materialize_resolved_remote_artifact_inner(
                 cancellation,
                 false,
                 writer,
-            )?,
+            ),
             None => verify_canonical_payload_zip64(
                 &artifact.manifest.canonical_payload,
                 &artifact.encoding,
                 package_path,
                 cancellation,
-            )?,
+            ),
+        };
+        let verification = match verification {
+            Ok(verification) => verification,
+            Err(error) => {
+                // Only remove an ordinary retained file. Symlinks and other
+                // special filesystem entries remain fail-closed and are never
+                // followed or silently replaced. Removing a corrupt regular
+                // package lets the next attempt reconstruct it from verified
+                // parts instead of failing forever on the same bytes.
+                let proves_corruption = matches!(
+                    &error,
+                    CacheError::DigestMismatch { .. } | CacheError::InvalidManifest(_)
+                );
+                if proves_corruption
+                    && package_metadata.as_ref().is_some_and(|metadata| {
+                        metadata.is_file() && !metadata.file_type().is_symlink()
+                    })
+                {
+                    fs::remove_file(package_path)?;
+                }
+                return Err(error);
+            }
         };
         return report(
             artifact,
@@ -285,26 +347,87 @@ fn materialize_resolved_remote_artifact_inner(
                 package_path: package_path.to_owned(),
             },
             verification,
+            MaterializationTimings {
+                payload_verification_millis: elapsed_millis(verification_started.elapsed()),
+                ..MaterializationTimings::default()
+            },
         );
     }
 
     fs::create_dir_all(parts_root)?;
     let reader = RemoteShardReader::new(remote, 1)?;
-    let part_fetch = reader.fetch_transport_parts(
-        &artifact.repository,
-        &artifact.revision,
-        &artifact.encoding,
-        parts_root,
-        resources,
-        cancellation,
-    )?;
-    let package = reconstruct_transport_package_from_verified_parts(
-        &artifact.encoding,
-        parts_root,
-        package_path,
-        resources,
-        cancellation,
-    )?;
+    let mut part_fetch_millis = 0u64;
+    let mut package_reconstruction_millis = 0u64;
+    let mut repaired_reused_parts = false;
+    let mut quarantined_reused_parts = QuarantineCleanup::default();
+    let (mut part_fetch, package) = loop {
+        let performance = xc_core::performance_stage_with("cache.remote.part_fetch", || {
+            performance_metadata(artifact, "remote-or-part-reuse")
+        });
+        let part_fetch_started = Instant::now();
+        let part_fetch = reader.fetch_transport_parts_for_reconstruction(
+            &artifact.repository,
+            &artifact.revision,
+            &artifact.encoding,
+            parts_root,
+            resources,
+            cancellation,
+        )?;
+        part_fetch_millis =
+            part_fetch_millis.saturating_add(elapsed_millis(part_fetch_started.elapsed()));
+        drop(performance);
+        let performance =
+            xc_core::performance_stage_with("cache.remote.package_reconstruction", || {
+                performance_metadata(artifact, "part-reuse")
+            });
+        let package_started = Instant::now();
+        let reconstructed = reconstruct_transport_package(
+            &artifact.encoding,
+            parts_root,
+            package_path,
+            resources,
+            cancellation,
+        );
+        package_reconstruction_millis =
+            package_reconstruction_millis.saturating_add(elapsed_millis(package_started.elapsed()));
+        drop(performance);
+        match reconstructed {
+            Ok(package) => break (part_fetch, package),
+            // Reused parts are digest-checked during the reconstruction copy.
+            // A corrupt one is quarantined and fetched again exactly once;
+            // a second failure, or a failure with no corrupt reused part,
+            // is reported unchanged.
+            Err(CacheError::DigestMismatch { expected, actual })
+                if !repaired_reused_parts && !part_fetch.reused_sequences.is_empty() =>
+            {
+                let quarantined = quarantine_corrupt_reused_parts(
+                    &artifact.encoding,
+                    parts_root,
+                    &part_fetch.reused_sequences,
+                    resources,
+                    cancellation,
+                )?;
+                if quarantined.is_empty() {
+                    return Err(CacheError::DigestMismatch { expected, actual });
+                }
+                eprintln!(
+                    "  cache transport: {} reused part(s) failed verification and were quarantined; fetching them again",
+                    quarantined.len()
+                );
+                quarantined_reused_parts.absorb(quarantined);
+                repaired_reused_parts = true;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    // Downloaded parts were verified while streaming and reused parts were
+    // verified during the one-pass reconstruction above. At this boundary the
+    // report can truthfully account for the whole package as verified.
+    part_fetch.verified_bytes = artifact.encoding.package_size_bytes;
+    let performance = xc_core::performance_stage_with("cache.remote.payload_verification", || {
+        performance_metadata(artifact, "reconstructed")
+    });
+    let verification_started = Instant::now();
     let verified = match decoded_writer {
         Some(writer) => verify_canonical_payload_zip64_to_writer(
             &artifact.manifest.canonical_payload,
@@ -329,10 +452,18 @@ fn materialize_resolved_remote_artifact_inner(
     let verification = match verified {
         Ok(verification) => verification,
         Err(error) => {
-            let _ = fs::remove_file(package_path);
+            if matches!(
+                &error,
+                CacheError::DigestMismatch { .. } | CacheError::InvalidManifest(_)
+            ) {
+                let _ = fs::remove_file(package_path);
+            }
             return Err(error);
         }
     };
+    let payload_verification_millis = elapsed_millis(verification_started.elapsed());
+    drop(performance);
+    quarantined_reused_parts.cleanup();
     report(
         artifact,
         projected_new_local_bytes,
@@ -340,6 +471,11 @@ fn materialize_resolved_remote_artifact_inner(
         Some(part_fetch),
         package,
         verification,
+        MaterializationTimings {
+            part_fetch_millis,
+            package_reconstruction_millis,
+            payload_verification_millis,
+        },
     )
 }
 
@@ -350,6 +486,7 @@ fn report(
     part_fetch: Option<PartFetchReport>,
     package: DeterministicPackageReport,
     verification: VerifiedPackageReport,
+    timings: MaterializationTimings,
 ) -> Result<RemoteArtifactMaterializationReport, CacheError> {
     let manifest_digest = artifact.manifest.digest()?;
     let transport_digest = artifact.encoding.digest()?;
@@ -369,6 +506,9 @@ fn report(
         part_fetch,
         package,
         verification,
+        part_fetch_elapsed_millis: timings.part_fetch_millis,
+        package_reconstruction_elapsed_millis: timings.package_reconstruction_millis,
+        payload_verification_elapsed_millis: timings.payload_verification_millis,
     })
 }
 
@@ -417,7 +557,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use xc_core::{AssuranceLevel, PublicationAuthorityMode};
+    use xc_core::{AssuranceLevel, CancellationReason, PublicationAuthorityMode};
 
     struct MemoryRemote {
         revision: String,
@@ -659,7 +799,7 @@ mod tests {
             receipt_source: source,
             dependencies: Vec::new(),
         };
-        let remote = MemoryRemote {
+        let mut remote = MemoryRemote {
             revision: artifact.revision.clone(),
             paths: remote_paths,
             reads: AtomicUsize::new(0),
@@ -676,8 +816,24 @@ mod tests {
         )
         .unwrap();
         assert!(!first.reused_verified_package);
+        let serialized = serde_json::to_value(&first).unwrap();
+        for operational_only in [
+            "part_fetch_elapsed_millis",
+            "package_reconstruction_elapsed_millis",
+            "payload_verification_elapsed_millis",
+        ] {
+            assert!(
+                serialized.get(operational_only).is_none(),
+                "schema-v1 JSON must not gain timing field {operational_only}"
+            );
+        }
         assert_eq!(
-            first.part_fetch.unwrap().downloaded_sequences.len(),
+            first
+                .part_fetch
+                .as_ref()
+                .unwrap()
+                .downloaded_sequences
+                .len(),
             artifact.encoding.ordered_parts.len()
         );
         let reads = remote.reads.load(Ordering::Relaxed);
@@ -696,6 +852,93 @@ mod tests {
         assert_eq!(
             second.verification.logical_size_bytes,
             logical_bytes.len() as u64
+        );
+
+        // Cancellation is not evidence of corruption. A Ctrl-C during a warm
+        // verification must leave the valid immutable package available for
+        // the next run.
+        let cancelled = CancellationToken::new();
+        cancelled.cancel(CancellationReason::UserRequested);
+        let error = materialize_resolved_remote_artifact(
+            &remote,
+            &artifact,
+            &parts_root,
+            &package_path,
+            &ResourcePolicy::default(),
+            &cancelled,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::Cancelled(_)));
+        assert!(package_path.is_file());
+
+        // A corrupt retained package is removed after the failing
+        // verification. The next call can then rebuild it from its verified
+        // retained parts without downloading them again.
+        let mut corrupt_package = fs::read(&package_path).unwrap();
+        corrupt_package[0] ^= 1;
+        fs::write(&package_path, corrupt_package).unwrap();
+        let reads_before_package_repair = remote.reads.load(Ordering::Relaxed);
+        let error = materialize_resolved_remote_artifact(
+            &remote,
+            &artifact,
+            &parts_root,
+            &package_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::DigestMismatch { .. }));
+        assert!(
+            !package_path.exists(),
+            "the corrupt ordinary package must not wedge later attempts"
+        );
+        let rebuilt = materialize_resolved_remote_artifact(
+            &remote,
+            &artifact,
+            &parts_root,
+            &package_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(!rebuilt.reused_verified_package);
+        assert_eq!(
+            remote.reads.load(Ordering::Relaxed),
+            reads_before_package_repair,
+            "retained verified parts repair the package without network I/O"
+        );
+
+        // The same rule applies when cancellation arrives during validation
+        // immediately after a package was reconstructed from verified parts.
+        // The package is complete and valid, so the next run may reuse it.
+        struct CancellingWriter<'a>(&'a CancellationToken);
+        impl std::io::Write for CancellingWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.cancel(CancellationReason::UserRequested);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        fs::remove_file(&package_path).unwrap();
+        let cancellation = CancellationToken::new();
+        let mut writer = CancellingWriter(&cancellation);
+        let error = materialize_resolved_remote_artifact_to_writer(
+            &remote,
+            &artifact,
+            &parts_root,
+            &package_path,
+            &ResourcePolicy::default(),
+            &cancellation,
+            &mut writer,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::Cancelled(_)));
+        assert!(
+            package_path.is_file(),
+            "cancellation after reconstruction must retain the complete package"
         );
 
         let mut dependency = artifact.clone();
@@ -741,6 +984,121 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, CacheError::InvalidManifest(_)));
+
+        // Reused parts deliberately skip a preliminary full-file hash. Their
+        // digests are still checked while bytes are copied into the package.
+        // A corrupt reused part is quarantined and fetched again exactly
+        // once, so the run succeeds with a freshly downloaded copy instead
+        // of failing identically on every attempt.
+        fs::remove_file(&package_path).unwrap();
+        let corrupt_part = &artifact.encoding.ordered_parts[0];
+        let corrupt_path = corrupt_part
+            .repository_path
+            .split('/')
+            .fold(parts_root.clone(), |path, component| path.join(component));
+        let mut corrupt_bytes = fs::read(&corrupt_path).unwrap();
+        corrupt_bytes[0] ^= 1;
+        fs::write(&corrupt_path, &corrupt_bytes).unwrap();
+        let reads_before_repair = remote.reads.load(Ordering::Relaxed);
+        let repaired = materialize_resolved_remote_artifact(
+            &remote,
+            &artifact,
+            &parts_root,
+            &package_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(package_path.exists());
+        assert_eq!(
+            remote.reads.load(Ordering::Relaxed),
+            reads_before_repair + 1,
+            "exactly the corrupt part is downloaded again"
+        );
+        assert_eq!(
+            repaired.part_fetch.as_ref().unwrap().downloaded_sequences,
+            vec![corrupt_part.sequence]
+        );
+        assert_eq!(
+            fs::read(&corrupt_path).unwrap(),
+            remote.paths[&corrupt_part.repository_path],
+            "the repaired part is the remote's bytes"
+        );
+        let quarantined = fs::read_dir(corrupt_path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(
+            quarantined, 0,
+            "a successfully repaired part must not leave unaccounted quarantine bytes"
+        );
+
+        // A retained part of the wrong size is corruption too. It is
+        // quarantined at fetch time and downloaded again, before any
+        // reconstruction is attempted.
+        fs::remove_file(&package_path).unwrap();
+        let truncated_part = &artifact.encoding.ordered_parts[1];
+        let truncated_path = truncated_part
+            .repository_path
+            .split('/')
+            .fold(parts_root.clone(), |path, component| path.join(component));
+        let intact = fs::read(&truncated_path).unwrap();
+        fs::write(&truncated_path, &intact[..intact.len() - 1]).unwrap();
+        let reads_before_size_repair = remote.reads.load(Ordering::Relaxed);
+        let repaired = materialize_resolved_remote_artifact(
+            &remote,
+            &artifact,
+            &parts_root,
+            &package_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(package_path.exists());
+        assert_eq!(
+            remote.reads.load(Ordering::Relaxed),
+            reads_before_size_repair + 1
+        );
+        assert_eq!(
+            repaired.part_fetch.as_ref().unwrap().downloaded_sequences,
+            vec![truncated_part.sequence]
+        );
+        assert_eq!(fs::read(&truncated_path).unwrap(), intact);
+        let quarantined_after_size_repair = fs::read_dir(truncated_path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(quarantined_after_size_repair, 0);
+
+        // When the replacement download is corrupt as well, the run fails
+        // closed without leaving a visible package.
+        fs::remove_file(&package_path).unwrap();
+        fs::write(&corrupt_path, &corrupt_bytes).unwrap();
+        remote
+            .paths
+            .insert(corrupt_part.repository_path.clone(), corrupt_bytes);
+        let error = materialize_resolved_remote_artifact(
+            &remote,
+            &artifact,
+            &parts_root,
+            &package_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CacheError::DigestMismatch { .. }));
+        assert!(!package_path.exists());
+        assert_eq!(
+            fs::read_dir(corrupt_path.parent().unwrap())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+                .count(),
+            0,
+            "failed repair must not leak quarantine files outside accounting"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

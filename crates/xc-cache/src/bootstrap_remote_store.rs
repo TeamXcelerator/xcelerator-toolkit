@@ -6,12 +6,63 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use xc_core::{CancellationToken, ResourcePolicy};
 
 type HistoricalBatchInventory = Vec<(RepositoryPublicationBatch, RemoteReadReport)>;
 type HistoricalBatchCache = HashMap<(String, String), HistoricalBatchInventory>;
+type MetadataDocumentKey = (String, String, String);
+
+#[derive(Default)]
+struct MetadataDocumentCache {
+    retained_bytes: u64,
+    documents: HashMap<MetadataDocumentKey, (Arc<[u8]>, RemoteReadReport)>,
+}
+
+fn regular_file_has_exact_size(
+    path: &std::path::Path,
+    size_bytes: u64,
+) -> Result<bool, CacheError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.len() == size_bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Return only transport paths that are not already represented by a local
+/// complete package or retained part. Content is still verified by the normal
+/// materialization path before use; this is only a network-preparation filter.
+fn missing_local_transport_paths(
+    root: &std::path::Path,
+    encoding: &TransportEncodingRecord,
+) -> Result<Vec<RemotePathPrefetch>, CacheError> {
+    encoding.validate()?;
+    let package_path = root
+        .join("packages")
+        .join(format!("{}.zip", encoding.digest()?.0));
+    if regular_file_has_exact_size(&package_path, encoding.package_size_bytes)? {
+        return Ok(Vec::new());
+    }
+    let parts_root = root.join("parts");
+    let mut missing = Vec::new();
+    for part in &encoding.ordered_parts {
+        let part_path = part
+            .repository_path
+            .split('/')
+            .fold(parts_root.clone(), |path, component| path.join(component));
+        if !regular_file_has_exact_size(&part_path, part.size_bytes)? {
+            missing.push(RemotePathPrefetch {
+                repository_path: part.repository_path.clone(),
+                maximum_bytes: part.size_bytes,
+            });
+        }
+    }
+    Ok(missing)
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,11 +94,13 @@ pub struct GitHubBootstrapCacheStore {
     required: bool,
     remote: GitCliRemoteStore,
     resolved: Mutex<HashMap<ContentDigest, ResolvedRemoteArtifact>>,
+    verified_transports: Mutex<HashMap<ContentDigest, VerifiedTransportParts>>,
     discovered_keys: Mutex<HashMap<(String, String), Vec<ArtifactKey>>>,
     continuation_inventory_lock: Mutex<()>,
     registry_snapshot: Mutex<Option<BootstrapRegistry>>,
     shard_revisions: Mutex<HashMap<String, String>>,
     historical_batches: Mutex<HistoricalBatchCache>,
+    metadata_documents: Mutex<MetadataDocumentCache>,
 }
 
 impl GitHubBootstrapCacheStore {
@@ -88,11 +141,13 @@ impl GitHubBootstrapCacheStore {
             )?,
             root,
             resolved: Mutex::new(HashMap::new()),
+            verified_transports: Mutex::new(HashMap::new()),
             discovered_keys: Mutex::new(HashMap::new()),
             continuation_inventory_lock: Mutex::new(()),
             registry_snapshot: Mutex::new(None),
             shard_revisions: Mutex::new(HashMap::new()),
             historical_batches: Mutex::new(HashMap::new()),
+            metadata_documents: Mutex::new(MetadataDocumentCache::default()),
         })
     }
 
@@ -166,6 +221,18 @@ impl GitHubBootstrapCacheStore {
         revision: &str,
         path: &str,
     ) -> Result<(T, RemoteReadReport), CacheError> {
+        const MAXIMUM_RETAINED_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+        let cache_key = (repository.to_owned(), revision.to_owned(), path.to_owned());
+        let cached = {
+            let cache = self
+                .metadata_documents
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.documents.get(&cache_key).cloned()
+        };
+        if let Some((bytes, report)) = cached {
+            return Ok((serde_json::from_slice(bytes.as_ref())?, report));
+        }
         let mut bytes = Vec::new();
         let report = self.remote.read_committed_path(
             repository,
@@ -175,7 +242,22 @@ impl GitHubBootstrapCacheStore {
             &CancellationToken::new(),
             &mut bytes,
         )?;
-        Ok((serde_json::from_slice(&bytes)?, report))
+        let value = serde_json::from_slice(&bytes)?;
+        let retained_bytes = bytes.len() as u64;
+        let mut cache = self
+            .metadata_documents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !cache.documents.contains_key(&cache_key)
+            && cache.retained_bytes.saturating_add(retained_bytes)
+                <= MAXIMUM_RETAINED_METADATA_BYTES
+        {
+            cache.retained_bytes = cache.retained_bytes.saturating_add(retained_bytes);
+            cache
+                .documents
+                .insert(cache_key, (Arc::from(bytes), report.clone()));
+        }
+        Ok((value, report))
     }
 
     /// Read and validate the immutable publication-batch inventory once for a
@@ -729,6 +811,38 @@ impl GitHubBootstrapCacheStore {
             provenance_digest: Some(resolved.manifest.digest()?),
         })
     }
+
+    /// The key under which resolved remote state is retained: the canonical
+    /// manifest digest that every adapter carries as its provenance. The
+    /// logical payload digest is not sufficient, because the schema permits
+    /// identical payload bytes under different dependency closures, and
+    /// those are different artifacts with different transports.
+    fn resolved_key(manifest: &ArtifactManifest) -> Result<ContentDigest, CacheError> {
+        manifest.provenance_digest.clone().ok_or_else(|| {
+            CacheError::InvalidManifest(format!(
+                "remote adapter manifest for {} / {} carries no canonical manifest digest",
+                manifest.key.kind, manifest.key.logical_key
+            ))
+        })
+    }
+
+    fn remember_resolved(
+        &self,
+        adapter_manifest: &ArtifactManifest,
+        resolved: ResolvedRemoteArtifact,
+    ) -> Result<(), CacheError> {
+        let key = Self::resolved_key(adapter_manifest)?;
+        if key != resolved.manifest.digest()? {
+            return Err(CacheError::InvalidManifest(
+                "remote adapter manifest does not name the resolved canonical manifest".to_owned(),
+            ));
+        }
+        self.resolved
+            .lock()
+            .map_err(|_| CacheError::Io("public cache lock poisoned".to_owned()))?
+            .insert(key, resolved);
+        Ok(())
+    }
 }
 
 impl CacheStore for GitHubBootstrapCacheStore {
@@ -776,11 +890,114 @@ impl CacheStore for GitHubBootstrapCacheStore {
             parameters_digest: identity.semantic_digest.clone(),
         };
         let adapter_manifest = self.adapter_manifest_for(key, &resolved)?;
-        self.resolved
-            .lock()
-            .map_err(|_| CacheError::Io("public cache lock poisoned".to_owned()))?
-            .insert(adapter_manifest.content_digest.clone(), resolved);
+        self.remember_resolved(&adapter_manifest, resolved)?;
         Ok(vec![adapter_manifest])
+    }
+
+    fn prefetch_manifests(&self, manifests: &[ArtifactManifest]) -> Result<(), CacheError> {
+        if manifests.is_empty() {
+            return Ok(());
+        }
+        let resolved = self
+            .resolved
+            .lock()
+            .map_err(|_| CacheError::Io("public cache lock poisoned".to_owned()))?;
+        let mut batches = BTreeMap::<(String, String), BTreeMap<String, u64>>::new();
+        let mut artifact_count = 0usize;
+        for manifest in manifests {
+            let key = Self::resolved_key(manifest)?;
+            let artifact = resolved
+                .get(&key)
+                .ok_or_else(|| CacheError::NotFound(key.to_string()))?;
+            let missing_paths = missing_local_transport_paths(&self.root, &artifact.encoding)?;
+            if missing_paths.is_empty() {
+                continue;
+            }
+            artifact_count = artifact_count.saturating_add(1);
+            let paths = batches
+                .entry((artifact.repository.clone(), artifact.revision.clone()))
+                .or_default();
+            for part in missing_paths {
+                paths
+                    .entry(part.repository_path)
+                    .and_modify(|maximum| *maximum = (*maximum).max(part.maximum_bytes))
+                    .or_insert(part.maximum_bytes);
+            }
+        }
+        drop(resolved);
+        let cancellation = CancellationToken::new();
+        let repository_count = batches.len();
+        let prepared_path_count = batches.values().map(BTreeMap::len).sum::<usize>();
+        let prepared_bytes = batches
+            .values()
+            .flat_map(BTreeMap::values)
+            .fold(0u64, |total, bytes| total.saturating_add(*bytes));
+        let batches = batches
+            .into_iter()
+            .map(|((repository, revision), paths)| {
+                let paths = paths
+                    .into_iter()
+                    .map(|(repository_path, maximum_bytes)| RemotePathPrefetch {
+                        repository_path,
+                        maximum_bytes,
+                    })
+                    .collect::<Vec<_>>();
+                (repository, revision, paths)
+            })
+            .collect::<Vec<_>>();
+        let concurrency = std::env::var("XC_CACHE_PREFETCH_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 8);
+        let started = Instant::now();
+        let performance = xc_core::performance_stage_with("cache.remote.prefetch", || {
+            xc_core::PerformanceStageMetadata {
+                operation: Some("dependency-closure".to_owned()),
+                cache_disposition: Some("transport-prefetch".to_owned()),
+                scheduling: Some(format!(
+                    "bounded-repository-batches;workers={concurrency};repositories={repository_count};paths={prepared_path_count}"
+                )),
+                ..xc_core::PerformanceStageMetadata::default()
+            }
+        });
+        for batch in batches.chunks(concurrency) {
+            std::thread::scope(|scope| {
+                let workers = batch
+                    .iter()
+                    .map(|(repository, revision, paths)| {
+                        let cancellation = &cancellation;
+                        scope.spawn(move || {
+                            self.remote.prefetch_committed_paths(
+                                repository,
+                                revision,
+                                paths,
+                                cancellation,
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for worker in workers {
+                    worker.join().map_err(|_| {
+                        CacheError::Io("cache prefetch worker panicked".to_owned())
+                    })??;
+                }
+                Ok::<(), CacheError>(())
+            })?;
+        }
+        drop(performance);
+        if prepared_bytes >= 64 * 1024 * 1024 {
+            eprintln!(
+                "  cache prefetch: {} artifacts, {:.1} MB, {} immutable paths across {} repositories in {:.3}s (workers={})",
+                artifact_count,
+                prepared_bytes as f64 / 1_000_000.0,
+                prepared_path_count,
+                repository_count,
+                started.elapsed().as_secs_f64(),
+                concurrency
+            );
+        }
+        Ok(())
     }
 
     fn candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
@@ -807,10 +1024,7 @@ impl CacheStore for GitHubBootstrapCacheStore {
             assurance,
             resolved.index.disposition,
         )?;
-        self.resolved
-            .lock()
-            .map_err(|_| CacheError::Io("public cache lock poisoned".to_owned()))?
-            .insert(adapter_manifest.content_digest.clone(), resolved);
+        self.remember_resolved(&adapter_manifest, resolved)?;
         Ok(vec![adapter_manifest])
     }
 
@@ -912,7 +1126,7 @@ impl CacheStore for GitHubBootstrapCacheStore {
             .resolved
             .lock()
             .map_err(|_| CacheError::Io("public cache lock poisoned".to_owned()))?
-            .get(&manifest.content_digest)
+            .get(&Self::resolved_key(manifest)?)
             .cloned()
             .ok_or_else(|| CacheError::NotFound(manifest.content_digest.to_string()))?;
         let package = self
@@ -932,9 +1146,33 @@ impl CacheStore for GitHubBootstrapCacheStore {
             &CancellationToken::new(),
             writer,
         )?;
+        {
+            // A reconstruction verified every part in this process. A package
+            // reuse did not touch the parts, so they are offered unverified
+            // and staging hashes them before linking.
+            let identity = Self::resolved_key(manifest)?;
+            let parts_verified = report.part_fetch.is_some();
+            let mut verified_transports = self
+                .verified_transports
+                .lock()
+                .map_err(|_| CacheError::Io("verified transport lock poisoned".to_owned()))?;
+            let already_verified = verified_transports
+                .get(&identity)
+                .is_some_and(|existing| existing.parts_verified);
+            if parts_verified || !already_verified {
+                verified_transports.insert(
+                    identity,
+                    VerifiedTransportParts {
+                        encoding: resolved.encoding.clone(),
+                        parts_root: self.root.join("parts"),
+                        parts_verified,
+                    },
+                );
+            }
+        }
         if resolved.encoding.package_size_bytes >= 64 * 1024 * 1024 {
             eprintln!(
-                "  cache transport: {} {:.1} MB, {} parts ({} downloaded, {} reused), verified and decoded once in {:.3}s",
+                "  cache transport: {} {:.1} MB, {} parts ({} downloaded, {} reused), fetch {:.3}s, reconstruct {:.3}s, verify/decode {:.3}s, total {:.3}s",
                 resolved.family,
                 resolved.encoding.package_size_bytes as f64 / 1_000_000.0,
                 resolved.encoding.ordered_parts.len(),
@@ -948,6 +1186,9 @@ impl CacheStore for GitHubBootstrapCacheStore {
                     .map_or(resolved.encoding.ordered_parts.len(), |parts| {
                         parts.reused_sequences.len()
                     }),
+                report.part_fetch_elapsed_millis as f64 / 1_000.0,
+                report.package_reconstruction_elapsed_millis as f64 / 1_000.0,
+                report.payload_verification_elapsed_millis as f64 / 1_000.0,
                 started.elapsed().as_secs_f64()
             );
         }
@@ -962,22 +1203,66 @@ impl CacheStore for GitHubBootstrapCacheStore {
             .resolved
             .lock()
             .map_err(|_| CacheError::Io("public cache lock poisoned".to_owned()))?
-            .get(&manifest.content_digest)
+            .get(&Self::resolved_key(manifest)?)
             .cloned()
             .ok_or_else(|| CacheError::NotFound(manifest.content_digest.to_string()))?;
         let path = self
             .root
             .join("packages")
             .join(format!("{}.zip", resolved.encoding.digest()?.0));
-        if !path.exists() {
-            return Ok(None);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() != resolved.encoding.package_size_bytes
+        {
+            return Err(CacheError::InvalidManifest(format!(
+                "retained package has invalid filesystem metadata: {}",
+                path.display()
+            )));
         }
         Ok(Some(VerifiedEncodedPayload {
             path,
             encoding: "zip-json-entry-v1".to_owned(),
+            encoder_profile: Some(resolved.encoding.encoder_profile.clone()),
             content_digest: resolved.encoding.package_digest,
             size_bytes: resolved.encoding.package_size_bytes,
         }))
+    }
+
+    fn verified_transport_parts(
+        &self,
+        manifest: &ArtifactManifest,
+    ) -> Result<Option<VerifiedTransportParts>, CacheError> {
+        let identity = Self::resolved_key(manifest)?;
+        if let Some(verified) = self
+            .verified_transports
+            .lock()
+            .map_err(|_| CacheError::Io("verified transport lock poisoned".to_owned()))?
+            .get(&identity)
+        {
+            return Ok(Some(verified.clone()));
+        }
+        // No materialization ran for this manifest in this process (for
+        // example a metadata-only closure resolution). Offer the retained
+        // part store unverified; staging hashes each part before linking and
+        // falls back to the verified package when a part is absent or wrong.
+        // The entry is keyed by the exact canonical manifest, so two
+        // artifacts with identical payload bytes and different closures can
+        // never exchange encodings here.
+        Ok(self
+            .resolved
+            .lock()
+            .map_err(|_| CacheError::Io("public cache lock poisoned".to_owned()))?
+            .get(&identity)
+            .map(|resolved| VerifiedTransportParts {
+                encoding: resolved.encoding.clone(),
+                parts_root: self.root.join("parts"),
+                parts_verified: false,
+            }))
     }
 }
 
@@ -992,6 +1277,371 @@ fn visibility_name(visibility: CacheVisibility) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A resolved remote artifact whose payload bytes are fixed and whose
+    /// canonical closure is the caller's. Two calls with different closures
+    /// therefore describe two different published artifacts that share every
+    /// payload byte, every ZIP byte, and every split part, but not their
+    /// canonical manifests or transport encodings.
+    fn resolved_fixture(
+        root: &std::path::Path,
+        label: &str,
+        dependencies: Vec<PayloadDependencyIdentity>,
+    ) -> ResolvedRemoteArtifact {
+        let payload = br#"{"same":"bytes under two closures"}"#;
+        let canonical_payload = CanonicalPayloadEnvelope {
+            schema_version: 1,
+            scalar_backend: "json".to_owned(),
+            precision_bits: None,
+            scalar_representation: "json".to_owned(),
+            dimensions: vec![payload.len() as u64],
+            endianness: "not-applicable".to_owned(),
+            special_value_encoding: "not-applicable".to_owned(),
+            ordered_items: vec![LogicalPayloadItem {
+                normalized_path: "payload.json".to_owned(),
+                content_digest: ContentDigest::sha256(payload),
+                size_bytes: payload.len() as u64,
+            }],
+            dependencies,
+        };
+        let payload_digest = canonical_payload.digest().unwrap();
+        let package_path = root.join(format!("{label}.zip"));
+        package_canonical_payload_bytes_zip64(
+            &canonical_payload,
+            "payload.json",
+            payload,
+            &package_path,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let encoded = fs::read(&package_path).unwrap();
+        let encoding = stream_split_encoded(
+            &mut encoded.as_slice(),
+            payload_digest.clone(),
+            DETERMINISTIC_ZIP64_PROFILE_V1,
+            &TransportPolicy {
+                maximum_file_bytes_exclusive: 1_000,
+                split_part_bytes: 32,
+                maximum_batch_payload_bytes: 1_000,
+                maximum_pending_batches: 1,
+            },
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let transport_digest = encoding.digest().unwrap();
+        let semantic_key = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "ccm_tau_matrix".to_owned(),
+            mathematical_semantics_version: "fixture-v1".to_owned(),
+            resolved_mathematical_parameters: serde_json::json!({"case": "same-bytes"}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        let semantic_digest = semantic_key.digest().unwrap();
+        let manifest = CanonicalArtifactManifest {
+            schema_version: 1,
+            artifact_family: "ccm-matrices".to_owned(),
+            semantic_key,
+            semantic_digest: semantic_digest.clone(),
+            canonical_payload,
+            payload_digest: payload_digest.clone(),
+            transport_digests: vec![transport_digest.clone()],
+            resolved_mathematical_configuration_digest: ContentDigest::sha256(b"config"),
+            producer_toolkit_version: ToolkitVersion::parse("0.14.1").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.14.1").unwrap(),
+            maximum_reader_version: None,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            claim_scope: "same-bytes fixture".to_owned(),
+            assumptions: Vec::new(),
+        };
+        let manifest_digest = manifest.digest().unwrap();
+        let transaction_id = ContentDigest::sha256(label.as_bytes()).0;
+        let index = ShardIndexEntry {
+            semantic_digest: semantic_digest.clone(),
+            canonical_payload_digest: payload_digest.clone(),
+            manifest_digest: manifest_digest.clone(),
+            achieved_assurance: ArtifactAssuranceState::Computed,
+            disposition: ArtifactDisposition::Active,
+            producer_toolkit_version: ToolkitVersion::parse("0.14.1").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.14.1").unwrap(),
+            transport_digests: vec![transport_digest.clone()],
+            publication_transaction_id: transaction_id.clone(),
+        };
+        let receipt = PublicationReceipt {
+            schema_version: 1,
+            transaction_id: transaction_id.clone(),
+            idempotency_key: ContentDigest(transaction_id),
+            destination: PublicationDestination::Public,
+            principal: "fixture".to_owned(),
+            authorized_repository: "team/shard".to_owned(),
+            repository_permission_evidence_digest: ContentDigest::sha256(b"permission"),
+            shard_id: "fixture-001".to_owned(),
+            branch: "main".to_owned(),
+            semantic_digest: semantic_digest.clone(),
+            canonical_payload_digest: payload_digest,
+            manifest_digest: manifest_digest.clone(),
+            transport_digest: transport_digest.clone(),
+            policy_digest: ContentDigest::sha256(b"policy"),
+            policy_id: "fixture-owner-policy".to_owned(),
+            authority_mode: xc_core::PublicationAuthorityMode::OwnerDirect,
+            validation_evidence_digests: vec![ContentDigest::sha256(b"validation")],
+            contributor_authorization_digest: None,
+            reviewer_approvals: Vec::new(),
+            payload_commit_ids: vec!["payload-commit".to_owned()],
+            payload_batch_record_commit_ids: Vec::new(),
+            payload_batch_record_digests: BTreeMap::new(),
+            metadata_commit_id: "metadata-commit".to_owned(),
+            metadata_file_digests: BTreeMap::from([(
+                "manifests/fixture.json".to_owned(),
+                manifest_digest,
+            )]),
+            discoverability_subject_digests: BTreeMap::from([(
+                "indexes/fixture/00.json".to_owned(),
+                ContentDigest::sha256(b"index"),
+            )]),
+            remote_verification_results: vec![RemoteCommitVerificationResult {
+                phase: "immutable_metadata".to_owned(),
+                sequence: 0,
+                commit_id: "metadata-commit".to_owned(),
+                verified: true,
+                content_digests: vec![transport_digest],
+            }],
+            verified_at_unix_seconds: 1,
+        };
+        let source = RemoteReadReport {
+            repository_path: "fixture.json".to_owned(),
+            revision: "a".repeat(40),
+            size_bytes: 1,
+            content_digest: ContentDigest::sha256(b"fixture"),
+        };
+        ResolvedRemoteArtifact {
+            family: "ccm-matrices".to_owned(),
+            semantic_digest,
+            overlay: "public".to_owned(),
+            visibility: CacheVisibility::Public,
+            shard_id: "fixture-001".to_owned(),
+            authorized_repository: "team/shard".to_owned(),
+            repository: "team/shard".to_owned(),
+            revision: source.revision.clone(),
+            index,
+            manifest,
+            encoding,
+            receipt: RemotePublicationEvidence::ArtifactReceipt(Box::new(receipt)),
+            index_source: source.clone(),
+            manifest_source: source.clone(),
+            encoding_source: source.clone(),
+            receipt_source: source,
+            dependencies: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn same_byte_artifacts_with_different_closures_keep_their_own_transports() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-bootstrap-same-bytes-identity-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let store = GitHubBootstrapCacheStore::public("fixture-owner", root.join("store")).unwrap();
+
+        let artifact_a = resolved_fixture(&root, "a", Vec::new());
+        let artifact_b = resolved_fixture(
+            &root,
+            "b",
+            vec![PayloadDependencyIdentity {
+                artifact_family: "ccm-matrices".to_owned(),
+                semantic_digest: ContentDigest::sha256(b"dependency semantic"),
+                manifest_digest: ContentDigest::sha256(b"dependency manifest"),
+                payload_digest: ContentDigest::sha256(b"dependency payload"),
+            }],
+        );
+        assert_eq!(
+            artifact_a.manifest.canonical_payload.ordered_items,
+            artifact_b.manifest.canonical_payload.ordered_items,
+            "identical payload bytes"
+        );
+        assert_eq!(
+            artifact_a.encoding.ordered_parts, artifact_b.encoding.ordered_parts,
+            "identical split parts"
+        );
+        assert_ne!(
+            artifact_a.manifest.digest().unwrap(),
+            artifact_b.manifest.digest().unwrap(),
+            "different canonical manifests"
+        );
+        assert_ne!(
+            artifact_a.encoding, artifact_b.encoding,
+            "different transport encodings"
+        );
+
+        let key = ArtifactKey {
+            kind: "ccm_tau_matrix".to_owned(),
+            logical_key: "closure/same-bytes".to_owned(),
+            parameters_digest: artifact_a.semantic_digest.clone(),
+        };
+        let adapter_a = store
+            .adapter_manifest_for(key.clone(), &artifact_a)
+            .unwrap();
+        let adapter_b = store.adapter_manifest_for(key, &artifact_b).unwrap();
+        assert_eq!(
+            adapter_a.content_digest, adapter_b.content_digest,
+            "the logical payload digest cannot tell them apart"
+        );
+        assert_ne!(adapter_a.provenance_digest, adapter_b.provenance_digest);
+
+        // Resolve A, then B, then ask for A's transport parts.
+        store
+            .remember_resolved(&adapter_a, artifact_a.clone())
+            .unwrap();
+        store
+            .remember_resolved(&adapter_b, artifact_b.clone())
+            .unwrap();
+        let parts_a = store.verified_transport_parts(&adapter_a).unwrap().unwrap();
+        assert_eq!(parts_a.encoding, artifact_a.encoding);
+        let parts_b = store.verified_transport_parts(&adapter_b).unwrap().unwrap();
+        assert_eq!(parts_b.encoding, artifact_b.encoding);
+        // The encoded descriptor is addressed the same way; A's package is
+        // the one named by A's encoding.
+        let package_a = store
+            .root
+            .join("packages")
+            .join(format!("{}.zip", artifact_a.encoding.digest().unwrap().0));
+        fs::create_dir_all(package_a.parent().unwrap()).unwrap();
+        fs::write(
+            &package_a,
+            vec![0u8; artifact_a.encoding.package_size_bytes as usize],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .verified_encoded_payload(&adapter_a)
+                .unwrap()
+                .unwrap()
+                .content_digest,
+            artifact_a.encoding.package_digest
+        );
+        assert!(
+            store
+                .verified_encoded_payload(&adapter_b)
+                .unwrap()
+                .is_none(),
+            "B's package was never materialized, so B has no encoded descriptor"
+        );
+
+        // An adapter that carries no canonical manifest digest is refused
+        // rather than answered from the payload digest.
+        let mut anonymous = adapter_a.clone();
+        anonymous.provenance_digest = None;
+        assert!(matches!(
+            store.verified_transport_parts(&anonymous),
+            Err(CacheError::InvalidManifest(_))
+        ));
+        assert!(matches!(
+            store.remember_resolved(&anonymous, artifact_a.clone()),
+            Err(CacheError::InvalidManifest(_))
+        ));
+
+        // Concurrent variant: writers keep re-resolving A and B in
+        // alternation while readers ask for each one's parts. Every answer
+        // must belong to the artifact that was asked about.
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    for _ in 0..200 {
+                        store
+                            .remember_resolved(&adapter_a, artifact_a.clone())
+                            .unwrap();
+                        store
+                            .remember_resolved(&adapter_b, artifact_b.clone())
+                            .unwrap();
+                    }
+                });
+                scope.spawn(|| {
+                    for _ in 0..200 {
+                        assert_eq!(
+                            store
+                                .verified_transport_parts(&adapter_a)
+                                .unwrap()
+                                .unwrap()
+                                .encoding,
+                            artifact_a.encoding
+                        );
+                        assert_eq!(
+                            store
+                                .verified_transport_parts(&adapter_b)
+                                .unwrap()
+                                .unwrap()
+                                .encoding,
+                            artifact_b.encoding
+                        );
+                    }
+                });
+            }
+        });
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dependency_prefetch_skips_locally_available_packages_and_parts() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-bootstrap-local-prefetch-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let package_bytes = b"abcdef";
+        let encoding = TransportEncodingRecord {
+            schema_version: 1,
+            canonical_payload_digest: ContentDigest::sha256(b"canonical payload"),
+            encoder_profile: DETERMINISTIC_ZIP64_PROFILE_V1.to_owned(),
+            package_size_bytes: package_bytes.len() as u64,
+            package_digest: ContentDigest::sha256(package_bytes),
+            ordered_parts: vec![
+                TransportPart {
+                    sequence: 0,
+                    repository_path: "objects/aa/part-00000".to_owned(),
+                    size_bytes: 3,
+                    content_digest: ContentDigest::sha256(b"abc"),
+                },
+                TransportPart {
+                    sequence: 1,
+                    repository_path: "objects/bb/part-00001".to_owned(),
+                    size_bytes: 3,
+                    content_digest: ContentDigest::sha256(b"def"),
+                },
+            ],
+            reconstruction: "concatenate ordered parts".to_owned(),
+        };
+        assert_eq!(
+            missing_local_transport_paths(&root, &encoding)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let first_part = root.join("parts/objects/aa/part-00000");
+        fs::create_dir_all(first_part.parent().unwrap()).unwrap();
+        fs::write(&first_part, b"abc").unwrap();
+        let missing = missing_local_transport_paths(&root, &encoding).unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].repository_path, "objects/bb/part-00001");
+
+        let package_path = root
+            .join("packages")
+            .join(format!("{}.zip", encoding.digest().unwrap().0));
+        fs::create_dir_all(package_path.parent().unwrap()).unwrap();
+        fs::write(package_path, package_bytes).unwrap();
+        assert!(missing_local_transport_paths(&root, &encoding)
+            .unwrap()
+            .is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn bootstrap_manifest_paths_are_partitioned_by_semantic_digest() {
@@ -1159,6 +1809,70 @@ mod tests {
         let root = std::env::temp_dir().join("xc-private-consumer-acceptance");
         let store = GitHubBootstrapCacheStore::private("TeamXcelerator", root).unwrap();
         assert_claim_1a_resolves(&store, CacheVisibility::Private);
+    }
+
+    #[test]
+    #[ignore = "authenticated V1-corpus staging acceptance against the private shard"]
+    fn claim_1a_v1_artifact_stages_for_republication() {
+        let root = std::env::temp_dir().join("xc-private-v1-republication-acceptance");
+        let _ = fs::remove_dir_all(&root);
+        let store =
+            GitHubBootstrapCacheStore::private("TeamXcelerator", root.join("remote")).unwrap();
+        let key = ArtifactKey {
+            kind: "gauss_legendre_rule".to_owned(),
+            logical_key: "live-claim-1a".to_owned(),
+            parameters_digest: ContentDigest(
+                "a23310358f5f5e1f83db0cef44bd27d2a26ff1bdbffd94f02292bdba64f8b3fa".to_owned(),
+            ),
+        };
+        let resolved = store.resolve(&key).unwrap().expect("published V1 artifact");
+        assert!(resolved.manifest.canonical_payload.dependencies.is_empty());
+        assert_eq!(
+            resolved.encoding.encoder_profile,
+            DETERMINISTIC_ZIP64_PROFILE_V1
+        );
+        let resolved_manifest_digest = resolved.manifest.digest().unwrap();
+        let adapter = store
+            .candidates(&key)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| {
+                candidate.provenance_digest.as_ref() == Some(&resolved_manifest_digest)
+            })
+            .expect("identity-bound adapter manifest");
+        let (payload, encoded) = store.read_payload_and_encoded(&adapter).unwrap();
+        let encoded = encoded.expect("verified retained package");
+        let transport = store
+            .verified_transport_parts(&adapter)
+            .unwrap()
+            .expect("retained V1 parts");
+        let sink = CanonicalStagingProductionSink::new(
+            root.join("staging"),
+            TransportPolicy::default(),
+            ResourcePolicy::default(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        ArtifactProductionSink::record_with_verified_transport(
+            &sink,
+            ProducedArtifactRecord {
+                operation: "cache.acceptance.v1-republication".to_owned(),
+                semantic_key: resolved.manifest.semantic_key.clone(),
+                logical_key: adapter.key.logical_key.clone(),
+                manifest: adapter,
+                achieved_assurance: resolved.index.achieved_assurance,
+                assurance_evidence_digests: Vec::new(),
+                payload,
+            },
+            &encoded,
+            &transport,
+        )
+        .unwrap();
+        let staged = sink.drafts().unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].manifest, resolved.manifest);
+        assert_eq!(staged[0].encoding, resolved.encoding);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

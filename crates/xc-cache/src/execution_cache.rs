@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 #[cfg(test)]
 use std::io::Cursor;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use xc_core::{
@@ -21,8 +21,7 @@ use xc_core::{
 pub const SEMANTIC_KEY_MANIFEST_TAG: &str = "xc.semantic_key.v1";
 pub const REMOTE_CANONICAL_MANIFEST_TAG: &str = "xc.remote_canonical_manifest.v1";
 pub const OUTPUT_VALIDATION_SEED_TAG: &str = "xc.output_validation.seed_source.v1";
-use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
+use zip::ZipArchive;
 
 /// Whether a computation may consult or populate the cache fabric.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1338,6 +1337,22 @@ fn computed_artifact_assurance() -> crate::ArtifactAssuranceState {
     crate::ArtifactAssuranceState::Computed
 }
 
+/// Metadata-only counterpart of [`ProducedArtifactRecord`] for an artifact
+/// whose verified encoded representation a cache layer already holds. The
+/// logical payload is neither read nor carried: staging splits the encoded
+/// object and either proves it decodes to `manifest.content_digest` (a new
+/// artifact) or binds it through the retained canonical manifest's transport
+/// digest (a reused artifact).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedArtifactRecord {
+    pub operation: String,
+    pub semantic_key: SemanticKeyEnvelope,
+    pub logical_key: String,
+    pub manifest: ArtifactManifest,
+    pub achieved_assurance: crate::ArtifactAssuranceState,
+    pub assurance_evidence_digests: Vec<ContentDigest>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactProductionAssessment {
     pub achieved_assurance: crate::ArtifactAssuranceState,
@@ -1502,6 +1517,88 @@ pub trait ArtifactProductionSink: Send + Sync {
         Ok(false)
     }
 
+    /// Return the already validated canonical manifest for an exact staged
+    /// dependency. Closure traversal can then continue through its parents
+    /// without resolving and decoding the staged payload again. Returning a
+    /// manifest does not suppress traversal; it suppresses only redundant
+    /// payload I/O.
+    fn retained_canonical_manifest(
+        &self,
+        _identity: &crate::PayloadDependencyIdentity,
+    ) -> Result<Option<crate::CanonicalArtifactManifest>, CacheError> {
+        Ok(None)
+    }
+
+    /// Record an artifact while preserving a verified deterministic encoded
+    /// representation already held by the selected cache layer. Production
+    /// sinks that do not support encoded adoption retain the payload-only
+    /// behavior.
+    fn record_with_verified_encoded(
+        &self,
+        artifact: ProducedArtifactRecord,
+        _encoded: &crate::VerifiedEncodedPayload,
+    ) -> Result<(), CacheError> {
+        self.record(artifact)
+    }
+
+    fn record_with_verified_transport(
+        &self,
+        artifact: ProducedArtifactRecord,
+        encoded: &crate::VerifiedEncodedPayload,
+        _transport: &crate::VerifiedTransportParts,
+    ) -> Result<(), CacheError> {
+        self.record_with_verified_encoded(artifact, encoded)
+    }
+
+    /// Whether [`Self::record_encoded`] is implemented. The closure walker
+    /// uses it to decide between resolving a dependency as metadata plus its
+    /// verified encoded object and loading the logical payload.
+    fn supports_encoded_records(&self) -> bool {
+        false
+    }
+
+    /// Record an artifact from its manifest and verified encoded object
+    /// without its logical payload. Sinks that need the payload keep this
+    /// default, which refuses the call; callers consult
+    /// [`Self::supports_encoded_records`] first.
+    fn record_encoded(
+        &self,
+        _artifact: EncodedArtifactRecord,
+        _encoded: &crate::VerifiedEncodedPayload,
+        _transport: Option<&crate::VerifiedTransportParts>,
+    ) -> Result<(), CacheError> {
+        Err(CacheError::InvalidTransition(
+            "this production sink records only payload-carrying artifacts".to_owned(),
+        ))
+    }
+
+    /// Return the canonical manifest for an exact staged adapter artifact.
+    /// This permits key-based closure traversal without decoding the payload.
+    fn retained_canonical_manifest_for_artifact(
+        &self,
+        _key: &crate::ArtifactKey,
+        _content_digest: &ContentDigest,
+        _minimum_quality: crate::CacheQuality,
+    ) -> Result<Option<crate::CanonicalArtifactManifest>, CacheError> {
+        Ok(None)
+    }
+
+    /// Whether this identity's complete transitive closure has already been
+    /// walked successfully in this process.
+    fn canonical_closure_complete(
+        &self,
+        _identity: &crate::PayloadDependencyIdentity,
+    ) -> Result<bool, CacheError> {
+        Ok(false)
+    }
+
+    fn mark_canonical_closure_complete(
+        &self,
+        _identity: &crate::PayloadDependencyIdentity,
+    ) -> Result<(), CacheError> {
+        Ok(())
+    }
+
     fn record(&self, artifact: ProducedArtifactRecord) -> Result<(), CacheError>;
 
     fn contains_artifact(
@@ -1529,6 +1626,49 @@ pub trait ArtifactProductionSink: Send + Sync {
         -> Result<(), CacheError>;
 
     fn record_evidence(&self, kind: &str, bytes: &[u8]) -> Result<ContentDigest, CacheError>;
+}
+
+fn record_produced_artifact(
+    sink: &dyn ArtifactProductionSink,
+    artifact: ProducedArtifactRecord,
+    encoded: Option<&crate::VerifiedEncodedPayload>,
+    transport: Option<&crate::VerifiedTransportParts>,
+) -> Result<(), CacheError> {
+    if let (Some(encoded), Some(transport)) = (encoded, transport) {
+        sink.record_with_verified_transport(artifact, encoded, transport)
+    } else if let Some(encoded) = encoded {
+        sink.record_with_verified_encoded(artifact, encoded)
+    } else {
+        sink.record(artifact)
+    }
+}
+
+/// Record a dependency that was resolved as metadata plus its verified
+/// encoded object. The logical payload was never read.
+fn record_encoded_dependency(
+    sink: &dyn ArtifactProductionSink,
+    operation: &str,
+    resolved: crate::ResolvedEncodedArtifact,
+) -> Result<(), CacheError> {
+    let semantic_key = manifest_semantic_key(&resolved.manifest)?;
+    let crate::ResolvedEncodedArtifact {
+        manifest,
+        encoded,
+        transport,
+        ..
+    } = resolved;
+    sink.record_encoded(
+        EncodedArtifactRecord {
+            operation: operation.to_owned(),
+            semantic_key,
+            logical_key: manifest.key.logical_key.clone(),
+            manifest,
+            achieved_assurance: crate::ArtifactAssuranceState::Computed,
+            assurance_evidence_digests: Vec::new(),
+        },
+        &encoded,
+        transport.as_ref(),
+    )
 }
 
 /// Durable application-owned queue for validated artifacts awaiting explicit
@@ -1597,22 +1737,10 @@ impl DirectoryArtifactProductionSink {
 
     #[cfg(test)]
     fn encode_payload_zip(payload: &[u8]) -> Result<Vec<u8>, CacheError> {
-        let cursor = Cursor::new(Vec::new());
-        let mut writer = ZipWriter::new(cursor);
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Deflated)
-            .compression_level(Some(6))
-            .last_modified_time(DateTime::default())
-            .unix_permissions(0o644)
-            .large_file(true);
-        writer
-            .start_file("payload.json", options)
-            .map_err(|error| CacheError::Io(error.to_string()))?;
-        writer.write_all(payload)?;
-        Ok(writer
-            .finish()
-            .map_err(|error| CacheError::Io(error.to_string()))?
-            .into_inner())
+        Ok(
+            crate::write_deterministic_zip_entry(Cursor::new(Vec::new()), "payload.json", payload)?
+                .into_inner(),
+        )
     }
 
     fn zip_contains_payload(path: &Path, payload: &[u8]) -> Result<bool, CacheError> {
@@ -1664,20 +1792,8 @@ impl DirectoryArtifactProductionSink {
             std::process::id()
         ));
         let output = fs::File::create(&temporary)?;
-        let mut writer = ZipWriter::new(output);
-        let options = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Deflated)
-            .compression_level(Some(6))
-            .last_modified_time(DateTime::default())
-            .unix_permissions(0o644)
-            .large_file(true);
-        writer
-            .start_file("payload.json", options)
-            .map_err(|error| CacheError::Io(error.to_string()))?;
-        writer.write_all(payload)?;
-        writer
-            .finish()
-            .map_err(|error| CacheError::Io(error.to_string()))?;
+        let output = crate::write_deterministic_zip_entry(output, "payload.json", payload)?;
+        drop(output);
         match fs::rename(&temporary, path) {
             Ok(()) => Ok(()),
             Err(_error) if path.exists() && Self::zip_contains_payload(path, payload)? => {
@@ -1943,6 +2059,22 @@ fn emit_dependency_closure(
     manifest: &ArtifactManifest,
     visiting: &mut BTreeSet<String>,
 ) -> Result<(), CacheError> {
+    let unresolved = manifest
+        .dependencies
+        .iter()
+        .filter_map(|dependency| {
+            match sink.retained_canonical_manifest_for_artifact(
+                &dependency.key,
+                &dependency.content_digest,
+                dependency.required_quality,
+            ) {
+                Ok(Some(_)) => None,
+                Ok(None) => Some(Ok(dependency.clone())),
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .collect::<Result<Vec<_>, CacheError>>()?;
+    resolver.prefetch_exact_dependencies(&unresolved, acceptance)?;
     for dependency in &manifest.dependencies {
         let identity = format!(
             "{}\n{}\n{}\n{}",
@@ -1957,32 +2089,84 @@ fn emit_dependency_closure(
                 dependency.key.kind, dependency.key.logical_key
             )));
         }
-        let resolved = resolver.resolve(&dependency.key, acceptance)?;
+        if let Some(staged) = sink.retained_canonical_manifest_for_artifact(
+            &dependency.key,
+            &dependency.content_digest,
+            dependency.required_quality,
+        )? {
+            emit_retained_canonical_dependencies(resolver, acceptance, sink, &staged, visiting)?;
+            visiting.remove(&identity);
+            continue;
+        }
+        // Prefer the metadata-only route: the dependency's verified encoded
+        // object is split (and its retained parts linked) by staging, so the
+        // logical payload is never inflated just to be re-hashed.
+        let encoded_route = if sink.supports_encoded_records() {
+            resolver.resolve_exact_encoded(
+                &dependency.key,
+                &dependency.content_digest,
+                dependency.required_quality,
+                acceptance,
+            )?
+        } else {
+            None
+        };
+        if let Some(resolved) = encoded_route {
+            // A node that is already staged still gets its dependencies
+            // walked: a reopened staging directory may hold drafts from a run
+            // that failed before this walk completed, or that predates
+            // canonical-closure staging entirely. Being staged suppresses
+            // only re-recording.
+            emit_dependency_closure(resolver, acceptance, sink, &resolved.manifest, visiting)?;
+            emit_retained_canonical_closure(
+                resolver,
+                acceptance,
+                sink,
+                &resolved.manifest,
+                visiting,
+            )?;
+            if !sink.contains_artifact(&dependency.key, &dependency.content_digest)? {
+                record_encoded_dependency(sink, "cache.dependency.resolve", resolved)?;
+            }
+            visiting.remove(&identity);
+            continue;
+        }
+        let resolved = resolver.resolve_exact(
+            &dependency.key,
+            &dependency.content_digest,
+            dependency.required_quality,
+            acceptance,
+        )?;
         if resolved.manifest.content_digest != dependency.content_digest
-            || resolved.manifest.quality < dependency.required_quality
+            || resolved.manifest.quality.admissible_rank()
+                < dependency.required_quality.admissible_rank()
         {
             return Err(CacheError::InvalidManifest(format!(
                 "resolved dependency {} / {} does not match the exact required content or quality",
                 dependency.key.kind, dependency.key.logical_key
             )));
         }
-        // A node that is already staged still gets its dependencies walked:
-        // a reopened staging directory may hold drafts from a run that failed
-        // before this walk completed, or that predates canonical-closure
-        // staging entirely. Being staged suppresses only re-recording.
         emit_dependency_closure(resolver, acceptance, sink, &resolved.manifest, visiting)?;
         emit_retained_canonical_closure(resolver, acceptance, sink, &resolved.manifest, visiting)?;
         if !sink.contains_artifact(&dependency.key, &dependency.content_digest)? {
             let semantic_key = manifest_semantic_key(&resolved.manifest)?;
-            sink.record(ProducedArtifactRecord {
-                operation: "cache.dependency.resolve".to_owned(),
-                semantic_key,
-                logical_key: resolved.manifest.key.logical_key.clone(),
-                manifest: resolved.manifest,
-                achieved_assurance: crate::ArtifactAssuranceState::Computed,
-                assurance_evidence_digests: Vec::new(),
-                payload: resolved.payload,
-            })?;
+            let transport =
+                resolver.verified_transport_parts(&resolved.layer_name, &resolved.manifest)?;
+            let encoded = resolved.encoded_payload.clone();
+            record_produced_artifact(
+                sink,
+                ProducedArtifactRecord {
+                    operation: "cache.dependency.resolve".to_owned(),
+                    semantic_key,
+                    logical_key: resolved.manifest.key.logical_key.clone(),
+                    manifest: resolved.manifest,
+                    achieved_assurance: crate::ArtifactAssuranceState::Computed,
+                    assurance_evidence_digests: Vec::new(),
+                    payload: resolved.payload,
+                },
+                encoded.as_ref(),
+                transport.as_ref(),
+            )?;
         }
         visiting.remove(&identity);
     }
@@ -2086,6 +2270,39 @@ fn emit_retained_canonical_closure(
             manifest.key.kind, manifest.key.logical_key
         )));
     }
+    emit_retained_canonical_dependencies(resolver, acceptance, sink, &canonical, visiting)
+}
+
+fn emit_retained_canonical_dependencies(
+    resolver: &CacheResolver,
+    acceptance: &CachePolicy,
+    sink: &dyn ArtifactProductionSink,
+    canonical: &crate::CanonicalArtifactManifest,
+    visiting: &mut BTreeSet<String>,
+) -> Result<(), CacheError> {
+    let canonical_identity = crate::PayloadDependencyIdentity {
+        artifact_family: canonical.artifact_family.clone(),
+        semantic_digest: canonical.semantic_digest.clone(),
+        manifest_digest: canonical.digest()?,
+        payload_digest: canonical.payload_digest.clone(),
+    };
+    canonical_identity.validate()?;
+    if sink.canonical_closure_complete(&canonical_identity)? {
+        return Ok(());
+    }
+    let unresolved = canonical
+        .canonical_payload
+        .dependencies
+        .iter()
+        .filter_map(
+            |dependency| match sink.retained_canonical_manifest(dependency) {
+                Ok(Some(_)) => None,
+                Ok(None) => Some(Ok(dependency.clone())),
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .collect::<Result<Vec<_>, CacheError>>()?;
+    resolver.prefetch_dependency_identities(&unresolved, acceptance)?;
     for dependency in &canonical.canonical_payload.dependencies {
         dependency.validate()?;
         let visit_key = format!(
@@ -2101,32 +2318,74 @@ fn emit_retained_canonical_closure(
                 dependency.artifact_family, dependency.semantic_digest.0
             )));
         }
-        let resolved = resolver
-            .resolve_dependency_identity(dependency, acceptance)?
-            .ok_or_else(|| {
-                CacheError::InvalidManifest(format!(
-                    "publication closure requires published dependency {}/{} (manifest {}), \
-                     which no configured cache layer can resolve by identity",
-                    dependency.artifact_family,
-                    dependency.semantic_digest.0,
-                    dependency.manifest_digest.0
-                ))
-            })?;
-        emit_retained_canonical_closure(resolver, acceptance, sink, &resolved.manifest, visiting)?;
-        if !sink.contains_dependency_identity(dependency)? {
-            let semantic_key = manifest_semantic_key(&resolved.manifest)?;
-            sink.record(ProducedArtifactRecord {
-                operation: "cache.dependency.closure".to_owned(),
-                semantic_key,
-                logical_key: resolved.manifest.key.logical_key.clone(),
-                manifest: resolved.manifest,
-                achieved_assurance: crate::ArtifactAssuranceState::Computed,
-                assurance_evidence_digests: Vec::new(),
-                payload: resolved.payload,
-            })?;
+        // The staged-draft check comes first, as in the key-based walk: a
+        // resumed run must not consult any cache layer (or fail because one
+        // is unreachable) for an artifact it already holds in staging.
+        let staged = sink.retained_canonical_manifest(dependency)?;
+        let encoded_route = if staged.is_none() && sink.supports_encoded_records() {
+            resolver.resolve_dependency_identity_encoded(dependency, acceptance)?
+        } else {
+            None
+        };
+        if let Some(staged) = staged {
+            // A staged node is metadata-complete but may come from an
+            // interrupted earlier run. Always traverse its parents; only the
+            // payload resolve and re-record are skipped.
+            emit_retained_canonical_dependencies(resolver, acceptance, sink, &staged, visiting)?;
+        } else if let Some(resolved) = encoded_route {
+            emit_retained_canonical_closure(
+                resolver,
+                acceptance,
+                sink,
+                &resolved.manifest,
+                visiting,
+            )?;
+            if !sink.contains_dependency_identity(dependency)? {
+                record_encoded_dependency(sink, "cache.dependency.closure", resolved)?;
+            }
+        } else {
+            let resolved = resolver
+                .resolve_dependency_identity(dependency, acceptance)?
+                .ok_or_else(|| {
+                    CacheError::InvalidManifest(format!(
+                        "publication closure requires published dependency {}/{} (manifest {}), \
+                         which no configured cache layer can resolve by identity",
+                        dependency.artifact_family,
+                        dependency.semantic_digest.0,
+                        dependency.manifest_digest.0
+                    ))
+                })?;
+            emit_retained_canonical_closure(
+                resolver,
+                acceptance,
+                sink,
+                &resolved.manifest,
+                visiting,
+            )?;
+            if !sink.contains_dependency_identity(dependency)? {
+                let semantic_key = manifest_semantic_key(&resolved.manifest)?;
+                let transport =
+                    resolver.verified_transport_parts(&resolved.layer_name, &resolved.manifest)?;
+                let encoded = resolved.encoded_payload.clone();
+                record_produced_artifact(
+                    sink,
+                    ProducedArtifactRecord {
+                        operation: "cache.dependency.closure".to_owned(),
+                        semantic_key,
+                        logical_key: resolved.manifest.key.logical_key.clone(),
+                        manifest: resolved.manifest,
+                        achieved_assurance: crate::ArtifactAssuranceState::Computed,
+                        assurance_evidence_digests: Vec::new(),
+                        payload: resolved.payload,
+                    },
+                    encoded.as_ref(),
+                    transport.as_ref(),
+                )?;
+            }
         }
         visiting.remove(&visit_key);
     }
+    sink.mark_canonical_closure_complete(&canonical_identity)?;
     Ok(())
 }
 
@@ -2286,7 +2545,7 @@ where
     if request.mode.consults_cache_for_result_reuse() {
         if let (Some(resolver), Some(acceptance)) = (request.resolver, request.acceptance) {
             match resolver.resolve(&key, acceptance) {
-                Ok(resolved) => {
+                Ok(mut resolved) => {
                     let performance_decode = xc_core::performance_stage_with(
                         "cache.artifact.reuse_decode_validate",
                         || {
@@ -2392,15 +2651,26 @@ where
                             &resolved.manifest,
                             &mut BTreeSet::new(),
                         )?;
-                        sink.record(ProducedArtifactRecord {
-                            operation: request.operation.to_owned(),
-                            semantic_key: request.semantic_key.clone(),
-                            logical_key: request.logical_key.to_owned(),
-                            manifest: resolved.manifest.clone(),
-                            achieved_assurance: crate::ArtifactAssuranceState::Computed,
-                            assurance_evidence_digests: Vec::new(),
-                            payload: resolved.payload.clone(),
-                        })?;
+                        let transport = resolver
+                            .verified_transport_parts(&resolved.layer_name, &resolved.manifest)?;
+                        // The payload has served its purpose (typed decode
+                        // and local adoption); hand it to staging instead of
+                        // copying it.
+                        let payload = std::mem::take(&mut resolved.payload);
+                        record_produced_artifact(
+                            sink,
+                            ProducedArtifactRecord {
+                                operation: request.operation.to_owned(),
+                                semantic_key: request.semantic_key.clone(),
+                                logical_key: request.logical_key.to_owned(),
+                                manifest: resolved.manifest.clone(),
+                                achieved_assurance: crate::ArtifactAssuranceState::Computed,
+                                assurance_evidence_digests: Vec::new(),
+                                payload,
+                            },
+                            resolved.encoded_payload.as_ref(),
+                            transport.as_ref(),
+                        )?;
                     }
                     return Ok(ArtifactExecutionCacheResult {
                         value,
@@ -2492,15 +2762,39 @@ where
                 )
             })?;
             emit_dependency_closure(resolver, acceptance, sink, &manifest, &mut BTreeSet::new())?;
-            sink.record(ProducedArtifactRecord {
-                operation: request.operation.to_owned(),
-                semantic_key: request.semantic_key.clone(),
-                logical_key: request.logical_key.to_owned(),
-                manifest: manifest.clone(),
-                achieved_assurance: assessment.achieved_assurance,
-                assurance_evidence_digests: assessment.evidence_digests.clone(),
-                payload: payload.clone(),
-            })?;
+            let encoded = store.verified_encoded_payload(&manifest)?;
+            let transport = store.verified_transport_parts(&manifest)?;
+            match encoded {
+                // The store just encoded this payload; staging splits that
+                // verified object and proves it decodes to the manifest's
+                // logical digest, so the payload need not be copied again.
+                Some(encoded) if sink.supports_encoded_records() => sink.record_encoded(
+                    EncodedArtifactRecord {
+                        operation: request.operation.to_owned(),
+                        semantic_key: request.semantic_key.clone(),
+                        logical_key: request.logical_key.to_owned(),
+                        manifest: manifest.clone(),
+                        achieved_assurance: assessment.achieved_assurance,
+                        assurance_evidence_digests: assessment.evidence_digests.clone(),
+                    },
+                    &encoded,
+                    transport.as_ref(),
+                )?,
+                encoded => record_produced_artifact(
+                    sink,
+                    ProducedArtifactRecord {
+                        operation: request.operation.to_owned(),
+                        semantic_key: request.semantic_key.clone(),
+                        logical_key: request.logical_key.to_owned(),
+                        manifest: manifest.clone(),
+                        achieved_assurance: assessment.achieved_assurance,
+                        assurance_evidence_digests: assessment.evidence_digests.clone(),
+                        payload: payload.clone(),
+                    },
+                    encoded.as_ref(),
+                    transport.as_ref(),
+                )?,
+            }
         }
         Some(manifest)
     } else {
@@ -2650,6 +2944,7 @@ mod tests {
     use crate::{CacheLayer, DependencyRef, FilesystemCacheStore};
     use serde_json::json;
     use std::fs;
+    use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -2677,6 +2972,15 @@ mod tests {
         }
 
         fn candidates(&self, _key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
+            Err(CacheError::Io(
+                "simulated reference transport failure".to_owned(),
+            ))
+        }
+
+        fn identity_candidates(
+            &self,
+            _identity: &crate::PayloadDependencyIdentity,
+        ) -> Result<Vec<ArtifactManifest>, CacheError> {
             Err(CacheError::Io(
                 "simulated reference transport failure".to_owned(),
             ))
@@ -3216,6 +3520,236 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// ZIP store wrapper that counts logical payload reads, so a test can
+    /// prove the closure walk staged a dependency without inflating it.
+    struct PayloadReadCountingStore {
+        inner: crate::ZipJsonFilesystemCacheStore,
+        payload_reads: std::sync::Arc<AtomicUsize>,
+    }
+
+    impl crate::CacheStore for PayloadReadCountingStore {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn writable(&self) -> bool {
+            self.inner.writable()
+        }
+
+        fn visibility(&self) -> CacheVisibility {
+            self.inner.visibility()
+        }
+
+        fn put(
+            &self,
+            draft: &crate::ArtifactDraft,
+            payload: &[u8],
+        ) -> Result<ArtifactManifest, CacheError> {
+            self.inner.put(draft, payload)
+        }
+
+        fn candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
+            self.inner.candidates(key)
+        }
+
+        fn identity_candidates(
+            &self,
+            identity: &crate::PayloadDependencyIdentity,
+        ) -> Result<Vec<ArtifactManifest>, CacheError> {
+            self.inner.identity_candidates(identity)
+        }
+
+        fn read_payload_to(
+            &self,
+            manifest: &ArtifactManifest,
+            writer: &mut dyn Write,
+        ) -> Result<(), CacheError> {
+            self.payload_reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.read_payload_to(manifest, writer)
+        }
+
+        fn read_payload_and_encoded(
+            &self,
+            manifest: &ArtifactManifest,
+        ) -> Result<(Vec<u8>, Option<crate::VerifiedEncodedPayload>), CacheError> {
+            self.payload_reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.read_payload_and_encoded(manifest)
+        }
+
+        fn verified_encoded_payload(
+            &self,
+            manifest: &ArtifactManifest,
+        ) -> Result<Option<crate::VerifiedEncodedPayload>, CacheError> {
+            self.inner.verified_encoded_payload(manifest)
+        }
+
+        fn put_verified_encoded_payload(
+            &self,
+            draft: &crate::ArtifactDraft,
+            logical_digest: &ContentDigest,
+            logical_size_bytes: u64,
+            encoded: &crate::VerifiedEncodedPayload,
+        ) -> Result<Option<ArtifactManifest>, CacheError> {
+            self.inner.put_verified_encoded_payload(
+                draft,
+                logical_digest,
+                logical_size_bytes,
+                encoded,
+            )
+        }
+    }
+
+    #[test]
+    fn closure_dependencies_from_a_zip_store_are_staged_without_reading_payloads() {
+        let root = root("execution-cache-metadata-only-closure");
+        let _ = fs::remove_dir_all(&root);
+        let policy = policy();
+        let payload_reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let counting = PayloadReadCountingStore {
+            inner: crate::ZipJsonFilesystemCacheStore::new(
+                "workstation",
+                root.join("cache"),
+                true,
+                CacheVisibility::Local,
+            ),
+            payload_reads: payload_reads.clone(),
+        };
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(counting),
+        }]);
+        let author_sink = crate::CanonicalStagingProductionSink::new(
+            root.join("author-staging"),
+            crate::TransportPolicy::default(),
+            xc_core::ResourcePolicy::default(),
+            xc_core::CancellationToken::new(),
+        )
+        .unwrap();
+        let grandparent_key = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "ccm_tau_matrix".to_owned(),
+            mathematical_semantics_version: "ccm-fixture-v1".to_owned(),
+            resolved_mathematical_parameters: json!({"role": "grandparent"}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        let mut grandparent_request = request(
+            &grandparent_key,
+            &resolver,
+            &policy,
+            ArtifactExecutionCacheMode::PreferReuse,
+        );
+        grandparent_request.logical_key = "ccm/fixture/grandparent";
+        grandparent_request.production_sink = Some(&author_sink);
+        let grandparent = resolve_or_compute_json_artifact(
+            &grandparent_request,
+            || Ok(vec!["grandparent".to_owned()]),
+            |_| Ok(()),
+        )
+        .unwrap()
+        .produced_manifest
+        .unwrap();
+        let parent_key = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "ccm_even_sector_matrix".to_owned(),
+            mathematical_semantics_version: "ccm-fixture-v1".to_owned(),
+            resolved_mathematical_parameters: json!({"role": "parent"}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        let mut parent_request = request(
+            &parent_key,
+            &resolver,
+            &policy,
+            ArtifactExecutionCacheMode::PreferReuse,
+        );
+        parent_request.logical_key = "ccm/fixture/parent";
+        parent_request.production_sink = Some(&author_sink);
+        let compute_parent = || {
+            Ok((
+                vec!["parent".to_owned()],
+                vec![DependencyRef {
+                    key: grandparent.key.clone(),
+                    content_digest: grandparent.content_digest.clone(),
+                    required_quality: CacheQuality::Validated,
+                }],
+            ))
+        };
+        let parent = resolve_or_compute_json_artifact_with_dependencies(
+            &parent_request,
+            compute_parent,
+            |_| Ok(()),
+        )
+        .unwrap()
+        .produced_manifest
+        .unwrap();
+        let author_drafts = author_sink.drafts().unwrap();
+        assert_eq!(author_drafts.len(), 2);
+        let reads_after_authoring = payload_reads.load(Ordering::Relaxed);
+
+        // A later run with an empty staging directory reuses the parent. Its
+        // own payload is read once for the typed decode; the grandparent is
+        // staged from its ZIP object and its parts without ever being
+        // inflated.
+        let consumer_sink = crate::CanonicalStagingProductionSink::new(
+            root.join("consumer-staging"),
+            crate::TransportPolicy::default(),
+            xc_core::ResourcePolicy::default(),
+            xc_core::CancellationToken::new(),
+        )
+        .unwrap();
+        let mut reuse_request = request(
+            &parent_key,
+            &resolver,
+            &policy,
+            ArtifactExecutionCacheMode::RequireReuse,
+        );
+        reuse_request.logical_key = "ccm/fixture/parent";
+        reuse_request.production_sink = Some(&consumer_sink);
+        let reused = resolve_or_compute_json_artifact_with_dependencies(
+            &reuse_request,
+            || -> Result<(Vec<String>, Vec<DependencyRef>), CacheError> {
+                panic!("required reuse must not compute")
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            reused.reused_manifest.as_ref().unwrap().content_digest,
+            parent.content_digest
+        );
+        assert_eq!(
+            payload_reads.load(Ordering::Relaxed) - reads_after_authoring,
+            1,
+            "only the reused parent's own payload is read"
+        );
+        let consumer_drafts = consumer_sink.drafts().unwrap();
+        assert_eq!(consumer_drafts.len(), 2);
+        for author_draft in &author_drafts {
+            let consumer_draft = consumer_drafts
+                .iter()
+                .find(|draft| {
+                    draft.manifest.semantic_digest == author_draft.manifest.semantic_digest
+                })
+                .expect("every author draft is staged again");
+            assert_eq!(consumer_draft.manifest, author_draft.manifest);
+            assert_eq!(consumer_draft.encoding, author_draft.encoding);
+            for part in &author_draft.encoding.ordered_parts {
+                assert_eq!(
+                    fs::read(consumer_draft.staged_parts_root.join(&part.repository_path)).unwrap(),
+                    fs::read(author_draft.staged_parts_root.join(&part.repository_path)).unwrap()
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
     /// Author-side fixture for the reused-artifact closure scenarios: a
     /// grandparent and a parent that depends on it, both staged canonically so
     /// the parent's retained manifest names the grandparent by published
@@ -3478,6 +4012,28 @@ mod tests {
             "grandparent reachable only by identity was not staged"
         );
         assert_closure_covered(&drafts);
+        let parent_identity = crate::PayloadDependencyIdentity {
+            artifact_family: fixture.parent_canonical.artifact_family.clone(),
+            semantic_digest: fixture.parent_canonical.semantic_digest.clone(),
+            manifest_digest: fixture.parent_canonical.digest().unwrap(),
+            payload_digest: fixture.parent_canonical.payload_digest.clone(),
+        };
+        assert!(crate::ArtifactProductionSink::canonical_closure_complete(
+            &consumer_sink,
+            &parent_identity
+        )
+        .unwrap());
+        // A completed in-process closure must return before consulting a
+        // resolver. An empty resolver makes any accidental second traversal
+        // fail loudly instead of merely adding no drafts.
+        emit_retained_canonical_dependencies(
+            &CacheResolver::new(Vec::new()),
+            &policy,
+            &consumer_sink,
+            &fixture.parent_canonical,
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
         let _ = fs::remove_dir_all(fixture.root);
     }
 
@@ -3559,6 +4115,76 @@ mod tests {
             "the reopened staging must gain the missing grandparent"
         );
         assert_closure_covered(&drafts);
+        let _ = fs::remove_dir_all(fixture.root);
+    }
+
+    /// A resumed run must answer an already staged identity dependency from
+    /// the reopened staging directory without consulting any cache layer.
+    /// The resolver here fails on every lookup, so any resolution attempt
+    /// for the staged grandparent surfaces as an error.
+    #[test]
+    fn reopened_staging_does_not_resolve_already_staged_identity_dependencies() {
+        let fixture = adopted_pair_fixture("execution-cache-resume-without-resolution");
+        let policy = policy();
+        let staging_root = fixture.root.join("consumer-staging");
+        {
+            let seed_sink = crate::CanonicalStagingProductionSink::new(
+                &staging_root,
+                crate::TransportPolicy::default(),
+                xc_core::ResourcePolicy::default(),
+                xc_core::CancellationToken::new(),
+            )
+            .unwrap();
+            for manifest in [&fixture.grandparent, &fixture.parent] {
+                let resolved = fixture
+                    .consumer_resolver
+                    .resolve_exact(
+                        &manifest.key,
+                        &manifest.content_digest,
+                        CacheQuality::Validated,
+                        &policy,
+                    )
+                    .unwrap();
+                seed_sink
+                    .record(ProducedArtifactRecord {
+                        operation: "test.seed".to_owned(),
+                        semantic_key: manifest_semantic_key(&resolved.manifest).unwrap(),
+                        logical_key: manifest.key.logical_key.clone(),
+                        manifest: resolved.manifest,
+                        achieved_assurance: crate::ArtifactAssuranceState::Computed,
+                        assurance_evidence_digests: Vec::new(),
+                        payload: resolved.payload,
+                    })
+                    .unwrap();
+            }
+            assert_eq!(seed_sink.drafts().unwrap().len(), 2);
+        }
+
+        let reopened = crate::CanonicalStagingProductionSink::new(
+            &staging_root,
+            crate::TransportPolicy::default(),
+            xc_core::ResourcePolicy::default(),
+            xc_core::CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(reopened.drafts().unwrap().len(), 2);
+        let faulting_resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FaultingReferenceStore),
+        }]);
+        emit_retained_canonical_dependencies(
+            &faulting_resolver,
+            &policy,
+            &reopened,
+            &fixture.parent_canonical,
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.drafts().unwrap().len(),
+            2,
+            "the walk neither re-records nor resolves staged members"
+        );
         let _ = fs::remove_dir_all(fixture.root);
     }
 

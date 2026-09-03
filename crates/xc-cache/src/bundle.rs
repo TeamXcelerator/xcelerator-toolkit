@@ -1149,7 +1149,7 @@ mod tests {
         CanonicalPayloadEnvelope, LogicalPayloadItem, PayloadDependencyIdentity, PayloadFileSource,
         RemoteSemanticQuery, SemanticArtifactOverlayClass, SemanticArtifactSource,
         SemanticArtifactSourceKind, SemanticKeyEnvelope, TransportPolicy,
-        DETERMINISTIC_ZIP64_PROFILE_V1,
+        CURRENT_DETERMINISTIC_ZIP64_PROFILE,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1196,7 +1196,7 @@ mod tests {
             &CancellationToken::new(),
         )
         .unwrap();
-        assert_eq!(package.encoder_profile, DETERMINISTIC_ZIP64_PROFILE_V1);
+        assert_eq!(package.encoder_profile, CURRENT_DETERMINISTIC_ZIP64_PROFILE);
         let parts_root = artifact_root.join("parts");
         let mut input = File::open(&package_path).unwrap();
         let encoding = stream_split_encoded(

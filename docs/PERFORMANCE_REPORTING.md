@@ -30,6 +30,29 @@ not enter semantic keys, execution fingerprints, artifact payloads, manifests,
 cache publication, or output-validation reports. `performance-reports/` and
 `*.performance.json` are ignored by Git.
 
+Managed remote artifacts of at least 64 MiB also emit one human-readable
+`cache transport` line. It separates the complete part-fetch phase (including
+Git blob hydration), deterministic package reconstruction, and canonical
+payload verification/decode, followed by total wall time. Downloaded and
+reused part counts are reported alongside those timings. These measurements
+are operational only and do not enter any artifact identity. On a cold shard,
+compare the fetch field before and after transport changes; on a partly warm
+part store, the reconstruction field exposes local reread costs that network
+timing alone would hide. A second `cache transport` line reports when reused
+parts failed verification and were quarantined and fetched again; on a
+healthy part store that line never appears.
+
+When `XC_PERF_REPORT` is set, the same work also appears as operational stages
+named `cache.remote.part_fetch`, `cache.remote.package_reconstruction`,
+`cache.remote.payload_verification`, `cache.remote.prefetch`,
+`cache.publication.stage_encode`, and
+`cache.publication.stage_verified_encoded`, with direct verified-part reuse as
+the nested `cache.publication.stage_verified_parts` stage. Large bounded
+dependency-prefetch batches also print their artifact, byte, path, repository,
+worker, and wall-time totals. These timing fields are not added to schema-v1
+materialization JSON; strict existing consumers therefore retain the same
+serialized contract.
+
 ## Controlled comparisons
 
 Use the same release build, claim arguments, precision, runtime policy, worker
