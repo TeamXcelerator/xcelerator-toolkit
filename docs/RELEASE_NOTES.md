@@ -1,5 +1,22 @@
 # Release notes
 
+## 0.14.3
+
+Version 0.14.3 adds backward-compatible rollover for registry-managed cache
+families. A family document may name an `active_writable_shard` while retaining
+its legacy `current_writable_shard` pointer. Rollover-aware readers search the
+active shard first and then every declared predecessor from newest to oldest;
+managed publication and exact dependency preflight use the active shard while
+accepting dependency proofs retained in historical shards. A semantic identity
+named by the active shard shadows older copies, preserving revocation, reader-
+floor, and assurance decisions. Released single-shard readers continue to use
+the unchanged legacy pointer and therefore retain access to the predecessor.
+
+This routing release does not change artifact semantic keys or logical payload
+schemas. Existing artifacts remain readable. Newly computed manifests record
+producer version 0.14.3 in the normal release-bound way; artifacts reused from
+an earlier release retain their verified canonical manifest identities.
+
 ## 0.14.2
 
 Version 0.14.2 is a cache-reuse performance and correctness release. It removes

@@ -157,6 +157,18 @@ Publication requires an explicit resolved request naming `private`, `public`, or
 
 Repository deployment names follow `xcelerator-cache-<visibility>-registry` for registries and `xcelerator-cache-<visibility>-<family-id>-<sequence>` for shards, where visibility is `private` or `public` and sequence is a four-digit, one-based number beginning at `0001`. This grammar is validated during bootstrap and rollover. It is not a routing shortcut: readers and publishers still obtain the exact repository from the trusted visibility-specific registry, and private and public shard histories and writable pointers remain independent.
 
+For each family, the registry names one ordered shard inventory and exactly one
+active writable shard. Managed publication targets only that writable shard.
+Resolution checks the active shard first and then historical shards from newest
+to oldest, applying the same manifest, index, receipt, reader-version, and
+assurance validation in every repository. Exact dependency preflight follows the
+same inventory, so a new child can safely name a parent that remains in a
+read-only predecessor after rollover. The optional family-level
+`active_writable_shard` permits a backward-compatible transition: the root and
+family `current_writable_shard` fields can stay on the predecessor so released
+single-shard readers continue to find existing objects, while rollover-aware
+clients publish to and read from the successor.
+
 Owner-direct publication may automatically validate and publish when authority and policy permit. Contributors stage privately and use a review branch or fork plus approval attestations for public publication. Public manifests pass an allowlist sanitizer; credentials, private locations, unpublished inputs, and disallowed metadata are rejected.
 
 The transaction protocol is:
@@ -188,7 +200,7 @@ The capacity ledger is committed with every cache batch and represents exactly t
 
 The shard ledger reports logical artifact bytes, unique reachable object bytes, projected new bytes, reachable Git payload, estimated history/overhead, reserve, and remaining safe capacity. Admission is serialized against the current ref so concurrent publishers cannot both consume the same reserve.
 
-When admission would exceed the hard ceiling or governance requires separation, an authorized topology transaction creates and validates a successor shard, updates the registry route atomically, and marks the old shard read-only. A failed rollover leaves the old route valid.
+When admission would exceed the hard ceiling or governance requires separation, an authorized topology transaction creates and validates a successor shard, updates the family route atomically, and marks the old shard read-only. The family inventory retains both repositories: new writes go only to the successor while existing artifacts and dependency proofs remain resolvable from the predecessor. A failed rollover leaves the old route valid.
 
 Successor activation is fail closed. `SuccessorShardReadinessEvidence` binds repository ownership and visibility, branch protection, trust metadata, a read/write health check, reviewer approval, and a clean exact-revision audit. The successor must be empty, have no audit issues or unreferenced state, and expose a canonical initial ledger with the approved 100,000,000,000-byte hard capacity and complete history coverage. The registry replacement increments generation, binds the prior topology digest, marks the old writer read-only, and activates only its next-sequence declared successor. Registry mutation rechecks both head and path digest and uses one remotely verified compare-and-swap commit.
 

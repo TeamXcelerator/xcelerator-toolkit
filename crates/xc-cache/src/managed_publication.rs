@@ -223,6 +223,20 @@ fn repository_url(owner: &str, family: &str, destination: PublicationDestination
     )
 }
 
+fn legacy_bootstrap_shard(
+    owner: &str,
+    family: &str,
+    destination: PublicationDestination,
+) -> crate::bootstrap_topology::BootstrapShard {
+    crate::bootstrap_topology::BootstrapShard {
+        authorized_repository: repository(owner, family, destination),
+        repository_url: repository_url(owner, family, destination),
+        shard_id: shard_id(family, destination),
+        sequence: 1,
+        writable: true,
+    }
+}
+
 fn target_staging_root(root: &Path, destination: PublicationDestination) -> PathBuf {
     root.join("managed-targets").join(match destination {
         PublicationDestination::Private => "private",
@@ -658,11 +672,18 @@ fn prepare_family_candidates<'a>(
     context: &ManagedPublicationPlanningContext,
     active_session: &AuthenticatedGitHubSession,
     staging_root: &Path,
+    target: &crate::bootstrap_topology::BootstrapShard,
 ) -> Result<Vec<PreparedFamilyCandidate<'a>>, CacheError> {
     let mut candidates = Vec::with_capacity(pending_drafts.len());
     for draft in pending_drafts {
         let sessions_for_target = BTreeMap::from([(destination, active_session.clone())]);
-        let artifact = prepare_managed_artifact_publication(draft, context, &sessions_for_target)?;
+        let targets = BTreeMap::from([(destination, target.clone())]);
+        let artifact = prepare_managed_artifact_publication_for_targets(
+            draft,
+            context,
+            &sessions_for_target,
+            &targets,
+        )?;
         crate::publication_staging::validate_public_documents(
             artifact
                 .coordinated
@@ -889,13 +910,14 @@ fn execute_family_batch_publication(
     resources: &xc_core::ResourcePolicy,
     replace_existing_semantic: bool,
     event_unix_seconds: u64,
+    target: &crate::bootstrap_topology::BootstrapShard,
 ) -> Result<Vec<ManagedPublicationExecutionReport>, CacheError> {
     let first = drafts.first().ok_or_else(|| {
         CacheError::InvalidTransition("family batch publication received no drafts".to_owned())
     })?;
-    let authorized = repository(owner, &first.family, destination);
-    let repository_url = repository_url(owner, &first.family, destination);
-    let shard = shard_id(&first.family, destination);
+    let authorized = target.authorized_repository.clone();
+    let repository_url = target.repository_url.clone();
+    let shard = target.shard_id.clone();
     let cancellation = xc_core::CancellationToken::for_policy(resources);
     let staging_root = journal_root
         .join("family-batches")
@@ -922,7 +944,14 @@ fn execute_family_batch_publication(
     // repository access instead of rejecting the original five-minute probe.
     let mut active_session = session.clone();
     refresh_github_write_session(&mut active_session, principal, &authorized)?;
-    verify_bootstrap_registry_route(&remote, owner, &first.family, destination, &cancellation)?;
+    verify_bootstrap_registry_route(
+        &remote,
+        owner,
+        &first.family,
+        destination,
+        target,
+        &cancellation,
+    )?;
     let observed_head = remote.read_ref(&repository_url, "main")?;
     let mut pending_drafts = drafts.to_vec();
     // A destination can be missing both an historical closure member and its
@@ -1019,6 +1048,7 @@ fn execute_family_batch_publication(
         &preparation_context,
         &active_session,
         &staging_root,
+        target,
     )?;
     let prepared_files = prepared_candidate_files(&prepared_candidates);
     remote.prepare_staged_parts(&repository_url, &prepared_files)?;
@@ -1585,82 +1615,27 @@ struct BootstrapReconciliation<'a> {
     observed_metadata_bytes: u64,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BootstrapRegistry {
-    schema_version: u32,
-    repository: String,
-    default_branch: String,
-    families: Vec<BootstrapRegistryFamily>,
-    #[serde(default)]
-    separate_visibility_inventory: Option<bool>,
-    #[serde(default)]
-    visibility: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BootstrapRegistryFamily {
-    family: String,
-    current_writable_shard: String,
-    metadata: String,
-}
-
 fn verify_bootstrap_registry_route(
     remote: &dyn crate::RemoteGitStore,
     owner: &str,
     family: &str,
     destination: PublicationDestination,
+    expected: &crate::bootstrap_topology::BootstrapShard,
     cancellation: &xc_core::CancellationToken,
 ) -> Result<(), CacheError> {
-    let visibility = visibility_name(destination);
-    let authorized_registry = format!("{owner}/xcelerator-cache-{visibility}-registry");
-    let registry_url = format!("https://github.com/{authorized_registry}.git");
-    let revision = remote.read_ref(&registry_url, "main")?;
-    let mut bytes = Vec::new();
-    remote.read_committed_path(
-        &registry_url,
-        &revision,
-        "registry.json",
-        4 * 1024 * 1024,
+    let topology = crate::bootstrap_topology::read_bootstrap_family_topology(
+        remote,
+        owner,
+        visibility(destination),
+        family,
         cancellation,
-        &mut bytes,
     )?;
-    let registry: BootstrapRegistry = serde_json::from_slice(&bytes)?;
-    if registry.schema_version != 1
-        || registry.repository != authorized_registry
-        || registry.default_branch != "main"
-        || registry.families.iter().any(|entry| {
-            entry.family.trim().is_empty()
-                || entry.current_writable_shard.trim().is_empty()
-                || entry.metadata.trim().is_empty()
-        })
-        || registry
-            .separate_visibility_inventory
-            .is_some_and(|separate| !separate)
-        || registry
-            .visibility
-            .as_ref()
-            .is_some_and(|declared| declared != visibility)
-    {
-        return Err(CacheError::InvalidManifest(format!(
-            "{visibility} bootstrap registry identity or family entries are invalid"
-        )));
-    }
-    let expected_shard = repository(owner, family, destination);
-    let route = registry
-        .families
-        .iter()
-        .find(|entry| entry.family == family)
-        .ok_or_else(|| {
-            CacheError::NoWritableShard(format!(
-                "{visibility} registry has no route for family {family:?}"
-            ))
-        })?;
-    if route.current_writable_shard != expected_shard {
+    if &topology.current_writable != expected {
         return Err(CacheError::NoWritableShard(format!(
-            "{visibility} registry routes {family:?} to {:?}, not expected {:?}",
-            route.current_writable_shard, expected_shard
+            "{} registry route for {family:?} changed from {:?} to {:?}",
+            visibility_name(destination),
+            expected.authorized_repository,
+            topology.current_writable.authorized_repository
         )));
     }
     Ok(())
@@ -2047,14 +2022,47 @@ type HistoricalDependencyInventories =
 
 fn exact_destination_dependency_exists(
     remote: &dyn crate::RemoteGitStore,
-    owner: &str,
     destination: PublicationDestination,
     dependency: &crate::PayloadDependencyIdentity,
+    topology: &crate::bootstrap_topology::BootstrapFamilyTopology,
     revisions: &mut BTreeMap<String, String>,
     historical_inventories: &mut HistoricalDependencyInventories,
     resources: &xc_core::ResourcePolicy,
 ) -> Result<bool, CacheError> {
-    let repository_endpoint = repository_url(owner, &dependency.artifact_family, destination);
+    if topology.family != dependency.artifact_family
+        || topology.visibility != visibility(destination)
+    {
+        return Err(CacheError::InvalidManifest(
+            "dependency topology does not match the requested family and visibility".to_owned(),
+        ));
+    }
+    for shard in &topology.readable_shards {
+        if exact_destination_dependency_exists_in_shard(
+            remote,
+            destination,
+            dependency,
+            shard,
+            revisions,
+            historical_inventories,
+            resources,
+        )? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_destination_dependency_exists_in_shard(
+    remote: &dyn crate::RemoteGitStore,
+    destination: PublicationDestination,
+    dependency: &crate::PayloadDependencyIdentity,
+    shard: &crate::bootstrap_topology::BootstrapShard,
+    revisions: &mut BTreeMap<String, String>,
+    historical_inventories: &mut HistoricalDependencyInventories,
+    resources: &xc_core::ResourcePolicy,
+) -> Result<bool, CacheError> {
+    let repository_endpoint = shard.repository_url.clone();
     let revision = if let Some(revision) = revisions.get(&repository_endpoint) {
         revision.clone()
     } else {
@@ -2145,7 +2153,7 @@ fn exact_destination_dependency_exists(
             &cancellation,
         )?;
         let suffix = format!("/{}.json", visibility_name(destination));
-        let authorized_repository = repository(owner, &dependency.artifact_family, destination);
+        let authorized_repository = &shard.authorized_repository;
         let mut identities = BTreeSet::new();
         let mut total_batch_bytes = 0u64;
         for path in listing.paths.iter().filter(|path| path.ends_with(&suffix)) {
@@ -2177,7 +2185,7 @@ fn exact_destination_dependency_exists(
             }
             if document.value.destination != destination
                 || document.value.family != dependency.artifact_family
-                || document.value.authorized_repository != authorized_repository
+                || document.value.authorized_repository != *authorized_repository
                 || document.value.branch != "main"
             {
                 continue;
@@ -2279,6 +2287,25 @@ pub fn prepare_managed_artifact_publication(
     context: &ManagedPublicationPlanningContext,
     sessions: &BTreeMap<PublicationDestination, AuthenticatedGitHubSession>,
 ) -> Result<ManagedPreparedArtifactPublication, CacheError> {
+    let targets = destinations(context.target)?
+        .into_iter()
+        .map(|destination| {
+            (
+                destination,
+                legacy_bootstrap_shard(&context.owner, &draft.family, destination),
+            )
+        })
+        .collect();
+    prepare_managed_artifact_publication_for_targets(draft, context, sessions, &targets)
+}
+
+#[allow(clippy::too_many_lines)]
+fn prepare_managed_artifact_publication_for_targets(
+    draft: &CanonicalProductionDraft,
+    context: &ManagedPublicationPlanningContext,
+    sessions: &BTreeMap<PublicationDestination, AuthenticatedGitHubSession>,
+    targets: &BTreeMap<PublicationDestination, crate::bootstrap_topology::BootstrapShard>,
+) -> Result<ManagedPreparedArtifactPublication, CacheError> {
     if context.owner.trim().is_empty()
         || context.owner.contains('/')
         || context.principal.trim().is_empty()
@@ -2292,6 +2319,7 @@ pub fn prepare_managed_artifact_publication(
     if context.target_heads.keys().copied().collect::<Vec<_>>() != destinations
         || context.capacity_ledgers.keys().copied().collect::<Vec<_>>() != destinations
         || sessions.keys().copied().collect::<Vec<_>>() != destinations
+        || targets.keys().copied().collect::<Vec<_>>() != destinations
     {
         return Err(CacheError::InvalidManifest(
             "managed publication heads, ledgers, and sessions must match the target".to_owned(),
@@ -2317,11 +2345,12 @@ pub fn prepare_managed_artifact_publication(
     // Construct the fixed-shape attestation once to derive the public schema
     // allowlist. The final policy digest changes values, never leaf paths.
     let placeholder_policy = ContentDigest::sha256(b"managed-policy-placeholder");
-    let public_repository = repository(
-        &context.owner,
-        &draft.family,
-        PublicationDestination::Public,
-    );
+    let public_repository = targets
+        .get(&PublicationDestination::Public)
+        .or_else(|| targets.values().next())
+        .expect("a non-none target has a repository")
+        .authorized_repository
+        .clone();
     let public_manifest = manifests
         .get(&PublicationDestination::Public)
         .or_else(|| manifests.values().next())
@@ -2395,7 +2424,7 @@ pub fn prepare_managed_artifact_publication(
             allowed_repository_names: destinations
                 .iter()
                 .copied()
-                .map(|destination| repository(&context.owner, &draft.family, destination))
+                .map(|destination| targets[&destination].authorized_repository.clone())
                 .collect(),
             ..PublicSanitizerProfile::default()
         },
@@ -2408,8 +2437,9 @@ pub fn prepare_managed_artifact_publication(
     let mut inputs = BTreeMap::new();
     let mut bundles = BTreeMap::new();
     for destination in destinations.iter().copied() {
-        let shard_id = shard_id(&draft.family, destination);
-        let authorized_repository = repository(&context.owner, &draft.family, destination);
+        let target = &targets[&destination];
+        let shard_id = target.shard_id.clone();
+        let authorized_repository = target.authorized_repository.clone();
         let repository_name = authorized_repository
             .split_once('/')
             .expect("managed repository contains owner separator")
@@ -2421,7 +2451,7 @@ pub fn prepare_managed_artifact_publication(
             ordered_shards: vec![TopologyShardRoute {
                 shard_id: shard_id.clone(),
                 endpoint_id: shard_id.clone(),
-                sequence: 1,
+                sequence: target.sequence,
                 status: TopologyShardStatus::Writable,
                 successor_shard_id: None,
             }],
@@ -2727,8 +2757,14 @@ fn execute_managed_family_drafts_on_github(
     journal_root: &Path,
     resources: &xc_core::ResourcePolicy,
     replace_existing_semantic: bool,
+    targets: &BTreeMap<PublicationDestination, crate::bootstrap_topology::BootstrapShard>,
 ) -> Result<ManagedRunPublicationReport, CacheError> {
     let destinations = destinations(target)?;
+    if targets.keys().copied().collect::<Vec<_>>() != destinations {
+        return Err(CacheError::InvalidManifest(
+            "managed family publication targets do not match its destinations".to_owned(),
+        ));
+    }
     let event_unix_seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| CacheError::InvalidTransition(error.to_string()))?
@@ -2756,8 +2792,8 @@ fn execute_managed_family_drafts_on_github(
     // receipt, but no longer pays for a fresh bare repository and fetch.
     let mut sessions = BTreeMap::new();
     for destination in destinations.iter().copied() {
-        let authorized_repository = repository(owner, &first_draft.family, destination);
-        sessions.insert(destination, probe.probe_repository(&authorized_repository)?);
+        let authorized_repository = &targets[&destination].authorized_repository;
+        sessions.insert(destination, probe.probe_repository(authorized_repository)?);
     }
     let principals = sessions
         .values()
@@ -2788,6 +2824,7 @@ fn execute_managed_family_drafts_on_github(
             resources,
             replace_existing_semantic,
             event_unix_seconds,
+            &targets[&destination],
         )?);
     }
     return Ok(ManagedRunPublicationReport {
@@ -2840,11 +2877,13 @@ fn execute_managed_family_drafts_on_github(
         let mut heads = BTreeMap::new();
         let mut ledgers = BTreeMap::new();
         for destination in destinations.iter().copied() {
+            let legacy_target = legacy_bootstrap_shard(owner, &draft.family, destination);
             verify_bootstrap_registry_route(
                 &remotes[&destination],
                 owner,
                 &draft.family,
                 destination,
+                &legacy_target,
                 &cancellation,
             )?;
             let authorized_repository = repository(owner, &draft.family, destination);
@@ -3168,6 +3207,10 @@ fn execute_managed_drafts_on_github_inner(
 ) -> Result<ManagedRunPublicationReport, CacheError> {
     let requested_destinations = destinations(target)?;
     let mut groups = Vec::<(PublicationTarget, Vec<CanonicalProductionDraft>)>::new();
+    let mut family_topologies = BTreeMap::<
+        (PublicationDestination, String),
+        crate::bootstrap_topology::BootstrapFamilyTopology,
+    >::new();
     for destination in requested_destinations.iter().copied() {
         // Mirror the inventory's routing: private-only kinds ride the private
         // leg and are withheld from the public one, so a mixed draft set
@@ -3206,6 +3249,20 @@ fn execute_managed_drafts_on_github_inner(
             "preflight@invalid",
         )?
         .with_resource_policy(resources.clone());
+        for family in destination_drafts
+            .iter()
+            .map(|draft| draft.family.as_str())
+            .collect::<BTreeSet<_>>()
+        {
+            let topology = crate::bootstrap_topology::read_bootstrap_family_topology(
+                &dependency_remote,
+                owner,
+                visibility(destination),
+                family,
+                &xc_core::CancellationToken::for_policy(resources),
+            )?;
+            family_topologies.insert((destination, family.to_owned()), topology);
+        }
         let mut dependency_revisions = BTreeMap::new();
         let mut historical_dependency_inventories = BTreeMap::new();
         let mut dependency_results =
@@ -3221,11 +3278,22 @@ fn execute_managed_drafts_on_github_inner(
                 if let Some(exists) = dependency_results.get(&identity) {
                     return Ok(*exists);
                 }
+                let topology_key = (destination, dependency.artifact_family.clone());
+                if !family_topologies.contains_key(&topology_key) {
+                    let topology = crate::bootstrap_topology::read_bootstrap_family_topology(
+                        &dependency_remote,
+                        owner,
+                        visibility(destination),
+                        &dependency.artifact_family,
+                        &xc_core::CancellationToken::for_policy(resources),
+                    )?;
+                    family_topologies.insert(topology_key.clone(), topology);
+                }
                 let exists = exact_destination_dependency_exists(
                     &dependency_remote,
-                    owner,
                     destination,
                     dependency,
+                    &family_topologies[&topology_key],
                     &mut dependency_revisions,
                     &mut historical_dependency_inventories,
                     resources,
@@ -3275,8 +3343,15 @@ fn execute_managed_drafts_on_github_inner(
                 )
             })?;
         for destination in destinations(*group_target)? {
-            let authorized_repository = repository(owner, family, destination);
-            let session = probe.probe_repository(&authorized_repository)?;
+            let topology = family_topologies
+                .get(&(destination, family.to_owned()))
+                .ok_or_else(|| {
+                    CacheError::NoWritableShard(format!(
+                        "managed preflight has no topology for {family:?}"
+                    ))
+                })?;
+            let authorized_repository = &topology.current_writable.authorized_repository;
+            let session = probe.probe_repository(authorized_repository)?;
             principals.insert(session.evidence().principal.clone());
         }
     }
@@ -3296,6 +3371,19 @@ fn execute_managed_drafts_on_github_inner(
                 .unwrap_or("empty");
             let family_started = std::time::Instant::now();
             let family_draft_refs = family_drafts.iter().collect::<Vec<_>>();
+            let targets = destinations(*group_target)?
+                .into_iter()
+                .map(|destination| {
+                    let topology = family_topologies
+                        .get(&(destination, family.to_owned()))
+                        .ok_or_else(|| {
+                            CacheError::NoWritableShard(format!(
+                                "managed publication has no topology for {family:?}"
+                            ))
+                        })?;
+                    Ok((destination, topology.current_writable.clone()))
+                })
+                .collect::<Result<BTreeMap<_, _>, CacheError>>()?;
             let report = execute_managed_family_drafts_on_github(
                 &family_draft_refs,
                 *group_target,
@@ -3303,6 +3391,7 @@ fn execute_managed_drafts_on_github_inner(
                 journal_root,
                 resources,
                 replace_existing_semantic,
+                &targets,
             )?;
             eprintln!(
                 "publication family {family}: evaluated {} staged candidate(s) in {:.3}s",
@@ -3489,8 +3578,10 @@ mod tests {
             RepositoryPermission::Write,
             crate::AUTHORITY_PROBE_MAX_AGE_SECONDS + 1,
         );
-        let error = prepare_family_candidates(&[&draft], destination, &context, &stale, &prepared)
-            .unwrap_err();
+        let target = legacy_bootstrap_shard("example-org", &draft.family, destination);
+        let error =
+            prepare_family_candidates(&[&draft], destination, &context, &stale, &prepared, &target)
+                .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -3503,9 +3594,15 @@ mod tests {
             &authorized,
             RepositoryPermission::Write,
         );
-        let candidates =
-            prepare_family_candidates(&[&draft], destination, &context, &active, &prepared)
-                .unwrap();
+        let candidates = prepare_family_candidates(
+            &[&draft],
+            destination,
+            &context,
+            &active,
+            &prepared,
+            &target,
+        )
+        .unwrap();
         assert_eq!(candidates.len(), 1);
         active.require_write_for("test-owner", &authorized).unwrap();
         let _ = fs::remove_dir_all(root);
@@ -3696,6 +3793,117 @@ mod tests {
                 None => Err(CacheError::NotFound(part.repository_path.clone())),
             }
         }
+    }
+
+    #[test]
+    fn bootstrap_topology_routes_writes_to_successor_and_keeps_predecessor_readable() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-bootstrap-rollover-routing-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let remote = FilesystemMemoryRemote::new(root.clone());
+        let registry_repository =
+            "https://github.com/example-org/xcelerator-cache-private-registry.git";
+        let family = "ccm-matrices";
+        let first = "example-org/xcelerator-cache-private-ccm-matrices-0001";
+        let second = "example-org/xcelerator-cache-private-ccm-matrices-0002";
+        let descriptor = |repository: &str, sequence: u32, writable: bool| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "repository": repository,
+                "family": family,
+                "visibility": "private",
+                "shard": sequence,
+                "default_branch": "main",
+                "immutable_objects": true,
+                "writable": writable,
+                "capacity_policy": {
+                    "maximum_reachable_payload_bytes": 100000000000u64,
+                    "rollover_repository_pattern":
+                        "xcelerator-cache-private-ccm-matrices-{shard:04d}"
+                }
+            }))
+            .unwrap()
+        };
+        let tree = BTreeMap::from([
+            (
+                "registry.json".to_owned(),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 1,
+                    "repository": "example-org/xcelerator-cache-private-registry",
+                    "default_branch": "main",
+                    "separate_visibility_inventory": true,
+                    "visibility": "private",
+                    "families": [{
+                        "family": family,
+                        "current_writable_shard": first,
+                        "metadata": "families/ccm-matrices.json"
+                    }]
+                }))
+                .unwrap(),
+            ),
+            (
+                "families/ccm-matrices.json".to_owned(),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 1,
+                    "family": family,
+                    "display_name": "CCM matrices",
+                    "description": "fixture",
+                    "visibility": "private",
+                    "artifact_kinds": ["ccm_tau_matrix"],
+                    "current_writable_shard": first,
+                    "active_writable_shard": second,
+                    "shards": [
+                        "shards/xcelerator-cache-private-ccm-matrices-0001.json",
+                        "shards/xcelerator-cache-private-ccm-matrices-0002.json"
+                    ]
+                }))
+                .unwrap(),
+            ),
+            (
+                "shards/xcelerator-cache-private-ccm-matrices-0001.json".to_owned(),
+                descriptor(first, 1, false),
+            ),
+            (
+                "shards/xcelerator-cache-private-ccm-matrices-0002.json".to_owned(),
+                descriptor(second, 2, true),
+            ),
+        ]);
+        remote.insert_repository(
+            registry_repository.to_owned(),
+            "registry-head".to_owned(),
+            tree,
+        );
+
+        let topology = crate::bootstrap_topology::read_bootstrap_family_topology(
+            &remote,
+            "example-org",
+            CacheVisibility::Private,
+            family,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(topology.current_writable.authorized_repository, second);
+        assert_eq!(topology.current_writable.sequence, 2);
+        assert_eq!(
+            topology
+                .readable_shards
+                .iter()
+                .map(|shard| shard.authorized_repository.as_str())
+                .collect::<Vec<_>>(),
+            vec![second, first]
+        );
+        verify_bootstrap_registry_route(
+            &remote,
+            "example-org",
+            family,
+            PublicationDestination::Private,
+            &topology.current_writable,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     fn visibility_token(repository: &str) -> &'static str {
@@ -4218,12 +4426,38 @@ mod tests {
             head.to_owned(),
             published_destination_tree(&[&draft], PublicationDestination::Private),
         );
+        let historical = legacy_bootstrap_shard(
+            "example-org",
+            &dependency.artifact_family,
+            PublicationDestination::Private,
+        );
+        let current = crate::bootstrap_topology::BootstrapShard {
+            authorized_repository: "example-org/xcelerator-cache-private-ccm-matrices-0002"
+                .to_owned(),
+            repository_url:
+                "https://github.com/example-org/xcelerator-cache-private-ccm-matrices-0002.git"
+                    .to_owned(),
+            shard_id: "private-ccm-matrices-0002".to_owned(),
+            sequence: 2,
+            writable: true,
+        };
+        remote.insert_repository(
+            current.repository_url.clone(),
+            "empty-successor".to_owned(),
+            BTreeMap::new(),
+        );
+        let topology = crate::bootstrap_topology::BootstrapFamilyTopology {
+            family: dependency.artifact_family.clone(),
+            visibility: CacheVisibility::Private,
+            current_writable: current.clone(),
+            readable_shards: vec![current, historical],
+        };
 
         assert!(exact_destination_dependency_exists(
             &remote,
-            "example-org",
             PublicationDestination::Private,
             &dependency,
+            &topology,
             &mut BTreeMap::new(),
             &mut BTreeMap::new(),
             &ResourcePolicy::default(),
@@ -4234,9 +4468,9 @@ mod tests {
         missing.manifest_digest = ContentDigest::sha256(b"not-published");
         assert!(!exact_destination_dependency_exists(
             &remote,
-            "example-org",
             PublicationDestination::Private,
             &missing,
+            &topology,
             &mut BTreeMap::new(),
             &mut BTreeMap::new(),
             &ResourcePolicy::default(),
@@ -4307,11 +4541,22 @@ mod tests {
             "superseded-head".to_owned(),
             tree.clone(),
         );
+        let target = legacy_bootstrap_shard(
+            "example-org",
+            &dependency.artifact_family,
+            PublicationDestination::Private,
+        );
+        let topology = crate::bootstrap_topology::BootstrapFamilyTopology {
+            family: dependency.artifact_family.clone(),
+            visibility: CacheVisibility::Private,
+            current_writable: target.clone(),
+            readable_shards: vec![target],
+        };
         assert!(exact_destination_dependency_exists(
             &remote,
-            "example-org",
             PublicationDestination::Private,
             &dependency,
+            &topology,
             &mut BTreeMap::new(),
             &mut BTreeMap::new(),
             &ResourcePolicy::default(),
@@ -4322,9 +4567,9 @@ mod tests {
         remote.insert_repository(repository.to_owned(), "unproven-head".to_owned(), tree);
         assert!(!exact_destination_dependency_exists(
             &remote,
-            "example-org",
             PublicationDestination::Private,
             &dependency,
+            &topology,
             &mut BTreeMap::new(),
             &mut BTreeMap::new(),
             &ResourcePolicy::default(),
@@ -4937,9 +5182,6 @@ mod tests {
             PublicationDestination::Private,
             PublicationDestination::Public,
         ] {
-            let authorized = repository("TeamXcelerator", "quadrature", destination);
-            let session = probe.probe_repository(&authorized).unwrap();
-            principals.insert(session.evidence().principal.clone());
             let remote = crate::GitCliRemoteStore::new(
                 root.join(visibility_name(destination)).join("transport"),
                 root.join(visibility_name(destination)).join("staging"),
@@ -4947,15 +5189,28 @@ mod tests {
                 "preflight@invalid",
             )
             .unwrap();
+            let topology = crate::bootstrap_topology::read_bootstrap_family_topology(
+                &remote,
+                "TeamXcelerator",
+                visibility(destination),
+                "quadrature",
+                &cancellation,
+            )
+            .unwrap();
+            let target = topology.current_writable;
+            let authorized = target.authorized_repository.clone();
+            let session = probe.probe_repository(&authorized).unwrap();
+            principals.insert(session.evidence().principal.clone());
             verify_bootstrap_registry_route(
                 &remote,
                 "TeamXcelerator",
                 "quadrature",
                 destination,
+                &target,
                 &cancellation,
             )
             .unwrap();
-            let shard_url = repository_url("TeamXcelerator", "quadrature", destination);
+            let shard_url = target.repository_url;
             let head = remote.read_ref(&shard_url, "main").unwrap();
             let has_ledger = remote
                 .immutable_path_digest(&shard_url, &head, crate::DEFAULT_CAPACITY_LEDGER_PATH)

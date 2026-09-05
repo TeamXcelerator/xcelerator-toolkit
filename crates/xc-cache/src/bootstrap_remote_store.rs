@@ -98,6 +98,7 @@ pub struct GitHubBootstrapCacheStore {
     discovered_keys: Mutex<HashMap<(String, String), Vec<ArtifactKey>>>,
     continuation_inventory_lock: Mutex<()>,
     registry_snapshot: Mutex<Option<BootstrapRegistry>>,
+    family_topologies: Mutex<HashMap<String, crate::bootstrap_topology::BootstrapFamilyTopology>>,
     shard_revisions: Mutex<HashMap<String, String>>,
     historical_batches: Mutex<HistoricalBatchCache>,
     metadata_documents: Mutex<MetadataDocumentCache>,
@@ -145,6 +146,7 @@ impl GitHubBootstrapCacheStore {
             discovered_keys: Mutex::new(HashMap::new()),
             continuation_inventory_lock: Mutex::new(()),
             registry_snapshot: Mutex::new(None),
+            family_topologies: Mutex::new(HashMap::new()),
             shard_revisions: Mutex::new(HashMap::new()),
             historical_batches: Mutex::new(HashMap::new()),
             metadata_documents: Mutex::new(MetadataDocumentCache::default()),
@@ -178,6 +180,12 @@ impl GitHubBootstrapCacheStore {
         if registry.schema_version != 1
             || registry.repository != registry_id
             || registry.default_branch != "main"
+            || registry.families.is_empty()
+            || registry.families.iter().any(|route| {
+                route.family.trim().is_empty()
+                    || route.current_writable_shard.trim().is_empty()
+                    || route.metadata.trim().is_empty()
+            })
             || registry
                 .visibility
                 .as_deref()
@@ -213,6 +221,33 @@ impl GitHubBootstrapCacheStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(repository.to_owned(), revision.clone());
         Ok(revision)
+    }
+
+    fn family_topology(
+        &self,
+        family: &str,
+    ) -> Result<crate::bootstrap_topology::BootstrapFamilyTopology, CacheError> {
+        if let Some(topology) = self
+            .family_topologies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(family)
+            .cloned()
+        {
+            return Ok(topology);
+        }
+        let topology = crate::bootstrap_topology::read_bootstrap_family_topology(
+            &self.remote,
+            &self.owner,
+            self.visibility,
+            family,
+            &CancellationToken::new(),
+        )?;
+        self.family_topologies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(family.to_owned(), topology.clone());
+        Ok(topology)
     }
 
     fn read_json<T: serde::de::DeserializeOwned>(
@@ -335,55 +370,56 @@ impl GitHubBootstrapCacheStore {
         let Some(family) = family_for_artifact_kind(&key.kind) else {
             return Ok(None);
         };
-        let visibility_name = visibility_name(self.visibility);
-        let registry = self.registry_snapshot()?;
-        let route = registry
-            .families
-            .iter()
-            .find(|route| route.family == family)
-            .ok_or_else(|| CacheError::NotFound(format!("public family {family}")))?;
-        if route.metadata.trim().is_empty()
-            || !route.current_writable_shard.starts_with(&format!(
-                "{}/xcelerator-cache-{visibility_name}-{family}-",
-                self.owner
-            ))
-        {
-            return Err(CacheError::InvalidManifest(format!(
-                "{visibility_name} route for {family} is invalid"
-            )));
-        }
-        let repository = format!("https://github.com/{}.git", route.current_writable_shard);
-        let revision = self.shard_revision(&repository)?;
+        let topology = self.family_topology(family)?;
         let prefix = &key.parameters_digest.0[..2];
         let index_path = format!("indexes/{family}/{prefix}.json");
-        let (index, index_source): (ShardIndexPartition, _) =
-            match self.read_json(&repository, &revision, &index_path) {
-                Ok(value) => value,
-                Err(CacheError::NotFound(_)) => return Ok(None),
-                Err(error) => return Err(error),
-            };
-        index.validate()?;
         let current = crate::current_toolkit_version()?;
-        let Some(entry) = index
-            .lookup(&key.parameters_digest)
-            .filter(|entry| entry.disposition == ArtifactDisposition::Active)
-            .filter(|entry| entry.achieved_assurance.mathematical().is_some())
-            .filter(|entry| entry.minimum_reader_version <= current)
-            .max_by_key(|entry| (entry.achieved_assurance, entry.manifest_digest.clone()))
-            .cloned()
-        else {
-            return Ok(None);
-        };
-        let semantic_digest = &key.parameters_digest;
-        self.materialize_indexed_entry(
-            repository,
-            revision,
-            family,
-            route,
-            semantic_digest,
-            entry,
-            index_source,
-        )
+        for shard in &topology.readable_shards {
+            let repository = shard.repository_url.clone();
+            let revision = self.shard_revision(&repository)?;
+            let (index, index_source): (ShardIndexPartition, _) =
+                match self.read_json(&repository, &revision, &index_path) {
+                    Ok(value) => value,
+                    Err(CacheError::NotFound(_)) => continue,
+                    Err(error) => return Err(error),
+                };
+            index.validate()?;
+            if index.family != family {
+                return Err(CacheError::InvalidManifest(format!(
+                    "shard index {index_path:?} belongs to {:?}, not {family:?}",
+                    index.family
+                )));
+            }
+            let entries_for_identity = index.lookup(&key.parameters_digest).collect::<Vec<_>>();
+            let Some(entry) = entries_for_identity
+                .iter()
+                .copied()
+                .filter(|entry| entry.disposition == ArtifactDisposition::Active)
+                .filter(|entry| entry.achieved_assurance.mathematical().is_some())
+                .filter(|entry| entry.minimum_reader_version <= current)
+                .max_by_key(|entry| (entry.achieved_assurance, entry.manifest_digest.clone()))
+                .cloned()
+            else {
+                // Once a newer shard names this semantic identity, its live
+                // policy disposition shadows older shards. Falling back to a
+                // predecessor here could silently undo a revocation, reader
+                // floor, or assurance downgrade recorded during rollover.
+                if !entries_for_identity.is_empty() {
+                    return Ok(None);
+                }
+                continue;
+            };
+            return self.materialize_indexed_entry(
+                repository,
+                revision,
+                family,
+                shard,
+                &key.parameters_digest,
+                entry,
+                index_source,
+            );
+        }
+        Ok(None)
     }
 
     /// Resolve an artifact by its exact published dependency identity.
@@ -400,134 +436,124 @@ impl GitHubBootstrapCacheStore {
     ) -> Result<Option<ResolvedRemoteArtifact>, CacheError> {
         identity.validate()?;
         let family = identity.artifact_family.as_str();
-        let visibility_name = visibility_name(self.visibility);
-        let registry = self.registry_snapshot()?;
-        let Some(route) = registry
-            .families
-            .iter()
-            .find(|route| route.family == family)
-        else {
-            return Ok(None);
-        };
-        if route.metadata.trim().is_empty()
-            || !route.current_writable_shard.starts_with(&format!(
-                "{}/xcelerator-cache-{visibility_name}-{family}-",
-                self.owner
-            ))
-        {
-            return Err(CacheError::InvalidManifest(format!(
-                "{visibility_name} route for {family} is invalid"
-            )));
-        }
-        let repository = format!("https://github.com/{}.git", route.current_writable_shard);
-        let revision = self.shard_revision(&repository)?;
+        let topology = self.family_topology(family)?;
         let Some(prefix) = identity.semantic_digest.0.get(..2) else {
             return Err(CacheError::InvalidManifest(
                 "dependency identity semantic digest is too short to address an index".to_owned(),
             ));
         };
         let index_path = format!("indexes/{family}/{prefix}.json");
-        let indexed =
-            match self.read_json::<ShardIndexPartition>(&repository, &revision, &index_path) {
-                Ok((index, source)) => {
-                    index.validate()?;
-                    Some((index, source))
-                }
-                Err(CacheError::NotFound(_)) => None,
-                Err(error) => return Err(error),
-            };
         let current = crate::current_toolkit_version()?;
-        let active_entry = indexed.as_ref().and_then(|(index, source)| {
-            index
-                .lookup(&identity.semantic_digest)
-                .find(|entry| {
-                    entry.disposition == ArtifactDisposition::Active
-                        && entry.manifest_digest == identity.manifest_digest
-                        && entry.minimum_reader_version <= current
-                })
-                .cloned()
-                .map(|entry| (entry, source.clone()))
-        });
-        let (entry, index_source) = if let Some(active_entry) = active_entry {
-            active_entry
-        } else {
-            let manifest_path =
-                bootstrap_manifest_path(&identity.semantic_digest, &identity.manifest_digest);
-            let (manifest, manifest_source): (CanonicalArtifactManifest, _) =
-                match self.read_json(&repository, &revision, &manifest_path) {
-                    Ok(value) => value,
-                    Err(CacheError::NotFound(_)) => return Ok(None),
+        for shard in &topology.readable_shards {
+            let repository = shard.repository_url.clone();
+            let revision = self.shard_revision(&repository)?;
+            let indexed =
+                match self.read_json::<ShardIndexPartition>(&repository, &revision, &index_path) {
+                    Ok((index, source)) => {
+                        index.validate()?;
+                        if index.family != family {
+                            return Err(CacheError::InvalidManifest(format!(
+                                "shard index {index_path:?} belongs to the wrong family"
+                            )));
+                        }
+                        Some((index, source))
+                    }
+                    Err(CacheError::NotFound(_)) => None,
                     Err(error) => return Err(error),
                 };
-            manifest.validate()?;
-            if manifest_source.content_digest != identity.manifest_digest
-                || manifest.digest()? != identity.manifest_digest
-                || manifest.artifact_family != family
-                || manifest.semantic_digest != identity.semantic_digest
-                || manifest.payload_digest != identity.payload_digest
-                || manifest.minimum_reader_version > current
-            {
-                return Err(CacheError::InvalidManifest(format!(
+            let active_entry = indexed.as_ref().and_then(|(index, source)| {
+                index
+                    .lookup(&identity.semantic_digest)
+                    .find(|entry| {
+                        entry.disposition == ArtifactDisposition::Active
+                            && entry.manifest_digest == identity.manifest_digest
+                            && entry.minimum_reader_version <= current
+                    })
+                    .cloned()
+                    .map(|entry| (entry, source.clone()))
+            });
+            let (entry, index_source) = if let Some(active_entry) = active_entry {
+                active_entry
+            } else {
+                let manifest_path =
+                    bootstrap_manifest_path(&identity.semantic_digest, &identity.manifest_digest);
+                let (manifest, manifest_source): (CanonicalArtifactManifest, _) =
+                    match self.read_json(&repository, &revision, &manifest_path) {
+                        Ok(value) => value,
+                        Err(CacheError::NotFound(_)) => continue,
+                        Err(error) => return Err(error),
+                    };
+                manifest.validate()?;
+                if manifest_source.content_digest != identity.manifest_digest
+                    || manifest.digest()? != identity.manifest_digest
+                    || manifest.artifact_family != family
+                    || manifest.semantic_digest != identity.semantic_digest
+                    || manifest.payload_digest != identity.payload_digest
+                    || manifest.minimum_reader_version > current
+                {
+                    return Err(CacheError::InvalidManifest(format!(
                     "historical manifest for {family}/{} does not reproduce the requested dependency identity",
                     identity.semantic_digest.0
                 )));
-            }
-            let expected_destination = match self.visibility {
-                CacheVisibility::Private => PublicationDestination::Private,
-                CacheVisibility::Public => PublicationDestination::Public,
-                _ => unreachable!("GitHub bootstrap stores are private or public"),
-            };
-            let batches = self.historical_batches(&repository, &revision)?;
-            let Some((batch, batch_source, artifact)) = historical_publication_for_identity(
-                &batches,
-                expected_destination,
-                family,
-                &route.current_writable_shard,
-                identity,
-                &manifest_path,
-            ) else {
-                return Err(CacheError::InvalidManifest(format!(
+                }
+                let expected_destination = match self.visibility {
+                    CacheVisibility::Private => PublicationDestination::Private,
+                    CacheVisibility::Public => PublicationDestination::Public,
+                    _ => unreachable!("GitHub bootstrap stores are private or public"),
+                };
+                let batches = self.historical_batches(&repository, &revision)?;
+                let Some((batch, batch_source, artifact)) = historical_publication_for_identity(
+                    &batches,
+                    expected_destination,
+                    family,
+                    &shard.authorized_repository,
+                    identity,
+                    &manifest_path,
+                ) else {
+                    return Err(CacheError::InvalidManifest(format!(
                     "historical manifest for {family}/{} has no canonical publication-batch proof",
                     identity.semantic_digest.0
                 )));
+                };
+                (
+                    ShardIndexEntry {
+                        semantic_digest: identity.semantic_digest.clone(),
+                        canonical_payload_digest: identity.payload_digest.clone(),
+                        manifest_digest: identity.manifest_digest.clone(),
+                        achieved_assurance: artifact.achieved_assurance,
+                        disposition: ArtifactDisposition::Active,
+                        producer_toolkit_version: artifact.producer_toolkit_version.clone(),
+                        minimum_reader_version: manifest.minimum_reader_version,
+                        transport_digests: vec![artifact.transport_digest.clone()],
+                        publication_transaction_id: batch.batch_id.0.clone(),
+                    },
+                    batch_source.clone(),
+                )
             };
-            (
-                ShardIndexEntry {
-                    semantic_digest: identity.semantic_digest.clone(),
-                    canonical_payload_digest: identity.payload_digest.clone(),
-                    manifest_digest: identity.manifest_digest.clone(),
-                    achieved_assurance: artifact.achieved_assurance,
-                    disposition: ArtifactDisposition::Active,
-                    producer_toolkit_version: artifact.producer_toolkit_version.clone(),
-                    minimum_reader_version: manifest.minimum_reader_version,
-                    transport_digests: vec![artifact.transport_digest.clone()],
-                    publication_transaction_id: batch.batch_id.0.clone(),
-                },
-                batch_source.clone(),
-            )
-        };
-        let resolved = self.materialize_indexed_entry(
-            repository,
-            revision,
-            family,
-            route,
-            &identity.semantic_digest,
-            entry,
-            index_source,
-        )?;
-        let Some(resolved) = resolved else {
-            return Ok(None);
-        };
-        if resolved.manifest.semantic_digest != identity.semantic_digest
-            || resolved.manifest.digest()? != identity.manifest_digest
-            || resolved.manifest.payload_digest != identity.payload_digest
-        {
-            return Err(CacheError::InvalidManifest(format!(
-                "shard entry for {}/{} does not reproduce the requested dependency identity",
-                family, identity.semantic_digest.0
-            )));
+            let resolved = self.materialize_indexed_entry(
+                repository,
+                revision,
+                family,
+                shard,
+                &identity.semantic_digest,
+                entry,
+                index_source,
+            )?;
+            let Some(resolved) = resolved else {
+                continue;
+            };
+            if resolved.manifest.semantic_digest != identity.semantic_digest
+                || resolved.manifest.digest()? != identity.manifest_digest
+                || resolved.manifest.payload_digest != identity.payload_digest
+            {
+                return Err(CacheError::InvalidManifest(format!(
+                    "shard entry for {}/{} does not reproduce the requested dependency identity",
+                    family, identity.semantic_digest.0
+                )));
+            }
+            return Ok(Some(resolved));
         }
-        Ok(Some(resolved))
+        Ok(None)
     }
 
     /// Fetch, validate, and assemble one indexed shard entry. Shared by the
@@ -539,7 +565,7 @@ impl GitHubBootstrapCacheStore {
         repository: String,
         revision: String,
         family: &str,
-        route: &BootstrapFamily,
+        shard: &crate::bootstrap_topology::BootstrapShard,
         semantic_digest: &ContentDigest,
         entry: ShardIndexEntry,
         index_source: RemoteReadReport,
@@ -584,7 +610,7 @@ impl GitHubBootstrapCacheStore {
             &receipt_source,
             expected_destination,
             family,
-            &route.current_writable_shard,
+            &shard.authorized_repository,
             semantic_digest,
             &entry,
             &manifest_path,
@@ -595,8 +621,8 @@ impl GitHubBootstrapCacheStore {
             semantic_digest: semantic_digest.clone(),
             overlay: self.name.clone(),
             visibility: self.visibility,
-            shard_id: route.current_writable_shard.clone(),
-            authorized_repository: route.current_writable_shard.clone(),
+            shard_id: shard.shard_id.clone(),
+            authorized_repository: shard.authorized_repository.clone(),
             repository,
             revision,
             index: entry,
@@ -1067,17 +1093,7 @@ impl CacheStore for GitHubBootstrapCacheStore {
             return Ok(cached.into_iter().take(maximum_keys).collect());
         }
         let result = (|| {
-            let visibility_name = visibility_name(self.visibility);
-            let registry = self.registry_snapshot()?;
-            let route = registry
-                .families
-                .iter()
-                .find(|route| route.family == family)
-                .ok_or_else(|| {
-                    CacheError::NotFound(format!("{visibility_name} family {family}"))
-                })?;
-            let repository = format!("https://github.com/{}.git", route.current_writable_shard);
-            let revision = self.shard_revision(&repository)?;
+            let topology = self.family_topology(family)?;
             let current = crate::current_toolkit_version()?;
             let mut entries =
                 if let Ok(bytes) = fs::read(self.local_continuation_inventory_path(query)?) {
@@ -1087,20 +1103,27 @@ impl CacheStore for GitHubBootstrapCacheStore {
                 } else {
                     Vec::new()
                 };
-            match self.read_json::<CcmEigenpairContinuationIndex>(
-                &repository,
-                &revision,
-                &inventory_path,
-            ) {
-                Ok((inventory, _)) => {
-                    inventory.validate()?;
-                    for entry in inventory.entries {
-                        entries.retain(|current| current.semantic_digest != entry.semantic_digest);
-                        entries.push(entry);
+            // Historical shards are merged oldest-to-newest so a current
+            // writable shard wins if the same semantic identity was carried
+            // forward during rollover.
+            for shard in topology.readable_shards.iter().rev() {
+                let revision = self.shard_revision(&shard.repository_url)?;
+                match self.read_json::<CcmEigenpairContinuationIndex>(
+                    &shard.repository_url,
+                    &revision,
+                    &inventory_path,
+                ) {
+                    Ok((inventory, _)) => {
+                        inventory.validate()?;
+                        for entry in inventory.entries {
+                            entries
+                                .retain(|current| current.semantic_digest != entry.semantic_digest);
+                            entries.push(entry);
+                        }
                     }
+                    Err(CacheError::NotFound(_)) => {}
+                    Err(error) => return Err(error),
                 }
-                Err(CacheError::NotFound(_)) => {}
-                Err(error) => return Err(error),
             }
             let inventory = CcmEigenpairContinuationIndex::rebuild(query, entries)?;
             let keys = inventory.query(query, &current, maximum_keys)?;

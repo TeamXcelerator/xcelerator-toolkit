@@ -1,6 +1,6 @@
 # Research workflow entry points
 
-Version target: `0.14.2`
+Version target: `0.14.3`
 
 These examples are stable, nonmutating entry points for the three release-required research workflows. Run them from the repository root. Successful commands write machine-readable JSON to standard output and return status 0; failures write Rust error context to standard error and return nonzero. None reads credentials, publishes cache data, or mutates a remote repository.
 

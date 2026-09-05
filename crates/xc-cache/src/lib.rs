@@ -11,6 +11,7 @@
 mod artifact_validation;
 mod batch_publication;
 mod bootstrap_remote_store;
+mod bootstrap_topology;
 mod bundle;
 mod cache_provenance;
 mod compatibility;

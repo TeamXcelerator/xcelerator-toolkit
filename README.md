@@ -7,7 +7,7 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-Version 0.14.2 is a cache-reuse performance and correctness release built on
+Version 0.14.3 adds backward-compatible multi-shard cache rollover, building on
 the CCM capture and managed-publication functionality delivered in 0.14.1.
 Publishing children of shard-reused artifacts to a new
 destination now stages the full dependency closure without recomputation,
@@ -106,7 +106,7 @@ If you use Xcelerator Toolkit in research, please cite the exact version or Git 
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.14.2},
+  version = {0.14.3},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }
@@ -191,6 +191,12 @@ minimum reader version.
 Caching is automatic for ordinary consumers. The toolkit checks compatible local and public artifacts, validates a candidate before reuse, and computes on a miss. No credentials or cache configuration are required for that normal workflow.
 
 Authenticated publication to private or public cache storage is an optional author operation and is disabled by default. See [Cache Schema](docs/CACHE_SCHEMA.md) for the artifact model. Toolkit changes can be checked against current cached outputs with [cache output validation](docs/OUTPUT_VALIDATION.md).
+
+Managed GitHub routing is registry-driven. A family may span multiple ordered
+repositories after rollover: publication uses the family document's active
+writable shard, while reuse and exact dependency checks search it and its
+read-only predecessors. The root route can remain on a predecessor as a
+compatibility pointer for released single-shard readers.
 
 Version 0.13.1 adds generation-fenced publication leases for private shards. Concurrent authors serialize publication per shard, while each content batch and its coordination heartbeat advance atomically.
 
