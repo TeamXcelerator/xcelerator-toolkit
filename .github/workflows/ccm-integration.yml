@@ -1,7 +1,7 @@
 name: Controlled CCM source integration
 
-# One deliberate run when this file is created/edited, not on source edits.
-# The integration commit removes this bootstrap workflow from the branch.
+# One deliberate run when this file is edited, not on ordinary source edits.
+# Workflow cleanup is performed through the authenticated owner connection.
 on:
   push:
     branches: [work/ccm-audit-hardening]
@@ -47,9 +47,11 @@ jobs:
         run: |
           python3 tools/integrate_candidate.py
           cargo fmt --all
-          rm .github/workflows/ccm-integration.yml
+          # Do not ask a runtime token to change its own workflow permissions.
+          # Only tracked source edits and retired preparation scripts are staged.
+          git restore -- .github/workflows
           git diff --check
-          git add -- crates Cargo.toml Cargo.lock tests/external-consumer tools .github/workflows
+          git add -u -- crates Cargo.toml Cargo.lock tests/external-consumer tools
           git -c user.name=TeamXceleratorDev -c user.email=5178942+TeamXceleratorDev@users.noreply.github.com commit -m "v0.14.4: integrate CCM correctness, research, and performance improvements"
           git -c credential.helper= -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' push origin HEAD:refs/heads/work/ccm-audit-hardening
           git rev-parse HEAD | tee "$EVIDENCE/source-commit.txt"
