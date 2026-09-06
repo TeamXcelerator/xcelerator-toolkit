@@ -1,8 +1,13 @@
 name: CCM qualification
 
-# Development qualification is explicit, not triggered by each edit or PR update.
+# Explicit qualification only. Ordinary source edits do not start a run.
 on:
   workflow_dispatch:
+    inputs:
+      benchmark:
+        description: Run release-mode performance comparisons
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -21,30 +26,14 @@ jobs:
       XC_PUBLISH_EXECUTE: 'false'
       RAYON_NUM_THREADS: '2'
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
-      # Preparation affects only the scratch checkout. Results qualify this
-      # prepared candidate, not an unmodified committed source tree. The edits
-      # still require explicit source commits and clean-checkout validation.
-      - name: Prepare candidate changes in the scratch checkout
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('tools/apply_ccm_hardening.py')
-          text = path.read_text()
-          old = 's = once(s, "use rug::{ops::Pow, Float};", "use rug::{ops::Pow, Assign, Float};")'
-          new = 's = s.replace("use rug::{ops::Pow, Float};", "use rug::{ops::Pow, Assign, Float};", 1)'
-          assert text.count(old) == 2
-          path.write_text(text.replace(old, new))
-          PY
-          python3 tools/apply_ccm_hardening.py
-          python3 tools/extend_ccm_research.py
-          python3 tools/finalize_ccm_review.py
-      - name: Isolate caches and record toolchain
+      - name: Isolate caches and record the exact source and toolchain
         run: |
           echo "XC_CACHE_ROOT=$RUNNER_TEMP/xc-cache" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/xc-target" >> "$GITHUB_ENV"
+          git rev-parse HEAD
           rustup update stable
           rustup component add rustfmt clippy --toolchain stable
           rustc -Vv
@@ -54,14 +43,23 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential m4 libgmp-dev libmpfr-dev libmpc-dev libflint-dev
       - name: Formatting
-        run: cargo fmt --all
+        run: cargo fmt --all -- --check
       - name: Read-only inventory regression tests
-        run: python3 -m unittest discover -s tools -p 'test_*.py'
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
       - name: Default workspace tests
-        run: cargo test --workspace --locked --quiet
-      - name: High precision and interval regression tests
+        run: cargo test --workspace --locked --quiet --no-fail-fast
+      - name: High-precision workspace tests without interval backend
+        run: cargo test --workspace --features hp --locked --quiet --no-fail-fast
+      - name: High-precision and interval workspace tests
         run: cargo test --workspace --features hp,arb --locked --quiet --no-fail-fast
       - name: Warnings-as-errors Clippy
         run: cargo clippy --workspace --all-targets --features hp,arb --locked --quiet -- -D warnings
-      - name: Release prime-generator performance comparison
+      - name: Warnings-as-errors documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --features hp,arb --locked --quiet
+      - name: Release prime-component performance comparison
+        if: ${{ inputs.benchmark }}
         run: cargo test -p xc-spectral --release --features hp --locked --quiet audit_prime_generator_benchmark -- --ignored --nocapture
+      - name: Confirm source was not modified during qualification
+        run: git diff --exit-code
