@@ -4,6 +4,7 @@ AI-generated assistance; owner-authorized scope in docs/CCM_HARDENING.md.
 """
 from pathlib import Path
 import hashlib
+import re
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -84,10 +85,10 @@ start = s.index("/// Opt-in exact-rational-input matrix assembly for mechanism e
 end = s.index("#[cfg(test)]\nmod audit_research_tests", start)
 helper = s[start:end]
 s = s[:start] + s[end:]
-anchor = "#[cfg(test)]\nmod tests {"
-if anchor not in s:
+anchor = re.search(r'#\[cfg\(test\)\]\n(?:#\[[^\n]*\]\n)*mod tests\s*\{', s)
+if anchor is None:
     raise RuntimeError("could not locate existing HP test module")
-s = s.replace(anchor, helper + anchor, 1)
+s = s[:anchor.start()] + helper + s[anchor.start():]
 start = s.index('            println!("CCM_BENCH ')
 end = s.index('\n', start)
 s = s[:start] + """            println!(\"CCM_BENCH {}\", serde_json::json!({
