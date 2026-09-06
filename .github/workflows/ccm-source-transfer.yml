@@ -1,0 +1,64 @@
+name: Transfer locally qualified CCM source
+
+# One explicitly authorized transfer of an already tested exact patch.
+# This transient workflow and its data are removed before the main merge.
+on:
+  push:
+    branches: [work/ccm-audit-hardening]
+    paths: [.github/workflows/ccm-source-transfer.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ccm-qualified-source-transfer
+  cancel-in-progress: false
+
+jobs:
+  transfer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Verify exact base and tested patch bytes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, bz2, hashlib, json, pathlib, subprocess
+          m = json.loads(pathlib.Path('tools/ccm-source-transfer.json').read_text())
+          assert m['schema_version'] == 1
+          assert subprocess.check_output(['git','rev-parse','HEAD^'], text=True).strip() == m['expected_parent_commit']
+          encoded = ''.join(pathlib.Path(p['path']).read_text() for p in m['parts'])
+          packed = base64.b64decode(encoded, validate=True)
+          assert hashlib.sha256(packed).hexdigest() == m['compressed_sha256']
+          patch = bz2.decompress(packed)
+          assert hashlib.sha256(patch).hexdigest() == m['patch_sha256']
+          allowed = set()
+          for f in m['files']:
+              p = pathlib.Path(f['path'])
+              assert not p.is_absolute() and '..' not in p.parts and p.parts[0] in {'crates','docs','README.md'}
+              assert not p.is_symlink()
+              allowed.add(p.as_posix())
+              if f['before_sha256'] is None:
+                  assert not p.exists(), str(p)
+              else:
+                  assert hashlib.sha256(p.read_bytes()).hexdigest() == f['before_sha256'], str(p)
+          subprocess.run(['git','apply','--check','--index','-'], input=patch, check=True)
+          subprocess.run(['git','apply','--index','-'], input=patch, check=True)
+          assert set(subprocess.check_output(['git','diff','--cached','--name-only'], text=True).splitlines()) == allowed
+          for f in m['files']:
+              assert hashlib.sha256(pathlib.Path(f['path']).read_bytes()).hexdigest() == f['after_sha256'], f['path']
+          subprocess.run(['git','diff','--cached','--check'], check=True)
+          print('Verified exact transfer of',len(allowed),'locally tested source files.')
+          PY
+      - name: Commit exact source to the authorized work branch only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          git -c user.name=TeamXceleratorDev -c user.email=5178942+TeamXceleratorDev@users.noreply.github.com commit -m "v0.14.4: integrate retained-prefix diagnostics, checked exports, and capture plans"
+          git -c credential.helper= -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' push origin HEAD:refs/heads/work/ccm-audit-hardening
+          git rev-parse HEAD
