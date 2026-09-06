@@ -1,14 +1,11 @@
 name: CCM qualification
 
+# Development qualification is explicit, not triggered by each edit or PR update.
 on:
-  push:
-    branches: [work/ccm-audit-hardening]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ccm-qualification-${{ github.ref }}
@@ -26,10 +23,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      # BEGIN ONE-SHOT MATERIALIZATION
-      - name: Apply source-hash-guarded numerical and research edits
+      # Preparation affects only the scratch checkout. Results qualify this
+      # prepared candidate, not an unmodified committed source tree. The edits
+      # still require explicit source commits and clean-checkout validation.
+      - name: Prepare candidate changes in the scratch checkout
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -43,7 +41,6 @@ jobs:
           python3 tools/apply_ccm_hardening.py
           python3 tools/extend_ccm_research.py
           python3 tools/finalize_ccm_review.py
-      # END ONE-SHOT MATERIALIZATION
       - name: Isolate caches and record toolchain
         run: |
           echo "XC_CACHE_ROOT=$RUNNER_TEMP/xc-cache" >> "$GITHUB_ENV"
@@ -68,24 +65,3 @@ jobs:
         run: cargo clippy --workspace --all-targets --features hp,arb --locked --quiet -- -D warnings
       - name: Release prime-generator performance comparison
         run: cargo test -p xc-spectral --release --features hp --locked --quiet audit_prime_generator_benchmark -- --ignored --nocapture
-      # BEGIN ONE-SHOT PUBLICATION
-      - name: Commit only qualified source edits to the authorized work branch
-        if: github.event_name == 'push' && github.ref == 'refs/heads/work/ccm-audit-hardening' && github.repository == 'TeamXcelerator/xcelerator-toolkit'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          path = Path('.github/workflows/ccm-qualification.yml')
-          text = path.read_text().replace('  contents: write', '  contents: read')
-          text = re.sub(r'      # BEGIN ONE-SHOT MATERIALIZATION\n.*?      # END ONE-SHOT MATERIALIZATION\n', '', text, flags=re.S)
-          text = re.sub(r'      # BEGIN ONE-SHOT PUBLICATION\n.*?      # END ONE-SHOT PUBLICATION\n', '', text, flags=re.S)
-          text = text.replace('run: cargo fmt --all\n', 'run: cargo fmt --all -- --check\n')
-          path.write_text(text)
-          PY
-          git rm -f -- tools/apply_ccm_hardening.py tools/extend_ccm_research.py tools/finalize_ccm_review.py
-          git add -- crates Cargo.toml Cargo.lock tests/external-consumer tools .github/workflows/ccm-qualification.yml
-          git -c user.name=TeamXceleratorDev -c user.email=5178942+TeamXceleratorDev@users.noreply.github.com commit -m "v0.14.4: qualify CCM correctness, research, and performance hardening"
-          git -c credential.helper= -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' push origin HEAD:refs/heads/work/ccm-audit-hardening
-      # END ONE-SHOT PUBLICATION
