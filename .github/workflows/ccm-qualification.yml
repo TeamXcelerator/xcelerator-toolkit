@@ -31,6 +31,15 @@ jobs:
       # BEGIN ONE-SHOT MATERIALIZATION
       - name: Apply source-hash-guarded numerical and research edits
         run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('tools/apply_ccm_hardening.py')
+          text = path.read_text()
+          old = 's = once(s, "use rug::{ops::Pow, Float};", "use rug::{ops::Pow, Assign, Float};")'
+          new = 's = s.replace("use rug::{ops::Pow, Float};", "use rug::{ops::Pow, Assign, Float};", 1)'
+          assert text.count(old) == 2
+          path.write_text(text.replace(old, new))
+          PY
           python3 tools/apply_ccm_hardening.py
           python3 tools/extend_ccm_research.py
       # END ONE-SHOT MATERIALIZATION
@@ -74,7 +83,7 @@ jobs:
           text = text.replace('run: cargo fmt --all\n', 'run: cargo fmt --all -- --check\n')
           path.write_text(text)
           PY
-          git rm -- tools/apply_ccm_hardening.py tools/extend_ccm_research.py
+          git rm -f -- tools/apply_ccm_hardening.py tools/extend_ccm_research.py
           git add -- crates Cargo.toml Cargo.lock tests/external-consumer tools .github/workflows/ccm-qualification.yml
           git -c user.name=TeamXceleratorDev -c user.email=5178942+TeamXceleratorDev@users.noreply.github.com commit -m "v0.14.4: qualify CCM correctness, research, and performance hardening"
           git -c credential.helper= -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' push origin HEAD:refs/heads/work/ccm-audit-hardening
