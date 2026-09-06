@@ -74,3 +74,7 @@ pub mod reduction;
 // available to f64-only planners, while no process environment or platform
 // detection can silently alter execution.
 pub mod hp_runtime;
+
+/// Fixed-order prefix moments and precision-aware decimal export.
+#[cfg(feature = "hp")]
+pub mod prefix;

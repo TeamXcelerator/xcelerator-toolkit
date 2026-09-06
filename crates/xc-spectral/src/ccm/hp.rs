@@ -3337,6 +3337,53 @@ fn decode_weil_eigenpair(
     Ok((eps_n, xi, diagnostics))
 }
 
+// Replay the historical projection and final symmetry averaging entrywise.
+// This removes an O(N^2) temporary MPFR matrix without changing a single
+// projection operation or relaxing the full-Tau dependency comparison.
+fn even_sector_matches_tau(sector: &[Float], tau: &[Float], n: usize, p: u32) -> bool {
+    let Some(full) = n.checked_mul(2).and_then(|x| x.checked_add(1)) else {
+        return false;
+    };
+    let Some(d) = n.checked_add(1) else {
+        return false;
+    };
+    if full.checked_mul(full) != Some(tau.len()) || d.checked_mul(d) != Some(sector.len()) {
+        return false;
+    }
+    let sqrt_two = Float::with_val(p, 2).sqrt();
+    let entry = |i: usize, j: usize| {
+        if i == 0 && j == 0 {
+            return tau[n * full + n].clone();
+        }
+        if i == 0 || j == 0 {
+            let k = i.max(j);
+            let mut v = tau[n * full + n - k].clone();
+            v += &tau[n * full + n + k];
+            v /= &sqrt_two;
+            return v;
+        }
+        let mut v = tau[(n - i) * full + n - j].clone();
+        v += &tau[(n - i) * full + n + j];
+        v += &tau[(n + i) * full + n - j];
+        v += &tau[(n + i) * full + n + j];
+        v /= 2u32;
+        v
+    };
+    for i in 0..d {
+        for j in i..d {
+            let mut expected = entry(i, j);
+            if i != j {
+                expected += entry(j, i);
+                expected /= 2u32;
+            }
+            if sector[i * d + j] != expected || sector[j * d + i] != expected {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn build_even_sector_matrix(tau: &[Float], n_modes: usize, prec: u32) -> Vec<Float> {
     let full_dim = 2 * n_modes + 1;
     let even_dim = n_modes + 1;
@@ -3536,8 +3583,7 @@ fn resolve_even_sector_matrix_via_cache(
                 ));
             }
             let decoded = parse_hp_vector(&artifact.entries, cfg.precision_bits)?;
-            let expected = build_even_sector_matrix(tau, params.n_modes, cfg.precision_bits);
-            if decoded != expected {
+            if !even_sector_matches_tau(&decoded, tau, params.n_modes, cfg.precision_bits) {
                 return Err(CacheError::InvalidManifest(
                     "CCM even-sector matrix is inconsistent with its full tau dependency"
                         .to_owned(),
@@ -22614,6 +22660,28 @@ mod tests {
 
 #[cfg(test)]
 mod audit_research_tests {
+    #[test]
+    fn streaming_even_validation_matches_materialized_projection() {
+        for p in [64, 128, 257] {
+            for n in 0..=8 {
+                let d = 2 * n + 1;
+                // Intentionally not symmetric: test the final averaging order.
+                let tau = (0..d * d)
+                    .map(|i| {
+                        let mut v = Float::with_val(p, (i as i64 * 17 % 101) - 50);
+                        v /= (i % 7 + 1) as u32;
+                        v
+                    })
+                    .collect::<Vec<_>>();
+                let mut sector = build_even_sector_matrix(&tau, n, p);
+                assert!(even_sector_matches_tau(&sector, &tau, n, p));
+                sector[0] += 1;
+                assert!(!even_sector_matches_tau(&sector, &tau, n, p));
+            }
+        }
+        assert!(!even_sector_matches_tau(&[], &[], usize::MAX, 128));
+    }
+
     use super::super::research::*;
     use super::*;
 

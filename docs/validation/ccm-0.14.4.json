@@ -1,0 +1,236 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-06",
+  "version": "0.14.4",
+  "original_baseline": "e4e8ec5912c12ae12836187813b6962e5cd71aa6",
+  "work_branch_base": "afe5d30e6e73e535d685899fedf584dd5209b9b1",
+  "scope": "local Linux fixed-toolchain validation; not independent human audit or private warehouse certification",
+  "toolchain": "rustc 1.98.1 / cargo 1.98.1",
+  "gates": {
+    "format": {
+      "exit_status": 0
+    },
+    "default": {
+      "exit_status": 0,
+      "passed": 499,
+      "failed": 0,
+      "ignored": 6
+    },
+    "hp-arb": {
+      "exit_status": 0,
+      "passed": 921,
+      "failed": 0,
+      "ignored": 27
+    },
+    "clippy": {
+      "exit_status": 0
+    },
+    "rustdoc": {
+      "exit_status": 0
+    },
+    "external-consumer": {
+      "exit_status": 0,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "inventory": {
+      "exit_status": 0
+    },
+    "prefix-example": {
+      "exit_status": 0
+    },
+    "benchmark": {
+      "exit_status": 0,
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "final-guards": {
+      "exit_status": 0,
+      "passed": 921,
+      "failed": 0,
+      "ignored": 27
+    },
+    "prefix-final": {
+      "exit_status": 0
+    },
+    "release-repeatability": {
+      "exit_status": 0
+    },
+    "cross-release": {
+      "exit_status": 0
+    },
+    "cross-version-reuse": {
+      "exit_status": 0
+    }
+  },
+  "repeatability": {
+    "schema_version": 1,
+    "scope": "same-host fixed-build cold-process numerical-byte comparison",
+    "all_repeats_match": true,
+    "all_prior_0144_snapshots_match": true,
+    "private_warehouse_access": false,
+    "status": "passed",
+    "process_count": 84
+  },
+  "retained_prefix_repeatability": {
+    "status": "passed",
+    "process_count": 30,
+    "source_files_unchanged": true
+  },
+  "cached_payload_repeatability": {
+    "status": "passed",
+    "runs": 84,
+    "artifact_records_verified": 636,
+    "numerical_payload_fields_excluded": [],
+    "package_bytes_excluded": [],
+    "manifest_timestamps_not_compared": true,
+    "rows": [
+      {
+        "case": "c100",
+        "run_count": 12,
+        "artifact_records_per_run": 10,
+        "identical_payloads_packages_dependencies": true
+      },
+      {
+        "case": "c13",
+        "run_count": 12,
+        "artifact_records_per_run": 10,
+        "identical_payloads_packages_dependencies": true
+      },
+      {
+        "case": "c500",
+        "run_count": 12,
+        "artifact_records_per_run": 13,
+        "identical_payloads_packages_dependencies": true
+      },
+      {
+        "case": "certificate",
+        "run_count": 12,
+        "artifact_records_per_run": 0,
+        "identical_payloads_packages_dependencies": true
+      },
+      {
+        "case": "legacy13",
+        "run_count": 12,
+        "artifact_records_per_run": 10,
+        "identical_payloads_packages_dependencies": true
+      },
+      {
+        "case": "research",
+        "run_count": 12,
+        "artifact_records_per_run": 0,
+        "identical_payloads_packages_dependencies": true
+      },
+      {
+        "case": "seeded13",
+        "run_count": 12,
+        "artifact_records_per_run": 10,
+        "identical_payloads_packages_dependencies": true
+      }
+    ]
+  },
+  "cross_release": {
+    "status": "passed",
+    "cases": [
+      {
+        "case": "c13",
+        "baseline": "0.14.3 e4e8ec5912c1",
+        "comparison": "0.14.4 snapshot independently checked by current candidate repeats",
+        "exact_numerical_bytes_match": true,
+        "sha256": "0728f0bb7ceff7c5021b4f180680828f9af5bf5cc54ff0a980707d3f9b0eb042"
+      },
+      {
+        "case": "c100",
+        "baseline": "0.14.3 e4e8ec5912c1",
+        "comparison": "0.14.4 snapshot independently checked by current candidate repeats",
+        "exact_numerical_bytes_match": true,
+        "sha256": "caa47d24f9a8adbb9c2fe182fa909a44f9c66e0b43ad794dbd394c6997b3d652"
+      },
+      {
+        "case": "c500",
+        "baseline": "0.14.3 e4e8ec5912c1",
+        "comparison": "0.14.4 snapshot independently checked by current candidate repeats",
+        "exact_numerical_bytes_match": true,
+        "sha256": "65a0f30694397455dd709c0233109537c1655118168d72fe1e9d4cd3d8b474bf"
+      },
+      {
+        "case": "legacy13",
+        "baseline": "0.14.3 e4e8ec5912c1",
+        "comparison": "0.14.4 snapshot independently checked by current candidate repeats",
+        "exact_numerical_bytes_match": true,
+        "sha256": "91f186090567c23040202d8f583f1d31b83775d6afc3178782c094a1179248fa"
+      },
+      {
+        "case": "seeded13",
+        "baseline": "0.14.3 e4e8ec5912c1",
+        "comparison": "0.14.4 snapshot independently checked by current candidate repeats",
+        "exact_numerical_bytes_match": true,
+        "sha256": "1ab0c0b98ce639a5ec064aaf32567617708733c85b48f15837e8bee10949f454"
+      }
+    ],
+    "claim_scope": "tested ordinary numerical snapshots; certification and alternative arithmetic intentionally excluded"
+  },
+  "strict_old_cache_reuse": {
+    "status": "passed",
+    "cases": [
+      {
+        "case": "c13",
+        "source_version": "0.14.3",
+        "reader_version": "0.14.4",
+        "mode": "require_reuse",
+        "exact_result_match": true,
+        "existing_artifact_and_object_files": 30,
+        "no_added_or_changed_artifact_files": true
+      },
+      {
+        "case": "c100",
+        "source_version": "0.14.3",
+        "reader_version": "0.14.4",
+        "mode": "require_reuse",
+        "exact_result_match": true,
+        "existing_artifact_and_object_files": 30,
+        "no_added_or_changed_artifact_files": true
+      },
+      {
+        "case": "c500",
+        "source_version": "0.14.3",
+        "reader_version": "0.14.4",
+        "mode": "require_reuse",
+        "exact_result_match": true,
+        "existing_artifact_and_object_files": 39,
+        "no_added_or_changed_artifact_files": true
+      },
+      {
+        "case": "legacy13",
+        "source_version": "0.14.3",
+        "reader_version": "0.14.4",
+        "mode": "require_reuse",
+        "exact_result_match": true,
+        "existing_artifact_and_object_files": 30,
+        "no_added_or_changed_artifact_files": true
+      },
+      {
+        "case": "seeded13",
+        "source_version": "0.14.3",
+        "reader_version": "0.14.4",
+        "mode": "require_reuse",
+        "exact_result_match": true,
+        "existing_artifact_and_object_files": 30,
+        "no_added_or_changed_artifact_files": true
+      }
+    ],
+    "scope": "five synthetic/public-configuration local caches; no private warehouse claim"
+  },
+  "source_mutations_private_warehouse": false,
+  "new_external_dependencies": false,
+  "independent_human_review_claimed": false,
+  "outstanding": [
+    "Paper application adoption of two-phase capture plan and claim-driver changes",
+    "Private registry registration for new diagnostic kind if remote publication is authorized",
+    "Two retained research ladders and nine checkpoint reference comparisons",
+    "Owner private release audit and intended Windows/WSL large-N qualification",
+    "Proof-specific interval certification for new diagnostics"
+  ]
+}

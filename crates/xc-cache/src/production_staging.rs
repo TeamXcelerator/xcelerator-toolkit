@@ -1356,6 +1356,7 @@ const CCM_ROOT_KINDS: &[&str] = &[
     "ccm_spectral_window",
 ];
 const CCM_EVIDENCE_KINDS: &[&str] = &[
+    "ccm_prefix_analysis",
     "ccm_convergence_diagnostics",
     "ccm_root_conditioning_analysis",
     "ccm_prime_power_response_analysis",
@@ -1388,6 +1389,7 @@ const CCM_DISTANCE_KINDS: &[&str] = &[
 /// and an explicit public-only request fails when nothing staged is
 /// public-eligible.
 const PRIVATE_ONLY_ARTIFACT_KINDS: &[&str] = &[
+    "ccm_prefix_analysis",
     "ccm_deviation_decomposition",
     "ccm_distance_resolution_evidence",
     "ccm_target_distance",
@@ -3679,5 +3681,21 @@ mod tests {
             .iter()
             .any(|draft| draft == &drafts[0]));
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod prefix_routing_tests {
+    #[test]
+    fn prefix_kind_is_private_evidence_not_a_new_matrix() {
+        assert_eq!(
+            super::family_for_artifact_kind("ccm_prefix_analysis"),
+            Some("ccm-evidence")
+        );
+        assert!(super::artifact_kind_is_private_only("ccm_prefix_analysis"));
+        assert!(!super::artifact_kind_admitted_to_destination(
+            "ccm_prefix_analysis",
+            crate::PublicationDestination::Public
+        ));
     }
 }
