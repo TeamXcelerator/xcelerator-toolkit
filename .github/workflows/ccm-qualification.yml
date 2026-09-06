@@ -1,0 +1,66 @@
+name: CCM qualification
+
+# Validation is explicitly requested; normal edits and PR updates do not run it.
+# No source preparation, repository writes, or warehouse publication occurs.
+on:
+  workflow_dispatch:
+    inputs:
+      benchmark:
+        description: Run the explicit release prime-component comparison
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ccm-qualification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: 1.98.1
+      XC_CACHE_REMOTE: none
+      XC_PUBLISH_TARGET: none
+      XC_PUBLISH_EXECUTE: 'false'
+      RAYON_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Isolate caches and install the qualified toolchain
+        run: |
+          echo "XC_CACHE_ROOT=$RUNNER_TEMP/xc-cache" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/xc-target" >> "$GITHUB_ENV"
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+          rustc -Vv
+          cargo -V
+          git rev-parse HEAD
+      - name: Install existing native prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential m4 libgmp-dev libmpfr-dev libmpc-dev libflint-dev
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Read-only inventory tests
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+      - name: Default workspace tests
+        run: cargo test --workspace --locked --no-fail-fast
+      - name: High-precision and interval workspace tests
+        run: cargo test --workspace --features hp,arb --locked --no-fail-fast
+      - name: Warnings-as-errors Clippy
+        run: cargo clippy --workspace --all-targets --features hp,arb --locked -- -D warnings
+      - name: Warnings-as-errors documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --features hp,arb --locked
+      - name: External consumer tests
+        run: cargo test --manifest-path tests/external-consumer/Cargo.toml --features hp --locked
+      - name: Explicit release prime-component comparison
+        if: ${{ inputs.benchmark }}
+        run: cargo test -p xc-spectral --release --features hp --locked audit_prime_generator_benchmark -- --ignored --nocapture
+      - name: Confirm tracked source was not modified
+        run: git diff --exit-code

@@ -15,7 +15,7 @@
 
 use anyhow::{anyhow, Result};
 use rayon::prelude::*;
-use rug::{ops::Pow, Float};
+use rug::{ops::Pow, Assign, Float};
 
 /// Build an HP zero at the given precision. Uses an integer literal so
 /// no f64 round-trip occurs.
@@ -92,9 +92,13 @@ pub fn lu_factor(a: &[Float], dim: usize) -> Result<LuFactors> {
         lu[(k + 1) * dim..].par_chunks_mut(dim).for_each(|row| {
             let mut factor = row[k].clone();
             factor /= &pivot;
-            row[k] = factor.clone();
+            row[k].assign(&factor);
+            let mut product = hp_zero(pivot.prec());
             for (j_off, j) in ((k + 1)..dim).enumerate() {
-                let mut product = pivot_row[j_off].clone();
+                if product.prec() != pivot_row[j_off].prec() {
+                    product.set_prec(pivot_row[j_off].prec());
+                }
+                product.assign(&pivot_row[j_off]);
                 product *= &factor;
                 row[j] -= &product;
             }

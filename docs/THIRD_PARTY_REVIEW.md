@@ -30,3 +30,28 @@ distribution.
 Expanding the FLINT ABI, vendoring upstream code, static linking, redistributing
 native libraries, or incorporating any source fragment requires a new review;
 the current independent-formula decisions do not authorize those changes.
+
+## 0.14.4 retained-source diagnostic extension
+
+- Owner authorization: Ronnie Andrews, Jr. / TeamXceleratorDev explicitly
+  requested all Toolkit audit and research improvements and main-branch
+  integration in the September 6, 2026 CCM research conversation.
+- Original/generated implementation: fixed-order prefix LDLT, block-inverse
+  trace recurrences, normalized checkpoint exports, capture-plan integration,
+  and preservation checks were implemented with AI assistance from algebraic
+  identities and the existing project-owned numerical/cache interfaces.
+  The prototype from the same owner-authorized conversation was promoted and
+  tested; no outside source implementation or unpublished campaign payload is
+  incorporated. The exact-rational Gauss-Jordan test oracle is a separate
+  independently implemented algorithm, not an independent human review.
+- Dependencies: no direct or transitive dependency requirement or locked
+  external package was added or upgraded by this extension. Existing Rug,
+  MPFR/GMP, Rayon, serde, and optional dynamically linked FLINT are reused.
+- Validation fixtures: generated synthetic positive-definite matrices and
+  small public CCM configurations only. Runtime source snapshots and local
+  compiler/native-library bundles used for testing are not tracked or shipped
+  in this repository.
+- Scope: tests and byte-identity checks support the documented finite sample;
+  private release audit, independent reviewer approval, and missing research
+  checkpoint reproduction are not asserted. Existing owner review policy
+  remains in effect for release approval.

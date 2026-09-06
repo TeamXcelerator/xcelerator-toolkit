@@ -7,6 +7,34 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
+## 0.14.4: deterministic diagnostics and retained-source analysis
+
+Version 0.14.4 corrects cutoff-free zero-mode endpoint handling, gives the
+corrected certificate its own semantics, and adds precision-aware analytic
+series budgets. Ordinary quadrature-derived matrices, eigenstates, and roots
+retain their numerical contracts and compatibility floors. Default allocation
+and validation-memory improvements preserve the established operation order.
+Alternative prime aggregation and quadrature bucketing remain separately
+identified opt-in research routes, not automatic capture-level changes.
+
+New APIs provide fixed-order positive-definite prefix ladders, inverse-trace
+moments, normalization-explicit checkpoint vectors, and cancellation-aware
+post-serialization checks. The versioned `CcmCapturePlan::ultra` includes the
+retained-source diagnostic phase without implicitly requesting certification.
+The paper applications must adopt both capture phases; upgrading the library
+alone does not rewrite their CLI behavior. The new `ccm_prefix_analysis` kind is
+private-only and does not replace any existing source artifact.
+
+- [Prefix API, formulas, precision, and capture contract](docs/CCM_PREFIX_ANALYSIS.md)
+- [Completed qualification and remaining boundaries](docs/CCM_HARDENING.md)
+- [Desktop / VS Code Codex handoff](docs/CODEX_HANDOFF.md)
+
+No private warehouse payloads or registry changes are included. This source
+integration is not a release tag, a private-campaign reproduction, or a claim
+that every configuration/platform has been certified.
+
+## Existing artifact fabric (0.14.3)
+
 Version 0.14.3 adds backward-compatible multi-shard cache rollover, building on
 the CCM capture and managed-publication functionality delivered in 0.14.1.
 Publishing children of shard-reused artifacts to a new

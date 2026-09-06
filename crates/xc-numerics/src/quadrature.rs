@@ -402,19 +402,19 @@ mod hp {
     ///
     /// - `Off`          — no cache at all. Always compute; never read or
     ///   write any cache file.
-    /// - `JsonOnly`     — read a local uncompressed `.json` if present;
-    ///   otherwise compute. Does not consult `.json.zip` or the remote.
+    /// - `JsonOnly`     — deprecated compatibility variant; computes without
+    ///   reading or writing files under the zip-only cache contract.
     /// - `JsonZip`      — local `.json.zip`, read in memory, then compute.
     ///   This is the default for the standalone API. Managed remote resolution
     ///   is provided by `gauss_legendre_nodes_via_cache`.
     ///
-    /// On a fresh compute, `JsonOnly` writes only the `.json`; `JsonZip`
-    /// writes a `.json.zip`; `Off` writes nothing.
+    /// On a fresh compute, only `JsonZip` writes a `.json.zip`. `Off` and
+    /// the deprecated `JsonOnly` variant write nothing.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum CacheMode {
         /// No caching: always compute, never touch disk or network.
         Off,
-        /// Local uncompressed `.json` only.
+        /// Deprecated compatibility variant: no reads or writes.
         JsonOnly,
         /// Local `.json.zip`, followed by computation on a miss (default).
         #[default]
@@ -640,6 +640,22 @@ mod hp {
         }
     }
 
+    #[cfg(test)]
+    thread_local! {
+        static TEST_CACHE_ROOT: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Test-only, thread-local cache placement. Never mutates the process
+    /// environment or cwd, and never redirects another concurrently running
+    /// test. Production continues to honor XC_CACHE_ROOT unchanged.
+    #[cfg(test)]
+    pub(super) fn replace_test_cache_root(
+        root: Option<std::path::PathBuf>,
+    ) -> Option<std::path::PathBuf> {
+        TEST_CACHE_ROOT.with(|current| current.replace(root))
+    }
+
     /// Cache directory: `$XC_CACHE_ROOT/gl_cache` when that is set, else
     /// `<cwd>/data/gl_cache`. Created on demand so fresh checkouts work
     /// without manual setup.
@@ -649,6 +665,12 @@ mod hp {
     /// binary cache files into that checkout, where they are neither the
     /// operator's chosen cache volume nor necessarily ignored by git.
     fn gl_cache_dir() -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(root) = TEST_CACHE_ROOT.with(|current| current.borrow().clone()) {
+            let dir = root.join("gl_cache");
+            std::fs::create_dir_all(&dir).ok()?;
+            return Some(dir);
+        }
         let root = match std::env::var_os("XC_CACHE_ROOT") {
             Some(root) if !root.is_empty() => std::path::PathBuf::from(root),
             _ => std::env::current_dir().ok()?.join("data"),
@@ -676,6 +698,12 @@ mod hp {
     fn parse_gl_json(data: &str, n: usize, prec: u32) -> Option<(Vec<Float>, Vec<Float>)> {
         let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
         let obj = parsed.as_object()?;
+        if obj.get("schema_version")?.as_u64()? != 1
+            || obj.get("n_pts")?.as_u64()? != u64::try_from(n).ok()?
+            || obj.get("precision_bits")?.as_u64()? != u64::from(prec)
+        {
+            return None;
+        }
 
         let file_ver = obj.get("toolkit_version").and_then(|v| v.as_str())?;
         if version_is_older(file_ver, &effective_min_version()) {
@@ -794,6 +822,9 @@ mod hp {
         use std::io::Read;
         let file = std::fs::File::open(zip_path).ok()?;
         let mut archive = zip::ZipArchive::new(file).ok()?;
+        if archive.len() != 1 {
+            return None;
+        }
         let entry_name = format!("prec{}_npts{}.json", prec, n);
         let mut entry = archive.by_name(&entry_name).ok()?;
         let mut data = String::new();
@@ -1519,26 +1550,14 @@ mod tests {
 mod hp_cache_tests {
     //! Tests for the HP GL cache lookup logic introduced in v0.4.1.
     //!
-    //! These tests exercise the cwd-relative cache directory and the
-    //! `.json` / `.json.zip` lookup priority. To avoid polluting the
-    //! caller's `data/gl_cache/` directory, each test runs in an
-    //! isolated temp directory via `std::env::set_current_dir`.
-    //!
-    //! Because `set_current_dir` mutates global process state, these
-    //! tests must run sequentially. We use a single mutex to serialize
-    //! them and restore the original cwd on drop.
+    //! Cache lookup tests use a thread-local test root. They neither depend
+    //! on nor mutate XC_CACHE_ROOT or the process working directory, and can
+    //! safely execute concurrently with numerical tests.
 
     use super::*;
     use rug::Float;
     use std::io::Write;
     use std::path::PathBuf;
-    use std::sync::Mutex;
-
-    /// Serialize all cwd-mutating tests in this module. Cargo runs
-    /// tests in parallel by default; cwd is per-process (not
-    /// per-thread), so two cache tests racing would corrupt each
-    /// other. The mutex enforces sequential access.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn allocation_reduction_preserves_exact_gl_payload_values() {
@@ -1552,36 +1571,21 @@ mod hp_cache_tests {
         }
     }
 
-    /// Guard that restores the original cwd when dropped, so a panic
-    /// inside a test doesn't leave the test runner in a temp dir
-    /// (which would break subsequent unrelated tests).
-    struct CwdGuard {
-        original: PathBuf,
-        _lock: std::sync::MutexGuard<'static, ()>,
+    /// A panic-safe per-thread override, independent of the user's cache
+    /// environment. No global cwd mutation is necessary for cache tests.
+    struct CacheRootGuard {
+        original: Option<PathBuf>,
     }
-    impl CwdGuard {
+    impl CacheRootGuard {
         fn enter(temp: &std::path::Path) -> Self {
-            // Recover from poison: a previously-panicking test will have
-            // poisoned the lock, but subsequent tests can still safely
-            // acquire it (the global cwd state isn't corrupted by a test
-            // panic — the prior test's CwdGuard::drop ran on unwind and
-            // restored the original cwd). Without this recovery, one
-            // test panic cascades into all subsequent tests panicking
-            // on "cwd lock poisoned" instead of running.
-            let lock = CWD_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let original = std::env::current_dir().expect("no cwd");
-            std::env::set_current_dir(temp).expect("set_current_dir to temp");
-            CwdGuard {
-                original,
-                _lock: lock,
+            Self {
+                original: hp::replace_test_cache_root(Some(temp.join("data"))),
             }
         }
     }
-    impl Drop for CwdGuard {
+    impl Drop for CacheRootGuard {
         fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
+            hp::replace_test_cache_root(self.original.take());
         }
     }
 
@@ -1723,7 +1727,15 @@ mod hp_cache_tests {
         // Weights are already exact decimal strings.
         let weights: Vec<String> = weights_exact.iter().map(|s| s.to_string()).collect();
 
-        serde_json::json!([nodes, weights]).to_string()
+        serde_json::json!({
+            "schema_version": 1,
+            "toolkit_version": hp::toolkit_version_for_test(),
+            "n_pts": n,
+            "precision_bits": 64,
+            "nodes": nodes,
+            "weights": weights,
+        })
+        .to_string()
     }
 
     /// Produce a valid-envelope JSON but with structurally-invalid
@@ -1765,7 +1777,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_reads_zip_ignoring_stale_json() {
         let temp = fresh_temp_dir("zip_is_truth");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 4;
         let prec: u32 = 64;
@@ -1817,7 +1829,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_reads_zip_without_writing_decompressed_json() {
         let temp = fresh_temp_dir("zip_fallback");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 5;
         let prec: u32 = 64;
@@ -1861,7 +1873,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_computes_fresh_and_writes_json() {
         let temp = fresh_temp_dir("compute_fresh");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 8;
         let prec: u32 = 128;
@@ -1919,7 +1931,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_mode_off_never_touches_disk() {
         let temp = fresh_temp_dir("mode_off");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 8;
         let prec: u32 = 128;
@@ -1948,7 +1960,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_mode_json_only_ignores_zip() {
         let temp = fresh_temp_dir("mode_json_only");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 4;
         let prec: u32 = 64;
@@ -2035,7 +2047,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_fresh_compute_writes_zip_only() {
         let temp = fresh_temp_dir("compute_writes_zip_only");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 8;
         let prec: u32 = 128;
@@ -2088,7 +2100,7 @@ mod hp_cache_tests {
     #[test]
     fn fresh_compute_integrates_x_squared() {
         let temp = fresh_temp_dir("integrate_x2");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         // Use small n, modest precision: enough to validate, fast to run.
         let n = 16;
@@ -2134,7 +2146,7 @@ mod hp_cache_tests {
     #[test]
     fn hp_gl_nodes_satisfy_symmetry_and_moments() {
         let temp = fresh_temp_dir("symmetry_moments");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n: usize = 12;
         let prec: u32 = 256;
@@ -2204,7 +2216,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_discards_structurally_invalid_json_and_recomputes() {
         let temp = fresh_temp_dir("structurally_invalid");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 6;
         let prec: u32 = 128;
@@ -2279,7 +2291,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_handles_corrupt_zip_gracefully() {
         let temp = fresh_temp_dir("corrupt_zip");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 4;
         let prec: u32 = 64;
@@ -2309,7 +2321,7 @@ mod hp_cache_tests {
         use hp::CacheFileStatus;
 
         let temp = fresh_temp_dir("verify_dir");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let cache_dir = temp.join("data").join("gl_cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
@@ -2420,12 +2432,32 @@ mod hp_cache_tests {
     #[test]
     fn verify_gl_cache_dir_handles_missing_directory() {
         let temp = fresh_temp_dir("verify_missing");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let nonexistent = temp.join("does_not_exist");
         let report = hp::verify_gl_cache_dir(&nonexistent).unwrap();
         assert_eq!(report.statuses.len(), 0);
         assert_eq!(report.ok_count(), 0);
         assert_eq!(report.failure_count(), 0);
+    }
+}
+
+#[cfg(all(test, feature = "hp"))]
+mod cache_envelope_regression {
+    use super::hp;
+
+    #[test]
+    fn mislabeled_cache_envelopes_are_rejected_before_numeric_decode() {
+        let good = serde_json::json!({
+            "schema_version": 1, "toolkit_version": hp::toolkit_version_for_test(),
+            "n_pts": 2, "precision_bits": 128,
+            "nodes": ["-0.5", "0.5"], "weights": ["1", "1"]
+        });
+        assert!(hp::parse_gl_json_for_test(&good.to_string(), 2, 128).is_some());
+        for (field, value) in [("schema_version", 2), ("n_pts", 3), ("precision_bits", 64)] {
+            let mut bad = good.clone();
+            bad[field] = serde_json::json!(value);
+            assert!(hp::parse_gl_json_for_test(&bad.to_string(), 2, 128).is_none());
+        }
     }
 }
