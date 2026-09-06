@@ -39,8 +39,11 @@ pub mod cutoff_free;
 
 pub mod artifacts;
 pub mod convergence;
+
 pub mod rank_one;
 pub mod reproduction;
+#[cfg(feature = "hp")]
+pub mod research;
 pub mod window;
 
 /// How λ² is represented and processed.

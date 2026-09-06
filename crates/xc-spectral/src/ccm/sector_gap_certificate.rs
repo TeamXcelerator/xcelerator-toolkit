@@ -30,11 +30,11 @@ use xc_numerics::interval::RationalInterval;
 #[cfg(feature = "arb")]
 use super::CcmParams;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const CLAIM_SCOPE: &str =
     "cutoff_free_finite_ccm_conditional_sector_ordering_simplicity_and_unconditional_full_inertia";
 const INTERVAL_MATRIX_SEMANTICS: &str =
-    "raw_full_cutoff_free_tau_certified_by_interval_ldlt_then_reflection_orbits_intersected_for_conditional_parity_projection";
+    "raw_full_corrected_endpoint_aggregate_prime_tau_certified_by_interval_ldlt_then_reflection_orbits_intersected_for_conditional_parity_projection_v3";
 const PARITY_INVARIANCE_PREMISE: &str =
     "the exact closed_form_ccm_tau matrix is centrosymmetric under index reflection";
 
@@ -117,6 +117,17 @@ pub struct PortableCcmSectorGapCertificate {
     pub claim_scope: String,
 }
 
+fn checked_full_dimension(n_modes: usize) -> Result<usize> {
+    let dimension = n_modes
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("CCM certificate dimension overflow"))?;
+    if n_modes == 0 || dimension.checked_mul(dimension).is_none() {
+        bail!("CCM certificate requires a nonempty representable matrix");
+    }
+    Ok(dimension)
+}
+
 fn invalid_report(message: impl Into<String>) -> VerificationReport {
     VerificationReport {
         valid: false,
@@ -187,7 +198,7 @@ fn project_parity_sectors(
     if n_modes == 0 {
         bail!("CCM sector-gap certification requires N >= 1");
     }
-    let full_dimension = 2 * n_modes + 1;
+    let full_dimension = checked_full_dimension(n_modes)?;
     if tau.len() != full_dimension * full_dimension {
         bail!("CCM sector-gap projection received the wrong full Tau dimension");
     }
@@ -365,7 +376,7 @@ fn build_certificate_from_tau(
         }
     }
 
-    let full_dimension = 2 * n_modes + 1;
+    let full_dimension = checked_full_dimension(n_modes)?;
     let inertia_report =
         verify_portable_interval_inertia_certificate(&full_matrix_inertia_certificate);
     if !inertia_report.valid {
@@ -501,6 +512,9 @@ pub fn verify_portable_ccm_sector_gap_certificate(
         if certificate.schema_version != SCHEMA_VERSION
             || certificate.lambda_squared != certificate.integer_cutoff_c.to_string()
             || certificate.n_modes == 0
+            || checked_full_dimension(certificate.n_modes).is_err()
+            || certificate.integer_cutoff_c <= 1
+            || certificate.precision_bits > i32::MAX as u32 - 64
             || certificate.precision_bits < 64
             || certificate.geometric_terms == 0
             || certificate.scalar_backend.trim().is_empty()
@@ -542,7 +556,7 @@ pub fn verify_portable_ccm_sector_gap_certificate(
                 bail!("CCM sector-gap certificate has an invalid numerical discovery guide");
             }
         }
-        let full_dimension = 2 * certificate.n_modes + 1;
+        let full_dimension = checked_full_dimension(certificate.n_modes)?;
         let expected_cutoff = certificate.integer_cutoff_c.to_string();
         let expected_modes = certificate.n_modes.to_string();
         let expected_geometric_terms = certificate.geometric_terms.to_string();
@@ -610,21 +624,8 @@ pub fn verify_portable_ccm_sector_gap_certificate(
         }
         let (even, odd) =
             project_parity_sectors(&tau, certificate.n_modes, certificate.precision_bits)?;
-        let expected_even_guides = interval_midpoint_guides(
-            &even,
-            certificate.n_modes + 1,
-            2,
-            certificate.precision_bits,
-        )?;
-        let expected_odd_guides =
-            interval_midpoint_guides(&odd, certificate.n_modes, 1, certificate.precision_bits)?;
-        if certificate.certification_even_ground_guide != expected_even_guides[0].to_string()
-            || certificate.certification_even_first_excited_guide
-                != expected_even_guides[1].to_string()
-            || certificate.certification_odd_ground_guide != expected_odd_guides[0].to_string()
-        {
-            bail!("CCM cutoff-free midpoint discovery guides differ from exact Tau replay");
-        }
+        // Discovery guides are provenance only. Selected-eigenvalue and
+        // shifted-inertia records below independently replay the proof.
         if certificate.even_ground.requested_index != 0
             || certificate.even_first_excited.requested_index != 1
             || certificate.odd_ground.requested_index != 0
@@ -749,18 +750,24 @@ pub(crate) fn resolve_sector_gap_certificate_via_cache(
     {
         bail!("CCM sector-gap certification requires retained even, odd, and gap guide manifests");
     }
+    let geometric_terms = super::cutoff_free::recommended_geometric_terms(
+        params.lambda_sq_int(),
+        params.n_modes,
+        precision_bits,
+    );
     let lambda_squared = params.lambda_sq_int().to_string();
     let scalar_backend = format!("system-flint-arb-{}", super::arb_bridge::backend_version());
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_sector_gap_certificate".to_owned(),
         mathematical_semantics_version:
-            "ccm-cutoff-free-sector-gap-certificate-v0.14.1-v2".to_owned(),
+            "ccm-cutoff-free-sector-gap-certificate-v0.14.4-v3".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared,
             "n_modes": params.n_modes,
             "precision_bits": precision_bits,
-            "geometric_terms": 32,
+            "geometric_terms": geometric_terms,
+            "assembly_semantics": super::cutoff_free::ASSEMBLY_SEMANTICS,
             "relative_enclosure_bits": options.relative_enclosure_bits,
             "maximum_bracket_expansions": options.maximum_bracket_expansions,
             "even_spectrum_content_digest": even_manifest.content_digest.0,
@@ -791,7 +798,7 @@ pub(crate) fn resolve_sector_gap_certificate_via_cache(
             ),
         ]),
         algorithm_semantics: Some(
-            "cutoff_free_interval_assembly_full_matrix_ldlt_then_conditional_symmetry_intersection_parity_projection_exact_shifted_inertia_v2".to_owned(),
+            "corrected_endpoint_aggregate_prime_interval_assembly_full_matrix_ldlt_then_conditional_symmetry_intersection_parity_projection_exact_shifted_inertia_v3".to_owned(),
         ),
     };
     let semantic_digest = semantic_key.digest()?;
@@ -815,7 +822,7 @@ pub(crate) fn resolve_sector_gap_certificate_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Certified,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+        minimum_reader_version: ToolkitVersion::parse("0.14.4")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -917,7 +924,7 @@ pub(crate) fn resolve_sector_gap_certificate_via_cache(
                 || artifact.integer_cutoff_c != params.lambda_sq_int()
                 || artifact.n_modes != params.n_modes
                 || artifact.precision_bits != precision_bits
-                || artifact.geometric_terms != 32
+                || artifact.geometric_terms != geometric_terms
                 || artifact.scalar_backend != scalar_backend
                 || artifact.relative_enclosure_bits != options.relative_enclosure_bits
                 || artifact.maximum_bracket_expansions != options.maximum_bracket_expansions
@@ -1058,7 +1065,43 @@ mod tests {
         .unwrap();
         let report = verify_portable_ccm_sector_gap_certificate(&certificate);
         assert!(report.valid, "{:?}", report.errors);
-        assert_eq!(certificate.certified_finite_ground_parity, "odd");
+        assert_eq!(certificate.certified_finite_ground_parity, "even");
+        // Independent defining-integral point references, not claimed as
+        // certificates. The exact inertia brackets must contain these guides.
+        for (enclosure, reference) in [
+            (
+                &certificate.even_ground,
+                "0.0000002813455493029913661539146578227022091079",
+            ),
+            (
+                &certificate.odd_ground,
+                "0.0000368183629881845746854474379778896395739896",
+            ),
+        ] {
+            let point = Float::with_val(precision_bits, Float::parse(reference).unwrap())
+                .to_rational()
+                .unwrap();
+            assert!(parse(&enclosure.lower).unwrap() < point);
+            assert!(point < parse(&enclosure.upper).unwrap());
+        }
+    }
+
+    #[test]
+    fn offline_replay_does_not_require_reproducing_numerical_discovery_guides() {
+        let mut certificate = synthetic_certificate();
+        certificate.certification_even_ground_guide = "0.75".to_owned();
+        let report = verify_portable_ccm_sector_gap_certificate(&certificate);
+        assert!(report.valid, "{:?}", report.errors);
+    }
+
+    #[test]
+    fn malformed_dimensions_and_old_schema_fail_closed() {
+        let mut certificate = synthetic_certificate();
+        certificate.n_modes = usize::MAX;
+        assert!(!verify_portable_ccm_sector_gap_certificate(&certificate).valid);
+        let mut certificate = synthetic_certificate();
+        certificate.schema_version = 2;
+        assert!(!verify_portable_ccm_sector_gap_certificate(&certificate).valid);
     }
 
     #[test]

@@ -19,6 +19,27 @@ use xc_certify::PortableIntervalInertiaCertificate;
 use xc_numerics::interval::RationalInterval;
 use xc_numerics::mpfr_interval::MpfrInterval;
 
+/// Corrected finite-endpoint and aggregate-prime assembly identity.
+/// Old inertia records may remain readable as records, but are not evidence
+/// for this assembly. Sector certificates independently version their schema.
+pub const ASSEMBLY_SEMANTICS: &str = "ccm-cutoff-free-zero-endpoint-aggregate-primes-v0.14.4-v1";
+
+/// Deterministic conservative analytic-tail budget, with no floating-point
+/// estimate of log(c). For c >= 2 and b=floor(log2(c)), the common special-value
+/// tail is at most 6*2^(-2*M*b). The additional dimension allowance covers the
+/// O(N) frequency factor and O(d) row-sum propagation in the archimedean form.
+/// This controls the analytic series tail, NOT total assembly roundoff or a
+/// spectral gap. Exact interval verification still decides certificate success.
+pub fn recommended_geometric_terms(c: u64, modes: usize, precision_bits: u32) -> usize {
+    let b = u64::from(63_u32.saturating_sub(c.leading_zeros())).max(1);
+    let d = modes.saturating_mul(2).saturating_add(1);
+    let dimension_bits = u64::from(usize::BITS - d.leading_zeros());
+    let required = u64::from(precision_bits) + 2 * dimension_bits + 16;
+    usize::try_from(required.div_ceil(2 * b))
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CutoffFreeConfig {
     pub integer_cutoff_c: u64,
@@ -33,7 +54,7 @@ impl CutoffFreeConfig {
             integer_cutoff_c,
             modes,
             precision_bits,
-            geometric_terms: 32,
+            geometric_terms: recommended_geometric_terms(integer_cutoff_c, modes, precision_bits),
         }
     }
 
@@ -46,6 +67,13 @@ impl CutoffFreeConfig {
         }
         if self.geometric_terms == 0 {
             bail!("cutoff-free CCM requires at least one geometric correction term");
+        }
+        let dimension = self.modes.checked_mul(2).and_then(|n| n.checked_add(1));
+        if dimension.and_then(|n| n.checked_mul(n)).is_none()
+            || self.modes > (i64::MAX as usize) / 4
+            || self.geometric_terms > ((i64::MAX - 1) / 4) as usize
+        {
+            bail!("cutoff-free CCM dimensions or series indices overflow");
         }
         Ok(())
     }
@@ -79,6 +107,7 @@ impl CutoffFreeMatrix {
     /// component evidence without first running a full inertia proof.
     pub fn component_evidence_digest(&self) -> Result<ContentDigest> {
         let component_evidence = (
+            ASSEMBLY_SEMANTICS,
             self.config.integer_cutoff_c,
             self.config.modes,
             self.config.precision_bits,
@@ -101,6 +130,10 @@ impl CutoffFreeMatrix {
             self.scalar_backend.clone(),
             self.component_evidence_digest()?,
             std::collections::BTreeMap::from([
+                (
+                    "assembly_semantics".to_owned(),
+                    ASSEMBLY_SEMANTICS.to_owned(),
+                ),
                 (
                     "integer_cutoff_c".to_owned(),
                     self.config.integer_cutoff_c.to_string(),
@@ -161,17 +194,8 @@ fn special_values(
     terms: usize,
 ) -> Result<SpecialValues> {
     let p = l.precision();
-    if n == 0 {
-        let zero = MpfrInterval::from_i64(0, p);
-        let quarter = q(1, 4, p);
-        let (trigamma, _) = complex_trigamma(&quarter, &zero)?;
-        return Ok(SpecialValues {
-            s: zero.clone(),
-            cc: zero,
-            xc: trigamma.div(&MpfrInterval::from_i64(4, p))?,
-        });
-    }
-
+    // n=0 needs the SAME finite-endpoint correction as every other mode.
+    // psi_1(1/4)/4 alone is the integral over [0,infinity), not [0,L].
     let n_interval = MpfrInterval::from_u64(n as u64, p);
     let b = pi.mul(&n_interval).div(l)?;
     let w = b.mul(&MpfrInterval::from_i64(2, p));
@@ -225,7 +249,18 @@ fn special_values(
         .div(&MpfrInterval::from_i64(4, p))?
         .sub(&l.mul(&gx1))
         .sub(&gx2);
-    Ok(SpecialValues { s, cc, xc })
+    // The sine and (cos-1) integrals vanish identically at zero frequency;
+    // preserve that identity instead of subtracting two interval evaluations.
+    if n == 0 {
+        let zero = MpfrInterval::from_i64(0, p);
+        Ok(SpecialValues {
+            s: zero.clone(),
+            cc: zero,
+            xc,
+        })
+    } else {
+        Ok(SpecialValues { s, cc, xc })
+    }
 }
 
 fn signed_s(values: &[SpecialValues], n: i64) -> MpfrInterval {
@@ -283,6 +318,40 @@ pub fn assemble(config: &CutoffFreeConfig) -> Result<CutoffFreeMatrix> {
             })
             .collect::<Result<_>>()?;
 
+    // Sum the prime-power generators once per mode. Off-diagonal entries
+    // are divided differences of these generators. Outward rounding remains
+    // in force, and the changed enclosure arithmetic has a NEW identity.
+    let mut sine_moments = Vec::with_capacity(config.modes + 1);
+    let mut diagonal_moments = Vec::with_capacity(config.modes + 1);
+    for n in 0..=config.modes {
+        let nf = MpfrInterval::from_u64(n as u64, p);
+        let mut sine = zero.clone();
+        let mut diagonal = zero.clone();
+        for (log_power, log_prime, sqrt_power) in &prime_data {
+            let phase = pi.mul(&two).mul(&nf).mul(log_power).div(&l)?;
+            let weight = log_prime.div(sqrt_power)?;
+            if n != 0 {
+                sine = sine.add(&phase.sin().mul(&weight));
+            }
+            diagonal = diagonal.add(
+                &one.sub(&log_power.div(&l)?)
+                    .mul(&two)
+                    .mul(&phase.cos())
+                    .mul(&weight),
+            );
+        }
+        sine_moments.push(sine);
+        diagonal_moments.push(diagonal);
+    }
+    let signed_moment = |n: i64| {
+        let value = sine_moments[n.unsigned_abs() as usize].clone();
+        if n < 0 {
+            value.neg()
+        } else {
+            value
+        }
+    };
+
     let dimension = config.dimension();
     let count = dimension * dimension;
     let mut w02 = vec![zero.to_rational_interval(); count];
@@ -320,21 +389,13 @@ pub fn assemble(config: &CutoffFreeConfig) -> Result<CutoffFreeMatrix> {
                     .div(&pi.mul(&MpfrInterval::from_i64(n - m, p)))?
             };
 
-            let mut wp_cell = zero.clone();
-            for (log_power, log_prime, sqrt_power) in &prime_data {
-                let q_cell = if n == m {
-                    let phase = pi.mul(&two).mul(&nf).mul(log_power).div(&l)?;
-                    one.sub(&log_power.div(&l)?).mul(&two).mul(&phase.cos())
-                } else {
-                    let m_phase = pi.mul(&two).mul(&mf).mul(log_power).div(&l)?;
-                    let n_phase = pi.mul(&two).mul(&nf).mul(log_power).div(&l)?;
-                    m_phase
-                        .sin()
-                        .sub(&n_phase.sin())
-                        .div(&pi.mul(&MpfrInterval::from_i64(n - m, p)))?
-                };
-                wp_cell = wp_cell.add(&q_cell.mul(log_prime).div(sqrt_power)?);
-            }
+            let wp_cell = if n == m {
+                diagonal_moments[n.unsigned_abs() as usize].clone()
+            } else {
+                signed_moment(m)
+                    .sub(&signed_moment(n))
+                    .div(&pi.mul(&MpfrInterval::from_i64(n - m, p)))?
+            };
             let tau_cell = w02_cell.sub(&wr_cell).sub(&wp_cell);
             let indices = [row * dimension + column, column * dimension + row];
             for index in indices {
@@ -425,5 +486,102 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod endpoint_regression {
+    use super::*;
+
+    #[test]
+    fn zero_mode_matches_independent_defining_integral() {
+        for (c, expected) in [
+            (5, "2.25608966855868498643015465180094363462904"),
+            (13, "2.88506309771709566996707209569382572588128"),
+            (100, "3.67872561806049666284203395968608485646508"),
+        ] {
+            let matrix = assemble(&CutoffFreeConfig::new(c, 0, 192)).unwrap();
+            let actual = Float::with_val(192, matrix.wr[0].midpoint());
+            let expected = Float::with_val(192, Float::parse(expected).unwrap());
+            let error = Float::with_val(192, actual - expected).abs();
+            let tolerance = Float::with_val(192, Float::parse("1e-37").unwrap());
+            assert!(
+                error < tolerance,
+                "zero-mode finite-endpoint regression at c={c}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn analytic_tail_budget_grows_with_precision() {
+        let low = CutoffFreeConfig::new(13, 4, 256);
+        let high = CutoffFreeConfig::new(13, 4, 2048);
+        assert!(high.geometric_terms > low.geometric_terms);
+        assert!(recommended_geometric_terms(100, 4, 256) < low.geometric_terms);
+        let b = 3_u64;
+        let d_bits = u64::from(usize::BITS - low.dimension().leading_zeros());
+        assert!(2 * b * low.geometric_terms as u64 >= 256 + 2 * d_bits + 16);
+    }
+
+    #[test]
+    fn zero_frequency_keeps_exact_vanishing_integrals() {
+        let p = 192;
+        let l = MpfrInterval::from_u64(13, p).ln().unwrap();
+        let zero = MpfrInterval::from_i64(0, p);
+        let (psi, _) = complex_digamma(&q(1, 4, p), &zero).unwrap();
+        let values = special_values(0, &l, &MpfrInterval::pi(p), &psi, 64).unwrap();
+        assert_eq!(values.s.to_rational_interval(), zero.to_rational_interval());
+        assert_eq!(
+            values.cc.to_rational_interval(),
+            zero.to_rational_interval()
+        );
+        let (infinite, _) = complex_trigamma(&q(1, 4, p), &zero).unwrap();
+        assert!(values.xc.upper() < infinite.div(&MpfrInterval::from_i64(4, p)).unwrap().lower());
+    }
+
+    #[test]
+    fn aggregate_prime_entries_agree_with_direct_interval_sum() {
+        let cfg = CutoffFreeConfig::new(13, 3, 192);
+        let matrix = assemble(&cfg).unwrap();
+        let p = cfg.precision_bits;
+        let zero = MpfrInterval::from_i64(0, p);
+        let one = MpfrInterval::from_i64(1, p);
+        let two = MpfrInterval::from_i64(2, p);
+        let pi = MpfrInterval::pi(p);
+        let l = MpfrInterval::from_u64(13, p).ln().unwrap();
+        for n in -3_i64..=3 {
+            for m in -3_i64..=3 {
+                let mut direct = zero.clone();
+                for (power, prime, _) in prime_powers_up_to(13) {
+                    let x = MpfrInterval::from_u64(power, p).ln().unwrap();
+                    let phase = |mode: i64| {
+                        pi.mul(&two)
+                            .mul(&MpfrInterval::from_i64(mode, p))
+                            .mul(&x)
+                            .div(&l)
+                            .unwrap()
+                    };
+                    let kernel = if n == m {
+                        one.sub(&x.div(&l).unwrap()).mul(&two).mul(&phase(n).cos())
+                    } else {
+                        phase(m)
+                            .sin()
+                            .sub(&phase(n).sin())
+                            .div(&pi.mul(&MpfrInterval::from_i64(n - m, p)))
+                            .unwrap()
+                    };
+                    direct = direct.add(
+                        &kernel
+                            .mul(&MpfrInterval::from_u64(prime, p).ln().unwrap())
+                            .div(&MpfrInterval::from_u64(power, p).sqrt().unwrap())
+                            .unwrap(),
+                    );
+                }
+                let index = (n + 3) as usize * 7 + (m + 3) as usize;
+                assert!(matrix.wp[index]
+                    .intersection(&direct.to_rational_interval())
+                    .is_some());
+            }
+        }
     }
 }

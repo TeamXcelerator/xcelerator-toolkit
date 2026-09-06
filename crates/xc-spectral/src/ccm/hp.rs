@@ -11,7 +11,7 @@
 
 use anyhow::{bail, Result};
 use rayon::prelude::*;
-use rug::{ops::Pow, Float};
+use rug::{ops::Pow, Assign, Float};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -13785,6 +13785,16 @@ fn compute_archimedean_integrals_tracked(
     cfg: &HighPrecConfig,
     fabric_cache: Option<&ArtifactCacheContext<'_>>,
 ) -> Result<(ComputedArchimedeanIntegrals, Vec<ArtifactManifest>)> {
+    compute_archimedean_integrals_tracked_with_bucket(n_modes, l, cfg, fabric_cache, 1)
+}
+
+fn compute_archimedean_integrals_tracked_with_bucket(
+    n_modes: usize,
+    l: &Float,
+    cfg: &HighPrecConfig,
+    fabric_cache: Option<&ArtifactCacheContext<'_>>,
+    bucket: usize,
+) -> Result<(ComputedArchimedeanIntegrals, Vec<ArtifactManifest>)> {
     let prec = cfg.precision_bits;
     let base_pts = cfg.quad_points;
     let prec_extra = (prec / 2) as usize;
@@ -13795,9 +13805,14 @@ fn compute_archimedean_integrals_tracked(
     );
 
     use std::collections::HashMap;
-    let pts_for_n: Vec<usize> = (0..=n_modes)
-        .map(|n| base_pts.max(3 * n + prec_extra))
-        .collect();
+    let pts_for_n: Vec<usize> = if bucket == 1 {
+        // Preserve the original production sequence and exact GL identities.
+        (0..=n_modes)
+            .map(|n| base_pts.max(3 * n + prec_extra))
+            .collect()
+    } else {
+        super::research::quadrature_orders(n_modes, base_pts, prec, bucket)?
+    };
     let unique_pts: Vec<usize> = {
         let mut values = pts_for_n.clone();
         values.sort_unstable();
@@ -14140,28 +14155,31 @@ fn compute_prime_component_matrix(
         .for_each(|(row, matrix_row)| {
             let n = row as i64 - n_modes as i64;
             let n_index = (n + n_modes as i64) as usize;
+            // One scratch allocation per row, not per prime-power/cell.
+            // Operation ordering is unchanged: this route must remain
+            // bit-identical to compute_prime_component_matrix_reference.
+            let mut sum = Float::with_val(prec, 0);
+            let mut kernel = Float::with_val(prec, 0);
+            let mut term = Float::with_val(prec, 0);
             for (column, matrix_cell) in matrix_row.iter_mut().enumerate() {
                 let m = column as i64 - n_modes as i64;
                 let m_index = (m + n_modes as i64) as usize;
-                let mut sum = Float::with_val(prec, 0);
+                sum.assign(0);
                 for data in &prime_data {
-                    let kernel = if n == m {
-                        let mut factor = data.diagonal_factor.clone();
-                        factor *= &data.cosines[n_index];
-                        factor
+                    if n == m {
+                        kernel.assign(&data.diagonal_factor);
+                        kernel *= &data.cosines[n_index];
                     } else {
-                        let mut difference = data.sines[m_index].clone();
-                        difference -= &data.sines[n_index];
-                        difference /=
-                            &difference_denominators[(n - m + 2 * n_modes as i64) as usize];
-                        difference
-                    };
-                    let mut term = kernel;
+                        kernel.assign(&data.sines[m_index]);
+                        kernel -= &data.sines[n_index];
+                        kernel /= &difference_denominators[(n - m + 2 * n_modes as i64) as usize];
+                    }
+                    term.assign(&kernel);
                     term *= &data.log_prime;
                     term /= &data.sqrt_power;
-                    sum += term;
+                    sum += &term;
                 }
-                *matrix_cell = sum;
+                matrix_cell.assign(&sum);
             }
         });
     matrix
@@ -16602,6 +16620,176 @@ mod weil_eigvec_cache {
 // Matrix fixtures below use the row-major index convention `m[i * dim + j]`
 // uniformly, including `i = 0` rows where `0 * dim` is kept for alignment
 // with neighboring entries. Allow the erasing_op lint in this test module.
+#[cfg(test)]
+fn compute_prime_component_matrix_v0143_reference(
+    n_modes: usize,
+    prime_cutoff: u64,
+    l: &Float,
+    prec: u32,
+) -> Vec<Float> {
+    let dim = 2 * n_modes + 1;
+    let _performance = xc_core::performance_stage_with("ccm.tau.prime_component", || {
+        let mut metadata = ccm_performance_metadata("ccm.tau.prime_component", dim, prec);
+        metadata.retained_hp_entries = Some(dim.saturating_mul(dim));
+        metadata
+    });
+    let pi_v = pi(prec);
+    let mut two_pi = pi_v.clone();
+    two_pi *= 2u32;
+    let mode_values = (-(n_modes as i64)..=(n_modes as i64))
+        .map(|mode| fl_i(prec, mode))
+        .collect::<Vec<_>>();
+    let mode_frequencies = mode_values
+        .iter()
+        .map(|mode| {
+            let mut frequency = two_pi.clone();
+            frequency *= mode;
+            frequency /= l;
+            frequency
+        })
+        .collect::<Vec<_>>();
+    let difference_denominators = (-(2 * n_modes as i64)..=(2 * n_modes as i64))
+        .map(|difference| {
+            let mut denominator = pi_v.clone();
+            denominator *= fl_i(prec, difference);
+            denominator
+        })
+        .collect::<Vec<_>>();
+    struct PrimeKernelTable {
+        log_prime: Float,
+        sqrt_power: Float,
+        diagonal_factor: Float,
+        sines: Vec<Float>,
+        cosines: Vec<Float>,
+    }
+    let prime_data: Vec<PrimeKernelTable> = prime_powers_up_to(prime_cutoff)
+        .into_iter()
+        .map(|(power, prime, _)| {
+            let log_power = Float::with_val(prec, power).ln();
+            let log_prime = Float::with_val(prec, prime).ln();
+            let sqrt_power = Float::with_val(prec, power).sqrt();
+            let mut diagonal_factor = Float::with_val(prec, 1);
+            let mut ratio = log_power.clone();
+            ratio /= l;
+            diagonal_factor -= ratio;
+            diagonal_factor *= 2u32;
+            let phases = mode_frequencies
+                .iter()
+                .map(|frequency| {
+                    let mut phase = frequency.clone();
+                    phase *= &log_power;
+                    phase
+                })
+                .collect::<Vec<_>>();
+            let sines = phases.iter().map(|phase| phase.clone().sin()).collect();
+            let cosines = phases.into_iter().map(Float::cos).collect();
+            PrimeKernelTable {
+                log_prime,
+                sqrt_power,
+                diagonal_factor,
+                sines,
+                cosines,
+            }
+        })
+        .collect();
+    let mut matrix = vec![Float::with_val(prec, 0); dim * dim];
+    matrix
+        .par_chunks_mut(dim)
+        .enumerate()
+        .for_each(|(row, matrix_row)| {
+            let n = row as i64 - n_modes as i64;
+            let n_index = (n + n_modes as i64) as usize;
+            for (column, matrix_cell) in matrix_row.iter_mut().enumerate() {
+                let m = column as i64 - n_modes as i64;
+                let m_index = (m + n_modes as i64) as usize;
+                let mut sum = Float::with_val(prec, 0);
+                for data in &prime_data {
+                    let kernel = if n == m {
+                        let mut factor = data.diagonal_factor.clone();
+                        factor *= &data.cosines[n_index];
+                        factor
+                    } else {
+                        let mut difference = data.sines[m_index].clone();
+                        difference -= &data.sines[n_index];
+                        difference /=
+                            &difference_denominators[(n - m + 2 * n_modes as i64) as usize];
+                        difference
+                    };
+                    let mut term = kernel;
+                    term *= &data.log_prime;
+                    term /= &data.sqrt_power;
+                    sum += term;
+                }
+                *matrix_cell = sum;
+            }
+        });
+    matrix
+}
+
+/// Opt-in exact-rational-input matrix assembly for mechanism experiments.
+/// This never substitutes a research matrix under an ordinary Tau cache key.
+/// Only quadrature rules are reused by their existing order/precision identity.
+/// The returned identity records the actual order list and prime arithmetic.
+pub fn assemble_research_matrix_hp(
+    cutoff: &super::research::ExactCutoff,
+    n_modes: usize,
+    cfg: &HighPrecConfig,
+    options: &super::research::ResearchAssemblyOptions,
+) -> Result<super::research::ResearchMatrixHp> {
+    use super::research::{
+        aggregate_prime_component_hp, quadrature_orders, PrimeAssemblyRoute,
+        ResearchAssemblyIdentity, ResearchMatrixHp, RESEARCH_ASSEMBLY_SEMANTICS,
+    };
+    let dimension = options.validate(cutoff, n_modes)?;
+    let precision_bits = cfg.precision_bits;
+    let length = cutoff.log_length(precision_bits)?;
+    let orders = quadrature_orders(
+        n_modes,
+        cfg.quad_points,
+        precision_bits,
+        options.quadrature_order_bucket,
+    )?;
+    let (integrals, _) = compute_archimedean_integrals_tracked_with_bucket(
+        n_modes,
+        &length,
+        cfg,
+        None,
+        options.quadrature_order_bucket,
+    )?;
+    let (pole, archimedean) =
+        assemble_pole_and_archimedean_components(n_modes, &length, precision_bits, &integrals);
+    let prime = match options.prime_route {
+        PrimeAssemblyRoute::CanonicalCellSum => {
+            compute_prime_component_matrix(n_modes, cutoff.prime_cutoff(), &length, precision_bits)
+        }
+        PrimeAssemblyRoute::AggregateGenerators => {
+            aggregate_prime_component_hp(cutoff, n_modes, precision_bits, options)?
+        }
+    };
+    let mut entries = assemble_tau_components(
+        &ComputedCcmMatrixComponents {
+            pole,
+            archimedean,
+            prime,
+        },
+        precision_bits,
+    );
+    force_symmetric(&mut entries, dimension);
+    Ok(ResearchMatrixHp {
+        identity: ResearchAssemblyIdentity {
+            semantics: RESEARCH_ASSEMBLY_SEMANTICS.to_owned(),
+            exact_cutoff: cutoff.canonical(),
+            prime_cutoff: cutoff.prime_cutoff(),
+            n_modes,
+            precision_bits,
+            prime_route: options.prime_route,
+            quadrature_orders: orders,
+            assurance: "computed_point_matrix_not_certified".to_owned(),
+        },
+        entries,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::erasing_op)]
 mod tests {
@@ -22421,5 +22609,147 @@ mod tests {
         let poles = secular_poles(&two_pi_over_l, n_max, prec);
         let _result = super::newton_xi_hat_zero(&xi, &poles, &seed_near_pole, prec, 10);
         // No assertion on result — just verifying no panic / infinite loop.
+    }
+}
+
+#[cfg(test)]
+mod audit_research_tests {
+    use super::super::research::*;
+    use super::*;
+
+    #[test]
+    fn audit_aggregate_prime_matches_canonical_at_multiple_precisions() {
+        for precision_bits in [128, 256] {
+            for c in [5, 13, 100] {
+                let cutoff = ExactCutoff::parse(&c.to_string()).unwrap();
+                let length = cutoff.log_length(precision_bits).unwrap();
+                let options = ResearchAssemblyOptions::default();
+                let expected = compute_prime_component_matrix(6, c, &length, precision_bits);
+                let actual =
+                    aggregate_prime_component_hp(&cutoff, 6, precision_bits, &options).unwrap();
+                let tolerance =
+                    Float::with_val(precision_bits, 2).pow(-((precision_bits - 32) as i32));
+                for (a, b) in actual.iter().zip(&expected) {
+                    let difference = Float::with_val(precision_bits, a - b).abs();
+                    assert!(
+                        difference < tolerance,
+                        "prime generator disagreement at c={c}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn audit_research_route_retains_its_identity_and_never_floors_from_f64() {
+        let cutoff = ExactCutoff::parse("12.99999999999999999999999999999999999999").unwrap();
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.precision_bits = 192;
+        cfg.quad_points = 128;
+        let options = ResearchAssemblyOptions {
+            prime_route: PrimeAssemblyRoute::AggregateGenerators,
+            quadrature_order_bucket: 32,
+            ..ResearchAssemblyOptions::default()
+        };
+        let matrix = assemble_research_matrix_hp(&cutoff, 2, &cfg, &options).unwrap();
+        assert_eq!(matrix.identity.prime_cutoff, 12);
+        assert_eq!(
+            matrix.identity.prime_route,
+            PrimeAssemblyRoute::AggregateGenerators
+        );
+        assert_eq!(matrix.identity.quadrature_orders, vec![128; 3]);
+        assert!(matrix.content_digest().unwrap().validate());
+        assert_eq!(matrix.entries.len(), 25);
+    }
+
+    #[test]
+    fn canonical_prime_scratch_reuse_is_bit_identical_to_v0143() {
+        for p in [128, 256, 1024] {
+            for c in [5, 13, 100] {
+                let length = Float::with_val(p, c).ln();
+                assert_eq!(
+                    compute_prime_component_matrix(8, c, &length, p),
+                    compute_prime_component_matrix_v0143_reference(8, c, &length, p),
+                    "default prime bytes changed at c={c}, p={p}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "arb")]
+    fn corrected_interval_matrix_agrees_with_independent_quadrature_route() {
+        for p in [128, 192] {
+            for c in [5, 13, 100] {
+                let cutoff = ExactCutoff::parse(&c.to_string()).unwrap();
+                let mut cfg = HighPrecConfig::for_decimal_digits(40);
+                cfg.precision_bits = p;
+                cfg.quad_points = 256;
+                let quadrature = assemble_research_matrix_hp(
+                    &cutoff,
+                    2,
+                    &cfg,
+                    &ResearchAssemblyOptions::default(),
+                )
+                .unwrap();
+                let intervals = super::super::cutoff_free::assemble(
+                    &super::super::cutoff_free::CutoffFreeConfig::new(c, 2, p),
+                )
+                .unwrap();
+                let tolerance = Float::with_val(p, 2).pow(-((p - 32) as i32));
+                for (point, interval) in quadrature.entries.iter().zip(&intervals.tau) {
+                    let error =
+                        Float::with_val(p, point - Float::with_val(p, interval.midpoint())).abs();
+                    assert!(
+                        error < tolerance,
+                        "assembly disagreement at c={c}, p={p}: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit release-mode performance measurement, no speed assertion"]
+    fn audit_prime_generator_benchmark() {
+        let p = 256;
+        let cutoff = ExactCutoff::parse("500").unwrap();
+        let length = cutoff.log_length(p).unwrap();
+        let options = ResearchAssemblyOptions::default();
+        for n in [32, 64, 128] {
+            let mut baseline = Vec::new();
+            let mut canonical = Vec::new();
+            let mut aggregate = Vec::new();
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                let previous = compute_prime_component_matrix_v0143_reference(n, 500, &length, p);
+                baseline.push(start.elapsed().as_nanos());
+                let start = std::time::Instant::now();
+                let reference = compute_prime_component_matrix(n, 500, &length, p);
+                canonical.push(start.elapsed().as_nanos());
+                assert_eq!(previous, reference);
+                let start = std::time::Instant::now();
+                let candidate = aggregate_prime_component_hp(&cutoff, n, p, &options).unwrap();
+                aggregate.push(start.elapsed().as_nanos());
+                let tolerance = Float::with_val(p, 2).pow(-((p - 32) as i32));
+                assert!(reference
+                    .iter()
+                    .zip(&candidate)
+                    .all(|(a, b)| Float::with_val(p, a - b).abs() < tolerance));
+            }
+            baseline.sort_unstable();
+            canonical.sort_unstable();
+            aggregate.sort_unstable();
+            println!(
+                "CCM_BENCH {}",
+                serde_json::json!({
+                    "cutoff": 500, "n_modes": n, "precision_bits": p, "samples": 3,
+                    "v0143_baseline_median_ns": baseline[1],
+                    "canonical_median_ns": canonical[1], "aggregate_median_ns": aggregate[1],
+                    "peak_rss_bytes": peak_resident_memory_bytes(),
+                    "scope": "prime_component_only_not_whole_solver_speedup",
+                })
+            );
+        }
     }
 }
