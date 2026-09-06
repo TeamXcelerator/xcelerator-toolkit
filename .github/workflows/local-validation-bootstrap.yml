@@ -1,0 +1,51 @@
+name: Isolated offline validation bootstrap
+
+# One explicit provisioning operation. No ordinary edit triggers this job.
+on:
+  push:
+    branches: [work/ccm-audit-hardening]
+    paths: [.github/workflows/local-validation-bootstrap.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Prepare exact compiler and locked registry sources
+        env:
+          CARGO_HOME: ${{ runner.temp }}/cargo-home
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+          cargo +1.98.1 fetch --locked
+          cargo +1.98.1 fetch --manifest-path tests/external-consumer/Cargo.toml --locked
+          mkdir -p "$RUNNER_TEMP/validation-bootstrap/native" "$RUNNER_TEMP/validation-bootstrap/sources"
+          tar -C "$HOME/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu" -czf "$RUNNER_TEMP/validation-bootstrap/rust-toolchain.tar.gz" bin lib share
+          tar -C "$CARGO_HOME" -czf "$RUNNER_TEMP/validation-bootstrap/registry.tar.gz" registry
+          cd "$RUNNER_TEMP/validation-bootstrap/native"
+          # Unmodified distro packages, used only to install the already-declared
+          # dynamic FLINT/MPFR development dependencies in an isolated test host.
+          # Packages retain their own copyright/license records. Not Toolkit output.
+          apt-get download libflint-dev libflint18t64 libmpfr-dev libmpc-dev libmpc3 libgmp-dev
+          cd "$RUNNER_TEMP/validation-bootstrap/sources"
+          git clone --quiet --depth 1 --branch work/ccm-audit-hardening https://github.com/TeamXcelerator/ccm-reproduction-and-convergence.git paper1
+          git clone --quiet --depth 1 --branch work/ccm-audit-hardening https://github.com/TeamXcelerator/ccm-convergence-rate.git paper3
+          for repo in paper1 paper3; do
+            git -C "$repo" rev-parse HEAD > "$repo.commit"
+            git -C "$repo" archive --format=tar.gz -o "$PWD/$repo.tar.gz" HEAD
+            rm -rf "$repo"
+          done
+          cd "$RUNNER_TEMP/validation-bootstrap"
+          find . -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: isolated-validation-bootstrap
+          path: ${{ runner.temp }}/validation-bootstrap/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
