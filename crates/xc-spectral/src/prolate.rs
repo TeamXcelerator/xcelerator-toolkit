@@ -788,7 +788,8 @@ pub mod hp {
     #[serde(deny_unknown_fields)]
     struct PortableProlateSpectrum {
         schema_version: u32,
-        lambda_squared: u64,
+        lambda: String,
+        lambda_precision_bits: u32,
         grid_points: usize,
         precision_bits: u32,
         eigenvalues: Vec<String>,
@@ -801,12 +802,13 @@ pub mod hp {
 
     fn decode_prolate_spectrum(
         artifact: &PortableProlateSpectrum,
-        lambda_sq: LambdaSq,
+        lambda: &Float,
         n_grid: usize,
         prec: u32,
     ) -> std::result::Result<Vec<Float>, CacheError> {
-        if artifact.schema_version != 1
-            || artifact.lambda_squared != lambda_sq.value_u64
+        if artifact.schema_version != 2
+            || artifact.lambda != lambda.to_string()
+            || artifact.lambda_precision_bits != lambda.prec()
             || artifact.grid_points != n_grid
             || artifact.precision_bits != prec
             || artifact.eigenvalues.len() != n_grid
@@ -839,7 +841,7 @@ pub mod hp {
     }
 
     fn prolate_spectrum_via_cache(
-        lambda_sq: LambdaSq,
+        lambda: &Float,
         n_grid: usize,
         prec: u32,
         diag: &[Float],
@@ -849,9 +851,11 @@ pub mod hp {
         let semantic_key = SemanticKeyEnvelope {
             schema_version: 1,
             artifact_kind: "prolate_eigenvalue_spectrum".to_owned(),
-            mathematical_semantics_version: "prolate-fd-spectrum-v0.13.0-v1".to_owned(),
+            mathematical_semantics_version: "prolate-fd-exact-source-spectrum-v0.15.0-v1"
+                .to_owned(),
             resolved_mathematical_parameters: serde_json::json!({
-                "lambda_squared": lambda_sq.value_u64,
+                "lambda": lambda.to_string(),
+                "lambda_precision_bits": lambda.prec(),
                 "grid_points": n_grid,
                 "precision_bits": prec,
                 "scalar_backend": "rug_mpfr",
@@ -863,7 +867,10 @@ pub mod hp {
             source_data_identities: BTreeMap::new(),
             algorithm_semantics: None,
         };
-        let logical_key = format!("prolate/{}/{n_grid}/{prec}", lambda_sq.value_u64);
+        let logical_key = format!(
+            "prolate/exact-lambda/{}/{n_grid}/{prec}",
+            semantic_key.digest()?.0
+        );
         let request = ArtifactExecutionCacheRequest {
             operation: "prolate.spectrum.resolve_or_compute",
             semantic_key: &semantic_key,
@@ -877,7 +884,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+            minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
             maximum_reader_version: None,
             tags: BTreeMap::from([("domain".to_owned(), "prolate".to_owned())]),
             provenance_digest: None,
@@ -893,16 +900,103 @@ pub mod hp {
                         ))
                     })?;
                 Ok(PortableProlateSpectrum {
-                    schema_version: 1,
-                    lambda_squared: lambda_sq.value_u64,
+                    schema_version: 2,
+                    lambda: lambda.to_string(),
+                    lambda_precision_bits: lambda.prec(),
                     grid_points: n_grid,
                     precision_bits: prec,
                     eigenvalues: eigenvalues.iter().map(Float::to_string).collect(),
                 })
             },
-            |artifact| decode_prolate_spectrum(artifact, lambda_sq, n_grid, prec).map(|_| ()),
+            |artifact| decode_prolate_spectrum(artifact, lambda, n_grid, prec).map(|_| ()),
         )?;
-        decode_prolate_spectrum(&resolved.value, lambda_sq, n_grid, prec)
+        decode_prolate_spectrum(&resolved.value, lambda, n_grid, prec)
+    }
+
+    // The standalone noninteger route uses the same exact-source payload as
+    // the managed route. Never round lambda squared to reuse an integer key.
+    fn exact_standalone_prolate_spectrum(
+        lambda: &Float,
+        n_grid: usize,
+        prec: u32,
+        diag: &[Float],
+        off_diag: &[Float],
+        cache_directory: Option<&std::path::Path>,
+    ) -> Result<Vec<Float>> {
+        let identity = xc_cache::ContentDigest::sha256(&serde_json::to_vec(&(
+            "prolate-fd-exact-source-spectrum-v0.15.0-v1",
+            lambda.to_string(),
+            lambda.prec(),
+            n_grid,
+            prec,
+        ))?);
+        let entry_name = format!("exact_lambda_{}.json", identity.0);
+        let path = cache_directory.map(|dir| dir.join(format!("{entry_name}.zip")));
+        if let Some(path) = &path {
+            if path.exists() {
+                let read = || -> Result<Vec<Float>> {
+                    use std::io::Read;
+                    let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+                    let mut bytes = Vec::new();
+                    zip.by_name(&entry_name)?.read_to_end(&mut bytes)?;
+                    let artifact: PortableProlateSpectrum = serde_json::from_slice(&bytes)?;
+                    Ok(decode_prolate_spectrum(&artifact, lambda, n_grid, prec)?)
+                };
+                match read() {
+                    Ok(values) => return Ok(values),
+                    Err(error) => warn_prolate_cache_skip(path, &error.to_string()),
+                }
+            }
+        }
+        let eigenvalues = tridiag_eigenvalues_hp(diag, off_diag, prec)?;
+        let artifact = PortableProlateSpectrum {
+            schema_version: 2,
+            lambda: lambda.to_string(),
+            lambda_precision_bits: lambda.prec(),
+            grid_points: n_grid,
+            precision_bits: prec,
+            eigenvalues: eigenvalues.iter().map(Float::to_string).collect(),
+        };
+        let values = decode_prolate_spectrum(&artifact, lambda, n_grid, prec)?;
+        if let Some(path) = path {
+            let save = || -> Result<()> {
+                use std::io::Write;
+                // A unique sibling prevents readers seeing a partially written zip.
+                let temporary = path.with_extension(format!(
+                    "zip.{}.{}.tmp",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)?
+                        .as_nanos()
+                ));
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)?;
+                let write = || -> Result<()> {
+                    let mut writer = zip::ZipWriter::new(file);
+                    writer.start_file(
+                        &entry_name,
+                        zip::write::SimpleFileOptions::default()
+                            .compression_method(zip::CompressionMethod::Deflated)
+                            .large_file(true),
+                    )?;
+                    writer.write_all(&serde_json::to_vec(&artifact)?)?;
+                    writer.finish()?.sync_all()?;
+                    std::fs::rename(&temporary, &path)?;
+                    Ok(())
+                };
+                let result = write();
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&temporary);
+                }
+                result
+            };
+            if let Err(error) = save() {
+                warn_prolate_cache_skip(&path, &format!("write failed: {error}"));
+            }
+        }
+        Ok(values)
     }
 
     /// Toolkit version string embedded in every prolate eigvals cache file
@@ -1042,9 +1136,13 @@ pub mod hp {
         basis_vectors: &[Vec<Float>],
         precision_bits: u32,
     ) -> Result<ProlateSubspaceFormsHp> {
-        if precision_bits <= 32 || n_grid == 0 || basis_vectors.is_empty() {
+        if precision_bits <= 32
+            || n_grid == 0
+            || n_grid.is_multiple_of(2)
+            || basis_vectors.is_empty()
+        {
             anyhow::bail!(
-                "prolate HP subspace forms require precision above 32 bits and positive dimensions"
+                "prolate HP subspace forms require precision above 32 bits, an odd positive grid, and a nonempty basis"
             );
         }
         if !lambda.is_finite() || lambda <= &Float::with_val(precision_bits, 0) {
@@ -1443,29 +1541,13 @@ pub mod hp {
         None
     }
 
-    /// Round-trip check: for the cache key to be valid, `λ²` must
-    /// round to an exact non-negative integer to within working
-    /// precision tolerance. Returns `None` if the value isn't an
-    /// integer (or is negative); the cache layer treats this as
-    /// "cache disabled for this caller" and falls through to compute.
+    /// Integer compatibility keys require exact positive integrality. A nearby
+    /// cutoff is a different source and must never alias this key.
     fn lambda_sq_int_for_key(lambda_sq: &Float) -> Option<LambdaSq> {
-        if lambda_sq.is_sign_negative() || lambda_sq.is_zero() {
+        if !lambda_sq.is_finite() || lambda_sq <= &0 || !lambda_sq.is_integer() {
             return None;
         }
-        // round(λ²) and compare back.
-        let rounded = lambda_sq.clone().round();
-        let mut diff = lambda_sq.clone();
-        diff -= &rounded;
-        let abs_diff = diff.abs();
-        // Generous tolerance: 1e-10. λ² in representative configurations is
-        // exactly integer (13, 100, 1000); this rounds at f64 → HP
-        // round-trip noise (~1e-15 at most).
-        let tol = Float::with_val(lambda_sq.prec(), rug::Float::parse("1e-10").unwrap());
-        if !abs_diff.cmp_abs(&tol).map(|o| o.is_lt()).unwrap_or(false) {
-            return None;
-        }
-        // Convert rounded HP → u64. to_integer().to_u64() handles this.
-        rounded
+        lambda_sq
             .to_integer()
             .and_then(|i| i.to_u64())
             .map(LambdaSq::integer)
@@ -1996,7 +2078,15 @@ pub mod hp {
     ) -> Result<HpProlateResult> {
         let start = std::time::Instant::now();
 
-        // Grid forced odd.
+        if !lambda.is_finite()
+            || lambda <= &0
+            || !(32..=1_000_000).contains(&prec)
+            || n_grid >= u32::MAX as usize
+            || n_sample < 2
+        {
+            anyhow::bail!("prolate requires finite positive lambda, valid precision, grid < u32::MAX, and at least two samples");
+        }
+        // Grid forced odd; the guard above also protects N+1 and u32 casts.
         let n = if n_grid % 2 == 0 { n_grid + 1 } else { n_grid };
         if n < 16 {
             anyhow::bail!("n_grid too small (got {}); need at least 16 to find h_4", n);
@@ -2034,16 +2124,18 @@ pub mod hp {
         // tridiagonal QR is ~30 minutes; if we've computed this exact
         // (λ², n_grid, prec) before, the cache turns that into a
         // ~5-second JSON read. Cache key derives from λ²_int — only
-        // active when λ² is integer-valued (representative configurations are
-        // 13/100/1000); non-integer λ² silently bypasses the cache.
+        // used only when λ² is exactly integer-valued. Other cutoffs use an
+        // exact-source zip identity, including rounded square roots of integers.
         let mut lambda_sq_for_key = lambda.clone();
         lambda_sq_for_key *= lambda;
         let cache_key = lambda_sq_int_for_key(&lambda_sq_for_key);
 
-        let eigenvalues: Vec<Float> = if let Some(lambda_sq_int) = cache_key {
-            if let ProlateCacheRoute::Fabric(cache) = &cache_route {
-                prolate_spectrum_via_cache(lambda_sq_int, n, prec, &diag, &off_diag, cache)?
-            } else if let ProlateCacheRoute::Standalone(mode) = cache_route {
+        let eigenvalues: Vec<Float> = if let ProlateCacheRoute::Fabric(cache) = &cache_route {
+            // Exact source keys support every finite cutoff and enforce RequireReuse
+            // even when lambda squared is not an integer.
+            prolate_spectrum_via_cache(lambda, n, prec, &diag, &off_diag, cache)?
+        } else if let Some(lambda_sq_int) = cache_key {
+            if let ProlateCacheRoute::Standalone(mode) = cache_route {
                 if let Some(cached) = load_prolate_eigvals_cache(lambda_sq_int, n, prec, mode) {
                     eprintln!(
                         "[HP prolate] loaded {} cached eigenvalues for λ²={}, N={}, prec={} bits",
@@ -2072,15 +2164,22 @@ pub mod hp {
                 unreachable!("prolate cache route was exhaustively matched")
             }
         } else {
-            eprintln!("[HP prolate] computing all {} eigenvalues of PW_λ via tridiag QR (cache disabled: λ² not integer)...", n);
-            let eig_start = std::time::Instant::now();
-            let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec)?;
-            eprintln!(
-                "[HP prolate] {} eigenvalues computed in {:.1}s",
-                evals.len(),
-                eig_start.elapsed().as_secs_f64()
-            );
-            evals
+            let directory = if matches!(
+                cache_route,
+                ProlateCacheRoute::Standalone(CacheMode::JsonZip)
+            ) {
+                prolate_cache_dir()
+            } else {
+                None
+            };
+            exact_standalone_prolate_spectrum(
+                lambda,
+                n,
+                prec,
+                &diag,
+                &off_diag,
+                directory.as_deref(),
+            )?
         };
         if eigenvalues.len() != n {
             anyhow::bail!(
@@ -2127,7 +2226,10 @@ pub mod hp {
                 &off_diag,
                 lambda_k,
                 prec,
-                TridiagEigvecOptions::default(),
+                TridiagEigvecOptions {
+                    solver: xc_numerics::eigen::TridiagSolver::BandedInterleaved,
+                    ..TridiagEigvecOptions::default()
+                },
             ) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -2594,6 +2696,47 @@ pub mod hp {
         use xc_numerics::fmt::display_hp;
 
         #[test]
+        fn exact_standalone_cache_reuses_noninteger_sources_and_never_aliases_nearby_cutoffs() {
+            let root = std::env::temp_dir().join(format!(
+                "xc-exact-prolate-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let p = 128;
+            let lambda = Float::with_val(p, Float::parse("3.123456789").unwrap());
+            let n = 17;
+            let (d, e) = build_pw_matrix(&lambda, n, p);
+            let cold =
+                exact_standalone_prolate_spectrum(&lambda, n, p, &d, &e, Some(&root)).unwrap();
+            // Empty solver inputs prove the second call gets its spectrum from disk.
+            let warm =
+                exact_standalone_prolate_spectrum(&lambda, n, p, &[], &[], Some(&root)).unwrap();
+            assert_eq!(cold, warm);
+            assert!(exact_standalone_prolate_spectrum(&lambda, n, p, &[], &[], None).is_err());
+            let near = Float::with_val(p, Float::parse("3.123456789000000000001").unwrap());
+            assert!(exact_standalone_prolate_spectrum(&near, n, p, &[], &[], Some(&root)).is_err());
+            let path = std::fs::read_dir(&root)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            std::fs::write(&path, b"broken zip").unwrap();
+            assert!(
+                exact_standalone_prolate_spectrum(&lambda, n, p, &[], &[], Some(&root)).is_err()
+            );
+            assert_eq!(
+                cold,
+                exact_standalone_prolate_spectrum(&lambda, n, p, &d, &e, Some(&root)).unwrap()
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
         fn prolate_spectrum_round_trips_through_common_cache_fabric() {
             use xc_cache::{
                 ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheQuality, CacheResolver,
@@ -2616,7 +2759,7 @@ pub mod hp {
                 )),
             }]);
             let policy = CachePolicy {
-                current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 minimum_quality: CacheQuality::Validated,
                 accepted_schema_versions: vec![1],
                 allow_deprecated: false,
@@ -2639,7 +2782,7 @@ pub mod hp {
             let precision = 128;
             let lambda = Float::with_val(precision, 2);
             let (diagonal, off_diagonal) = build_pw_matrix(&lambda, 15, precision);
-            let key = LambdaSq::integer(4);
+            let key = &lambda;
             let first =
                 prolate_spectrum_via_cache(key, 15, precision, &diagonal, &off_diagonal, &context)
                     .unwrap();
@@ -2647,6 +2790,27 @@ pub mod hp {
                 prolate_spectrum_via_cache(key, 15, precision, &diagonal, &off_diagonal, &context)
                     .unwrap();
             assert_eq!(first, second);
+            let required = ArtifactCacheContext {
+                mode: ArtifactExecutionCacheMode::RequireReuse,
+                write_on_miss: false,
+                ..context
+            };
+            let mut nearby = lambda.clone();
+            nearby.next_up();
+            assert!(prolate_spectrum_via_cache(
+                &nearby,
+                15,
+                precision,
+                &diagonal,
+                &off_diagonal,
+                &required
+            )
+            .is_err());
+            assert_eq!(
+                prolate_spectrum_via_cache(key, 15, precision, &diagonal, &off_diagonal, &required)
+                    .unwrap(),
+                first
+            );
 
             let validation_root = root.join("validation");
             let session = ManagedArtifactCacheSession::with_layers_for_test(
@@ -2933,7 +3097,7 @@ pub mod hp {
         // ---------------------------------------------------------------
 
         /// `lambda_sq_int_for_key` accepts integer-valued λ² (within
-        /// 1e-10 tolerance) and rejects non-integer values.
+        /// exact equality) and rejects even nearby non-integer values.
         #[test]
         fn cache_key_accepts_integer_lambda_sq() {
             let prec = 256;
@@ -2958,6 +3122,8 @@ pub mod hp {
             );
             // Non-integer rejected.
             assert_eq!(lambda_sq_int_for_key(&hp(prec, "13.5")), None);
+            assert_eq!(lambda_sq_int_for_key(&hp(prec, "13.000000000001")), None);
+            assert_eq!(lambda_sq_int_for_key(&hp(prec, "12.999999999999")), None);
             assert_eq!(lambda_sq_int_for_key(&hp(prec, "100.001")), None);
             // Negative or zero rejected.
             assert_eq!(lambda_sq_int_for_key(&hp(prec, "0")), None);

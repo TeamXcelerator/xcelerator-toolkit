@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CCM retained point-matrix reduction check v1",
+  "description": "Computed source-bound diagnostics. JSON shape validation does not certify numerical correctness; use the toolkit reader for identity, budget and finite-scalar checks.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "algorithm_semantics",
+    "matrix_source",
+    "cutoff",
+    "acceptance_tolerance",
+    "assurance",
+    "n_modes",
+    "dimension",
+    "source_precision_bits",
+    "working_precision_bits",
+    "authorized_maximum_dimension",
+    "estimated_matrix_working_bytes",
+    "schema_version",
+    "checks_passed",
+    "diagonal",
+    "off_diagonal",
+    "computed_eigenvalues",
+    "diagnostics"
+  ],
+  "properties": {
+    "algorithm_semantics": {
+      "type": "string"
+    },
+    "matrix_source": {
+      "type": "string"
+    },
+    "cutoff": {
+      "type": "string"
+    },
+    "acceptance_tolerance": {
+      "type": "string"
+    },
+    "assurance": {
+      "type": "string"
+    },
+    "n_modes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "dimension": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_precision_bits": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "working_precision_bits": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "authorized_maximum_dimension": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "estimated_matrix_working_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "checks_passed": {
+      "type": "boolean"
+    },
+    "diagonal": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "off_diagonal": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "computed_eigenvalues": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "absolute_similarity_residual",
+        "relative_similarity_residual",
+        "absolute_orthogonality_residual",
+        "relative_orthogonality_residual",
+        "source_frobenius_norm",
+        "tridiagonal_frobenius_norm",
+        "basis_frobenius_norm"
+      ],
+      "properties": {
+        "absolute_similarity_residual": {
+          "type": "string"
+        },
+        "relative_similarity_residual": {
+          "type": "string"
+        },
+        "absolute_orthogonality_residual": {
+          "type": "string"
+        },
+        "relative_orthogonality_residual": {
+          "type": "string"
+        },
+        "source_frobenius_norm": {
+          "type": "string"
+        },
+        "tridiagonal_frobenius_norm": {
+          "type": "string"
+        },
+        "basis_frobenius_norm": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

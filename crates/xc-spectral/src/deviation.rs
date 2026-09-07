@@ -23,7 +23,7 @@
 //! are two defensible ways to read that weight as an inner product: applied to
 //! each factor, or applied once to the product. They are not equivalent — the
 //! choice moves derived norm ratios by several percent. Neither is privileged
-//! here, so [`project`] takes the metric explicitly and callers are expected to
+//! here, so `project` takes the metric explicitly and callers are expected to
 //! record which one produced a number. See [`DeviationMetric`].
 //!
 //! ## Behavior at a crossing

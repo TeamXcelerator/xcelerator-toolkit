@@ -15,7 +15,7 @@
 
 use anyhow::{anyhow, Result};
 use rayon::prelude::*;
-use rug::{ops::Pow, Float};
+use rug::{ops::Pow, Assign, Float};
 
 /// Build an HP zero at the given precision. Uses an integer literal so
 /// no f64 round-trip occurs.
@@ -92,9 +92,13 @@ pub fn lu_factor(a: &[Float], dim: usize) -> Result<LuFactors> {
         lu[(k + 1) * dim..].par_chunks_mut(dim).for_each(|row| {
             let mut factor = row[k].clone();
             factor /= &pivot;
-            row[k] = factor.clone();
+            row[k].assign(&factor);
+            let mut product = hp_zero(pivot.prec());
             for (j_off, j) in ((k + 1)..dim).enumerate() {
-                let mut product = pivot_row[j_off].clone();
+                if product.prec() != pivot_row[j_off].prec() {
+                    product.set_prec(pivot_row[j_off].prec());
+                }
+                product.assign(&pivot_row[j_off]);
                 product *= &factor;
                 row[j] -= &product;
             }
@@ -459,6 +463,9 @@ pub fn tridiag_lu_factor_hp(
 /// Forward substitution: `L·y = P·b` where `L` has `l[k]` on the
 /// sub-diagonal. Back substitution: `U·x = y` where `U` has main
 /// diagonal `u_d`, super-diagonal `u_s`, and super-super-diagonal `u_ss`.
+///
+/// Historical v1 retained for byte replay; incorrect for some later-pivot
+/// inputs. New analyses should use [`tridiag_lu_solve_pivoted_hp`].
 pub fn tridiag_lu_solve_hp(
     factors: &TridiagLuFactors,
     b: &[Float],
@@ -515,6 +522,91 @@ pub fn tridiag_lu_solve_hp(
     }
 
     Ok(x)
+}
+
+/// Identity for corrected adjacent-pivot solves. New retained results must
+/// distinguish this from the historical final-permutation solve.
+pub const TRIDIAG_PIVOTED_SOLVE_SEMANTICS: &str = "tridiag-lu-interleaved-pivots-v2";
+
+/// Corrected tridiagonal solve, O(n) work and storage.
+///
+/// The legacy solve applies all RHS pivots before elimination, incorrectly
+/// treating multipliers as a single bidiagonal L even after later row swaps.
+/// This version interleaves each adjacent pivot and elimination. The final
+/// permutation recovers the sequence because factorization processes pairs in
+/// increasing order, at most once per pair. Existing factors are unchanged.
+/// This is a computed solve, not a forward-error or eigenvector certificate.
+pub fn tridiag_lu_solve_pivoted_hp(
+    factors: &TridiagLuFactors,
+    b: &[Float],
+    prec: u32,
+) -> Result<Vec<Float>> {
+    let n = factors.u_d.len();
+    if n == 0
+        || prec < 32
+        || b.len() != n
+        || factors.perm.len() != n
+        || factors.l.len() != n - 1
+        || factors.u_s.len() != n - 1
+        || factors.u_ss.len() != n.saturating_sub(2)
+    {
+        return Err(anyhow!(
+            "invalid tridiagonal factors, RHS shape or precision"
+        ));
+    }
+    if factors.u_d.iter().any(Float::is_zero)
+        || factors
+            .l
+            .iter()
+            .chain(&factors.u_d)
+            .chain(&factors.u_s)
+            .chain(&factors.u_ss)
+            .chain(b)
+            .any(|x| !x.is_finite() || x.prec() > prec)
+    {
+        return Err(anyhow!(
+            "nonfinite/singular factors or down-rounded solve inputs"
+        ));
+    }
+    let mut y = b
+        .iter()
+        .map(|x| Float::with_val(prec, x))
+        .collect::<Vec<_>>();
+    let mut carried_original_row = 0;
+    for k in 0..n - 1 {
+        if factors.perm[k] == k + 1 {
+            y.swap(k, k + 1);
+        } else if factors.perm[k] == carried_original_row {
+            carried_original_row = k + 1;
+        } else {
+            return Err(anyhow!(
+                "factor permutation is not an adjacent elimination sequence"
+            ));
+        }
+        let mut update = Float::with_val(prec, &factors.l[k]);
+        update *= &y[k];
+        y[k + 1] -= update;
+    }
+    if factors.perm[n - 1] != carried_original_row {
+        return Err(anyhow!("invalid final factor permutation"));
+    }
+    for k in (0..n).rev() {
+        if k + 1 < n {
+            let mut term = Float::with_val(prec, &factors.u_s[k]);
+            term *= &y[k + 1];
+            y[k] -= term;
+        }
+        if k + 2 < n {
+            let mut term = Float::with_val(prec, &factors.u_ss[k]);
+            term *= &y[k + 2];
+            y[k] -= term;
+        }
+        y[k] /= &factors.u_d[k];
+    }
+    if y.iter().any(|x| !x.is_finite()) {
+        return Err(anyhow!("nonfinite tridiagonal solve"));
+    }
+    Ok(y)
 }
 
 /// In-place ℓ² normalization of an HP vector. Sum-of-squares is computed

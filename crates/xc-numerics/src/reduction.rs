@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use rayon::prelude::*;
-use rug::Float;
+use rug::{Assign, Float};
 use serde::{Deserialize, Serialize};
 use xc_core::{
     CrossFingerprintComparison, DecimalLiteral, DeterministicReductionPolicy, ExecutionFingerprint,
@@ -108,6 +108,187 @@ pub fn deterministic_pairwise_sum_hp_owned(mut values: Vec<Float>, precision_bit
         values = next;
     }
     values.pop().expect("nonempty input produces one root")
+}
+
+/// Reusable leaves for the canonical adjacent-pair reduction. Each call keeps
+/// the same rounding points and tree as the owned reduction, including odd
+/// tails, while retaining MPFR allocations between inner-loop evaluations.
+pub(crate) struct PairwiseScratch {
+    values: Vec<Float>,
+    absolute_values: Vec<Float>,
+    precision_bits: u32,
+}
+impl PairwiseScratch {
+    pub(crate) fn new(precision_bits: u32) -> Self {
+        Self {
+            values: Vec::new(),
+            absolute_values: Vec::new(),
+            precision_bits,
+        }
+    }
+
+    pub(crate) fn sum_by(
+        &mut self,
+        length: usize,
+        mut leaf: impl FnMut(usize, &mut Float),
+    ) -> Float {
+        if length == 0 {
+            return Float::with_val(self.precision_bits, 0);
+        }
+        if self.values.len() < length {
+            self.values
+                .resize_with(length, || Float::with_val(self.precision_bits, 0));
+        }
+        for (i, value) in self.values[..length].iter_mut().enumerate() {
+            leaf(i, value);
+        }
+        Self::reduce_strided(&mut self.values, length, 1);
+        self.values[0].clone()
+    }
+
+    // Power-of-two blocks preserve the full adjacent-pair tree, including a
+    // partial last block. Block roots stay in their original slots; reducing
+    // them with a stride avoids allocations for every triangular inner sum.
+    fn reduce_strided(values: &mut [Float], mut count: usize, stride: usize) {
+        while count > 1 {
+            let (left, right) = values.split_at_mut(stride);
+            left[0] += &right[0];
+            for i in 1..count.div_ceil(2) {
+                let (destination, sources) = values.split_at_mut(2 * i * stride);
+                destination[i * stride].assign(&sources[0]);
+                if 2 * i + 1 < count {
+                    destination[i * stride] += &sources[stride];
+                }
+            }
+            count = count.div_ceil(2);
+        }
+    }
+
+    pub(crate) fn sum_by_indexed(
+        &mut self,
+        length: usize,
+        leaf: impl Fn(usize, &mut Float) + Sync,
+    ) -> Float {
+        if length < 512 || rayon::current_num_threads() == 1 {
+            return self.sum_by(length, leaf);
+        }
+        const BLOCK: usize = 128;
+        self.values.resize_with(self.values.len().max(length), || {
+            Float::with_val(self.precision_bits, 0)
+        });
+        self.values[..length]
+            .par_chunks_mut(BLOCK)
+            .enumerate()
+            .for_each(|(block, values)| {
+                for (offset, value) in values.iter_mut().enumerate() {
+                    leaf(block * BLOCK + offset, value);
+                }
+                Self::reduce_strided(values, values.len(), 1);
+            });
+        Self::reduce_strided(&mut self.values, length.div_ceil(BLOCK), BLOCK);
+        self.values[0].clone()
+    }
+
+    /// Sum the rounded leaves and their absolute values through the same tree.
+    /// The second sum is a computed cancellation diagnostic, not an enclosure.
+    pub(crate) fn sum_by_with_absolute(
+        &mut self,
+        length: usize,
+        parallel: bool,
+        leaf: impl Fn(usize, &mut Float) + Sync,
+    ) -> (Float, Float) {
+        if length == 0 {
+            return (
+                Float::with_val(self.precision_bits, 0),
+                Float::with_val(self.precision_bits, 0),
+            );
+        }
+        self.values.resize_with(self.values.len().max(length), || {
+            Float::with_val(self.precision_bits, 0)
+        });
+        self.absolute_values
+            .resize_with(self.absolute_values.len().max(length), || {
+                Float::with_val(self.precision_bits, 0)
+            });
+        let block_size = if parallel && length >= 512 && rayon::current_num_threads() > 1 {
+            128
+        } else {
+            length
+        };
+        let evaluate = |block: usize, values: &mut [Float], absolute: &mut [Float]| {
+            for (offset, (value, abs)) in values.iter_mut().zip(absolute.iter_mut()).enumerate() {
+                leaf(block * block_size + offset, value);
+                abs.assign(&*value);
+                abs.abs_mut();
+            }
+            Self::reduce_strided(values, values.len(), 1);
+            Self::reduce_strided(absolute, absolute.len(), 1);
+        };
+        if block_size == length {
+            evaluate(
+                0,
+                &mut self.values[..length],
+                &mut self.absolute_values[..length],
+            );
+        } else {
+            self.values[..length]
+                .par_chunks_mut(block_size)
+                .zip(self.absolute_values[..length].par_chunks_mut(block_size))
+                .enumerate()
+                .for_each(|(block, (values, absolute))| evaluate(block, values, absolute));
+        }
+        let blocks = length.div_ceil(block_size);
+        Self::reduce_strided(&mut self.values, blocks, block_size);
+        Self::reduce_strided(&mut self.absolute_values, blocks, block_size);
+        (self.values[0].clone(), self.absolute_values[0].clone())
+    }
+}
+
+#[cfg(test)]
+mod indexed_inner_tests {
+    use super::*;
+    #[test]
+    fn parallel_block_trees_and_absolute_sums_match_the_serial_tree() {
+        for p in [64, 128, 256, 512, 2722] {
+            for workers in [1, 2, 4] {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        let mut scratch = PairwiseScratch::new(p);
+                        for n in [0, 1, 127, 128, 255, 256, 511, 512, 513, 1023, 1024, 2049, 5] {
+                            let values: Vec<_> = (0..n)
+                                .map(|i| {
+                                    let mut v = Float::with_val(p, 1);
+                                    if i % 4 == 0 {
+                                        v <<= p + 8;
+                                    }
+                                    if i % 4 == 2 {
+                                        v <<= p + 8;
+                                        v = -v;
+                                    }
+                                    if i % 4 == 3 {
+                                        v = -v;
+                                    }
+                                    v
+                                })
+                                .collect();
+                            let expected = deterministic_pairwise_sum_hp(&values, p);
+                            let absolute: Vec<_> = values.iter().map(|v| v.clone().abs()).collect();
+                            assert_eq!(
+                                scratch.sum_by_indexed(n, |i, v| v.assign(&values[i])),
+                                expected
+                            );
+                            let (sum, abs) =
+                                scratch.sum_by_with_absolute(n, true, |i, v| v.assign(&values[i]));
+                            assert_eq!(sum, expected);
+                            assert_eq!(abs, deterministic_pairwise_sum_hp(&absolute, p));
+                        }
+                    });
+            }
+        }
+    }
 }
 
 /// Sum MPFR values with parallel fixed-index leaf chunks and a serial,
@@ -221,6 +402,36 @@ pub fn compare_hp_reduction_artifacts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reused_pairwise_storage_matches_cancellation_and_odd_tail_reductions() {
+        for bits in [64, 128, 256, 512] {
+            let mut scratch = PairwiseScratch::new(bits);
+            for length in [0, 1, 2, 3, 17, 128, 511, 5, 0, 2] {
+                let leaves: Vec<_> = (0..length)
+                    .map(|i| {
+                        Float::with_val(
+                            bits,
+                            Float::parse(match i % 4 {
+                                0 => "1e100",
+                                1 => "-1e100",
+                                2 => "0.333333333333333333333333333333333333",
+                                _ => "-1e-50",
+                            })
+                            .unwrap(),
+                        )
+                    })
+                    .collect();
+                let expected = deterministic_pairwise_sum_hp(&leaves, bits);
+                let actual = scratch.sum_by(length, |i, value| value.assign(&leaves[i]));
+                assert_eq!(
+                    encode(&actual, bits),
+                    encode(&expected, bits),
+                    "bits={bits}, length={length}"
+                );
+            }
+        }
+    }
     use rug::ops::Pow;
 
     /// Unique decimal recovery of a P-bit float needs ceil(P*log10(2)) + 1

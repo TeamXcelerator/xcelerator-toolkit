@@ -17,6 +17,20 @@ pub struct EigenpairDiagnostics<T> {
     pub orthogonality_error: T,
 }
 
+/// Computed checks of A*Q=Q*T and Q^T*Q=I. Small values alone do not
+/// certify input construction, eigenvalue separation or continuum accuracy.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SymmetricReductionDiagnostics<T> {
+    pub absolute_similarity_residual: T,
+    pub relative_similarity_residual: T,
+    pub absolute_orthogonality_residual: T,
+    pub relative_orthogonality_residual: T,
+    pub source_frobenius_norm: T,
+    pub tridiagonal_frobenius_norm: T,
+    pub basis_frobenius_norm: T,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetryClassification {
@@ -155,5 +169,33 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+/// Optional retained-prefix data. The legacy default preserves the two-moment
+/// payload; enabling the third moment or omitting cancellation is separately keyed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrefixDiagnosticPolicy {
+    pub third_inverse_moment: bool,
+    pub innovation_cancellation: bool,
+}
+impl Default for PrefixDiagnosticPolicy {
+    fn default() -> Self {
+        Self {
+            third_inverse_moment: false,
+            innovation_cancellation: true,
+        }
+    }
+}
+impl PrefixDiagnosticPolicy {
+    pub fn is_legacy_default(&self) -> bool {
+        *self == Self::default()
+    }
+    pub fn full() -> Self {
+        Self {
+            third_inverse_moment: true,
+            innovation_cancellation: true,
+        }
     }
 }

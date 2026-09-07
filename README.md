@@ -7,6 +7,71 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
+## v0.15.0: reproducible research evidence
+
+This release turns retained numerical results into source-bound data for finite
+research tests: typed observables, frozen hypotheses, resolution budgets,
+prefix and Schur diagnostics, checked vector exports, capture receipts, and
+stable reduction checks. Managed receipts record every requested diagnostic
+outcome, and evaluation packets retain selected observation bytes for score
+replay.
+
+Capture accepts certified and cross-checked sources, preserves actionable
+failure reasons, and groups receipt attempts by their resolved plan. Prefix
+working precision and export policies are explicit overrides. Scheduled
+stabilization retains changing quadrature identities across an N ladder.
+
+Prefix ladders retain model-qualified eigenvalue estimates, pivot and innovation
+cancellation diagnostics, and optional exact nesting checks. New Ultra plans
+also capture the third inverse moment, stronger moment endpoints and a two-mode
+fit with a trace-closure residual. Cancellation capture can be omitted through
+an explicit policy. A local shard manifest can be
+loaded directly with explicit resource limits and verified source provenance.
+
+The numerical hardening adds corrected sector reduction and selected-vector
+solves under new identities, exact prolate cache inputs, stronger quadrature
+and factor validation, and guarded HP root refinement. Distance profiles and
+measurements now round-trip at their declared precision; child diagnostics use
+the same retained parents on cold, backfill, refresh, and reuse paths. An
+unresolved Q/2Q/4Q check is visible in the returned capture result.
+
+Performance work includes fewer matrix/component allocations, reusable linear
+storage tridiagonal solves, shared function evaluations, lazy 4Q refinement,
+reusable MPFR inner-loop storage, parallel prefix factor columns and independent
+innovation solves in separate phases,
+parallel cross terms, long inner sums and reduction checks with fixed summation order, and cached retained-reduction
+children.
+See the release validation for measured evaluation counts, test coverage and
+the limits of these performance claims.
+
+Both public and private evidence catalogs register `ccm_prefix_analysis` and
+`ccm_retained_reduction_check`. Public retained diagnostics require authenticated
+public parents; target-derived evidence keeps its private publication policy.
+
+- [Release notes and migration](docs/RELEASE_NOTES.md)
+- [Numerical compatibility and existing artifacts](docs/NUMERICAL_COMPATIBILITY.md)
+- [Release validation](docs/VALIDATION.md)
+- [Prefix formulas, precision, and capture](docs/CCM_PREFIX_ANALYSIS.md)
+- [Prefix convergence models and local shard inputs](docs/PREFIX_CONVERGENCE.md)
+- [Frozen research evidence workflow](docs/RESEARCH_EVIDENCE.md)
+- [Capture levels and application integration](docs/CAPTURE_LEVELS.md)
+
+Ultra requests a finite set of measurements. The capture runner executes a
+primary diagnostic adapter and retained-source follow-up, then saves a managed
+receipt including missing, blocked and failed work. Budgeted reduction checks
+can join that receipt; full quadrature verification remains explicit. Capture
+completion and numerical acceptance are reported separately. Applications adopt
+the runner through the documented API; existing application flags do not change
+merely because the library was updated.
+
+`ccm::hp::capture_run::RetainedCcmRun` supplies the primary adapter for new
+applications: compute the claim once, save its primary result, and attempt
+supplemental diagnostics independently with authenticated source manifests.
+Eigenfunction profiles remain capturable when the runtime target is absent;
+target-dependent children report their unavailable input separately.
+
+## Existing artifact fabric (0.14.3)
+
 Version 0.14.3 adds backward-compatible multi-shard cache rollover, building on
 the CCM capture and managed-publication functionality delivered in 0.14.1.
 Publishing children of shard-reused artifacts to a new
@@ -106,7 +171,7 @@ If you use Xcelerator Toolkit in research, please cite the exact version or Git 
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.14.3},
+  version = {0.15.0},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }
@@ -132,7 +197,9 @@ If you use Xcelerator Toolkit in research, please cite the exact version or Git 
 
 ## Getting started
 
-The minimum supported Rust version is 1.85.
+The minimum supported Rust version is 1.98. Development uses the stable
+channel selected by `rust-toolchain.toml`; v0.15.0 was qualified with Rust
+1.98.1. Record the exact compiler version for reproducible experiments.
 
 ```bash
 cargo build --workspace --release --locked
@@ -435,6 +502,12 @@ cancellation, and dominance studies without treating any one prime-event
 formula as the research target. It uses the same v2 even-sector isolation gate
 and reduced solve as prime-power response capture; near-crossing ambiguity is a
 hard capture error, never a residual-passing response payload.
+
+Existing schema-2 response root velocities can be corrected from their exact
+retained eigenpairs and L2 tangents using the [offline response repair tool](docs/CCM_RESPONSE_REPAIR.md).
+It stages new v3 artifacts and corresponding private receipts without rerunning
+claims, preserves original artifacts and failed outcomes, and publishes only
+through a separate additive request at the original visibility.
 
 Finite sector-gap certification is a third explicit opt-in and is likewise
 **not** implied by `maximum`. It requires an Arb-enabled build and retained

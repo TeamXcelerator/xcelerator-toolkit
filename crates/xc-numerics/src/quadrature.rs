@@ -402,19 +402,19 @@ mod hp {
     ///
     /// - `Off`          — no cache at all. Always compute; never read or
     ///   write any cache file.
-    /// - `JsonOnly`     — read a local uncompressed `.json` if present;
-    ///   otherwise compute. Does not consult `.json.zip` or the remote.
+    /// - `JsonOnly`     — deprecated compatibility variant; computes without
+    ///   reading or writing files under the zip-only cache contract.
     /// - `JsonZip`      — local `.json.zip`, read in memory, then compute.
     ///   This is the default for the standalone API. Managed remote resolution
     ///   is provided by `gauss_legendre_nodes_via_cache`.
     ///
-    /// On a fresh compute, `JsonOnly` writes only the `.json`; `JsonZip`
-    /// writes a `.json.zip`; `Off` writes nothing.
+    /// On a fresh compute, only `JsonZip` writes a `.json.zip`. `Off` and
+    /// the deprecated `JsonOnly` variant write nothing.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub enum CacheMode {
         /// No caching: always compute, never touch disk or network.
         Off,
-        /// Local uncompressed `.json` only.
+        /// Deprecated compatibility variant: no reads or writes.
         JsonOnly,
         /// Local `.json.zip`, followed by computation on a miss (default).
         #[default]
@@ -476,7 +476,11 @@ mod hp {
     /// Used by `load_gl_cache` to discard structurally-broken cache
     /// files (e.g. wrong precision, value corruption, accidental edit)
     /// before they pollute downstream HP integration.
-    fn cache_structural_check(nodes: &[Float], weights: &[Float], prec: u32) -> Option<String> {
+    pub(super) fn cache_structural_check(
+        nodes: &[Float],
+        weights: &[Float],
+        prec: u32,
+    ) -> Option<String> {
         let n = nodes.len();
         if weights.len() != n {
             return Some(format!(
@@ -485,7 +489,42 @@ mod hp {
                 n
             ));
         }
+        if n == 0 {
+            return Some("empty Gauss-Legendre rule".to_owned());
+        }
+        for (i, (x, w)) in nodes.iter().zip(weights).enumerate() {
+            if !x.is_finite() || !w.is_finite() || x <= &-1 || x >= &1 || w <= &0 {
+                return Some(format!(
+                    "invalid interior node or positive finite weight at {i}"
+                ));
+            }
+            if i > 0 && nodes[i - 1] >= *x {
+                return Some(format!("nodes are not strictly increasing at {i}"));
+            }
+        }
         let tol = cache_structural_tol(prec);
+        // Cheap O(n) independent even moments. This detects many symmetric
+        // corruptions that mass and the first moment alone cannot detect.
+        for degree in [2u32, 4, 6] {
+            if degree as usize >= 2 * n {
+                continue;
+            }
+            let mut moment = Float::with_val(prec, 0);
+            for (x, w) in nodes.iter().zip(weights) {
+                let mut term = Float::with_val(prec, 1);
+                for _ in 0..degree {
+                    term *= x;
+                }
+                term *= w;
+                moment += term;
+            }
+            let mut expected = Float::with_val(prec, 2);
+            expected /= degree + 1;
+            moment -= expected;
+            if moment.abs() >= tol {
+                return Some(format!("degree-{degree} Gauss-Legendre moment mismatch"));
+            }
+        }
 
         // Identity 1: Σ w_i = 2.
         let mut wsum = Float::with_val(prec, 0);
@@ -640,6 +679,22 @@ mod hp {
         }
     }
 
+    #[cfg(test)]
+    thread_local! {
+        static TEST_CACHE_ROOT: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Test-only, thread-local cache placement. Never mutates the process
+    /// environment or cwd, and never redirects another concurrently running
+    /// test. Production continues to honor XC_CACHE_ROOT unchanged.
+    #[cfg(test)]
+    pub(super) fn replace_test_cache_root(
+        root: Option<std::path::PathBuf>,
+    ) -> Option<std::path::PathBuf> {
+        TEST_CACHE_ROOT.with(|current| current.replace(root))
+    }
+
     /// Cache directory: `$XC_CACHE_ROOT/gl_cache` when that is set, else
     /// `<cwd>/data/gl_cache`. Created on demand so fresh checkouts work
     /// without manual setup.
@@ -649,6 +704,12 @@ mod hp {
     /// binary cache files into that checkout, where they are neither the
     /// operator's chosen cache volume nor necessarily ignored by git.
     fn gl_cache_dir() -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        if let Some(root) = TEST_CACHE_ROOT.with(|current| current.borrow().clone()) {
+            let dir = root.join("gl_cache");
+            std::fs::create_dir_all(&dir).ok()?;
+            return Some(dir);
+        }
         let root = match std::env::var_os("XC_CACHE_ROOT") {
             Some(root) if !root.is_empty() => std::path::PathBuf::from(root),
             _ => std::env::current_dir().ok()?.join("data"),
@@ -676,6 +737,12 @@ mod hp {
     fn parse_gl_json(data: &str, n: usize, prec: u32) -> Option<(Vec<Float>, Vec<Float>)> {
         let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
         let obj = parsed.as_object()?;
+        if obj.get("schema_version")?.as_u64()? != 1
+            || obj.get("n_pts")?.as_u64()? != u64::try_from(n).ok()?
+            || obj.get("precision_bits")?.as_u64()? != u64::from(prec)
+        {
+            return None;
+        }
 
         let file_ver = obj.get("toolkit_version").and_then(|v| v.as_str())?;
         if version_is_older(file_ver, &effective_min_version()) {
@@ -794,6 +861,9 @@ mod hp {
         use std::io::Read;
         let file = std::fs::File::open(zip_path).ok()?;
         let mut archive = zip::ZipArchive::new(file).ok()?;
+        if archive.len() != 1 {
+            return None;
+        }
         let entry_name = format!("prec{}_npts{}.json", prec, n);
         let mut entry = archive.by_name(&entry_name).ok()?;
         let mut data = String::new();
@@ -1033,6 +1103,73 @@ mod hp {
         (p1, deriv)
     }
 
+    /// Computed full-rule diagnostics, separate from the cheap cache read screen.
+    #[derive(Clone, Debug)]
+    pub struct GaussLegendreRuleCheckHp {
+        pub order: usize,
+        pub precision_bits: u32,
+        pub maximum_legendre_residual: Float,
+        pub maximum_relative_weight_defect: Float,
+        pub tolerance: Float,
+        pub checks_passed: bool,
+    }
+
+    /// Check every Legendre root and derivative-weight identity in O(n^2)
+    /// arithmetic. The explicit order budget is enforced before recurrence
+    /// work. This point-arithmetic check is not an interval certificate.
+    pub fn check_gauss_legendre_rule_hp(
+        nodes: &[Float],
+        weights: &[Float],
+        prec: u32,
+        maximum_order: usize,
+    ) -> anyhow::Result<GaussLegendreRuleCheckHp> {
+        if !(64..=1_000_000).contains(&prec)
+            || nodes.len() > maximum_order
+            || nodes.is_empty()
+            || nodes.iter().chain(weights).any(|x| x.prec() > prec)
+        {
+            anyhow::bail!("invalid GL precision/order budget or down-rounded input");
+        }
+        if let Some(reason) = cache_structural_check(nodes, weights, prec) {
+            anyhow::bail!(reason);
+        }
+        let n = nodes.len();
+        let mut root_max = Float::with_val(prec, 0);
+        let mut weight_max = Float::with_val(prec, 0);
+        for (x, w) in nodes.iter().zip(weights) {
+            let (pn, dpn) = legendre_p_and_deriv(n, x, prec);
+            let residual = pn.abs();
+            if !residual.is_finite() || !dpn.is_finite() {
+                anyhow::bail!("nonfinite GL recurrence");
+            }
+            if residual > root_max {
+                root_max = residual;
+            }
+            let mut defect = Float::with_val(prec, 1);
+            defect -= x.clone().square();
+            defect *= dpn.square();
+            defect *= w;
+            defect /= 2;
+            defect -= 1;
+            let defect = defect.abs();
+            if !defect.is_finite() {
+                anyhow::bail!("nonfinite GL weight check");
+            }
+            if defect > weight_max {
+                weight_max = defect;
+            }
+        }
+        let tolerance = cache_structural_tol(prec);
+        Ok(GaussLegendreRuleCheckHp {
+            order: n,
+            precision_bits: prec,
+            checks_passed: root_max < tolerance && weight_max < tolerance,
+            maximum_legendre_residual: root_max,
+            maximum_relative_weight_defect: weight_max,
+            tolerance,
+        })
+    }
+
     // ===========================================================================
     // Public cache-verification API
     // ===========================================================================
@@ -1233,9 +1370,10 @@ mod hp {
 
 #[cfg(feature = "hp")]
 pub use hp::{
-    gauss_legendre_nodes, gauss_legendre_nodes_scheduled, gauss_legendre_nodes_via_cache,
-    gauss_legendre_nodes_via_cache_scheduled, verify_gl_cache_dir, CacheFileStatus, CacheMode,
-    CacheVerifyReport, CachedQuadratureRule, QuadratureCacheRequest,
+    check_gauss_legendre_rule_hp, gauss_legendre_nodes, gauss_legendre_nodes_scheduled,
+    gauss_legendre_nodes_via_cache, gauss_legendre_nodes_via_cache_scheduled, verify_gl_cache_dir,
+    CacheFileStatus, CacheMode, CacheVerifyReport, CachedQuadratureRule, GaussLegendreRuleCheckHp,
+    QuadratureCacheRequest,
 };
 
 #[cfg(test)]
@@ -1519,26 +1657,14 @@ mod tests {
 mod hp_cache_tests {
     //! Tests for the HP GL cache lookup logic introduced in v0.4.1.
     //!
-    //! These tests exercise the cwd-relative cache directory and the
-    //! `.json` / `.json.zip` lookup priority. To avoid polluting the
-    //! caller's `data/gl_cache/` directory, each test runs in an
-    //! isolated temp directory via `std::env::set_current_dir`.
-    //!
-    //! Because `set_current_dir` mutates global process state, these
-    //! tests must run sequentially. We use a single mutex to serialize
-    //! them and restore the original cwd on drop.
+    //! Cache lookup tests use a thread-local test root. They neither depend
+    //! on nor mutate XC_CACHE_ROOT or the process working directory, and can
+    //! safely execute concurrently with numerical tests.
 
     use super::*;
     use rug::Float;
     use std::io::Write;
     use std::path::PathBuf;
-    use std::sync::Mutex;
-
-    /// Serialize all cwd-mutating tests in this module. Cargo runs
-    /// tests in parallel by default; cwd is per-process (not
-    /// per-thread), so two cache tests racing would corrupt each
-    /// other. The mutex enforces sequential access.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn allocation_reduction_preserves_exact_gl_payload_values() {
@@ -1552,36 +1678,21 @@ mod hp_cache_tests {
         }
     }
 
-    /// Guard that restores the original cwd when dropped, so a panic
-    /// inside a test doesn't leave the test runner in a temp dir
-    /// (which would break subsequent unrelated tests).
-    struct CwdGuard {
-        original: PathBuf,
-        _lock: std::sync::MutexGuard<'static, ()>,
+    /// A panic-safe per-thread override, independent of the user's cache
+    /// environment. No global cwd mutation is necessary for cache tests.
+    struct CacheRootGuard {
+        original: Option<PathBuf>,
     }
-    impl CwdGuard {
+    impl CacheRootGuard {
         fn enter(temp: &std::path::Path) -> Self {
-            // Recover from poison: a previously-panicking test will have
-            // poisoned the lock, but subsequent tests can still safely
-            // acquire it (the global cwd state isn't corrupted by a test
-            // panic — the prior test's CwdGuard::drop ran on unwind and
-            // restored the original cwd). Without this recovery, one
-            // test panic cascades into all subsequent tests panicking
-            // on "cwd lock poisoned" instead of running.
-            let lock = CWD_LOCK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let original = std::env::current_dir().expect("no cwd");
-            std::env::set_current_dir(temp).expect("set_current_dir to temp");
-            CwdGuard {
-                original,
-                _lock: lock,
+            Self {
+                original: hp::replace_test_cache_root(Some(temp.join("data"))),
             }
         }
     }
-    impl Drop for CwdGuard {
+    impl Drop for CacheRootGuard {
         fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
+            hp::replace_test_cache_root(self.original.take());
         }
     }
 
@@ -1613,117 +1724,45 @@ mod hp_cache_tests {
         dir
     }
 
-    /// Write a 2-element JSON array of decimal-string node/weight
-    /// values for the given (n, prec). The values are deterministic
-    /// fakes — not actual GL nodes, but well-formed enough to round
-    /// trip through `parse_gl_json`.
-    /// Generate a structurally-valid synthetic GL cache JSON for use in
-    /// cache-priority and zip-fallback tests, where the *content* of
-    /// the cache file isn't important (we're testing the cache lookup
-    /// machinery, not GL correctness). The values are not real GL
-    /// nodes/weights, but they satisfy the three structural identities
-    /// `cache_structural_check` enforces:
-    ///
-    ///   - antisymmetric nodes:  nodes[i] + nodes[n-1-i] = 0
-    ///   - mirror weights:       weights[i] = weights[n-1-i]
-    ///   - sum of weights = 2,   first moment = 0
-    ///
-    /// **Exactness matters.** The structural validator runs at HP
-    /// precision and computes Σw exactly. If the f64-formatted weight
-    /// strings round-trip through HP with ULP error (e.g. "4e-01" for
-    /// 2/5, which is 0.4 + 2e-17 in binary), Σw is not exactly 2 and
-    /// the validator (correctly) rejects the fixture. We side-step this
-    /// by picking weights from `{1/4, 1/2, 3/4, 1/8, ...}` — exact
-    /// powers-of-2 fractions that round-trip through binary HP exactly.
-    /// For each `n`, the weight pattern is chosen so the sum is
-    /// exactly 2 in binary arithmetic.
-    ///
-    /// `epsilon` controls the smallest absolute node value, so two
-    /// synthetic fixtures with different epsilons are distinguishable
-    /// (used by the cache-priority test).
-    fn synthetic_valid_gl_json(n: usize, epsilon: f64) -> String {
-        // Weight pattern: pick mirror-symmetric weights summing to 2
-        // using only exact-binary fractions (1/2, 1/4, 3/4, 3/8, etc.).
-        // For arbitrary n, use a uniform "{1/2 each pair}" structure
-        // when n is even and `2/n` is exact (power of 2), and a
-        // "split-the-middle" structure otherwise.
-        //
-        // The simplest universal pattern: weights = [w, w, ..., w_center, ..., w, w]
-        // with paired w = 1/2 and w_center = 2 - n_pairs (for odd n only).
-        //
-        // For n even with an even count of pairs:
-        //   each weight = 2/n. Exact only if n ∈ {1, 2, 4, 8, 16}.
-        //
-        // We instead use a deterministic recipe that's exact for any n:
-        //   - For n = 1: [2.0]   (degenerate; rarely used in tests)
-        //   - For n = 2: [1.0, 1.0]
-        //   - For n ≥ 3: pair the first n-2 elements with weight 1/2 each
-        //                (sum = (n-2)/2 from these), and split the
-        //                remaining (2 - (n-2)/2) = (6 - n)/2 = ?
-        //
-        // Cleaner recipe: assign weight 0.5 to indices {0, n-1, 1, n-2}
-        // (the outer two pairs) and the remainder uniformly to the rest.
-        // But "the rest" weight = (2 - 4*0.5) / (n-4) = 0/(n-4) = 0 for
-        // n > 4 — which makes interior weights zero (technically
-        // structurally valid: zero is symmetric and contributes nothing).
-        //
-        // Use this: outer two pairs each weighted 0.5 (mirror); all
-        // interior weights = 0. Σw = 4 × 0.5 = 2 exactly. Σx·w on the
-        // antisymmetric outer four cancels exactly. The interior zero
-        // weights contribute 0 to all moments. Structurally valid for
-        // any n ≥ 4.
-        //
-        // For n < 4: special-case. n = 2: both 1.0; n = 3: outer pair
-        // 0.5 each, center 1.0.
-        let weights_exact: Vec<&'static str> = match n {
-            0 => Vec::new(),
-            1 => vec!["2"],
-            2 => vec!["1", "1"],
-            3 => vec!["5e-1", "1", "5e-1"],
-            _ => {
-                // n ≥ 4: outer two pairs at 0.5, interior zero.
-                let mut w = vec!["0"; n];
-                w[0] = "5e-1";
-                w[n - 1] = "5e-1";
-                w[1] = "5e-1";
-                w[n - 2] = "5e-1";
-                w
-            }
-        };
+    #[test]
+    fn rule_validation_rejects_symmetric_but_wrong_rules() {
+        let p = 128;
+        let (nodes, weights) = hp::gauss_legendre_nodes(8, p, hp::CacheMode::Off);
+        assert!(hp::cache_structural_check(&nodes, &weights, p).is_none());
+        assert!(
+            hp::check_gauss_legendre_rule_hp(&nodes, &weights, p, 8)
+                .unwrap()
+                .checks_passed
+        );
+        assert!(hp::check_gauss_legendre_rule_hp(&nodes, &weights, p, 7).is_err());
 
-        // Nodes: antisymmetric. We use simple f64 arithmetic to build
-        // them, then format the strings; mirror-symmetry of the
-        // pre/post-image ensures that even when individual values have
-        // ULP error in their f64 representation, the antisymmetric sum
-        // (nodes[i] + nodes[n-1-i]) of two strings parsed independently
-        // at HP gives exactly 0 (since one parsed value is the negation
-        // of the other, character-for-character).
-        let nodes: Vec<String> = (0..n)
-            .map(|i| {
-                match (2 * i + 1).cmp(&n) {
-                    std::cmp::Ordering::Less => {
-                        // Lower half.
-                        let v = epsilon + 0.1 * (i as f64);
-                        format!("-{:.20e}", v)
-                    }
-                    std::cmp::Ordering::Equal => {
-                        // Center (only for odd n).
-                        "0".to_string()
-                    }
-                    std::cmp::Ordering::Greater => {
-                        // Upper half: mirror of lower half.
-                        let j = n - 1 - i;
-                        let v = epsilon + 0.1 * (j as f64);
-                        format!("{:.20e}", v)
-                    }
-                }
-            })
-            .collect();
+        let mut bad = nodes.clone();
+        for x in &mut bad {
+            *x /= 2;
+        }
+        assert!(hp::cache_structural_check(&bad, &weights, p).is_some());
+        let mut bad = weights.clone();
+        bad[0] = Float::with_val(p, 0);
+        bad[7] = Float::with_val(p, 0);
+        assert!(hp::cache_structural_check(&nodes, &bad, p).is_some());
+        let mut bad = nodes.clone();
+        bad.swap(0, 1);
+        assert!(hp::cache_structural_check(&bad, &weights, p).is_some());
+        assert!(hp::cache_structural_check(&[], &[], p).is_some());
+    }
 
-        // Weights are already exact decimal strings.
-        let weights: Vec<String> = weights_exact.iter().map(|s| s.to_string()).collect();
-
-        serde_json::json!([nodes, weights]).to_string()
+    /// Real small GL rules exercise cache paths without weakening validation.
+    fn valid_gl_json(n: usize) -> String {
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, 64, hp::CacheMode::Off);
+        serde_json::json!({
+            "schema_version": 1,
+            "toolkit_version": hp::toolkit_version_for_test(),
+            "n_pts": n,
+            "precision_bits": 64,
+            "nodes": nodes.iter().map(Float::to_string).collect::<Vec<_>>(),
+            "weights": weights.iter().map(Float::to_string).collect::<Vec<_>>(),
+        })
+        .to_string()
     }
 
     /// Produce a valid-envelope JSON but with structurally-invalid
@@ -1765,7 +1804,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_reads_zip_ignoring_stale_json() {
         let temp = fresh_temp_dir("zip_is_truth");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 4;
         let prec: u32 = 64;
@@ -1774,7 +1813,7 @@ mod hp_cache_tests {
 
         // Stale .json fixture: epsilon = 0.01 (smallest |node| ≈ 0.01).
         // This must be IGNORED under the zip-only contract.
-        let json_payload = synthetic_valid_gl_json(n, 0.01);
+        let json_payload = structurally_invalid_gl_json(n, prec);
         let json_path = cache_dir.join(format!("prec{}_npts{}.json", prec, n));
         std::fs::write(&json_path, &json_payload).unwrap();
 
@@ -1788,7 +1827,7 @@ mod hp_cache_tests {
         zip_writer
             .start_file(format!("prec{}_npts{}.json", prec, n), opts)
             .unwrap();
-        let zip_payload = synthetic_valid_gl_json(n, 0.5);
+        let zip_payload = valid_gl_json(n);
         zip_writer.write_all(zip_payload.as_bytes()).unwrap();
         zip_writer.finish().unwrap();
 
@@ -1817,7 +1856,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_reads_zip_without_writing_decompressed_json() {
         let temp = fresh_temp_dir("zip_fallback");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 5;
         let prec: u32 = 64;
@@ -1826,7 +1865,7 @@ mod hp_cache_tests {
 
         // Structurally-valid .json.zip with a known payload; no
         // uncompressed .json yet.
-        let payload = synthetic_valid_gl_json(n, 0.05);
+        let payload = valid_gl_json(n);
         let zip_path = cache_dir.join(format!("prec{}_npts{}.json.zip", prec, n));
         let zip_file = std::fs::File::create(&zip_path).unwrap();
         let mut zip_writer = zip::ZipWriter::new(zip_file);
@@ -1861,7 +1900,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_computes_fresh_and_writes_json() {
         let temp = fresh_temp_dir("compute_fresh");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 8;
         let prec: u32 = 128;
@@ -1919,7 +1958,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_mode_off_never_touches_disk() {
         let temp = fresh_temp_dir("mode_off");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 8;
         let prec: u32 = 128;
@@ -1948,7 +1987,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_mode_json_only_ignores_zip() {
         let temp = fresh_temp_dir("mode_json_only");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 4;
         let prec: u32 = 64;
@@ -2035,7 +2074,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_fresh_compute_writes_zip_only() {
         let temp = fresh_temp_dir("compute_writes_zip_only");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 8;
         let prec: u32 = 128;
@@ -2088,7 +2127,7 @@ mod hp_cache_tests {
     #[test]
     fn fresh_compute_integrates_x_squared() {
         let temp = fresh_temp_dir("integrate_x2");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         // Use small n, modest precision: enough to validate, fast to run.
         let n = 16;
@@ -2134,7 +2173,7 @@ mod hp_cache_tests {
     #[test]
     fn hp_gl_nodes_satisfy_symmetry_and_moments() {
         let temp = fresh_temp_dir("symmetry_moments");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n: usize = 12;
         let prec: u32 = 256;
@@ -2204,7 +2243,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_discards_structurally_invalid_json_and_recomputes() {
         let temp = fresh_temp_dir("structurally_invalid");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 6;
         let prec: u32 = 128;
@@ -2279,7 +2318,7 @@ mod hp_cache_tests {
     #[test]
     fn cache_handles_corrupt_zip_gracefully() {
         let temp = fresh_temp_dir("corrupt_zip");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let n = 4;
         let prec: u32 = 64;
@@ -2309,7 +2348,7 @@ mod hp_cache_tests {
         use hp::CacheFileStatus;
 
         let temp = fresh_temp_dir("verify_dir");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let cache_dir = temp.join("data").join("gl_cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
@@ -2420,12 +2459,32 @@ mod hp_cache_tests {
     #[test]
     fn verify_gl_cache_dir_handles_missing_directory() {
         let temp = fresh_temp_dir("verify_missing");
-        let _guard = CwdGuard::enter(&temp);
+        let _guard = CacheRootGuard::enter(&temp);
 
         let nonexistent = temp.join("does_not_exist");
         let report = hp::verify_gl_cache_dir(&nonexistent).unwrap();
         assert_eq!(report.statuses.len(), 0);
         assert_eq!(report.ok_count(), 0);
         assert_eq!(report.failure_count(), 0);
+    }
+}
+
+#[cfg(all(test, feature = "hp"))]
+mod cache_envelope_regression {
+    use super::hp;
+
+    #[test]
+    fn mislabeled_cache_envelopes_are_rejected_before_numeric_decode() {
+        let good = serde_json::json!({
+            "schema_version": 1, "toolkit_version": hp::toolkit_version_for_test(),
+            "n_pts": 2, "precision_bits": 128,
+            "nodes": ["-0.5", "0.5"], "weights": ["1", "1"]
+        });
+        assert!(hp::parse_gl_json_for_test(&good.to_string(), 2, 128).is_some());
+        for (field, value) in [("schema_version", 2), ("n_pts", 3), ("precision_bits", 64)] {
+            let mut bad = good.clone();
+            bad[field] = serde_json::json!(value);
+            assert!(hp::parse_gl_json_for_test(&bad.to_string(), 2, 128).is_none());
+        }
     }
 }

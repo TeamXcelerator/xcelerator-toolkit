@@ -158,7 +158,10 @@ pub fn stage_immutable_publication_metadata(
         .check()
         .map_err(|error| CacheError::Cancelled(error.to_string()))?;
     if destination == PublicationDestination::Public
-        && crate::artifact_kind_is_private_only(&bundle.manifest.semantic_key.artifact_kind)
+        && !crate::artifact_semantics_admitted_to_destination(
+            &bundle.manifest.semantic_key,
+            destination,
+        )
     {
         return Err(CacheError::PermissionDenied(format!(
             "artifact kind {:?} is private-only",

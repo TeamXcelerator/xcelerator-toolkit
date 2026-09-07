@@ -114,7 +114,10 @@ pub fn build_managed_publication_inventory(
     if target == xc_core::PublicationTarget::Public
         && !drafts.is_empty()
         && drafts.iter().all(|draft| {
-            artifact_kind_is_private_only(draft.manifest.semantic_key.artifact_kind.as_str())
+            !artifact_semantics_admitted_to_destination(
+                &draft.manifest.semantic_key,
+                crate::PublicationDestination::Public,
+            )
         })
     {
         let restricted = drafts
@@ -131,8 +134,8 @@ pub fn build_managed_publication_inventory(
         draft.manifest.validate()?;
         draft.encoding.validate()?;
         for destination in &destinations {
-            if !artifact_kind_admitted_to_destination(
-                draft.manifest.semantic_key.artifact_kind.as_str(),
+            if !artifact_semantics_admitted_to_destination(
+                &draft.manifest.semantic_key,
                 *destination,
             ) {
                 continue;
@@ -1356,6 +1359,10 @@ const CCM_ROOT_KINDS: &[&str] = &[
     "ccm_spectral_window",
 ];
 const CCM_EVIDENCE_KINDS: &[&str] = &[
+    "research_capture_receipt",
+    "research_hypothesis_evaluation",
+    "ccm_prefix_analysis",
+    "ccm_retained_reduction_check",
     "ccm_convergence_diagnostics",
     "ccm_root_conditioning_analysis",
     "ccm_prime_power_response_analysis",
@@ -1388,6 +1395,8 @@ const CCM_DISTANCE_KINDS: &[&str] = &[
 /// and an explicit public-only request fails when nothing staged is
 /// public-eligible.
 const PRIVATE_ONLY_ARTIFACT_KINDS: &[&str] = &[
+    "research_capture_receipt",
+    "research_hypothesis_evaluation",
     "ccm_deviation_decomposition",
     "ccm_distance_resolution_evidence",
     "ccm_target_distance",
@@ -1406,6 +1415,31 @@ pub fn artifact_kind_is_private_only(kind: &str) -> bool {
 /// instead of failing the whole publication, while the staging, planning, and
 /// bootstrap guards remain hard backstops should a private-only artifact ever
 /// reach a public surface anyway.
+pub fn artifact_semantics_admitted_to_destination(
+    semantic: &crate::SemanticKeyEnvelope,
+    destination: crate::PublicationDestination,
+) -> bool {
+    if destination == crate::PublicationDestination::Private {
+        return true;
+    }
+    if !artifact_kind_admitted_to_destination(&semantic.artifact_kind, destination) {
+        return false;
+    }
+    if matches!(
+        semantic.artifact_kind.as_str(),
+        "ccm_prefix_analysis" | "ccm_retained_reduction_check"
+    ) {
+        // Missing policy in historical private children fails closed. The
+        // producing retained-source API derives this flag from authenticated parents.
+        return semantic
+            .resolved_mathematical_parameters
+            .get("source_parents_are_public")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    }
+    true
+}
+
 pub fn artifact_kind_admitted_to_destination(
     kind: &str,
     destination: crate::PublicationDestination,
@@ -3679,5 +3713,59 @@ mod tests {
             .iter()
             .any(|draft| draft == &drafts[0]));
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod prefix_routing_tests {
+    #[test]
+    fn prefix_kind_is_source_only_evidence_not_a_new_matrix() {
+        assert_eq!(
+            super::family_for_artifact_kind("ccm_prefix_analysis"),
+            Some("ccm-evidence")
+        );
+        assert!(!super::artifact_kind_is_private_only("ccm_prefix_analysis"));
+        assert!(super::artifact_kind_admitted_to_destination(
+            "ccm_prefix_analysis",
+            crate::PublicationDestination::Public
+        ));
+    }
+}
+
+#[cfg(test)]
+mod source_visibility_tests {
+    #[test]
+    fn retained_diagnostics_need_explicit_public_source_eligibility() {
+        for kind in ["ccm_prefix_analysis", "ccm_retained_reduction_check"] {
+            let mut key = crate::SemanticKeyEnvelope {
+                schema_version: 1,
+                artifact_kind: kind.into(),
+                mathematical_semantics_version: "test-v1".into(),
+                resolved_mathematical_parameters: serde_json::json!({}),
+                normalization: None,
+                target: None,
+                subspace: None,
+                source_data_identities: Default::default(),
+                algorithm_semantics: None,
+            };
+            assert!(!super::artifact_semantics_admitted_to_destination(
+                &key,
+                crate::PublicationDestination::Public
+            ));
+            assert!(super::artifact_semantics_admitted_to_destination(
+                &key,
+                crate::PublicationDestination::Private
+            ));
+            key.resolved_mathematical_parameters["source_parents_are_public"] = false.into();
+            assert!(!super::artifact_semantics_admitted_to_destination(
+                &key,
+                crate::PublicationDestination::Public
+            ));
+            key.resolved_mathematical_parameters["source_parents_are_public"] = true.into();
+            assert!(super::artifact_semantics_admitted_to_destination(
+                &key,
+                crate::PublicationDestination::Public
+            ));
+        }
     }
 }

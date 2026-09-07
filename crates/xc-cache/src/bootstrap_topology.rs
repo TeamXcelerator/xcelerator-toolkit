@@ -191,10 +191,14 @@ pub(crate) fn read_bootstrap_family_topology(
         &route.metadata,
         cancellation,
     )?;
+    if family_document.current_writable_shard != route.current_writable_shard {
+        return Err(CacheError::InvalidManifest(format!(
+            "{visibility_name} family {family:?} legacy current_writable_shard must match the registry route; select the rollover destination with active_writable_shard"
+        )));
+    }
     if family_document.schema_version != 1
         || family_document.family != family
         || family_document.visibility != visibility_name
-        || family_document.current_writable_shard != route.current_writable_shard
         || family_document.display_name.trim().is_empty()
         || family_document.description.trim().is_empty()
         || family_document.artifact_kinds.is_empty()

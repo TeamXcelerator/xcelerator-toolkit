@@ -1557,6 +1557,14 @@ pub trait ArtifactProductionSink: Send + Sync {
         false
     }
 
+    /// Whether a newly computed artifact must carry its logical payload even
+    /// when this sink supports encoded records. Capture observers can opt in
+    /// for selected keys without disabling encoded dependency traversal.
+    /// The producer already holds these bytes; no archive decoding is needed.
+    fn requires_produced_payload(&self, _key: &ArtifactKey) -> bool {
+        false
+    }
+
     /// Record an artifact from its manifest and verified encoded object
     /// without its logical payload. Sinks that need the payload keep this
     /// default, which refuses the call; callers consult
@@ -2768,18 +2776,23 @@ where
                 // The store just encoded this payload; staging splits that
                 // verified object and proves it decodes to the manifest's
                 // logical digest, so the payload need not be copied again.
-                Some(encoded) if sink.supports_encoded_records() => sink.record_encoded(
-                    EncodedArtifactRecord {
-                        operation: request.operation.to_owned(),
-                        semantic_key: request.semantic_key.clone(),
-                        logical_key: request.logical_key.to_owned(),
-                        manifest: manifest.clone(),
-                        achieved_assurance: assessment.achieved_assurance,
-                        assurance_evidence_digests: assessment.evidence_digests.clone(),
-                    },
-                    &encoded,
-                    transport.as_ref(),
-                )?,
+                Some(encoded)
+                    if sink.supports_encoded_records()
+                        && !sink.requires_produced_payload(&manifest.key) =>
+                {
+                    sink.record_encoded(
+                        EncodedArtifactRecord {
+                            operation: request.operation.to_owned(),
+                            semantic_key: request.semantic_key.clone(),
+                            logical_key: request.logical_key.to_owned(),
+                            manifest: manifest.clone(),
+                            achieved_assurance: assessment.achieved_assurance,
+                            assurance_evidence_digests: assessment.evidence_digests.clone(),
+                        },
+                        &encoded,
+                        transport.as_ref(),
+                    )?
+                }
                 encoded => record_produced_artifact(
                     sink,
                     ProducedArtifactRecord {

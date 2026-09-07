@@ -580,7 +580,10 @@ impl GitHubBootstrapCacheStore {
         // boundary here as the key-based path, including for historical shard
         // entries that predate the restriction.
         if self.visibility == CacheVisibility::Public
-            && artifact_kind_is_private_only(&manifest.semantic_key.artifact_kind)
+            && !crate::artifact_semantics_admitted_to_destination(
+                &manifest.semantic_key,
+                crate::PublicationDestination::Public,
+            )
         {
             return Ok(None);
         }
@@ -1306,7 +1309,7 @@ mod tests {
     /// therefore describe two different published artifacts that share every
     /// payload byte, every ZIP byte, and every split part, but not their
     /// canonical manifests or transport encodings.
-    fn resolved_fixture(
+    pub(super) fn resolved_fixture(
         root: &std::path::Path,
         label: &str,
         dependencies: Vec<PayloadDependencyIdentity>,
@@ -1969,3 +1972,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "bootstrap_receipt_tests.rs"]
+mod receipt_tests;

@@ -103,3 +103,29 @@ mod tests {
         super::public_solver_and_certificate_workflow().unwrap();
     }
 }
+
+#[cfg(test)]
+#[test]
+fn external_consumer_can_record_and_validate_partial_capture() {
+    let result = xc_cache::collect_capture(
+        &"synthetic external consumer",
+        vec!["measurement".into(), "missing".into()],
+        |id| {
+            if id == "missing" {
+                Err(xc_cache::CaptureFailure::Missing {
+                    reason: "synthetic missing input".into(),
+                })
+            } else {
+                xc_cache::CapturedDiagnostic::new(&"-0.25", vec![]).map_err(|_| {
+                    xc_cache::CaptureFailure::Failed {
+                        reason: "serialization failed".into(),
+                    }
+                })
+            }
+        },
+    )
+    .unwrap();
+    result.validate().unwrap();
+    assert!(!result.receipt.is_complete());
+    assert_eq!(result.receipt.outcomes().len(), 2);
+}

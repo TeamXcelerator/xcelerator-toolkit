@@ -175,6 +175,26 @@ impl DecimalLiteral {
         DecimalParts::parse(&self.0).map(|_| ())
     }
 
+    /// Exact compact decimal identity, without binary conversion. Ordinary
+    /// construction preserves the original spelling; callers opt in when
+    /// numerically equivalent configuration values should share an identity.
+    pub fn canonical(&self) -> Result<Self, ConfigError> {
+        let parts = DecimalParts::parse(&self.0)?;
+        if parts.sign == 0 {
+            return Ok(Self("0".into()));
+        }
+        let mut text = if parts.sign < 0 {
+            "-".to_owned()
+        } else {
+            String::new()
+        };
+        text.extend(parts.digits.iter().map(|d| char::from(b'0' + d)));
+        if parts.scale != 0 {
+            text.push_str(&format!("e{}", parts.scale));
+        }
+        Ok(Self(text))
+    }
+
     /// Exact comparison for finite base-10 literals.  This is suitable for
     /// configuration and certificate structure checks at arbitrary scale.
     pub fn cmp_numeric(&self, other: &Self) -> Result<Ordering, ConfigError> {
@@ -254,6 +274,23 @@ mod tests {
 
     fn decimal(value: &str) -> DecimalLiteral {
         DecimalLiteral::new(value).unwrap()
+    }
+
+    #[test]
+    fn canonical_decimals_preserve_exact_value_and_merge_equivalent_spellings() {
+        for spelling in ["1e-50", "1E-50", "0.1e-49", "+0.0001E-46"] {
+            let value = decimal(spelling);
+            let canonical = value.canonical().unwrap();
+            assert_eq!(canonical.as_str(), "1e-50");
+            assert_eq!(value.cmp_numeric(&canonical).unwrap(), Ordering::Equal);
+        }
+        for spelling in ["-0", "0e999999", "+000.000"] {
+            assert_eq!(decimal(spelling).canonical().unwrap().as_str(), "0");
+        }
+        assert_eq!(
+            decimal("-0012.300").canonical().unwrap().as_str(),
+            "-123e-1"
+        );
     }
 
     #[test]

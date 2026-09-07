@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Replayable hypothesis evaluation v1",
+  "description": "Private-only full research record. Shape validation is not numerical validation: the toolkit reader must verify plan coverage, exact dependency bindings and payload/score replay.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "semantics",
+    "frozen",
+    "inventory",
+    "selected_observations",
+    "score",
+    "producer_toolkit_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "semantics": {
+      "const": "replayable-hypothesis-evaluation-v1"
+    },
+    "frozen": {
+      "type": "object"
+    },
+    "inventory": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "selected_observations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "metadata_digest",
+          "payload"
+        ],
+        "properties": {
+          "metadata_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "payload": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "score": {
+      "type": "object",
+      "required": [
+        "semantics",
+        "specification_digest",
+        "partition",
+        "analysis_precision_bits",
+        "verdict",
+        "complete",
+        "cases"
+      ]
+    },
+    "producer_toolkit_version": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

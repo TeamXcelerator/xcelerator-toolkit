@@ -27,6 +27,7 @@ mod governance;
 mod governance_records;
 mod large_corpus_acceptance;
 mod live_github_acceptance;
+mod local_shard;
 mod managed_publication;
 mod materialization;
 mod output_validation;
@@ -40,8 +41,10 @@ mod publication_orchestrator;
 mod publication_recovery;
 mod publication_staging;
 mod publisher;
+mod registration;
 mod registry;
 mod remote_reader;
+mod research_artifacts;
 mod rollover;
 mod semantic_api;
 mod semantic_resolver;
@@ -67,6 +70,7 @@ pub use governance::*;
 pub use governance_records::*;
 pub use large_corpus_acceptance::*;
 pub use live_github_acceptance::*;
+pub use local_shard::*;
 pub use managed_publication::*;
 pub use materialization::*;
 pub use output_validation::*;
@@ -80,8 +84,10 @@ pub use publication_orchestrator::*;
 pub use publication_recovery::*;
 pub use publication_staging::*;
 pub use publisher::*;
+pub use registration::*;
 pub use registry::*;
 pub use remote_reader::*;
+pub use research_artifacts::*;
 pub use rollover::*;
 pub use semantic_api::*;
 pub use semantic_resolver::*;
@@ -2695,6 +2701,32 @@ impl CacheResolver {
                     encoded,
                     transport,
                 }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve exact published dependency metadata without reading or fetching
+    /// payload objects. Reverify the canonical identity even when a store says
+    /// it found a matching candidate.
+    pub fn resolve_dependency_identity_manifest(
+        &self,
+        identity: &crate::PayloadDependencyIdentity,
+        policy: &CachePolicy,
+    ) -> Result<Option<(String, ArtifactManifest)>, CacheError> {
+        identity.validate()?;
+        for layer in &self.layers {
+            for manifest in layer.store.identity_candidates(identity)? {
+                if !policy.accepts(&manifest) {
+                    continue;
+                }
+                if !manifest_matches_dependency_identity(&manifest, identity)? {
+                    return Err(CacheError::InvalidManifest(format!(
+                        "cache layer {} returned a candidate that does not match dependency identity {}/{}",
+                        layer.store.name(), identity.artifact_family, identity.semantic_digest.0
+                    )));
+                }
+                return Ok(Some((layer.store.name().to_owned(), manifest)));
             }
         }
         Ok(None)

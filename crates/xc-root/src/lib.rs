@@ -371,6 +371,23 @@ pub fn safeguarded_newton_f64_controlled(
     let mut upper = bracket.upper;
     let mut f_lower = checked_evaluate(function, lower, &mut function_evaluations)?;
     let f_upper = checked_evaluate(function, upper, &mut function_evaluations)?;
+    if f_lower == 0.0 || f_upper == 0.0 {
+        let endpoint = if f_lower == 0.0 { lower } else { upper };
+        return Ok(RootApproximationF64 {
+            midpoint: endpoint,
+            bracket: RootBracketF64 {
+                lower: endpoint,
+                upper: endpoint,
+            },
+            residual: 0.0,
+            derivative_magnitude: None,
+            iterations: 0,
+            function_evaluations,
+            derivative_evaluations: 0,
+            status: RootApproximationStatus::Refined,
+            method: "safeguarded_newton_f64".into(),
+        });
+    }
     if f_lower.is_sign_positive() == f_upper.is_sign_positive() {
         return Err(RootError::NoBracket(
             "safeguarded Newton requires opposite endpoint signs".to_owned(),
@@ -381,7 +398,7 @@ pub fn safeguarded_newton_f64_controlled(
         check_cancellation(cancellation)?;
         let fx = checked_evaluate(function, x, &mut function_evaluations)?;
         if fx.abs() <= stopping.residual_tolerance || stopping.x_converged(lower, upper, x) {
-            let derivative = function.derivative(x).ok();
+            let derivative = function.derivative(x).ok().filter(|v| v.is_finite());
             derivative_evaluations += usize::from(derivative.is_some());
             return Ok(RootApproximationF64 {
                 midpoint: x,
@@ -758,6 +775,24 @@ fn hp_same_nonzero_sign(left: &rug::Float, right: &rug::Float) -> bool {
 }
 
 #[cfg(feature = "hp")]
+fn checked_hp_evaluate(
+    function: &dyn RealFunctionHp,
+    x: &rug::Float,
+    bits: u32,
+) -> Result<rug::Float, RootError> {
+    if !x.is_finite() {
+        return Err(RootError::Evaluation("nonfinite HP root argument".into()));
+    }
+    let value = function.evaluate(x, bits)?;
+    if !value.is_finite() {
+        return Err(RootError::Evaluation(
+            "nonfinite HP root function value".into(),
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "hp")]
 pub fn bisect_hp(
     function: &dyn RealFunctionHp,
     lower: &rug::Float,
@@ -787,7 +822,11 @@ pub fn bisect_hp_controlled(
     use rug::Float;
     check_cancellation(cancellation)?;
     stopping.validate()?;
-    if precision_bits < 32 || lower >= upper {
+    if !(32..=1_000_000).contains(&precision_bits)
+        || !lower.is_finite()
+        || !upper.is_finite()
+        || lower >= upper
+    {
         return Err(RootError::InvalidConfiguration(
             "HP bisection requires precision >= 32 and lower < upper".to_owned(),
         ));
@@ -797,9 +836,14 @@ pub fn bisect_hp_controlled(
     let mut function_evaluations = 0usize;
     let mut lower = Float::with_val(precision_bits, lower);
     let mut upper = Float::with_val(precision_bits, upper);
-    let mut f_lower = function.evaluate(&lower, precision_bits)?;
+    if lower >= upper {
+        return Err(RootError::InvalidConfiguration(
+            "HP bracket collapsed at working precision".into(),
+        ));
+    }
+    let mut f_lower = checked_hp_evaluate(function, &lower, precision_bits)?;
     function_evaluations += 1;
-    let f_upper = function.evaluate(&upper, precision_bits)?;
+    let f_upper = checked_hp_evaluate(function, &upper, precision_bits)?;
     function_evaluations += 1;
     if f_lower == 0 {
         return Ok(RootApproximationHp {
@@ -842,7 +886,7 @@ pub fn bisect_hp_controlled(
         let mut midpoint = lower.clone();
         midpoint += &upper;
         midpoint /= 2;
-        let f_midpoint = function.evaluate(&midpoint, precision_bits)?;
+        let f_midpoint = checked_hp_evaluate(function, &midpoint, precision_bits)?;
         function_evaluations += 1;
         let mut residual = f_midpoint.clone();
         residual.abs_mut();
@@ -850,7 +894,10 @@ pub fn bisect_hp_controlled(
         width -= &lower;
         width.abs_mut();
         if residual <= residual_tolerance || width <= x_tolerance {
-            let derivative = function.derivative(&midpoint, precision_bits).ok();
+            let derivative = function
+                .derivative(&midpoint, precision_bits)
+                .ok()
+                .filter(|v| v.is_finite());
             let derivative_magnitude = derivative.as_ref().map(|value| {
                 let mut magnitude = value.clone();
                 magnitude.abs_mut();
@@ -916,7 +963,14 @@ pub fn safeguarded_newton_hp_controlled(
     use rug::Float;
     check_cancellation(cancellation)?;
     stopping.validate()?;
-    if precision_bits < 32 || lower >= upper || initial < lower || initial > upper {
+    if !(32..=1_000_000).contains(&precision_bits)
+        || !lower.is_finite()
+        || !upper.is_finite()
+        || !initial.is_finite()
+        || lower >= upper
+        || initial < lower
+        || initial > upper
+    {
         return Err(RootError::InvalidConfiguration(
             "HP safeguarded Newton requires precision >= 32 and an initial point inside lower < upper"
                 .to_owned(),
@@ -926,13 +980,34 @@ pub fn safeguarded_newton_hp_controlled(
     let residual_tolerance = parse_hp_decimal(&stopping.residual_tolerance, precision_bits)?;
     let mut lower = Float::with_val(precision_bits, lower);
     let mut upper = Float::with_val(precision_bits, upper);
+    if lower >= upper {
+        return Err(RootError::InvalidConfiguration(
+            "HP bracket collapsed at working precision".into(),
+        ));
+    }
     let mut x = Float::with_val(precision_bits, initial);
     let mut function_evaluations = 0usize;
     let mut derivative_evaluations = 0usize;
-    let mut f_lower = function.evaluate(&lower, precision_bits)?;
+    let mut f_lower = checked_hp_evaluate(function, &lower, precision_bits)?;
     function_evaluations += 1;
-    let f_upper = function.evaluate(&upper, precision_bits)?;
+    let f_upper = checked_hp_evaluate(function, &upper, precision_bits)?;
     function_evaluations += 1;
+    if f_lower.is_zero() || f_upper.is_zero() {
+        let endpoint = if f_lower.is_zero() { &lower } else { &upper };
+        return Ok(RootApproximationHp {
+            midpoint: hp_string(endpoint, precision_bits),
+            lower: hp_string(endpoint, precision_bits),
+            upper: hp_string(endpoint, precision_bits),
+            residual: "0".into(),
+            derivative_magnitude: None,
+            precision_bits,
+            iterations: 0,
+            function_evaluations,
+            derivative_evaluations: 0,
+            status: RootApproximationStatus::Refined,
+            method: "safeguarded_newton_hp".into(),
+        });
+    }
     if hp_same_nonzero_sign(&f_lower, &f_upper) {
         return Err(RootError::NoBracket(
             "HP safeguarded Newton endpoint signs agree".to_owned(),
@@ -941,7 +1016,7 @@ pub fn safeguarded_newton_hp_controlled(
 
     for iteration in 1..=stopping.maximum_iterations {
         check_cancellation(cancellation)?;
-        let fx = function.evaluate(&x, precision_bits)?;
+        let fx = checked_hp_evaluate(function, &x, precision_bits)?;
         function_evaluations += 1;
         let mut residual = fx.clone();
         residual.abs_mut();
@@ -949,7 +1024,10 @@ pub fn safeguarded_newton_hp_controlled(
         width -= &lower;
         width.abs_mut();
         if residual <= residual_tolerance || width <= x_tolerance {
-            let derivative = function.derivative(&x, precision_bits).ok();
+            let derivative = function
+                .derivative(&x, precision_bits)
+                .ok()
+                .filter(|v| v.is_finite());
             derivative_evaluations += usize::from(derivative.is_some());
             let derivative_magnitude = derivative.as_ref().map(|value| {
                 let mut magnitude = value.clone();
@@ -979,13 +1057,13 @@ pub fn safeguarded_newton_hp_controlled(
         let derivative = function.derivative(&x, precision_bits)?;
         derivative_evaluations += 1;
         let mut candidate = x.clone();
-        let valid_derivative = derivative != 0;
+        let valid_derivative = derivative.is_finite() && derivative != 0;
         if valid_derivative {
             let mut step = fx;
             step /= derivative;
             candidate -= step;
         }
-        if !valid_derivative || candidate <= lower || candidate >= upper {
+        if !valid_derivative || !candidate.is_finite() || candidate <= lower || candidate >= upper {
             candidate = lower.clone();
             candidate += &upper;
             candidate /= 2;
@@ -1393,6 +1471,68 @@ mod hp_tests {
             value *= 2;
             Ok(value)
         }
+    }
+
+    struct LinearWithNanDerivative;
+    impl RealFunctionHp for LinearWithNanDerivative {
+        fn evaluate(&self, x: &Float, precision_bits: u32) -> Result<Float, RootError> {
+            let mut y = Float::with_val(precision_bits, x);
+            y -= 1;
+            Ok(y)
+        }
+        fn derivative(&self, _: &Float, precision_bits: u32) -> Result<Float, RootError> {
+            Ok(Float::with_val(precision_bits, rug::float::Special::Nan))
+        }
+    }
+    #[test]
+    fn hp_refinement_checks_endpoints_nonfinite_and_precision_collapse() {
+        let p = 128;
+        let f = |x| Float::with_val(p, x);
+        let stop = RootStoppingHp {
+            x_tolerance: xc_core::DecimalLiteral::new("1e-20").unwrap(),
+            residual_tolerance: xc_core::DecimalLiteral::new("1e-20").unwrap(),
+            maximum_iterations: 100,
+        };
+        for (a, b) in [(1, 2), (0, 1)] {
+            let result =
+                safeguarded_newton_hp(&LinearWithNanDerivative, &f(a), &f(b), &f(a), p, &stop)
+                    .unwrap();
+            assert_eq!(result.iterations, 0);
+            assert_eq!(result.lower, result.upper);
+        }
+        let result =
+            safeguarded_newton_hp(&LinearWithNanDerivative, &f(0), &f(2), &f(0), p, &stop).unwrap();
+        assert_eq!(result.status, RootApproximationStatus::Refined);
+        assert!(result.derivative_magnitude.is_none());
+        let nan = Float::with_val(p, rug::float::Special::Nan);
+        assert!(bisect_hp(&LinearWithNanDerivative, &nan, &f(2), p, &stop).is_err());
+        assert!(
+            safeguarded_newton_hp(&LinearWithNanDerivative, &f(0), &f(2), &nan, p, &stop).is_err()
+        );
+        let mut b = f(1);
+        b.next_up();
+        assert!(bisect_hp(&LinearWithNanDerivative, &f(1), &b, 32, &stop).is_err());
+        assert!(
+            safeguarded_newton_hp(&LinearWithNanDerivative, &f(1), &b, &f(1), 32, &stop).is_err()
+        );
+    }
+    struct NanFunction;
+    impl RealFunctionHp for NanFunction {
+        fn evaluate(&self, _: &Float, p: u32) -> Result<Float, RootError> {
+            Ok(Float::with_val(p, rug::float::Special::Nan))
+        }
+    }
+    #[test]
+    fn hp_refinement_rejects_nonfinite_function_values() {
+        let stop = RootStoppingHp {
+            x_tolerance: xc_core::DecimalLiteral::new("1e-20").unwrap(),
+            residual_tolerance: xc_core::DecimalLiteral::new("1e-20").unwrap(),
+            maximum_iterations: 100,
+        };
+        let a = Float::with_val(128, 0);
+        let b = Float::with_val(128, 2);
+        assert!(bisect_hp(&NanFunction, &a, &b, 128, &stop).is_err());
+        assert!(safeguarded_newton_hp(&NanFunction, &a, &b, &a, 128, &stop).is_err());
     }
 
     #[test]

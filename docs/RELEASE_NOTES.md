@@ -1,5 +1,152 @@
 # Release notes
 
+## 0.15.0
+
+- Fixed managed publication of closures containing local, private and public
+  aliases of the same canonical artifact. Equivalent aliases publish once per
+  destination; remapped dependencies are sorted and deduplicated, while distinct
+  historical closures, assurance requirements and evidence are retained. Invalid
+  transport bindings remain errors. Numerical payloads and semantic versions
+  are unchanged; existing caches and published artifacts remain usable.
+- Fixed reuse of managed research receipts and evaluations from published shards
+  and locally retained shard copies. Validation now checks the authenticated
+  canonical dependency graph, including exact source content and quality,
+  without reading source payloads. Existing receipt identities and bytes remain
+  reusable; no artifact repair or numerical rerun is required for this reader fix.
+- Added an offline retained-response repair path and explicit additive publisher.
+  It rebuilds affected root velocities from original eigenpairs and stored L2
+  tangents, updates embedded capture measurements and their dependency digests,
+  and preserves failed outcomes and original visibility. No claim rerun or
+  matrix solve is required when the retained inputs are available. See the
+  [repair guide](CCM_RESPONSE_REPAIR.md).
+
+- Prime-power and cutoff-flow root velocities now use the L2 state and tangent
+  directly, avoiding catastrophic cancellation from a tiny CCM boundary sum.
+  New response semantics preserve historical artifacts and require corrected
+  children and receipts without replacing their source matrices or roots. See
+  [numerical compatibility](NUMERICAL_COMPATIBILITY.md#root-response-normalization).
+- Added `RetainedCcmRun` for applications that save a primary claim result once
+  and attempt supplemental diagnostics independently. Failed measurements leave
+  the retained source available, while each successful measurement supplies its
+  exact source manifests to the shared receipt runner.
+- Fixed retained capture of newly computed artifacts when a ZIP cache uses
+  encoded publication staging. Selected diagnostic payloads now reach the
+  receipt observer while dependency transports keep their encoded reuse path.
+  Existing numerical artifact identities and bytes are unchanged; reruns can
+  add a complete receipt while retaining an earlier incomplete record.
+- Eigenfunction profiles can now be retained without a target specification.
+  Their identities and payload bytes agree with the existing distance route.
+  Natural/adaptive primary states are preserved and cannot silently become
+  even-state response or checkpoint sources.
+
+The v0.15.0 tag is updated with the managed capture and evaluation APIs described
+below. Consumers of an earlier v0.15.0 checkout should refresh the Git dependency
+and lockfile. Retain the resolved Git commit for reproducible experiments.
+
+This release adds source-bound research evidence, corrected numerical routes
+and more precise diagnostic persistence for reproducible finite experiments.
+
+- Typed observables and cohort compatibility, seven explicit resolution axes,
+  immutable hypothesis specifications, directed-MPFR finite-domain scoring,
+  signed correction/stabilization helpers, capture completeness receipts, and
+  replayable evaluation packets with embedded selected observation bytes.
+- Managed `research_capture_receipt` and `research_hypothesis_evaluation`
+  artifacts, exact source dependencies, private-only publication, and warm
+  identity/replay validation. The capture runner records every requested group,
+  continues independent work after returned failures, and can include an
+  explicitly budgeted reduction check in the same receipt.
+- Retained-source prefix ladders, inverse moments, normalized checkpoint
+  vectors, overlaps, and post-serialization export checks; budgeted stable
+  reduction reports now support managed caching and exact parent dependencies.
+- Prefix v2 adds two-mode gap and corrected eigenvalue estimates, innovation
+  cancellation measurements, and typed cancellation observables. The gap model
+  requires a dominant second inverse mode; two moments alone do not determine
+  the spectral gap. See [convergence and precision guidance](PREFIX_CONVERGENCE.md).
+- A bounded offline shard reader verifies canonical metadata, active index
+  bindings, ordered parts and decoded payloads. The retained-prefix example
+  accepts canonical manifest paths and records exact nesting comparisons with
+  explicitly supplied smaller matrices, preserving both source identities.
+- Extended prefix policies retain the third inverse moment, its scalar
+  consistency checks and stronger moment endpoints, plus a two-mode T2/T3 fit
+  with an independent T1 closure residual. New Ultra plans request these data.
+  Cancellation capture can be omitted explicitly. The model does not identify
+  an arbitrary spectrum from three moments.
+- Stable Householder sector reductions and corrected interleaved-pivot selected
+  vectors use new cache identities. Historical solver APIs remain available.
+- HP roots reject nonfinite evaluations and collapsed working-precision brackets;
+  safeguarded Newton accepts exact endpoint roots and falls back on unusable derivatives.
+- Quadrature readers check finite ordered interior nodes, positive weights, and
+  higher moments. An explicit budgeted verifier checks every Legendre root and
+  derivative-weight identity. Cached LU factors receive three deterministic
+  solve-backward-error probes.
+- Prolate managed spectra key the actual finite input and its precision. Nearby
+  cutoffs cannot alias, nonintegral inputs participate in RequireReuse, and trial
+  subspace forms reject inconsistent even grids.
+- Primary profile/distance exports round-trip at declared precision. Resolution,
+  residual, and decomposition children bind the actual retained parents and have
+  new identities. Cold/backfill/refresh/reuse returns agree exactly in regression
+  coverage; incomplete refinement is returned explicitly.
+- 4Q-only evaluations are deferred until needed. Existing allocation, shared
+  evaluation, and linear-storage solver improvements are included.
+- Public/private evidence catalogs and shared reduction payload schema are
+  synchronized. Source-only publication eligibility is checked at production,
+  routing, staging, and remote read boundaries. Target-derived kinds stay private.
+
+Capture now accepts validated-or-stronger source grades, retains secret-screened
+error details, and groups attempts by plan digest. Prefix working precision,
+pivot margin and export policy can be overridden in the resolved plan.
+The prefix builders enable capture in any order; known precision conflicts
+are rejected during plan validation, with explicit source-bound validation
+available when precision is inherited.
+Equivalent tolerance spellings share identities. A scheduled stabilization API
+retains realized quadrature identities when order grows with N. Standalone
+prolate zip caching supports exact noninteger inputs as well as the historical
+exact-integer compatibility route.
+
+Retained reduction checks parallelize independent rows and reuse MPFR product
+storage. Prefix factorization, independent innovation solves and moment accumulation
+run in separate phases. Gram cross terms run in indexed parallel blocks with reusable
+MPFR leaves while preserving the fixed pairwise tree. Long factor inner sums
+use parallel blocks when needed; sufficiently large multi-worker factorizations
+also distribute independent entries within each column, preserving every
+entry's arithmetic and ordered pivot stops. Independent innovation columns run on separate workers
+with serial inner sums. No fused multiply-add replaces separately rounded
+operations.
+Release qualification now includes successful checkpoint eigenstate exports,
+per-eigenvalue errors, a dense rational reflector fixture with distinct known
+eigenvalues, and separate prefix, Householder, assessment and QR timings.
+The retained CCM precision comparison records signed, absolute and relative
+differences and empirical decimal agreement at every common prefix.
+
+The cutoff-free zero-mode endpoint correction can change certified ground
+parity. Schema-2 sector-gap certificates must be recomputed before use as
+current evidence. The schema-3 verifier reconstructs the interval operator and
+replays its interval certificates; midpoint discovery guides are checked for
+valid structure and retained as provenance, without replaying the discovery
+eigensolve. New assembly and certificate semantics and prefix/certificate
+reader floors use 0.15.0. Corrected development drafts carrying 0.14.4 remain
+distinct historical identities and are recognized by the impact inventory.
+
+Upgrading an existing campaign requests new sector and distance chains; old
+objects remain available for deliberate historical replay. The impact tool
+now counts directly changed identities and their descendants separately from
+the known certificate defect, and reports missing rollover repositories.
+Use its per-kind counts with measured dimension/precision costs before sizing
+a campaign; root/Tau/eigenstate kind identities are not broadly invalidated.
+Extended prefix policies use v3 identities so old reports cannot silently omit
+new measurements. Fresh Ultra plans request the full policy; old serialized
+plans preserve their requests. Two-moment/cancellation-enabled v2 children
+remain byte-reusable. Computation must be allowed to backfill new children.
+Existing v1 scalar observations remain readable. No new artifact kind or
+public/private shard schema is needed for this extension.
+
+See [numerical compatibility](NUMERICAL_COMPATIBILITY.md),
+[capture integration](CAPTURE_LEVELS.md) and [release validation](VALIDATION.md).
+Applications adopt `execute_with_receipt` to run primary and retained phases
+with automatic managed outcome recording. Reduction and full quadrature checks
+remain explicitly budgeted requests.
+
+
 ## 0.14.3
 
 Version 0.14.3 adds backward-compatible rollover for registry-managed cache

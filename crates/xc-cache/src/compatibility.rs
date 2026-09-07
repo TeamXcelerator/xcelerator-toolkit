@@ -111,11 +111,14 @@ pub fn artifact_compatibility_policy(
         "ccm_spectral_window" => "0.13.0",
         "ccm_post_discovery_comparison" => "0.13.0",
         "ccm_convergence_diagnostics" => "0.13.0",
+        "ccm_prefix_analysis" => "0.15.0",
+        "ccm_retained_reduction_check" => "0.15.0",
+        "research_capture_receipt" | "research_hypothesis_evaluation" => "0.15.0",
         "ccm_root_conditioning_analysis" => "0.14.1",
         "ccm_deviation_decomposition" => "0.14.1",
         "ccm_prime_power_response_analysis" => "0.14.1",
         "ccm_u_flow_response_analysis" => "0.14.1",
-        "ccm_sector_gap_certificate" => "0.14.1",
+        "ccm_sector_gap_certificate" => "0.15.0",
         "ccm_cross_check_record" => "0.13.0",
         "ccm_validation_record" => "0.13.0",
         "ccm_certificate_bundle" => "0.13.0",
@@ -140,6 +143,21 @@ pub fn artifact_compatibility_policy(
             | "ccm_sector_gap_certificate"
     ) {
         policy.minimum_reader_version = ToolkitVersion::parse("0.14.1")?;
+    }
+    if matches!(
+        artifact_kind,
+        "ccm_prefix_analysis" | "ccm_sector_gap_certificate"
+    ) {
+        policy.minimum_reader_version = ToolkitVersion::parse("0.15.0")?;
+    }
+    if artifact_kind == "ccm_retained_reduction_check" {
+        policy.minimum_reader_version = ToolkitVersion::parse("0.15.0")?;
+    }
+    if matches!(
+        artifact_kind,
+        "research_capture_receipt" | "research_hypothesis_evaluation"
+    ) {
+        policy.minimum_reader_version = ToolkitVersion::parse("0.15.0")?;
     }
     Ok(policy)
 }
@@ -306,11 +324,11 @@ mod tests {
             artifact_compatibility_policy("ccm-evidence", "ccm_sector_gap_certificate").unwrap();
         assert_eq!(
             sector_gap_certificate.minimum_producer_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
+            ToolkitVersion::parse("0.15.0").unwrap()
         );
         assert_eq!(
             sector_gap_certificate.minimum_reader_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
+            ToolkitVersion::parse("0.15.0").unwrap()
         );
     }
 

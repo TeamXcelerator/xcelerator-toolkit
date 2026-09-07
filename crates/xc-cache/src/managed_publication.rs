@@ -1885,6 +1885,24 @@ fn remap_destination_drafts_with_existing(
     let mut source_identities = BTreeMap::<Identity, usize>::new();
     for (index, draft) in drafts.iter().enumerate() {
         draft.manifest.validate()?;
+        draft.encoding.validate()?;
+        if draft.family != draft.manifest.artifact_family
+            || draft.encoding.canonical_payload_digest != draft.manifest.payload_digest
+            || !draft
+                .manifest
+                .transport_digests
+                .contains(&draft.encoding.digest()?)
+        {
+            return Err(CacheError::InvalidManifest(
+                "managed publication draft family or transport binding disagrees with its manifest"
+                    .to_owned(),
+            ));
+        }
+        crate::ArtifactProductionAssessment {
+            achieved_assurance: draft.achieved_assurance,
+            evidence_digests: draft.assurance_evidence_digests.clone(),
+        }
+        .validate()?;
         let mut manifests = vec![draft.manifest.clone()];
         let neutral = destination_neutral_manifest(draft)?;
         if neutral != draft.manifest {
@@ -1897,13 +1915,23 @@ fn remap_destination_drafts_with_existing(
                 manifest.digest()?,
                 manifest.payload_digest.clone(),
             );
-            if let Some(previous) = source_identities.insert(identity, index) {
-                if previous != index {
+            if let Some(previous) = source_identities.get(&identity) {
+                // A local draft and a reused public/private manifest can
+                // name the very same destination-neutral artifact. Keep all
+                // exact aliases available to the closure walk. Equivalence
+                // requires the entire neutral manifest and bound transport,
+                // never merely the semantic key or payload.json bytes.
+                if destination_neutral_manifest(&drafts[*previous])?
+                    != destination_neutral_manifest(draft)?
+                    || drafts[*previous].encoding != draft.encoding
+                {
                     return Err(CacheError::InvalidManifest(
-                        "managed publication closure contains an ambiguous exact or destination-neutral artifact identity"
+                        "managed publication closure contains conflicting artifact aliases"
                             .to_owned(),
                     ));
                 }
+            } else {
+                source_identities.insert(identity, index);
             }
         }
     }
@@ -1951,6 +1979,24 @@ fn remap_destination_drafts_with_existing(
             }
 
             let mut destination_draft = draft.clone();
+            // Different source identities can become the same destination
+            // identity, and manifest hashes can change their relative order.
+            // Canonicalize the complete remapped edge set before hashing it.
+            dependencies.sort_by(|left, right| {
+                (
+                    &left.artifact_family,
+                    &left.semantic_digest,
+                    &left.manifest_digest,
+                    &left.payload_digest,
+                )
+                    .cmp(&(
+                        &right.artifact_family,
+                        &right.semantic_digest,
+                        &right.manifest_digest,
+                        &right.payload_digest,
+                    ))
+            });
+            dependencies.dedup();
             destination_draft.manifest.canonical_payload.dependencies = dependencies;
             destination_draft.manifest.payload_digest =
                 destination_draft.manifest.canonical_payload.digest()?;
@@ -1971,10 +2017,51 @@ fn remap_destination_drafts_with_existing(
         }
     }
 
-    let remapped = remapped
-        .into_iter()
-        .map(|draft| draft.expect("all destination drafts were remapped"))
-        .collect::<Vec<_>>();
+    // Coalesce only after recursive remapping: children with different source
+    // edges may now have identical destination manifests. Publish each once,
+    // retaining every evidence digest and the strongest requested assurance.
+    let mut unique = BTreeMap::<Identity, CanonicalProductionDraft>::new();
+    for draft in remapped.into_iter().flatten() {
+        let identity = (
+            draft.family.clone(),
+            draft.manifest.semantic_digest.clone(),
+            draft.manifest.digest()?,
+            draft.manifest.payload_digest.clone(),
+        );
+        if let Some(existing) = unique.get_mut(&identity) {
+            if existing.manifest != draft.manifest || existing.encoding != draft.encoding {
+                return Err(CacheError::InvalidManifest(
+                    "managed publication closure contains conflicting destination aliases"
+                        .to_owned(),
+                ));
+            }
+            let achieved = existing.achieved_assurance.max(draft.achieved_assurance);
+            let required = existing.required_assurance.max(draft.required_assurance);
+            let mut evidence = existing.assurance_evidence_digests.clone();
+            evidence.extend(draft.assurance_evidence_digests.iter().cloned());
+            evidence.sort();
+            evidence.dedup();
+            // A directly observed artifact retains its live-index role even
+            // when a historical closure alias was encountered first.
+            let source_order = |d: &CanonicalProductionDraft| {
+                (
+                    d.source_operation == "cache.dependency.closure",
+                    d.source_operation.clone(),
+                    d.source_logical_key.clone(),
+                    d.source_manifest_digest.clone(),
+                )
+            };
+            if source_order(&draft) < source_order(existing) {
+                *existing = draft;
+            }
+            existing.achieved_assurance = achieved;
+            existing.required_assurance = required;
+            existing.assurance_evidence_digests = evidence;
+        } else {
+            unique.insert(identity, draft);
+        }
+    }
+    let remapped = unique.into_values().collect::<Vec<_>>();
     let identities = remapped
         .iter()
         .map(|draft| {
@@ -3220,8 +3307,8 @@ fn execute_managed_drafts_on_github_inner(
         let destination_drafts: Vec<CanonicalProductionDraft> = drafts
             .iter()
             .filter(|draft| {
-                crate::artifact_kind_admitted_to_destination(
-                    draft.manifest.semantic_key.artifact_kind.as_str(),
+                crate::artifact_semantics_admitted_to_destination(
+                    &draft.manifest.semantic_key,
                     destination,
                 )
             })
@@ -3426,6 +3513,11 @@ fn execute_managed_drafts_on_github_inner(
 
 #[cfg(test)]
 mod tests {
+    mod alias_tests {
+        use super::*;
+        include!("managed_publication_alias_tests.rs");
+    }
+
     /// Publishing code must resolve its commit identity through
     /// [`publication_author_name`] and [`publication_author_email`], never a
     /// literal address. A hardcoded identity silently produces commits that

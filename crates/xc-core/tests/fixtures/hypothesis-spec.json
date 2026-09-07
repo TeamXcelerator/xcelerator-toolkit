@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "model_id": "synthetic-finite-correction",
+  "model_version": "1",
+  "evaluator_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "observable": {
+    "definition_id": "synthetic-correction",
+    "definition_version": 1,
+    "target": "finite",
+    "transform": {
+      "kind": "identity"
+    },
+    "normalization": "value at one",
+    "metric": "declared weighted integral",
+    "target_definition": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "derivative_coordinate": null,
+    "root": null,
+    "prolate": null
+  },
+  "parameters": {
+    "leading": {
+      "value": "0.125",
+      "origin": {
+        "origin": "theory_fixed",
+        "justification": "synthetic fixture definition"
+      }
+    }
+  },
+  "regime": "synthetic finite test, no asymptotic claim",
+  "selection_policy": "one required record per declared case",
+  "exposure_record": "synthetic development data; no prospective claim",
+  "prior_specification": null,
+  "exclusions": {
+    "excluded": "explicit development exclusion"
+  },
+  "cases": {
+    "dev": {
+      "family_id": "c13",
+      "design": {
+        "coordinates": {
+          "c=lambda^2": "13"
+        },
+        "n_modes": 4,
+        "dimension": 9,
+        "parity": "natural",
+        "basis": "orthonormal Fourier -N..N",
+        "method": "synthetic-exact-input",
+        "quadrature_identity": "not-applicable-synthetic",
+        "source_precision_bits": 256,
+        "exact_input_identity": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "partition": "development",
+      "prediction": "0.125",
+      "absolute_tolerance": "0.0001",
+      "prediction_sign": null
+    }
+  },
+  "scoring_semantics": "frozen-finite-domain-absolute-envelope-v1"
+}

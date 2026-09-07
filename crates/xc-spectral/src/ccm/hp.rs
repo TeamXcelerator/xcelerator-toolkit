@@ -11,7 +11,7 @@
 
 use anyhow::{bail, Result};
 use rayon::prelude::*;
-use rug::{ops::Pow, Float};
+use rug::{ops::Pow, Assign, Float};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -33,6 +33,12 @@ use xc_operator::{
 use xc_zeta::zeros::ReferenceZeroDatasetIdentity;
 
 use super::{prime_powers_up_to, window::ZeroTarget, CcmParams, CcmResult};
+
+/// Run once, then acquire supplemental measurements independently.
+pub mod capture_run;
+
+/// Rebuild response scalars from authenticated retained states and tangents.
+pub mod response_repair;
 
 // Conservative crossovers from the ignored release-mode benchmark below.
 // Decimal conversion becomes worthwhile at fewer entries as MPFR precision
@@ -3337,6 +3343,53 @@ fn decode_weil_eigenpair(
     Ok((eps_n, xi, diagnostics))
 }
 
+// Replay the historical projection and final symmetry averaging entrywise.
+// This removes an O(N^2) temporary MPFR matrix without changing a single
+// projection operation or relaxing the full-Tau dependency comparison.
+fn even_sector_matches_tau(sector: &[Float], tau: &[Float], n: usize, p: u32) -> bool {
+    let Some(full) = n.checked_mul(2).and_then(|x| x.checked_add(1)) else {
+        return false;
+    };
+    let Some(d) = n.checked_add(1) else {
+        return false;
+    };
+    if full.checked_mul(full) != Some(tau.len()) || d.checked_mul(d) != Some(sector.len()) {
+        return false;
+    }
+    let sqrt_two = Float::with_val(p, 2).sqrt();
+    let entry = |i: usize, j: usize| {
+        if i == 0 && j == 0 {
+            return tau[n * full + n].clone();
+        }
+        if i == 0 || j == 0 {
+            let k = i.max(j);
+            let mut v = tau[n * full + n - k].clone();
+            v += &tau[n * full + n + k];
+            v /= &sqrt_two;
+            return v;
+        }
+        let mut v = tau[(n - i) * full + n - j].clone();
+        v += &tau[(n - i) * full + n + j];
+        v += &tau[(n + i) * full + n - j];
+        v += &tau[(n + i) * full + n + j];
+        v /= 2u32;
+        v
+    };
+    for i in 0..d {
+        for j in i..d {
+            let mut expected = entry(i, j);
+            if i != j {
+                expected += entry(j, i);
+                expected /= 2u32;
+            }
+            if sector[i * d + j] != expected || sector[j * d + i] != expected {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn build_even_sector_matrix(tau: &[Float], n_modes: usize, prec: u32) -> Vec<Float> {
     let full_dim = 2 * n_modes + 1;
     let even_dim = n_modes + 1;
@@ -3536,8 +3589,7 @@ fn resolve_even_sector_matrix_via_cache(
                 ));
             }
             let decoded = parse_hp_vector(&artifact.entries, cfg.precision_bits)?;
-            let expected = build_even_sector_matrix(tau, params.n_modes, cfg.precision_bits);
-            if decoded != expected {
+            if !even_sector_matches_tau(&decoded, tau, params.n_modes, cfg.precision_bits) {
                 return Err(CacheError::InvalidManifest(
                     "CCM even-sector matrix is inconsistent with its full tau dependency"
                         .to_owned(),
@@ -3778,7 +3830,7 @@ fn resolve_sector_tridiagonal_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_sector_tridiagonal".to_owned(),
-        mathematical_semantics_version: "ccm-parity-tridiagonal-v0.13.0-v3".to_owned(),
+        mathematical_semantics_version: "ccm-parity-tridiagonal-v0.15.0-v1".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -3790,9 +3842,7 @@ fn resolve_sector_tridiagonal_via_cache(
         target: Some("symmetric_tridiagonal_reduction".to_owned()),
         subspace: Some(parity.as_str().to_owned()),
         source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some(
-            "dense_householder_with_consistent_signed_off_diagonal_and_reusable_q_v2".to_owned(),
-        ),
+        algorithm_semantics: Some("householder-scaled-opposite-sign-v1".to_owned()),
     };
     let logical_key = format!(
         "ccm/sector-tridiagonal/{}/{}/{}/{}",
@@ -3831,8 +3881,12 @@ fn resolve_sector_tridiagonal_via_cache(
         &request,
         || {
             let (diagonal, off_diagonal, basis) =
-                xc_numerics::eigen::householder_tridiag_hp(matrix, dimension, cfg.precision_bits)
-                    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                xc_numerics::eigen::householder_tridiag_hp_stable(
+                    matrix,
+                    dimension,
+                    cfg.precision_bits,
+                )
+                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
             computed_transform.replace(Some(SectorTransformHp { basis }));
             Ok((
                 PortableSectorTridiagonal {
@@ -4008,7 +4062,7 @@ fn resolve_sector_transform_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_sector_transform".to_owned(),
-        mathematical_semantics_version: "ccm-parity-householder-basis-v0.13.0-v2".to_owned(),
+        mathematical_semantics_version: "ccm-parity-householder-basis-v0.15.0-v1".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -4021,7 +4075,7 @@ fn resolve_sector_transform_via_cache(
         target: Some("tridiagonal_to_dense_eigenvector_transform".to_owned()),
         subspace: Some(parity.as_str().to_owned()),
         source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some("dense_householder_q_accumulation".to_owned()),
+        algorithm_semantics: Some("householder-scaled-opposite-sign-v1".to_owned()),
     };
     let logical_key = format!(
         "ccm/sector-transform/{}/{}/{}/{}",
@@ -4061,12 +4115,13 @@ fn resolve_sector_transform_via_cache(
             let basis = if let Some(precomputed) = precomputed {
                 precomputed.basis.clone()
             } else {
-                let (diagonal, off_diagonal, basis) = xc_numerics::eigen::householder_tridiag_hp(
-                    matrix,
-                    dimension,
-                    cfg.precision_bits,
-                )
-                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                let (diagonal, off_diagonal, basis) =
+                    xc_numerics::eigen::householder_tridiag_hp_stable(
+                        matrix,
+                        dimension,
+                        cfg.precision_bits,
+                    )
+                    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
                 if diagonal != tridiagonal.diagonal || off_diagonal != tridiagonal.off_diagonal {
                     return Err(CacheError::InvalidManifest(
                         "CCM Householder basis did not reproduce the cached tridiagonal".to_owned(),
@@ -4630,7 +4685,7 @@ fn compute_sector_spectrum(
                 xc_numerics::eigen::TridiagEigvecOptions {
                     max_steps: cfg.inverse_iter_steps,
                     early_termination: true,
-                    solver: xc_numerics::eigen::TridiagSolver::Banded,
+                    solver: xc_numerics::eigen::TridiagSolver::BandedInterleaved,
                 },
             )?;
             let eigenvector = (0..dimension)
@@ -4821,7 +4876,7 @@ fn resolve_sector_spectrum_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_sector_spectrum".to_owned(),
-        mathematical_semantics_version: "ccm-parity-sector-spectrum-v0.13.0-v3".to_owned(),
+        mathematical_semantics_version: "ccm-parity-sector-spectrum-v0.15.0-v1".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -4839,7 +4894,8 @@ fn resolve_sector_spectrum_via_cache(
         subspace: Some(parity.as_str().to_owned()),
         source_data_identities: BTreeMap::new(),
         algorithm_semantics: Some(
-            "indexed_eigenvalues_plus_banded_tridiagonal_inverse_iteration_and_householder_backtransform_v1".to_owned(),
+            "indexed_eigenvalues_interleaved_pivoted_solve_stable_householder_backtransform_v2"
+                .to_owned(),
         ),
     };
     let logical_key = format!(
@@ -5165,7 +5221,7 @@ fn compute_sector_branch(
     cfg: &HighPrecConfig,
 ) -> Result<CcmSectorSpectrumHp> {
     let (diagonal, off_diagonal, basis) =
-        xc_numerics::eigen::householder_tridiag_hp(matrix, dimension, cfg.precision_bits)?;
+        xc_numerics::eigen::householder_tridiag_hp_stable(matrix, dimension, cfg.precision_bits)?;
     let tridiagonal = SectorTridiagonalHp {
         diagonal,
         off_diagonal,
@@ -5443,7 +5499,7 @@ pub fn analyze_sector_gap_with_options_via_cache(
     xc_numerics::hp_runtime::run_hp(|| analyze_sector_gap_inner(params, cfg, options, Some(cache)))
 }
 
-fn factorization_backward_error(
+fn factorization_probe_backward_error(
     matrix: &[Float],
     factors: &xc_numerics::linalg::LuFactors,
     dimension: usize,
@@ -5467,55 +5523,67 @@ fn factorization_backward_error(
     {
         return None;
     }
-    let rhs: Vec<Float> = (0..dimension)
-        .map(|index| Float::with_val(precision_bits, index + 1))
-        .collect();
-    let solution = xc_numerics::linalg::lu_solve(factors, &rhs, dimension, precision_bits);
-    if solution.iter().any(|value| !value.is_finite()) {
-        return None;
-    }
-    let mut maximum_residual = Float::with_val(precision_bits, 0);
-    let mut matrix_norm = Float::with_val(precision_bits, 0);
-    for row in 0..dimension {
-        let mut value = Float::with_val(precision_bits, 0);
-        let mut row_sum = Float::with_val(precision_bits, 0);
-        for column in 0..dimension {
-            let mut term = matrix[row * dimension + column].clone();
-            row_sum += term.clone().abs();
-            term *= &solution[column];
-            value += term;
+    let mut worst = Float::with_val(precision_bits, 0);
+    // Three deterministic independent probes, O(d^2) each. This is a
+    // solve-backward-error screen, not a full PA=LU certificate.
+    for probe in 0..3 {
+        let rhs: Vec<Float> = (0..dimension)
+            .map(|index| match probe {
+                0 => Float::with_val(precision_bits, index + 1),
+                1 => Float::with_val(precision_bits, if index % 2 == 0 { 1 } else { -1 }),
+                _ => Float::with_val(precision_bits, 1),
+            })
+            .collect();
+        let solution = xc_numerics::linalg::lu_solve(factors, &rhs, dimension, precision_bits);
+        if solution.iter().any(|value| !value.is_finite()) {
+            return None;
         }
-        if row_sum > matrix_norm {
-            matrix_norm = row_sum;
+        let mut maximum_residual = Float::with_val(precision_bits, 0);
+        let mut matrix_norm = Float::with_val(precision_bits, 0);
+        for row in 0..dimension {
+            let mut value = Float::with_val(precision_bits, 0);
+            let mut row_sum = Float::with_val(precision_bits, 0);
+            for column in 0..dimension {
+                let mut term = matrix[row * dimension + column].clone();
+                row_sum += term.clone().abs();
+                term *= &solution[column];
+                value += term;
+            }
+            if row_sum > matrix_norm {
+                matrix_norm = row_sum;
+            }
+            value -= &rhs[row];
+            let residual = value.abs();
+            if residual > maximum_residual {
+                maximum_residual = residual;
+            }
         }
-        value -= &rhs[row];
-        let residual = value.abs();
-        if residual > maximum_residual {
-            maximum_residual = residual;
+        let mut solution_norm = Float::with_val(precision_bits, 0);
+        for value in &solution {
+            let magnitude = value.clone().abs();
+            if magnitude > solution_norm {
+                solution_norm = magnitude;
+            }
+        }
+        let mut rhs_norm = Float::with_val(precision_bits, 0);
+        for value in &rhs {
+            let magnitude = value.clone().abs();
+            if magnitude > rhs_norm {
+                rhs_norm = magnitude;
+            }
+        }
+        let mut scale = matrix_norm;
+        scale *= solution_norm;
+        scale += rhs_norm;
+        if scale.is_zero() || !scale.is_finite() {
+            return None;
+        }
+        maximum_residual /= scale;
+        if maximum_residual > worst {
+            worst = maximum_residual;
         }
     }
-    let mut solution_norm = Float::with_val(precision_bits, 0);
-    for value in &solution {
-        let magnitude = value.clone().abs();
-        if magnitude > solution_norm {
-            solution_norm = magnitude;
-        }
-    }
-    let mut rhs_norm = Float::with_val(precision_bits, 0);
-    for value in &rhs {
-        let magnitude = value.clone().abs();
-        if magnitude > rhs_norm {
-            rhs_norm = magnitude;
-        }
-    }
-    let mut scale = matrix_norm;
-    scale *= solution_norm;
-    scale += rhs_norm;
-    if scale.is_zero() || !scale.is_finite() {
-        return None;
-    }
-    maximum_residual /= scale;
-    Some(maximum_residual)
+    Some(worst)
 }
 
 fn resolve_factorization_via_cache(
@@ -5627,7 +5695,7 @@ fn resolve_factorization_via_cache(
             let tolerance =
                 Float::with_val(cfg.precision_bits, 2).pow(-((cfg.precision_bits / 4) as i32));
             let backward_error =
-                factorization_backward_error(matrix, &factors, dimension, cfg.precision_bits)
+                factorization_probe_backward_error(matrix, &factors, dimension, cfg.precision_bits)
                     .ok_or_else(|| {
                         CacheError::InvalidManifest(
                     "CCM factorization has invalid dimensions, permutation, or finite values"
@@ -5640,7 +5708,7 @@ fn resolve_factorization_via_cache(
             } else {
                 Err(CacheError::InvalidManifest(
                     format!(
-                        "CCM factorization failed its normwise backward-error check: error={}, tolerance={}",
+                        "CCM factorization failed its three-probe normwise solve-backward-error check: error={}, tolerance={}",
                         xc_numerics::fmt::display_hp(&backward_error, 8),
                         xc_numerics::fmt::display_hp(&tolerance, 8)
                     ),
@@ -7761,6 +7829,20 @@ fn resolve_root_range_via_cache(
                         .map_err(|error| anyhow::anyhow!("invalid bundled root seed: {error}"))
                 })
                 .collect::<Result<Vec<_>>>()?;
+            // Dataset labels alone do not authenticate the actual supplied seeds.
+            // Reuse a larger window only for the same values at working precision.
+            let start = first_root_index - 1;
+            if candidate_seeds[start..start + seeds.len()]
+                .iter()
+                .zip(seeds)
+                .any(|(canonical, supplied)| {
+                    canonical != &Float::with_val(cfg.precision_bits, supplied)
+                })
+            {
+                eprintln!("[CCM cache] larger seeded-window reuse declined: supplied values differ from bundled reference seeds at working precision");
+                // Every candidate uses the same bundled values on this window.
+                break;
+            }
             let candidate_semantic = root_range_semantic_key(
                 params,
                 cfg,
@@ -8789,7 +8871,7 @@ fn compute_response_spectral_preparation(
     let even_sector_matrix =
         build_even_sector_matrix(&symmetric_tau, params.n_modes, cfg.precision_bits);
     let even_dimension = params.n_modes + 1;
-    let (diagonal, off_diagonal, _) = xc_numerics::eigen::householder_tridiag_hp(
+    let (diagonal, off_diagonal, _) = xc_numerics::eigen::householder_tridiag_hp_stable(
         &even_sector_matrix,
         even_dimension,
         cfg.precision_bits,
@@ -9533,6 +9615,10 @@ fn apply_prime_power_velocity(
     })
 }
 
+// Root motion is invariant under a common, parameter-dependent normalization.
+// Call with the L2 state and its tangent: differentiating xi = s*u first adds
+// s'*R_u(root), which vanishes analytically but can destroy hundreds of digits
+// when the CCM boundary sum is tiny. Keep the scale derivative as separate data.
 fn prime_power_root_velocity_response(
     xi: &[Float],
     xi_velocity: &[Float],
@@ -9817,18 +9903,6 @@ fn compute_prime_power_response_analysis(
         ccm_scale_response *= &response_sum;
         ccm_scale_response /= &unit_state_sum;
         ccm_scale_response = -ccm_scale_response;
-        let ccm_vector_response = eigenvector_response
-            .iter()
-            .zip(&unit_state)
-            .map(|(response, state)| {
-                let mut value = Float::with_val(precision_bits, response);
-                value *= &ccm_scale;
-                let mut scale_term = Float::with_val(precision_bits, state);
-                scale_term *= &ccm_scale_response;
-                value += scale_term;
-                value
-            })
-            .collect::<Vec<_>>();
         let root_velocity_responses = roots
             .iter()
             .map(|outcome| {
@@ -9836,8 +9910,8 @@ fn compute_prime_power_response_analysis(
                     .value()
                     .map(|root| {
                         prime_power_root_velocity_response(
-                            xi,
-                            &ccm_vector_response,
+                            &unit_state,
+                            &eigenvector_response,
                             &poles,
                             root,
                             precision_bits,
@@ -10085,25 +10159,13 @@ fn validate_prime_power_response_analysis(
             )));
         }
 
-        let ccm_vector_response = response
-            .iter()
-            .zip(&unit_state)
-            .map(|(response, state)| {
-                let mut value = Float::with_val(precision_bits, response);
-                value *= &ccm_scale;
-                let mut scale_term = Float::with_val(precision_bits, state);
-                scale_term *= &ccm_scale_response;
-                value += scale_term;
-                value
-            })
-            .collect::<Vec<_>>();
         for (root_outcome, retained_response) in roots.iter().zip(&event.root_velocity_responses) {
             let expected = root_outcome
                 .value()
                 .map(|root| {
                     prime_power_root_velocity_response(
-                        xi,
-                        &ccm_vector_response,
+                        &unit_state,
+                        &response,
                         &poles,
                         root,
                         precision_bits,
@@ -10170,7 +10232,7 @@ fn resolve_prime_power_response_analysis_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_prime_power_response_analysis".to_owned(),
-        mathematical_semantics_version: "ccm-prime-power-response-v0.14.1-v2".to_owned(),
+        mathematical_semantics_version: "ccm-prime-power-response-v0.15.0-v3".to_owned(),
         resolved_mathematical_parameters: resolved_parameters,
         normalization: Some(PRIME_POWER_RESPONSE_NORMALIZATION.to_owned()),
         target: Some("selected_ccm_state_and_root_prime_velocity_response".to_owned()),
@@ -10319,7 +10381,6 @@ fn compute_u_flow_response_channel(
     unit_state: &[Float],
     unit_state_sum: &Float,
     ccm_scale: &Float,
-    xi: &[Float],
     roots: &[EigenvalueResult],
     poles: &[Float],
     bordered_solver: &EvenSectorBorderedResponseSolver,
@@ -10356,18 +10417,6 @@ fn compute_u_flow_response_channel(
     gauge_term *= response_sum;
     gauge_term /= unit_state_sum;
     ccm_scale_response -= gauge_term;
-    let ccm_vector_response = eigenvector_response
-        .iter()
-        .zip(unit_state)
-        .map(|(response, state)| {
-            let mut value = Float::with_val(precision_bits, response);
-            value *= ccm_scale;
-            let mut scale_term = Float::with_val(precision_bits, state);
-            scale_term *= &ccm_scale_response;
-            value += scale_term;
-            value
-        })
-        .collect::<Vec<_>>();
     let fixed_pole_root_velocity_responses = roots
         .iter()
         .map(|outcome| {
@@ -10375,8 +10424,8 @@ fn compute_u_flow_response_channel(
                 .value()
                 .map(|root| {
                     prime_power_root_velocity_response(
-                        xi,
-                        &ccm_vector_response,
+                        unit_state,
+                        &eigenvector_response,
                         poles,
                         root,
                         precision_bits,
@@ -10416,7 +10465,7 @@ fn compute_u_flow_response_channel(
             bordered_solve_relative_residual: lossless_hp_decimal(&relative_residual),
             fixed_pole_root_velocity_responses,
         },
-        ccm_vector_response,
+        eigenvector_response,
     ))
 }
 
@@ -10491,14 +10540,14 @@ fn compute_u_flow_response_analysis(
         velocity_actions.tau_total.as_slice(),
     ];
     let mut channels = Vec::with_capacity(U_FLOW_CHANNELS.len());
-    let mut total_ccm_vector_response = None;
+    let mut total_l2_vector_response = None;
     for (index, (channel, action)) in U_FLOW_CHANNELS.iter().zip(action_slices).enumerate() {
         let target_velocity = if index + 1 == U_FLOW_CHANNELS.len() {
             &normalization_target_velocity
         } else {
             &zero_target_velocity
         };
-        let (portable, ccm_vector_response) = compute_u_flow_response_channel(
+        let (portable, l2_vector_response) = compute_u_flow_response_channel(
             channel,
             action,
             target_velocity,
@@ -10507,7 +10556,6 @@ fn compute_u_flow_response_analysis(
             &unit_state,
             &unit_state_sum,
             &ccm_scale,
-            xi,
             roots,
             &poles,
             &bordered_solver,
@@ -10515,11 +10563,11 @@ fn compute_u_flow_response_analysis(
             precision_bits,
         )?;
         if index + 1 == U_FLOW_CHANNELS.len() {
-            total_ccm_vector_response = Some(ccm_vector_response);
+            total_l2_vector_response = Some(l2_vector_response);
         }
         channels.push(portable);
     }
-    let total_ccm_vector_response = total_ccm_vector_response
+    let total_l2_vector_response = total_l2_vector_response
         .ok_or_else(|| anyhow::anyhow!("CCM u-flow total response channel is missing"))?;
     let zero_xi_velocity = vec![Float::with_val(precision_bits, 0); dimension];
     let secular_pole_motion_root_velocity_responses = roots
@@ -10529,7 +10577,7 @@ fn compute_u_flow_response_analysis(
                 .value()
                 .map(|root| {
                     secular_root_velocity_response(
-                        xi,
+                        &unit_state,
                         &zero_xi_velocity,
                         &poles,
                         &pole_velocities,
@@ -10548,8 +10596,8 @@ fn compute_u_flow_response_analysis(
                 .value()
                 .map(|root| {
                     secular_root_velocity_response(
-                        xi,
-                        &total_ccm_vector_response,
+                        &unit_state,
+                        &total_l2_vector_response,
                         &poles,
                         &pole_velocities,
                         root,
@@ -10601,7 +10649,6 @@ fn validate_u_flow_response_channel(
     unit_state: &[Float],
     unit_state_sum: &Float,
     ccm_scale: &Float,
-    xi: &[Float],
     roots: &[EigenvalueResult],
     poles: &[Float],
     shifted_frobenius_norm: &Float,
@@ -10673,18 +10720,6 @@ fn validate_u_flow_response_channel(
             "CCM u-flow channel {expected_channel} failed its numerical replay"
         )));
     }
-    let ccm_vector_response = response
-        .iter()
-        .zip(unit_state)
-        .map(|(response, state)| {
-            let mut value = Float::with_val(precision_bits, response);
-            value *= ccm_scale;
-            let mut scale_term = Float::with_val(precision_bits, state);
-            scale_term *= &ccm_scale_response;
-            value += scale_term;
-            value
-        })
-        .collect::<Vec<_>>();
     for (root_outcome, retained_response) in roots
         .iter()
         .zip(&artifact.fixed_pole_root_velocity_responses)
@@ -10693,8 +10728,8 @@ fn validate_u_flow_response_channel(
             .value()
             .map(|root| {
                 prime_power_root_velocity_response(
-                    xi,
-                    &ccm_vector_response,
+                    unit_state,
+                    &response,
                     poles,
                     root,
                     precision_bits,
@@ -10709,7 +10744,7 @@ fn validate_u_flow_response_channel(
             )));
         }
     }
-    Ok(ccm_vector_response)
+    Ok(response)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10819,7 +10854,7 @@ fn validate_u_flow_response_analysis(
         velocity_actions.tau_prime.as_slice(),
         velocity_actions.tau_total.as_slice(),
     ];
-    let mut total_ccm_vector_response = None;
+    let mut total_l2_vector_response = None;
     for (index, ((channel, expected_channel), expected_action)) in artifact
         .channels
         .iter()
@@ -10832,7 +10867,7 @@ fn validate_u_flow_response_analysis(
         } else {
             &zero_target_velocity
         };
-        let ccm_vector_response = validate_u_flow_response_channel(
+        let l2_vector_response = validate_u_flow_response_channel(
             channel,
             expected_channel,
             expected_action,
@@ -10842,17 +10877,16 @@ fn validate_u_flow_response_analysis(
             &unit_state,
             &unit_state_sum,
             &ccm_scale,
-            xi,
             roots,
             &poles,
             &shifted_frobenius_norm,
             precision_bits,
         )?;
         if index + 1 == U_FLOW_CHANNELS.len() {
-            total_ccm_vector_response = Some(ccm_vector_response);
+            total_l2_vector_response = Some(l2_vector_response);
         }
     }
-    let total_ccm_vector_response = total_ccm_vector_response
+    let total_l2_vector_response = total_l2_vector_response
         .ok_or_else(|| invalid("CCM u-flow response is missing its total channel".to_owned()))?;
     let zero_xi_velocity = vec![Float::with_val(precision_bits, 0); dimension];
     for ((root_outcome, retained_pole_motion), retained_total) in roots
@@ -10864,7 +10898,7 @@ fn validate_u_flow_response_analysis(
             .value()
             .map(|root| {
                 secular_root_velocity_response(
-                    xi,
+                    &unit_state,
                     &zero_xi_velocity,
                     &poles,
                     &pole_velocities,
@@ -10879,8 +10913,8 @@ fn validate_u_flow_response_analysis(
             .value()
             .map(|root| {
                 secular_root_velocity_response(
-                    xi,
-                    &total_ccm_vector_response,
+                    &unit_state,
+                    &total_l2_vector_response,
                     &poles,
                     &pole_velocities,
                     root,
@@ -10961,7 +10995,7 @@ fn resolve_u_flow_response_analysis_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_u_flow_response_analysis".to_owned(),
-        mathematical_semantics_version: "ccm-u-flow-response-v0.14.1-v2".to_owned(),
+        mathematical_semantics_version: "ccm-u-flow-response-v0.15.0-v3".to_owned(),
         resolved_mathematical_parameters: resolved_parameters,
         normalization: Some(U_FLOW_RESPONSE_NORMALIZATION.to_owned()),
         target: Some("selected_ccm_state_and_root_complete_u_flow".to_owned()),
@@ -13785,6 +13819,16 @@ fn compute_archimedean_integrals_tracked(
     cfg: &HighPrecConfig,
     fabric_cache: Option<&ArtifactCacheContext<'_>>,
 ) -> Result<(ComputedArchimedeanIntegrals, Vec<ArtifactManifest>)> {
+    compute_archimedean_integrals_tracked_with_bucket(n_modes, l, cfg, fabric_cache, 1)
+}
+
+fn compute_archimedean_integrals_tracked_with_bucket(
+    n_modes: usize,
+    l: &Float,
+    cfg: &HighPrecConfig,
+    fabric_cache: Option<&ArtifactCacheContext<'_>>,
+    bucket: usize,
+) -> Result<(ComputedArchimedeanIntegrals, Vec<ArtifactManifest>)> {
     let prec = cfg.precision_bits;
     let base_pts = cfg.quad_points;
     let prec_extra = (prec / 2) as usize;
@@ -13795,9 +13839,14 @@ fn compute_archimedean_integrals_tracked(
     );
 
     use std::collections::HashMap;
-    let pts_for_n: Vec<usize> = (0..=n_modes)
-        .map(|n| base_pts.max(3 * n + prec_extra))
-        .collect();
+    let pts_for_n: Vec<usize> = if bucket == 1 {
+        // Preserve the original production sequence and exact GL identities.
+        (0..=n_modes)
+            .map(|n| base_pts.max(3 * n + prec_extra))
+            .collect()
+    } else {
+        super::research::quadrature_orders(n_modes, base_pts, prec, bucket)?
+    };
     let unique_pts: Vec<usize> = {
         let mut values = pts_for_n.clone();
         values.sort_unstable();
@@ -14140,28 +14189,31 @@ fn compute_prime_component_matrix(
         .for_each(|(row, matrix_row)| {
             let n = row as i64 - n_modes as i64;
             let n_index = (n + n_modes as i64) as usize;
+            // One scratch allocation per row, not per prime-power/cell.
+            // Operation ordering is unchanged: this route must remain
+            // bit-identical to compute_prime_component_matrix_reference.
+            let mut sum = Float::with_val(prec, 0);
+            let mut kernel = Float::with_val(prec, 0);
+            let mut term = Float::with_val(prec, 0);
             for (column, matrix_cell) in matrix_row.iter_mut().enumerate() {
                 let m = column as i64 - n_modes as i64;
                 let m_index = (m + n_modes as i64) as usize;
-                let mut sum = Float::with_val(prec, 0);
+                sum.assign(0);
                 for data in &prime_data {
-                    let kernel = if n == m {
-                        let mut factor = data.diagonal_factor.clone();
-                        factor *= &data.cosines[n_index];
-                        factor
+                    if n == m {
+                        kernel.assign(&data.diagonal_factor);
+                        kernel *= &data.cosines[n_index];
                     } else {
-                        let mut difference = data.sines[m_index].clone();
-                        difference -= &data.sines[n_index];
-                        difference /=
-                            &difference_denominators[(n - m + 2 * n_modes as i64) as usize];
-                        difference
-                    };
-                    let mut term = kernel;
+                        kernel.assign(&data.sines[m_index]);
+                        kernel -= &data.sines[n_index];
+                        kernel /= &difference_denominators[(n - m + 2 * n_modes as i64) as usize];
+                    }
+                    term.assign(&kernel);
                     term *= &data.log_prime;
                     term /= &data.sqrt_power;
-                    sum += term;
+                    sum += &term;
                 }
-                *matrix_cell = sum;
+                matrix_cell.assign(&sum);
             }
         });
     matrix
@@ -16603,6 +16655,176 @@ mod weil_eigvec_cache {
 // uniformly, including `i = 0` rows where `0 * dim` is kept for alignment
 // with neighboring entries. Allow the erasing_op lint in this test module.
 #[cfg(test)]
+fn compute_prime_component_matrix_v0143_reference(
+    n_modes: usize,
+    prime_cutoff: u64,
+    l: &Float,
+    prec: u32,
+) -> Vec<Float> {
+    let dim = 2 * n_modes + 1;
+    let _performance = xc_core::performance_stage_with("ccm.tau.prime_component", || {
+        let mut metadata = ccm_performance_metadata("ccm.tau.prime_component", dim, prec);
+        metadata.retained_hp_entries = Some(dim.saturating_mul(dim));
+        metadata
+    });
+    let pi_v = pi(prec);
+    let mut two_pi = pi_v.clone();
+    two_pi *= 2u32;
+    let mode_values = (-(n_modes as i64)..=(n_modes as i64))
+        .map(|mode| fl_i(prec, mode))
+        .collect::<Vec<_>>();
+    let mode_frequencies = mode_values
+        .iter()
+        .map(|mode| {
+            let mut frequency = two_pi.clone();
+            frequency *= mode;
+            frequency /= l;
+            frequency
+        })
+        .collect::<Vec<_>>();
+    let difference_denominators = (-(2 * n_modes as i64)..=(2 * n_modes as i64))
+        .map(|difference| {
+            let mut denominator = pi_v.clone();
+            denominator *= fl_i(prec, difference);
+            denominator
+        })
+        .collect::<Vec<_>>();
+    struct PrimeKernelTable {
+        log_prime: Float,
+        sqrt_power: Float,
+        diagonal_factor: Float,
+        sines: Vec<Float>,
+        cosines: Vec<Float>,
+    }
+    let prime_data: Vec<PrimeKernelTable> = prime_powers_up_to(prime_cutoff)
+        .into_iter()
+        .map(|(power, prime, _)| {
+            let log_power = Float::with_val(prec, power).ln();
+            let log_prime = Float::with_val(prec, prime).ln();
+            let sqrt_power = Float::with_val(prec, power).sqrt();
+            let mut diagonal_factor = Float::with_val(prec, 1);
+            let mut ratio = log_power.clone();
+            ratio /= l;
+            diagonal_factor -= ratio;
+            diagonal_factor *= 2u32;
+            let phases = mode_frequencies
+                .iter()
+                .map(|frequency| {
+                    let mut phase = frequency.clone();
+                    phase *= &log_power;
+                    phase
+                })
+                .collect::<Vec<_>>();
+            let sines = phases.iter().map(|phase| phase.clone().sin()).collect();
+            let cosines = phases.into_iter().map(Float::cos).collect();
+            PrimeKernelTable {
+                log_prime,
+                sqrt_power,
+                diagonal_factor,
+                sines,
+                cosines,
+            }
+        })
+        .collect();
+    let mut matrix = vec![Float::with_val(prec, 0); dim * dim];
+    matrix
+        .par_chunks_mut(dim)
+        .enumerate()
+        .for_each(|(row, matrix_row)| {
+            let n = row as i64 - n_modes as i64;
+            let n_index = (n + n_modes as i64) as usize;
+            for (column, matrix_cell) in matrix_row.iter_mut().enumerate() {
+                let m = column as i64 - n_modes as i64;
+                let m_index = (m + n_modes as i64) as usize;
+                let mut sum = Float::with_val(prec, 0);
+                for data in &prime_data {
+                    let kernel = if n == m {
+                        let mut factor = data.diagonal_factor.clone();
+                        factor *= &data.cosines[n_index];
+                        factor
+                    } else {
+                        let mut difference = data.sines[m_index].clone();
+                        difference -= &data.sines[n_index];
+                        difference /=
+                            &difference_denominators[(n - m + 2 * n_modes as i64) as usize];
+                        difference
+                    };
+                    let mut term = kernel;
+                    term *= &data.log_prime;
+                    term /= &data.sqrt_power;
+                    sum += term;
+                }
+                *matrix_cell = sum;
+            }
+        });
+    matrix
+}
+
+/// Opt-in exact-rational-input matrix assembly for mechanism experiments.
+/// This never substitutes a research matrix under an ordinary Tau cache key.
+/// Only quadrature rules are reused by their existing order/precision identity.
+/// The returned identity records the actual order list and prime arithmetic.
+pub fn assemble_research_matrix_hp(
+    cutoff: &super::research::ExactCutoff,
+    n_modes: usize,
+    cfg: &HighPrecConfig,
+    options: &super::research::ResearchAssemblyOptions,
+) -> Result<super::research::ResearchMatrixHp> {
+    use super::research::{
+        aggregate_prime_component_hp, quadrature_orders, PrimeAssemblyRoute,
+        ResearchAssemblyIdentity, ResearchMatrixHp, RESEARCH_ASSEMBLY_SEMANTICS,
+    };
+    let dimension = options.validate(cutoff, n_modes)?;
+    let precision_bits = cfg.precision_bits;
+    let length = cutoff.log_length(precision_bits)?;
+    let orders = quadrature_orders(
+        n_modes,
+        cfg.quad_points,
+        precision_bits,
+        options.quadrature_order_bucket,
+    )?;
+    let (integrals, _) = compute_archimedean_integrals_tracked_with_bucket(
+        n_modes,
+        &length,
+        cfg,
+        None,
+        options.quadrature_order_bucket,
+    )?;
+    let (pole, archimedean) =
+        assemble_pole_and_archimedean_components(n_modes, &length, precision_bits, &integrals);
+    let prime = match options.prime_route {
+        PrimeAssemblyRoute::CanonicalCellSum => {
+            compute_prime_component_matrix(n_modes, cutoff.prime_cutoff(), &length, precision_bits)
+        }
+        PrimeAssemblyRoute::AggregateGenerators => {
+            aggregate_prime_component_hp(cutoff, n_modes, precision_bits, options)?
+        }
+    };
+    let mut entries = assemble_tau_components(
+        &ComputedCcmMatrixComponents {
+            pole,
+            archimedean,
+            prime,
+        },
+        precision_bits,
+    );
+    force_symmetric(&mut entries, dimension);
+    Ok(ResearchMatrixHp {
+        identity: ResearchAssemblyIdentity {
+            semantics: RESEARCH_ASSEMBLY_SEMANTICS.to_owned(),
+            exact_cutoff: cutoff.canonical(),
+            prime_cutoff: cutoff.prime_cutoff(),
+            n_modes,
+            precision_bits,
+            prime_route: options.prime_route,
+            quadrature_orders: orders,
+            assurance: "computed_point_matrix_not_certified".to_owned(),
+        },
+        entries,
+    })
+}
+
+#[cfg(test)]
 #[allow(clippy::erasing_op)]
 mod tests {
     use super::*;
@@ -17594,7 +17816,8 @@ mod tests {
         );
         let matrix = vec![one.clone(), one.clone(), one, one_plus_delta];
         let factors = xc_numerics::linalg::lu_factor(&matrix, 2).unwrap();
-        let backward_error = factorization_backward_error(&matrix, &factors, 2, precision).unwrap();
+        let backward_error =
+            factorization_probe_backward_error(&matrix, &factors, 2, precision).unwrap();
         let tolerance = Float::with_val(precision, 2).pow(-((precision / 4) as i32));
         assert!(
             backward_error < tolerance,
@@ -17608,7 +17831,8 @@ mod tests {
             perm: vec![0, 0],
         };
         assert!(
-            factorization_backward_error(&matrix, &invalid_permutation, 2, precision).is_none()
+            factorization_probe_backward_error(&matrix, &invalid_permutation, 2, precision)
+                .is_none()
         );
     }
 
@@ -18930,6 +19154,103 @@ mod tests {
     }
 
     #[test]
+    fn retained_ccm_prefix_precision_comparison_uses_identical_source_entries() {
+        use super::super::research::{ExactCutoff, ResearchAssemblyOptions};
+        let mut cfg = HighPrecConfig::for_decimal_digits(80);
+        cfg.precision_bits = 256;
+        cfg.quad_points = 128;
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let modes = 16;
+        let matrix = assemble_research_matrix_hp(
+            &ExactCutoff::parse("13").unwrap(),
+            modes,
+            &cfg,
+            &ResearchAssemblyOptions::default(),
+        )
+        .unwrap();
+        let even = build_even_sector_matrix(&matrix.entries, modes, 256);
+        let original = even.clone();
+        let reports = [256, 512].map(|p| {
+            xc_numerics::prefix::analyze_prefixes_with_policy(
+                &even,
+                modes + 1,
+                p,
+                32,
+                &[],
+                &xc_core::PrefixDiagnosticPolicy::full(),
+            )
+            .unwrap()
+        });
+        assert_eq!(original, even);
+        assert!(reports.iter().all(|r| !r.rows.is_empty()));
+        // Decode at each report's original precision before widening. These
+        // compare computed binary points, not the printed decimal roundoffs.
+        let comparison_bits = 576;
+        fn scalar_paths(
+            value: &serde_json::Value,
+            path: &str,
+            out: &mut std::collections::BTreeMap<String, String>,
+        ) {
+            if let Some(text) = value.as_str() {
+                if Float::parse(text).is_ok() {
+                    out.insert(path.into(), text.into());
+                }
+            }
+            if let Some(object) = value.as_object() {
+                for (name, child) in object {
+                    let path = if path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{path}.{name}")
+                    };
+                    scalar_paths(child, &path, out);
+                }
+            }
+        }
+        let differences: Vec<_> = reports[0].rows.iter().zip(&reports[1].rows).map(|(left, right)| {
+            assert_eq!(left.dimension, right.dimension);
+            let left = serde_json::to_value(left).unwrap();
+            let right = serde_json::to_value(right).unwrap();
+            let mut left_scalars=std::collections::BTreeMap::new();
+            let mut right_scalars=std::collections::BTreeMap::new();
+            scalar_paths(&left, "", &mut left_scalars);
+            scalar_paths(&right, "", &mut right_scalars);
+            let unavailable: std::collections::BTreeSet<_>=left_scalars.keys().chain(right_scalars.keys())
+                .filter(|name| !left_scalars.contains_key(*name) || !right_scalars.contains_key(*name)).cloned().collect();
+            let mut metrics = serde_json::Map::new();
+            for (name, left_text) in &left_scalars {
+                let Some(right_text)=right_scalars.get(name) else { continue; };
+                let mut a = Float::with_val(256, Float::parse(left_text).unwrap());
+                let mut b = Float::with_val(512, Float::parse(right_text).unwrap());
+                a.set_prec(comparison_bits);
+                b.set_prec(comparison_bits);
+                let signed = a - &b;
+                let absolute = signed.clone().abs();
+                let relative = if b.is_zero() { None } else { Some(absolute.clone() / b.abs()) };
+                let digits = relative.as_ref().filter(|r| !r.is_zero())
+                    .map(|r| (-r.clone().log10()).floor().to_i32_saturating().unwrap().max(0));
+                metrics.insert(name.clone(), serde_json::json!({
+                    "signed_difference_low_minus_high":xc_numerics::prefix::lossless_decimal(&signed),
+                    "absolute_difference":xc_numerics::prefix::lossless_decimal(&absolute),
+                    "relative_difference_to_high":relative.as_ref().map(xc_numerics::prefix::lossless_decimal),
+                    "decimal_agreement_digits":digits,
+                    "identical_binary_points":absolute.is_zero(),
+                }));
+            }
+            serde_json::json!({"dimension":left["dimension"],"metrics":metrics,"unavailable_comparison_metrics":unavailable,"two_mode_status_low":left["third_inverse_moment"]["two_mode_fit"]["status"],"two_mode_status_high":right["third_inverse_moment"]["two_mode_fit"]["status"]})
+        }).collect();
+        println!("CCM_PREFIX_PRECISION {}", serde_json::to_string(&serde_json::json!({
+            "cutoff":"13", "n_modes":modes,"source_precision_bits":256,
+            "source_identity":matrix.identity,"source_digest":matrix.content_digest().unwrap(),
+            "interpretation":"Working precision comparison of one computed CCM source; no assembly accuracy or positivity certificate.",
+            "comparison_precision_bits":comparison_bits,
+            "agreement_definition":"max(0, floor(-log10(abs(low-high)/abs(high)))); null for zero difference or zero reference. Empirical agreement is not a count of certified or trustworthy source digits; shared errors and assembly uncertainty are unmeasured.",
+            "differences":differences,
+            "reports":reports,
+        })).unwrap());
+    }
+
+    #[test]
     fn odd_sector_projection_preserves_historical_values_and_quadratic_form() {
         let precision_bits = 256;
         let n_modes = 2;
@@ -19006,7 +19327,8 @@ mod tests {
             selected_enclosures: Vec::new(),
         };
         let (diagonal, off_diagonal, basis) =
-            xc_numerics::eigen::householder_tridiag_hp(&matrix, dimension, precision_bits).unwrap();
+            xc_numerics::eigen::householder_tridiag_hp_stable(&matrix, dimension, precision_bits)
+                .unwrap();
         let tridiagonal = SectorTridiagonalHp {
             diagonal,
             off_diagonal,
@@ -19891,6 +20213,212 @@ mod tests {
     }
 
     #[test]
+    fn u_flow_root_transport_avoids_tiny_boundary_sum_gauge_cancellation() {
+        // A genuine secular root of weights (1,1,b,1,1), b=-4+2^-60,
+        // on poles (-2,-1,0,1,2). Its numerator is
+        // (b+4)t^4-(5b+10)t^2+4b. Differentiate this polynomial independently.
+        // The sum-normalization derivative is enormous, although root motion
+        // and the L2 tangent are well conditioned.
+        let bits = 192;
+        let reference_bits = 384;
+        let mut delta = Float::with_val(reference_bits, 1);
+        delta >>= 60;
+        let mut b = Float::with_val(reference_bits, -4);
+        b += &delta;
+        let mut linear = Float::with_val(reference_bits, &b);
+        linear *= -5;
+        linear -= 10;
+        let mut constant = Float::with_val(reference_bits, &b);
+        constant *= 4;
+        let mut discriminant = Float::with_val(reference_bits, &linear);
+        discriminant.square_mut();
+        let mut product = Float::with_val(reference_bits, &delta);
+        product *= &constant;
+        product *= 4;
+        discriminant -= product;
+        discriminant.sqrt_mut();
+        discriminant += &linear;
+        let mut root_squared = Float::with_val(reference_bits, &constant);
+        root_squared *= -2;
+        root_squared /= discriminant;
+        let root_reference = Float::with_val(reference_bits, &root_squared).sqrt();
+        let mut expected = Float::with_val(reference_bits, &root_squared);
+        expected -= 1;
+        let mut factor = Float::with_val(reference_bits, &root_squared);
+        factor -= 4;
+        expected *= factor;
+        expected = -expected;
+        let mut denominator = Float::with_val(reference_bits, &delta);
+        denominator *= &root_squared;
+        denominator *= 4;
+        linear *= 2;
+        denominator += linear;
+        denominator *= &root_reference;
+        expected /= denominator;
+
+        let weights = vec![
+            Float::with_val(reference_bits, 1),
+            Float::with_val(reference_bits, 1),
+            b,
+            Float::with_val(reference_bits, 1),
+            Float::with_val(reference_bits, 1),
+        ];
+        let norm = deterministic_l2_norm_hp(&weights, reference_bits);
+        let unit_reference = weights
+            .iter()
+            .map(|weight| {
+                let mut value = Float::with_val(reference_bits, weight);
+                value /= &norm;
+                value
+            })
+            .collect::<Vec<_>>();
+        let action = unit_reference
+            .iter()
+            .enumerate()
+            .map(|(index, state)| {
+                let mut value = Float::with_val(reference_bits, state);
+                value *= &unit_reference[2];
+                if index == 2 {
+                    value -= 1;
+                }
+                value /= &norm;
+                Float::with_val(bits, value) // -du/db
+            })
+            .collect::<Vec<_>>();
+        let unit_state = unit_reference
+            .iter()
+            .map(|x| Float::with_val(bits, x))
+            .collect::<Vec<_>>();
+        let mut tau = Vec::new();
+        for row in 0..5 {
+            for column in 0..5 {
+                let mut value = Float::with_val(bits, &unit_state[row]);
+                value *= &unit_state[column];
+                value = -value;
+                if row == column {
+                    value += 2;
+                }
+                tau.push(value);
+            }
+        }
+        let params = CcmParams::from_lambda_sq_integer(13, 2);
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.precision_bits = bits;
+        let eigenvalue = Float::with_val(bits, 1);
+        let preparation = compute_response_spectral_preparation(&params, &cfg, &tau).unwrap();
+        let solver = build_even_sector_bordered_response_solver(
+            &preparation,
+            &params,
+            &cfg,
+            &eigenvalue,
+            &unit_state,
+        )
+        .unwrap();
+        let shifted_norm = shifted_matrix_frobenius_norm(&tau, &eigenvalue, 5, bits);
+        let sum = xc_numerics::reduction::deterministic_pairwise_sum_hp(&unit_state, bits);
+        let scale = Float::with_val(bits, &sum).recip();
+        let zero = Float::with_val(bits, 0);
+        let poles = (-2..=2)
+            .map(|j| Float::with_val(bits, j))
+            .collect::<Vec<_>>();
+        let roots = vec![EigenvalueResult::Converged(RootRefinement {
+            value: Float::with_val(bits, &root_reference),
+            diagnostics: RootRefinementDiagnostics {
+                iterations: 1,
+                final_correction: zero.clone(),
+                residual: zero.clone(),
+                achieved_decimal_digits: Float::with_val(bits, 50),
+            },
+        })];
+        let (artifact, tangent) = compute_u_flow_response_channel(
+            "synthetic",
+            &action,
+            &zero,
+            &tau,
+            &eigenvalue,
+            &unit_state,
+            &sum,
+            &scale,
+            &roots,
+            &poles,
+            &solver,
+            &shifted_norm,
+            bits,
+        )
+        .unwrap();
+        let actual = parse_hp_scalar(
+            artifact.fixed_pole_root_velocity_responses[0]
+                .as_ref()
+                .unwrap(),
+            reference_bits,
+        )
+        .unwrap();
+        let mut error = actual;
+        error -= &expected;
+        error.abs_mut();
+        let mut tolerance = Float::with_val(reference_bits, 1);
+        tolerance >>= 160;
+        assert!(
+            error < tolerance,
+            "normalization gauge contaminated root motion: {error}"
+        );
+        // Demonstrate that this fixture detects the former production path,
+        // rather than merely replaying the corrected implementation.
+        let scale_velocity =
+            parse_hp_scalar(&artifact.ccm_normalization_scale_velocity_response, bits).unwrap();
+        let legacy_weights = unit_state
+            .iter()
+            .map(|state| {
+                let mut value = Float::with_val(bits, state);
+                value *= &scale;
+                value
+            })
+            .collect::<Vec<_>>();
+        let legacy_tangent = tangent
+            .iter()
+            .zip(&unit_state)
+            .map(|(velocity, state)| {
+                let mut value = Float::with_val(bits, velocity);
+                value *= &scale;
+                let mut gauge = Float::with_val(bits, state);
+                gauge *= &scale_velocity;
+                value += gauge;
+                value
+            })
+            .collect::<Vec<_>>();
+        let mut legacy_error = prime_power_root_velocity_response(
+            &legacy_weights,
+            &legacy_tangent,
+            &poles,
+            roots[0].value().unwrap(),
+            bits,
+        )
+        .unwrap();
+        legacy_error -= &expected;
+        legacy_error.abs_mut();
+        assert!(
+            legacy_error > tolerance,
+            "fixture must expose the former gauge loss"
+        );
+        validate_u_flow_response_channel(
+            &artifact,
+            "synthetic",
+            &action,
+            &zero,
+            &tau,
+            &eigenvalue,
+            &unit_state,
+            &sum,
+            &scale,
+            &roots,
+            &poles,
+            &shifted_norm,
+            bits,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn u_flow_response_records_decomposed_state_and_moving_root_transport() {
         let precision_bits = 192;
         let params = CcmParams::from_lambda_sq_integer(13, 1);
@@ -20197,6 +20725,12 @@ mod tests {
         .unwrap();
         assert_eq!(u_flow_created, u_flow_reused);
         assert_eq!(u_flow_created, u_flow_refreshed);
+        response_repair::check_fresh_response_repair(
+            prime_created,
+            u_flow_created,
+            &xi,
+            &state_eigenvalue,
+        );
         let _ = std::fs::remove_dir_all(cache_root);
     }
 
@@ -22421,5 +22955,178 @@ mod tests {
         let poles = secular_poles(&two_pi_over_l, n_max, prec);
         let _result = super::newton_xi_hat_zero(&xi, &poles, &seed_near_pole, prec, 10);
         // No assertion on result — just verifying no panic / infinite loop.
+    }
+}
+
+#[cfg(test)]
+mod audit_research_tests {
+    #[test]
+    fn streaming_even_validation_matches_materialized_projection() {
+        for p in [64, 128, 257] {
+            for n in 0..=8 {
+                let d = 2 * n + 1;
+                // Intentionally not symmetric: test the final averaging order.
+                let tau = (0..d * d)
+                    .map(|i| {
+                        let mut v = Float::with_val(p, (i as i64 * 17 % 101) - 50);
+                        v /= (i % 7 + 1) as u32;
+                        v
+                    })
+                    .collect::<Vec<_>>();
+                let mut sector = build_even_sector_matrix(&tau, n, p);
+                assert!(even_sector_matches_tau(&sector, &tau, n, p));
+                sector[0] += 1;
+                assert!(!even_sector_matches_tau(&sector, &tau, n, p));
+            }
+        }
+        assert!(!even_sector_matches_tau(&[], &[], usize::MAX, 128));
+    }
+
+    use super::super::research::*;
+    use super::*;
+
+    #[test]
+    fn audit_aggregate_prime_matches_canonical_at_multiple_precisions() {
+        for precision_bits in [128, 256] {
+            for c in [5, 13, 100] {
+                let cutoff = ExactCutoff::parse(&c.to_string()).unwrap();
+                let length = cutoff.log_length(precision_bits).unwrap();
+                let options = ResearchAssemblyOptions::default();
+                let expected = compute_prime_component_matrix(6, c, &length, precision_bits);
+                let actual =
+                    aggregate_prime_component_hp(&cutoff, 6, precision_bits, &options).unwrap();
+                let tolerance =
+                    Float::with_val(precision_bits, 2).pow(-((precision_bits - 32) as i32));
+                for (a, b) in actual.iter().zip(&expected) {
+                    let difference = Float::with_val(precision_bits, a - b).abs();
+                    assert!(
+                        difference < tolerance,
+                        "prime generator disagreement at c={c}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn audit_research_route_retains_its_identity_and_never_floors_from_f64() {
+        let cutoff = ExactCutoff::parse("12.99999999999999999999999999999999999999").unwrap();
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.precision_bits = 192;
+        cfg.quad_points = 128;
+        let options = ResearchAssemblyOptions {
+            prime_route: PrimeAssemblyRoute::AggregateGenerators,
+            quadrature_order_bucket: 32,
+            ..ResearchAssemblyOptions::default()
+        };
+        let matrix = assemble_research_matrix_hp(&cutoff, 2, &cfg, &options).unwrap();
+        assert_eq!(matrix.identity.prime_cutoff, 12);
+        assert_eq!(
+            matrix.identity.prime_route,
+            PrimeAssemblyRoute::AggregateGenerators
+        );
+        assert_eq!(matrix.identity.quadrature_orders, vec![128; 3]);
+        assert!(matrix.content_digest().unwrap().validate());
+        assert_eq!(matrix.entries.len(), 25);
+    }
+
+    #[test]
+    fn canonical_prime_scratch_reuse_is_bit_identical_to_v0143() {
+        for p in [128, 256, 1024] {
+            for c in [5, 13, 100] {
+                let length = Float::with_val(p, c).ln();
+                assert_eq!(
+                    compute_prime_component_matrix(8, c, &length, p),
+                    compute_prime_component_matrix_v0143_reference(8, c, &length, p),
+                    "default prime bytes changed at c={c}, p={p}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "arb")]
+    fn corrected_interval_matrix_agrees_with_independent_quadrature_route() {
+        for p in [128, 192] {
+            for c in [5, 13, 100] {
+                let cutoff = ExactCutoff::parse(&c.to_string()).unwrap();
+                let mut cfg = HighPrecConfig::for_decimal_digits(40);
+                cfg.precision_bits = p;
+                cfg.quad_points = 256;
+                let quadrature = assemble_research_matrix_hp(
+                    &cutoff,
+                    2,
+                    &cfg,
+                    &ResearchAssemblyOptions::default(),
+                )
+                .unwrap();
+                let intervals = super::super::cutoff_free::assemble(
+                    &super::super::cutoff_free::CutoffFreeConfig::new(c, 2, p),
+                )
+                .unwrap();
+                let tolerance = Float::with_val(p, 2).pow(-((p - 32) as i32));
+                for (point, interval) in quadrature.entries.iter().zip(&intervals.tau) {
+                    let error =
+                        Float::with_val(p, point - Float::with_val(p, interval.midpoint())).abs();
+                    assert!(
+                        error < tolerance,
+                        "assembly disagreement at c={c}, p={p}: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit release-mode performance measurement, no speed assertion"]
+    fn audit_prime_generator_benchmark() {
+        let p = 256;
+        let cutoff = ExactCutoff::parse("500").unwrap();
+        let length = cutoff.log_length(p).unwrap();
+        let options = ResearchAssemblyOptions::default();
+        for n in [32, 64, 128] {
+            let mut baseline = Vec::new();
+            let mut canonical = Vec::new();
+            let mut aggregate = Vec::new();
+            let mut canonical_identity = true;
+            let mut maximum_aggregate_error = Float::with_val(p, 0);
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                let previous = compute_prime_component_matrix_v0143_reference(n, 500, &length, p);
+                baseline.push(start.elapsed().as_nanos());
+                let start = std::time::Instant::now();
+                let reference = compute_prime_component_matrix(n, 500, &length, p);
+                canonical.push(start.elapsed().as_nanos());
+                canonical_identity &= previous == reference;
+                assert!(canonical_identity);
+                let start = std::time::Instant::now();
+                let candidate = aggregate_prime_component_hp(&cutoff, n, p, &options).unwrap();
+                aggregate.push(start.elapsed().as_nanos());
+                let tolerance = Float::with_val(p, 2).pow(-((p - 32) as i32));
+                for (a, b) in reference.iter().zip(&candidate) {
+                    let error = Float::with_val(p, a - b).abs();
+                    assert!(error < tolerance);
+                    if error > maximum_aggregate_error {
+                        maximum_aggregate_error = error;
+                    }
+                }
+            }
+            baseline.sort_unstable();
+            canonical.sort_unstable();
+            aggregate.sort_unstable();
+            println!(
+                "CCM_BENCH {}",
+                serde_json::json!({
+                    "cutoff": 500, "n_modes": n, "precision_bits": p, "samples": 3,
+                    "v0143_baseline_median_ns": baseline[1],
+                    "canonical_median_ns": canonical[1], "aggregate_median_ns": aggregate[1],
+                    "canonical_point_identity": canonical_identity,
+                    "maximum_aggregate_absolute_error": xc_numerics::prefix::lossless_decimal(&maximum_aggregate_error),
+                    "aggregate_absolute_tolerance": xc_numerics::prefix::lossless_decimal(&Float::with_val(p, 2).pow(-((p - 32) as i32))),
+                    "peak_rss_bytes": peak_resident_memory_bytes(),
+                    "scope": "prime_component_only_not_whole_solver_speedup",
+                })
+            );
+        }
     }
 }

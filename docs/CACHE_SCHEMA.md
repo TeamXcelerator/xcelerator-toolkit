@@ -327,3 +327,55 @@ not proof inputs. This artifact is routed to the existing `ccm-evidence`
 public/private shards and has a 0.14.1 producer and reader floor.
 
 Mk assigns separate artifacts to exact moments, basis and symmetry data, transformations, dense fixtures, matrix-free or structured operators, approximation bounds, adaptive-space histories, checkpoints, candidates, and quotient certificates. Corrected construction semantics invalidate only their dependent closure.
+
+## v0.15.0 retained evidence
+
+The evidence family adds `ccm_retained_reduction_check` (producer/reader floor
+0.15.0), and both visibility catalogs register it alongside `ccm_prefix_analysis`.
+The logical reduction payload shape is specified in
+[schemas/ccm-retained-reduction-check-v1.schema.json](schemas/ccm-retained-reduction-check-v1.schema.json).
+The registry and transport protocols retain schema version 1; no existing
+objects or shard pointers are rewritten by type registration.
+
+For these source-only children, `source_parents_are_public` is an identity-bearing
+boolean derived by the retained-source producer. Public routing/staging/reads
+require true; historical records lacking the field remain private. The usual
+private-only target-kind rules still apply. See [numerical compatibility](NUMERICAL_COMPATIBILITY.md) for the
+new sector, prolate and distance semantic keys and warm numerical-validation scope.
+
+
+## Managed research records
+
+The `ccm-evidence` family includes private-only `research_capture_receipt` and
+`research_hypothesis_evaluation` kinds. Both have producer/reader floor 0.15.0
+and source-bound, content-addressed record identities. Receipts bind every
+requested outcome and embedded measurement; evaluations embed selected
+observation bytes and replay their frozen score. Exact source dependencies are
+retained for publication closure. Neither record upgrades source assurance.
+
+Both registries carry identical portable shape schemas. Public catalogs exclude
+these two full-record kinds, and public routing, staging and reads reject them.
+Under publication to both lanes they are admitted only to the private lane.
+Existing source-only prefix/reduction eligibility and ordinary Tau/eigenstate/root
+compatibility floors remain unchanged. Prefix analysis and corrected sector-gap
+certificates require 0.15.0 readers/producers. See [capture integration](CAPTURE_LEVELS.md)
+and [evaluation replay](RESEARCH_EVIDENCE.md#managed-evaluation-and-replay).
+
+## Rollover topology invariants
+
+A family lists every shard in consecutive sequence order, including archived
+predecessors. Exactly one descriptor is writable, and it must be the final
+listed shard. `active_writable_shard` selects that destination. If absent, the
+family's `current_writable_shard` is used. The registry-level route must equal
+the family document's legacy `current_writable_shard`; it need not equal the
+active pointer when preserving access for older single-shard readers. Update
+the corresponding public and private topology documents consistently.
+
+An offline inventory needs every listed predecessor and rollover shard in each
+dependency visibility. `ccm_artifact_impact.py --registry` reports absent
+registered repositories; unresolved manifest digests remain an explicit
+coverage gap even when every repository is present. An inventory of main does
+not include unpublished workstation drafts. The `xcelerator-coordination`
+branch stores publication synchronization state, not artifact manifests; it
+can help investigate incomplete publication but cannot fill a dependency gap
+by itself. Do not pass a coordination-only snapshot as an artifact shard.

@@ -878,10 +878,13 @@ pub fn tridiag_selected_eigenpairs_hp(
 pub enum TridiagSolver {
     /// Banded LU on the tridiagonal directly (Thomas with partial
     /// pivoting via `linalg::tridiag_lu_factor_hp`). O(n) factor,
-    /// O(n) per-step solve, O(n) memory. The right choice for
-    /// production: at HP-1000, N=8001 the LU factor lands in
-    /// milliseconds and resident memory is a few KB.
+    /// O(n) per-step solve, O(n) memory. Historical replay only: this
+    /// route has a known later-pivot RHS defect. Use BandedInterleaved
+    /// for new explicit analyses and record the distinct semantics.
     Banded,
+    /// Corrected adjacent-pivot RHS solve, O(n) storage and work per step.
+    /// Explicitly distinct from historical Banded for retained-output identity.
+    BandedInterleaved,
     /// Dense LU after explicitly densifying `(T - λI + ε·I)` to an
     /// `n × n` matrix. O(n³) factor, O(n²) per-step solve, O(n²)
     /// memory. Retained for cross-validation: reviewers can compare
@@ -892,10 +895,22 @@ pub enum TridiagSolver {
     Dense,
 }
 
+impl TridiagSolver {
+    /// Bind this value into any new retained algorithm identity.
+    pub fn semantics_id(self) -> &'static str {
+        match self {
+            Self::Banded => "tridiag-lu-final-permutation-v1",
+            Self::BandedInterleaved => crate::linalg::TRIDIAG_PIVOTED_SOLVE_SEMANTICS,
+            Self::Dense => "dense-pivoted-lu-v1",
+        }
+    }
+}
+
 /// Options for `tridiag_eigenvector_for_value_hp`.
 ///
-/// `Default::default()` is the production choice (banded LU, early
-/// termination on, 200-step ceiling).
+/// `Default::default()` preserves the historical Banded route for replay.
+/// New analyses should select BandedInterleaved explicitly and independently
+/// check the recovered vector's residual and branch eligibility.
 #[derive(Debug, Clone, Copy)]
 pub struct TridiagEigvecOptions {
     /// Upper bound on inverse-iteration steps. The iteration runs at
@@ -927,8 +942,8 @@ impl Default for TridiagEigvecOptions {
 /// iteration on `(T - λI + ε·I)`, where `ε = 2^-(prec - 32)` is a small
 /// shift that prevents singularity.
 ///
-/// The default options (banded LU, `early_termination=true`,
-/// `max_steps=200`) are the right choice for production. Callers who
+/// The default options preserve historical Banded arithmetic. For new
+/// explicit analyses choose BandedInterleaved and record its identity. Callers who
 /// need bit-identical, deterministic-step-count output across runs
 /// should set `early_termination=false`. Callers who want to
 /// cross-validate against the dense LU path should set
@@ -982,6 +997,7 @@ pub fn tridiag_eigenvector_for_value_hp(
     let epsilon: Float = two.pow(-((prec as i32) - 32));
     let log_tag = match opts.solver {
         TridiagSolver::Banded => "[HP eigvec/banded]",
+        TridiagSolver::BandedInterleaved => "[HP eigvec/banded-interleaved-v2]",
         TridiagSolver::Dense => "[HP eigvec]",
     };
 
@@ -1022,7 +1038,7 @@ pub fn tridiag_eigenvector_for_value_hp(
             );
             Factored::Dense(lu)
         }
-        TridiagSolver::Banded => {
+        TridiagSolver::Banded | TridiagSolver::BandedInterleaved => {
             // Build the shifted tridiagonal in three short vectors.
             // Length n + 2(n-1) = 3n-2 HP entries — a few KB at HP-1000
             // vs the ~26 GB the dense form would need at N=8001.
@@ -1096,7 +1112,13 @@ pub fn tridiag_eigenvector_for_value_hp(
         // Solve (T - λI + ε·I) y = v_k. Banded is O(n); dense is O(n²).
         let mut new_v = match &factored {
             Factored::Dense(lu) => lu_solve(lu, &v, n, prec),
-            Factored::Banded(factors) => crate::linalg::tridiag_lu_solve_hp(factors, &v, prec)?,
+            Factored::Banded(factors) => {
+                if opts.solver == TridiagSolver::BandedInterleaved {
+                    crate::linalg::tridiag_lu_solve_pivoted_hp(factors, &v, prec)?
+                } else {
+                    crate::linalg::tridiag_lu_solve_hp(factors, &v, prec)?
+                }
+            }
         };
         normalize_l2(&mut new_v);
 
@@ -1205,10 +1227,258 @@ fn householder_tridiag_hp_impl(
     prec: u32,
     accumulate_q: bool,
 ) -> Result<(Vec<Float>, Vec<Float>, Vec<Float>)> {
-    if a.len() != n * n {
-        return Err(anyhow!("matrix length {} != n² = {}", a.len(), n * n));
+    householder_tridiag_hp_route(a, n, prec, accumulate_q, false)
+}
+
+/// Stable route identity; distinct from historical same-sign reflector sources.
+pub const STABLE_HOUSEHOLDER_SEMANTICS: &str = "householder-scaled-opposite-sign-v1";
+
+/// Stable symmetric reduction with an explicitly accumulated orthogonal basis.
+/// Uses scaled columns and the opposite-sign norm so the reflector's first
+/// component does not cancel. The inputs are finite and exactly symmetric;
+/// source values may be widened to analysis precision but never down-rounded.
+/// This is a computed decomposition, not a certified spectrum or eigenvector.
+pub fn householder_tridiag_hp_stable(
+    a: &[Float],
+    n: usize,
+    prec: u32,
+) -> Result<(Vec<Float>, Vec<Float>, Vec<Float>)> {
+    validate_stable_symmetric_input(a, n, prec)?;
+    householder_tridiag_hp_route(a, n, prec, true, true)
+}
+
+/// The same stable reduction, omitting the n-by-n Q allocation and updates.
+/// Its tridiagonal entries are identical to the with-Q route at fixed inputs.
+pub fn dense_symmetric_tridiagonal_hp_stable(
+    a: &[Float],
+    n: usize,
+    prec: u32,
+) -> Result<(Vec<Float>, Vec<Float>)> {
+    validate_stable_symmetric_input(a, n, prec)?;
+    let (d, e, _) = householder_tridiag_hp_route(a, n, prec, false, true)?;
+    Ok((d, e))
+}
+
+/// Stable Householder reduction followed by the existing tridiagonal QR.
+/// The returned eigenvalues are computed estimates, not certified enclosures.
+/// No relative-accuracy or sign guarantee is made for eigenvalues tiny compared
+/// with the input norm. A positive returned point can be unresolved at this
+/// source/working precision; assess retained-source precision sensitivity and
+/// matrix-assembly error separately (see docs/PREFIX_CONVERGENCE.md).
+pub fn dense_symmetric_eigenvalues_hp_stable(
+    a: &[Float],
+    n: usize,
+    prec: u32,
+) -> Result<Vec<Float>> {
+    let (d, e) = dense_symmetric_tridiagonal_hp_stable(a, n, prec)?;
+    let values = tridiag_eigenvalues_hp(&d, &e, prec)?;
+    if values.iter().any(|x| !x.is_finite()) {
+        return Err(anyhow!("nonfinite stable spectrum"));
     }
-    let mut h: Vec<Float> = a.to_vec();
+    Ok(values)
+}
+
+fn validate_stable_symmetric_input(a: &[Float], n: usize, prec: u32) -> Result<()> {
+    if n == 0 || n.checked_mul(n) != Some(a.len()) || !(64..=1_000_000).contains(&prec) {
+        return Err(anyhow!(
+            "invalid symmetric matrix shape or analysis precision"
+        ));
+    }
+    if a.iter().any(|x| !x.is_finite() || x.prec() > prec) {
+        return Err(anyhow!(
+            "stable reduction requires finite inputs without down-rounding"
+        ));
+    }
+    for i in 0..n {
+        for j in 0..i {
+            if a[i * n + j] != a[j * n + i] {
+                return Err(anyhow!(
+                    "stable reduction requires exactly symmetric storage"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Independently evaluate a supplied reduction against the original matrix.
+/// Frobenius residuals use scaled sum-of-squares; no full residual matrix is
+/// allocated. Cost is O(n^3) arithmetic and O(1) extra scalar storage beyond
+/// the supplied arrays. This does not rerun Householder and can check retained
+/// legacy Q/T data. Results are computed diagnostics, not interval certificates.
+pub fn assess_symmetric_reduction_hp(
+    a: &[Float],
+    diag: &[Float],
+    off_diag: &[Float],
+    q: &[Float],
+    prec: u32,
+) -> Result<xc_core::SymmetricReductionDiagnostics<Float>> {
+    let n = diag.len();
+    validate_stable_symmetric_input(a, n, prec)?;
+    if off_diag.len() != n - 1
+        || q.len() != a.len()
+        || diag
+            .iter()
+            .chain(off_diag)
+            .chain(q)
+            .any(|x| !x.is_finite() || x.prec() > prec)
+    {
+        return Err(anyhow!("invalid supplied symmetric reduction"));
+    }
+    let mut residual = ScaledSquareSum::new(prec);
+    let mut orthogonality = ScaledSquareSum::new(prec);
+    let mut source = ScaledSquareSum::new(prec);
+    let mut tridiagonal = ScaledSquareSum::new(prec);
+    let mut basis = ScaledSquareSum::new(prec);
+    for v in a {
+        source.add(v)?;
+    }
+    for v in q {
+        basis.add(v)?;
+    }
+    for v in diag {
+        tridiagonal.add(v)?;
+    }
+    for v in off_diag {
+        tridiagonal.add(v)?;
+        tridiagonal.add(v)?;
+    }
+    // Bound temporary residual storage to 16 rows. Indexed parallel collection
+    // and serial row-major norm accumulation preserve every rounding operation
+    // regardless of worker count. Products use reusable, separately rounded
+    // scratch values, not fused multiply-adds.
+    for start in (0..n).step_by(16) {
+        let rows: Vec<_> = (start..(start + 16).min(n))
+            .into_par_iter()
+            .map_init(
+                || (hp_zero(prec), hp_zero(prec), hp_zero(prec)),
+                |(aq, qtq, product), i| {
+                    (0..n)
+                        .map(|j| {
+                            aq.assign(0);
+                            qtq.assign(0);
+                            for k in 0..n {
+                                product.assign(&a[i * n + k] * &q[k * n + j]);
+                                *aq += &*product;
+                                product.assign(&q[k * n + i] * &q[k * n + j]);
+                                *qtq += &*product;
+                            }
+                            product.assign(&q[i * n + j] * &diag[j]);
+                            *aq -= &*product;
+                            if j > 0 {
+                                product.assign(&q[i * n + j - 1] * &off_diag[j - 1]);
+                                *aq -= &*product;
+                            }
+                            if j + 1 < n {
+                                product.assign(&q[i * n + j + 1] * &off_diag[j]);
+                                *aq -= &*product;
+                            }
+                            if i == j {
+                                *qtq -= 1;
+                            }
+                            (aq.clone(), qtq.clone())
+                        })
+                        .collect::<Vec<_>>()
+                },
+            )
+            .collect();
+        for row in rows {
+            for (aq, qtq) in row {
+                residual.add(&aq)?;
+                orthogonality.add(&qtq)?;
+            }
+        }
+    }
+    let absolute_similarity_residual = residual.norm()?;
+    let absolute_orthogonality_residual = orthogonality.norm()?;
+    let source_frobenius_norm = source.norm()?;
+    let tridiagonal_frobenius_norm = tridiagonal.norm()?;
+    let basis_frobenius_norm = basis.norm()?;
+    let mut denominator =
+        Float::with_val(prec, &source_frobenius_norm + &tridiagonal_frobenius_norm);
+    denominator *= &basis_frobenius_norm;
+    if !denominator.is_finite() {
+        return Err(anyhow!("unrepresentable diagnostic normalization"));
+    }
+    let mut relative_similarity_residual = absolute_similarity_residual.clone();
+    if !denominator.is_zero() {
+        relative_similarity_residual /= denominator;
+    }
+    let relative_orthogonality_residual = Float::with_val(
+        prec,
+        &absolute_orthogonality_residual / Float::with_val(prec, n).sqrt(),
+    );
+    Ok(xc_core::SymmetricReductionDiagnostics {
+        absolute_similarity_residual,
+        relative_similarity_residual,
+        absolute_orthogonality_residual,
+        relative_orthogonality_residual,
+        source_frobenius_norm,
+        tridiagonal_frobenius_norm,
+        basis_frobenius_norm,
+    })
+}
+
+// Streaming norm avoids squaring the largest/smallest raw exponent and avoids
+// allocating two n-by-n diagnostic residual arrays. Reduction order is fixed.
+struct ScaledSquareSum {
+    scale: Float,
+    sum: Float,
+}
+impl ScaledSquareSum {
+    fn new(p: u32) -> Self {
+        Self {
+            scale: hp_zero(p),
+            sum: hp_zero(p),
+        }
+    }
+    fn add(&mut self, value: &Float) -> Result<()> {
+        if !value.is_finite() {
+            return Err(anyhow!("nonfinite reduction diagnostic"));
+        }
+        let value = value.clone().abs();
+        if value.is_zero() {
+            return Ok(());
+        }
+        let p = self.scale.prec();
+        if value > self.scale {
+            let mut ratio = Float::with_val(p, &self.scale / &value);
+            ratio.square_mut();
+            self.sum *= ratio;
+            self.sum += 1;
+            self.scale.assign(value);
+        } else {
+            let mut ratio = Float::with_val(p, &value / &self.scale);
+            ratio.square_mut();
+            self.sum += ratio;
+        }
+        Ok(())
+    }
+    fn norm(self) -> Result<Float> {
+        let p = self.scale.prec();
+        let value = Float::with_val(p, self.scale * self.sum.sqrt());
+        if !value.is_finite() {
+            return Err(anyhow!("unrepresentable Frobenius norm"));
+        }
+        Ok(value)
+    }
+}
+
+fn householder_tridiag_hp_route(
+    a: &[Float],
+    n: usize,
+    prec: u32,
+    accumulate_q: bool,
+    stable: bool,
+) -> Result<(Vec<Float>, Vec<Float>, Vec<Float>)> {
+    if n == 0 || n.checked_mul(n) != Some(a.len()) {
+        return Err(anyhow!("invalid Householder matrix dimension or length"));
+    }
+    let mut h: Vec<Float> = if stable {
+        a.iter().map(|x| Float::with_val(prec, x)).collect()
+    } else {
+        a.to_vec()
+    };
 
     // Q starts as identity; we apply each Householder reflection from the
     // right as we go, accumulating into Q. (Equivalently, store Householder
@@ -1230,7 +1500,26 @@ fn householder_tridiag_hp_impl(
     for k in 0..n.saturating_sub(2) {
         // Pull out the column-k subdiagonal portion: x = h[k+1..n, k].
         let m = n - k - 1; // length of subdiagonal portion
-        let x: Vec<Float> = (0..m).map(|i| h[(k + 1 + i) * n + k].clone()).collect();
+        let mut x: Vec<Float> = (0..m).map(|i| h[(k + 1 + i) * n + k].clone()).collect();
+        let column_scale = if stable {
+            let scale = x
+                .iter()
+                .map(|v| v.clone().abs())
+                .max_by(Float::total_cmp)
+                .unwrap();
+            if !scale.is_finite() {
+                return Err(anyhow!("nonfinite Householder column"));
+            }
+            if scale.is_zero() {
+                continue;
+            }
+            for v in &mut x {
+                *v /= &scale;
+            }
+            Some(scale)
+        } else {
+            None
+        };
 
         // ‖x‖ via parallel reduction.
         let alpha_terms: Vec<Float> = x
@@ -1249,30 +1538,20 @@ fn householder_tridiag_hp_impl(
             continue;
         }
 
-        // Householder vector: v = x ± α·e₁, sign chosen to avoid cancellation.
-        // Standard choice: sign = -sign(x[0]) so x[0] gets a magnitude bump.
-        let sign_x0_negative = x[0].is_sign_negative();
-        let alpha_signed = if sign_x0_negative {
-            // sign(x[0]) is negative → use -α, so v[0] = x[0] + (-α) = x[0] - α
-            // Wait: we want v[0] = x[0] - sign(x[0])·α = x[0] + α (since sign was negative).
-            // Effectively v[0] = x[0] + α (always shifts away from zero).
-            // Let's compute as: signed_alpha = sign(x[0]) * α.
-            // Then v[0] = x[0] - signed_alpha + 2*signed_alpha if cancellation would occur.
-            // Simpler: signed_alpha = sign(x[0]) * α; new x[0] = -signed_alpha.
-            let mut s = alpha.clone();
-            s = -s;
-            s
+        // Legacy: v=x-sign(x0)*norm. Stable: v=x+sign(x0)*norm on
+        // a scaled column. The resulting off-diagonal has the opposite sign
+        // in the stable route; changing only v or only T would break AQ=QT.
+        let alpha_signed = if x[0].is_sign_negative() {
+            -alpha.clone()
         } else {
             alpha.clone()
         };
-
-        // v = x; v[0] += alpha_signed (i.e. shift away from zero)
         let mut v = x;
-        // v[0] = x[0] - sign(x[0])*α  (this guarantees |v[0]| > |x[0]|)
-        // Equivalently, v[0] += -sign(x[0])*α = -alpha_signed (with our convention).
-        let mut v0 = v[0].clone();
-        v0 -= &alpha_signed;
-        v[0] = v0;
+        if stable {
+            v[0] += &alpha_signed;
+        } else {
+            v[0] -= &alpha_signed;
+        }
 
         // ‖v‖² via parallel reduction.
         let v_norm_terms: Vec<Float> = v
@@ -1309,8 +1588,13 @@ fn householder_tridiag_hp_impl(
             .into_par_iter()
             .map(|i| {
                 let mut acc = hp_zero(prec);
+                let mut t = hp_zero(prec);
                 for j in 0..m {
-                    let mut t = h[(k + 1 + i) * n + (k + 1 + j)].clone();
+                    let entry = &h[(k + 1 + i) * n + (k + 1 + j)];
+                    if t.prec() != entry.prec() {
+                        t.set_prec(entry.prec());
+                    }
+                    t.assign(entry);
                     t *= &v[j];
                     acc += &t;
                 }
@@ -1321,22 +1605,8 @@ fn householder_tridiag_hp_impl(
             })
             .collect();
 
-        // β = (vᵀ p) / 2  (note: p already has the 2/‖v‖² factor)
-        // Wait — let me redo. Standard Householder symmetric update:
-        //   p = (2/‖v‖²) · h_sub · v  (p is a vector of length m)
-        //   K = (vᵀ p) / ‖v‖²         (a scalar)
-        //   q = p - K · v             (a vector)
-        //   h_sub_new = h_sub - v·qᵀ - q·vᵀ
-        //
-        // This is the textbook NumRec §11.2 update, but adapted: actually
-        // that text uses h ← H h H = h - 2 v vᵀ h - 2 h v vᵀ + 4 (vᵀ h v) v vᵀ / ‖v‖⁴
-        // = h - v pᵀ - p vᵀ where p = 2 h v / ‖v‖² - K v with K = vᵀ p / ‖v‖²
-        //   ... actually the simpler form is:  h ← h - v pᵀ - p vᵀ + 2 K v vᵀ
-        // where p = 2 h v / ‖v‖² and K = vᵀ p / ‖v‖² / 2. Let me just use:
-        //
-        //   h_sub ← h_sub - v·qᵀ - q·vᵀ   where q = p - β·v, p = 2·h_sub·v/‖v‖², β = vᵀp/(2·‖v‖²)
-        //
-        // I'll trust the textbook form and verify with tests.
+        // With p=2*A*v/(v^T*v), q=p-(v^T*p)/(v^T*v)*v gives
+        // H*A*H=A-v*q^T-q*v^T. The same update serves both conventions.
 
         // vᵀ p — parallel reduce.
         let vt_p_terms: Vec<Float> = (0..m)
@@ -1374,11 +1644,16 @@ fn householder_tridiag_hp_impl(
         // additional m-by-m MPFR matrix while preserving the old cell order.
         apply_householder_trailing_update_hp(&mut h, n, k, &v, &q_vec);
 
-        // Direct substitution into H = I - 2vv^T/(v^Tv) gives
-        // Hx = sign(x[0])||x||e1 for the `v` constructed above. Negating
-        // this value preserves eigenvalues but breaks Q^T A Q = T and makes
-        // back-transformed eigenvectors invalid.
-        let new_off_diag = alpha_signed;
+        let new_off_diag = if let Some(scale) = column_scale {
+            let mut value = -alpha_signed;
+            value *= scale;
+            value
+        } else {
+            alpha_signed
+        };
+        if stable && !new_off_diag.is_finite() {
+            return Err(anyhow!("nonfinite Householder off-diagonal"));
+        }
         h[(k + 1) * n + k] = new_off_diag.clone();
         h[k * n + (k + 1)] = new_off_diag;
 
@@ -1395,8 +1670,9 @@ fn householder_tridiag_hp_impl(
             q.par_chunks_mut(n).for_each(|q_row| {
                 // Compute coefficient: c = (2/‖v‖²) · sum_j q_row[k+1+j] · v[j]
                 let mut c = hp_zero(prec);
+                let mut t = hp_zero(prec);
                 for j in 0..m {
-                    let mut t = q_row[k + 1 + j].clone();
+                    t.assign(&q_row[k + 1 + j]);
                     t *= &v[j];
                     c += &t;
                 }
@@ -1404,9 +1680,9 @@ fn householder_tridiag_hp_impl(
                 c /= &v_norm_sq;
                 // Update: q_row[k+1+j] -= c · v[j]
                 for j in 0..m {
-                    let mut delta = c.clone();
-                    delta *= &v[j];
-                    q_row[k + 1 + j] -= &delta;
+                    t.assign(&c);
+                    t *= &v[j];
+                    q_row[k + 1 + j] -= &t;
                 }
             });
         }
@@ -1416,6 +1692,15 @@ fn householder_tridiag_hp_impl(
     let diag: Vec<Float> = (0..n).map(|i| h[i * n + i].clone()).collect();
     let off_diag: Vec<Float> = (0..(n - 1)).map(|i| h[(i + 1) * n + i].clone()).collect();
 
+    if stable
+        && diag
+            .iter()
+            .chain(&off_diag)
+            .chain(&q)
+            .any(|x| !x.is_finite())
+    {
+        return Err(anyhow!("nonfinite stable Householder output"));
+    }
     Ok((diag, off_diag, q))
 }
 

@@ -73,6 +73,27 @@ impl PortableHpFloat {
                 "negative_zero is valid only for a zero significand".to_owned(),
             ));
         }
+        if !significand.is_zero() {
+            let magnitude = significand.abs();
+            let significant_bits = magnitude.significant_bits();
+            // Powers of two in the integer significand do not consume MPFR
+            // precision. Reject only bits that reconstruction would round.
+            let effective_bits = significant_bits - magnitude.find_one(0).unwrap();
+            if effective_bits > self.precision_bits {
+                return Err(HpFormatError(
+                    "portable HP significand cannot be represented exactly at the declared precision"
+                        .to_owned(),
+                ));
+            }
+            let normalized_exponent = i64::from(self.binary_exponent) + i64::from(significant_bits);
+            if normalized_exponent < i64::from(rug::float::exp_min())
+                || normalized_exponent > i64::from(rug::float::exp_max())
+            {
+                return Err(HpFormatError(
+                    "portable HP value is outside the active MPFR exponent range".to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -93,6 +114,11 @@ impl PortableHpFloat {
         let mut value = Float::new(self.precision_bits);
         value.assign(significand);
         value <<= self.binary_exponent;
+        if !value.is_finite() || value.is_zero() {
+            return Err(HpFormatError(
+                "portable HP reconstruction overflowed or underflowed".to_owned(),
+            ));
+        }
         Ok(value)
     }
 }
@@ -499,6 +525,61 @@ mod tests {
             upper: PortableHpFloat::from_float(&fl(128, "1")).unwrap(),
         };
         assert!(reversed.validate().is_err());
+    }
+
+    #[test]
+    fn portable_payloads_cannot_round_away_a_significant_bit() {
+        for sign in ["", "-"] {
+            let encoded = serde_json::json!({
+                "precision_bits":64,
+                "significand_hex":format!("{sign}10000000000000001"),
+                "binary_exponent":-64,
+                "negative_zero":false,
+            });
+            let payload: PortableHpFloat = serde_json::from_value(encoded).unwrap();
+            assert!(payload.validate().is_err());
+            assert!(payload.to_float().is_err());
+            let interval = PortableHpInterval {
+                lower: payload.clone(),
+                upper: payload,
+            };
+            assert!(interval.to_bounds().is_err());
+        }
+    }
+
+    #[test]
+    fn portable_exact_powers_and_exponent_boundaries_remain_lossless() {
+        for sign in ["", "-"] {
+            let payload = PortableHpFloat {
+                precision_bits: 2,
+                significand_hex: format!("{sign}30000000000000000"),
+                binary_exponent: -64,
+                negative_zero: false,
+            };
+            assert_eq!(
+                payload.to_float().unwrap(),
+                if sign.is_empty() { 3 } else { -3 }
+            );
+        }
+        let mut payload = PortableHpFloat {
+            precision_bits: 64,
+            significand_hex: "1".into(),
+            binary_exponent: rug::float::exp_min() - 1,
+            negative_zero: false,
+        };
+        let minimum = payload.to_float().unwrap();
+        assert!(minimum.is_finite() && !minimum.is_zero());
+        assert_eq!(
+            PortableHpFloat::from_float(&minimum)
+                .unwrap()
+                .to_float()
+                .unwrap(),
+            minimum
+        );
+        payload.binary_exponent -= 1;
+        assert!(payload.validate().is_err());
+        payload.binary_exponent = rug::float::exp_max();
+        assert!(payload.validate().is_err());
     }
 
     #[test]

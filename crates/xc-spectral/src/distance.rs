@@ -1089,6 +1089,9 @@ pub mod hp {
         /// convention. Report them together: the spread between rules is the
         /// convention sensitivity of the measurement.
         pub distances: Vec<WeightedGridValueHp>,
+        /// All requested uniform-grid refinements met their fixed tolerance.
+        /// None means no applicable refinement was requested; false is retained evidence.
+        pub resolution_tolerance_met: Option<bool>,
     }
 
     /// Measure `d(N, λ)` end to end for one CCM configuration.
@@ -1121,6 +1124,7 @@ pub mod hp {
             n_modes: params.n_modes,
             eigenvalue: resolved.eigenvalue,
             distances: vec![distance],
+            resolution_tolerance_met: None,
         })
     }
 
@@ -1710,6 +1714,10 @@ pub mod hp {
         })
     }
 
+    fn retained_decimal(value: &Float, prec: u32) -> String {
+        Float::with_val(prec, value).to_string()
+    }
+
     pub(crate) fn decimal(value: &Float, prec: u32) -> String {
         let digits = ((f64::from(prec) * std::f64::consts::LOG10_2) as usize).max(20);
         value.to_string_radix(10, Some(digits))
@@ -1862,8 +1870,10 @@ pub mod hp {
             || artifact.lambda_squared != lambda_squared
             || artifact.n_modes != n_modes
             || artifact.precision_bits != precision_bits
-            || artifact.alpha != decimal(alpha, precision_bits)
-            || artifact.eigenvalue != decimal(expected_eigenvalue, precision_bits)
+            || (artifact.alpha != decimal(alpha, precision_bits)
+                && artifact.alpha != retained_decimal(alpha, precision_bits))
+            || (artifact.eigenvalue != decimal(expected_eigenvalue, precision_bits)
+                && artifact.eigenvalue != retained_decimal(expected_eigenvalue, precision_bits))
             || artifact.measurements.len() != rules.len()
         {
             return Err(invalid_retained_payload(
@@ -2002,8 +2012,6 @@ pub mod hp {
             lambda: &Float,
             prec: u32,
         ) -> Self {
-            use rayon::prelude::*;
-
             let mut values: std::collections::HashMap<(Integer, i32), Float> =
                 std::collections::HashMap::new();
             if let Some(seeds) = seeds {
@@ -2015,10 +2023,26 @@ pub mod hp {
                 }
             }
 
+            let mut table = Self {
+                eigenfunction,
+                values,
+            };
+            table.extend(rules, lambda, prec);
+            table
+        }
+
+        /// Extend with only previously unseen points; existing evaluations stay exact.
+        pub(crate) fn extend(
+            &mut self,
+            rules: &[(UniformGridScheme, GridVariable, usize)],
+            lambda: &Float,
+            prec: u32,
+        ) {
+            use rayon::prelude::*;
             // Deduplicate across every requested rule before evaluating.
             let mut pending: Vec<Float> = Vec::new();
             let mut seen: std::collections::HashSet<(Integer, i32)> =
-                values.keys().cloned().collect();
+                self.values.keys().cloned().collect();
             for (scheme, variable, steps) in rules.iter().copied() {
                 for u in uniform_rule_abscissae(lambda, scheme, variable, steps, prec) {
                     let Some(key) = u.to_integer_exp() else {
@@ -2032,18 +2056,13 @@ pub mod hp {
 
             let evaluated: Vec<(Float, Float)> = pending
                 .par_iter()
-                .map(|u| (u.clone(), eigenfunction.eval(u)))
+                .map(|u| (u.clone(), self.eigenfunction.eval(u)))
                 .collect();
-            values.reserve(evaluated.len());
+            self.values.reserve(evaluated.len());
             for (u, value) in evaluated {
                 if let Some(key) = u.to_integer_exp() {
-                    values.insert(key, value);
+                    self.values.insert(key, value);
                 }
-            }
-
-            Self {
-                eigenfunction,
-                values,
             }
         }
 
@@ -2193,22 +2212,12 @@ pub mod hp {
                 .base_value_samples
                 .and_then(|all_samples| all_samples.get(rule_index))
                 .filter(|samples| !samples.is_empty());
-            // Both refinement levels are enumerated now so their shared
-            // abscissae are evaluated once, in one parallel pass, rather than
-            // lazily during integration. 4Q is included even though it is
-            // conditional: it shares every 2Q abscissa, so enumerating it
-            // early costs one extra evaluation set only when 4Q actually runs,
-            // and lets the whole ladder be evaluated in a single pass.
-            let four_resolution_hint = steps.checked_mul(RESOLUTION_EVIDENCE_MAXIMUM_MULTIPLIER);
-            let mut precompute_rules = vec![(scheme, variable, twice_resolution)];
-            if let Some(four) = four_resolution_hint {
-                precompute_rules.push((scheme, variable, four));
-            }
-            let exact_values = (scheme != UniformGridScheme::Midpoint).then(|| {
+            // Build only 2Q. Extend the same exact-value table if 4Q is needed.
+            let mut exact_values = (scheme != UniformGridScheme::Midpoint).then(|| {
                 PrecomputedEigenfunctionValues::build(
                     eigenfunction,
                     samples.map(Vec::as_slice),
-                    &precompute_rules,
+                    &[(scheme, variable, twice_resolution)],
                     lambda,
                     precision_bits,
                 )
@@ -2259,6 +2268,13 @@ pub mod hp {
                     variable,
                     steps: four_resolution,
                 };
+                if let Some(values) = exact_values.as_mut() {
+                    values.extend(
+                        &[(scheme, variable, four_resolution)],
+                        lambda,
+                        precision_bits,
+                    );
+                }
                 let four_distance = distance_to_target_with_tables_bound(
                     |u: &Float| {
                         exact_values
@@ -2450,6 +2466,57 @@ pub mod hp {
                 }
             }
 
+            // Re-derive discrepancies from retained measurements. A self-consistent
+            // verdict over forged difference fields is not numerical evidence.
+            let check_difference = |left: &str,
+                                    right: &str,
+                                    absolute: &str,
+                                    relative: &str|
+             -> std::result::Result<(), xc_cache::CacheError> {
+                let left = parse_retained_float(left, precision_bits, "refinement distance")?;
+                let right = parse_retained_float(right, precision_bits, "refinement distance")?;
+                let (expected_absolute, expected_relative) =
+                    absolute_and_relative_difference(&left, &right, precision_bits);
+                let observed_absolute =
+                    parse_retained_float(absolute, precision_bits, "absolute difference")?;
+                let observed_relative =
+                    parse_retained_float(relative, precision_bits, "relative difference")?;
+                let mut epsilon = Float::with_val(precision_bits, 1);
+                epsilon >>= precision_bits.saturating_sub(16);
+                let mut scale = left.clone().abs().max(&right.clone().abs());
+                if scale.is_zero() {
+                    scale = Float::with_val(precision_bits, 1);
+                }
+                let absolute_tolerance = Float::with_val(precision_bits, &epsilon * scale);
+                let mut relative_tolerance = expected_relative.clone().abs();
+                relative_tolerance += 1;
+                relative_tolerance *= epsilon;
+                if Float::with_val(precision_bits, observed_absolute - expected_absolute).abs()
+                    > absolute_tolerance
+                    || Float::with_val(precision_bits, observed_relative - expected_relative).abs()
+                        > relative_tolerance
+                {
+                    return Err(invalid_retained_payload(
+                        "refinement discrepancies do not follow from retained distances",
+                    ));
+                }
+                Ok(())
+            };
+            check_difference(
+                &entry.base_distance,
+                &entry.twice_distance,
+                &entry.q_to_2q_absolute_difference,
+                &entry.q_to_2q_relative_difference,
+            )?;
+            if let Some(four) = &entry.four_times_distance {
+                check_difference(
+                    &entry.twice_distance,
+                    four,
+                    &entry.final_absolute_difference,
+                    &entry.final_relative_difference,
+                )?;
+            }
+
             let q_to_2q_relative = parse_retained_float(
                 &entry.q_to_2q_relative_difference,
                 precision_bits,
@@ -2513,6 +2580,7 @@ pub mod hp {
         pub(crate) precision_bits: u32,
     }
 
+    #[cfg(test)]
     pub(crate) fn compute_target_residual_analysis(
         source: TargetResidualAnalysisSource<'_>,
     ) -> Result<PortableTargetResidualAnalysis> {
@@ -3163,6 +3231,140 @@ pub mod hp {
         };
     }
 
+    /// Retain the canonical even eigenfunction without requiring a target.
+    /// This uses the same profile identity and bytes as distance capture.
+    pub fn capture_ccm_profile_via_cache(
+        params: &crate::ccm::CcmParams,
+        cfg: &crate::ccm::hp::HighPrecConfig,
+        profile_steps: usize,
+        variable: GridVariable,
+        cache: &xc_cache::ArtifactCacheContext<'_>,
+    ) -> Result<xc_cache::ArtifactExecutionCacheResult<PortableEigenfunctionProfile>> {
+        use std::collections::BTreeMap;
+        use xc_cache::{
+            resolve_or_compute_json_artifact_with_dependencies, ArtifactExecutionCacheRequest,
+            CacheQuality, DependencyRef, SemanticKeyEnvelope, ToolkitVersion,
+        };
+        if profile_steps == 0 || u32::try_from(profile_steps).is_err() {
+            anyhow::bail!("profile step count must fit a positive u32");
+        }
+        let prec = cfg.precision_bits;
+        let working = prec.saturating_add(GUARD_BITS);
+        let lambda_sq_identity = lambda_squared_identity(params);
+        let lambda_sq = if params.lambda_sq.is_integer {
+            Float::with_val(working, params.lambda_sq.value_u64)
+        } else {
+            Float::with_val(working, params.lambda_sq.value_f64)
+        };
+        if lambda_sq <= 1u32 {
+            anyhow::bail!("profile requires lambda_squared > 1");
+        }
+        let lambda = lambda_sq.sqrt();
+        let canonical_state =
+            crate::ccm::hp::resolve_canonical_even_eigenstate_via_cache(params, cfg, cache)?;
+        let eigenpair_content_digest = canonical_state.manifest.content_digest.0.clone();
+        let profile_key = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "ccm_eigenfunction_profile".to_owned(),
+            mathematical_semantics_version: "ccm-eigenfunction-profile-lossless-v0.15.0-v1"
+                .to_owned(),
+            resolved_mathematical_parameters: serde_json::json!({
+                "lambda_squared": lambda_sq_identity,
+                "n_modes": params.n_modes,
+                "precision_bits": prec,
+                "grid_variable": variable.as_str(),
+                "profile_steps": profile_steps,
+                "eigenpair_content_digest": eigenpair_content_digest,
+                "definition": "even CCM ground eigenfunction sampled on [1, lambda]"
+            }),
+            normalization: Some("f(1)=1".to_owned()),
+            target: Some("finite_ccm_even_ground_eigenfunction".to_owned()),
+            subspace: Some("even".to_owned()),
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: Some(
+                "even_cosine_reconstruction_from_canonical_weil_eigenpair_v2".to_owned(),
+            ),
+        };
+        let profile_logical_key = format!(
+            "ccm/eigenfunction-profile/{}/{}/{}/{}/{}",
+            lambda_sq_identity,
+            params.n_modes,
+            prec,
+            variable.as_str(),
+            profile_steps
+        );
+        let profile_request = ArtifactExecutionCacheRequest {
+            operation: "ccm.eigenfunction_profile.resolve_or_compute",
+            semantic_key: &profile_key,
+            logical_key: &profile_logical_key,
+            resolver: cache.resolver,
+            reference_resolver: cache.reference_resolver,
+            acceptance: cache.acceptance,
+            ordered_overlays: cache.ordered_overlays.clone(),
+            mode: cache.mode,
+            write_on_miss: cache.write_on_miss,
+            write_visibility: cache.write_visibility,
+            produced_quality: CacheQuality::Validated,
+            producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
+            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            maximum_reader_version: None,
+            tags: BTreeMap::from([
+                ("domain".to_owned(), "ccm".to_owned()),
+                ("artifact".to_owned(), "eigenfunction_profile".to_owned()),
+            ]),
+            provenance_digest: None,
+            production_sink: cache.production_sink,
+        };
+
+        Ok(resolve_or_compute_json_artifact_with_dependencies(
+            &profile_request,
+            || {
+                let eigenfunction = WeilEigenfunction::from_v_basis(
+                    &canonical_state.eigenvector,
+                    params.n_modes,
+                    &lambda,
+                    prec,
+                )
+                .map_err(|error| xc_cache::CacheError::InvalidManifest(error.to_string()))?;
+                let (u_values, f_values) =
+                    sample_profile(&eigenfunction, &lambda, profile_steps, variable, prec);
+                Ok((
+                    PortableEigenfunctionProfile {
+                        schema_version: 1,
+                        lambda_squared: lambda_sq_identity.clone(),
+                        n_modes: params.n_modes,
+                        precision_bits: prec,
+                        grid_variable: variable.as_str().to_owned(),
+                        sample_count: u_values.len(),
+                        normalization: "f(1)=1".to_owned(),
+                        u_values: u_values.iter().map(|v| retained_decimal(v, prec)).collect(),
+                        f_values: f_values.iter().map(|v| retained_decimal(v, prec)).collect(),
+                        normalized_coefficients: eigenfunction
+                            .normalized_coefficients()
+                            .iter()
+                            .map(|v| retained_decimal(v, prec))
+                            .collect(),
+                    },
+                    vec![DependencyRef {
+                        key: canonical_state.manifest.key.clone(),
+                        content_digest: canonical_state.manifest.content_digest.clone(),
+                        required_quality: CacheQuality::Validated,
+                    }],
+                ))
+            },
+            |artifact| {
+                validate_portable_eigenfunction_profile(
+                    artifact,
+                    &lambda_sq_identity,
+                    params.n_modes,
+                    prec,
+                    variable,
+                    profile_steps,
+                )
+            },
+        )?)
+    }
+
     fn capture_ccm_distance_via_cache_internal(
         params: &crate::ccm::CcmParams,
         cfg: &crate::ccm::hp::HighPrecConfig,
@@ -3275,8 +3477,6 @@ pub mod hp {
             eigenvalue: Float,
             distances: Vec<WeightedGridValueHp>,
             norm_values: Vec<Float>,
-            signed_residual_values: Option<Vec<Float>>,
-            base_value_samples: Vec<Vec<(Float, Float)>>,
             u_values: Vec<Float>,
             f_values: Vec<Float>,
         }
@@ -3302,32 +3502,12 @@ pub mod hp {
             gl_tables.preload_managed(rules, prec, cache)?;
             let mut distances = Vec::with_capacity(rules.len());
             let mut norm_values = Vec::with_capacity(rules.len());
-            let mut base_value_samples = Vec::with_capacity(rules.len());
-            let mut signed_residual_values = derived_capture
-                .residual_analysis
-                .then(|| Vec::with_capacity(rules.len()));
             for rule in rules {
                 let recorded_values = std::cell::RefCell::new(Vec::new());
-                let recorded_samples = std::cell::RefCell::new(Vec::new());
-                let retain_base_samples = derived_capture.resolution_evidence
-                    && matches!(
-                        *rule,
-                        WeightedIntegrationRule::UniformGrid {
-                            scheme: UniformGridScheme::LeftRiemann
-                                | UniformGridScheme::RightRiemann
-                                | UniformGridScheme::Trapezoid,
-                            ..
-                        }
-                    );
                 let distance = distance_to_target_with_tables_bound(
                     |u: &Float| {
                         let value = eigenfunction.eval(u);
                         recorded_values.borrow_mut().push(value.clone());
-                        if retain_base_samples {
-                            recorded_samples
-                                .borrow_mut()
-                                .push((u.clone(), value.clone()));
-                        }
                         value
                     },
                     &lambda,
@@ -3338,37 +3518,6 @@ pub mod hp {
                     Some(&target_definition_digest),
                 )?;
                 let recorded_values = recorded_values.into_inner();
-                if let Some(signed_values) = &mut signed_residual_values {
-                    let signed_cursor = std::cell::Cell::new(0usize);
-                    let signed_replay_overrun = std::cell::Cell::new(false);
-                    let signed = signed_residual_to_target_with_tables(
-                        |_u: &Float| {
-                            let index = signed_cursor.get();
-                            signed_cursor.set(index + 1);
-                            match recorded_values.get(index) {
-                                Some(value) => value.clone(),
-                                None => {
-                                    signed_replay_overrun.set(true);
-                                    Float::with_val(working, 0u32)
-                                }
-                            }
-                        },
-                        &lambda,
-                        alpha,
-                        *rule,
-                        prec,
-                        Some(&mut gl_tables),
-                        Some(&target_definition_digest),
-                    )?;
-                    if signed_replay_overrun.get() || signed_cursor.get() != recorded_values.len() {
-                        anyhow::bail!(
-                            "fused distance/signed-residual replay expected {} evaluations, consumed {}",
-                            recorded_values.len(),
-                            signed_cursor.get()
-                        );
-                    }
-                    signed_values.push(signed);
-                }
                 let cursor = std::cell::Cell::new(0usize);
                 let replay_overrun = std::cell::Cell::new(false);
                 let norm = weighted_alpha_norm_with_tables(
@@ -3398,7 +3547,6 @@ pub mod hp {
                 }
                 distances.push(distance);
                 norm_values.push(norm.value);
-                base_value_samples.push(recorded_samples.into_inner());
             }
 
             // The profile grid follows the first rule's variable; the
@@ -3411,8 +3559,6 @@ pub mod hp {
                 eigenfunction,
                 distances,
                 norm_values,
-                signed_residual_values,
-                base_value_samples,
                 u_values,
                 f_values,
             })
@@ -3426,13 +3572,21 @@ pub mod hp {
             grid_variable: variable.as_str().to_owned(),
             sample_count: state.u_values.len(),
             normalization: "f(1)=1".to_owned(),
-            u_values: state.u_values.iter().map(|v| decimal(v, prec)).collect(),
-            f_values: state.f_values.iter().map(|v| decimal(v, prec)).collect(),
+            u_values: state
+                .u_values
+                .iter()
+                .map(|v| retained_decimal(v, prec))
+                .collect(),
+            f_values: state
+                .f_values
+                .iter()
+                .map(|v| retained_decimal(v, prec))
+                .collect(),
             normalized_coefficients: state
                 .eigenfunction
                 .normalized_coefficients()
                 .iter()
-                .map(|v| decimal(v, prec))
+                .map(|v| retained_decimal(v, prec))
                 .collect(),
         };
         let build_distance_payload = |state: &ComputedCapture| PortableTargetDistance {
@@ -3441,7 +3595,7 @@ pub mod hp {
             lambda_squared: lambda_sq_identity.clone(),
             n_modes: params.n_modes,
             precision_bits: prec,
-            alpha: decimal(alpha, prec),
+            alpha: retained_decimal(alpha, prec),
             measurements: rules
                 .iter()
                 .zip(state.distances.iter().zip(&state.norm_values))
@@ -3450,48 +3604,60 @@ pub mod hp {
                     quadrature_rule: rule.rule().to_owned(),
                     grid_variable: rule.variable().as_str().to_owned(),
                     resolution: rule.resolution(),
-                    distance_to_target: decimal(&distance.value, prec),
-                    eigenfunction_norm: decimal(norm, prec),
+                    distance_to_target: retained_decimal(&distance.value, prec),
+                    eigenfunction_norm: retained_decimal(norm, prec),
                 })
                 .collect(),
-            eigenvalue: decimal(&state.eigenvalue, prec),
+            eigenvalue: retained_decimal(&state.eigenvalue, prec),
         };
-        let build_resolution_evidence_payload = |state: &ComputedCapture| {
-            compute_distance_resolution_evidence_with_samples(
-                &state.eigenfunction,
-                &lambda,
-                alpha,
-                rules,
-                ResolutionEvidenceEvaluationSource {
-                    base_distances: &state.distances,
-                    base_value_samples: Some(&state.base_value_samples),
-                },
-                &target_definition_digest,
-                &lambda_sq_identity,
-                prec,
-            )
-        };
-        let build_residual_analysis_payload = |state: &ComputedCapture| {
-            compute_target_residual_analysis(TargetResidualAnalysisSource {
-                eigenfunction: &state.eigenfunction,
-                lambda: &lambda,
-                alpha,
-                rules,
-                base_distances: &state.distances,
-                u_values: &state.u_values,
-                f_values: &state.f_values,
-                precomputed_signed_residuals: state.signed_residual_values.as_deref(),
-                target_definition_digest: &target_definition_digest,
-                lambda_squared: &lambda_sq_identity,
-                sampling_variable: variable,
-                precision_bits: prec,
-            })
-        };
+        let build_resolution_evidence_payload =
+            |profile: &PortableEigenfunctionProfile, distance: &PortableTargetDistance| {
+                let retained = decode_retained_distance_source(
+                    profile, distance, &lambda, alpha, rules, prec,
+                )?;
+                compute_distance_resolution_evidence(
+                    &retained.eigenfunction,
+                    &lambda,
+                    alpha,
+                    rules,
+                    &retained.distances,
+                    &target_definition_digest,
+                    &lambda_sq_identity,
+                    prec,
+                )
+            };
+        let build_residual_analysis_payload =
+            |profile: &PortableEigenfunctionProfile, distance: &PortableTargetDistance| {
+                let retained = decode_retained_distance_source(
+                    profile, distance, &lambda, alpha, rules, prec,
+                )?;
+                let mut gl_tables = SharedGlTables::new();
+                gl_tables.preload_managed(rules, prec, cache)?;
+                compute_target_residual_analysis_with_tables(
+                    TargetResidualAnalysisSource {
+                        eigenfunction: &retained.eigenfunction,
+                        lambda: &lambda,
+                        alpha,
+                        rules,
+                        base_distances: &retained.distances,
+                        u_values: &retained.u_values,
+                        f_values: &retained.f_values,
+                        precomputed_signed_residuals: None,
+                        target_definition_digest: &target_definition_digest,
+                        lambda_squared: &lambda_sq_identity,
+                        sampling_variable: variable,
+                        precision_bits: prec,
+                    },
+                    Some(&mut gl_tables),
+                )
+            };
+        let mut resolution_tolerance_met = None;
 
         let profile_key = SemanticKeyEnvelope {
             schema_version: 1,
             artifact_kind: "ccm_eigenfunction_profile".to_owned(),
-            mathematical_semantics_version: "ccm-eigenfunction-profile-v0.14.1-v2".to_owned(),
+            mathematical_semantics_version: "ccm-eigenfunction-profile-lossless-v0.15.0-v1"
+                .to_owned(),
             resolved_mathematical_parameters: serde_json::json!({
                 "lambda_squared": lambda_sq_identity,
                 "n_modes": params.n_modes,
@@ -3543,7 +3709,8 @@ pub mod hp {
         let distance_key = SemanticKeyEnvelope {
             schema_version: 1,
             artifact_kind: "ccm_target_distance".to_owned(),
-            mathematical_semantics_version: "ccm-runtime-target-distance-v0.14.1-v3".to_owned(),
+            mathematical_semantics_version: "ccm-runtime-target-distance-lossless-v0.15.0-v1"
+                .to_owned(),
             resolved_mathematical_parameters: serde_json::json!({
                 "target_definition_digest": target_definition_digest,
                 "lambda_squared": lambda_sq_identity,
@@ -3873,6 +4040,14 @@ pub mod hp {
             )
         };
 
+        let bind_key = |key: &SemanticKeyEnvelope, dependencies: &[DependencyRef]| {
+            let mut key = key.clone();
+            key.mathematical_semantics_version =
+                format!("{}-retained-parents-v0.15.0-v1", key.artifact_kind);
+            key.resolved_mathematical_parameters["retained_parent_dependencies"] =
+                serde_json::json!(dependencies);
+            key
+        };
         if cache.mode.consults_cache_for_result_reuse() {
             // Reuse modes: compute lazily, only when an artifact misses. A
             // full hit performs no sector resolution, no eigenfunction
@@ -3920,55 +4095,57 @@ pub mod hp {
                 structural_distance_check,
             )?;
             structural_distance_check(&resolved_distance.value)?;
+            let mut child_dependencies = eigenpair_dependency();
+            child_dependencies.push(measurement_dependency(
+                &resolved_profile,
+                &profile_key,
+                &profile_logical_key,
+            )?);
+            child_dependencies.push(measurement_dependency(
+                &resolved_distance,
+                &distance_key,
+                &distance_logical_key,
+            )?);
+            child_dependencies.sort_by(|a, b| a.key.kind.cmp(&b.key.kind));
+            let evidence_key = bind_key(&evidence_key, &child_dependencies);
+            let residual_key = bind_key(&residual_key, &child_dependencies);
+            let decomposition_key = bind_key(&decomposition_key, &child_dependencies);
+            let evidence_request = ArtifactExecutionCacheRequest {
+                semantic_key: &evidence_key,
+                minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+                ..evidence_request
+            };
+            let residual_request = ArtifactExecutionCacheRequest {
+                semantic_key: &residual_key,
+                minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+                ..residual_request
+            };
+            let decomposition_request = ArtifactExecutionCacheRequest {
+                semantic_key: &decomposition_key,
+                minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+                ..decomposition_request
+            };
 
             if derived_capture.resolution_evidence {
                 let resolved_evidence = resolve_or_compute_json_artifact_with_dependencies(
                     &evidence_request,
                     || {
-                        let guard = state.borrow();
-                        if let Some(computed) = guard.as_ref() {
-                            return build_resolution_evidence_payload(computed)
-                                .map(|payload| (payload, eigenpair_dependency()))
-                                .map_err(|error| {
-                                    CacheError::InvalidTransition(format!(
-                                        "distance resolution-evidence computation failed: {error}"
-                                    ))
-                                });
-                        }
-                        drop(guard);
-                        let retained = decode_retained_distance_source(
+                        build_resolution_evidence_payload(
                             &resolved_profile.value,
                             &resolved_distance.value,
-                            &lambda,
-                            alpha,
-                            rules,
-                            prec,
                         )
+                        .map(|payload| (payload, child_dependencies.clone()))
                         .map_err(|error| {
                             CacheError::InvalidTransition(format!(
-                                "retained distance source could not be reconstructed: {error}"
-                            ))
-                        })?;
-                        compute_distance_resolution_evidence(
-                            &retained.eigenfunction,
-                            &lambda,
-                            alpha,
-                            rules,
-                            &retained.distances,
-                            &target_definition_digest,
-                            &lambda_sq_identity,
-                            prec,
-                        )
-                        .map(|payload| (payload, eigenpair_dependency()))
-                        .map_err(|error| {
-                            CacheError::InvalidTransition(format!(
-                                "distance resolution-evidence backfill failed: {error}"
+                                "resolution evidence failed: {error}"
                             ))
                         })
                     },
                     structural_resolution_evidence_check,
                 )?;
                 structural_resolution_evidence_check(&resolved_evidence.value)?;
+                resolution_tolerance_met = resolution_verdict(&resolved_evidence.value);
+                check_measurement_dependencies(&resolved_evidence, &child_dependencies)?;
             }
 
             if derived_capture.deviation_decomposition {
@@ -3988,7 +4165,7 @@ pub mod hp {
                     &decomposition_request,
                     || {
                         compute_deviation_decomposition_payload(&resolved_profile.value, prec)
-                            .map(|payload| (payload, eigenpair_dependency()))
+                            .map(|payload| (payload, child_dependencies.clone()))
                             .map_err(|error| {
                                 CacheError::InvalidTransition(format!(
                                     "deviation decomposition computation failed: {error}"
@@ -3998,81 +4175,30 @@ pub mod hp {
                     check,
                 )?;
                 check(&resolved_decomposition.value)?;
+                check_measurement_dependencies(&resolved_decomposition, &child_dependencies)?;
             }
 
             if derived_capture.residual_analysis {
                 let resolved_residual = resolve_or_compute_json_artifact_with_dependencies(
                     &residual_request,
                     || {
-                        let guard = state.borrow();
-                        if let Some(computed) = guard.as_ref() {
-                            return build_residual_analysis_payload(computed)
-                                .map(|payload| (payload, eigenpair_dependency()))
-                                .map_err(|error| {
-                                    CacheError::InvalidTransition(format!(
-                                        "target residual-analysis computation failed: {error}"
-                                    ))
-                                });
-                        }
-                        drop(guard);
-                        let retained = decode_retained_distance_source(
+                        build_residual_analysis_payload(
                             &resolved_profile.value,
                             &resolved_distance.value,
-                            &lambda,
-                            alpha,
-                            rules,
-                            prec,
                         )
+                        .map(|payload| (payload, child_dependencies.clone()))
                         .map_err(|error| {
                             CacheError::InvalidTransition(format!(
-                                "retained distance source could not be reconstructed: {error}"
-                            ))
-                        })?;
-                        let mut gl_tables = SharedGlTables::new();
-                        gl_tables
-                            .preload_managed(rules, prec, cache)
-                            .map_err(|error| {
-                                CacheError::InvalidTransition(format!(
-                                    "managed distance quadrature resolution failed: {error}"
-                                ))
-                            })?;
-                        compute_target_residual_analysis_with_tables(
-                            TargetResidualAnalysisSource {
-                                eigenfunction: &retained.eigenfunction,
-                                lambda: &lambda,
-                                alpha,
-                                rules,
-                                base_distances: &retained.distances,
-                                u_values: &retained.u_values,
-                                f_values: &retained.f_values,
-                                precomputed_signed_residuals: None,
-                                target_definition_digest: &target_definition_digest,
-                                lambda_squared: &lambda_sq_identity,
-                                sampling_variable: variable,
-                                precision_bits: prec,
-                            },
-                            Some(&mut gl_tables),
-                        )
-                        .map(|payload| (payload, eigenpair_dependency()))
-                        .map_err(|error| {
-                            CacheError::InvalidTransition(format!(
-                                "target residual-analysis backfill failed: {error}"
+                                "residual analysis failed: {error}"
                             ))
                         })
                     },
                     structural_residual_analysis_check,
                 )?;
                 structural_residual_analysis_check(&resolved_residual.value)?;
+                check_measurement_dependencies(&resolved_residual, &child_dependencies)?;
             }
 
-            if let Some(state) = state.into_inner() {
-                return Ok(CcmTargetDistanceHp {
-                    lambda_squared: params.lambda_squared(),
-                    n_modes: params.n_modes,
-                    eigenvalue: state.eigenvalue,
-                    distances: state.distances,
-                });
-            }
             // Full hit: decode the measurement from the retained artifact.
             let parse = |text: &str| -> Result<Float> {
                 let parsed = Float::parse(text)
@@ -4094,6 +4220,7 @@ pub mod hp {
                 n_modes: params.n_modes,
                 eigenvalue: parse(&resolved_distance.value.eigenvalue)?,
                 distances,
+                resolution_tolerance_met,
             });
         }
 
@@ -4134,12 +4261,45 @@ pub mod hp {
         if resolved_distance.value != distance_payload {
             anyhow::bail!("resolved CCM target distance disagrees with replayed values");
         }
+        let mut child_dependencies = eigenpair_dependency();
+        child_dependencies.push(measurement_dependency(
+            &resolved_profile,
+            &profile_key,
+            &profile_logical_key,
+        )?);
+        child_dependencies.push(measurement_dependency(
+            &resolved_distance,
+            &distance_key,
+            &distance_logical_key,
+        )?);
+        child_dependencies.sort_by(|a, b| a.key.kind.cmp(&b.key.kind));
+        let evidence_key = bind_key(&evidence_key, &child_dependencies);
+        let residual_key = bind_key(&residual_key, &child_dependencies);
+        let decomposition_key = bind_key(&decomposition_key, &child_dependencies);
+        let evidence_request = ArtifactExecutionCacheRequest {
+            semantic_key: &evidence_key,
+            minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+            ..evidence_request
+        };
+        let residual_request = ArtifactExecutionCacheRequest {
+            semantic_key: &residual_key,
+            minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+            ..residual_request
+        };
+        let decomposition_request = ArtifactExecutionCacheRequest {
+            semantic_key: &decomposition_key,
+            minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+            ..decomposition_request
+        };
 
         if derived_capture.resolution_evidence {
-            let evidence_payload = build_resolution_evidence_payload(&state)?;
+            let evidence_payload = build_resolution_evidence_payload(
+                &resolved_profile.value,
+                &resolved_distance.value,
+            )?;
             let resolved_evidence = resolve_or_compute_json_artifact_with_dependencies(
                 &evidence_request,
-                || Ok((evidence_payload.clone(), eigenpair_dependency())),
+                || Ok((evidence_payload.clone(), child_dependencies.clone())),
                 |artifact| {
                     if artifact != &evidence_payload {
                         return Err(CacheError::InvalidManifest(
@@ -4150,6 +4310,8 @@ pub mod hp {
                     Ok(())
                 },
             )?;
+            resolution_tolerance_met = resolution_verdict(&resolved_evidence.value);
+            check_measurement_dependencies(&resolved_evidence, &child_dependencies)?;
             if resolved_evidence.value != evidence_payload {
                 anyhow::bail!(
                     "resolved CCM distance resolution evidence disagrees with replayed values"
@@ -4179,7 +4341,7 @@ pub mod hp {
                                 "deviation decomposition computation failed: {error}"
                             ))
                         })
-                        .map(|payload| (payload, eigenpair_dependency()))
+                        .map(|payload| (payload, child_dependencies.clone()))
                 },
                 check,
             )?;
@@ -4187,10 +4349,11 @@ pub mod hp {
         }
 
         if derived_capture.residual_analysis {
-            let residual_payload = build_residual_analysis_payload(&state)?;
+            let residual_payload =
+                build_residual_analysis_payload(&resolved_profile.value, &resolved_distance.value)?;
             let resolved_residual = resolve_or_compute_json_artifact_with_dependencies(
                 &residual_request,
-                || Ok((residual_payload.clone(), eigenpair_dependency())),
+                || Ok((residual_payload.clone(), child_dependencies.clone())),
                 |artifact| {
                     if artifact != &residual_payload {
                         return Err(CacheError::InvalidManifest(
@@ -4211,9 +4374,69 @@ pub mod hp {
         Ok(CcmTargetDistanceHp {
             lambda_squared: params.lambda_squared(),
             n_modes: params.n_modes,
-            eigenvalue: state.eigenvalue,
-            distances: state.distances,
+            eigenvalue: parse_retained_float(
+                &resolved_distance.value.eigenvalue,
+                prec,
+                "eigenvalue",
+            )?,
+            distances: decode_retained_distance_source(
+                &resolved_profile.value,
+                &resolved_distance.value,
+                &lambda,
+                alpha,
+                rules,
+                prec,
+            )?
+            .distances,
+            resolution_tolerance_met,
         })
+    }
+
+    fn resolution_verdict(evidence: &PortableDistanceResolutionEvidence) -> Option<bool> {
+        (!evidence.refinements.is_empty())
+            .then(|| evidence.refinements.iter().all(|r| r.tolerance_met))
+    }
+    fn measurement_dependency<T: Serialize>(
+        result: &xc_cache::ArtifactExecutionCacheResult<T>,
+        key: &xc_cache::SemanticKeyEnvelope,
+        logical: &str,
+    ) -> Result<xc_cache::DependencyRef> {
+        if let Some(manifest) = result
+            .produced_manifest
+            .as_ref()
+            .or(result.reused_manifest.as_ref())
+        {
+            return Ok(xc_cache::DependencyRef {
+                key: manifest.key.clone(),
+                content_digest: manifest.content_digest.clone(),
+                required_quality: xc_cache::CacheQuality::Validated,
+            });
+        }
+        // Disabled cache routes have no manifest; bind the canonical in-memory
+        // payload only in that case.
+        Ok(xc_cache::DependencyRef {
+            key: xc_cache::ArtifactKey {
+                kind: key.artifact_kind.clone(),
+                logical_key: logical.into(),
+                parameters_digest: key.digest()?,
+            },
+            content_digest: xc_cache::ContentDigest::sha256(&serde_json::to_vec(&result.value)?),
+            required_quality: xc_cache::CacheQuality::Validated,
+        })
+    }
+    fn check_measurement_dependencies<T>(
+        result: &xc_cache::ArtifactExecutionCacheResult<T>,
+        expected: &[xc_cache::DependencyRef],
+    ) -> Result<()> {
+        if result
+            .produced_manifest
+            .as_ref()
+            .or(result.reused_manifest.as_ref())
+            .is_some_and(|m| m.dependencies != expected)
+        {
+            anyhow::bail!("measurement child dependency closure mismatch");
+        }
+        Ok(())
     }
 
     /// One `D_alpha` value under one integration rule.
@@ -5126,7 +5349,7 @@ mod tests {
                 )),
             }]);
             let policy = CachePolicy {
-                current_toolkit_version: ToolkitVersion::parse("0.14.1").unwrap(),
+                current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 minimum_quality: CacheQuality::Validated,
                 accepted_schema_versions: vec![1],
                 allow_deprecated: false,
@@ -5234,13 +5457,20 @@ mod tests {
                 // Every Q point recurs in 2Q and every 2Q point in 4Q, so the
                 // union is exactly the 4Q set: 33 abscissae covering all three
                 // levels instead of 9 + 17 + 33 = 59 evaluations.
-                let exact_values = hp::PrecomputedEigenfunctionValues::build(
+                let mut exact_values = hp::PrecomputedEigenfunctionValues::build(
                     &eigenfunction,
                     Some(&samples),
-                    &[
-                        (UniformGridScheme::Trapezoid, variable, 16),
-                        (UniformGridScheme::Trapezoid, variable, 32),
-                    ],
+                    &[(UniformGridScheme::Trapezoid, variable, 16)],
+                    &lambda,
+                    prec,
+                );
+                assert_eq!(
+                    exact_values.retained(),
+                    17,
+                    "a 2Q success must not evaluate 4Q-only points"
+                );
+                exact_values.extend(
+                    &[(UniformGridScheme::Trapezoid, variable, 32)],
                     &lambda,
                     prec,
                 );
@@ -5549,6 +5779,22 @@ mod tests {
             )
             .unwrap();
 
+            let mut fabricated = evidence.clone();
+            fabricated.refinements[0].base_distance = "999".into();
+            assert!(
+                hp::validate_portable_distance_resolution_evidence(
+                    &fabricated,
+                    &test_target_digest(),
+                    "9",
+                    4,
+                    prec,
+                    &alpha,
+                    &rules,
+                )
+                .is_err(),
+                "stored difference fields cannot override the retained measurements"
+            );
+
             let mut tampered = evidence;
             tampered.refinements[0].final_resolution = 16;
             assert!(hp::validate_portable_distance_resolution_evidence(
@@ -5793,7 +6039,7 @@ mod tests {
                 )),
             }]);
             let policy = CachePolicy {
-                current_toolkit_version: ToolkitVersion::parse("0.14.1").unwrap(),
+                current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
                 minimum_quality: CacheQuality::Validated,
                 accepted_schema_versions: vec![1],
                 allow_deprecated: false,
@@ -5873,6 +6119,30 @@ mod tests {
             )
             .unwrap();
             assert_eq!(first.distances.len(), 2);
+            assert_eq!(first.eigenvalue, backfilled.eigenvalue);
+            assert_eq!(backfilled.eigenvalue, refreshed.eigenvalue);
+            assert_eq!(backfilled.eigenvalue, reused.eigenvalue);
+            assert_eq!(
+                backfilled.resolution_tolerance_met,
+                reused.resolution_tolerance_met
+            );
+            assert_eq!(
+                backfilled.resolution_tolerance_met,
+                refreshed.resolution_tolerance_met
+            );
+            assert!(backfilled.resolution_tolerance_met.is_some());
+            for (((a, b), c), d) in first
+                .distances
+                .iter()
+                .zip(&backfilled.distances)
+                .zip(&refreshed.distances)
+                .zip(&reused.distances)
+            {
+                assert_eq!(a.value, b.value);
+                assert_eq!(b.value, c.value);
+                assert_eq!(c.value, d.value);
+            }
+
             let replay_tolerance = Float::with_val(
                 cfg.precision_bits,
                 Float::parse("1e-55").expect("fixed replay tolerance is valid"),
