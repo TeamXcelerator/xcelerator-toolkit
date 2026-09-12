@@ -1789,6 +1789,16 @@ fn stage_record(
                 encoded.encoding
             )));
         }
+        // The encoded length is already known. Reject before writing any
+        // split parts, leaving the complete local object available for recovery.
+        if let Some(maximum) = resources.maximum_transfer_bytes {
+            if encoded.size_bytes > maximum {
+                return Err(CacheError::ResourceLimit(format!(
+                    "encoded transfer {} bytes exceeds policy limit {maximum}; complete local object retained at {}",
+                    encoded.size_bytes, encoded.path.display()
+                )));
+            }
+        }
         let direct_transport = if retained_remote_manifest.is_some() {
             verified_transport
         } else {

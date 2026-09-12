@@ -1,25 +1,25 @@
 {
   "schema_version": 1,
   "release": "v0.15.0",
-  "qualified_at_utc": "2026-09-10T05:48:35.510330+00:00",
+  "qualified_at_utc": "2026-09-15T07:47:18.040957+00:00",
   "toolchain": "1.98.1",
   "source_digest": {
-    "sha256": "a40109caedbd00e98d44fc6c6d4811b9b03d2deaa91751a99734275bb319fd9f",
+    "sha256": "1c95252b594223d23918bc317940cc45f716b176cb0793918aaa1b76441311e4",
     "encoding": "sorted tracked Rust sources plus root/consumer manifests and locks; path NUL then LF-normalized contents NUL",
-    "file_count": 170
+    "file_count": 175
   },
   "checks": {
     "native_workspace": {
-      "passed": 528,
+      "passed": 533,
       "failed": 0,
       "ignored": 6,
       "profile": "debug",
       "features": []
     },
     "hp_arb_workspace": {
-      "passed": 1010,
+      "passed": 1023,
       "failed": 0,
-      "ignored": 34,
+      "ignored": 37,
       "profile": "release",
       "features": [
         "hp",
@@ -163,6 +163,24 @@
       "regression_tests": 5,
       "overlaps_workspace_suite": true,
       "scope": "Actual canonical staging and reopening with local/private/public aliases; recursive remapping, destination deduplication, both visibility lanes, active index and batch proof reuse, assurance/evidence preservation, invalid transport rejection, and distinct historical closures. Offline tests; no live claim or GitHub mutation."
+    },
+    "complete_positive_root_regressions": {
+      "passed": 4,
+      "failed": 0,
+      "overlaps_workspace_suite": true,
+      "scope": "Beyond-band roots, zero residues and absent positive roots, unsupported symmetry and repeated roots, independent ordinal/cache identity and incomplete-count behavior."
+    },
+    "retained_complete_root_replay": {
+      "passed": 1,
+      "failed": 0,
+      "explicit_ignored_test": true,
+      "scope": "Retained C=2500 N=50 P=3386-bit eigenpair: all 50 roots converged and root payloads identical across cold, required reuse and refresh."
+    },
+    "response_performance_regressions": {
+      "passed": 4,
+      "failed": 0,
+      "overlaps_workspace_suite": true,
+      "scope": "Exact full response JSON against the frozen prior scalar implementation; root arithmetic at 128/192/1024/3386/6708 bits and 1/2/4 workers; budget fallback; changed payload, wrong source, pole and zero derivative rejection."
     }
   },
   "retained_release_qualification": {
@@ -10717,5 +10735,300 @@
       "ccm-u-flow-response-v0.15.0-v3"
     ],
     "source_artifacts_changed": false
+  },
+  "complete_positive_root_correction": {
+    "prior_source_sha256": "a40109caedbd00e98d44fc6c6d4811b9b03d2deaa91751a99734275bb319fd9f",
+    "repeated_checks": [
+      "native_workspace",
+      "hp_arb_workspace",
+      "native_clippy",
+      "hp_arb_clippy",
+      "external_consumer_native",
+      "external_consumer_hp",
+      "external_native_clippy",
+      "external_hp_clippy",
+      "rustdoc_warnings_denied",
+      "doctests",
+      "retained_complete_root_replay"
+    ],
+    "artifact_semantics": "ccm-root-range-v0.15.0-v10",
+    "primary_source_artifacts_changed": false,
+    "retained_eigenpair_payload_sha256": "8abba079f7e9036302fe107677db377774c0b3b099df53123dbd086e4f52c198",
+    "geometry": "Exact stored MPFR pole points of an exactly even point source; FLINT/Arb positive numerator-root isolation followed by adaptive source refinement.",
+    "scope": "Local software and retained-source qualification; complete positive movable roots of the finite point source, not an infinite-operator or full determinant ordinal certificate. Existing discovery policies and source identities remain available. No live publication or application campaign rerun claimed.",
+    "remaining_qualification": "Earlier targeted, application and performance records retain their original qualification scope and source digests; no new campaign speedup claim.",
+    "log_sha256": {
+      "ccm-complete-native-all.log": "b6e3f3e031e578f4a32653e37aeac199eb1d059c3445235bc792a01b99c33fa8",
+      "ccm-complete-hp-all.log": "e2c1d9f751d8016af6c256966c7bfe493dfdab1d4997b78aec902f51885cccb6",
+      "ccm-complete-native-clippy.log": "16a554893d7e966a4bc49fde779a38c40ef1b5d300a2f1b3eeb2f763f9847099",
+      "ccm-complete-hp-clippy.log": "cf7d96f072f4e36531d04347e681189ec4d412cd561845348b48a4bcc95e5e5b",
+      "ccm-complete-consumer-native.log": "7914be5659e7ee4283b92385f6e10e01115251e7481fe88fc273941a30bb77f8",
+      "ccm-complete-consumer-hp.log": "6df0aad2092c364f973be49631b706d3638dd4206501621eb182bb8e49844531",
+      "ccm-complete-consumer-native-clippy.log": "39d59e697ab9d1f212c280f5d1f4bf7de0fe42e0b4b61a6178bcf8e3ab747dd6",
+      "ccm-complete-consumer-hp-clippy.log": "e13ebc61fc43d3a89e2acd3ee6e326e780961dab42ad23f9c0036b5b2625b7c7",
+      "ccm-complete-hp-doc.log": "1b53fa8bf5a222b1e4b9837686e4806922da2bff1a70fc1b8c6313e0a7874e3c",
+      "ccm-complete-doctests.log": "93892aad6271380592af703b11dc12a337e822488d058b0f58cda02cd7c8074e",
+      "ccm-complete-retained.log": "cdd309841151819a49411337abf97b0da364e20f9048d60555e1fd6b6c6137d7"
+    }
+  },
+  "response_performance_amendment": {
+    "prior_source_sha256": "6f6d26aacd4813bbec35baee969675e87d5847f30ddd13c2530ed8eb3ff2992a",
+    "baseline_revision": "545041c192cb5a8b78a7dd34c53f93c8bd40681a",
+    "measurement_source_sha256": "51880592e4d14a59042ac23ede6aa91c30aeddabef1f7ceeec59b80a3a713753",
+    "repeated_checks": [
+      "native_workspace",
+      "hp_arb_workspace",
+      "native_clippy",
+      "hp_arb_clippy",
+      "external_consumer_native",
+      "external_consumer_hp",
+      "external_native_clippy",
+      "external_hp_clippy",
+      "rustdoc_warnings_denied",
+      "doctests",
+      "formatting",
+      "benchmark_ccm-response-kernel-sample-1.log",
+      "benchmark_ccm-response-validation-sample-1.log",
+      "benchmark_ccm-response-kernel-sample-2.log",
+      "benchmark_ccm-response-validation-sample-2.log",
+      "benchmark_ccm-response-kernel-sample-3.log",
+      "benchmark_ccm-response-validation-sample-3.log"
+    ],
+    "artifact_semantics_changed": false,
+    "source_artifacts_changed": false,
+    "policy": "Three sequential samples per synthetic benchmark, release mode, no remote access or publication. Timings include exact-byte regression controls; kernel preparation is separate. Full fixture uses synthetic diagonal Tau and diagnostic root points, not physical CCM roots. No campaign speedup forecast. Source formatting only was finalized after the measurements.",
+    "kernel_samples": [
+      {
+        "sample": 1,
+        "baseline_seconds": 6.899668391,
+        "bit_identical": true,
+        "bits": 6708,
+        "candidate_seconds": 3.236991925,
+        "dimension": 801,
+        "events": 3,
+        "payload_sha256": "b69071921166018aa77d375dda193cf31546cedd7b4064970f23ceadc8fab451",
+        "preparation_seconds": 1.282580593,
+        "roots": 400,
+        "workers": 1
+      },
+      {
+        "sample": 1,
+        "baseline_seconds": 6.899668391,
+        "bit_identical": true,
+        "bits": 6708,
+        "candidate_seconds": 0.894067129,
+        "dimension": 801,
+        "events": 3,
+        "payload_sha256": "b69071921166018aa77d375dda193cf31546cedd7b4064970f23ceadc8fab451",
+        "preparation_seconds": 0.480180871,
+        "roots": 400,
+        "workers": 4
+      },
+      {
+        "sample": 2,
+        "baseline_seconds": 6.737999097,
+        "bit_identical": true,
+        "bits": 6708,
+        "candidate_seconds": 3.373631852,
+        "dimension": 801,
+        "events": 3,
+        "payload_sha256": "b69071921166018aa77d375dda193cf31546cedd7b4064970f23ceadc8fab451",
+        "preparation_seconds": 1.296243302,
+        "roots": 400,
+        "workers": 1
+      },
+      {
+        "sample": 2,
+        "baseline_seconds": 6.737999097,
+        "bit_identical": true,
+        "bits": 6708,
+        "candidate_seconds": 0.891833665,
+        "dimension": 801,
+        "events": 3,
+        "payload_sha256": "b69071921166018aa77d375dda193cf31546cedd7b4064970f23ceadc8fab451",
+        "preparation_seconds": 0.417719034,
+        "roots": 400,
+        "workers": 4
+      },
+      {
+        "sample": 3,
+        "baseline_seconds": 6.817750799,
+        "bit_identical": true,
+        "bits": 6708,
+        "candidate_seconds": 3.211244166,
+        "dimension": 801,
+        "events": 3,
+        "payload_sha256": "b69071921166018aa77d375dda193cf31546cedd7b4064970f23ceadc8fab451",
+        "preparation_seconds": 1.306184303,
+        "roots": 400,
+        "workers": 1
+      },
+      {
+        "sample": 3,
+        "baseline_seconds": 6.817750799,
+        "bit_identical": true,
+        "bits": 6708,
+        "candidate_seconds": 0.902594456,
+        "dimension": 801,
+        "events": 3,
+        "payload_sha256": "b69071921166018aa77d375dda193cf31546cedd7b4064970f23ceadc8fab451",
+        "preparation_seconds": 0.638608559,
+        "roots": 400,
+        "workers": 4
+      }
+    ],
+    "complete_response_samples": [
+      {
+        "sample": 1,
+        "bit_identical": true,
+        "bits": 1024,
+        "candidate_compute_seconds": 0.141736121,
+        "dimension": 49,
+        "events": 193,
+        "fresh_seal_record_and_verify_seconds": 0.009328178,
+        "numerical_replay_seconds": 0.13671242,
+        "payload_bytes": 5130939,
+        "payload_sha256": "c116e133ec9b08291031e5636a3ef675b5a4035fe804ea096d840a59492d237f",
+        "reference_compute_seconds": 0.463365892,
+        "roots": 24,
+        "scope": "Synthetic diagonal source; software and timing qualification, not CCM research measurements.",
+        "workers": 4
+      },
+      {
+        "sample": 2,
+        "bit_identical": true,
+        "bits": 1024,
+        "candidate_compute_seconds": 0.148697066,
+        "dimension": 49,
+        "events": 193,
+        "fresh_seal_record_and_verify_seconds": 0.009342416,
+        "numerical_replay_seconds": 0.171175758,
+        "payload_bytes": 5130939,
+        "payload_sha256": "c116e133ec9b08291031e5636a3ef675b5a4035fe804ea096d840a59492d237f",
+        "reference_compute_seconds": 0.454047375,
+        "roots": 24,
+        "scope": "Synthetic diagonal source; software and timing qualification, not CCM research measurements.",
+        "workers": 4
+      },
+      {
+        "sample": 3,
+        "bit_identical": true,
+        "bits": 1024,
+        "candidate_compute_seconds": 0.164979562,
+        "dimension": 49,
+        "events": 193,
+        "fresh_seal_record_and_verify_seconds": 0.009296766,
+        "numerical_replay_seconds": 0.136885068,
+        "payload_bytes": 5130939,
+        "payload_sha256": "c116e133ec9b08291031e5636a3ef675b5a4035fe804ea096d840a59492d237f",
+        "reference_compute_seconds": 0.44401761,
+        "roots": 24,
+        "scope": "Synthetic diagonal source; software and timing qualification, not CCM research measurements.",
+        "workers": 4
+      }
+    ],
+    "medians_seconds": {
+      "kernel_scalar_seconds": 6.817750799,
+      "kernel_four_worker_seconds": 0.894067129,
+      "kernel_four_worker_preparation_seconds": 0.480180871,
+      "kernel_four_worker_total_seconds": 1.374248,
+      "complete_reference_seconds": 0.454047375,
+      "complete_candidate_seconds": 0.148697066,
+      "complete_numerical_replay_seconds": 0.136885068,
+      "fresh_seal_record_and_verify_seconds": 0.009328178
+    },
+    "remaining_qualification": "Earlier scientific, registration, application and unrelated performance records retain their original qualification scope. Complete-root isolation before root-window lookup remains unchanged. The running Vast application is not upgraded by this source change.",
+    "log_sha256": {
+      "ccm-response-native-all.log": "4ae54756383a6132c4610a842cab68d4b22b7e562654da531132f162a95b7da0",
+      "ccm-response-hp-all.log": "952ca786ba0fd868bfad99438a2ec33a4bbdb8d4b9442dcf887ae4c7631f1456",
+      "ccm-response-native-clippy.log": "732186322402325172940531d8d6d7cfac85dc902585b2bef6715ad6839dacfd",
+      "ccm-response-clippy.log": "cba43083e2673bd6068a1281457f69a3c18bb77aec5c32331452db18f3366a18",
+      "ccm-response-consumer-native.log": "4928853a93e0db7d7283a0ebe3819365feba548d45955cf8cb9c3865bbbe0ce4",
+      "ccm-response-consumer-hp.log": "eebb5d7244cf9ebfa177b45bb32a22a3b909e814f1766d94bbff068aae8bcc2a",
+      "ccm-response-consumer-native-clippy.log": "2b34696728dc82b03cbf6311d7e3a6a41658bbde097834c3010a78bc82842c1a",
+      "ccm-response-consumer-hp-clippy.log": "afcca9c74a4a08c3d98a6b5906139128088ea90bfb37613305e41fc9834b2da7",
+      "ccm-response-doc.log": "359937325236b1cb3adb1eaaa00e45b80ea3a0cf59b7ad53ff002f18d9bd66c1",
+      "ccm-response-doctests.log": "80f174b34353e83fa5b5bc16492a751b4e6bed85cac4200d39cfaf0b07b5f834",
+      "ccm-response-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "ccm-response-kernel-sample-1.log": "8492bc6f3821b7e59ab51c9407bfb37445eda446c329da77dcf325a480c959f7",
+      "ccm-response-validation-sample-1.log": "8480649b3b11853cbd4acd6375b76bc9626b993517fcfcd9eea623897aac8d66",
+      "ccm-response-kernel-sample-2.log": "f5d676ac0dd2f20f0ab7a20c341de421c3beb708d309a8d0c99c94125510c71f",
+      "ccm-response-validation-sample-2.log": "995c800f3379135714d73e41ae73a4d9bf43b7ef94a258a097e36d1085f73da5",
+      "ccm-response-kernel-sample-3.log": "4d69a0ceca8f17b14381e9f81ca63af40ed3ef58f972f9f038548956e1a09769",
+      "ccm-response-validation-sample-3.log": "803d0d5bed94d56e5d41b84d53659e538287b5aaf7603a9e90e80ea248d099ae",
+      "ccm-response-final-source-tests.log": "9e9033e33b1bfba9a13a322d75161d42ca4ccc4970d33798205ac580827b8342",
+      "ccm-response-final-source-clippy.log": "1b8a803f55735a37d984e6b187e36a80ba53889a5ba5145a6eb5b74e56812793",
+      "ccm-response-final-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "final_source_checks": "After formatting, repeated the eleven response regressions, strict HP/Arb Clippy and formatter check. Full suites and benchmark samples precede only whitespace and loop chunk-size extraction with unchanged operations."
+  },
+  "publication_transport_amendment": {
+    "previous_source_digest": {
+      "sha256": "51880592e4d14a59042ac23ede6aa91c30aeddabef1f7ceeec59b80a3a713753",
+      "encoding": "sorted tracked Rust sources plus root/consumer manifests and locks; path NUL then LF-normalized contents NUL",
+      "file_count": 173
+    },
+    "source_digest": {
+      "sha256": "c0b78344992e6fafec290dcc5cdd8730ee7966db7b2b3701de89bae1d0d973d9",
+      "encoding": "sorted tracked Rust sources plus root/consumer manifests and locks; path NUL then LF-normalized contents NUL",
+      "file_count": 173
+    },
+    "scope": "Command-local Git delta-search policy and bounded progress reporting. No numerical algorithms or artifact identities changed. Full native and HP/Arb suites repeated; existing unrelated benchmark and scientific records retain their prior source scope.",
+    "git_version": "2.50.1.windows.1",
+    "packing_input_bytes": 754974720,
+    "packing_default_seconds": [
+      109.5672702,
+      100.8924945
+    ],
+    "packing_no_delta_seconds": [
+      13.3407712,
+      13.4546832
+    ],
+    "pack_sha256_all_four": "e4922b2c1805682af5a314bbcd25d747c7a29bc8a19db46c2c3d725ce5656c71",
+    "log_sha256": {
+      "ccm-publication-native-all.log": "a4ff26884c6e4dfc283758c100f77aa257f21593fcbae70c1ebe843284af3ae1",
+      "ccm-publication-hp-all.log": "c0d8873dda48cabc0734ac5f696024366681626b92510efb7fd5fa53d871e147",
+      "ccm-publication-native-clippy.log": "e7796916a9f48521993d87d622095c401cf09a3c15627b9861f9473c8d148cc3",
+      "ccm-publication-hp-clippy.log": "e74869b543a5a26dc357a1ff6b9c1ede77000129c9a31c5dbb76e5a65b1e2662",
+      "ccm-publication-doc.log": "62c08185dbed3854b4e1888c43a8e46e3a668fad38346716b60108042e955062",
+      "ccm-publication-doctests.log": "5a83e8229ed117349b6427ca1e3be5466f37e94c6ea96b5607b6676b2f4a9d4d",
+      "ccm-publication-consumer-native.log": "d2b4243e43cb704c8594f81ab421a23f5c76648ceb550e6cf9f19b06b62fcf1a",
+      "ccm-publication-consumer-hp.log": "8d1d64be794204430cf03c5741b9d3d997f0d9b7ef48e7a03bcb73b7759ad0c0",
+      "ccm-publication-consumer-native-clippy.log": "9800e0976594d2386ed68968c18174b3dff73ad024aaa75550370e37cc879298",
+      "ccm-publication-consumer-hp-clippy.log": "42285aef1bf1205426816c50339b70e23edaba9cd25d55fff0081436da46d45b"
+    },
+    "network_speedup_measured": false,
+    "actions_executed": false
+  },
+  "publication_recovery_amendment": {
+    "previous_source_digest": {
+      "sha256": "c0b78344992e6fafec290dcc5cdd8730ee7966db7b2b3701de89bae1d0d973d9",
+      "encoding": "sorted tracked Rust sources plus root/consumer manifests and locks; path NUL then LF-normalized contents NUL",
+      "file_count": 173
+    },
+    "source_digest": {
+      "sha256": "1c95252b594223d23918bc317940cc45f716b176cb0793918aaa1b76441311e4",
+      "encoding": "sorted tracked Rust sources plus root/consumer manifests and locks; path NUL then LF-normalized contents NUL",
+      "file_count": 175
+    },
+    "scope": "Explicit managed resource policy propagated to remote reads, staging and publication. Known-size staging rejects before copying. Exact retained-object publication recovery verifies hashes and closure without numerical producer or numerical replay; original failed receipts remain unchanged.",
+    "targeted_recovery_regressions": {
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0
+    },
+    "live_vast_recovery_executed": false,
+    "actions_executed": false,
+    "log_sha256": {
+      "recovery-workspace-native.log": "ff12e648737572a41012ec50f78e02414f316c1e3d483ec400dd2de994b0e985",
+      "recovery-hp.log": "4f37be1cf0c52202d28e3027949087fd6ec6fa46fc281492ac04886e33b1ba5d",
+      "recovery-native-clippy.log": "3c4e2570743cbe4d33567b9785bab2b57e61a442568362b67c85947831ca13e6",
+      "recovery-hp-clippy.log": "031a157d3edabf2abd1cc1599ad6bea7461a5ed0c747185aedd4b8e9959373d7",
+      "recovery-hp-doc.log": "c6ca1cfefa741a3205ec280d7d70edc2deefdd6621c28f71fb0658da1e18ab11",
+      "recovery-consumer-native.log": "daa8443542d92328b7b0531f590c58ce2a7cb3686cadea04acba7126e5eff0a1",
+      "recovery-consumer-hp.log": "933164742aa9b17f53a4323c52df35af99541a2a68bf14d7f0a2e95738e2091e",
+      "recovery-tests.log": "f12905431eda2ad97eda1be025c8c8b3c4522cbbef58df77bea7992e6412268b"
+    },
+    "toolchain_note": "WSL HP tests use installed 1.98.1; Clippy and rustdoc use stable, verified as the identical rustc 1.98.1 (48a229cea) build because the separately named 1.98.1 installation lacks Clippy."
   }
 }

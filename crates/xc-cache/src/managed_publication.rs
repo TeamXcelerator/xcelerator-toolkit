@@ -1084,6 +1084,11 @@ fn execute_family_batch_publication(
         // A clean bootstrap shard has no ledger or index yet. Initialize those
         // sidecars before planning the first repository batch; subsequent runs
         // simply reuse the verified sidecars.
+        let locked_preparation_started = std::time::Instant::now();
+        eprintln!(
+            "publication family {}: checking destination metadata",
+            first.family
+        );
         let (head, mut ledger) = ensure_managed_shard_sidecars(
             &remote,
             &active_session,
@@ -1434,9 +1439,29 @@ fn execute_family_batch_publication(
             .saturating_sub(1024 * 1024);
         let batches = crate::plan_publication_batches(&ordered_parts, &batch_policy)?;
         let total_batches = batches.len();
+        eprintln!(
+            "publication family {}: metadata ready in {:.3}s; {} batch(es), {} staged bytes",
+            first.family,
+            locked_preparation_started.elapsed().as_secs_f64(),
+            total_batches,
+            ordered_parts
+                .iter()
+                .map(|part| part.size_bytes)
+                .sum::<u64>()
+        );
         let mut current_head = head;
         let mut steps = 0;
         for batch_plan in batches {
+            let batch_started = std::time::Instant::now();
+            let batch_number = batch_plan.sequence + 1;
+            let mut reused_bytes = 0u64;
+            eprintln!(
+                "publication family {}: batch {}/{} checking {} file(s)",
+                first.family,
+                batch_number,
+                total_batches,
+                batch_plan.parts.len()
+            );
             let mut commit_parts = Vec::with_capacity(batch_plan.parts.len() + 1);
             for part in batch_plan.parts {
                 match remote.immutable_path_digest(
@@ -1447,6 +1472,7 @@ fn execute_family_batch_publication(
                     Some(existing) if existing == part.content_digest => {
                         // An earlier transaction or an interrupted retry
                         // already committed these exact bytes.
+                        reused_bytes += part.size_bytes;
                         continue;
                     }
                     Some(existing) if part.repository_path.starts_with("objects/") => {
@@ -1459,6 +1485,11 @@ fn execute_family_batch_publication(
                 }
                 commit_parts.push(part);
             }
+            eprintln!(
+                "publication family {}: batch {}/{} checked in {:.3}s; {} existing bytes reused, {} new or updated bytes",
+                first.family, batch_number, total_batches, batch_started.elapsed().as_secs_f64(),
+                reused_bytes, commit_parts.iter().map(|part| part.size_bytes).sum::<u64>()
+            );
             if commit_parts.is_empty() {
                 continue;
             }
@@ -1522,6 +1553,13 @@ fn execute_family_batch_publication(
                     }
                 }
             }
+            eprintln!(
+                "publication family {}: batch {}/{} committed in {:.3}s",
+                first.family,
+                batch_number,
+                total_batches,
+                batch_started.elapsed().as_secs_f64()
+            );
         }
         Ok(vec![ManagedPublicationExecutionReport {
             transaction_id: batch.batch_id.0.clone(),

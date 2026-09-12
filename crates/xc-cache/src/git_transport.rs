@@ -13,9 +13,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use xc_core::{CancellationToken, ResourcePolicy};
 
 const GIT_REVISION_METADATA_RESERVATION_BYTES: u64 = 512 * 1024;
@@ -1979,13 +1979,190 @@ where
     if let Some(directory) = directory {
         command.arg("-C").arg(directory);
     }
-    command.args(arguments);
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    let operation = match arguments.first().and_then(|value| value.to_str()) {
+        Some("push") => Some("push"),
+        Some("fetch") => Some("fetch"),
+        Some("ls-remote") => Some("ls-remote"),
+        _ => None,
+    };
+    if operation == Some("push") {
+        // Artifact parts are already compressed and content-addressed. Searching
+        // for deltas between different archives is costly and cannot improve
+        // exact-object reuse. Keep this policy local to publication pushes.
+        command.args(["-c", "pack.window=0"]);
+        command.arg("push").arg("--progress").args(&arguments[1..]);
+    } else {
+        command.args(&arguments);
+    }
     for (key, value) in environment {
         command.env(key, value);
     }
-    command
-        .output()
-        .map_err(|error| CacheError::Io(format!("failed to launch git: {error}")))
+    match operation {
+        Some(operation) => run_observed_git_command(command, operation),
+        None => command
+            .output()
+            .map_err(|error| CacheError::Io(format!("failed to launch git: {error}"))),
+    }
+}
+
+/// Only structured numerical progress reaches the console. Remote stderr,
+/// repository URLs, paths and credential-helper output are never echoed live.
+fn numerical_git_progress(line: &str) -> Option<String> {
+    let line = line.trim();
+    for phase in ["Counting objects", "Compressing objects", "Writing objects"] {
+        let Some(rest) = line.strip_prefix(phase) else {
+            continue;
+        };
+        let rest = rest.strip_prefix(':')?.trim();
+        let (percent, rest) = rest.split_once('%')?;
+        let percent = percent.trim().parse::<u8>().ok().filter(|p| *p <= 100)?;
+        let rest = rest.trim().strip_prefix('(')?;
+        let (counts, suffix) = rest.split_once(')')?;
+        let (done, total) = counts.split_once('/')?;
+        let done = done.trim().parse::<u64>().ok()?;
+        let total = total.trim().parse::<u64>().ok()?;
+        if done <= total {
+            let mut progress = format!("{phase}: {percent}% ({done}/{total})");
+            if phase == "Writing objects" {
+                if let Some(bytes) = suffix.trim().strip_prefix(',') {
+                    let (amount, rate) = bytes.trim().split_once('|').unwrap_or((bytes.trim(), ""));
+                    for (value, rate_suffix) in [(amount, ""), (rate, "/s")] {
+                        let mut words = value.trim().trim_end_matches(", done.").split_whitespace();
+                        if let (Some(number), Some(unit), None) =
+                            (words.next(), words.next(), words.next())
+                        {
+                            if let Ok(number) = number.parse::<f64>() {
+                                let unit = unit.trim_end_matches(',');
+                                let base = if rate_suffix.is_empty() {
+                                    Some(unit)
+                                } else {
+                                    unit.strip_suffix("/s")
+                                };
+                                if number.is_finite()
+                                    && number >= 0.0
+                                    && matches!(base, Some("bytes" | "KiB" | "MiB" | "GiB" | "TiB"))
+                                {
+                                    progress.push_str(&format!("; {number:.2} {unit}"));
+                                }
+                            }
+                        }
+                    }
+                }
+                if percent == 100 {
+                    progress.push_str("; awaiting remote completion");
+                }
+            }
+            return Some(progress);
+        }
+    }
+    None
+}
+
+struct GitCommandHeartbeat {
+    stop: mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl GitCommandHeartbeat {
+    fn start(operation: &'static str, phase: Arc<Mutex<String>>, started: Instant) -> Self {
+        let (stop, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            while matches!(
+                receiver.recv_timeout(Duration::from_secs(30)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let phase = phase.lock().unwrap_or_else(|error| error.into_inner());
+                eprintln!(
+                    "publication Git {operation}: running {:.1}s; {}",
+                    started.elapsed().as_secs_f64(),
+                    phase
+                );
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for GitCommandHeartbeat {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_observed_git_command(
+    mut command: Command,
+    operation: &'static str,
+) -> Result<Output, CacheError> {
+    let started = Instant::now();
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| CacheError::Io(format!("failed to launch git: {error}")))?;
+    let phase = Arc::new(Mutex::new("waiting for Git progress".to_owned()));
+    let heartbeat = GitCommandHeartbeat::start(operation, Arc::clone(&phase), started);
+    if operation == "push" {
+        eprintln!(
+            "publication Git push: started (compressed-artifact packing; delta search disabled)"
+        );
+    }
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CacheError::Io("git stderr was unavailable".to_owned()))?;
+    let reader = thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        const RETAINED_STDERR_BYTES: usize = 64 * 1024;
+        let mut retained = Vec::new();
+        let mut line = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            let count = stderr.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            retained.extend_from_slice(&buffer[..count]);
+            if retained.len() > RETAINED_STDERR_BYTES {
+                retained.drain(..retained.len() - RETAINED_STDERR_BYTES);
+            }
+            for &byte in &buffer[..count] {
+                if byte == b'\r' || byte == b'\n' {
+                    if let Ok(text) = std::str::from_utf8(&line) {
+                        if let Some(progress) = numerical_git_progress(text) {
+                            *phase.lock().unwrap_or_else(|error| error.into_inner()) = progress;
+                        }
+                    }
+                    line.clear();
+                } else if line.len() < 4096 {
+                    line.push(byte);
+                }
+            }
+        }
+        Ok(retained)
+    });
+    // wait_with_output drains stdout concurrently with the stderr reader.
+    let output = child.wait_with_output();
+    let stderr = reader
+        .join()
+        .map_err(|_| CacheError::Io("git progress reader panicked".to_owned()))?;
+    drop(heartbeat);
+    let mut output = output?;
+    output.stderr = stderr?;
+    if operation == "push" || started.elapsed() >= Duration::from_secs(30) {
+        eprintln!(
+            "publication Git {operation}: finished in {:.3}s; success={}",
+            started.elapsed().as_secs_f64(),
+            output.status.success()
+        );
+    }
+    Ok(output)
 }
 
 fn run_git_with_input<I>(
@@ -2384,6 +2561,32 @@ mod tests {
             format!("file:///{canonical}")
         } else {
             format!("file://{canonical}")
+        }
+    }
+
+    #[test]
+    fn publication_progress_accepts_only_numeric_local_git_phases() {
+        assert_eq!(
+            numerical_git_progress("Writing objects:  75% (3/4), 200.00 MiB | 2.0 MiB/s"),
+            Some("Writing objects: 75% (3/4); 200.00 MiB; 2.00 MiB/s".to_owned())
+        );
+        assert_eq!(
+            numerical_git_progress("Compressing objects: 100% (12/12), done."),
+            Some("Compressing objects: 100% (12/12)".to_owned())
+        );
+        assert_eq!(
+            numerical_git_progress("Writing objects: 100% (4/4), secret | token"),
+            Some("Writing objects: 100% (4/4); awaiting remote completion".to_owned())
+        );
+        for line in [
+            "remote: Writing objects: 50% (1/2), secret",
+            "https://user:secret@example.invalid/repo",
+            "Writing objects: secret% (1/2)",
+            "Writing objects: 101% (1/2)",
+            "Writing objects: 50% (3/2)",
+            "Writing objects: 50% (1/secret)",
+        ] {
+            assert!(numerical_git_progress(line).is_none(), "{line}");
         }
     }
 

@@ -22,8 +22,11 @@ integrate capture into applications, and interpret retained numerical evidence.
 - [Cache schema and behavior](CACHE_SCHEMA.md)
 - [Cache output validation](OUTPUT_VALIDATION.md)
 - [Performance reporting](PERFORMANCE_REPORTING.md)
+- [Publication performance and progress](PUBLICATION_PERFORMANCE.md)
 
 ## Distribution and provenance
 
 - [Third-party review summary](THIRD_PARTY_REVIEW.md)
 - [References](REFERENCES.md)
+
+Large retained artifacts can use [explicit resource limits and publication-only recovery](PUBLICATION_RECOVERY.md). This preserves numerical results and the original capture history.

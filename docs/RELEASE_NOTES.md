@@ -2,6 +2,21 @@
 
 ## 0.15.0
 
+- Artifact publication avoids Git delta searches on compressed archives and
+  reports batch sizes, reused bytes, push timings and 30-second Git progress
+  heartbeats. Retained local packing tests improved by 7.5-8.2x with identical
+  pack bytes; network speed is outside that measurement. Existing numerical
+  artifacts and publication recovery remain compatible. See
+  [publication performance](PUBLICATION_PERFORMANCE.md).
+
+- Response generation and replay prepare fixed root derivatives once, reuse MPFR
+  reduction storage and parallelize independent events, roots and phase values.
+  Optional denominator storage has an explicit memory bound. Large response
+  phases print progress. Fresh responses bind their already-checked computation
+  to exact payload bytes, avoiding an immediate duplicate numerical replay;
+  cache reads and explicit verification retain their numerical checks. Artifact
+  bytes and identities are unchanged. See [response performance](CCM_RESPONSE_PERFORMANCE.md).
+
 - Fixed managed publication of closures containing local, private and public
   aliases of the same canonical artifact. Equivalent aliases publish once per
   destination; remapped dependencies are sorted and deduplicated, while distinct
@@ -42,6 +57,12 @@
 The v0.15.0 tag is updated with the managed capture and evaluation APIs described
 below. Consumers of an earlier v0.15.0 checkout should refresh the Git dependency
 and lockfile. Retain the resolved Git commit for reproducible experiments.
+
+Complete positive movable-root discovery is available through the Arb-enabled
+API. It isolates roots beyond the last retained pole from the exact even
+point-source numerator, with distinct root identities and explicit incomplete
+outcomes. Adaptive refinement remains separately configurable. See the
+[acquisition and migration guide](CCM_COMPLETE_ROOT_DISCOVERY.md).
 
 This release adds source-bound research evidence, corrected numerical routes
 and more precise diagnostic persistence for reproducible finite experiments.
@@ -732,3 +753,5 @@ comparison during production qualification.
 
 See [Performance reporting](PERFORMANCE_REPORTING.md) for controlled benchmark
 guidance and the scope of recorded diagnostics.
+
+Managed resource policies now propagate through cache reads, staging and publication. Exact retained-object recovery supports publication without numerical recomputation; see [the recovery guide](PUBLICATION_RECOVERY.md). Mathematical identities and serialized numerical payloads are unchanged.

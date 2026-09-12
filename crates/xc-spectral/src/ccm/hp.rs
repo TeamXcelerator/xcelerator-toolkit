@@ -40,6 +40,12 @@ pub mod capture_run;
 /// Rebuild response scalars from authenticated retained states and tangents.
 pub mod response_repair;
 
+mod complete_discovery;
+mod response_performance;
+#[cfg(test)]
+mod response_performance_reference;
+use response_performance::{FreshResponseSeal, PreparedRootResponses, ResponseProgress};
+
 // Conservative crossovers from the ignored release-mode benchmark below.
 // Decimal conversion becomes worthwhile at fewer entries as MPFR precision
 // rises; low-precision decoding uses larger batches to amortize Rayon barriers.
@@ -208,6 +214,10 @@ pub struct IndependentRootDiscoveryOptions {
     /// Return the complete available finite window when it cannot fill the
     /// requested target. The returned root list may be empty.
     pub allow_incomplete: bool,
+    /// Isolate all positive movable roots of an exactly even point source,
+    /// including beyond the last pole. Requires the `arb` feature.
+    #[serde(default)]
+    pub complete_positive: bool,
 }
 
 impl IndependentRootDiscoveryOptions {
@@ -219,6 +229,16 @@ impl IndependentRootDiscoveryOptions {
                 IndependentRootDomain::Positive
             },
             allow_incomplete,
+            complete_positive: false,
+        }
+    }
+    /// Source-only full-range acquisition, with exact rational numerator
+    /// isolation. Incomplete mathematical windows remain explicit outcomes.
+    pub fn complete_positive(allow_incomplete: bool) -> Self {
+        Self {
+            domain: IndependentRootDomain::Positive,
+            allow_incomplete,
+            complete_positive: true,
         }
     }
 }
@@ -255,7 +275,19 @@ impl RootWindowSemantics {
     }
 
     fn is_advanced(self) -> bool {
-        self.artifact_format == RootArtifactFormat::AdvancedV7
+        self.artifact_format != RootArtifactFormat::LegacyV6
+    }
+    fn is_complete_positive(self) -> bool {
+        self.artifact_format == RootArtifactFormat::CompleteV10
+    }
+    fn completeness(self, mode: RootArtifactMode) -> &'static str {
+        match mode {
+            RootArtifactMode::Independent if self.is_complete_positive() => {
+                "complete_positive_movable_point_source"
+            }
+            RootArtifactMode::Independent => "unverified_computed_discovery",
+            RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
+        }
     }
 }
 
@@ -263,6 +295,7 @@ impl RootWindowSemantics {
 enum RootArtifactFormat {
     LegacyV6,
     AdvancedV7,
+    CompleteV10,
 }
 
 #[derive(Debug)]
@@ -7452,11 +7485,7 @@ fn decode_root_range(
         || artifact.reference_seeds_used
             != (artifact_mode == RootArtifactMode::ReferenceSeededRefinement)
         || artifact.reference_dataset.as_ref() != reference_dataset
-        || artifact.completeness
-            != match artifact_mode {
-                RootArtifactMode::Independent => "unverified_computed_discovery",
-                RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
-            }
+        || artifact.completeness != semantics.completeness(artifact_mode)
         || artifact.starting_points != expected_seeds
         || artifact.outcomes.len() != seeds.len()
         || artifact.solver != cfg.root_solver.display_name().to_ascii_lowercase()
@@ -7625,10 +7654,7 @@ fn root_range_semantic_key(
         "discovery_mode": artifact_mode.as_str(),
         "starting_points": seed_strings,
         "reference_seeds_used": artifact_mode == RootArtifactMode::ReferenceSeededRefinement,
-        "completeness": match artifact_mode {
-            RootArtifactMode::Independent => "unverified_computed_discovery",
-            RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
-        },
+        "completeness": semantics.completeness(artifact_mode),
         "solver": cfg.root_solver.display_name().to_ascii_lowercase(),
         "solver_steps": cfg.solver_steps,
         "accuracy_guard_bits": GUARD_BITS
@@ -7685,6 +7711,23 @@ fn root_range_semantic_key(
             serde_json::json!(semantics.domain.as_str()),
         );
     }
+    if semantics.is_complete_positive() {
+        let parameters = resolved_parameters
+            .as_object_mut()
+            .expect("semantic parameters");
+        parameters.insert(
+            "discovery_extent".into(),
+            serde_json::json!("all_positive_movable_roots"),
+        );
+        parameters.insert(
+            "discovery_method".into(),
+            serde_json::json!("exact_even_point_numerator_flint_arb_v1"),
+        );
+        parameters.insert(
+            "pole_geometry".into(),
+            serde_json::json!("exact_stored_mpfr_pole_points"),
+        );
+    }
     let mut source_data_identities = reference_dataset
         .map(|dataset| {
             BTreeMap::from([(
@@ -7708,9 +7751,9 @@ fn root_range_semantic_key(
             RootArtifactMode::ReferenceSeededRefinement => "ccm_root_refinement",
         }
         .to_owned(),
-        mathematical_semantics_version: if cfg.root_precision_policy
-            == RootPrecisionPolicy::Adaptive
-        {
+        mathematical_semantics_version: if semantics.is_complete_positive() {
+            "ccm-root-range-v0.15.0-v10"
+        } else if cfg.root_precision_policy == RootPrecisionPolicy::Adaptive {
             "ccm-root-range-v0.14.1-v9"
         } else if semantics.is_advanced() {
             "ccm-root-range-v0.13.3-v7"
@@ -7751,7 +7794,17 @@ fn root_range_logical_key(
     semantics: RootWindowSemantics,
 ) -> String {
     let parity_policy = cfg.effective_parity_policy();
-    if semantics.is_advanced() {
+    if semantics.is_complete_positive() {
+        format!(
+            "ccm/root-discovery/complete-positive/{}/{}/{}/{}/{}-{}",
+            lambda_squared_cache_identity(params),
+            params.n_modes,
+            cfg.precision_bits,
+            parity_policy.cache_label(),
+            first_root_index,
+            last_root_index
+        )
+    } else if semantics.is_advanced() {
         format!(
             "ccm/root-discovery/advanced/{}/{}/{}/{}/{}/{}-{}",
             semantics.domain.as_str(),
@@ -7962,7 +8015,9 @@ fn resolve_root_range_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(if semantics.is_advanced() {
+        minimum_reader_version: ToolkitVersion::parse(if semantics.is_complete_positive() {
+            "0.15.0"
+        } else if semantics.is_advanced() {
             "0.13.3"
         } else {
             "0.13.0"
@@ -8046,11 +8101,7 @@ fn resolve_root_range_via_cache(
                     reference_seeds_used: artifact_mode
                         == RootArtifactMode::ReferenceSeededRefinement,
                     reference_dataset: reference_dataset.cloned(),
-                    completeness: match artifact_mode {
-                        RootArtifactMode::Independent => "unverified_computed_discovery",
-                        RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
-                    }
-                    .to_owned(),
+                    completeness: semantics.completeness(artifact_mode).to_owned(),
                     starting_points: seeds.iter().map(Float::to_string).collect(),
                     outcomes,
                     solver: cfg.root_solver.display_name().to_ascii_lowercase(),
@@ -9564,10 +9615,10 @@ fn apply_prime_power_velocity(
         })
         .collect::<Vec<_>>();
     let sines = phases
-        .iter()
+        .par_iter()
         .map(|phase| phase.clone().sin())
         .collect::<Vec<_>>();
-    let cosines = phases.into_iter().map(Float::cos).collect::<Vec<_>>();
+    let cosines = phases.into_par_iter().map(Float::cos).collect::<Vec<_>>();
 
     let action = modes
         .par_iter()
@@ -9866,97 +9917,96 @@ fn compute_prime_power_response_analysis(
     let portable_roots = ccm_response_roots(roots, first_positive_root_index);
     let prime_content = prime_powers_up_to(params.lambda_sq_int());
     let lambda_identity = lambda_squared_cache_identity(params);
-    let mut events = Vec::with_capacity(prime_content.len());
+    let prepared_roots = PreparedRootResponses::new(&unit_state, &poles, roots, precision_bits)?;
+    let progress = ResponseProgress::new("compute", prime_content.len(), roots.len());
 
-    for (power, prime, exponent) in prime_content {
-        let velocity = apply_prime_power_velocity(
-            params.n_modes,
-            power,
-            prime,
-            l,
-            &unit_state,
-            precision_bits,
-        )?;
-        let eigenvalue_response =
-            deterministic_dot_hp(&unit_state, &velocity.action, precision_bits);
-        let projected_forcing = velocity
-            .action
-            .iter()
-            .zip(&unit_state)
-            .map(|(action, state)| {
-                let mut projection = Float::with_val(precision_bits, state);
-                projection *= &eigenvalue_response;
-                let mut value = Float::with_val(precision_bits, action);
-                value -= projection;
-                value
-            })
-            .collect::<Vec<_>>();
-        let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits);
-        let (eigenvector_response, lagrange_multiplier) =
-            solve_even_sector_bordered_response(&bordered_solver, &projected_forcing);
-        let response_norm = deterministic_l2_norm_hp(&eigenvector_response, precision_bits);
-        let response_sum = xc_numerics::reduction::deterministic_pairwise_sum_hp(
-            &eigenvector_response,
-            precision_bits,
-        );
-        let mut ccm_scale_response = Float::with_val(precision_bits, &ccm_scale);
-        ccm_scale_response *= &response_sum;
-        ccm_scale_response /= &unit_state_sum;
-        ccm_scale_response = -ccm_scale_response;
-        let root_velocity_responses = roots
-            .iter()
-            .map(|outcome| {
-                outcome
-                    .value()
-                    .map(|root| {
-                        prime_power_root_velocity_response(
-                            &unit_state,
-                            &eigenvector_response,
-                            &poles,
-                            root,
-                            precision_bits,
-                        )
-                        .map(|response| lossless_hp_decimal(&response))
+    let chunk_size = response_performance::event_chunk_size(prime_content.len());
+    let chunks = prime_content
+        .par_chunks(chunk_size)
+        .map(|chunk| -> Result<Vec<PortablePrimePowerResponseEvent>> {
+            let mut events = Vec::with_capacity(chunk.len());
+            for &(power, prime, exponent) in chunk {
+                let velocity = apply_prime_power_velocity(
+                    params.n_modes,
+                    power,
+                    prime,
+                    l,
+                    &unit_state,
+                    precision_bits,
+                )?;
+                let eigenvalue_response =
+                    deterministic_dot_hp(&unit_state, &velocity.action, precision_bits);
+                let projected_forcing = velocity
+                    .action
+                    .iter()
+                    .zip(&unit_state)
+                    .map(|(action, state)| {
+                        let mut projection = Float::with_val(precision_bits, state);
+                        projection *= &eigenvalue_response;
+                        let mut value = Float::with_val(precision_bits, action);
+                        value -= projection;
+                        value
                     })
-                    .transpose()
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let relative_residual = bordered_response_relative_residual(
-            tau,
-            state_eigenvalue,
-            &unit_state,
-            &projected_forcing,
-            &eigenvector_response,
-            &lagrange_multiplier,
-            &shifted_frobenius_norm,
-            precision_bits,
-        );
-        if !weil_eigvec_cache::residual_within_precision_floor(&relative_residual, precision_bits) {
-            bail!(
-                "prime-power response bordered solve for {power} failed its precision-scaled residual gate"
-            );
-        }
+                    .collect::<Vec<_>>();
+                let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits);
+                let (eigenvector_response, lagrange_multiplier) =
+                    solve_even_sector_bordered_response(&bordered_solver, &projected_forcing);
+                let response_norm = deterministic_l2_norm_hp(&eigenvector_response, precision_bits);
+                let response_sum = xc_numerics::reduction::deterministic_pairwise_sum_hp(
+                    &eigenvector_response,
+                    precision_bits,
+                );
+                let mut ccm_scale_response = Float::with_val(precision_bits, &ccm_scale);
+                ccm_scale_response *= &response_sum;
+                ccm_scale_response /= &unit_state_sum;
+                ccm_scale_response = -ccm_scale_response;
+                let root_velocity_responses = prepared_roots.values(&eigenvector_response)?;
+                let relative_residual = bordered_response_relative_residual(
+                    tau,
+                    state_eigenvalue,
+                    &unit_state,
+                    &projected_forcing,
+                    &eigenvector_response,
+                    &lagrange_multiplier,
+                    &shifted_frobenius_norm,
+                    precision_bits,
+                );
+                if !weil_eigvec_cache::residual_within_precision_floor(&relative_residual, precision_bits) {
+                    bail!(
+                        "prime-power response bordered solve for {power} failed its precision-scaled residual gate"
+                    );
+            }
 
-        events.push(PortablePrimePowerResponseEvent {
-            power,
-            prime,
-            exponent,
-            log_power: lossless_hp_decimal(&velocity.log_power),
-            von_mangoldt_weight: lossless_hp_decimal(&velocity.von_mangoldt_weight),
-            reduced_position: lossless_hp_decimal(&velocity.reduced_position),
-            velocity_coefficient: lossless_hp_decimal(&velocity.velocity_coefficient),
-            edge_jump_coefficient: lossless_hp_decimal(&velocity.edge_jump_coefficient),
-            observation_is_event_edge: lambda_identity == power.to_string(),
-            eigenvalue_velocity_response: lossless_hp_decimal(&eigenvalue_response),
-            projected_forcing_norm: lossless_hp_decimal(&projected_forcing_norm),
-            l2_eigenvector_velocity_response_norm: lossless_hp_decimal(&response_norm),
-            l2_eigenvector_velocity_response: encode_hp_vector(&eigenvector_response),
-            ccm_normalization_scale_velocity_response: lossless_hp_decimal(&ccm_scale_response),
-            bordered_lagrange_multiplier: lossless_hp_decimal(&lagrange_multiplier),
-            bordered_solve_relative_residual: lossless_hp_decimal(&relative_residual),
-            root_velocity_responses,
-        });
-    }
+            events.push(PortablePrimePowerResponseEvent {
+                power,
+                prime,
+                exponent,
+                log_power: lossless_hp_decimal(&velocity.log_power),
+                von_mangoldt_weight: lossless_hp_decimal(&velocity.von_mangoldt_weight),
+                reduced_position: lossless_hp_decimal(&velocity.reduced_position),
+                velocity_coefficient: lossless_hp_decimal(&velocity.velocity_coefficient),
+                edge_jump_coefficient: lossless_hp_decimal(&velocity.edge_jump_coefficient),
+                observation_is_event_edge: lambda_identity == power.to_string(),
+                eigenvalue_velocity_response: lossless_hp_decimal(&eigenvalue_response),
+                projected_forcing_norm: lossless_hp_decimal(&projected_forcing_norm),
+                l2_eigenvector_velocity_response_norm: lossless_hp_decimal(&response_norm),
+                l2_eigenvector_velocity_response: encode_hp_vector(&eigenvector_response),
+                ccm_normalization_scale_velocity_response: lossless_hp_decimal(&ccm_scale_response),
+                bordered_lagrange_multiplier: lossless_hp_decimal(&lagrange_multiplier),
+                bordered_solve_relative_residual: lossless_hp_decimal(&relative_residual),
+                root_velocity_responses,
+            });
+                progress.completed();
+            }
+            Ok(events)
+        })
+        .collect::<Vec<_>>();
+    let events = chunks
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
 
     let parity_policy = cfg.effective_parity_policy();
     Ok(PortablePrimePowerResponseAnalysis {
@@ -10076,110 +10126,129 @@ fn validate_prime_power_response_analysis(
     let (poles, _) = ccm_secular_poles_and_u_velocities(l, params.n_modes, precision_bits);
     let lambda_identity = lambda_squared_cache_identity(params);
 
-    for (event, (power, prime, exponent)) in artifact.events.iter().zip(expected_content) {
-        if event.power != power
-            || event.prime != prime
-            || event.exponent != exponent
-            || event.observation_is_event_edge != (lambda_identity == power.to_string())
-            || event.l2_eigenvector_velocity_response.len() != dimension
-            || event.root_velocity_responses.len() != roots.len()
-        {
-            return Err(invalid(format!(
+    let prepared_roots = PreparedRootResponses::new(&unit_state, &poles, roots, precision_bits)
+        .map_err(|error| invalid(error.to_string()))?;
+    let progress = ResponseProgress::new("validate", expected_content.len(), roots.len());
+    let chunk_size = response_performance::event_chunk_size(artifact.events.len());
+    let chunks = artifact
+        .events
+        .par_chunks(chunk_size)
+        .enumerate()
+        .map(
+            |(chunk_index, events)| -> std::result::Result<(), CacheError> {
+                for (event, (power, prime, exponent)) in events
+                    .iter()
+                    .zip(expected_content[chunk_index * chunk_size..].iter().copied())
+                {
+                    if event.power != power
+                        || event.prime != prime
+                        || event.exponent != exponent
+                        || event.observation_is_event_edge != (lambda_identity == power.to_string())
+                        || event.l2_eigenvector_velocity_response.len() != dimension
+                        || event.root_velocity_responses.len() != roots.len()
+                    {
+                        return Err(invalid(format!(
                 "CCM prime-power response event {power} has incompatible shape or identity"
             )));
-        }
-        let velocity = apply_prime_power_velocity(
-            params.n_modes,
-            power,
-            prime,
-            l,
-            &unit_state,
-            precision_bits,
-        )
-        .map_err(|error| invalid(error.to_string()))?;
-        let eigenvalue_response =
-            deterministic_dot_hp(&unit_state, &velocity.action, precision_bits);
-        let projected_forcing = velocity
-            .action
-            .iter()
-            .zip(&unit_state)
-            .map(|(action, state)| {
-                let mut projection = Float::with_val(precision_bits, state);
-                projection *= &eigenvalue_response;
-                let mut value = Float::with_val(precision_bits, action);
-                value -= projection;
-                value
-            })
-            .collect::<Vec<_>>();
-        let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits);
-        let response = parse_hp_vector(&event.l2_eigenvector_velocity_response, precision_bits)?;
-        if response.iter().any(|value| !value.is_finite()) {
-            return Err(invalid(format!(
-                "CCM prime-power response event {power} contains a nonfinite vector value"
-            )));
-        }
-        let response_norm = deterministic_l2_norm_hp(&response, precision_bits);
-        let response_sum =
-            xc_numerics::reduction::deterministic_pairwise_sum_hp(&response, precision_bits);
-        let mut ccm_scale_response = Float::with_val(precision_bits, &ccm_scale);
-        ccm_scale_response *= &response_sum;
-        ccm_scale_response /= &unit_state_sum;
-        ccm_scale_response = -ccm_scale_response;
-        let lagrange_multiplier =
-            parse_hp_scalar(&event.bordered_lagrange_multiplier, precision_bits)?;
-        let relative_residual = bordered_response_relative_residual(
-            tau,
-            state_eigenvalue,
-            &unit_state,
-            &projected_forcing,
-            &response,
-            &lagrange_multiplier,
-            &shifted_frobenius_norm,
-            precision_bits,
-        );
-
-        if event.log_power != lossless_hp_decimal(&velocity.log_power)
-            || event.von_mangoldt_weight != lossless_hp_decimal(&velocity.von_mangoldt_weight)
-            || event.reduced_position != lossless_hp_decimal(&velocity.reduced_position)
-            || event.velocity_coefficient != lossless_hp_decimal(&velocity.velocity_coefficient)
-            || event.edge_jump_coefficient != lossless_hp_decimal(&velocity.edge_jump_coefficient)
-            || event.eigenvalue_velocity_response != lossless_hp_decimal(&eigenvalue_response)
-            || event.projected_forcing_norm != lossless_hp_decimal(&projected_forcing_norm)
-            || event.l2_eigenvector_velocity_response_norm != lossless_hp_decimal(&response_norm)
-            || event.ccm_normalization_scale_velocity_response
-                != lossless_hp_decimal(&ccm_scale_response)
-            || event.bordered_solve_relative_residual != lossless_hp_decimal(&relative_residual)
-            || !weil_eigvec_cache::residual_within_precision_floor(
-                &relative_residual,
-                precision_bits,
-            )
-        {
-            return Err(invalid(format!(
-                "CCM prime-power response event {power} failed its numerical replay"
-            )));
-        }
-
-        for (root_outcome, retained_response) in roots.iter().zip(&event.root_velocity_responses) {
-            let expected = root_outcome
-                .value()
-                .map(|root| {
-                    prime_power_root_velocity_response(
+                    }
+                    let velocity = apply_prime_power_velocity(
+                        params.n_modes,
+                        power,
+                        prime,
+                        l,
                         &unit_state,
-                        &response,
-                        &poles,
-                        root,
                         precision_bits,
                     )
-                    .map(|response| lossless_hp_decimal(&response))
-                })
-                .transpose()
-                .map_err(|error| invalid(error.to_string()))?;
-            if retained_response != &expected {
-                return Err(invalid(format!(
-                    "CCM prime-power response event {power} has an invalid root response"
-                )));
-            }
-        }
+                    .map_err(|error| invalid(error.to_string()))?;
+                    let eigenvalue_response =
+                        deterministic_dot_hp(&unit_state, &velocity.action, precision_bits);
+                    let projected_forcing = velocity
+                        .action
+                        .iter()
+                        .zip(&unit_state)
+                        .map(|(action, state)| {
+                            let mut projection = Float::with_val(precision_bits, state);
+                            projection *= &eigenvalue_response;
+                            let mut value = Float::with_val(precision_bits, action);
+                            value -= projection;
+                            value
+                        })
+                        .collect::<Vec<_>>();
+                    let projected_forcing_norm =
+                        deterministic_l2_norm_hp(&projected_forcing, precision_bits);
+                    let response =
+                        parse_hp_vector(&event.l2_eigenvector_velocity_response, precision_bits)?;
+                    if response.iter().any(|value| !value.is_finite()) {
+                        return Err(invalid(format!(
+                "CCM prime-power response event {power} contains a nonfinite vector value"
+            )));
+                    }
+                    let response_norm = deterministic_l2_norm_hp(&response, precision_bits);
+                    let response_sum = xc_numerics::reduction::deterministic_pairwise_sum_hp(
+                        &response,
+                        precision_bits,
+                    );
+                    let mut ccm_scale_response = Float::with_val(precision_bits, &ccm_scale);
+                    ccm_scale_response *= &response_sum;
+                    ccm_scale_response /= &unit_state_sum;
+                    ccm_scale_response = -ccm_scale_response;
+                    let lagrange_multiplier =
+                        parse_hp_scalar(&event.bordered_lagrange_multiplier, precision_bits)?;
+                    let relative_residual = bordered_response_relative_residual(
+                        tau,
+                        state_eigenvalue,
+                        &unit_state,
+                        &projected_forcing,
+                        &response,
+                        &lagrange_multiplier,
+                        &shifted_frobenius_norm,
+                        precision_bits,
+                    );
+
+                    if event.log_power != lossless_hp_decimal(&velocity.log_power)
+                        || event.von_mangoldt_weight
+                            != lossless_hp_decimal(&velocity.von_mangoldt_weight)
+                        || event.reduced_position != lossless_hp_decimal(&velocity.reduced_position)
+                        || event.velocity_coefficient
+                            != lossless_hp_decimal(&velocity.velocity_coefficient)
+                        || event.edge_jump_coefficient
+                            != lossless_hp_decimal(&velocity.edge_jump_coefficient)
+                        || event.eigenvalue_velocity_response
+                            != lossless_hp_decimal(&eigenvalue_response)
+                        || event.projected_forcing_norm
+                            != lossless_hp_decimal(&projected_forcing_norm)
+                        || event.l2_eigenvector_velocity_response_norm
+                            != lossless_hp_decimal(&response_norm)
+                        || event.ccm_normalization_scale_velocity_response
+                            != lossless_hp_decimal(&ccm_scale_response)
+                        || event.bordered_solve_relative_residual
+                            != lossless_hp_decimal(&relative_residual)
+                        || !weil_eigvec_cache::residual_within_precision_floor(
+                            &relative_residual,
+                            precision_bits,
+                        )
+                    {
+                        return Err(invalid(format!(
+                            "CCM prime-power response event {power} failed its numerical replay"
+                        )));
+                    }
+
+                    let expected = prepared_roots
+                        .values(&response)
+                        .map_err(|error| invalid(error.to_string()))?;
+                    if event.root_velocity_responses != expected {
+                        return Err(invalid(format!(
+                            "CCM prime-power response event {power} has an invalid root response"
+                        )));
+                    }
+                    progress.completed();
+                }
+                Ok(())
+            },
+        )
+        .collect::<Vec<_>>();
+    for chunk in chunks {
+        chunk?;
     }
     Ok(())
 }
@@ -10302,6 +10371,7 @@ fn resolve_prime_power_response_analysis_via_cache(
         provenance_digest: Some(root_manifest.content_digest.clone()),
         production_sink: cache.production_sink,
     };
+    let fresh = FreshResponseSeal::default();
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
@@ -10322,6 +10392,10 @@ fn resolve_prime_power_response_analysis_via_cache(
                 &spectral_preparation.numerical,
             )
             .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            // Explicit verification modes retain independent numerical replay.
+            if !cache.mode.compares_against_reference() {
+                fresh.record(&artifact)?;
+            }
             Ok((
                 artifact,
                 canonical_dependency_refs(vec![
@@ -10337,6 +10411,10 @@ fn resolve_prime_power_response_analysis_via_cache(
             ))
         },
         |artifact| {
+            if fresh.verify_fresh(artifact)? {
+                eprintln!("[HP] response validation: exact fresh payload seal verified; production numerical gates already passed");
+                return Ok(());
+            }
             validate_prime_power_response_analysis(
                 artifact,
                 params,
@@ -11068,6 +11146,7 @@ fn resolve_u_flow_response_analysis_via_cache(
         provenance_digest: Some(root_manifest.content_digest.clone()),
         production_sink: cache.production_sink,
     };
+    let fresh = FreshResponseSeal::default();
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
@@ -11089,6 +11168,10 @@ fn resolve_u_flow_response_analysis_via_cache(
                 &spectral_preparation.numerical,
             )
             .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            // Explicit verification modes retain independent numerical replay.
+            if !cache.mode.compares_against_reference() {
+                fresh.record(&artifact)?;
+            }
             Ok((
                 artifact,
                 canonical_dependency_refs(vec![
@@ -11104,6 +11187,10 @@ fn resolve_u_flow_response_analysis_via_cache(
             ))
         },
         |artifact| {
+            if fresh.verify_fresh(artifact)? {
+                eprintln!("[HP] response validation: exact fresh payload seal verified; production numerical gates already passed");
+                return Ok(());
+            }
             validate_u_flow_response_analysis(
                 artifact,
                 params,
@@ -11247,7 +11334,9 @@ fn record_run_evidence_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(if semantics.is_advanced() {
+        minimum_reader_version: ToolkitVersion::parse(if semantics.is_complete_positive() {
+            "0.15.0"
+        } else if semantics.is_advanced() {
             "0.13.3"
         } else {
             "0.13.0"
@@ -12102,6 +12191,9 @@ fn independently_discovered_starting_points(
 ) -> Result<IndependentRootDiscoveryPlan> {
     if xi.len() != params.matrix_size() {
         bail!("independent HP discovery requires one weight per CCM pole");
+    }
+    if options.complete_positive {
+        return complete_discovery::plan(params, l, xi, target, options, precision_bits);
     }
     let mut spacing = pi(precision_bits);
     spacing *= 2u32;
@@ -12977,6 +13069,9 @@ fn run_inner_retaining_source(
         ensure_root_window_usable(&roots, artifact_seeds.len(), false, root_semantics.domain)?;
         (roots, None, None, false)
     };
+    if root_semantics.is_complete_positive() {
+        complete_discovery::validate_assignment(&canonical_roots, &artifact_seeds)?;
+    }
     let eigenvalues_pos = selected_root_positions
         .iter()
         .map(|position| {
@@ -18538,6 +18633,218 @@ mod tests {
         .contains("requested assurance rejects stagnated"));
     }
 
+    #[cfg(feature = "arb")]
+    fn check_complete_root_cache(
+        params: &CcmParams,
+        cfg: &HighPrecConfig,
+        xi: &[Float],
+        count: usize,
+    ) {
+        use xc_cache::{
+            ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
+            FilesystemCacheStore,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "xc-complete-roots-{}-{}-{}",
+            std::process::id(),
+            params.n_modes,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "workstation",
+                root.clone(),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse("0.15.0").unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let context = |mode, write_on_miss| ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["workstation".into()],
+            mode,
+            write_on_miss,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy:
+                xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let l = log_lambda_sq_hp(params, cfg.precision_bits);
+        let plan = independently_discovered_starting_points(
+            params,
+            &l,
+            xi,
+            &ZeroTarget::FirstK { count },
+            IndependentRootDiscoveryOptions::complete_positive(false),
+            cfg.precision_bits,
+        )
+        .unwrap();
+        assert_eq!(plan.selected_positions.len(), count);
+        let source = conditioning_test_manifest("ccm_secular_source", "complete-point-source");
+        let mut identity = None;
+        let mut values = None;
+        for mode in [
+            ArtifactExecutionCacheMode::PreferReuse,
+            ArtifactExecutionCacheMode::RequireReuse,
+            ArtifactExecutionCacheMode::Refresh,
+        ] {
+            let (roots, manifest, _) = resolve_root_range_via_cache(
+                params,
+                cfg,
+                CcmEigenstateSolver::Auto,
+                &l,
+                xi,
+                1,
+                &plan.artifact_seeds,
+                &source,
+                &context(mode, mode != ArtifactExecutionCacheMode::RequireReuse),
+                RootArtifactMode::Independent,
+                None,
+                plan.request_semantics,
+            )
+            .unwrap();
+            assert!(
+                roots.iter().all(EigenvalueResult::is_converged),
+                "{roots:?}"
+            );
+            complete_discovery::validate_assignment(&roots, &plan.artifact_seeds).unwrap();
+            let current = roots
+                .iter()
+                .map(|r| r.value().unwrap().to_string())
+                .collect::<Vec<_>>();
+            if let Some(expected) = &values {
+                assert_eq!(&current, expected);
+            } else {
+                values = Some(current);
+            }
+            if let Some(expected) = &identity {
+                assert_eq!(&manifest.content_digest, expected);
+            } else {
+                identity = Some(manifest.content_digest);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "arb")]
+    fn complete_root_cache_retains_distinct_identity_and_replays_all_roots() {
+        let params = CcmParams::from_lambda_sq_integer(13, 2);
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.root_precision_policy = RootPrecisionPolicy::Adaptive;
+        let xi = [2.5, -20., 36., -20., 2.5]
+            .into_iter()
+            .map(|v| Float::with_val(cfg.precision_bits, v))
+            .collect::<Vec<_>>();
+        check_complete_root_cache(&params, &cfg, &xi, 2);
+        let l = log_lambda_sq_hp(&params, cfg.precision_bits);
+        let full = independently_discovered_starting_points(
+            &params,
+            &l,
+            &xi,
+            &ZeroTarget::FirstK { count: 2 },
+            IndependentRootDiscoveryOptions::complete_positive(false),
+            cfg.precision_bits,
+        )
+        .unwrap();
+        let source = ContentDigest::sha256(b"test");
+        let old = root_range_semantic_key(
+            &params,
+            &cfg,
+            1,
+            &full.artifact_seeds,
+            RootArtifactMode::Independent,
+            None,
+            RootWindowSemantics::advanced(IndependentRootDomain::Positive, 2, true),
+            Some(&source),
+        )
+        .unwrap();
+        let new = root_range_semantic_key(
+            &params,
+            &cfg,
+            1,
+            &full.artifact_seeds,
+            RootArtifactMode::Independent,
+            None,
+            full.request_semantics,
+            Some(&source),
+        )
+        .unwrap();
+        assert_ne!(old.digest().unwrap(), new.digest().unwrap());
+        assert_eq!(
+            new.mathematical_semantics_version,
+            "ccm-root-range-v0.15.0-v10"
+        );
+        let zero = vec![Float::with_val(cfg.precision_bits, 0); 5];
+        let mut only_central = zero;
+        only_central[2] = Float::with_val(cfg.precision_bits, 1);
+        let empty = independently_discovered_starting_points(
+            &params,
+            &l,
+            &only_central,
+            &ZeroTarget::FirstK { count: 2 },
+            IndependentRootDiscoveryOptions::complete_positive(true),
+            cfg.precision_bits,
+        )
+        .unwrap();
+        assert!(empty.artifact_seeds.is_empty());
+        assert!(independently_discovered_starting_points(
+            &params,
+            &l,
+            &only_central,
+            &ZeroTarget::FirstK { count: 2 },
+            IndependentRootDiscoveryOptions::complete_positive(false),
+            cfg.precision_bits
+        )
+        .is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "arb")]
+    #[ignore = "requires an explicit retained eigenpair JSON fixture; no network or matrix assembly"]
+    fn complete_root_retained_claim2a_replay() {
+        let path = std::env::var("CCM_COMPLETE_EIGENPAIR_FIXTURE")
+            .expect("set retained eigenpair fixture path");
+        let raw = std::fs::read(path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(value["lambda_squared"], "2500");
+        assert_eq!(value["n_modes"], 50);
+        assert_eq!(value["precision_bits"], 3386);
+        eprintln!(
+            "retained eigenpair SHA256: {}",
+            ContentDigest::sha256(&raw).0
+        );
+        let params = CcmParams::from_lambda_sq_integer(2500, 50);
+        let mut cfg = HighPrecConfig::for_decimal_digits(1000);
+        cfg.root_precision_policy = RootPrecisionPolicy::Adaptive;
+        let xi = value["eigenvector"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                Float::with_val(
+                    cfg.precision_bits,
+                    Float::parse(v.as_str().unwrap()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        check_complete_root_cache(&params, &cfg, &xi, 50);
+    }
+
     #[test]
     fn adaptive_root_cache_ignores_legacy_parent_and_refreshes_identically() {
         use xc_cache::{
@@ -19839,6 +20146,177 @@ mod tests {
                 precision_bits
             ));
         }
+    }
+
+    fn response_performance_fixture(n: usize, cutoff: u64, bits: u32, benchmark: bool) {
+        let params = CcmParams::from_lambda_sq_integer(cutoff, n);
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.precision_bits = bits;
+        let l = log_lambda_sq_hp(&params, bits);
+        let dimension = params.matrix_size();
+        let mut tau = vec![Float::with_val(bits, 0); dimension * dimension];
+        for index in 0..dimension {
+            let offset = index.abs_diff(n);
+            tau[index * dimension + index] = Float::with_val(bits, 1 + offset * offset);
+        }
+        let state_eigenvalue = Float::with_val(bits, 1);
+        let mut xi = vec![Float::with_val(bits, 0); dimension];
+        xi[n] = l.clone().sqrt();
+        let roots = (0..n)
+            .map(|index| {
+                let mut value = Float::with_val(bits, index + n + 1);
+                value += Float::with_val(bits, 0.25);
+                EigenvalueResult::Converged(RootRefinement {
+                    value,
+                    diagnostics: RootRefinementDiagnostics {
+                        iterations: 1,
+                        final_correction: Float::with_val(bits, 0),
+                        residual: Float::with_val(bits, 0),
+                        achieved_decimal_digits: Float::with_val(bits, 40),
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        let tau_manifest = conditioning_test_manifest("ccm_tau_matrix", "response-perf-tau");
+        let eigenpair_manifest =
+            conditioning_test_manifest("ccm_weil_eigenpair", "response-perf-state");
+        let root_manifest =
+            conditioning_test_manifest("ccm_root_discovery_window", "response-perf-roots");
+        let secular_manifest =
+            conditioning_test_manifest("ccm_secular_source", "response-perf-source");
+        let selection = root_selection_digest(&roots).unwrap();
+        let preparation = compute_response_spectral_preparation(&params, &cfg, &tau).unwrap();
+        let started = Instant::now();
+        let reference = response_performance_reference::reference_prime_power_response(
+            &params,
+            &cfg,
+            &l,
+            &tau,
+            &state_eigenvalue,
+            &xi,
+            &roots,
+            1,
+            &tau_manifest,
+            &eigenpair_manifest,
+            &root_manifest,
+            &secular_manifest,
+            &selection,
+            &preparation,
+        )
+        .unwrap();
+        let reference_seconds = started.elapsed().as_secs_f64();
+        let started = Instant::now();
+        let actual = compute_prime_power_response_analysis(
+            &params,
+            &cfg,
+            &l,
+            &tau,
+            &state_eigenvalue,
+            &xi,
+            &roots,
+            1,
+            &tau_manifest,
+            &eigenpair_manifest,
+            &root_manifest,
+            &secular_manifest,
+            &selection,
+            &preparation,
+        )
+        .unwrap();
+        let compute_seconds = started.elapsed().as_secs_f64();
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&reference).unwrap()
+        );
+        let started = Instant::now();
+        validate_prime_power_response_analysis(
+            &actual,
+            &params,
+            &cfg,
+            &l,
+            &tau,
+            &state_eigenvalue,
+            &xi,
+            &roots,
+            1,
+            &tau_manifest,
+            &eigenpair_manifest,
+            &root_manifest,
+            &secular_manifest,
+            &selection,
+            &preparation,
+        )
+        .unwrap();
+        let replay_seconds = started.elapsed().as_secs_f64();
+        let started = Instant::now();
+        let seal = FreshResponseSeal::default();
+        seal.record(&actual).unwrap();
+        assert!(seal.verify_fresh(&actual).unwrap());
+        let seal_seconds = started.elapsed().as_secs_f64();
+        if benchmark {
+            eprintln!(
+                "RESPONSE_VALIDATION_BENCH {}",
+                serde_json::json!({"dimension":dimension,"bits":bits,"roots":n,"events":actual.events.len(),"workers":rayon::current_num_threads(),"reference_compute_seconds":reference_seconds,"candidate_compute_seconds":compute_seconds,"numerical_replay_seconds":replay_seconds,"fresh_seal_record_and_verify_seconds":seal_seconds,"payload_bytes":serde_json::to_vec(&actual).unwrap().len(),"payload_sha256":ContentDigest::sha256(&serde_json::to_vec(&actual).unwrap()).0,"bit_identical":true,"scope":"Synthetic diagonal source; software and timing qualification, not CCM research measurements."})
+            );
+        }
+        let mut altered = actual.clone();
+        altered.events[0].root_velocity_responses[0] = Some("1".into());
+        assert!(seal.verify_fresh(&altered).is_err());
+        assert!(validate_prime_power_response_analysis(
+            &altered,
+            &params,
+            &cfg,
+            &l,
+            &tau,
+            &state_eigenvalue,
+            &xi,
+            &roots,
+            1,
+            &tau_manifest,
+            &eigenpair_manifest,
+            &root_manifest,
+            &secular_manifest,
+            &selection,
+            &preparation
+        )
+        .is_err());
+        let mut wrong_source = tau_manifest.clone();
+        wrong_source.content_digest = ContentDigest::sha256(b"different-source");
+        assert!(validate_prime_power_response_analysis(
+            &actual,
+            &params,
+            &cfg,
+            &l,
+            &tau,
+            &state_eigenvalue,
+            &xi,
+            &roots,
+            1,
+            &wrong_source,
+            &eigenpair_manifest,
+            &root_manifest,
+            &secular_manifest,
+            &selection,
+            &preparation
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn response_performance_full_payload_matches_prechange_oracle() {
+        for workers in [1, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap()
+                .install(|| response_performance_fixture(3, 13, 192, false));
+        }
+    }
+
+    #[test]
+    #[ignore = "explicit bounded full-response and fresh-validation benchmark"]
+    fn response_validation_benchmark() {
+        response_performance_fixture(24, 1000, 1024, true);
     }
 
     #[test]

@@ -93,6 +93,7 @@ pub struct GitHubBootstrapCacheStore {
     visibility: CacheVisibility,
     required: bool,
     remote: GitCliRemoteStore,
+    resources: ResourcePolicy,
     resolved: Mutex<HashMap<ContentDigest, ResolvedRemoteArtifact>>,
     verified_transports: Mutex<HashMap<ContentDigest, VerifiedTransportParts>>,
     discovered_keys: Mutex<HashMap<(String, String), Vec<ArtifactKey>>>,
@@ -141,6 +142,7 @@ impl GitHubBootstrapCacheStore {
                 "cache-reader@localhost",
             )?,
             root,
+            resources: ResourcePolicy::default(),
             resolved: Mutex::new(HashMap::new()),
             verified_transports: Mutex::new(HashMap::new()),
             discovered_keys: Mutex::new(HashMap::new()),
@@ -151,6 +153,13 @@ impl GitHubBootstrapCacheStore {
             historical_batches: Mutex::new(HashMap::new()),
             metadata_documents: Mutex::new(MetadataDocumentCache::default()),
         })
+    }
+
+    /// Apply the same resource limits to transport and payload materialization.
+    pub fn with_resource_policy(mut self, resources: ResourcePolicy) -> Self {
+        self.remote = self.remote.with_resource_policy(resources.clone());
+        self.resources = resources;
+        self
     }
 
     /// Verify that the bootstrap registry can be reached before a numerical
@@ -1168,7 +1177,7 @@ impl CacheStore for GitHubBootstrapCacheStore {
             &resolved,
             &self.root.join("parts"),
             &package,
-            &ResourcePolicy::default(),
+            &self.resources,
             &CancellationToken::new(),
             writer,
         )?;

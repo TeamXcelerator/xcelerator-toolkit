@@ -9,6 +9,10 @@
 
 ## v0.15.0: reproducible research evidence
 
+Artifact publication now skips unnecessary Git delta searches on compressed
+archives and exposes batch timings and transfer progress. See the
+[measured scope and recovery guidance](docs/PUBLICATION_PERFORMANCE.md).
+
 This release turns retained numerical results into source-bound data for finite
 research tests: typed observables, frozen hypotheses, resolution budgets,
 prefix and Schur diagnostics, checked vector exports, capture receipts, and
@@ -41,6 +45,11 @@ reusable MPFR inner-loop storage, parallel prefix factor columns and independent
 innovation solves in separate phases,
 parallel cross terms, long inner sums and reduction checks with fixed summation order, and cached retained-reduction
 children.
+Response capture prepares fixed root geometry once and processes independent
+events and roots in parallel with bounded temporary storage. Fresh responses
+reuse their production checks through an exact process-local payload seal;
+cached responses retain numerical replay. Both paths report event progress.
+See [response performance and validation](docs/CCM_RESPONSE_PERFORMANCE.md).
 See the release validation for measured evaluation counts, test coverage and
 the limits of these performance claims.
 
@@ -50,6 +59,7 @@ public parents; target-derived evidence keeps its private publication policy.
 
 - [Release notes and migration](docs/RELEASE_NOTES.md)
 - [Numerical compatibility and existing artifacts](docs/NUMERICAL_COMPATIBILITY.md)
+- [Complete positive movable-root discovery](docs/CCM_COMPLETE_ROOT_DISCOVERY.md)
 - [Release validation](docs/VALIDATION.md)
 - [Prefix formulas, precision, and capture](docs/CCM_PREFIX_ANALYSIS.md)
 - [Prefix convergence models and local shard inputs](docs/PREFIX_CONVERGENCE.md)
@@ -580,3 +590,5 @@ Copyright © 2026 Ronnie Andrews, Jr. / Team Xcelerator Inc. All rights reserved
 This is source-available software, not an open-source license. Reading the repository does not grant permission to modify, redistribute, incorporate, or commercially use the software beyond the license terms.
 
 Repository: <https://github.com/TeamXcelerator/xcelerator-toolkit>
+
+Large retained artifacts can use [explicit resource limits and publication-only recovery](docs/PUBLICATION_RECOVERY.md). This preserves numerical results and the original capture history.

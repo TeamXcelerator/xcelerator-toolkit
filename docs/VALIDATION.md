@@ -6,8 +6,8 @@ source digest, features, counts and scope.
 
 | Check | Result |
 |---|---|
-| Windows default workspace, all targets, debug | 528 passed; 6 ignored |
-| WSL GNU/Linux HP + Arb workspace, all targets, release | 1010 passed; 34 ignored |
+| Windows default workspace, all targets, debug | 533 passed; 6 ignored |
+| WSL GNU/Linux HP + Arb workspace, all targets, release | 1023 passed; 37 ignored |
 | Column scheduling, frozen-reference compatibility and stop order | 2 passed; overlaps the workspace suite |
 | Final capture source-binding regressions | 12 passed; overlaps the workspace suite |
 | Read-only artifact-impact inventory unit tests | 11 passed |
@@ -69,6 +69,37 @@ outcomes without losing the primary result. These are integration checks, not
 reruns of published paper claims. Earlier performance measurements retain their
 original source digest in the machine-readable record; this adapter amendment
 does not claim new campaign speedups.
+
+The complete positive-root correction repeated both workspace suites, both
+strict workspace and external-consumer Clippy tiers, both consumer test tiers,
+HP rustdoc and doctests. Four added regressions cover the beyond-band roots,
+unsupported inputs, explicit incomplete counts and distinct cold/warm identities.
+An explicitly invoked retained-source test also recovered all 50 positive movable
+roots at C=2500, N=50, 3386-bit source precision: all refinements converged, with
+byte-identical root payloads under cold acquisition, required reuse and refresh.
+This is finite point-source qualification, not a full spectral ordinal certificate.
+See [complete root discovery](CCM_COMPLETE_ROOT_DISCOVERY.md) for prerequisites,
+assurance limits and cache compatibility. Earlier performance records were not
+rerun for this correction.
+
+The response performance amendment repeated both workspace and external-consumer
+test and strict Clippy tiers, HP rustdoc, doctests and formatting. Four additional
+regressions preserve full response bytes and root arithmetic across precisions
+and worker counts, and reject corrupted or mismatched inputs. Two optional
+synthetic benchmarks ran three times each; these executions are separate from
+the ignored-test totals. See [response performance](CCM_RESPONSE_PERFORMANCE.md)
+for the measured scopes and fresh-versus-cached validation policy. Existing
+scientific and unrelated performance records retain their original scope.
+
+The publication transport amendment repeated both complete workspace suites,
+both strict workspace and external-consumer Clippy tiers, both consumer test
+tiers, HP rustdoc and doctests, formatting and the artifact-impact checks.
+The added progress regression permits only structured numerical Git progress.
+Local Git integration checks retain atomic ref updates, historical blob handling,
+prepared-object reuse and interrupted publication behavior. Four retained-sample
+packs were byte-identical while local packing became faster; see
+[publication performance](PUBLICATION_PERFORMANCE.md) for scope and timings.
+No live GitHub publication speedup or scientific rerun is claimed.
 
 ## Reproduce the checks
 
@@ -254,3 +285,5 @@ The corrected tridiagonal solve retains linear factor storage and work.
 Eigenvalue-only stable reduction omits Q. Prefix ladders currently cache scalar
 and export policies together, so changing an export request can require a new
 child computation.
+
+The publication-recovery amendment repeats both full workspace tiers, both strict workspace Clippy tiers, HP rustdoc and both external consumers. Four regressions cover retained production after a staging limit, exact dependency recovery and reopening, corrupt or missing objects, and bounded resource-policy input. This is offline qualification; no live large-artifact recovery is claimed.

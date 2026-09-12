@@ -83,3 +83,11 @@ validation-reference, or published artifacts to manufacture a cold state.
 `XC_CACHE_MODE=verify` remains the authority for proving that an optimization
 preserves current artifact payload bytes. A faster performance report cannot
 override a validation mismatch.
+
+## Response event progress
+
+Large prime-power response jobs print event counts and elapsed time separately
+for computation and numerical replay. These operational messages are independent
+of the optional timing sidecar and do not change artifact bytes. See
+[response capture and validation](CCM_RESPONSE_PERFORMANCE.md) for bounded parallel
+execution, fresh-data validation, benchmarks and the remaining acquisition cost.

@@ -1,5 +1,9 @@
 //! Typed resolve-or-compute execution over the common cache fabric.
 
+#[path = "managed_recovery.rs"]
+mod managed_recovery;
+pub use managed_recovery::managed_resource_policy_from_environment;
+
 use crate::{
     ArtifactDraft, ArtifactKey, ArtifactManifest, CacheError, CachePolicy, CacheQuality,
     CacheResolver, CacheVisibility, ContentDigest, SemanticKeyEnvelope, ToolkitVersion,
@@ -519,6 +523,7 @@ pub struct ManagedArtifactCacheSession {
     reference_resolver: Option<CacheResolver>,
     policy: CachePolicy,
     production_sink: Option<crate::CanonicalStagingProductionSink>,
+    resources: xc_core::ResourcePolicy,
     publication_target: xc_core::PublicationTarget,
     repository_owner: String,
     execute_remote_mutations: bool,
@@ -673,6 +678,7 @@ fn managed_layer_plan(
 fn instantiate_managed_layer(
     descriptor: ManagedLayerDescriptor,
     repository_owner: &str,
+    resources: &xc_core::ResourcePolicy,
 ) -> Result<crate::CacheLayer, CacheError> {
     let store: Box<dyn crate::CacheStore> = match descriptor.backend {
         ManagedLayerBackend::ZipJson => Box::new(crate::ZipJsonFilesystemCacheStore::new(
@@ -683,7 +689,8 @@ fn instantiate_managed_layer(
         )),
         ManagedLayerBackend::GitHubPrivateRequired => {
             let store =
-                crate::GitHubBootstrapCacheStore::private(repository_owner, &descriptor.root)?;
+                crate::GitHubBootstrapCacheStore::private(repository_owner, &descriptor.root)?
+                    .with_resource_policy(resources.clone());
             store.preflight()?;
             Box::new(store)
         }
@@ -691,12 +698,14 @@ fn instantiate_managed_layer(
             let store = crate::GitHubBootstrapCacheStore::public_required(
                 repository_owner,
                 &descriptor.root,
-            )?;
+            )?
+            .with_resource_policy(resources.clone());
             store.preflight()?;
             Box::new(store)
         }
         ManagedLayerBackend::GitHubPublicOptional => Box::new(
-            crate::GitHubBootstrapCacheStore::public(repository_owner, &descriptor.root)?,
+            crate::GitHubBootstrapCacheStore::public(repository_owner, &descriptor.root)?
+                .with_resource_policy(resources.clone()),
         ),
     };
     debug_assert_eq!(store.name(), descriptor.name);
@@ -711,10 +720,11 @@ fn instantiate_managed_layer(
 fn instantiate_managed_layers(
     descriptors: Vec<ManagedLayerDescriptor>,
     repository_owner: &str,
+    resources: &xc_core::ResourcePolicy,
 ) -> Result<Vec<crate::CacheLayer>, CacheError> {
     descriptors
         .into_iter()
-        .map(|descriptor| instantiate_managed_layer(descriptor, repository_owner))
+        .map(|descriptor| instantiate_managed_layer(descriptor, repository_owner, resources))
         .collect()
 }
 
@@ -731,6 +741,16 @@ fn reference_overlay_names(mode: ManagedRemoteCacheMode) -> Vec<String> {
 
 impl ManagedArtifactCacheSession {
     pub fn new(config: ManagedArtifactCacheConfig) -> Result<Self, CacheError> {
+        Self::new_with_resources(config, xc_core::ResourcePolicy::default())
+    }
+
+    /// Supply explicit resource limits for remote reads, staging and publication.
+    /// This does not change mathematical identities or numerical settings.
+    pub fn new_with_resources(
+        config: ManagedArtifactCacheConfig,
+        resources: xc_core::ResourcePolicy,
+    ) -> Result<Self, CacheError> {
+        managed_recovery::validate_resources(&resources)?;
         let output_validation = config.output_validation.clone();
         let remote_cache_mode = output_validation
             .as_ref()
@@ -752,15 +772,16 @@ impl ManagedArtifactCacheSession {
             remote_cache_mode,
         )?;
         let execution_layers =
-            instantiate_managed_layers(plan.execution, &config.repository_owner)?;
+            instantiate_managed_layers(plan.execution, &config.repository_owner, &resources)?;
         let reference_layers =
-            instantiate_managed_layers(plan.reference, &config.repository_owner)?;
+            instantiate_managed_layers(plan.reference, &config.repository_owner, &resources)?;
         Self::from_layer_sets(
             config,
             output_validation,
             remote_cache_mode,
             execution_layers,
             reference_layers,
+            resources,
         )
     }
 
@@ -770,6 +791,7 @@ impl ManagedArtifactCacheSession {
         remote_cache_mode: ManagedRemoteCacheMode,
         execution_layers: Vec<crate::CacheLayer>,
         reference_layers: Vec<crate::CacheLayer>,
+        resources: xc_core::ResourcePolicy,
     ) -> Result<Self, CacheError> {
         let production_cache_installed = output_validation.is_none();
         let resolver = CacheResolver::new(execution_layers);
@@ -806,7 +828,7 @@ impl ManagedArtifactCacheSession {
                 crate::CanonicalStagingProductionSink::new(
                     root,
                     crate::TransportPolicy::default(),
-                    xc_core::ResourcePolicy::default(),
+                    resources.clone(),
                     xc_core::CancellationToken::new(),
                 )
             })
@@ -838,6 +860,7 @@ impl ManagedArtifactCacheSession {
             reference_resolver,
             policy,
             production_sink,
+            resources,
             publication_target: config.publication_target,
             repository_owner: config.repository_owner,
             execute_remote_mutations: config.execute_remote_mutations,
@@ -866,12 +889,15 @@ impl ManagedArtifactCacheSession {
             remote_cache_mode,
             execution_layers,
             reference_layers,
+            xc_core::ResourcePolicy::default(),
         )
     }
 
     pub fn from_environment() -> Result<Option<Self>, CacheError> {
         ManagedArtifactCacheConfig::from_environment()?
-            .map(Self::new)
+            .map(|config| {
+                Self::new_with_resources(config, managed_resource_policy_from_environment()?)
+            })
             .transpose()
     }
 
@@ -1077,7 +1103,7 @@ impl ManagedArtifactCacheSession {
                 self.publication_target,
                 &self.repository_owner,
                 &sink.staging_root().join("journals"),
-                &xc_core::ResourcePolicy::default(),
+                &self.resources,
                 self.replace_existing_publication,
             )?;
             let persisted = persist_publication_execution_report(sink.staging_root(), &report)?;
