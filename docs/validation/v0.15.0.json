@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
   "release": "v0.15.0",
-  "qualified_at_utc": "2026-09-10T05:48:35.510330+00:00",
+  "qualified_at_utc": "2026-09-12T16:10:03.945855+00:00",
   "toolchain": "1.98.1",
   "source_digest": {
-    "sha256": "a40109caedbd00e98d44fc6c6d4811b9b03d2deaa91751a99734275bb319fd9f",
+    "sha256": "6f6d26aacd4813bbec35baee969675e87d5847f30ddd13c2530ed8eb3ff2992a",
     "encoding": "sorted tracked Rust sources plus root/consumer manifests and locks; path NUL then LF-normalized contents NUL",
-    "file_count": 170
+    "file_count": 171
   },
   "checks": {
     "native_workspace": {
@@ -17,9 +17,9 @@
       "features": []
     },
     "hp_arb_workspace": {
-      "passed": 1010,
+      "passed": 1014,
       "failed": 0,
-      "ignored": 34,
+      "ignored": 35,
       "profile": "release",
       "features": [
         "hp",
@@ -163,6 +163,18 @@
       "regression_tests": 5,
       "overlaps_workspace_suite": true,
       "scope": "Actual canonical staging and reopening with local/private/public aliases; recursive remapping, destination deduplication, both visibility lanes, active index and batch proof reuse, assurance/evidence preservation, invalid transport rejection, and distinct historical closures. Offline tests; no live claim or GitHub mutation."
+    },
+    "complete_positive_root_regressions": {
+      "passed": 4,
+      "failed": 0,
+      "overlaps_workspace_suite": true,
+      "scope": "Beyond-band roots, zero residues and absent positive roots, unsupported symmetry and repeated roots, independent ordinal/cache identity and incomplete-count behavior."
+    },
+    "retained_complete_root_replay": {
+      "passed": 1,
+      "failed": 0,
+      "explicit_ignored_test": true,
+      "scope": "Retained C=2500 N=50 P=3386-bit eigenpair: all 50 roots converged and root payloads identical across cold, required reuse and refresh."
     }
   },
   "retained_release_qualification": {
@@ -10717,5 +10729,40 @@
       "ccm-u-flow-response-v0.15.0-v3"
     ],
     "source_artifacts_changed": false
+  },
+  "complete_positive_root_correction": {
+    "prior_source_sha256": "a40109caedbd00e98d44fc6c6d4811b9b03d2deaa91751a99734275bb319fd9f",
+    "repeated_checks": [
+      "native_workspace",
+      "hp_arb_workspace",
+      "native_clippy",
+      "hp_arb_clippy",
+      "external_consumer_native",
+      "external_consumer_hp",
+      "external_native_clippy",
+      "external_hp_clippy",
+      "rustdoc_warnings_denied",
+      "doctests",
+      "retained_complete_root_replay"
+    ],
+    "artifact_semantics": "ccm-root-range-v0.15.0-v10",
+    "primary_source_artifacts_changed": false,
+    "retained_eigenpair_payload_sha256": "8abba079f7e9036302fe107677db377774c0b3b099df53123dbd086e4f52c198",
+    "geometry": "Exact stored MPFR pole points of an exactly even point source; FLINT/Arb positive numerator-root isolation followed by adaptive source refinement.",
+    "scope": "Local software and retained-source qualification; complete positive movable roots of the finite point source, not an infinite-operator or full determinant ordinal certificate. Existing discovery policies and source identities remain available. No live publication or application campaign rerun claimed.",
+    "remaining_qualification": "Earlier targeted, application and performance records retain their original qualification scope and source digests; no new campaign speedup claim.",
+    "log_sha256": {
+      "ccm-complete-native-all.log": "b6e3f3e031e578f4a32653e37aeac199eb1d059c3445235bc792a01b99c33fa8",
+      "ccm-complete-hp-all.log": "e2c1d9f751d8016af6c256966c7bfe493dfdab1d4997b78aec902f51885cccb6",
+      "ccm-complete-native-clippy.log": "16a554893d7e966a4bc49fde779a38c40ef1b5d300a2f1b3eeb2f763f9847099",
+      "ccm-complete-hp-clippy.log": "cf7d96f072f4e36531d04347e681189ec4d412cd561845348b48a4bcc95e5e5b",
+      "ccm-complete-consumer-native.log": "7914be5659e7ee4283b92385f6e10e01115251e7481fe88fc273941a30bb77f8",
+      "ccm-complete-consumer-hp.log": "6df0aad2092c364f973be49631b706d3638dd4206501621eb182bb8e49844531",
+      "ccm-complete-consumer-native-clippy.log": "39d59e697ab9d1f212c280f5d1f4bf7de0fe42e0b4b61a6178bcf8e3ab747dd6",
+      "ccm-complete-consumer-hp-clippy.log": "e13ebc61fc43d3a89e2acd3ee6e326e780961dab42ad23f9c0036b5b2625b7c7",
+      "ccm-complete-hp-doc.log": "1b53fa8bf5a222b1e4b9837686e4806922da2bff1a70fc1b8c6313e0a7874e3c",
+      "ccm-complete-doctests.log": "93892aad6271380592af703b11dc12a337e822488d058b0f58cda02cd7c8074e",
+      "ccm-complete-retained.log": "cdd309841151819a49411337abf97b0da364e20f9048d60555e1fd6b6c6137d7"
+    }
   }
 }

@@ -50,6 +50,7 @@ public parents; target-derived evidence keeps its private publication policy.
 
 - [Release notes and migration](docs/RELEASE_NOTES.md)
 - [Numerical compatibility and existing artifacts](docs/NUMERICAL_COMPATIBILITY.md)
+- [Complete positive movable-root discovery](docs/CCM_COMPLETE_ROOT_DISCOVERY.md)
 - [Release validation](docs/VALIDATION.md)
 - [Prefix formulas, precision, and capture](docs/CCM_PREFIX_ANALYSIS.md)
 - [Prefix convergence models and local shard inputs](docs/PREFIX_CONVERGENCE.md)

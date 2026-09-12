@@ -7,7 +7,7 @@ source digest, features, counts and scope.
 | Check | Result |
 |---|---|
 | Windows default workspace, all targets, debug | 528 passed; 6 ignored |
-| WSL GNU/Linux HP + Arb workspace, all targets, release | 1010 passed; 34 ignored |
+| WSL GNU/Linux HP + Arb workspace, all targets, release | 1014 passed; 35 ignored |
 | Column scheduling, frozen-reference compatibility and stop order | 2 passed; overlaps the workspace suite |
 | Final capture source-binding regressions | 12 passed; overlaps the workspace suite |
 | Read-only artifact-impact inventory unit tests | 11 passed |
@@ -69,6 +69,18 @@ outcomes without losing the primary result. These are integration checks, not
 reruns of published paper claims. Earlier performance measurements retain their
 original source digest in the machine-readable record; this adapter amendment
 does not claim new campaign speedups.
+
+The complete positive-root correction repeated both workspace suites, both
+strict workspace and external-consumer Clippy tiers, both consumer test tiers,
+HP rustdoc and doctests. Four added regressions cover the beyond-band roots,
+unsupported inputs, explicit incomplete counts and distinct cold/warm identities.
+An explicitly invoked retained-source test also recovered all 50 positive movable
+roots at C=2500, N=50, 3386-bit source precision: all refinements converged, with
+byte-identical root payloads under cold acquisition, required reuse and refresh.
+This is finite point-source qualification, not a full spectral ordinal certificate.
+See [complete root discovery](CCM_COMPLETE_ROOT_DISCOVERY.md) for prerequisites,
+assurance limits and cache compatibility. Earlier performance records were not
+rerun for this correction.
 
 ## Reproduce the checks
 

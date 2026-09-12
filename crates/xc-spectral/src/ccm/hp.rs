@@ -40,6 +40,8 @@ pub mod capture_run;
 /// Rebuild response scalars from authenticated retained states and tangents.
 pub mod response_repair;
 
+mod complete_discovery;
+
 // Conservative crossovers from the ignored release-mode benchmark below.
 // Decimal conversion becomes worthwhile at fewer entries as MPFR precision
 // rises; low-precision decoding uses larger batches to amortize Rayon barriers.
@@ -208,6 +210,10 @@ pub struct IndependentRootDiscoveryOptions {
     /// Return the complete available finite window when it cannot fill the
     /// requested target. The returned root list may be empty.
     pub allow_incomplete: bool,
+    /// Isolate all positive movable roots of an exactly even point source,
+    /// including beyond the last pole. Requires the `arb` feature.
+    #[serde(default)]
+    pub complete_positive: bool,
 }
 
 impl IndependentRootDiscoveryOptions {
@@ -219,6 +225,16 @@ impl IndependentRootDiscoveryOptions {
                 IndependentRootDomain::Positive
             },
             allow_incomplete,
+            complete_positive: false,
+        }
+    }
+    /// Source-only full-range acquisition, with exact rational numerator
+    /// isolation. Incomplete mathematical windows remain explicit outcomes.
+    pub fn complete_positive(allow_incomplete: bool) -> Self {
+        Self {
+            domain: IndependentRootDomain::Positive,
+            allow_incomplete,
+            complete_positive: true,
         }
     }
 }
@@ -255,7 +271,19 @@ impl RootWindowSemantics {
     }
 
     fn is_advanced(self) -> bool {
-        self.artifact_format == RootArtifactFormat::AdvancedV7
+        self.artifact_format != RootArtifactFormat::LegacyV6
+    }
+    fn is_complete_positive(self) -> bool {
+        self.artifact_format == RootArtifactFormat::CompleteV10
+    }
+    fn completeness(self, mode: RootArtifactMode) -> &'static str {
+        match mode {
+            RootArtifactMode::Independent if self.is_complete_positive() => {
+                "complete_positive_movable_point_source"
+            }
+            RootArtifactMode::Independent => "unverified_computed_discovery",
+            RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
+        }
     }
 }
 
@@ -263,6 +291,7 @@ impl RootWindowSemantics {
 enum RootArtifactFormat {
     LegacyV6,
     AdvancedV7,
+    CompleteV10,
 }
 
 #[derive(Debug)]
@@ -7452,11 +7481,7 @@ fn decode_root_range(
         || artifact.reference_seeds_used
             != (artifact_mode == RootArtifactMode::ReferenceSeededRefinement)
         || artifact.reference_dataset.as_ref() != reference_dataset
-        || artifact.completeness
-            != match artifact_mode {
-                RootArtifactMode::Independent => "unverified_computed_discovery",
-                RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
-            }
+        || artifact.completeness != semantics.completeness(artifact_mode)
         || artifact.starting_points != expected_seeds
         || artifact.outcomes.len() != seeds.len()
         || artifact.solver != cfg.root_solver.display_name().to_ascii_lowercase()
@@ -7625,10 +7650,7 @@ fn root_range_semantic_key(
         "discovery_mode": artifact_mode.as_str(),
         "starting_points": seed_strings,
         "reference_seeds_used": artifact_mode == RootArtifactMode::ReferenceSeededRefinement,
-        "completeness": match artifact_mode {
-            RootArtifactMode::Independent => "unverified_computed_discovery",
-            RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
-        },
+        "completeness": semantics.completeness(artifact_mode),
         "solver": cfg.root_solver.display_name().to_ascii_lowercase(),
         "solver_steps": cfg.solver_steps,
         "accuracy_guard_bits": GUARD_BITS
@@ -7685,6 +7707,23 @@ fn root_range_semantic_key(
             serde_json::json!(semantics.domain.as_str()),
         );
     }
+    if semantics.is_complete_positive() {
+        let parameters = resolved_parameters
+            .as_object_mut()
+            .expect("semantic parameters");
+        parameters.insert(
+            "discovery_extent".into(),
+            serde_json::json!("all_positive_movable_roots"),
+        );
+        parameters.insert(
+            "discovery_method".into(),
+            serde_json::json!("exact_even_point_numerator_flint_arb_v1"),
+        );
+        parameters.insert(
+            "pole_geometry".into(),
+            serde_json::json!("exact_stored_mpfr_pole_points"),
+        );
+    }
     let mut source_data_identities = reference_dataset
         .map(|dataset| {
             BTreeMap::from([(
@@ -7708,9 +7747,9 @@ fn root_range_semantic_key(
             RootArtifactMode::ReferenceSeededRefinement => "ccm_root_refinement",
         }
         .to_owned(),
-        mathematical_semantics_version: if cfg.root_precision_policy
-            == RootPrecisionPolicy::Adaptive
-        {
+        mathematical_semantics_version: if semantics.is_complete_positive() {
+            "ccm-root-range-v0.15.0-v10"
+        } else if cfg.root_precision_policy == RootPrecisionPolicy::Adaptive {
             "ccm-root-range-v0.14.1-v9"
         } else if semantics.is_advanced() {
             "ccm-root-range-v0.13.3-v7"
@@ -7751,7 +7790,17 @@ fn root_range_logical_key(
     semantics: RootWindowSemantics,
 ) -> String {
     let parity_policy = cfg.effective_parity_policy();
-    if semantics.is_advanced() {
+    if semantics.is_complete_positive() {
+        format!(
+            "ccm/root-discovery/complete-positive/{}/{}/{}/{}/{}-{}",
+            lambda_squared_cache_identity(params),
+            params.n_modes,
+            cfg.precision_bits,
+            parity_policy.cache_label(),
+            first_root_index,
+            last_root_index
+        )
+    } else if semantics.is_advanced() {
         format!(
             "ccm/root-discovery/advanced/{}/{}/{}/{}/{}/{}-{}",
             semantics.domain.as_str(),
@@ -7962,7 +8011,9 @@ fn resolve_root_range_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(if semantics.is_advanced() {
+        minimum_reader_version: ToolkitVersion::parse(if semantics.is_complete_positive() {
+            "0.15.0"
+        } else if semantics.is_advanced() {
             "0.13.3"
         } else {
             "0.13.0"
@@ -8046,11 +8097,7 @@ fn resolve_root_range_via_cache(
                     reference_seeds_used: artifact_mode
                         == RootArtifactMode::ReferenceSeededRefinement,
                     reference_dataset: reference_dataset.cloned(),
-                    completeness: match artifact_mode {
-                        RootArtifactMode::Independent => "unverified_computed_discovery",
-                        RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
-                    }
-                    .to_owned(),
+                    completeness: semantics.completeness(artifact_mode).to_owned(),
                     starting_points: seeds.iter().map(Float::to_string).collect(),
                     outcomes,
                     solver: cfg.root_solver.display_name().to_ascii_lowercase(),
@@ -11247,7 +11294,9 @@ fn record_run_evidence_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(if semantics.is_advanced() {
+        minimum_reader_version: ToolkitVersion::parse(if semantics.is_complete_positive() {
+            "0.15.0"
+        } else if semantics.is_advanced() {
             "0.13.3"
         } else {
             "0.13.0"
@@ -12102,6 +12151,9 @@ fn independently_discovered_starting_points(
 ) -> Result<IndependentRootDiscoveryPlan> {
     if xi.len() != params.matrix_size() {
         bail!("independent HP discovery requires one weight per CCM pole");
+    }
+    if options.complete_positive {
+        return complete_discovery::plan(params, l, xi, target, options, precision_bits);
     }
     let mut spacing = pi(precision_bits);
     spacing *= 2u32;
@@ -12977,6 +13029,9 @@ fn run_inner_retaining_source(
         ensure_root_window_usable(&roots, artifact_seeds.len(), false, root_semantics.domain)?;
         (roots, None, None, false)
     };
+    if root_semantics.is_complete_positive() {
+        complete_discovery::validate_assignment(&canonical_roots, &artifact_seeds)?;
+    }
     let eigenvalues_pos = selected_root_positions
         .iter()
         .map(|position| {
@@ -18536,6 +18591,218 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("requested assurance rejects stagnated"));
+    }
+
+    #[cfg(feature = "arb")]
+    fn check_complete_root_cache(
+        params: &CcmParams,
+        cfg: &HighPrecConfig,
+        xi: &[Float],
+        count: usize,
+    ) {
+        use xc_cache::{
+            ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
+            FilesystemCacheStore,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "xc-complete-roots-{}-{}-{}",
+            std::process::id(),
+            params.n_modes,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "workstation",
+                root.clone(),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse("0.15.0").unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let context = |mode, write_on_miss| ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["workstation".into()],
+            mode,
+            write_on_miss,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy:
+                xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let l = log_lambda_sq_hp(params, cfg.precision_bits);
+        let plan = independently_discovered_starting_points(
+            params,
+            &l,
+            xi,
+            &ZeroTarget::FirstK { count },
+            IndependentRootDiscoveryOptions::complete_positive(false),
+            cfg.precision_bits,
+        )
+        .unwrap();
+        assert_eq!(plan.selected_positions.len(), count);
+        let source = conditioning_test_manifest("ccm_secular_source", "complete-point-source");
+        let mut identity = None;
+        let mut values = None;
+        for mode in [
+            ArtifactExecutionCacheMode::PreferReuse,
+            ArtifactExecutionCacheMode::RequireReuse,
+            ArtifactExecutionCacheMode::Refresh,
+        ] {
+            let (roots, manifest, _) = resolve_root_range_via_cache(
+                params,
+                cfg,
+                CcmEigenstateSolver::Auto,
+                &l,
+                xi,
+                1,
+                &plan.artifact_seeds,
+                &source,
+                &context(mode, mode != ArtifactExecutionCacheMode::RequireReuse),
+                RootArtifactMode::Independent,
+                None,
+                plan.request_semantics,
+            )
+            .unwrap();
+            assert!(
+                roots.iter().all(EigenvalueResult::is_converged),
+                "{roots:?}"
+            );
+            complete_discovery::validate_assignment(&roots, &plan.artifact_seeds).unwrap();
+            let current = roots
+                .iter()
+                .map(|r| r.value().unwrap().to_string())
+                .collect::<Vec<_>>();
+            if let Some(expected) = &values {
+                assert_eq!(&current, expected);
+            } else {
+                values = Some(current);
+            }
+            if let Some(expected) = &identity {
+                assert_eq!(&manifest.content_digest, expected);
+            } else {
+                identity = Some(manifest.content_digest);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "arb")]
+    fn complete_root_cache_retains_distinct_identity_and_replays_all_roots() {
+        let params = CcmParams::from_lambda_sq_integer(13, 2);
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.root_precision_policy = RootPrecisionPolicy::Adaptive;
+        let xi = [2.5, -20., 36., -20., 2.5]
+            .into_iter()
+            .map(|v| Float::with_val(cfg.precision_bits, v))
+            .collect::<Vec<_>>();
+        check_complete_root_cache(&params, &cfg, &xi, 2);
+        let l = log_lambda_sq_hp(&params, cfg.precision_bits);
+        let full = independently_discovered_starting_points(
+            &params,
+            &l,
+            &xi,
+            &ZeroTarget::FirstK { count: 2 },
+            IndependentRootDiscoveryOptions::complete_positive(false),
+            cfg.precision_bits,
+        )
+        .unwrap();
+        let source = ContentDigest::sha256(b"test");
+        let old = root_range_semantic_key(
+            &params,
+            &cfg,
+            1,
+            &full.artifact_seeds,
+            RootArtifactMode::Independent,
+            None,
+            RootWindowSemantics::advanced(IndependentRootDomain::Positive, 2, true),
+            Some(&source),
+        )
+        .unwrap();
+        let new = root_range_semantic_key(
+            &params,
+            &cfg,
+            1,
+            &full.artifact_seeds,
+            RootArtifactMode::Independent,
+            None,
+            full.request_semantics,
+            Some(&source),
+        )
+        .unwrap();
+        assert_ne!(old.digest().unwrap(), new.digest().unwrap());
+        assert_eq!(
+            new.mathematical_semantics_version,
+            "ccm-root-range-v0.15.0-v10"
+        );
+        let zero = vec![Float::with_val(cfg.precision_bits, 0); 5];
+        let mut only_central = zero;
+        only_central[2] = Float::with_val(cfg.precision_bits, 1);
+        let empty = independently_discovered_starting_points(
+            &params,
+            &l,
+            &only_central,
+            &ZeroTarget::FirstK { count: 2 },
+            IndependentRootDiscoveryOptions::complete_positive(true),
+            cfg.precision_bits,
+        )
+        .unwrap();
+        assert!(empty.artifact_seeds.is_empty());
+        assert!(independently_discovered_starting_points(
+            &params,
+            &l,
+            &only_central,
+            &ZeroTarget::FirstK { count: 2 },
+            IndependentRootDiscoveryOptions::complete_positive(false),
+            cfg.precision_bits
+        )
+        .is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "arb")]
+    #[ignore = "requires an explicit retained eigenpair JSON fixture; no network or matrix assembly"]
+    fn complete_root_retained_claim2a_replay() {
+        let path = std::env::var("CCM_COMPLETE_EIGENPAIR_FIXTURE")
+            .expect("set retained eigenpair fixture path");
+        let raw = std::fs::read(path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(value["lambda_squared"], "2500");
+        assert_eq!(value["n_modes"], 50);
+        assert_eq!(value["precision_bits"], 3386);
+        eprintln!(
+            "retained eigenpair SHA256: {}",
+            ContentDigest::sha256(&raw).0
+        );
+        let params = CcmParams::from_lambda_sq_integer(2500, 50);
+        let mut cfg = HighPrecConfig::for_decimal_digits(1000);
+        cfg.root_precision_policy = RootPrecisionPolicy::Adaptive;
+        let xi = value["eigenvector"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                Float::with_val(
+                    cfg.precision_bits,
+                    Float::parse(v.as_str().unwrap()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        check_complete_root_cache(&params, &cfg, &xi, 50);
     }
 
     #[test]
