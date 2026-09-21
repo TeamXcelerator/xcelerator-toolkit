@@ -567,14 +567,7 @@ mod tests {
         )
     }
 
-    fn temporary_root(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("test-tmp")
-            .join(format!("{name}-{}", std::process::id()))
-    }
+    use crate::test_support::temporary_root;
 
     #[test]
     fn append_only_checkpoint_store_loads_latest_verified_snapshot() {

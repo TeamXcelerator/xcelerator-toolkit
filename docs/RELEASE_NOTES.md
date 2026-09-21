@@ -1,5 +1,149 @@
 # Release notes
 
+## 0.15.1
+
+Generic Gaussian target series now use a remaining-tail bound for each
+component. Normalization no longer makes HP early stopping scale-dependent;
+HP term-budget exhaustion returns an error, and a binary64 polynomial zero
+cannot prematurely terminate a series. Gaussian target identities change,
+including external targets with a Gaussian auxiliary profile.
+
+Generic binary64 root refinement now keeps finite extreme brackets finite.
+Overflow-safe midpoint and discovery interpolation prevent false infinite
+roots and missed windows; nonfinite discovery values are reported as errors.
+Optional derivative diagnostics contain only finite values.
+
+Stable HP Archimedean derivative evaluation now has a distinct u-flow v4
+identity and reader floor 0.15.1. This prevents exact-replay conflicts with
+legacy v3 actions after stable gamma evaluation changes low-order bits.
+Root-only repairs preserve legacy derivative semantics; current u-flow
+production requires fresh actions and tangents. Original evidence is retained.
+
+Publication now retains every exact parent identity required by a staged child,
+including directly observed parents, coalesced aliases, and dependencies in other
+cache families. Equivalent numerical content cannot substitute for that identity.
+Ordinary publication preserves equal-or-newer live entries while adding required
+historical parents; explicit refresh/replacement keeps its existing behavior.
+Exact historical lookup and publication preflight also honor quarantine and
+revocation of the named manifest instead of bypassing them through old batch proof.
+
+The f64 archimedean origin guard now uses the correct off-diagonal limit
+`-1/L`, with direct-integrand and quadrature-reachability regressions. The
+guard is inactive for integer cutoffs `C>=2`, including Claim 1a, but can be
+reached at fractional cutoffs near 1. That origin-limit fix did not change
+the HP matrix builder; separate HP formula corrections are tracked by the
+full mathematics audit.
+
+Checkpoint I/O is quiet by default, with stage heartbeats and errors retained.
+Comparison discovery follows authenticated published factor/sector ancestry.
+Applications can explicitly prepare sampled target data and a finite Fourier
+projection and its finite transform jets from their configured runtime evaluator.
+Weighted atoms, a polynomial arithmetic-tail form, model energy/band, and Fourier
+block allowances are derived from the current retained state and matrix plus the
+bundled ordinate table. Finite scope and unresolved bound conditions remain
+explicit; no previous run's result or chat attachment is required. Finite contour
+enclosures use centered Taylor coefficients with an integral remainder to reduce
+interval dependency loss; acceptance still requires every boundary segment.
+
+Ultra capture authenticates published canonical parent identities when local
+adapter dependency lists are empty. This repairs retained-state ancestry,
+root diagnostics, component lookup, and reused prefix/reduction checks without
+changing numerical source bytes. Reusing a larger root window now notifies
+the capture observer. Checkpoint progress abbreviates long display labels while
+preserving exact storage keys. Missing external inputs remain explicit.
+
+Provider evaluation errors now retain their original diagnosis through distance,
+crossing and residual calculations. Checked point-evaluation APIs are available
+alongside scalar callbacks. Successful values and target identities are unchanged.
+
+Reference data and tooling have explicit checkout-independent byte policies.
+The bundled ordinate table now uses its existing committed LF bytes on every
+platform, with one shared pinned digest checked by the library and production
+example. Ordinates are unchanged. Existing artifacts retain their original
+reference provenance; new reference-seeded identities can differ from historical
+Windows CRLF-based identities. No old artifact is relabeled or deleted.
+Complete qualification enforces committed sources and raw-byte checks, and both
+compact-export consumers reject malformed field policies consistently.
+
+Audit hardening applies parent visibility uniformly at publication routing, binds
+local checkpoints to source/build identity, always replays supplied source certificates,
+and distinguishes finite enclosures in receipt coverage. Scoring-root ordering/count,
+Arb failure paths, frozen input bytes and same-size Git-object mutations are checked.
+Per-diagnostic schemas retain required measurements and versioned request contracts.
+Complete local qualification now runs through one command; local operational-store
+retention is documented. Existing primary scientific payloads are preserved.
+Publication test fixtures use short paths independent of checkout location.
+Release qualification discloses source differences from Git, guards all 34 schemas,
+and rejects optimized Python. Compact exports and queries share one field policy;
+band cutoff failures propagate as errors, and successful coverage notes are clean.
+
+Authenticated chunked atom inputs remove fixed table-count ceilings under explicit
+resource policies. Ultra's existing weighted-tail, band and tail-model kinds add
+signed per-ordinal kernels, structured band coverage and fixed cutoff ladders.
+The band recurrence has bounded basis storage, per-degree restart and deterministic
+parallel contractions. Compact scalar exports and offline research/publication
+query tools preserve exact values and source identities. See [usage](ATOM_RESEARCH.md).
+
+- Verified archive import avoids redundant Git compression; unchanged verified
+  loose blobs reuse digest checks on Unix; other platforms reverify fully. Durable per-attempt operational reports retain
+  publication timings, reuse and remaining batches without changing scientific keys.
+- Existing model artifacts now retain three band inverse moments, tail-on/off
+  energy, Gram diagnostics, a model vector/residual and signed energy contributions.
+  Explicit root/reference joins enable spacing-based diagnostics. These three
+  producers use new semantics while old reports remain preserved.
+- README now leads with setup, capture interpretation and recovery. Detailed
+  cache/target configuration and historical release material have dedicated guides.
+
+- Publication lease renewal preserves monotone heartbeat timestamps during a
+  backward wall-clock correction, while retaining the existing atomic fencing
+  checks and rejecting invalid starting lock records.
+
+- Ultra v6 requests preflight inventory, independent component consistency,
+  independent configuration comparisons, signed-functional band reconstruction,
+  finite transform enclosures and reference projection. Capture receipts separate
+  retained records from resolved numerical rows and conditional/unknown coverage.
+- Reusable external reference files prepare sampled values, finite transform jets,
+  projection inputs and optional finite moment models without embedding a target
+  formula. Verified local cohorts supply comparisons without primary recomputation.
+- Resource limits, progress heartbeats, integrity-checked row-block checkpoints,
+  shared complement factorization and contour-segment checkpoints support recovery
+  of the new diagnostics. Arb enclosures can incorporate an exact-replayed finite
+  source certificate; failed hypotheses remain qualified outcomes.
+
+- Ultra v6 adds complex transform and contour samples, full signed root transport,
+  operator-cluster coupling and feedback, all parent-derived Fourier prefixes,
+  fixed-basis tail-model solves, and observable error budgets. Automatic compact
+  actions and retained-source reuse reduce duplicate work. Missing external
+  models and unresolved denominators remain explicit; old plans are preserved.
+
+- External target providers use versioned request/reply IDs and explicit working
+  precision declarations. Duplicated or mismatched replies fail closed. Executable
+  rechecks and optional private stderr logs harden the runtime boundary; point
+  values remain point measurements, not accuracy certificates.
+
+- [Extended retained diagnostics](EXTENDED_RESEARCH.md) add external numerical references, analytic compactness quantities, weighted projections, signed transform channels, arithmetic and directional energy, weighted tails, cluster comparisons, and conditional resolution/energy budgets. Ultra v6 preserves old capture plans.
+- Additive backfill supports all thirty kinds, freezes external file hashes, and preserves prior target measurements. External campaign evaluators are independently supplied and explicitly authorized by the caller.
+
+- Thirty new managed [retained](RETAINED_RESEARCH.md) and [extended research artifact kinds](EXTENDED_RESEARCH.md)
+  preserve state geometry, indexed finite transforms, total operator energy,
+  root-window statistics, explicit references/datasets, finite projections,
+  cohort comparisons and attributed observation imports.
+- New shared Ultra plans add retained-source and extended diagnostic groups.
+  Reference-dependent groups require external inputs; stabilization requires a cohort.
+  Failed or unresolved measurements remain visible and independent work survives.
+- An [offline additive backfill command](RESEARCH_BACKFILL.md) authenticates
+  retained inputs, freezes each batch, preserves successful output, and records
+  retry history without rerunning primary calculations or overwriting old data.
+- Compact reports, fixed-order parallel reductions, borrowed live matrices and
+  metadata-only ancestry checks limit duplicate work. Warm validation does not
+  repeat the new numerical kernels. No new campaign timing claim is made.
+- New kinds require v0.15.1 readers/producers. Existing numerical identities,
+  old capture plans and source artifacts remain compatible. Both registry
+  lanes receive matching schemas and their appropriate kind registrations.
+- See [release validation](VALIDATION.md). These are finite observations and
+  software checks, not a proof of CCM convergence or RH. The remaining
+  proof-dependent proposals are listed in the coverage guide.
+
 ## 0.15.0
 
 - Artifact publication avoids Git delta searches on compressed archives and

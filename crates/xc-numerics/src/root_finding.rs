@@ -8,15 +8,15 @@
 //! at their call sites in domain-specific code where the function
 //! signature varies.
 
-/// Bisect `f` on `[a, b]` assuming a sign change in the interval.
-/// Returns the root or `None` if no sign change is detected.
+/// Bisect a continuous finite-valued function on a sign-change bracket.
 ///
-/// If `f(a)` or `f(b)` evaluates to a value with magnitude below `tol`,
-/// that endpoint is returned directly — including the exact-zero case.
-/// Past iterations track the sign at the left endpoint via a cached
-/// boolean so the inner loop never multiplies function values (avoids
-/// over-/underflow when `f` returns very large or very small magnitudes,
-/// which is common at HP boundaries even after `to_f64`).
+/// Returns `None` for invalid bounds or tolerance, a non-finite evaluation,
+/// or absent sign change. Exact zero endpoints are accepted even at `tol=0`.
+/// A positive `tol` permits either an absolute residual or bracket-width exit.
+/// After `max_iter` steps the midpoint is an approximation, not a certificate
+/// that tolerance was attained. Use `xc-root` for an explicit convergence report.
+/// Continuity is a caller obligation: a sign change across a discontinuity
+/// does not establish a root.
 pub fn bisect_f64<F: Fn(f64) -> f64>(
     f: &F,
     mut a: f64,
@@ -24,52 +24,76 @@ pub fn bisect_f64<F: Fn(f64) -> f64>(
     tol: f64,
     max_iter: usize,
 ) -> Option<f64> {
+    if !a.is_finite() || !b.is_finite() || a > b || !tol.is_finite() || tol < 0.0 {
+        return None;
+    }
     let fa = f(a);
     let fb = f(b);
-
-    // Endpoint hits: either exactly zero or within tol → return that
-    // endpoint as the root. Subsumes the |f(a) * f(b)| == 0 case so we
-    // don't depend on float sign-of-zero behavior in the bracket check.
-    if fa.abs() < tol {
+    if !fa.is_finite() || !fb.is_finite() {
+        return None;
+    }
+    if fa == 0.0 || fa.abs() < tol {
         return Some(a);
     }
-    if fb.abs() < tol {
+    if fb == 0.0 || fb.abs() < tol {
         return Some(b);
     }
-
-    // No sign change → no root we can guarantee. Use signum to avoid
-    // over-/underflow in fa * fb when either side has extreme magnitude.
-    if fa.signum() == fb.signum() {
+    if fa.is_sign_positive() == fb.is_sign_positive() {
         return None;
     }
 
-    // Track the sign at the left endpoint instead of recomputing f(a)
-    // each iteration. Equivalent to the textbook formulation, but
-    // immune to multiplication over-/underflow on extreme inputs.
-    let mut fa_sign = fa.signum();
-
+    // Same-sign subtraction cannot overflow; opposite-sign halving avoids
+    // overflow in both a+b and b-a. Neither route leaves a finite bracket.
+    let midpoint = |left: f64, right: f64| {
+        if left.is_sign_positive() == right.is_sign_positive() {
+            left + 0.5 * (right - left)
+        } else {
+            0.5 * left + 0.5 * right
+        }
+    };
+    let mut fa_positive = fa.is_sign_positive();
     for _ in 0..max_iter {
-        let m = 0.5 * (a + b);
+        let m = midpoint(a, b);
         let fm = f(m);
-        if (b - a).abs() < tol || fm.abs() < tol {
+        if !fm.is_finite() {
+            return None;
+        }
+        if fm == 0.0 || (b - a).abs() < tol || fm.abs() < tol || m == a || m == b {
             return Some(m);
         }
-
-        if fm.signum() != fa_sign {
-            // Sign change in [a, m] → root is there; shrink b.
+        if fm.is_sign_positive() != fa_positive {
             b = m;
         } else {
-            // Sign change in [m, b] → root is there; shrink a, update sign.
             a = m;
-            fa_sign = fm.signum();
+            fa_positive = fm.is_sign_positive();
         }
     }
-    Some(0.5 * (a + b))
+    let m = midpoint(a, b);
+    f(m).is_finite().then_some(m)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_evaluations_never_become_roots() {
+        assert!(bisect_f64(&|_| f64::NAN, -1.0, 1.0, 1e-12, 200).is_none());
+        assert!(bisect_f64(&|x| 1.0 / x, -1.0, 1.0, 1e-12, 200).is_none());
+        assert!(bisect_f64(&|x| x, f64::NEG_INFINITY, 1.0, 1e-12, 200).is_none());
+        assert!(bisect_f64(&|x| x, -1.0, 1.0, f64::NAN, 200).is_none());
+        assert!(bisect_f64(&|x| x, -1.0, 1.0, -1.0, 200).is_none());
+    }
+
+    #[test]
+    fn exact_zeros_and_finite_extreme_brackets_are_preserved() {
+        assert_eq!(bisect_f64(&|x| x, 0.0, 1.0, 0.0, 0), Some(0.0));
+        assert_eq!(bisect_f64(&|x| x, -1.0, 0.0, 0.0, 0), Some(0.0));
+        assert_eq!(bisect_f64(&|x| x, -1e308, 1e308, 0.0, 1), Some(0.0));
+        let root = bisect_f64(&|x| x - 1.4e308, 1e308, 1.7e308, 0.0, 100).unwrap();
+        assert!(root.is_finite());
+        assert!((root / 1.4e308 - 1.0).abs() <= 2.0 * f64::EPSILON);
+    }
 
     /// Bisect should find the root of x² - 2 (i.e., √2) on [1, 2].
     #[test]

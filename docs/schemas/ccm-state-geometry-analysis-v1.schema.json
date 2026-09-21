@@ -1,0 +1,261 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CCM retained state geometry analysis v1",
+  "description": "Computed point diagnostics of the actual retained Fourier state. Grid refinement is sensitivity evidence, not an error enclosure. No global sign or ground-selection certificate.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "semantics",
+    "source",
+    "lambda_squared",
+    "n_modes",
+    "source_precision_bits",
+    "source_eigenvalue",
+    "options",
+    "convention",
+    "assurance",
+    "physical_sign_status",
+    "coefficient_norm",
+    "raw_center",
+    "unit_l2_center",
+    "coefficient_evenness_defect",
+    "unit_l2_signed_mass",
+    "orientation",
+    "coarse",
+    "refined",
+    "refinement_absolute_differences"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "semantics": {
+      "const": "ccm-retained-fourier-state-geometry-v1"
+    },
+    "source": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "lambda_squared": {
+      "$ref": "#/$defs/scalar"
+    },
+    "n_modes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 8192
+    },
+    "source_precision_bits": {
+      "type": "integer",
+      "minimum": 64,
+      "maximum": 1000000
+    },
+    "source_eigenvalue": {
+      "$ref": "#/$defs/scalar"
+    },
+    "options": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "working_precision_bits",
+        "base_intervals"
+      ],
+      "properties": {
+        "working_precision_bits": {
+          "type": "integer",
+          "minimum": 64,
+          "maximum": 1000000
+        },
+        "base_intervals": {
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 131072,
+          "multipleOf": 8
+        }
+      }
+    },
+    "convention": {
+      "const": "x=log(u); L=log(lambda_squared); sum_j xi_j exp(2*pi*i*j*(x/L+1/2)); unit_L2_dx; center_positive_else_largest_coefficient_positive"
+    },
+    "assurance": {
+      "const": "computed_point_diagnostics; source_error_and_quadrature_error_not_enclosed; no_ground_selection_or_global_sign_certificate"
+    },
+    "physical_sign_status": {
+      "enum": [
+        "sampled_real_state_only",
+        "unavailable_nonreal_fourier_state"
+      ]
+    },
+    "coefficient_norm": {
+      "$ref": "#/$defs/scalar"
+    },
+    "raw_center": {
+      "$ref": "#/$defs/scalar"
+    },
+    "unit_l2_center": {
+      "$ref": "#/$defs/scalar"
+    },
+    "coefficient_evenness_defect": {
+      "$ref": "#/$defs/scalar"
+    },
+    "unit_l2_signed_mass": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/scalar"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "orientation": {
+      "enum": [
+        -1,
+        1
+      ]
+    },
+    "coarse": {
+      "$ref": "#/$defs/grid"
+    },
+    "refined": {
+      "$ref": "#/$defs/grid"
+    },
+    "refinement_absolute_differences": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {
+        "$ref": "#/$defs/scalar"
+      }
+    }
+  },
+  "$defs": {
+    "scalar": {
+      "type": "string",
+      "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+    },
+    "grid": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "intervals",
+        "l2_mass",
+        "spatial_moments",
+        "outer_shell_masses",
+        "sampled_real_minimum",
+        "sampled_negative_part_l1"
+      ],
+      "properties": {
+        "intervals": {
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 262144
+        },
+        "l2_mass": {
+          "$ref": "#/$defs/scalar"
+        },
+        "spatial_moments": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/scalar"
+          }
+        },
+        "outer_shell_masses": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/scalar"
+          }
+        },
+        "sampled_real_minimum": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/scalar"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sampled_negative_part_l1": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/scalar"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "physical_sign_status": {
+            "const": "sampled_real_state_only"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unit_l2_signed_mass": {
+            "$ref": "#/$defs/scalar"
+          },
+          "coarse": {
+            "properties": {
+              "sampled_real_minimum": {
+                "$ref": "#/$defs/scalar"
+              },
+              "sampled_negative_part_l1": {
+                "$ref": "#/$defs/scalar"
+              }
+            }
+          },
+          "refined": {
+            "properties": {
+              "sampled_real_minimum": {
+                "$ref": "#/$defs/scalar"
+              },
+              "sampled_negative_part_l1": {
+                "$ref": "#/$defs/scalar"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "unit_l2_signed_mass": {
+            "type": "null"
+          },
+          "coarse": {
+            "properties": {
+              "sampled_real_minimum": {
+                "type": "null"
+              },
+              "sampled_negative_part_l1": {
+                "type": "null"
+              }
+            }
+          },
+          "refined": {
+            "properties": {
+              "sampled_real_minimum": {
+                "type": "null"
+              },
+              "sampled_negative_part_l1": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

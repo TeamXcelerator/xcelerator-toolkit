@@ -29,6 +29,10 @@ pub const BUNDLED_ZETA_ZEROS_RESOURCE: &str = "xc-zeta/data/zeta_zeros_1000x2500
 /// of these 2,500-digit values.
 pub const BUNDLED_ZETA_ZEROS_JSON: &[u8] = include_bytes!("../data/zeta_zeros_1000x2500.json");
 
+/// SHA-256 of the exact canonical bundled bytes, invariant across checkouts.
+pub const BUNDLED_ZETA_ZEROS_SHA256: &str =
+    "115889b81ba4a42bdb858ffb0167a8e1d0689c514a57192a3640784bd3bd26de";
+
 /// Stable provenance for a reference-zero dataset used as an explicit solver
 /// input.  Comparison-only callers need not construct this record; seeded
 /// numerical APIs require it so the seed source participates in artifact
@@ -61,6 +65,11 @@ impl ReferenceZeroDatasetIdentity {
 pub fn bundled_dataset_identity() -> Result<ReferenceZeroDatasetIdentity> {
     let records: Vec<String> = serde_json::from_slice(BUNDLED_ZETA_ZEROS_JSON)?;
     let content_sha256 = format!("{:x}", Sha256::digest(BUNDLED_ZETA_ZEROS_JSON));
+    if content_sha256 != BUNDLED_ZETA_ZEROS_SHA256 {
+        return Err(anyhow!(
+            "bundled reference-zero bytes differ from the pinned dataset"
+        ));
+    }
     let identity = ReferenceZeroDatasetIdentity {
         schema_version: 1,
         resource_id: BUNDLED_ZETA_ZEROS_RESOURCE.to_owned(),
@@ -156,6 +165,19 @@ pub fn first_n_hp(path: &Path, n: usize, prec: u32) -> Result<Vec<rug::Float>> {
 #[cfg(test)]
 #[allow(clippy::excessive_precision)] // reference zeros quoted at published precision
 mod tests {
+    #[test]
+    fn bundled_reference_bytes_match_pinned_provenance() {
+        use super::*;
+        assert_eq!(
+            format!("{:x}", Sha256::digest(BUNDLED_ZETA_ZEROS_JSON)),
+            BUNDLED_ZETA_ZEROS_SHA256
+        );
+        assert_eq!(
+            bundled_dataset_identity().unwrap().content_sha256,
+            BUNDLED_ZETA_ZEROS_SHA256
+        );
+    }
+
     use super::*;
     use std::io::Write;
 

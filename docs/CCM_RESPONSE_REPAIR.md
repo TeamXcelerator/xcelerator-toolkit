@@ -3,8 +3,10 @@
 The `ccm_response_repair` example repairs schema-2 prime-power and cutoff-flow
 root velocities from the exact original eigenpair and retained L2 tangent
 vectors. It performs no matrix assembly, eigenstate solve, bordered solve, or
-paper-claim run. The output uses the ordinary v3 response semantic identities
-introduced in v0.15.0. See [numerical compatibility](NUMERICAL_COMPATIBILITY.md#root-response-normalization)
+paper-claim run. Legacy v2 inputs produce the v3 root-normalization identity
+introduced in v0.15.0. Already-v4 u-flow inputs preserve v4 under exact replay.
+This root-only tool does not recompute derivative actions or tangents and cannot
+upgrade legacy u-flow calculations to the current stable-derivative v4 identity. See [numerical compatibility](NUMERICAL_COMPATIBILITY.md#root-response-normalization)
 for the defect and its scope.
 
 The repair changes only root-velocity fields. Eigenvalues, roots, eigenvector

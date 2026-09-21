@@ -379,3 +379,25 @@ not include unpublished workstation drafts. The `xcelerator-coordination`
 branch stores publication synchronization state, not artifact manifests; it
 can help investigate incomplete publication but cannot fill a dependency gap
 by itself. Do not pass a coordination-only snapshot as an artifact shard.
+
+## Retained state geometry
+
+`ccm_state_geometry_analysis` uses `ccm-evidence`, with producer and reader floor
+v0.15.1. Its identity binds the exact source dependency, grid and precision
+policy, Fourier normalization, and parent publication eligibility.
+[Geometry documentation](STATE_GEOMETRY.md) and its
+[payload schema](schemas/ccm-state-geometry-analysis-v1.schema.json) define the
+measurement scope. Registration is additive in both registry and shard lanes;
+historical objects and indexes are not rewritten.
+
+## Retained research records in v0.15.1
+
+The nine kinds in the [coverage guide](RETAINED_RESEARCH.md) use producer and
+reader floors of 0.15.1. Older mathematical artifacts keep their existing floors
+and identities. `ccm_reference_source` belongs to `prolate`, projection to
+`ccm-distance`, and the other new kinds to `ccm-evidence`. Reference sources,
+projections and imported observation packets are private-only under the
+existing target/import policy. Both registry lanes carry their shape schemas;
+public catalogs exclude the restricted kinds. Eligible source-only children
+require public parents and complete authenticated dependency closure before
+public publication. Registration alone creates no payload or publication.

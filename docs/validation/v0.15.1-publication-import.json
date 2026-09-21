@@ -1,0 +1,43 @@
+{
+  "scope": "Retained 90 MiB compressed artifact part, local import plus no-delta packing, two reversed trials; no network or claim runtime",
+  "input_sha256": "0028bcd53a20f19e1f938ab1fcd3d7beda24028b14fcb93499c5d401dfd3f507",
+  "input_bytes": 94371840,
+  "rows": [
+    {
+      "policy": "default",
+      "import_seconds": 3.4926113000838086,
+      "pack_seconds": 2.6287719999672845,
+      "combined_seconds": 6.121383300051093,
+      "pack_bytes": 94400673,
+      "pack_sha256": "08d6aab763bdccb7b6589512f6277c0a72ab62aa4495f03add88143f3fa05ca1",
+      "oid": "ae9511d7c92dc72db0b10357858b9f78c9a05428"
+    },
+    {
+      "policy": "no-loose-compression",
+      "import_seconds": 0.9568793999496847,
+      "pack_seconds": 2.0101453999523073,
+      "combined_seconds": 2.967024799901992,
+      "pack_bytes": 94400673,
+      "pack_sha256": "08d6aab763bdccb7b6589512f6277c0a72ab62aa4495f03add88143f3fa05ca1",
+      "oid": "ae9511d7c92dc72db0b10357858b9f78c9a05428"
+    },
+    {
+      "policy": "no-loose-compression",
+      "import_seconds": 0.9629695999901742,
+      "pack_seconds": 1.8157284000189975,
+      "combined_seconds": 2.7786980000091717,
+      "pack_bytes": 94400673,
+      "pack_sha256": "08d6aab763bdccb7b6589512f6277c0a72ab62aa4495f03add88143f3fa05ca1",
+      "oid": "ae9511d7c92dc72db0b10357858b9f78c9a05428"
+    },
+    {
+      "policy": "default",
+      "import_seconds": 2.150600199936889,
+      "pack_seconds": 1.7599555000197142,
+      "combined_seconds": 3.9105556999566033,
+      "pack_bytes": 94400673,
+      "pack_sha256": "08d6aab763bdccb7b6589512f6277c0a72ab62aa4495f03add88143f3fa05ca1",
+      "oid": "ae9511d7c92dc72db0b10357858b9f78c9a05428"
+    }
+  ]
+}

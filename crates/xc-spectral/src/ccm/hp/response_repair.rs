@@ -4,7 +4,7 @@
 use super::*;
 use xc_cache::{LocalShardJson, REMOTE_CANONICAL_MANIFEST_TAG};
 
-/// Corrected bytes and their ordinary production semantic key. The caller must
+/// Corrected root-response bytes and their retained arithmetic semantic key. The caller must
 /// retain the old artifact and publish the result additively, at the same
 /// visibility. This does not certify the retained numerical sources.
 pub struct RepairedResponse {
@@ -135,8 +135,9 @@ fn moving_responses(
 /// Repair an old schema-2 response using its exact original eigenpair and its
 /// retained L2 tangent vectors, at the original MPFR working precision.
 /// Authentication includes raw payload hashes, canonical identities, the exact
-/// eigenpair dependency, and the shared numerical configuration. Already-v3
-/// sources are accepted only if replay reproduces their bytes exactly.
+/// eigenpair dependency, and the shared numerical configuration. Already-corrected
+/// v3/v4 sources require byte-exact replay. A root-only repair never promotes
+/// legacy u-flow actions and tangents to the stable-derivative v4 identity.
 pub fn repair_retained_response(
     response: &LocalShardJson,
     eigenpair: &LocalShardJson,
@@ -165,12 +166,15 @@ pub fn repair_retained_response(
         ),
         _ => bail!("unsupported retained response kind"),
     };
+    let stable_flow = semantic.artifact_kind == "ccm_u_flow_response_analysis"
+        && semantic.mathematical_semantics_version == U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS;
     if semantic.mathematical_semantics_version != old_version
         && semantic.mathematical_semantics_version != new_version
+        && !stable_flow
     {
         bail!("unsupported response semantics; schema-1 responses do not retain repair inputs");
     }
-    let was_current = semantic.mathematical_semantics_version == new_version;
+    let was_current = semantic.mathematical_semantics_version == new_version || stable_flow;
     let metadata: serde_json::Value = serde_json::from_slice(&response.payload)?;
     let bits = state.precision_bits;
     let dimension = state
@@ -282,7 +286,9 @@ pub fn repair_retained_response(
     if was_current && response.payload != payload {
         bail!("current response failed exact retained replay");
     }
-    semantic.mathematical_semantics_version = new_version.into();
+    if !stable_flow {
+        semantic.mathematical_semantics_version = new_version.into();
+    }
     Ok(RepairedResponse {
         payload,
         semantic_key: semantic,
@@ -428,6 +434,18 @@ pub(super) fn check_fresh_response_repair(
     };
     let fresh_prime = serde_json::to_vec(&prime).unwrap();
     let fresh_flow = serde_json::to_vec(&flow).unwrap();
+    let stable = fixture_source(
+        "ccm_u_flow_response_analysis",
+        U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS,
+        fresh_flow.clone(),
+        vec![dep.clone()],
+    );
+    let stable_replay = repair_retained_response(&stable, &state).unwrap();
+    assert_eq!(stable_replay.payload, fresh_flow);
+    assert_eq!(
+        stable_replay.semantic_key.mathematical_semantics_version,
+        U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS
+    );
     for event in &mut prime.events {
         for x in event.root_velocity_responses.iter_mut().flatten() {
             *x = "123".into();
@@ -466,6 +484,12 @@ pub(super) fn check_fresh_response_repair(
     ] {
         let mut old = fixture_source(kind, version, bytes.clone(), vec![dep.clone()]);
         let corrected = repair_retained_response(&old, &state).unwrap();
+        if kind == "ccm_u_flow_response_analysis" {
+            assert_eq!(
+                corrected.semantic_key.mathematical_semantics_version,
+                "ccm-u-flow-response-v0.15.0-v3"
+            );
+        }
         assert_eq!(
             corrected.payload, expected,
             "repair must reproduce fresh producer bytes"

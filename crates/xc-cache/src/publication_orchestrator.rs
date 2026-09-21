@@ -359,12 +359,7 @@ mod tests {
     }
 
     fn temporary_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("test-tmp")
-            .join(format!("publication-orchestrator-{}", std::process::id()))
+        crate::test_support::temporary_root("publication-orchestrator")
     }
 
     #[test]

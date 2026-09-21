@@ -43,6 +43,7 @@ struct FlatGitTreeNode {
     leaves: BTreeMap<String, GitTreeLeaf>,
 }
 
+type VerifiedDigestCache = BTreeMap<(PathBuf, String, u64), (ContentDigest, LooseObjectStamp)>;
 #[derive(Debug)]
 pub struct GitCliRemoteStore {
     git_executable: OsString,
@@ -60,6 +61,8 @@ pub struct GitCliRemoteStore {
     /// transport so concurrent preparations cannot each see enough room and
     /// collectively overcommit.
     disk_reservations: Arc<Mutex<DiskReservationState>>,
+    verified_blob_digests: Mutex<VerifiedDigestCache>,
+    metrics: crate::publication_metrics::PublicationMetrics,
 }
 
 #[derive(Debug, Default)]
@@ -121,6 +124,8 @@ impl GitCliRemoteStore {
             prepared_blob_oids: Mutex::new(BTreeMap::new()),
             resolved_blob_oids: Mutex::new(BTreeMap::new()),
             disk_reservations: Arc::new(Mutex::new(DiskReservationState::default())),
+            verified_blob_digests: Mutex::new(BTreeMap::new()),
+            metrics: crate::publication_metrics::PublicationMetrics::default(),
         };
         if store.author_name.trim().is_empty() || store.author_email.trim().is_empty() {
             return Err(CacheError::InvalidManifest(
@@ -154,6 +159,33 @@ impl GitCliRemoteStore {
         self
     }
 
+    pub(crate) fn enable_publication_metrics(&self, directory: &Path) {
+        if self.metrics.enable(directory).is_err() {
+            eprintln!("publication telemetry could not be initialized");
+        }
+    }
+    pub(crate) fn publication_event(
+        &self,
+        phase: &str,
+        elapsed: Duration,
+        details: serde_json::Value,
+    ) {
+        self.metrics.record(phase, elapsed, details);
+    }
+    fn observed_push(
+        &self,
+        session: &Path,
+        arguments: Vec<OsString>,
+    ) -> Result<Output, CacheError> {
+        let start = Instant::now();
+        let result = run_git_allow_failure(&self.git_executable, Some(session), arguments, &[]);
+        self.publication_event(
+            "git_push",
+            start.elapsed(),
+            serde_json::json!({"success":result.as_ref().is_ok_and(|o|o.status.success())}),
+        );
+        result
+    }
     pub fn with_resource_policy(mut self, resources: ResourcePolicy) -> Self {
         self.resources = resources;
         self
@@ -175,6 +207,10 @@ impl GitCliRemoteStore {
         if session.exists() {
             fs::remove_dir_all(&session)?;
         }
+        self.verified_blob_digests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(p, _, _), _| p != &session);
         self.prepared_blob_oids
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -205,6 +241,10 @@ impl GitCliRemoteStore {
         self.resolved_blob_oids
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.verified_blob_digests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.repository_operation_locks
             .lock()
@@ -711,16 +751,29 @@ impl GitCliRemoteStore {
             }
             // Resolving the staged path performs the required SHA-256 and
             // length validation before Git is allowed to ingest the bytes.
-            missing.insert(key.clone(), self.staged_part_path(part)?);
+            let started = Instant::now();
+            let path = self.staged_part_path(part);
+            self.publication_event(
+                "staged_verification",
+                started.elapsed(),
+                serde_json::json!({"bytes":part.size_bytes,"success":path.is_ok()}),
+            );
+            let archive = part.repository_path.starts_with("objects/sha256/")
+                && part.repository_path.ends_with(".part");
+            missing.insert(key.clone(), (path?, archive));
         }
 
-        let missing = missing.into_iter().collect::<Vec<_>>();
+        let mut missing = missing.into_iter().collect::<Vec<_>>();
+        missing.sort_by_key(|(_, (_, archive))| *archive);
         let mut start = 0;
         while start < missing.len() {
             let mut end = start;
             let mut argument_bytes = 0usize;
             while end < missing.len() && end - start < MAXIMUM_PATHS_PER_INVOCATION {
-                let path_bytes = missing[end].1.as_os_str().to_string_lossy().len();
+                if missing[end].1 .1 != missing[start].1 .1 {
+                    break;
+                }
+                let path_bytes = missing[end].1 .0.as_os_str().to_string_lossy().len();
                 if end > start
                     && argument_bytes.saturating_add(path_bytes)
                         > MAXIMUM_ARGUMENT_BYTES_PER_INVOCATION
@@ -730,17 +783,28 @@ impl GitCliRemoteStore {
                 argument_bytes = argument_bytes.saturating_add(path_bytes);
                 end += 1;
             }
-            let mut arguments = vec![
+            let archive = missing[start].1 .1;
+            let mut arguments = Vec::new();
+            if archive {
+                arguments.extend([
+                    OsString::from("-c"),
+                    OsString::from("core.looseCompression=0"),
+                ]);
+            }
+            arguments.extend([
                 OsString::from("hash-object"),
                 OsString::from("-w"),
                 OsString::from("--"),
-            ];
+            ]);
             arguments.extend(
                 missing[start..end]
                     .iter()
-                    .map(|(_, path)| path.as_os_str().to_owned()),
+                    .map(|(_, (path, _))| path.as_os_str().to_owned()),
             );
-            let output = run_git(&self.git_executable, Some(&session), arguments, &[])?;
+            let started = Instant::now();
+            let output = run_git(&self.git_executable, Some(&session), arguments, &[]);
+            self.publication_event("git_import",started.elapsed(),serde_json::json!({"files":end-start,"archive_compression_disabled":archive,"scheduled_bytes":missing[start..end].iter().map(|(k,_)|k.2).sum::<u64>(),"success":output.is_ok()}));
+            let output = output?;
             let object_ids = parse_object_id_lines(
                 &output.stdout,
                 "git hash-object",
@@ -1205,6 +1269,25 @@ impl RemoteGitStore for GitCliRemoteStore {
                 "immutable path digest requires {size_bytes} bytes above the {maximum_bytes}-byte limit"
             )));
         }
+        let started = Instant::now();
+        let key = (session.clone(), object.object_id.clone(), size_bytes);
+        let loose = session
+            .join("objects")
+            .join(&object.object_id[..2])
+            .join(&object.object_id[2..]);
+        let stamp = loose_object_stamp(&loose);
+        if let Some((digest, previous_stamp)) = self
+            .verified_blob_digests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            if stamp == Some(previous_stamp) {
+                self.publication_event("destination_verification",started.elapsed(),serde_json::json!({"bytes":size_bytes,"reused_verified_bytes":size_bytes,"success":true}));
+                return Ok(Some(digest));
+            }
+        }
         let mut child = Command::new(&self.git_executable)
             .arg("-C")
             .arg(&session)
@@ -1253,7 +1336,23 @@ impl RemoteGitStore for GitCliRemoteStore {
                 "immutable path digest read {observed} bytes, expected {size_bytes}"
             )));
         }
-        Ok(Some(ContentDigest(format!("{:x}", hasher.finalize()))))
+        let digest = ContentDigest(format!("{:x}", hasher.finalize()));
+        if let Some(stamp) = stamp.filter(|stamp| Some(*stamp) == loose_object_stamp(&loose)) {
+            let mut cache = self
+                .verified_blob_digests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= 8192 {
+                cache.clear();
+            }
+            cache.insert(key, (digest.clone(), stamp));
+        }
+        self.publication_event(
+            "destination_verification",
+            started.elapsed(),
+            serde_json::json!({"bytes":size_bytes,"reused_verified_bytes":0,"success":true}),
+        );
+        Ok(Some(digest))
     }
 
     fn read_committed_path(
@@ -1691,15 +1790,13 @@ impl RemoteGitStore for GitCliRemoteStore {
         }
         let session = self.fetch_revision(&request.repository, &request.expected_head)?;
         let commit_id = self.commit_tree(&session, request)?;
-        let push = run_git_allow_failure(
-            &self.git_executable,
-            Some(&session),
-            [
+        let push = self.observed_push(
+            &session,
+            vec![
                 OsString::from("push"),
                 OsString::from("origin"),
                 OsString::from(format!("{commit_id}:refs/heads/{}", request.branch)),
             ],
-            &[],
         )?;
         if push.status.success() {
             Ok(CompareAndSwapResult::Committed { commit_id })
@@ -1751,15 +1848,13 @@ impl RemoteGitStore for GitCliRemoteStore {
         }
         let session = self.ensure_session(&request.repository)?;
         let commit_id = self.commit_root_tree(&session, request)?;
-        let push = run_git_allow_failure(
-            &self.git_executable,
-            Some(&session),
-            [
+        let push = self.observed_push(
+            &session,
+            vec![
                 OsString::from("push"),
                 OsString::from("origin"),
                 OsString::from(format!("{commit_id}:refs/heads/{}", request.branch)),
             ],
-            &[],
         )?;
         if push.status.success() {
             Ok(CreateRefResult::Created { commit_id })
@@ -1849,7 +1944,7 @@ impl RemoteGitStore for GitCliRemoteStore {
                 commit_ids[&commit.branch], commit.branch
             ))
         }));
-        let push = run_git_allow_failure(&self.git_executable, Some(&session), arguments, &[])?;
+        let push = self.observed_push(&session, arguments)?;
         if push.status.success() {
             return Ok(AtomicCompareAndSwapResult::Committed { commit_ids });
         }
@@ -1984,6 +2079,10 @@ where
         Some("push") => Some("push"),
         Some("fetch") => Some("fetch"),
         Some("ls-remote") => Some("ls-remote"),
+        Some("hash-object") => Some("object-import"),
+        Some("-c") if arguments.get(2).and_then(|v| v.to_str()) == Some("hash-object") => {
+            Some("object-import")
+        }
         _ => None,
     };
     if operation == Some("push") {
@@ -2513,18 +2612,42 @@ fn directory_size_bytes(path: &Path) -> Result<u64, CacheError> {
     Ok(total)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LooseObjectStamp {
+    len: u64,
+    modified: std::time::SystemTime,
+    device: u64,
+    inode: u64,
+    changed: i64,
+    changed_nanos: i64,
+}
+#[cfg(unix)]
+fn loose_object_stamp(path: &Path) -> Option<LooseObjectStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::symlink_metadata(path).ok()?;
+    if !m.is_file() || m.file_type().is_symlink() {
+        return None;
+    }
+    Some(LooseObjectStamp {
+        len: m.len(),
+        modified: m.modified().ok()?,
+        device: m.dev(),
+        inode: m.ino(),
+        changed: m.ctime(),
+        changed_nanos: m.ctime_nsec(),
+    })
+}
+#[cfg(not(unix))]
+fn loose_object_stamp(_path: &Path) -> Option<LooseObjectStamp> {
+    // No reliable change counter through portable std metadata: reverify the bytes.
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn temporary_root(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("test-tmp")
-            .join(format!("{name}-{}", std::process::id()))
-    }
+    use crate::test_support::temporary_root;
 
     fn test_git(directory: Option<&Path>, arguments: &[&str]) -> bool {
         let mut command = Command::new("git");
@@ -3417,6 +3540,15 @@ mod tests {
         .unwrap();
         let repository = remote.to_string_lossy().to_string();
 
+        let meta = b"metadata remains normally compressed";
+        fs::write(staging.join("index.json"), meta).unwrap();
+        parts.push(TransportPart {
+            sequence: parts.len() as u64,
+            repository_path: "index.json".into(),
+            size_bytes: meta.len() as u64,
+            content_digest: ContentDigest::sha256(meta),
+        });
+        store.enable_publication_metrics(&root.join("metrics"));
         store.prepare_staged_parts(&repository, &parts).unwrap();
         for local_path in &local_paths {
             fs::remove_file(local_path).unwrap();
@@ -3441,7 +3573,77 @@ mod tests {
                 .verify_committed_part(&repository, &commit_id, part)
                 .unwrap();
         }
+        let part = &parts[0];
+        store
+            .verify_committed_part(&repository, &commit_id, part)
+            .unwrap();
+        let (_, object) = store
+            .resolve_blob_object(&repository, &commit_id, &part.repository_path)
+            .unwrap()
+            .unwrap();
+        let loose = store
+            .session_path(&repository)
+            .join("objects")
+            .join(&object.object_id[..2])
+            .join(&object.object_id[2..]);
+        // Changed on-disk storage invalidates the cache and cannot conceal damage.
+        let original = fs::read(&loose).unwrap();
+        #[cfg(windows)]
+        #[allow(clippy::permissions_set_readonly_false)]
+        // Windows readonly bit on this test-owned Git blob only.
+        {
+            let mut permissions = fs::metadata(&loose).unwrap().permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&loose, permissions).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&loose, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let old_time = fs::metadata(&loose).unwrap().modified().unwrap();
+        fs::write(&loose, vec![0u8; original.len()]).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&loose)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        assert!(store
+            .verify_committed_part(&repository, &commit_id, part)
+            .is_err());
+        fs::write(&loose, original).unwrap();
+        store
+            .verify_committed_part(&repository, &commit_id, part)
+            .unwrap();
+        let log = fs::read_dir(root.join("metrics"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let rows = fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+            .collect::<Vec<_>>();
+        assert!(rows
+            .iter()
+            .any(|r| r["phase"] == "git_import"
+                && r["details"]["archive_compression_disabled"] == true));
+        assert!(rows
+            .iter()
+            .any(|r| r["phase"] == "git_import"
+                && r["details"]["archive_compression_disabled"] == false));
+        assert!(rows
+            .iter()
+            .any(|r| r["phase"] == "git_push" && r["details"]["success"] == true));
+        #[cfg(unix)]
+        assert!(rows
+            .iter()
+            .any(|r| r["details"]["reused_verified_bytes"].as_u64().unwrap_or(0) > 0));
         store.cleanup_session(&repository).unwrap();
+        assert!(store.verified_blob_digests.lock().unwrap().is_empty());
         let _ = fs::remove_dir_all(root);
     }
 

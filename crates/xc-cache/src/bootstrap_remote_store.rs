@@ -103,6 +103,7 @@ pub struct GitHubBootstrapCacheStore {
     shard_revisions: Mutex<HashMap<String, String>>,
     historical_batches: Mutex<HistoricalBatchCache>,
     metadata_documents: Mutex<MetadataDocumentCache>,
+    revocation_partitions: Mutex<HashMap<MetadataDocumentKey, Option<RevocationIndexPartition>>>,
 }
 
 impl GitHubBootstrapCacheStore {
@@ -152,6 +153,7 @@ impl GitHubBootstrapCacheStore {
             shard_revisions: Mutex::new(HashMap::new()),
             historical_batches: Mutex::new(HashMap::new()),
             metadata_documents: Mutex::new(MetadataDocumentCache::default()),
+            revocation_partitions: Mutex::new(HashMap::new()),
         })
     }
 
@@ -372,6 +374,94 @@ impl GitHubBootstrapCacheStore {
         Ok(batches)
     }
 
+    fn has_active_revocation(
+        &self,
+        repository: &str,
+        revision: &str,
+        scope: RevocationScope,
+        identity: &ContentDigest,
+    ) -> Result<bool, CacheError> {
+        if !identity.validate() {
+            return Err(CacheError::InvalidManifest(
+                "revocation lookup requires a valid identity".to_owned(),
+            ));
+        }
+        let prefix = &identity.0[..2];
+        let key = (
+            repository.to_owned(),
+            revision.to_owned(),
+            prefix.to_owned(),
+        );
+        let cached = self
+            .revocation_partitions
+            .lock()
+            .map_err(|_| CacheError::Io("revocation cache lock poisoned".to_owned()))?
+            .get(&key)
+            .cloned();
+        let partition = match cached {
+            Some(partition) => partition,
+            None => {
+                let partition = match self.read_json::<RevocationIndexPartition>(
+                    repository,
+                    revision,
+                    &format!("revocations/indexes/{prefix}.json"),
+                ) {
+                    Ok((partition, _)) => {
+                        partition.validate()?;
+                        if partition.identity_prefix != prefix {
+                            return Err(CacheError::InvalidManifest(
+                                "revocation partition prefix does not match its path".to_owned(),
+                            ));
+                        }
+                        Some(partition)
+                    }
+                    Err(CacheError::NotFound(_)) => None,
+                    Err(error) => return Err(error),
+                };
+                self.revocation_partitions
+                    .lock()
+                    .map_err(|_| CacheError::Io("revocation cache lock poisoned".to_owned()))?
+                    .insert(key, partition.clone());
+                partition
+            }
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| CacheError::Io(error.to_string()))?
+            .as_secs();
+        Ok(partition
+            .as_ref()
+            .is_some_and(|p| p.active(scope, identity, now).is_some()))
+    }
+
+    fn entry_is_revoked(
+        &self,
+        repository: &str,
+        revision: &str,
+        shard: &crate::bootstrap_topology::BootstrapShard,
+        entry: &ShardIndexEntry,
+    ) -> Result<bool, CacheError> {
+        let repository_digest = repository_identity_digest(&shard.authorized_repository);
+        for (scope, identity) in [
+            (RevocationScope::Semantic, &entry.semantic_digest),
+            (RevocationScope::Payload, &entry.canonical_payload_digest),
+            (RevocationScope::Manifest, &entry.manifest_digest),
+            (RevocationScope::Repository, &repository_digest),
+        ]
+        .into_iter()
+        .chain(
+            entry
+                .transport_digests
+                .iter()
+                .map(|d| (RevocationScope::Transport, d)),
+        ) {
+            if self.has_active_revocation(repository, revision, scope, identity)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn resolve(&self, key: &ArtifactKey) -> Result<Option<ResolvedRemoteArtifact>, CacheError> {
         if self.visibility == CacheVisibility::Public && artifact_kind_is_private_only(&key.kind) {
             return Ok(None);
@@ -380,12 +470,30 @@ impl GitHubBootstrapCacheStore {
             return Ok(None);
         };
         let topology = self.family_topology(family)?;
+        if !key.parameters_digest.validate() {
+            return Err(CacheError::InvalidManifest(
+                "invalid bootstrap semantic identity".to_owned(),
+            ));
+        }
         let prefix = &key.parameters_digest.0[..2];
         let index_path = format!("indexes/{family}/{prefix}.json");
         let current = crate::current_toolkit_version()?;
         for shard in &topology.readable_shards {
             let repository = shard.repository_url.clone();
             let revision = self.shard_revision(&repository)?;
+            if self.has_active_revocation(
+                &repository,
+                &revision,
+                RevocationScope::Semantic,
+                &key.parameters_digest,
+            )? || self.has_active_revocation(
+                &repository,
+                &revision,
+                RevocationScope::Repository,
+                &repository_identity_digest(&shard.authorized_repository),
+            )? {
+                return Ok(None);
+            }
             let (index, index_source): (ShardIndexPartition, _) =
                 match self.read_json(&repository, &revision, &index_path) {
                     Ok(value) => value,
@@ -400,33 +508,36 @@ impl GitHubBootstrapCacheStore {
                 )));
             }
             let entries_for_identity = index.lookup(&key.parameters_digest).collect::<Vec<_>>();
-            let Some(entry) = entries_for_identity
+            let mut candidates = entries_for_identity
                 .iter()
                 .copied()
                 .filter(|entry| entry.disposition == ArtifactDisposition::Active)
                 .filter(|entry| entry.achieved_assurance.mathematical().is_some())
                 .filter(|entry| entry.minimum_reader_version <= current)
-                .max_by_key(|entry| (entry.achieved_assurance, entry.manifest_digest.clone()))
                 .cloned()
-            else {
-                // Once a newer shard names this semantic identity, its live
-                // policy disposition shadows older shards. Falling back to a
-                // predecessor here could silently undo a revocation, reader
-                // floor, or assurance downgrade recorded during rollover.
-                if !entries_for_identity.is_empty() {
-                    return Ok(None);
+                .collect::<Vec<_>>();
+            candidates.sort_by_key(|entry| {
+                std::cmp::Reverse((entry.achieved_assurance, entry.manifest_digest.clone()))
+            });
+            for entry in candidates {
+                if self.entry_is_revoked(&repository, &revision, shard, &entry)? {
+                    continue;
                 }
-                continue;
-            };
-            return self.materialize_indexed_entry(
-                repository,
-                revision,
-                family,
-                shard,
-                &key.parameters_digest,
-                entry,
-                index_source,
-            );
+                return self.materialize_indexed_entry(
+                    repository,
+                    revision,
+                    family,
+                    shard,
+                    &key.parameters_digest,
+                    entry,
+                    index_source,
+                );
+            }
+            // Explicit policy in a newer shard cannot be undone by falling
+            // back to an older copy, including revocation-only rejections.
+            if !entries_for_identity.is_empty() {
+                return Ok(None);
+            }
         }
         Ok(None)
     }
@@ -470,6 +581,27 @@ impl GitHubBootstrapCacheStore {
                     Err(CacheError::NotFound(_)) => None,
                     Err(error) => return Err(error),
                 };
+            if indexed.as_ref().is_some_and(|(index, _)| {
+                index.blocks_exact_manifest(&identity.semantic_digest, &identity.manifest_digest)
+            }) {
+                return Ok(None);
+            }
+            // Historical publication receipts establish prior availability;
+            // they do not override a current revocation when the index no
+            // longer contains that manifest.
+            for (scope, digest) in [
+                (RevocationScope::Semantic, &identity.semantic_digest),
+                (RevocationScope::Payload, &identity.payload_digest),
+                (RevocationScope::Manifest, &identity.manifest_digest),
+                (
+                    RevocationScope::Repository,
+                    &repository_identity_digest(&shard.authorized_repository),
+                ),
+            ] {
+                if self.has_active_revocation(&repository, &revision, scope, digest)? {
+                    return Ok(None);
+                }
+            }
             let active_entry = indexed.as_ref().and_then(|(index, source)| {
                 index
                     .lookup(&identity.semantic_digest)
@@ -504,6 +636,16 @@ impl GitHubBootstrapCacheStore {
                     "historical manifest for {family}/{} does not reproduce the requested dependency identity",
                     identity.semantic_digest.0
                 )));
+                }
+                for digest in &manifest.transport_digests {
+                    if self.has_active_revocation(
+                        &repository,
+                        &revision,
+                        RevocationScope::Transport,
+                        digest,
+                    )? {
+                        return Ok(None);
+                    }
                 }
                 let expected_destination = match self.visibility {
                     CacheVisibility::Private => PublicationDestination::Private,
@@ -579,6 +721,9 @@ impl GitHubBootstrapCacheStore {
         entry: ShardIndexEntry,
         index_source: RemoteReadReport,
     ) -> Result<Option<ResolvedRemoteArtifact>, CacheError> {
+        if self.entry_is_revoked(&repository, &revision, shard, &entry)? {
+            return Ok(None);
+        }
         let visibility_name = visibility_name(self.visibility);
         let manifest_path = bootstrap_manifest_path(semantic_digest, &entry.manifest_digest);
         let (manifest, manifest_source): (CanonicalArtifactManifest, _) =
@@ -1311,6 +1456,154 @@ fn visibility_name(visibility: CacheVisibility) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_revocations_block_active_and_unindexed_historical_reads() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-bootstrap-revocation-audit-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let artifact = resolved_fixture(&root, "revoked-history", Vec::new());
+        let identity = PayloadDependencyIdentity {
+            artifact_family: artifact.manifest.artifact_family.clone(),
+            semantic_digest: artifact.semantic_digest.clone(),
+            manifest_digest: artifact.manifest.digest().unwrap(),
+            payload_digest: artifact.manifest.payload_digest.clone(),
+        };
+        let shard = crate::bootstrap_topology::BootstrapShard {
+            authorized_repository: "fixture/shard".into(),
+            repository_url: "fixture-shard".into(),
+            shard_id: "fixture-001".into(),
+            sequence: 1,
+            writable: true,
+        };
+        let identities = [
+            (RevocationScope::Semantic, identity.semantic_digest.clone()),
+            (RevocationScope::Payload, identity.payload_digest.clone()),
+            (RevocationScope::Manifest, identity.manifest_digest.clone()),
+            (
+                RevocationScope::Transport,
+                artifact.manifest.transport_digests[0].clone(),
+            ),
+            (
+                RevocationScope::Repository,
+                repository_identity_digest(&shard.authorized_repository),
+            ),
+        ];
+        for visibility in [CacheVisibility::Private, CacheVisibility::Public] {
+            for indexed in [false, true] {
+                for (scope, digest) in &identities {
+                    let store = GitHubBootstrapCacheStore::new(
+                        "fixture",
+                        root.join("store"),
+                        visibility,
+                        true,
+                    )
+                    .unwrap();
+                    store.family_topologies.lock().unwrap().insert(
+                        identity.artifact_family.clone(),
+                        crate::bootstrap_topology::BootstrapFamilyTopology {
+                            family: identity.artifact_family.clone(),
+                            visibility,
+                            current_writable: shard.clone(),
+                            readable_shards: vec![shard.clone()],
+                        },
+                    );
+                    store
+                        .shard_revisions
+                        .lock()
+                        .unwrap()
+                        .insert(shard.repository_url.clone(), "head".into());
+                    let partition = ShardIndexPartition::rebuild(
+                        identity.artifact_family.clone(),
+                        identity.semantic_digest.0[..2].to_owned(),
+                        if indexed {
+                            vec![artifact.index.clone()]
+                        } else {
+                            vec![]
+                        },
+                    )
+                    .unwrap();
+                    let mut documents = vec![
+                        (
+                            format!(
+                                "indexes/{}/{}.json",
+                                identity.artifact_family,
+                                &identity.semantic_digest.0[..2]
+                            ),
+                            canonical_json_bytes(&partition).unwrap(),
+                        ),
+                        (
+                            bootstrap_manifest_path(
+                                &identity.semantic_digest,
+                                &identity.manifest_digest,
+                            ),
+                            canonical_json_bytes(&artifact.manifest).unwrap(),
+                        ),
+                    ];
+                    let mut partitions = BTreeMap::new();
+                    for (_, id) in &identities {
+                        partitions.entry(id.0[..2].to_owned()).or_insert(
+                            RevocationIndexPartition {
+                                schema_version: 1,
+                                identity_prefix: id.0[..2].to_owned(),
+                                records: vec![],
+                            },
+                        );
+                    }
+                    partitions
+                        .get_mut(&digest.0[..2])
+                        .unwrap()
+                        .records
+                        .push(RevocationRecord {
+                            schema_version: 1,
+                            scope: *scope,
+                            identity_digest: digest.clone(),
+                            reason: "audit counterexample".into(),
+                            effective_unix_seconds: 0,
+                            replacement_digest: None,
+                            incident_reference: None,
+                            authorizing_evidence_digest: ContentDigest::sha256(b"audit evidence"),
+                        });
+                    for (prefix, partition) in partitions {
+                        documents.push((
+                            format!("revocations/indexes/{prefix}.json"),
+                            canonical_json_bytes(&partition).unwrap(),
+                        ));
+                    }
+                    // No encoding or publication proof is installed. A revoked
+                    // identity must stop before attempting any of those reads.
+                    for (path, bytes) in documents {
+                        let mut source = artifact.index_source.clone();
+                        source.content_digest = ContentDigest::sha256(&bytes);
+                        store.metadata_documents.lock().unwrap().documents.insert(
+                            (shard.repository_url.clone(), "head".into(), path),
+                            (Arc::from(bytes), source),
+                        );
+                    }
+                    let exact = store.resolve_identity(&identity);
+                    assert!(
+                        matches!(exact, Ok(None)),
+                        "exact {visibility:?} indexed={indexed} {scope:?}: {exact:?}"
+                    );
+                    if indexed {
+                        let key = ArtifactKey {
+                            kind: artifact.manifest.semantic_key.artifact_kind.clone(),
+                            logical_key: "audit".into(),
+                            parameters_digest: identity.semantic_digest.clone(),
+                        };
+                        let by_key = store.resolve(&key);
+                        assert!(
+                            matches!(by_key, Ok(None)),
+                            "key {visibility:?} {scope:?}: {by_key:?}"
+                        );
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
 
     /// A resolved remote artifact whose payload bytes are fixed and whose
@@ -1474,6 +1767,83 @@ mod tests {
             receipt_source: source,
             dependencies: Vec::new(),
         }
+    }
+
+    #[test]
+    fn exact_identity_stops_at_explicit_rejection_before_historical_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-bootstrap-rejected-identity-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let artifact = resolved_fixture(&root, "rejected", Vec::new());
+        let identity = PayloadDependencyIdentity {
+            artifact_family: artifact.manifest.artifact_family.clone(),
+            semantic_digest: artifact.semantic_digest.clone(),
+            manifest_digest: artifact.manifest.digest().unwrap(),
+            payload_digest: artifact.manifest.payload_digest.clone(),
+        };
+        let shard = crate::bootstrap_topology::BootstrapShard {
+            authorized_repository: "fixture/shard".to_owned(),
+            repository_url: "fixture-shard".to_owned(),
+            shard_id: "fixture-001".to_owned(),
+            sequence: 1,
+            writable: true,
+        };
+        for visibility in [CacheVisibility::Private, CacheVisibility::Public] {
+            for disposition in [
+                ArtifactDisposition::Quarantined,
+                ArtifactDisposition::Revoked,
+            ] {
+                let store =
+                    GitHubBootstrapCacheStore::new("fixture", root.join("store"), visibility, true)
+                        .unwrap();
+                store.family_topologies.lock().unwrap().insert(
+                    identity.artifact_family.clone(),
+                    crate::bootstrap_topology::BootstrapFamilyTopology {
+                        family: identity.artifact_family.clone(),
+                        visibility,
+                        current_writable: shard.clone(),
+                        readable_shards: vec![shard.clone()],
+                    },
+                );
+                store
+                    .shard_revisions
+                    .lock()
+                    .unwrap()
+                    .insert(shard.repository_url.clone(), "head".to_owned());
+                let mut entry = artifact.index.clone();
+                entry.disposition = disposition;
+                let partition = ShardIndexPartition::rebuild(
+                    identity.artifact_family.clone(),
+                    identity.semantic_digest.0[..2].to_owned(),
+                    vec![entry],
+                )
+                .unwrap();
+                let index_path = format!(
+                    "indexes/{}/{}.json",
+                    identity.artifact_family,
+                    &identity.semantic_digest.0[..2]
+                );
+                let manifest_path =
+                    bootstrap_manifest_path(&identity.semantic_digest, &identity.manifest_digest);
+                // The historical manifest is intentionally malformed. Any attempt
+                // to continue through the fallback fails, without network access.
+                for (path, bytes) in [
+                    (index_path, canonical_json_bytes(&partition).unwrap()),
+                    (manifest_path, b"not valid JSON".to_vec()),
+                ] {
+                    let mut source = artifact.index_source.clone();
+                    source.content_digest = ContentDigest::sha256(&bytes);
+                    store.metadata_documents.lock().unwrap().documents.insert(
+                        (shard.repository_url.clone(), "head".to_owned(), path),
+                        (Arc::from(bytes), source),
+                    );
+                }
+                assert!(store.resolve_identity(&identity).unwrap().is_none());
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

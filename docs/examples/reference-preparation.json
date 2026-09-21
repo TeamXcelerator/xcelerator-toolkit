@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "lambda_squared": "9",
+  "precision_bits": 128,
+  "definition_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "approximation_scope": "software fixture: compact finite constant on the declared support",
+  "finite_reference": {
+    "schema_version": 1,
+    "reference": {
+      "schema_version": 1,
+      "definition": "finite constant fixture",
+      "lambda_squared": "9",
+      "precision_bits": 128,
+      "coefficients": [
+        "1"
+      ],
+      "approximation_scope": "compact finite Fourier function"
+    },
+    "basis": [],
+    "projection": {
+      "working_precision_bits": 192,
+      "normalization": "center_one",
+      "fixed_second_component": null
+    }
+  },
+  "sampled_reference": null,
+  "weighted_atoms": [],
+  "atom_coordinate": null,
+  "atom_coverage": null,
+  "tail_form": null,
+  "completion": null
+}

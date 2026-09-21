@@ -1,0 +1,2 @@
+# Supported validation-engine range; the qualification record captures the actual version.
+jsonschema>=4.10.3,<5

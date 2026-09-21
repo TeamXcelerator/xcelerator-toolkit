@@ -4,15 +4,16 @@
 //! CCM "Zeta Spectral Triples" construction.
 //!
 //! Implements the CCM operator family `D_log(λ, N)`.
-//! (27 Nov 2025), whose eigenvalues converge to the imaginary parts
-//! of the non-trivial Riemann zeta zeros as `λ, N → ∞`.
+//! (27 Nov 2025). Numerical experiments compare its finite spectra with
+//! Riemann zeta zeros. Convergence as `λ, N → ∞` remains an open obligation;
+//! the construction and software do not prove that limit.
 //!
 //! ## Pipeline
 //!
 //! 1. Sieve prime powers `k ≤ λ²`.
 //! 2. Build the Weil quadratic form matrix `τ_{n,m}` for `n,m ∈ {-N,…,N}`.
-//! 3. Eigendecompose `τ`. Take the smallest eigenvalue `ε_N` and the
-//!    (forced even) eigenvector `ξ`.
+//! 3. Solve the reduced even sector and lift its lowest eigenvector `ξ`.
+//!    This selects an even Ritz state; it does not prove full-space ground selection.
 //! 4. The eigenvalues of `D_log(λ, N)` are the zeros of the rational
 //!    function `R(z) = Σ ξ_j / (z − 2πj/L)`.
 
@@ -212,13 +213,14 @@ impl CcmParams {
 /// Result of a single CCM run at f64 precision.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CcmResult {
-    /// Positive roots of the eigenpair-derived CCM secular equation at f64
-    /// precision, in the order paired with the supplied seeds.
+    /// Positive sign-change roots discovered from the even-sector state at f64
+    /// precision, in ascending order. The search has no completeness guarantee.
     pub eigenvalues_pos: Vec<f64>,
-    /// Smallest Weil-form eigenvalue (the spectral gap quantity ε_N).
+    /// Lowest computed even-sector Ritz value. Binary64 does not certify its
+    /// sign or its ordering against the odd sector or the continuum spectrum.
     pub weil_min_eigenvalue: f64,
-    /// Smallest-eigenvalue eigenvector of the Weil form, ℓ²-normalized,
-    /// in the V_n basis order.
+    /// Selected even-sector state in centered V_n order, scaled so its
+    /// component sum is sqrt(L). It is not normalized to unit ℓ² norm.
     pub xi: Vec<f64>,
     /// Wall-clock seconds for the entire f64 run.
     pub elapsed_seconds: f64,
@@ -303,7 +305,10 @@ pub const DEFAULT_BISECT_TOL: f64 = 1e-12;
 /// Default maximum bisection iterations for f64 spectrum root-finding.
 pub const DEFAULT_BISECT_MAX_ITER: usize = 200;
 
-/// f64 CPU tier — fast but limited to ~13 digits.
+/// Binary64 exploratory even-sector computation. Matrix integration scales
+/// with the highest Fourier mode. Near-degenerate states and tiny boundary
+/// sums can still be unresolved at binary64 precision; no certified root
+/// ordinal, spectral sign, or continuum ground selection is supplied.
 pub fn run_f64(params: &CcmParams) -> Result<CcmResult> {
     use nalgebra::SymmetricEigen;
 
@@ -313,7 +318,23 @@ pub fn run_f64(params: &CcmParams) -> Result<CcmResult> {
 
     let tau = build_tau_f64(params, l, params.lambda_sq_int())?;
 
-    let eig = SymmetricEigen::new(tau);
+    // Project the operator onto an orthonormal even basis before solving.
+    // Projecting the unrestricted minimum eigenvector afterward can turn an
+    // odd vector's rounding noise into a spurious normalized even state.
+    let mut even = nalgebra::DMatrix::<f64>::zeros(n + 1, n + 1);
+    even[(0, 0)] = tau[(n, n)];
+    for i in 1..=n {
+        even[(0, i)] = (tau[(n, n + i)] + tau[(n, n - i)]) / 2.0_f64.sqrt();
+        even[(i, 0)] = even[(0, i)];
+        for j in 1..=n {
+            even[(i, j)] = 0.5
+                * (tau[(n + i, n + j)]
+                    + tau[(n + i, n - j)]
+                    + tau[(n - i, n + j)]
+                    + tau[(n - i, n - j)]);
+        }
+    }
+    let eig = SymmetricEigen::new(even);
     let (eps_n, idx_min) = eig
         .eigenvalues
         .iter()
@@ -321,16 +342,13 @@ pub fn run_f64(params: &CcmParams) -> Result<CcmResult> {
         .min_by(|a, b| a.1.total_cmp(b.1))
         .map(|(i, &v)| (v, i))
         .ok_or_else(|| anyhow!("empty spectrum"))?;
-    let xi_raw: Vec<f64> = eig.eigenvectors.column(idx_min).iter().copied().collect();
-
-    // Symmetrize as even.
+    let sector_state = eig.eigenvectors.column(idx_min);
     let mut xi = vec![0.0_f64; 2 * n + 1];
-    for j in 0..=n {
-        let pos = params.idx(j as i64);
-        let neg = params.idx(-(j as i64));
-        let avg = 0.5 * (xi_raw[pos] + xi_raw[neg]);
-        xi[pos] = avg;
-        xi[neg] = avg;
+    xi[n] = sector_state[0];
+    for j in 1..=n {
+        let value = sector_state[j] / 2.0_f64.sqrt();
+        xi[n + j] = value;
+        xi[n - j] = value;
     }
 
     // Normalize: Σ ξ_j = √L.
@@ -354,14 +372,48 @@ pub fn run_f64(params: &CcmParams) -> Result<CcmResult> {
     })
 }
 
+fn archimedean_origin_limit_f64(n: i64, m: i64, l: f64) -> f64 {
+    let omega_0 = if n == m { 2.0 } else { 0.0 };
+    // Both the diagonal cosine formula and the off-diagonal sine difference
+    // have omega'(0) = -2/L. Since 2*sinh(x) = 2*x + O(x^3), the limit is
+    // omega(0)/4 + omega'(0)/2, independent of the off-diagonal indices.
+    let omega_prime_0 = -2.0 / l;
+    omega_0 / 4.0 + omega_prime_0 / 2.0
+}
+
 fn build_tau_f64(params: &CcmParams, l: f64, lambda_sq_int: u64) -> Result<nalgebra::DMatrix<f64>> {
     use nalgebra::DMatrix;
 
     let n_max = params.n_modes;
-    let dim = params.matrix_size();
+    if !l.is_finite()
+        || l <= 0.0
+        || !params.lambda_squared().is_finite()
+        || params.lambda_squared() <= 1.0
+        || (!params.lambda_sq.is_integer && params.lambda_squared().floor() as u64 != lambda_sq_int)
+    {
+        return Err(anyhow!(
+            "CCM requires finite lambda-squared > 1 and a matching prime cutoff"
+        ));
+    }
+    let dim = n_max
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(1))
+        .ok_or_else(|| anyhow!("CCM matrix dimension overflow"))?;
+    let quadrature_order = n_max
+        .checked_mul(3)
+        .and_then(|v| v.checked_add(32))
+        .ok_or_else(|| anyhow!("CCM quadrature order overflow"))?
+        .max(64);
+    // Resolve one rule for the entire matrix. Fixed GL64 aliases higher modes.
+    let (nodes, weights) = xc_numerics::quadrature::gl_nodes_weights_f64(quadrature_order);
+    let quadrature: Vec<(f64, f64)> = nodes
+        .iter()
+        .zip(&weights)
+        .map(|(&node, &weight)| (0.5 * l * (1.0 + node), 0.5 * l * weight))
+        .collect();
     let mut tau = DMatrix::<f64>::zeros(dim, dim);
 
-    let kappa = (4.0 * std::f64::consts::PI * (l.exp() - 1.0) / (l.exp() + 1.0)).ln() + EULER_GAMMA;
+    let kappa = (4.0 * std::f64::consts::PI * (0.5 * l).tanh()).ln() + EULER_GAMMA;
     let sinh2_l_over_4 = (l / 4.0).sinh().powi(2);
     let sixteen_pi2 = 16.0 * std::f64::consts::PI * std::f64::consts::PI;
     let l2 = l * l;
@@ -381,29 +433,34 @@ fn build_tau_f64(params: &CcmParams, l: f64, lambda_sq_int: u64) -> Result<nalge
             let omega_0 = if n == m { 2.0 } else { 0.0 };
             let two_pi_n_over_l = 2.0 * std::f64::consts::PI * nf / l;
             let two_pi_m_over_l = 2.0 * std::f64::consts::PI * mf / l;
-            let omega_f64 = |x: f64| -> f64 {
-                if n == m {
-                    2.0 * (1.0 - x / l) * (two_pi_n_over_l * x).cos()
-                } else {
-                    ((two_pi_m_over_l * x).sin() - (two_pi_n_over_l * x).sin())
-                        / (std::f64::consts::PI * ((n - m) as f64))
-                }
-            };
             let integrand = |x: f64| -> f64 {
-                let num = (x / 2.0).exp() * omega_f64(x) - omega_0;
-                let den = x.exp() - (-x).exp();
-                if x.abs() < INTEGRAND_SINGULARITY_GUARD {
-                    let omega_prime_0 = if n == m {
-                        -omega_0 / l
-                    } else {
-                        2.0 * mf / ((n - m) as f64)
-                    };
-                    omega_0 / 4.0 + omega_prime_0 / 2.0
+                if x == 0.0 {
+                    return archimedean_origin_limit_f64(n, m, l);
+                }
+                if n == m {
+                    let phase = two_pi_n_over_l * x;
+                    let cosine = phase.cos();
+                    // Rearrange exp(x/2)*(1-x/L)*cos(phase)-1 without
+                    // subtracting nearly equal numbers at the origin.
+                    (-2.0 * (0.5 * phase).sin().powi(2) - (x / l) * cosine
+                        + (0.5 * x).exp_m1() * (1.0 - x / l) * cosine)
+                        / x.sinh()
                 } else {
-                    num / den
+                    let difference = std::f64::consts::PI * (nf - mf) * x / l;
+                    let mean = std::f64::consts::PI * (nf + mf) * x / l;
+                    let sinc = if difference == 0.0 {
+                        1.0
+                    } else {
+                        difference.sin() / difference
+                    };
+                    let omega = -2.0 * (x / l) * sinc * mean.cos();
+                    (0.5 * x).exp() * omega / (2.0 * x.sinh())
                 }
             };
-            let integral = xc_numerics::quadrature::gauss_legendre_64pt_f64(integrand, 0.0, l);
+            let integral: f64 = quadrature
+                .iter()
+                .map(|&(x, weight)| weight * integrand(x))
+                .sum();
             let wr = (omega_0 / 2.0) * kappa + integral;
 
             // W_p
@@ -426,11 +483,14 @@ fn build_tau_f64(params: &CcmParams, l: f64, lambda_sq_int: u64) -> Result<nalge
     Ok(tau)
 }
 
-/// Find positive eigenvalues of `D_log(λ, N)` as zeros of the rational
-/// function `R(t) = ξ_0 + 2t Σ_{j=1}^{N} ξ_j / (t − j²)`, located in
-/// the intervals `(k², (k+1)²)`.
+/// Discover positive sign-change roots of the even-state secular function
+/// `R(t) = ξ_0 + 2t Σ ξ_j/(t-j²)`, including the interval below the first pole.
 ///
-/// `tol` and `max_iter` control the bisection precision.
+/// This exploratory search does not prove completeness: signed residues can
+/// produce multiple roots per pole gap, and the final exterior window is finite.
+/// `tol` controls absolute residual or t-bracket width, not physical-ordinate
+/// error or comparison accuracy against a Riemann zero. For complete root counts
+/// use the HP certified discovery route.
 pub fn solve_spectrum_f64(
     xi: &[f64],
     n_max: usize,
@@ -438,6 +498,19 @@ pub fn solve_spectrum_f64(
     tol: f64,
     max_iter: usize,
 ) -> Result<Vec<f64>> {
+    let expected = n_max.checked_mul(2).and_then(|v| v.checked_add(1));
+    if expected != Some(xi.len())
+        || xi.iter().any(|x| !x.is_finite())
+        || !l.is_finite()
+        || l <= 0.0
+        || !tol.is_finite()
+        || tol < 0.0
+    {
+        return Err(anyhow!("invalid f64 secular state, length, or tolerance"));
+    }
+    if n_max == 0 {
+        return Ok(Vec::new());
+    }
     let xi_pos: Vec<f64> = (0..=n_max).map(|j| xi[j + n_max]).collect();
 
     let f = |t: f64| -> f64 {
@@ -451,7 +524,7 @@ pub fn solve_spectrum_f64(
     };
 
     let mut roots = Vec::with_capacity(n_max);
-    for k in 1..=n_max {
+    for k in 0..=n_max {
         let lo = (k as f64).powi(2);
         let hi = ((k + 1) as f64).powi(2);
         let eps = INTEGRAND_SINGULARITY_GUARD * (hi - lo);
@@ -474,6 +547,126 @@ pub fn solve_spectrum_f64(
 #[allow(clippy::excessive_precision)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archimedean_origin_limit_matches_direct_integrand_extrapolation() {
+        for cutoff in [2.0_f64, 7.0, 13.0, 1200.0] {
+            let l = cutoff.ln();
+            for (n, m) in [
+                (0, 0),
+                (1, 1),
+                (-3, -3),
+                (1, 0),
+                (2, 1),
+                (3, 1),
+                (3, 2),
+                (0, 1),
+                (-1, 1),
+                (3, -2),
+            ] {
+                // Extrapolate the original analytic integrand, never calling
+                // its origin guard or substituting the proposed limit.
+                let direct = |x: f64| {
+                    let a = 2.0 * std::f64::consts::PI * n as f64 / l;
+                    let b = 2.0 * std::f64::consts::PI * m as f64 / l;
+                    let omega = if n == m {
+                        2.0 * (1.0 - x / l) * (a * x).cos()
+                    } else {
+                        ((b * x).sin() - (a * x).sin()) / (std::f64::consts::PI * (n - m) as f64)
+                    };
+                    ((x / 2.0).exp() * omega - if n == m { 2.0 } else { 0.0 }) / (2.0 * x.sinh())
+                };
+                let h = l * 2.0_f64.powi(-20);
+                let extrapolated = 3.0 * direct(h) - 3.0 * direct(2.0 * h) + direct(3.0 * h);
+                let limit = archimedean_origin_limit_f64(n, m, l);
+                assert!(
+                    (limit - extrapolated).abs() < 1e-8 * (1.0 + limit.abs()),
+                    "C={cutoff}, n={n}, m={m}: guard={limit}, extrapolated={extrapolated}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn archimedean_origin_guard_is_inactive_for_integer_but_reachable_for_fractional_cutoffs() {
+        let (nodes, _) = xc_numerics::quadrature::gl_nodes_weights_f64(64);
+        let minimum = |p: CcmParams| {
+            nodes
+                .iter()
+                .map(|x| 0.5 * p.log_length() * (1.0 + x))
+                .fold(f64::INFINITY, f64::min)
+        };
+        // C=2 is the smallest valid integer cutoff; mapped nodes increase with C.
+        assert!(minimum(CcmParams::from_lambda_sq_integer(2, 1)) > INTEGRAND_SINGULARITY_GUARD);
+        assert!(
+            minimum(CcmParams::from_lambda_sq_fractional(1.00000001, 1))
+                < INTEGRAND_SINGULARITY_GUARD
+        );
+    }
+
+    #[test]
+    fn f64_matrix_matches_independent_high_mode_and_small_length_integrals() {
+        // Independently integrated defining Weil distribution at 90 decimal
+        // digits with mpmath tanh-sinh, including direct pole integration.
+        // Reproduction: Research 2026-09-23-full-mathematics-revalidation.
+        let params = CcmParams::from_lambda_sq_integer(13, 120);
+        let matrix = build_tau_f64(&params, params.log_length(), 13).unwrap();
+        for (n, m, expected) in [
+            (64, 64, 4.182967328799878),
+            (64, 63, 0.31200771112145644),
+            (120, 120, 4.636760801387921),
+            (120, 0, 0.00670592132993459),
+        ] {
+            let actual = matrix[(params.idx(n), params.idx(m))];
+            assert!(
+                (actual - expected).abs() < 2e-11,
+                "n={n}, m={m}: actual={actual}, reference={expected}"
+            );
+        }
+        // The reference uses the exact binary64 cutoff input, not a rounded
+        // decimal surrogate. The former fixed origin guard is inaccurate here.
+        let params = CcmParams::from_lambda_sq_fractional(1.00000001, 3);
+        let matrix = build_tau_f64(&params, params.log_length(), 1).unwrap();
+        for (n, m, expected) in [(3, 3, 19.522062402308804), (3, 2, 0.004117773807046028)] {
+            let actual = matrix[(params.idx(n), params.idx(m))];
+            assert!(
+                (actual - expected).abs() < 2e-11,
+                "small L n={n}, m={m}: actual={actual}, reference={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn f64_selected_even_state_has_a_small_full_matrix_residual() {
+        let params = CcmParams::from_lambda_sq_integer(13, 32);
+        let result = run_f64(&params).unwrap();
+        let matrix = build_tau_f64(&params, params.log_length(), 13).unwrap();
+        let xi = nalgebra::DVector::from_column_slice(&result.xi);
+        let residual = &matrix * &xi - result.weil_min_eigenvalue * &xi;
+        assert!(residual.norm() / xi.norm() < 1e-11);
+        for j in 0..=params.n_modes {
+            assert_eq!(result.xi[params.n_modes + j], result.xi[params.n_modes - j]);
+        }
+    }
+
+    #[test]
+    fn f64_secular_search_includes_the_first_positive_gap() {
+        // R(t)=(3t-1)/(t-1), with the exact positive ordinate 1/sqrt(3)
+        // when L=2*pi. No reference-zero input or production root oracle.
+        let roots = solve_spectrum_f64(&[1.0, 1.0, 1.0], 1, 2.0 * std::f64::consts::PI, 1e-14, 200)
+            .unwrap();
+        assert_eq!(roots.len(), 1);
+        assert!((roots[0] - 1.0 / 3.0_f64.sqrt()).abs() < 1e-13);
+        assert!(solve_spectrum_f64(&[f64::NAN; 3], 1, 1.0, 1e-14, 200).is_err());
+        assert!(solve_spectrum_f64(&[1.0], 1, 1.0, 1e-14, 200).is_err());
+    }
+
+    #[test]
+    fn f64_ccm_rejects_invalid_cutoffs_before_assembly() {
+        for cutoff in [0.0, 0.5, 1.0, f64::NAN, f64::INFINITY] {
+            assert!(run_f64(&CcmParams::from_lambda_sq_fractional(cutoff, 1)).is_err());
+        }
+    }
 
     #[test]
     fn f64_ccm_result_round_trips_without_loss() {
@@ -686,3 +879,41 @@ mod tests {
         assert!(roots.is_empty(), "n_max=0 should produce no roots");
     }
 }
+
+#[cfg(feature = "hp")]
+pub mod state_geometry;
+
+#[cfg(feature = "hp")]
+pub mod retained_evidence;
+
+/// Additional retained-source observations and external runtime research inputs.
+#[cfg(feature = "hp")]
+pub mod extended_research;
+
+/// Complete retained-run convergence measurements and optional numerical models.
+#[cfg(feature = "hp")]
+pub mod convergence_capture;
+
+#[cfg(feature = "hp")]
+pub mod capture_runtime;
+#[cfg(feature = "hp")]
+pub mod research_completion;
+
+#[cfg(feature = "hp")]
+mod transform_enclosure;
+
+#[cfg(feature = "hp")]
+pub mod research_cohort;
+#[cfg(feature = "hp")]
+pub mod research_prepare;
+#[cfg(feature = "hp")]
+mod research_target;
+
+#[cfg(feature = "hp")]
+pub mod atom_research;
+
+#[cfg(feature = "hp")]
+mod band_runtime;
+
+#[cfg(feature = "hp")]
+mod research_export;

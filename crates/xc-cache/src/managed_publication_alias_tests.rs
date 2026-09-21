@@ -116,6 +116,7 @@ fn destination_aliases_publish_once_with_closed_dependencies_in_both_lanes() {
                 "ccm-matrices",
                 destination,
                 &refs,
+                &publication_dependency_identities(remapped.iter()),
                 &CancellationToken::new(),
             )
             .unwrap();

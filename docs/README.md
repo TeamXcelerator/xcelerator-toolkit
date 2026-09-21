@@ -6,6 +6,12 @@ integrate capture into applications, and interpret retained numerical evidence.
 
 ## Use
 
+- [Ultra completeness, prerequisites and recovery](ULTRA_COMPLETENESS.md)
+- [Retained research artifact definitions](RETAINED_RESEARCH.md)
+- [Extended diagnostics and conventions](EXTENDED_RESEARCH.md)
+- [Additive historical backfill](RESEARCH_BACKFILL.md)
+- [Detailed cache and target configuration](CACHE_AND_TARGET_CONFIGURATION.md)
+
 - [Release notes](RELEASE_NOTES.md)
 - [Numerical compatibility and existing artifacts](NUMERICAL_COMPATIBILITY.md)
 - [Release validation](VALIDATION.md)
@@ -30,3 +36,14 @@ integrate capture into applications, and interpret retained numerical evidence.
 - [References](REFERENCES.md)
 
 Large retained artifacts can use [explicit resource limits and publication-only recovery](PUBLICATION_RECOVERY.md). This preserves numerical results and the original capture history.
+
+- [Large atom inputs, cutoff studies and searchable exports](ATOM_RESEARCH.md)
+
+## Retained calculations and repair
+
+- [Complete root discovery](CCM_COMPLETE_ROOT_DISCOVERY.md)
+- [Response performance](CCM_RESPONSE_PERFORMANCE.md)
+- [Response artifact repair](CCM_RESPONSE_REPAIR.md)
+- [State geometry](STATE_GEOMETRY.md)
+
+- [Local research storage and retention](LOCAL_RESEARCH_STORAGE.md)

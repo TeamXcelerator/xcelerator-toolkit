@@ -501,24 +501,37 @@ pub fn acquire_private_publication_lease(
     }
 }
 
+fn renewed_lock_at(
+    lock: &PrivatePublicationLock,
+    observed_main_head: &str,
+    policy: &PrivatePublicationLeasePolicy,
+    wall_time: u64,
+) -> Result<PrivatePublicationLock, CacheError> {
+    policy.validate()?;
+    lock.validate()?;
+    if !valid_revision(observed_main_head) {
+        return Err(CacheError::InvalidManifest(
+            "private lease renewal observed an invalid main head".to_owned(),
+        ));
+    }
+    // Wall-clock corrections must not move an established lease heartbeat
+    // backward. This does not bypass the atomic coordination-head fence.
+    let now = wall_time.max(lock.heartbeat_at_unix_seconds);
+    let mut renewed = lock.clone();
+    renewed.observed_main_head = observed_main_head.to_owned();
+    renewed.heartbeat_at_unix_seconds = now;
+    renewed.lease_expires_at_unix_seconds = now.saturating_add(policy.lease_seconds);
+    renewed.validate()?;
+    Ok(renewed)
+}
+
 pub fn prepare_private_lease_renewal(
     lease: &PrivatePublicationLease,
     observed_main_head: &str,
     staging_root: &Path,
     policy: &PrivatePublicationLeasePolicy,
 ) -> Result<(RemoteCommitRequest, PrivatePublicationLock), CacheError> {
-    policy.validate()?;
-    if !valid_revision(observed_main_head) {
-        return Err(CacheError::InvalidManifest(
-            "private lease renewal observed an invalid main head".to_owned(),
-        ));
-    }
-    let now = now_unix_seconds()?;
-    let mut renewed = lease.lock.clone();
-    renewed.observed_main_head = observed_main_head.to_owned();
-    renewed.heartbeat_at_unix_seconds = now;
-    renewed.lease_expires_at_unix_seconds = now.saturating_add(policy.lease_seconds);
-    renewed.validate()?;
+    let renewed = renewed_lock_at(&lease.lock, observed_main_head, policy, now_unix_seconds()?)?;
     let part = stage_json(staging_root, PRIVATE_PUBLICATION_LOCK_PATH, &renewed)?;
     Ok((
         RemoteCommitRequest {
@@ -653,14 +666,7 @@ mod tests {
     use std::fs;
     use std::process::{Command, Stdio};
 
-    fn temporary_root(name: &str) -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("test-tmp")
-            .join(format!("{name}-{}", std::process::id()))
-    }
+    use crate::test_support::temporary_root;
 
     fn test_git(directory: Option<&Path>, arguments: &[&str]) -> bool {
         let mut command = Command::new("git");
@@ -691,6 +697,42 @@ mod tests {
         lock.validate().unwrap();
         assert!(!lock.expired_at(159, 60));
         assert!(lock.expired_at(160, 60));
+    }
+
+    #[test]
+    fn lease_renewal_survives_clock_rollback_without_advancing_fence_or_expiration() {
+        let lock = PrivatePublicationLock {
+            schema_version: 1,
+            owner_run_id: "run".into(),
+            publication_transaction_id: "transaction".into(),
+            github_principal: "principal".into(),
+            toolkit_version: "0.15.1".into(),
+            instance_fingerprint: ContentDigest::sha256(b"instance"),
+            process_id: 1,
+            fencing_generation: 3,
+            observed_main_head: "a".repeat(40),
+            acquired_at_unix_seconds: 10,
+            heartbeat_at_unix_seconds: 20,
+            lease_expires_at_unix_seconds: 100,
+        };
+        let policy = PrivatePublicationLeasePolicy {
+            lease_seconds: 80,
+            ..Default::default()
+        };
+        let renewed = renewed_lock_at(&lock, &"b".repeat(40), &policy, 5).unwrap();
+        assert_eq!(renewed.heartbeat_at_unix_seconds, 20);
+        assert_eq!(renewed.lease_expires_at_unix_seconds, 100);
+        assert_eq!(renewed.fencing_generation, lock.fencing_generation);
+        assert_eq!(
+            renewed.acquired_at_unix_seconds,
+            lock.acquired_at_unix_seconds
+        );
+        assert_eq!(renewed.observed_main_head, "b".repeat(40));
+        let advanced = renewed_lock_at(&renewed, &"c".repeat(40), &policy, 30).unwrap();
+        assert_eq!(advanced.lease_expires_at_unix_seconds, 110);
+        let mut invalid = lock;
+        invalid.acquired_at_unix_seconds = 21;
+        assert!(renewed_lock_at(&invalid, &"a".repeat(40), &policy, 50).is_err());
     }
 
     #[test]

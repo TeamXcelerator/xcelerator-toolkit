@@ -8,7 +8,15 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 pub use xc_core::PrefixDiagnosticPolicy;
 
-pub const CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v1";
+pub const CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v6";
+pub const RUN_ONCE_CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v5";
+pub const EXTENDED_CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v4";
+pub const RETAINED_CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v3";
+pub const GEOMETRY_CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v2";
+pub const LEGACY_CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v1";
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -31,6 +39,16 @@ pub struct CcmCapturePlan {
     pub capture_prime_power_response: bool,
     pub capture_u_flow_response: bool,
     pub capture_prefix_analysis: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capture_state_geometry: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capture_retained_research: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capture_extended_research: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capture_complete_research: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capture_reference_projection: bool,
     pub prefix_checkpoint_dimensions: Vec<usize>,
     /// Optional arithmetic precision for retained diagnostics. Source bytes and
     /// their assembly precision remain unchanged and independently recorded.
@@ -93,7 +111,12 @@ impl CcmCapturePlan {
         let ultra = level == CcmCaptureLevel::Ultra;
         Ok(Self {
             schema_version: 1,
-            semantics: CAPTURE_PLAN_SEMANTICS.into(),
+            semantics: if ultra {
+                CAPTURE_PLAN_SEMANTICS
+            } else {
+                LEGACY_CAPTURE_PLAN_SEMANTICS
+            }
+            .into(),
             level,
             source_even_dimension,
             sector_eigenpairs: match level {
@@ -104,6 +127,11 @@ impl CcmCapturePlan {
             capture_prime_power_response: ultra,
             capture_u_flow_response: ultra,
             capture_prefix_analysis: ultra,
+            capture_state_geometry: ultra,
+            capture_retained_research: ultra,
+            capture_extended_research: ultra,
+            capture_complete_research: ultra,
+            capture_reference_projection: ultra,
             prefix_checkpoint_dimensions: if ultra {
                 vec![source_even_dimension]
             } else {
@@ -120,6 +148,17 @@ impl CcmCapturePlan {
     }
     /// Top-tier measurements. This does not request either interval certificate
     /// route, alternative prime arithmetic, or a new quadrature-order policy.
+    /// Request a projection using explicitly supplied finite reference inputs.
+    /// The caller must also configure RetainedCcmRun::set_research_inputs.
+    pub fn with_reference_projection(mut self) -> Result<Self> {
+        if !self.capture_retained_research {
+            bail!("reference projection requires a current Ultra plan");
+        }
+        self.capture_reference_projection = true;
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn ultra(maximum_eigenpairs: usize, source_even_dimension: usize) -> Result<Self> {
         Self::resolve(
             CcmCaptureLevel::Ultra,
@@ -164,7 +203,61 @@ impl CcmCapturePlan {
             || (ultra && !self.capture_prefix_analysis)
             || self.requires_even_sector != (ultra || self.capture_prefix_analysis)
             || self.schema_version != 1
-            || self.semantics != CAPTURE_PLAN_SEMANTICS
+            || ![
+                CAPTURE_PLAN_SEMANTICS,
+                RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
+                EXTENDED_CAPTURE_PLAN_SEMANTICS,
+                RETAINED_CAPTURE_PLAN_SEMANTICS,
+                GEOMETRY_CAPTURE_PLAN_SEMANTICS,
+                LEGACY_CAPTURE_PLAN_SEMANTICS,
+            ]
+            .contains(&self.semantics.as_str())
+            || (self.semantics == LEGACY_CAPTURE_PLAN_SEMANTICS && self.capture_state_geometry)
+            || (self.capture_reference_projection && !self.capture_retained_research)
+            || (![
+                CAPTURE_PLAN_SEMANTICS,
+                RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
+                EXTENDED_CAPTURE_PLAN_SEMANTICS,
+                RETAINED_CAPTURE_PLAN_SEMANTICS,
+            ]
+            .contains(&self.semantics.as_str())
+                && self.capture_retained_research)
+            || ([
+                CAPTURE_PLAN_SEMANTICS,
+                RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
+                EXTENDED_CAPTURE_PLAN_SEMANTICS,
+                RETAINED_CAPTURE_PLAN_SEMANTICS,
+            ]
+            .contains(&self.semantics.as_str())
+                && self.capture_retained_research != ultra)
+            || ([
+                CAPTURE_PLAN_SEMANTICS,
+                RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
+                EXTENDED_CAPTURE_PLAN_SEMANTICS,
+                RETAINED_CAPTURE_PLAN_SEMANTICS,
+            ]
+            .contains(&self.semantics.as_str())
+                && self.capture_state_geometry != ultra)
+            || (![
+                CAPTURE_PLAN_SEMANTICS,
+                RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
+                EXTENDED_CAPTURE_PLAN_SEMANTICS,
+            ]
+            .contains(&self.semantics.as_str())
+                && self.capture_extended_research)
+            || ([
+                CAPTURE_PLAN_SEMANTICS,
+                RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
+                EXTENDED_CAPTURE_PLAN_SEMANTICS,
+            ]
+            .contains(&self.semantics.as_str())
+                && self.capture_extended_research != ultra)
+            || (![CAPTURE_PLAN_SEMANTICS, RUN_ONCE_CAPTURE_PLAN_SEMANTICS]
+                .contains(&self.semantics.as_str())
+                && self.capture_complete_research)
+            || ([CAPTURE_PLAN_SEMANTICS, RUN_ONCE_CAPTURE_PLAN_SEMANTICS]
+                .contains(&self.semantics.as_str())
+                && self.capture_complete_research != ultra)
             || self.certification_requested
             || self.changes_numerical_algorithm
             || self.source_even_dimension == 0
@@ -244,6 +337,65 @@ impl CcmCapturePlan {
         }
         if self.level == CcmCaptureLevel::Ultra {
             requested.push("deviation_decomposition".into());
+        }
+        if self.capture_retained_research {
+            requested
+                .extend(["indexed_transform", "operator_energy", "root_band"].map(str::to_owned));
+        }
+        if self.capture_extended_research {
+            requested.extend(
+                [
+                    "compactness",
+                    "weighted_reference_projection",
+                    "signed_transform",
+                    "arithmetic_energy",
+                    "directional_response",
+                    "weighted_tail",
+                    "spectral_cluster",
+                    "resolution_budget",
+                    "energy_allowance",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        if self.capture_complete_research {
+            for id in &mut requested {
+                if matches!(
+                    id.as_str(),
+                    "arithmetic_energy" | "directional_response" | "spectral_cluster"
+                ) {
+                    id.push_str("_full");
+                }
+            }
+            requested.extend(
+                [
+                    "complex_transform",
+                    "root_transport",
+                    "operator_cluster",
+                    "finite_section_transfer",
+                    "tail_operator",
+                    "observable_budget",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        if self.semantics == CAPTURE_PLAN_SEMANTICS && self.capture_complete_research {
+            requested.insert(0, "capture_preflight".into());
+            requested.extend(
+                [
+                    "consistency",
+                    "configuration_comparison",
+                    "band_reconstruction",
+                    "transform_enclosure",
+                ]
+                .map(str::to_owned),
+            );
+        }
+        if self.capture_reference_projection {
+            requested.push("reference_projection".into());
+        }
+        if self.capture_state_geometry {
+            requested.push("state_geometry".into());
         }
         if self.capture_prime_power_response {
             requested.push("prime_power_response".into());
@@ -595,6 +747,124 @@ impl CcmCapturePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn v5_roundtrip_keeps_its_work_set_while_v6_adds_completion() {
+        let current = CcmCapturePlan::ultra(8, 33).unwrap();
+        let mut old = current.clone();
+        old.semantics = RUN_ONCE_CAPTURE_PLAN_SEMANTICS.into();
+        old.capture_reference_projection = false;
+        let bytes = serde_json::to_vec(&old).unwrap();
+        let restored: CcmCapturePlan = serde_json::from_slice(&bytes).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
+        assert!(!restored
+            .receipt()
+            .unwrap()
+            .outcomes()
+            .contains_key("capture_preflight"));
+        assert!(!restored
+            .receipt()
+            .unwrap()
+            .outcomes()
+            .contains_key("reference_projection"));
+        for id in [
+            "capture_preflight",
+            "consistency",
+            "configuration_comparison",
+            "band_reconstruction",
+            "transform_enclosure",
+            "reference_projection",
+        ] {
+            assert!(current.receipt().unwrap().outcomes().contains_key(id));
+        }
+    }
+    #[test]
+    fn v4_recipe_roundtrips_without_new_work_and_v5_requests_all_roots() {
+        let plan = CcmCapturePlan::ultra(8, 1001).unwrap();
+        let receipt = plan.receipt().unwrap();
+        for id in [
+            "arithmetic_energy_full",
+            "directional_response_full",
+            "spectral_cluster_full",
+            "complex_transform",
+            "root_transport",
+            "operator_cluster",
+            "finite_section_transfer",
+            "tail_operator",
+            "observable_budget",
+        ] {
+            assert!(receipt.outcomes().contains_key(id), "{id}");
+        }
+        let mut old = serde_json::to_value(plan).unwrap();
+        old["semantics"] = EXTENDED_CAPTURE_PLAN_SEMANTICS.into();
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_complete_research");
+        let restored: CcmCapturePlan = serde_json::from_value(old.clone()).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), old);
+        let r = restored.receipt().unwrap();
+        assert!(r.outcomes().contains_key("directional_response"));
+        assert!(!r.outcomes().contains_key("root_transport"));
+    }
+    #[test]
+    fn v3_ultra_keeps_its_original_diagnostic_set() {
+        let mut old = serde_json::to_value(CcmCapturePlan::ultra(8, 33).unwrap()).unwrap();
+        old["semantics"] = RETAINED_CAPTURE_PLAN_SEMANTICS.into();
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_complete_research");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_extended_research");
+        let old: CcmCapturePlan = serde_json::from_value(old).unwrap();
+        old.validate().unwrap();
+        let old_receipt = old.receipt().unwrap();
+        assert!(old_receipt.outcomes().contains_key("indexed_transform"));
+        assert!(!old_receipt.outcomes().contains_key("compactness"));
+        let new = CcmCapturePlan::ultra(8, 33).unwrap().receipt().unwrap();
+        assert!(new.outcomes().contains_key("weighted_tail"));
+        assert_ne!(old_receipt.plan_digest(), new.plan_digest());
+    }
+
+    #[test]
+    fn new_ultra_geometry_does_not_rewrite_legacy_plans() {
+        let new = CcmCapturePlan::ultra(8, 33).unwrap();
+        assert!(new
+            .receipt()
+            .unwrap()
+            .outcomes()
+            .contains_key("state_geometry"));
+        let mut old = serde_json::to_value(&new).unwrap();
+        old["semantics"] = LEGACY_CAPTURE_PLAN_SEMANTICS.into();
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_reference_projection");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_complete_research");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_retained_research");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_extended_research");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_state_geometry");
+        let restored: CcmCapturePlan = serde_json::from_value(old.clone()).unwrap();
+        restored.validate().unwrap();
+        assert!(!restored
+            .receipt()
+            .unwrap()
+            .outcomes()
+            .contains_key("state_geometry"));
+        assert_eq!(serde_json::to_value(&restored).unwrap(), old);
+        assert_ne!(restored.receipt().unwrap(), new.receipt().unwrap());
+        let mut inconsistent = restored;
+        inconsistent.capture_state_geometry = true;
+        assert!(inconsistent.validate().is_err());
+    }
     #[test]
     fn prefix_diagnostic_policy_is_explicit_and_old_plans_do_not_gain_new_work() {
         let full = CcmCapturePlan::ultra(2, 3).unwrap();

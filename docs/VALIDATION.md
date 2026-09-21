@@ -1,5 +1,168 @@
 # Release validation
 
+## v0.15.1
+
+The Gaussian-target amendment replaces first-small-term stopping with a
+remaining-tail check, rejects HP term-budget exhaustion and binds the corrected
+semantics in cache identities. Five regressions and 163 independent Arb checks
+pass, including unequal scales and the historical reference descriptor through
+6,708 bits. Complete local v9 native and HP/Arb qualification passes. Historical
+target-dependent artifacts and the full mathematical/Research audit remain open.
+
+The capability-identity amendment binds Arb availability in transform-enclosure
+and band requests. It prevents an Arb-enabled run from reusing a feature-required
+absence result and preserves same-capability warm reuse. Optional Boolean schema
+fields preserve legacy readability while rejecting invalid types. Complete local
+v8-r2 native and HP/Arb release qualification passes. The corresponding cache
+schema mirrors await publication; this run did not request mirror checks.
+The full mathematical and historical research audit remains open.
+
+The stable u-flow amendment separates fresh derivative actions from historical
+v3 arithmetic using a v4 identity. The generic binary64 root amendment prevents
+infinite points labeled refined and discovery windows lost through overflow.
+Counterexamples and targeted regressions pass, along with complete local v7
+release qualification. This does not clear all historical artifacts or research.
+
+The nonfinite eigenpair amendment rejects NaN/infinite inputs and nonfinite
+residual arithmetic. Previously a NaN row could disappear from a maximum fold
+and leave a zero residual. Explicit invalid-input and finite-overflow examples
+now fail closed; the complete local v5 release tiers pass. This validation repair
+does not establish lowest-state selection or clear the entire historical corpus.
+
+The root and revocation amendment requires a directed upper bound on the Newton
+correction at the stored finite-source point before reporting convergence. Root
+identities bind the exact secular source; fixed roots use payload schema 6.
+State selection checks ambiguity at the final optimum. Bootstrap readers enforce
+active revocations during ordinary, historical and materialization lookup in
+both cache lanes. Complete local v4 qualification passes. Root correction checks
+do not certify existence, uniqueness, eigenstate accuracy or zeta correspondence.
+
+The full-mathematics audit amendment fixes directed integer interval conversion,
+finite bisection handling, high-mode f64 quadrature, even-sector Ritz selection,
+and stable f64/HP CCM kernels and cutoff validation. It also rejects missing
+source edges and revalidates adopted canonical manifests during offline reuse.
+These repairs pass both complete local release tiers. Independent numerical
+comparisons are recorded in the 2026-09-23 full-mathematics revalidation study.
+The entire mathematical audit remains open; passing regressions do not clear
+all historical results or research conclusions. The earlier amendments below
+describe their own historical scope.
+
+The cache-provenance amendment preserves every exact parent named by a staged
+child, including cross-family dependencies and coalesced closure aliases. It
+keeps newer live-index selections intact and blocks historical fallback for
+explicitly quarantined or revoked manifests. Complete native and HP/Arb
+qualification passes. Historical cache repair is recorded separately in the
+2026-09-23 cache-provenance repair study; numerical formulas are unchanged.
+
+The f64 origin-limit amendment adds direct-integrand and guard-reachability
+regressions. Both workspace tiers pass, with all six native checks retained
+from the same-source review and complete HP qualification repeated locally.
+The guard is inactive for integer C>=2; fractional cutoffs near 1 can reach it.
+HP formulas are unchanged. These checks do not clear the historical corpus.
+
+Install the validation prerequisites, then use the documented native/HP build
+prerequisites. The record captures the installed schema-engine version.
+Run complete qualification from a committed source tree:
+
+```sh
+python3 -m pip install -r tools/requirements-validation.txt
+python3 tools/check_release.py --tier hp --complete --metadata-root /path/to/repos --output /path/to/new-qualification
+```
+
+On Windows use `--tier native`. Omit `--metadata-root` when artifact repositories
+are unavailable; the output explicitly marks mirror checks as not requested.
+The HP complete command builds the ordinary backfill executable, exercises all
+thirty kinds, validates positive and negative schema cases, checks interruption
+and budget recovery, regenerates schemas for comparison, checks documentation
+reachability and writes the reproducible source digest. All 34 schema files are
+covered: 30 are regenerated, and four hand-maintained contracts have explicit
+LF-normalized SHA-256 pins in `tools/handmaintained_schemas.json`. Intentional
+hand-maintained contract edits require reviewed pin updates. Qualification rejects
+optimized Python (`-O` or `PYTHONOPTIMIZE`) so child
+acceptance scripts retain their assertions. Main gates also use explicit errors.
+
+The complete command checks prerequisites, committed source identity and exact
+repository bytes before compiling, and repeats the committed-source check during
+asset qualification. It rejects CRLF text staged in the index, CR/BOM script
+bytes in HEAD/index/worktree, and changes to the pinned raw reference table.
+Source digests include the table without line-ending normalization. The byte
+pins are in `tools/byte_exact_inputs.json`.
+
+For local development, run the native/HP tier without `--complete`; final release
+qualification requires committed code and tooling. The final validation record is
+a documentation-only amendment of the qualified source snapshot: its recorded
+source digest must still equal the final release's committed source digest.
+No campaign, historical backfill, artifact publication or GitHub Actions runs.
+
+The [machine-readable record](validation/v0.15.1.json) binds the qualified
+source files, toolchains, commands, exit statuses and log hashes.
+
+The published-source capture amendment also checks canonical factor/sector
+ancestry, altered parent rejection, root/secular binding, cached prefix/reduction
+reuse, and observation of larger retained root windows without changing the
+requested numerical result. Checkpoint I/O is quiet by default. New controls cover
+source-bound atom/tail preparation, complete origin mass, interval block bounds,
+finite polynomial bands, centered contour enclosures and HP-only compatibility.
+The near-carrier amendment adds a convergent sinc coefficient series with an
+explicit remainder, stable tiny-argument derivatives, and energy-allowance
+scale interpretation. Shifted/complex carriers, branch boundaries and zero
+or negative trial energies have regressions; the retained C13/N120 contour
+replay still certifies its finite-function count with no unresolved rows.
+
+| Check | Result |
+|---|---|
+| Windows default workspace, all targets, debug | 571 passed; 0 failed; 6 ignored |
+| WSL Ubuntu 24.04 HP + Arb workspace, all targets, release | 1139 passed; 0 failed; 38 ignored |
+| Strict workspace and external-consumer Clippy, both tiers | Passed |
+| Rustdoc with warnings denied and doctests, both tiers | Passed; no runnable doctests |
+| Independently locked external consumer, both tiers | 3 passed on each tier |
+| Additive backfill CLI | Thirty kinds; cold/warm identity, corrupt input, failed rows, resume and output-preservation checks passed |
+| Payload JSON Schema validation | All thirty generated packets passed; negative schema cases and thirty previous packets checked |
+| Shared registry/shard metadata | Previous mirror qualification preserved; current capability schema mirror update pending |
+| Artifact-impact inventory unit tests | 11 passed |
+| Chunk preparation, research query and publication-summary tests | 5 passed |
+| Release guards (source provenance, schema inventory, optimization, raw bytes) | 5 passed |
+| Fresh Git clones, autocrlf=true and false | Identical pinned reference bytes, LF scripts and committed source digest |
+| Historical Windows cache tests from a 132-character checkout path, d608eab | 285 passed; 0 failed; 6 ignored |
+| Band interruption, worker identity and raised-budget recovery | Passed synthetic end-to-end checks |
+
+Analytic regressions cover Fourier carrier limits and derivatives, odd/complex
+state handling, raw nonorthogonal projection coefficients, singular projection
+inputs, total matrix energy, exact ancestry, adaptive root precision, missing
+rows, resource budgets and frozen finite cohort rules. Extended regressions
+cover analytic origin moments, weighted reference conventions, signed transform
+channels, component closure, projected directional response, weighted tail
+coverage, cluster matching and conditional error/energy allowances. New checks
+cover complex analytic continuation, closed contour retention, signed support
+motion, all parent-derived prefixes, Schur feedback, workspace limits, tail-model
+energy independent of the retained eigenvalue, and foreign optional input isolation.
+Completion regressions cover signed-measure positivity failure, independent
+component defects, explicit cohort comparisons, source-independent preparation,
+finite moment assembly, checkpoint corruption, adaptive contour exhaustion and
+a replayed finite source-certificate angle allowance. Additional regressions
+cover changed Git blob storage, mixed metadata/archive import, durable attempt
+metrics, band moments, explicit reference joins, tail-on/off model energy and
+tiny-energy vector resolution. A deterministic lease test covers backward
+wall-clock corrections without changing the fencing generation. Production
+adapter tests exercise cold/warm capture and encoded publication staging without
+remote writes.
+
+Atom regressions cover inputs beyond the former count limit, authenticated chunks,
+self-atom exclusions, coincident evaluations, signed kernel sums, fixed cutoff
+energies and band roots, exact decimal exports and deterministic block reductions.
+
+Runtime target regressions cover normalization, content identity, schema policy,
+and rejection of nonfinite distances. External providers have separate cutoff,
+precision, executable-digest, and protocol checks. These are software checks, not
+certificates for an externally defined mathematical function.
+
+The two suite counts overlap. Ignored tests, including live GitHub checks, were
+not executed. No GitHub Actions ran. This qualification does not rerun a paper
+claim, execute historical backfill, certify an infinite-dimensional result, or
+claim a new campaign speedup.
+
+## v0.15.0 historical qualification
+
 The v0.15.0 numerical source passed the checks below. The
 [machine-readable summary](validation/v0.15.0.json) identifies the tested
 source digest, features, counts and scope.

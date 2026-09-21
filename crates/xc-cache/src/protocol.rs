@@ -247,6 +247,28 @@ impl CanonicalArtifactManifest {
                 "maximum reader version precedes minimum reader version".to_owned(),
             ));
         }
+        // A named CCM numerical input is not a substitute for its provenance
+        // edge. Old exported adapters occasionally dropped all parent edges,
+        // making graph closure checks vacuously pass despite retained inputs.
+        // This is a minimum structural check; resolving and validating the
+        // complete exact parent set remains a separate reader obligation.
+        if self.semantic_key.artifact_kind.starts_with("ccm_")
+            && self.canonical_payload.dependencies.is_empty()
+            && self
+                .semantic_key
+                .resolved_mathematical_parameters
+                .as_object()
+                .is_some_and(|parameters| {
+                    parameters
+                        .iter()
+                        .any(|(name, value)| name.ends_with("_content_digest") && value.is_string())
+                })
+        {
+            return Err(CacheError::InvalidManifest(
+                "CCM manifest names numerical source content but has no dependency edges"
+                    .to_owned(),
+            ));
+        }
         crate::artifact_compatibility_policy(
             &self.artifact_family,
             &self.semantic_key.artifact_kind,
@@ -865,6 +887,24 @@ mod tests {
         assert!(manifest.validate().is_ok());
         manifest.payload_digest = ContentDigest::sha256(b"other-payload");
         assert!(manifest.validate().is_err());
+        manifest.payload_digest = manifest.canonical_payload.digest().unwrap();
+        manifest.semantic_key.resolved_mathematical_parameters = serde_json::json!({
+            "eigenpair_content_digest": ContentDigest::sha256(b"parent value").0
+        });
+        manifest.semantic_digest = manifest.semantic_key.digest().unwrap();
+        let error = manifest.validate().unwrap_err().to_string();
+        assert!(error.contains("no dependency edges"));
+        manifest
+            .canonical_payload
+            .dependencies
+            .push(PayloadDependencyIdentity {
+                artifact_family: "weil-states".to_owned(),
+                semantic_digest: ContentDigest::sha256(b"parent semantic"),
+                manifest_digest: ContentDigest::sha256(b"parent manifest"),
+                payload_digest: ContentDigest::sha256(b"parent payload"),
+            });
+        manifest.payload_digest = manifest.canonical_payload.digest().unwrap();
+        assert!(manifest.validate().is_ok());
     }
 
     #[test]

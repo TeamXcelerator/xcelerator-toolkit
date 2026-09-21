@@ -57,3 +57,61 @@ an earlier numerical claim assessment.
 
 A running executable retains its original publication implementation until it
 exits. Updating a checkout does not accelerate an already running push.
+
+## Archive import and verification reuse
+
+v0.15.1 imports verified canonical `objects/sha256/*.part` archive pieces with
+command-local `core.looseCompression=0`. Metadata retains ordinary compression.
+This changes Git's local storage work, not blob identity or archive bytes. It is
+separate from the existing no-delta push policy; global Git settings are untouched.
+A synthetic 32 MiB compressed archive imported in 0.70-0.72 seconds with the
+default policy and 0.25 seconds without loose-object compression in two reversed
+Windows trials. All Git object IDs matched. This measures local import only,
+not live GitHub throughput or complete campaign runtime.
+
+Verified loose blobs have a bounded process-local SHA-256 cache keyed by exact
+session, Git object ID and size. Unchanged file size and modification time are
+required for reuse. Changed/missing storage is rechecked; packed objects retain
+the streaming path. Session cleanup clears entries. The first read still checks
+all bytes, size and resource limits. This is not a persistent trust certificate.
+
+## Durable operational reports
+
+Family publication writes append-only attempts under
+`family-batches/<family>/<destination>/publication-metrics/attempt-*.jsonl` in the
+journal directory. Each record has a schema version, phase, elapsed seconds and
+phase-specific details. Timings are excluded from scientific keys and payloads.
+
+Records cover preparation, lock waiting, metadata, staged verification, Git
+import/push, destination verification reuse, batch completion and pending batches.
+A resumed invocation creates a new attempt file, preserving previous failures.
+Scheduled payload bytes are not actual wire bytes. Git push time includes local
+packing and remote acknowledgment; it is not a separate bandwidth measurement.
+A missing final-success event means completion must be checked against the
+canonical publication report. Operational logging failure does not bypass any
+publication check or turn an unsuccessful transaction into success.
+
+## Retained archive measurement
+
+A verified 90 MiB artifact part was imported into fresh local Git repositories
+and then packed with the existing no-delta policy. Two trials reversed the order:
+
+| Trial | Default import + pack | No loose compression + pack | Improvement |
+|---|---:|---:|---:|
+| First | 6.121 s | 2.967 s | 2.06x |
+| Reversed | 3.911 s | 2.779 s | 1.41x |
+
+All four resulting packs have identical bytes and SHA-256. Warm filesystem state
+and concurrent local work can affect timings. This measurement includes import
+and local packing, not network transfer, remote processing or complete claims.
+The [raw record](validation/v0.15.1-publication-import.json) retains individual
+phase times, byte counts and hashes. `tools/benchmark_publication_import.py`
+replays this comparison on a caller-selected verified part without a remote.
+
+
+Verified loose-blob digest reuse requires a platform change stamp. On Unix this
+binds device, inode, length, modification time and nanosecond change time; replacing
+a same-length object and restoring its modification time still invalidates reuse.
+Platforms without a reliable change stamp through the current adapter perform
+full byte verification. This local corruption check is not a security boundary
+against an administrator who can alter the process or its trusted storage.

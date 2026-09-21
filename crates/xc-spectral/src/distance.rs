@@ -44,6 +44,33 @@
 use anyhow::Result;
 use xc_numerics::grid_integral::{uniform_grid_integral_f64, GridVariable, UniformGridScheme};
 
+// Quadrature callbacks return scalars. Preserve the first evaluation error
+// separately, skip further provider calls after failure, and report the cause
+// before the quadrature's resulting nonfinite-value error.
+#[derive(Default)]
+struct EvaluationFailure(std::cell::RefCell<Option<anyhow::Error>>);
+impl EvaluationFailure {
+    fn capture<T>(&self, evaluate: impl FnOnce() -> Result<T>, fallback: impl FnOnce() -> T) -> T {
+        if self.0.borrow().is_some() {
+            return fallback();
+        }
+        match evaluate() {
+            Ok(value) => value,
+            Err(error) => {
+                *self.0.borrow_mut() = Some(error);
+                fallback()
+            }
+        }
+    }
+
+    fn finish<T>(self, result: Result<T>) -> Result<T> {
+        match self.0.into_inner() {
+            Some(error) => Err(error),
+            None => result,
+        }
+    }
+}
+
 /// How a weighted integral is evaluated.
 ///
 /// The two families are peers. Neither is the toolkit's preferred or
@@ -211,6 +238,10 @@ pub fn weighted_alpha_distance_f64<F: Fn(f64) -> f64, G: Fn(f64) -> f64>(
     rule.validate()?;
     let integrand = |u: f64| (f(u) - g(u)).abs() * u.powf(-alpha);
     let value = integrate_f64(integrand, lambda, rule)?;
+    anyhow::ensure!(
+        value.is_finite(),
+        "distance evaluation produced a nonfinite value"
+    );
     Ok(WeightedGridValueF64 {
         value,
         lambda,
@@ -227,7 +258,16 @@ pub fn distance_to_target_f64<F: Fn(f64) -> f64>(
     rule: WeightedIntegrationRule,
 ) -> Result<WeightedGridValueF64> {
     let target = crate::target::TargetEvaluatorF64::from_environment()?;
-    weighted_alpha_distance_f64(f, |u| target.value(u), lambda, alpha, rule)
+    target.validate_lambda(lambda)?;
+    let failure = EvaluationFailure::default();
+    let result = weighted_alpha_distance_f64(
+        f,
+        |u| failure.capture(|| target.try_value(u), || f64::NAN),
+        lambda,
+        alpha,
+        rule,
+    );
+    failure.finish(result)
 }
 
 /// The even CCM eigenfunction reconstructed from `V_n` coefficients,
@@ -399,7 +439,8 @@ pub fn target_crossings_f64<F: Fn(f64) -> f64>(
         anyhow::bail!("crossing detection needs at least two samples");
     }
     let target = crate::target::TargetEvaluatorF64::from_environment()?;
-    let difference = |u: f64| f(u) - target.value(u);
+    target.validate_lambda(lambda)?;
+    let difference = |u: f64| -> Result<f64> { Ok(f(u) - target.try_value(u)?) };
     let (lo, hi) = match variable {
         GridVariable::U => (1.0_f64, lambda),
         GridVariable::LogU => (0.0_f64, lambda.ln()),
@@ -419,7 +460,7 @@ pub fn target_crossings_f64<F: Fn(f64) -> f64>(
     // construction and carries no sign information.
     for index in 1..=samples {
         let u = point(index);
-        let value = difference(u);
+        let value = difference(u)?;
         let sign = if value > 0.0 {
             1_i8
         } else if value < 0.0 {
@@ -715,6 +756,10 @@ pub mod hp {
             difference * weight(u, &alpha_working, working)
         };
         let value = integrate_with(integrand, lambda, rule, prec, tables)?;
+        anyhow::ensure!(
+            value.is_finite(),
+            "distance evaluation produced a nonfinite value"
+        );
         Ok(WeightedGridValueHp {
             value,
             lambda: Float::with_val(prec, lambda),
@@ -759,20 +804,28 @@ pub mod hp {
     ) -> Result<WeightedGridValueHp> {
         let working = prec.saturating_add(GUARD_BITS);
         let target = crate::target::hp::TargetEvaluator::from_environment(working)?;
+        target.validate_lambda(lambda)?;
         if expected_target_digest.is_some_and(|expected| expected != target.definition_digest()) {
             anyhow::bail!(
                 "runtime target specification changed after its semantic identity was fixed"
             );
         }
-        weighted_alpha_distance_with_tables(
+        let failure = super::EvaluationFailure::default();
+        let result = weighted_alpha_distance_with_tables(
             f,
-            |u| target.value(u),
+            |u| {
+                failure.capture(
+                    || target.try_value(u),
+                    || Float::with_val(working, f64::NAN),
+                )
+            },
             lambda,
             alpha,
             rule,
             prec,
             tables,
-        )
+        );
+        failure.finish(result)
     }
 
     /// Signed counterpart of [`distance_to_target_with_tables`]. This keeps
@@ -791,18 +844,29 @@ pub mod hp {
         rule.validate()?;
         let working = prec.saturating_add(GUARD_BITS);
         let target = crate::target::hp::TargetEvaluator::from_environment(working)?;
+        target.validate_lambda(lambda)?;
         if expected_target_digest.is_some_and(|expected| expected != target.definition_digest()) {
             anyhow::bail!(
                 "runtime target specification changed after its semantic identity was fixed"
             );
         }
         let alpha_working = Float::with_val(working, alpha);
+        let failure = super::EvaluationFailure::default();
         let integrand = |u: &Float| {
             let mut residual = f(u);
-            residual -= target.value(u);
+            residual -= failure.capture(
+                || target.try_value(u),
+                || Float::with_val(working, f64::NAN),
+            );
             residual * weight(u, &alpha_working, working)
         };
-        integrate_with(integrand, lambda, rule, prec, tables)
+        let result = integrate_with(integrand, lambda, rule, prec, tables);
+        let value = failure.finish(result)?;
+        anyhow::ensure!(
+            value.is_finite(),
+            "signed residual evaluation produced a nonfinite value"
+        );
+        Ok(value)
     }
 
     /// The even CCM eigenfunction at HP, normalized so `f(1) = 1`.
@@ -1028,6 +1092,7 @@ pub mod hp {
         }
         let working = prec.saturating_add(GUARD_BITS);
         let target = crate::target::hp::TargetEvaluator::from_environment(working)?;
+        target.validate_lambda(lambda)?;
         let (lo, hi) = match variable {
             GridVariable::U => (
                 Float::with_val(working, 1u32),
@@ -1053,7 +1118,7 @@ pub mod hp {
                 GridVariable::LogU => point.exp(),
             };
             let mut difference = f(&u);
-            difference -= target.value(&u);
+            difference -= target.try_value(&u)?;
             let sign = match difference.cmp0() {
                 Some(std::cmp::Ordering::Greater) => 1_i8,
                 Some(std::cmp::Ordering::Less) => -1,
@@ -1664,6 +1729,9 @@ pub mod hp {
 
         let working = prec.saturating_add(64);
         let target = crate::target::hp::TargetEvaluator::from_environment(working)?;
+        target.validate_lambda(
+            &Float::with_val(working, Float::parse(&profile.lambda_squared)?).sqrt(),
+        )?;
         let parameter = target
             .auxiliary_parameter()
             .ok_or_else(|| anyhow::anyhow!("target specification has no auxiliary profile"))?;
@@ -1676,7 +1744,7 @@ pub mod hp {
             let u = parse(u_text, &format!("profile abscissa {index}"))?;
             let f = parse(f_text, &format!("profile value {index}"))?;
             let mut d = f;
-            d -= target.value(&u);
+            d -= target.try_value(&u)?;
             reference.push(target.auxiliary_value(&u)?);
             deviation.push(d);
             us.push(u);
@@ -2609,6 +2677,7 @@ pub mod hp {
         }
         let working = source.precision_bits.saturating_add(GUARD_BITS);
         let target = crate::target::hp::TargetEvaluator::from_environment(working)?;
+        target.validate_lambda(source.lambda)?;
         if target.definition_digest() != source.target_definition_digest {
             anyhow::bail!(
                 "runtime target specification changed after its semantic identity was fixed"
@@ -2617,7 +2686,7 @@ pub mod hp {
         let mut residuals = Vec::with_capacity(source.u_values.len());
         let mut sample_signs = Vec::with_capacity(source.u_values.len());
         for (u, f_value) in source.u_values.iter().zip(source.f_values) {
-            let residual = Float::with_val(source.precision_bits, f_value - target.value(u));
+            let residual = Float::with_val(source.precision_bits, f_value - target.try_value(u)?);
             sample_signs.push(if residual > 0u32 {
                 1
             } else if residual < 0u32 {
@@ -3448,6 +3517,11 @@ pub mod hp {
             );
         }
         let lambda = lambda_sq.sqrt();
+        if target_spec.external_profile.is_some() {
+            crate::target::hp::TargetEvaluator::from_spec(&target_spec, working)?
+                .validate_lambda(&lambda)?;
+            // Validate a finite source before any warm target-derived artifact can be reused.
+        }
         let variable = rules[0].variable();
         let canonical_state =
             crate::ccm::hp::resolve_canonical_even_eigenstate_via_cache(params, cfg, cache)?;
@@ -4967,9 +5041,67 @@ mod tests {
         }
     }
 
-    /// The self-distance of any profile is exactly zero — the same invariant
-    /// the collaboration uses as a harness check ("tested every exported
-    /// eigenfunction against itself ... exactly zero").
+    // Callback failure takes precedence over its downstream NaN fallout.
+    #[test]
+    fn quadrature_preserves_first_evaluation_error() {
+        let failure = EvaluationFailure::default();
+        let calls = std::cell::Cell::new(0);
+        let result = weighted_alpha_distance_f64(
+            |_| 1.0,
+            |_| {
+                failure.capture(
+                    || {
+                        calls.set(calls.get() + 1);
+                        if calls.get() == 1 {
+                            Ok(1.0)
+                        } else {
+                            anyhow::bail!("target provider request/reply mismatch")
+                        }
+                    },
+                    || f64::NAN,
+                )
+            },
+            2.0,
+            0.5,
+            WeightedIntegrationRule::UniformGrid {
+                scheme: UniformGridScheme::Trapezoid,
+                variable: GridVariable::U,
+                steps: 8,
+            },
+        );
+        assert_eq!(
+            failure.finish(result).unwrap_err().to_string(),
+            "target provider request/reply mismatch"
+        );
+        assert_eq!(calls.get(), 2);
+        let original: Result<f64> = Err(anyhow::anyhow!("arithmetic failure"));
+        assert_eq!(
+            EvaluationFailure::default()
+                .finish(original)
+                .unwrap_err()
+                .to_string(),
+            "arithmetic failure"
+        );
+    }
+
+    #[test]
+    fn nonfinite_distance_is_an_error() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let result = weighted_alpha_distance_f64(
+                |_| 1.0,
+                |_| bad,
+                2.0,
+                0.5,
+                WeightedIntegrationRule::UniformGrid {
+                    scheme: UniformGridScheme::Trapezoid,
+                    variable: GridVariable::U,
+                    steps: 8,
+                },
+            );
+            assert!(result.is_err());
+        }
+    }
+
     #[test]
     fn self_distance_is_exactly_zero() {
         let lambda = 250.0_f64.sqrt();
@@ -5238,6 +5370,25 @@ mod tests {
 
         /// HP self-distance is exactly zero at every precision — mirrors the
         /// collaboration's own harness invariant at 3535–7189 bits.
+        #[test]
+        fn hp_nonfinite_distance_is_an_error() {
+            for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                let result = hp::weighted_alpha_distance(
+                    |_| Float::with_val(128, 1),
+                    |_| Float::with_val(128, bad),
+                    &Float::with_val(128, 2),
+                    &Float::with_val(128, 0.5),
+                    WeightedIntegrationRule::UniformGrid {
+                        scheme: UniformGridScheme::Trapezoid,
+                        variable: GridVariable::U,
+                        steps: 8,
+                    },
+                    128,
+                );
+                assert!(result.is_err());
+            }
+        }
+
         #[test]
         fn hp_self_distance_is_exactly_zero() {
             for prec in [256u32, 1024] {

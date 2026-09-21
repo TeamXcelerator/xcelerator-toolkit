@@ -31,20 +31,18 @@ impl MpfrInterval {
         Ok(Self { lower, upper })
     }
 
+    /// Enclose the exact integer even when its significand exceeds `precision`.
     pub fn from_i64(value: i64, precision: u32) -> Self {
-        let value = Float::with_val(precision, value);
-        Self {
-            lower: value.clone(),
-            upper: value,
-        }
+        let (lower, _) = Float::with_val_round(precision, value, Round::Down);
+        let (upper, _) = Float::with_val_round(precision, value, Round::Up);
+        Self { lower, upper }
     }
 
+    /// Enclose the exact integer even when its significand exceeds `precision`.
     pub fn from_u64(value: u64, precision: u32) -> Self {
-        let value = Float::with_val(precision, value);
-        Self {
-            lower: value.clone(),
-            upper: value,
-        }
+        let (lower, _) = Float::with_val_round(precision, value, Round::Down);
+        let (upper, _) = Float::with_val_round(precision, value, Round::Up);
+        Self { lower, upper }
     }
 
     pub fn from_rational(value: &Rational, precision: u32) -> Self {
@@ -544,6 +542,27 @@ pub fn evaluate_complex_polynomial_mpfr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_constructors_enclose_exact_inputs_at_every_supported_precision() {
+        // Exact rational comparisons are independent of MPFR's rounded point.
+        for precision in [2, 16, 32, 53, 63, 64, 96] {
+            for value in [0_u64, 1, 13, (1_u64 << 32) + 1, u64::MAX] {
+                let interval = MpfrInterval::from_u64(value, precision).to_rational_interval();
+                assert!(
+                    interval.contains(&Rational::from(value)),
+                    "u64={value}, p={precision}"
+                );
+            }
+            for value in [i64::MIN, i64::MIN + 1, -4_294_967_297, -13, 0, 13, i64::MAX] {
+                let interval = MpfrInterval::from_i64(value, precision).to_rational_interval();
+                assert!(
+                    interval.contains(&Rational::from(value)),
+                    "i64={value}, p={precision}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn directed_arithmetic_contains_exact_values() {

@@ -37,6 +37,7 @@ mod private_coordination;
 mod production_staging;
 mod protocol;
 mod publication;
+mod publication_metrics;
 mod publication_orchestrator;
 mod publication_recovery;
 mod publication_staging;
@@ -50,6 +51,9 @@ mod semantic_api;
 mod semantic_resolver;
 mod shard_audit;
 mod shard_repair;
+mod source_binding;
+#[cfg(test)]
+mod test_support;
 mod trust;
 
 pub use artifact_validation::*;
@@ -93,6 +97,7 @@ pub use semantic_api::*;
 pub use semantic_resolver::*;
 pub use shard_audit::*;
 pub use shard_repair::*;
+pub use source_binding::*;
 pub use trust::*;
 
 use fs2::FileExt;
@@ -497,6 +502,13 @@ impl CachePolicy {
         let mut warnings = Vec::new();
         if let Err(error) = manifest.validate() {
             reasons.push(format!("manifest validation failed: {error}"));
+        }
+        // A promoted shard hit must pass the same canonical validation on
+        // ordinary offline reuse as on identity lookup and publication.
+        if manifest.tags.contains_key(REMOTE_CANONICAL_MANIFEST_TAG) {
+            if let Err(error) = validate_adopted_manifest(manifest) {
+                reasons.push(format!("retained canonical binding failed: {error}"));
+            }
         }
         if !self
             .accepted_schema_versions
@@ -1507,6 +1519,45 @@ impl FilesystemCacheStore {
         let content_digest = ContentDigest(hex_digest(whole_hasher.finalize().as_slice()));
         self.publish_manifest(draft, objects, content_digest, size_bytes)
     }
+}
+
+fn validate_adopted_manifest(manifest: &ArtifactManifest) -> Result<(), CacheError> {
+    let canonical: CanonicalArtifactManifest = serde_json::from_str(
+        manifest
+            .tags
+            .get(REMOTE_CANONICAL_MANIFEST_TAG)
+            .ok_or_else(|| {
+                CacheError::InvalidManifest(
+                    "adopted artifact lacks its canonical manifest".to_owned(),
+                )
+            })?,
+    )?;
+    let semantic_key: SemanticKeyEnvelope = serde_json::from_str(
+        manifest
+            .tags
+            .get(SEMANTIC_KEY_MANIFEST_TAG)
+            .ok_or_else(|| {
+                CacheError::InvalidManifest("adopted artifact lacks its semantic key".to_owned())
+            })?,
+    )?;
+    semantic_key.validate()?;
+    if semantic_key.artifact_kind != manifest.key.kind
+        || semantic_key.digest()? != manifest.key.parameters_digest
+    {
+        return Err(CacheError::InvalidManifest(
+            "adopted artifact key disagrees with retained semantics".to_owned(),
+        ));
+    }
+    let family = production_staging::family_for_artifact_kind(&semantic_key.artifact_kind)
+        .ok_or_else(|| CacheError::InvalidManifest("unknown adopted artifact family".to_owned()))?;
+    validate_retained_canonical_binding(
+        &canonical,
+        &semantic_key,
+        family,
+        &manifest.content_digest,
+        manifest.size_bytes,
+        manifest.provenance_digest.as_ref(),
+    )
 }
 
 /// Whether a locally retained manifest is the artifact a published
@@ -3110,14 +3161,7 @@ mod tests {
         }
     }
 
-    fn temporary_root(name: &str) -> PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("test-tmp")
-            .join(format!("{name}-{}", std::process::id()))
-    }
+    use crate::test_support::temporary_root;
 
     #[test]
     fn sha256_matches_standard_vectors() {
@@ -3291,6 +3335,37 @@ mod tests {
             .put(&artifact, br#"{"fixture":"different bytes"}"#)
             .unwrap();
         assert_ne!(tampered.content_digest, honest.content_digest);
+        let acceptance = CachePolicy {
+            current_toolkit_version: version("0.15.1"),
+            minimum_quality: CacheQuality::Staged,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        assert!(acceptance.accepts(&honest));
+        assert!(!acceptance.accepts(&tampered));
+        let mut missing_edges = canonical.clone();
+        missing_edges.semantic_key.resolved_mathematical_parameters = serde_json::json!({
+            "source_content_digest": ContentDigest::sha256(b"source").0
+        });
+        missing_edges.semantic_digest = missing_edges.semantic_key.digest().unwrap();
+        let mut adopted = honest.clone();
+        adopted.key.parameters_digest = missing_edges.semantic_digest.clone();
+        adopted.tags.insert(
+            SEMANTIC_KEY_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&missing_edges.semantic_key).unwrap(),
+        );
+        adopted.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+            serde_json::to_string(&missing_edges).unwrap(),
+        );
+        assert!(!acceptance.accepts(&adopted));
+        adopted.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.to_owned(),
+            "not json".to_owned(),
+        );
+        assert!(!acceptance.accepts(&adopted));
         let found = store.identity_candidates(&identity).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].content_digest, honest.content_digest);

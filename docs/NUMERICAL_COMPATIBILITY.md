@@ -5,6 +5,75 @@ versioned semantic identities. An upgrade does not rewrite stored artifacts or
 establish the accuracy of an earlier experiment. The changes below apply to
 the library; applications must update their dependencies and rebuild to use them.
 
+## Additive changes in v0.15.1
+
+Ultra capture-plan v6 adds completion diagnostics; serialized v1-v5 plans keep
+their original request sets. New extended diagnostics use v2 request semantics,
+so earlier child measurements are preserved rather than silently reinterpreted.
+That capture-plan addition preserves primary source identities. Separate
+mathematical corrections and arithmetic identity changes are described below.
+
+Capture receipts with the optional numerical coverage summary require reader
+v0.15.1. Historical receipts remain readable without that summary; unknown
+legacy outcome shapes are reported as unassessed, not numerically resolved.
+Changing an external target or improving a child producer calls for additive
+backfill from exact retained sources. It does not establish corruption in those
+sources or require deleting previous target measurements.
+
+See [Ultra completeness](ULTRA_COMPLETENESS.md) and [backfill](RESEARCH_BACKFILL.md).
+
+### Gaussian target-series termination
+
+Generic series sum finite partial sums only after bounding their omitted
+absolute monomial tails. Each base/parameter component must separately meet
+its relative budget. A polynomial zero cannot establish convergence; exhausting
+`maximum_terms` returns an error in both backends. Binary64 base normalization
+cancels constant scales before evaluation and uses a normalization-aware
+absolute budget when the normalized value approaches underflow.
+
+This corrects HP scale-sensitive early termination, HP silent exhaustion, and
+binary64 premature termination at a small or zero polynomial term. Gaussian
+target-definition digests bind `gaussian-series-relative-geometric-tail-v2`.
+External-only targets retain their existing protocol identity; external targets
+with Gaussian auxiliary series also bind the new summation semantics. Old
+target-dependent cache results remain historical and cannot satisfy requests
+using the new definition digest. An unchanged descriptor file therefore has a
+new evaluation identity. No original payload is silently relabeled.
+
+The tail comparison is computed floating-point arithmetic, not a directed
+interval certificate for the complete evaluator. Cancellation and source
+accuracy remain separate concerns. Independent Arb checks verify selected
+values, parameters and unequal scales using incomplete-gamma integral tail
+bounds; full historical distance and conclusion revalidation remains open.
+
+### Stable cutoff-flow derivative identity
+
+Current u-flow production uses `ccm-u-flow-response-v0.15.1-v4`, with reader
+floor 0.15.1. The stable gamma difference used in Archimedean derivatives
+changes low-order action bits even when both formulas are accurate. Reusing
+the old v3 identity would make its required exact numerical replay fail.
+The new identity requires fresh derivative actions, bordered tangents and
+dependent responses. Existing matrix/state inputs keep their own identities
+and require their separate validation; no old numerical payload is relabeled.
+
+The offline root-only repair continues to map legacy v2 responses to v3.
+It preserves their derivative arithmetic and cannot upgrade them to v4.
+Already-v4 sources may be checked by exact retained replay without changing
+their identity. An arithmetic identity change alone does not establish that
+old numerical values were inaccurate at a scientifically relevant scale.
+
+### Finite binary64 root ranges
+
+The generic `xc-root` bisection, safeguarded Newton fallback and pole-aware
+discovery now support finite brackets whose full width overflows binary64.
+Previously, a bracket such as `[-1e308, 1e308]` could produce an infinite
+midpoint labeled refined, or be skipped by discovery. Midpoint, width and
+subdivision arithmetic now avoid that overflow. Discovery rejects nonfinite
+function values, and optional derivative diagnostics omit nonfinite values.
+These point approximations require the stated continuity/domain assumptions;
+they are not certified root enclosures or a completeness proof. The HP CCM
+root algorithms are unchanged by this generic binary64 correction.
+
 ## Changes in v0.15.0
 
 | Product | Current behavior | Existing artifacts |
@@ -97,9 +166,10 @@ evidence; a small factorization or reduction residual does not establish them.
 
 ### Root-response normalization
 
-Prime-power and cutoff-flow responses use
+The root-normalization correction introduced
 `ccm-prime-power-response-v0.15.0-v3` and
-`ccm-u-flow-response-v0.15.0-v3`. Payload schema 2 and the artifact kinds are
+`ccm-u-flow-response-v0.15.0-v3`. Current cutoff-flow production additionally
+uses the stable-derivative v4 identity described above. Payload schema 2 and the artifact kinds are
 unchanged. Earlier v2 computations differentiated the CCM-normalized weights
 before evaluating the secular derivative. A tiny eigenvector boundary sum can
 make that normalization derivative enormous. Its contribution vanishes at an
@@ -195,3 +265,13 @@ source, root, eigenstate or retained-reduction identities. Old serialized plans
 keep their old requests; fresh Ultra plans or explicit policy selection request
 new children. The impact inventory reports older prefix children as candidates
 for the new-data backfill, not as evidence of corrupted numbers.
+
+### Capability-dependent retained diagnostics
+
+Transform-enclosure and band-reconstruction requests bind the availability of
+the Arb backend into their semantic cache identity. A build without Arb can
+produce a qualified feature-required absence; that record cannot satisfy a
+later Arb-enabled request. Legacy requests without a capability declaration
+also require a fresh calculation under the new identity. Historical bytes are
+preserved. This identity repair does not invalidate an independently verified
+finite enclosure or claim that a missing result contained a false certificate.

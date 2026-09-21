@@ -32,7 +32,7 @@ CORRECTED_SEMANTICS = {
 }
 CURRENT_IDENTITIES = {
     "ccm_prime_power_response_analysis": "ccm-prime-power-response-v0.15.0-v3",
-    "ccm_u_flow_response_analysis": "ccm-u-flow-response-v0.15.0-v3",
+    "ccm_u_flow_response_analysis": "ccm-u-flow-response-v0.15.1-v4",
     "ccm_prefix_analysis": "ccm-retained-even-prefix-moments-checked-exports-v3",
     "ccm_sector_tridiagonal": "ccm-parity-tridiagonal-v0.15.0-v1",
     "ccm_sector_transform": "ccm-parity-householder-basis-v0.15.0-v1",

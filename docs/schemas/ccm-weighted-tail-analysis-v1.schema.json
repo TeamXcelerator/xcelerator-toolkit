@@ -1,0 +1,393 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ccm_weighted_tail_analysis v1",
+  "description": "Source-bound observations; shape validation does not establish numerical correctness, ground selection, or convergence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "semantics",
+    "kind",
+    "scope",
+    "source_dependencies",
+    "request",
+    "data"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "semantics": {
+      "const": "ccm-retained-research-observations-v1"
+    },
+    "kind": {
+      "const": "ccm_weighted_tail_analysis"
+    },
+    "scope": {
+      "const": "finite_point_inputs; no_source_error_enclosure; no_ground_selection_or_convergence_certificate"
+    },
+    "source_dependencies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "content_digest",
+          "required_quality"
+        ],
+        "properties": {
+          "key": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "logical_key",
+              "parameters_digest"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string"
+              },
+              "logical_key": {
+                "type": "string"
+              },
+              "parameters_digest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          },
+          "content_digest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "required_quality": {
+            "enum": [
+              "validated",
+              "cross_checked",
+              "certified",
+              "published",
+              "quarantined",
+              "staged",
+              "deprecated"
+            ]
+          }
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "semantics",
+        "diagnostic",
+        "expected_rows",
+        "options",
+        "external_input_digest",
+        "state_selection_policy",
+        "state_manifest_tags"
+      ],
+      "properties": {
+        "semantics": {
+          "enum": [
+            "extended-retained-diagnostics-v2",
+            "extended-retained-diagnostics-v3",
+            "extended-retained-diagnostics-v4"
+          ]
+        },
+        "diagnostic": {
+          "const": "weighted_tail"
+        },
+        "expected_rows": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "working_precision_bits",
+            "maximum_rows",
+            "maximum_directional_rows",
+            "maximum_estimated_output_bytes",
+            "exponential_rates",
+            "relative_tolerance"
+          ],
+          "properties": {
+            "working_precision_bits": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "maximum_rows": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "maximum_directional_rows": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "maximum_estimated_output_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "exponential_rates": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+              }
+            },
+            "relative_tolerance": {
+              "type": "string",
+              "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+            },
+            "maximum_working_bytes": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        },
+        "external_input_digest": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state_selection_policy": {
+          "type": "string"
+        },
+        "state_manifest_tags": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "diagnostic",
+        "outcome",
+        "reason",
+        "lambda_squared",
+        "n_modes",
+        "source_precision_bits",
+        "working_precision_bits",
+        "convention",
+        "assurance",
+        "values",
+        "rows"
+      ],
+      "properties": {
+        "diagnostic": {
+          "const": "weighted_tail"
+        },
+        "outcome": {
+          "enum": [
+            "point_measurement",
+            "partial_unresolved",
+            "unresolved",
+            "missing_input",
+            "rank_or_precision_unresolved",
+            "conditional_bound_expression",
+            "sufficient_bound_unavailable"
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "lambda_squared": {
+          "type": "string",
+          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+        },
+        "n_modes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_precision_bits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "working_precision_bits": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "convention": {
+          "type": "string"
+        },
+        "assurance": {
+          "const": "point_diagnostics_only; external_inputs_and_allowances_not_certified; no_RH_or_ground_selection_premise"
+        },
+        "values": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "ordinal",
+              "label",
+              "outcome",
+              "values",
+              "notes"
+            ],
+            "properties": {
+              "ordinal": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "label": {
+                "type": "string"
+              },
+              "outcome": {
+                "enum": [
+                  "point_measurement",
+                  "missing_input",
+                  "budget_limited",
+                  "carrier_or_unresolved",
+                  "unresolved_denominator",
+                  "cancellation_limited",
+                  "unresolved_derivative",
+                  "channels_resolved_budget_unassessed",
+                  "conditional_budget_met",
+                  "conditional_budget_not_met",
+                  "conditional_budget_unresolved"
+                ]
+              },
+              "values": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string",
+                  "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                }
+              },
+              "notes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "label": {
+                      "const": "signed_atom_kernel"
+                    },
+                    "outcome": {
+                      "enum": [
+                        "point_measurement",
+                        "certified_finite_enclosure"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "values": {
+                      "required": [
+                        "signed_kernel_1",
+                        "signed_kernel_2",
+                        "signed_kernel_3",
+                        "used_atoms",
+                        "explicitly_excluded_atoms"
+                      ]
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "label": {
+                      "not": {
+                        "const": "signed_atom_kernel"
+                      }
+                    },
+                    "outcome": {
+                      "const": "point_measurement"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "values": {
+                      "required": [
+                        "cutoff",
+                        "included_mass",
+                        "included_absolute_mass",
+                        "included_count",
+                        "remaining_supplied_mass",
+                        "weighted_inverse_moment_1",
+                        "weighted_inverse_moment_2",
+                        "weighted_inverse_moment_3"
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "point_measurement",
+                  "certified_finite_enclosure",
+                  "conditional_bound_expression"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "values": {
+                "required": []
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -37,6 +37,16 @@ class ImpactTests(unittest.TestCase):
         self.assertEqual(report["active_affected_count"], 0)  # certificate-only defect rule
         self.assertNotIn("ccm_weil_eigenpair", report["active_recompute_by_kind"])
 
+    def test_stable_flow_epoch_requires_new_flow_and_receipt_identities(self):
+        artifact(self.root, "a", "ccm_weil_eigenpair", "unchanged-v1")
+        artifact(self.root, "b", "ccm_u_flow_response_analysis", "ccm-u-flow-response-v0.15.0-v3", ["a"])
+        artifact(self.root, "c", "research_capture_receipt", "unchanged-v1", ["b"])
+        artifact(self.root, "d", "ccm_u_flow_response_analysis", "ccm-u-flow-response-v0.15.1-v4", ["a"])
+        report = impact.inventory([self.root])
+        self.assertEqual(report["active_recompute_count"], 2)
+        self.assertEqual(report["active_affected_count"], 0)
+        self.assertEqual(report["active_recompute_by_kind"], {"ccm_u_flow_response_analysis": 1, "research_capture_receipt": 1})
+
     def test_upgrade_rules_count_descendants_without_calling_them_corrupt(self):
         artifact(self.root, "a", "ccm_sector_tridiagonal", "ccm-parity-tridiagonal-v0.13.0-v3")
         artifact(self.root, "b", "ccm_sector_eigenvalues", "unchanged-v1", ["a"])

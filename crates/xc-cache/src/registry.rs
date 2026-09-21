@@ -682,6 +682,23 @@ impl ShardIndexPartition {
             .filter(move |entry| &entry.semantic_digest == semantic_digest)
     }
 
+    /// An explicit rejection of this exact manifest cannot be bypassed by
+    /// historical publication evidence or a copy in an older shard. A rejected
+    /// sibling does not reject other manifests under the same semantic key.
+    pub(crate) fn blocks_exact_manifest(
+        &self,
+        semantic_digest: &ContentDigest,
+        manifest_digest: &ContentDigest,
+    ) -> bool {
+        self.lookup(semantic_digest).any(|entry| {
+            &entry.manifest_digest == manifest_digest
+                && matches!(
+                    entry.disposition,
+                    ArtifactDisposition::Revoked | ArtifactDisposition::Quarantined
+                )
+        })
+    }
+
     /// Reject a publication that would make an older producer compete with an
     /// already discoverable newer result for the same semantic identity.
     pub fn ensure_monotonic_producer(
@@ -967,6 +984,42 @@ mod tests {
             (&pair[0].semantic_digest, &pair[0].manifest_digest)
                 <= (&pair[1].semantic_digest, &pair[1].manifest_digest)
         }));
+    }
+
+    #[test]
+    fn exact_manifest_rejection_does_not_reject_a_sibling_or_superseded_history() {
+        let original = entry(b"exact-quarantine");
+        for disposition in [
+            ArtifactDisposition::Active,
+            ArtifactDisposition::Deprecated,
+            ArtifactDisposition::Quarantined,
+            ArtifactDisposition::Revoked,
+        ] {
+            let mut selected = original.clone();
+            selected.disposition = disposition;
+            let partition = ShardIndexPartition::rebuild(
+                "ccm",
+                original.semantic_digest.0[..2].to_owned(),
+                vec![selected],
+            )
+            .unwrap();
+            assert_eq!(
+                partition
+                    .blocks_exact_manifest(&original.semantic_digest, &original.manifest_digest,),
+                matches!(
+                    disposition,
+                    ArtifactDisposition::Quarantined | ArtifactDisposition::Revoked
+                )
+            );
+            assert!(!partition.blocks_exact_manifest(
+                &original.semantic_digest,
+                &ContentDigest::sha256(b"different-manifest"),
+            ));
+        }
+        let empty =
+            ShardIndexPartition::rebuild("ccm", original.semantic_digest.0[..2].to_owned(), vec![])
+                .unwrap();
+        assert!(!empty.blocks_exact_manifest(&original.semantic_digest, &original.manifest_digest));
     }
 
     #[test]

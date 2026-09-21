@@ -1004,6 +1004,49 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "arb")]
+    fn replayed_finite_certificate_bounds_source_angle_and_rejects_wrong_binding() {
+        use crate::ccm::{state_geometry::RetainedState, transform_enclosure::test_source_error};
+        let mut certificate = synthetic_certificate();
+        let ver = serde_json::json!({"major":0,"minor":15,"patch":1,"prerelease":null});
+        let manifest=serde_json::from_value(serde_json::json!({
+            "schema_version":1,"key":{"kind":"ccm_weil_eigenpair","logical_key":"synthetic finite angle","parameters_digest":digest("key")},
+            "content_digest":digest("state"),"size_bytes":0,"objects":[],"created_unix_seconds":1,
+            "producer_toolkit_version":ver,"minimum_reader_version":ver,"maximum_reader_version":null,"quality":"validated","visibility":"local","immutable":true,"dependencies":[],"tags":{},"provenance_digest":null
+        })).unwrap();
+        let mut state = RetainedState {
+            manifest,
+            cutoff: "5".into(),
+            modes: 2,
+            precision: 128,
+            coefficients: [0, 0, 1, 0, 0]
+                .iter()
+                .map(|v| Float::with_val(128, *v))
+                .collect(),
+            eigenvalue: "1".into(),
+            selection_policy: Some("synthetic even ground".into()),
+        };
+        let exact = test_source_error(&state, &certificate).unwrap();
+        assert!(exact.contains_zero());
+        state.coefficients[1] = Float::with_val(128, 1) / 100;
+        state.coefficients[3] = state.coefficients[1].clone();
+        let allowance = test_source_error(&state, &certificate).unwrap();
+        let norm = Float::with_val(128, 1) + Float::with_val(128, 2) / 10000u32;
+        let actual = (Float::with_val(128, 2) - Float::with_val(128, 2) / norm.sqrt()).sqrt();
+        assert!(allowance.upper() >= &actual);
+        assert!(allowance.upper() < &Float::with_val(128, 0.021));
+        let mut malformed = certificate.clone();
+        malformed.n_modes = usize::MAX;
+        let completion = crate::ccm::research_completion::CompletionInputs {
+            sector_certificate: Some(malformed),
+            ..Default::default()
+        };
+        assert!(completion.validate(5, 128).is_err());
+        certificate.lambda_squared = "6".into();
+        assert!(test_source_error(&state, &certificate).is_err());
+    }
+
+    #[test]
     fn exact_sector_certificate_replays_and_proves_the_finite_claims() {
         let certificate = synthetic_certificate();
         let report = verify_portable_ccm_sector_gap_certificate(&certificate);

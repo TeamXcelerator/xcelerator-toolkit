@@ -129,3 +129,37 @@ fn external_consumer_can_record_and_validate_partial_capture() {
     assert!(!result.receipt.is_complete());
     assert_eq!(result.receipt.outcomes().len(), 2);
 }
+
+#[test]
+fn current_ultra_requests_retained_research_without_changing_primary_algorithm() {
+    let plan = xc_spectral::ccm::capture::CcmCapturePlan::ultra(8, 17).unwrap();
+    plan.validate().unwrap();
+    assert!(
+        plan.capture_state_geometry
+            && plan.capture_retained_research
+            && plan.capture_extended_research
+    );
+    assert!(plan
+        .receipt()
+        .unwrap()
+        .outcomes()
+        .contains_key("directional_response_full"));
+    assert!(!plan.changes_numerical_algorithm && !plan.certification_requested);
+    assert!(plan.capture_reference_projection);
+    for id in [
+        "capture_preflight",
+        "consistency",
+        "configuration_comparison",
+        "band_reconstruction",
+        "transform_enclosure",
+    ] {
+        assert!(plan.receipt().unwrap().outcomes().contains_key(id));
+    }
+    assert!(
+        plan.clone()
+            .with_reference_projection()
+            .unwrap()
+            .capture_reference_projection
+    );
+    assert_eq!(plan.semantics, "ccm-measurement-capture-plan-v6");
+}

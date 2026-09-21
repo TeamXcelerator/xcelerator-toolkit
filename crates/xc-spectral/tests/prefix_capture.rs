@@ -7,6 +7,108 @@ use xc_cache::{
     ToolkitVersion,
 };
 use xc_spectral::ccm::prefix::*;
+#[path = "common/published_sources.rs"]
+mod published_sources;
+
+#[test]
+fn published_prefix_and_reduction_reuse_authenticate_canonical_parents() {
+    use xc_cache::*;
+    let root = std::env::temp_dir().join(format!("published-prefix-{}", std::process::id()));
+    let producer = FilesystemCacheStore::new(
+        "producer",
+        root.join("producer"),
+        true,
+        CacheVisibility::Local,
+    );
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(producer),
+    }]);
+    let policy = CachePolicy {
+        current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        minimum_quality: CacheQuality::Validated,
+        accepted_schema_versions: vec![1],
+        allow_deprecated: false,
+        allow_quarantined: false,
+        allowed_visibilities: vec![CacheVisibility::Local],
+    };
+    let mut cache = ArtifactCacheContext {
+        resolver: Some(&resolver),
+        reference_resolver: None,
+        acceptance: Some(&policy),
+        ordered_overlays: vec!["producer".into()],
+        mode: ArtifactExecutionCacheMode::PreferReuse,
+        write_on_miss: true,
+        write_visibility: CacheVisibility::Local,
+        requested_assurance: xc_core::AssuranceLevel::Computed,
+        certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+        production_sink: None,
+    };
+    let (m, bytes) = matrix();
+    let m = published_sources::published(m, &[]);
+    let a = read_matrix(&m, &bytes);
+    let prefix = analyze_retained_prefixes_via_cache(&a, &options(), &[], &cache).unwrap();
+    let reduction = check_retained_reduction_via_cache(&a, 256, 2, "1e-60", &cache).unwrap();
+    let remote = FilesystemCacheStore::new(
+        "published",
+        root.join("published"),
+        true,
+        CacheVisibility::Local,
+    );
+    for (manifest, payload) in [
+        (
+            prefix.produced_manifest.as_ref().unwrap(),
+            serde_json::to_vec(&prefix.value).unwrap(),
+        ),
+        (
+            reduction.produced_manifest.as_ref().unwrap(),
+            serde_json::to_vec(&reduction.value).unwrap(),
+        ),
+    ] {
+        let p = published_sources::published(manifest.clone(), &[&m]);
+        remote
+            .put(
+                &ArtifactDraft {
+                    schema_version: p.schema_version,
+                    key: p.key,
+                    producer_toolkit_version: p.producer_toolkit_version,
+                    minimum_reader_version: p.minimum_reader_version,
+                    maximum_reader_version: p.maximum_reader_version,
+                    quality: p.quality,
+                    visibility: p.visibility,
+                    immutable: p.immutable,
+                    dependencies: p.dependencies,
+                    tags: p.tags,
+                    provenance_digest: p.provenance_digest,
+                },
+                &payload,
+            )
+            .unwrap();
+    }
+    let published = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(remote),
+    }]);
+    cache.resolver = Some(&published);
+    cache.mode = ArtifactExecutionCacheMode::RequireReuse;
+    cache.write_on_miss = false;
+    let reused = analyze_retained_prefixes_via_cache(&a, &options(), &[], &cache).unwrap();
+    assert!(reused.reused_manifest.unwrap().dependencies.is_empty());
+    assert_eq!(reused.value, prefix.value);
+    let reused = check_retained_reduction_via_cache(&a, 256, 2, "1e-60", &cache).unwrap();
+    assert!(reused.reused_manifest.unwrap().dependencies.is_empty());
+    assert_eq!(
+        serde_json::to_value(reused.value).unwrap(),
+        serde_json::to_value(reduction.value).unwrap()
+    );
+    // Identical matrix bytes with different published ancestry cannot satisfy
+    // the child manifest, even though they retain the same lookup key.
+    let wrong = published_sources::published(m.clone(), &[&m]);
+    let wrong = read_matrix(&wrong, &bytes);
+    assert!(analyze_retained_prefixes_via_cache(&wrong, &options(), &[], &cache).is_err());
+    assert!(check_retained_reduction_via_cache(&wrong, 256, 2, "1e-60", &cache).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
 
 fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
     let bytes = serde_json::to_vec(&value).unwrap();

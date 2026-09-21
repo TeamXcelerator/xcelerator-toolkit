@@ -1,20 +1,17 @@
-# Treat reference data as binary so SHA-256 hashes are stable across
-# platforms (no autocrlf line-ending conversion on Windows checkouts).
-data/*.json -text
+# Canonical text bytes in commits and checkouts, including Windows/WSL workflows.
+* text=auto eol=lf
+
+# Exact reference bytes participate in scientific provenance. Never convert them.
+**/data/*.json -text
 *.pdf binary
 
-# Shell scripts must be checked out with LF line endings, even on Windows,
-# so they execute correctly on Linux (Vast) without "bad interpreter" errors.
+# Executable tooling must retain a kernel-readable LF shebang.
 *.sh text eol=lf
+tools/*.py text eol=lf
 
-# Rust / TOML / Markdown / lock files — let git auto-handle.
-*.rs text
-*.toml text
-*.md text
-*.lock text
-
-# Repository administration tooling and manifests.
-scripts/*.py text eol=lf
-scripts/tests/*.py text eol=lf
-config/*.json text eol=lf
-config/*.txt text eol=lf
+*.rs text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.lock text eol=lf

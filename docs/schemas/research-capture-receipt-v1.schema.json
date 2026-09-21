@@ -247,6 +247,83 @@
           }
         }
       }
+    },
+    "numerical_coverage": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "outcome",
+          "retained_rows",
+          "expected_rows",
+          "resolved_rows",
+          "qualified_rows",
+          "unresolved_rows",
+          "row_outcomes",
+          "reason",
+          "recovery"
+        ],
+        "properties": {
+          "outcome": {
+            "type": "string"
+          },
+          "retained_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "expected_rows": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resolved_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "qualified_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "unresolved_rows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "row_outcomes": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "recovery": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
     }
   }
 }

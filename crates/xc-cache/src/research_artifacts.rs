@@ -50,12 +50,113 @@ fn safe_failure_reason(error: impl std::fmt::Display) -> String {
     }
 }
 
+/// Numerical coverage is separate from successful acquisition. Unknown legacy
+/// payloads remain unassessed; a saved conditional expression is not a resolved result.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NumericalCoverage {
+    pub outcome: String,
+    pub retained_rows: usize,
+    pub expected_rows: Option<usize>,
+    pub resolved_rows: usize,
+    pub qualified_rows: usize,
+    pub unresolved_rows: usize,
+    pub row_outcomes: BTreeMap<String, usize>,
+    pub reason: Option<String>,
+    pub recovery: Option<String>,
+}
+impl NumericalCoverage {
+    pub fn from_value(value: &serde_json::Value) -> Self {
+        let data = value.get("data").unwrap_or(value);
+        let mut result = Self {
+            outcome: "unassessed".into(),
+            reason: data["reason"].as_str().map(str::to_owned),
+            expected_rows: value["request"]["expected_rows"]
+                .as_u64()
+                .and_then(|n| n.try_into().ok()),
+            ..Self::default()
+        };
+        if let Some(rows) = data["rows"].as_array() {
+            result.retained_rows = rows.len();
+            for row in rows {
+                let outcome = row["outcome"].as_str().unwrap_or("unassessed");
+                *result.row_outcomes.entry(outcome.into()).or_default() += 1;
+                match outcome {
+                    "point_measurement" | "certified_finite_enclosure" => result.resolved_rows += 1,
+                    "conditional_budget_met"
+                    | "conditional_budget_not_met"
+                    | "channels_resolved_budget_unassessed" => result.qualified_rows += 1,
+                    _ => result.unresolved_rows += 1,
+                }
+            }
+        }
+        let outcome = data["outcome"].as_str().unwrap_or("unassessed");
+        result.outcome = if result.unresolved_rows > 0
+            || result
+                .expected_rows
+                .is_some_and(|n| n > result.retained_rows)
+        {
+            "partial_unresolved"
+        } else if result.qualified_rows > 0 {
+            "qualified"
+        } else {
+            outcome
+        }
+        .into();
+        if !matches!(
+            result.outcome.as_str(),
+            "point_measurement" | "certified_finite_enclosure"
+        ) {
+            result.recovery = Some("inspect retained outcome and prerequisite fields; rerun only this diagnostic with corrected inputs or an explicit resource/precision policy; reuse primary sources".into());
+        }
+        result
+    }
+}
+
 pub struct CapturedDiagnostic {
     pub value: serde_json::Value,
     /// Exact manifests supplied by the diagnostic's authenticated cache route.
     pub sources: Vec<ArtifactManifest>,
 }
 impl CapturedDiagnostic {
+    /// A retained qualified-absence record must not become a completed measurement.
+    pub fn qualified(self) -> Result<Self, CaptureFailure> {
+        if matches!(
+            self.value["kind"].as_str(),
+            Some(
+                "ccm_compactness_analysis"
+                    | "ccm_weighted_reference_projection"
+                    | "ccm_signed_transform_analysis"
+                    | "ccm_arithmetic_energy_analysis"
+                    | "ccm_directional_response_analysis"
+                    | "ccm_weighted_tail_analysis"
+                    | "ccm_spectral_cluster_analysis"
+                    | "ccm_resolution_budget_analysis"
+                    | "ccm_energy_allowance_analysis"
+                    | "ccm_complex_transform_analysis"
+                    | "ccm_root_transport_analysis"
+                    | "ccm_operator_cluster_analysis"
+                    | "ccm_finite_section_transfer"
+                    | "ccm_tail_operator_analysis"
+                    | "ccm_observable_budget_analysis"
+                    | "ccm_reference_projection_analysis"
+                    | "ccm_capture_preflight"
+                    | "ccm_consistency_analysis"
+                    | "ccm_configuration_comparison"
+                    | "ccm_band_reconstruction"
+                    | "ccm_transform_enclosure"
+            )
+        ) && self.value["data"]["outcome"] == "missing_input"
+        {
+            return Err(CaptureFailure::Missing {
+                reason: self.value["data"]["reason"]
+                    .as_str()
+                    .unwrap_or("required retained inputs unavailable")
+                    .to_string(),
+            });
+        }
+        Ok(self)
+    }
     pub fn new<T: Serialize>(
         value: &T,
         sources: Vec<ArtifactManifest>,
@@ -93,6 +194,8 @@ pub struct CaptureArtifact {
     pub receipt: CaptureReceipt,
     pub measurements: BTreeMap<String, CapturedMeasurement>,
     pub source_dependencies: Vec<DependencyRef>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub numerical_coverage: BTreeMap<String, NumericalCoverage>,
 }
 
 fn canonical_dependencies(
@@ -156,6 +259,23 @@ fn measurement_evidence(
     })
 }
 impl CaptureArtifact {
+    /// Also works on historical receipts that do not embed a coverage summary.
+    pub fn coverage(&self) -> BTreeMap<String, NumericalCoverage> {
+        self.receipt.outcomes().iter().map(|(id, outcome)| {
+            let summary = if let Some(m) = self.measurements.get(id) {
+                NumericalCoverage::from_value(&m.value)
+            } else {
+                let (status, reason) = match outcome {
+                    DiagnosticOutcome::Missing { reason } => ("missing_input", reason.clone()),
+                    DiagnosticOutcome::Blocked { reason } => ("blocked", reason.clone()),
+                    DiagnosticOutcome::Failed { reason } => ("failed", reason.clone()),
+                    _ => ("unassessed", "no retained measurement".into()),
+                };
+                NumericalCoverage { outcome: status.into(), reason: Some(reason), recovery: Some("recover this diagnostic from retained sources; inspect prerequisite or error".into()), ..Default::default() }
+            };
+            (id.clone(), summary)
+        }).collect()
+    }
     pub fn validate(&self) -> Result<(), CacheError> {
         if self.schema_version != 1 || self.semantics != CAPTURE_RECORD_SEMANTICS {
             return Err(invalid("unsupported capture record"));
@@ -203,6 +323,9 @@ impl CaptureArtifact {
         )?;
         if deps != self.source_dependencies {
             return Err(invalid("capture dependency closure mismatch"));
+        }
+        if !self.numerical_coverage.is_empty() && self.numerical_coverage != self.coverage() {
+            return Err(invalid("capture numerical coverage mismatch"));
         }
         xc_core::validate_secret_free(self, "capture record").map_err(|e| invalid(e.to_string()))
     }
@@ -274,6 +397,9 @@ pub fn repair_capture_measurements(
             .values()
             .flat_map(|m| m.source_dependencies.clone()),
     )?;
+    if !original.numerical_coverage.is_empty() {
+        repaired.numerical_coverage = repaired.coverage();
+    }
     repaired.validate()?;
     Ok(repaired)
 }
@@ -298,7 +424,7 @@ where
         .map_err(|e| invalid(e.to_string()))?;
     let mut measurements = BTreeMap::new();
     for id in &requested {
-        let outcome = match execute(id) {
+        let outcome = match execute(id).and_then(CapturedDiagnostic::qualified) {
             Ok(diagnostic) => {
                 let measurement = (|| {
                     xc_core::validate_secret_free(&diagnostic.value, "capture measurement")
@@ -338,7 +464,7 @@ where
             .values()
             .flat_map(|m| m.source_dependencies.clone()),
     )?;
-    let record = CaptureArtifact {
+    let mut record = CaptureArtifact {
         schema_version: 1,
         semantics: CAPTURE_RECORD_SEMANTICS.into(),
         resolved_plan,
@@ -346,7 +472,9 @@ where
         receipt,
         measurements,
         source_dependencies,
+        numerical_coverage: BTreeMap::new(),
     };
+    record.numerical_coverage = record.coverage();
     record.validate()?;
     Ok(record)
 }
@@ -424,7 +552,18 @@ where
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+        minimum_reader_version: ToolkitVersion::parse(
+            if kind == CAPTURE_RECEIPT_KIND
+                && serde_json::to_value(record)
+                    .map_err(|e| invalid(e.to_string()))?
+                    .get("numerical_coverage")
+                    .is_some()
+            {
+                "0.15.1"
+            } else {
+                "0.15.0"
+            },
+        )?,
         maximum_reader_version: None,
         tags,
         provenance_digest: None,
@@ -897,5 +1036,57 @@ mod tests {
         )
         .is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    #[test]
+    fn acquired_rows_are_not_automatically_resolved() {
+        let c = NumericalCoverage::from_value(
+            &serde_json::json!({"request":{"expected_rows":4},"data":{"outcome":"point_measurement","rows":[{"outcome":"point_measurement"},{"outcome":"unresolved_denominator"},{"outcome":"conditional_budget_met"}]}}),
+        );
+        assert_eq!(c.retained_rows, 3);
+        assert_eq!(c.expected_rows, Some(4));
+        assert_eq!(c.resolved_rows, 1);
+        assert_eq!(c.qualified_rows, 1);
+        assert_eq!(c.unresolved_rows, 1);
+        assert_eq!(c.outcome, "partial_unresolved");
+        assert!(c.recovery.is_some());
+        let legacy = NumericalCoverage::from_value(&serde_json::json!({"value":"3"}));
+        assert_eq!(legacy.outcome, "unassessed");
+        assert_eq!(legacy.expected_rows, None);
+    }
+    #[test]
+    fn summaries_are_validated_and_historical_receipts_remain_readable() {
+        let r=collect_capture(&serde_json::json!({"policy":"test"}),vec!["a".into()],|_|CapturedDiagnostic::new(&serde_json::json!({"data":{"outcome":"partial_unresolved","reason":"no slope"}}),vec![]).map_err(CaptureFailure::failed)).unwrap();
+        assert_eq!(r.numerical_coverage["a"].outcome, "partial_unresolved");
+        let mut corrupted = r.clone();
+        corrupted.numerical_coverage.get_mut("a").unwrap().outcome = "point_measurement".into();
+        assert!(corrupted.validate().is_err());
+        let mut historical = serde_json::to_value(r).unwrap();
+        historical
+            .as_object_mut()
+            .unwrap()
+            .remove("numerical_coverage");
+        serde_json::from_value::<CaptureArtifact>(historical)
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod enclosure_coverage_audit {
+    #[test]
+    fn enclosure_rows_remain_distinct_from_point_samples() {
+        let c = super::NumericalCoverage::from_value(
+            &serde_json::json!({"data":{"outcome":"partial_unresolved","rows":[{"outcome":"certified_finite_enclosure"},{"outcome":"point_measurement"},{"outcome":"missing_input"}]}}),
+        );
+        assert_eq!(c.resolved_rows, 2);
+        assert_eq!(c.unresolved_rows, 1);
+        assert_eq!(c.row_outcomes["certified_finite_enclosure"], 1);
+        assert_eq!(c.row_outcomes["point_measurement"], 1);
     }
 }

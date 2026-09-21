@@ -839,7 +839,9 @@ pub fn analyze_retained_prefixes_via_cache(
         .as_ref()
         .or(result.reused_manifest.as_ref())
     {
-        if manifest.dependencies != dependencies {
+        let mut sources = vec![&matrix.manifest];
+        sources.extend(eigenpairs.iter().map(|e| &e.manifest));
+        if !xc_cache::manifest_sources_match(manifest, &sources)? {
             bail!("cached prefix source dependency bindings differ");
         }
     }
@@ -1252,13 +1254,14 @@ pub fn check_retained_reduction_via_cache(
             Ok(())
         },
     )?;
-    if result
+    if let Some(manifest) = result
         .produced_manifest
         .as_ref()
         .or(result.reused_manifest.as_ref())
-        .is_some_and(|m| m.dependencies != dependencies)
     {
-        bail!("retained reduction dependency closure mismatch");
+        if !xc_cache::manifest_sources_match(manifest, &[&matrix.manifest])? {
+            bail!("retained reduction dependency closure mismatch");
+        }
     }
     Ok(result)
 }

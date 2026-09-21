@@ -1350,6 +1350,8 @@ const PROLATE_KINDS: &[&str] = &[
     "ccm_prolate_basis",
     "ccm_prolate_candidate",
     "ccm_band_concentration",
+    "ccm_reference_source",
+    "ccm_external_research_source",
 ];
 const CCM_ROOT_KINDS: &[&str] = &[
     "ccm_secular_source",
@@ -1359,10 +1361,35 @@ const CCM_ROOT_KINDS: &[&str] = &[
     "ccm_spectral_window",
 ];
 const CCM_EVIDENCE_KINDS: &[&str] = &[
+    "ccm_compactness_analysis",
+    "ccm_arithmetic_energy_analysis",
+    "ccm_directional_response_analysis",
+    "ccm_weighted_tail_analysis",
+    "ccm_spectral_cluster_analysis",
+    "ccm_resolution_budget_analysis",
+    "ccm_energy_allowance_analysis",
+    "ccm_complex_transform_analysis",
+    "ccm_root_transport_analysis",
+    "ccm_operator_cluster_analysis",
+    "ccm_finite_section_transfer",
+    "ccm_tail_operator_analysis",
+    "ccm_observable_budget_analysis",
+    "ccm_capture_preflight",
+    "ccm_consistency_analysis",
+    "ccm_configuration_comparison",
+    "ccm_band_reconstruction",
+    "ccm_transform_enclosure",
     "research_capture_receipt",
     "research_hypothesis_evaluation",
     "ccm_prefix_analysis",
     "ccm_retained_reduction_check",
+    "ccm_state_geometry_analysis",
+    "research_observation_packet",
+    "research_reference_dataset",
+    "ccm_indexed_transform_analysis",
+    "ccm_operator_energy_analysis",
+    "ccm_root_band_analysis",
+    "ccm_stabilization_analysis",
     "ccm_convergence_diagnostics",
     "ccm_root_conditioning_analysis",
     "ccm_prime_power_response_analysis",
@@ -1379,6 +1406,9 @@ const CCM_EVIDENCE_KINDS: &[&str] = &[
 /// eigenstate plus a stated quadrature convention, and are published so that
 /// downstream analysis does not have to repeat the spectral solve.
 const CCM_DISTANCE_KINDS: &[&str] = &[
+    "ccm_weighted_reference_projection",
+    "ccm_signed_transform_analysis",
+    "ccm_reference_projection_analysis",
     "ccm_deviation_decomposition",
     "ccm_discretization_distance",
     "ccm_distance_resolution_evidence",
@@ -1395,6 +1425,20 @@ const CCM_DISTANCE_KINDS: &[&str] = &[
 /// and an explicit public-only request fails when nothing staged is
 /// public-eligible.
 const PRIVATE_ONLY_ARTIFACT_KINDS: &[&str] = &[
+    "ccm_band_reconstruction",
+    "ccm_configuration_comparison",
+    "ccm_external_research_source",
+    "ccm_weighted_reference_projection",
+    "ccm_signed_transform_analysis",
+    "ccm_arithmetic_energy_analysis",
+    "ccm_weighted_tail_analysis",
+    "ccm_spectral_cluster_analysis",
+    "ccm_energy_allowance_analysis",
+    "ccm_operator_cluster_analysis",
+    "ccm_tail_operator_analysis",
+    "research_observation_packet",
+    "ccm_reference_source",
+    "ccm_reference_projection_analysis",
     "research_capture_receipt",
     "research_hypothesis_evaluation",
     "ccm_deviation_decomposition",
@@ -1425,10 +1469,30 @@ pub fn artifact_semantics_admitted_to_destination(
     if !artifact_kind_admitted_to_destination(&semantic.artifact_kind, destination) {
         return false;
     }
-    if matches!(
-        semantic.artifact_kind.as_str(),
-        "ccm_prefix_analysis" | "ccm_retained_reduction_check"
-    ) {
+    if let Some(public) = semantic
+        .resolved_mathematical_parameters
+        .get("source_parents_are_public")
+    {
+        return public.as_bool() == Some(true);
+    }
+    if semantic
+        .mathematical_semantics_version
+        .starts_with("ccm-retained-research-")
+        || matches!(
+            semantic.artifact_kind.as_str(),
+            "ccm_compactness_analysis"
+                | "ccm_directional_response_analysis"
+                | "ccm_resolution_budget_analysis"
+                | "ccm_prefix_analysis"
+                | "ccm_retained_reduction_check"
+                | "ccm_state_geometry_analysis"
+                | "research_reference_dataset"
+                | "ccm_indexed_transform_analysis"
+                | "ccm_operator_energy_analysis"
+                | "ccm_root_band_analysis"
+                | "ccm_stabilization_analysis"
+        )
+    {
         // Missing policy in historical private children fails closed. The
         // producing retained-source API derives this flag from authenticated parents.
         return semantic
@@ -3746,11 +3810,22 @@ mod prefix_routing_tests {
 mod source_visibility_tests {
     #[test]
     fn retained_diagnostics_need_explicit_public_source_eligibility() {
-        for kind in ["ccm_prefix_analysis", "ccm_retained_reduction_check"] {
+        for kind in [
+            "ccm_prefix_analysis",
+            "ccm_retained_reduction_check",
+            "ccm_capture_preflight",
+            "ccm_complex_transform_analysis",
+            "ccm_consistency_analysis",
+            "ccm_finite_section_transfer",
+            "ccm_observable_budget_analysis",
+            "ccm_root_transport_analysis",
+            "ccm_transform_enclosure",
+            "future_retained_kind",
+        ] {
             let mut key = crate::SemanticKeyEnvelope {
                 schema_version: 1,
                 artifact_kind: kind.into(),
-                mathematical_semantics_version: "test-v1".into(),
+                mathematical_semantics_version: "ccm-retained-research-observations-v1".into(),
                 resolved_mathematical_parameters: serde_json::json!({}),
                 normalization: None,
                 target: None,

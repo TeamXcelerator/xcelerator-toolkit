@@ -1092,6 +1092,10 @@ pub enum LambdaSquaredMode {
 
 impl ExactLambdaSquaredHp {
     pub fn new(decimal: xc_core::DecimalLiteral, prime_cutoff: u64) -> Result<Self> {
+        let one = xc_core::DecimalLiteral::new("1")?;
+        if !decimal.cmp_numeric(&one)?.is_gt() {
+            bail!("lambda-squared must be greater than one");
+        }
         let floor = xc_core::DecimalLiteral::new(prime_cutoff.to_string())?;
         let ordering = decimal.cmp_numeric(&floor)?;
         if ordering.is_lt() {
@@ -1147,13 +1151,27 @@ pub fn localized_weil_form_exact_hp(
     cfg: &HighPrecConfig,
     include_primes: bool,
 ) -> Result<ExactCcmWeilFormHp> {
+    // Public fields and deserialization can bypass `new`; check the complete
+    // exact identity again before numerical work or provenance is produced.
+    let validated =
+        ExactLambdaSquaredHp::new(lambda_squared.decimal.clone(), lambda_squared.prime_cutoff)?;
+    if validated.mode != lambda_squared.mode {
+        bail!("lambda-squared mode disagrees with its exact decimal value");
+    }
+    let dimension = n_modes
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("CCM matrix dimension overflow"))?;
+    dimension
+        .checked_mul(dimension)
+        .ok_or_else(|| anyhow::anyhow!("CCM matrix element count overflow"))?;
     xc_numerics::hp_runtime::run_hp(|| {
         let parsed = Float::parse(lambda_squared.decimal.as_str()).map_err(|error| {
             anyhow::anyhow!("failed to parse exact lambda-squared literal for MPFR: {error}")
         })?;
         let value = Float::with_val(cfg.precision_bits, parsed);
-        if value <= 0 {
-            bail!("lambda-squared must be positive");
+        if !value.is_finite() || value <= 1 {
+            bail!("working precision must resolve finite lambda-squared greater than one");
         }
         let l = value.ln();
         let mut matrix = build_tau_hp_compute_exact(
@@ -1163,7 +1181,7 @@ pub fn localized_weil_form_exact_hp(
             cfg,
             include_primes,
         )?;
-        force_symmetric(&mut matrix, 2 * n_modes + 1);
+        force_symmetric(&mut matrix, dimension);
         let prime_content = if include_primes {
             prime_powers_up_to(lambda_squared.prime_cutoff)
                 .into_iter()
@@ -1447,7 +1465,8 @@ pub enum RootSolver {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RootPrecisionPolicy {
-    /// Preserve the historical fixed 64-bit guard and cache identity.
+    /// Use a fixed 64-bit guard with source-bound identity and directed
+    /// confirmation of the stored root point.
     #[default]
     FixedGuard,
     /// Escalate root-only arithmetic until the requested target is confirmed
@@ -1508,10 +1527,9 @@ pub const MAX_QUAD_POINTS: usize = 4000;
 /// Multiplier: quad_points = digits * QUAD_POINTS_PER_DIGIT (clamped to [MIN, MAX]).
 pub const QUAD_POINTS_PER_DIGIT: usize = 3;
 
-/// HP singularity guard for `rho_hp(x)` near `x = 0`. Below this magnitude
-/// we use the Taylor-series branch instead of `1 / (2 sinh(x/2))` directly.
-/// Stored as a string literal so it is parsed as an HP `Float` at the
-/// caller's working precision (no f64 round-trip).
+/// Historical small-x threshold, retained for source compatibility.
+/// HP rho evaluation now uses exp(x/2)/(2 sinh(x)) at every nonzero x;
+/// a fixed two-term Taylor approximation cannot support arbitrary precision.
 pub const HP_SINGULARITY_GUARD_STR: &str = "1e-30";
 
 impl HighPrecConfig {
@@ -1574,9 +1592,9 @@ impl HighPrecConfig {
         self.force_even = policy.legacy_force_even();
     }
 
-    /// Opt in to adaptive root-only precision and its distinct v9 cache
-    /// identity. The default remains the historical fixed-guard policy so
-    /// existing claim scripts retain byte-identical root artifacts.
+    /// Opt in to adaptive root-only precision and its distinct cache identity.
+    /// This refines the exact stored secular source; it does not increase the
+    /// upstream matrix or eigenstate precision. The default uses a fixed guard.
     pub fn with_adaptive_root_precision(mut self) -> Self {
         self.root_precision_policy = RootPrecisionPolicy::Adaptive;
         self
@@ -2406,14 +2424,19 @@ pub fn select_ccm_state_hp(
     };
     let mut selected = eligible[0];
     let mut selected_score = score(selected);
+    let mut ambiguous = false;
     for candidate in eligible.iter().skip(1) {
         let candidate_score = score(candidate);
         if candidate_score < selected_score {
             selected = candidate;
             selected_score = candidate_score;
+            ambiguous = false;
         } else if candidate_score == selected_score {
-            anyhow::bail!("requested CCM state target is ambiguous at the selected boundary");
+            ambiguous = true;
         }
+    }
+    if ambiguous {
+        anyhow::bail!("requested CCM state target is ambiguous at the selected boundary");
     }
     Ok(SelectedCcmStateHp {
         requested_target: target,
@@ -6959,7 +6982,12 @@ fn adaptive_root_outcome(
                         poles,
                         stored_value,
                         result.diagnostics.iterations,
-                        Float::with_val(base_precision, &verification_correction),
+                        Float::with_val_round(
+                            base_precision,
+                            &verification_correction,
+                            rug::float::Round::Up,
+                        )
+                        .0,
                         target_bits,
                         base_precision,
                     )
@@ -7470,7 +7498,7 @@ fn decode_root_range(
 ) -> std::result::Result<Vec<EigenvalueResult>, CacheError> {
     let parity_policy = cfg.effective_parity_policy();
     let adaptive_precision = cfg.root_precision_policy == RootPrecisionPolicy::Adaptive;
-    let expected_schema = if adaptive_precision { 5 } else { 3 };
+    let expected_schema = if adaptive_precision { 5 } else { 6 };
     let expected_target_bits = cfg.precision_bits.saturating_sub(GUARD_BITS).max(1);
     let expected_seeds: Vec<String> = seeds.iter().map(Float::to_string).collect();
     if artifact.schema_version != expected_schema
@@ -7497,14 +7525,14 @@ fn decode_root_range(
                 || artifact.maximum_extra_precision_bits
                     != Some(cfg.root_maximum_extra_precision_bits)
                 || artifact.verification_precision_bits
-                    != Some(cfg.root_verification_precision_bits)
-                || artifact.secular_source_content_digest.as_ref() != secular_source_digest))
+                    != Some(cfg.root_verification_precision_bits)))
+        || secular_source_digest.is_none()
+        || artifact.secular_source_content_digest.as_ref() != secular_source_digest
         || (!adaptive_precision
             && (artifact.root_precision_policy.is_some()
                 || artifact.target_precision_bits.is_some()
                 || artifact.maximum_extra_precision_bits.is_some()
-                || artifact.verification_precision_bits.is_some()
-                || artifact.secular_source_content_digest.is_some()))
+                || artifact.verification_precision_bits.is_some()))
     {
         return Err(CacheError::InvalidManifest(
             "CCM root-range payload does not match its semantic identity".to_owned(),
@@ -7580,7 +7608,14 @@ fn decode_root_range(
             )
             .is_err()
         } else {
+            let confirmed_correction = cfg
+                .precision_bits
+                .checked_add(GUARD_BITS)
+                .and_then(|p| secular_correction_at(xi, &poles, value, p, cfg.root_solver))
+                .map(|v| Float::with_val_round(cfg.precision_bits, v, rug::float::Round::Up).0);
             portable_result.adaptive_precision.is_some()
+                || (status == "converged"
+                    && confirmed_correction.as_ref() != Some(&result.diagnostics.final_correction))
                 || (status == "converged" && !correction_meets_target)
                 || (status != "converged" && correction_meets_target)
                 || (status == "approximate" && result.diagnostics.iterations != cfg.solver_steps)
@@ -7640,10 +7675,11 @@ fn root_range_semantic_key(
     let seed_strings: Vec<String> = seeds.iter().map(Float::to_string).collect();
     let parity_policy = cfg.effective_parity_policy();
     cfg.validate_root_precision_policy()?;
-    if cfg.root_precision_policy == RootPrecisionPolicy::Adaptive && secular_source_digest.is_none()
-    {
-        bail!("adaptive CCM root precision requires the exact secular-source content digest");
-    }
+    let secular_source_digest = secular_source_digest
+        .filter(|digest| digest.validate())
+        .ok_or_else(|| {
+            anyhow::anyhow!("CCM root identity requires the exact secular-source content digest")
+        })?;
     let mut resolved_parameters = serde_json::json!({
         "lambda_squared": lambda_squared_cache_identity(params),
         "n_modes": params.n_modes,
@@ -7657,7 +7693,9 @@ fn root_range_semantic_key(
         "completeness": semantics.completeness(artifact_mode),
         "solver": cfg.root_solver.display_name().to_ascii_lowercase(),
         "solver_steps": cfg.solver_steps,
-        "accuracy_guard_bits": GUARD_BITS
+        "accuracy_guard_bits": GUARD_BITS,
+        "convergence_confirmation": "directed_interval_newton_at_stored_point_v1",
+        "secular_source_content_digest": secular_source_digest.0
     });
     if cfg.root_precision_policy == RootPrecisionPolicy::Adaptive {
         let parameters = resolved_parameters
@@ -7686,10 +7724,6 @@ fn root_range_semantic_key(
         parameters.insert(
             "precision_escalation_rule".to_owned(),
             serde_json::json!("double_extra_bits_from_64_bit_quantum_v1"),
-        );
-        parameters.insert(
-            "secular_source_content_digest".to_owned(),
-            serde_json::json!(secular_source_digest.expect("adaptive source digest").0),
         );
     }
     add_adaptive_parity_parameter(&mut resolved_parameters, parity_policy);
@@ -7736,14 +7770,10 @@ fn root_range_semantic_key(
             )])
         })
         .unwrap_or_default();
-    if cfg.root_precision_policy == RootPrecisionPolicy::Adaptive {
-        source_data_identities.insert(
-            "ccm_secular_source".to_owned(),
-            secular_source_digest
-                .expect("adaptive source digest")
-                .clone(),
-        );
-    }
+    source_data_identities.insert(
+        "ccm_secular_source".to_owned(),
+        secular_source_digest.clone(),
+    );
     Ok(SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: match artifact_mode {
@@ -7752,13 +7782,13 @@ fn root_range_semantic_key(
         }
         .to_owned(),
         mathematical_semantics_version: if semantics.is_complete_positive() {
-            "ccm-root-range-v0.15.0-v10"
+            "ccm-root-range-v0.15.1-v13"
         } else if cfg.root_precision_policy == RootPrecisionPolicy::Adaptive {
-            "ccm-root-range-v0.14.1-v9"
+            "ccm-root-range-v0.15.1-v12"
         } else if semantics.is_advanced() {
-            "ccm-root-range-v0.13.3-v7"
+            "ccm-root-range-v0.15.1-v11-advanced"
         } else {
-            "ccm-root-range-v0.13.0-v6"
+            "ccm-root-range-v0.15.1-v11"
         }
         .to_owned(),
         resolved_mathematical_parameters: resolved_parameters,
@@ -7931,7 +7961,10 @@ fn resolve_root_range_via_cache(
                 maximum_reader_version: None,
                 tags: BTreeMap::new(),
                 provenance_digest: None,
-                production_sink: None,
+                // A selected wider window is a retained source too. Observers
+                // need its authenticated payload, and publication needs its
+                // original dependency closure; neither requires new roots.
+                production_sink: cache.production_sink,
             };
             let validated_candidate = RefCell::new(None);
             let candidate = resolve_or_compute_json_artifact_with_dependencies(
@@ -8088,7 +8121,7 @@ fn resolve_root_range_via_cache(
                     schema_version: if cfg.root_precision_policy == RootPrecisionPolicy::Adaptive {
                         5
                     } else {
-                        3
+                        6
                     },
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
@@ -8119,9 +8152,7 @@ fn resolve_root_range_via_cache(
                     verification_precision_bits: (cfg.root_precision_policy
                         == RootPrecisionPolicy::Adaptive)
                         .then_some(cfg.root_verification_precision_bits),
-                    secular_source_content_digest: (cfg.root_precision_policy
-                        == RootPrecisionPolicy::Adaptive)
-                        .then_some(secular_manifest.content_digest.clone()),
+                    secular_source_content_digest: Some(secular_manifest.content_digest.clone()),
                 },
                 dependencies,
             ))
@@ -9223,27 +9254,8 @@ struct UFlowVelocityActions {
     tau_total: Vec<Float>,
 }
 
-fn rho_hp_velocity_with_guard(
-    x: &Float,
-    x_velocity: &Float,
-    tiny: &Float,
-    precision_bits: u32,
-) -> Float {
-    if x.cmp_abs(tiny)
-        .map(|ordering| ordering.is_lt())
-        .unwrap_or(false)
-    {
-        // This is the derivative of the same local approximation used by
-        // `rho_hp_with_guard`, not a second numerical convention.
-        let mut denominator = Float::with_val(precision_bits, x);
-        denominator.square_mut();
-        denominator *= 2u32;
-        let mut derivative = Float::with_val(precision_bits, -1);
-        derivative /= denominator;
-        derivative *= x_velocity;
-        return derivative;
-    }
-    let rho = rho_hp_with_guard(x, tiny, precision_bits);
+fn rho_hp_velocity(x: &Float, x_velocity: &Float, precision_bits: u32) -> Float {
+    let rho = rho_hp(x, precision_bits);
     let mut coth = Float::with_val(precision_bits, x).cosh();
     coth /= Float::with_val(precision_bits, x).sinh();
     let mut logarithmic_derivative = Float::with_val(precision_bits, 1);
@@ -9268,10 +9280,6 @@ fn compute_archimedean_integral_velocities_l(
     frequency /= l;
     let mut half_l = Float::with_val(precision_bits, l);
     half_l /= 2u32;
-    let singularity_guard = Float::with_val(
-        precision_bits,
-        Float::parse(HP_SINGULARITY_GUARD_STR).expect("static singularity guard parses"),
-    );
 
     let mut alpha_base = Float::with_val(precision_bits, 0);
     let mut alpha_integrand_velocity = Float::with_val(precision_bits, 0);
@@ -9286,13 +9294,12 @@ fn compute_archimedean_integral_velocities_l(
         x_velocity /= 2u32;
         let mut x = node_plus_one;
         x *= &half_l;
-        let rho = rho_hp_with_guard(&x, &singularity_guard, precision_bits);
-        let rho_velocity =
-            rho_hp_velocity_with_guard(&x, &x_velocity, &singularity_guard, precision_bits);
+        let rho = rho_hp(&x, precision_bits);
+        let rho_velocity = rho_hp_velocity(&x, &x_velocity, precision_bits);
         let mut phase = Float::with_val(precision_bits, &frequency);
         phase *= &x;
         let sine = phase.clone().sin();
-        let cosine = phase.cos();
+        let cosine = phase.clone().cos();
 
         if n != 0 {
             let mut base = Float::with_val(precision_bits, &sine);
@@ -9317,8 +9324,7 @@ fn compute_archimedean_integral_velocities_l(
         let mut negative_half = Float::with_val(precision_bits, &x);
         negative_half /= -2i32;
         let exponential = negative_half.exp();
-        let mut gamma_difference = Float::with_val(precision_bits, &cosine);
-        gamma_difference -= &exponential;
+        let gamma_difference = gamma_difference_hp(&phase, &x, precision_bits);
         let mut gamma_value = Float::with_val(precision_bits, &gamma_difference);
         gamma_value *= &rho;
         gamma_value *= weight;
@@ -10437,6 +10443,7 @@ fn resolve_prime_power_response_analysis_via_cache(
     Ok(resolved.value)
 }
 
+const U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS: &str = "ccm-u-flow-response-v0.15.1-v4";
 const U_FLOW_RESPONSE_NORMALIZATION: &str =
     "l2_eigenvector_gauge_with_sum_xi_equals_sqrt_u_and_moving_uniform_secular_poles";
 const U_FLOW_RESPONSE_VELOCITY_PARAMETER: &str = "u=log(lambda_squared)";
@@ -11073,7 +11080,7 @@ fn resolve_u_flow_response_analysis_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_u_flow_response_analysis".to_owned(),
-        mathematical_semantics_version: "ccm-u-flow-response-v0.15.0-v3".to_owned(),
+        mathematical_semantics_version: U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS.to_owned(),
         resolved_mathematical_parameters: resolved_parameters,
         normalization: Some(U_FLOW_RESPONSE_NORMALIZATION.to_owned()),
         target: Some("selected_ccm_state_and_root_complete_u_flow".to_owned()),
@@ -11111,7 +11118,7 @@ fn resolve_u_flow_response_analysis_via_cache(
             ),
         ]),
         algorithm_semantics: Some(
-            "analytic_tau_component_u_derivatives_even_sector_isolated_bordered_lu_and_moving_secular_poles_v2"
+            "analytic_tau_component_u_derivatives_stable_gamma_even_sector_isolated_bordered_lu_and_moving_secular_poles_v3"
                 .to_owned(),
         ),
     };
@@ -11137,7 +11144,7 @@ fn resolve_u_flow_response_analysis_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+        minimum_reader_version: ToolkitVersion::parse("0.15.1")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -14696,12 +14703,9 @@ fn signed_alpha(table: &[Float], n: i64, prec: u32) -> Float {
 }
 
 fn compute_kappa_half(l: &Float, prec: u32) -> Float {
-    let exp_l = l.clone().exp();
-    let mut numerator = exp_l.clone();
-    numerator -= 1u32;
-    let mut denominator = exp_l;
-    denominator += 1u32;
-    numerator /= &denominator;
+    let mut half_l = Float::with_val(prec, l);
+    half_l /= 2u32;
+    let mut numerator = half_l.tanh();
     let mut four_pi = pi(prec);
     four_pi *= 4u32;
     numerator *= &four_pi;
@@ -14712,8 +14716,8 @@ fn compute_kappa_half(l: &Float, prec: u32) -> Float {
 }
 
 /// Evaluate alpha, beta, and gamma in one ordered quadrature pass. Each
-/// accumulator follows the exact operation order of its former standalone
-/// evaluator; only node mapping, rho, phase cosine, and kappa are shared.
+/// accumulator follows the same operation order as the standalone test
+/// evaluator. Gamma uses a cancellation-free trigonometric/expm1 difference.
 fn compute_archimedean_integrals_l(
     n: i64,
     l: &Float,
@@ -14729,10 +14733,6 @@ fn compute_archimedean_integrals_l(
     frequency /= l;
     let mut half_l = l.clone();
     half_l /= 2u32;
-    let singularity_guard = Float::with_val(
-        prec,
-        Float::parse(HP_SINGULARITY_GUARD_STR).expect("static singularity guard parses"),
-    );
     let mut alpha = Float::with_val(prec, 0);
     let mut beta = Float::with_val(prec, 0);
     let mut gamma = Float::with_val(prec, 0);
@@ -14740,13 +14740,12 @@ fn compute_archimedean_integrals_l(
         let mut x = node.clone();
         x += 1u32;
         x *= &half_l;
-        let rho = rho_hp_with_guard(&x, &singularity_guard, prec);
+        let rho = rho_hp(&x, prec);
         let mut phase = frequency.clone();
         phase *= &x;
-        // Keep MPFR's standalone sin/cos routes so the fused evaluator is
-        // byte-identical to the former separate integrands.
+        // Keep separate sin/cos routes for the alpha and beta integrands.
         let sine = phase.clone().sin();
-        let cosine = phase.cos();
+        let cosine = phase.clone().cos();
 
         if n != 0 {
             let mut alpha_value = sine;
@@ -14763,11 +14762,7 @@ fn compute_archimedean_integrals_l(
         beta_term *= &beta_value;
         beta += &beta_term;
 
-        let mut negative_half = x;
-        negative_half /= -2i32;
-        let exponential = negative_half.exp();
-        let mut gamma_value = cosine;
-        gamma_value -= &exponential;
+        let mut gamma_value = gamma_difference_hp(&phase, &x, prec);
         gamma_value *= &rho;
         let mut gamma_term = weight.clone();
         gamma_term *= &gamma_value;
@@ -14835,12 +14830,7 @@ fn compute_gamma_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Flo
     let f = |x: &Float| -> Float {
         let mut ph = freq.clone();
         ph *= x;
-        let c = ph.cos();
-        let mut neg_half = x.clone();
-        neg_half /= -2i32;
-        let e = neg_half.exp();
-        let mut diff = c;
-        diff -= &e;
+        let mut diff = gamma_difference_hp(&ph, x, prec);
         diff *= &rho_hp(x, prec);
         diff
     };
@@ -14850,32 +14840,27 @@ fn compute_gamma_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Flo
     v
 }
 
-#[cfg(test)]
 fn rho_hp(x: &Float, prec: u32) -> Float {
-    let tiny = Float::with_val(prec, Float::parse(HP_SINGULARITY_GUARD_STR).unwrap());
-    rho_hp_with_guard(x, &tiny, prec)
+    let mut half_x = Float::with_val(prec, x);
+    half_x /= 2u32;
+    let mut value = half_x.exp();
+    let mut denominator = Float::with_val(prec, x).sinh();
+    denominator *= 2u32;
+    value /= denominator;
+    value
 }
 
-fn rho_hp_with_guard(x: &Float, tiny: &Float, prec: u32) -> Float {
-    if x.cmp_abs(tiny).map(|o| o.is_lt()).unwrap_or(false) {
-        let mut v = x.clone().recip();
-        v /= 2u32;
-        v += {
-            let mut q = Float::with_val(prec, 1);
-            q /= 4u32;
-            q
-        };
-        v
-    } else {
-        let mut hx = x.clone();
-        hx /= 2u32;
-        let e = hx.exp();
-        let mut d = x.clone().sinh();
-        d *= 2u32;
-        let mut r = e;
-        r /= &d;
-        r
-    }
+// cos(phase) - exp(-x/2), with neither subtraction of values near one.
+fn gamma_difference_hp(phase: &Float, x: &Float, prec: u32) -> Float {
+    let mut half_phase = Float::with_val(prec, phase);
+    half_phase /= 2u32;
+    let mut value = half_phase.sin();
+    value.square_mut();
+    value *= -2i32;
+    let mut negative_half = Float::with_val(prec, x);
+    negative_half /= -2i32;
+    value -= negative_half.exp_m1();
+    value
 }
 
 #[cfg(test)]
@@ -14956,15 +14941,43 @@ fn solve_r_zero(
     n_steps: usize,
     method: RootSolver,
 ) -> EigenvalueResult {
-    solve_r_zero_with_target(
+    let target_bits = prec.saturating_sub(GUARD_BITS).max(1);
+    let outcome = solve_r_zero_with_target(xi, poles, seed, prec, target_bits, n_steps, method);
+    let EigenvalueResult::Converged(result) = outcome else {
+        return outcome;
+    };
+    let correction = prec
+        .checked_add(GUARD_BITS)
+        .and_then(|verification_precision| {
+            secular_correction_at(xi, poles, &result.value, verification_precision, method)
+        });
+    let Some(correction) = correction else {
+        return EigenvalueResult::Failed {
+            iterations: result.diagnostics.iterations,
+            reason:
+                "root convergence could not be confirmed by a finite Newton-correction enclosure"
+                    .to_owned(),
+        };
+    };
+    let correction = Float::with_val_round(prec, correction, rug::float::Round::Up).0;
+    let accepted =
+        correction < root_correction_tolerance_for_target(&result.value, target_bits, prec);
+    match root_refinement(
         xi,
         poles,
-        seed,
+        result.value,
+        result.diagnostics.iterations,
+        correction,
+        target_bits,
         prec,
-        prec.saturating_sub(GUARD_BITS).max(1),
-        n_steps,
-        method,
-    )
+    ) {
+        Some(result) if accepted => EigenvalueResult::Converged(result),
+        Some(result) => EigenvalueResult::Stagnated(result),
+        None => EigenvalueResult::Failed {
+            iterations: result.diagnostics.iterations,
+            reason: "root confirmation landed on a secular pole".to_owned(),
+        },
+    }
 }
 
 fn solve_r_zero_with_target(
@@ -15012,70 +15025,48 @@ fn secular_residual_and_scale_at(
     Some((residual.abs(), term_scale))
 }
 
-/// Return the magnitude of one Newton or Halley correction at an unchanged
-/// point. Adaptive refinement uses this as a confirmation check rather than
-/// inferring convergence from a repeated rounded iterate.
+/// Enclose the magnitude of the Newton correction at an unchanged stored
+/// point with directed interval arithmetic. This confirms the requested point
+/// correction; it does not by itself certify existence or uniqueness of a root.
 fn secular_correction_at(
     xi: &[Float],
     poles: &[Float],
     z: &Float,
     prec: u32,
-    method: RootSolver,
+    _method: RootSolver,
 ) -> Option<Float> {
-    let mut residual = Float::with_val(prec, 0);
-    let mut derivative = Float::with_val(prec, 0);
-    let mut second_derivative = Float::with_val(prec, 0);
+    use xc_numerics::mpfr_interval::MpfrInterval;
+    // Acceptance uses a directed enclosure of |R/R'| at the stored point.
+    // A small Halley update alone is unsafe: it vanishes at stationary
+    // nonroots and can be tiny when the second derivative dominates.
+    if xi.is_empty()
+        || xi.len() != poles.len()
+        || !z.is_finite()
+        || z.prec() > prec
+        || xi
+            .iter()
+            .chain(poles)
+            .any(|v| !v.is_finite() || v.prec() > prec)
+    {
+        return None;
+    }
+    let point = |v: &Float| MpfrInterval::point(Float::with_val(prec, v));
+    let mut residual = MpfrInterval::from_u64(0, prec);
+    let mut derivative = MpfrInterval::from_u64(0, prec);
+    let value = point(z);
     for (weight, pole) in xi.iter().zip(poles) {
-        let mut denominator = Float::with_val(prec, z);
-        denominator -= pole;
-        if denominator.is_zero() {
-            return None;
-        }
-        let mut term = Float::with_val(prec, weight);
-        term /= &denominator;
-        residual += &term;
-
-        let mut denominator_squared = denominator.clone();
-        denominator_squared.square_mut();
-        let mut derivative_term = Float::with_val(prec, weight);
-        derivative_term /= &denominator_squared;
-        derivative -= derivative_term;
-
-        if method == RootSolver::Halley {
-            let mut denominator_cubed = denominator_squared;
-            denominator_cubed *= &denominator;
-            let mut second_term = Float::with_val(prec, weight);
-            second_term /= denominator_cubed;
-            second_term *= 2u32;
-            second_derivative += second_term;
-        }
+        let inverse = value.sub(&point(pole)).reciprocal().ok()?;
+        let term = point(weight).mul(&inverse);
+        residual = residual.add(&term);
+        derivative = derivative.sub(&term.mul(&inverse));
     }
-    match method {
-        RootSolver::Newton => {
-            if derivative.is_zero() {
-                None
-            } else {
-                residual /= derivative;
-                Some(residual.abs())
-            }
-        }
-        RootSolver::Halley => {
-            let mut denominator = derivative.clone();
-            denominator.square_mut();
-            denominator *= 2u32;
-            let mut product = residual.clone();
-            product *= second_derivative;
-            denominator -= product;
-            if denominator.is_zero() {
-                None
-            } else {
-                residual *= derivative;
-                residual *= 2u32;
-                residual /= denominator;
-                Some(residual.abs())
-            }
-        }
+    let correction = residual.div(&derivative).ok()?;
+    if !correction.lower().is_finite() || !correction.upper().is_finite() {
+        return None;
     }
+    let left = correction.lower().clone().abs();
+    let right = correction.upper().clone().abs();
+    Some(if left >= right { left } else { right })
 }
 
 fn achieved_decimal_digits(value: &Float, correction: &Float, prec: u32) -> Float {
@@ -15174,14 +15165,7 @@ fn newton_xi_hat_zero(
     prec: u32,
     n_steps: usize,
 ) -> EigenvalueResult {
-    newton_xi_hat_zero_with_target(
-        xi,
-        poles,
-        seed,
-        prec,
-        prec.saturating_sub(GUARD_BITS).max(1),
-        n_steps,
-    )
+    solve_r_zero(xi, poles, seed, prec, n_steps, RootSolver::Newton)
 }
 
 fn newton_xi_hat_zero_with_target(
@@ -15293,14 +15277,7 @@ fn halley_xi_hat_zero(
     prec: u32,
     n_steps: usize,
 ) -> EigenvalueResult {
-    halley_xi_hat_zero_with_target(
-        xi,
-        poles,
-        seed,
-        prec,
-        prec.saturating_sub(GUARD_BITS).max(1),
-        n_steps,
-    )
+    solve_r_zero(xi, poles, seed, prec, n_steps, RootSolver::Halley)
 }
 
 fn halley_xi_hat_zero_with_target(
@@ -16467,7 +16444,11 @@ mod weil_eigvec_cache {
         eps_n: &Float,
         prec: u32,
     ) -> Option<Float> {
-        if xi.len() != dim || tau.len() != dim * dim {
+        if xi.len() != dim
+            || tau.len() != dim * dim
+            || !eps_n.is_finite()
+            || xi.iter().chain(tau).any(|value| !value.is_finite())
+        {
             return None;
         }
 
@@ -16505,6 +16486,11 @@ mod weil_eigvec_cache {
             .collect();
         let mut resid_inf = Float::with_val(prec, 0);
         for residual in residuals {
+            // NaN comparisons are false. Never let a nonfinite row disappear
+            // into the maximum's initial zero, including finite-input overflow.
+            if !residual.is_finite() {
+                return None;
+            }
             if residual > resid_inf {
                 resid_inf = residual;
             }
@@ -16518,7 +16504,7 @@ mod weil_eigvec_cache {
         // floor.
         let mut rel = resid_inf;
         rel /= &xi_linf;
-        Some(rel)
+        rel.is_finite().then_some(rel)
     }
 
     pub(super) fn residual_within_precision_floor(residual: &Float, prec: u32) -> bool {
@@ -16922,6 +16908,100 @@ pub fn assemble_research_matrix_hp(
 #[cfg(test)]
 #[allow(clippy::erasing_op)]
 mod tests {
+    #[test]
+    fn mathematics_audit_root_identity_binds_fixed_source() {
+        let params = CcmParams::from_lambda_sq_integer(5, 2);
+        let cfg = HighPrecConfig::for_decimal_digits(40);
+        let seeds = vec![Float::with_val(cfg.precision_bits, 14)];
+        let key = |source: &ContentDigest| {
+            root_range_semantic_key(
+                &params,
+                &cfg,
+                1,
+                &seeds,
+                RootArtifactMode::Independent,
+                None,
+                RootWindowSemantics::strict_positive(1),
+                Some(source),
+            )
+            .unwrap()
+        };
+        let a = ContentDigest::sha256(b"first exact point source");
+        let b = ContentDigest::sha256(b"different exact point source");
+        assert_ne!(key(&a).digest().unwrap(), key(&b).digest().unwrap());
+    }
+
+    #[test]
+    fn mathematics_audit_state_selection_checks_only_final_boundary() {
+        let targets = [
+            CcmStateTarget::AlgebraicGround,
+            CcmStateTarget::SmallestPositive,
+            CcmStateTarget::NearestZero,
+            CcmStateTarget::ParityRestricted {
+                parity: CcmParity::Even,
+                criterion: CcmStateCriterion::AlgebraicGround,
+            },
+        ];
+        let make = |index, value| CcmStateCandidateHp {
+            algebraic_index: index,
+            eigenvalue: Float::with_val(128, value),
+            eigenvector: vec![Float::with_val(128, 1)],
+            parity: CcmParity::Even,
+        };
+        for target in targets {
+            for values in [[2, 2, 1], [2, 1, 2], [1, 2, 2]] {
+                let candidates = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| make(i, *v))
+                    .collect::<Vec<_>>();
+                let result = select_ccm_state_hp(target, &candidates).unwrap();
+                assert_eq!(result.eigenvalue, 1);
+            }
+            for values in [[1, 1, 2], [1, 2, 1], [2, 1, 1]] {
+                let candidates = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| make(i, *v))
+                    .collect::<Vec<_>>();
+                assert!(select_ccm_state_hp(target, &candidates).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn root_convergence_halley_stationary_nonroot_is_rejected() {
+        let p = 128;
+        // R(z)=1/(z+1)-1/(z-1) has no finite root. At z=0,
+        // R=2 and R'=0, so an unguarded Halley update is exactly zero.
+        let xi = [Float::with_val(p, 1), Float::with_val(p, -1)];
+        let poles = [Float::with_val(p, -1), Float::with_val(p, 1)];
+        let result = halley_xi_hat_zero(&xi, &poles, &Float::with_val(p, 0), p, 8);
+        assert!(!result.is_converged(), "stationary nonroot was accepted");
+    }
+
+    #[test]
+    fn root_convergence_rounded_cancellation_is_not_a_zero() {
+        let p = 96;
+        let large = Float::with_val(p, 2).pow(160);
+        let mut xi = (-4..=4).map(|_| Float::with_val(p, 0)).collect::<Vec<_>>();
+        xi[0] = Float::with_val(p, rug::Rational::from((81, 4))) * &large;
+        xi[1] = Float::with_val(p, 1);
+        xi[2] = Float::with_val(p, rug::Rational::from((-25, 2))) * &large;
+        xi[4] = Float::with_val(p, rug::Rational::from((1, 4))) * &large;
+        xi[5] = Float::with_val(p, 1);
+        xi[6] = Float::with_val(p, -3);
+        let poles = (-4..=4).map(|j| Float::with_val(p, j)).collect::<Vec<_>>();
+        let seed = Float::with_val(p, rug::Rational::from((1, 2)));
+        // Exact arithmetic gives R=2/7 and R'=-404/147, hence
+        // |R/R'|=21/202. The working-precision sum rounds R to zero.
+        let result = newton_xi_hat_zero(&xi, &poles, &seed, p, 8);
+        assert!(
+            !result.is_converged(),
+            "canceled nonzero residual was accepted"
+        );
+    }
+
     use super::*;
     use std::sync::Mutex;
 
@@ -17683,7 +17763,7 @@ mod tests {
             RootArtifactMode::Independent,
             None,
             RootWindowSemantics::strict_positive(seeds.len()),
-            None,
+            Some(&ContentDigest::sha256(b"test exact secular source")),
         )
         .unwrap();
         let seeded = root_range_semantic_key(
@@ -17694,13 +17774,13 @@ mod tests {
             RootArtifactMode::ReferenceSeededRefinement,
             Some(&dataset),
             RootWindowSemantics::strict_positive(seeds.len()),
-            None,
+            Some(&ContentDigest::sha256(b"test exact secular source")),
         )
         .unwrap();
         assert_eq!(independent.artifact_kind, "ccm_root_discovery_window");
         assert_eq!(
             independent.mathematical_semantics_version,
-            "ccm-root-range-v0.13.0-v6"
+            "ccm-root-range-v0.15.1-v11"
         );
         assert!(independent
             .resolved_mathematical_parameters
@@ -17715,7 +17795,10 @@ mod tests {
             .get("allow_incomplete")
             .is_none());
         assert_eq!(seeded.artifact_kind, "ccm_root_refinement");
-        assert!(independent.source_data_identities.is_empty());
+        assert_eq!(independent.source_data_identities.len(), 1);
+        assert!(independent
+            .source_data_identities
+            .contains_key("ccm_secular_source"));
         assert_eq!(
             seeded.source_data_identities.get("reference_zero_dataset"),
             Some(&ContentDigest(dataset.content_sha256.clone()))
@@ -17729,13 +17812,13 @@ mod tests {
             RootArtifactMode::Independent,
             None,
             RootWindowSemantics::advanced(IndependentRootDomain::Signed, 200, true),
-            None,
+            Some(&ContentDigest::sha256(b"test exact secular source")),
         )
         .unwrap();
         assert_eq!(signed.target.as_deref(), Some("signed_ccm_spectral_roots"));
         assert_eq!(
             signed.mathematical_semantics_version,
-            "ccm-root-range-v0.13.3-v7"
+            "ccm-root-range-v0.15.1-v11-advanced"
         );
         assert_ne!(independent.digest().unwrap(), signed.digest().unwrap());
         let same_signed_window_for_another_request = root_range_semantic_key(
@@ -17746,7 +17829,7 @@ mod tests {
             RootArtifactMode::Independent,
             None,
             RootWindowSemantics::advanced(IndependentRootDomain::Signed, 8, false),
-            None,
+            Some(&ContentDigest::sha256(b"test exact secular source")),
         )
         .unwrap();
         assert_eq!(
@@ -17765,7 +17848,7 @@ mod tests {
             RootArtifactMode::ReferenceSeededRefinement,
             Some(&other_dataset),
             RootWindowSemantics::strict_positive(seeds.len()),
-            None,
+            Some(&ContentDigest::sha256(b"test exact secular source")),
         )
         .unwrap();
         assert_ne!(seeded.digest().unwrap(), other_seeded.digest().unwrap());
@@ -17777,7 +17860,7 @@ mod tests {
             RootArtifactMode::Independent,
             Some(&dataset),
             RootWindowSemantics::strict_positive(seeds.len()),
-            None,
+            Some(&ContentDigest::sha256(b"test exact secular source")),
         )
         .is_err());
         assert!(root_range_semantic_key(
@@ -17788,13 +17871,13 @@ mod tests {
             RootArtifactMode::ReferenceSeededRefinement,
             None,
             RootWindowSemantics::strict_positive(seeds.len()),
-            None,
+            Some(&ContentDigest::sha256(b"test exact secular source")),
         )
         .is_err());
     }
 
     #[test]
-    fn adaptive_root_precision_has_a_new_identity_and_preserves_legacy_identity() {
+    fn fixed_and_adaptive_root_confirmation_have_distinct_new_identities() {
         let params = CcmParams::from_lambda_sq_integer(13, 4);
         let adaptive = HighPrecConfig::for_decimal_digits(40).with_adaptive_root_precision();
         let seeds = vec![Float::with_val(adaptive.precision_bits, 14)];
@@ -17812,7 +17895,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             adaptive_key.mathematical_semantics_version,
-            "ccm-root-range-v0.14.1-v9"
+            "ccm-root-range-v0.15.1-v12"
         );
         assert_eq!(
             adaptive_key
@@ -17837,12 +17920,12 @@ mod tests {
             RootArtifactMode::Independent,
             None,
             RootWindowSemantics::strict_positive(1),
-            None,
+            Some(&ContentDigest::sha256(b"test exact secular source")),
         )
         .unwrap();
         assert_eq!(
             fixed_key.mathematical_semantics_version,
-            "ccm-root-range-v0.13.0-v6"
+            "ccm-root-range-v0.15.1-v11"
         );
         assert!(fixed_key
             .resolved_mathematical_parameters
@@ -18570,7 +18653,7 @@ mod tests {
             },
         };
         let artifact = PortableRootRange {
-            schema_version: 3,
+            schema_version: 6,
             lambda_squared: lambda_squared_cache_identity(&params),
             n_modes: params.n_modes,
             precision_bits: cfg.precision_bits,
@@ -18593,7 +18676,7 @@ mod tests {
             target_precision_bits: None,
             maximum_extra_precision_bits: None,
             verification_precision_bits: None,
-            secular_source_content_digest: None,
+            secular_source_content_digest: Some(ContentDigest::sha256(b"stagnated point source")),
         };
         let legacy_json = serde_json::to_value(&artifact).unwrap();
         assert!(legacy_json.get("root_domain").is_none());
@@ -18610,7 +18693,7 @@ mod tests {
             &xi,
             &l,
             RootWindowSemantics::strict_positive(1),
-            None,
+            Some(&ContentDigest::sha256(b"stagnated point source")),
             false,
         )
         .is_ok());
@@ -18625,7 +18708,7 @@ mod tests {
             &xi,
             &l,
             RootWindowSemantics::strict_positive(1),
-            None,
+            Some(&ContentDigest::sha256(b"stagnated point source")),
             true,
         )
         .unwrap_err()
@@ -18787,7 +18870,7 @@ mod tests {
         assert_ne!(old.digest().unwrap(), new.digest().unwrap());
         assert_eq!(
             new.mathematical_semantics_version,
-            "ccm-root-range-v0.15.0-v10"
+            "ccm-root-range-v0.15.1-v13"
         );
         let zero = vec![Float::with_val(cfg.precision_bits, 0); 5];
         let mut only_central = zero;
@@ -21042,7 +21125,7 @@ mod tests {
             )),
         }]);
         let policy = CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.14.1").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -21169,6 +21252,31 @@ mod tests {
             &context(ArtifactExecutionCacheMode::PreferReuse, true),
         )
         .unwrap();
+        // Stable gamma evaluation must never share the legacy v3 cache key.
+        let store = resolver.first_writable(CacheVisibility::Local).unwrap();
+        let keys = store
+            .matching_keys("ccm_u_flow_response_analysis", "ccm/u-flow-response/", 10)
+            .unwrap();
+        assert_eq!(keys.len(), 1);
+        let manifests = store.candidates(&keys[0]).unwrap();
+        let semantic: SemanticKeyEnvelope =
+            serde_json::from_str(&manifests[0].tags[xc_cache::SEMANTIC_KEY_MANIFEST_TAG]).unwrap();
+        assert_eq!(
+            semantic.mathematical_semantics_version,
+            "ccm-u-flow-response-v0.15.1-v4"
+        );
+        assert_eq!(
+            manifests[0].minimum_reader_version,
+            ToolkitVersion::parse("0.15.1").unwrap()
+        );
+        let mut legacy = semantic.clone();
+        legacy.mathematical_semantics_version = "ccm-u-flow-response-v0.15.0-v3".into();
+        legacy.algorithm_semantics = Some(
+            "analytic_tau_component_u_derivatives_even_sector_isolated_bordered_lu_and_moving_secular_poles_v2".into(),
+        );
+        assert_ne!(semantic.digest().unwrap(), legacy.digest().unwrap());
+        assert_eq!(keys[0].parameters_digest, semantic.digest().unwrap());
+
         let u_flow_reused = resolve_u_flow_response_analysis_via_cache(
             &params,
             &cfg,
@@ -21592,6 +21700,70 @@ mod tests {
                 _ => panic!("saved CCM eigenvalue status changed"),
             }
         }
+    }
+
+    #[test]
+    fn exact_hp_cutoff_rejects_invalid_or_unresolved_domain() {
+        let decimal = |text| xc_core::DecimalLiteral::new(text).unwrap();
+        for (text, floor) in [("0", 0), ("0.9", 0), ("1", 1)] {
+            assert!(ExactLambdaSquaredHp::new(decimal(text), floor).is_err());
+        }
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = 64;
+        let unresolved =
+            ExactLambdaSquaredHp::new(decimal("1.0000000000000000000000000000000000000001"), 1)
+                .unwrap();
+        assert!(localized_weil_form_exact_hp(unresolved, 0, &cfg, true).is_err());
+        let bypassed = ExactLambdaSquaredHp {
+            decimal: decimal("13.5"),
+            prime_cutoff: 12,
+            mode: LambdaSquaredMode::Fractional,
+        };
+        assert!(localized_weil_form_exact_hp(bypassed, 0, &cfg, true).is_err());
+        let wrong_mode = ExactLambdaSquaredHp {
+            decimal: decimal("13.5"),
+            prime_cutoff: 13,
+            mode: LambdaSquaredMode::Integer,
+        };
+        assert!(localized_weil_form_exact_hp(wrong_mode, 0, &cfg, true).is_err());
+    }
+
+    #[test]
+    fn hp_small_x_kernel_retains_requested_precision() {
+        let p = 512;
+        let x = Float::with_val(p, Float::parse("1e-40").unwrap());
+        let x_ref = Float::with_val(1024, &x);
+        // Algebraically independent rho = exp(-x/2)/(1-exp(-2x)).
+        let mut numerator = x_ref.clone();
+        numerator /= -2;
+        numerator.exp_mut();
+        let mut denominator = x_ref.clone();
+        denominator *= -2;
+        denominator.exp_m1_mut();
+        denominator *= -1;
+        let reference = numerator / denominator;
+        let relative = (Float::with_val(1024, rho_hp(&x, p)) / &reference - 1u32).abs();
+        assert!(relative < Float::with_val(1024, 2).pow(-500));
+        // Its derivative is rho*(1/2-coth(x)); coth = 1+2/expm1(2x).
+        let mut two_x = x_ref.clone();
+        two_x *= 2;
+        let mut coth = two_x.exp_m1().recip();
+        coth *= 2;
+        coth += 1;
+        let derivative = (Float::with_val(1024, 0.5) - coth) * reference;
+        let relative = (Float::with_val(1024, rho_hp_velocity(&x, &Float::with_val(p, 1), p))
+            / derivative
+            - 1u32)
+            .abs();
+        assert!(relative < Float::with_val(1024, 2).pow(-500));
+        // At zero phase the old cos-exp subtraction rounded this to zero.
+        let tiny_x = Float::with_val(256, Float::parse("1e-100").unwrap());
+        let stable = gamma_difference_hp(&Float::with_val(256, 0), &tiny_x, 256);
+        let mut expected = Float::with_val(1024, &tiny_x);
+        expected /= -2;
+        expected = 1u32 - expected.exp();
+        let relative = (Float::with_val(1024, stable) / expected - 1u32).abs();
+        assert!(relative < Float::with_val(1024, 2).pow(-245));
     }
 
     #[test]
@@ -23606,5 +23778,65 @@ mod audit_research_tests {
                 })
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod eigenpair_nonfinite_audit_regressions {
+    use super::*;
+
+    #[test]
+    fn eigenpair_residual_rejects_nonfinite_inputs() {
+        let p = 128;
+        let base_tau = [1, 0, 0, 1].map(|v| Float::with_val(p, v));
+        let base_xi = [1, 1].map(|v| Float::with_val(p, v));
+        for special in [rug::float::Special::Nan, rug::float::Special::Infinity] {
+            let invalid = Float::with_val(p, special);
+            let mut tau = base_tau.clone();
+            tau[0] = invalid.clone();
+            assert!(
+                weil_eigvec_cache::relative_residual_norm(
+                    &tau,
+                    2,
+                    &base_xi,
+                    &Float::with_val(p, 1),
+                    p,
+                )
+                .is_none(),
+                "nonfinite matrix entry was accepted"
+            );
+            let mut xi = base_xi.clone();
+            xi[0] = invalid.clone();
+            assert!(
+                weil_eigvec_cache::relative_residual_norm(
+                    &base_tau,
+                    2,
+                    &xi,
+                    &Float::with_val(p, 1),
+                    p,
+                )
+                .is_none(),
+                "nonfinite vector entry was accepted"
+            );
+            assert!(
+                weil_eigvec_cache::relative_residual_norm(&base_tau, 2, &base_xi, &invalid, p,)
+                    .is_none(),
+                "nonfinite eigenvalue was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn eigenpair_residual_rejects_nonfinite_arithmetic() {
+        let p = 128;
+        let big = Float::with_val(p, Float::parse("1e200000000").unwrap());
+        assert!(big.is_finite());
+        let tau = vec![big.clone(); 4];
+        let xi = vec![big.clone(), -big];
+        assert!(
+            weil_eigvec_cache::relative_residual_norm(&tau, 2, &xi, &Float::with_val(p, 0), p,)
+                .is_none(),
+            "overflow cancellation was silently treated as zero residual"
+        );
     }
 }

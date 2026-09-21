@@ -190,10 +190,22 @@ impl RootStoppingF64 {
     }
 
     fn x_converged(&self, lower: f64, upper: f64, midpoint: f64) -> bool {
-        (upper - lower).abs()
-            <= self
-                .absolute_x_tolerance
-                .max(self.relative_x_tolerance * midpoint.abs().max(1.0))
+        if !midpoint.is_finite() {
+            return false;
+        }
+        let width = upper - lower;
+        let scale = midpoint.abs().max(1.0);
+        if width.is_finite() {
+            width
+                <= self
+                    .absolute_x_tolerance
+                    .max(self.relative_x_tolerance * scale)
+        } else {
+            // Opposite large endpoints can have an unrepresentable full width.
+            // Scale both sides before subtracting or multiplying.
+            (0.5 * upper - 0.5 * lower)
+                <= (0.5 * self.absolute_x_tolerance).max((0.5 * self.relative_x_tolerance) * scale)
+        }
     }
 }
 
@@ -201,6 +213,11 @@ fn checked_evaluate<F>(function: &F, x: f64, evaluations: &mut usize) -> Result<
 where
     F: RealFunctionF64 + ?Sized,
 {
+    if !x.is_finite() {
+        return Err(RootError::Evaluation(
+            "root evaluation point must be finite".to_owned(),
+        ));
+    }
     *evaluations += 1;
     let value = function.evaluate(x)?;
     if value.is_finite() {
@@ -280,12 +297,15 @@ where
 
     for iteration in 1..=stopping.maximum_iterations {
         check_cancellation(cancellation)?;
-        let midpoint = lower + 0.5 * (upper - lower);
+        let midpoint = lower.midpoint(upper);
         let f_midpoint = checked_evaluate(function, midpoint, &mut evaluations)?;
         if f_midpoint.abs() <= stopping.residual_tolerance
             || stopping.x_converged(lower, upper, midpoint)
         {
-            let derivative = function.derivative(midpoint).ok();
+            let derivative = function
+                .derivative(midpoint)
+                .ok()
+                .filter(|value| value.is_finite());
             return Ok(RootApproximationF64 {
                 midpoint,
                 bracket: RootBracketF64 { lower, upper },
@@ -428,7 +448,7 @@ pub fn safeguarded_newton_f64_controlled(
         x = if candidate.is_finite() && candidate > lower && candidate < upper {
             candidate
         } else {
-            lower + 0.5 * (upper - lower)
+            lower.midpoint(upper)
         };
     }
     Err(RootError::NonConvergence(format!(
@@ -515,21 +535,39 @@ pub fn discover_pole_aware_sign_changes_f64_controlled(
     for window in boundaries.windows(2) {
         check_cancellation(cancellation)?;
         let width = window[1] - window[0];
-        let margin = (options.pole_margin_fraction * width)
-            .max(f64::EPSILON * window[0].abs().max(window[1].abs()).max(1.0));
+        let fractional_margin = if width.is_finite() {
+            options.pole_margin_fraction * width
+        } else {
+            (0.5 * window[1] - 0.5 * window[0]) * (2.0 * options.pole_margin_fraction)
+        };
+        let margin =
+            fractional_margin.max(f64::EPSILON * window[0].abs().max(window[1].abs()).max(1.0));
         let interval_lower = window[0] + margin;
         let interval_upper = window[1] - margin;
-        if interval_lower >= interval_upper {
+        if !interval_lower.is_finite()
+            || !interval_upper.is_finite()
+            || interval_lower >= interval_upper
+        {
             continue;
         }
+        let mut evaluations = 0;
         let mut x0 = interval_lower;
-        let mut f0 = function.evaluate(x0)?;
+        let mut f0 = checked_evaluate(function, x0, &mut evaluations)?;
         for step in 1..=options.subdivisions_per_interval {
             check_cancellation(cancellation)?;
-            let x1 = interval_lower
-                + (interval_upper - interval_lower) * step as f64
-                    / options.subdivisions_per_interval as f64;
-            let f1 = function.evaluate(x1)?;
+            let fraction = step as f64 / options.subdivisions_per_interval as f64;
+            let x1 = if step == options.subdivisions_per_interval {
+                interval_upper
+            } else if interval_lower.is_sign_positive() == interval_upper.is_sign_positive() {
+                interval_lower + fraction * (interval_upper - interval_lower)
+            } else {
+                (1.0 - fraction) * interval_lower + fraction * interval_upper
+            };
+            // The requested subdivision can exceed binary64 spatial resolution.
+            if x1 <= x0 {
+                continue;
+            }
+            let f1 = checked_evaluate(function, x1, &mut evaluations)?;
             if f0 == 0.0 || f1 == 0.0 || f0.is_sign_positive() != f1.is_sign_positive() {
                 let bracket = RootBracketF64 {
                     lower: x0,
@@ -1746,5 +1784,114 @@ mod hp_tests {
         let meromorphic =
             certify_meromorphic_rational_contour(&numerator, &denominator, rectangle, 20).unwrap();
         assert_eq!(meromorphic.zeros_minus_poles, 1);
+    }
+}
+
+#[cfg(test)]
+mod finite_range_audit_tests {
+    use super::*;
+    struct ScaledTanh;
+    impl RealFunctionF64 for ScaledTanh {
+        fn evaluate(&self, x: f64) -> Result<f64, RootError> {
+            assert!(x.is_finite(), "solver evaluated outside its finite domain");
+            Ok((x / 1e308).tanh() - 0.1)
+        }
+        fn derivative(&self, _: f64) -> Result<f64, RootError> {
+            Ok(0.0)
+        }
+    }
+    impl MeromorphicFunctionF64 for ScaledTanh {
+        fn real_poles(&self) -> &[f64] {
+            &[]
+        }
+    }
+    #[test]
+    fn wide_finite_brackets_produce_finite_roots() {
+        let bracket = RootBracketF64 {
+            lower: -1e308,
+            upper: 1e308,
+        };
+        let stop = RootStoppingF64::default();
+        let bisected = bisect_f64(&ScaledTanh, bracket, &stop).unwrap();
+        let fallback = safeguarded_newton_f64(&ScaledTanh, bracket, bracket.lower, &stop).unwrap();
+        for result in [bisected, fallback] {
+            assert!(result.midpoint.is_finite());
+            assert!(result.midpoint >= bracket.lower && result.midpoint <= bracket.upper);
+            assert!((result.midpoint / 1e308 - 0.1_f64.atanh()).abs() < 1e-12);
+            assert!(result.residual < 1e-12);
+        }
+    }
+    #[test]
+    fn wide_discovery_range_keeps_its_real_root() {
+        let roots = discover_pole_aware_sign_changes_f64(
+            &ScaledTanh,
+            -1e308,
+            1e308,
+            &PoleAwareDiscoveryOptionsF64::default(),
+        )
+        .unwrap();
+        assert_eq!(roots.len(), 1);
+        assert!((roots[0].midpoint / 1e308 - 0.1_f64.atanh()).abs() < 1e-12);
+    }
+    struct InvalidEvaluation;
+    impl RealFunctionF64 for InvalidEvaluation {
+        fn evaluate(&self, _: f64) -> Result<f64, RootError> {
+            Ok(f64::NAN)
+        }
+    }
+    impl MeromorphicFunctionF64 for InvalidEvaluation {
+        fn real_poles(&self) -> &[f64] {
+            &[]
+        }
+    }
+    #[test]
+    fn discovery_reports_invalid_evaluations_instead_of_no_roots() {
+        assert!(matches!(
+            discover_pole_aware_sign_changes_f64(
+                &InvalidEvaluation,
+                -1.0,
+                1.0,
+                &PoleAwareDiscoveryOptionsF64::default(),
+            ),
+            Err(RootError::Evaluation(_))
+        ));
+    }
+    #[test]
+    fn nonfinite_point_is_rejected_before_callback() {
+        struct Unreachable;
+        impl RealFunctionF64 for Unreachable {
+            fn evaluate(&self, _: f64) -> Result<f64, RootError> {
+                panic!("invalid point dispatched")
+            }
+        }
+        let mut count = 0;
+        assert!(matches!(
+            checked_evaluate(&Unreachable, f64::INFINITY, &mut count),
+            Err(RootError::Evaluation(_))
+        ));
+        assert_eq!(count, 0);
+    }
+    #[test]
+    fn optional_derivative_evidence_must_be_finite() {
+        struct Linear;
+        impl RealFunctionF64 for Linear {
+            fn evaluate(&self, x: f64) -> Result<f64, RootError> {
+                Ok(x - 0.5)
+            }
+            fn derivative(&self, _: f64) -> Result<f64, RootError> {
+                Ok(f64::INFINITY)
+            }
+        }
+        let result = bisect_f64(
+            &Linear,
+            RootBracketF64 {
+                lower: 0.0,
+                upper: 1.0,
+            },
+            &RootStoppingF64::default(),
+        )
+        .unwrap();
+        assert_eq!(result.midpoint, 0.5);
+        assert_eq!(result.derivative_magnitude, None);
     }
 }

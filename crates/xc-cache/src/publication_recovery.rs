@@ -355,7 +355,6 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::io::Write;
-    use std::path::Path;
     use xc_core::PublicationTarget;
 
     fn journal() -> PublicationTransactionJournal {
@@ -532,12 +531,7 @@ mod tests {
 
     #[test]
     fn abandon_is_append_only_and_retains_remote_object_accounting() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("test-tmp")
-            .join(format!("abandon-{}", std::process::id()));
+        let root = crate::test_support::temporary_root("abandon");
         let _ = std::fs::remove_dir_all(&root);
         let store = PublicationJournalStore::new(&root);
         let mut journal = journal();
@@ -579,12 +573,7 @@ mod tests {
 
     #[test]
     fn abandon_refuses_a_receipt_that_may_already_be_discoverable() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("test-tmp")
-            .join(format!("abandon-receipt-{}", std::process::id()));
+        let root = crate::test_support::temporary_root("abandon-receipt");
         let _ = std::fs::remove_dir_all(&root);
         let store = PublicationJournalStore::new(&root);
         let mut journal = journal();

@@ -6,9 +6,10 @@ publish = false
 
 [features]
 default = []
-hp = ["dep:rug", "dep:xc-numerics", "xc-certify/hp"]
+hp = ["dep:rug", "dep:xc-numerics", "xc-certify/hp", "xc-spectral/hp"]
 
 [dependencies]
+xc-spectral = { path = "../../crates/xc-spectral" }
 xc-cache = { path = "../../crates/xc-cache" }
 xc-certify = { path = "../../crates/xc-certify" }
 xc-core = { path = "../../crates/xc-core" }

@@ -3,12 +3,13 @@
 `ccm::capture::CcmCapturePlan` defines a versioned set of requested
 measurements. Applications execute the plan and retain its outcomes. Selecting
 a level does not execute a campaign, change a numerical algorithm, request a
-certificate, or publish data.
+new sector-gap certificate, or publish data. Finite transform enclosure diagnostics
+use Arb when available and can consume an already supplied sector certificate.
 
 For a new calculation, `ccm::hp::capture_run::RetainedCcmRun` executes a seeded
 or independently acquired primary claim once through an explicit managed cache
 context. Save `primary()` before supplemental work, then call
-`capture_diagnostic` for each requested primary ID. Each call returns measurement
+`capture_diagnostic_outcome` for each requested primary ID. Each call returns measurement
 bytes with authenticated source manifests; an error leaves the primary state
 available for other diagnostics. Pass `retained_even_sources` to the shared
 runner for prefix, checkpoint, and budgeted reduction capture. Finalize the
@@ -27,7 +28,7 @@ not require decoding unrelated dependency payloads.
 
 ## Default coverage
 
-The table describes the shared v0.15.0 plan, not a similarly named option in an
+The table describes the shared v0.15.1 plan, not a similarly named option in an
 application that implements its own capture policy.
 
 | Level | Additional measurements requested by the shared plan |
@@ -35,7 +36,19 @@ application that implements its own capture policy.
 | Claim / Research | No supplemental groups beyond the application's primary computation |
 | Gap | Evenness and selected sector analysis with two eigenpairs |
 | Maximum | Evenness, full sector eigenvalue spectra with a bounded number of selected vectors, root conditioning, profile, target distance, resolution and target residual analysis |
-| Ultra | Maximum plus deviation decomposition, prime-power response, u-flow response and retained prefix analysis |
+| Ultra | Maximum plus deviation decomposition, prime-power response, u-flow response, retained prefix analysis, state geometry, indexed transforms, total operator energy, root-window summaries, and the twenty extended diagnostic groups, reference projection, and numerical coverage summaries |
+
+See [extended diagnostics](EXTENDED_RESEARCH.md) for the additional groups and
+external input file. Old v1/v2/v3/v4/v5 plans retain their request sets.
+
+New Ultra plans use capture-plan v6 and request [retained research diagnostics](RETAINED_RESEARCH.md)
+through the actual primary eigenpair. Old serialized plans keep their original
+request set and receipt identity. Ultra requests reference projection automatically; other levels may select it with
+`with_reference_projection()`. An external reference is still required. A missing
+source is never a completed projection. Local cohort discovery adds independent
+configuration comparisons; the frozen stabilization-rule operation remains separate.
+See [Ultra completeness](ULTRA_COMPLETENESS.md) for preparation, budgets,
+checkpoint recovery, finite enclosures and numerical coverage.
 
 Ultra's default prefix vector checkpoint is the full source even-sector
 dimension. The scalar prefix ladder covers accepted pivots up to that
@@ -142,7 +155,7 @@ before scheduling a larger campaign.
 
 ## Additional explicit work
 
-| Facility | How it is requested in v0.15.0 |
+| Facility | How it is requested in v0.15.1 |
 |---|---|
 | Retained reduction similarity/orthogonality report | Supply `RetainedReductionRequest` to `execute_with_receipt_and_reduction` to execute and record it; the standalone `check_retained_reduction_via_cache` API also remains available |
 | Full Gauss--Legendre rule verification | Call `check_gauss_legendre_rule_hp` with an order budget; ordinary reads apply cheaper screens |

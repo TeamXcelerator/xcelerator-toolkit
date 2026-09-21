@@ -100,7 +100,7 @@ pub fn gauss_legendre_npt_f64<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, n: usize)
 
 /// Compute n-point Gauss-Legendre nodes and weights on `[-1, 1]` at f64.
 ///
-/// The nodes are sorted in ascending order. Callers that need to set up
+/// The nodes are in descending order, with weights in the same order. Callers that need to set up
 /// a variable-integrand integral (e.g. a complex-valued integrand with
 /// multiple accumulator sums) can call this directly rather than using
 /// [`gauss_legendre_npt_f64`], which takes a single closure.

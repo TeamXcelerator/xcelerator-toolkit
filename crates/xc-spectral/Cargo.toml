@@ -37,6 +37,7 @@ xc-cache = { workspace = true, features = ["test-support"] }
 
 [build-dependencies]
 cc = "1.2"
+sha2 = { workspace = true }
 
 [[example]]
 name = "ccm_first_fifty_production"

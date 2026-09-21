@@ -113,6 +113,10 @@ pub fn artifact_compatibility_policy(
         "ccm_convergence_diagnostics" => "0.13.0",
         "ccm_prefix_analysis" => "0.15.0",
         "ccm_retained_reduction_check" => "0.15.0",
+        "ccm_state_geometry_analysis" | "research_observation_packet" | "research_reference_dataset"
+        | "ccm_reference_source" | "ccm_reference_projection_analysis" | "ccm_indexed_transform_analysis"
+        | "ccm_operator_energy_analysis" | "ccm_root_band_analysis" | "ccm_stabilization_analysis" => "0.15.1",
+        "ccm_compactness_analysis" | "ccm_arithmetic_energy_analysis" | "ccm_directional_response_analysis" | "ccm_weighted_tail_analysis" | "ccm_spectral_cluster_analysis" | "ccm_resolution_budget_analysis" | "ccm_energy_allowance_analysis" | "ccm_weighted_reference_projection" | "ccm_signed_transform_analysis" | "ccm_external_research_source" | "ccm_complex_transform_analysis" | "ccm_root_transport_analysis" | "ccm_operator_cluster_analysis" | "ccm_finite_section_transfer" | "ccm_tail_operator_analysis" | "ccm_observable_budget_analysis" | "ccm_capture_preflight" | "ccm_consistency_analysis" | "ccm_configuration_comparison" | "ccm_band_reconstruction" | "ccm_transform_enclosure" => "0.15.1",
         "research_capture_receipt" | "research_hypothesis_evaluation" => "0.15.0",
         "ccm_root_conditioning_analysis" => "0.14.1",
         "ccm_deviation_decomposition" => "0.14.1",
@@ -150,7 +154,7 @@ pub fn artifact_compatibility_policy(
     ) {
         policy.minimum_reader_version = ToolkitVersion::parse("0.15.0")?;
     }
-    if artifact_kind == "ccm_retained_reduction_check" {
+    if matches!(artifact_kind, "ccm_retained_reduction_check") {
         policy.minimum_reader_version = ToolkitVersion::parse("0.15.0")?;
     }
     if matches!(
@@ -158,6 +162,41 @@ pub fn artifact_compatibility_policy(
         "research_capture_receipt" | "research_hypothesis_evaluation"
     ) {
         policy.minimum_reader_version = ToolkitVersion::parse("0.15.0")?;
+    }
+    if matches!(
+        artifact_kind,
+        "ccm_compactness_analysis"
+            | "ccm_arithmetic_energy_analysis"
+            | "ccm_directional_response_analysis"
+            | "ccm_weighted_tail_analysis"
+            | "ccm_spectral_cluster_analysis"
+            | "ccm_resolution_budget_analysis"
+            | "ccm_energy_allowance_analysis"
+            | "ccm_complex_transform_analysis"
+            | "ccm_root_transport_analysis"
+            | "ccm_operator_cluster_analysis"
+            | "ccm_finite_section_transfer"
+            | "ccm_tail_operator_analysis"
+            | "ccm_observable_budget_analysis"
+            | "ccm_capture_preflight"
+            | "ccm_consistency_analysis"
+            | "ccm_configuration_comparison"
+            | "ccm_band_reconstruction"
+            | "ccm_transform_enclosure"
+            | "ccm_weighted_reference_projection"
+            | "ccm_signed_transform_analysis"
+            | "ccm_external_research_source"
+            | "ccm_state_geometry_analysis"
+            | "research_observation_packet"
+            | "research_reference_dataset"
+            | "ccm_reference_source"
+            | "ccm_reference_projection_analysis"
+            | "ccm_indexed_transform_analysis"
+            | "ccm_operator_energy_analysis"
+            | "ccm_root_band_analysis"
+            | "ccm_stabilization_analysis"
+    ) {
+        policy.minimum_reader_version = ToolkitVersion::parse("0.15.1")?;
     }
     Ok(policy)
 }

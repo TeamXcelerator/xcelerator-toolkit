@@ -15,13 +15,15 @@ use xc_spectral::ccm::{
     hp::{self, HighPrecConfig, PortableHighPrecResult},
     CcmParams,
 };
-use xc_zeta::zeros::{BUNDLED_ZETA_ZEROS_JSON, BUNDLED_ZETA_ZEROS_RESOURCE};
+use xc_zeta::zeros::{
+    BUNDLED_ZETA_ZEROS_JSON, BUNDLED_ZETA_ZEROS_RESOURCE,
+    BUNDLED_ZETA_ZEROS_SHA256 as REFERENCE_SHA256,
+};
 
 const CUTOFF: u64 = 13;
 const MODES: usize = 120;
 const DECIMAL_DIGITS: u32 = 200;
 const ROOTS: usize = 50;
-const REFERENCE_SHA256: &str = "10c022e1c912b67d3ae281c7ad069811ed39b84478c13e167f9d00a067a87224";
 const REFERENCE_CITATION: &str = "Computed to 2,500 significant digits using rigorous Arb interval arithmetic (F. Johansson, Arb: efficient arbitrary-precision midpoint-radius interval arithmetic, IEEE Trans. Comput. 66 (2017), 1281-1292); leading 1,000 digits independently cross-checked against A. M. Odlyzko's standard zeta-zero tabulation";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
