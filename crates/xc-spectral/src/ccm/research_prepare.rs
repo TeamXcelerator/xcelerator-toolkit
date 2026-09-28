@@ -1,12 +1,15 @@
 //! Derive finite research inputs from the retained run and the bundled ordinate table.
 //! No result from another run, fitted energy, or assumed ordinate-tail constant is used.
+use super::research_prepare_math as arithmetic;
 use super::{
     convergence_capture::TailForm, extended_research::*, retained_evidence::*,
     state_geometry::RetainedState,
 };
 use anyhow::{ensure, Result};
 use rayon::prelude::*;
-use rug::{float::Constant, ops::Pow, Float};
+#[cfg(test)]
+use rug::float::Constant;
+use rug::Float;
 use xc_cache::ContentDigest;
 use xc_numerics::prefix::lossless_decimal as dec;
 
@@ -21,44 +24,50 @@ pub fn prepare_arithmetic_inputs(
     matrix: &RetainedMatrix<'_>,
 ) -> Result<ExternalResearchInputs> {
     matrix.match_state(state)?;
-    ensure!(state.modes > 0 && state.modes <= 512, "automatic polynomial preparation supports 1..512 modes; larger sections require an explicit resource policy");
+    ensure!(
+        state.modes > 0 && state.modes <= 512,
+        "automatic polynomial preparation supports 1..512 modes; larger sections require an explicit resource policy"
+    );
     let _stage = super::capture_runtime::Stage::new("retained arithmetic research preparation");
     let p = state.precision.saturating_add(128);
     precision(p)?;
     let table = xc_zeta::zeros::bundled_dataset_identity()?;
     let definition = ContentDigest::sha256(&serde_json::to_vec(&(
-        "retained-arithmetic-polynomial-v2",
+        "retained-arithmetic-polynomial-v4",
         &matrix.manifest.content_digest,
         &table,
         state.modes,
         p,
     ))?);
-    let store =
-        super::capture_runtime::Checkpoints::new(&(&definition, &state.manifest.content_digest))?;
+    let store = super::capture_runtime::Checkpoints::new(&(
+        "directed-point-stages-exact-tail-v3",
+        &definition,
+        &state.manifest.content_digest,
+    ))?;
     if let Some(input) = store.load::<ExternalResearchInputs>("arithmetic-inputs")? {
         input.matches(state)?;
         return Ok(input);
     }
     let n = state.modes;
     let dim = 2 * n + 1;
-    let l = scalar(&state.cutoff, p)?.ln();
-    let beta = Float::with_val(p, Constant::Pi) * 2u32 / &l;
-    let scale = Float::with_val(p, &beta) * n;
+    let l = finite_math::rounded_log_cutoff(&state.cutoff, p)?;
     let zeros = xc_zeta::zeros::bundled_first_n_strings(table.record_count)?;
     let ordinates = coeffs(&zeros, p)?;
-    let z = ordinates
-        .iter()
-        .map(|t| (Float::with_val(p, t) / &scale).square())
-        .collect::<Vec<_>>();
+    let z = arithmetic::coordinates(&ordinates, &l, n, p)?;
     // Fixed before any solve: retain at most degree 64 after a known-ordinate prefix.
     let degree = n.min(64);
     let prefix = n - degree;
     let d = degree + 1;
-    let scope = format!("finite retained arithmetic section; coordinate z=(t/(2*pi*N/log(C)))^2; first {prefix} bundled ordinate decimals fixed as prefix; monomial basis 1,z,...,z^{degree} after that prefix; all {} bundled atoms through t={}; table sha256={}; arithmetic remainder=V^T*A*V/2-explicit head, includes all omitted signed form contributions and assembly error; no RH, complete critical-line head, continuum transfer, or source-accuracy premise", table.record_count, zeros.last().unwrap(), table.content_sha256);
+    let scope = format!(
+        "finite retained arithmetic section with correctly rounded point stages at {p} bits and exact dyadic head/tail splitting; coordinate z=(t/(2*pi*N/log(C)))^2; first {prefix} bundled ordinate decimals fixed as prefix; monomial basis 1,z,...,z^{degree} after that prefix; all {} bundled atoms through t={}; table sha256={}; arithmetic remainder=V^T*A*V/2-explicit head, includes all omitted signed form contributions of the stored matrix; no RH, complete critical-line head, continuum transfer, or source-accuracy premise",
+        table.record_count,
+        zeros.last().unwrap(),
+        table.content_sha256
+    );
     let mut input: ExternalResearchInputs = serde_json::from_value(serde_json::json!({
         "schema_version":1,"source_eigenpair":state.manifest.content_digest,
         "lambda_squared":state.cutoff,"n_modes":n,"precision_bits":p,
-        "convention_id":"retained-arithmetic-polynomial-v2","definition_digest":definition,
+        "convention_id":"retained-arithmetic-polynomial-v4","definition_digest":definition,
         "approximation_scope":scope
     }))?;
     // State-weighted measures: transform squared and physical unit coefficient masses.
@@ -70,22 +79,25 @@ pub fn prepare_arithmetic_inputs(
             Ok(WeightedAtom {
                 ordinal: j + 1,
                 coordinate: dec(&z[j]),
-                weight: dec(&v.square()),
+                weight: dec(&arithmetic::square_sum(&[v], p)?),
                 family: "zero".into(),
                 partition: "bundled_decimal_head".into(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let unit = source_unit(state, p);
+    let unit = source_unit(state, p)?;
     for k in 0..=n {
-        let mass = if k == 0 {
-            unit[n].clone().square()
-        } else {
-            unit[n - k].clone().square() + unit[n + k].clone().square()
-        };
+        let mass = arithmetic::square_sum(
+            &if k == 0 {
+                vec![unit[n].clone()]
+            } else {
+                vec![unit[n - k].clone(), unit[n + k].clone()]
+            },
+            p,
+        )?;
         input.atoms.push(WeightedAtom {
             ordinal: k + 1,
-            coordinate: dec(&(Float::with_val(p, k) / n).square()),
+            coordinate: dec(&arithmetic::round(&arithmetic::lattice(k, n), p)?),
             weight: dec(&mass),
             family: "lattice".into(),
             partition: "all_modes_including_origin;ordinal=mode+1".into(),
@@ -94,98 +106,25 @@ pub fn prepare_arithmetic_inputs(
     input.atom_coordinate = Some("z=(t/(2*pi*N/log(C)))^2; lattice z=(mode/N)^2".into());
     input.atom_coverage = Some(scope.clone());
 
-    // V in the full -N..N coefficient coordinates. The two reflected entries
-    // each equal (-1)^k (k_k/kappa) F(a_k)/sqrt(L), so their norm includes d_k.
-    let mut factorial = vec![Float::with_val(p, 1); 2 * n + 1];
-    for k in 1..=2 * n {
-        factorial[k] = Float::with_val(p, &factorial[k - 1]) * k;
-    }
-    let n_power = Float::with_val(p, n).pow(2 * n as u32);
-    let mut v = vec![Float::with_val(p, 0); dim * d];
-    for k in 0..=n {
-        let a = (Float::with_val(p, k) / n).square();
-        let mut value =
-            Float::with_val(p, &n_power) / &factorial[n - k] / &factorial[n + k] / l.clone().sqrt();
-        if k % 2 == 1 {
-            value = -value;
-        }
-        for r in &z[..prefix] {
-            value *= Float::with_val(p, &a) - r;
-        }
-        for j in 0..d {
-            v[(n + k) * d + j] = value.clone();
-            v[(n - k) * d + j] = value.clone();
-            value *= &a;
-        }
-    }
-    let av = (0..dim)
-        .into_par_iter()
-        .map(|r| {
-            (0..d)
-                .map(|j| {
-                    let mut sum = Float::with_val(p, 0);
-                    for k in 0..dim {
-                        // The quadratic form of a slightly asymmetric retained point matrix
-                        // is exactly the form of its symmetric part.
-                        let a = (Float::with_val(p, &matrix.entries[r * dim + k])
-                            + &matrix.entries[k * dim + r])
-                            / 2u32;
-                        sum += a * &v[k * d + j];
-                    }
-                    sum
-                })
-                .collect::<Vec<_>>()
-        })
-        .flatten()
-        .collect::<Vec<_>>();
-    let mut gram = vec![Float::with_val(p, 0); d * d];
-    let mut actual = gram.clone();
-    for i in 0..d {
-        for j in 0..=i {
-            let mut g = Float::with_val(p, 0);
-            let mut a = g.clone();
-            for k in 0..dim {
-                g += Float::with_val(p, &v[k * d + i]) * &v[k * d + j];
-                a += Float::with_val(p, &v[k * d + i]) * &av[k * d + j];
-            }
-            gram[i * d + j] = g.clone();
-            gram[j * d + i] = g;
-            a /= 2u32;
-            actual[i * d + j] = a.clone();
-            actual[j * d + i] = a;
-        }
-    }
-    let mut moments = vec![Float::with_val(p, 0); 2 * d - 1];
-    for (j, t) in ordinates.iter().enumerate().skip(prefix) {
-        let x = Float::with_val(p, t) / &beta;
-        let pi_x = Float::with_val(p, Constant::Pi) * &x;
-        let mut f = pi_x.clone().sin() / pi_x;
-        for r in &z[..prefix] {
-            f *= Float::with_val(p, &z[j]) - r;
-        }
-        for k in 1..=n {
-            f /= Float::with_val(p, &z[j]) - (Float::with_val(p, k) / n).square();
-        }
-        let mut weight = f.square();
-        for m in &mut moments {
-            *m += &weight;
-            weight *= &z[j];
-        }
-    }
-    let head = (0..d * d)
-        .map(|k| moments[k / d + k % d].clone())
-        .collect::<Vec<_>>();
-    let tail = actual
-        .iter()
-        .zip(&head)
-        .map(|(a, h)| Float::with_val(p, a) - h)
-        .collect::<Vec<_>>();
-    let form=TailForm {definition_digest:definition.clone(),dimension:d,finite_zero_form:head.iter().map(dec).collect(),tail_correction:tail.iter().map(dec).collect(),lattice_gram:gram.iter().map(dec).collect(),tail_operator_error:None,coverage:scope.clone(),hypotheses:vec!["Point arithmetic of the exact retained parent; assembly/source error is not bounded here. Model energy is computed without retained eigenvalue or eigenvector inputs.".into()],polynomial_coordinate:Some(input.atom_coordinate.clone().unwrap())};
+    let v = arithmetic::basis(&z, &l, n, d, p)?;
+    let (gram, actual) = arithmetic::forms(&matrix.entries, &v, dim, d, p)?;
+    let head = arithmetic::head(&ordinates, &z, &l, n, d, p)?;
+    let (output_precision, tail) = arithmetic::split(&actual, &head, p)?;
+    let form=TailForm {definition_digest:definition.clone(),dimension:d,finite_zero_form:head.iter().map(dec).collect(),tail_correction:vec!["0".into();d*d],lattice_gram:gram.iter().map(dec).collect(),tail_operator_error:None,coverage:scope.clone(),hypotheses:vec!["Point arithmetic of the exact retained parent; assembly/source error is not bounded here. Model energy is computed without retained eigenvalue or eigenvector inputs.".into()],polynomial_coordinate:Some(input.atom_coordinate.clone().unwrap())};
     input.run_once = Some(super::convergence_capture::RunOnceInputs {
         tail_form: Some(form),
         ..Default::default()
     });
     input.energy_allowance = Some(block_allowance(state, matrix, p)?);
+    super::research_completion::promote_input_precision(&mut input, output_precision)?;
+    input
+        .run_once
+        .as_mut()
+        .unwrap()
+        .tail_form
+        .as_mut()
+        .unwrap()
+        .tail_correction = tail.iter().map(dec).collect();
     input.validate()?;
     if let Err(e) = store.save("arithmetic-inputs", &input) {
         eprintln!("arithmetic preparation checkpoint unavailable: {e}");
@@ -336,7 +275,118 @@ fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<
 mod tests {
     use super::*;
     use xc_cache::*;
+    fn exhaustive_preparation_fixture() -> ExternalResearchInputs {
+        let p = 64;
+        let n = 3;
+        let d = 7;
+        let state = RetainedState {
+            manifest: manifest("ccm_weil_eigenpair", b"exact preparation closure"),
+            cutoff: "13".into(),
+            modes: n,
+            precision: p,
+            coefficients: vec![Float::with_val(p, 1); d],
+            eigenvalue: "1".into(),
+            selection_policy: None,
+        };
+        let values = (0..d * d)
+            .map(|k| Float::with_val(p, u32::from(k / d == k % d)))
+            .collect::<Vec<_>>();
+        let matrix = RetainedMatrix::from_admitted_runtime(
+            manifest("ccm_tau_matrix", b"identity preparation closure"),
+            state.cutoff.clone(),
+            n,
+            p,
+            &values,
+        )
+        .unwrap();
+        prepare_arithmetic_inputs(&state, &matrix).unwrap()
+    }
+    #[test]
+    fn exhaustive_preparation_lattice_coordinates_round_once() {
+        let input = exhaustive_preparation_fixture();
+        let point = input
+            .atoms
+            .iter()
+            .find(|a| a.family == "lattice" && a.ordinal == 2)
+            .unwrap();
+        let p = input.precision_bits;
+        assert_eq!(
+            scalar(&point.coordinate, p).unwrap(),
+            Float::with_val(p, Float::with_val(192, rug::Rational::from((1, 9))))
+        );
+    }
+    #[test]
+    fn exhaustive_preparation_ordinate_coordinate_rounds_once() {
+        let input = exhaustive_preparation_fixture();
+        let p = 64 + 128;
+        let l = finite_math::rounded_log_cutoff("13", p).unwrap();
+        let text = xc_zeta::zeros::bundled_first_n_strings(1).unwrap();
+        let t = scalar(&text[0], p).unwrap();
+        let want =
+            (Float::with_val(2048, t) * l / (Float::with_val(2048, Constant::Pi) * 6u32)).square();
+        let got = scalar(&input.atoms[0].coordinate, input.precision_bits).unwrap();
+        assert_eq!(Float::with_val(p, got), Float::with_val(p, want));
+    }
+    #[test]
+    fn exhaustive_preparation_tail_split_preserves_exact_identity_form() {
+        let input = exhaustive_preparation_fixture();
+        let p = input.precision_bits;
+        let form = input.run_once.unwrap().tail_form.unwrap();
+        for ((h, t), g) in form
+            .finite_zero_form
+            .iter()
+            .zip(&form.tail_correction)
+            .zip(&form.lattice_gram)
+        {
+            let h = scalar(h, p).unwrap().to_rational().unwrap();
+            let t = scalar(t, p).unwrap().to_rational().unwrap();
+            let g = scalar(g, p).unwrap().to_rational().unwrap();
+            assert_eq!(h + t, g / 2);
+        }
+    }
 
+    #[test]
+    fn exhaustive_research_log_preparation_uses_exact_decimal_length() {
+        let p = 64;
+        let work = p + 128;
+        let state = RetainedState {
+            manifest: manifest("ccm_weil_eigenpair", b"exact-log-preparation-state"),
+            cutoff: "1.000001".into(),
+            modes: 1,
+            precision: p,
+            coefficients: [0, 1, 0].map(|x| Float::with_val(p, x)).to_vec(),
+            eigenvalue: "1".into(),
+            selection_policy: None,
+        };
+        let matrix = [1, 0, 0, 0, 1, 0, 0, 0, 1].map(|x| Float::with_val(p, x));
+        let retained = RetainedMatrix::from_admitted_runtime(
+            manifest("ccm_tau_matrix", b"exact-log-preparation-matrix"),
+            state.cutoff.clone(),
+            1,
+            p,
+            &matrix,
+        )
+        .unwrap();
+        let actual = prepare_arithmetic_inputs(&state, &retained).unwrap();
+        let exact = rug::Rational::from((1_000_001, 1_000_000));
+        let mut lo = Float::with_val_round(2048, &exact, rug::float::Round::Down).0;
+        let mut hi = Float::with_val_round(2048, &exact, rug::float::Round::Up).0;
+        lo.ln_round(rug::float::Round::Down);
+        hi.ln_round(rug::float::Round::Up);
+        let length = Float::with_val(work, lo);
+        assert_eq!(length, Float::with_val(work, hi));
+        assert_eq!(actual.convention_id, "retained-arithmetic-polynomial-v4");
+
+        let first = xc_zeta::zeros::bundled_first_n_strings(1).unwrap();
+        let ordinate = scalar(&first[0], work).unwrap();
+        let expected = Float::with_val(
+            work,
+            (Float::with_val(2048, ordinate) * length
+                / (Float::with_val(2048, Constant::Pi) * 2u32))
+                .square(),
+        );
+        assert_eq!(scalar(&actual.atoms[0].coordinate, work).unwrap(), expected);
+    }
     #[test]
     fn exported_scalar_bounds_remain_outward_at_higher_reader_precision() {
         for text in ["0", "0.1", "-0.1", "1e-60", "-1e-60"] {

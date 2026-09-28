@@ -133,6 +133,73 @@ pub struct PrimeFloorReport {
     pub maximum_absolute_modulation_digits: f64,
 }
 
+/// Validate metadata against exact decimal cutoffs with floor <=10,000,000.
+/// The bounded integer sieve derives primality and all distinct prime powers.
+fn exact_prime_floor_metadata(text: &str) -> Result<(bool, usize, u64), CcmConvergenceError> {
+    let invalid = |e: String| CcmConvergenceError(e);
+    let literal = xc_core::DecimalLiteral::new(text).map_err(|e| invalid(e.to_string()))?;
+    let canonical = literal.canonical().map_err(|e| invalid(e.to_string()))?;
+    let (digits, exponent) = canonical
+        .as_str()
+        .split_once('e')
+        .map_or((canonical.as_str(), "0"), |(d, e)| (d, e));
+    let exponent = exponent
+        .parse::<i64>()
+        .map_err(|e| invalid(e.to_string()))?;
+    if digits.starts_with('-') || digits.len() > 1_000_000 {
+        return Err(invalid(
+            "prime-floor cutoff is outside the supported positive range".into(),
+        ));
+    }
+    let integral = exponent >= 0;
+    let floor = if exponent >= 0 {
+        if exponent > 8 || digits.len() as u64 + exponent as u64 > 8 {
+            return Err(invalid(
+                "prime-floor cutoff exceeds the 10,000,000 sieve budget".into(),
+            ));
+        }
+        let base = digits.parse::<u64>().map_err(|e| invalid(e.to_string()))?;
+        base * 10u64.pow(exponent as u32)
+    } else {
+        let retained = digits
+            .len()
+            .saturating_sub(usize::try_from(exponent.unsigned_abs()).unwrap_or(usize::MAX));
+        if retained > 8 {
+            return Err(invalid(
+                "prime-floor cutoff exceeds the 10,000,000 sieve budget".into(),
+            ));
+        }
+        if retained == 0 {
+            0
+        } else {
+            digits[..retained]
+                .parse::<u64>()
+                .map_err(|e| invalid(e.to_string()))?
+        }
+    };
+    if !(2..=10_000_000).contains(&floor) {
+        return Err(invalid(
+            "prime-floor cutoff floor must be in 2..=10,000,000".into(),
+        ));
+    }
+    let primes =
+        xc_numerics::primes::try_sieve_primes(floor).map_err(|e| invalid(e.to_string()))?;
+    let is_prime = integral && primes.binary_search(&floor).is_ok();
+    let mut count = 0;
+    let mut largest = 0;
+    for prime in primes {
+        let mut power = prime;
+        loop {
+            count += 1;
+            largest = largest.max(power);
+            if power > floor / prime {
+                break;
+            }
+            power *= prime;
+        }
+    }
+    Ok((is_prime, count, largest))
+}
 pub fn analyze_prime_floor(
     mut points: Vec<PrimeFloorPoint>,
 ) -> Result<PrimeFloorReport, CcmConvergenceError> {
@@ -152,7 +219,24 @@ pub fn analyze_prime_floor(
                 "prime-floor points require cutoff and finite prime-power diagnostics".to_owned(),
             ));
         }
+        let expected = exact_prime_floor_metadata(&point.cutoff)?;
+        if expected
+            != (
+                point.cutoff_is_prime,
+                point.prime_power_count,
+                point.largest_prime_power,
+            )
+        {
+            return Err(CcmConvergenceError(
+                "prime-floor metadata does not match its exact cutoff".into(),
+            ));
+        }
         point.arithmetic_modulation_digits = point.measured_digits - point.smooth_leading_digits;
+        if !point.arithmetic_modulation_digits.is_finite() {
+            return Err(CcmConvergenceError(
+                "prime-floor modulation is not representable".to_owned(),
+            ));
+        }
     }
     let contains_nonprime_cutoff = points.iter().any(|point| !point.cutoff_is_prime);
     if !contains_nonprime_cutoff {
@@ -345,5 +429,37 @@ mod tests {
         }])
         .is_err());
         assert!(analyze_precision_sweep(50, Vec::new()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod prime_floor_tests {
+    use super::*;
+    #[test]
+    fn cutoff_metadata_is_derived_without_binary_rounding() {
+        for text in ["13", "13.0", "1.3e1"] {
+            assert_eq!(exact_prime_floor_metadata(text).unwrap(), (true, 9, 13));
+        }
+        assert_eq!(
+            exact_prime_floor_metadata("12.99999999999999999999999999999999999").unwrap(),
+            (false, 8, 11)
+        );
+        assert_eq!(
+            exact_prime_floor_metadata("13.00000000000000000000000000000000001").unwrap(),
+            (false, 9, 13)
+        );
+        for text in ["1e1000000", "-13", "1"] {
+            assert!(exact_prime_floor_metadata(text).is_err());
+        }
+        let point = PrimeFloorPoint {
+            cutoff: "13".into(),
+            cutoff_is_prime: false,
+            prime_power_count: 2,
+            largest_prime_power: 97,
+            smooth_leading_digits: 1.,
+            measured_digits: 1.,
+            arithmetic_modulation_digits: 0.,
+        };
+        assert!(analyze_prime_floor(vec![point.clone(), point]).is_err());
     }
 }

@@ -1,116 +1,58 @@
-//! Reuse fixed root geometry without changing the rounded response formula.
+//! Reuse directed root geometry while preserving correctly rounded responses.
 use super::*;
-
-// Avoid retaining an unbounded K-by-(2N+1) MPFR table. Derivatives are still
-// prepared once when the optional denominator table exceeds this budget.
 const GEOMETRY_BUDGET_BYTES: u128 = 512 * 1024 * 1024;
 const ROOT_BATCH_SIZE: usize = 16;
-
 struct PreparedRoot<'a> {
     value: &'a Float,
-    denominators: Option<Vec<Float>>,
-    derivative: Float,
+    geometry: root_response_math::Geometry,
 }
-
 pub(super) struct PreparedRootResponses<'a> {
     roots: Vec<Option<PreparedRoot<'a>>>,
+    unit: &'a [Float],
     poles: &'a [Float],
     precision_bits: u32,
 }
-
-// Same adjacent-pair tree as deterministic_pairwise_sum_hp; leaf allocations
-// survive across roots in a batch. No reassociation or reciprocal multiplication.
-struct RootScratch {
-    leaves: Vec<Float>,
-    denominator: Float,
-}
-impl RootScratch {
-    fn new(dimension: usize, bits: u32) -> Self {
-        Self {
-            leaves: (0..dimension).map(|_| Float::with_val(bits, 0)).collect(),
-            denominator: Float::with_val(bits, 0),
-        }
-    }
-    fn sum(&mut self, bits: u32) -> Float {
-        let mut count = self.leaves.len();
-        if count == 0 {
-            return Float::with_val(bits, 0);
-        }
-        while count > 1 {
-            let (left, right) = self.leaves.split_at_mut(1);
-            left[0] += &right[0];
-            for index in 1..count.div_ceil(2) {
-                let (destination, source) = self.leaves.split_at_mut(2 * index);
-                destination[index].assign(&source[0]);
-                if 2 * index + 1 < count {
-                    destination[index] += &source[1];
-                }
-            }
-            count = count.div_ceil(2);
-        }
-        self.leaves[0].clone()
-    }
-}
-
 impl<'a> PreparedRootResponses<'a> {
     pub(super) fn new(
-        unit: &[Float],
+        unit: &'a [Float],
         poles: &'a [Float],
         roots: &'a [EigenvalueResult],
         bits: u32,
     ) -> Result<Self> {
         Self::with_budget(unit, poles, roots, bits, GEOMETRY_BUDGET_BYTES)
     }
-
     fn with_budget(
-        unit: &[Float],
+        unit: &'a [Float],
         poles: &'a [Float],
         roots: &'a [EigenvalueResult],
         bits: u32,
         budget: u128,
     ) -> Result<Self> {
+        root_response_math::validate(unit, bits)?;
+        root_response_math::validate(poles, bits)?;
         if unit.len() != poles.len() {
-            bail!("prime-power root response received incompatible source dimensions");
+            bail!("root-response source dimensions differ");
         }
-        let bytes = (roots.len() as u128)
-            .saturating_mul(poles.len() as u128)
-            .saturating_mul(u128::from(bits).div_ceil(8) + 64);
-        let retain_denominators = bytes <= budget;
+        let point_bytes = u128::from(bits + 4096).div_ceil(8) + 96;
+        let bytes = roots.len() as u128 * poles.len() as u128 * point_bytes * 2;
+        let retain = bytes <= budget.min(GEOMETRY_BUDGET_BYTES);
+        let storage =
+            roots.len() as u128 * (point_bytes * 4 + 128) + if retain { bytes } else { 0 };
+        let workers = roots.len().min(rayon::current_num_threads()) as u128;
+        if storage + workers * poles.len() as u128 * point_bytes * 24 > (8u128 << 30) {
+            bail!("prepared root responses exceed combined workspace budget");
+        }
         let prepared = roots
             .par_iter()
             .map(|outcome| {
                 outcome
                     .value()
                     .map(|value| {
-                        let mut derivative_terms = Vec::with_capacity(unit.len());
-                        let mut denominators =
-                            retain_denominators.then(|| Vec::with_capacity(unit.len()));
-                        for (weight, pole) in unit.iter().zip(poles) {
-                            let mut denominator = Float::with_val(bits, value);
-                            denominator -= pole;
-                            if denominator.is_zero() {
-                                bail!("prime-power root response encountered a secular pole");
-                            }
-                            if let Some(stored) = &mut denominators {
-                                stored.push(denominator.clone());
-                            }
-                            denominator.square_mut();
-                            let mut derivative = Float::with_val(bits, weight);
-                            derivative /= denominator;
-                            derivative = -derivative;
-                            derivative_terms.push(derivative);
-                        }
-                        let derivative = xc_numerics::reduction::deterministic_pairwise_sum_hp(
-                            &derivative_terms,
-                            bits,
-                        );
-                        if derivative.is_zero() {
-                            bail!("prime-power root response has a zero secular derivative");
-                        }
                         Ok(PreparedRoot {
                             value,
-                            denominators,
-                            derivative,
+                            geometry: root_response_math::Geometry::prepare(
+                                unit, poles, value, bits, 64, retain,
+                            )?,
                         })
                     })
                     .transpose()
@@ -120,45 +62,43 @@ impl<'a> PreparedRootResponses<'a> {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             roots: prepared,
+            unit,
             poles,
             precision_bits: bits,
         })
     }
-
     pub(super) fn values(&self, tangent: &[Float]) -> Result<Vec<Option<String>>> {
+        root_response_math::validate(tangent, self.precision_bits)?;
         if tangent.len() != self.poles.len() {
-            bail!("prime-power root response received incompatible source dimensions");
+            bail!("root-response tangent dimensions differ");
         }
-        // Fixed chunks bound scratch use, retain source order and avoid a
-        // separate MPFR allocation tree for every root of every event.
         let chunks = self
             .roots
             .par_chunks(ROOT_BATCH_SIZE)
             .map(|roots| {
-                let mut scratch = RootScratch::new(tangent.len(), self.precision_bits);
                 roots
                     .iter()
                     .map(|root| {
-                        root.as_ref().map(|root| {
-                            for (index, leaf) in scratch.leaves.iter_mut().enumerate() {
-                                leaf.assign(&tangent[index]);
-                                if let Some(denominators) = &root.denominators {
-                                    *leaf /= &denominators[index];
-                                } else {
-                                    scratch.denominator.assign(root.value);
-                                    scratch.denominator -= &self.poles[index];
-                                    *leaf /= &scratch.denominator;
-                                }
-                            }
-                            let mut response = scratch.sum(self.precision_bits);
-                            response = -response;
-                            response /= &root.derivative;
-                            lossless_hp_decimal(&response)
-                        })
+                        root.as_ref()
+                            .map(|root| {
+                                root_response_math::evaluate(
+                                    self.unit,
+                                    tangent,
+                                    self.poles,
+                                    None,
+                                    root.value,
+                                    self.precision_bits,
+                                    Some(&root.geometry),
+                                )
+                                .map(|x| lossless_hp_decimal(&x))
+                            })
+                            .transpose()
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>>>()
             })
-            .collect::<Vec<_>>();
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
         Ok(chunks.into_iter().flatten().collect())
     }
 }
@@ -182,7 +122,10 @@ impl ResponseProgress {
     pub(super) fn new(phase: &'static str, total: usize, roots: usize) -> Self {
         let started = Instant::now();
         if total >= 64 {
-            eprintln!("[HP] prime-power response {phase}: 0/{total} events; {roots} roots/event; {} workers", rayon::current_num_threads());
+            eprintln!(
+                "[HP] prime-power response {phase}: 0/{total} events; {roots} roots/event; {} workers",
+                rayon::current_num_threads()
+            );
         }
         Self {
             phase,
@@ -324,6 +267,121 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    #[test]
+    fn exhaustive_response_range_prepared_extreme_scale() {
+        let p = 128;
+        for e in [-700_000_000i32, 700_000_000] {
+            let h = Float::with_val(p, 1) << e;
+            let unit = [Float::with_val(p, 1), Float::with_val(p, 1)];
+            let tangent = [Float::with_val(p, 1), Float::with_val(p, -1)];
+            let poles = [-h.clone(), h.clone()];
+            let roots = [outcome(Float::with_val(p, 0))];
+            for budget in [0, GEOMETRY_BUDGET_BYTES] {
+                let prepared =
+                    PreparedRootResponses::with_budget(&unit, &poles, &roots, p, budget).unwrap();
+                assert_eq!(
+                    prepared.values(&tangent).unwrap(),
+                    vec![Some(lossless_hp_decimal(&h))]
+                );
+            }
+        }
+    }
+    #[test]
+    fn exhaustive_response_range_scalar_extreme_scale() {
+        let p = 128;
+        for e in [-700_000_000i32, 700_000_000] {
+            let h = Float::with_val(p, 1) << e;
+            let unit = [Float::with_val(p, 1), Float::with_val(p, 1)];
+            let tangent = [Float::with_val(p, 1), Float::with_val(p, -1)];
+            let poles = [-h.clone(), h.clone()];
+            let root = Float::with_val(p, 0);
+            assert_eq!(
+                prime_power_root_velocity_response(&unit, &tangent, &poles, &root, p).unwrap(),
+                h
+            );
+        }
+    }
+    #[test]
+    fn exhaustive_response_range_moving_poles_preserve_finite_translation() {
+        let p = 128;
+        let big = Float::with_val(p, 1) << 700_000_000u32;
+        let unit = [big.clone(), big.clone()];
+        let tangent = vec![Float::with_val(p, 0); 2];
+        let poles = [Float::with_val(p, -1), Float::with_val(p, 1)];
+        let root = Float::with_val(p, 0);
+        assert_eq!(
+            secular_root_velocity_response(
+                &unit,
+                &tangent,
+                &poles,
+                &[big.clone(), big.clone()],
+                &root,
+                p
+            )
+            .unwrap(),
+            big
+        );
+    }
+    #[test]
+    fn exhaustive_response_range_prepared_cancellation() {
+        let p = 64;
+        let big = Float::with_val(p, 1) << 100u32;
+        let unit = [
+            Float::with_val(p, 0),
+            Float::with_val(p, 0),
+            Float::with_val(p, 1),
+        ];
+        let tangent = [Float::with_val(p, &big * 3u32), Float::with_val(p, 2), -big];
+        let poles = [
+            Float::with_val(p, -1),
+            Float::with_val(p, 0),
+            Float::with_val(p, 1),
+        ];
+        let roots = [outcome(Float::with_val(p, 2))];
+        let prepared = PreparedRootResponses::new(&unit, &poles, &roots, p).unwrap();
+        assert_eq!(
+            prepared.values(&tangent).unwrap(),
+            vec![Some(lossless_hp_decimal(&Float::with_val(p, 1)))]
+        );
+    }
+    #[test]
+    fn exhaustive_response_range_precision_preflight_is_fallible() {
+        let unit = [Float::with_val(128, 1)];
+        let poles = [Float::with_val(128, 0)];
+        let roots = [outcome(Float::with_val(128, 1))];
+        assert!(
+            std::panic::catch_unwind(|| PreparedRootResponses::new(&unit, &poles, &roots, 0))
+                .is_ok_and(|x| x.is_err())
+        );
+        assert!(PreparedRootResponses::new(&unit, &poles, &roots, 64).is_err());
+    }
+    #[test]
+    fn exhaustive_response_range_nonfinite_source_rejected() {
+        let unit = [Float::with_val(128, rug::float::Special::Nan)];
+        let poles = [Float::with_val(128, 0)];
+        let roots = [outcome(Float::with_val(128, 1))];
+        assert!(PreparedRootResponses::new(&unit, &poles, &roots, 128).is_err());
+    }
+    #[test]
+    fn exhaustive_response_range_nonfinite_tangent_rejected() {
+        let unit = [Float::with_val(128, 1)];
+        let poles = [Float::with_val(128, 0)];
+        let roots = [outcome(Float::with_val(128, 1))];
+        let prepared = PreparedRootResponses::new(&unit, &poles, &roots, 128).unwrap();
+        assert!(prepared
+            .values(&[Float::with_val(128, rug::float::Special::Nan)])
+            .is_err());
+    }
+    #[test]
+    fn exhaustive_response_range_unrepresentable_result_is_error() {
+        let unit = [Float::with_val(128, 1)];
+        let poles = [Float::with_val(128, 0)];
+        let roots = [outcome(Float::with_val(128, 2))];
+        let prepared = PreparedRootResponses::new(&unit, &poles, &roots, 128).unwrap();
+        let tangent = [Float::with_val(128, 0.75) << rug::float::exp_max()];
+        assert!(prepared.values(&tangent).is_err());
     }
     #[test]
     fn prepared_root_responses_preserve_bits_threads_and_budget_fallback() {

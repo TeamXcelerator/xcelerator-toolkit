@@ -9,8 +9,11 @@
 //! cross-checks must be able to reproduce a partner's quadrature convention
 //! exactly, not merely converge to the same limit:
 //!
+//! For sufficiently smooth transformed integrands:
+//!
 //! - left/right Riemann sums carry an `O(h)` error term proportional to
-//!   `F(b) − F(a)`;
+//!   `g(hi) - g(lo)` for the integrand in the grid variable (negative
+//!   for left and positive for right sums, with coefficient `h/2`);
 //! - midpoint and trapezoid rules carry `O(h²)` error;
 //! - a grid uniform in `log u` and a grid uniform in `u` are different rules
 //!   with different finite-step values.
@@ -25,6 +28,9 @@
 //! publication.
 
 use anyhow::Result;
+
+/// Arithmetic identity: exact endpoints and rounded interior points confined to the domain.
+pub const UNIFORM_GRID_SEMANTICS: &str = "uniform-grid-relative-log-span-pinned-endpoints-v3";
 
 /// Which uniform-grid rule to apply.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,32 +93,57 @@ fn validate_bounds(a: f64, b: f64, steps: usize, variable: GridVariable) -> Resu
     Ok(())
 }
 
+fn finite_grid_value(value: f64) -> Result<f64> {
+    if !value.is_finite() {
+        anyhow::bail!("uniform-grid evaluation or accumulation is nonfinite");
+    }
+    Ok(value)
+}
+
 fn uniform_sum_f64<F: Fn(f64) -> f64>(
     g: F,
     lo: f64,
     hi: f64,
     steps: usize,
     scheme: UniformGridScheme,
-) -> f64 {
+) -> Result<f64> {
+    // Integer and half-integer grid offsets must be exactly representable.
+    if steps as u128 > (1u128 << 52) {
+        anyhow::bail!("binary64 grid offsets require steps <= 2^52");
+    }
     let h = (hi - lo) / steps as f64;
+    if !lo.is_finite() || !hi.is_finite() || hi <= lo || !h.is_finite() || h <= 0.0 {
+        anyhow::bail!("uniform grid is not representable at binary64 precision");
+    }
+    let sample = |x: f64| -> Result<f64> {
+        finite_grid_value(x)?;
+        finite_grid_value(g(x.clamp(lo, hi)))
+    };
+    let sum_samples = |start: usize, end: usize, offset: f64| -> Result<f64> {
+        (start..end).try_fold(-0.0, |sum, i| {
+            finite_grid_value(sum + sample(lo + (i as f64 + offset) * h)?)
+        })
+    };
     let sum = match scheme {
-        UniformGridScheme::LeftRiemann => (0..steps).map(|i| g(lo + i as f64 * h)).sum::<f64>(),
-        UniformGridScheme::RightRiemann => (1..=steps).map(|i| g(lo + i as f64 * h)).sum::<f64>(),
-        UniformGridScheme::Midpoint => (0..steps)
-            .map(|i| g(lo + (i as f64 + 0.5) * h))
-            .sum::<f64>(),
+        UniformGridScheme::LeftRiemann => sum_samples(0, steps, 0.0)?,
+        UniformGridScheme::RightRiemann => (1..=steps).try_fold(-0.0, |sum, i| {
+            finite_grid_value(sum + sample(if i == steps { hi } else { lo + i as f64 * h })?)
+        })?,
+        UniformGridScheme::Midpoint => sum_samples(0, steps, 0.5)?,
         UniformGridScheme::Trapezoid => {
-            let interior = (1..steps).map(|i| g(lo + i as f64 * h)).sum::<f64>();
-            0.5 * (g(lo) + g(hi)) + interior
+            let interior = sum_samples(1, steps, 0.0)?;
+            finite_grid_value(0.5 * finite_grid_value(sample(lo)? + sample(hi)?)? + interior)?
         }
     };
-    sum * h
+    finite_grid_value(sum * h)
 }
 
 /// Integrate `f` over `[a, b]` on a uniform grid of `steps` cells at binary64.
 ///
 /// The scheme and grid variable are the caller's stated convention; record
 /// both (e.g. via [`UniformGridScheme::as_str`]) with any reported value.
+/// Nonfinite samples/arithmetic and unrepresentable grid widths return errors.
+/// This computed finite sum does not certify discretization or callback error.
 pub fn uniform_grid_integral_f64<F: Fn(f64) -> f64>(
     f: F,
     a: f64,
@@ -122,28 +153,67 @@ pub fn uniform_grid_integral_f64<F: Fn(f64) -> f64>(
     variable: GridVariable,
 ) -> Result<f64> {
     validate_bounds(a, b, steps, variable)?;
-    Ok(match variable {
+    match variable {
         GridVariable::U => uniform_sum_f64(f, a, b, steps, scheme),
         GridVariable::LogU => {
+            let lo = 0.0;
+            let relative = (b - a) / a;
+            let hi = if relative.is_finite() {
+                relative.ln_1p()
+            } else {
+                b.ln() - a.ln()
+            };
             let g = |t: f64| {
-                let u = t.exp();
+                let u = if t == lo {
+                    a
+                } else if t == hi {
+                    b
+                } else {
+                    let growth = t.exp();
+                    let point = if growth.is_finite() {
+                        a * growth
+                    } else {
+                        (a.ln() + t).exp()
+                    };
+                    point.clamp(a, b)
+                };
+                if !u.is_finite() || u <= 0.0 {
+                    return f64::NAN;
+                }
                 f(u) * u
             };
-            uniform_sum_f64(g, a.ln(), b.ln(), steps, scheme)
+            uniform_sum_f64(g, lo, hi, steps, scheme)
         }
-    })
+    }
 }
 
 #[cfg(feature = "hp")]
 pub mod hp {
     //! High-precision uniform-grid integration via rug/MPFR.
 
-    use super::{validate_bounds, GridVariable, UniformGridScheme};
-    use anyhow::Result;
+    use super::{GridVariable, UniformGridScheme};
+    use anyhow::{bail, Result};
     use rug::Float;
 
-    /// Accumulation guard bits above the requested precision.
     const GUARD_BITS: u32 = 32;
+
+    fn grid_point(lo: &Float, h: &Float, index: usize, midpoint: bool, working: u32) -> Float {
+        let mut offset = Float::with_val(working, index);
+        if midpoint {
+            // Exact dyadic half; never convert the integer index through f64.
+            offset += Float::with_val(working, 1) / 2;
+        }
+        offset *= h;
+        offset += lo;
+        offset
+    }
+
+    fn finite(value: Float) -> Result<Float> {
+        if !value.is_finite() {
+            bail!("HP uniform-grid evaluation or accumulation is nonfinite");
+        }
+        Ok(value)
+    }
 
     fn uniform_sum<F: Fn(&Float) -> Float>(
         g: F,
@@ -152,50 +222,66 @@ pub mod hp {
         steps: usize,
         scheme: UniformGridScheme,
         working: u32,
-    ) -> Float {
+    ) -> Result<Float> {
+        if !lo.is_finite() || !hi.is_finite() || hi <= lo {
+            bail!("HP grid bounds collapse or are nonfinite at working precision");
+        }
         let mut h = Float::with_val(working, hi - lo);
-        h /= steps as u32;
-        let point = |i: f64| {
-            let mut x = h.clone();
-            x *= Float::with_val(working, i);
-            x += lo;
-            x
+        h /= steps;
+        if !h.is_finite() || h <= 0 {
+            bail!("HP grid spacing is nonpositive or nonfinite");
+        }
+        let sample = |x: &Float| -> Result<Float> {
+            if !x.is_finite() {
+                bail!("HP grid sample point is nonfinite");
+            }
+            let bounded = x.clone().max(lo).min(hi);
+            finite(Float::with_val(working, g(&bounded)))
         };
-        let mut sum = Float::with_val(working, 0u32);
-        match scheme {
-            UniformGridScheme::LeftRiemann => {
-                for i in 0..steps {
-                    sum += g(&point(i as f64));
-                }
+        let mut sum = Float::with_val(working, 0);
+        let (start, end, midpoint) = match scheme {
+            UniformGridScheme::LeftRiemann => (0, steps, false),
+            UniformGridScheme::Midpoint => (0, steps, true),
+            UniformGridScheme::Trapezoid => {
+                let mut edges = sample(lo)?;
+                edges += sample(hi)?;
+                edges = finite(edges)?;
+                edges /= 2;
+                sum += edges;
+                (1, steps, false)
             }
             UniformGridScheme::RightRiemann => {
                 for i in 1..=steps {
-                    sum += g(&point(i as f64));
+                    let point = if i == steps {
+                        hi.clone()
+                    } else {
+                        grid_point(lo, &h, i, false, working)
+                    };
+                    sum += sample(&point)?;
+                    if !sum.is_finite() {
+                        bail!("HP uniform-grid accumulation is nonfinite");
+                    }
                 }
+                return finite(sum * h);
             }
-            UniformGridScheme::Midpoint => {
-                for i in 0..steps {
-                    sum += g(&point(i as f64 + 0.5));
-                }
-            }
-            UniformGridScheme::Trapezoid => {
-                let mut edges = g(&Float::with_val(working, lo));
-                edges += g(&Float::with_val(working, hi));
-                edges /= 2u32;
-                sum += edges;
-                for i in 1..steps {
-                    sum += g(&point(i as f64));
-                }
+        };
+        for i in start..end {
+            sum += sample(&grid_point(lo, &h, i, midpoint, working))?;
+            if !sum.is_finite() {
+                bail!("HP uniform-grid accumulation is nonfinite");
             }
         }
-        sum * h
+        finite(sum * h)
     }
 
-    /// Integrate `f` over `[a, b]` on a uniform grid of `steps` cells at
-    /// `prec` bits (accumulated at `prec + 32`).
+    /// Compute the chosen finite quadrature sum at the maximum of `prec + 32`
+    /// and the endpoint precisions, then
+    /// round to `prec`. Bounds and grid indices never pass through binary64.
     ///
-    /// The scheme and grid variable are the caller's stated convention; record
-    /// both with any reported value.
+    /// Bounds must be finite and ordered, with positive lower bound for a
+    /// log grid. Invalid precision, unresolved grid bounds, and nonfinite
+    /// samples or arithmetic return errors. This is a computed quadrature
+    /// value: discretization error and callback accuracy require separate bounds.
     pub fn uniform_grid_integral<F: Fn(&Float) -> Float>(
         f: F,
         a: &Float,
@@ -205,25 +291,80 @@ pub mod hp {
         variable: GridVariable,
         prec: u32,
     ) -> Result<Float> {
-        validate_bounds(a.to_f64(), b.to_f64(), steps, variable)?;
-        let working = prec.saturating_add(GUARD_BITS);
+        if !a.is_finite() || !b.is_finite() || b <= a || steps == 0 {
+            bail!("HP integration requires finite bounds b > a and at least one step");
+        }
+        if variable == GridVariable::LogU && a <= &0 {
+            bail!("an HP log-u grid requires a > 0");
+        }
+        let working = prec
+            .checked_add(GUARD_BITS)
+            .filter(|&p| p <= rug::float::prec_max());
+        if prec < rug::float::prec_min() || working.is_none() {
+            bail!("HP integration precision is outside the supported range");
+        }
+        let working = working
+            .expect("validated working precision")
+            .max(a.prec())
+            .max(b.prec());
+        if usize::BITS - steps.leading_zeros() + 1 > working {
+            bail!("HP working precision cannot represent the requested grid offsets");
+        }
         let value = match variable {
-            GridVariable::U => {
-                let a = Float::with_val(working, a);
-                let b = Float::with_val(working, b);
-                uniform_sum(f, &a, &b, steps, scheme, working)
-            }
+            GridVariable::U => uniform_sum(
+                f,
+                &Float::with_val(working, a),
+                &Float::with_val(working, b),
+                steps,
+                scheme,
+                working,
+            )?,
             GridVariable::LogU => {
-                let lo = Float::with_val(working, a).ln();
-                let hi = Float::with_val(working, b).ln();
-                let g = |t: &Float| {
-                    let u = t.clone().exp();
-                    f(&u) * u
+                let lo = Float::with_val(working, 0);
+                let mut relative = Float::with_val(working, b - a);
+                relative /= a;
+                let hi = if relative.is_finite() {
+                    relative.ln_1p()
+                } else {
+                    Float::with_val(working, b).ln() - Float::with_val(working, a).ln()
                 };
-                uniform_sum(g, &lo, &hi, steps, scheme, working)
+                let g = |t: &Float| {
+                    let u = if t == &lo {
+                        Float::with_val(working, a)
+                    } else if t == &hi {
+                        Float::with_val(working, b)
+                    } else {
+                        let growth = t.clone().exp();
+                        let point = if growth.is_finite() {
+                            Float::with_val(working, a) * growth
+                        } else {
+                            (Float::with_val(working, a).ln() + t).exp()
+                        };
+                        point.max(a).min(b)
+                    };
+                    if !u.is_finite() || u <= 0 {
+                        return Float::with_val(working, rug::float::Special::Nan);
+                    }
+                    Float::with_val(working, f(&u)) * u
+                };
+                uniform_sum(g, &lo, &hi, steps, scheme, working)?
             }
         };
-        Ok(Float::with_val(prec, value))
+        finite(Float::with_val(prec, value))
+    }
+
+    #[cfg(test)]
+    mod exact_index_tests {
+        use super::*;
+        #[test]
+        #[cfg(target_pointer_width = "64")]
+        fn high_grid_indices_keep_their_integer_and_half_integer_bits() {
+            let p = 128;
+            let i = (1usize << 54) + 1;
+            let point = grid_point(&Float::with_val(p, 0), &Float::with_val(p, 1), i, true, p);
+            let expected = Float::with_val(p, 2 * i + 1) / 2;
+            assert_eq!(point, expected);
+        }
     }
 }
 

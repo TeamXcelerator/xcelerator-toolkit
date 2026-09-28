@@ -1,10 +1,10 @@
 //! Backend-neutral semantic artifact resolution.
 
 use crate::{
-    resolve_cache_bundle_semantic_artifact, resolve_remote_semantic_artifact,
-    ArtifactAssuranceState, ArtifactDisposition, CacheBundleConsumptionPolicy, CacheBundlePolicy,
-    CacheBundleSemanticResolutionRequest, CacheError, CanonicalArtifactManifest, ContentDigest,
-    RemoteGitStore, RemoteResolverOverlay, RemoteSemanticQuery,
+    resolve_remote_semantic_artifact, ArtifactAssuranceState, ArtifactDisposition,
+    CacheBundleConsumptionPolicy, CacheBundlePolicy, CacheBundleSemanticResolutionRequest,
+    CacheError, CanonicalArtifactManifest, ContentDigest, RemoteGitStore, RemoteResolverOverlay,
+    RemoteSemanticQuery,
 };
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -196,16 +196,19 @@ pub fn resolve_semantic_artifact(
                     minimum_assurance: query.minimum_assurance,
                     allow_deprecated: query.allow_deprecated,
                 };
-                match resolve_cache_bundle_semantic_artifact(CacheBundleSemanticResolutionRequest {
-                    bundle_root: root,
-                    scratch_root,
-                    family: &query.family,
-                    semantic_digest: &semantic_digest,
-                    bundle_policy: policy,
-                    consumption_policy: &consumption,
-                    resources,
-                    cancellation,
-                }) {
+                match crate::bundle::resolve_cache_bundle_semantic_artifact_filtered(
+                    CacheBundleSemanticResolutionRequest {
+                        bundle_root: root,
+                        scratch_root,
+                        family: &query.family,
+                        semantic_digest: &semantic_digest,
+                        bundle_policy: policy,
+                        consumption_policy: &consumption,
+                        resources,
+                        cancellation,
+                    },
+                    |artifact| validate_bundle_query(query, artifact),
+                ) {
                     Ok(report) => {
                         rejections.extend(report.rejected_manifest_digests.into_iter().map(
                             |(digest, reason)| SemanticArtifactSourceRejection {
@@ -311,4 +314,57 @@ fn source_name_kind_class<'a>(
 
 fn path_locator(path: &Path) -> String {
     PathBuf::from(path).to_string_lossy().into_owned()
+}
+
+fn validate_bundle_query(
+    query: &RemoteSemanticQuery,
+    artifact: &crate::CacheBundleArtifactRecord,
+) -> Result<(), CacheError> {
+    let manifest = &artifact.manifest;
+    if (!query.allowed_scalar_backends.is_empty()
+        && !query
+            .allowed_scalar_backends
+            .contains(&manifest.canonical_payload.scalar_backend))
+        || query
+            .minimum_precision_bits
+            .is_some_and(|minimum| manifest.canonical_payload.precision_bits.unwrap_or(0) < minimum)
+        || query
+            .required_configuration_digest
+            .as_ref()
+            .is_some_and(|required| {
+                required != &manifest.resolved_mathematical_configuration_digest
+            })
+    {
+        return Err(CacheError::InvalidManifest(
+            "bundle candidate violates the requested backend, precision, or configuration"
+                .to_owned(),
+        ));
+    }
+    if let Some(receipt) = &artifact.origin_receipt {
+        if !query
+            .accepted_publication_policy_digests
+            .contains(&receipt.policy_digest)
+        {
+            return Err(CacheError::InvalidManifest(
+                "bundle origin publication policy is not accepted".to_owned(),
+            ));
+        }
+    }
+    if !query
+        .required_provenance_evidence_digests
+        .iter()
+        .all(|required| {
+            artifact.origin_receipt.as_ref().is_some_and(|receipt| {
+                receipt
+                    .metadata_file_digests
+                    .values()
+                    .any(|digest| digest == required)
+            })
+        })
+    {
+        return Err(CacheError::InvalidManifest(
+            "bundle lacks required provenance evidence".to_owned(),
+        ));
+    }
+    Ok(())
 }

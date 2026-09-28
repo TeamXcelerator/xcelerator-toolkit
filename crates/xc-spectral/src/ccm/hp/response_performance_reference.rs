@@ -1,7 +1,18 @@
-//! Frozen scalar response oracle from Toolkit 545041c, compiled only for tests.
+//! Serial execution reference derived from Toolkit 545041c, only for tests.
+//! Shares current point arithmetic; independent math oracles live in other tests.
 use super::*;
-
 fn reference_prime_power_velocity(
+    n_modes: usize,
+    power: u64,
+    prime: u64,
+    l: &Float,
+    vector: &[Float],
+    p: u32,
+) -> Result<PrimePowerVelocityAction> {
+    prime_response_kernel::evaluate(n_modes, power, prime, l, vector, p, false)
+}
+
+pub(super) fn direct_prime_power_velocity_reference(
     n_modes: usize,
     power: u64,
     prime: u64,
@@ -124,25 +135,12 @@ pub(super) fn reference_prime_power_response(
         bail!("prime-power response capture requires a retained state and root window");
     }
 
-    let xi_norm = deterministic_l2_norm_hp(xi, precision_bits);
-    if xi_norm.is_zero() {
-        bail!("prime-power response capture received a zero eigenstate");
-    }
-    let unit_state = xi
-        .iter()
-        .map(|value| {
-            let mut normalized = Float::with_val(precision_bits, value);
-            normalized /= &xi_norm;
-            normalized
-        })
-        .collect::<Vec<_>>();
-    let unit_state_sum =
-        xc_numerics::reduction::deterministic_pairwise_sum_hp(&unit_state, precision_bits);
+    let unit_state = response_unit_state(xi, precision_bits)?;
+    let unit_state_sum = response_state_sum(&unit_state, precision_bits)?;
     if unit_state_sum.is_zero() {
         bail!("prime-power response cannot preserve the CCM zero-sum eigenstate normalization");
     }
-    let mut ccm_scale = Float::with_val(precision_bits, l).sqrt();
-    ccm_scale /= &unit_state_sum;
+    let ccm_scale = response_normalization_scale(&unit_state, l, precision_bits)?;
     let spectral_isolation = response_spectral_isolation(
         spectral_preparation,
         params,
@@ -158,9 +156,9 @@ pub(super) fn reference_prime_power_response(
         &unit_state,
     )?;
     let shifted_frobenius_norm =
-        shifted_matrix_frobenius_norm(tau, state_eigenvalue, dimension, precision_bits);
-    let (poles, _) = ccm_secular_poles_and_u_velocities(l, params.n_modes, precision_bits);
-    let portable_roots = ccm_response_roots(roots, first_positive_root_index);
+        shifted_matrix_frobenius_norm(tau, state_eigenvalue, dimension, precision_bits)?;
+    let (poles, _) = ccm_secular_poles_and_u_velocities(l, params.n_modes, precision_bits)?;
+    let portable_roots = ccm_response_roots(roots, first_positive_root_index)?;
     let prime_content = prime_powers_up_to(params.lambda_sq_int());
     let lambda_identity = lambda_squared_cache_identity(params);
     let mut events = Vec::with_capacity(prime_content.len());
@@ -175,31 +173,25 @@ pub(super) fn reference_prime_power_response(
             precision_bits,
         )?;
         let eigenvalue_response =
-            deterministic_dot_hp(&unit_state, &velocity.action, precision_bits);
-        let projected_forcing = velocity
-            .action
-            .iter()
-            .zip(&unit_state)
-            .map(|(action, state)| {
-                let mut projection = Float::with_val(precision_bits, state);
-                projection *= &eigenvalue_response;
-                let mut value = Float::with_val(precision_bits, action);
-                value -= projection;
-                value
-            })
-            .collect::<Vec<_>>();
-        let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits);
-        let (eigenvector_response, lagrange_multiplier) =
-            solve_even_sector_bordered_response(&bordered_solver, &projected_forcing);
-        let response_norm = deterministic_l2_norm_hp(&eigenvector_response, precision_bits);
-        let response_sum = xc_numerics::reduction::deterministic_pairwise_sum_hp(
-            &eigenvector_response,
+            deterministic_dot_hp(&unit_state, &velocity.action, precision_bits)?;
+        let projected_forcing = projected_response_forcing(
+            &velocity.action,
+            &unit_state,
+            &eigenvalue_response,
             precision_bits,
-        );
-        let mut ccm_scale_response = Float::with_val(precision_bits, &ccm_scale);
-        ccm_scale_response *= &response_sum;
-        ccm_scale_response /= &unit_state_sum;
-        ccm_scale_response = -ccm_scale_response;
+        )?;
+        let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
+        let (eigenvector_response, lagrange_multiplier) =
+            solve_even_sector_bordered_response(&bordered_solver, &projected_forcing)?;
+        let response_norm = deterministic_l2_norm_hp(&eigenvector_response, precision_bits)?;
+        let ccm_scale_response = response_normalization_tangent(
+            &unit_state,
+            &eigenvector_response,
+            &Float::with_val(precision_bits, 0),
+            &ccm_scale,
+            &unit_state_sum,
+            precision_bits,
+        )?;
         let root_velocity_responses = roots
             .iter()
             .map(|outcome| {
@@ -227,7 +219,7 @@ pub(super) fn reference_prime_power_response(
             &lagrange_multiplier,
             &shifted_frobenius_norm,
             precision_bits,
-        );
+        )?;
         if !weil_eigvec_cache::residual_within_precision_floor(&relative_residual, precision_bits) {
             bail!(
                 "prime-power response bordered solve for {power} failed its precision-scaled residual gate"

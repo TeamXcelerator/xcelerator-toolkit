@@ -63,18 +63,16 @@ pub fn manifest_depends_on(
         let Some(parent) = retained_canonical_manifest(source)? else {
             return Ok(false);
         };
-        return Ok(
-            source.quality.admissible_rank() >= CacheQuality::Validated.admissible_rank()
-                && canonical
-                    .canonical_payload
-                    .dependencies
-                    .contains(&identity(&parent)?),
-        );
+        return Ok(source.quality.satisfies(CacheQuality::Validated)
+            && canonical
+                .canonical_payload
+                .dependencies
+                .contains(&identity(&parent)?));
     }
     Ok(manifest.dependencies.iter().any(|d| {
         d.key == source.key
             && d.content_digest == source.content_digest
-            && source.quality.admissible_rank() >= d.required_quality.admissible_rank()
+            && source.quality.satisfies(d.required_quality)
     }))
 }
 
@@ -84,33 +82,52 @@ pub fn manifest_sources_match(
     manifest: &ArtifactManifest,
     sources: &[&ArtifactManifest],
 ) -> Result<bool, CacheError> {
-    let count = match retained_canonical_manifest(manifest)? {
-        Some(canonical) => canonical.canonical_payload.dependencies.len(),
-        None => manifest.dependencies.len(),
-    };
-    let mut unique = Vec::<&ArtifactManifest>::new();
-    for source in sources {
-        if !unique
+    if let Some(canonical) = retained_canonical_manifest(manifest)? {
+        let key = |d: &PayloadDependencyIdentity| {
+            (
+                d.artifact_family.clone(),
+                d.semantic_digest.clone(),
+                d.manifest_digest.clone(),
+                d.payload_digest.clone(),
+            )
+        };
+        let expected = canonical
+            .canonical_payload
+            .dependencies
             .iter()
-            .any(|s| s.key == source.key && s.content_digest == source.content_digest)
-        {
-            unique.push(source);
+            .map(&key)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut actual = std::collections::BTreeSet::new();
+        for source in sources {
+            let Some(parent) = retained_canonical_manifest(source)? else {
+                return Ok(false);
+            };
+            if !source.quality.satisfies(CacheQuality::Validated) {
+                return Ok(false);
+            }
+            actual.insert(key(&identity(&parent)?));
         }
+        return Ok(actual == expected);
     }
-    if count != unique.len() {
-        return Ok(false);
-    }
-    for source in unique {
+    let mut unique = std::collections::BTreeSet::new();
+    for source in sources {
         if !manifest_depends_on(manifest, source)? {
             return Ok(false);
         }
+        unique.insert((
+            source.key.kind.clone(),
+            source.key.logical_key.clone(),
+            source.key.parameters_digest.clone(),
+            source.content_digest.clone(),
+        ));
     }
-    Ok(true)
+    Ok(unique.len() == manifest.dependencies.len())
 }
 
 /// Resolve exact direct parent metadata without reading numerical payloads.
 /// Supplied manifests permit offline ancestry walks; missing or invalid metadata
 /// remains an error and is never replaced by a same-configuration guess.
+/// The original acceptance minimum also applies to explicitly supplied parents.
 pub fn resolve_manifest_sources(
     manifest: &ArtifactManifest,
     provided: &[ArtifactManifest],
@@ -122,7 +139,9 @@ pub fn resolve_manifest_sources(
             let mut found = None;
             for candidate in provided {
                 if let Some(parent) = retained_canonical_manifest(candidate)? {
-                    if identity(&parent)? == *dependency {
+                    if identity(&parent)? == *dependency
+                        && candidate.quality.satisfies(CacheQuality::Validated)
+                    {
                         found = Some(candidate.clone());
                         break;
                     }
@@ -143,7 +162,7 @@ pub fn resolve_manifest_sources(
                     dependency.manifest_digest,
                 ))
             })?;
-            if source.quality.admissible_rank() < CacheQuality::Validated.admissible_rank() {
+            if !source.quality.satisfies(CacheQuality::Validated) {
                 return Err(CacheError::InvalidManifest(
                     "inadmissible published source".into(),
                 ));
@@ -152,18 +171,36 @@ pub fn resolve_manifest_sources(
         }
     } else {
         for dependency in &manifest.dependencies {
+            let minimum_quality = CacheQuality::Validated
+                .combined_minimum(dependency.required_quality)
+                .ok_or_else(|| {
+                    CacheError::InvalidManifest(
+                        "source validation and dependency quality requirements are incompatible"
+                            .to_owned(),
+                    )
+                })?;
             let mut found = provided
                 .iter()
-                .find(|m| m.key == dependency.key && m.content_digest == dependency.content_digest)
+                .find(|m| {
+                    m.key == dependency.key
+                        && m.content_digest == dependency.content_digest
+                        && m.quality.satisfies(minimum_quality)
+                })
                 .cloned();
             if found.is_none() {
                 if let (Some(resolver), Some(policy)) = (cache.resolver, cache.acceptance) {
+                    let mut policy = policy.clone();
+                    policy.minimum_quality = policy.minimum_quality
+                        .combined_minimum(minimum_quality)
+                        .ok_or_else(|| CacheError::InvalidManifest(
+                            "source cache policy and dependency quality requirements are incompatible".to_owned()
+                        ))?;
                     found = Some(
                         resolver
                             .resolve_exact_manifest(
                                 &dependency.key,
                                 &dependency.content_digest,
-                                policy,
+                                &policy,
                             )?
                             .1,
                     );
@@ -176,17 +213,23 @@ pub fn resolve_manifest_sources(
                 ))
             })?;
             source.validate()?;
-            if source.quality.admissible_rank()
-                < dependency
-                    .required_quality
-                    .admissible_rank()
-                    .max(CacheQuality::Validated.admissible_rank())
+            if !source.quality.satisfies(dependency.required_quality)
+                || !source.quality.satisfies(CacheQuality::Validated)
             {
                 return Err(CacheError::InvalidManifest(
                     "inadmissible local source".into(),
                 ));
             }
             sources.push(source);
+        }
+    }
+    if let Some(policy) = cache.acceptance {
+        for source in &sources {
+            if !source.quality.satisfies(policy.minimum_quality) {
+                return Err(CacheError::InvalidManifest(
+                    "source does not satisfy the original cache acceptance minimum".to_owned(),
+                ));
+            }
         }
     }
     Ok(sources)

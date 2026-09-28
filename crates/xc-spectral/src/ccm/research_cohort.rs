@@ -40,19 +40,23 @@ pub fn register(record: &CohortRegistration) -> Result<()> {
     std::fs::create_dir_all(&root)?;
     let bytes = serde_json::to_vec(record)?;
     let path = root.join(format!("{}.json", ContentDigest::sha256(&bytes).0));
-    match std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-    {
-        Ok(mut f) => {
-            use std::io::Write;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e.into()),
-    };
+    publish_registration(&path, &bytes)
+}
+fn publish_registration(path: &Path, bytes: &[u8]) -> Result<()> {
+    // The digest names complete canonical bytes. A stale partial file is repaired;
+    // concurrent writers for this identity publish exactly the same bytes.
+    use std::io::Read;
+    let limit = u64::try_from(bytes.len())?
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("cohort registration byte budget overflow"))?;
+    let existing = std::fs::File::open(path).and_then(|file| {
+        let mut retained = Vec::new();
+        file.take(limit).read_to_end(&mut retained)?;
+        Ok(retained)
+    });
+    if existing.ok().as_deref() != Some(bytes) {
+        xc_cache::atomic_replace_cache_file(path, bytes)?;
+    }
     Ok(())
 }
 fn metadata(root: &Path, limit: usize) -> Result<Vec<ArtifactManifest>> {
@@ -130,14 +134,20 @@ fn matrix_source(
 }
 
 fn same_cutoff(manifest: &ArtifactManifest, cutoff: &str) -> Result<bool> {
-    if let Some(canonical) = retained_canonical_manifest(manifest)? {
-        return Ok(
-            canonical.semantic_key.resolved_mathematical_parameters["lambda_squared"].as_str()
-                == Some(cutoff),
-        );
-    }
-    let parts = manifest.key.logical_key.split('/').collect::<Vec<_>>();
-    Ok(parts.len() >= 6 && parts[2] == cutoff)
+    let wanted = xc_core::DecimalLiteral::new(cutoff)?.canonical()?;
+    let candidate = if let Some(canonical) = retained_canonical_manifest(manifest)? {
+        canonical.semantic_key.resolved_mathematical_parameters["lambda_squared"]
+            .as_str()
+            .map(str::to_owned)
+    } else {
+        let parts = manifest.key.logical_key.split('/').collect::<Vec<_>>();
+        (parts.len() >= 6).then(|| parts[2].to_owned())
+    };
+    // Invalid historical coordinates are not members; no source is decoded.
+    Ok(candidate
+        .and_then(|s| xc_core::DecimalLiteral::new(s).ok())
+        .and_then(|s| s.canonical().ok())
+        .is_some_and(|s| s == wanted))
 }
 pub(crate) fn discover(
     s: &RetainedState,
@@ -174,10 +184,13 @@ pub(crate) fn discover(
     // Existing cache states need no new registration or primary computation.
     if std::env::var_os("XC_RESEARCH_COHORT_DIR").is_none() {
         if let Some(config) = ManagedArtifactCacheConfig::from_environment()? {
-            for manifest in metadata(
-                &config.cache_root.join("artifacts/ccm_weil_eigenpair"),
-                4096,
-            )? {
+            let mut retained = Vec::new();
+            for root in
+                xc_cache::local_artifact_kind_directories(&config.cache_root, "ccm_weil_eigenpair")
+            {
+                retained.extend(metadata(&root, 4096usize.saturating_sub(retained.len()))?);
+            }
+            for manifest in retained {
                 if manifest.content_digest == s.manifest.content_digest
                     || registrations
                         .iter()
@@ -384,5 +397,21 @@ mod tests {
         state.key.logical_key = "local-shard/weil-states/opaque".into();
         assert!(same_cutoff(&state, "13").unwrap());
         assert!(!same_cutoff(&state, "100").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod cohort_registration_tests {
+    use super::*;
+    #[test]
+    fn partial_cohort_registration_is_replaced() {
+        let root = crate::fresh_test_dir("remaining-cohort-registration");
+        let bytes = br#"{"complete":"canonical record"}"#;
+        let path = root.join(format!("{}.json", ContentDigest::sha256(bytes).0));
+        std::fs::write(&path, b"{").unwrap();
+        publish_registration(&path, bytes).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        publish_registration(&path, bytes).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }

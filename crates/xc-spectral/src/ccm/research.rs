@@ -9,15 +9,24 @@
 //! need not reproduce the rounding of the canonical cell-by-cell route.
 
 use anyhow::{anyhow, bail, Result};
-use rug::{float::Constant, ops::Pow, Float, Integer, Rational};
+#[cfg(test)]
+use rug::float::Constant;
+use rug::{ops::Pow, Float, Integer, Rational};
 use serde::{Deserialize, Serialize};
 use xc_cache::ContentDigest;
 use xc_numerics::mpfr_interval::MpfrInterval;
 
+#[cfg(test)]
 use super::prime_powers_up_to;
+#[path = "research_exact.rs"]
+mod exact;
+#[path = "research_prime.rs"]
+mod prime_math;
+pub const FINITE_DIAGNOSTIC_ARITHMETIC: &str = "exact-stored-point-research-v0.15.2-v1";
 
-pub const RESEARCH_ASSEMBLY_SEMANTICS: &str = "ccm-exact-input-research-assembly-v0.15.0-v1";
-pub const AGGREGATE_PRIME_SEMANTICS: &str = "ccm-prime-divided-difference-generators-v0.15.0-v1";
+pub const RESEARCH_ASSEMBLY_SEMANTICS: &str =
+    "ccm-exact-input-research-assembly-length-aware-arch-v2";
+pub const AGGREGATE_PRIME_SEMANTICS: &str = "ccm-prime-divided-difference-generators-v0.15.2-v1";
 
 /// Exact cutoff input. The active prime set is derived from the rational
 /// floor, never from a rounded floating-point display value.
@@ -38,7 +47,11 @@ impl ExactCutoff {
         }
         let literal = literal.strip_prefix('+').unwrap_or(literal);
         let value = if let Some((numerator, denominator)) = literal.split_once('/') {
-            if denominator.contains('/') || numerator.is_empty() || denominator.is_empty() {
+            if numerator.is_empty()
+                || denominator.is_empty()
+                || !numerator.bytes().all(|b| b.is_ascii_digit())
+                || !denominator.bytes().all(|b| b.is_ascii_digit())
+            {
                 bail!("invalid rational cutoff");
             }
             let numerator = Integer::from_str_radix(numerator, 10)?;
@@ -82,7 +95,14 @@ impl ExactCutoff {
         Self::from_rational(value)
     }
 
+    /// Construct from an exact rational within a 1,048,576-bit budget for
+    /// each of its numerator and denominator, before division or promotion.
     pub fn from_rational(value: Rational) -> Result<Self> {
+        if value.numer().significant_bits() > 1_048_576
+            || value.denom().significant_bits() > 1_048_576
+        {
+            bail!("exact cutoff numerator or denominator exceeds the rational bit budget");
+        }
         if value <= 1 {
             bail!("CCM cutoff must be greater than one");
         }
@@ -106,13 +126,25 @@ impl ExactCutoff {
     pub fn canonical(&self) -> String {
         format!("{}/{}", self.value.numer(), self.value.denom())
     }
+    /// Correctly rounded log of the exact rational cutoff. Close to one,
+    /// form C-1 exactly before directed log1p; never round C to one first.
     pub fn log_length(&self, precision_bits: u32) -> Result<Float> {
+        use rug::float::Round;
         require_precision(precision_bits)?;
-        let length = Float::with_val(precision_bits, &self.value).ln();
-        if !length.is_finite() || length <= 0 {
-            bail!("working precision cannot resolve a positive cutoff log length");
+        let delta = Rational::from(&self.value - 1);
+        for guard in [64, 128, 256, 512, 1024, 2048, 4096] {
+            let work = precision_bits + guard;
+            let mut lower = Float::with_val_round(work, &delta, Round::Down).0;
+            let mut upper = Float::with_val_round(work, &delta, Round::Up).0;
+            lower.ln_1p_round(Round::Down);
+            upper.ln_1p_round(Round::Up);
+            let lo = Float::with_val(precision_bits, lower);
+            let hi = Float::with_val(precision_bits, upper);
+            if lo == hi && lo.is_finite() && lo > 0 {
+                return Ok(lo);
+            }
         }
-        Ok(length)
+        bail!("exact rational cutoff logarithm unresolved within 4096 guard bits")
     }
 }
 
@@ -124,7 +156,8 @@ pub enum PrimeAssemblyRoute {
 }
 
 /// Explicit resource ceilings for opt-in assembly. These are operational
-/// limits, not fitted mathematical constants, and may be raised explicitly.
+/// limits, not fitted mathematical constants. The implementation additionally
+/// enforces an 8193-dimensional ceiling and an 8 GiB arithmetic workspace budget.
 #[derive(Clone, Copy, Debug)]
 pub struct ResearchAssemblyOptions {
     pub prime_route: PrimeAssemblyRoute,
@@ -150,7 +183,10 @@ impl ResearchAssemblyOptions {
         if self.quadrature_order_bucket == 0 || self.maximum_dimension == 0 {
             bail!("research order bucket and dimension limit must be positive");
         }
-        if dimension > self.maximum_dimension || cutoff.prime_cutoff() > self.maximum_prime_cutoff {
+        if dimension > self.maximum_dimension
+            || dimension > 8193
+            || cutoff.prime_cutoff() > self.maximum_prime_cutoff
+        {
             bail!("research assembly exceeds the explicit resource ceilings");
         }
         Ok(dimension)
@@ -193,8 +229,8 @@ impl ResearchMatrixHp {
 }
 
 fn require_precision(precision_bits: u32) -> Result<()> {
-    if !(64..=i32::MAX as u32 - 64).contains(&precision_bits) {
-        bail!("research precision must be between 64 and i32::MAX-64 bits");
+    if !(64..=1_000_000).contains(&precision_bits) {
+        bail!("research precision must be between 64 and 1000000 bits");
     }
     Ok(())
 }
@@ -241,83 +277,65 @@ pub fn quadrature_orders(
         .collect()
 }
 
+/// Plan length-aware archimedean Gauss-Legendre orders, rounded to a bucket.
+/// The nearest true pole maps to `-1 + 2*pi*i/L`. Its Bernstein ellipse
+/// predicts geometric convergence; 64 guard bits and the `3*mode` term supply
+/// a practical margin. This order policy is a heuristic, not an assembly-error
+/// certificate. `base` remains an explicit lower bound.
+pub fn quadrature_orders_for_length(
+    n_modes: usize,
+    base: usize,
+    precision_bits: u32,
+    bucket: usize,
+    length: &Float,
+) -> Result<Vec<usize>> {
+    require_precision(precision_bits)?;
+    checked_dimension(n_modes)?;
+    let l = length.to_f64();
+    if base == 0 || bucket == 0 || !l.is_finite() || l <= 0.0 {
+        bail!("quadrature base, bucket, and finite length must be positive");
+    }
+    let y = 2.0 * std::f64::consts::PI / l;
+    // For ellipse semimajor axis a=(y+sqrt(4+y*y))/2, avoid
+    // cancellation in a-1 and acosh(a) when the pole is close to -1.
+    let a_minus_one = (y + y * (y / (y.hypot(2.0) + 2.0))) / 2.0;
+    let log_rho = 2.0 * (a_minus_one / 2.0).sqrt().asinh();
+    let floor =
+        ((f64::from(precision_bits) + 64.0) / (2.0 * log_rho / std::f64::consts::LN_2)).ceil();
+    if !floor.is_finite() || !(1.0..=1_000_000.0).contains(&floor) {
+        bail!("length-aware archimedean order exceeds the quadrature budget");
+    }
+    (0..=n_modes)
+        .map(|n| {
+            let order = n
+                .checked_mul(3)
+                .and_then(|v| v.checked_add(floor as usize))
+                .ok_or_else(|| anyhow!("quadrature order overflow"))?
+                .max(base);
+            let order = order
+                .div_ceil(bucket)
+                .checked_mul(bucket)
+                .ok_or_else(|| anyhow!("bucketed order overflow"))?;
+            if order > 1_000_000 {
+                bail!("length-aware archimedean order exceeds the quadrature budget");
+            }
+            Ok(order)
+        })
+        .collect()
+}
+
 /// O(K*d+d^2) arithmetic and O(d) generator storage, plus the output matrix.
-/// This is a POINT implementation, not an interval enclosure. Component-level
-/// agreement alone does not certify a deeply cancelled smallest eigenvalue.
+/// Entries are correctly rounded from directed bounds at the exact rational
+/// cutoff. Unresolved rounding or resource/range exhaustion returns an error.
+/// The returned matrix is still a point approximation; it does not certify the
+/// eigenvalue or include error from other matrix components.
 pub fn aggregate_prime_component_hp(
     cutoff: &ExactCutoff,
     n_modes: usize,
     precision_bits: u32,
     options: &ResearchAssemblyOptions,
 ) -> Result<Vec<Float>> {
-    let dimension = options.validate(cutoff, n_modes)?;
-    let length = cutoff.log_length(precision_bits)?;
-    let pi = Float::with_val(precision_bits, Constant::Pi);
-    let mut two_pi = pi.clone();
-    two_pi *= 2;
-    let prime_data = prime_powers_up_to(cutoff.prime_cutoff())
-        .into_iter()
-        .map(|(power, prime, _)| {
-            let x = Float::with_val(precision_bits, power).ln();
-            let mut weight = Float::with_val(precision_bits, prime).ln();
-            weight /= Float::with_val(precision_bits, power).sqrt();
-            (x, weight)
-        })
-        .collect::<Vec<_>>();
-    let mut sines = Vec::with_capacity(n_modes + 1);
-    let mut diagonal = Vec::with_capacity(n_modes + 1);
-    for n in 0..=n_modes {
-        let mut sine = Float::with_val(precision_bits, 0);
-        let mut diag = Float::with_val(precision_bits, 0);
-        for (log_power, weight) in &prime_data {
-            let mut ratio = Float::with_val(precision_bits, log_power);
-            ratio /= &length;
-            let mut phase = two_pi.clone();
-            phase *= n as u64;
-            phase *= &ratio;
-            if n != 0 {
-                let mut value = phase.clone().sin();
-                value *= weight;
-                sine += value;
-            }
-            let mut value = Float::with_val(precision_bits, 1);
-            value -= &ratio;
-            value *= 2;
-            value *= phase.cos();
-            value *= weight;
-            diag += value;
-        }
-        sines.push(sine);
-        diagonal.push(diag);
-    }
-    let signed_sine = |mode: i64| {
-        let value = sines[mode.unsigned_abs() as usize].clone();
-        if mode < 0 {
-            -value
-        } else {
-            value
-        }
-    };
-    let mut matrix = vec![Float::with_val(precision_bits, 0); dimension * dimension];
-    for row in 0..dimension {
-        let n = row as i64 - n_modes as i64;
-        for column in row..dimension {
-            let m = column as i64 - n_modes as i64;
-            let value = if n == m {
-                diagonal[n.unsigned_abs() as usize].clone()
-            } else {
-                let mut value = signed_sine(m);
-                value -= signed_sine(n);
-                let mut denominator = pi.clone();
-                denominator *= n - m;
-                value /= denominator;
-                value
-            };
-            matrix[row * dimension + column] = value.clone();
-            matrix[column * dimension + row] = value;
-        }
-    }
-    Ok(matrix)
+    prime_math::evaluate(cutoff, n_modes, precision_bits, options)
 }
 
 fn validate_symmetric_matrix(
@@ -326,7 +344,7 @@ fn validate_symmetric_matrix(
     precision_bits: u32,
 ) -> Result<()> {
     require_precision(precision_bits)?;
-    if dimension == 0 || dimension.checked_mul(dimension) != Some(matrix.len()) {
+    if dimension == 0 || dimension > 257 || dimension.checked_mul(dimension) != Some(matrix.len()) {
         bail!("expected a nonempty square matrix");
     }
     if matrix
@@ -345,23 +363,6 @@ fn validate_symmetric_matrix(
     Ok(())
 }
 
-fn dot(left: &[Float], right: &[Float], p: u32) -> Float {
-    let terms = left
-        .iter()
-        .zip(right)
-        .map(|(a, b)| {
-            let mut value = Float::with_val(p, a);
-            value *= b;
-            value
-        })
-        .collect::<Vec<_>>();
-    xc_numerics::reduction::deterministic_pairwise_sum_hp_owned(terms, p)
-}
-
-fn norm(vector: &[Float], p: u32) -> Float {
-    dot(vector, vector, p).sqrt()
-}
-
 fn matrix_digest(matrix: &[Float], dimension: usize, p: u32) -> Result<ContentDigest> {
     let values = matrix
         .iter()
@@ -376,6 +377,7 @@ fn matrix_digest(matrix: &[Float], dimension: usize, p: u32) -> Result<ContentDi
 #[serde(deny_unknown_fields)]
 pub struct NestedSchurReport {
     pub schema_version: u32,
+    pub arithmetic: String,
     pub smaller_dimension: usize,
     pub precision_bits: u32,
     pub smaller_matrix_digest: ContentDigest,
@@ -391,8 +393,13 @@ pub struct NestedSchurReport {
     pub assurance: String,
     /// In the generalized case: small A, small G, large A, large G.
     pub generalized_input_digests: Option<[ContentDigest; 4]>,
+    /// Independent defects of A and G; the original defect field measures A-zG.
+    #[serde(default)]
+    pub generalized_prefix_defects: Option<[String; 2]>,
 }
 
+/// Exact stored-point Schur diagnostic for a prefix of 1..256 directions.
+/// Rational workspace is limited to 64 Mbit; exhaustion is an explicit error.
 /// One added direction in a shared ORTHONORMAL basis. For a nonorthonormal
 /// basis, use `analyze_nested_gram_schur_hp`, which forms A-zG explicitly.
 /// A measured nesting defect is retained; the Schur calculation always uses
@@ -410,81 +417,51 @@ pub fn analyze_nested_schur_hp(
         .checked_add(1)
         .ok_or_else(|| anyhow!("dimension overflow"))?;
     validate_symmetric_matrix(larger, bigger, precision_bits)?;
-    if !shift.is_finite()
-        || shift.prec() < precision_bits
-        || !prefix_tolerance.is_finite()
-        || prefix_tolerance.prec() < precision_bits
-        || prefix_tolerance < &0
-    {
-        bail!("shift and nonnegative prefix tolerance must be finite");
-    }
-    let n = smaller_dimension;
-    let p = precision_bits;
-    let mut defect = Float::with_val(p, 0);
-    let mut block = Vec::with_capacity(n * n);
-    let mut border = Vec::with_capacity(n);
-    for i in 0..n {
-        border.push(Float::with_val(p, &larger[i * bigger + n]));
-        for j in 0..n {
-            let mut delta = Float::with_val(p, &larger[i * bigger + j]);
-            delta -= &smaller[i * n + j];
-            delta.abs_mut();
-            if delta > defect {
-                defect = delta;
-            }
-            let mut value = Float::with_val(p, &larger[i * bigger + j]);
-            if i == j {
-                value -= shift;
-            }
-            block.push(value);
-        }
-    }
-    let factors = xc_numerics::linalg::lu_factor(&block, n)?;
-    let solution = xc_numerics::linalg::lu_solve(&factors, &border, n, p);
-    if solution.iter().any(|v| !v.is_finite()) {
-        bail!("nonfinite Schur solve");
-    }
-    let residual = (0..n)
-        .map(|i| {
-            let mut value = dot(&block[i * n..(i + 1) * n], &solution, p);
-            value -= &border[i];
-            value
-        })
-        .collect::<Vec<_>>();
-    let border_norm = norm(&border, p);
-    let mut denominator = norm(&block, p);
-    denominator *= norm(&solution, p);
-    denominator += &border_norm;
-    let mut relative = norm(&residual, p);
-    if !denominator.is_zero() {
-        relative /= denominator;
-    }
-    let mut schur = Float::with_val(p, &larger[n * bigger + n]);
-    schur -= shift;
-    schur -= dot(&border, &solution, p);
-    if !defect.is_finite()
-        || !border_norm.is_finite()
-        || !relative.is_finite()
-        || !schur.is_finite()
-    {
-        bail!("nonfinite nested-section diagnostic");
+    let small = exact::points(smaller, precision_bits, 257 * 257)?;
+    let large = exact::points(larger, precision_bits, 257 * 257)?;
+    let shift_q = exact::point(shift, precision_bits)?;
+    let values = exact::schur(&small, &large, smaller_dimension, &shift_q)?;
+    schur_report(
+        values,
+        smaller_dimension,
+        shift,
+        prefix_tolerance,
+        precision_bits,
+        matrix_digest(smaller, smaller_dimension, precision_bits)?,
+        matrix_digest(larger, bigger, precision_bits)?,
+    )
+}
+fn schur_report(
+    values: exact::Schur,
+    n: usize,
+    shift: &Float,
+    tolerance: &Float,
+    p: u32,
+    small_digest: ContentDigest,
+    large_digest: ContentDigest,
+) -> Result<NestedSchurReport> {
+    let tolerance_q = exact::point(tolerance, p)?;
+    if tolerance_q < 0 {
+        bail!("Schur prefix tolerance must be nonnegative");
     }
     Ok(NestedSchurReport {
-        schema_version: 1,
+        schema_version: 3,
+        arithmetic: FINITE_DIAGNOSTIC_ARITHMETIC.into(),
         smaller_dimension: n,
         precision_bits: p,
-        smaller_matrix_digest: matrix_digest(smaller, n, p)?,
-        larger_matrix_digest: matrix_digest(larger, bigger, p)?,
-        prefix_within_tolerance: &defect <= prefix_tolerance,
-        prefix_maximum_absolute_defect: defect.to_string_radix(10, None),
-        requested_prefix_tolerance: prefix_tolerance.to_string_radix(10, None),
+        smaller_matrix_digest: small_digest,
+        larger_matrix_digest: large_digest,
+        prefix_within_tolerance: values.defect <= tolerance_q,
+        prefix_maximum_absolute_defect: exact::output(&values.defect, p)?.to_string_radix(10, None),
+        requested_prefix_tolerance: tolerance.to_string_radix(10, None),
         shift: shift.to_string_radix(10, None),
-        border_norm: border_norm.to_string_radix(10, None),
-        schur_complement: schur.to_string_radix(10, None),
-        solve_relative_residual: relative.to_string_radix(10, None),
+        border_norm: exact::sqrt(&values.border_squared, p)?.to_string_radix(10, None),
+        schur_complement: exact::output(&values.value, p)?.to_string_radix(10, None),
+        solve_relative_residual: "0".into(),
         schur_uses_actual_larger_prefix: true,
-        assurance: "computed_diagnostic_not_a_positivity_certificate".to_owned(),
+        assurance: "exact_stored_point_schur_correctly_rounded_not_a_positivity_certificate".into(),
         generalized_input_digests: None,
+        generalized_prefix_defects: None,
     })
 }
 
@@ -508,41 +485,70 @@ pub fn analyze_nested_gram_schur_hp(
         .ok_or_else(|| anyhow!("dimension overflow"))?;
     validate_symmetric_matrix(large_a, bigger, p)?;
     validate_symmetric_matrix(large_g, bigger, p)?;
-    if !shift.is_finite() || shift.prec() < p {
-        bail!("generalized shift must be finite at the requested precision");
-    }
-    let pencil = |a: &[Float], g: &[Float]| {
-        a.iter()
-            .zip(g)
-            .map(|(a, g)| {
-                let mut value = Float::with_val(p, g);
-                value *= shift;
-                value = -value;
-                value += a;
-                value
-            })
-            .collect::<Vec<_>>()
+    let shift_q = exact::point(shift, p)?;
+    let small = exact::pencil(
+        &exact::points(small_a, p, 257 * 257)?,
+        &exact::points(small_g, p, 257 * 257)?,
+        &shift_q,
+    )?;
+    let large = exact::pencil(
+        &exact::points(large_a, p, 257 * 257)?,
+        &exact::points(large_g, p, 257 * 257)?,
+        &shift_q,
+    )?;
+    let values = exact::schur(&small, &large, smaller_dimension, &Rational::from(0))?;
+    // Digest the exact pencils as numerator/denominator pairs; rounding them
+    // before the Schur solve would erase low source bits after cancellation.
+    let pencil_digest = |q: &[Rational]| -> Result<ContentDigest> {
+        Ok(ContentDigest::sha256(&serde_json::to_vec(&(
+            FINITE_DIAGNOSTIC_ARITHMETIC,
+            p,
+            q.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        ))?))
     };
-    let small = pencil(small_a, small_g);
-    let large = pencil(large_a, large_g);
-    let zero = Float::with_val(p, 0);
-    let mut report = analyze_nested_schur_hp(
-        &small,
-        &large,
+    let mut report = schur_report(
+        values,
         smaller_dimension,
-        &zero,
+        shift,
         prefix_tolerance,
         p,
+        pencil_digest(&small)?,
+        pencil_digest(&large)?,
     )?;
+    let prefix_defect = |small: &[Float], large: &[Float]| -> Result<Rational> {
+        let small = exact::points(small, p, 257 * 257)?;
+        let large = exact::points(large, p, 257 * 257)?;
+        let mut defect = Rational::from(0);
+        for row in 0..smaller_dimension {
+            for column in 0..smaller_dimension {
+                defect = defect.max(
+                    (large[row * bigger + column].clone()
+                        - &small[row * smaller_dimension + column])
+                        .abs(),
+                );
+            }
+        }
+        Ok(defect)
+    };
+    let defects = [
+        prefix_defect(small_a, large_a)?,
+        prefix_defect(small_g, large_g)?,
+    ];
+    let tolerance = exact::point(prefix_tolerance, p)?;
+    report.prefix_within_tolerance = defects.iter().all(|d| d <= &tolerance);
+    report.generalized_prefix_defects = Some([
+        exact::output(&defects[0], p)?.to_string_radix(10, None),
+        exact::output(&defects[1], p)?.to_string_radix(10, None),
+    ]);
     report.generalized_input_digests = Some([
         matrix_digest(small_a, smaller_dimension, p)?,
         matrix_digest(small_g, smaller_dimension, p)?,
         matrix_digest(large_a, bigger, p)?,
         matrix_digest(large_g, bigger, p)?,
     ]);
-    report.shift = shift.to_string_radix(10, None);
     report.assurance =
-        "computed_generalized_pencil_diagnostic_gram_positivity_not_certified".to_owned();
+        "exact_stored_point_generalized_schur_correctly_rounded_gram_positivity_not_certified"
+            .into();
     Ok(report)
 }
 
@@ -550,6 +556,7 @@ pub fn analyze_nested_gram_schur_hp(
 #[serde(deny_unknown_fields)]
 pub struct RootTransferReport {
     pub schema_version: u32,
+    pub arithmetic: String,
     pub precision_bits: u32,
     pub source_digest: ContentDigest,
     pub expansion_point: String,
@@ -564,45 +571,9 @@ pub struct RootTransferReport {
     pub assurance: String,
 }
 
-fn secular_value_derivative(
-    weights: &[Float],
-    poles: &[Float],
-    point: &Float,
-    p: u32,
-) -> Result<(Float, Float, Float, Float)> {
-    let mut terms = Vec::with_capacity(weights.len());
-    let mut derivatives = Vec::with_capacity(weights.len());
-    let mut nearest: Option<Float> = None;
-    let mut magnitude_sum = Float::with_val(p, 0);
-    for (weight, pole) in weights.iter().zip(poles) {
-        let mut denominator = Float::with_val(p, point);
-        denominator -= pole;
-        if denominator.is_zero() {
-            bail!("secular evaluation encountered a pole");
-        }
-        let distance = denominator.clone().abs();
-        if nearest.as_ref().is_none_or(|old| &distance < old) {
-            nearest = Some(distance);
-        }
-        let mut term = Float::with_val(p, weight);
-        term /= &denominator;
-        magnitude_sum += term.clone().abs();
-        let mut derivative = -term.clone();
-        derivative /= denominator;
-        terms.push(term);
-        derivatives.push(derivative);
-    }
-    Ok((
-        xc_numerics::reduction::deterministic_pairwise_sum_hp_owned(terms, p),
-        xc_numerics::reduction::deterministic_pairwise_sum_hp_owned(derivatives, p),
-        nearest.ok_or_else(|| anyhow!("empty secular source"))?,
-        magnitude_sum,
-    ))
-}
-
-/// Evaluate -F_new(r_old)/F_new'(r_old) and compare with a supplied target
-/// estimate. No reference zero is used to produce the prediction. A supplied
-/// target is checked by residual but is NOT thereby promoted to a certificate.
+/// Correctly rounded -F_new(r_old)/F_new'(r_old) of the exact stored points.
+/// Exact rational comparisons decide pole crossings and supplied displacements.
+/// This local Newton prediction is not a root enclosure or a source-error bound.
 pub fn analyze_root_transfer_hp(
     new_weights: &[Float],
     poles: &[Float],
@@ -611,52 +582,35 @@ pub fn analyze_root_transfer_hp(
     p: u32,
 ) -> Result<RootTransferReport> {
     require_precision(p)?;
-    if new_weights.is_empty()
-        || new_weights.len() != poles.len()
-        || new_weights
-            .iter()
-            .chain(poles)
-            .any(|v| !v.is_finite() || v.prec() < p)
-        || !old_root.is_finite()
-        || old_root.prec() < p
-        || target_estimate.is_some_and(|v| !v.is_finite() || v.prec() < p)
-    {
-        bail!("incompatible or nonfinite root-transfer inputs");
+    let weights = exact::points(new_weights, p, 8193)?;
+    let poles_q = exact::points(poles, p, 8193)?;
+    let old = exact::point(old_root, p)?;
+    let source = exact::secular(&weights, &poles_q, &old)?;
+    if source.derivative == 0 {
+        bail!("root-transfer derivative is zero");
     }
-    if poles.windows(2).any(|pair| pair[0] >= pair[1]) {
-        bail!("poles must be strictly ordered");
-    }
-    let (value, derivative, nearest, _) =
-        secular_value_derivative(new_weights, poles, old_root, p)?;
-    if derivative.is_zero() {
-        bail!("root-transfer derivative is unresolved or zero");
-    }
-    let mut prediction = -value.clone();
-    prediction /= &derivative;
-    if !prediction.is_finite() {
-        bail!("nonfinite root-transfer prediction");
-    }
-    let mut predicted_target = Float::with_val(p, old_root);
-    predicted_target += &prediction;
-    let crosses = poles.iter().any(|pole| {
-        (old_root < pole && pole <= &predicted_target)
-            || (&predicted_target <= pole && pole < old_root)
+    let prediction = -source.value.clone() / &source.derivative;
+    let predicted_target = old.clone() + &prediction;
+    exact::budget([&prediction, &predicted_target].into_iter())?;
+    let crosses = poles_q.iter().any(|pole| {
+        (old < *pole && pole <= &predicted_target) || (&predicted_target <= pole && *pole < old)
     });
     let mut observed = None;
     let mut prediction_error = None;
     let mut target_residual = None;
     if let Some(target) = target_estimate {
-        let (mut residual, _, _, scale) = secular_value_derivative(new_weights, poles, target, p)?;
-        residual.abs_mut();
-        if !scale.is_zero() {
-            residual /= scale;
-        }
-        target_residual = Some(residual.to_string_radix(10, None));
-        let mut displacement = Float::with_val(p, target);
-        displacement -= old_root;
-        observed = Some(displacement.to_string_radix(10, None));
-        displacement -= &prediction;
-        prediction_error = Some(displacement.to_string_radix(10, None));
+        let target = exact::point(target, p)?;
+        let at_target = exact::secular(&weights, &poles_q, &target)?;
+        let residual = if at_target.absolute_sum == 0 {
+            Rational::from(0)
+        } else {
+            at_target.value.abs() / at_target.absolute_sum
+        };
+        target_residual = Some(exact::output(&residual, p)?.to_string_radix(10, None));
+        let displacement = target - &old;
+        observed = Some(exact::output(&displacement, p)?.to_string_radix(10, None));
+        prediction_error =
+            Some(exact::output(&(displacement - &prediction), p)?.to_string_radix(10, None));
     }
     let encoded_weights = new_weights
         .iter()
@@ -667,7 +621,8 @@ pub fn analyze_root_transfer_hp(
         .map(|v| v.to_string_radix(10, None))
         .collect::<Vec<_>>();
     Ok(RootTransferReport {
-        schema_version: 1,
+        schema_version: 2,
+        arithmetic: FINITE_DIAGNOSTIC_ARITHMETIC.into(),
         precision_bits: p,
         source_digest: ContentDigest::sha256(&serde_json::to_vec(&(
             p,
@@ -675,15 +630,15 @@ pub fn analyze_root_transfer_hp(
             encoded_poles,
         ))?),
         expansion_point: old_root.to_string_radix(10, None),
-        function_value: value.to_string_radix(10, None),
-        derivative: derivative.to_string_radix(10, None),
-        nearest_pole_distance: nearest.to_string_radix(10, None),
-        predicted_displacement: prediction.to_string_radix(10, None),
+        function_value: exact::output(&source.value, p)?.to_string_radix(10, None),
+        derivative: exact::output(&source.derivative, p)?.to_string_radix(10, None),
+        nearest_pole_distance: exact::output(&source.nearest, p)?.to_string_radix(10, None),
+        predicted_displacement: exact::output(&prediction, p)?.to_string_radix(10, None),
         predicted_step_crosses_pole: crosses,
         observed_displacement: observed,
         displacement_prediction_error: prediction_error,
         supplied_target_relative_residual: target_residual,
-        assurance: "computed_local_linearization_not_a_root_enclosure".to_owned(),
+        assurance: "exact_stored_point_linearization_correctly_rounded_not_a_root_enclosure".into(),
     })
 }
 
@@ -695,10 +650,15 @@ pub struct StripErrorPanel {
     pub supremum_absolute_error: Rational,
 }
 
-/// Conditional transform estimate on |Im z|<=height. The exact input premises
+/// Conditional estimate for F(z)=integral f(x) exp(i*x*z) dx on |Im z|<=height.
+/// Panel endpoints and widths use the integration coordinate x (x=log(u)
+/// in a log-coordinate model); no additional measure or density is supplied.
+/// The tail premise bounds integral |f-g| exp(height*|x|) dx off the panels.
+/// The exact input premises
 /// must bound |f-g| on EACH ENTIRE panel and the weighted tail outside their
 /// union. This function rigorously encloses the algebraic bound, but it cannot
-/// certify those external functional premises from point samples.
+/// certify those external functional premises from point samples. An
+/// unrepresentable finite enclosure returns an error, not an invalid interval.
 pub fn conditional_transform_strip_bound(
     panels: &[StripErrorPanel],
     height: &Rational,
@@ -719,6 +679,11 @@ pub fn conditional_transform_strip_bound(
         {
             bail!("panels must be a contiguous partition with nonnegative supremum bounds");
         }
+        // An identically zero error contributes zero at every finite height;
+        // do not manufacture 0 * an overflowing exponential.
+        if panel.supremum_absolute_error == 0 {
+            continue;
+        }
         let extent = panel.left.clone().abs().max(panel.right.clone().abs());
         let mut width = panel.right.clone();
         width -= &panel.left;
@@ -727,6 +692,9 @@ pub fn conditional_transform_strip_bound(
             .mul(&height.mul(&MpfrInterval::from_rational(&extent, p)).exp());
         bound = bound.add(&panel_bound);
     }
+    // Nonfallible interval arithmetic propagates an invalid sentinel on range
+    // failure. A successful public bound must be a valid finite enclosure.
+    bound.validate()?;
     Ok(bound)
 }
 
@@ -884,5 +852,322 @@ mod tests {
             192
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod strip_range_contract_tests {
+    use super::*;
+    #[test]
+    fn unrepresentable_positive_strip_bound_is_an_error() {
+        let panel = StripErrorPanel {
+            left: Rational::from(-1),
+            right: Rational::from(1),
+            supremum_absolute_error: Rational::from(1),
+        };
+        let height = Rational::from(Integer::from(1) << 64u32);
+        assert!(
+            conditional_transform_strip_bound(&[panel], &height, &Rational::from(0), 64,).is_err()
+        );
+    }
+    #[test]
+    fn zero_error_panel_does_not_evaluate_an_unneeded_exponential() {
+        let panel = StripErrorPanel {
+            left: Rational::from(-1),
+            right: Rational::from(1),
+            supremum_absolute_error: Rational::from(0),
+        };
+        let height = Rational::from(Integer::from(1) << 64u32);
+        let bound =
+            conditional_transform_strip_bound(&[panel], &height, &Rational::from(3), 64).unwrap();
+        bound.validate().unwrap();
+        assert_eq!(bound.lower(), &Float::with_val(64, 3));
+        assert_eq!(bound.upper(), bound.lower());
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_research_log {
+    use super::*;
+    fn directed_reference(value: &Rational, p: u32) -> Float {
+        use rug::float::Round;
+        let mut lo = Float::with_val_round(4096, value, Round::Down).0;
+        let mut hi = Float::with_val_round(4096, value, Round::Up).0;
+        lo.ln_round(Round::Down);
+        hi.ln_round(Round::Up);
+        let lower = Float::with_val(p, lo);
+        let upper = Float::with_val(p, hi);
+        assert_eq!(
+            lower, upper,
+            "reference interval must determine the rounding"
+        );
+        lower
+    }
+    #[test]
+    fn exhaustive_research_log_preserves_cutoffs_near_one() {
+        let denominator = Integer::from(1) << 200;
+        let exact = Rational::from((Integer::from(&denominator + 1), denominator));
+        let cutoff = ExactCutoff::from_rational(exact).unwrap();
+        let actual = cutoff.log_length(64);
+        assert!(
+            actual.is_ok(),
+            "resolvable nonzero log was lost by rounding the cutoff first: {actual:?}"
+        );
+        let expected = directed_reference(cutoff.value(), 64);
+        assert_eq!(actual.unwrap(), expected);
+    }
+    #[test]
+    fn exhaustive_research_log_rounds_the_exact_rational_log_once() {
+        for p in [64, 128, 256] {
+            for denominator in 3..=17 {
+                for numerator in denominator + 1..=denominator + 20 {
+                    let cutoff =
+                        ExactCutoff::from_rational(Rational::from((numerator, denominator)))
+                            .unwrap();
+                    let reference = directed_reference(cutoff.value(), p);
+                    assert_eq!(
+                        cutoff.log_length(p).unwrap(),
+                        reference,
+                        "p={p}, cutoff={numerator}/{denominator}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn exhaustive_research_log_precision_ceiling_precedes_allocation() {
+        assert!(quadrature_orders(0, 1, 1_000_001, 1).is_err());
+    }
+    #[test]
+    fn exhaustive_research_log_rational_input_has_a_bit_budget() {
+        let denominator = Integer::from(1) << 1_048_577;
+        let value = Rational::from((Integer::from(&denominator + 1), denominator));
+        assert!(ExactCutoff::from_rational(value).is_err());
+    }
+    #[test]
+    fn exhaustive_research_log_near_one_at_the_rational_budget_and_precision_domain() {
+        for exponent in [200u32, 4096, 1_048_575] {
+            let denominator = Integer::from(1) << exponent;
+            let cutoff = ExactCutoff::from_rational(Rational::from((
+                Integer::from(&denominator + 1),
+                denominator,
+            )))
+            .unwrap();
+            // delta-delta^2/2 < log(1+delta) < delta; at p=64 the
+            // entire interval rounds to delta for all these exponents.
+            assert_eq!(
+                cutoff.log_length(64).unwrap(),
+                Float::with_val(64, 1) >> exponent
+            );
+            assert_eq!(cutoff.prime_cutoff(), 1);
+        }
+        let cutoff = ExactCutoff::parse("2").unwrap();
+        for p in [0, 1, 63, 1_000_001, u32::MAX] {
+            assert!(cutoff.log_length(p).is_err());
+        }
+        assert!(require_precision(64).is_ok());
+        assert!(require_precision(1_000_000).is_ok());
+        assert_eq!(
+            cutoff.log_length(128).unwrap(),
+            Float::with_val(128, 2).ln()
+        );
+    }
+    #[test]
+    fn exhaustive_research_log_exact_representations_share_correct_rounding() {
+        for group in [
+            ["13.1", "131/10", "1.31e1"],
+            ["2", "2/1", "2.0000"],
+            ["1.000001", "1000001/1000000", "1000001e-6"],
+        ] {
+            let base = ExactCutoff::parse(group[0]).unwrap();
+            for literal in group {
+                let value = ExactCutoff::parse(literal).unwrap();
+                assert_eq!(base, value);
+                for p in [64, 128, 256] {
+                    assert_eq!(
+                        value.log_length(p).unwrap(),
+                        directed_reference(value.value(), p)
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            RESEARCH_ASSEMBLY_SEMANTICS,
+            "ccm-exact-input-research-assembly-length-aware-arch-v2"
+        );
+        assert_eq!(
+            AGGREGATE_PRIME_SEMANTICS,
+            "ccm-prime-divided-difference-generators-v0.15.2-v1"
+        );
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_aggregate_prime {
+    use super::*;
+    fn independent(c: &ExactCutoff, n: usize, p: u32) -> Vec<Float> {
+        let w = 2048;
+        let l = c.log_length(w).unwrap();
+        let pi = Float::with_val(w, Constant::Pi);
+        let dim = 2 * n + 1;
+        let mut out = vec![Float::with_val(w, 0); dim * dim];
+        for (power, prime, _) in prime_powers_up_to(c.prime_cutoff()) {
+            if c.value() == &Rational::from(power) {
+                continue;
+            }
+            let ratio = Float::with_val(w, power).ln() / &l;
+            let weight = Float::with_val(w, prime).ln() / Float::with_val(w, power).sqrt();
+            for i in 0..dim {
+                for j in 0..dim {
+                    let m = i as i64 - n as i64;
+                    let k = j as i64 - n as i64;
+                    let x = Float::with_val(w, &pi) * 2 * &ratio;
+                    let value = if m == k {
+                        (Float::with_val(w, 1) - &ratio) * 2 * (Float::with_val(w, &x) * m).cos()
+                    } else {
+                        ((Float::with_val(w, &x) * k).sin() - (Float::with_val(w, &x) * m).sin())
+                            / (Float::with_val(w, &pi) * (m - k))
+                    };
+                    out[i * dim + j] += value * &weight;
+                }
+            }
+        }
+        out.iter().map(|x| Float::with_val(p, x)).collect()
+    }
+    #[test]
+    fn exhaustive_aggregate_prime_exact_first_edge_is_zero() {
+        let c = ExactCutoff::parse("2").unwrap();
+        let a =
+            aggregate_prime_component_hp(&c, 3, 128, &ResearchAssemblyOptions::default()).unwrap();
+        assert!(
+            a.iter().all(Float::is_zero),
+            "edge event has identically zero matrix contribution"
+        );
+    }
+    #[test]
+    fn exhaustive_aggregate_prime_rounds_final_matrix_once() {
+        for p in [64, 128, 256] {
+            for n in 0..=3 {
+                for text in ["3", "7", "13", "17/2"] {
+                    let c = ExactCutoff::parse(text).unwrap();
+                    let got =
+                        aggregate_prime_component_hp(&c, n, p, &ResearchAssemblyOptions::default())
+                            .unwrap();
+                    let want = independent(&c, n, p);
+                    assert_eq!(got, want, "C={text},n={n},p={p}");
+                }
+            }
+        }
+    }
+    #[test]
+    fn exhaustive_aggregate_prime_near_edge_retains_nonzero() {
+        let c = ExactCutoff::from_rational(
+            Rational::from(2) + Rational::from((Integer::from(1), Integer::from(1) << 400)),
+        )
+        .unwrap();
+        let got =
+            aggregate_prime_component_hp(&c, 0, 128, &ResearchAssemblyOptions::default()).unwrap();
+        assert_eq!(got, independent(&c, 0, 128));
+        assert!(got[0] > 0);
+    }
+    #[test]
+    fn exhaustive_aggregate_prime_resource_validation_is_bounded() {
+        let o = ResearchAssemblyOptions {
+            maximum_dimension: usize::MAX,
+            ..Default::default()
+        };
+        assert!(o
+            .validate(&ExactCutoff::parse("2").unwrap(), 100_000)
+            .is_err());
+    }
+}
+
+#[cfg(test)]
+mod research_controls_tests {
+    use super::*;
+    #[test]
+    fn generalized_prefix_checks_both_forms_before_shift_cancellation() {
+        let f = |x| Float::with_val(192, x);
+        let report = analyze_nested_gram_schur_hp(
+            &[f(4)],
+            &[f(2)],
+            &[f(6), f(1), f(1), f(5)],
+            &[f(4), f(0), f(0), f(1)],
+            1,
+            &f(1),
+            &f(0),
+            192,
+        )
+        .unwrap();
+        assert!(!report.prefix_within_tolerance);
+        let defects = report.generalized_prefix_defects.unwrap();
+        for defect in defects {
+            assert_eq!(Float::with_val(192, Float::parse(defect).unwrap()), 2);
+        }
+        assert_eq!(
+            Float::with_val(192, Float::parse(report.schur_complement).unwrap()),
+            3.5
+        );
+        assert_eq!(
+            Float::with_val(
+                192,
+                Float::parse(report.prefix_maximum_absolute_defect).unwrap()
+            ),
+            0
+        );
+    }
+    #[test]
+    fn cutoff_rational_grammar_is_ascii_and_has_one_sign() {
+        for text in ["+13/+1", "++13/1", "1_3/1", "13/0_1", "13/+1"] {
+            assert!(ExactCutoff::parse(text).is_err(), "{text}");
+        }
+        for text in ["13/1", "+13/1", "13.0", "1.3e1"] {
+            assert_eq!(
+                ExactCutoff::parse(text).unwrap().value(),
+                &Rational::from(13)
+            );
+        }
+    }
+    #[test]
+    fn point_conversion_admits_declared_schur_and_transfer_shapes() {
+        for p in [64, 192, 1024] {
+            let values = vec![Float::with_val(p, 1); 257 * 257];
+            assert_eq!(
+                exact::points(&values, p, 257 * 257).unwrap().len(),
+                values.len()
+            );
+        }
+        let values = vec![Float::with_val(192, 1); 8193];
+        assert_eq!(exact::points(&values, 192, 8193).unwrap().len(), 8193);
+        let huge = Float::with_val(192, 1) << 100_000_000u32;
+        assert!(exact::points(&[huge], 192, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod length_order_tests {
+    use super::*;
+    #[test]
+    fn length_order_has_independent_ellipse_geometry_and_bucket_floor() {
+        // The ellipse through (-1,y) obeys a=(y+sqrt(4+y^2))/2.
+        // This direct acosh computation is safe at these ordinary lengths.
+        for l in [
+            2.5f64,
+            13.815510557964274,
+            15.201804919084164,
+            16.11809565095832,
+        ] {
+            let length = Float::with_val(128, l);
+            for p in [256u32, 512] {
+                let y = 2.0 * std::f64::consts::PI / l;
+                let a = (y + (4.0 + y * y).sqrt()) / 2.0;
+                let floor = ((f64::from(p) + 64.0) / (2.0 * a.acosh() / std::f64::consts::LN_2))
+                    .ceil() as usize;
+                let orders = quadrature_orders_for_length(3, 1, p, 1, &length).unwrap();
+                assert_eq!(orders, (0..=3).map(|n| 3 * n + floor).collect::<Vec<_>>());
+                let bucket = quadrature_orders_for_length(3, 1000, p, 32, &length).unwrap();
+                assert!(bucket.iter().all(|&m| m >= 1000 && m % 32 == 0));
+            }
+        }
     }
 }

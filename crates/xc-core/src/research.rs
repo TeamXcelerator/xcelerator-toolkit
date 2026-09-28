@@ -77,8 +77,18 @@ impl Diagnostics {
     }
 }
 
+/// Identity of terminal completion and assurance consistency semantics.
+pub const RESEARCH_RESULT_SEMANTICS: &str = "research-result-terminal-completion-v2";
+
+fn legacy_research_result_semantics() -> String {
+    "research-result-unversioned-v1".to_owned()
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResearchResult<T> {
+    /// Producer semantics; absent historical markers retain their legacy identity.
+    #[serde(default = "legacy_research_result_semantics")]
+    pub semantics: String,
     pub value: Option<T>,
     pub completion: CompletionStatus,
     pub status: ResultStatus,
@@ -103,6 +113,7 @@ impl<T> ResearchResult<T> {
         provenance: SolverProvenance,
     ) -> Self {
         Self {
+            semantics: RESEARCH_RESULT_SEMANTICS.to_owned(),
             value: Some(value),
             completion: CompletionStatus::Successful,
             status: ResultStatus::Converged,
@@ -124,6 +135,7 @@ impl<T> ResearchResult<T> {
         provenance: SolverProvenance,
     ) -> Self {
         Self {
+            semantics: RESEARCH_RESULT_SEMANTICS.to_owned(),
             value: None,
             completion,
             status,
@@ -139,19 +151,64 @@ impl<T> ResearchResult<T> {
     }
 
     pub fn with_status(mut self, status: ResultStatus) -> Self {
+        self.semantics = RESEARCH_RESULT_SEMANTICS.to_owned();
+        if matches!(
+            self.completion,
+            CompletionStatus::Failed | CompletionStatus::Cancelled
+        ) {
+            self.achieved_assurance = None;
+        } else if matches!(
+            status,
+            ResultStatus::Failed | ResultStatus::InvalidConfiguration
+        ) {
+            self.completion = CompletionStatus::Failed;
+            self.achieved_assurance = None;
+        } else if status != ResultStatus::Converged {
+            self.completion = CompletionStatus::Inconclusive;
+            self.achieved_assurance = self
+                .achieved_assurance
+                .map(|level| level.min(AssuranceLevel::Computed));
+        }
+        if status != ResultStatus::Converged {
+            self.completed_assurance_checks.retain(|check| {
+                !check.starts_with("portable certificate verified for ")
+                    && check != "independent route comparison accepted"
+            });
+            if !self
+                .missing_assurance_checks
+                .iter()
+                .any(|check| check == "successful completion")
+            {
+                self.missing_assurance_checks
+                    .push("successful completion".to_owned());
+            }
+        }
         self.status = status;
         self
     }
 
     /// Derive achieved assurance and its audit trail from completed evidence.
-    /// Callers cannot directly assign an assurance level.
+    /// The supplied evidence must come from the caller's completed checks;
+    /// this method does not independently replay the underlying mathematics.
     pub fn with_assurance_evidence(mut self, evidence: &AssuranceEvidence) -> Self {
+        self.semantics = RESEARCH_RESULT_SEMANTICS.to_owned();
         let evaluation = evaluate_assurance(
             self.requested_assurance,
-            self.completion == CompletionStatus::Successful,
+            self.completion == CompletionStatus::Successful
+                && self.status == ResultStatus::Converged,
             evidence,
         );
-        self.achieved_assurance = evaluation.achieved;
+        self.achieved_assurance = if matches!(
+            self.completion,
+            CompletionStatus::Failed | CompletionStatus::Cancelled
+        ) || matches!(
+            self.status,
+            ResultStatus::Failed | ResultStatus::InvalidConfiguration
+        ) {
+            None
+        } else {
+            self.value.as_ref().and(evaluation.achieved)
+        };
         self.completed_assurance_checks = evaluation.completed_checks;
         self.missing_assurance_checks = evaluation.missing_checks;
         self
@@ -167,8 +224,70 @@ impl<T> ResearchResult<T> {
 }
 
 impl<T: Serialize> ResearchResult<T> {
-    /// Validates that a result is safe to persist in a report or archive.
+    /// Checks internal assurance consistency; caller attestations are not proof replay.
+    pub fn validate_assurance_consistency(&self) -> Result<(), crate::ConfigError> {
+        let invalid = (self.value.is_none() && self.achieved_assurance.is_some())
+            || (self.achieved_assurance.is_some()
+                && (matches!(
+                    self.completion,
+                    CompletionStatus::Failed | CompletionStatus::Cancelled
+                ) || self
+                    .missing_assurance_checks
+                    .iter()
+                    .any(|check| check == "valid primary computation")
+                    || !self
+                        .completed_assurance_checks
+                        .iter()
+                        .any(|check| check == "primary computation diagnostics accepted")))
+            || (matches!(
+                self.status,
+                ResultStatus::Failed | ResultStatus::InvalidConfiguration
+            ) && (self.completion == CompletionStatus::Successful
+                || self.achieved_assurance.is_some()))
+            || (self
+                .achieved_assurance
+                .is_some_and(|level| level > AssuranceLevel::Computed)
+                && (self.completion != CompletionStatus::Successful
+                    || self.status != ResultStatus::Converged));
+        if invalid {
+            return Err(crate::ConfigError::new(
+                "research result assurance contradicts value, status, or completion",
+            ));
+        }
+        let accepted = match self.achieved_assurance {
+            Some(AssuranceLevel::Certified) => {
+                self.completed_assurance_checks.iter().any(|check| {
+                    check
+                        .strip_prefix("portable certificate verified for ")
+                        .is_some_and(|scope| !scope.trim().is_empty())
+                }) && !self.missing_assurance_checks.iter().any(|check| {
+                    check.contains("certificate")
+                        || check.contains("decisive approximation")
+                        || check == "successful completion"
+                })
+            }
+            Some(AssuranceLevel::CrossChecked) => {
+                self.completed_assurance_checks
+                    .iter()
+                    .any(|check| check == "independent route comparison accepted")
+                    && !self.missing_assurance_checks.iter().any(|check| {
+                        check.contains("independent route comparison")
+                            || check == "successful completion"
+                    })
+            }
+            _ => true,
+        };
+        if !accepted {
+            return Err(crate::ConfigError::new(
+                "research result assurance lacks consistent completed checks",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks consistency and secret-free persistence, not the truth of attestations.
     pub fn validate_for_persistence(&self) -> Result<(), crate::ConfigError> {
+        self.validate_assurance_consistency()?;
         crate::validate_secret_free(self, "research result")
     }
 }
@@ -233,7 +352,7 @@ mod tests {
             ..AssuranceEvidence::default()
         });
         assert_eq!(result.requested_assurance, AssuranceLevel::Certified);
-        assert_eq!(result.achieved_assurance, Some(AssuranceLevel::Computed));
+        assert_eq!(result.achieved_assurance, None);
         assert!(result
             .completed_assurance_checks
             .iter()
@@ -247,5 +366,35 @@ mod tests {
         let decoded: ResearchResult<String> = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, result);
         assert!(!encoded.contains("\"achieved_assurance\":\"certified\""));
+    }
+    #[test]
+    fn contradictory_saved_assurance_and_failed_status_are_rejected() {
+        let mut result = ResearchResult::computed(1, SolverProvenance::current_package("f64"));
+        result.achieved_assurance = Some(AssuranceLevel::Certified);
+        assert!(result.validate_for_persistence().is_err());
+        result
+            .completed_assurance_checks
+            .push("portable certificate verified for stored source".into());
+        assert!(result.validate_for_persistence().is_ok());
+        result.value = None;
+        assert!(result.validate_for_persistence().is_err());
+        let failed = ResearchResult::computed(1, SolverProvenance::current_package("f64"))
+            .with_status(ResultStatus::Failed);
+        assert_eq!(failed.achieved_assurance, None);
+        assert_eq!(failed.completion, CompletionStatus::Failed);
+        failed.validate_for_persistence().unwrap();
+        let failed = failed.with_assurance_evidence(&AssuranceEvidence {
+            computation_valid: true,
+            ..AssuranceEvidence::default()
+        });
+        assert_eq!(failed.achieved_assurance, None);
+        failed.validate_for_persistence().unwrap();
+    }
+
+    #[test]
+    fn missing_approximation_ledger_is_not_an_empty_ledger() {
+        let mut value = serde_json::to_value(AssuranceEvidence::default()).unwrap();
+        value.as_object_mut().unwrap().remove("approximations");
+        assert!(serde_json::from_value::<AssuranceEvidence>(value).is_err());
     }
 }

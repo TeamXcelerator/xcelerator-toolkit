@@ -24,8 +24,18 @@ fn hp_zero(prec: u32) -> Float {
     Float::with_val(prec, 0)
 }
 
-fn needs_even_projection(odd_deviation: &Float, threshold: &Float) -> bool {
-    odd_deviation > threshold
+/// Orthogonal reflection projection of an already normalized finite vector.
+/// Write each mirrored pair once so the returned parity is exact in storage.
+fn project_even_normalized(v: &mut [Float]) -> Result<()> {
+    for i in 0..v.len() / 2 {
+        let j = v.len() - 1 - i;
+        let mut average = v[i].clone();
+        average += &v[j];
+        average /= 2;
+        v[i] = average.clone();
+        v[j] = average;
+    }
+    try_normalize_l2(v)
 }
 
 // ===========================================================================
@@ -54,7 +64,7 @@ pub struct LuFactors {
 ///
 /// Input `a` is row-major (length `dim²`). Returns `LuFactors` suitable
 /// for solving `A · x = b` via [`lu_solve`]. Returns an error if the
-/// matrix is exactly singular (a zero pivot is encountered after
+/// matrix has a zero computed pivot (a zero pivot is encountered after
 /// pivoting).
 ///
 /// The Schur-complement update is parallelized across rows via rayon.
@@ -62,6 +72,16 @@ pub struct LuFactors {
 /// callers (`inverse_iteration`) the LU factor is computed once and
 /// reused per step.
 pub fn lu_factor(a: &[Float], dim: usize) -> Result<LuFactors> {
+    if dim == 0
+        || dim.checked_mul(dim) != Some(a.len())
+        || a.iter().any(|x| !x.is_finite())
+        || a.first()
+            .is_some_and(|first| a.iter().any(|x| x.prec() != first.prec()))
+    {
+        return Err(anyhow!(
+            "dense LU requires a finite nonempty square matrix at one uniform arithmetic precision"
+        ));
+    }
     let mut lu: Vec<Float> = a.to_vec();
     let mut perm: Vec<usize> = (0..dim).collect();
     for k in 0..dim {
@@ -81,8 +101,8 @@ pub fn lu_factor(a: &[Float], dim: usize) -> Result<LuFactors> {
             perm.swap(k, max_idx);
         }
         let pivot = lu[k * dim + k].clone();
-        if pivot.is_zero() {
-            return Err(anyhow!("singular matrix"));
+        if !pivot.is_finite() || pivot.is_zero() {
+            return Err(anyhow!("dense LU encountered a nonfinite or zero pivot"));
         }
         let pivot_row: Vec<Float> = ((k + 1)..dim).map(|j| lu[k * dim + j].clone()).collect();
         // Each trailing row is disjoint, so Rayon may update it in place.
@@ -104,7 +124,25 @@ pub fn lu_factor(a: &[Float], dim: usize) -> Result<LuFactors> {
             }
         });
     }
+    if lu.iter().any(|value| !value.is_finite()) {
+        return Err(anyhow!(
+            "dense LU arithmetic exceeds the finite exponent range"
+        ));
+    }
     Ok(LuFactors { lu, perm })
+}
+
+/// Explicitly round stored coefficients once before uniform-precision dense LU.
+/// Widening inputs increases arithmetic precision, not source accuracy.
+pub fn lu_factor_at_precision(a: &[Float], dim: usize, precision_bits: u32) -> Result<LuFactors> {
+    if !(32..=1_000_000).contains(&precision_bits) || a.iter().any(|x| !x.is_finite()) {
+        return Err(anyhow!("invalid dense LU working precision or input"));
+    }
+    let working: Vec<_> = a
+        .iter()
+        .map(|x| Float::with_val(precision_bits, x))
+        .collect();
+    lu_factor(&working, dim)
 }
 
 /// Below this row length, the inner triangular-solve reduction runs
@@ -147,10 +185,11 @@ pub fn lu_solve(factors: &LuFactors, b: &[Float], dim: usize, prec: u32) -> Vec<
 ///   deterministic single-threaded benchmarking, or callers that are
 ///   already saturating all cores at a higher level.
 ///
-/// The result is identical to working precision either way. HP reduction
-/// order can differ between the serial and parallel paths, but the
-/// difference is below the working-precision floor (the eigenvalue and
-/// eigenvector reference tests confirm this tolerance).
+/// Each route is deterministic, but the serial and parallel reduction orders
+/// differ. There is no general cross-route forward-error guarantee for an
+/// ill-conditioned factorization. Check residuals and conditioning separately.
+/// This compatibility wrapper panics on invalid input or nonfinite output;
+/// use [`try_lu_solve_with`] to propagate failure.
 pub fn lu_solve_with(
     factors: &LuFactors,
     b: &[Float],
@@ -158,9 +197,57 @@ pub fn lu_solve_with(
     prec: u32,
     parallel: bool,
 ) -> Vec<Float> {
+    try_lu_solve_with(factors, b, dim, prec, parallel)
+        .expect("valid finite dense LU solve required")
+}
+
+/// Checked dense solve at the requested precision. Factor entries must be
+/// finite at exactly the requested factorization precision, the permutation
+/// bijective, and pivots nonzero. Reprecision of retained factors is rejected;
+/// refactor the original source matrix with `lu_factor_at_precision` instead. This checks algebraic storage, not factorization provenance or
+/// conditioning; callers still need a residual against the original matrix.
+pub fn try_lu_solve(factors: &LuFactors, b: &[Float], dim: usize, prec: u32) -> Result<Vec<Float>> {
+    try_lu_solve_with(factors, b, dim, prec, true)
+}
+
+/// Checked dense solve with deterministic serial or parallel inner reductions.
+pub fn try_lu_solve_with(
+    factors: &LuFactors,
+    b: &[Float],
+    dim: usize,
+    prec: u32,
+    parallel: bool,
+) -> Result<Vec<Float>> {
+    if !(32..=1_000_000).contains(&prec)
+        || dim.checked_mul(dim) != Some(factors.lu.len())
+        || b.len() != dim
+        || factors.perm.len() != dim
+    {
+        return Err(anyhow!("invalid dense LU solve dimensions or precision"));
+    }
+    let mut seen = vec![false; dim];
+    for &index in &factors.perm {
+        if index >= dim || seen[index] {
+            return Err(anyhow!("dense LU permutation must be a bijection"));
+        }
+        seen[index] = true;
+    }
+    if factors
+        .lu
+        .iter()
+        .any(|v| !v.is_finite() || v.prec() != prec)
+        || b.iter().any(|v| !v.is_finite() || v.prec() > prec)
+        || (0..dim).any(|i| factors.lu[i * dim + i].is_zero())
+    {
+        return Err(anyhow!(
+            "nonfinite/zero-pivot factors, factor precision mismatch, or down-rounded RHS"
+        ));
+    }
     let lu = &factors.lu;
     let perm = &factors.perm;
-    let pb: Vec<Float> = (0..dim).map(|i| b[perm[i]].clone()).collect();
+    let pb: Vec<Float> = (0..dim)
+        .map(|i| Float::with_val(prec, &b[perm[i]]))
+        .collect();
 
     // Forward substitution: solve L·y = P·b. L has implicit unit diagonal.
     let mut y = vec![hp_zero(prec); dim];
@@ -175,7 +262,7 @@ pub fn lu_solve_with(
             let terms: Vec<Float> = (0..i)
                 .into_par_iter()
                 .map(|j| {
-                    let mut t = lu[i * dim + j].clone();
+                    let mut t = Float::with_val(prec, &lu[i * dim + j]);
                     t *= &y[j];
                     t
                 })
@@ -187,7 +274,7 @@ pub fn lu_solve_with(
         } else {
             let mut s = pb[i].clone();
             for j in 0..i {
-                let mut t = lu[i * dim + j].clone();
+                let mut t = Float::with_val(prec, &lu[i * dim + j]);
                 t *= &y[j];
                 s -= &t;
             }
@@ -206,7 +293,7 @@ pub fn lu_solve_with(
             let terms: Vec<Float> = ((i + 1)..dim)
                 .into_par_iter()
                 .map(|j| {
-                    let mut t = lu[i * dim + j].clone();
+                    let mut t = Float::with_val(prec, &lu[i * dim + j]);
                     t *= &x[j];
                     t
                 })
@@ -218,7 +305,7 @@ pub fn lu_solve_with(
         } else {
             let mut s = y[i].clone();
             for j in (i + 1)..dim {
-                let mut t = lu[i * dim + j].clone();
+                let mut t = Float::with_val(prec, &lu[i * dim + j]);
                 t *= &x[j];
                 s -= &t;
             }
@@ -227,7 +314,10 @@ pub fn lu_solve_with(
         s /= &lu[i * dim + i];
         x[i] = s;
     }
-    x
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(anyhow!("dense LU solve exceeds the finite exponent range"));
+    }
+    Ok(x)
 }
 
 // ===========================================================================
@@ -293,16 +383,27 @@ pub struct TridiagLuFactors {
 /// `lower[i] == upper[i] == off_diag[i]`. The factorizer does not exploit
 /// symmetry; partial pivoting can break it.
 ///
-/// At HP, "small" pivots are detected via comparison against a precision-
-/// derived threshold `2^-(prec - 16)`. A truly zero pivot returns an
-/// error; a small-but-nonzero pivot proceeds (the resulting factorization
-/// is well-conditioned for shift values typical of inverse iteration).
+/// Zero or nonfinite computed pivots cause an error. Nonzero computed pivots
+/// proceed without a condition-number estimate. Neither successful factorization
+/// nor a computed zero pivot establishes exact nonsingularity or singularity;
+/// callers must independently check the resulting solve or eigenpair residual.
 pub fn tridiag_lu_factor_hp(
     lower: &[Float],
     diag: &[Float],
     upper: &[Float],
     prec: u32,
 ) -> Result<TridiagLuFactors> {
+    if !(32..=1_000_000).contains(&prec)
+        || lower
+            .iter()
+            .chain(diag)
+            .chain(upper)
+            .any(|v| !v.is_finite() || v.prec() > prec)
+    {
+        return Err(anyhow!(
+            "tridiagonal LU requires finite inputs without precision reduction"
+        ));
+    }
     let n = diag.len();
     if n == 0 {
         return Err(anyhow!("empty matrix"));
@@ -334,9 +435,9 @@ pub fn tridiag_lu_factor_hp(
     //
     // We maintain mutable copies of all three diagonals plus an
     // implicit "extra column" for the fill-in.
-    let mut a: Vec<Float> = lower.to_vec();
-    let mut d: Vec<Float> = diag.to_vec();
-    let mut c: Vec<Float> = upper.to_vec();
+    let mut a: Vec<Float> = lower.iter().map(|v| Float::with_val(prec, v)).collect();
+    let mut d: Vec<Float> = diag.iter().map(|v| Float::with_val(prec, v)).collect();
+    let mut c: Vec<Float> = upper.iter().map(|v| Float::with_val(prec, v)).collect();
     // f[k] tracks the (k, k+2) entry that pivoting can introduce. Length
     // n-2 (since the rightmost two rows have no super-super-diagonal).
     let mut f: Vec<Float> = vec![hp_zero(prec); n.saturating_sub(2)];
@@ -408,7 +509,7 @@ pub fn tridiag_lu_factor_hp(
         let abs_pivot = pivot.clone().abs();
         if abs_pivot.is_zero() {
             return Err(anyhow!(
-                "tridiag LU: zero pivot at row {} (matrix is singular)",
+                "tridiag LU: computed zero pivot at row {}; exact singularity is not established",
                 k
             ));
         }
@@ -448,6 +549,13 @@ pub fn tridiag_lu_factor_hp(
     // super-diagonal. The factor structure is:
     //   L: identity + l[k] at position (k+1, k)
     //   U: d[k] on main, c[k] on super, u_ss[k] on super-super
+    if d.iter().any(|v| !v.is_finite() || v.is_zero())
+        || l.iter().chain(&c).chain(&u_ss).any(|v| !v.is_finite())
+    {
+        return Err(anyhow!(
+            "tridiagonal LU has a nonfinite or zero final pivot/factor"
+        ));
+    }
     Ok(TridiagLuFactors {
         l,
         u_d: d,
@@ -457,71 +565,17 @@ pub fn tridiag_lu_factor_hp(
     })
 }
 
-/// Solve `A·x = b` given the tridiagonal LU factorization of `A` from
-/// `tridiag_lu_factor_hp`. Returns `x` of length `n`.
+/// Solve `A·x = b` with adjacent pivots interleaved with elimination.
 ///
-/// Forward substitution: `L·y = P·b` where `L` has `l[k]` on the
-/// sub-diagonal. Back substitution: `U·x = y` where `U` has main
-/// diagonal `u_d`, super-diagonal `u_s`, and super-super-diagonal `u_ss`.
-///
-/// Historical v1 retained for byte replay; incorrect for some later-pivot
-/// inputs. New analyses should use [`tridiag_lu_solve_pivoted_hp`].
+/// This ordinary entry point uses the corrected O(n) algorithm and the same
+/// checked domain as [`tridiag_lu_solve_pivoted_hp`]. Historical final-permutation
+/// arithmetic was incorrect and is available only from a pinned older revision.
 pub fn tridiag_lu_solve_hp(
     factors: &TridiagLuFactors,
     b: &[Float],
     prec: u32,
 ) -> Result<Vec<Float>> {
-    let n = factors.u_d.len();
-    if b.len() != n {
-        return Err(anyhow!("b length {} != n = {}", b.len(), n));
-    }
-
-    // Apply permutation: pb[i] = b[perm[i]].
-    let pb: Vec<Float> = (0..n).map(|i| b[factors.perm[i]].clone()).collect();
-
-    // Forward sub: y[0] = pb[0]; y[k] = pb[k] - l[k-1] * y[k-1].
-    let mut y = vec![hp_zero(prec); n];
-    y[0] = pb[0].clone();
-    for k in 1..n {
-        let mut s = pb[k].clone();
-        let mut term = factors.l[k - 1].clone();
-        term *= &y[k - 1];
-        s -= &term;
-        y[k] = s;
-    }
-
-    // Back sub: U·x = y.
-    //   x[n-1] = y[n-1] / u_d[n-1]
-    //   x[n-2] = (y[n-2] - u_s[n-2] * x[n-1]) / u_d[n-2]
-    //   x[k]   = (y[k] - u_s[k] * x[k+1] - u_ss[k] * x[k+2]) / u_d[k]
-    //          for k = n-3 down to 0
-    let mut x = vec![hp_zero(prec); n];
-    {
-        let mut s = y[n - 1].clone();
-        s /= &factors.u_d[n - 1];
-        x[n - 1] = s;
-    }
-    if n >= 2 {
-        let mut s = y[n - 2].clone();
-        let mut term = factors.u_s[n - 2].clone();
-        term *= &x[n - 1];
-        s -= &term;
-        s /= &factors.u_d[n - 2];
-        x[n - 2] = s;
-    }
-    for k in (0..(n.saturating_sub(2))).rev() {
-        let mut s = y[k].clone();
-        let mut term = factors.u_s[k].clone();
-        term *= &x[k + 1];
-        s -= &term;
-        let mut term2 = factors.u_ss[k].clone();
-        term2 *= &x[k + 2];
-        s -= &term2;
-        s /= &factors.u_d[k];
-        x[k] = s;
-    }
-
-    Ok(x)
+    tridiag_lu_solve_pivoted_hp(factors, b, prec)
 }
 
 /// Identity for corrected adjacent-pivot solves. New retained results must
@@ -543,7 +597,7 @@ pub fn tridiag_lu_solve_pivoted_hp(
 ) -> Result<Vec<Float>> {
     let n = factors.u_d.len();
     if n == 0
-        || prec < 32
+        || !(32..=1_000_000).contains(&prec)
         || b.len() != n
         || factors.perm.len() != n
         || factors.l.len() != n - 1
@@ -609,33 +663,94 @@ pub fn tridiag_lu_solve_pivoted_hp(
     Ok(y)
 }
 
-/// In-place ℓ² normalization of an HP vector. Sum-of-squares is computed
-/// via parallel reduction; the per-element divide is parallelized too.
+/// In-place computed L2 normalization. Empty input is a no-op. Invalid or
+/// zero vectors become NaNs for compatibility with the infallible API; use
+/// [`try_normalize_l2`] when failure must be propagated explicitly.
 pub fn normalize_l2(v: &mut [Float]) {
-    if v.is_empty() {
-        return;
+    if try_normalize_l2(v).is_err() {
+        for value in v {
+            *value = Float::with_val(value.prec(), rug::float::Special::Nan);
+        }
     }
-    let prec = v[0].prec();
-    // Parallel squares, then the canonical adjacent pairwise tree. HP addition is
-    // non-associative, so rayon's `.reduce()` (runtime-dependent combine
-    // order) would make ‖v‖ — and hence the normalized v — drift in the
-    // low bits run-to-run. The sequential fold keeps it bit-identical.
-    let squares: Vec<Float> = v
-        .par_iter()
-        .map(|vk| {
-            let mut t = vk.clone();
-            t *= vk;
-            t
-        })
-        .collect();
-    let norm_sq = crate::reduction::deterministic_pairwise_sum_hp_owned(squares, prec);
-    let norm = norm_sq.sqrt();
-    v.par_iter_mut().for_each(|vk| {
-        *vk /= &norm;
-    });
 }
 
-/// Rayleigh quotient `xᵀ A x` for a symmetric matrix `a` (row-major).
+/// Arithmetic identity for managed artifacts depending on L2 normalization.
+pub const L2_NORMALIZATION_ARITHMETIC_V2: &str = "power_two_scaled_max_precision_l2_v2";
+
+/// Normalize a finite nonzero vector at the maximum input precision.
+///
+/// Exact common binary scaling places the largest magnitude in [1, 2) before
+/// the deterministic sum of squares. This prevents avoidable exponent failures
+/// and preserves ordinary uniform-precision rounding when intermediates stay
+/// in range. Mixed-precision inputs and outputs use the maximum input precision.
+/// A nonzero component may not silently become zero. On failure the input is
+/// unchanged; empty input is a no-op. This is a computed point normalization,
+/// not an interval norm certificate or an all-domain forward-error bound.
+pub fn try_normalize_l2(v: &mut [Float]) -> Result<()> {
+    if v.is_empty() {
+        return Ok(());
+    }
+    if v.iter().any(|x| !x.is_finite()) || v.iter().all(Float::is_zero) {
+        return Err(anyhow!("L2 normalization requires a finite nonzero vector"));
+    }
+    let prec = v.iter().map(Float::prec).max().expect("nonempty vector");
+    let exponent = v
+        .iter()
+        .filter_map(Float::get_exp)
+        .max()
+        .expect("nonzero vector");
+    let shift = i64::from(exponent) - 1;
+    let mut scaled: Vec<Float> = v
+        .par_iter()
+        .map(|value| {
+            let mut value = Float::with_val(prec, value);
+            if shift >= 0 {
+                value >>= shift as u32;
+            } else {
+                value <<= (-shift) as u32;
+            }
+            value
+        })
+        .collect();
+    if scaled
+        .iter()
+        .zip(v.iter())
+        .any(|(value, source)| !value.is_finite() || (value.is_zero() && !source.is_zero()))
+    {
+        return Err(anyhow!(
+            "L2 normalization scaling cannot preserve a nonzero component"
+        ));
+    }
+    let squares = scaled
+        .par_iter()
+        .map(|value| value.clone().square())
+        .collect();
+    let norm = crate::reduction::deterministic_pairwise_sum_hp_owned(squares, prec).sqrt();
+    if !norm.is_finite() || norm <= 0 {
+        return Err(anyhow!("L2 norm is unrepresentable"));
+    }
+    scaled.par_iter_mut().for_each(|value| *value /= &norm);
+    if scaled
+        .iter()
+        .zip(v.iter())
+        .any(|(value, source)| !value.is_finite() || (value.is_zero() && !source.is_zero()))
+    {
+        return Err(anyhow!(
+            "normalized vector cannot preserve a nonzero component"
+        ));
+    }
+    for (destination, value) in v.iter_mut().zip(scaled) {
+        *destination = value;
+    }
+    Ok(())
+}
+
+/// Quadratic form `xᵀ A x` for a symmetric matrix `a` (row-major).
+/// This equals the Rayleigh quotient only for a unit Euclidean-norm vector;
+/// this historical helper does not divide by `xᵀ x`. Nonunit vectors retain
+/// their quadratic-form scaling. Callers must provide matching finite data.
+/// Products and accumulation use `prec` bits, including when exact stored
+/// coefficients were supplied with a smaller significand precision.
 /// Per-row contributions are computed in parallel, then summed through the
 /// canonical adjacent pairwise tree (not rayon
 /// `.reduce()`) because HP addition is non-associative: a runtime-
@@ -649,7 +764,7 @@ pub fn rayleigh_quotient(a: &[Float], dim: usize, xi: &[Float], prec: u32) -> Fl
         .map(|i| {
             let mut row_sum = hp_zero(prec);
             for j in 0..dim {
-                let mut t = a[i * dim + j].clone();
+                let mut t = Float::with_val(prec, &a[i * dim + j]);
                 t *= &xi[j];
                 row_sum += &t;
             }
@@ -668,6 +783,8 @@ pub enum ShiftedRefinementOutcome {
     NotAttempted,
     Accepted,
     RejectedEigenvalueJump,
+    RejectedResidualIncrease,
+    /// Compatibility label: computed LU factorization failed; this does not prove a zero computed pivot.
     Singular,
 }
 
@@ -676,9 +793,12 @@ pub enum ShiftedRefinementOutcome {
 pub struct InverseIterationDiagnostics {
     pub configured_step_limit: usize,
     pub unshifted_steps: usize,
+    /// The unshifted vector met the matrix-scaled computed residual floor.
     pub unshifted_converged: bool,
     pub final_relative_rayleigh_change: Option<Float>,
     pub shifted_refinement: ShiftedRefinementOutcome,
+    /// Legacy field name: ||A v - lambda v||_infinity / ||v||_infinity.
+    /// It has matrix units and is not a dimensionless backward error.
     pub final_relative_residual_norm: Float,
 }
 
@@ -688,6 +808,31 @@ pub struct InverseIterationOutput {
     pub eigenvalue: Float,
     pub eigenvector: Vec<Float>,
     pub diagnostics: InverseIterationDiagnostics,
+}
+
+/// Bind this arithmetic identity into retained inverse-iteration artifacts.
+pub const INVERSE_ITERATION_SEMANTICS: &str =
+    "dense-inverse-iteration-mixed-parity-residual-checked-wrapper-v3";
+
+fn matrix_residual_floor(matrix: &[Float], dimension: usize, p: u32) -> Result<Float> {
+    let scale = matrix
+        .chunks_exact(dimension)
+        .map(|row| {
+            row.iter()
+                .fold(Float::with_val(p, 0), |sum, v| sum + v.clone().abs())
+        })
+        .max_by(Float::total_cmp)
+        .ok_or_else(|| anyhow!("empty inverse-iteration matrix"))?;
+    let mut floor = Float::with_val(p, 2).pow(-(p as i32));
+    floor *= dimension;
+    floor *= 64;
+    floor *= scale;
+    if !floor.is_finite() || floor.is_zero() {
+        return Err(anyhow!(
+            "matrix-scaled inverse-iteration residual floor is unrepresentable"
+        ));
+    }
+    Ok(floor)
 }
 
 fn relative_eigen_residual_infinity(
@@ -712,6 +857,13 @@ fn relative_eigen_residual_infinity(
             residual.abs()
         })
         .collect::<Vec<_>>();
+    if residuals
+        .iter()
+        .chain(eigenvector)
+        .any(|value| !value.is_finite())
+    {
+        return None;
+    }
     let residual_maximum = residuals
         .into_iter()
         .max_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal))?;
@@ -728,7 +880,7 @@ fn relative_eigen_residual_infinity(
     }
     let mut relative = residual_maximum;
     relative /= vector_maximum;
-    Some(relative)
+    relative.is_finite().then_some(relative)
 }
 
 fn try_residual_verified_shifted_refinement(
@@ -754,19 +906,12 @@ fn try_residual_verified_shifted_refinement(
     let Ok(factors) = lu_factor(&shifted, dimension) else {
         return Ok(None);
     };
-    let mut refined = lu_solve(&factors, eigenvector, dimension, precision_bits);
-    normalize_l2(&mut refined);
+    let Ok(mut refined) = try_lu_solve(&factors, eigenvector, dimension, precision_bits) else {
+        return Ok(None);
+    };
+    try_normalize_l2(&mut refined)?;
     if force_even {
-        refined = (0..dimension)
-            .into_par_iter()
-            .map(|index| {
-                let mut value = refined[index].clone();
-                value += &refined[dimension - 1 - index];
-                value /= 2u32;
-                value
-            })
-            .collect();
-        normalize_l2(&mut refined);
+        project_even_normalized(&mut refined)?;
     }
     let refined_eigenvalue = rayleigh_quotient(matrix, dimension, &refined, precision_bits);
     let mut change = refined_eigenvalue.clone();
@@ -792,45 +937,45 @@ fn try_residual_verified_shifted_refinement(
     ) else {
         return Ok(None);
     };
-    let residual_floor = Float::with_val(precision_bits, 2).pow(-((precision_bits as i32) - 32));
+    let residual_floor = matrix_residual_floor(matrix, dimension, precision_bits)?;
     if !relative_residual.is_finite() || relative_residual >= residual_floor {
         return Ok(None);
     }
     Ok(Some((refined_eigenvalue, refined, relative_residual)))
 }
 
-/// Inverse iteration to find the smallest-eigenpair of a symmetric
-/// matrix at high precision.
+/// Unshifted inverse iteration for a symmetric matrix at high precision.
+/// It favors eigenvalues of smallest absolute magnitude having nonzero
+/// overlap with the starting vector. It does not certify the lowest
+/// algebraic index; that interpretation requires a positive-definite matrix
+/// and suitable starting overlap (or an independent index check).
 ///
 /// `force_even = true` projects the iterate onto the even subspace
-/// at each step (`xi_i ← (xi_i + xi_{n-1-i}) / 2`). This is the right
-/// behavior when the construction has reflection symmetry and the
+/// before the first solve and at each step (`xi_i ← (xi_i + xi_{n-1-i}) / 2`).
+/// Exact symmetric storage is required; forced-even requests additionally
+/// require reflection-invariant storage. This applies when the
 /// smallest *even* eigenvector is the object of interest, not the
 /// natural smallest eigenvalue.
 ///
+/// Stored matrix coefficients are rounded once to `prec` bits before any
+/// factorization, action or refinement; the default unconstrained seed has
+/// both reflection parities. Uniform inputs already at `prec` are
+/// used directly. This specifies arithmetic precision, not source accuracy.
 /// Returns `(eigenvalue, eigenvector)`. The eigenvector is ℓ²-normalized.
 ///
-/// # Convergence floors
-///
-/// The eigenvector residual `‖A·v - μ·v‖` is governed by *two* floors,
-/// whichever is larger:
-///
-/// 1. **Rate floor**: `(λ_min / λ_next_smallest)^max_steps`. Active when
-///    the iteration runs to `max_steps` without converging. Tight when
-///    the smallest eigenvalue is well-separated from the next-smallest.
-/// 2. **Rayleigh sqrt-floor**: When the iteration's
-///    Rayleigh-quotient stability test triggers early termination
-///    (eigenvalue change `|Δμ/μ| < 2^-(prec-32)`), the eigenvector
-///    residual is bounded by `√(2^-(prec-32))` ≈ `10^-(0.15·prec)`.
-///    This follows from Rayleigh's quadratic convergence: when the
-///    eigenvalue is good to ε, the eigenvector is good to √ε.
-///
-/// At HP-256 the Rayleigh sqrt-floor is ~10⁻³³; at HP-1000 it's ~10⁻⁴⁹⁸.
-/// To reach working-precision residual regardless of which floor is
-/// active, callers should use a *shifted* inverse iteration. For
-/// tridiagonal inputs see [`crate::eigen::tridiag_eigenvector_for_value_hp`]
-/// (which factorizes `T - λI + ε·I` once and runs the iteration on
-/// the deflated system, reaching ~10⁻⁹⁰⁰ at HP-1000 in tens of steps).
+/// # Convergence and evidence
+/// Unshifted convergence requires a computed infinity residual at most
+/// `64*n*2^-prec*||A||_infinity*||v||_infinity`. Successive Rayleigh changes are
+/// recorded separately. These are working-precision point diagnostics.
+/// A finite step limit and small successive Rayleigh changes are stopping
+/// diagnostics, not bounds on eigenvector error. Convergence depends on
+/// spectral ratios, gaps, and starting overlap. The familiar square-root
+/// relation between Rayleigh error and vector error requires a separated
+/// target and a bound on the true Rayleigh error, not merely successive
+/// iterate agreement. Inspect the returned residual diagnostics and use
+/// independently counted index enclosures when state selection matters. Plain
+/// tuple-returning wrappers reject candidates above the residual floor; detailed
+/// variants retain unsuccessful candidates with explicit diagnostics.
 pub fn inverse_iteration(
     a: &[Float],
     dim: usize,
@@ -839,6 +984,20 @@ pub fn inverse_iteration(
     force_even: bool,
 ) -> Result<(Float, Vec<Float>)> {
     let output = inverse_iteration_detailed(a, dim, prec, max_steps, force_even)?;
+    accepted_plain_inverse_output(output, a, dim, prec)
+}
+
+fn accepted_plain_inverse_output(
+    output: InverseIterationOutput,
+    a: &[Float],
+    dim: usize,
+    p: u32,
+) -> Result<(Float, Vec<Float>)> {
+    let working: Vec<_> = a.iter().map(|x| Float::with_val(p, x)).collect();
+    let floor = matrix_residual_floor(&working, dim, p)?;
+    if output.diagnostics.final_relative_residual_norm > floor {
+        return Err(anyhow!("inverse iteration did not converge within its configured work budget; inspect the detailed API for the residual and partial candidate"));
+    }
     Ok((output.eigenvalue, output.eigenvector))
 }
 
@@ -855,7 +1014,7 @@ pub fn inverse_iteration_detailed(
 
 /// Inverse iteration with an optional warm-start vector.
 /// When `start` is `Some(v)`, uses `v` as the initial guess instead of
-/// the Gaussian. When `None`, falls back to the Gaussian initial guess.
+/// the mixed-parity Gaussian. When `None`, uses the documented default seed.
 /// Warm-start from a nearby-precision cached ξ
 /// dramatically reduces iteration count for P-sweep campaigns.
 pub fn inverse_iteration_from(
@@ -867,7 +1026,7 @@ pub fn inverse_iteration_from(
     start: Option<Vec<Float>>,
 ) -> Result<(Float, Vec<Float>)> {
     let output = inverse_iteration_from_detailed(a, dim, prec, max_steps, force_even, start)?;
-    Ok((output.eigenvalue, output.eigenvector))
+    accepted_plain_inverse_output(output, a, dim, prec)
 }
 
 /// Diagnostic-preserving variant of [`inverse_iteration_from`].
@@ -885,7 +1044,9 @@ pub fn inverse_iteration_from_detailed(
 /// Inverse iteration using a previously validated LU factorization of `a`.
 /// The retained factors avoid repeating the dominant initial O(n^3)
 /// factorization; the shifted refinement remains freshly factorized because
-/// its matrix depends on the newly computed Rayleigh quotient.
+/// its matrix depends on the newly computed Rayleigh quotient. Every retained
+/// factor must have the requested arithmetic precision; widening already
+/// rounded factors cannot restore the missing factorization accuracy.
 pub fn inverse_iteration_from_factors(
     a: &[Float],
     factors: &LuFactors,
@@ -898,7 +1059,7 @@ pub fn inverse_iteration_from_factors(
     let output = inverse_iteration_from_factors_detailed(
         a, factors, dim, prec, max_steps, force_even, start,
     )?;
-    Ok((output.eigenvalue, output.eigenvector))
+    accepted_plain_inverse_output(output, a, dim, prec)
 }
 
 /// Diagnostic-preserving variant of [`inverse_iteration_from_factors`].
@@ -911,7 +1072,7 @@ pub fn inverse_iteration_from_factors_detailed(
     force_even: bool,
     start: Option<Vec<Float>>,
 ) -> Result<InverseIterationOutput> {
-    if factors.lu.len() != dim * dim || factors.perm.len() != dim {
+    if dim.checked_mul(dim) != Some(factors.lu.len()) || factors.perm.len() != dim {
         return Err(anyhow!(
             "LU factor dimensions do not match inverse-iteration matrix"
         ));
@@ -936,17 +1097,79 @@ fn inverse_iteration_from_optional_factors(
     start: Option<Vec<Float>>,
     retained_factors: Option<&LuFactors>,
 ) -> Result<InverseIterationOutput> {
+    if !(33..=rug::float::prec_max().min(i32::MAX as u32)).contains(&prec)
+        || dim == 0
+        || dim.checked_mul(dim) != Some(a.len())
+        || a.iter().any(|x| !x.is_finite())
+        || start
+            .as_ref()
+            .is_some_and(|v| v.len() != dim || v.iter().any(|x| !x.is_finite()))
+    {
+        return Err(anyhow!(
+            "invalid inverse-iteration matrix, starting vector, or precision"
+        ));
+    }
     if max_steps == 0 {
         return Err(anyhow!("inverse-iteration limit must be positive"));
     }
+    for i in 0..dim {
+        for j in 0..dim {
+            if a[i * dim + j] != a[j * dim + i] {
+                return Err(anyhow!(
+                    "inverse iteration requires exact symmetric storage"
+                ));
+            }
+            if force_even && a[i * dim + j] != a[(dim - 1 - i) * dim + (dim - 1 - j)] {
+                return Err(anyhow!(
+                    "forced-even inverse iteration requires reflection-invariant storage"
+                ));
+            }
+        }
+    }
+    // Stored coefficients are point inputs, not an instruction to perform
+    // products, factorization and refinement at their storage precision.
+    let working_matrix;
+    let a = if a.iter().all(|value| value.prec() == prec) {
+        a
+    } else {
+        working_matrix = a
+            .iter()
+            .map(|value| Float::with_val(prec, value))
+            .collect::<Vec<_>>();
+        if working_matrix.iter().any(|value| !value.is_finite()) {
+            return Err(anyhow!(
+                "inverse-iteration precision conversion is unrepresentable"
+            ));
+        }
+        &working_matrix
+    };
     let computed_factors;
     let lu = if let Some(factors) = retained_factors {
+        if factors.lu.iter().any(|value| value.prec() != prec) {
+            return Err(anyhow!(
+                "retained LU arithmetic precision must match inverse iteration"
+            ));
+        }
         factors
     } else {
         computed_factors = lu_factor(a, dim)?;
         &computed_factors
     };
 
+    if lu.lu.len() != a.len()
+        || lu.perm.len() != dim
+        || lu.lu.iter().any(|x| !x.is_finite())
+        || (0..dim).any(|i| lu.lu[i * dim + i].is_zero())
+    {
+        return Err(anyhow!("invalid retained inverse-iteration LU factors"));
+    }
+    let mut seen = vec![false; dim];
+    for &index in &lu.perm {
+        if index >= dim || seen[index] {
+            return Err(anyhow!("invalid retained LU row permutation"));
+        }
+        seen[index] = true;
+    }
     // Initial guess: warm-start from provided vector, or fall back to
     // Gaussian centered at the middle index.
     let mut xi: Vec<Float> = if let Some(warm) = start {
@@ -977,20 +1200,31 @@ fn inverse_iteration_from_optional_factors(
                 x_sq /= 2u32;
                 let mut arg = Float::with_val(prec, 0);
                 arg -= &x_sq;
-                arg.exp()
+                let mut seed = arg.exp();
+                if !force_even {
+                    // Break exact reflection parity before the first solve.
+                    // This gives both parity sectors support; it is not a
+                    // global nonorthogonality or target-index certificate.
+                    let mut weight = Float::with_val(prec, i);
+                    weight /= dim + 1;
+                    weight += 1;
+                    seed *= weight;
+                }
+                seed
             })
             .collect()
     };
-    normalize_l2(&mut xi);
+    try_normalize_l2(&mut xi)?;
+    if force_even {
+        project_even_normalized(&mut xi)?;
+    }
 
     let mut mu = hp_zero(prec);
     let mut prev_mu = mu.clone();
-    let convergence_threshold = Float::with_val(prec, 2).pow(-((prec as i32) - 32));
+    let convergence_threshold = matrix_residual_floor(a, dim, prec)?;
     let early_rescue_threshold =
         Float::with_val(prec, 2).pow(-(((prec.saturating_sub(32) / 2).max(8)) as i32));
     let mut early_rescue_attempted = false;
-    let mut even_projection_threshold = Float::with_val(prec, 1);
-    even_projection_threshold /= 2u32;
     let mut converged = false;
     let mut final_relative_change: Option<Float> = None;
     let mut unshifted_steps = 0usize;
@@ -998,78 +1232,25 @@ fn inverse_iteration_from_optional_factors(
     let iter_start = std::time::Instant::now();
     for step in 0..max_steps {
         unshifted_steps = step + 1;
-        let mut v = lu_solve(lu, &xi, dim, prec);
-        normalize_l2(&mut v);
+        let mut v = try_lu_solve(lu, &xi, dim, prec)?;
+        try_normalize_l2(&mut v)?;
         if force_even {
-            // Auto-detect natural symmetry, only project
-            // when the vector is drifting odd. This avoids the overhead of
-            // projecting an already-even vector, and logs when odd drift
-            // is detected (debug mode only).
-            //
-            // Symmetry deviation: max_i |v[i] - v[dim-1-i]| / max_i |v[i]|
-            // ≈ 0 → even (no projection needed)
-            // ≈ 2 → odd (projection needed; log warning in debug)
-            let linf: Float = v
-                .iter()
-                .map(|x| x.clone().abs())
-                .fold(hp_zero(prec), |a, b| if b > a { b } else { a });
-            let odd_dev: Float = if linf.is_zero() {
-                hp_zero(prec)
-            } else {
-                let max_asym = (0..dim)
-                    .map(|i| {
-                        let mut d = v[i].clone();
-                        d -= &v[dim - 1 - i];
-                        d.abs()
-                    })
-                    .fold(hp_zero(prec), |a, b| if b > a { b } else { a });
-                let mut rel = max_asym;
-                rel /= &linf;
-                rel
-            };
-            // Threshold: projection needed if deviation > 0.5 (halfway between
-            // even=0 and odd=2). Below threshold the vector is already even
-            // enough — skip projection to save cost.
-            let needs_projection = needs_even_projection(&odd_dev, &even_projection_threshold);
-            if needs_projection {
-                crate::hp_debug!(
-                    "[HP invit] step {}: natural vector is odd (deviation={}), applying even projection",
-                    step + 1,
-                    crate::fmt::display_hp(&odd_dev, 4)
-                );
-                let xi_sym: Vec<Float> = (0..dim)
-                    .into_par_iter()
-                    .map(|i| {
-                        let mut s = v[i].clone();
-                        s += &v[dim - 1 - i];
-                        s /= 2u32;
-                        s
-                    })
-                    .collect();
-                xi = xi_sym;
-            } else {
-                xi = v;
-            }
-        } else {
-            xi = v;
+            project_even_normalized(&mut v)?;
         }
-        normalize_l2(&mut xi);
+        xi = v;
         mu = rayleigh_quotient(a, dim, &xi, prec);
 
         if step > 2 {
             let mut diff = mu.clone();
             diff -= &prev_mu;
-            let step_converged = if !mu.is_zero() {
-                let mut r = diff.clone().abs();
-                r /= &mu.clone().abs();
-                final_relative_change = Some(r.clone());
-                r < convergence_threshold
+            final_relative_change = Some(if !mu.is_zero() {
+                Float::with_val(prec, diff.clone().abs() / mu.clone().abs())
             } else {
-                let absolute_change = diff.clone().abs();
-                let converged = absolute_change < convergence_threshold;
-                final_relative_change = Some(absolute_change);
-                converged
-            };
+                diff.abs()
+            });
+            let residual = relative_eigen_residual_infinity(a, dim, &xi, &mu, prec)
+                .ok_or_else(|| anyhow!("inverse-iteration residual is unrepresentable"))?;
+            let step_converged = residual <= convergence_threshold;
             if step_converged {
                 converged = true;
                 crate::hp_debug!(
@@ -1142,13 +1323,9 @@ fn inverse_iteration_from_optional_factors(
     }
 
     // ── Part 2: Shifted inverse iteration refinement ─────────────────────
-    // The Rayleigh-quotient convergence above gives μ at full precision but
-    // ξ only at √(tol) ≈ half-precision. One step of shifted inverse
-    // iteration at μ yields a full-precision eigenvector.
-    //
-    // Solves (A − μ·I)·v = ξ_old, then normalizes. The shift makes the
-    // target eigenvalue appear near-zero, so one solve gives full-precision
-    // convergence regardless of eigenvalue gaps.
+    // A shifted solve may improve the vector, but a small successive Rayleigh
+    // change does not bound vector error, and one refinement has no universal
+    // gap-independent accuracy guarantee. Retain the actual final residual.
     let shifted_a: Vec<Float> = (0..dim * dim)
         .into_par_iter()
         .map(|idx| {
@@ -1164,20 +1341,10 @@ fn inverse_iteration_from_optional_factors(
 
     let shifted_refinement = match lu_factor(&shifted_a, dim) {
         Ok(shifted_lu) => {
-            let mut xi_refined = lu_solve(&shifted_lu, &xi, dim, prec);
-            normalize_l2(&mut xi_refined);
+            let mut xi_refined = try_lu_solve(&shifted_lu, &xi, dim, prec)?;
+            try_normalize_l2(&mut xi_refined)?;
             if force_even {
-                let xi_sym: Vec<Float> = (0..dim)
-                    .into_par_iter()
-                    .map(|i| {
-                        let mut s = xi_refined[i].clone();
-                        s += &xi_refined[dim - 1 - i];
-                        s /= 2u32;
-                        s
-                    })
-                    .collect();
-                xi_refined = xi_sym;
-                normalize_l2(&mut xi_refined);
+                project_even_normalized(&mut xi_refined)?;
             }
 
             // ── Part 3: Confidence check ─────────────────────────────────
@@ -1199,7 +1366,13 @@ fn inverse_iteration_from_optional_factors(
             // Accept refinement only if eigenvalue didn't jump (< 1% relative change)
             let mut accept_tol = Float::with_val(prec, 1);
             accept_tol /= 100u32;
-            if check_ratio < accept_tol {
+            let before = relative_eigen_residual_infinity(a, dim, &xi, &mu, prec)
+                .ok_or_else(|| anyhow!("inverse-iteration residual is unrepresentable"))?;
+            let after = relative_eigen_residual_infinity(a, dim, &xi_refined, &mu_refined, prec)
+                .ok_or_else(|| anyhow!("shifted inverse-iteration residual is unrepresentable"))?;
+            if after > before {
+                ShiftedRefinementOutcome::RejectedResidualIncrease
+            } else if check_ratio < accept_tol {
                 xi = xi_refined;
                 mu = mu_refined;
                 crate::hp_debug!("[HP invit] shifted refinement accepted (delta_mu/mu < 1%)",);
@@ -1213,10 +1386,10 @@ fn inverse_iteration_from_optional_factors(
             }
         }
         Err(_) => {
-            // Shifted matrix is singular (exact eigenvalue hit) — skip
-            // refinement. The unrefined ξ from inverse iteration is used.
+            // A computed factorization failed. This is not proof that the
+            // exact shifted matrix is singular; keep the previous candidate.
             crate::hp_debug!(
-                "[HP invit] shifted matrix singular at μ — skipping refinement (eigvec at sqrt-precision)",
+                "[HP invit] computed shifted factorization failed; keeping the previous candidate",
             );
             ShiftedRefinementOutcome::Singular
         }
@@ -1243,6 +1416,9 @@ fn inverse_iteration_from_optional_factors(
             .collect();
         let mut max_r = hp_zero(prec);
         for r in &residuals {
+            if !r.is_finite() {
+                return Err(anyhow!("inverse-iteration residual is nonfinite"));
+            }
             if *r > max_r {
                 max_r = r.clone();
             }
@@ -1262,11 +1438,14 @@ fn inverse_iteration_from_optional_factors(
             vector_maximum = magnitude;
         }
     }
-    if vector_maximum.is_zero() {
+    if !mu.is_finite() || xi.iter().any(|value| !value.is_finite()) || vector_maximum.is_zero() {
         return Err(anyhow!("inverse iteration produced a zero eigenvector"));
     }
     let mut relative_residual_norm = residual_norm;
     relative_residual_norm /= vector_maximum;
+    if !relative_residual_norm.is_finite() {
+        return Err(anyhow!("inverse-iteration relative residual is nonfinite"));
+    }
 
     Ok(InverseIterationOutput {
         eigenvalue: mu,
@@ -1389,21 +1568,6 @@ mod tests {
     use crate::fmt::{display_hp, matching_digits, relative_difference};
     use rug::Float;
 
-    #[test]
-    fn hp_even_projection_decision_does_not_round_through_f64() {
-        let prec = 256;
-        let mut threshold = Float::with_val(prec, 1);
-        threshold /= 2u32;
-        let epsilon = Float::with_val(prec, 2).pow(-200);
-        let mut below = threshold.clone();
-        below -= &epsilon;
-        let mut above = threshold.clone();
-        above += epsilon;
-
-        assert!(!needs_even_projection(&below, &threshold));
-        assert!(needs_even_projection(&above, &threshold));
-    }
-
     /// Build an HP `Float` from an integer-valued seed at the given precision.
     /// Used in tests for textbook small matrices where matrix entries are
     /// integers (or short decimals); these are exact at any HP precision.
@@ -1514,7 +1678,10 @@ mod tests {
         a[1 * dim + 1] = hp(prec, "1.1");
         a[2 * dim + 2] = hp(prec, "2.0");
         a[3 * dim + 3] = hp(prec, "3.0");
-        let (mu, v) = inverse_iteration(&a, dim, prec, 200, false).unwrap();
+        let output = inverse_iteration_detailed(&a, dim, prec, 200, false).unwrap();
+        assert!(!output.diagnostics.unshifted_converged);
+        assert!(accepted_plain_inverse_output(output.clone(), &a, dim, prec).is_err());
+        let (mu, v) = (output.eigenvalue, output.eigenvector);
         // Must converge to 1.0, not 1.1
         assert_hp_close(
             &mu,
@@ -1543,7 +1710,10 @@ mod tests {
         a[1 * dim + 1] = hp(prec, "1.01"); // gap = 0.01
         a[2 * dim + 2] = hp(prec, "5.0");
         a[3 * dim + 3] = hp(prec, "10.0");
-        let (mu, v) = inverse_iteration(&a, dim, prec, 200, false).unwrap();
+        let output = inverse_iteration_detailed(&a, dim, prec, 200, false).unwrap();
+        assert!(!output.diagnostics.unshifted_converged);
+        assert!(accepted_plain_inverse_output(output.clone(), &a, dim, prec).is_err());
+        let (mu, v) = (output.eigenvalue, output.eigenvector);
         // Eigenvalue must be 1.0 (not 1.01).
         let mut diff = mu.clone();
         diff -= &hp(prec, "1.0");
@@ -1986,7 +2156,14 @@ mod tests {
         let n = 10;
         let a = strang_dense(prec, n);
         // Use inverse_iteration to get the smallest eigenpair.
-        let (mu, v) = inverse_iteration(&a, n, prec, 200, false).unwrap();
+        let output = inverse_iteration_detailed(&a, n, prec, 200, false).unwrap();
+        assert!(!output.diagnostics.unshifted_converged);
+        assert!(accepted_plain_inverse_output(output.clone(), &a, n, prec).is_err());
+        let (mu, v) = (output.eigenvalue, output.eigenvector);
+        // Independent closed-form eigenvalue of the exact Strang matrix.
+        let angle = Float::with_val(prec + 128, rug::float::Constant::Pi) / (n + 1);
+        let exact_value = Float::with_val(prec + 128, 2) - angle.cos() * 2;
+        assert!(Float::with_val(prec + 128, &mu - &exact_value).abs() < hp(prec + 128, "1e-100"));
         let rq = rayleigh_quotient(&a, n, &v, prec);
         let mut diff = rq.clone();
         diff -= &mu;
@@ -2846,7 +3023,14 @@ mod tests {
         let n = 20;
         let a = strang_dense(prec, n);
 
-        let (mu, v) = inverse_iteration(&a, n, prec, 200, false).unwrap();
+        let output = inverse_iteration_detailed(&a, n, prec, 200, false).unwrap();
+        assert!(!output.diagnostics.unshifted_converged);
+        assert!(accepted_plain_inverse_output(output.clone(), &a, n, prec).is_err());
+        let (mu, v) = (output.eigenvalue, output.eigenvector);
+        // Independent closed-form eigenvalue of the exact Strang matrix.
+        let angle = Float::with_val(prec + 128, rug::float::Constant::Pi) / (n + 1);
+        let exact_value = Float::with_val(prec + 128, 2) - angle.cos() * 2;
+        assert!(Float::with_val(prec + 128, &mu - &exact_value).abs() < hp(prec + 128, "1e-100"));
         assert_eq!(v.len(), n);
 
         let mut max_resid = hp_zero(prec);

@@ -4,7 +4,8 @@
 //! Publication-ready tables and convergence-dataset exports.
 //!
 //! Values are exported from exact strings already present in result objects;
-//! this layer never reparses or rounds numerical output. A bundle contains
+//! decimal validation is exact and exports retain the original spelling without
+//! binary64 conversion or rounding. A bundle contains
 //! CSV, LaTeX, and JSON views plus a digest-bound manifest, all carrying the
 //! same requirement identifiers and provenance.
 
@@ -326,6 +327,16 @@ pub struct ConvergenceTableRow {
     pub median_accuracy_digits: String,
     pub index_penalty_digits: String,
     pub completion_status: String,
+    /// Mathematical object to which the reported accuracy applies.
+    #[serde(default = "unspecified_accuracy_scope")]
+    pub accuracy_scope: String,
+    /// Exact stored source binding, when accuracy is conditional on stored data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_weights_digest: Option<String>,
+}
+
+fn unspecified_accuracy_scope() -> String {
+    "unspecified".to_owned()
 }
 
 /// Builds the canonical publication table for a finite CCM convergence sequence.
@@ -336,11 +347,11 @@ pub struct ConvergenceTableRow {
 /// It does not infer a continuum limit from those rows.
 ///
 /// # Precision
-/// Numeric observations are accepted as canonical decimal strings so export
+/// Numeric observations are accepted as finite decimal strings so export
 /// does not round them through binary64; precision bits remain explicit.
 ///
 /// # Failure states
-/// Empty, out-of-order, incomplete, noncanonical, or provenance-inconsistent
+/// Empty, out-of-order, incomplete, nonfinite, malformed, or provenance-inconsistent
 /// rows return `PublicationExportError` before a table is emitted.
 ///
 /// # Assurance and validity
@@ -370,12 +381,48 @@ pub fn ccm_convergence_publication_table(
                 || row.median_accuracy_digits.trim().is_empty()
                 || row.index_penalty_digits.trim().is_empty()
                 || row.completion_status.trim().is_empty()
+                || row.accuracy_scope.trim().is_empty()
+                || row.source_weights_digest.as_ref().is_some_and(|digest| {
+                    digest.len() != 64
+                        || !digest
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
         })
     {
         return Err(PublicationExportError::InvalidTable(
             "convergence rows require positive sequence/N/K, at least 53 bits, and complete exact-string summaries"
                 .to_owned(),
         ));
+    }
+    if rows
+        .windows(2)
+        .any(|pair| pair[0].sequence_index >= pair[1].sequence_index)
+    {
+        return Err(PublicationExportError::InvalidTable(
+            "convergence sequence indices must be strictly increasing".to_owned(),
+        ));
+    }
+    let one = crate::DecimalLiteral::new("1").expect("one is a valid decimal");
+    for row in rows {
+        let decimal = |text: &str| {
+            crate::DecimalLiteral::new(text)
+                .map_err(|error| PublicationExportError::InvalidTable(error.to_string()))
+        };
+        let cutoff = decimal(&row.lambda_squared)?;
+        let minimum = decimal(&row.minimum_accuracy_digits)?;
+        let median = decimal(&row.median_accuracy_digits)?;
+        decimal(&row.index_penalty_digits)?;
+        let compare = |left: &crate::DecimalLiteral, right: &crate::DecimalLiteral| {
+            left.cmp_numeric(right)
+                .map_err(|error| PublicationExportError::InvalidTable(error.to_string()))
+        };
+        if !compare(&cutoff, &one)?.is_gt() || compare(&minimum, &median)?.is_gt() {
+            return Err(PublicationExportError::InvalidTable(
+                "convergence cutoff must exceed one and minimum accuracy may not exceed the median"
+                    .to_owned(),
+            ));
+        }
     }
     let columns = vec![
         PublicationColumn::new(
@@ -408,6 +455,16 @@ pub fn ccm_convergence_publication_table(
             PublicationColumnAlignment::Right,
         ),
         PublicationColumn::new(
+            "accuracy_scope",
+            "Accuracy scope",
+            PublicationColumnAlignment::Left,
+        ),
+        PublicationColumn::new(
+            "source_weights_digest",
+            "Stored source SHA-256",
+            PublicationColumnAlignment::Left,
+        ),
+        PublicationColumn::new(
             "completion_status",
             "Status",
             PublicationColumnAlignment::Left,
@@ -433,6 +490,11 @@ pub fn ccm_convergence_publication_table(
                 (
                     "index_penalty_digits".to_owned(),
                     row.index_penalty_digits.clone(),
+                ),
+                ("accuracy_scope".to_owned(), row.accuracy_scope.clone()),
+                (
+                    "source_weights_digest".to_owned(),
+                    row.source_weights_digest.clone().unwrap_or_default(),
                 ),
                 (
                     "completion_status".to_owned(),
@@ -663,6 +725,8 @@ mod tests {
                 median_accuracy_digits: "31.5".to_owned(),
                 index_penalty_digits: "4.75".to_owned(),
                 completion_status: "successful".to_owned(),
+                accuracy_scope: "caller_attested_root_records".to_owned(),
+                source_weights_digest: None,
             }],
             provenance(),
         )
@@ -673,8 +737,10 @@ mod tests {
     fn convergence_exports_fixed_columns_and_provenance_without_rounding() {
         let table = table();
         let csv = table.render_csv().unwrap();
-        assert!(csv.contains("lambda squared,N,p (bits),K,D min,D median,Index penalty,Status"));
-        assert!(csv.contains("13,120,512,50,18.25,31.5,4.75,successful"));
+        assert!(csv.contains("lambda squared,N,p (bits),K,D min,D median,Index penalty,Accuracy scope,Stored source SHA-256,Status"));
+        assert!(
+            csv.contains("13,120,512,50,18.25,31.5,4.75,caller_attested_root_records,,successful")
+        );
         assert!(csv.contains("abc1234"));
         assert!(csv.contains("v0.13.0"));
         assert!(csv.contains(&"a".repeat(64)));

@@ -7,6 +7,8 @@
 //! Mathematical construction and the caller's trust in a source manifest are
 //! separate from checking the payload's exact byte digest here.
 
+mod numerical_checks;
+
 use anyhow::{bail, Result};
 use rug::Float;
 use serde::{Deserialize, Serialize};
@@ -20,13 +22,13 @@ use xc_cache::{
 use xc_numerics::prefix::{
     analyze_prefixes_with_policy, checked_decimal_export, lossless_decimal, PrefixAnalysisReport,
 };
-use xc_numerics::reduction::deterministic_pairwise_sum_hp_owned;
 
-pub const PREFIX_SEMANTICS: &str = "ccm-retained-even-prefix-moments-checked-exports-v2";
+pub const PREFIX_SEMANTICS: &str = "ccm-retained-even-prefix-moments-checked-exports-v8";
 pub const LEGACY_PREFIX_SEMANTICS: &str = "ccm-retained-even-prefix-moments-checked-exports-v1";
-pub const EXTENDED_PREFIX_SEMANTICS: &str = "ccm-retained-even-prefix-moments-checked-exports-v3";
+pub const EXTENDED_PREFIX_SEMANTICS: &str = "ccm-retained-even-prefix-moments-checked-exports-v10";
 pub use xc_core::PrefixDiagnosticPolicy;
 pub const PREFIX_ARTIFACT_KIND: &str = "ccm_prefix_analysis";
+pub const RETAINED_REDUCTION_SEMANTICS: &str = "ccm-retained-reduction-v0.15.1-v3";
 const REDUCTION_ASSURANCE: &str = "computed stored-matrix checks; no construction, branch, positivity or continuum certificate; Q computed but not retained in this report";
 pub const EVEN_BASIS: &str = "orthonormal_reflection_even_basis_zero_then_positive_modes";
 
@@ -70,6 +72,9 @@ fn authenticate(
     bytes: &[u8],
     allowed: &[ContentDigest],
 ) -> Result<()> {
+    if bytes.len() as u128 > (2u128 << 30) {
+        bail!("retained prefix payload exceeds the encoded byte budget");
+    }
     manifest.validate()?;
     if manifest.quality.admissible_rank() < CacheQuality::Validated.admissible_rank()
         || !manifest.immutable
@@ -83,11 +88,28 @@ fn authenticate(
 }
 
 fn scalar(text: &str, p: u32) -> Result<Float> {
-    let value = Float::with_val(p, Float::parse(text)?);
-    if !value.is_finite() {
-        bail!("nonfinite diagnostic/source scalar");
+    precision(p)?;
+    if text.len() > 1_048_576 {
+        bail!("prefix scalar exceeds the input budget");
     }
-    Ok(value)
+    super::retained_evidence::scalar(text, p)
+}
+fn validate_cutoff(text: &str) -> Result<()> {
+    if text.len() > 1_048_576
+        || xc_core::DecimalLiteral::new(text)?.cmp_numeric(&xc_core::DecimalLiteral::new("1")?)?
+            != std::cmp::Ordering::Greater
+    {
+        bail!("retained prefix cutoff must be an exact finite decimal greater than one");
+    }
+    Ok(())
+}
+fn decode_budget(count: usize, p: u32, encoded_bytes: usize) -> Result<()> {
+    precision(p)?;
+    let bytes = count as u128 * (u128::from(p).div_ceil(8) + 96) * 2 + encoded_bytes as u128 * 3;
+    if bytes > (8u128 << 30) {
+        bail!("retained prefix decoding exceeds the combined workspace budget");
+    }
+    Ok(())
 }
 
 fn precision(p: u32) -> Result<()> {
@@ -130,6 +152,8 @@ impl RetainedEvenMatrix {
         {
             bail!("invalid retained even-matrix shape or metadata");
         }
+        validate_cutoff(&payload.lambda_squared)?;
+        decode_budget(payload.entries.len(), payload.precision_bits, bytes.len())?;
         let entries = payload
             .entries
             .iter()
@@ -200,12 +224,14 @@ impl RetainedEvenEigenpair {
         }
         let v: Payload = serde_json::from_slice(bytes)?;
         precision(v.precision_bits)?;
-        if ![2, 3].contains(&v.schema_version)
+        if ![2, 3, 4, 5].contains(&v.schema_version)
             || v.n_modes > 8192
             || v.n_modes.checked_mul(2).and_then(|n| n.checked_add(1)) != Some(v.eigenvector.len())
         {
             bail!("invalid eigenpair shape or schema");
         }
+        validate_cutoff(&v.lambda_squared)?;
+        decode_budget(v.eigenvector.len(), v.precision_bits, bytes.len())?;
         let vector = v
             .eigenvector
             .iter()
@@ -339,62 +365,39 @@ pub fn check_prefix_nesting(
     })
 }
 
-fn dot(a: &[Float], b: &[Float], p: u32) -> Float {
-    deterministic_pairwise_sum_hp_owned(
-        a.iter()
-            .zip(b)
-            .map(|(a, b)| {
-                let mut v = Float::with_val(p, a);
-                v *= b;
-                v
-            })
-            .collect(),
-        p,
-    )
-}
-fn norm(a: &[Float], p: u32) -> Float {
-    dot(a, a, p).sqrt()
-}
-fn unit(v: &[Float], p: u32) -> Result<Vec<Float>> {
-    let n = norm(v, p);
-    if !n.is_finite() || n.is_zero() {
-        bail!("unresolved vector normalization");
+fn dot(a: &[Float], b: &[Float], p: u32) -> Result<Float> {
+    numerical_checks::workspace(a.len(), p)?;
+    if a.len() != b.len() || a.iter().chain(b).any(|x| !x.is_finite() || x.prec() > p) {
+        bail!("invalid prefix dot-product shape or source precision");
     }
-    Ok(v.iter()
-        .map(|x| {
-            let mut v = Float::with_val(p, x);
-            v /= &n;
-            v
-        })
-        .collect())
+    super::retained_evidence::point::dot(a, b, p)
+}
+
+fn unit(v: &[Float], p: u32) -> Result<Vec<Float>> {
+    numerical_checks::unit(v, p)
 }
 fn residual(a: &[Float], stride: usize, v: &[Float], rhs: &[Float], p: u32) -> Float {
-    let n = v.len();
-    let r = (0..n)
-        .map(|i| {
-            let mut x = dot(&a[i * stride..i * stride + n], v, p);
-            x -= &rhs[i];
-            x
-        })
-        .collect::<Vec<_>>();
-    let row_squares = (0..n)
-        .map(|i| {
-            let row = &a[i * stride..i * stride + n];
-            dot(row, row, p)
-        })
-        .collect();
-    let mut scale = deterministic_pairwise_sum_hp_owned(row_squares, p).sqrt();
-    scale *= norm(v, p);
-    scale += norm(rhs, p);
-    let mut result = norm(&r, p);
-    if !scale.is_zero() {
-        result /= &scale;
-    }
-    // Failed normalization must not pass a `NaN > tolerance` comparison.
-    if !result.is_finite() || !scale.is_finite() {
-        return Float::with_val(p, rug::float::Special::Infinity);
-    }
-    result
+    numerical_checks::backward_error(
+        a,
+        stride,
+        v,
+        numerical_checks::RightHandSide::Vector(rhs),
+        p,
+    )
+    .unwrap_or_else(|_| Float::with_val(p, rug::float::Special::Infinity))
+}
+fn eigenpair_residual(a: &[Float], stride: usize, v: &[Float], lambda: &Float, p: u32) -> Float {
+    numerical_checks::backward_error(
+        a,
+        stride,
+        v,
+        numerical_checks::RightHandSide::Eigenvalue(lambda),
+        p,
+    )
+    .unwrap_or_else(|_| Float::with_val(p, rug::float::Special::Infinity))
+}
+fn upper_decimal(value: &Float) -> String {
+    value.to_string_radix_round(10, None, rug::float::Round::Up)
 }
 
 /// O(D^3) prefix analysis; only explicitly supplied retained eigenstates are
@@ -409,7 +412,7 @@ pub fn analyze_retained_prefixes(
     if p < matrix.precision {
         bail!("analysis cannot down-round the retained source");
     }
-    let tolerance = scalar(&options.export_relative_tolerance, p)?;
+    let tolerance = acceptance_tolerance(&options.export_relative_tolerance, p)?;
     if tolerance <= 0 || tolerance >= 1 {
         bail!("export tolerance must be in (0,1)");
     }
@@ -421,7 +424,9 @@ pub fn analyze_retained_prefixes(
     )?;
     let mut by_dimension = BTreeMap::new();
     for pair in eigenpairs {
-        if pair.cutoff != matrix.cutoff
+        if xc_core::DecimalLiteral::new(&pair.cutoff)?
+            .cmp_numeric(&xc_core::DecimalLiteral::new(&matrix.cutoff)?)?
+            != std::cmp::Ordering::Equal
             || pair.precision > p
             || !options.checkpoint_dimensions.contains(&(pair.modes + 1))
             || by_dimension.insert(pair.modes + 1, pair).is_some()
@@ -460,10 +465,11 @@ pub fn analyze_retained_prefixes(
         let pair = by_dimension.get(&k);
         let mut xi = Vec::new();
         if let Some(pair) = pair {
+            let source_unit = unit(&pair.vector, p)?;
             let sqrt2 = Float::with_val(p, 2).sqrt();
-            xi.push(Float::with_val(p, &pair.vector[pair.modes]));
+            xi.push(Float::with_val(p, &source_unit[pair.modes]));
             for j in 1..k {
-                let mut x = Float::with_val(p, &pair.vector[pair.modes + j]);
+                let mut x = Float::with_val(p, &source_unit[pair.modes + j]);
                 x *= &sqrt2;
                 xi.push(x);
             }
@@ -490,7 +496,7 @@ pub fn analyze_retained_prefixes(
             if decoded[k..]
                 .iter()
                 .zip(&values[k..])
-                .any(|(a, b)| Float::with_val(p, a - b).abs() > tolerance)
+                .any(|(a, b)| !numerical_checks::component_close(a, b, &tolerance, p))
             {
                 return Ok(false);
             }
@@ -499,9 +505,7 @@ pub fn analyze_retained_prefixes(
             if decoded[k - 1] != 1 {
                 return Ok(false);
             }
-            let mut mass_error = norm(&decoded[k..2 * k], p);
-            mass_error -= 1;
-            mass_error.abs_mut();
+            let mass_error = numerical_checks::unit_deviation_upper(&decoded[k..2 * k], p)?;
             if mass_error > tolerance
                 || residual(&matrix.entries, matrix.dimension(), &decoded[..k], &rhs, p) > tolerance
             {
@@ -511,25 +515,21 @@ pub fn analyze_retained_prefixes(
             if renormalized
                 .iter()
                 .zip(&decoded[k..2 * k])
-                .any(|(a, b)| Float::with_val(p, a - b).abs() > tolerance)
+                .any(|(a, b)| !numerical_checks::component_close(a, b, &tolerance, p))
             {
                 return Ok(false);
             }
             if let Some(pair) = pair {
                 let vector = &decoded[2 * k..];
-                let mut error = norm(vector, p);
-                error -= 1;
-                error.abs_mut();
-                let rhs = vector
-                    .iter()
-                    .map(|x| {
-                        let mut v = Float::with_val(p, x);
-                        v *= &pair.eigenvalue;
-                        v
-                    })
-                    .collect::<Vec<_>>();
+                let error = numerical_checks::unit_deviation_upper(vector, p)?;
                 if error > tolerance
-                    || residual(&matrix.entries, matrix.dimension(), vector, &rhs, p) > tolerance
+                    || eigenpair_residual(
+                        &matrix.entries,
+                        matrix.dimension(),
+                        vector,
+                        &pair.eigenvalue,
+                        p,
+                    ) > tolerance
                 {
                     return Ok(false);
                 }
@@ -544,7 +544,7 @@ pub fn analyze_retained_prefixes(
                     .collect::<Result<Vec<_>>>()?;
                 let mut rhs = vec![Float::with_val(p, 0); k];
                 rhs[k - 1] = sigma.clone();
-                packet.decoded_innovation_backward_error = Some(lossless_decimal(&residual(
+                packet.decoded_innovation_backward_error = Some(upper_decimal(&residual(
                     &matrix.entries,
                     matrix.dimension(),
                     &decoded[..k],
@@ -562,24 +562,19 @@ pub fn analyze_retained_prefixes(
                 packet.unit_innovation = encoded[k..2 * k].to_vec();
                 if let Some(pair) = pair {
                     packet.unit_retained_eigenvector = encoded[2 * k..].to_vec();
-                    let overlap = dot(&decoded[k..2 * k], &decoded[2 * k..], p);
+                    let overlap = dot(&decoded[k..2 * k], &decoded[2 * k..], p)?;
                     packet.signed_overlap = Some(lossless_decimal(&overlap));
-                    packet.squared_overlap = Some(lossless_decimal(&overlap.square()));
-                    let rhs = decoded[2 * k..]
-                        .iter()
-                        .map(|x| {
-                            let mut v = Float::with_val(p, x);
-                            v *= &pair.eigenvalue;
-                            v
-                        })
-                        .collect::<Vec<_>>();
-                    packet.decoded_eigenpair_backward_error = Some(lossless_decimal(&residual(
-                        &matrix.entries,
-                        matrix.dimension(),
-                        &decoded[2 * k..],
-                        &rhs,
-                        p,
-                    )));
+                    packet.squared_overlap = Some(lossless_decimal(
+                        &super::retained_evidence::point::product(&[&overlap, &overlap], p)?,
+                    ));
+                    packet.decoded_eigenpair_backward_error =
+                        Some(upper_decimal(&eigenpair_residual(
+                            &matrix.entries,
+                            matrix.dimension(),
+                            &decoded[2 * k..],
+                            &pair.eigenvalue,
+                            p,
+                        )));
                 }
             }
             Err(error) => {
@@ -619,6 +614,8 @@ fn dependency(manifest: &ArtifactManifest) -> DependencyRef {
 /// their existing dependency closure without changing its identities.
 /// Source-only diagnostics may be public only when all supplied parents are
 /// public. Registry registration is separate from numerical execution.
+/// Warm reuse replays every numerical field from the supplied retained points
+/// in O(D^3) arithmetic; it does not reconstruct Tau matrices or eigenstates.
 pub fn analyze_retained_prefixes_via_cache(
     matrix: &RetainedEvenMatrix,
     options: &PrefixAnalysisOptions,
@@ -668,7 +665,14 @@ pub fn analyze_retained_prefixes_via_cache(
         target: Some("parent_derived_prefix_moments_and_checkpoint_exports".into()),
         subspace: Some("even".into()),
         source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some("unpivoted_ldlt_fixed_reduction_order".into()),
+        algorithm_semantics: Some(if options.diagnostics.is_legacy_default() {
+            "unpivoted_ldlt_directed_scaled_exports_and_full_source_replay_v2".into()
+        } else {
+            format!(
+                "unpivoted_ldlt_directed_scaled_exports_and_full_source_replay_v2+{}",
+                xc_numerics::prefix::TWO_MODE_MOMENT_SEMANTICS
+            )
+        }),
     };
     let logical = format!(
         "ccm/prefix/{}/{}",
@@ -688,7 +692,7 @@ pub fn analyze_retained_prefixes_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+        minimum_reader_version: ToolkitVersion::parse("0.15.1")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".into(), "ccm".into()),
@@ -697,139 +701,33 @@ pub fn analyze_retained_prefixes_via_cache(
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
+    // A fresh payload can use its exact process-local seal. Cache reuse has
+    // no such seal and must replay every field against the retained inputs.
+    let fresh = std::cell::RefCell::new(None);
     let result = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            analyze_retained_prefixes(matrix, options, eigenpairs)
-                .map(|r| (r, dependencies.clone()))
-                .map_err(|e| CacheError::InvalidManifest(e.to_string()))
-        },
-        |r| {
-            if r.schema_version != 1
-                || r.semantics != prefix_semantics(options)
-                || r.basis != EVEN_BASIS
-                || r.parent_matrix_source != matrix.manifest.content_digest
-                || r.options != *options
-                || r.parent_n_modes != matrix.modes
-                || r.cutoff != matrix.cutoff
-                || r.source_precision_bits != matrix.precision
-                || !r.prefixes_are_parent_derived
-                || !r.nesting_checks.is_empty()
-                || r.ladder.semantics
-                    != if options.diagnostics.is_legacy_default() {
-                        "prefix-spd-unpivoted-ldlt-innovation-gram-v2"
-                    } else {
-                        "prefix-spd-unpivoted-ldlt-innovation-gram-v3"
-                    }
-                || r.ladder.diagnostic_policy != options.diagnostics
-                || r.ladder.precision_bits != options.working_precision_bits
-                || r.ladder.requested_dimension != matrix.dimension()
-                || r.ladder.rows.len() > matrix.dimension()
-                || (r.ladder.stopped.is_none() && r.ladder.rows.len() != matrix.dimension())
-                || r.checkpoints
-                    .iter()
-                    .map(|r| r.dimension)
-                    .collect::<Vec<_>>()
-                    != options.checkpoint_dimensions
-                || r.assurance != "computed_point_diagnostics_and_export_checks_not_certified"
-            {
-                return Err(CacheError::InvalidManifest(
-                    "prefix diagnostic identity or shape mismatch".into(),
-                ));
+            let report = analyze_retained_prefixes(matrix, options, eigenpairs)
+                .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+            if !cache.mode.compares_against_reference() {
+                let bytes = serde_json::to_vec(&report)
+                    .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+                fresh.replace(Some(ContentDigest::sha256(&bytes)));
             }
-            for (i, row) in r.ladder.rows.iter().enumerate() {
-                if row.dimension != i + 1 {
-                    return Err(CacheError::InvalidManifest(
-                        "prefix rows are not ordered".into(),
-                    ));
-                }
-                let parse = |s: &str| {
-                    scalar(s, options.working_precision_bits)
-                        .map_err(|e| CacheError::InvalidManifest(e.to_string()))
-                };
-                if row.innovation_cancellation.is_some()
-                    != options.diagnostics.innovation_cancellation
-                    || row.third_inverse_moment.is_some()
-                        != options.diagnostics.third_inverse_moment
-                {
-                    return Err(CacheError::InvalidManifest(
-                        "prefix diagnostic presence differs from its policy".into(),
-                    ));
-                }
-                if let Some(cancellation) = &row.innovation_cancellation {
-                    let absolute_sum = parse(&cancellation.absolute_term_sum)?;
-                    let absolute_result = parse(&cancellation.absolute_result)?;
-                    if absolute_sum < 0
-                        || absolute_result < 0
-                        || cancellation.worst_component.is_some_and(|k| k >= i)
-                        || (i == 0 && cancellation.worst_component.is_some())
-                        || (i > 0 && cancellation.worst_component.is_none())
-                        || cancellation.zero_result_with_nonzero_terms
-                            != (absolute_result.is_zero() && absolute_sum > 0)
-                    {
-                        return Err(CacheError::InvalidManifest(
-                            "invalid innovation cancellation shape or status".into(),
-                        ));
-                    }
-                    match (&cancellation.ratio, &cancellation.decimal_digits_lost) {
-                        (None, None) if cancellation.zero_result_with_nonzero_terms => {}
-                        (Some(ratio), Some(digits))
-                            if !cancellation.zero_result_with_nonzero_terms
-                                && parse(ratio)? >= 1
-                                && parse(digits)? >= 0 => {}
-                        _ => {
-                            return Err(CacheError::InvalidManifest(
-                                "inconsistent innovation cancellation ratio".into(),
-                            ))
-                        }
-                    }
-                }
-                if let Some(third) = &row.third_inverse_moment {
-                    third
-                        .validate_for_moments(
-                            &parse(&row.inverse_trace)?,
-                            &parse(&row.inverse_square_trace)?,
-                            row.dimension,
-                        )
-                        .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
-                }
-                let lower = parse(&row.smallest_eigenvalue_lower_estimate)?;
-                let mut width = parse(&row.smallest_eigenvalue_upper_estimate)? / &lower;
-                width -= 1;
-                let resolved = width.is_finite() && width >= 0;
-                let expected_gap = (i > 0 && resolved).then(|| lossless_decimal(&width));
-                let expected_second = (i == 0 || resolved).then(|| {
-                    let mut value = lower.clone();
-                    if i > 0 {
-                        let mut correction = width.clone().square();
-                        correction /= 2;
-                        correction += 1;
-                        value *= correction;
-                    }
-                    lossless_decimal(&value)
-                });
-                if row.gap_ratio_estimate != expected_gap
-                    || row.smallest_eigenvalue_second_order_estimate != expected_second
-                {
-                    return Err(CacheError::InvalidManifest(
-                        "missing or inconsistent v2 moment-model diagnostics".into(),
-                    ));
-                }
-                for value in [
-                    &row.sigma,
-                    &row.innovation_mass,
-                    &row.inverse_trace,
-                    &row.inverse_square_trace,
-                ] {
-                    if scalar(value, options.working_precision_bits)
-                        .map_err(|e| CacheError::InvalidManifest(e.to_string()))?
-                        <= 0
-                    {
-                        return Err(CacheError::InvalidManifest(
-                            "nonpositive prefix metric".into(),
-                        ));
-                    }
-                }
+            Ok((report, dependencies.clone()))
+        },
+        |report| {
+            let bytes = serde_json::to_vec(report)
+                .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+            if fresh.borrow().as_ref() == Some(&ContentDigest::sha256(&bytes)) {
+                return Ok(());
+            }
+            let expected = analyze_retained_prefixes(matrix, options, eigenpairs)
+                .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+            if report != &expected {
+                return Err(CacheError::InvalidManifest(
+                    "retained prefix numerical rows or exports fail exact source replay".into(),
+                ));
             }
             Ok(())
         },
@@ -888,11 +786,27 @@ pub fn prefix_observations(
 ) -> Result<Vec<xc_core::ObservationPayload>> {
     use xc_core::*;
     resolution.validate()?;
+    precision(report.source_precision_bits)?;
+    precision(report.ladder.precision_bits)?;
+    precision(report.options.working_precision_bits)?;
+    validate_cutoff(&report.cutoff)?;
+    if report.parent_n_modes > 8192
+        || report.ladder.precision_bits != report.options.working_precision_bits
+        || report.ladder.precision_bits < report.source_precision_bits
+        || resolution.analysis_precision_bits < report.ladder.precision_bits
+    {
+        bail!("incoherent prefix report dimensions or analysis precision");
+    }
+
     if report.schema_version != 1
         || ![
             PREFIX_SEMANTICS,
             EXTENDED_PREFIX_SEMANTICS,
             LEGACY_PREFIX_SEMANTICS,
+            "ccm-retained-even-prefix-moments-checked-exports-v6",
+            "ccm-retained-even-prefix-moments-checked-exports-v7",
+            "ccm-retained-even-prefix-moments-checked-exports-v2",
+            "ccm-retained-even-prefix-moments-checked-exports-v3",
         ]
         .contains(&report.semantics.as_str())
         || report.basis != EVEN_BASIS
@@ -991,9 +905,10 @@ pub fn prefix_observations(
                 false,
             ),
             PrefixObservable::PivotCancellationDigits => {
-                let mut ratio = scalar(&row.pivot_cancellation_scale, report.ladder.precision_bits)?;
-                ratio /= scalar(&row.sigma, report.ladder.precision_bits)?;
-                derived = lossless_decimal(&ratio.log10());
+                let numerator = scalar(&row.pivot_cancellation_scale, report.ladder.precision_bits)?;
+                let denominator = scalar(&row.sigma, report.ladder.precision_bits)?;
+                if numerator <= 0 || denominator <= 0 { bail!("prefix cancellation ratio requires positive values"); }
+                derived = lossless_decimal(&super::hp::sector_gap_math::log_magnitude_ratio(&numerator,&denominator,report.ladder.precision_bits)?);
                 ("pivot-cancellation-decimal-digits", &derived, false)
             },
             PrefixObservable::InnovationCancellationDigits => (
@@ -1097,8 +1012,8 @@ pub struct RetainedReductionCheck {
     pub assurance: String,
 }
 /// Persist a source-bound stable-reduction diagnostic without rebuilding a source.
-/// A warm hit validates the recipe, shape, and finite diagnostic values; it does
-/// not repeat the cubic reduction. Use Refresh/Verify for numerical replay.
+/// A warm hit replays the complete computed report from the supplied retained
+/// matrix in O(d^3) arithmetic. This does not rebuild Tau or change assurance.
 pub fn check_retained_reduction_via_cache(
     matrix: &RetainedEvenMatrix,
     working_precision_bits: u32,
@@ -1117,7 +1032,7 @@ pub fn check_retained_reduction_via_cache(
     if matrix.dimension() > maximum_dimension || working_precision_bits < matrix.precision {
         bail!("retained reduction exceeds dimension or precision budget");
     }
-    let tolerance = scalar(relative_tolerance, working_precision_bits)?;
+    let tolerance = acceptance_tolerance(relative_tolerance, working_precision_bits)?;
     if tolerance <= 0 || tolerance >= 1 {
         bail!("invalid reduction tolerance");
     }
@@ -1137,7 +1052,7 @@ pub fn check_retained_reduction_via_cache(
     let semantic = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_retained_reduction_check".into(),
-        mathematical_semantics_version: "ccm-retained-reduction-v0.15.0-v1".into(),
+        mathematical_semantics_version: RETAINED_REDUCTION_SEMANTICS.into(),
         resolved_mathematical_parameters: serde_json::json!({
             "source_dependencies": dependencies, "source_parents_are_public": matrix.manifest.visibility == CacheVisibility::Public, "working_precision_bits": working_precision_bits,
             "maximum_dimension": maximum_dimension, "relative_tolerance": relative_tolerance,
@@ -1146,7 +1061,10 @@ pub fn check_retained_reduction_via_cache(
         target: Some("stored_point_matrix_reduction_diagnostics".into()),
         subspace: Some("even".into()),
         source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some(xc_numerics::eigen::STABLE_HOUSEHOLDER_SEMANTICS.into()),
+        algorithm_semantics: Some(format!(
+            "{};full_source_replay_v2",
+            xc_numerics::eigen::STABLE_HOUSEHOLDER_SEMANTICS
+        )),
     };
     let logical = format!(
         "ccm/retained-reduction/{}",
@@ -1165,91 +1083,47 @@ pub fn check_retained_reduction_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+        minimum_reader_version: ToolkitVersion::parse("0.15.1")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([("assurance".into(), "computed_not_certified".into())]),
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
+    let fresh = std::cell::RefCell::new(None);
     let result = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            check_retained_reduction(
+            let report = check_retained_reduction(
                 matrix,
                 working_precision_bits,
                 maximum_dimension,
                 relative_tolerance,
             )
-            .map(|r| (r, dependencies.clone()))
-            .map_err(|e| CacheError::InvalidManifest(e.to_string()))
+            .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+            if !cache.mode.compares_against_reference() {
+                let bytes = serde_json::to_vec(&report)
+                    .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+                fresh.replace(Some(ContentDigest::sha256(&bytes)));
+            }
+            Ok((report, dependencies.clone()))
         },
-        |r: &RetainedReductionCheck| {
-            let invalid = |s: &str| CacheError::InvalidManifest(s.into());
-            if r.schema_version != 1
-                || r.algorithm_semantics != xc_numerics::eigen::STABLE_HOUSEHOLDER_SEMANTICS
-                || r.matrix_source != matrix.manifest.content_digest
-                || r.dimension != matrix.dimension()
-                || r.n_modes != matrix.modes
-                || r.cutoff != matrix.cutoff
-                || r.source_precision_bits != matrix.precision
-                || r.working_precision_bits != working_precision_bits
-                || r.authorized_maximum_dimension != maximum_dimension
-                || r.acceptance_tolerance != relative_tolerance
-                || r.assurance != REDUCTION_ASSURANCE
-                || r.estimated_matrix_working_bytes != estimated_bytes as u64
-                || r.diagonal.len() != r.dimension
-                || r.off_diagonal.len() + 1 != r.dimension
-                || r.computed_eigenvalues.len() != r.dimension
-            {
-                return Err(invalid("retained reduction identity or shape mismatch"));
+        |report: &RetainedReductionCheck| {
+            let bytes = serde_json::to_vec(report)
+                .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+            if fresh.borrow().as_ref() == Some(&ContentDigest::sha256(&bytes)) {
+                return Ok(());
             }
-            for text in r
-                .diagonal
-                .iter()
-                .chain(&r.off_diagonal)
-                .chain(&r.computed_eigenvalues)
-            {
-                scalar(text, working_precision_bits)
-                    .map_err(|_| invalid("nonfinite reduction scalar"))?;
-            }
-            for text in [
-                &r.diagnostics.absolute_similarity_residual,
-                &r.diagnostics.absolute_orthogonality_residual,
-                &r.diagnostics.source_frobenius_norm,
-                &r.diagnostics.tridiagonal_frobenius_norm,
-                &r.diagnostics.basis_frobenius_norm,
-            ] {
-                if scalar(text, working_precision_bits)
-                    .map_err(|_| invalid("nonfinite reduction diagnostic"))?
-                    < 0
-                {
-                    return Err(invalid("negative reduction diagnostic"));
-                }
-            }
-            for pair in r.computed_eigenvalues.windows(2) {
-                if scalar(&pair[0], working_precision_bits)
-                    .map_err(|_| invalid("invalid spectrum"))?
-                    > scalar(&pair[1], working_precision_bits)
-                        .map_err(|_| invalid("invalid spectrum"))?
-                {
-                    return Err(invalid("unordered retained spectrum"));
-                }
-            }
-            let similarity = scalar(
-                &r.diagnostics.relative_similarity_residual,
+            let expected = check_retained_reduction(
+                matrix,
                 working_precision_bits,
+                maximum_dimension,
+                relative_tolerance,
             )
-            .map_err(|_| invalid("invalid similarity diagnostic"))?;
-            let orthogonality = scalar(
-                &r.diagnostics.relative_orthogonality_residual,
-                working_precision_bits,
-            )
-            .map_err(|_| invalid("invalid orthogonality diagnostic"))?;
-            if similarity < 0
-                || orthogonality < 0
-                || r.checks_passed != (similarity <= tolerance && orthogonality <= tolerance)
-            {
-                return Err(invalid("inconsistent reduction acceptance verdict"));
+            .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+            if report != &expected {
+                return Err(CacheError::InvalidManifest(
+                    "retained reduction numerical fields fail exact source replay".into(),
+                ));
             }
             Ok(())
         },
@@ -1294,7 +1168,7 @@ pub fn check_retained_reduction(
     if estimated_bytes > 16 * 1024_u128.pow(3) {
         bail!("retained reduction exceeds estimated matrix-storage budget");
     }
-    let tolerance = scalar(relative_tolerance, working_precision_bits)?;
+    let tolerance = acceptance_tolerance(relative_tolerance, working_precision_bits)?;
     if tolerance <= 0 || tolerance >= 1 {
         bail!("relative diagnostic tolerance must lie strictly between zero and one");
     }
@@ -1348,4 +1222,327 @@ pub fn check_retained_reduction(
         computed_eigenvalues: eigenvalues.iter().map(lossless_decimal).collect(),
         assurance: REDUCTION_ASSURANCE.into(),
     })
+}
+
+fn acceptance_tolerance(text: &str, p: u32) -> Result<Float> {
+    scalar(text, p)?;
+    // Accepting an error must not relax the exact supplied decimal limit.
+    Ok(Float::with_val_round(p, Float::parse(text)?, rug::float::Round::Down).0)
+}
+
+#[cfg(test)]
+mod renewed_boundary_contract {
+    use super::*;
+    #[test]
+    fn acceptance_decimal_cannot_round_up_to_half() {
+        let value = acceptance_tolerance("0.499999999999999999999999999999999999999", 64).unwrap();
+        assert!(value < 0.5);
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_retained_prefix {
+    use super::*;
+    use serde_json::json;
+    use xc_cache::{ArtifactKey, CacheObjectRef};
+    fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let digest = ContentDigest::sha256(&bytes);
+        (
+            ArtifactManifest {
+                schema_version: 1,
+                key: ArtifactKey::new(kind, "prefix-boundary-fixture", kind.as_bytes()).unwrap(),
+                content_digest: digest.clone(),
+                size_bytes: bytes.len() as u64,
+                objects: vec![CacheObjectRef {
+                    content_digest: digest,
+                    size_bytes: bytes.len() as u64,
+                }],
+                created_unix_seconds: 1,
+                producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                maximum_reader_version: None,
+                quality: CacheQuality::Validated,
+                visibility: CacheVisibility::Local,
+                immutable: true,
+                dependencies: vec![],
+                tags: BTreeMap::new(),
+                provenance_digest: None,
+            },
+            bytes,
+        )
+    }
+    fn matrix(cutoff: &str) -> (ArtifactManifest, Vec<u8>) {
+        source(
+            "ccm_even_sector_matrix",
+            json!({"schema_version":1,"lambda_squared":cutoff,"n_modes":1,"precision_bits":128,"dimension":2,"entries":["1","0","0","1"]}),
+        )
+    }
+    fn options() -> PrefixAnalysisOptions {
+        PrefixAnalysisOptions {
+            working_precision_bits: 128,
+            pivot_margin_bits: 32,
+            checkpoint_dimensions: vec![2],
+            export_significant_digits: vec![40, 48],
+            export_relative_tolerance: "1e-30".into(),
+            diagnostics: PrefixDiagnosticPolicy::default(),
+        }
+    }
+    fn report() -> CcmPrefixAnalysis {
+        let (m, b) = matrix("13");
+        let a = RetainedEvenMatrix::from_payload(&m, &b, std::slice::from_ref(&m.content_digest))
+            .unwrap();
+        analyze_retained_prefixes(&a, &options(), &[]).unwrap()
+    }
+    fn resolution() -> xc_core::ObservableResolution {
+        use xc_core::*;
+        ObservableResolution {
+            source_precision_bits: 128,
+            analysis_precision_bits: 128,
+            export_significant_digits: 40,
+            components: RESOLUTION_AXES
+                .iter()
+                .map(|&axis| ResolutionComponent {
+                    axis,
+                    classification: ResolutionClass::Unknown,
+                    absolute: None,
+                    explanation: "not evaluated for supplied report".into(),
+                    evidence: vec![],
+                    dependency_groups: Default::default(),
+                })
+                .collect(),
+        }
+    }
+    #[test]
+    fn current_retained_eigenpair_schemas_preserve_exact_points_and_authentication() {
+        for schema in [2, 3, 4, 5, 6] {
+            let (manifest, bytes) = source(
+                "ccm_weil_eigenpair",
+                json!({
+                    "schema_version": schema, "lambda_squared": "13", "n_modes": 1,
+                    "precision_bits": 128, "eigenvalue": "1", "eigenvector": ["1", "2", "1"],
+                    "force_even": true, "parity_policy": "even_sector",
+                }),
+            );
+            let approved = std::slice::from_ref(&manifest.content_digest);
+            let pair = RetainedEvenEigenpair::from_payload(&manifest, &bytes, approved);
+            let state = crate::ccm::state_geometry::RetainedState::from_payload(
+                &manifest, &bytes, approved,
+            );
+            if schema == 6 {
+                assert!(pair.is_err());
+                assert!(state.is_err());
+                continue;
+            }
+            let pair = pair.unwrap();
+            let state = state.unwrap();
+            // Exact integer point oracle; format support never transforms
+            // or silently projects the retained source coefficients.
+            assert_eq!(pair.eigenvalue, 1);
+            for (actual, expected) in pair.vector.iter().zip([1, 2, 1]) {
+                assert_eq!(actual.to_rational().unwrap(), rug::Rational::from(expected));
+            }
+            assert_eq!(state.coefficients, pair.vector);
+            let mut changed = bytes.clone();
+            changed[0] ^= 1;
+            assert!(RetainedEvenEigenpair::from_payload(&manifest, &changed, approved).is_err());
+            assert!(crate::ccm::state_geometry::RetainedState::from_payload(
+                &manifest, &changed, approved,
+            )
+            .is_err());
+        }
+    }
+    #[test]
+    fn exhaustive_retained_prefix_nonzero_decimal_underflow() {
+        assert!(scalar("1e-400000000", 128).is_err());
+    }
+    #[test]
+    fn exhaustive_retained_prefix_scalar_precision_is_fallible() {
+        assert!(std::panic::catch_unwind(|| scalar("1", 0)).is_ok_and(|x| x.is_err()));
+    }
+    #[test]
+    fn exhaustive_retained_prefix_dot_preserves_exact_cancellation() {
+        let p = 64;
+        let big = Float::with_val(p, 1) << 100u32;
+        let a = vec![big.clone(), Float::with_val(p, 1), -big];
+        let b = vec![Float::with_val(p, 1); 3];
+        assert_eq!(dot(&a, &b, p).unwrap(), 1);
+    }
+    #[test]
+    fn exhaustive_retained_prefix_matrix_cutoff_is_mathematical() {
+        let (m, b) = matrix("NaN");
+        assert!(
+            RetainedEvenMatrix::from_payload(&m, &b, std::slice::from_ref(&m.content_digest))
+                .is_err()
+        );
+    }
+    #[test]
+    fn exhaustive_retained_prefix_eigenpair_cutoff_is_mathematical() {
+        let (m, b) = source(
+            "ccm_weil_eigenpair",
+            json!({"schema_version":2,"lambda_squared":"1","n_modes":1,"precision_bits":128,"eigenvalue":"1","eigenvector":["0","1","0"]}),
+        );
+        assert!(RetainedEvenEigenpair::from_payload(
+            &m,
+            &b,
+            std::slice::from_ref(&m.content_digest)
+        )
+        .is_err());
+    }
+    #[test]
+    fn exhaustive_retained_prefix_restriction_normalizes_before_overflow() {
+        let (m, b) = matrix("13");
+        let a = RetainedEvenMatrix::from_payload(&m, &b, std::slice::from_ref(&m.content_digest))
+            .unwrap();
+        let big = Float::with_val(128, 0.75) << rug::float::exp_max();
+        assert!(big.is_finite());
+        let (m, b) = source(
+            "ccm_weil_eigenpair",
+            json!({"schema_version":2,"lambda_squared":"13","n_modes":1,"precision_bits":128,"eigenvalue":"1","eigenvector":[big.to_string(),"0",big.to_string()]}),
+        );
+        let pair =
+            RetainedEvenEigenpair::from_payload(&m, &b, std::slice::from_ref(&m.content_digest))
+                .unwrap();
+        let r = analyze_retained_prefixes(&a, &options(), &[pair]);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(r.unwrap().checkpoints[0].status, "export_checks_passed");
+    }
+    #[test]
+    fn exhaustive_retained_prefix_observation_precision_is_fallible() {
+        let mut r = report();
+        r.ladder.precision_bits = 0;
+        assert!(std::panic::catch_unwind(|| prefix_observations(
+            &r,
+            PrefixObservable::PivotCancellationDigits,
+            &resolution()
+        ))
+        .is_ok_and(|x| x.is_err()));
+    }
+    #[test]
+    fn exhaustive_retained_prefix_log_ratio_preserves_finite_result() {
+        let mut r = report();
+        for row in &mut r.ladder.rows {
+            row.sigma = (Float::with_val(128, 1) >> 700_000_000u32).to_string();
+            row.pivot_cancellation_scale = (Float::with_val(128, 1) << 700_000_000u32).to_string();
+        }
+        let values =
+            prefix_observations(&r, PrefixObservable::PivotCancellationDigits, &resolution());
+        assert!(values.is_ok(), "{values:?}");
+        let expected = Float::with_val(128, Float::with_val(512, 2).log10() * 1_400_000_000u32);
+        for item in values.unwrap() {
+            let xc_core::ObservedScalar::Finite { value } = item.value else {
+                panic!("finite observation required")
+            };
+            assert_eq!(scalar(value.as_str(), 128).unwrap(), expected);
+        }
+    }
+    #[test]
+    fn exhaustive_retained_prefix_unit_rejects_partial_component_underflow() {
+        let p = 64;
+        let tiny = Float::with_val(p, 1) << (rug::float::exp_min() - 1);
+        assert!(tiny > 0);
+        assert!(unit(
+            &[Float::with_val(p, 0.75), Float::with_val(p, 0.75), tiny],
+            p
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn exhaustive_retained_prefix_exact_dot_oracles() {
+        use rug::Rational;
+        for p in [64, 128, 256] {
+            for exponent in [-900i32, 0, 900] {
+                for case in 1i32..=16 {
+                    let a: Vec<_> = (0..7)
+                        .map(|i| Float::with_val(p, (case + 1) * (i - 3)) << exponent)
+                        .collect();
+                    let b: Vec<_> = (0..7)
+                        .map(|i| Float::with_val(p, (case - 2) * (i + 1) + 1) >> exponent)
+                        .collect();
+                    let exact = a
+                        .iter()
+                        .zip(&b)
+                        .map(|(x, y)| x.to_rational().unwrap() * y.to_rational().unwrap())
+                        .sum::<Rational>();
+                    assert_eq!(dot(&a, &b, p).unwrap(), Float::with_val(p, exact));
+                }
+            }
+            assert!(dot(&[], &[], p).is_err());
+            assert!(dot(&[Float::with_val(p, 1)], &[], p).is_err());
+        }
+    }
+    #[test]
+    fn exhaustive_retained_prefix_normalization_and_outward_norm_oracles() {
+        use rug::{float::Round, Rational};
+        for p in [64, 128, 256] {
+            for exponent in [-700_000_000i32, 0, 700_000_000] {
+                let vector = [
+                    Float::with_val(p, 3) << exponent,
+                    Float::with_val(p, 4) << exponent,
+                ];
+                let actual = unit(&vector, p).unwrap();
+                assert_eq!(actual[0], Float::with_val(p, Rational::from((3, 5))));
+                assert_eq!(actual[1], Float::with_val(p, Rational::from((4, 5))));
+                let q = actual
+                    .iter()
+                    .map(|x| x.to_rational().unwrap().square())
+                    .sum::<Rational>();
+                let work = p * 4;
+                let mut lo = Float::with_val_round(work, &q, Round::Down).0;
+                let mut hi = Float::with_val_round(work, &q, Round::Up).0;
+                lo.sqrt_round(Round::Down);
+                hi.sqrt_round(Round::Up);
+                let lo = (lo - 1u32).abs();
+                let hi = (hi - 1u32).abs();
+                let oracle = lo.max(&hi);
+                assert!(numerical_checks::unit_deviation_upper(&actual, p).unwrap() >= oracle);
+            }
+        }
+    }
+    #[test]
+    fn exhaustive_retained_prefix_exact_domains_and_budgets() {
+        assert!(validate_cutoff("1.00000000000000000000000000000000000000001").is_ok());
+        for text in [
+            "1",
+            "0",
+            "-2",
+            "NaN",
+            "inf",
+            "0.99999999999999999999999999999999999999",
+        ] {
+            assert!(validate_cutoff(text).is_err(), "{text}");
+        }
+        assert!(decode_budget(4, 128, 1000).is_ok());
+        assert!(decode_budget(8193usize * 8193, 1_000_000, 1000).is_err());
+        assert!(decode_budget(1, 128, usize::MAX).is_err());
+        assert!(numerical_checks::workspace(16385, 64).is_ok());
+        assert!(numerical_checks::workspace(16386, 64).is_err());
+        assert!(numerical_checks::workspace(16385, 1_000_000).is_err());
+        for p in [0, 63, 1_000_001, u32::MAX] {
+            assert!(scalar("1", p).is_err());
+        }
+        for text in ["NaN", "inf", "-inf", "1e400000000", "-1e-400000000"] {
+            assert!(scalar(text, 128).is_err());
+        }
+    }
+    #[test]
+    fn exhaustive_retained_prefix_export_distance_uses_outward_endpoint() {
+        let p = 64;
+        let one = Float::with_val(p, 1);
+        let tiny = Float::with_val(p, 1) >> 100u32;
+        assert!(!numerical_checks::component_close(&one, &(-tiny), &one, p));
+        assert!(numerical_checks::component_close(
+            &one,
+            &Float::with_val(p, 0),
+            &one,
+            p
+        ));
+        assert!(numerical_checks::component_close(
+            &one,
+            &one,
+            &Float::with_val(p, 0),
+            p
+        ));
+    }
 }

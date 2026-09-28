@@ -59,7 +59,7 @@ are part of the semantic key. Public publication requires a public parent.
 
 ## Ultra and historical plans
 
-New shared Ultra plans use `ccm-measurement-capture-plan-v3` and request
+New shared Ultra plans use `ccm-measurement-capture-plan-v6` and request
 `state_geometry`. The retained-run adapter handles this ID independently of
 other diagnostics. Lower levels retain their previous request sets. Serialized
 v1/v2 plans retain their version and do not acquire new requests; old receipts remain evidence

@@ -161,6 +161,18 @@ impl DecimalParts {
 }
 
 impl DecimalLiteral {
+    /// Exact decimal value of a finite binary64 input, without shortest-display
+    /// rounding. Every such value has at most 1074 fractional decimal digits.
+    pub fn from_f64_exact(value: f64) -> Result<Self, ConfigError> {
+        if !value.is_finite() {
+            return Err(ConfigError::new(
+                "exact decimal export requires a finite binary64 value",
+            ));
+        }
+        let fixed = format!("{value:.1074}");
+        Self::new(fixed.trim_end_matches('0').trim_end_matches('.')).and_then(|v| v.canonical())
+    }
+
     pub fn new(value: impl Into<String>) -> Result<Self, ConfigError> {
         let value = value.into();
         DecimalParts::parse(&value)?;
@@ -203,6 +215,55 @@ impl DecimalLiteral {
         Ok(left.cmp_numeric(&right))
     }
 
+    /// Compare `self` with the exact sum `left + right`. Decimal exponents
+    /// remain sparse, so widely separated scales do not allocate intervening
+    /// zeros or pass through a floating-point backend.
+    pub fn cmp_sum(&self, left: &Self, right: &Self) -> Result<Ordering, ConfigError> {
+        self.cmp_sum_many(&[left, right])
+    }
+
+    /// Compare against an exact finite sum without expanding exponent gaps.
+    pub fn cmp_sum_many(&self, terms: &[&Self]) -> Result<Ordering, ConfigError> {
+        use std::collections::BTreeMap;
+        let mut positive = BTreeMap::<i128, u128>::new();
+        let mut negative = BTreeMap::<i128, u128>::new();
+        for (literal, multiplier) in
+            std::iter::once((self, 1)).chain(terms.iter().map(|term| (*term, -1)))
+        {
+            let part = DecimalParts::parse(&literal.0)?;
+            let sign = part.sign * multiplier;
+            if sign == 0 {
+                continue;
+            }
+            let digits = if sign > 0 {
+                &mut positive
+            } else {
+                &mut negative
+            };
+            for (offset, &digit) in part.digits.iter().rev().enumerate() {
+                if digit != 0 {
+                    *digits
+                        .entry(i128::from(part.scale) + offset as i128)
+                        .or_default() += u128::from(digit);
+                }
+            }
+        }
+        fn carry(mut digits: BTreeMap<i128, u128>) -> Vec<(i128, u128)> {
+            let mut result = Vec::new();
+            while let Some((power, value)) = digits.pop_first() {
+                if value % 10 != 0 {
+                    result.push((power, value % 10));
+                }
+                if value >= 10 {
+                    *digits.entry(power + 1).or_default() += value / 10;
+                }
+            }
+            result.reverse();
+            result
+        }
+        Ok(carry(positive).cmp(&carry(negative)))
+    }
+
     /// Convenience conversion for explicitly f64-only discovery paths.
     pub fn parse_f64(&self) -> Result<f64, ConfigError> {
         self.validate()?;
@@ -210,7 +271,11 @@ impl DecimalLiteral {
             .0
             .parse::<f64>()
             .map_err(|error| ConfigError::new(format!("invalid f64 decimal literal: {error}")))?;
-        if value.is_finite() {
+        if value.is_subnormal() || (value == 0.0 && DecimalParts::parse(&self.0)?.sign != 0) {
+            Err(ConfigError::new(
+                "nonzero decimal literal underflows f64; use a higher-precision route",
+            ))
+        } else if value.is_finite() {
             Ok(value)
         } else {
             Err(ConfigError::new(

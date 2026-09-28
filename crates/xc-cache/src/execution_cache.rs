@@ -523,6 +523,7 @@ pub struct ManagedArtifactCacheSession {
     reference_resolver: Option<CacheResolver>,
     policy: CachePolicy,
     production_sink: Option<crate::CanonicalStagingProductionSink>,
+    ephemeral_sink: Option<crate::EphemeralCacheStore>,
     resources: xc_core::ResourcePolicy,
     publication_target: xc_core::PublicationTarget,
     repository_owner: String,
@@ -860,6 +861,7 @@ impl ManagedArtifactCacheSession {
             reference_resolver,
             policy,
             production_sink,
+            ephemeral_sink: None,
             resources,
             publication_target: config.publication_target,
             repository_owner: config.repository_owner,
@@ -901,17 +903,104 @@ impl ManagedArtifactCacheSession {
             .transpose()
     }
 
+    /// Build a session that retains computed dependency manifests and assurance
+    /// evidence in bounded memory, with no persistent writes or publication.
+    /// PreferReuse and RequireReuse consult only the existing local cache.
+    /// Refresh and Disabled consult no persistent overlays. Disabled remains
+    /// the owning policy while its internal dependency graph uses Refresh.
+    /// Reference verification requires persistent comparison reports and is
+    /// incompatible with this session. Remote transport currently requires
+    /// persistent materialization and is rejected when reuse is requested.
+    pub fn new_read_only(
+        mut config: ManagedArtifactCacheConfig,
+        resources: xc_core::ResourcePolicy,
+    ) -> Result<Self, CacheError> {
+        managed_recovery::validate_resources(&resources)?;
+        if config.cache_mode.compares_against_reference() || config.output_validation.is_some() {
+            return Err(CacheError::InvalidTransition(
+                "read-only managed execution is incompatible with persistent reference-verification reports".to_owned(),
+            ));
+        }
+        let consults = config.cache_mode.consults_cache_for_result_reuse();
+        if consults && config.remote_cache_mode != ManagedRemoteCacheMode::None {
+            return Err(CacheError::InvalidTransition(
+                "read-only managed execution has no nonpersistent remote materialization transport"
+                    .to_owned(),
+            ));
+        }
+        let maximum_bytes = resources
+            .maximum_memory_bytes
+            .unwrap_or(8u64 << 30)
+            .min(8u64 << 30);
+        let ephemeral = crate::EphemeralCacheStore::new(maximum_bytes)?;
+        let mut layers = vec![crate::CacheLayer {
+            precedence: 0,
+            store: Box::new(ephemeral.clone()),
+        }];
+        if consults {
+            layers.push(crate::CacheLayer {
+                precedence: 1,
+                store: Box::new(crate::ephemeral_store::ReadOnlyBudgetedStore::new(
+                    Box::new(crate::ZipJsonFilesystemCacheStore::new(
+                        "workstation",
+                        &config.cache_root,
+                        false,
+                        CacheVisibility::Local,
+                    )),
+                    maximum_bytes,
+                )),
+            });
+        }
+        // Clear all persistent sinks before construction; do not create an
+        // ordinary managed session and subsequently turn off its write flags.
+        config.staging_root = None;
+        config.publication_target = xc_core::PublicationTarget::None;
+        config.execute_remote_mutations = false;
+        config.remote_cache_mode = ManagedRemoteCacheMode::None;
+        let mut session = Self::from_layer_sets(
+            config,
+            None,
+            ManagedRemoteCacheMode::None,
+            layers,
+            Vec::new(),
+            resources,
+        )?;
+        session.ephemeral_sink = Some(ephemeral);
+        Ok(session)
+    }
+
+    /// Load the owning mode and assurance, then construct a nonwriting session.
+    pub fn from_environment_read_only() -> Result<Option<Self>, CacheError> {
+        ManagedArtifactCacheConfig::from_environment()?
+            .map(|config| Self::new_read_only(config, managed_resource_policy_from_environment()?))
+            .transpose()
+    }
+
+    /// The policy selected by the caller, including Disabled for an ephemeral
+    /// graph that internally computes its dependency records.
+    pub fn execution_cache_mode(&self) -> ArtifactExecutionCacheMode {
+        self.cache_mode
+    }
+
     pub fn context(&self) -> ArtifactCacheContext<'_> {
         ArtifactCacheContext {
             resolver: Some(&self.resolver),
             reference_resolver: self.reference_resolver.as_ref(),
             acceptance: Some(&self.policy),
             ordered_overlays: {
-                let mut overlays = vec![if self.cache_mode.compares_against_reference() {
-                    "validation-computed".to_owned()
+                let mut overlays = if self.ephemeral_sink.is_some() {
+                    let mut names = vec!["ephemeral".to_owned()];
+                    if self.cache_mode.consults_cache_for_result_reuse() {
+                        names.push("workstation".to_owned());
+                    }
+                    names
                 } else {
-                    "workstation".to_owned()
-                }];
+                    vec![if self.cache_mode.compares_against_reference() {
+                        "validation-computed".to_owned()
+                    } else {
+                        "workstation".to_owned()
+                    }]
+                };
                 if self
                     .policy
                     .allowed_visibilities
@@ -928,15 +1017,28 @@ impl ManagedArtifactCacheSession {
                 }
                 overlays
             },
-            mode: self.cache_mode,
-            write_on_miss: self.cache_mode.writes_computed_artifacts(),
+            mode: if self.ephemeral_sink.is_some()
+                && self.cache_mode == ArtifactExecutionCacheMode::Disabled
+            {
+                ArtifactExecutionCacheMode::Refresh
+            } else {
+                self.cache_mode
+            },
+            write_on_miss: (self.ephemeral_sink.is_some()
+                && self.cache_mode == ArtifactExecutionCacheMode::Disabled)
+                || self.cache_mode.writes_computed_artifacts(),
             write_visibility: CacheVisibility::Local,
             requested_assurance: self.requested_assurance,
             certification_failure_policy: self.certification_failure_policy,
             production_sink: self
-                .production_sink
+                .ephemeral_sink
                 .as_ref()
-                .map(|sink| sink as &dyn ArtifactProductionSink),
+                .map(|sink| sink as &dyn ArtifactProductionSink)
+                .or_else(|| {
+                    self.production_sink
+                        .as_ref()
+                        .map(|sink| sink as &dyn ArtifactProductionSink)
+                }),
         }
     }
 
@@ -1406,6 +1508,7 @@ pub struct ArtifactAssuranceRequirement {
 
 impl ArtifactAssuranceRequirement {
     pub fn validate(&self) -> Result<(), CacheError> {
+        self.artifact_key.validate()?;
         if self.schema_version != 1
             || !self.content_digest.validate()
             || self.required_assurance == crate::ArtifactAssuranceState::Computed
@@ -1420,6 +1523,7 @@ impl ArtifactAssuranceRequirement {
 
 impl ArtifactAssuranceAttestation {
     pub fn validate(&self) -> Result<(), CacheError> {
+        self.artifact_key.validate()?;
         if self.schema_version != 1 || !self.content_digest.validate() {
             return Err(CacheError::InvalidManifest(
                 "artifact assurance attestation identity is invalid".to_owned(),
@@ -1480,6 +1584,33 @@ pub struct QueuedProducedArtifactRecord {
     pub payload_file: String,
 }
 
+fn validate_produced_record_metadata(
+    operation: &str,
+    semantic_key: &SemanticKeyEnvelope,
+    logical_key: &str,
+    manifest: &ArtifactManifest,
+    achieved_assurance: crate::ArtifactAssuranceState,
+    evidence_digests: &[ContentDigest],
+) -> Result<(), CacheError> {
+    semantic_key.validate()?;
+    manifest.validate()?;
+    ArtifactProductionAssessment {
+        achieved_assurance,
+        evidence_digests: evidence_digests.to_vec(),
+    }
+    .validate()?;
+    if operation.trim().is_empty()
+        || logical_key != manifest.key.logical_key
+        || semantic_key.artifact_kind != manifest.key.kind
+        || semantic_key.digest()? != manifest.key.parameters_digest
+    {
+        return Err(CacheError::InvalidManifest(
+            "produced artifact record metadata does not bind its exact identity".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl QueuedProducedArtifactRecord {
     pub fn load(&self, record_path: &Path) -> Result<ProducedArtifactRecord, CacheError> {
         if self.schema_version != 1 || self.payload_file != "payload.json.zip" {
@@ -1487,6 +1618,14 @@ impl QueuedProducedArtifactRecord {
                 "queued production record schema or payload path is invalid".to_owned(),
             ));
         }
+        validate_produced_record_metadata(
+            &self.operation,
+            &self.semantic_key,
+            &self.logical_key,
+            &self.manifest,
+            self.achieved_assurance,
+            &self.assurance_evidence_digests,
+        )?;
         let parent = record_path.parent().ok_or_else(|| {
             CacheError::InvalidManifest("queued production record has no parent".to_owned())
         })?;
@@ -1501,8 +1640,40 @@ impl QueuedProducedArtifactRecord {
         let mut entry = archive
             .by_name("payload.json")
             .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
-        let mut payload = Vec::with_capacity(self.manifest.size_bytes as usize);
-        entry.read_to_end(&mut payload)?;
+        if entry.size() != self.manifest.size_bytes {
+            return Err(CacheError::InvalidManifest(
+                "queued production ZIP size differs from its manifest".into(),
+            ));
+        }
+        // Do not reserve from untrusted metadata. Bound each decoded chunk
+        // before allocation, and validate the complete bytes before returning.
+        let mut payload = Vec::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = entry.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            let next_len = payload.len().checked_add(count).ok_or_else(|| {
+                CacheError::ResourceLimit("queued payload length exceeds usize".into())
+            })?;
+            if next_len as u64 > self.manifest.size_bytes {
+                return Err(CacheError::ResourceLimit(
+                    "queued payload exceeds its declared size".into(),
+                ));
+            }
+            payload.try_reserve(count).map_err(|error| {
+                CacheError::ResourceLimit(format!("queued payload allocation failed: {error}"))
+            })?;
+            payload.extend_from_slice(&buffer[..count]);
+        }
+        if payload.len() as u64 != self.manifest.size_bytes
+            || ContentDigest::sha256(&payload) != self.manifest.content_digest
+        {
+            return Err(CacheError::InvalidManifest(
+                "queued produced artifact failed payload identity verification".into(),
+            ));
+        }
         Ok(ProducedArtifactRecord {
             operation: self.operation.clone(),
             semantic_key: self.semantic_key.clone(),
@@ -1517,18 +1688,7 @@ impl QueuedProducedArtifactRecord {
 
 pub fn load_queued_produced_artifact(path: &Path) -> Result<ProducedArtifactRecord, CacheError> {
     let queued: QueuedProducedArtifactRecord = serde_json::from_slice(&fs::read(path)?)?;
-    let artifact = queued.load(path)?;
-    artifact.semantic_key.validate()?;
-    artifact.manifest.validate()?;
-    if artifact.manifest.key.parameters_digest != artifact.semantic_key.digest()?
-        || artifact.manifest.content_digest != ContentDigest::sha256(&artifact.payload)
-        || artifact.manifest.size_bytes != artifact.payload.len() as u64
-    {
-        return Err(CacheError::InvalidManifest(
-            "queued produced artifact failed identity verification".to_owned(),
-        ));
-    }
-    Ok(artifact)
+    queued.load(path)
 }
 
 pub trait ArtifactProductionSink: Send + Sync {
@@ -1737,36 +1897,18 @@ impl DirectoryArtifactProductionSink {
     }
 
     fn write_immutable(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
-        if path.exists() {
-            if fs::read(path)? == bytes {
-                return Ok(());
+        crate::with_record_update_lock(path, || {
+            if path.exists() {
+                if fs::read(path)? == bytes {
+                    return Ok(());
+                }
+                return Err(CacheError::InvalidManifest(format!(
+                    "artifact production queue path already contains different bytes: {}",
+                    path.display()
+                )));
             }
-            return Err(CacheError::InvalidManifest(format!(
-                "artifact production queue path already contains different bytes: {}",
-                path.display()
-            )));
-        }
-        let parent = path.parent().ok_or_else(|| {
-            CacheError::InvalidManifest("queued artifact path has no parent".to_owned())
-        })?;
-        fs::create_dir_all(parent)?;
-        let temporary = parent.join(format!(
-            ".{}.{}.tmp",
-            path.file_name().unwrap().to_string_lossy(),
-            std::process::id()
-        ));
-        fs::write(&temporary, bytes)?;
-        match fs::rename(&temporary, path) {
-            Ok(()) => Ok(()),
-            Err(_error) if path.exists() && fs::read(path)? == bytes => {
-                let _ = fs::remove_file(&temporary);
-                Ok(())
-            }
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                Err(CacheError::Io(error.to_string()))
-            }
-        }
+            crate::atomic_replace(path, bytes)
+        })
     }
 
     #[cfg(test)]
@@ -1807,58 +1949,50 @@ impl DirectoryArtifactProductionSink {
     }
 
     fn write_payload_zip_immutable(path: &Path, payload: &[u8]) -> Result<(), CacheError> {
-        if path.exists() {
-            if Self::zip_contains_payload(path, payload)? {
-                return Ok(());
+        crate::with_record_update_lock(path, || {
+            if path.exists() {
+                if Self::zip_contains_payload(path, payload)? {
+                    return Ok(());
+                }
+                return Err(CacheError::InvalidManifest(format!(
+                    "artifact production queue path already contains a different payload: {}",
+                    path.display()
+                )));
             }
-            return Err(CacheError::InvalidManifest(format!(
-                "artifact production queue path already contains a different payload: {}",
-                path.display()
-            )));
-        }
-        let parent = path.parent().ok_or_else(|| {
-            CacheError::InvalidManifest("queued artifact path has no parent".to_owned())
-        })?;
-        fs::create_dir_all(parent)?;
-        let temporary = parent.join(format!(
-            ".{}.{}.tmp",
-            path.file_name().unwrap().to_string_lossy(),
-            std::process::id()
-        ));
-        let output = fs::File::create(&temporary)?;
-        let output = crate::write_deterministic_zip_entry(output, "payload.json", payload)?;
-        drop(output);
-        match fs::rename(&temporary, path) {
-            Ok(()) => Ok(()),
-            Err(_error) if path.exists() && Self::zip_contains_payload(path, payload)? => {
-                let _ = fs::remove_file(&temporary);
+            let parent = path.parent().ok_or_else(|| {
+                CacheError::InvalidManifest("queued artifact path has no parent".to_owned())
+            })?;
+            let (temporary, output) = crate::create_private_sibling_file(parent, "queue-zip")?;
+            let result = (|| {
+                let output = crate::write_deterministic_zip_entry(output, "payload.json", payload)?;
+                output.sync_all()?;
+                drop(output);
+                fs::rename(&temporary, path)?;
                 Ok(())
-            }
-            Err(error) => {
+            })();
+            if result.is_err() {
                 let _ = fs::remove_file(&temporary);
-                Err(CacheError::Io(error.to_string()))
             }
-        }
+            result
+        })
     }
 }
 
 impl ArtifactProductionSink for DirectoryArtifactProductionSink {
     fn record(&self, artifact: ProducedArtifactRecord) -> Result<(), CacheError> {
-        artifact.semantic_key.validate()?;
-        artifact.manifest.validate()?;
-        ArtifactProductionAssessment {
-            achieved_assurance: artifact.achieved_assurance,
-            evidence_digests: artifact.assurance_evidence_digests.clone(),
-        }
-        .validate()?;
-        if artifact.operation.trim().is_empty()
-            || artifact.logical_key.trim().is_empty()
-            || artifact.manifest.key.parameters_digest != artifact.semantic_key.digest()?
-            || artifact.manifest.content_digest != ContentDigest::sha256(&artifact.payload)
+        validate_produced_record_metadata(
+            &artifact.operation,
+            &artifact.semantic_key,
+            &artifact.logical_key,
+            &artifact.manifest,
+            artifact.achieved_assurance,
+            &artifact.assurance_evidence_digests,
+        )?;
+        if artifact.manifest.content_digest != ContentDigest::sha256(&artifact.payload)
             || artifact.manifest.size_bytes != artifact.payload.len() as u64
         {
             return Err(CacheError::InvalidManifest(
-                "produced artifact record identity or payload is inconsistent".to_owned(),
+                "produced artifact payload is inconsistent".to_owned(),
             ));
         }
         let artifact_root = self.artifact_root(&artifact)?;
@@ -1887,6 +2021,12 @@ impl ArtifactProductionSink for DirectoryArtifactProductionSink {
         key: &ArtifactKey,
         content_digest: &ContentDigest,
     ) -> Result<bool, CacheError> {
+        key.validate()?;
+        if !content_digest.validate() {
+            return Err(CacheError::InvalidManifest(
+                "invalid queued content digest".into(),
+            ));
+        }
         Ok(self
             .root
             .join("pending")
@@ -2149,8 +2289,8 @@ fn emit_dependency_closure(
             // A node that is already staged still gets its dependencies
             // walked: a reopened staging directory may hold drafts from a run
             // that failed before this walk completed, or that predates
-            // canonical-closure staging entirely. Being staged suppresses
-            // only re-recording.
+            // canonical-closure staging entirely. Only a retained record that
+            // also meets the requested quality suppresses re-recording.
             emit_dependency_closure(resolver, acceptance, sink, &resolved.manifest, visiting)?;
             emit_retained_canonical_closure(
                 resolver,
@@ -2159,7 +2299,14 @@ fn emit_dependency_closure(
                 &resolved.manifest,
                 visiting,
             )?;
-            if !sink.contains_artifact(&dependency.key, &dependency.content_digest)? {
+            if sink
+                .retained_canonical_manifest_for_artifact(
+                    &dependency.key,
+                    &dependency.content_digest,
+                    dependency.required_quality,
+                )?
+                .is_none()
+            {
                 record_encoded_dependency(sink, "cache.dependency.resolve", resolved)?;
             }
             visiting.remove(&identity);
@@ -2172,8 +2319,10 @@ fn emit_dependency_closure(
             acceptance,
         )?;
         if resolved.manifest.content_digest != dependency.content_digest
-            || resolved.manifest.quality.admissible_rank()
-                < dependency.required_quality.admissible_rank()
+            || !resolved
+                .manifest
+                .quality
+                .satisfies(dependency.required_quality)
         {
             return Err(CacheError::InvalidManifest(format!(
                 "resolved dependency {} / {} does not match the exact required content or quality",
@@ -2182,7 +2331,14 @@ fn emit_dependency_closure(
         }
         emit_dependency_closure(resolver, acceptance, sink, &resolved.manifest, visiting)?;
         emit_retained_canonical_closure(resolver, acceptance, sink, &resolved.manifest, visiting)?;
-        if !sink.contains_artifact(&dependency.key, &dependency.content_digest)? {
+        if sink
+            .retained_canonical_manifest_for_artifact(
+                &dependency.key,
+                &dependency.content_digest,
+                dependency.required_quality,
+            )?
+            .is_none()
+        {
             let semantic_key = manifest_semantic_key(&resolved.manifest)?;
             let transport =
                 resolver.verified_transport_parts(&resolved.layer_name, &resolved.manifest)?;
@@ -2484,12 +2640,14 @@ fn access_record(
                 }]
             })
             .unwrap_or_default(),
-        validation_mode: CacheValidationMode::Full,
+        validation_mode: CacheValidationMode::Root,
         validation_outcome: CacheValidationOutcome::Passed,
         validation_detail: Some(if reused {
-            "typed payload decoded and domain validator passed".to_owned()
+            "root typed payload decoded and domain validator passed; dependency closure not attested"
+                .to_owned()
         } else {
-            "fresh typed payload passed domain validator".to_owned()
+            "fresh typed payload passed domain validator; dependency closure not attested"
+                .to_owned()
         }),
         validated_artifacts,
     };
@@ -2594,6 +2752,16 @@ where
                         ))
                     })?;
                     validate(&value)?;
+                    // Reject custom decoders that manufacture nonfinite values;
+                    // old whitespace/field order remains admissible JSON.
+                    let encoded = crate::finite_json::to_vec(&value)?;
+                    let decoded: T = serde_json::from_slice(&encoded)?;
+                    validate(&decoded)?;
+                    if crate::finite_json::to_vec(&decoded)? != encoded {
+                        return Err(CacheError::InvalidManifest(
+                            "cached typed payload changes on JSON round trip".to_owned(),
+                        ));
+                    }
                     drop(performance_decode);
                     let access = access_record(
                         request,
@@ -2752,7 +2920,15 @@ where
         metadata.cache_disposition = Some("computed".to_owned());
         metadata
     });
-    let payload = serde_json::to_vec(&value)?;
+    let payload = crate::finite_json::to_vec(&value)?;
+    // Return the same validated representation on cold and warm execution.
+    let value = serde_json::from_slice(&payload)?;
+    validate(&value)?;
+    if crate::finite_json::to_vec(&value)? != payload {
+        return Err(CacheError::InvalidManifest(
+            "typed payload changes on JSON round trip".to_owned(),
+        ));
+    }
     drop(performance_encode);
     let computed_dependencies = dependencies.clone();
     let produced_manifest = if request.write_on_miss {
@@ -2922,6 +3098,12 @@ where
         } else {
             CacheValidationOutcome::Failed
         };
+        if access.validation_outcome == CacheValidationOutcome::Failed {
+            // Verify mode's requested validation includes comparison with the
+            // freshly computed payload. A structurally valid reference that
+            // fails that comparison is inspected, not a validated artifact.
+            access.validated_artifacts.clear();
+        }
         access.validation_detail = Some(match status {
             crate::ArtifactOutputComparisonStatus::Match => {
                 "fresh logical payload is byte-identical to the inspected reference".to_owned()
@@ -3316,6 +3498,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_only_session_policies_and_no_persistent_side_effects() {
+        let root = root("r2-read-only-policy").join("never-created");
+        assert!(!root.exists());
+        for mode in [
+            ArtifactExecutionCacheMode::Disabled,
+            ArtifactExecutionCacheMode::PreferReuse,
+            ArtifactExecutionCacheMode::RequireReuse,
+            ArtifactExecutionCacheMode::Refresh,
+        ] {
+            let mut config = managed_verify_config(&root, "comparison");
+            config.output_validation = None;
+            config.cache_mode = mode;
+            config.staging_root = Some(root.join("forbidden-staging"));
+            config.publication_target = xc_core::PublicationTarget::Public;
+            config.execute_remote_mutations = true;
+            let session = ManagedArtifactCacheSession::new_read_only(
+                config,
+                xc_core::ResourcePolicy::default(),
+            )
+            .unwrap();
+            assert_eq!(session.execution_cache_mode(), mode);
+            let context = session.context();
+            assert!(context.production_sink.is_some());
+            assert_eq!(
+                context.mode,
+                if mode == ArtifactExecutionCacheMode::Disabled {
+                    ArtifactExecutionCacheMode::Refresh
+                } else {
+                    mode
+                }
+            );
+            let key = semantic_key();
+            let request = cache_context_request(&key, "ephemeral-fixture", &context);
+            let result =
+                resolve_or_compute_json_artifact(&request, || Ok(vec![1u32, 2, 3]), |_| Ok(()));
+            if mode == ArtifactExecutionCacheMode::RequireReuse {
+                assert!(matches!(result, Err(CacheError::NotFound(_))));
+            } else {
+                let cold = result.unwrap();
+                assert!(cold.produced_manifest.is_some());
+                let warm =
+                    resolve_or_compute_json_artifact(&request, || Ok(vec![1u32, 2, 3]), |_| Ok(()))
+                        .unwrap();
+                assert_eq!(cold.value, warm.value);
+            }
+            assert!(session.finalize_publication_inventory().unwrap().is_none());
+            assert!(!root.exists());
+        }
+        let config = managed_verify_config(&root, "comparison");
+        assert!(ManagedArtifactCacheSession::new_read_only(
+            config,
+            xc_core::ResourcePolicy::default()
+        )
+        .is_err());
+        let mut config = managed_verify_config(&root, "comparison");
+        config.output_validation = None;
+        config.cache_mode = ArtifactExecutionCacheMode::PreferReuse;
+        config.remote_cache_mode = ManagedRemoteCacheMode::Public;
+        assert!(ManagedArtifactCacheSession::new_read_only(
+            config,
+            xc_core::ResourcePolicy::default()
+        )
+        .is_err());
+        assert!(!root.exists());
+    }
+
     fn cache_context_request<'a>(
         semantic_key: &'a SemanticKeyEnvelope,
         logical_key: &'a str,
@@ -3354,6 +3603,30 @@ mod tests {
             source_data_identities: BTreeMap::new(),
             algorithm_semantics: None,
         }
+    }
+
+    #[test]
+    fn nonfinite_typed_values_fail_before_cache_write() {
+        let resolver = CacheResolver::new(vec![]);
+        let key = semantic_key();
+        let policy = policy();
+        let mut disabled = request(
+            &key,
+            &resolver,
+            &policy,
+            ArtifactExecutionCacheMode::Disabled,
+        );
+        disabled.resolver = None;
+        disabled.acceptance = None;
+        disabled.write_on_miss = false;
+        for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let result =
+                resolve_or_compute_json_artifact(&disabled, || Ok(Some(number)), |_| Ok(()));
+            assert!(result.is_err());
+        }
+        let result =
+            resolve_or_compute_json_artifact(&disabled, || Ok(Some(1.25_f64)), |_| Ok(())).unwrap();
+        assert_eq!(result.value, Some(1.25));
     }
 
     #[test]
@@ -5631,5 +5904,217 @@ mod tests {
         assert_eq!(report.totals.compared, 0);
         assert_eq!(report.totals.reference_absent, 0);
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_resumed_queue_contract {
+    use super::*;
+
+    fn record() -> ProducedArtifactRecord {
+        let semantic_key = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "quadrature_rule".into(),
+            mathematical_semantics_version: "audit-queue-v1".into(),
+            resolved_mathematical_parameters: serde_json::json!({"order": 4}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        let payload = br#"{"value":1}"#.to_vec();
+        let manifest = ArtifactManifest {
+            schema_version: 1,
+            key: ArtifactKey {
+                kind: semantic_key.artifact_kind.clone(),
+                logical_key: "audit/4".into(),
+                parameters_digest: semantic_key.digest().unwrap(),
+            },
+            content_digest: ContentDigest::sha256(&payload),
+            size_bytes: payload.len() as u64,
+            objects: vec![crate::CacheObjectRef {
+                content_digest: ContentDigest::sha256(&payload),
+                size_bytes: payload.len() as u64,
+            }],
+            created_unix_seconds: 1,
+            producer_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            maximum_reader_version: None,
+            quality: CacheQuality::Validated,
+            visibility: CacheVisibility::Local,
+            immutable: true,
+            dependencies: vec![],
+            tags: BTreeMap::new(),
+            provenance_digest: None,
+        };
+        ProducedArtifactRecord {
+            operation: "audit.queue".into(),
+            semantic_key,
+            logical_key: "audit/4".into(),
+            manifest,
+            achieved_assurance: crate::ArtifactAssuranceState::Computed,
+            assurance_evidence_digests: vec![],
+            payload,
+        }
+    }
+
+    fn queued_fixture(label: &str) -> (PathBuf, QueuedProducedArtifactRecord) {
+        let root = crate::test_support::temporary_root(label);
+        fs::create_dir_all(&root).unwrap();
+        let record = record();
+        fs::write(
+            root.join("payload.json.zip"),
+            DirectoryArtifactProductionSink::encode_payload_zip(&record.payload).unwrap(),
+        )
+        .unwrap();
+        let queued = QueuedProducedArtifactRecord {
+            schema_version: 1,
+            operation: record.operation,
+            semantic_key: record.semantic_key,
+            logical_key: record.logical_key,
+            manifest: record.manifest,
+            achieved_assurance: record.achieved_assurance,
+            assurance_evidence_digests: record.assurance_evidence_digests,
+            payload_file: "payload.json.zip".into(),
+        };
+        (root, queued)
+    }
+
+    #[test]
+    fn exhaustive_resumed_queue_rejects_capacity_overflow_without_panic() {
+        let (root, mut queued) = queued_fixture("queue-overflow");
+        queued.manifest.size_bytes = u64::MAX;
+        queued.manifest.objects[0].size_bytes = u64::MAX;
+        let result = std::panic::catch_unwind(|| queued.load(&root.join("record.json")));
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "malformed capacity must return an error"
+        );
+    }
+
+    #[test]
+    fn exhaustive_resumed_queue_load_checks_exact_payload_identity() {
+        let (root, queued) = queued_fixture("queue-payload");
+        fs::write(
+            root.join("payload.json.zip"),
+            DirectoryArtifactProductionSink::encode_payload_zip(br#"{"value":2}"#).unwrap(),
+        )
+        .unwrap();
+        let result = queued.load(&root.join("record.json"));
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            result.is_err(),
+            "direct queue loading accepted different mathematical payload bytes"
+        );
+    }
+
+    #[test]
+    fn exhaustive_resumed_queue_load_rejects_inconsistent_metadata() {
+        let (root, queued) = queued_fixture("queue-metadata");
+        let mut outcomes = Vec::new();
+        for case in 0..4 {
+            let mut bad = queued.clone();
+            match case {
+                0 => bad.logical_key = "other/identity".into(),
+                1 => bad.manifest.key.kind = "other_kind".into(),
+                2 => bad.operation.clear(),
+                _ => bad.achieved_assurance = crate::ArtifactAssuranceState::Certified,
+            }
+            fs::write(root.join("record.json"), serde_json::to_vec(&bad).unwrap()).unwrap();
+            outcomes.push(load_queued_produced_artifact(&root.join("record.json")).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(outcomes, vec![true; 4]);
+    }
+
+    #[test]
+    fn exhaustive_resumed_sink_rejects_mismatched_logical_and_kind_bindings() {
+        let root = crate::test_support::temporary_root("sink-binding");
+        let mut outcomes = Vec::new();
+        for case in 0..2 {
+            let sink = DirectoryArtifactProductionSink::new(root.join(case.to_string())).unwrap();
+            let mut bad = record();
+            if case == 0 {
+                bad.logical_key = "other/identity".into();
+            } else {
+                bad.manifest.key.kind = "other_kind".into();
+            }
+            outcomes.push(sink.record(bad).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(outcomes, vec![true; 2]);
+    }
+
+    #[test]
+    fn exhaustive_resumed_attestation_rejects_invalid_artifact_key() {
+        let mut artifact_key = record().manifest.key;
+        artifact_key.parameters_digest = ContentDigest("../../outside".into());
+        assert!(ArtifactAssuranceAttestation {
+            schema_version: 1,
+            artifact_key,
+            content_digest: ContentDigest::sha256(b"payload"),
+            achieved_assurance: crate::ArtifactAssuranceState::Computed,
+            evidence_digests: vec![]
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn exhaustive_resumed_requirement_rejects_invalid_artifact_key() {
+        let mut artifact_key = record().manifest.key;
+        artifact_key.parameters_digest = ContentDigest("../../outside".into());
+        assert!(ArtifactAssuranceRequirement {
+            schema_version: 1,
+            artifact_key,
+            content_digest: ContentDigest::sha256(b"payload"),
+            required_assurance: crate::ArtifactAssuranceState::Certified
+        }
+        .validate()
+        .is_err());
+    }
+
+    fn foreign_temporary_is_preserved(zip: bool) {
+        let root = crate::test_support::temporary_root(if zip {
+            "queue-zip-owner"
+        } else {
+            "queue-json-owner"
+        });
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join(if zip {
+            "payload.json.zip"
+        } else {
+            "record.json"
+        });
+        let foreign = root.join(format!(
+            ".{}.{}.tmp",
+            path.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        fs::write(&foreign, b"another writer owns these bytes").unwrap();
+        if zip {
+            DirectoryArtifactProductionSink::write_payload_zip_immutable(&path, b"new payload")
+                .unwrap();
+        } else {
+            DirectoryArtifactProductionSink::write_immutable(&path, b"new record").unwrap();
+        }
+        let retained = fs::read(&foreign).ok();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            retained.as_deref(),
+            Some(b"another writer owns these bytes".as_slice())
+        );
+    }
+
+    #[test]
+    fn exhaustive_resumed_queue_json_preserves_other_writer_temporary() {
+        foreign_temporary_is_preserved(false);
+    }
+
+    #[test]
+    fn exhaustive_resumed_queue_zip_preserves_other_writer_temporary() {
+        foreign_temporary_is_preserved(true);
     }
 }

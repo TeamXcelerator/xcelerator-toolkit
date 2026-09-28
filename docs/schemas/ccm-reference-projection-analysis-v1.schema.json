@@ -18,7 +18,30 @@
       "const": 1
     },
     "semantics": {
-      "const": "ccm-retained-research-observations-v1"
+      "enum": [
+        "ccm-retained-research-observations-v1",
+        "ccm-retained-research-observations-v2",
+        "ccm-retained-research-observations-v3",
+        "ccm-retained-research-observations-v4",
+        "ccm-retained-research-observations-v5",
+        "ccm-retained-research-observations-v6",
+        "ccm-retained-research-observations-v7",
+        "ccm-retained-research-observations-v8",
+        "ccm-retained-research-observations-v9",
+        "ccm-retained-research-observations-v10",
+        "ccm-retained-research-observations-v11",
+        "ccm-retained-research-observations-v12",
+        "ccm-retained-research-observations-v13",
+        "ccm-retained-research-observations-v14",
+        "ccm-retained-research-observations-v15",
+        "ccm-retained-research-observations-v16",
+        "ccm-retained-research-observations-v17",
+        "ccm-retained-research-observations-v18",
+        "ccm-retained-research-observations-v19",
+        "ccm-retained-research-observations-v20",
+        "ccm-retained-research-observations-v21",
+        "ccm-retained-research-observations-v22"
+      ]
     },
     "kind": {
       "const": "ccm_reference_projection_analysis"
@@ -54,13 +77,13 @@
               },
               "parameters_digest": {
                 "type": "string",
-                "pattern": "^[0-9a-f]{64}$"
+                "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
               }
             }
           },
           "content_digest": {
             "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
+            "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
           },
           "required_quality": {
             "enum": [
@@ -109,7 +132,7 @@
               "anyOf": [
                 {
                   "type": "string",
-                  "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                  "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
                 },
                 {
                   "type": "null"
@@ -120,17 +143,26 @@
         },
         "reference": {
           "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
+          "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
         },
         "ordered_basis": {
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
+            "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
           }
         },
         "metric": {
           "type": "string"
+        },
+        "projection_arithmetic": {
+          "const": "stable_normalization_interval_gram_v1"
+        },
+        "maximum_additional_guard_bits": {
+          "const": 4096
+        },
+        "projection_output": {
+          "const": "midpoints_with_outward_decimal_enclosures_v1"
         }
       }
     },
@@ -174,21 +206,21 @@
         },
         "source_center": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
         },
         "reference_center": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
         },
         "signed_unit_overlap": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
         },
         "difference_norm_squared": {
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+              "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
             },
             {
               "type": "null"
@@ -199,14 +231,14 @@
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+            "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
           }
         },
         "rhs": {
           "type": "array",
           "items": {
             "type": "string",
-            "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+            "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
           }
         },
         "coefficients": {
@@ -215,7 +247,7 @@
               "type": "array",
               "items": {
                 "type": "string",
-                "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
               }
             },
             {
@@ -227,7 +259,7 @@
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+              "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
             },
             {
               "type": "null"
@@ -238,7 +270,7 @@
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+              "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
             },
             {
               "type": "null"
@@ -249,7 +281,7 @@
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+              "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
             },
             {
               "type": "null"
@@ -260,7 +292,7 @@
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+              "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
             },
             {
               "type": "null"
@@ -271,7 +303,7 @@
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+              "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
             },
             {
               "type": "null"
@@ -280,8 +312,252 @@
         },
         "uncertainty": {
           "type": "string"
+        },
+        "pivot_metric": {
+          "type": "string"
+        },
+        "arithmetic_precision_bits": {
+          "type": "integer",
+          "minimum": 128,
+          "maximum": 1004096
+        },
+        "arithmetic_enclosures": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "required": [
+            "source_center",
+            "reference_center",
+            "signed_unit_overlap"
+          ]
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v3",
+              "ccm-retained-research-observations-v4",
+              "ccm-retained-research-observations-v5",
+              "ccm-retained-research-observations-v6",
+              "ccm-retained-research-observations-v7",
+              "ccm-retained-research-observations-v8",
+              "ccm-retained-research-observations-v9",
+              "ccm-retained-research-observations-v10",
+              "ccm-retained-research-observations-v11",
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "required": [
+              "pivot_metric"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v8",
+              "ccm-retained-research-observations-v9",
+              "ccm-retained-research-observations-v10",
+              "ccm-retained-research-observations-v11",
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "required": [
+              "arithmetic_precision_bits",
+              "arithmetic_enclosures"
+            ]
+          },
+          "request": {
+            "required": [
+              "projection_arithmetic",
+              "maximum_additional_guard_bits",
+              "projection_output"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v8",
+              "ccm-retained-research-observations-v9",
+              "ccm-retained-research-observations-v10",
+              "ccm-retained-research-observations-v11",
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "uncertainty": {
+                "const": "finite_stored_inputs_with_arithmetic_enclosures; no_reference_approximation_or_construction_error_enclosure"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v8",
+              "ccm-retained-research-observations-v9",
+              "ccm-retained-research-observations-v10",
+              "ccm-retained-research-observations-v11",
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          },
+          "data": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "point_measurement",
+                  "rank_or_precision_unresolved"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "arithmetic_enclosures": {
+                "required": [
+                  "difference_norm_squared"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v8",
+              "ccm-retained-research-observations-v9",
+              "ccm-retained-research-observations-v10",
+              "ccm-retained-research-observations-v11",
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          },
+          "data": {
+            "properties": {
+              "outcome": {
+                "const": "point_measurement"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "arithmetic_enclosures": {
+                "required": [
+                  "fit_residual_norm_squared",
+                  "minimum_pivot"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

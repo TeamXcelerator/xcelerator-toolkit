@@ -27,6 +27,7 @@ pub struct RetainedCcmRun {
     sectors: Option<CcmSectorGapResolution>,
     sector_record: Option<CapturedDiagnostic>,
     sector_error: Option<String>,
+    sector_options: Option<CcmSectorAnalysisOptions>,
 }
 
 // Observe only the requested logical payloads. Keep the configured publication
@@ -329,7 +330,8 @@ impl RetainedCcmRun {
                 matrix: matrix.clone(),
                 root: source.root_manifest.clone(),
                 secular: source.secular_manifest.clone(),
-                assembly_policy: "ccm-weil-form-v0.13.0-v2; corrected symmetric Tau".into(),
+                assembly_policy:
+                    "ccm-weil-form-v0.15.1-v3; requested quadrature; corrected symmetric Tau".into(),
                 quadrature_policy: format!(
                     "frequency-aware HP GL; configured quad_points={}",
                     cfg.quad_points
@@ -359,6 +361,7 @@ impl RetainedCcmRun {
             sectors: None,
             sector_record: None,
             sector_error: None,
+            sector_options: None,
         })
     }
     /// Explicit additional references; the legacy runtime target file is never imported.
@@ -484,7 +487,10 @@ impl RetainedCcmRun {
             })();
             match prepared {
                 Ok((mut prepared, manifest)) => {
-                    input.precision_bits = input.precision_bits.max(prepared.precision_bits);
+                    crate::ccm::research_completion::align_input_precisions(
+                        &mut input,
+                        &mut prepared,
+                    )?;
                     if input.atoms.is_empty() {
                         input.atoms = prepared.atoms;
                         input.atom_coordinate = prepared.atom_coordinate;
@@ -552,16 +558,16 @@ impl RetainedCcmRun {
                 )?;
                 let portable: PortablePrimeComponent = serde_json::from_slice(&source.payload)?;
                 let matrix = decode_prime_component(&portable, &self.params, state.precision)?;
-                let v = crate::ccm::extended_research::source_unit(&state, state.precision);
+                let v = crate::ccm::extended_research::source_unit(&state, state.precision)?;
                 let n = v.len();
                 let action = matrix
                     .par_chunks(n)
-                    .map(|row| {
-                        lossless_hp_decimal(
-                            &(-crate::ccm::retained_evidence::dot(row, &v, state.precision)),
-                        )
+                    .map(|row| -> Result<String> {
+                        Ok(lossless_hp_decimal(
+                            &(-crate::ccm::retained_evidence::dot(row, &v, state.precision)?),
+                        ))
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>>>()?;
                 Ok((OperatorAction{label:"tau_prime_direct".into(),source_digest:source.manifest.content_digest.clone(),action,convention:"negative direct unsigned prime matrix action on the same signed unit state; exact retained Tau parent".into()},source.manifest))
             })();
             match direct {
@@ -747,8 +753,7 @@ impl RetainedCcmRun {
     )> {
         use crate::ccm::convergence_capture::OperatorAction;
         let p = state.precision;
-        let n = state.coefficients.len();
-        let l = log_lambda_sq_hp(&self.params, p);
+        let l = log_lambda_sq_hp(&self.params, p)?;
         let tau = self
             .source
             .tau_manifest
@@ -776,40 +781,16 @@ impl RetainedCcmRun {
         if !xc_cache::manifest_depends_on(tau, &manifest)? {
             bail!("archimedean primitives do not match retained Tau ancestry");
         }
-        let v = crate::ccm::extended_research::source_unit(state, p);
-        let pi2 = pi(p).square() * 16u32;
-        let l2 = l.clone().square();
-        let pref = (Float::with_val(p, &l) / 4u32).sinh().square() * 32u32 * &l;
-        let rows = (0..n)
-            .into_par_iter()
-            .map(|r| {
-                let ri = r as i64 - state.modes as i64;
-                let mut pole = Float::with_val(p, 0);
-                let mut arch = Float::with_val(p, 0);
-                let mut total = Float::with_val(p, 0);
-                for (c, vc) in v.iter().enumerate() {
-                    let ci = c as i64 - state.modes as i64;
-                    let numerator = Float::with_val(p, &l2) - Float::with_val(p, &pi2) * ri * ci;
-                    let denominator = (Float::with_val(p, &pi2) * ci * ci + &l2)
-                        * (Float::with_val(p, &pi2) * ri * ri + &l2);
-                    pole += Float::with_val(p, &pref) * numerator / denominator * vc;
-                    let av = if ri == ci {
-                        (Float::with_val(p, &integrals.gamma[ri.unsigned_abs() as usize])
-                            - &integrals.beta[ri.unsigned_abs() as usize])
-                            * 2u32
-                    } else {
-                        (signed_alpha(&integrals.alpha, ci, p)
-                            - signed_alpha(&integrals.alpha, ri, p))
-                            / (ri - ci)
-                    };
-                    arch -= av * vc;
-                    total += Float::with_val(p, &self.source.tau[r * n + c]) * vc;
-                }
-                let prime = Float::with_val(p, &total) - &pole - &arch;
-                (pole, arch, prime)
-            })
-            .collect::<Vec<_>>();
-        let notes="signed action on center-oriented unit coefficient state; pole and archimedean from exact retained primitive ancestry; prime=Tau-pole-archimedean is an algebraic reconstruction, not an independent prime-closure validation";
+        let v = crate::ccm::extended_research::source_unit(state, p)?;
+        let rows = matrix_point_math::component_actions(
+            state.modes,
+            &l,
+            p,
+            &integrals,
+            &self.source.tau,
+            &v,
+        )?;
+        let notes = "correctly rounded stored-matrix action on center-oriented unit coefficient state; pole and archimedean from exact retained primitive ancestry; prime=Tau-pole-archimedean is an algebraic reconstruction, not an independent prime-closure validation";
         let actions = ["tau_pole", "tau_archimedean", "tau_prime_reconstructed"]
             .iter()
             .enumerate()
@@ -871,7 +852,7 @@ impl RetainedCcmRun {
         let sink = RecordingSink::new(cache, &["ccm_even_sector_matrix"]);
         let observed = observing(cache, &sink);
         let mut tau = self.source.tau.clone();
-        force_symmetric(&mut tau, self.params.matrix_size());
+        force_symmetric(&mut tau, self.params.matrix_size())?;
         let manifest = self
             .source
             .tau_manifest
@@ -910,15 +891,19 @@ impl RetainedCcmRun {
         options: &CcmResearchCaptureOptions,
         cache: &ArtifactCacheContext<'_>,
     ) -> Result<()> {
+        let options = options
+            .sector_analysis
+            .ok_or_else(|| anyhow::anyhow!("sector analysis not requested"))?;
+        if self.sector_options.is_some_and(|prior| prior != options) {
+            bail!("sector analysis options changed after capture; create a new retained run");
+        }
+        self.sector_options = Some(options);
         if let Some(error) = &self.sector_error {
             bail!("sector diagnostic unavailable: {error}");
         }
         if self.sectors.is_some() {
             return Ok(());
         }
-        let options = options
-            .sector_analysis
-            .ok_or_else(|| anyhow::anyhow!("sector analysis not requested"))?;
         let sink = RecordingSink::new(cache, &["ccm_sector_gap", "ccm_sector_spectrum"]);
         let observed = observing(cache, &sink);
         let source = RetainedCcmSource {
@@ -950,6 +935,9 @@ impl RetainedCcmRun {
     /// Attempt one primary diagnostic. Callers convert errors to explicit
     /// receipt outcomes and continue other independent requests. Measurements
     /// include exact authenticated artifact manifests, on fresh and warm runs.
+    /// Once sector analysis is attempted, its options are fixed for this retained
+    /// run. A different count or route requires a new run, preventing reuse of
+    /// sector-derived diagnostics under a different request.
     pub fn capture_diagnostic(
         &mut self,
         id: &str,
@@ -1015,17 +1003,26 @@ impl RetainedCcmRun {
                     })();
                     match prepared {
                         Ok((reference, input)) => {
-                            self.prepared_reference = Some(crate::ccm::research_completion::ReferencePreparation {
-                                schema_version: 1,
-                                finite_reference: Some(reference.clone()),
-                                sampled_reference: input.target.clone(),
-                                lambda_squared: input.lambda_squared.clone(),
-                                precision_bits: input.precision_bits,
-                                definition_digest: input.definition_digest.clone(),
-                                approximation_scope: format!("{}; signed jets refer to this explicitly finite Fourier projection, extended by zero outside the run window", input.approximation_scope),
-                                weighted_atoms: vec![], atom_coordinate: None, atom_coverage: None,
-                                tail_form: None, tail_recipe: None, completion: None,
-                            });
+                            self.prepared_reference = Some(
+                                crate::ccm::research_completion::ReferencePreparation {
+                                    schema_version: 1,
+                                    finite_reference: Some(reference.clone()),
+                                    sampled_reference: input.target.clone(),
+                                    lambda_squared: input.lambda_squared.clone(),
+                                    precision_bits: input.precision_bits,
+                                    definition_digest: input.definition_digest.clone(),
+                                    approximation_scope: format!(
+                                        "{}; signed jets refer to this explicitly finite Fourier projection, extended by zero outside the run window",
+                                        input.approximation_scope
+                                    ),
+                                    weighted_atoms: vec![],
+                                    atom_coordinate: None,
+                                    atom_coverage: None,
+                                    tail_form: None,
+                                    tail_recipe: None,
+                                    completion: None,
+                                },
+                            );
                             if self.research_inputs.is_none() {
                                 self.research_inputs = Some(reference);
                             }
@@ -1174,13 +1171,15 @@ impl RetainedCcmRun {
             if !self.prepared_reference_jets && roots.is_some() {
                 if let Some(reference) = &self.prepared_reference {
                     match reference.prepare(&state, roots.as_ref()) {
-                        Ok(prepared) => {
+                        Ok(mut prepared) => {
                             if let Some(existing) = &mut self.extended_inputs {
+                                crate::ccm::research_completion::align_input_precisions(
+                                    existing,
+                                    &mut prepared,
+                                )?;
                                 if existing.reference_jets.is_empty() {
                                     existing.reference_jets = prepared.reference_jets;
                                 }
-                                existing.precision_bits =
-                                    existing.precision_bits.max(prepared.precision_bits);
                             } else {
                                 self.extended_inputs = Some(prepared);
                             }
@@ -1370,7 +1369,7 @@ impl RetainedCcmRun {
                 let value =
                     evenness_from_sector_gap(&self.params, self.cfg.precision_bits, &sectors.gap)?;
                 return Ok(CapturedDiagnostic::new(
-                    &serde_json::json!({"method":"winning_parity_sector_lift", "evenness_deviation":value.evenness_deviation.to_string(), "natural_eigenvalue":value.natural_eigenvalue.to_string(), "forced_eigenvalue":value.forced_eigenvalue.to_string()}),
+                    &serde_json::json!({"method":"resolved_stored_parity_sector_lift_v2", "claim_scope":value.claim_scope, "assembly_error_bound":null, "evenness_deviation":value.evenness_deviation.to_string(), "natural_eigenvalue":value.natural_eigenvalue.to_string(), "forced_eigenvalue":value.forced_eigenvalue.to_string()}),
                     record.sources.clone(),
                 )?);
             }
@@ -1417,11 +1416,12 @@ impl RetainedCcmRun {
             m.clone()
                 .ok_or_else(|| anyhow::anyhow!("required primary source manifest missing"))
         };
+        let mut distance_resolution_verdicts = None;
         if matches!(id, "prime_power_response" | "u_flow_response") {
             if cfg.effective_parity_policy() != CcmParityPolicy::EvenSector {
                 bail!("response requires an isolated even-sector state; primary parity preserved");
             }
-            let l = log_lambda_sq_hp(p, cfg.precision_bits);
+            let l = log_lambda_sq_hp(p, cfg.precision_bits)?;
             let args = (
                 required(&source.tau_manifest)?,
                 required(&source.eigenpair_manifest)?,
@@ -1465,7 +1465,7 @@ impl RetainedCcmRun {
             resolve_root_conditioning_analysis_via_cache(
                 p,
                 cfg,
-                &log_lambda_sq_hp(p, cfg.precision_bits),
+                &log_lambda_sq_hp(p, cfg.precision_bits)?,
                 &primary.xi,
                 &primary.eigenvalues_pos,
                 primary.first_positive_root_index,
@@ -1513,7 +1513,7 @@ impl RetainedCcmRun {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("distance capture not requested"))?;
             let alpha = Float::with_val(cfg.precision_bits, Float::parse(&distance.alpha)?);
-            crate::distance::hp::capture_ccm_distance_with_derived_via_cache(
+            let captured = crate::distance::hp::capture_ccm_distance_with_derived_via_cache(
                 p,
                 cfg,
                 &alpha,
@@ -1524,8 +1524,26 @@ impl RetainedCcmRun {
                 id == "target_residual_analysis",
                 id == "deviation_decomposition",
             )?;
+            if id == "distance_resolution" {
+                distance_resolution_verdicts = Some((
+                    captured.resolution_tolerance_met,
+                    captured.resolution_ladder_tolerance_met,
+                ));
+            }
         }
-        let result = recorded(sink.finish()?)?;
+        let mut result = recorded(sink.finish()?)?;
+        if let Some((reported, ladder)) = distance_resolution_verdicts {
+            result = CapturedDiagnostic::new(
+                &serde_json::json!({
+                    "method": "returned_q_and_final_pair_resolution_verdicts_v1",
+                    "claim_scope": "empirical_adjacent_grid_agreement_not_integral_error_bound",
+                    "reported_resolution_tolerance_met": reported,
+                    "refinement_ladder_tolerance_met": ladder,
+                    "retained_evidence": result.value,
+                }),
+                result.sources,
+            )?;
+        }
         if id == "u_flow_response" {
             self.uflow_capture = Some(CapturedDiagnostic::new(
                 &result.value,

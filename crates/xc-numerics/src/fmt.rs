@@ -15,7 +15,7 @@
 //!
 //! All functions stay in `rug::Float`/MPFR throughout, except the final
 //! string conversion which uses MPFR's own decimal formatting via the
-//! `Display` / `LowerExp` impls of `rug::Float`.
+//! `Float::to_sign_string_exp_round` conversion used by the explicit display policy.
 
 use rug::float::{Round, Special};
 use rug::{Assign, Float, Integer};
@@ -30,7 +30,11 @@ pub const DISPLAY_HP_DEFAULT_DIGITS: usize = 6;
 ///
 /// `significand_hex * 2^binary_exponent` is the exact value. Retaining the
 /// original precision makes reconstruction lossless instead of treating a
-/// display-oriented decimal string as a persistence format.
+/// display-oriented decimal string as a persistence format. This is an exact
+/// encoding, not a unique canonical encoding of a real number: shifting factors
+/// of two between significand and exponent preserves its value. Derived `Eq`
+/// compares encodings; compare decoded Floats for numerical equality. Zero
+/// exponents and MPFR writer details are not mathematical identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortableHpFloat {
@@ -345,23 +349,20 @@ fn trim_fractional_zeros(value: &mut String) {
 
 /// Format an HP value at a given number of significant decimal digits in
 /// scientific notation. Returns e.g. `"1.23457e-1234"` or `"-3.00000e-59"`.
-/// Zero is rendered as `"0"`. No f64 conversion happens at any step, so
+/// Signed zero is preserved as `"0"` or `"-0"`. Requested digits are clamped
+/// to `1..=1_000_000`; use `format_hp_with_policy` for checked rejection.
+/// No f64 conversion happens at any step, so
 /// this works for arbitrarily small or large magnitudes.
 ///
-/// The implementation uses `rug::Float`'s `LowerExp` formatter, which uses
-/// MPFR's own decimal conversion routines — there is no f64 round-trip
-/// regardless of magnitude.
-///
-/// Note: `rug::Float`'s `LowerExp` treats the format-spec precision as
-/// **total significant digits**, not "digits after the decimal point" as
-/// `f64::LowerExp` does. So `format!("{:.4e}", x)` on a `rug::Float`
-/// produces 4 total sig digits ("9.994e2"), whereas the same on an `f64`
-/// produces 5 ("9.9945e2"). This function follows the rug convention so
-/// the `sig_digits` arg always means total sig digits regardless of the
-/// underlying type.
+/// The explicit display policy calls MPFR decimal conversion through
+/// `Float::to_sign_string_exp_round`; no binary64 conversion occurs.
+/// `sig_digits` specifies total significant decimal digits.
 pub fn display_hp(x: &Float, sig_digits: usize) -> String {
-    format_hp_with_policy(x, &HpDisplayPolicy::scientific(sig_digits.max(1)))
-        .expect("the bounded scientific display policy is valid")
+    format_hp_with_policy(
+        x,
+        &HpDisplayPolicy::scientific(sig_digits.clamp(1, 1_000_000)),
+    )
+    .expect("the bounded scientific display policy is valid")
 }
 
 /// Format with the default number of significant digits.
@@ -379,16 +380,19 @@ pub enum Sign {
     Zero,
     /// Strictly greater than zero.
     Positive,
+    /// NaN or infinity is not a finite real diagnostic value.
+    Nonfinite,
 }
 
 impl Sign {
-    /// Lowercase English label: `"negative"`, `"zero"`, or `"positive"`.
+    /// Lowercase label: `"negative"`, `"zero"`, `"positive"`, or `"nonfinite"`.
     /// Used for diagnostic logging.
     pub fn as_str(self) -> &'static str {
         match self {
             Sign::Negative => "negative",
             Sign::Zero => "zero",
             Sign::Positive => "positive",
+            Sign::Nonfinite => "nonfinite",
         }
     }
 }
@@ -396,7 +400,9 @@ impl Sign {
 /// Read the sign of an HP value without going through f64. Inspects MPFR
 /// metadata directly via `is_zero` and `is_sign_negative`.
 pub fn sign_of(x: &Float) -> Sign {
-    if x.is_zero() {
+    if !x.is_finite() {
+        Sign::Nonfinite
+    } else if x.is_zero() {
         Sign::Zero
     } else if x.is_sign_negative() {
         Sign::Negative
@@ -405,58 +411,131 @@ pub fn sign_of(x: &Float) -> Sign {
     }
 }
 
-/// Number of matching decimal digits between an HP computed value and an
-/// HP reference value, computed entirely in HP arithmetic.
-///
+/// Exact-binary-scaling comparison and computed-precision saturation semantics.
+pub const HP_COMPARISON_SEMANTICS: &str =
+    "hp-comparison-exact-binary-scaling-source-precision-cap-v2";
+
+/// Number of matching decimal digits between exact stored HP values.
 /// Returns `-log10(|computed - reference| / |reference|)` as a `Float` at
 /// the same precision as `computed`. If both values are equal, returns
-/// the maximum representable matching digits (precision_bits / log2(10)),
+/// floor(computed precision * log10(2)), the same cap used for unequal inputs,
 /// signaling "match to working precision". If `reference` is zero (and
 /// `computed` isn't), returns `-log10(|computed|)`.
 pub fn matching_digits(computed: &Float, reference: &Float) -> Float {
-    let prec = computed.prec();
-    let mut diff = computed.clone();
-    diff -= reference;
-    let abs_diff = diff.abs();
-
-    if abs_diff.is_zero() {
-        // Exact match — report a "matching to full working precision" value.
-        // Matching digits ≈ precision_bits / log2(10) ≈ precision_bits / 3.322
-        // We compute this in HP-friendly integer arithmetic.
-        let max_decimal_digits = (prec as u64) * 1000 / 3322; // ~prec * 0.30103
-        return Float::with_val(prec, max_decimal_digits);
+    let p = computed.prec();
+    let invalid = || Float::with_val(p, rug::float::Special::Nan);
+    if !computed.is_finite() || !reference.is_finite() {
+        return invalid();
     }
-
+    let Some(guard) = diagnostic_guard_precision(computed, reference) else {
+        return invalid();
+    };
+    let mut maximum = Float::with_val(guard, 2).log10();
+    maximum *= p;
+    maximum.floor_mut();
+    if computed == reference {
+        return Float::with_val(p, maximum);
+    }
+    let difference = Float::with_val(guard, computed - reference).abs();
+    if difference.is_finite() && !difference.is_zero() {
+        let relative = if reference.is_zero() {
+            difference
+        } else {
+            difference / Float::with_val(guard, reference).abs()
+        };
+        if relative.is_finite() && !relative.is_zero() {
+            return Float::with_val(p, (-relative.log10()).min(&maximum));
+        }
+    }
+    let Some((difference, exponent)) = scaled_diagnostic_difference(computed, reference, guard)
+    else {
+        return invalid();
+    };
+    let mut logarithm = if reference.is_zero() {
+        difference.log10()
+    } else {
+        let Some((denominator, reference_exponent)) = binary_diagnostic_scale(reference, guard)
+        else {
+            return invalid();
+        };
+        let mut value = (difference / denominator.abs()).log10();
+        let mut displacement = Float::with_val(guard, exponent - reference_exponent);
+        displacement *= Float::with_val(guard, 2).log10();
+        value += displacement;
+        value
+    };
     if reference.is_zero() {
-        // Reference is zero; report -log10(|diff|).
-        let log10 = abs_diff.log10();
-        let mut neg = Float::with_val(prec, 0);
-        neg -= &log10;
-        return neg;
+        let mut displacement = Float::with_val(guard, exponent);
+        displacement *= Float::with_val(guard, 2).log10();
+        logarithm += displacement;
     }
-
-    let abs_ref = reference.clone().abs();
-    let mut rel = abs_diff;
-    rel /= &abs_ref;
-    let log10 = rel.log10();
-    let mut neg = Float::with_val(prec, 0);
-    neg -= &log10;
-    neg
+    Float::with_val(p, (-logarithm).min(&maximum))
 }
-
-/// Relative difference `|a - b| / |b|`, computed entirely in HP arithmetic.
-/// Returns `None` if `b` is exactly zero (relative difference undefined).
+fn diagnostic_guard_precision(a: &Float, b: &Float) -> Option<u32> {
+    a.prec()
+        .max(b.prec())
+        .checked_add(64)
+        .filter(|p| *p <= rug::float::prec_max())
+}
+// The significand normalization uses only exact binary shifts. Dividing close
+// inputs separately by a general Float scale would destroy their difference.
+fn binary_diagnostic_scale(value: &Float, p: u32) -> Option<(Float, i64)> {
+    let (integer, exponent) = value.to_integer_exp()?;
+    if integer.is_zero() {
+        return Some((Float::with_val(p, 0), 0));
+    }
+    let bits = integer.significant_bits();
+    let mut significand = Float::with_val(p, integer);
+    significand >>= bits;
+    Some((significand, i64::from(exponent) + i64::from(bits)))
+}
+fn scaled_diagnostic_difference(a: &Float, b: &Float, p: u32) -> Option<(Float, i64)> {
+    let (mut left, le) = binary_diagnostic_scale(a, p)?;
+    let (mut right, re) = binary_diagnostic_scale(b, p)?;
+    let exponent = if a.is_zero() {
+        re
+    } else if b.is_zero() {
+        le
+    } else {
+        le.max(re)
+    };
+    if !left.is_zero() {
+        left >>= u32::try_from(exponent - le).ok()?;
+    }
+    if !right.is_zero() {
+        right >>= u32::try_from(exponent - re).ok()?;
+    }
+    let difference = Float::with_val(p, left - right).abs();
+    (difference.is_finite() && !difference.is_zero()).then_some((difference, exponent))
+}
+/// Computed relative difference of exact stored values, rounded to a's
+/// precision. Nonfinite inputs, zero reference, or an unrepresentable nonzero
+/// result return None; exact equality alone returns zero.
 pub fn relative_difference(a: &Float, b: &Float) -> Option<Float> {
-    if b.is_zero() {
+    if !a.is_finite() || !b.is_finite() || b.is_zero() {
         return None;
     }
-    let mut diff = a.clone();
-    diff -= b;
-    let abs_diff = diff.abs();
-    let abs_b = b.clone().abs();
-    let mut rel = abs_diff;
-    rel /= &abs_b;
-    Some(rel)
+    let p = a.prec();
+    if a == b {
+        return Some(Float::with_val(p, 0));
+    }
+    let guard = diagnostic_guard_precision(a, b)?;
+    let difference = Float::with_val(guard, a - b).abs();
+    let ordinary = Float::with_val(p, difference / Float::with_val(guard, b).abs());
+    if ordinary.is_finite() && !ordinary.is_zero() {
+        return Some(ordinary);
+    }
+    let (difference, exponent) = scaled_diagnostic_difference(a, b, guard)?;
+    let (denominator, reference_exponent) = binary_diagnostic_scale(b, guard)?;
+    let mut ratio = difference / denominator.abs();
+    let displacement = exponent - reference_exponent;
+    if displacement >= 0 {
+        ratio <<= u32::try_from(displacement).ok()?;
+    } else {
+        ratio >>= u32::try_from(-displacement).ok()?;
+    }
+    let result = Float::with_val(p, ratio);
+    (result.is_finite() && !result.is_zero()).then_some(result)
 }
 
 #[cfg(test)]

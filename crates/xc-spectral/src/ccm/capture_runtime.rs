@@ -293,7 +293,8 @@ impl Checkpoints {
             bytes: writer.bytes,
         };
         drop(writer.writer);
-        // A pre-existing valid checkpoint wins; interrupted checkpoints lack a seal.
+        // The newly computed checkpoint replaces the old one. An interrupted
+        // replacement has no matching seal and is rejected by the reader.
         if path.exists() {
             fs::remove_file(&path)?;
         }

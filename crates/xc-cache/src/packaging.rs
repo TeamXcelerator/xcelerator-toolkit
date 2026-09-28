@@ -61,6 +61,8 @@ pub struct DeterministicPackageReport {
     pub package_digest: ContentDigest,
     /// Local operational state; this path is not part of artifact identity.
     pub package_path: PathBuf,
+    /// Whether this operation created the immutable destination instead of reusing it.
+    pub created_new: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -112,6 +114,7 @@ where
             "streaming package archive path must be explicit and absent".to_owned(),
         ));
     }
+    let mut created_new = false;
     let result = (|| {
         let package = package_canonical_payload_zip64(
             request.envelope,
@@ -120,6 +123,7 @@ where
             request.resources,
             request.cancellation,
         )?;
+        created_new = package.created_new;
         let mut archive = BufReader::new(File::open(request.temporary_archive_path)?);
         let encoding = stream_split_encoded(
             &mut archive,
@@ -147,17 +151,22 @@ where
             cleanup_complete: true,
         })
     })();
-    let cleanup = match fs::remove_file(request.temporary_archive_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(CacheError::Io(format!(
-            "could not remove streaming archive {}: {error}",
-            request.temporary_archive_path.display()
-        ))),
+    let cleanup = if !created_new {
+        Ok(())
+    } else {
+        match fs::remove_file(request.temporary_archive_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(CacheError::Io(format!(
+                "could not remove streaming archive {}: {error}",
+                request.temporary_archive_path.display()
+            ))),
+        }
     };
     match (result, cleanup) {
         (Ok(mut report), Ok(())) => {
-            report.cleanup_complete = !request.temporary_archive_path.exists();
+            report.complete_archive_retained = request.temporary_archive_path.exists();
+            report.cleanup_complete = !created_new || !report.complete_archive_retained;
             Ok(report)
         }
         (_, Err(error)) => Err(error),
@@ -287,7 +296,7 @@ pub fn package_canonical_payload_bytes_zip64(
         let package_size_bytes = fs::metadata(&temporary_path)?.len();
         let mut digest_buffer = vec![0u8; COPY_BUFFER_BYTES as usize];
         let package_digest = digest_file(&temporary_path, cancellation, &mut digest_buffer)?;
-        publish_immutable_package(
+        let created_new = publish_immutable_package(
             &temporary_path,
             destination,
             &package_digest,
@@ -300,6 +309,7 @@ pub fn package_canonical_payload_bytes_zip64(
             package_size_bytes,
             package_digest,
             package_path: destination.to_path_buf(),
+            created_new,
         })
     })();
     if result.is_err() {
@@ -474,6 +484,7 @@ fn reconstruct_inner(
         package_size_bytes: package_size,
         package_digest,
         package_path: destination.to_owned(),
+        created_new: true,
     })
 }
 
@@ -779,7 +790,7 @@ fn package_inner(
     // Hard linking creates the immutable destination only if it is still
     // absent, avoiding a concurrent overwrite. The temporary name is in the
     // same directory so this is an atomic same-filesystem operation.
-    publish_immutable_package(
+    let created_new = publish_immutable_package(
         temporary_path,
         destination,
         &package_digest,
@@ -798,6 +809,7 @@ fn package_inner(
         package_size_bytes,
         package_digest,
         package_path: destination.to_owned(),
+        created_new,
     })
 }
 
@@ -819,11 +831,11 @@ fn publish_immutable_package(
     expected_digest: &ContentDigest,
     expected_size: u64,
     cancellation: &CancellationToken,
-) -> Result<(), CacheError> {
+) -> Result<bool, CacheError> {
     match fs::hard_link(temporary_path, destination) {
         Ok(()) => {
             let _ = fs::remove_file(temporary_path);
-            Ok(())
+            Ok(true)
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let metadata = fs::symlink_metadata(destination)?;
@@ -846,7 +858,7 @@ fn publish_immutable_package(
                     actual: format!("{digest} ({size} bytes)"),
                 });
             }
-            Ok(())
+            Ok(false)
         }
         Err(error) => Err(error.into()),
     }
@@ -884,6 +896,7 @@ fn verified_existing_transport_package(
         package_size_bytes: size,
         package_digest: digest,
         package_path: destination.to_owned(),
+        created_new: false,
     })
 }
 
@@ -1025,8 +1038,17 @@ impl Write for ControlledFile {
 
 impl Seek for ControlledFile {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        let position = self.inner.seek(position)?;
-        self.check(position)?;
+        let destination = match position {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+            SeekFrom::End(offset) => i128::from(self.length) + i128::from(offset),
+        };
+        let destination = u64::try_from(destination)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid seek position"))?;
+        // Reject before moving the underlying file. A failed seek must not
+        // leave its cursor outside the accounting maintained by this wrapper.
+        self.check(destination)?;
+        let position = self.inner.seek(SeekFrom::Start(destination))?;
         self.position = position;
         Ok(position)
     }
@@ -1304,6 +1326,19 @@ mod tests {
             &cancellation,
         )
         .unwrap();
+        assert!(report.created_new);
+        assert!(reconstructed_report.created_new);
+        assert!(
+            !reconstruct_transport_package(
+                &record,
+                &parts_root,
+                &reconstructed,
+                &ResourcePolicy::default(),
+                &cancellation
+            )
+            .unwrap()
+            .created_new
+        );
         assert_eq!(reconstructed_report.package_digest, report.package_digest);
         let verified =
             verify_canonical_payload_zip64(&envelope, &record, &reconstructed, &cancellation)
@@ -1342,6 +1377,7 @@ mod tests {
                 second.join().unwrap().unwrap(),
             )
         });
+        assert_ne!(first.created_new, second.created_new);
         assert_eq!(first.package_digest, report.package_digest);
         assert_eq!(second.package_digest, report.package_digest);
         verify_canonical_payload_zip64(&envelope, &record, &reconstructed, &cancellation).unwrap();
@@ -1432,5 +1468,20 @@ mod tests {
         assert!(format!("{}", deadline.check().unwrap_err()).contains("WallTime"));
         assert!(!deadline_destination.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn exhaustive_failed_seek_cannot_bypass_the_disk_limit() {
+        let root = std::env::temp_dir().join(format!("xc-seek-audit-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("controlled");
+        let file = File::create(&path).unwrap();
+        let mut controlled = ControlledFile::new(file, Some(10));
+        controlled.write_all(b"x").unwrap();
+        assert!(controlled.seek(SeekFrom::Start(100)).is_err());
+        controlled.write_all(b"y").unwrap();
+        drop(controlled);
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(bytes, b"xy");
     }
 }

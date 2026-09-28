@@ -205,3 +205,49 @@ v4, including the [atom diagnostics](ATOM_RESEARCH.md). Resolution diagnostics
 retain v3; other extended producers retain v2. Historical children remain readable and are not
 rewritten; requesting the new fields creates new children through live capture
 or additive backfill. The shared capture plan remains Ultra v6.
+
+### Reference preparation precision contract
+
+Prepared bundles use `external_reference_preparation_v2`. Numeric fields inherit
+the preparation precision unless their containing source declares its own precision.
+Numbers are decoded once at that original precision, promoted, and serialized at
+the new bundle precision. Working precision includes the finite reference and
+every basis precision; extra arithmetic does not increase source accuracy. Metadata,
+definitions, independently tagged comparisons, and portable certificates retain
+their existing meanings.
+
+Finite-reference roots must name the same retained source. Automatic real samples
+require an even reference and even bases. The center-one target has an exact unit
+center sample; raw basis centers retain their actual sums. Support-dependent jets
+use the exact decimal cutoff's logarithm, with bounded adaptive precision and
+explicit failure when unresolved. Full/window equality and zero exterior concern
+only the declared compact finite reference. Interior samples remain computed
+diagnostics without certified quadrature or source-error bounds.
+
+### Finite tail-form assembly and model solve
+
+`prepare_tail_form` evaluates finite weighted polynomial forms exactly in the
+declared stored dyadic input points and rounds only final matrix entries. Exact
+integer span, workspace and final exponent limits are enforced explicitly. The
+tail diagnostic preserves external source precision through recipe cutoff
+selection and assembly; newly synthesized form entries have working precision.
+
+Model energy solves `(finite_zero + tail) v = (E/2) lattice_gram v` and does not
+use retained energy to select the model eigenpair. The output includes the no-tail
+counterfactual and lattice-normalized eigenvector diagnostics. These point results
+do not certify an arbitrary supplied tail approximation or infinite spectrum.
+
+### Root-transport and finite-enclosure precision
+
+The root-transport adapter encloses arithmetic in the stored input points and the
+exact decimal cutoff. It propagates the existing directional intervals through
+the physical-coordinate identity and preserves the conditional nature of that
+response. Supplied secular comparisons must match the stored evaluation point,
+branch, parameter and activation convention before their values are compared.
+
+Finite transform rows interpret retained ordinates at their declared payload
+precision. Explicit contour coordinates use the external source precision and
+identify a dyadic rectangle in the output. All interval endpoints round outward
+when serialized; point aliases cannot silently change the function being enclosed.
+Finite contour certificates still concern only the declared finite function and
+its separately stated source-error premises.

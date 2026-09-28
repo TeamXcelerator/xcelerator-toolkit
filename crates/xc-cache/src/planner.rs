@@ -375,24 +375,27 @@ fn evaluate_candidate(
             unavailable_dependencies.join(", ")
         ));
     }
-    let projected_transfer = current_transfer_bytes.saturating_add(candidate.transfer_bytes);
-    if policy
-        .maximum_total_transfer_bytes
-        .is_some_and(|maximum| projected_transfer > maximum)
-    {
-        reasons.push(format!(
-            "projected transfer {projected_transfer} exceeds policy"
-        ));
+    match current_transfer_bytes.checked_add(candidate.transfer_bytes) {
+        None => reasons.push("projected transfer bytes exceed u64".to_owned()),
+        Some(total)
+            if policy
+                .maximum_total_transfer_bytes
+                .is_some_and(|maximum| total > maximum) =>
+        {
+            reasons.push(format!("projected transfer {total} exceeds policy"))
+        }
+        Some(_) => {}
     }
-    let projected_recomputation =
-        current_recomputation_units.saturating_add(candidate.recomputation_units);
-    if policy
-        .maximum_total_recomputation_units
-        .is_some_and(|maximum| projected_recomputation > maximum)
-    {
-        reasons.push(format!(
-            "projected recomputation {projected_recomputation} exceeds policy"
-        ));
+    match current_recomputation_units.checked_add(candidate.recomputation_units) {
+        None => reasons.push("projected recomputation units exceed u64".to_owned()),
+        Some(total)
+            if policy
+                .maximum_total_recomputation_units
+                .is_some_and(|maximum| total > maximum) =>
+        {
+            reasons.push(format!("projected recomputation {total} exceeds policy"))
+        }
+        Some(_) => {}
     }
     CacheCandidatePlanDecision {
         candidate_id: candidate.candidate_id.clone(),
@@ -712,5 +715,59 @@ mod tests {
             ],
         };
         assert!(plan_cache_derivations(&request).is_err());
+    }
+    #[test]
+    fn audit_planner_uses_representable_alternative_after_overflow() {
+        for transfer in [true, false] {
+            let mut p = policy();
+            p.maximum_total_transfer_bytes = Some(u64::MAX);
+            p.maximum_total_recomputation_units = Some(u64::MAX);
+            let source = node(
+                "a",
+                BTreeSet::new(),
+                vec![candidate(
+                    "first",
+                    CachePlanAction::Load,
+                    CachePlanTrust::PolicyTrusted,
+                    CachePlanLocality::WorkstationLocal,
+                    if transfer { u64::MAX } else { 0 },
+                    if transfer { 0 } else { u64::MAX },
+                    BTreeSet::new(),
+                )],
+            );
+            let deps = BTreeSet::from(["a".to_owned()]);
+            let next = node(
+                "b",
+                deps.clone(),
+                vec![
+                    candidate(
+                        "overflow",
+                        CachePlanAction::Load,
+                        CachePlanTrust::IndependentlyArchived,
+                        CachePlanLocality::WorkstationLocal,
+                        if transfer { 1 } else { 0 },
+                        if transfer { 0 } else { 1 },
+                        deps.clone(),
+                    ),
+                    candidate(
+                        "fits",
+                        CachePlanAction::Load,
+                        CachePlanTrust::PolicyTrusted,
+                        CachePlanLocality::WorkstationLocal,
+                        0,
+                        0,
+                        deps,
+                    ),
+                ],
+            );
+            let plan = plan_cache_derivations(&CachePlanRequest {
+                schema_version: 1,
+                policy: p,
+                nodes: vec![source, next],
+            })
+            .expect("overflowing candidate must not suppress a feasible alternative");
+            assert!(plan.complete);
+            assert_eq!(plan.nodes[1].selected_candidate_id.as_deref(), Some("fits"));
+        }
     }
 }

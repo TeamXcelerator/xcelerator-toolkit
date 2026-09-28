@@ -180,9 +180,10 @@ identities are superseded rather than reused; their canonical eigenpair parent
 can still avoid a fresh eigensolve. Managed target-distance capture resolves Gauss--Legendre nodes and
 weights through the existing `gauss_legendre_rule` artifact family, so
 configurations with the same order and working precision reuse one exact
-table. For left/right/trapezoid resolution evidence, Q/2Q/4Q also reuse an
-eigenfunction value only when the refined MPFR abscissa is binary-identical;
-midpoint grids remain independent.
+table. For left/right/trapezoid resolution evidence, the 2Q to conditional 4Q
+step reuses an eigenfunction value only when the refined MPFR abscissa is
+binary-identical. The original Q pass is not reused because resolution replay
+uses retained coefficients. Midpoint grids remain independent.
 
 The four runtime-target-derived kinds -- `ccm_target_distance`,
 `ccm_distance_resolution_evidence`, `ccm_target_residual_analysis`, and
@@ -215,6 +216,8 @@ scope. Adaptive keys bind the exact secular-source content digest. Historical
 v6/v7 root artifacts are not promoted or used as adaptive starting points;
 every v9 miss follows the same canonical computation path, so reuse, refresh,
 and verification cannot produce different payload bytes for one semantic key.
+
+Implementation status: requested forward-accuracy certification for prime-power and u-flow response observables is planned. Current captures provide point derivatives and backward residual checks; complete error propagation through eigenstate uncertainty and moving-pole cancellation remains unimplemented.
 
 Prime-power response is a separate, potentially expensive opt-in and is **not**
 implied by `maximum`. Set

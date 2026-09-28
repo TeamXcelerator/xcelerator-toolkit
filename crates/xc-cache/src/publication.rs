@@ -99,7 +99,7 @@ impl TransportEncodingRecord {
     }
 
     pub fn validate(&self) -> Result<(), CacheError> {
-        if self.schema_version == 0
+        if !matches!(self.schema_version, 1 | 2)
             || !matches!(
                 self.encoder_profile.as_str(),
                 crate::DETERMINISTIC_ZIP64_PROFILE_V1 | crate::DETERMINISTIC_ZIP64_PROFILE_V2
@@ -114,7 +114,7 @@ impl TransportEncodingRecord {
             ));
         }
         let mut total = 0u64;
-        let mut paths = std::collections::BTreeSet::new();
+        let mut paths = BTreeMap::new();
         for (index, part) in self.ordered_parts.iter().enumerate() {
             if part.sequence != index as u64
                 || part.repository_path.trim().is_empty()
@@ -122,11 +122,23 @@ impl TransportEncodingRecord {
                 || part.size_bytes == 0
                 || part.size_bytes >= GITHUB_HARD_FILE_BOUNDARY_BYTES
                 || !part.content_digest.validate()
-                || !paths.insert(&part.repository_path)
             {
                 return Err(CacheError::InvalidManifest(format!(
                     "transport part {index} is invalid"
                 )));
+            }
+            if let Some((digest, size)) = paths.insert(
+                &part.repository_path,
+                (&part.content_digest, part.size_bytes),
+            ) {
+                if self.schema_version == 1
+                    || digest != &part.content_digest
+                    || size != part.size_bytes
+                {
+                    return Err(CacheError::InvalidManifest(
+                        "repeated transport path requires schema 2 and identical bytes".to_owned(),
+                    ));
+                }
             }
             total = total.checked_add(part.size_bytes).ok_or_else(|| {
                 CacheError::InvalidManifest("transport size overflows u64".to_owned())
@@ -138,8 +150,28 @@ impl TransportEncodingRecord {
                 self.package_size_bytes
             )));
         }
+        unique_transport_blob_bytes(&self.ordered_parts)?;
         Ok(())
     }
+}
+
+/// Bytes occupied by distinct immutable content blobs; paths may alias one blob.
+pub(crate) fn unique_transport_blob_bytes(parts: &[TransportPart]) -> Result<u64, CacheError> {
+    let mut sizes = BTreeMap::new();
+    for part in parts {
+        if let Some(previous) = sizes.insert(&part.content_digest, part.size_bytes) {
+            if previous != part.size_bytes {
+                return Err(CacheError::InvalidManifest(
+                    "one transport blob has conflicting byte counts".to_owned(),
+                ));
+            }
+        }
+    }
+    sizes.values().try_fold(0u64, |sum, size| {
+        sum.checked_add(*size).ok_or_else(|| {
+            CacheError::ResourceLimit("unique transport bytes exceed u64".to_owned())
+        })
+    })
 }
 
 /// Split an already-canonical encoded stream into bounded, hashed parts. The
@@ -219,8 +251,19 @@ where
         ));
     }
     let package_digest = ContentDigest(format!("{:x}", package_hasher.finalize()));
+    let unique_paths = ordered_parts
+        .iter()
+        .map(|part| &part.repository_path)
+        .collect::<BTreeSet<_>>()
+        .len();
     let record = TransportEncodingRecord {
-        schema_version: 1,
+        // Schema 2 permits repeated occurrences of one immutable physical part.
+        // Keep schema 1, and its identity, for all historical unique-part cases.
+        schema_version: if unique_paths == ordered_parts.len() {
+            1
+        } else {
+            2
+        },
         canonical_payload_digest,
         encoder_profile: encoder_profile.into(),
         package_size_bytes: package_size,
@@ -251,6 +294,7 @@ pub fn plan_publication_batches(
             "publication requires at least one transport part".to_owned(),
         ));
     }
+    let mut physical_parts = BTreeMap::new();
     let mut batches = Vec::new();
     let mut current_parts = Vec::new();
     let mut current_bytes = 0u64;
@@ -263,6 +307,22 @@ pub fn plan_publication_batches(
             return Err(CacheError::InvalidManifest(format!(
                 "part {index} violates publication limits"
             )));
+        }
+        if !normalized_relative_path(&part.repository_path) || !part.content_digest.validate() {
+            return Err(CacheError::InvalidManifest(
+                "publication part identity or path is invalid".to_owned(),
+            ));
+        }
+        if let Some((digest, size)) = physical_parts.insert(
+            &part.repository_path,
+            (&part.content_digest, part.size_bytes),
+        ) {
+            if digest != &part.content_digest || size != part.size_bytes {
+                return Err(CacheError::InvalidManifest(
+                    "publication part path has conflicting bytes".to_owned(),
+                ));
+            }
+            continue;
         }
         if !current_parts.is_empty()
             && current_bytes.saturating_add(part.size_bytes) > policy.maximum_batch_payload_bytes
@@ -400,7 +460,8 @@ impl PayloadBatchRecord {
     }
 
     pub fn validate(&self) -> Result<(), CacheError> {
-        if self.schema_version == 0
+        if !matches!(self.schema_version, 1 | 2)
+            || !self.idempotency_key.validate()
             || self.transaction_id != self.idempotency_key.0
             || self.authorized_repository.trim().is_empty()
             || self.shard_id.trim().is_empty()
@@ -416,18 +477,31 @@ impl PayloadBatchRecord {
         let mut planned_bytes = 0u64;
         let mut new_bytes = 0u64;
         let mut previous_path: Option<&str> = None;
-        let mut object_digests = BTreeSet::new();
+        let mut object_digests = BTreeMap::new();
+        let mut new_digests = BTreeSet::new();
         for object in &self.objects {
             if !normalized_relative_path(&object.repository_path)
                 || object.size_bytes == 0
                 || object.size_bytes >= GITHUB_HARD_FILE_BOUNDARY_BYTES
                 || !object.content_digest.validate()
-                || !object_digests.insert(&object.content_digest)
                 || previous_path.is_some_and(|previous| previous >= object.repository_path.as_str())
             {
                 return Err(CacheError::InvalidManifest(
                     "payload batch objects are invalid, duplicated, or unordered".to_owned(),
                 ));
+            }
+            if let Some(previous) = object_digests.insert(
+                &object.content_digest,
+                (object.size_bytes, object.newly_introduced),
+            ) {
+                if self.schema_version == 1
+                    || previous != (object.size_bytes, object.newly_introduced)
+                {
+                    return Err(CacheError::InvalidManifest(
+                        "payload batch repeated blob identity is inconsistent or requires schema 2"
+                            .to_owned(),
+                    ));
+                }
             }
             previous_path = Some(&object.repository_path);
             planned_bytes = planned_bytes
@@ -435,7 +509,7 @@ impl PayloadBatchRecord {
                 .ok_or_else(|| {
                     CacheError::ResourceLimit("payload batch planned bytes exceed u64".to_owned())
                 })?;
-            if object.newly_introduced {
+            if object.newly_introduced && new_digests.insert(&object.content_digest) {
                 new_bytes = new_bytes.checked_add(object.size_bytes).ok_or_else(|| {
                     CacheError::ResourceLimit("payload batch new bytes exceed u64".to_owned())
                 })?;
@@ -936,7 +1010,13 @@ impl TargetPublicationJournal {
                 "only an uncommitted discoverability plan may be rebuilt".to_owned(),
             ));
         }
-        self.expected_head = current_head.into();
+        let current_head = current_head.into();
+        if current_head.trim().is_empty() {
+            return Err(CacheError::InvalidTransition(
+                "conflict head must be nonempty".to_owned(),
+            ));
+        }
+        self.expected_head = current_head;
         self.retry_count = self.retry_count.saturating_add(1);
         self.discoverability_commit = None;
         Ok(())
@@ -1145,7 +1225,13 @@ impl TargetPublicationJournal {
                 "ref conflict is valid only while uploading".to_owned(),
             ));
         }
-        self.expected_head = new_head.into();
+        let new_head = new_head.into();
+        if new_head.trim().is_empty() {
+            return Err(CacheError::InvalidTransition(
+                "conflict head must be nonempty".to_owned(),
+            ));
+        }
+        self.expected_head = new_head;
         self.retry_count = self.retry_count.saturating_add(1);
         Ok(())
     }
@@ -1268,16 +1354,23 @@ pub fn build_payload_batch_record(
         })
         .collect::<Vec<_>>();
     objects.sort_by(|left, right| left.repository_path.cmp(&right.repository_path));
+    let mut counted_new_digests = BTreeSet::new();
     let newly_committed_payload_bytes = objects
         .iter()
-        .filter(|object| object.newly_introduced)
+        .filter(|object| {
+            object.newly_introduced && counted_new_digests.insert(&object.content_digest)
+        })
         .try_fold(0u64, |total, object| {
             total.checked_add(object.size_bytes).ok_or_else(|| {
                 CacheError::ResourceLimit("payload batch new bytes exceed u64".to_owned())
             })
         })?;
+    let mut distinct_digests = BTreeSet::new();
+    let repeated_blob = objects
+        .iter()
+        .any(|object| !distinct_digests.insert(&object.content_digest));
     let record = PayloadBatchRecord {
-        schema_version: 1,
+        schema_version: if repeated_blob { 2 } else { 1 },
         transaction_id: journal.transaction_id.clone(),
         idempotency_key: journal.idempotency_key.clone(),
         destination,
@@ -1454,7 +1547,7 @@ impl PublicationTransactionJournal {
                 },
             );
         }
-        Ok(Self {
+        let journal = Self {
             schema_version: 1,
             transaction_id: idempotency_key.0.clone(),
             idempotency_key,
@@ -1463,13 +1556,17 @@ impl PublicationTransactionJournal {
             payload_digest,
             policy_digest,
             targets: journals,
-        })
+        };
+        journal.validate()?;
+        Ok(journal)
     }
 
     pub fn complete(&self) -> bool {
-        self.targets
-            .values()
-            .all(|target| target.state == PublicationTargetState::ReceiptComplete)
+        !self.targets.is_empty()
+            && self
+                .targets
+                .values()
+                .all(|target| target.state == PublicationTargetState::ReceiptComplete)
     }
 
     pub fn attach_target_audit_evidence(

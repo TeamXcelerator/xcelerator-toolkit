@@ -20,4 +20,8 @@ sha2 = { workspace = true }
 zip = { workspace = true }
 rayon = { workspace = true }
 fs2 = { workspace = true }
+getrandom = { workspace = true }
 xc-core = { workspace = true }
+
+[build-dependencies]
+sha2 = { workspace = true }

@@ -16,7 +16,10 @@ arb = ["hp"]
 
 [dependencies]
 anyhow = { workspace = true }
+getrandom = { workspace = true }
 nalgebra = { workspace = true }
+num-rational = "=0.4.2"
+num-traits = "=0.2.19"
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.®)
+// Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.Â®)
 // All rights reserved. See LICENSE in the repository root.
 
 //! Chunk-addressable vector storage and stored-operator contracts.
@@ -386,6 +386,8 @@ impl VectorWriteF64 for FileBackedVectorF64 {
 }
 
 /// Operator route whose public contract consumes chunk-addressable stores.
+/// Implementations may have written earlier chunks before an error; callers
+/// must not consume a partially updated output after a failed application.
 pub trait StoredLinearOperatorF64: Send + Sync {
     fn dimension(&self) -> usize;
     fn apply_stored(
@@ -437,14 +439,25 @@ impl StoredLinearOperatorF64 for StoredDiagonalF64 {
         let chunk = maximum_workspace_elements
             .min(input.preferred_chunk_elements())
             .min(output.preferred_chunk_elements())
-            .max(1);
+            .max(1)
+            .min(self.dimension());
         let mut buffer = vec![0.0; chunk];
         let mut start = 0usize;
         while start < self.dimension() {
             let take = (self.dimension() - start).min(chunk);
             input.read_chunk(start, &mut buffer[..take])?;
+            if buffer[..take].iter().any(|value| !value.is_finite()) {
+                return Err(OperatorError::InvalidData(
+                    "stored operator input contains a nonfinite value".to_owned(),
+                ));
+            }
             for (offset, value) in buffer[..take].iter_mut().enumerate() {
                 *value *= self.diagonal[start + offset];
+            }
+            if buffer[..take].iter().any(|value| !value.is_finite()) {
+                return Err(OperatorError::ApplicationFailed(
+                    "stored operator action produced a nonfinite value".to_owned(),
+                ));
             }
             output.write_chunk(start, &buffer[..take])?;
             start += take;
@@ -453,7 +466,10 @@ impl StoredLinearOperatorF64 for StoredDiagonalF64 {
     }
 }
 
-/// Deterministic sequential reduction over arbitrary vector stores.
+/// Deterministic sequential binary64 reduction over arbitrary vector stores.
+/// Nonfinite inputs, products, or partial sums return an error. Ordinary
+/// finite rounding (including underflow) is retained; this is not an exact
+/// dot product or an interval enclosure.
 pub fn dot_stored_f64(
     left: &dyn VectorReadF64,
     right: &dyn VectorReadF64,
@@ -473,7 +489,8 @@ pub fn dot_stored_f64(
     let chunk = maximum_workspace_elements
         .min(left.preferred_chunk_elements())
         .min(right.preferred_chunk_elements())
-        .max(1);
+        .max(1)
+        .min(left.dimension());
     let mut left_buffer = vec![0.0; chunk];
     let mut right_buffer = vec![0.0; chunk];
     let mut total = 0.0;
@@ -483,7 +500,21 @@ pub fn dot_stored_f64(
         left.read_chunk(start, &mut left_buffer[..take])?;
         right.read_chunk(start, &mut right_buffer[..take])?;
         for index in 0..take {
-            total += left_buffer[index] * right_buffer[index];
+            let left_value = left_buffer[index];
+            let right_value = right_buffer[index];
+            if !left_value.is_finite() || !right_value.is_finite() {
+                return Err(OperatorError::InvalidData(
+                    "stored dot product input contains a nonfinite value".to_owned(),
+                ));
+            }
+            let product = left_value * right_value;
+            let next_total = total + product;
+            if !product.is_finite() || !next_total.is_finite() {
+                return Err(OperatorError::ApplicationFailed(
+                    "stored dot product arithmetic produced a nonfinite value".to_owned(),
+                ));
+            }
+            total = next_total;
         }
         start += take;
     }

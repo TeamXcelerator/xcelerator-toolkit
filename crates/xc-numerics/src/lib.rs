@@ -14,7 +14,9 @@
 //!   for smallest eigenpair (with optional forced-even projection
 //!   and dual convergence-floor docs), ℓ² normalization, Rayleigh
 //!   quotient.
-//! - **`root_finding`**: bisection and Newton refinement helpers.
+//! - **`root_finding`**: native bisection helpers. HP interval Newton is in `xc-root`.
+//! - **`symmetric_f64`**: completion of approximate binary64 symmetric
+//!   eigensystems by Jacobi rotations, pairing each value with its column.
 //! - **`fmt`**: HP-only display/comparison helpers (no f64 fallbacks).
 //!   Use these wherever you would otherwise call `to_f64()` on a
 //!   `rug::Float` for printing or comparison.
@@ -29,6 +31,7 @@ pub mod grid_integral;
 pub mod primes;
 pub mod quadrature;
 pub mod root_finding;
+pub mod symmetric_f64;
 
 /// Debug logging macro controlled by [`set_hp_debug_logging`].
 static HP_DEBUG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -66,6 +69,9 @@ pub mod interval;
 
 #[cfg(feature = "hp")]
 pub mod mpfr_interval;
+
+#[cfg(feature = "hp")]
+pub mod symmetric_inertia;
 
 #[cfg(feature = "hp")]
 pub mod reduction;

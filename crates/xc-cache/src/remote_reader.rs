@@ -261,7 +261,14 @@ impl<'a> RemoteShardReader<'a> {
         };
         let mut missing = Vec::new();
         let mut quarantined_files = QuarantineCleanup::default();
+        let mut physical_parts = std::collections::BTreeMap::new();
+        let mut aliases = Vec::new();
+        let mut verified_sequences = std::collections::BTreeSet::new();
         for part in &record.ordered_parts {
+            if let Some(sequence) = physical_parts.insert(&part.repository_path, part.sequence) {
+                aliases.push((sequence, part.sequence, part.size_bytes));
+                continue;
+            }
             cancellation
                 .check()
                 .map_err(|error| CacheError::Cancelled(error.to_string()))?;
@@ -277,14 +284,14 @@ impl<'a> RemoteShardReader<'a> {
                             cancellation,
                         ) {
                             Ok(()) => {
+                                verified_sequences.insert(part.sequence);
                                 report.verified_bytes =
                                     report.verified_bytes.saturating_add(part.size_bytes);
                                 report.reused_sequences.push(part.sequence);
                                 continue;
                             }
                             Err(CacheError::DigestMismatch { .. }) => {
-                                let quarantine = quarantine_path(&destination);
-                                fs::rename(&destination, &quarantine)?;
+                                let quarantine = quarantine_existing_file(&destination)?;
                                 quarantined_files.track(quarantine);
                             }
                             Err(error) => return Err(error),
@@ -301,8 +308,7 @@ impl<'a> RemoteShardReader<'a> {
                             // Symlinks and non-regular files remain hard
                             // failures.
                             Err(CacheError::DigestMismatch { .. }) => {
-                                let quarantine = quarantine_path(&destination);
-                                fs::rename(&destination, &quarantine)?;
+                                let quarantine = quarantine_existing_file(&destination)?;
                                 quarantined_files.track(quarantine);
                                 eprintln!(
                                     "  cache transport: retained part {} has the wrong size and was quarantined; fetching it again",
@@ -345,11 +351,25 @@ impl<'a> RemoteShardReader<'a> {
             }
             missing.push((part, destination));
         }
-        let concurrency = std::env::var("XC_CACHE_DOWNLOAD_CONCURRENCY")
+        let mut concurrency = std::env::var("XC_CACHE_DOWNLOAD_CONCURRENCY")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(4)
-            .clamp(1, 8);
+            .clamp(1, 8)
+            .min(resources.maximum_threads.unwrap_or(8).max(1));
+        if let Some(limit) = resources.maximum_temporary_disk_bytes {
+            if let Some(largest) = missing.iter().map(|(part, _)| part.size_bytes).max() {
+                concurrency = concurrency.min((limit / largest.max(1)).max(1) as usize);
+            }
+        }
+        if let Some(limit) = resources.maximum_memory_bytes {
+            if limit == 0 {
+                return Err(CacheError::ResourceLimit(
+                    "download has zero memory budget".to_owned(),
+                ));
+            }
+            concurrency = concurrency.min((limit / limit.min(1024 * 1024)).max(1) as usize);
+        }
         self.remote.prefetch_committed_paths(
             repository,
             revision,
@@ -389,6 +409,7 @@ impl<'a> RemoteShardReader<'a> {
                     .collect::<Result<Vec<_>, CacheError>>()
             })?;
             for (sequence, size_bytes, downloaded) in results {
+                verified_sequences.insert(sequence);
                 if downloaded {
                     report.downloaded_sequences.push(sequence);
                     report.downloaded_bytes = report.downloaded_bytes.saturating_add(size_bytes);
@@ -396,6 +417,13 @@ impl<'a> RemoteShardReader<'a> {
                     report.reused_sequences.push(sequence);
                 }
                 report.verified_bytes = report.verified_bytes.saturating_add(size_bytes);
+            }
+        }
+        for (original, alias, size) in aliases {
+            report.reused_sequences.push(alias);
+            if verified_sequences.contains(&original) {
+                report.verified_bytes += size; // bounded by validated package total
+                verified_sequences.insert(alias);
             }
         }
         report.downloaded_sequences.sort_unstable();
@@ -567,8 +595,7 @@ pub(crate) fn quarantine_corrupt_reused_parts(
         ) {
             Ok(()) => {}
             Err(CacheError::DigestMismatch { .. }) => {
-                let quarantine = quarantine_path(&destination);
-                fs::rename(&destination, &quarantine)?;
+                let quarantine = quarantine_existing_file(&destination)?;
                 quarantined.track(quarantine);
             }
             Err(error) => return Err(error),
@@ -577,22 +604,20 @@ pub(crate) fn quarantine_corrupt_reused_parts(
     Ok(quarantined)
 }
 
-/// Sibling path a corrupt retained part is moved to until replacement has
-/// finished or the current operation exits; the name never collides with a
-/// part.
-fn quarantine_path(destination: &Path) -> PathBuf {
-    destination.with_file_name(format!(
-        "{}.corrupt-{}-{}",
-        destination
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or_default()
-    ))
+/// Move a corrupt part to an exclusively reserved sibling. On failure, only
+/// this call's empty reservation is removed; other quarantine files stay owned
+/// by their original cleanup guards.
+fn quarantine_existing_file(destination: &Path) -> Result<PathBuf, CacheError> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| CacheError::Io("quarantine source has no parent".to_owned()))?;
+    let (quarantine, reservation) = crate::create_private_sibling_file(parent, "corrupt-part")?;
+    drop(reservation);
+    if let Err(error) = fs::rename(destination, &quarantine) {
+        let _ = fs::remove_file(&quarantine);
+        return Err(error.into());
+    }
+    Ok(quarantine)
 }
 
 fn verify_local_part_metadata(path: &Path, expected_size: u64) -> Result<(), CacheError> {
@@ -999,5 +1024,91 @@ mod tests {
         ));
         assert_eq!(remote.reads.load(AtomicOrdering::Relaxed), 0);
         let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn exhaustive_repeated_parts_fetch_one_physical_file() {
+        let data = b"ABCD".to_vec();
+        let digest = ContentDigest::sha256(&data);
+        let parts = (0..3)
+            .map(|sequence| TransportPart {
+                sequence,
+                repository_path: "objects/part".into(),
+                size_bytes: 4,
+                content_digest: digest.clone(),
+            })
+            .collect::<Vec<_>>();
+        let record = TransportEncodingRecord {
+            schema_version: 2,
+            canonical_payload_digest: ContentDigest::sha256(b"logical"),
+            encoder_profile: crate::CURRENT_DETERMINISTIC_ZIP64_PROFILE.into(),
+            package_size_bytes: 12,
+            package_digest: ContentDigest::sha256(b"ABCDABCDABCD"),
+            ordered_parts: parts,
+            reconstruction: "concatenate".into(),
+        };
+        let remote = MemoryRemote {
+            revision: "a".repeat(40),
+            paths: BTreeMap::from([("objects/part".into(), data)]),
+            reads: AtomicUsize::new(0),
+            current_reads: AtomicUsize::new(0),
+            maximum_concurrent_reads: AtomicUsize::new(0),
+            delay_millis: 0,
+        };
+        let root = temporary_root("exhaustive-repeats");
+        let _ = fs::remove_dir_all(&root);
+        let reader = RemoteShardReader::new(&remote, 1024).unwrap();
+        let report = reader
+            .fetch_transport_parts(
+                "fixture",
+                &remote.revision,
+                &record,
+                &root,
+                &ResourcePolicy::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(remote.reads.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(report.downloaded_bytes, 4);
+        assert_eq!(report.verified_bytes, 12);
+        assert_eq!(report.downloaded_sequences, vec![0]);
+        assert_eq!(report.reused_sequences, vec![1, 2]);
+        let reused = reader
+            .fetch_transport_parts(
+                "fixture",
+                &remote.revision,
+                &record,
+                &root,
+                &ResourcePolicy::default(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(reused.downloaded_bytes, 0);
+        assert_eq!(reused.verified_bytes, 12);
+        assert_eq!(reused.reused_sequences, vec![0, 1, 2]);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod quarantine_ownership_tests {
+    use super::*;
+    #[test]
+    fn quarantine_reservations_keep_existing_files_and_failed_moves_isolated() {
+        let root = crate::test_support::temporary_root("quarantine-owned-reservations");
+        fs::create_dir_all(&root).unwrap();
+        let a = root.join("A");
+        let b = root.join("B");
+        fs::write(&a, b"bad A").unwrap();
+        fs::write(&b, b"bad B").unwrap();
+        let qa = quarantine_existing_file(&a).unwrap();
+        let qb = quarantine_existing_file(&b).unwrap();
+        assert_ne!(qa, qb);
+        assert_eq!(fs::read(&qa).unwrap(), b"bad A");
+        assert_eq!(fs::read(&qb).unwrap(), b"bad B");
+        assert!(quarantine_existing_file(&root.join("missing")).is_err());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        assert_eq!(fs::read(qa).unwrap(), b"bad A");
+        assert_eq!(fs::read(qb).unwrap(), b"bad B");
+        fs::remove_dir_all(root).unwrap();
     }
 }

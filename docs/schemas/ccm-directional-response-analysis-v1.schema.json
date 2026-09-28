@@ -18,7 +18,30 @@
       "const": 1
     },
     "semantics": {
-      "const": "ccm-retained-research-observations-v1"
+      "enum": [
+        "ccm-retained-research-observations-v1",
+        "ccm-retained-research-observations-v2",
+        "ccm-retained-research-observations-v3",
+        "ccm-retained-research-observations-v4",
+        "ccm-retained-research-observations-v5",
+        "ccm-retained-research-observations-v6",
+        "ccm-retained-research-observations-v7",
+        "ccm-retained-research-observations-v8",
+        "ccm-retained-research-observations-v9",
+        "ccm-retained-research-observations-v10",
+        "ccm-retained-research-observations-v11",
+        "ccm-retained-research-observations-v12",
+        "ccm-retained-research-observations-v13",
+        "ccm-retained-research-observations-v14",
+        "ccm-retained-research-observations-v15",
+        "ccm-retained-research-observations-v16",
+        "ccm-retained-research-observations-v17",
+        "ccm-retained-research-observations-v18",
+        "ccm-retained-research-observations-v19",
+        "ccm-retained-research-observations-v20",
+        "ccm-retained-research-observations-v21",
+        "ccm-retained-research-observations-v22"
+      ]
     },
     "kind": {
       "const": "ccm_directional_response_analysis"
@@ -54,13 +77,13 @@
               },
               "parameters_digest": {
                 "type": "string",
-                "pattern": "^[0-9a-f]{64}$"
+                "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
               }
             }
           },
           "content_digest": {
             "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
+            "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
           },
           "required_quality": {
             "enum": [
@@ -142,12 +165,12 @@
               "type": "array",
               "items": {
                 "type": "string",
-                "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
               }
             },
             "relative_tolerance": {
               "type": "string",
-              "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+              "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
             },
             "maximum_working_bytes": {
               "anyOf": [
@@ -166,7 +189,7 @@
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^[0-9a-f]{64}$"
+              "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
             },
             {
               "type": "null"
@@ -181,6 +204,36 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "resource_admission": {
+          "const": "resolved_working_bytes_v1"
+        },
+        "duplicate_coordinate_policy": {
+          "const": "all_ambiguous_members_withheld_v2"
+        },
+        "ladder_positivity_policy": {
+          "const": "all_required_recurrence_steps_including_failed_v2"
+        },
+        "source_unit_arithmetic": {
+          "enum": [
+            "binary_scaled_hypot_checked_v1",
+            "binary_scaled_hypot_checked_range_v2"
+          ]
+        },
+        "directional_arithmetic": {
+          "enum": [
+            "stored_points_homogeneous_projected_resolvent_intervals_v1",
+            "stored_points_projected_resolvent_displacement_checked_v2"
+          ]
+        },
+        "maximum_directional_guard_bits": {
+          "const": 4096
+        },
+        "directional_output": {
+          "const": "midpoints_with_outward_decimal_enclosures_v1"
+        },
+        "root_point_precision": {
+          "const": "declared_payload_precision_v1"
         }
       }
     },
@@ -227,7 +280,7 @@
         },
         "lambda_squared": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
         },
         "n_modes": {
           "type": "integer",
@@ -245,13 +298,16 @@
           "type": "string"
         },
         "assurance": {
-          "const": "point_diagnostics_only; external_inputs_and_allowances_not_certified; no_RH_or_ground_selection_premise"
+          "enum": [
+            "point_diagnostics_only; external_inputs_and_allowances_not_certified; no_RH_or_ground_selection_premise",
+            "finite_stored_point_arithmetic_enclosures; response ratios conditional on root, simple-minimum and displacement hypotheses; no source-error or ground-selection certificate"
+          ]
         },
         "values": {
           "type": "object",
           "additionalProperties": {
             "type": "string",
-            "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+            "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
           }
         },
         "rows": {
@@ -293,7 +349,7 @@
                 "type": "object",
                 "additionalProperties": {
                   "type": "string",
-                  "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                  "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
                 }
               },
               "notes": {
@@ -355,5 +411,255 @@
         }
       ]
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v4",
+              "ccm-retained-research-observations-v5",
+              "ccm-retained-research-observations-v6",
+              "ccm-retained-research-observations-v7",
+              "ccm-retained-research-observations-v8",
+              "ccm-retained-research-observations-v9",
+              "ccm-retained-research-observations-v10",
+              "ccm-retained-research-observations-v11",
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "required": [
+              "source_unit_arithmetic"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "required": [
+              "source_unit_arithmetic"
+            ],
+            "properties": {
+              "source_unit_arithmetic": {
+                "const": "binary_scaled_hypot_checked_range_v2"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "request": {
+            "properties": {
+              "source_unit_arithmetic": {
+                "enum": [
+                  "binary_scaled_hypot_checked_v1"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v11",
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "required": [
+              "directional_arithmetic",
+              "maximum_directional_guard_bits",
+              "directional_output",
+              "root_point_precision"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v11",
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "assurance": {
+                "const": "finite_stored_point_arithmetic_enclosures; response ratios conditional on root, simple-minimum and displacement hypotheses; no source-error or ground-selection certificate"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "data": {
+            "properties": {
+              "assurance": {
+                "const": "point_diagnostics_only; external_inputs_and_allowances_not_certified; no_RH_or_ground_selection_premise"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v11",
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "rows": {
+                "items": {
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {
+                          "outcome": {
+                            "enum": [
+                              "point_measurement",
+                              "unresolved_denominator",
+                              "channels_resolved_budget_unassessed"
+                            ]
+                          }
+                        }
+                      },
+                      "then": {
+                        "properties": {
+                          "values": {
+                            "required": [
+                              "t",
+                              "tau",
+                              "directional_energy",
+                              "direction_norm_squared",
+                              "orthogonality_defect",
+                              "rational_root_condition",
+                              "root_condition_tolerance",
+                              "t_lower",
+                              "t_upper",
+                              "tau_lower",
+                              "tau_upper",
+                              "directional_energy_lower",
+                              "directional_energy_upper",
+                              "direction_norm_squared_lower",
+                              "direction_norm_squared_upper",
+                              "orthogonality_defect_lower",
+                              "orthogonality_defect_upper",
+                              "rational_root_condition_lower",
+                              "rational_root_condition_upper",
+                              "root_condition_tolerance_lower",
+                              "root_condition_tolerance_upper",
+                              "arithmetic_precision_bits"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

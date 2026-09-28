@@ -110,12 +110,13 @@ impl ArtifactValidatorRegistry {
             registration.artifact_family.clone(),
             registration.artifact_kind.clone(),
         );
-        if self.validators.insert(key.clone(), registration).is_some() {
+        if self.validators.contains_key(&key) {
             return Err(CacheError::InvalidManifest(format!(
                 "duplicate validator for artifact family {:?} kind {:?}",
                 key.0, key.1
             )));
         }
+        self.validators.insert(key, registration);
         Ok(())
     }
 
@@ -138,6 +139,7 @@ impl ArtifactValidatorRegistry {
         &self,
         request: &ArtifactValidationRequest<'_>,
     ) -> Result<ArtifactValidationReport, CacheError> {
+        request.reader_version.validate()?;
         let family = request.manifest.artifact_family.as_str();
         let kind = request.manifest.semantic_key.artifact_kind.as_str();
         let validator = self
@@ -382,6 +384,33 @@ mod tests {
             })
             .unwrap();
         registry
+    }
+
+    #[test]
+    fn exhaustive_rejected_duplicate_registration_preserves_original_validator() {
+        let mut registry = registry();
+        let mut replacement = registry.validators.values().next().unwrap().clone();
+        replacement.validator_id = "permissive-replacement".into();
+        replacement.invariant_validator = |_| Ok(vec![ContentDigest::sha256(b"unearned")]);
+        assert!(registry.register(replacement).is_err());
+        let mut manifest = manifest();
+        manifest.claim_scope = "not the fixture theorem".into();
+        let report = registry
+            .validate_for_reuse(&ArtifactValidationRequest {
+                resolved_dependencies: &manifest.canonical_payload.dependencies,
+                verified_logical_items: &manifest.canonical_payload.ordered_items,
+                observed_scalar_backend: "mpfr",
+                observed_precision_bits: Some(256),
+                observed_dimensions: &[2, 2],
+                reader_version: &ToolkitVersion::parse("0.13.0").unwrap(),
+                manifest: &manifest,
+            })
+            .unwrap();
+        assert!(
+            !report.reusable,
+            "a rejected replacement must not weaken mathematical validation"
+        );
+        assert_eq!(report.validator_id, "fixture-matrix-v1");
     }
 
     #[test]

@@ -18,7 +18,30 @@
       "const": 1
     },
     "semantics": {
-      "const": "ccm-retained-research-observations-v1"
+      "enum": [
+        "ccm-retained-research-observations-v1",
+        "ccm-retained-research-observations-v2",
+        "ccm-retained-research-observations-v3",
+        "ccm-retained-research-observations-v4",
+        "ccm-retained-research-observations-v5",
+        "ccm-retained-research-observations-v6",
+        "ccm-retained-research-observations-v7",
+        "ccm-retained-research-observations-v8",
+        "ccm-retained-research-observations-v9",
+        "ccm-retained-research-observations-v10",
+        "ccm-retained-research-observations-v11",
+        "ccm-retained-research-observations-v12",
+        "ccm-retained-research-observations-v13",
+        "ccm-retained-research-observations-v14",
+        "ccm-retained-research-observations-v15",
+        "ccm-retained-research-observations-v16",
+        "ccm-retained-research-observations-v17",
+        "ccm-retained-research-observations-v18",
+        "ccm-retained-research-observations-v19",
+        "ccm-retained-research-observations-v20",
+        "ccm-retained-research-observations-v21",
+        "ccm-retained-research-observations-v22"
+      ]
     },
     "kind": {
       "const": "ccm_tail_operator_analysis"
@@ -54,13 +77,13 @@
               },
               "parameters_digest": {
                 "type": "string",
-                "pattern": "^[0-9a-f]{64}$"
+                "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
               }
             }
           },
           "content_digest": {
             "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
+            "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
           },
           "required_quality": {
             "enum": [
@@ -142,12 +165,12 @@
               "type": "array",
               "items": {
                 "type": "string",
-                "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
               }
             },
             "relative_tolerance": {
               "type": "string",
-              "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+              "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
             },
             "maximum_working_bytes": {
               "anyOf": [
@@ -166,7 +189,7 @@
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^[0-9a-f]{64}$"
+              "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
             },
             {
               "type": "null"
@@ -181,6 +204,48 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "resource_admission": {
+          "const": "resolved_working_bytes_v1"
+        },
+        "duplicate_coordinate_policy": {
+          "const": "all_ambiguous_members_withheld_v2"
+        },
+        "ladder_positivity_policy": {
+          "const": "all_required_recurrence_steps_including_failed_v2"
+        },
+        "declared_error_semantics": {
+          "const": "exact_decimal_upper_bound_v2"
+        },
+        "source_unit_arithmetic": {
+          "enum": [
+            "binary_scaled_hypot_checked_v1",
+            "binary_scaled_hypot_checked_range_v2"
+          ]
+        },
+        "l2_normalization_arithmetic": {
+          "const": "power_two_scaled_max_precision_l2_v2"
+        },
+        "model_linear_algebra_arithmetic": {
+          "const": "exact_stored_dot_product_stages_and_tail_bound_v0.15.2-v2"
+        },
+        "tail_model_arithmetic": {
+          "const": "declared_points_exact_dyadic_recipe_forms_v2"
+        },
+        "maximum_tail_form_exact_bits": {
+          "const": 8000000
+        },
+        "tail_model_checkpoint_arithmetic": {
+          "const": "finite-tail-model-original-matrix-dense-source-recovery-v8"
+        },
+        "tail_model_householder_arithmetic": {
+          "const": "householder-scaled-opposite-sign-v1"
+        },
+        "tail_model_qr_arithmetic": {
+          "const": "tridiag-qr-working-unit-deflation-exponent-safe-hypot-v3"
+        },
+        "tail_model_vector_recovery_arithmetic": {
+          "const": "dense-eigenvector-requested-source-rounding-exact-count-scaling-directed-index-gap-angle-v3"
         }
       }
     },
@@ -227,7 +292,7 @@
         },
         "lambda_squared": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
         },
         "n_modes": {
           "type": "integer",
@@ -251,7 +316,7 @@
           "type": "object",
           "additionalProperties": {
             "type": "string",
-            "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+            "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
           }
         },
         "rows": {
@@ -293,7 +358,7 @@
                 "type": "object",
                 "additionalProperties": {
                   "type": "string",
-                  "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                  "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
                 }
               },
               "notes": {
@@ -418,6 +483,182 @@
                 ]
               }
             }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v4",
+              "ccm-retained-research-observations-v5",
+              "ccm-retained-research-observations-v6",
+              "ccm-retained-research-observations-v7",
+              "ccm-retained-research-observations-v8",
+              "ccm-retained-research-observations-v9",
+              "ccm-retained-research-observations-v10",
+              "ccm-retained-research-observations-v11",
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "required": [
+              "source_unit_arithmetic"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "required": [
+              "source_unit_arithmetic"
+            ],
+            "properties": {
+              "source_unit_arithmetic": {
+                "const": "binary_scaled_hypot_checked_range_v2"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "request": {
+            "properties": {
+              "source_unit_arithmetic": {
+                "enum": [
+                  "binary_scaled_hypot_checked_v1"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v2",
+              "ccm-retained-research-observations-v3",
+              "ccm-retained-research-observations-v4",
+              "ccm-retained-research-observations-v5",
+              "ccm-retained-research-observations-v6",
+              "ccm-retained-research-observations-v7",
+              "ccm-retained-research-observations-v8",
+              "ccm-retained-research-observations-v9",
+              "ccm-retained-research-observations-v10",
+              "ccm-retained-research-observations-v11",
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "required": [
+              "l2_normalization_arithmetic"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "required": [
+              "tail_model_arithmetic",
+              "maximum_tail_form_exact_bits"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "request": {
+            "required": [
+              "tail_model_checkpoint_arithmetic"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "required": [
+              "tail_model_checkpoint_arithmetic",
+              "tail_model_householder_arithmetic",
+              "tail_model_qr_arithmetic",
+              "tail_model_vector_recovery_arithmetic"
+            ]
           }
         }
       }

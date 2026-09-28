@@ -21,7 +21,7 @@ const SENSITIVE_KEYS: &[&str] = &[
 /// The check reports only the JSON path and marker class; it never includes
 /// the suspected secret in an error or log message.
 pub fn validate_secret_free<T: Serialize>(record: &T, context: &str) -> Result<(), ConfigError> {
-    let value = serde_json::to_value(record)
+    let value = crate::finite_json::to_value(record)
         .map_err(|error| ConfigError::new(format!("{context} serialization failed: {error}")))?;
     inspect_value(&value, "$", context)
 }

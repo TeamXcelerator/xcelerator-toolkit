@@ -8,11 +8,11 @@
 //! precision) and verifies our HP eigensolver matches PARI's eigenvalues
 //! to ≥500 decimal digits.
 //!
-//! This is the strongest independent-implementation check possible:
-//! different language, different algorithms, different arithmetic backend.
+//! The fixture is generated independently with PARI's real polynomial-root
+//! algorithm applied to exact rational characteristic polynomials. This finite
+//! comparison complements algebraic tests; it is not an exhaustive proof.
 //!
-//! If `eigen_reference.json` is missing (i.e. user hasn't generated it
-//! with PARI yet), this test is skipped with an informative message.
+//! The committed fixture is required. Absence or corruption fails this profile.
 
 #![cfg(feature = "hp")]
 
@@ -24,7 +24,7 @@ use xc_numerics::fmt::{display_hp, matching_digits};
 
 /// Working precision for our HP solver. PARI generates at 2000 digits;
 /// we run at 1000 and require ≥500 matching digits — more than enough
-/// margin to expose any bugs.
+/// margin for detecting large errors in these finite reference cases.
 const TEST_PRECISION_BITS: u32 = 3338; // ≈ 1000 decimal digits
 const MIN_MATCHING_DIGITS: f64 = 500.0;
 
@@ -36,28 +36,26 @@ fn fixture_path() -> std::path::PathBuf {
     p
 }
 
-/// Skip-if-missing wrapper. Returns `None` when the fixture isn't present
-/// (so the test passes vacuously instead of failing on machines without PARI).
-fn load_fixture() -> Option<Value> {
+fn load_fixture() -> Value {
     let path = fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "[eigen_reference] fixture not found at {} — skipping. \
-             Generate with: cd tests/fixtures && gp -q generate_eigen_reference.gp > eigen_reference.json",
+    let data = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "required independent PARI fixture {}: {error}",
             path.display()
-        );
-        return None;
-    }
-    let data = std::fs::read_to_string(&path).expect("read fixture");
-    Some(serde_json::from_str(&data).expect("parse fixture JSON"))
+        )
+    });
+    let fixture: Value = serde_json::from_str(&data).expect("parse independent fixture JSON");
+    assert_eq!(fixture["precision_decimal_digits"].as_u64(), Some(2000));
+    assert!(fixture["generator"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("PARI/GP"));
+    fixture
 }
 
 #[test]
 fn pari_cross_check_all_cases() {
-    let fixture = match load_fixture() {
-        Some(f) => f,
-        None => return,
-    };
+    let fixture = load_fixture();
 
     let cases = fixture["cases"].as_array().expect("cases array");
     assert!(!cases.is_empty(), "no test cases in fixture");
@@ -133,7 +131,7 @@ fn pari_cross_check_all_cases() {
         // ≥MIN_MATCHING_DIGITS decimal digits.
         for (k, (c, r)) in computed.iter().zip(reference.iter()).enumerate() {
             let m = matching_digits(c, r);
-            if !m.is_infinite() && m < min_digits {
+            if !c.is_finite() || !r.is_finite() || !m.is_finite() || m < min_digits {
                 panic!(
                     "case '{}' eigenvalue {} matches PARI reference to only {} digits \
                      (need ≥{}). computed={}, reference={}",

@@ -33,7 +33,7 @@ fn near_tridiagonal_cancellation_is_detected_and_corrected() {
             ];
             let (d, e, q) = householder_tridiag_hp(&a, 3, p).unwrap();
             let old = assess_symmetric_reduction_hp(&a, &d, &e, &q, p).unwrap();
-            assert!(old.absolute_similarity_residual > b / 2);
+            assert!(old.relative_similarity_residual < tolerance(p));
             assert!(old.absolute_orthogonality_residual < tolerance(p));
             let (d, e, q) = householder_tridiag_hp_stable(&a, 3, p).unwrap();
             let corrected = assess_symmetric_reduction_hp(&a, &d, &e, &q, p).unwrap();
@@ -159,7 +159,7 @@ fn diagonal_singleton_and_invalid_input_contracts() {
     assert!(assess_symmetric_reduction_hp(&a, &d, &e, &q, p).is_err());
 }
 #[test]
-fn legacy_tridiagonal_source_retains_its_exact_identity_basis() {
+fn default_tridiagonal_source_uses_the_stable_orthogonal_basis() {
     let p = 128;
     let a = vec![
         f(p, 2),
@@ -173,12 +173,8 @@ fn legacy_tridiagonal_source_retains_its_exact_identity_basis() {
         f(p, 5),
     ];
     let (d, e, q) = householder_tridiag_hp(&a, 3, p).unwrap();
-    assert_eq!(d, vec![f(p, 2), f(p, 3), f(p, 5)]);
-    assert_eq!(e, vec![f(p, 1), f(p, -2)]);
-    assert_eq!(
-        q,
-        (0..9)
-            .map(|i| f(p, i32::from(i % 4 == 0)))
-            .collect::<Vec<_>>()
-    );
+    let diagnostics = assess_symmetric_reduction_hp(&a, &d, &e, &q, p).unwrap();
+    assert!(diagnostics.absolute_similarity_residual.is_zero());
+    assert!(diagnostics.absolute_orthogonality_residual.is_zero());
+    assert_eq!((d, e, q), householder_tridiag_hp_stable(&a, 3, p).unwrap());
 }

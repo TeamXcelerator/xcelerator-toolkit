@@ -22,6 +22,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             median_accuracy_digits: "31.5".to_owned(),
             index_penalty_digits: "4.75".to_owned(),
             completion_status: "successful".to_owned(),
+            accuracy_scope: "caller_attested_root_records".to_owned(),
+            source_weights_digest: None,
         }],
         provenance,
     )?;

@@ -108,14 +108,7 @@ fn rewrite_canonical(
 
 impl Fixture {
     fn new(aliases: bool) -> Self {
-        let directory = std::env::temp_dir().join(format!(
-            "xc-receipt-adapter-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let directory = crate::test_support::temporary_root("bootstrap-receipt-adapter");
         fs::create_dir_all(&directory).unwrap();
         let adapter =
             GitHubBootstrapCacheStore::public("fixture-owner", directory.join("remote")).unwrap();

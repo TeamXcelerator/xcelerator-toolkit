@@ -100,6 +100,7 @@ pub struct OutputPreservationValidationReport {
 
 impl OutputPreservationValidationReport {
     pub fn validate(&self) -> Result<(), CacheError> {
+        self.toolkit_version.validate()?;
         if self.schema_version != 1
             || !self.run_id.validate()
             || self.reference_mode.trim().is_empty()
@@ -119,6 +120,20 @@ impl OutputPreservationValidationReport {
         {
             return Err(CacheError::InvalidManifest(
                 "output-validation report metadata is invalid".to_owned(),
+            ));
+        }
+        let mut identity = self.clone();
+        identity.run_id = ContentDigest("0".repeat(64));
+        if self.run_id != ContentDigest::sha256(&serde_json::to_vec(&identity)?) {
+            return Err(CacheError::InvalidManifest(
+                "output-validation report content does not match its run identity".to_owned(),
+            ));
+        }
+        let mut classified = self.comparisons.clone();
+        classify_divergences(&mut classified);
+        if classified != self.comparisons {
+            return Err(CacheError::InvalidManifest(
+                "output-validation divergence classification is inconsistent".to_owned(),
             ));
         }
         let totals = comparison_totals(&self.comparisons);
@@ -168,7 +183,7 @@ pub struct OutputValidationRunConfig {
 struct ActiveOutputValidationRun {
     config: OutputValidationRunConfig,
     started_unix_seconds: u64,
-    records: BTreeMap<String, ArtifactOutputComparison>,
+    records: BTreeMap<(String, String, ContentDigest), ArtifactOutputComparison>,
 }
 
 fn claim_scope_active() -> &'static Mutex<bool> {
@@ -293,6 +308,7 @@ fn active_run() -> &'static Mutex<Option<ActiveOutputValidationRun>> {
 pub(crate) fn begin_output_validation_run(
     config: OutputValidationRunConfig,
 ) -> Result<(), CacheError> {
+    config.toolkit_version.validate()?;
     if config.validation_root.as_os_str().is_empty()
         || config.report_root.as_os_str().is_empty()
         || config.reference_mode.trim().is_empty()
@@ -431,9 +447,16 @@ pub(crate) fn record_output_comparison(
         )
     })?;
     if let Some(existing) = run.records.get_mut(&identity) {
-        if existing.computed_payload_digest != comparison.computed_payload_digest {
-            existing.intra_run_nondeterminism = true;
+        let nondeterminism = existing.intra_run_nondeterminism
+            || existing.computed_payload_digest != comparison.computed_payload_digest;
+        // Retain a nonpassing observation even when a previous comparison passed.
+        // A later match cannot erase a mismatch or an unavailable reference.
+        if existing.status == ArtifactOutputComparisonStatus::Match
+            && comparison.status != ArtifactOutputComparisonStatus::Match
+        {
+            *existing = comparison;
         }
+        existing.intra_run_nondeterminism = nondeterminism;
     } else {
         comparison.intra_run_nondeterminism = false;
         run.records.insert(identity, comparison);
@@ -543,6 +566,23 @@ fn persist_output_validation_report(
 
 fn validate_comparison(comparison: &ArtifactOutputComparison) -> Result<(), CacheError> {
     comparison.semantic_key.validate()?;
+    comparison.artifact_key.validate()?;
+    if let Some(version) = &comparison.reference_producer_toolkit_version {
+        version.validate()?;
+    }
+    for digest in [
+        &comparison.reference_manifest_digest,
+        &comparison.reference_payload_digest,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !digest.validate() {
+            return Err(CacheError::InvalidManifest(
+                "invalid reference comparison digest".to_owned(),
+            ));
+        }
+    }
     if comparison.schema_version != 1
         || comparison.operation.trim().is_empty()
         || !comparison.computed_manifest_digest.validate()
@@ -567,7 +607,8 @@ fn validate_comparison(comparison: &ArtifactOutputComparison) -> Result<(), Cach
         .iter()
         .chain(comparison.seed_source.iter())
     {
-        if !dependency.key.parameters_digest.validate() || !dependency.content_digest.validate() {
+        dependency.key.validate()?;
+        if !dependency.content_digest.validate() {
             return Err(CacheError::InvalidManifest(
                 "output comparison contains an invalid dependency identity".to_owned(),
             ));
@@ -576,7 +617,7 @@ fn validate_comparison(comparison: &ArtifactOutputComparison) -> Result<(), Cach
     if comparison
         .diverging_dependencies
         .iter()
-        .any(|dependency| !dependency.parameters_digest.validate())
+        .any(|dependency| dependency.validate().is_err())
     {
         return Err(CacheError::InvalidManifest(
             "output comparison contains an invalid diverging dependency".to_owned(),
@@ -585,7 +626,10 @@ fn validate_comparison(comparison: &ArtifactOutputComparison) -> Result<(), Cach
     match comparison.status {
         ArtifactOutputComparisonStatus::Match => {
             if comparison.reference_manifest_digest.is_none()
-                || comparison.reference_overlay.is_none()
+                || comparison
+                    .reference_overlay
+                    .as_ref()
+                    .is_none_or(|name| name.trim().is_empty())
                 || comparison.reference_producer_toolkit_version.is_none()
                 || comparison.reference_payload_digest.as_ref()
                     != Some(&comparison.computed_payload_digest)
@@ -601,7 +645,25 @@ fn validate_comparison(comparison: &ArtifactOutputComparison) -> Result<(), Cach
         ArtifactOutputComparisonStatus::Mismatch => {
             if comparison.reference_payload_digest.is_none()
                 || comparison.reference_manifest_digest.is_none()
+                || comparison
+                    .reference_overlay
+                    .as_ref()
+                    .is_none_or(|name| name.trim().is_empty())
+                || comparison.reference_producer_toolkit_version.is_none()
+                || comparison.reference_payload_size_bytes.is_none()
                 || comparison.first_differing_byte_offset.is_none()
+                || comparison
+                    .first_differing_byte_offset
+                    .is_some_and(|offset| {
+                        offset
+                            > comparison
+                                .computed_payload_size_bytes
+                                .min(comparison.reference_payload_size_bytes.unwrap_or(0))
+                    })
+                || (comparison.reference_payload_digest.as_ref()
+                    == Some(&comparison.computed_payload_digest)
+                    && comparison.reference_payload_size_bytes
+                        == Some(comparison.computed_payload_size_bytes))
             {
                 return Err(CacheError::InvalidManifest(
                     "mismatching output comparison lacks reference evidence".to_owned(),
@@ -615,7 +677,11 @@ fn validate_comparison(comparison: &ArtifactOutputComparison) -> Result<(), Cach
                 || comparison.reference_overlay.is_some()
                 || comparison.reference_producer_toolkit_version.is_some()
                 || comparison.reference_payload_size_bytes.is_some()
-                || comparison.reference_absence_reason.is_none()
+                || comparison.first_differing_byte_offset.is_some()
+                || comparison
+                    .reference_absence_reason
+                    .as_ref()
+                    .is_none_or(|reason| reason.trim().is_empty())
             {
                 return Err(CacheError::InvalidManifest(
                     "absent-reference comparison contains contradictory evidence".to_owned(),
@@ -694,14 +760,15 @@ fn comparison_totals(comparisons: &[ArtifactOutputComparison]) -> ArtifactOutput
     totals
 }
 
-fn comparison_sort_key(item: &ArtifactOutputComparison) -> String {
+fn comparison_sort_key(item: &ArtifactOutputComparison) -> (String, String, ContentDigest) {
     artifact_identity_key(&item.artifact_key)
 }
 
-fn artifact_identity_key(key: &ArtifactKey) -> String {
-    format!(
-        "{}\n{}\n{}",
-        key.kind, key.logical_key, key.parameters_digest.0
+fn artifact_identity_key(key: &ArtifactKey) -> (String, String, ContentDigest) {
+    (
+        key.kind.clone(),
+        key.logical_key.clone(),
+        key.parameters_digest.clone(),
     )
 }
 
@@ -1083,5 +1150,54 @@ mod tests {
         assert_eq!(report.totals.intra_run_nondeterminism, 1);
         let _ = fs::remove_dir_all(run_config.validation_root);
         let _ = fs::remove_dir_all(nondeterminism.validation_root);
+    }
+    #[test]
+    fn audit_output_identity_components_cannot_alias() {
+        let digest = ContentDigest::sha256(b"params");
+        let a = ArtifactKey {
+            kind: "a\nb".into(),
+            logical_key: "c".into(),
+            parameters_digest: digest.clone(),
+        };
+        let b = ArtifactKey {
+            kind: "a".into(),
+            logical_key: "b\nc".into(),
+            parameters_digest: digest,
+        };
+        assert_ne!(artifact_identity_key(&a), artifact_identity_key(&b));
+    }
+    #[test]
+    fn audit_changed_reference_cannot_leave_passing_report() {
+        let _guard = output_validation_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg = config("audit-reference-changed");
+        begin_output_validation_run(cfg.clone()).unwrap();
+        let key = semantic("same", 17);
+        let computed = manifest(&key, "same", b"same", vec![]);
+        record("compute", &key, &computed, b"same", &computed, b"same");
+        let changed = manifest(&key, "same", b"different", vec![]);
+        record("compute", &key, &computed, b"same", &changed, b"different");
+        let result = finalize_output_validation_run();
+        let _ = fs::remove_dir_all(cfg.validation_root);
+        assert!(
+            result.is_err(),
+            "a later mismatch must invalidate the whole run"
+        );
+    }
+    #[test]
+    fn audit_comparison_rejects_malformed_reference_digest() {
+        let _guard = output_validation_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg = config("audit-reference-invalid");
+        begin_output_validation_run(cfg).unwrap();
+        let key = semantic("same", 18);
+        let computed = manifest(&key, "same", b"same", vec![]);
+        record("compute", &key, &computed, b"same", &computed, b"same");
+        let run = active_run().lock().unwrap().take().unwrap();
+        let mut comparison = run.records.into_values().next().unwrap();
+        comparison.reference_manifest_digest = Some(ContentDigest("invalid".into()));
+        assert!(validate_comparison(&comparison).is_err());
     }
 }

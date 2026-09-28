@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use rayon::prelude::*;
-use rug::{Assign, Float};
+use rug::{float::Round, Assign, Float};
 use serde::{Deserialize, Serialize};
 use xc_core::{
     CrossFingerprintComparison, DecimalLiteral, DeterministicReductionPolicy, ExecutionFingerprint,
@@ -23,6 +23,8 @@ pub struct HpReductionComparison {
     pub plan: ReproducibilityComparisonPlan,
     pub left_payload_sha256: String,
     pub right_payload_sha256: String,
+    /// Round-trip encoding of an upward-rounded bound for the exact stored
+    /// scalar difference, at max(source precision)+64 bits.
     pub absolute_difference: String,
     pub absolute_tolerance: DecimalLiteral,
     pub accepted: bool,
@@ -331,6 +333,11 @@ pub fn deterministic_parallel_sum_hp(
             .collect()
     });
     let value = deterministic_pairwise_sum_hp(&level, precision_bits);
+    if !value.is_finite() {
+        return Err(anyhow!(
+            "deterministic HP reduction exceeds the finite exponent range"
+        ));
+    }
     let artifact = ReproducibleReductionArtifact::new(
         fingerprint,
         policy.clone(),
@@ -360,22 +367,45 @@ pub fn compare_hp_reduction_artifacts(
     let precision_bits = left
         .precision_bits
         .max(right.precision_bits)
-        .saturating_add(64);
-    let left_value = parse(&left.value, precision_bits, "left HP reduction value")?;
-    let right_value = parse(&right.value, precision_bits, "right HP reduction value")?;
-    let tolerance = parse(
-        criterion.absolute_tolerance.as_str(),
-        precision_bits,
-        "HP reduction absolute tolerance",
+        .checked_add(64)
+        .filter(|p| *p <= rug::float::prec_max())
+        .ok_or_else(|| anyhow!("HP reduction comparison guard precision is unsupported"))?;
+    // The payload encodes a stored Float, not the exact decimal rational
+    // displayed in its round-trip string. Decode at its own precision first.
+    let left_value = parse(&left.value, left.precision_bits, "left HP reduction value")?;
+    let right_value = parse(
+        &right.value,
+        right.precision_bits,
+        "right HP reduction value",
     )?;
-    if tolerance < 0 {
+    if encode(&left_value, left.precision_bits) != left.value
+        || encode(&right_value, right.precision_bits) != right.value
+    {
         return Err(anyhow!(
-            "HP reduction absolute tolerance must be nonnegative"
+            "HP reduction payload is not a canonical round-trip scalar"
         ));
     }
-    let mut difference = left_value;
-    difference -= right_value;
-    difference.abs_mut();
+    criterion.absolute_tolerance.validate()?;
+    let parsed = Float::parse(criterion.absolute_tolerance.as_str())
+        .context("parse HP reduction absolute tolerance")?;
+    let tolerance = Float::with_val_round(precision_bits, parsed, Round::Down).0;
+    if !tolerance.is_finite() || tolerance < 0 {
+        return Err(anyhow!(
+            "HP reduction absolute tolerance must be finite and nonnegative"
+        ));
+    }
+    // Upward difference and downward tolerance cannot promote a rounded
+    // boundary coincidence to exact numerical equivalence.
+    let difference = if left_value >= right_value {
+        Float::with_val_round(precision_bits, &left_value - &right_value, Round::Up).0
+    } else {
+        Float::with_val_round(precision_bits, &right_value - &left_value, Round::Up).0
+    };
+    if !difference.is_finite() {
+        return Err(anyhow!(
+            "HP reduction difference exceeds the finite exponent range"
+        ));
+    }
     let accepted = match plan.required_comparison {
         CrossFingerprintComparison::ByteIdentity => {
             left.payload_sha256 == right.payload_sha256 && left.value == right.value

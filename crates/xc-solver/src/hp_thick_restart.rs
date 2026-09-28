@@ -20,9 +20,16 @@ pub struct ThickRestartLanczosConfigHp {
     pub maximum_restarts: usize,
     pub minimum_restarts: usize,
     pub maximum_projected_sweeps: usize,
+    /// Absolute residual in operator units; acceptance is this OR the scaled
+    /// backward-error tolerance, followed by the separate stability guards.
+    /// Scaling the operator without scaling this tolerance changes acceptance.
     pub absolute_residual_tolerance: DecimalLiteral,
+    /// Dimensionless residual normalized by the computed action norms.
     pub scaled_backward_error_tolerance: DecimalLiteral,
+    /// Maximum absolute |lambda_new-lambda_old| in eigenvalue units.
+    /// This is iterate agreement, not an eigenvalue error bound.
     pub ritz_value_stability_tolerance: DecimalLiteral,
+    /// Absolute projected gap tolerance in eigenvalue/target-distance units.
     pub boundary_cluster_tolerance: DecimalLiteral,
 }
 
@@ -33,6 +40,7 @@ pub struct ThickRestartEigenpairHp {
     pub residual_norm: Float,
     pub scaled_backward_error: Float,
     pub diagnostics: super::EigenpairDiagnostics<Float>,
+    pub stopping_evidence: super::HpResidualAcceptance,
 }
 
 #[derive(Clone, Debug)]
@@ -50,11 +58,21 @@ pub struct ThickRestartBoundaryClusterHp {
 }
 
 #[derive(Clone, Debug)]
+/// Retained Ritz candidates with residual, stability, and source-bound count evidence.
+/// A successful separated request requires a complete count at its boundary;
+/// unavailable or mismatched counts retain candidates with an unresolved status.
 pub struct ThickRestartLanczosReportHp {
+    /// A source-bound count established the number of eigenvalues on the requested side.
+    pub global_target_ordering_established: bool,
+    pub boundary_count_evidence: super::BoundaryCountEvidenceHp,
+    pub algorithm: String,
     pub target: EigenTarget,
     pub requested_eigenpairs: usize,
     pub retained_eigenpairs: Vec<ThickRestartEigenpairHp>,
     pub boundary_cluster: Option<ThickRestartBoundaryClusterHp>,
+    pub effective_boundary_cluster_tolerance: Float,
+    /// Whether cluster members also appear in retained_eigenpairs.
+    pub cluster_members_in_retained_eigenpairs: bool,
     pub restarts: usize,
     pub krylov_steps: usize,
     pub operator_applications: usize,
@@ -84,20 +102,11 @@ fn zero(precision: u32) -> Float {
 }
 
 fn parse_positive(
-    value: &DecimalLiteral,
+    value: &xc_core::DecimalLiteral,
     precision: u32,
     name: &str,
 ) -> Result<Float, SolverError> {
-    let parsed = Float::parse(value.as_str()).map_err(|error| {
-        SolverError::InvalidConfiguration(format!("failed to parse {name}: {error}"))
-    })?;
-    let parsed = Float::with_val(precision, parsed);
-    if !parsed.is_finite() || parsed <= 0 {
-        return Err(SolverError::InvalidConfiguration(format!(
-            "{name} must be finite and positive"
-        )));
-    }
-    Ok(parsed)
+    super::hp_positive_threshold(value, precision, name, rug::float::Round::Down)
 }
 
 fn dot(left: &[Float], right: &[Float], precision: u32) -> Float {
@@ -111,11 +120,21 @@ fn dot(left: &[Float], right: &[Float], precision: u32) -> Float {
 }
 
 fn norm(vector: &[Float], precision: u32) -> Float {
-    dot(vector, vector, precision).sqrt()
+    super::hp_norm(vector, precision)
 }
 
 fn add_orthonormal(candidate: Vec<Float>, basis: &mut Vec<Vec<Float>>, precision: u32) -> bool {
     let mut candidate = candidate;
+    // Rank is invariant under nonzero scalar rescaling. Normalize before
+    // projection so the rejection threshold measures relative loss of rank.
+    let original_norm = norm(&candidate, precision);
+    if !original_norm.is_finite() || original_norm.is_zero() {
+        return false;
+    }
+    for value in &mut candidate {
+        *value = Float::with_val(precision, &*value);
+        *value /= &original_norm;
+    }
     for _ in 0..2 {
         for vector in basis.iter() {
             let projection = dot(vector, &candidate, precision);
@@ -143,17 +162,7 @@ fn apply(
     vector: &[Float],
     precision: u32,
 ) -> Result<Vec<Float>, SolverError> {
-    let mut output = vec![zero(precision); vector.len()];
-    operator.apply(vector, &mut output)?;
-    for value in &mut output {
-        if !value.is_finite() {
-            return Err(SolverError::NumericalBreakdown(
-                "HP Lanczos operator produced a nonfinite value".to_owned(),
-            ));
-        }
-        *value = Float::with_val(precision, &*value);
-    }
-    Ok(output)
+    super::hp_checked_action(operator, vector, precision)
 }
 
 fn orthogonality_errors(states: &[RitzState], precision: u32) -> (Vec<Float>, Float) {
@@ -219,7 +228,7 @@ impl ThickRestartLanczosHp {
         let retained = config
             .requested_eigenpairs
             .saturating_add(config.guard_eigenpairs);
-        if config.precision_bits <= 32
+        if !(33..=1_000_000).contains(&config.precision_bits)
             || dimension == 0
             || retained > dimension
             || config.requested_eigenpairs == 0
@@ -231,7 +240,7 @@ impl ThickRestartLanczosHp {
             || config.maximum_projected_sweeps == 0
         {
             return Err(SolverError::InvalidConfiguration(
-                "HP thick-restart Lanczos requires valid counts, mandatory guards, a retained block smaller than the bounded Krylov subspace, precision above 32 bits, and valid restart limits"
+                "HP thick-restart Lanczos requires valid counts, mandatory guards, a retained block smaller than the bounded Krylov subspace, precision in 33..=1000000 bits, and valid restart limits"
                     .to_owned(),
             ));
         }
@@ -250,6 +259,12 @@ impl ThickRestartLanczosHp {
             config.precision_bits,
             "Ritz-value stability tolerance",
         )?;
+        let cluster_tolerance = super::hp_positive_threshold(
+            &config.boundary_cluster_tolerance,
+            config.precision_bits,
+            "boundary cluster tolerance",
+            rug::float::Round::Up,
+        )?;
         let mut retained_states: Vec<RitzState> = Vec::new();
         let mut previous_values: Option<Vec<Float>> = None;
         let mut operator_applications = 0usize;
@@ -261,25 +276,40 @@ impl ThickRestartLanczosHp {
                 .iter()
                 .map(|state| state.vector.clone())
                 .collect();
-            let continuation = retained_states
-                .iter()
-                .take(config.requested_eigenpairs)
-                .max_by(|left, right| {
-                    left.residual_norm
-                        .partial_cmp(&right.residual_norm)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|state| state.residual.clone())
-                .unwrap_or_else(|| {
+            if retained_states.is_empty() {
+                for seed in 0..retained {
+                    let candidate = (0..dimension)
+                        .map(|row| Float::with_val(config.precision_bits, row + seed + 1).recip())
+                        .collect();
+                    let _ = add_orthonormal(candidate, &mut basis, config.precision_bits);
+                }
+            }
+            let continuation = if retained_states.is_empty() {
+                Some(
                     (0..dimension)
-                        .map(|row| {
-                            let mut value = Float::with_val(config.precision_bits, row + 1);
-                            value = value.recip();
-                            value
-                        })
-                        .collect()
-                });
-            let _ = add_orthonormal(continuation, &mut basis, config.precision_bits);
+                        .map(|row| Float::with_val(config.precision_bits, row + 1).recip())
+                        .collect(),
+                )
+            } else {
+                retained_states
+                    .iter()
+                    .filter(|state| {
+                        state.residual_norm > absolute_tolerance
+                            && state.backward_error > backward_tolerance
+                    })
+                    .max_by(|left, right| {
+                        left.residual_norm
+                            .partial_cmp(&right.residual_norm)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|state| state.residual.clone())
+            };
+            // Once requested residuals have converged, explore a fresh coordinate.
+            // Normalizing roundoff-sized residuals can retain the same invariant
+            // space and miss another direction of a repeated eigenvalue.
+            if let Some(continuation) = continuation {
+                let _ = add_orthonormal(continuation, &mut basis, config.precision_bits);
+            }
             for coordinate in 0..dimension {
                 if basis.len() > retained_states.len() {
                     break;
@@ -294,15 +324,13 @@ impl ThickRestartLanczosHp {
             // in low bits from a fresh operator application.
             let mut retained_applied: Vec<Option<Vec<Float>>> =
                 (0..basis.len()).map(|_| None).collect();
+            let mut expansion_index = 0usize;
             while basis.len() < config.maximum_subspace_dimension {
                 check_solver_cancellation(cancellation)?;
-                let candidate = apply(
-                    operator,
-                    basis.last().expect("basis is nonempty"),
-                    config.precision_bits,
-                )?;
+                let candidate = apply(operator, &basis[expansion_index], config.precision_bits)?;
                 operator_applications += 1;
-                let current = basis.len() - 1;
+                let current = expansion_index;
+                expansion_index += 1;
                 if reuse_direct_images {
                     retained_applied[current] = Some(candidate.clone());
                 }
@@ -390,15 +418,13 @@ impl ThickRestartLanczosHp {
                         result
                     })
                     .collect();
-                let residual_norm = norm(&residual, config.precision_bits);
-                let mut scale = norm(&applied_vector, config.precision_bits);
-                let mut value_scale = value.clone().abs();
-                value_scale *= norm(&vector, config.precision_bits);
-                scale += value_scale;
-                let mut backward_error = residual_norm.clone();
-                if !scale.is_zero() {
-                    backward_error /= scale;
-                }
+                let (residual_norm, backward_error) = super::hp_residual_measures(
+                    &residual,
+                    &applied_vector,
+                    &vector,
+                    &value,
+                    config.precision_bits,
+                )?;
                 states.push(RitzState {
                     vector,
                     applied: applied_vector,
@@ -412,10 +438,9 @@ impl ThickRestartLanczosHp {
                 .as_ref()
                 .map(|previous| {
                     let mut maximum = zero(config.precision_bits);
-                    for index in 0..config.requested_eigenpairs {
-                        let mut change = states[index].value.clone();
-                        change -= &previous[index];
-                        change.abs_mut();
+                    for index in 0..states.len() {
+                        let change =
+                            super::hp_ritz_change(&states[index].value, &previous[index], None);
                         if change > maximum {
                             maximum = change;
                         }
@@ -425,17 +450,29 @@ impl ThickRestartLanczosHp {
                 .unwrap_or_else(|| {
                     Float::with_val(config.precision_bits, rug::float::Special::Infinity)
                 });
-            let residuals_converged =
-                states
-                    .iter()
-                    .take(config.requested_eigenpairs)
-                    .all(|state| {
-                        state.residual_norm <= absolute_tolerance
-                            || state.backward_error <= backward_tolerance
-                    });
-            let converged = restart >= config.minimum_restarts
+            // Refine and qualify the entire retained requested+guard block.
+            let residuals_converged = states.iter().all(|state| {
+                state.residual_norm <= absolute_tolerance
+                    || state.backward_error <= backward_tolerance
+            });
+            let candidate_converged = restart >= config.minimum_restarts
                 && residuals_converged
                 && maximum_stability <= stability_tolerance;
+            let evidence = if candidate_converged || restart == config.maximum_restarts {
+                super::hp_boundary_count::boundary_count(
+                    operator,
+                    &config.target,
+                    config.requested_eigenpairs,
+                    &states.iter().map(|s| s.value.clone()).collect::<Vec<_>>(),
+                    &cluster_tolerance,
+                    config.precision_bits,
+                )?
+            } else {
+                super::BoundaryCountEvidenceHp::Unavailable {
+                    reason: "Ritz iteration has not met residual and stability requirements".into(),
+                }
+            };
+            let converged = candidate_converged;
             if converged || restart == config.maximum_restarts {
                 return build_report(
                     config,
@@ -445,6 +482,7 @@ impl ThickRestartLanczosHp {
                     operator_applications,
                     maximum_stability,
                     converged,
+                    evidence,
                 );
             }
             previous_values = Some(states.iter().map(|state| state.value.clone()).collect());
@@ -454,6 +492,8 @@ impl ThickRestartLanczosHp {
     }
 }
 
+// Keep actual work counters and distinct acceptance evidence explicit here.
+#[allow(clippy::too_many_arguments)]
 fn build_report(
     config: &ThickRestartLanczosConfigHp,
     states: Vec<RitzState>,
@@ -462,14 +502,32 @@ fn build_report(
     operator_applications: usize,
     maximum_stability: Float,
     converged: bool,
+    boundary_count_evidence: super::BoundaryCountEvidenceHp,
 ) -> Result<ThickRestartLanczosReportHp, SolverError> {
+    let absolute_tolerance = parse_positive(
+        &config.absolute_residual_tolerance,
+        config.precision_bits,
+        "absolute residual tolerance",
+    )?;
+    let backward_tolerance = parse_positive(
+        &config.scaled_backward_error_tolerance,
+        config.precision_bits,
+        "scaled backward-error tolerance",
+    )?;
     let operator_dimension = states.first().map_or(0, |state| state.vector.len());
-    let cluster_tolerance = parse_positive(
+    let cluster_tolerance = super::hp_positive_threshold(
         &config.boundary_cluster_tolerance,
         config.precision_bits,
         "boundary cluster tolerance",
+        rug::float::Round::Up,
     )?;
     let retained = states.len();
+    let cluster_tolerance = super::hp_effective_cluster_tolerance(
+        &cluster_tolerance,
+        states.iter().map(|state| &state.value),
+        operator_dimension,
+        config.precision_bits,
+    );
     let mut boundary_cluster = None;
     if config.requested_eigenpairs < retained {
         let requested = config.requested_eigenpairs - 1;
@@ -552,6 +610,16 @@ fn build_report(
                 .is_some_and(|range| range.contains(position))
         })
         .map(|(position, state)| ThickRestartEigenpairHp {
+            stopping_evidence: super::hp_residual_acceptance(
+                &state.applied,
+                &state.vector,
+                &state.value,
+                &state.residual_norm,
+                &state.backward_error,
+                &absolute_tolerance,
+                &backward_tolerance,
+                config.precision_bits,
+            ),
             eigenvalue: state.value.clone(),
             eigenvector: state.vector.clone(),
             residual_norm: state.residual_norm.clone(),
@@ -569,10 +637,22 @@ fn build_report(
             ResultStatus::UnresolvedCluster,
             TerminationReason::UnresolvedCluster,
         )
+    } else if converged && !boundary_count_evidence.establishes_requested_count() {
+        (
+            ResultStatus::UnresolvedEigenspace,
+            TerminationReason::UnresolvedEigenspace,
+        )
     } else if converged {
         (
             ResultStatus::Converged,
-            TerminationReason::BackwardErrorTolerance,
+            super::hp_block_termination(
+                states
+                    .iter()
+                    .take(config.requested_eigenpairs)
+                    .map(|state| (&state.residual_norm, &state.backward_error)),
+                &absolute_tolerance,
+                &backward_tolerance,
+            ),
         )
     } else {
         (
@@ -584,10 +664,15 @@ fn build_report(
     let mut provenance = SolverProvenance::current_package("rug_mpfr");
     provenance.precision_bits = Some(config.precision_bits);
     Ok(ThickRestartLanczosReportHp {
+        global_target_ordering_established: boundary_count_evidence.establishes_requested_count(),
+        boundary_count_evidence,
+        algorithm: super::HP_KRYLOV_COUNT_SEMANTICS.into(),
         target: config.target.clone(),
         requested_eigenpairs: config.requested_eigenpairs,
         retained_eigenpairs,
         boundary_cluster,
+        effective_boundary_cluster_tolerance: cluster_tolerance,
+        cluster_members_in_retained_eigenpairs: false,
         restarts,
         krylov_steps,
         operator_applications,
@@ -701,7 +786,17 @@ mod tests {
         let report = ThickRestartLanczosHp
             .solve(&operator, &config(EigenTarget::AlgebraicSmallest))
             .unwrap();
-        assert_eq!(report.status, ResultStatus::UnresolvedCluster);
+        assert_eq!(
+            report.status,
+            ResultStatus::UnresolvedCluster,
+            "pairs={:?}; stability={}",
+            report
+                .retained_eigenpairs
+                .iter()
+                .map(|pair| (&pair.eigenvalue, &pair.residual_norm))
+                .collect::<Vec<_>>(),
+            report.maximum_ritz_value_stability
+        );
         let cluster = report.boundary_cluster.unwrap();
         assert_eq!(cluster.dimension, 2);
         assert_eq!(cluster.requested_members, 1);
@@ -758,6 +853,57 @@ mod tests {
             assert_eq!(actual.residual_norm, expected.residual_norm);
             assert_eq!(actual.scaled_backward_error, expected.scaled_backward_error);
             assert_eq!(actual.diagnostics, expected.diagnostics);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tolerance_boundary_contract {
+    use super::*;
+    #[test]
+    fn acceptance_threshold_cannot_round_up_to_one() {
+        let threshold =
+            xc_core::DecimalLiteral::new("0.999999999999999999999999999999999999999999").unwrap();
+        // 1 exceeds the exact requested threshold, even though nearest
+        // rounding at 64 bits makes the two values indistinguishable.
+        assert!(parse_positive(&threshold, 64, "acceptance tolerance").unwrap() < 1);
+    }
+}
+
+#[cfg(test)]
+mod operator_precision_contract {
+    use super::*;
+    #[test]
+    fn action_cannot_silently_promote_lower_precision_results() {
+        let operator = xc_operator::DenseSymmetricHp::new(
+            "fixed 32-bit action",
+            2,
+            [1, 0, 0, 2].map(|v| Float::with_val(32, v)).to_vec(),
+            32,
+            &Float::with_val(32, 0),
+        )
+        .unwrap();
+        let vector = [Float::with_val(128, 1), Float::with_val(128, 1)];
+        assert!(apply(&operator, &vector, 128).is_err());
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_rank_contract {
+    use super::*;
+    #[test]
+    fn rank_is_invariant_under_nonzero_power_of_two_scaling() {
+        for exponent in [-200i32, 0, 200] {
+            let scale = Float::with_val(128, 2).pow(exponent);
+            let candidate = vec![scale.clone(), scale];
+            let mut basis = vec![vec![Float::with_val(128, 1), Float::with_val(128, 0)]];
+            assert!(
+                add_orthonormal(candidate, &mut basis, 128),
+                "scale exponent {exponent}"
+            );
+            assert_eq!(basis.len(), 2);
+            assert!(basis[1][0].clone().abs() < Float::with_val(128, 2).pow(-100));
+            assert_eq!(basis[1][1], 1);
         }
     }
 }

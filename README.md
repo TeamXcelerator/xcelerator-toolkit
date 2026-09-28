@@ -7,7 +7,7 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-## Retained research with v0.15.1
+## Retained research with v0.15.2
 
 Xcelerator Toolkit supplies high-precision numerical libraries and reusable,
 source-bound research data. Applications can retain a primary calculation once
@@ -34,8 +34,9 @@ sums and searchable scalar exports are described in the
 ## Getting started
 
 The minimum supported Rust version is 1.98. Development uses the stable
-channel selected by `rust-toolchain.toml`; v0.15.1 was qualified with Rust
-1.98.1. Record the exact compiler version for reproducible experiments.
+channel selected by `rust-toolchain.toml`; v0.15.2 was qualified locally with Rust
+1.98.0 on x86-64 Windows/MSVC and Ubuntu/WSL. Record the exact compiler version
+for reproducible experiments.
 
 ```bash
 cargo build --workspace --release --locked
@@ -118,7 +119,7 @@ A numerical claim does not need to be rerun just because publication stopped.
 - **Compute-first workflow** — request a result and use it. The toolkit reuses a compatible cache entry when available and computes the result when it is not.
 - **Computed assurance by default** — ordinary calculations run their normal validation and diagnostics without the substantial additional cost of rigorous certification.
 - **High-precision numerics** — GMP/MPFR-based arithmetic, deterministic reductions, structured linear algebra, root finding, and eigensolvers.
-- **Research mathematics** — CCM finite Weil forms, the CCM target function and weighted eigenfunction distances, prolate and Mellin methods, Suzuki screw functions, Yakaboylu operators, Dirichlet L-functions, zeta utilities, and Maynard–Tao variational calculations.
+- **Research mathematics** — CCM finite Weil forms, the CCM target function and weighted eigenfunction distances, prolate and Mellin methods, Suzuki screw functions, Yakaboylu operators, Dirichlet character data (generalized L-function CCM assembly is planned), zeta utilities, and Maynard–Tao variational calculations.
 - **Reusable artifacts** — versioned, content-addressed local and remote caching with validation before reuse.
 - **Output-preserving optimization** — cache verification compares recomputed payload bytes with current references, while deterministic HP parallelism and retained validated values reduce avoidable work without changing artifact identities.
 - **Optional stronger assurance** — independent cross-checks and replayable finite certificates are available for claims that need them.
@@ -138,7 +139,7 @@ Finite computations are always reported with their finite scope. They are not pr
 | [`xc-root`](crates/xc-root) | Root isolation, refinement, interval Newton, and contour-counting services. |
 | [`xc-certify`](crates/xc-certify) | Optional finite-dimensional certificate construction and replay. |
 | [`xc-cache`](crates/xc-cache) | Artifact identity, validation, and local or remote reuse. |
-| [`xc-spectral`](crates/xc-spectral) | CCM, prolate, Mellin, screw, Yakaboylu, and L-function workflows. |
+| [`xc-spectral`](crates/xc-spectral) | CCM, prolate, Mellin, screw, Yakaboylu, and Dirichlet character utilities; generalized L-function CCM assembly is planned. |
 | [`xc-variational`](crates/xc-variational) | Exact and high-precision Maynard–Tao engines. |
 | [`xc-zeta`](crates/xc-zeta) | Zeta reference-data loading. |
 | [`xc-cli`](crates/xc-cli) | Cache and research-operation command-line tools. |
@@ -179,7 +180,7 @@ cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-Maintainers additionally run private release audits and HP validation before tagging a release.
+Maintainers additionally run HP validation before tagging a release.
 
 ## Scientific limits and reproducibility
 

@@ -16,7 +16,7 @@ def source_digest(root=ROOT, require_committed=False):
  pins=json.loads(pins_path.read_text(encoding='utf-8')) if pins_path.exists() else {}
  def normalize(name,raw):return raw if name in pins else raw.replace(b'\r\n',b'\n')
  def source(name):
-  return name in pins or name in {'.gitattributes','tools/byte_exact_inputs.json','tools/handmaintained_schemas.json','tools/requirements-validation.txt'} or name.startswith('tools/') and name.endswith('.py') or Path(name).suffix in {'.rs','.c','.h'} or Path(name).name in {'Cargo.toml','Cargo.lock','compact_field_policy.txt'}
+  return name in pins or (Path(name).parent.name == '.cargo' and Path(name).name in {'config','config.toml'}) or Path(name).name in {'rust-toolchain','rust-toolchain.toml'} or name in {'.gitattributes','tools/byte_exact_inputs.json','tools/handmaintained_schemas.json','tools/requirements-validation.txt'} or name.startswith('tools/') and name.endswith('.py') or Path(name).suffix in {'.rs','.c','.h'} or Path(name).name in {'Cargo.toml','Cargo.lock','compact_field_policy.txt'}
  tracked=set(git('ls-files','--cached','-z').decode().split('\0'))-{''}
  others=set(git('ls-files','--others','--exclude-standard','-z').decode().split('\0'))-{''}
  names=sorted(n for n in tracked|others if source(n))
@@ -48,7 +48,7 @@ def repository_bytes(root=ROOT):
  entries=git('ls-files','--eol','-z').decode().split('\0')
  for entry in filter(None,entries):
   info,name=entry.split('\t',1)
-  require(not info.startswith(('i/crlf','i/mixed')), 'noncanonical text in Git index: '+name)
+  require('attr/-text' in info or not info.startswith(('i/crlf','i/mixed')), 'noncanonical text in Git index: '+name)
  names=[e.split('\t',1)[1] for e in filter(None,entries)]
  scripts=[n for n in names if n.endswith(('.py','.sh'))]
  for name in scripts:
@@ -112,6 +112,78 @@ def main():
    if f.name=='acceptance.json':continue
    packet=json.loads(f.read_text());report=packet['report'];kind=report.get('kind') or packet['manifest']['key']['kind'];schema=json.loads((ROOT/'docs/schemas'/(kind.replace('_','-')+'-v1.schema.json')).read_text());v=Draft202012Validator(schema);v.validate(report);tests.append(kind)
    require(not (report.get('data',{}).get('reason') or '').startswith(';'), 'leading separator in report reason: '+kind)
+   # Check the current revision contract on actual producer outputs. Shape
+   # validation does not certify their numerical values or archived revisions.
+   bad=json.loads(json.dumps(report));bad['semantics']='unknown-future-revision';require(not v.is_valid(bad), 'schema accepted unknown report semantics: '+kind);negative+=1
+   for name in ['source_unit_arithmetic','compactness_arithmetic','maximum_additional_guard_bits','atom_arithmetic','atom_coordinate_serialization','maximum_atom_guard_bits','maximum_atom_exponent_span_bits','cluster_arithmetic','maximum_cluster_guard_bits','cluster_precision_policy','weighted_profile_arithmetic','maximum_weighted_profile_guard_bits','weighted_profile_output','projection_arithmetic','projection_output','l2_normalization_arithmetic','signed_channel_arithmetic','energy_arithmetic','maximum_energy_guard_bits','energy_output','directional_arithmetic','maximum_directional_guard_bits','directional_output','root_point_precision','allowance_arithmetic','maximum_allowance_guard_bits','allowance_output','transform_arithmetic','maximum_transform_guard_bits','curvature_output','resolution_arithmetic','resolution_output','observation_arithmetic','observation_output','comparison_arithmetic','comparison_output','maximum_comparison_guard_bits','finite_transfer_arithmetic','finite_transfer_output','maximum_finite_transfer_guard_bits','consistency_arithmetic','consistency_output','maximum_consistency_guard_bits','cluster_basis_arithmetic','cluster_operator_arithmetic','cluster_operator_output','maximum_cluster_operator_guard_bits','complex_arithmetic','complex_point_construction','complex_output','maximum_complex_guard_bits','complex_root_point_precision','tail_model_arithmetic','maximum_tail_form_exact_bits','transport_arithmetic','transport_output','maximum_transport_guard_bits','enclosure_point_precision','enclosure_decimal_output','signed_band_arithmetic','maximum_signed_band_exact_bits','signed_band_inverse_arithmetic','maximum_signed_band_inverse_guard_bits','polynomial_band_arithmetic','polynomial_root_output','maximum_polynomial_band_exact_bits','polynomial_root_window','acceptance_rounding','relative_change_arithmetic']:
+    if name not in report.get('request',{}):continue
+    for remove in [True,False]:
+     bad=json.loads(json.dumps(report))
+     if remove:bad['request'].pop(name)
+     else:bad['request'][name]='unknown-arithmetic'
+     require(not v.is_valid(bad), 'schema accepted missing/unknown arithmetic contract: '+kind+' '+name);negative+=1
+   if kind=='ccm_tail_operator_analysis':
+    name='model_linear_algebra_arithmetic'
+    require(report['request'].get(name)=='exact_stored_dot_product_stages_and_tail_bound_v0.15.2-v2', 'current tail producer lacks its arithmetic stamp')
+    bad=json.loads(json.dumps(report));bad['request'][name]='unknown-arithmetic'
+    require(not v.is_valid(bad), 'schema accepted unknown tail model arithmetic');negative+=1
+    legacy=json.loads(json.dumps(report));legacy['request'].pop(name)
+    require(v.is_valid(legacy), 'schema no longer reads legacy tail reports without the new arithmetic stamp')
+   if kind=='ccm_complex_transform_analysis':
+    measured=next((k for k,row in enumerate(report['data']['rows']) if row['outcome']=='point_measurement'),None)
+    require(measured is not None,'complex producer yielded no measured row')
+    for name in ['arithmetic_precision_bits','z_re_lower','value_re_lower','derivative_re_upper','normalized_im_lower','log_derivative_re_upper','normalization_denominator_resolved']:
+     bad=json.loads(json.dumps(report));bad['data']['rows'][measured]['values'].pop(name);require(not v.is_valid(bad),'schema accepted missing complex field: '+name);negative+=1
+    for name in ['arithmetic_precision_bits','normalization_anchor_lower','normalization_anchor_upper']:
+     bad=json.loads(json.dumps(report));bad['data']['values'].pop(name);require(not v.is_valid(bad),'schema accepted missing complex anchor field: '+name);negative+=1
+   if kind=='ccm_operator_cluster_analysis' and report['data']['rows']:
+    for name in ['arithmetic_precision_bits','coupling_gram_lower','coupling_gram_upper','compressed_operator_lower']:
+     bad=json.loads(json.dumps(report));bad['data']['rows'][0]['values'].pop(name);require(not v.is_valid(bad),'schema accepted missing cluster field: '+name);negative+=1
+    for name in ['column_selection_threshold','source_leakage_squared_lower']:
+     bad=json.loads(json.dumps(report));bad['data']['values'].pop(name);require(not v.is_valid(bad),'schema accepted missing cluster report field: '+name);negative+=1
+   if kind in ('ccm_finite_section_transfer','ccm_consistency_analysis'):
+    first='low_residual_squared' if kind=='ccm_finite_section_transfer' else 'action_difference_norm'
+    measured=next((k for k,row in enumerate(report['data']['rows']) if first in row['values']),None)
+    if measured is not None:
+     for name in ['arithmetic_precision_bits',first+'_lower',first+'_upper']:
+      bad=json.loads(json.dumps(report));bad['data']['rows'][measured]['values'].pop(name);require(not v.is_valid(bad),'schema accepted missing finite transfer/consistency field: '+name);negative+=1
+   if kind=='ccm_observable_budget_analysis':
+    for name in ['arithmetic_precision_bits','transform_origin_lower','origin_absolute_terms_upper']:
+     bad=json.loads(json.dumps(report));bad['data']['values'].pop(name);require(not v.is_valid(bad),'schema accepted missing observation field: '+name);negative+=1
+   if kind=='ccm_configuration_comparison':
+    measured=next((k for k,row in enumerate(report['data']['rows']) if 'signed_energy_difference' in row['values']),None)
+    if measured is not None:
+     for name in ['arithmetic_precision_bits','signed_energy_difference_lower','comparison_C_upper']:
+      bad=json.loads(json.dumps(report));bad['data']['rows'][measured]['values'].pop(name);require(not v.is_valid(bad),'schema accepted missing comparison field: '+name);negative+=1
+   if kind=='ccm_resolution_budget_analysis':
+    measured=next((k for k,row in enumerate(report['data']['rows']) if 'transform' in row['values']),None)
+    require(measured is not None,'resolution producer yielded no measured row')
+    for name in ['arithmetic_precision_bits','transform_lower','derivative_upper']:
+     bad=json.loads(json.dumps(report));bad['data']['rows'][measured]['values'].pop(name);require(not v.is_valid(bad),'schema accepted missing resolution field: '+name);negative+=1
+    for name in ['finite_curvature_expression_upper','relative_tolerance_lower']:
+     bad=json.loads(json.dumps(report));bad['data']['values'].pop(name);require(not v.is_valid(bad),'schema accepted missing resolution field: '+name);negative+=1
+   if kind=='ccm_energy_allowance_analysis':
+    for name in ['arithmetic_precision_bits','denominator_lower','conditional_energy_allowance_upper','scale_comparison_resolved']:
+     bad=json.loads(json.dumps(report));bad['data']['values'].pop(name);require(not v.is_valid(bad),'schema accepted missing allowance field: '+name);negative+=1
+   if kind=='ccm_directional_response_analysis':
+    measured=next((k for k,row in enumerate(report['data']['rows']) if 'directional_energy' in row['values']),None)
+    require(measured is not None,'directional producer yielded no measured row')
+    for name in ['arithmetic_precision_bits','directional_energy_lower','rational_root_condition_upper','root_condition_tolerance']:
+     bad=json.loads(json.dumps(report));bad['data']['rows'][measured]['values'].pop(name);require(not v.is_valid(bad),'schema accepted missing directional field: '+name);negative+=1
+   if kind=='ccm_arithmetic_energy_analysis':
+    for name in ['arithmetic_precision_bits','total_tau_energy_lower','energy_closure_defect_upper']:
+     bad=json.loads(json.dumps(report));bad['data']['values'].pop(name);require(not v.is_valid(bad), 'schema accepted missing energy enclosure field: '+name);negative+=1
+    bad=json.loads(json.dumps(report));bad['data']['rows'][0]['values'].pop('energy_lower');require(not v.is_valid(bad), 'schema accepted missing component energy enclosure');negative+=1
+   if kind=='ccm_signed_transform_analysis':
+    for name in ['arithmetic_precision_bits','normalization_precision_bits']:
+     bad=json.loads(json.dumps(report));bad['data']['values'].pop(name);require(not v.is_valid(bad), 'schema accepted missing signed-channel precision: '+name);negative+=1
+   if kind=='ccm_reference_projection_analysis':
+    for name in ['pivot_metric','arithmetic_precision_bits','arithmetic_enclosures']:
+     bad=json.loads(json.dumps(report));bad['data'].pop(name);require(not v.is_valid(bad), 'schema accepted missing projection arithmetic field: '+name);negative+=1
+    for name in ['source_center','reference_center','signed_unit_overlap','difference_norm_squared','fit_residual_norm_squared','minimum_pivot']:
+     if name not in report['data']['arithmetic_enclosures']:continue
+     bad=json.loads(json.dumps(report));bad['data']['arithmetic_enclosures'].pop(name);require(not v.is_valid(bad), 'schema accepted missing projection enclosure: '+name);negative+=1
+    bad=json.loads(json.dumps(report));bad['data']['arithmetic_enclosures']['source_center']=['0'];require(not v.is_valid(bad), 'schema accepted malformed projection enclosure');negative+=1
    if 'diagnostic' in report.get('data',{}):
     bad=json.loads(json.dumps(report));bad['request']['semantics']='unknown';require(not v.is_valid(bad), 'schema accepted negative mutation: '+kind);negative+=1
     bad=json.loads(json.dumps(report));bad['request']['unexpected']=1;require(not v.is_valid(bad), 'schema accepted negative mutation: '+kind);negative+=1

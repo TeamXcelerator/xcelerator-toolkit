@@ -40,3 +40,7 @@ performance-reports/
 # Python tooling
 __pycache__/
 *.py[cod]
+
+# Generated deep replay evidence is retained in portable hashed archives.
+
+# September 28 generated evidence is retained in its verified portable archive.

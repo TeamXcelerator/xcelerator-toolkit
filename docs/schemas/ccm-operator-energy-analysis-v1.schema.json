@@ -18,7 +18,30 @@
       "const": 1
     },
     "semantics": {
-      "const": "ccm-retained-research-observations-v1"
+      "enum": [
+        "ccm-retained-research-observations-v1",
+        "ccm-retained-research-observations-v2",
+        "ccm-retained-research-observations-v3",
+        "ccm-retained-research-observations-v4",
+        "ccm-retained-research-observations-v5",
+        "ccm-retained-research-observations-v6",
+        "ccm-retained-research-observations-v7",
+        "ccm-retained-research-observations-v8",
+        "ccm-retained-research-observations-v9",
+        "ccm-retained-research-observations-v10",
+        "ccm-retained-research-observations-v11",
+        "ccm-retained-research-observations-v12",
+        "ccm-retained-research-observations-v13",
+        "ccm-retained-research-observations-v14",
+        "ccm-retained-research-observations-v15",
+        "ccm-retained-research-observations-v16",
+        "ccm-retained-research-observations-v17",
+        "ccm-retained-research-observations-v18",
+        "ccm-retained-research-observations-v19",
+        "ccm-retained-research-observations-v20",
+        "ccm-retained-research-observations-v21",
+        "ccm-retained-research-observations-v22"
+      ]
     },
     "kind": {
       "const": "ccm_operator_energy_analysis"
@@ -54,13 +77,13 @@
               },
               "parameters_digest": {
                 "type": "string",
-                "pattern": "^[0-9a-f]{64}$"
+                "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
               }
             }
           },
           "content_digest": {
             "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
+            "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
           },
           "required_quality": {
             "enum": [
@@ -90,6 +113,9 @@
         },
         "formula": {
           "type": "string"
+        },
+        "residual_semantics": {
+          "const": "raw_matrix_explicit_zero_eigenvalue_normalization_v2"
         }
       }
     },
@@ -113,7 +139,7 @@
       "properties": {
         "lambda_squared": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
         },
         "n_modes": {
           "type": "integer",
@@ -125,33 +151,39 @@
         },
         "source_eigenvalue": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
         },
         "coefficient_norm_squared": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
         },
         "rayleigh_quotient": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
         },
         "eigenvalue_defect": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
         },
         "relative_residual": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
+        },
+        "residual_normalization": {
+          "enum": [
+            "absolute_residual_per_coefficient_l2_norm",
+            "relative_to_abs_eigenvalue_and_coefficient_l2_norm"
+          ]
         },
         "sum_absolute_energy_terms": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
         },
         "cancellation_digits": {
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+              "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
             },
             {
               "type": "null"
@@ -166,5 +198,27 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "request": {
+            "required": [
+              "residual_semantics"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "required": [
+              "residual_normalization"
+            ]
+          }
+        }
+      }
+    }
+  ]
 }

@@ -248,6 +248,38 @@ impl ScholarlyArchiveManifest {
                 "archive manifest lacks a required scholarly-release artifact role".to_owned(),
             ));
         }
+        for (role, digest) in [
+            (
+                ScholarlyArchiveArtifactRole::DependencyLock,
+                &self.dependency_lock_digest,
+            ),
+            (
+                ScholarlyArchiveArtifactRole::Requirements,
+                &self.requirements_digest,
+            ),
+            (
+                ScholarlyArchiveArtifactRole::TechnicalDesign,
+                &self.technical_design_digest,
+            ),
+            (
+                ScholarlyArchiveArtifactRole::TrustSnapshot,
+                &self.trust_snapshot_digest,
+            ),
+        ] {
+            let mut matches = self
+                .artifacts
+                .iter()
+                .filter(|artifact| artifact.role == role);
+            if !matches
+                .next()
+                .is_some_and(|artifact| &artifact.sha256 == digest)
+                || matches.next().is_some()
+            {
+                return Err(ScholarlyArchiveError::InvalidManifest(format!(
+                    "archive provenance digest must bind exactly one {role:?} artifact"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -404,8 +436,8 @@ pub fn verify_archive_deposit_receipt(
         || !valid_doi(&receipt.doi)
         || !valid_timestamp(&receipt.deposited_at_utc)
         || !valid_timestamp(&receipt.verified_at_utc)
-        || receipt.deposited_at_utc < plan.manifest.created_at_utc
-        || receipt.verified_at_utc < receipt.deposited_at_utc
+        || !timestamp_at_or_after(&receipt.deposited_at_utc, &plan.manifest.created_at_utc)
+        || !timestamp_at_or_after(&receipt.verified_at_utc, &receipt.deposited_at_utc)
         || !receipt.immutable
         || receipt.objects.len() != plan.manifest.artifacts.len()
     {
@@ -426,11 +458,13 @@ pub fn verify_archive_deposit_receipt(
     Ok(())
 }
 
-/// Verify the complete post-deposit evidence without trusting a provider label.
+/// Verify the identity and byte bindings of post-deposit evidence.
 ///
 /// The caller supplies the revision resolved from the local immutable tag, the
 /// raw provider response bytes, and the exact local deposit inventory. This
 /// function binds those independent observations to the typed plan and receipt.
+/// The caller must authenticate and interpret the provider response to establish
+/// its DOI and immutability claims; hashing opaque bytes does not establish them.
 pub fn verify_archive_deposit_evidence<'a, I>(
     plan: &ScholarlyArchivePlan,
     receipt: &ArchiveDepositReceipt,
@@ -512,20 +546,68 @@ fn valid_revision(value: &str) -> bool {
 }
 
 fn valid_date(value: &str) -> bool {
-    value.len() == 10
-        && value.as_bytes()[4] == b'-'
-        && value.as_bytes()[7] == b'-'
-        && value
+    if value.len() != 10
+        || value.as_bytes()[4] != b'-'
+        || value.as_bytes()[7] != b'-'
+        || !value
             .bytes()
             .enumerate()
             .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let year = value[..4].parse::<u32>().expect("validated ASCII digits");
+    let month = value[5..7].parse::<u32>().expect("validated ASCII digits");
+    let day = value[8..].parse::<u32>().expect("validated ASCII digits");
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => return false,
+    };
+    year != 0 && (1..=days).contains(&day)
+}
+
+// UTC Gregorian timestamps: YYYY-MM-DDTHH:MM:SS[.digits]Z, years 0001..9999.
+// Leap-second labels and offsets are not accepted. Fractions retain every digit.
+fn timestamp_parts(value: &str) -> Option<(&str, &str)> {
+    if !value.is_ascii() || value.len() < 20 || !value.ends_with('Z') {
+        return None;
+    }
+    let bytes = value.as_bytes();
+    if !valid_date(&value[..10]) || bytes[10] != b'T' || bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    for (start, limit) in [(11, 24), (14, 60), (17, 60)] {
+        if !bytes[start..start + 2].iter().all(u8::is_ascii_digit)
+            || value[start..start + 2].parse::<u32>().ok()? >= limit
+        {
+            return None;
+        }
+    }
+    let suffix = &value[19..value.len() - 1];
+    let fraction = if suffix.is_empty() {
+        ""
+    } else {
+        let digits = suffix.strip_prefix('.')?;
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        digits.trim_end_matches('0')
+    };
+    Some((&value[..19], fraction))
 }
 
 fn valid_timestamp(value: &str) -> bool {
-    value.len() >= 20
-        && value.ends_with('Z')
-        && valid_date(&value[..10])
-        && value.as_bytes()[10] == b'T'
+    timestamp_parts(value).is_some()
+}
+
+fn timestamp_at_or_after(later: &str, earlier: &str) -> bool {
+    match (timestamp_parts(later), timestamp_parts(earlier)) {
+        (Some(later), Some(earlier)) => later >= earlier,
+        _ => false,
+    }
 }
 
 fn valid_orcid(value: &str) -> bool {
@@ -612,7 +694,7 @@ mod tests {
             .iter()
             .map(|(path, role)| (path.to_string(), format!("{role:?}:{path}").into_bytes()))
             .collect::<Vec<_>>();
-        let artifacts = entries
+        let artifacts: Vec<_> = entries
             .iter()
             .zip(&files)
             .map(|((path, role), (_, bytes))| ScholarlyArchiveArtifact {
@@ -643,10 +725,10 @@ mod tests {
             },
             tag: "v0.13.0".to_owned(),
             source_revision: "9".repeat(40),
-            dependency_lock_digest: "a".repeat(64),
-            requirements_digest: "b".repeat(64),
-            technical_design_digest: "c".repeat(64),
-            trust_snapshot_digest: "d".repeat(64),
+            dependency_lock_digest: artifacts.iter().find(|a| a.role == ScholarlyArchiveArtifactRole::DependencyLock).unwrap().sha256.clone(),
+            requirements_digest: artifacts.iter().find(|a| a.role == ScholarlyArchiveArtifactRole::Requirements).unwrap().sha256.clone(),
+            technical_design_digest: artifacts.iter().find(|a| a.role == ScholarlyArchiveArtifactRole::TechnicalDesign).unwrap().sha256.clone(),
+            trust_snapshot_digest: artifacts.iter().find(|a| a.role == ScholarlyArchiveArtifactRole::TrustSnapshot).unwrap().sha256.clone(),
             artifacts,
             created_at_utc: "2026-07-16T12:00:00Z".to_owned(),
             finite_claim_statement: "Finite archived results retain their recorded assurance and do not imply continuum claims."
@@ -757,5 +839,13 @@ mod tests {
 
         manifest.artifacts.remove(0);
         assert!(manifest.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_archive_contract {
+    #[test]
+    fn untrusted_unicode_timestamp_returns_false_without_panicking() {
+        assert!(!super::valid_timestamp("2026-09-2\u{1f4a3}T00:00:00Z"));
     }
 }

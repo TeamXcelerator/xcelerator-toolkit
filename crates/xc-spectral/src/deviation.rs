@@ -3,36 +3,16 @@
 
 //! Decomposition of a profile deviation against a runtime-supplied auxiliary profile.
 //!
-//! The normalized even CCM eigenfunction departs from the target `τ` by a
-//! shape, not by noise. That shape is the reference deviation profile of
-//! [`crate::target`], and the decomposition records how much of it is present:
+//! For supplied samples D=f-tau and a reference g, this module measures
+//! a=<D,g>/<g,g> and the residual D-a*g in either of two discrete metrics.
+//! This does not establish that a particular reference explains a family of
+//! deviations, or that an observed component is signal rather than noise.
 //!
-//! ```text
-//!   D(u) = f_{N,λ}(u) − τ(u)
-//!   a₁   = ⟨D, g⟩ / ⟨g, g⟩
-//!   R(u) = D(u) − a₁ g(u)
-//! ```
-//!
-//! `a₁` and the residual are facts about one `(λ², N)` configuration. Laws
-//! relating them across configurations — how `a₁` scales, where it changes
-//! sign, what structure the residual retains — are not computed here.
-//!
-//! ## Two metrics, both recorded
-//!
-//! The distance functional is `d(N,λ) = ∫₁^λ |f − τ| u^{−1/2} du`, and there
-//! are two defensible ways to read that weight as an inner product: applied to
-//! each factor, or applied once to the product. They are not equivalent — the
-//! choice moves derived norm ratios by several percent. Neither is privileged
-//! here, so `project` takes the metric explicitly and callers are expected to
-//! record which one produced a number. See [`DeviationMetric`].
-//!
-//! ## Behavior at a crossing
-//!
-//! `a₁` passes through zero at a cutoff-dependent `N`, where the deviation is
-//! carried by other structure instead. That is a fact to record, not a failure:
-//! the projection stays well defined, only `relative_residual` approaches one.
-//! Nothing here rejects such a configuration, because those are precisely the
-//! configurations that locate the crossing.
+//! Trapezoidal node weights approximate integrals on the profile domain
+//! `[1,lambda]`. FactorWeighted uses 1/u and IntegrandWeighted uses 1/sqrt(u).
+//! Each result must retain its metric. No continuum quadrature error is enclosed.
+//! A zero overlap is valid; the relative residual is then near one for a nonzero
+//! deviation. Trends across cutoffs and model interpretation are separate work.
 
 /// Which inner product the projection is taken in.
 ///
@@ -57,145 +37,8 @@ impl DeviationMetric {
 }
 
 #[cfg(feature = "hp")]
-pub mod hp {
-    use super::DeviationMetric;
-    use anyhow::{bail, Result};
-    use rug::Float;
-
-    /// One projection of a deviation onto one reference, in one metric.
-    #[derive(Clone, Debug)]
-    pub struct DeviationProjection {
-        /// `a₁ = ⟨D, g⟩ / ⟨g, g⟩`. Signed; passes through zero at a crossing.
-        pub amplitude: Float,
-        /// `‖D‖`.
-        pub deviation_norm: Float,
-        /// `‖g‖`.
-        pub reference_norm: Float,
-        /// `‖D − a₁ g‖`.
-        pub residual_norm: Float,
-        /// `‖D − a₁ g‖ / ‖D‖`, or zero when the deviation vanishes.
-        pub relative_residual: Float,
-    }
-
-    fn weight(metric: DeviationMetric, u: &Float, prec: u32) -> Float {
-        let u = Float::with_val(prec, u);
-        match metric {
-            DeviationMetric::FactorWeighted => u.recip(),
-            DeviationMetric::IntegrandWeighted => u.sqrt().recip(),
-        }
-    }
-
-    /// Trapezoidal `∫ a b w` over the supplied grid.
-    ///
-    /// The grid is the profile's own sample grid, so the rule is the one the
-    /// profile was built for rather than an independent quadrature.
-    fn inner_product(
-        us: &[Float],
-        a: &[Float],
-        b: &[Float],
-        metric: DeviationMetric,
-        prec: u32,
-    ) -> Float {
-        let mut total = Float::with_val(prec, 0u32);
-        for index in 0..us.len().saturating_sub(1) {
-            let mut left = Float::with_val(prec, &a[index]);
-            left *= &b[index];
-            left *= &weight(metric, &us[index], prec);
-
-            let mut right = Float::with_val(prec, &a[index + 1]);
-            right *= &b[index + 1];
-            right *= &weight(metric, &us[index + 1], prec);
-
-            let mut step = Float::with_val(prec, &us[index + 1]);
-            step -= &us[index];
-
-            let mut cell = left;
-            cell += &right;
-            cell /= 2u32;
-            cell *= &step;
-            total += cell;
-        }
-        total
-    }
-
-    fn norm(us: &[Float], values: &[Float], metric: DeviationMetric, prec: u32) -> Float {
-        inner_product(us, values, values, metric, prec).sqrt()
-    }
-
-    /// Project `deviation` onto `reference` over `us` in `metric`.
-    ///
-    /// All three slices must share the profile grid. `us` must be strictly
-    /// ascending with at least two points, and `reference` must not be identically
-    /// zero.
-    pub fn project(
-        us: &[Float],
-        deviation: &[Float],
-        reference: &[Float],
-        metric: DeviationMetric,
-        prec: u32,
-    ) -> Result<DeviationProjection> {
-        if us.len() < 2 {
-            bail!("deviation projection requires at least two grid points");
-        }
-        if deviation.len() != us.len() || reference.len() != us.len() {
-            bail!(
-                "deviation projection sample counts disagree: grid {}, deviation {}, reference {}",
-                us.len(),
-                deviation.len(),
-                reference.len()
-            );
-        }
-        if us.windows(2).any(|pair| pair[1] <= pair[0]) {
-            bail!("deviation projection requires a strictly ascending grid");
-        }
-        if us
-            .iter()
-            .chain(deviation)
-            .chain(reference)
-            .any(|v| !v.is_finite())
-        {
-            bail!("deviation projection requires finite samples");
-        }
-
-        let reference_square = inner_product(us, reference, reference, metric, prec);
-        if reference_square <= 0u32 {
-            bail!("deviation projection requires a reference of positive norm");
-        }
-        let overlap = inner_product(us, deviation, reference, metric, prec);
-        let mut amplitude = overlap;
-        amplitude /= &reference_square;
-
-        let residual: Vec<Float> = deviation
-            .iter()
-            .zip(reference)
-            .map(|(d, r)| {
-                let mut scaled = Float::with_val(prec, r);
-                scaled *= &amplitude;
-                let mut value = Float::with_val(prec, d);
-                value -= &scaled;
-                value
-            })
-            .collect();
-
-        let deviation_norm = norm(us, deviation, metric, prec);
-        let residual_norm = norm(us, &residual, metric, prec);
-        let relative_residual = if deviation_norm > 0u32 {
-            let mut ratio = Float::with_val(prec, &residual_norm);
-            ratio /= &deviation_norm;
-            ratio
-        } else {
-            Float::with_val(prec, 0u32)
-        };
-
-        Ok(DeviationProjection {
-            amplitude,
-            deviation_norm,
-            reference_norm: reference_square.sqrt(),
-            residual_norm,
-            relative_residual,
-        })
-    }
-}
+#[path = "deviation/projection.rs"]
+pub mod hp;
 
 #[cfg(all(test, feature = "hp"))]
 mod tests {

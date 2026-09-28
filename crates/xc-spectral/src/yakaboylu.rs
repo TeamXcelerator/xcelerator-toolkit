@@ -5,7 +5,7 @@
 //!
 //! Implements the matrix-element computations and W-positivity tests from
 //! Yakaboylu, *Nontrivial Riemann Zeros as Spectrum* (arxiv 2408.15135 v15,
-//! J. Phys. A 57:235204).
+//! <https://arxiv.org/html/2408.15135v15#S4>).
 //!
 //! ## Mathematical setup
 //!
@@ -25,7 +25,11 @@
 //! - Diagonal (γ = γ'): → 1
 //! - Off-diagonal (γ ≠ γ'): → 0
 //!
-//! ## Tests provided
+//! Portable limit verification and certified spectrum positivity are planned.
+//! The available `test_*` routines evaluate a supplied finite epsilon and
+//! report point deviations or heuristic spectrum labels.
+//!
+//! ## Operations and intended verification
 //!
 //! - **`v_r_matrix_element_f64` / `_hp`**: closed-form computation at f64 or HP.
 //! - **`build_w_matrix_f64` / hp::build_w_matrix**: W matrix on first N Riemann zeros.
@@ -34,19 +38,17 @@
 //!
 //! ## What this verifies (and doesn't)
 //!
-//! These tests verify that Yakaboylu's framework is *internally consistent*
-//! at the precision we test — they do NOT test RH. The W matrix is the
-//! identity on critical-line zeros (since 1 - ρ̄ = ρ for ρ on the line),
-//! which is trivially positive. The test's value is in catching
-//! implementation bugs and validating the matrix-element computation
-//! before using it on more speculative tests (like Bombieri's quadratic
-//! form on CCM ξ_λ).
-//!
-//! Synthetic off-critical-line "zeros" (β + iγ with β ≠ 1/2) can be fed
-//! in to verify the framework WOULD detect RH violations: such inputs
-//! produce W with negative eigenvalues, as expected.
+//! These routines evaluate the meromorphic formula and finite critical-line
+//! Lorentzian matrices. They do not verify the full operator framework or RH.
+//! The Lorentzian kernel is positive semidefinite for any real ordinates,
+//! whether or not they are zeta zeros, and is singular for repeated ordinates.
+//! Finite epsilon is not the epsilon-to-zero limit. Synthetic off-line inputs
+//! test the continued formula; they need not lie in its integral convergence
+//! strip and do not establish positivity of an underlying Hilbert-space form.
 
 use anyhow::Result;
+
+mod kernel;
 
 /// Matrix element ⟨Ψ_s | V̂_R,ε | Ψ_s'⟩ at f64 precision.
 ///
@@ -54,7 +56,9 @@ use anyhow::Result;
 /// For s, s' on the critical line, simplifies to `ε² / [ε² + (γ'-γ)²]`.
 ///
 /// `s_re`, `s_im` are real and imaginary parts of s.
-/// `sp_re`, `sp_im` are real and imaginary parts of s'.
+/// `sp_re`, `sp_im` are real and imaginary parts of s'. Invalid parameters,
+/// poles and unrepresentable arithmetic return NaNs; use the checked variant
+/// for an error. Computed values are not certified enclosures.
 pub fn v_r_matrix_element_f64(
     s_re: f64,
     s_im: f64,
@@ -62,108 +66,114 @@ pub fn v_r_matrix_element_f64(
     sp_im: f64,
     epsilon: f64,
 ) -> (f64, f64) {
-    // (s̄ + s' - 1) = (s_re - i·s_im) + (sp_re + i·sp_im) - 1
-    //              = (s_re + sp_re - 1) + i·(sp_im - s_im)
-    let a_re = s_re + sp_re - 1.0;
-    let a_im = sp_im - s_im;
-    // a² = (a_re + i·a_im)² = (a_re² - a_im²) + 2·i·a_re·a_im
-    let a_sq_re = a_re * a_re - a_im * a_im;
-    let a_sq_im = 2.0 * a_re * a_im;
-    // Denominator: ε² - a²
-    let den_re = epsilon * epsilon - a_sq_re;
-    let den_im = -a_sq_im;
-    // Quotient: ε² / (den_re + i·den_im) = ε² · (den_re - i·den_im) / (den_re² + den_im²)
-    let den_mag_sq = den_re * den_re + den_im * den_im;
-    let eps_sq = epsilon * epsilon;
-    let result_re = eps_sq * den_re / den_mag_sq;
-    let result_im = -eps_sq * den_im / den_mag_sq;
-    (result_re, result_im)
+    try_v_r_matrix_element_f64(s_re, s_im, sp_re, sp_im, epsilon).unwrap_or((f64::NAN, f64::NAN))
+}
+
+/// Checked point evaluation of epsilon^2/(epsilon^2-(conj(s)+s'-1)^2).
+/// Requires finite parameters and epsilon>0; poles and unrepresentable
+/// arithmetic fail. Outside |Re(conj(s)+s'-1)|<epsilon this is meromorphic
+/// continuation, not the convergent integral representation.
+pub fn try_v_r_matrix_element_f64(
+    s_re: f64,
+    s_im: f64,
+    sp_re: f64,
+    sp_im: f64,
+    epsilon: f64,
+) -> Result<(f64, f64)> {
+    kernel::entry_f64(s_re, s_im, sp_re, sp_im, epsilon)
 }
 
 /// Test the Lorentzian limit on a pair of critical-line zeros (f64).
 /// Returns `(M(ε), |M(ε) - target|)` where target is δ_{γ,γ'}.
 pub fn test_lorentzian_limit_f64(gamma1: f64, gamma2: f64, epsilon: f64) -> (f64, f64, f64) {
-    let s_re = 0.5;
-    let sp_re = 0.5;
-    let (m_re, m_im) = v_r_matrix_element_f64(s_re, gamma1, sp_re, gamma2, epsilon);
-    let target = if (gamma1 - gamma2).abs() < 1e-30 {
-        1.0
-    } else {
-        0.0
-    };
-    let dev = ((m_re - target).powi(2) + m_im.powi(2)).sqrt();
-    (m_re, m_im, dev)
+    try_test_lorentzian_limit_f64(gamma1, gamma2, epsilon).unwrap_or((f64::NAN, f64::NAN, f64::NAN))
 }
 
-/// Build the N×N matrix `W_{ij} = lim_{ε→0+} ⟨Ψ_ρ_i | V̂_R,ε | Ψ_{1-ρ̄_j}⟩`.
+/// Finite-epsilon deviation from the exact discrete delta (exact equality of
+/// stored ordinates); this point diagnostic does not prove a limit.
+pub fn try_test_lorentzian_limit_f64(
+    gamma1: f64,
+    gamma2: f64,
+    epsilon: f64,
+) -> Result<(f64, f64, f64)> {
+    let (real, imaginary) = try_v_r_matrix_element_f64(0.5, gamma1, 0.5, gamma2, epsilon)?;
+    let target = if gamma1 == gamma2 { 1.0 } else { 0.0 };
+    let deviation = (real - target).hypot(imaginary);
+    anyhow::ensure!(
+        deviation.is_finite(),
+        "Lorentzian deviation is outside binary64 range"
+    );
+    Ok((real, imaginary, deviation))
+}
+
+/// Build the finite-epsilon N×N matrix
+/// `W_{ij}(ε) = ⟨Ψ_ρ_i | V̂_R,ε | Ψ_{1-ρ̄_j}⟩`.
 ///
-/// On critical-line zeros, this should be approximately the identity matrix
-/// (each ρ pairs only with itself since 1-ρ̄ = ρ on the critical line).
+/// Distinct critical-line ordinates approach the identity as epsilon tends
+/// to zero. Repeated ordinates give identical rows and a singular matrix.
 ///
 /// Returns the matrix as a flat `Vec<f64>` in row-major order.
-/// We use small-but-not-zero ε to stay within f64 precision.
+/// This evaluates the supplied finite positive epsilon. Invalid data panics;
+/// use `try_build_w_matrix_f64` to receive an error.
 pub fn build_w_matrix_f64(zeros: &[f64], epsilon: f64) -> Vec<f64> {
+    try_build_w_matrix_f64(zeros, epsilon).expect("valid representable finite Lorentzian matrix")
+}
+
+/// Checked finite-epsilon Lorentzian matrix. Requires at least one finite
+/// ordinate and finite epsilon>0; repeated ordinates are permitted.
+pub fn try_build_w_matrix_f64(zeros: &[f64], epsilon: f64) -> Result<Vec<f64>> {
     let n = zeros.len();
-    let mut w = vec![0.0; n * n];
+    anyhow::ensure!(
+        n > 0 && epsilon.is_finite() && epsilon > 0.0 && zeros.iter().all(|x| x.is_finite()),
+        "Lorentzian matrix requires nonempty finite ordinates and epsilon>0"
+    );
+    let entries = n
+        .checked_mul(n)
+        .ok_or_else(|| anyhow::anyhow!("matrix dimension overflow"))?;
+    let mut matrix = vec![0.0; entries];
     for i in 0..n {
-        for j in 0..n {
-            // ρ_i = 1/2 + i·γ_i. 1 - ρ̄_j = 1 - (1/2 - i·γ_j) = 1/2 + i·γ_j = ρ_j (on line)
-            // So we want ⟨Ψ_ρ_i | V̂_R | Ψ_ρ_j⟩ which on the line is the Lorentzian.
-            let (m_re, _m_im) = v_r_matrix_element_f64(0.5, zeros[i], 0.5, zeros[j], epsilon);
-            w[i * n + j] = m_re;
+        for j in 0..=i {
+            let (value, _) = try_v_r_matrix_element_f64(0.5, zeros[i], 0.5, zeros[j], epsilon)?;
+            matrix[i * n + j] = value;
+            matrix[j * n + i] = value;
         }
     }
-    w
+    Ok(matrix)
 }
 
 /// Compute the smallest eigenvalue of an N×N symmetric matrix to test
 /// positivity. Returns the smallest eigenvalue.
 pub fn smallest_eigenvalue_f64(matrix: &[f64], n: usize) -> Result<f64> {
-    use nalgebra::{DMatrix, SymmetricEigen};
-    if matrix.len() != n * n {
-        anyhow::bail!(
-            "matrix size mismatch: got {}, expected {}",
-            matrix.len(),
-            n * n
-        );
-    }
-    let m = DMatrix::from_row_slice(n, n, matrix);
-    let eig = SymmetricEigen::new(m);
-    let smallest = eig
-        .eigenvalues
-        .iter()
-        .cloned()
-        .fold(f64::INFINITY, f64::min);
-    Ok(smallest)
+    Ok(kernel::spectrum_f64(matrix, n)?[0])
 }
 
 /// Test W positivity on the first N Riemann zeros (f64 path).
 /// Returns the f64 result struct.
 pub fn test_w_positivity_f64(zeros: &[f64], epsilon: f64) -> Result<WPositivityResultF64> {
     let n = zeros.len();
-    let w = build_w_matrix_f64(zeros, epsilon);
-    let smallest = smallest_eigenvalue_f64(&w, n)?;
-
-    use nalgebra::{DMatrix, SymmetricEigen};
-    let m = DMatrix::from_row_slice(n, n, &w);
-    let eig = SymmetricEigen::new(m);
-    let mut evals: Vec<f64> = eig.eigenvalues.iter().copied().collect();
-    evals.sort_by(|a, b| a.total_cmp(b));
-    let largest = evals.last().copied().unwrap_or(0.0);
-    let cond = if smallest.abs() > 1e-300 {
-        largest / smallest.abs()
-    } else {
+    let matrix = try_build_w_matrix_f64(zeros, epsilon)?;
+    let values = kernel::spectrum_f64(&matrix, n)?;
+    let smallest = values[0];
+    let largest = values[n - 1];
+    let mut ordered = zeros.to_vec();
+    ordered.sort_by(f64::total_cmp);
+    let duplicates = ordered.windows(2).any(|pair| pair[0] == pair[1]);
+    let condition = if duplicates || smallest == 0.0 {
         f64::INFINITY
+    } else {
+        largest.abs() / smallest.abs()
     };
-
+    let tolerance = 64.0 * (n as f64) * f64::EPSILON;
     Ok(WPositivityResultF64 {
         n_zeros: n,
         epsilon_f64: epsilon,
         smallest_eigenvalue_f64: smallest,
         largest_eigenvalue_f64: largest,
-        condition_number_f64: cond,
-        positive_definite: smallest > -1e-10,
-        all_eigenvalues_f64: evals,
+        condition_number_f64: condition,
+        positive_definite: !duplicates && smallest > tolerance,
+        positive_semidefinite_with_tolerance: smallest >= -tolerance,
+        positivity_tolerance_f64: tolerance,
+        all_eigenvalues_f64: values,
     })
 }
 
@@ -179,25 +189,32 @@ pub struct WPositivityResultF64 {
     pub n_zeros: usize,
     /// Regularization parameter ε used in the V̂_R matrix element.
     pub epsilon_f64: f64,
-    /// Smallest eigenvalue of W. Should be > 0 for true zeros on the
-    /// critical line; negative values suggest off-line zeros or
-    /// numerical noise.
+    /// Computed smallest eigenvalue. The exact critical-line kernel is
+    /// positive semidefinite for any real ordinates, including nonzeros of
+    /// zeta. Negative computed values reflect numerical error, not evidence
+    /// of off-line zeros (this API fixes every real part at one half).
     pub smallest_eigenvalue_f64: f64,
     /// Largest eigenvalue of W.
     pub largest_eigenvalue_f64: f64,
     /// Spectral condition number `largest / |smallest|`. Returned as
-    /// `f64::INFINITY` if `|smallest| < 1e-300`.
+    /// `f64::INFINITY` for duplicate ordinates, zero computed minimum, or
+    /// overflow of the computed ratio. Not a certified condition bound.
     pub condition_number_f64: f64,
-    /// `true` if `smallest > -1e-10` (positivity within numerical
-    /// tolerance). The threshold is intentionally loose at f64 to
-    /// distinguish numerical noise from a real positivity violation.
+    /// Strict computed positive margin above the reported tolerance, with
+    /// no duplicate ordinates. This is not a certified eigenvalue lower bound.
     pub positive_definite: bool,
+    /// Computed smallest eigenvalue is at least minus the reported tolerance.
+    pub positive_semidefinite_with_tolerance: bool,
+    /// Heuristic roundoff scale 64*N*binary64 epsilon (the matrix norm is <=N).
+    pub positivity_tolerance_f64: f64,
     /// All eigenvalues of W, sorted ascending.
     pub all_eigenvalues_f64: Vec<f64>,
 }
 
 /// High-precision matrix element using rug Float.
-/// Same closed-form formula but at user-chosen precision.
+/// Uses epsilon's precision for output. Invalid parameters, poles and
+/// unrepresentable arithmetic return NaNs. The checked variant accepts an
+/// explicit output precision and returns an error.
 #[cfg(feature = "hp")]
 pub fn v_r_matrix_element_hp(
     s_re: &rug::Float,
@@ -206,45 +223,30 @@ pub fn v_r_matrix_element_hp(
     sp_im: &rug::Float,
     epsilon: &rug::Float,
 ) -> (rug::Float, rug::Float) {
-    let prec = epsilon.prec();
-    // a = s̄ + s' - 1 = (s_re + sp_re - 1) + i·(sp_im - s_im)
-    let mut a_re = s_re.clone();
-    a_re += sp_re;
-    a_re -= 1u32;
-    let mut a_im = sp_im.clone();
-    a_im -= s_im;
-    // a² = (a_re² - a_im²) + 2i·a_re·a_im
-    let mut a_sq_re = a_re.clone();
-    a_sq_re.square_mut();
-    let mut tmp = a_im.clone();
-    tmp.square_mut();
-    a_sq_re -= &tmp;
-    let mut a_sq_im = a_re.clone();
-    a_sq_im *= &a_im;
-    a_sq_im *= 2u32;
-    // Denominator: ε² - a²
-    let mut eps_sq = epsilon.clone();
-    eps_sq.square_mut();
-    let mut den_re = eps_sq.clone();
-    den_re -= &a_sq_re;
-    let mut den_im = a_sq_im.clone();
-    den_im = -den_im;
-    // |den|² = den_re² + den_im²
-    let mut den_mag_sq = den_re.clone();
-    den_mag_sq.square_mut();
-    let mut tmp2 = den_im.clone();
-    tmp2.square_mut();
-    den_mag_sq += &tmp2;
-    // Quotient = ε² · (den_re - i·den_im) / |den|²
-    let mut result_re = eps_sq.clone();
-    result_re *= &den_re;
-    result_re /= &den_mag_sq;
-    let mut result_im = eps_sq;
-    result_im *= &den_im;
-    result_im = -result_im;
-    result_im /= &den_mag_sq;
-    let _ = prec;
-    (result_re, result_im)
+    try_v_r_matrix_element_hp(s_re, s_im, sp_re, sp_im, epsilon, epsilon.prec()).unwrap_or_else(
+        |_| {
+            (
+                rug::Float::with_val(epsilon.prec(), rug::float::Special::Nan),
+                rug::Float::with_val(epsilon.prec(), rug::float::Special::Nan),
+            )
+        },
+    )
+}
+
+/// Checked HP meromorphic matrix element, rounded to explicit working precision.
+/// Input precision and exponent range are checked; the implementation uses
+/// 32 guard bits above the largest input/output precision. This is point
+/// arithmetic, not a certified enclosure near a pole.
+#[cfg(feature = "hp")]
+pub fn try_v_r_matrix_element_hp(
+    s_re: &rug::Float,
+    s_im: &rug::Float,
+    sp_re: &rug::Float,
+    sp_im: &rug::Float,
+    epsilon: &rug::Float,
+    precision: u32,
+) -> Result<(rug::Float, rug::Float)> {
+    kernel::entry_hp(s_re, s_im, sp_re, sp_im, epsilon, precision)
 }
 
 // Reference Riemann-zero literals below are quoted at published precision
@@ -449,55 +451,64 @@ pub mod hp {
     ///
     /// On critical-line zeros (β = 1/2), `1 - ρ̄_j = ρ_j`, so we use
     /// `s = 1/2 + iγ_i` and `s' = 1/2 + iγ_j`. Returns the matrix as
-    /// a flat `Vec<Float>` in row-major order.
+    /// a flat `Vec<Float>` in row-major order. Invalid input panics; use
+    /// `try_build_w_matrix` for checked validation.
     pub fn build_w_matrix(gammas: &[Float], epsilon: &Float, prec: u32) -> Vec<Float> {
+        try_build_w_matrix(gammas, epsilon, prec).expect("valid representable HP Lorentzian matrix")
+    }
+
+    /// Checked finite-epsilon Lorentzian matrix; every entry has `prec` bits.
+    pub fn try_build_w_matrix(gammas: &[Float], epsilon: &Float, prec: u32) -> Result<Vec<Float>> {
+        anyhow::ensure!((32..=1_000_000).contains(&prec) && !gammas.is_empty()
+            && epsilon.is_finite() && epsilon>&0 && gammas.iter().all(Float::is_finite),
+            "HP Lorentzian matrix requires valid precision, finite nonempty ordinates and epsilon>0");
         let n = gammas.len();
-
-        // s_re = 1/2 (HP literal, exact at any precision).
-        let mut half = Float::with_val(prec, 1);
-        half /= 2u32;
-
-        // Build row-by-row in parallel; each row of W_{ij} for fixed i
-        // calls v_r_matrix_element_hp(half, γ_i, half, γ_j, ε) for every j,
-        // all independent across i and j.
+        let entries = n
+            .checked_mul(n)
+            .ok_or_else(|| anyhow::anyhow!("matrix dimension overflow"))?;
+        let half = Float::with_val(prec, 0.5);
         let rows: Vec<Vec<Float>> = (0..n)
             .into_par_iter()
             .map(|i| {
                 (0..n)
                     .map(|j| {
-                        let (m_re, _m_im) = super::v_r_matrix_element_hp(
-                            &half, &gammas[i], &half, &gammas[j], epsilon,
-                        );
-                        m_re
+                        super::try_v_r_matrix_element_hp(
+                            &half, &gammas[i], &half, &gammas[j], epsilon, prec,
+                        )
+                        .map(|pair| pair.0)
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>>>()
             })
-            .collect();
-
-        // Flatten row-major.
-        let mut w: Vec<Float> = Vec::with_capacity(n * n);
+            .collect::<Result<Vec<_>>>()?;
+        let mut matrix = Vec::with_capacity(entries);
         for row in rows {
-            w.extend(row);
+            matrix.extend(row);
         }
-        w
+        Ok(matrix)
     }
 
     /// Compute the smallest eigenvalue of an N×N symmetric matrix at HP
     /// precision, using the HP eigensolver in `xc_numerics::eigen`.
     pub fn smallest_eigenvalue(matrix: &[Float], n: usize, prec: u32) -> Result<Float> {
-        if matrix.len() != n * n {
-            anyhow::bail!(
-                "matrix size mismatch: got {}, expected {}",
-                matrix.len(),
-                n * n
-            );
-        }
-        let evals = dense_symmetric_eigenvalues_hp(matrix, n, prec)?;
-        // Eigenvalues are returned ascending; smallest is first.
-        evals
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("no eigenvalues returned"))
+        Ok(checked_spectrum(matrix, n, prec)?.remove(0))
+    }
+
+    fn checked_spectrum(matrix: &[Float], n: usize, prec: u32) -> Result<Vec<Float>> {
+        anyhow::ensure!(
+            (33..=1_000_000).contains(&prec) && n > 0 && n.checked_mul(n) == Some(matrix.len()),
+            "HP symmetric spectrum requires valid precision and a nonempty square matrix"
+        );
+        anyhow::ensure!(
+            matrix.iter().all(Float::is_finite)
+                && (0..n).all(|i| (0..i).all(|j| matrix[i * n + j] == matrix[j * n + i])),
+            "HP spectrum requires finite exactly symmetric storage"
+        );
+        let values = dense_symmetric_eigenvalues_hp(matrix, n, prec)?;
+        anyhow::ensure!(
+            values.len() == n && values.iter().all(Float::is_finite),
+            "nonfinite or incomplete HP spectrum"
+        );
+        Ok(values)
     }
 
     /// HP W-positivity result. All numeric fields HP except `n_zeros`
@@ -512,10 +523,16 @@ pub mod hp {
         pub smallest_eigenvalue: Float,
         /// Largest eigenvalue of W at HP precision.
         pub largest_eigenvalue: Float,
-        /// Spectral condition number `largest / |smallest|` at HP precision.
+        /// Computed extremal-eigenvalue ratio, with infinity for duplicates,
+        /// a zero computed minimum, or an unrepresentable ratio. Not certified.
         pub condition_number: Float,
-        /// `true` if W is positive-definite within HP-tight tolerance.
+        /// Strict computed positive margin above the reported tolerance,
+        /// without duplicate ordinates. This is not a certified lower bound.
         pub positive_definite: bool,
+        /// Computed minimum is at least minus the reported tolerance.
+        pub positive_semidefinite_with_tolerance: bool,
+        /// Heuristic roundoff scale N*2^(16-prec); matrix norm is at most N.
+        pub positivity_tolerance: Float,
         /// All eigenvalues of W at HP precision, sorted ascending.
         pub all_eigenvalues: Vec<Float>,
     }
@@ -527,48 +544,34 @@ pub mod hp {
         epsilon: &Float,
         prec: u32,
     ) -> Result<HpWPositivityResult> {
+        anyhow::ensure!(
+            (33..=1_000_000).contains(&prec),
+            "HP positivity precision must be in 33..=1000000 bits"
+        );
         let n = gammas.len();
-        let w = build_w_matrix(gammas, epsilon, prec);
-        let mut evals = dense_symmetric_eigenvalues_hp(&w, n, prec)?;
-        // Should already be ascending from the eigensolver, but defensive.
-        evals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        let smallest = evals
-            .first()
-            .cloned()
-            .unwrap_or_else(|| Float::with_val(prec, 0));
-        let largest = evals
-            .last()
-            .cloned()
-            .unwrap_or_else(|| Float::with_val(prec, 0));
-
-        // Condition number = |largest| / |smallest|. Threshold for "smallest
-        // is essentially zero": 10^-300 (HP literal).
-        let abs_smallest = smallest.clone().abs();
-        let zero_thresh = Float::with_val(prec, Float::parse("1e-300").unwrap());
-        let condition_number = if abs_smallest > zero_thresh {
-            let mut t = largest.clone();
-            t /= &abs_smallest;
-            t
+        let matrix = try_build_w_matrix(gammas, epsilon, prec)?;
+        let values = checked_spectrum(&matrix, n, prec)?;
+        let smallest = values[0].clone();
+        let largest = values[n - 1].clone();
+        let mut ordered = gammas.to_vec();
+        ordered.sort_by(Float::total_cmp);
+        let duplicates = ordered.windows(2).any(|pair| pair[0] == pair[1]);
+        let condition = if duplicates || smallest.is_zero() {
+            Float::with_val(prec, rug::float::Special::Infinity)
         } else {
-            // Treat as numerically infinite; use a sentinel HP value.
-            // (We could use Float infinity but a large finite value is
-            // friendlier for downstream code.)
-            Float::with_val(prec, Float::parse("1e300").unwrap())
+            Float::with_val(prec, largest.clone().abs() / smallest.clone().abs())
         };
-
-        // Positive-definite threshold: smallest > -1e-10.
-        let neg_tol = Float::with_val(prec, Float::parse("-1e-10").unwrap());
-        let positive_definite = smallest > neg_tol;
-
+        let tolerance = Float::with_val(prec, n) >> (prec - 16);
         Ok(HpWPositivityResult {
             n_zeros: n,
-            epsilon: epsilon.clone(),
+            epsilon: Float::with_val(prec, epsilon),
+            positive_definite: !duplicates && smallest > tolerance,
+            positive_semidefinite_with_tolerance: smallest >= -tolerance.clone(),
+            positivity_tolerance: tolerance,
             smallest_eigenvalue: smallest,
             largest_eigenvalue: largest,
-            condition_number,
-            positive_definite,
-            all_eigenvalues: evals,
+            condition_number: condition,
+            all_eigenvalues: values,
         })
     }
 

@@ -16,14 +16,16 @@ use xc_cache::{
 use xc_numerics::prefix::lossless_decimal;
 
 pub const ARTIFACT_KIND: &str = "ccm_state_geometry_analysis";
-pub const SEMANTICS: &str = "ccm-retained-fourier-state-geometry-v1";
+pub const SEMANTICS: &str = "ccm-retained-fourier-state-geometry-v4";
 const CONVENTION: &str = "x=log(u); L=log(lambda_squared); sum_j xi_j exp(2*pi*i*j*(x/L+1/2)); unit_L2_dx; center_positive_else_largest_coefficient_positive";
 const ASSURANCE: &str = "computed_point_diagnostics; source_error_and_quadrature_error_not_enclosed; no_ground_selection_or_global_sign_certificate";
 
 fn scalar(s: &str, p: u32) -> Result<Float> {
     let value = Float::with_val(p, Float::parse(s)?);
-    if !value.is_finite() {
-        bail!("nonfinite state geometry scalar");
+    if !value.is_finite()
+        || (value.is_zero() && xc_core::DecimalLiteral::new(s)?.canonical()?.as_str() != "0")
+    {
+        bail!("state geometry scalar is outside the finite exponent range");
     }
     Ok(value)
 }
@@ -91,7 +93,7 @@ impl RetainedState {
             parity_policy: Option<serde_json::Value>,
         }
         let v: Payload = serde_json::from_slice(bytes)?;
-        if ![2, 3].contains(&v.schema_version)
+        if ![2, 3, 4, 5].contains(&v.schema_version)
             || v.n_modes > 8192
             || !(64..=1_000_000).contains(&v.precision_bits)
             || v.eigenvector.len() != 2 * v.n_modes + 1
@@ -168,19 +170,22 @@ fn grid(
     source: &RetainedState,
     options: &GeometryOptions,
     intervals: usize,
+    coefficients: &[Float],
     scale: &Float,
     even: bool,
 ) -> Result<GeometryGrid> {
-    let p = options.working_precision_bits;
-    let l = scalar(&source.cutoff, p)?.ln();
+    let output_precision = options.working_precision_bits;
+    let p = output_precision + 32;
+    let encode = |v: &Float| lossless_decimal(&Float::with_val(output_precision, v));
+    let l = super::retained_evidence::finite_math::rounded_log_cutoff(&source.cutoff, p)?;
     let two_pi = Float::with_val(p, Constant::Pi) * 2;
     let pairs: Vec<_> = (1..=source.modes)
         .map(|n| {
             (
-                Float::with_val(p, &source.coefficients[source.modes + n])
-                    + &source.coefficients[source.modes - n],
-                Float::with_val(p, &source.coefficients[source.modes + n])
-                    - &source.coefficients[source.modes - n],
+                Float::with_val(p, &coefficients[source.modes + n])
+                    + &coefficients[source.modes - n],
+                Float::with_val(p, &coefficients[source.modes + n])
+                    - &coefficients[source.modes - n],
             )
         })
         .collect();
@@ -200,7 +205,7 @@ fn grid(
                 let (sin, cos) = angle.sin_cos(Float::new(p));
                 let mut cn = Float::with_val(p, 1);
                 let mut sn = Float::with_val(p, 0);
-                let mut re = Float::with_val(p, &source.coefficients[source.modes]);
+                let mut re = Float::with_val(p, &coefficients[source.modes]);
                 let mut im = Float::with_val(p, 0);
                 let mut next_cos = Float::new(p);
                 let mut next_sin = Float::new(p);
@@ -218,11 +223,9 @@ fn grid(
                 im *= scale;
                 let energy = Float::with_val(p, &re * &re) + Float::with_val(p, &im * &im);
                 sums[0] += &energy;
-                // Average the two endpoint values for the nonperiodic odd moment.
-                // All even moments and the Fourier energy have equal endpoints.
-                if j != 0 {
-                    sums[1] += Float::with_val(p, &energy * &x);
-                }
+                // Real Fourier coefficients imply f(-x)=conj(f(x)), even when
+                // the coefficient vector is not even. Energy is exactly even;
+                // the endpoint-averaged odd moment on this symmetric grid is zero.
                 let x2 = Float::with_val(p, &x * &x);
                 sums[2] += Float::with_val(p, &energy * &x2);
                 sums[3] += Float::with_val(p, &energy) * x2.square();
@@ -265,11 +268,11 @@ fn grid(
     }
     Ok(GeometryGrid {
         intervals,
-        l2_mass: lossless_decimal(&sums[0]),
-        spatial_moments: sums[1..4].iter().map(lossless_decimal).collect(),
-        outer_shell_masses: sums[4..7].iter().map(lossless_decimal).collect(),
-        sampled_real_minimum: minimum.as_ref().map(lossless_decimal),
-        sampled_negative_part_l1: even.then(|| lossless_decimal(&sums[7])),
+        l2_mass: encode(&sums[0]),
+        spatial_moments: sums[1..4].iter().map(encode).collect(),
+        outer_shell_masses: sums[4..7].iter().map(encode).collect(),
+        sampled_real_minimum: minimum.as_ref().map(encode),
+        sampled_negative_part_l1: even.then(|| encode(&sums[7])),
     })
 }
 fn grid_values(g: &GeometryGrid) -> Vec<&str> {
@@ -285,30 +288,60 @@ pub fn analyze_state_geometry(
 ) -> Result<StateGeometryAnalysis> {
     options.validate(source)?;
     let p = options.working_precision_bits;
-    let mut norm2 = Float::with_val(p, 0);
-    let mut center = Float::with_val(p, &source.coefficients[source.modes]);
-    let mut defect = Float::with_val(p, 0);
-    for v in &source.coefficients {
-        norm2 += Float::with_val(p, v * v);
+    let working = p + 32;
+    let encode = |v: &Float| lossless_decimal(&Float::with_val(p, v));
+    // MPFR hypot rescales internally: no raw square may silently underflow.
+    let mut norm = Float::with_val(working, 0);
+    for value in &source.coefficients {
+        norm = norm.hypot(&Float::with_val(working, value));
     }
-    for n in 1..=source.modes {
-        let a = &source.coefficients[source.modes + n];
-        let b = &source.coefficients[source.modes - n];
-        let pair = Float::with_val(p, a) + b;
-        if n.is_multiple_of(2) {
-            center += pair;
-        } else {
-            center -= pair;
-        }
-        defect += (Float::with_val(p, a) - b).square() * 2;
+    if !norm.is_finite() || norm <= 0 {
+        bail!("state coefficient norm is outside the finite exponent range");
     }
-    if !norm2.is_finite() || norm2 <= 0 || !center.is_finite() || !defect.is_finite() {
-        bail!("state normalization exceeds the arithmetic range");
-    }
+    let coefficients: Vec<Float> = source
+        .coefficients
+        .iter()
+        .map(|value| {
+            let normalized = super::retained_evidence::point::quotient(value, &norm, working)?;
+            if !normalized.is_finite() || (!value.is_zero() && normalized.is_zero()) {
+                bail!("normalized state coefficient is outside the finite exponent range");
+            }
+            Ok(normalized)
+        })
+        .collect::<Result<_>>()?;
+    let center_terms: Vec<Float> = source
+        .coefficients
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let value = Float::with_val(working, value);
+            if index.abs_diff(source.modes).is_multiple_of(2) {
+                value
+            } else {
+                -value
+            }
+        })
+        .collect();
+    let center = super::retained_evidence::point::sum(&center_terms, working)?;
     let even = source
         .coefficients
         .iter()
         .eq(source.coefficients.iter().rev());
+    let mut defect = Float::with_val(working, 0);
+    for n in 1..=source.modes {
+        let difference = Float::with_val(working, &coefficients[source.modes + n])
+            - &coefficients[source.modes - n];
+        if !difference.is_finite()
+            || (difference.is_zero()
+                && source.coefficients[source.modes + n] != source.coefficients[source.modes - n])
+        {
+            bail!("state evenness difference is outside the finite exponent range");
+        }
+        defect = defect.hypot(&difference).hypot(&difference);
+    }
+    if !defect.is_finite() || (!even && defect.is_zero()) {
+        bail!("state evenness defect is outside the finite exponent range");
+    }
     let orient_value = if center == 0 {
         source
             .coefficients
@@ -318,11 +351,36 @@ pub fn analyze_state_geometry(
     } else {
         &center
     };
-    let orientation = if orient_value < &0 { -1 } else { 1 };
-    let l = scalar(&source.cutoff, p)?.ln();
-    let scale = Float::with_val(p, orientation) / (Float::with_val(p, &norm2) * &l).sqrt();
-    let coarse = grid(source, options, options.base_intervals, &scale, even)?;
-    let refined = grid(source, options, 2 * options.base_intervals, &scale, even)?;
+    let orientation: i32 = if orient_value < &0 { -1 } else { 1 };
+    let l = super::retained_evidence::finite_math::rounded_log_cutoff(&source.cutoff, working)?;
+    let sqrt_length = l.sqrt();
+    let scale = Float::with_val(working, orientation) / &sqrt_length;
+    let unit_center = Float::with_val(working, &center) / &norm * &scale;
+    if !unit_center.is_finite() || (!center.is_zero() && unit_center.is_zero()) {
+        bail!("unit state center is outside the finite exponent range");
+    }
+    let signed_mass: Float =
+        Float::with_val(working, &coefficients[source.modes]) * &sqrt_length * orientation;
+    if !signed_mass.is_finite() || (!coefficients[source.modes].is_zero() && signed_mass.is_zero())
+    {
+        bail!("unit state signed mass is outside the finite exponent range");
+    }
+    let coarse = grid(
+        source,
+        options,
+        options.base_intervals,
+        &coefficients,
+        &scale,
+        even,
+    )?;
+    let refined = grid(
+        source,
+        options,
+        2 * options.base_intervals,
+        &coefficients,
+        &scale,
+        even,
+    )?;
     let differences = grid_values(&coarse)
         .iter()
         .zip(grid_values(&refined))
@@ -345,15 +403,11 @@ pub fn analyze_state_geometry(
             "unavailable_nonreal_fourier_state"
         }
         .into(),
-        coefficient_norm: lossless_decimal(&norm2.clone().sqrt()),
-        raw_center: lossless_decimal(&center),
-        unit_l2_center: lossless_decimal(&(center * &scale)),
-        unit_l2_signed_mass: even.then(|| {
-            lossless_decimal(
-                &(Float::with_val(p, &source.coefficients[source.modes]) * &l * &scale),
-            )
-        }),
-        coefficient_evenness_defect: lossless_decimal(&(defect / norm2).sqrt()),
+        coefficient_norm: encode(&norm),
+        raw_center: encode(&center),
+        unit_l2_center: encode(&unit_center),
+        unit_l2_signed_mass: even.then(|| encode(&signed_mass)),
+        coefficient_evenness_defect: encode(&defect),
         orientation,
         coarse,
         refined,
@@ -491,7 +545,9 @@ pub fn analyze_state_geometry_via_cache(
         target: Some("actual_retained_state_geometry".into()),
         subspace: None,
         source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some("periodic_trapezoid_two_grids_fixed_chunks_v1".into()),
+        algorithm_semantics: Some(
+            "periodic_trapezoid_exact_cutoff_checked_hypot_normalization_v4".into(),
+        ),
     };
     let logical = format!("ccm/state-geometry/{}", source.manifest.content_digest.0);
     let request = ArtifactExecutionCacheRequest {

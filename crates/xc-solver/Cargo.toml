@@ -11,15 +11,16 @@ rust-version.workspace = true
 
 [features]
 default = []
-hp-reference = ["dep:rug", "dep:xc-numerics", "xc-numerics/hp", "xc-operator/hp"]
+hp-reference = ["dep:rug", "xc-numerics/hp", "xc-operator/hp"]
 
 [dependencies]
+num-bigint = "0.4.8"
 nalgebra = { workspace = true }
 serde = { workspace = true }
 rug = { workspace = true, optional = true }
 xc-core = { workspace = true }
 xc-operator = { workspace = true }
-xc-numerics = { workspace = true, optional = true }
+xc-numerics = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

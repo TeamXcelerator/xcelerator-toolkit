@@ -55,6 +55,10 @@ fn main() {
         })
         .unwrap();
     let report = verify_bundle(&bundle);
-    assert!(report.valid, "certificate should verify: {report:?}");
+    assert!(
+        report.valid,
+        "certificate structure should validate: {report:?}"
+    );
+    assert!(!report.mathematical_claim_verified);
     println!("{}", serde_json::to_string_pretty(&bundle).unwrap());
 }

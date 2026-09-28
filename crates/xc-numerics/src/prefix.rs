@@ -23,7 +23,9 @@ pub use xc_core::PrefixDiagnosticPolicy;
 mod factor;
 #[path = "prefix_moments.rs"]
 mod moments;
-pub use moments::{ThirdInverseMoment, TwoModeMomentFit, TwoModeMomentStatus};
+pub use moments::{
+    ThirdInverseMoment, TwoModeMomentFit, TwoModeMomentStatus, TWO_MODE_MOMENT_SEMANTICS,
+};
 #[cfg(test)]
 #[path = "prefix_reference.rs"]
 mod reference;

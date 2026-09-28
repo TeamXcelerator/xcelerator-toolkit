@@ -1,0 +1,89 @@
+{
+  "adaptive": {
+    "algorithm_semantics": "halley+adaptive_root_precision_v1",
+    "artifact_kind": "ccm_root_discovery_window",
+    "mathematical_semantics_version": "ccm-root-discovery-v0.15.2-v2",
+    "normalization": null,
+    "resolved_mathematical_parameters": {
+      "accuracy_guard_bits": 64,
+      "completeness": "complete_requested_window_point_source",
+      "convergence_confirmation": "directed_local_root_sign_witness_at_stored_point_v2",
+      "discovery_method": "exact_point_numerator_exact_window_v1",
+      "discovery_mode": "independent",
+      "first_root_index": 1,
+      "force_even": true,
+      "generic_discovery_semantics": "root-discovery-disjoint-bracket-distinctness-v2",
+      "lambda_squared": "2",
+      "maximum_extra_precision_bits": 4096,
+      "n_modes": 3,
+      "point_refinement_semantics": "root-point-positional-stop-local-nondecreasing-residual-growth-v3",
+      "pole_geometry": "exact_stored_mpfr_pole_points",
+      "precision_bits": 131,
+      "precision_escalation_rule": "double_extra_bits_from_64_bit_quantum_v1",
+      "reference_seeds_used": false,
+      "residual_arithmetic": "guarded_point_difference_quotient_exact_sum_v2",
+      "root_count": 1,
+      "root_precision_policy": "adaptive_v1",
+      "secular_source_content_digest": "77658c05a6a0640d7eb1e2cf1d3e8aa5077a6419e4cf2c85f62baabf199f6635",
+      "solver": "halley",
+      "solver_steps": 2000,
+      "source_accuracy_scope": "exact_stored_point_source",
+      "starting_points": [
+        "1.0000000000000000000000000000000000000000"
+      ],
+      "target_precision_bits": 67,
+      "verification_precision_bits": 64
+    },
+    "schema_version": 1,
+    "source_data_identities": {
+      "ccm_secular_source": "77658c05a6a0640d7eb1e2cf1d3e8aa5077a6419e4cf2c85f62baabf199f6635"
+    },
+    "subspace": "even",
+    "target": "positive_ccm_spectral_roots"
+  },
+  "fixed": {
+    "algorithm_semantics": "halley+confirmed_retained_correction_v2",
+    "artifact_kind": "ccm_root_discovery_window",
+    "mathematical_semantics_version": "ccm-root-discovery-v0.15.2-v2",
+    "normalization": null,
+    "resolved_mathematical_parameters": {
+      "accuracy_guard_bits": 64,
+      "completeness": "complete_requested_window_point_source",
+      "convergence_confirmation": "directed_local_root_sign_witness_at_stored_point_v2",
+      "discovery_method": "exact_point_numerator_exact_window_v1",
+      "discovery_mode": "independent",
+      "first_root_index": 1,
+      "fixed_guard_correction_guards": [
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096
+      ],
+      "force_even": true,
+      "generic_discovery_semantics": "root-discovery-disjoint-bracket-distinctness-v2",
+      "lambda_squared": "2",
+      "n_modes": 3,
+      "point_refinement_semantics": "root-point-positional-stop-local-nondecreasing-residual-growth-v3",
+      "pole_geometry": "exact_stored_mpfr_pole_points",
+      "precision_bits": 131,
+      "reference_seeds_used": false,
+      "residual_arithmetic": "guarded_point_difference_quotient_exact_sum_v2",
+      "root_count": 1,
+      "secular_source_content_digest": "77658c05a6a0640d7eb1e2cf1d3e8aa5077a6419e4cf2c85f62baabf199f6635",
+      "solver": "halley",
+      "solver_steps": 2000,
+      "starting_points": [
+        "1.0000000000000000000000000000000000000000"
+      ]
+    },
+    "schema_version": 1,
+    "source_data_identities": {
+      "ccm_secular_source": "77658c05a6a0640d7eb1e2cf1d3e8aa5077a6419e4cf2c85f62baabf199f6635"
+    },
+    "subspace": "even",
+    "target": "positive_ccm_spectral_roots"
+  }
+}

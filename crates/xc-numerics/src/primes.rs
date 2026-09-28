@@ -3,36 +3,52 @@
 
 //! Prime number utilities: sieve of Eratosthenes, prime enumeration.
 
-/// Sieve of Eratosthenes up to `bound` (inclusive). Returns a sorted
-/// vector of all primes ≤ bound.
+/// Sieve of Eratosthenes through the inclusive bound, in ascending order.
+/// Panics when the platform cannot index or allocate the sieve. Use
+/// [`try_sieve_primes`] to receive an explicit error for those domains.
 pub fn sieve_primes(bound: u64) -> Vec<u64> {
+    try_sieve_primes(bound).expect("representable and allocatable prime sieve required")
+}
+
+/// Checked exact integer sieve. Time and storage grow with the inclusive bound.
+pub fn try_sieve_primes(bound: u64) -> anyhow::Result<Vec<u64>> {
     if bound < 2 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let n = bound as usize;
-    let mut is_prime = vec![true; n + 1];
+    let n = usize::try_from(bound)
+        .map_err(|_| anyhow::anyhow!("prime bound exceeds platform indices"))?;
+    let length = n
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("prime sieve length overflow"))?;
+    let mut is_prime = Vec::new();
+    is_prime.try_reserve_exact(length)?;
+    is_prime.resize(length, true);
     is_prime[0] = false;
     is_prime[1] = false;
     let mut p = 2usize;
-    while p * p <= n {
+    while p <= n / p {
         if is_prime[p] {
-            let mut q = p * p;
-            while q <= n {
+            let mut q = p * p; // p <= n/p proves this product fits.
+            loop {
                 is_prime[q] = false;
+                if q > n - p {
+                    break;
+                }
                 q += p;
             }
         }
         p += 1;
     }
-    (2..=n).filter(|&i| is_prime[i]).map(|i| i as u64).collect()
+    let count = is_prime[2..].iter().filter(|&&prime| prime).count();
+    let mut primes = Vec::new();
+    primes.try_reserve_exact(count)?;
+    primes.extend((2..=n).filter(|&i| is_prime[i]).map(|i| i as u64));
+    Ok(primes)
 }
 
-/// Count primes up to `bound` (π(x) function).
-///
-/// Returns 0 for `bound < 2`. This is a convenience wrapper around
-/// `sieve_primes(bound).len()`; for large `bound` where the prime list
-/// itself is not needed, prefer `sieve_primes` directly to avoid the
-/// heap allocation for the intermediate `Vec`.
+/// Count primes through the inclusive bound; allocates the sieve and prime list.
+/// Returns zero for bounds below two. Has the same resource contract as
+/// [`sieve_primes`].
 pub fn prime_count(bound: u64) -> usize {
     sieve_primes(bound).len()
 }

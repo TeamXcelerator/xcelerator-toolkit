@@ -21,6 +21,22 @@ pub use external::ExternalProfileSpec;
 /// Environment variable naming the private target-profile specification.
 pub const TARGET_SPEC_FILE_ENV: &str = "XC_TARGET_SPEC_FILE";
 
+// Decimal coefficients can become significant after normalization or polynomial
+// evaluation. Do not interpret a nonzero input outside binary64 range as zero.
+fn checked_decimal_f64(text: &str) -> Result<f64> {
+    let value = text.parse::<f64>().context("invalid target decimal")?;
+    anyhow::ensure!(value.is_finite(), "target decimal must be finite");
+    anyhow::ensure!(
+        value != 0.0 || xc_core::DecimalLiteral::new(text)?.canonical()?.as_str() == "0",
+        "nonzero target decimal underflows binary64; use the HP evaluator"
+    );
+    anyhow::ensure!(
+        value == 0.0 || value.is_normal(),
+        "nonzero target decimal is subnormal in binary64 and loses relative precision; use the HP evaluator"
+    );
+    Ok(value)
+}
+
 /// Exact scale applied to a polynomial. The algebraic form avoids freezing an
 /// irrational coefficient at the decimal precision of a private JSON file.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -49,12 +65,8 @@ impl ScalarScaleSpec {
     fn validate(&self, field: &str) -> Result<()> {
         match self {
             Self::Decimal { value } => {
-                let parsed = value
-                    .parse::<f64>()
+                xc_core::DecimalLiteral::new(value)
                     .with_context(|| format!("{field} contains an invalid decimal scale"))?;
-                if !parsed.is_finite() {
-                    anyhow::bail!("{field} scale must be finite");
-                }
             }
             Self::RationalTimesSquareRoot {
                 rational_denominator,
@@ -76,7 +88,7 @@ impl ScalarScaleSpec {
     fn value_f64(&self) -> Result<f64> {
         self.validate("polynomial")?;
         Ok(match self {
-            Self::Decimal { value } => value.parse::<f64>()?,
+            Self::Decimal { value } => checked_decimal_f64(value)?,
             Self::RationalTimesSquareRoot {
                 rational_numerator,
                 rational_denominator,
@@ -134,12 +146,8 @@ impl GaussianPolynomialSeriesSpec {
             .iter()
             .chain(&self.parameter_polynomial_coefficients)
         {
-            let parsed = coefficient
-                .parse::<f64>()
+            xc_core::DecimalLiteral::new(coefficient)
                 .with_context(|| format!("{field} contains an invalid decimal coefficient"))?;
-            if !parsed.is_finite() {
-                anyhow::bail!("{field} coefficients must be finite");
-            }
         }
         self.polynomial_scale
             .validate(&format!("{field}.polynomial_scale"))?;
@@ -243,15 +251,18 @@ impl TargetProfileSpec {
         let bytes = if self.external_profile.is_some() {
             if self.auxiliary_series.is_some() {
                 serde_json::to_vec(&(
-                    "external-target-provider-protocol-v1",
-                    "gaussian-series-relative-geometric-tail-v2",
+                    "external-target-provider-nonce-bound-working-input-v3",
+                    "gaussian-series-exponent-floor-and-zero-tail-v5",
                     self,
                 ))?
             } else {
-                serde_json::to_vec(&("external-target-provider-protocol-v1", self))?
+                serde_json::to_vec(&(
+                    "external-target-provider-nonce-bound-working-input-v3",
+                    self,
+                ))?
             }
         } else {
-            serde_json::to_vec(&("gaussian-series-relative-geometric-tail-v2", self))?
+            serde_json::to_vec(&("gaussian-series-exponent-floor-and-zero-tail-v5", self))?
         };
         Ok(xc_cache::ContentDigest::sha256(&bytes).0)
     }
@@ -308,13 +319,7 @@ struct CompiledSeriesF64 {
 
 impl CompiledSeriesF64 {
     fn new(spec: &GaussianPolynomialSeriesSpec) -> Result<Self> {
-        let parse = |value: &str| -> Result<f64> {
-            let parsed = value.parse::<f64>().context("invalid target coefficient")?;
-            if !parsed.is_finite() {
-                anyhow::bail!("target coefficients must be finite");
-            }
-            Ok(parsed)
-        };
+        let parse = checked_decimal_f64;
         Ok(Self {
             term_input_power: spec.term_input_power,
             polynomial_coefficients: spec
@@ -348,7 +353,12 @@ impl CompiledSeriesF64 {
         // These constant factors cancel in base(u)/base(1). Remove them before
         // evaluating, so a harmless small scale cannot cause underflow.
         for coefficient in &mut result.polynomial_coefficients {
+            let original = *coefficient;
             *coefficient /= maximum;
+            anyhow::ensure!(
+                coefficient.is_finite() && (original == 0.0 || coefficient.is_normal()),
+                "nonzero target coefficient loses binary64 relative precision during normalization; use the HP evaluator"
+            );
         }
         result.polynomial_scale = 1.0;
         result.parameter_polynomial_coefficients.clear();
@@ -359,8 +369,18 @@ impl CompiledSeriesF64 {
         if coefficients.is_empty() || scale == 0.0 || x.is_infinite() {
             return 0.0;
         }
-        let direct = common * scale * polynomial_f64(coefficients, x);
-        if common != 0.0 && direct.is_finite() {
+        let polynomial = polynomial_f64(coefficients, x);
+        let scaled_common = common * scale;
+        let direct = scaled_common * polynomial;
+        // A nonzero subnormal intermediate may already have lost most of its
+        // precision before a later factor restores the final value's range.
+        if (-x).exp().is_normal()
+            && common.is_normal()
+            && scale.is_normal()
+            && scaled_common.is_normal()
+            && polynomial.is_finite()
+            && (direct.is_normal() || polynomial == 0.0)
+        {
             return direct;
         }
         // Avoid 0*infinity when the Gaussian and polynomial factors separately
@@ -396,6 +416,10 @@ impl CompiledSeriesF64 {
         if scale == 0.0 {
             return true;
         }
+        let scale_of_sum = sum.abs().max(normalization_floor);
+        // If every accumulated term rounded to zero, bound the entire series,
+        // including those lost terms, before accepting a rounded zero.
+        let n = if scale_of_sum == 0.0 { 0 } else { n };
         let m = f64::from(n) + 1.0;
         let degree = f64::from(self.term_input_power) + 2.0 * degree as f64;
         let decay = std::f64::consts::PI * u * u * (2.0 * m + 1.0);
@@ -419,8 +443,12 @@ impl CompiledSeriesF64 {
         let log_tail = std::f64::consts::LN_2
             + maximum
             + logs.iter().map(|x| (x - maximum).exp()).sum::<f64>().ln();
-        let scale = sum.abs().max(normalization_floor);
-        scale > 0.0 && log_tail <= scale.ln() + (f64::EPSILON / 4.0).ln()
+        if scale_of_sum == 0.0 {
+            let rounding_margin = 64.0 * f64::EPSILON * (1.0 + log_tail.abs());
+            log_tail + rounding_margin < f64::from_bits(1).ln() - std::f64::consts::LN_2
+        } else {
+            log_tail <= scale_of_sum.ln() + (f64::EPSILON / 4.0).ln()
+        }
     }
 
     fn components(&self, u: f64) -> Result<(f64, f64)> {
@@ -523,7 +551,12 @@ impl TargetEvaluatorF64 {
                 if parameter_value == 0.0 || !parameter_value.is_finite() {
                     anyhow::bail!("auxiliary target parameter is singular at u = 1");
                 }
-                Ok((compiled, -base_value / parameter_value))
+                let parameter = -base_value / parameter_value;
+                anyhow::ensure!(
+                    parameter.is_finite() && (base_value == 0.0 || parameter != 0.0),
+                    "auxiliary target parameter is not representable"
+                );
+                Ok((compiled, parameter))
             })
             .transpose()?;
         Ok(Self {
@@ -590,7 +623,12 @@ impl TargetEvaluatorF64 {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("target specification has no auxiliary profile"))?;
         let (base, coefficient) = series.components(u)?;
-        Ok(base + parameter * coefficient)
+        let value = base + parameter * coefficient;
+        anyhow::ensure!(
+            value.is_finite(),
+            "auxiliary target produced a nonfinite value"
+        );
+        Ok(value)
     }
 }
 
@@ -598,9 +636,22 @@ impl TargetEvaluatorF64 {
 pub mod hp {
     use super::{GaussianPolynomialSeriesSpec, ScalarScaleSpec, TargetProfileSpec};
     use anyhow::{Context, Result};
-    use rug::{float::Constant, Float};
+    use rug::{
+        float::{Constant, Round},
+        ops::AddAssignRound,
+        Float,
+    };
 
     const GUARD_BITS: u32 = 64;
+
+    fn checked_round(value: &Float, precision: u32, field: &str) -> Result<Float> {
+        let rounded = Float::with_val(precision, value);
+        anyhow::ensure!(
+            rounded.is_finite() && (value == &0 || rounded != 0),
+            "{field} is not representable at requested precision"
+        );
+        Ok(rounded)
+    }
 
     #[derive(Clone, Debug)]
     struct CompiledSeries {
@@ -615,12 +666,135 @@ pub mod hp {
     }
 
     impl CompiledSeries {
+        fn decimal(text: &str, precision: u32) -> Result<Float> {
+            let parsed = Float::parse(text).context("invalid target decimal")?;
+            let (value, ordering) = Float::with_val_round(precision, parsed, Round::Nearest);
+            anyhow::ensure!(
+                value.is_finite(),
+                "target decimal is not finite at working precision"
+            );
+            anyhow::ensure!(
+                value != 0 || ordering == std::cmp::Ordering::Equal,
+                "nonzero target decimal is below the supported exponent range"
+            );
+            anyhow::ensure!(
+                ordering == std::cmp::Ordering::Equal
+                    || value.get_exp() != Some(rug::float::exp_min()),
+                "target decimal loses relative precision at the MPFR exponent floor"
+            );
+            Ok(value)
+        }
+
+        /// Logarithms of absolute monomials, including every multiplicative
+        /// factor before exponentiation. Coefficients equal to zero are omitted.
+        fn monomial_logs(
+            &self,
+            input: &Float,
+            x: &Float,
+            coefficients: &[Float],
+            scale: &Float,
+        ) -> Result<Vec<(Float, bool)>> {
+            anyhow::ensure!(
+                input.is_finite() && input > &0 && x.is_finite() && x > &0,
+                "target series argument is outside the supported exponent range"
+            );
+            if scale == &0 {
+                return Ok(Vec::new());
+            }
+            let mut common = scale.clone().abs().ln();
+            if self.term_input_power != 0 {
+                common += input.clone().ln() * self.term_input_power;
+            }
+            common -= x;
+            let log_x = x.clone().ln();
+            let mut logs = Vec::new();
+            for (k, coefficient) in coefficients.iter().enumerate() {
+                if coefficient == &0 {
+                    continue;
+                }
+                let mut log = common.clone();
+                log += coefficient.clone().abs().ln();
+                if k != 0 {
+                    log += Float::with_val(self.working_precision, &log_x * k as u32);
+                }
+                anyhow::ensure!(
+                    log.is_finite(),
+                    "target monomial logarithm is not representable"
+                );
+                logs.push((
+                    log,
+                    coefficient.is_sign_negative() != scale.is_sign_negative(),
+                ));
+            }
+            Ok(logs)
+        }
+
+        /// Preserve ordinary arithmetic away from the exponent boundary. When
+        /// its separate factors lose range, evaluate signed monomials in the
+        /// log domain. Budget a smallest-positive value for every exponential
+        /// rounded at the lower exponent boundary; do not silently certify zero.
+        fn term(
+            &self,
+            input: &Float,
+            x: &Float,
+            coefficients: &[Float],
+            scale: &Float,
+            range_error: &mut Float,
+        ) -> Result<Float> {
+            let p = self.working_precision;
+            if scale == &0 || coefficients.iter().all(|c| c == &0) {
+                return Ok(Float::with_val(p, 0));
+            }
+            let gaussian = (-x.clone()).exp();
+            let common = Float::with_val(p, &gaussian * self.input_power(input));
+            let polynomial = self.polynomial(coefficients, x);
+            let product = Float::with_val(p, &common * &polynomial);
+            let direct = Float::with_val(p, &product * scale);
+            let above_floor = |v: &Float| v.get_exp().is_some_and(|e| e > rug::float::exp_min());
+            if above_floor(&gaussian)
+                && common.is_finite()
+                && above_floor(&common)
+                && polynomial.is_finite()
+                && (above_floor(&product) || polynomial == 0)
+                && direct.is_finite()
+                && (above_floor(&direct) || polynomial == 0)
+            {
+                return Ok(direct);
+            }
+            let mut result = Float::with_val(p, 0);
+            for (log, negative) in self.monomial_logs(input, x, coefficients, scale)? {
+                let mut term = log.exp();
+                anyhow::ensure!(term.is_finite(), "target monomial is not representable");
+                if !above_floor(&term) {
+                    let mut floor = Float::with_val(p, 0);
+                    floor.next_up();
+                    range_error.add_assign_round(floor, Round::Up);
+                }
+                if negative {
+                    term = -term;
+                }
+                result += term;
+            }
+            anyhow::ensure!(result.is_finite(), "target term is not representable");
+            Ok(result)
+        }
+
+        fn range_error_is_negligible(&self, error: &Float, sum: &Float) -> bool {
+            if error == &0 {
+                return true;
+            }
+            if sum == &0 {
+                return false;
+            }
+            let budget = sum.clone().abs().ln()
+                - Float::with_val(self.working_precision, 2).ln() * self.working_precision;
+            error.clone().ln() <= budget
+        }
+
         fn scale(spec: &ScalarScaleSpec, working_precision: u32) -> Result<Float> {
             spec.validate("polynomial scale")?;
             Ok(match spec {
-                ScalarScaleSpec::Decimal { value } => {
-                    Float::with_val(working_precision, Float::parse(value)?)
-                }
+                ScalarScaleSpec::Decimal { value } => Self::decimal(value, working_precision)?,
                 ScalarScaleSpec::RationalTimesSquareRoot {
                     rational_numerator,
                     rational_denominator,
@@ -638,14 +812,7 @@ pub mod hp {
         }
 
         fn new(spec: &GaussianPolynomialSeriesSpec, working_precision: u32) -> Result<Self> {
-            let parse = |value: &str| -> Result<Float> {
-                let parsed = Float::parse(value).context("invalid target coefficient")?;
-                let value = Float::with_val(working_precision, parsed);
-                if !value.is_finite() {
-                    anyhow::bail!("target coefficients must be finite");
-                }
-                Ok(value)
-            };
+            let parse = |value: &str| Self::decimal(value, working_precision);
             Ok(Self {
                 working_precision,
                 term_input_power: spec.term_input_power,
@@ -686,9 +853,9 @@ pub mod hp {
             value
         }
 
-        /// Absolute-monomial geometric tail; see the binary64 derivation.
-        /// Each component has its own relative budget, so an arbitrarily
-        /// scaled base or parameter polynomial cannot hide the other tail.
+        /// Absolute-monomial geometric tail, compared in the log domain so
+        /// neither the tail nor its relative budget can silently underflow.
+        /// These are computed estimates, not outward-rounded certificates.
         fn tail_is_negligible(
             &self,
             u: &Float,
@@ -696,44 +863,49 @@ pub mod hp {
             coefficients: &[Float],
             scale: &Float,
             sum: &Float,
-        ) -> bool {
-            let Some(degree) = coefficients.iter().rposition(|c| *c != 0u32) else {
-                return true;
+        ) -> Result<bool> {
+            let Some(degree) = coefficients.iter().rposition(|c| c != &0) else {
+                return Ok(true);
             };
-            if *scale == 0u32 {
-                return true;
+            if scale == &0 {
+                return Ok(true);
+            }
+            if sum == &0 {
+                return Ok(false);
             }
             let p = self.working_precision;
             let m = n + 1;
             let pi = Float::with_val(p, Constant::Pi);
-            let mut decay = Float::with_val(p, u).square();
+            let mut decay = u.clone().square();
             decay *= &pi;
             decay *= 2 * m + 1;
+            anyhow::ensure!(
+                decay.is_finite(),
+                "target tail argument is outside the supported exponent range"
+            );
             let mut log_ratio = Float::with_val(p, self.term_input_power + 2 * degree as u32);
             log_ratio /= m;
             log_ratio -= decay;
-            // A margin from 1/2 keeps the geometric comparison clear of
-            // floating-point boundary rounding. This is computed arithmetic,
-            // not an outward-rounded certificate.
-            if log_ratio > -Float::with_val(p, 1u32) {
-                return false;
+            // The stronger ratio <= exp(-1) leaves a margin below 1/2.
+            if log_ratio > -1 {
+                return Ok(false);
             }
-            let mut input = Float::with_val(p, u);
-            input *= m;
-            let mut x = input.clone().square();
-            x *= pi;
-            let mut envelope = Float::with_val(p, 0u32);
-            for coefficient in coefficients.iter().rev() {
-                envelope *= &x;
-                envelope += coefficient.clone().abs();
+            let input = Float::with_val(p, u * m);
+            let x = input.clone().square() * pi;
+            let logs = self.monomial_logs(&input, &x, coefficients, scale)?;
+            let maximum = logs
+                .iter()
+                .map(|(v, _)| v)
+                .max_by(|a, b| a.partial_cmp(b).unwrap())
+                .expect("nonzero polynomial");
+            let mut envelope = Float::with_val(p, 0);
+            for (log, _) in &logs {
+                envelope += Float::with_val(p, log - maximum).exp();
             }
-            let mut tail = (-x).exp();
-            tail *= self.input_power(&input);
-            tail *= envelope;
-            tail *= scale.clone().abs();
-            tail *= 2u32;
-            let tolerance = sum.clone().abs() >> p;
-            tail.is_finite() && tail <= tolerance
+            let ln2 = Float::with_val(p, 2).ln();
+            let log_tail = envelope.ln() + maximum + &ln2;
+            let log_budget = sum.clone().abs().ln() - ln2 * p;
+            Ok(log_tail <= log_budget)
         }
 
         fn components(&self, u: &Float) -> Result<(Float, Float)> {
@@ -745,22 +917,27 @@ pub mod hp {
             let pi = Float::with_val(self.working_precision, Constant::Pi);
             let mut base_sum = Float::with_val(self.working_precision, 0u32);
             let mut parameter_sum = Float::with_val(self.working_precision, 0u32);
+            let mut base_range_error = Float::with_val(self.working_precision, 0);
+            let mut parameter_range_error = Float::with_val(self.working_precision, 0);
             for n in 1..=self.maximum_terms {
                 let mut input = u.clone();
                 input *= n;
                 let mut x = input.clone().square();
                 x *= &pi;
-                let mut common = (-x.clone()).exp();
-                common *= self.input_power(&input);
-                let mut base_term = common.clone();
-                base_term *= self.polynomial(&self.polynomial_coefficients, &x);
-                base_term *= &self.polynomial_scale;
-                let mut parameter_term = Float::with_val(self.working_precision, 0u32);
-                if !self.parameter_polynomial_coefficients.is_empty() {
-                    parameter_term = common;
-                    parameter_term *= self.polynomial(&self.parameter_polynomial_coefficients, &x);
-                    parameter_term *= &self.parameter_polynomial_scale;
-                }
+                let base_term = self.term(
+                    &input,
+                    &x,
+                    &self.polynomial_coefficients,
+                    &self.polynomial_scale,
+                    &mut base_range_error,
+                )?;
+                let parameter_term = self.term(
+                    &input,
+                    &x,
+                    &self.parameter_polynomial_coefficients,
+                    &self.parameter_polynomial_scale,
+                    &mut parameter_range_error,
+                )?;
                 base_sum += base_term;
                 parameter_sum += parameter_term;
                 anyhow::ensure!(
@@ -774,21 +951,32 @@ pub mod hp {
                         &self.polynomial_coefficients,
                         &self.polynomial_scale,
                         &base_sum,
-                    )
+                    )?
                     && self.tail_is_negligible(
                         &u,
                         n,
                         &self.parameter_polynomial_coefficients,
                         &self.parameter_polynomial_scale,
                         &parameter_sum,
-                    )
+                    )?
+                    && self.range_error_is_negligible(&base_range_error, &base_sum)
+                    && self.range_error_is_negligible(&parameter_range_error, &parameter_sum)
                 {
                     let sqrt_u = u.sqrt();
                     base_sum *= &sqrt_u;
                     parameter_sum *= sqrt_u;
+                    anyhow::ensure!(
+                        base_sum.is_finite() && parameter_sum.is_finite(),
+                        "target series produced a nonfinite value"
+                    );
                     return Ok((base_sum, parameter_sum));
                 }
             }
+            anyhow::ensure!(
+                self.range_error_is_negligible(&base_range_error, &base_sum)
+                    && self.range_error_is_negligible(&parameter_range_error, &parameter_sum),
+                "target series is outside the supported exponent range at working precision"
+            );
             anyhow::bail!("target series did not converge within maximum_terms")
         }
     }
@@ -808,7 +996,13 @@ pub mod hp {
     impl TargetEvaluator {
         pub fn from_spec(spec: &TargetProfileSpec, precision_bits: u32) -> Result<Self> {
             spec.validate()?;
-            let working = precision_bits.saturating_add(GUARD_BITS);
+            anyhow::ensure!(
+                (rug::float::prec_min()..=1_000_000).contains(&precision_bits),
+                "target precision must be between 1 and 1000000 bits"
+            );
+            let working = precision_bits
+                .checked_add(GUARD_BITS)
+                .context("target precision overflow")?;
             let base = spec
                 .base_series
                 .as_ref()
@@ -837,7 +1031,12 @@ pub mod hp {
                     if parameter_value == 0u32 || !parameter_value.is_finite() {
                         anyhow::bail!("auxiliary target parameter is singular at u = 1");
                     }
-                    let parameter = Float::with_val(working, -base_value / parameter_value);
+                    let parameter = Float::with_val(working, -base_value.clone() / parameter_value);
+                    anyhow::ensure!(
+                        parameter.is_finite() && (base_value == 0 || parameter != 0),
+                        "auxiliary target parameter is not representable"
+                    );
+                    checked_round(&parameter, precision_bits, "auxiliary target parameter")?;
                     Ok((compiled, parameter))
                 })
                 .transpose()?;
@@ -884,12 +1083,17 @@ pub mod hp {
                     .components(u)?
                     .0
             };
+            let nonzero = value != 0;
             value /= &self.base_at_one;
+            anyhow::ensure!(
+                !nonzero || value != 0,
+                "normalized target is below the supported exponent range"
+            );
             anyhow::ensure!(
                 value.is_finite(),
                 "target evaluation produced a nonfinite value"
             );
-            Ok(Float::with_val(self.requested_precision, value))
+            checked_round(&value, self.requested_precision, "target value")
         }
 
         /// Scalar callback compatibility; use [`Self::try_value`] to retain errors.
@@ -912,7 +1116,11 @@ pub mod hp {
             let (mut base, mut coefficient) = series.components(u)?;
             coefficient *= parameter;
             base += coefficient;
-            Ok(Float::with_val(self.requested_precision, base))
+            anyhow::ensure!(
+                base.is_finite(),
+                "auxiliary target produced a nonfinite value"
+            );
+            checked_round(&base, self.requested_precision, "auxiliary target value")
         }
     }
 }
@@ -1036,6 +1244,26 @@ mod summation_regressions {
         )
         .abs();
         assert!(difference < (Float::with_val(128, 1) >> 120));
+    }
+
+    #[cfg(feature = "hp")]
+    #[test]
+    fn hp_target_admits_coefficients_beyond_binary64_range() {
+        use rug::Float;
+        let mut spec = testing_profile_spec();
+        spec.auxiliary_series = None;
+        let reference = hp::TargetEvaluator::from_spec(&spec, 256).unwrap();
+        spec.base_series.as_mut().unwrap().polynomial_coefficients = vec!["1e400".into()];
+        spec.validate().unwrap();
+        assert!(TargetEvaluatorF64::from_spec(&spec).is_err());
+        let scaled = hp::TargetEvaluator::from_spec(&spec, 256).unwrap();
+        let u = Float::with_val(256, Float::parse("1.1").unwrap());
+        let difference = Float::with_val(
+            256,
+            reference.try_value(&u).unwrap() - scaled.try_value(&u).unwrap(),
+        )
+        .abs();
+        assert!(difference < (Float::with_val(256, 1) >> 235));
     }
 
     #[cfg(feature = "hp")]

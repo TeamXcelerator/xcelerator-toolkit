@@ -111,6 +111,7 @@ pub struct F64BatchReproducibilityReport {
     pub left_payload_sha256: String,
     pub right_payload_sha256: String,
     pub exact_payload_identity: bool,
+    /// Upward binary64 bound on the exact stored-output differences.
     pub maximum_absolute_difference: f64,
     pub declared_absolute_tolerance: f64,
     pub accepted: bool,
@@ -152,7 +153,18 @@ pub fn compare_f64_operator_batches(
                     "batch comparison rejects nonfinite output".to_owned(),
                 ));
             }
-            maximum_absolute_difference = maximum_absolute_difference.max((left - right).abs());
+            let (a, b) = (left.abs(), right.abs());
+            let difference = if left.is_sign_negative() == right.is_sign_negative() {
+                crate::add_bound_f64(a.max(b), -a.min(b))
+            } else {
+                crate::add_bound_f64(a, b)
+            };
+            if !difference.is_finite() {
+                return Err(OperatorError::InvalidData(
+                    "batch difference exceeds finite binary64 range".into(),
+                ));
+            }
+            maximum_absolute_difference = maximum_absolute_difference.max(difference);
         }
     }
     let comparison_plan = left_fingerprint
@@ -233,6 +245,30 @@ mod tests {
             resolved_resource_policy_digest: resources.digest().unwrap(),
             reproducibility: Reproducibility::Bitwise,
         }
+    }
+
+    #[test]
+    fn batch_comparison_does_not_round_excess_error_into_tolerance() {
+        let left = [OperatorBatchOutcome {
+            input_ordinal: 0,
+            task_id: "x".into(),
+            output: vec![1.0],
+        }];
+        let right = [OperatorBatchOutcome {
+            input_ordinal: 0,
+            task_id: "x".into(),
+            output: vec![-2.0f64.powi(-100)],
+        }];
+        let report = compare_f64_operator_batches(
+            &left,
+            &fingerprint(1, "serial"),
+            &right,
+            &fingerprint(2, "parallel"),
+            1.0,
+        )
+        .unwrap();
+        assert!(!report.accepted, "exact difference is 1 + 2^-100 > 1");
+        assert!(report.maximum_absolute_difference > 1.0);
     }
 
     #[test]

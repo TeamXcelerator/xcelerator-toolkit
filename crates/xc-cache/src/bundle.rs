@@ -340,6 +340,7 @@ pub struct CacheBundleConsumptionPolicy {
 
 impl CacheBundleConsumptionPolicy {
     pub fn validate(&self) -> Result<(), CacheError> {
+        self.reader_version.validate()?;
         if self.schema_version == 0 {
             return Err(CacheError::InvalidManifest(
                 "cache bundle consumption policy schema is required".to_owned(),
@@ -541,6 +542,13 @@ pub fn verify_cache_bundle(
 pub fn resolve_cache_bundle_semantic_artifact(
     request: CacheBundleSemanticResolutionRequest<'_>,
 ) -> Result<CacheBundleSemanticResolutionReport, CacheError> {
+    resolve_cache_bundle_semantic_artifact_filtered(request, |_| Ok(()))
+}
+
+pub(crate) fn resolve_cache_bundle_semantic_artifact_filtered(
+    request: CacheBundleSemanticResolutionRequest<'_>,
+    validate_candidate: impl Fn(&CacheBundleArtifactRecord) -> Result<(), CacheError>,
+) -> Result<CacheBundleSemanticResolutionReport, CacheError> {
     if request.family.trim().is_empty() || !request.semantic_digest.validate() {
         return Err(CacheError::InvalidManifest(
             "bundle semantic query requires a family and digest".to_owned(),
@@ -566,7 +574,9 @@ pub fn resolve_cache_bundle_semantic_artifact(
         artifact.identity.artifact_family == request.family
             && artifact.identity.semantic_digest == *request.semantic_digest
     }) {
-        match validate_consumable_closure(artifact, &artifacts, request.consumption_policy) {
+        match validate_candidate(artifact).and_then(|_| {
+            validate_consumable_closure(artifact, &artifacts, request.consumption_policy)
+        }) {
             Ok(_) => accepted.push(artifact),
             Err(error) => {
                 rejected_manifest_digests
@@ -576,8 +586,10 @@ pub fn resolve_cache_bundle_semantic_artifact(
     }
     accepted.sort_by(|left, right| {
         right
-            .achieved_assurance
-            .cmp(&left.achieved_assurance)
+            .manifest
+            .producer_toolkit_version
+            .cmp(&left.manifest.producer_toolkit_version)
+            .then_with(|| right.achieved_assurance.cmp(&left.achieved_assurance))
             .then_with(|| {
                 left.identity
                     .manifest_digest
@@ -642,7 +654,9 @@ pub fn materialize_cache_bundle_artifact(
     ) {
         Ok(report) => report,
         Err(error) => {
-            let _ = fs::remove_file(destination);
+            if package.created_new {
+                let _ = fs::remove_file(destination);
+            }
             return Err(error);
         }
     };
@@ -772,7 +786,10 @@ fn plan_export_parts(
             let source_path =
                 resolve_transport_part_path(&source.parts_root, &part.repository_path)?;
             match planned.get(&part.repository_path) {
-                Some(existing) if existing.part != *part => {
+                Some(existing)
+                    if existing.part.size_bytes != part.size_bytes
+                        || existing.part.content_digest != part.content_digest =>
+                {
                     return Err(CacheError::InvalidManifest(format!(
                         "bundle part path {:?} has conflicting identities",
                         part.repository_path
@@ -801,7 +818,10 @@ fn plan_manifest_parts(
     for artifact in &manifest.artifacts {
         for part in &artifact.encoding.ordered_parts {
             match planned.get(&part.repository_path) {
-                Some(existing) if existing != part => {
+                Some(existing)
+                    if existing.size_bytes != part.size_bytes
+                        || existing.content_digest != part.content_digest =>
+                {
                     return Err(CacheError::InvalidManifest(format!(
                         "bundle part path {:?} has conflicting identities",
                         part.repository_path
@@ -907,6 +927,7 @@ fn verify_decoded_artifacts(
     for artifact in &manifest.artifacts {
         check_cancelled(cancellation)?;
         let package_path = unique_scratch_path(scratch_root, &artifact.identity.manifest_digest);
+        let mut created_new = false;
         let result = reconstruct_transport_package(
             &artifact.encoding,
             &bundle_root.join(CACHE_BUNDLE_PARTS_DIRECTORY),
@@ -914,7 +935,8 @@ fn verify_decoded_artifacts(
             resources,
             cancellation,
         )
-        .and_then(|_| {
+        .and_then(|package| {
+            created_new = package.created_new;
             verify_canonical_payload_zip64(
                 &artifact.manifest.canonical_payload,
                 &artifact.encoding,
@@ -922,7 +944,9 @@ fn verify_decoded_artifacts(
                 cancellation,
             )
         });
-        let _ = fs::remove_file(&package_path);
+        if created_new {
+            let _ = fs::remove_file(&package_path);
+        }
         result?;
     }
     Ok(())
@@ -1544,5 +1568,121 @@ mod tests {
         );
         assert!(matches!(result, Err(CacheError::DigestMismatch { .. })));
         fs::remove_dir_all(root).unwrap();
+    }
+    fn exhaustive_local_policy_case(field: &str) {
+        let root = temporary_root(&format!("exhaustive-{field}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = fixture(&root, "root", None);
+        let semantic_key = source.artifact.manifest.semantic_key.clone();
+        let bundle = root.join("export.bundle");
+        let policy = CacheBundlePolicy::default();
+        export_cache_bundle(
+            &CacheBundleExportRequest {
+                schema_version: 1,
+                roots: vec![source.artifact.identity.clone()],
+                sources: vec![source],
+            },
+            &bundle,
+            &policy,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut query = RemoteSemanticQuery {
+            family: "fixture".into(),
+            semantic_key,
+            minimum_assurance: ArtifactAssuranceState::Computed,
+            allowed_scalar_backends: BTreeSet::new(),
+            minimum_precision_bits: None,
+            required_configuration_digest: None,
+            required_provenance_evidence_digests: BTreeSet::new(),
+            current_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            accepted_publication_policy_digests: [ContentDigest::sha256(b"policy")]
+                .into_iter()
+                .collect(),
+            allow_deprecated: false,
+            evaluation_unix_seconds: 0,
+            maximum_topology_bytes: 1024,
+            maximum_index_bytes: 1024,
+            maximum_manifest_bytes: 1024,
+            maximum_encoding_bytes: 1024,
+            maximum_receipt_bytes: 1024,
+            maximum_revocation_partition_bytes: 1024,
+            maximum_dependency_depth: 8,
+            maximum_dependency_count: 10,
+        };
+        match field {
+            "backend" => {
+                query.allowed_scalar_backends.insert("mpfr".into());
+            }
+            "precision" => query.minimum_precision_bits = Some(128),
+            "configuration" => {
+                query.required_configuration_digest = Some(ContentDigest::sha256(b"different"))
+            }
+            "evidence" => {
+                query
+                    .required_provenance_evidence_digests
+                    .insert(ContentDigest::sha256(b"missing evidence"));
+            }
+            _ => unreachable!(),
+        }
+        let scratch = root.join("scratch");
+        let report = resolve_semantic_artifact(
+            None,
+            &query,
+            &[SemanticArtifactSource::ExportBundle {
+                name: "bundle",
+                overlay_class: SemanticArtifactOverlayClass::WorkstationLocal,
+                root: &bundle,
+                scratch_root: &scratch,
+                policy: &policy,
+            }],
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        assert!(
+            report.selected.is_none(),
+            "ignored {field} consumption constraint"
+        );
+    }
+    #[test]
+    fn exhaustive_bundle_query_enforces_backend() {
+        exhaustive_local_policy_case("backend");
+    }
+    #[test]
+    fn exhaustive_bundle_query_enforces_precision() {
+        exhaustive_local_policy_case("precision");
+    }
+    #[test]
+    fn exhaustive_bundle_query_enforces_configuration() {
+        exhaustive_local_policy_case("configuration");
+    }
+    #[test]
+    fn exhaustive_bundle_query_enforces_evidence() {
+        exhaustive_local_policy_case("evidence");
+    }
+    #[test]
+    fn exhaustive_repeated_part_occurrences_share_one_bundle_file() {
+        let root = temporary_root("exhaustive-repeated-part");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut source = fixture(&root, "root", None);
+        let first = source.artifact.encoding.ordered_parts[0].clone();
+        let mut second = first.clone();
+        second.sequence = 1;
+        source.artifact.encoding.ordered_parts = vec![first, second];
+        // Part planning handles physical file identities; occurrence sequence
+        // belongs to reconstruction and must not make these bytes conflict.
+        let manifest = CacheBundleManifest {
+            schema_version: 1,
+            roots: vec![source.artifact.identity.clone()],
+            artifacts: vec![source.artifact],
+        };
+        let result = plan_manifest_parts(&manifest);
+        fs::remove_dir_all(&root).unwrap();
+        assert_eq!(result.unwrap().len(), 1);
     }
 }

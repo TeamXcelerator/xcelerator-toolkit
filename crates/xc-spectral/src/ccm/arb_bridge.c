@@ -5,6 +5,8 @@
  * No FLINT source is copied into or statically linked with the toolkit.
  */
 
+#include <stdint.h>
+#include <stddef.h>
 #include <mpfr.h>
 #include <flint/acb.h>
 #include <flint/acb_hypgeom.h>
@@ -14,6 +16,15 @@
 #include <flint/fmpq.h>
 #include <flint/fmpq_poly.h>
 #include <flint/fmpz_poly.h>
+
+/* Rust uses isize for every slong argument and output slot. */
+typedef char xc_flint_slong_pointer_width[
+    (sizeof(slong) == sizeof(intptr_t)) ? 1 : -1];
+
+size_t xc_arb_slong_size(void)
+{
+    return sizeof(slong);
+}
 
 const char *xc_arb_flint_version(void)
 {

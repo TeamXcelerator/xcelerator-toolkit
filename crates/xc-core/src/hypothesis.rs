@@ -25,10 +25,15 @@ fn digest(value: &ConfigDigest, field: &str) -> Result<(), ConfigError> {
     }
     Ok(())
 }
-/// Canonical, secret-free JSON identity shared by frozen plans and managed records.
+/// Representation identity of secret-free JSON, shared by frozen plans and managed records.
+///
+/// Object keys are sorted; array order and decimal string spelling are preserved.
+/// This does not identify all mathematically equivalent inputs. Native JSON numbers
+/// use the pinned serde_json formatter; portable exact quantities should use
+/// validated decimal strings under the relevant domain's normalization contract.
 pub fn research_digest<T: Serialize>(value: &T) -> Result<ConfigDigest, ConfigError> {
-    crate::validate_secret_free(value, "research specification")?;
-    let value = serde_json::to_value(value).map_err(|e| ConfigError::new(e.to_string()))?;
+    let value = crate::finite_json::to_value(value).map_err(|e| ConfigError::new(e.to_string()))?;
+    crate::validate_secret_free(&value, "research specification")?;
     let text = canonical_json(&value).map_err(|e| ConfigError::new(e.to_string()))?;
     Ok(ConfigDigest(sha256_hex(text.as_bytes())))
 }
@@ -370,9 +375,15 @@ impl ObservationPayload {
             ObservableTransform::SignedLogMagnitude { .. }
         );
         match &self.value {
-            ObservedScalar::ExactZero if signed_log => {
+            ObservedScalar::ExactZero
+                if signed_log
+                    || matches!(
+                        self.observable.transform,
+                        ObservableTransform::PositiveLog { .. }
+                    ) =>
+            {
                 return Err(ConfigError::new(
-                    "an exact original zero has no finite signed logarithm",
+                    "an exact original zero has no finite logarithm",
                 ))
             }
             ObservedScalar::SignedLogMagnitude { log_magnitude, .. } => {
@@ -500,7 +511,11 @@ impl HypothesisSpec {
             required(id, "case ID")?;
             required(&c.family_id, "family ID")?;
             c.design.validate()?;
-            let design_digest = research_digest(&c.design)?.0;
+            let mut canonical_design = c.design.clone();
+            for coordinate in canonical_design.coordinates.values_mut() {
+                *coordinate = coordinate.canonical()?;
+            }
+            let design_digest = research_digest(&canonical_design)?.0;
             if designs
                 .insert(design_digest, (c.partition, c.family_id.clone()))
                 .is_some_and(|(p, family)| p != c.partition || family != c.family_id)

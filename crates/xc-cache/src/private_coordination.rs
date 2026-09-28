@@ -12,7 +12,7 @@ use crate::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::path::Path;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use xc_core::CancellationToken;
 
 pub const PRIVATE_COORDINATION_BRANCH: &str = "xcelerator-coordination";
@@ -89,10 +89,9 @@ impl PrivatePublicationLock {
     }
 
     pub fn expired_at(&self, now_unix_seconds: u64, clock_skew_grace_seconds: u64) -> bool {
-        now_unix_seconds
-            >= self
-                .lease_expires_at_unix_seconds
-                .saturating_add(clock_skew_grace_seconds)
+        self.lease_expires_at_unix_seconds
+            .checked_add(clock_skew_grace_seconds)
+            .is_some_and(|expiration| now_unix_seconds >= expiration)
     }
 }
 
@@ -284,7 +283,9 @@ fn lock_record(
         observed_main_head: main_head.to_owned(),
         acquired_at_unix_seconds: acquired_at,
         heartbeat_at_unix_seconds: now,
-        lease_expires_at_unix_seconds: now.saturating_add(policy.lease_seconds),
+        lease_expires_at_unix_seconds: now.checked_add(policy.lease_seconds).ok_or_else(|| {
+            CacheError::ResourceLimit("private publication lease expiration exceeds u64".to_owned())
+        })?,
     };
     record.validate()?;
     Ok(record)
@@ -338,13 +339,19 @@ pub fn acquire_private_publication_lease(
             "private publication lease target is incomplete".to_owned(),
         ));
     }
-    let started = now_unix_seconds()?;
+    let started = Instant::now();
     let mut poll_seconds = policy.initial_poll_seconds;
     let mut last_status = 0u64;
     loop {
         cancellation
             .check()
             .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+        if started.elapsed().as_secs() >= policy.maximum_wait_seconds {
+            return Err(CacheError::ResourceLimit(format!(
+                "timed out waiting {} seconds for private publication lock in {repository}",
+                policy.maximum_wait_seconds
+            )));
+        }
         let main_head = remote.read_ref(repository, main_branch)?;
         let now = now_unix_seconds()?;
         match remote.read_ref(repository, PRIVATE_COORDINATION_BRANCH) {
@@ -467,7 +474,7 @@ pub fn acquire_private_publication_lease(
                         CompareAndSwapResult::RefConflict { .. } => continue,
                     }
                 }
-                if now.saturating_sub(started) >= policy.maximum_wait_seconds {
+                if started.elapsed().as_secs() >= policy.maximum_wait_seconds {
                     return Err(CacheError::ResourceLimit(format!(
                         "timed out waiting {} seconds for private publication lock in {repository}",
                         policy.maximum_wait_seconds
@@ -478,7 +485,7 @@ pub fn acquire_private_publication_lease(
                     eprintln!(
                         "private publication lock held: principal={} run={} generation={} lease_remaining={}s; waiting",
                         existing.github_principal,
-                        &existing.owner_run_id[..12.min(existing.owner_run_id.len())],
+                        existing.owner_run_id.chars().take(12).collect::<String>(),
                         existing.fencing_generation,
                         existing.lease_expires_at_unix_seconds.saturating_sub(now)
                     );
@@ -490,6 +497,11 @@ pub fn acquire_private_publication_lease(
                         policy.maximum_poll_seconds,
                         &owner.owner_run_id,
                         state.fencing_generation,
+                    )
+                    .min(
+                        policy
+                            .maximum_wait_seconds
+                            .saturating_sub(started.elapsed().as_secs()),
                     ),
                     cancellation,
                 )?;
@@ -520,7 +532,10 @@ fn renewed_lock_at(
     let mut renewed = lock.clone();
     renewed.observed_main_head = observed_main_head.to_owned();
     renewed.heartbeat_at_unix_seconds = now;
-    renewed.lease_expires_at_unix_seconds = now.saturating_add(policy.lease_seconds);
+    renewed.lease_expires_at_unix_seconds =
+        now.checked_add(policy.lease_seconds).ok_or_else(|| {
+            CacheError::ResourceLimit("private publication lease expiration exceeds u64".to_owned())
+        })?;
     renewed.validate()?;
     Ok(renewed)
 }
@@ -877,5 +892,35 @@ mod tests {
         assert_eq!(second.lock.fencing_generation, 2);
         release_private_publication_lease(&store, &second, &staging, false).unwrap();
         let _ = fs::remove_dir_all(root);
+    }
+    fn audit_boundary_lock() -> PrivatePublicationLock {
+        PrivatePublicationLock {
+            schema_version: 1,
+            owner_run_id: "run".into(),
+            publication_transaction_id: "transaction".into(),
+            github_principal: "principal".into(),
+            toolkit_version: "0.15.1".into(),
+            instance_fingerprint: ContentDigest::sha256(b"instance"),
+            process_id: 1,
+            fencing_generation: 1,
+            observed_main_head: "a".repeat(40),
+            acquired_at_unix_seconds: 1,
+            heartbeat_at_unix_seconds: 2,
+            lease_expires_at_unix_seconds: u64::MAX,
+        }
+    }
+    #[test]
+    fn audit_expiration_does_not_round_overflowed_grace_down() {
+        assert!(!audit_boundary_lock().expired_at(u64::MAX, 1));
+    }
+    #[test]
+    fn audit_renewal_rejects_unrepresentable_expiration() {
+        assert!(renewed_lock_at(
+            &audit_boundary_lock(),
+            &"a".repeat(40),
+            &PrivatePublicationLeasePolicy::default(),
+            u64::MAX - 1
+        )
+        .is_err());
     }
 }

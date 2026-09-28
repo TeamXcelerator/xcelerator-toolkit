@@ -329,9 +329,9 @@ impl DraftInventory {
             .iter()
             .filter(|index| {
                 minimum_quality.is_none_or(|minimum| {
-                    self.drafts[**index].source_quality.is_some_and(|quality| {
-                        quality.admissible_rank() >= minimum.admissible_rank()
-                    })
+                    self.drafts[**index]
+                        .source_quality
+                        .is_some_and(|quality| quality.satisfies(minimum))
                 })
             })
             .min_by(|left, right| {
@@ -398,6 +398,7 @@ trait DependencyDraftLookup {
         &self,
         key: &ArtifactKey,
         content_digest: &ContentDigest,
+        minimum_quality: crate::CacheQuality,
     ) -> Option<&CanonicalProductionDraft>;
 }
 
@@ -406,10 +407,31 @@ impl DependencyDraftLookup for &[CanonicalProductionDraft] {
         &self,
         key: &ArtifactKey,
         content_digest: &ContentDigest,
+        minimum_quality: crate::CacheQuality,
     ) -> Option<&CanonicalProductionDraft> {
-        self.iter().find(|draft| {
-            &draft.source_artifact_key == key && &draft.source_content_digest == content_digest
-        })
+        self.iter()
+            .filter(|draft| {
+                &draft.source_artifact_key == key
+                    && &draft.source_content_digest == content_digest
+                    && draft
+                        .source_quality
+                        .is_some_and(|quality| quality.satisfies(minimum_quality))
+            })
+            .min_by(|left, right| {
+                right
+                    .source_quality
+                    .map(crate::CacheQuality::admissible_rank)
+                    .cmp(
+                        &left
+                            .source_quality
+                            .map(crate::CacheQuality::admissible_rank),
+                    )
+                    .then_with(|| {
+                        left.source_manifest_digest
+                            .0
+                            .cmp(&right.source_manifest_digest.0)
+                    })
+            })
     }
 }
 
@@ -418,8 +440,9 @@ impl DependencyDraftLookup for DraftInventory {
         &self,
         key: &ArtifactKey,
         content_digest: &ContentDigest,
+        minimum_quality: crate::CacheQuality,
     ) -> Option<&CanonicalProductionDraft> {
-        self.find_by_source(key, content_digest)
+        self.find_by_source_with_quality(key, content_digest, Some(minimum_quality))
     }
 }
 
@@ -874,6 +897,32 @@ impl CanonicalStagingProductionSink {
             .drafts
             .lock()
             .map_err(|_| CacheError::Io("canonical staging sink lock is poisoned".to_owned()))?;
+        // A warm source shortcut must not erase a newly supplied operational
+        // dependency requirement. Check it before returning an existing draft.
+        if !record
+            .manifest
+            .tags
+            .contains_key(REMOTE_CANONICAL_MANIFEST_TAG)
+        {
+            for dependency in &record.manifest.dependencies {
+                if inventory
+                    .dependency_draft(
+                        &dependency.key,
+                        &dependency.content_digest,
+                        dependency.required_quality,
+                    )
+                    .is_none()
+                {
+                    return Err(CacheError::NotFound(format!(
+                        "canonical dependency draft meeting {:?} is missing for {} / {} / {}",
+                        dependency.required_quality,
+                        dependency.key.kind,
+                        dependency.key.logical_key,
+                        dependency.content_digest,
+                    )));
+                }
+            }
+        }
         // Deduplicate by exact published identity as well as by source key.
         // The key-based and identity-based closure walks can meet on a
         // diamond: the same artifact staged first through an identity
@@ -898,12 +947,19 @@ impl CanonicalStagingProductionSink {
                 record.manifest.provenance_digest.as_ref(),
             )?;
             let manifest_digest = canonical.digest()?;
-            if let Some(index) = inventory.find_identity_index(
-                &canonical.artifact_family,
-                &canonical.semantic_digest,
-                &manifest_digest,
-                &canonical.payload_digest,
-            ) {
+            if let Some(index) = inventory
+                .find_identity_index(
+                    &canonical.artifact_family,
+                    &canonical.semantic_digest,
+                    &manifest_digest,
+                    &canonical.payload_digest,
+                )
+                .filter(|index| {
+                    inventory.drafts[*index]
+                        .source_quality
+                        .is_some_and(|quality| quality.satisfies(record.manifest.quality))
+                })
+            {
                 let existing = &inventory.drafts[index];
                 // Prefer real adapter provenance over a synthetic identity
                 // closure key when the key-based walk later reaches it.
@@ -947,7 +1003,11 @@ impl CanonicalStagingProductionSink {
             .tags
             .contains_key(REMOTE_CANONICAL_MANIFEST_TAG)
             && inventory
-                .find_by_source(&record.manifest.key, &record.manifest.content_digest)
+                .find_by_source_with_quality(
+                    &record.manifest.key,
+                    &record.manifest.content_digest,
+                    Some(record.manifest.quality),
+                )
                 .is_some()
         {
             self.mark_observed(record.manifest)?;
@@ -1213,7 +1273,7 @@ impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
                 CacheError::InvalidManifest("assurance attestation path has no parent".to_owned())
             })?;
             fs::create_dir_all(parent)?;
-            fs::write(&attestation_path, bytes)?;
+            crate::atomic_replace(&attestation_path, &bytes)?;
         }
         // The attestation identity is the source key plus logical content;
         // apply it to every staged canonical closure carrying that exact
@@ -1308,7 +1368,7 @@ impl crate::ArtifactProductionSink for CanonicalStagingProductionSink {
                 CacheError::InvalidManifest("artifact evidence path has no parent".to_owned())
             })?;
             fs::create_dir_all(parent)?;
-            fs::write(path, bytes)?;
+            crate::atomic_replace(&path, bytes)?;
         }
         Ok(digest)
     }
@@ -1694,11 +1754,18 @@ fn stage_record(
         let mut dependencies = Vec::new();
         for dependency in &record.manifest.dependencies {
             let draft = dependency_drafts
-                .dependency_draft(&dependency.key, &dependency.content_digest)
+                .dependency_draft(
+                    &dependency.key,
+                    &dependency.content_digest,
+                    dependency.required_quality,
+                )
                 .ok_or_else(|| {
                     CacheError::NotFound(format!(
-                        "canonical dependency draft is missing for {} / {} / {}",
-                        dependency.key.kind, dependency.key.logical_key, dependency.content_digest
+                        "canonical dependency draft meeting {:?} is missing for {} / {} / {}",
+                        dependency.required_quality,
+                        dependency.key.kind,
+                        dependency.key.logical_key,
+                        dependency.content_digest
                     ))
                 })?;
             dependencies.push(crate::PayloadDependencyIdentity {
@@ -1805,7 +1872,7 @@ fn stage_record(
                     )));
                 }
                 fs::create_dir_all(path.parent().unwrap())?;
-                fs::write(path, bytes)?;
+                crate::atomic_replace(&path, bytes)?;
                 Ok(())
             },
         )
@@ -2009,9 +2076,11 @@ fn stage_record(
         required_assurance: None,
         assurance_evidence_digests: record.assurance_evidence_digests.to_vec(),
     };
-    fs::write(
-        draft_root.join("draft.json"),
-        serde_json::to_vec_pretty(&draft)?,
+    // Commit the marker only after its complete bytes are synced in a sibling.
+    // A process interruption leaves no partial draft.json for the next reader.
+    crate::atomic_replace(
+        &draft_root.join("draft.json"),
+        &serde_json::to_vec_pretty(&draft)?,
     )?;
     Ok(draft)
 }
@@ -2068,6 +2137,7 @@ mod tests {
             "ccm-roots",
             "ccm-evidence",
             "ccm-distance",
+            "maynard-tao",
         ] {
             for kind in artifact_kinds_for_family(family).unwrap() {
                 assert!(

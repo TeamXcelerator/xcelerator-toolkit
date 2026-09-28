@@ -1,5 +1,53 @@
 # Release validation
 
+## v0.15.2 consolidated release
+
+The v0.15.2 release combines all repairs made after v0.15.1. It supersedes the
+release status of the historical checkpoints below. Source changes are qualified
+locally; the only checked-in GitHub workflow is manually dispatched.
+
+Native Windows HP/FLINT,
+32-bit execution, external schema synchronization, and clearance of historical
+scientific conclusions remain outside qualification.
+
+## Original v0.15.2 checkpoint before consolidation
+
+Local qualification uses Rust 1.98.0 on x86-64 Windows/MSVC and Ubuntu/WSL.
+The complete optimized HP/Arb workspace has **2,101 passing tests**, no failures,
+and 38 explicitly reviewed ordinary skips. Native Windows defaults have
+**833 passing tests**, no failures, and six ordinary skips. Both platforms pass
+strict workspace Clippy, external consumer tests (three per platform) and Clippy,
+strict rustdoc, and doctests. Twenty normally skipped numerical cases pass in
+separate optimized processes. All eight performance probes pass, including both explicit memory-probe routes.
+The 401-by-401 cutoff-free interval certificate at 9,000 bits also passes.
+
+All **57 Python tool tests** pass. Actual producer qualification covers all
+30 retained artifact kinds, all 34 schema contracts, 342 negative schema cases,
+byte/source checks, corruption rejection, and interrupted/budget-limited recovery.
+The first HP complete command exposed a missing tail-model schema property;
+that failure is retained. The repaired schema and complete asset suite then passed
+on both platforms. The combined record verifies that Rust and Cargo inputs did
+not change between the compiled workspace qualification and the schema amendment.
+
+The continuation records **103 repaired reproduced failure cases**, **3,901
+independent exact-rational or directed-reference configurations**, and source
+inspection of **3,771 production declarations**. These are finite evidence counts,
+not a proof of universal correctness. See the
+[numerical contracts](NUMERICAL_COMPATIBILITY.md).
+
+Five of six explicitly run live read-only cache checks passed. The historical
+reproduction fixture check failed because its exact manifest was revoked for incomplete
+source dependencies; the resolver correctly returned no artifact. The revocation
+is retained as evidence, and this test is not counted as passing. Three retained-run
+replays lack their required original fixtures. Native Windows HP/FLINT, 32-bit
+execution, external cache schema mirrors, and clearance of historical numerical
+results are outside this qualification. No GitHub Actions were run.
+
+Correct rounding of documented finite point stages does not establish quadrature
+truncation bounds, total source accuracy, all eigensolve errors, or continuum
+claims. Conditional tail bounds retain their stated external hypotheses. The
+separate cutoff-free interval route certifies its own documented finite model.
+
 ## v0.15.1
 
 The Gaussian-target amendment replaces first-small-term stopping with a
@@ -7,7 +55,7 @@ remaining-tail check, rejects HP term-budget exhaustion and binds the corrected
 semantics in cache identities. Five regressions and 163 independent Arb checks
 pass, including unequal scales and the historical reference descriptor through
 6,708 bits. Complete local v9 native and HP/Arb qualification passes. Historical
-target-dependent artifacts and the full mathematical/Research audit remain open.
+target-dependent artifacts require separate revalidation.
 
 The capability-identity amendment binds Arb availability in transform-enclosure
 and band requests. It prevents an Arb-enabled run from reusing a feature-required
@@ -15,7 +63,6 @@ absence result and preserves same-capability warm reuse. Optional Boolean schema
 fields preserve legacy readability while rejecting invalid types. Complete local
 v8-r2 native and HP/Arb release qualification passes. The corresponding cache
 schema mirrors await publication; this run did not request mirror checks.
-The full mathematical and historical research audit remains open.
 
 The stable u-flow amendment separates fresh derivative actions from historical
 v3 arithmetic using a v4 identity. The generic binary64 root amendment prevents
@@ -37,14 +84,12 @@ active revocations during ordinary, historical and materialization lookup in
 both cache lanes. Complete local v4 qualification passes. Root correction checks
 do not certify existence, uniqueness, eigenstate accuracy or zeta correspondence.
 
-The full-mathematics audit amendment fixes directed integer interval conversion,
+The full-mathematics amendment fixes directed integer interval conversion,
 finite bisection handling, high-mode f64 quadrature, even-sector Ritz selection,
 and stable f64/HP CCM kernels and cutoff validation. It also rejects missing
 source edges and revalidates adopted canonical manifests during offline reuse.
-These repairs pass both complete local release tiers. Independent numerical
-comparisons are recorded in the 2026-09-23 full-mathematics revalidation study.
-The entire mathematical audit remains open; passing regressions do not clear
-all historical results or research conclusions. The earlier amendments below
+These repairs pass both complete local release tiers. Passing regressions do not
+clear all historical results or research conclusions. The earlier amendments below
 describe their own historical scope.
 
 The cache-provenance amendment preserves every exact parent named by a staged

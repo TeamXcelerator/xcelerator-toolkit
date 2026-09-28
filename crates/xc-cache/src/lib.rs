@@ -19,8 +19,10 @@ mod coordinator;
 mod cost_governance;
 mod dedup_governance;
 mod durability;
+mod ephemeral_store;
 mod execution_cache;
 mod finalizer;
+mod finite_json;
 mod git_transport;
 mod github_auth;
 mod governance;
@@ -34,6 +36,8 @@ mod output_validation;
 mod packaging;
 mod planner;
 mod private_coordination;
+#[cfg(test)]
+mod private_temp_tests;
 mod production_staging;
 mod protocol;
 mod publication;
@@ -66,6 +70,7 @@ pub use coordinator::*;
 pub use cost_governance::*;
 pub use dedup_governance::*;
 pub use durability::*;
+pub use ephemeral_store::EphemeralCacheStore;
 pub use execution_cache::*;
 pub use finalizer::*;
 pub use git_transport::*;
@@ -217,6 +222,7 @@ impl Display for ContentDigest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolkitVersion {
     pub major: u64,
     pub minor: u64,
@@ -225,6 +231,8 @@ pub struct ToolkitVersion {
 }
 
 impl ToolkitVersion {
+    /// Parse core and optional prerelease compatibility versions. Build metadata
+    /// is not retained by this representation and is rejected.
     pub fn parse(value: &str) -> Result<Self, CacheError> {
         let (core, prerelease) = match value.split_once('-') {
             Some((core, prerelease)) if !prerelease.is_empty() => {
@@ -244,16 +252,44 @@ impl ToolkitVersion {
             )));
         }
         let parse = |part: &str| {
+            if part.is_empty()
+                || !part.bytes().all(|c| c.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+            {
+                return Err(CacheError::InvalidManifest(format!(
+                    "invalid toolkit version {value:?}"
+                )));
+            }
             part.parse::<u64>().map_err(|_| {
                 CacheError::InvalidManifest(format!("invalid toolkit version {value:?}"))
             })
         };
-        Ok(Self {
+        let result = Self {
             major: parse(parts[0])?,
             minor: parse(parts[1])?,
             patch: parse(parts[2])?,
             prerelease,
-        })
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    /// Validate records constructed directly or deserialized from an artifact.
+    pub fn validate(&self) -> Result<(), CacheError> {
+        if self.prerelease.as_ref().is_some_and(|label| {
+            label.split('.').any(|part| {
+                part.is_empty()
+                    || !part.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+                    || (part.len() > 1
+                        && part.starts_with('0')
+                        && part.bytes().all(|c| c.is_ascii_digit()))
+            })
+        }) {
+            return Err(CacheError::InvalidManifest(
+                "invalid toolkit prerelease identifier".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -275,7 +311,29 @@ impl Ord for ToolkitVersion {
                 (None, None) => Ordering::Equal,
                 (None, Some(_)) => Ordering::Greater,
                 (Some(_), None) => Ordering::Less,
-                (Some(left), Some(right)) => left.cmp(right),
+                (Some(left), Some(right)) => {
+                    let mut left_parts = left.split('.');
+                    let mut right_parts = right.split('.');
+                    loop {
+                        let order = match (left_parts.next(), right_parts.next()) {
+                            (None, None) => break Ordering::Equal,
+                            (None, Some(_)) => break Ordering::Less,
+                            (Some(_), None) => break Ordering::Greater,
+                            (Some(a), Some(b)) => match (
+                                a.bytes().all(|c| c.is_ascii_digit()),
+                                b.bytes().all(|c| c.is_ascii_digit()),
+                            ) {
+                                (true, true) => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+                                (true, false) => Ordering::Less,
+                                (false, true) => Ordering::Greater,
+                                (false, false) => a.cmp(b),
+                            },
+                        };
+                        if order != Ordering::Equal {
+                            break order;
+                        }
+                    }
+                }
             })
     }
 }
@@ -299,14 +357,46 @@ pub enum CacheQuality {
 }
 
 impl CacheQuality {
+    /// Whether this operational grade satisfies an explicit requirement.
+    /// Publication is a disposition and carries no implicit mathematical grade;
+    /// quarantined and deprecated records cannot establish validation evidence.
+    pub fn satisfies(self, minimum: Self) -> bool {
+        match (self, minimum) {
+            (Self::Quarantined | Self::Deprecated, _) => false,
+            (_, Self::Quarantined | Self::Deprecated) => false,
+            (Self::Published, Self::Published) => true,
+            (Self::Published, _) | (_, Self::Published) => false,
+            _ => self.admissible_rank() >= minimum.admissible_rank(),
+        }
+    }
+
+    /// Conjoin compatible operational minima without erasing either requirement.
+    pub(crate) fn combined_minimum(self, other: Self) -> Option<Self> {
+        if matches!(self, Self::Quarantined | Self::Deprecated)
+            || matches!(other, Self::Quarantined | Self::Deprecated)
+        {
+            return None;
+        }
+        if self == Self::Published || other == Self::Published {
+            return (self == other).then_some(Self::Published);
+        }
+        Some(if self.admissible_rank() >= other.admissible_rank() {
+            self
+        } else {
+            other
+        })
+    }
+
+    /// Ordering within ordinary validation grades; use `satisfies` for gates.
     pub fn admissible_rank(self) -> u8 {
         match self {
-            Self::Quarantined | Self::Deprecated => 0,
+            // Legacy publication encodes disposition, not retained assurance.
+            // No validation grade may be inferred without the source record.
+            Self::Quarantined | Self::Deprecated | Self::Published => 0,
             Self::Staged => 1,
             Self::Validated => 2,
             Self::CrossChecked => 3,
             Self::Certified => 4,
-            Self::Published => 5,
         }
     }
 }
@@ -328,6 +418,18 @@ pub struct ArtifactKey {
 }
 
 impl ArtifactKey {
+    pub fn validate(&self) -> Result<(), CacheError> {
+        if self.kind.trim().is_empty()
+            || self.logical_key.trim().is_empty()
+            || !self.parameters_digest.validate()
+        {
+            return Err(CacheError::InvalidManifest(
+                "artifact key requires nonempty fields and a SHA-256 parameter digest".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn new(
         kind: impl Into<String>,
         logical_key: impl Into<String>,
@@ -383,6 +485,13 @@ pub struct ArtifactManifest {
 
 impl ArtifactManifest {
     pub fn validate(&self) -> Result<(), CacheError> {
+        self.key.validate()?;
+        self.producer_toolkit_version.validate()?;
+        self.minimum_reader_version.validate()?;
+        if let Some(maximum) = &self.maximum_reader_version {
+            maximum.validate()?;
+        }
+
         if self.schema_version != 1 {
             return Err(CacheError::InvalidManifest(
                 "only manifest schema_version 1 is supported".to_owned(),
@@ -395,6 +504,7 @@ impl ArtifactManifest {
         }
         let mut previous_dependency: Option<(&str, &str, &ContentDigest, &ContentDigest)> = None;
         for dependency in &self.dependencies {
+            dependency.key.validate()?;
             if !dependency.content_digest.validate() || !dependency.key.parameters_digest.validate()
             {
                 return Err(CacheError::InvalidManifest(
@@ -484,7 +594,11 @@ pub struct CachePolicy {
     pub current_toolkit_version: ToolkitVersion,
     pub minimum_quality: CacheQuality,
     pub accepted_schema_versions: Vec<u32>,
+    /// Compatibility field controlling disposition diagnostics. This cannot
+    /// restore validation evidence or override the minimum-quality check.
     pub allow_deprecated: bool,
+    /// Compatibility field controlling disposition diagnostics. This cannot
+    /// restore validation evidence or override the minimum-quality check.
     pub allow_quarantined: bool,
     pub allowed_visibilities: Vec<CacheVisibility>,
 }
@@ -499,9 +613,29 @@ pub struct CacheAcceptanceDecision {
 impl CachePolicy {
     pub fn assess(&self, manifest: &ArtifactManifest) -> CacheAcceptanceDecision {
         let mut reasons = Vec::new();
+        if let Err(error) = self.current_toolkit_version.validate() {
+            reasons.push(format!("reader version validation failed: {error}"));
+        }
+
         let mut warnings = Vec::new();
         if let Err(error) = manifest.validate() {
             reasons.push(format!("manifest validation failed: {error}"));
+        }
+        // The producer floor applies to local entries as well as promoted shards.
+        // Local schema/reader admission remains governed by this CachePolicy.
+        if let Some(family) = production_staging::family_for_artifact_kind(&manifest.key.kind) {
+            match artifact_compatibility_policy(family, &manifest.key.kind) {
+                Ok(policy)
+                    if manifest.producer_toolkit_version < policy.minimum_producer_version =>
+                {
+                    reasons
+                        .push("producer precedes the artifact kind compatibility floor".to_owned());
+                }
+                Err(error) => {
+                    reasons.push(format!("artifact compatibility policy failed: {error}"))
+                }
+                _ => {}
+            }
         }
         // A promoted shard hit must pass the same canonical validation on
         // ordinary offline reuse as on identity lookup and publication.
@@ -549,16 +683,16 @@ impl CachePolicy {
                 reasons.push("quarantined artifacts are disabled".to_owned())
             }
             CacheQuality::Deprecated => warnings.push(
-                "deprecated artifact accepted only because policy explicitly allows it".to_owned(),
+                "legacy allow_deprecated flag does not restore validation evidence".to_owned(),
             ),
             CacheQuality::Quarantined => warnings.push(
-                "quarantined artifact accepted only because policy explicitly allows it".to_owned(),
+                "legacy allow_quarantined flag does not restore validation evidence".to_owned(),
             ),
             _ => {}
         }
-        if manifest.quality.admissible_rank() < self.minimum_quality.admissible_rank() {
+        if !manifest.quality.satisfies(self.minimum_quality) {
             reasons.push(format!(
-                "artifact quality {:?} is below required {:?}",
+                "artifact quality {:?} does not satisfy required {:?}",
                 manifest.quality, self.minimum_quality
             ));
         }
@@ -621,7 +755,16 @@ impl CachePromotionPolicy {
                 "quarantine and deprecation are governance actions, not promotions".to_owned(),
             ));
         }
-        if request.target_quality.admissible_rank() < request.source_quality.admissible_rank() {
+        if request.source_quality == CacheQuality::Published
+            && request.target_quality != CacheQuality::Published
+        {
+            return Err(CacheError::InvalidManifest(
+                "a legacy publication record does not retain source validation evidence".to_owned(),
+            ));
+        }
+        if request.target_quality != CacheQuality::Published
+            && request.target_quality.admissible_rank() < request.source_quality.admissible_rank()
+        {
             return Err(CacheError::InvalidManifest(
                 "promotion target quality is below source quality".to_owned(),
             ));
@@ -636,7 +779,7 @@ impl CachePromotionPolicy {
         }
         if self.require_certified_before_publication
             && request.target_quality == CacheQuality::Published
-            && request.source_quality.admissible_rank() < CacheQuality::Certified.admissible_rank()
+            && !request.source_quality.satisfies(CacheQuality::Certified)
         {
             return Err(CacheError::InvalidManifest(
                 "publication policy requires a certified source artifact".to_owned(),
@@ -681,6 +824,17 @@ impl Default for ManifestIndex {
             manifests: Vec::new(),
         }
     }
+}
+
+fn allocate_byte_buffer(size: u64) -> Result<Vec<u8>, CacheError> {
+    let capacity = usize::try_from(size).map_err(|_| {
+        CacheError::ResourceLimit("declared byte size does not fit this platform".into())
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|error| {
+        CacheError::ResourceLimit(format!("declared byte buffer cannot be allocated: {error}"))
+    })?;
+    Ok(bytes)
 }
 
 pub trait CacheStore: Send + Sync {
@@ -774,8 +928,8 @@ pub trait CacheStore: Send + Sync {
     }
 
     fn read_payload(&self, manifest: &ArtifactManifest) -> Result<Vec<u8>, CacheError> {
-        let capacity = usize::try_from(manifest.size_bytes).unwrap_or(0);
-        let mut payload = Vec::with_capacity(capacity);
+        manifest.validate()?;
+        let mut payload = allocate_byte_buffer(manifest.size_bytes)?;
         self.read_payload_to(manifest, &mut payload)?;
         Ok(payload)
     }
@@ -904,10 +1058,25 @@ impl FilesystemCacheStore {
 
     fn key_directory(&self, key: &ArtifactKey) -> PathBuf {
         self.root
-            .join("artifacts")
-            .join(encode_component(&key.kind))
-            .join(encode_component(&key.logical_key))
+            .join("artifacts-v2")
+            .join(ContentDigest::sha256(key.kind.as_bytes()).0)
+            .join(ContentDigest::sha256(key.logical_key.as_bytes()).0)
             .join(&key.parameters_digest.0)
+    }
+
+    fn legacy_key_directory(&self, key: &ArtifactKey) -> Option<PathBuf> {
+        let kind = encode_component(&key.kind);
+        let logical = encode_component(&key.logical_key);
+        if matches!(kind.as_str(), "." | "..") || matches!(logical.as_str(), "." | "..") {
+            return None;
+        }
+        Some(
+            self.root
+                .join("artifacts")
+                .join(kind)
+                .join(logical)
+                .join(&key.parameters_digest.0),
+        )
     }
 
     fn index_path(&self, key: &ArtifactKey) -> PathBuf {
@@ -915,9 +1084,14 @@ impl FilesystemCacheStore {
     }
 
     fn load_index(&self, key: &ArtifactKey) -> Result<ManifestIndex, CacheError> {
-        let path = self.index_path(key);
+        key.validate()?;
+        Self::load_index_at(&self.key_directory(key))
+    }
+
+    fn load_index_at(key_directory: &Path) -> Result<ManifestIndex, CacheError> {
+        let path = key_directory.join("index.json");
         if !path.exists() {
-            let manifest_directory = self.key_directory(key).join("manifests");
+            let manifest_directory = key_directory.join("manifests");
             if !manifest_directory.exists() {
                 return Ok(ManifestIndex::default());
             }
@@ -947,6 +1121,21 @@ impl FilesystemCacheStore {
                 index.schema_version,
                 path.display()
             )));
+        }
+        let mut seen = BTreeSet::new();
+        for relative in &index.manifests {
+            let fields = relative.split('/').collect::<Vec<_>>();
+            if fields.len() != 2
+                || fields[0] != "manifests"
+                || fields[1].is_empty()
+                || !fields[1].ends_with(".json")
+                || relative.contains(['\\', ':'])
+                || !seen.insert(relative)
+            {
+                return Err(CacheError::InvalidManifest(
+                    "manifest index contains an unsafe or duplicate entry".to_owned(),
+                ));
+            }
         }
         Ok(index)
     }
@@ -1046,30 +1235,11 @@ impl FilesystemCacheStore {
         // Verify under a private sibling name before exposing the canonical
         // content-addressed path. A same-filesystem source remains zero-copy;
         // other filesystems fall back to one verified copy.
-        let temporary = path.with_extension(format!(
-            "xc-adopt-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|error| CacheError::Io(error.to_string()))?
-                .as_nanos()
-        ));
+        let parent = path
+            .parent()
+            .ok_or_else(|| CacheError::Io("object path has no parent".to_owned()))?;
+        let temporary = stage_encoded_object(&encoded.path, parent)?;
         let result = (|| {
-            match fs::hard_link(&encoded.path, &temporary) {
-                Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::CrossesDevices
-                            | std::io::ErrorKind::PermissionDenied
-                            | std::io::ErrorKind::Unsupported
-                    ) =>
-                {
-                    fs::copy(&encoded.path, &temporary)?;
-                }
-                Err(error) => return Err(error.into()),
-            }
-
             let (adopted_digest, adopted_size) = digest_file(&temporary)?;
             if adopted_digest != object.content_digest || adopted_size != object.size_bytes {
                 return Err(CacheError::DigestMismatch {
@@ -1140,17 +1310,19 @@ impl FilesystemCacheStore {
         let manifest_path = key_directory.join(&relative_manifest);
         atomic_write(&manifest_path, &manifest_bytes)?;
 
-        let mut index = self.load_index(&manifest.key)?;
-        let relative_string = relative_manifest.to_string_lossy().replace('\\', "/");
-        if !index
-            .manifests
-            .iter()
-            .any(|entry| entry == &relative_string)
-        {
-            index.manifests.push(relative_string);
-        }
-        let index_bytes = serde_json::to_vec_pretty(&index)?;
-        atomic_replace(&self.index_path(&manifest.key), &index_bytes)?;
+        with_record_update_lock(&self.index_path(&manifest.key), || {
+            let mut index = self.load_index(&manifest.key)?;
+            let relative_string = relative_manifest.to_string_lossy().replace('\\', "/");
+            if !index
+                .manifests
+                .iter()
+                .any(|entry| entry == &relative_string)
+            {
+                index.manifests.push(relative_string);
+            }
+            let index_bytes = serde_json::to_vec_pretty(&index)?;
+            atomic_replace(&self.index_path(&manifest.key), &index_bytes)
+        })?;
         self.update_ccm_eigenpair_continuation_inventory(&manifest, manifest_record_digest)?;
         let root_relative_manifest = self.root_relative_path(&manifest_path)?;
         if let Some(entry) = Self::identity_inventory_entry(&manifest, &root_relative_manifest) {
@@ -1339,43 +1511,45 @@ impl FilesystemCacheStore {
         &self,
         semantic_digest: &ContentDigest,
     ) -> Result<Vec<(ArtifactManifest, String)>, CacheError> {
-        let artifacts_root = self.root.join("artifacts");
         let mut discovered = Vec::new();
-        if !artifacts_root.is_dir() {
-            return Ok(discovered);
-        }
-        for kind_entry in fs::read_dir(&artifacts_root)? {
-            let kind_path = kind_entry?.path();
-            if !kind_path.is_dir() {
+        for artifacts_root in [self.root.join("artifacts-v2"), self.root.join("artifacts")] {
+            if !artifacts_root.is_dir() {
                 continue;
             }
-            for logical_entry in fs::read_dir(&kind_path)? {
-                let logical_path = logical_entry?.path();
-                if !logical_path.is_dir() {
+            for kind_entry in fs::read_dir(&artifacts_root)? {
+                let kind_path = kind_entry?.path();
+                if !kind_path.is_dir() {
                     continue;
                 }
-                let manifest_directory = logical_path.join(&semantic_digest.0).join("manifests");
-                if !manifest_directory.is_dir() {
-                    continue;
-                }
-                for entry in fs::read_dir(&manifest_directory)? {
-                    let entry = entry?;
-                    if !entry.file_type()?.is_file()
-                        || entry
-                            .path()
-                            .extension()
-                            .is_none_or(|extension| extension != "json")
-                    {
+                for logical_entry in fs::read_dir(&kind_path)? {
+                    let logical_path = logical_entry?.path();
+                    if !logical_path.is_dir() {
                         continue;
                     }
-                    let manifest: ArtifactManifest =
-                        serde_json::from_slice(&fs::read(entry.path())?)?;
-                    manifest.validate()?;
-                    if manifest.key.parameters_digest != *semantic_digest {
+                    let manifest_directory =
+                        logical_path.join(&semantic_digest.0).join("manifests");
+                    if !manifest_directory.is_dir() {
                         continue;
                     }
-                    let relative = self.root_relative_path(&entry.path())?;
-                    discovered.push((manifest, relative));
+                    for entry in fs::read_dir(&manifest_directory)? {
+                        let entry = entry?;
+                        if !entry.file_type()?.is_file()
+                            || entry
+                                .path()
+                                .extension()
+                                .is_none_or(|extension| extension != "json")
+                        {
+                            continue;
+                        }
+                        let manifest: ArtifactManifest =
+                            serde_json::from_slice(&fs::read(entry.path())?)?;
+                        manifest.validate()?;
+                        if manifest.key.parameters_digest != *semantic_digest {
+                            continue;
+                        }
+                        let relative = self.root_relative_path(&entry.path())?;
+                        discovered.push((manifest, relative));
+                    }
                 }
             }
         }
@@ -1415,29 +1589,24 @@ impl FilesystemCacheStore {
         else {
             return Ok(());
         };
-        static INVENTORY_UPDATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = INVENTORY_UPDATE_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .map_err(|_| {
-                CacheError::Io("local continuation inventory lock was poisoned".to_owned())
-            })?;
         let path = query
             .repository_path()?
             .split('/')
             .fold(self.root.clone(), |path, component| path.join(component));
-        let mut entries = if path.exists() {
-            let existing: CcmEigenpairContinuationIndex =
-                serde_json::from_slice(&fs::read(&path)?)?;
-            existing.validate()?;
-            existing.entries
-        } else {
-            Vec::new()
-        };
-        entries.retain(|entry| entry.semantic_digest != addition.semantic_digest);
-        entries.push(addition);
-        let inventory = CcmEigenpairContinuationIndex::rebuild(&query, entries)?;
-        atomic_replace(&path, &serde_json::to_vec_pretty(&inventory)?)
+        with_record_update_lock(&path, || {
+            let mut entries = if path.exists() {
+                let existing: CcmEigenpairContinuationIndex =
+                    serde_json::from_slice(&fs::read(&path)?)?;
+                existing.validate()?;
+                existing.entries
+            } else {
+                Vec::new()
+            };
+            entries.retain(|entry| entry.semantic_digest != addition.semantic_digest);
+            entries.push(addition);
+            let inventory = CcmEigenpairContinuationIndex::rebuild(&query, entries)?;
+            atomic_replace(&path, &serde_json::to_vec_pretty(&inventory)?)
+        })
     }
 
     /// Store an artifact as multiple immutable content-addressed objects.
@@ -1490,7 +1659,8 @@ impl FilesystemCacheStore {
         let mut whole_hasher = Sha256::new();
         let mut size_bytes = 0u64;
         let mut objects = Vec::new();
-        let mut buffer = vec![0u8; chunk_size];
+        let mut buffer = allocate_byte_buffer(chunk_size as u64)?;
+        buffer.resize(chunk_size, 0);
         loop {
             let mut filled = 0usize;
             while filled < buffer.len() {
@@ -1711,33 +1881,53 @@ impl CacheStore for FilesystemCacheStore {
     }
 
     fn candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
-        let index = self.load_index(key)?;
-        let key_directory = self.key_directory(key);
-        let mut manifests = Vec::new();
-        for relative in index.manifests {
-            let path = key_directory.join(relative);
-            if !path.exists() {
-                return Err(CacheError::NotFound(path.display().to_string()));
-            }
-            let manifest: ArtifactManifest = serde_json::from_slice(&fs::read(&path)?)?;
-            manifest.validate()?;
-            if &manifest.key != key {
-                return Err(CacheError::InvalidManifest(format!(
-                    "manifest key mismatch at {}",
-                    path.display()
-                )));
-            }
-            manifests.push(manifest);
+        key.validate()?;
+        let mut directories = vec![(self.key_directory(key), false)];
+        if let Some(legacy) = self.legacy_key_directory(key) {
+            directories.push((legacy, true));
         }
-        manifests.sort_by(|left, right| {
+        let mut manifests = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (key_directory, legacy) in directories {
+            for relative in Self::load_index_at(&key_directory)?.manifests {
+                let path = key_directory.join(relative);
+                let bytes = fs::read(&path)?;
+                let manifest: ArtifactManifest = serde_json::from_slice(&bytes)?;
+                manifest.validate()?;
+                if &manifest.key != key {
+                    if legacy {
+                        continue;
+                    }
+                    return Err(CacheError::InvalidManifest(format!(
+                        "manifest key mismatch at {}",
+                        path.display()
+                    )));
+                }
+                if seen.insert(ContentDigest::sha256(&serde_json::to_vec(&manifest)?)) {
+                    manifests.push(manifest);
+                }
+            }
+        }
+        let mut ranked = manifests
+            .into_iter()
+            .map(|manifest| {
+                let digest = ContentDigest::sha256(&serde_json::to_vec(&manifest)?);
+                Ok((digest, manifest))
+            })
+            .collect::<Result<Vec<_>, CacheError>>()?;
+        ranked.sort_by(|(left_digest, left), (right_digest, right)| {
             right
-                .quality
-                .admissible_rank()
-                .cmp(&left.quality.admissible_rank())
-                .then_with(|| right.created_unix_seconds.cmp(&left.created_unix_seconds))
-                .then_with(|| right.content_digest.0.cmp(&left.content_digest.0))
+                .producer_toolkit_version
+                .cmp(&left.producer_toolkit_version)
+                .then_with(|| {
+                    right
+                        .quality
+                        .admissible_rank()
+                        .cmp(&left.quality.admissible_rank())
+                })
+                .then_with(|| left_digest.cmp(right_digest))
         });
-        Ok(manifests)
+        Ok(ranked.into_iter().map(|(_, manifest)| manifest).collect())
     }
 
     fn matching_keys(
@@ -1749,54 +1939,45 @@ impl CacheStore for FilesystemCacheStore {
         if maximum_keys == 0 {
             return Ok(Vec::new());
         }
-        let kind_root = self.root.join("artifacts").join(encode_component(kind));
-        if !kind_root.exists() {
-            return Ok(Vec::new());
-        }
         let mut keys = BTreeSet::new();
-        for logical_entry in fs::read_dir(kind_root)? {
-            let logical_entry = logical_entry?;
-            if !logical_entry.file_type()?.is_dir() {
+        'roots: for kind_root in local_artifact_kind_directories(&self.root, kind) {
+            if !kind_root.is_dir() {
                 continue;
             }
-            for parameter_entry in fs::read_dir(logical_entry.path())? {
-                let parameter_entry = parameter_entry?;
-                if !parameter_entry.file_type()?.is_dir() {
+            for logical_entry in fs::read_dir(kind_root)? {
+                let logical_entry = logical_entry?;
+                if !logical_entry.file_type()?.is_dir() {
                     continue;
                 }
-                let manifest_root = parameter_entry.path().join("manifests");
-                if !manifest_root.exists() {
-                    continue;
-                }
-                let Some(manifest_entry) = fs::read_dir(manifest_root)?
-                    .filter_map(Result::ok)
-                    .find(|entry| {
-                        entry.file_type().is_ok_and(|kind| kind.is_file())
-                            && entry
-                                .path()
-                                .extension()
-                                .is_some_and(|value| value == "json")
-                    })
-                else {
-                    continue;
-                };
-                let manifest: ArtifactManifest =
-                    serde_json::from_slice(&fs::read(manifest_entry.path())?)?;
-                manifest.validate()?;
-                if manifest.key.kind == kind
-                    && manifest.key.logical_key.starts_with(logical_key_prefix)
-                {
-                    keys.insert((
-                        manifest.key.logical_key.clone(),
-                        manifest.key.parameters_digest.clone(),
-                    ));
-                    if keys.len() >= maximum_keys {
-                        break;
+                for parameter_entry in fs::read_dir(logical_entry.path())? {
+                    let parameter_entry = parameter_entry?;
+                    if !parameter_entry.file_type()?.is_dir() {
+                        continue;
+                    }
+                    let manifest_root = parameter_entry.path().join("manifests");
+                    if !manifest_root.is_dir() {
+                        continue;
+                    }
+                    for entry in fs::read_dir(manifest_root)? {
+                        let entry = entry?;
+                        if !entry.file_type()?.is_file()
+                            || entry.path().extension().is_none_or(|e| e != "json")
+                        {
+                            continue;
+                        }
+                        let manifest: ArtifactManifest =
+                            serde_json::from_slice(&fs::read(entry.path())?)?;
+                        manifest.validate()?;
+                        if manifest.key.kind == kind
+                            && manifest.key.logical_key.starts_with(logical_key_prefix)
+                        {
+                            keys.insert((manifest.key.logical_key, manifest.key.parameters_digest));
+                            if keys.len() >= maximum_keys {
+                                break 'roots;
+                            }
+                        }
                     }
                 }
-            }
-            if keys.len() >= maximum_keys {
-                break;
             }
         }
         Ok(keys
@@ -1885,12 +2066,18 @@ impl CacheStore for FilesystemCacheStore {
                 if count == 0 {
                     break;
                 }
-                object_hasher.update(&buffer[..count]);
-                whole_hasher.update(&buffer[..count]);
-                writer.write_all(&buffer[..count])?;
                 object_size = object_size
                     .checked_add(count as u64)
                     .ok_or_else(|| CacheError::Io("object size exceeds u64".to_owned()))?;
+                if object_size > object.size_bytes {
+                    return Err(CacheError::ResourceLimit(format!(
+                        "object {} exceeds its declared {}-byte size",
+                        object.content_digest, object.size_bytes
+                    )));
+                }
+                object_hasher.update(&buffer[..count]);
+                whole_hasher.update(&buffer[..count]);
+                writer.write_all(&buffer[..count])?;
             }
             let actual = ContentDigest(hex_digest(object_hasher.finalize().as_slice()));
             if actual != object.content_digest {
@@ -2019,13 +2206,8 @@ impl ZipJsonFilesystemCacheStore {
                         object_path.display()
                     )));
                 }
-                let capacity = usize::try_from(object.size_bytes).map_err(|_| {
-                    CacheError::ResourceLimit(
-                        "single-pass ZIP object size does not fit this platform".to_owned(),
-                    )
-                })?;
                 let mut input = fs::File::open(&object_path)?;
-                let mut bytes = Vec::with_capacity(capacity);
+                let mut bytes = allocate_byte_buffer(object.size_bytes)?;
                 (&mut input)
                     .take(object.size_bytes)
                     .read_to_end(&mut bytes)?;
@@ -2309,8 +2491,8 @@ impl CacheStore for ZipJsonFilesystemCacheStore {
         &self,
         manifest: &ArtifactManifest,
     ) -> Result<(Vec<u8>, Option<VerifiedEncodedPayload>), CacheError> {
-        let capacity = usize::try_from(manifest.size_bytes).unwrap_or(0);
-        let mut payload = Vec::with_capacity(capacity);
+        manifest.validate()?;
+        let mut payload = allocate_byte_buffer(manifest.size_bytes)?;
         // `read_payload_to` verifies the compressed object before opening it
         // and then verifies the logical JSON while decoding. Constructing the
         // descriptor from that same verified object avoids hashing the full
@@ -2470,8 +2652,7 @@ impl CacheResolver {
                         .into_iter()
                         .find(|manifest| {
                             manifest.content_digest == dependency.content_digest
-                                && manifest.quality.admissible_rank()
-                                    >= dependency.required_quality.admissible_rank()
+                                && manifest.quality.satisfies(dependency.required_quality)
                                 && policy.accepts(manifest)
                         })
                 {
@@ -2595,48 +2776,73 @@ impl CacheResolver {
 
     /// Verify that every exact dependency named by the selected artifact is
     /// present, compatible, and at least as strong as the dependency's stated
-    /// quality requirement. Payloads are not loaded.
+    /// quality requirement, and that the graph is acyclic. Payloads are not loaded.
     pub fn validate_dependency_closure(
         &self,
         manifest: &ArtifactManifest,
         policy: &CachePolicy,
     ) -> Result<Vec<ArtifactManifest>, CacheError> {
+        manifest.validate()?;
         let mut visited = BTreeSet::new();
+        let node_identity = |node: &ArtifactManifest| {
+            (
+                node.key.kind.clone(),
+                node.key.logical_key.clone(),
+                node.key.parameters_digest.clone(),
+                node.content_digest.clone(),
+            )
+        };
+        let mut active = BTreeSet::from([node_identity(manifest)]);
         let mut ordered = Vec::new();
-        self.visit_dependencies(manifest, policy, &mut visited, &mut ordered)?;
-        Ok(ordered)
-    }
-
-    fn visit_dependencies(
-        &self,
-        manifest: &ArtifactManifest,
-        policy: &CachePolicy,
-        visited: &mut BTreeSet<String>,
-        ordered: &mut Vec<ArtifactManifest>,
-    ) -> Result<(), CacheError> {
-        for dependency in &manifest.dependencies {
-            let identity = format!(
-                "{}:{}:{}:{}",
+        // Explicit DFS frames avoid exhausting the call stack on a long chain.
+        // Resolve every edge before deduplicating: another parent can require
+        // stronger quality for the same semantic key and payload.
+        let mut stack = vec![(manifest.clone(), 0usize)];
+        while let Some((parent, next)) = stack.last_mut() {
+            let Some(dependency) = parent.dependencies.get(*next).cloned() else {
+                let (complete, _) = stack.pop().expect("active closure frame");
+                active.remove(&node_identity(&complete));
+                if !stack.is_empty() {
+                    ordered.push(complete);
+                }
+                continue;
+            };
+            *next += 1;
+            let mut dependency_policy = policy.clone();
+            dependency_policy.minimum_quality = policy.minimum_quality
+                .combined_minimum(dependency.required_quality)
+                .ok_or_else(|| CacheError::InvalidManifest(
+                    "cache policy and dependency require incompatible quality/disposition evidence".to_owned()
+                ))?;
+            let (_, resolved) = self.resolve_exact_manifest(
+                &dependency.key,
+                &dependency.content_digest,
+                &dependency_policy,
+            )?;
+            if !resolved.quality.satisfies(dependency.required_quality) {
+                return Err(CacheError::InvalidManifest(
+                    "resolved dependency does not satisfy its stated quality requirement"
+                        .to_owned(),
+                ));
+            }
+            let identity = (
                 dependency.key.kind,
                 dependency.key.logical_key,
                 dependency.key.parameters_digest,
-                dependency.content_digest
+                dependency.content_digest,
+                resolved.quality.admissible_rank(),
             );
-            if !visited.insert(identity) {
-                continue;
+            if active.contains(&node_identity(&resolved)) {
+                return Err(CacheError::InvalidManifest(
+                    "dependency closure contains a cycle".to_owned(),
+                ));
             }
-            let (_, resolved) =
-                self.resolve_exact_manifest(&dependency.key, &dependency.content_digest, policy)?;
-            if resolved.quality.admissible_rank() < dependency.required_quality.admissible_rank() {
-                return Err(CacheError::InvalidManifest(format!(
-                    "dependency {} has quality {:?}, requires {:?}",
-                    resolved.content_digest, resolved.quality, dependency.required_quality
-                )));
+            if visited.insert(identity) {
+                active.insert(node_identity(&resolved));
+                stack.push((resolved, 0));
             }
-            self.visit_dependencies(&resolved, policy, visited, ordered)?;
-            ordered.push(resolved);
         }
-        Ok(())
+        Ok(ordered)
     }
 
     pub fn resolve(
@@ -2717,7 +2923,7 @@ impl CacheResolver {
         policy: &CachePolicy,
     ) -> bool {
         &manifest.content_digest == content_digest
-            && manifest.quality.admissible_rank() >= required_quality.admissible_rank()
+            && manifest.quality.satisfies(required_quality)
             && policy.accepts(manifest)
     }
 
@@ -2953,6 +3159,8 @@ pub struct RepositoryShard {
 }
 
 impl RepositoryShard {
+    /// Saturating estimate only; `can_accept` uses checked arithmetic so an
+    /// overflowing sum cannot be admitted even with a u64::MAX capacity.
     pub fn projected_total_bytes(&self, new_payload_bytes: u64, new_history_bytes: u64) -> u64 {
         self.reachable_payload_bytes
             .saturating_add(self.estimated_history_bytes)
@@ -2971,8 +3179,12 @@ impl RepositoryShard {
             && self.visibility == visibility
             && (self.artifact_kinds.is_empty()
                 || self.artifact_kinds.iter().any(|kind| kind == artifact_kind))
-            && self.projected_total_bytes(new_payload_bytes, new_history_bytes)
-                <= self.safe_payload_limit_bytes
+            && self
+                .reachable_payload_bytes
+                .checked_add(self.estimated_history_bytes)
+                .and_then(|total| total.checked_add(new_payload_bytes))
+                .and_then(|total| total.checked_add(new_history_bytes))
+                .is_some_and(|total| total <= self.safe_payload_limit_bytes)
     }
 }
 
@@ -3009,6 +3221,21 @@ impl CacheRepositoryRegistry {
                 ))
             })
     }
+}
+
+/// Metadata directories for one artifact kind, current layout first.
+/// New records hash each complete UTF-8 key component, avoiding legacy escape
+/// collisions, Windows case/device aliases, dot traversal and long filenames.
+/// The old layout is retained for read compatibility and complete-key filtering.
+pub fn local_artifact_kind_directories(root: &Path, kind: &str) -> Vec<PathBuf> {
+    let mut paths = vec![root
+        .join("artifacts-v2")
+        .join(ContentDigest::sha256(kind.as_bytes()).0)];
+    let legacy = encode_component(kind);
+    if !matches!(legacy.as_str(), "." | "..") {
+        paths.push(root.join("artifacts").join(legacy));
+    }
+    paths
 }
 
 fn encode_component(value: &str) -> String {
@@ -3048,28 +3275,144 @@ fn digest_file(path: &Path) -> Result<(ContentDigest, u64), CacheError> {
     ))
 }
 
+// A clock reading is not a unique file name. Reserve each staging file with
+// create_new before writing, and never remove a path owned by another writer.
+fn private_sibling_candidate(parent: &Path, prefix: &str) -> Result<PathBuf, CacheError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| CacheError::Io("private staging sequence exhausted".to_owned()))?;
+    Ok(parent.join(format!(".{prefix}-{}-{sequence}", std::process::id())))
+}
+
+fn create_private_sibling_file(
+    parent: &Path,
+    prefix: &str,
+) -> Result<(PathBuf, fs::File), CacheError> {
+    for _ in 0..128 {
+        let path = private_sibling_candidate(parent, prefix)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(CacheError::Io(
+        "could not reserve a private staging file after 128 collisions".to_owned(),
+    ))
+}
+
+// hard_link reserves its destination exclusively. The copy fallback must use
+// the same ownership rule, and a failed reservation must never be cleaned up.
+fn stage_encoded_object(source: &Path, parent: &Path) -> Result<PathBuf, CacheError> {
+    for _ in 0..128 {
+        let temporary = private_sibling_candidate(parent, "xc-adopt")?;
+        match fs::hard_link(source, &temporary) {
+            Ok(()) => return Ok(temporary),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::CrossesDevices
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                let mut output = match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)
+                {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                let copied: std::io::Result<()> = (|| {
+                    let mut input = fs::File::open(source)?;
+                    std::io::copy(&mut input, &mut output)?;
+                    output.sync_all()
+                })();
+                drop(output);
+                if let Err(error) = copied {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(error.into());
+                }
+                return Ok(temporary);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(CacheError::Io(
+        "could not reserve private adoption staging after 128 collisions".to_owned(),
+    ))
+}
+
+fn write_private_sibling_file(
+    parent: &Path,
+    prefix: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, CacheError> {
+    let (temporary, mut file) = create_private_sibling_file(parent, prefix)?;
+    let written: std::io::Result<()> = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    drop(file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(temporary)
+}
+
+/// Serialize a record's read-modify-write across threads and processes.
+fn with_record_update_lock<T>(
+    path: &Path,
+    update: impl FnOnce() -> Result<T, CacheError>,
+) -> Result<T, CacheError> {
+    static RECORD_UPDATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = RECORD_UPDATE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| CacheError::Io("local record update lock was poisoned".to_owned()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| CacheError::Io("record has no parent".to_owned()))?;
+    fs::create_dir_all(parent)?;
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    lock_file.lock_exclusive()?;
+    let result = update();
+    let _ = FileExt::unlock(&lock_file);
+    result
+}
+
+/// Replace a disposable cache file using an exclusively owned, synced sibling
+/// and one atomic rename. Readers see the old or new complete file. Failure
+/// preserves the old destination and cleans the newly created sibling.
+pub fn atomic_replace_cache_file(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
+    atomic_replace(path, bytes)
+}
+
 fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
     let parent = path
         .parent()
         .ok_or_else(|| CacheError::Io(format!("path has no parent: {}", path.display())))?;
     fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(
-        ".replace-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| CacheError::Io(error.to_string()))?
-            .as_nanos()
-    ));
-    {
-        let mut file = fs::File::create(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    #[cfg(windows)]
-    if path.exists() {
-        fs::remove_file(path)?;
-    }
+    let temporary = write_private_sibling_file(parent, "replace", bytes)?;
+    // std::fs::rename replaces an existing file on Windows as well as Unix.
+    // Removing it first would expose a missing record to concurrent readers.
     fs::rename(&temporary, path).map_err(|error| {
         let _ = fs::remove_file(&temporary);
         CacheError::Io(format!("failed to replace {}: {error}", path.display()))
@@ -3081,20 +3424,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
         .parent()
         .ok_or_else(|| CacheError::Io(format!("path has no parent: {}", path.display())))?;
     fs::create_dir_all(parent)?;
-    let unique = format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| CacheError::Io(error.to_string()))?
-            .as_nanos()
-    );
-    let temporary = parent.join(unique);
-    {
-        let mut file = fs::File::create(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
+    let temporary = write_private_sibling_file(parent, "tmp", bytes)?;
     match fs::rename(&temporary, path) {
         Ok(()) => Ok(()),
         Err(error) if path.exists() => {
@@ -3137,6 +3467,31 @@ pub fn sha256_hex(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn quality_minimum_conjunction_preserves_both_requirements() {
+        let qualities = [
+            CacheQuality::Quarantined,
+            CacheQuality::Staged,
+            CacheQuality::Validated,
+            CacheQuality::CrossChecked,
+            CacheQuality::Certified,
+            CacheQuality::Published,
+            CacheQuality::Deprecated,
+        ];
+        for left in qualities {
+            for right in qualities {
+                for actual in qualities {
+                    assert_eq!(
+                        left.combined_minimum(right)
+                            .is_some_and(|minimum| actual.satisfies(minimum)),
+                        actual.satisfies(left) && actual.satisfies(right),
+                        "actual={actual:?}, left={left:?}, right={right:?}",
+                    );
+                }
+            }
+        }
+    }
+
     fn version(value: &str) -> ToolkitVersion {
         ToolkitVersion::parse(value).unwrap()
     }
@@ -3162,6 +3517,37 @@ mod tests {
     }
 
     use crate::test_support::temporary_root;
+
+    #[test]
+    fn plain_local_entries_obey_kind_floor_and_producer_priority() {
+        let root = temporary_root("plain-local-kind-floor");
+        let store = FilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let key = ArtifactKey::new("ccm_discretization_distance", "fixture", b"{}").unwrap();
+        let older = store
+            .put(
+                &draft(key.clone(), CacheQuality::Certified, CacheVisibility::Local),
+                b"old",
+            )
+            .unwrap();
+        let policy = CachePolicy {
+            current_toolkit_version: version("0.15.2"),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        assert!(!policy.assess(&older).accepted);
+        let mut newer = draft(key.clone(), CacheQuality::Validated, CacheVisibility::Local);
+        newer.producer_toolkit_version = version("0.15.2");
+        let newer = store.put(&newer, b"new").unwrap();
+        assert!(policy.assess(&newer).accepted);
+        assert_eq!(
+            store.candidates(&key).unwrap()[0].content_digest,
+            newer.content_digest
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn sha256_matches_standard_vectors() {
@@ -4164,7 +4550,7 @@ mod tests {
             .put(
                 &draft(
                     key.clone(),
-                    CacheQuality::Published,
+                    CacheQuality::Certified,
                     CacheVisibility::Public,
                 ),
                 b"public",
@@ -4309,6 +4695,7 @@ mod tests {
 // ===========================================================================
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitHubRepositoryEndpoint {
     pub shard_id: String,
     pub owner: String,
@@ -4369,6 +4756,7 @@ impl GitHubRepositoryEndpoint {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheNetworkRegistry {
     pub schema_version: u32,
     pub repositories: Vec<GitHubRepositoryEndpoint>,
@@ -4493,6 +4881,20 @@ pub fn plan_github_publication(
     if !endpoint.enabled_for_write {
         return Err(CacheError::ReadOnlyLayer(endpoint.shard_id.clone()));
     }
+    let capacity_repository = shard
+        .repository
+        .strip_prefix("https://github.com/")
+        .or_else(|| shard.repository.strip_prefix("git@github.com:"))
+        .unwrap_or(&shard.repository)
+        .trim_end_matches(".git");
+    if !capacity_repository
+        .eq_ignore_ascii_case(&format!("{}/{}", endpoint.owner, endpoint.repository))
+    {
+        return Err(CacheError::InvalidManifest(format!(
+            "capacity and network repository identities disagree for shard {:?}",
+            shard.id
+        )));
+    }
     if endpoint.visibility != visibility {
         return Err(CacheError::InvalidManifest(format!(
             "capacity and network visibility disagree for shard {:?}",
@@ -4530,7 +4932,7 @@ mod github_registry_tests {
             schema_version: 1,
             shards: vec![RepositoryShard {
                 id: "tau-public-001".to_owned(),
-                repository: "example-org/public-shard-a".to_owned(),
+                repository: "TeamXcelerator/public-shard-a".to_owned(),
                 visibility: CacheVisibility::Public,
                 artifact_kinds: vec!["ccm_tau_matrix".to_owned()],
                 reachable_payload_bytes: 62_000_000_000,
@@ -4637,6 +5039,6 @@ mod cache_acceptance_tests {
         assert!(decision
             .reasons
             .iter()
-            .any(|reason| reason.contains("below required")));
+            .any(|reason| reason.contains("does not satisfy required")));
     }
 }

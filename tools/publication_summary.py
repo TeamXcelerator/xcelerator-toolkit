@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Summarize durable publication attempts. Timings overlap; bytes are not wire traffic."""
-import argparse, collections, json
+import argparse, collections, json, math
 from pathlib import Path
 
 def summarize(paths):
@@ -12,15 +12,21 @@ def summarize(paths):
             for number,line in enumerate(stream,1):
                 try:
                     event=json.loads(line)
-                    if event.get('schema_version')!=1 or not isinstance(event.get('details'),dict):raise ValueError('unsupported event')
-                    phase=event['phase'];stats=phases[phase];stats['calls']+=1
-                    seconds=float(event['elapsed_seconds'])
-                    if not 0<=seconds<float('inf'):raise ValueError('invalid duration')
-                    stats['seconds']+=seconds
+                    if not isinstance(event,dict) or type(event.get('schema_version')) is not int or event['schema_version']!=1 or not isinstance(event.get('details'),dict):raise ValueError('unsupported event')
+                    phase=event['phase']
+                    if not isinstance(phase,str) or not phase:raise ValueError('invalid phase')
+                    seconds=event['elapsed_seconds']
+                    if type(seconds) not in (int,float) or not 0<=seconds<float('inf'):raise ValueError('invalid duration')
+                    seconds=float(seconds)
+                    previous=phases.get(phase)
+                    total=(previous['seconds'] if previous else 0.0)+seconds
+                    if not math.isfinite(total):raise ValueError('phase duration total exceeds finite range')
+                    # Validate the whole event before changing any aggregate.
+                    stats=phases[phase];stats['calls']+=1;stats['seconds']=total
                     detail=event['details']
                     if detail.get('success') is False:stats['failed_calls']+=1
                     for name,value in detail.items():
-                        if 'bytes' in name and isinstance(value,int) and value>=0:
+                        if 'bytes' in name and type(value) is int and value>=0:
                             stats['byte_counters'][name]=stats['byte_counters'].get(name,0)+value
                         if 'remaining' in name or 'pending' in name:pending={name:value}
                     if phase=='attempt_finished':finished=detail.get('success')

@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
 """Synthetic acceptance test for additive backfill. No scientific data or network."""
-import argparse, hashlib, json, subprocess, tempfile
+import argparse, hashlib, json, os, subprocess, tempfile
 from pathlib import Path
+
+if not __debug__:
+    raise RuntimeError("test_research_backfill.py requires Python without -O so acceptance checks execute")
+
+def local_environment():
+    """Keep synthetic acceptance runs independent of ambient research/cache settings."""
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(("XC_RESEARCH_", "XC_CACHE_", "XC_PUBLISH_"))}
+    env.update(XC_CACHE_REMOTE="none", XC_PUBLISH_TARGET="none", XC_PUBLISH_EXECUTE="false")
+    return env
+
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("binary",type=Path);p.add_argument("--packets",type=Path,required=True)
-    a=p.parse_args();a.binary=a.binary.resolve();a.packets.mkdir(parents=True,exist_ok=True)
+    a=p.parse_args();a.binary=a.binary.resolve()
+    if not a.binary.is_file():raise ValueError('backfill binary must be an existing file')
+    a.packets.mkdir(parents=True,exist_ok=True)
     def enc(v):return json.dumps(v,separators=(",",":")).encode()
     def digest(v):return hashlib.sha256(v).hexdigest()
     with tempfile.TemporaryDirectory(prefix="ccm-backfill-test-") as temp:
@@ -45,13 +58,20 @@ def main():
       tasks.append((diagnostic,dict(operation="extended_research",diagnostic=diagnostic,state=st,matrix=tau if diagnostic in ["arithmetic_energy","directional_response","root_transport","operator_cluster","finite_section_transfer"] else None,roots=roots if diagnostic in ["directional_response","resolution_budget","complex_transform","root_transport","observable_budget"] else None,secular=sec if diagnostic in ["directional_response","resolution_budget","complex_transform","root_transport","observable_budget"] else None,parent_manifests=[],input="preparation.json" if diagnostic=="weighted_reference_projection" else "external.json",input_sha256=digest(preparation_bytes if diagnostic=="weighted_reference_projection" else external_bytes),options=None)))
      batch=dict(schema_version=1,approved_payload_digests=approved,cache_root="cache",jobs=[dict(id=i,task=t) for i,t in tasks])
      plan=root/"batch.json";plan.write_bytes(enc(batch));out=root/"output"
-     def run(plan=plan,out=out):return subprocess.run([str(a.binary),str(plan),str(out)],capture_output=True,text=True)
+     def run(plan=plan,out=out):
+      previous=set(out.glob('summary-*.json'))
+      result=subprocess.run([str(a.binary),str(plan),str(out)],capture_output=True,text=True,env=local_environment())
+      created=set(out.glob('summary-*.json'))-previous
+      assert len(created)<=1,('multiple summaries for one attempt',created)
+      result.summary=json.loads(next(iter(created)).read_text()) if created else None
+      return result
      cold=run();assert cold.returncode==0,cold.stderr
      saved={i:(out/(i+".json")).read_bytes() for i,_ in tasks}
      warm=run();assert warm.returncode==0,warm.stderr
      assert all((out/(i+".json")).read_bytes()==b for i,b in saved.items())
      for i,b in saved.items():(a.packets/(i+".json")).write_bytes(b)
-     summary=json.loads(sorted(out.glob("summary-*.json"))[-1].read_text())
+     summary=warm.summary
+     assert summary is not None,warm.stderr
      assert next(x for x in summary["outcomes"] if x["id"]=="transform")["row_outcomes"]["missing_input"]==1
      assert any(row["label"]=="band_cutoff" for row in json.loads(saved['band_reconstruction'])["report"]["data"]["rows"])
      assert any(row["label"]=="signed_atom_kernel" for row in json.loads(saved['weighted_tail'])["report"]["data"]["rows"])
@@ -70,8 +90,9 @@ def main():
      source=root/st["payload"];original=source.read_bytes();source.write_bytes(original+b" ")
      bad=run();assert bad.returncode!=0 and "INCOMPLETE" in bad.stderr
      assert all((out/(i+".json")).read_bytes()==b for i,b in saved.items())
-     failed=json.loads(sorted(out.glob("summary-*.json"))[-1].read_text())
-     assert failed["failed_jobs"]>0 and any(x.get("status")=="retained" for x in failed["outcomes"])
+     failed=bad.summary
+     assert failed is not None,bad.stderr
+     assert failed["failed_jobs"]>0 and any(x.get("status")=="retained" for x in failed["outcomes"]),(failed,bad.stderr)
      source.write_bytes(original)
      assert run().returncode==0
      # A different batch cannot reuse the frozen output directory.

@@ -157,13 +157,14 @@ for every successfully loaded observation; their dependency closure is retained.
 the existing factorization format. Each row swap is interleaved with its
 elimination. Both working storage and per-RHS work are O(n). The inverse
 iteration API exposes this as `TridiagSolver::BandedInterleaved` with distinct
-`semantics_id()` value `tridiag-lu-interleaved-pivots-v2`.
+`semantics_id()` value `tridiag-interleaved-scaled-shift-residual-v3`.
 
-The historical `Banded` API remains available for deliberate replay. v0.15.0
-sector diagnostics and managed prolate selected vectors explicitly select the
-corrected route under distinct identities. Other legacy consumers retain their
-established route. Correcting the inner solve does not certify branch selection
-or the outer iteration's stopping criterion; see [numerical compatibility](NUMERICAL_COMPATIBILITY.md).
+Both `Banded` and `BandedInterleaved` now use the corrected solver. The ordinary
+`tridiag_lu_solve_hp` entry point also uses it. Defective historical arithmetic
+requires a pinned older revision. The eigensolver semantic ID is
+`tridiag-interleaved-scaled-shift-residual-v3`; the lower-level solve identity is
+`tridiag-lu-interleaved-pivots-v2`. Correcting the inner solve does not certify
+branch selection or outer convergence; see [numerical compatibility](NUMERICAL_COMPATIBILITY.md).
 
 Validation covers the exact failing 3-by-3 example, nonsingular integer
 tridiagonals with varied pivot patterns, dense-LU comparison, an explicit
@@ -185,7 +186,11 @@ needed; use the with-Q route to check the transformation or recover vectors.
 `dense_symmetric_eigenvalues_hp_stable` composes it with existing tridiagonal
 QR. These routines require finite, exactly symmetric stored point matrices
 and reject silent down-rounding. They are explicit analysis routes and the v0.15.0 sector diagnostic routes use
-them under new identities. Legacy APIs remain for historical replay.
+them under new identities. As of the default-route correction in0.15.1,
+the ordinary Householder APIs also use scaled opposite-sign reflections. They
+explicitly round input points to their requested working precision; the
+`_stable` variants keep their stricter no-down-rounding contract. Historical
+same-sign arithmetic requires its pinned historical source revision.
 
 `assess_symmetric_reduction_hp(A, d, e, Q, bits)` checks any supplied reduction,
 including legacy data, directly against A. It computes
@@ -294,3 +299,138 @@ The [capture receipt schema](schemas/research-capture-receipt-v1.schema.json)
 and [evaluation schema](schemas/research-hypothesis-evaluation-v1.schema.json)
 check portable shape. Toolkit validation additionally checks coverage, digests,
 exact dependencies and score replay; JSON shape alone is not scientific evidence.
+
+
+### Selected HP eigenpair matrix scale (0.15.1)
+
+Selected inverse-iteration acceptance now uses an upward absolute row-sum norm
+of the stored tridiagonal matrix. Padded Gershgorin search endpoints no longer
+set its residual threshold or scaled backward-error denominator. The previous
+absolute padding floor could accept an inaccurate vector for a tiny matrix:
+for 2^-400*diag(-1,1), the selected positive state had relative residual about
+0.607 yet passed at128 bits. The corrected gate rejects that state. A sufficiently
+resolved input tolerance recovers the correct eigenspace; exhausted adaptive
+recovery remains inconclusive. Only an exactly zero matrix uses unit normalization.
+
+Eigenvalue bracketing and its managed spectral artifacts are unchanged. The
+selected-eigenpair and adaptive adapters have no implicit cache access; persisted
+computed states need source-bound revalidation. Residual reports are computed
+estimates, not interval certificates. Existing boundary rejections, unrepresentable
+norm bounds and inadequate absolute tolerances remain explicit failure states.
+Historical incidence remains unvalidated.
+
+
+### Gaussian target exponent range and auxiliary parameters (0.15.1)
+
+HP Gaussian products now use a log-domain monomial fallback when separate
+factors lose exponent range. Previously exp(-x) could become zero even though
+exp(-x)*x^63 and the normalized target were representable. Tail comparisons
+also use logarithms, and estimated losses at the exponent floor must fit the
+component's relative working-precision budget. A vanished partial sum cannot
+establish convergence for a nonzero polynomial. Unresolved range or term-budget
+cases return errors. Nonzero decimal coefficients/scales cannot silently parse
+as zero in the HP backend. Requested HP precision is checked before allocation:
+1 through 1000000 bits, plus 64 internal guard bits; an external provider must
+also support the requested working precision under its existing contract.
+
+Both backends reject overflowing or underflowing nonzero solved auxiliary
+parameters. Final auxiliary values must be finite, and HP returned values and
+parameters must remain representable at requested precision. The Gaussian
+definition identity advances to gaussian-series-log-range-checked-v3, including
+Gaussian auxiliary series on external targets. External-only protocol identities
+are unchanged. No historical payload is relabeled or numerically cleared.
+
+Seven public-API regressions cover the repaired boundaries and cache identities.
+Independent 640-bit mpmath calculations check 648 HP and 216 binary64 evaluations;
+18 additional log-domain reference cases span the MPFR underflow boundary.
+These are computed point values and tail estimates, not full interval
+certificates or uniform accuracy guarantees for arbitrary cancellation.
+Historical impact remains unvalidated.
+
+
+## Directed full-matrix inertia scope
+
+Schema-2 portable inertia starts by enclosing every exact rational matrix
+endpoint with directed MPFR rounding. Congruent row and column permutations
+preserve inertia. A strictly signed pivot, or a 2x2 block with determinant
+excluding zero and two certified eigenvalue signs, contributes its inertia.
+Directed interval Schur updates enclose all exact updates, so induction
+preserves the matrix-family enclosure. No numerical zero threshold is used.
+
+Fixed precision can leave a nonsingular matrix unresolved; increasing precision
+can resolve it. A replayed inconclusive record verifies only the partial counts
+and unresolved remainder. Generic replay verifies the supplied matrix family,
+not the assembly theorem, an infinite-dimensional limit, or a historical cache.
+The selected-eigenvalue exact-rational path has a separate performance scope.
+Independent congruence and perturbation fixtures, explicit 2x2 spectra,
+precision-boundary cases, and refreshed-hash tampering tests exercise this path.
+
+
+### Stored-vector finite arithmetic
+
+Stored diagonal actions and sequential dot products reject nonfinite decoded
+inputs and nonfinite computed results. Previously segmented output could accept
+infinity while file-backed output rejected it, and stored dot products could
+return success with infinity or NaN. Diagonal chunks are checked before writing;
+earlier chunks may already have been written if a later chunk fails, so output
+must be discarded on error. Finite successful arithmetic keeps the same order
+and results. These are binary64 point operations, with ordinary rounding and
+underflow, not exact dot products or certified enclosures. Four regressions
+cover numerical failures, exact integer references across chunk boundaries,
+and invalid retained bytes. Historical incidence remains unvalidated.
+
+
+### Shifted eigenvalue-count input dimensions
+
+Both public shifted-count APIs now check positive dimension and checked n*n
+equality with the supplied matrix length before cloning or computing diagonal
+offsets. A malformed overflowing dimension previously caused a panic with
+overflow checking, or a practically unbounded wrapped-index loop in release.
+Invalid shapes now produce the existing inconclusive result. Valid shifts,
+exact-rational inertia, selected-index decisions and portable proof bytes are
+unchanged; existing valid cache and certificate identities remain applicable.
+
+Independent rational orthogonal spectral fixtures cover threshold contacts,
+interval perturbations, selected indices and clusters: 1494 conclusive counts,
+1008 unresolved boundaries and 396 portable selected proofs. All 2898 valid
+results match the prior implementation, including pivot records. Invalid
+domains, selection controls and proof mutations also reject. This does not
+remove the exact-rational path's scaling limitation or establish historical
+correctness outside the tested and derived scope.
+
+
+## Sampled crossing diagnostics
+
+Standalone native and HP target-crossing APIs reject nonfinite profile/residual
+samples and non-increasing grids. Opposite nonzero signs remain connected across
+exact-zero samples; the initial sign is the first nonzero sampled sign. HP grid
+counts and indices no longer narrow through u32. Requested HP precision must
+be 1..=999936 bits, leaving the existing 64 guard bits within the target domain.
+The compatibility method integrand_appears_smooth only reports absence of a
+detected sign change; it certifies neither smoothness nor a convergence rate.
+These APIs do not persist artifacts. The separate retained residual-analysis
+producer keeps its explicit adjacent-nonzero-profile-samples policy and identity.
+
+Receipt adapter tests use the shared atomic-counter fixture-path helper,
+avoiding concurrent timestamp collisions. This test-isolation fix changes
+no numerical or persisted artifact semantics.
+
+
+## Private cache staging ownership
+
+Filesystem atomic writes and replacements reserve private sibling files with
+exclusive creation and a checked process-local counter. Existing names are
+skipped, with a bounded 128-collision retry; writing/sync failures clean up only
+the owned staging name. Equal timestamps can no longer make two writers share
+a staging handle and change an already published file. The controlled before
+case reproduced that race; its repaired counterpart preserves both writers
+and a preexisting sentinel. Logical payload bytes and cache identities do not
+change. Destination replacement/index merging and historical incidence remain
+separate obligations.
+
+The same ownership rule now covers encoded-object adoption and corrupt-part
+quarantine. Adoption keeps exclusive hard-link staging and uses exclusive
+creation for a cross-filesystem copy fallback; failed reservations never delete
+another writer's path. Quarantine first reserves its destination exclusively
+and cleans up only its own failed reservation. These changes do not establish
+concurrent index-merge or crash-atomicity guarantees.

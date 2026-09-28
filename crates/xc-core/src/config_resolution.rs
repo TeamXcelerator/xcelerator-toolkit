@@ -101,6 +101,8 @@ impl Display for ConfigDigest {
 /// A validated typed configuration and its identity-bearing representation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EffectiveConfiguration<T> {
+    #[serde(default = "historical_resolution_semantics")]
+    pub algorithm_semantics: String,
     pub resolved: T,
     pub canonical_json: String,
     pub digest: ConfigDigest,
@@ -110,14 +112,33 @@ pub struct EffectiveConfiguration<T> {
     pub overrides: Vec<ConfigOverrideRecord>,
 }
 
+pub const CONFIGURATION_RESOLUTION_SEMANTICS: &str = "typed-variant-replacement-resolution-v2";
+fn historical_resolution_semantics() -> String {
+    "object-deep-merge-resolution-v1".to_owned()
+}
+
 /// Validation hook implemented by every root configuration type.
 pub trait ValidateResolvedConfig {
     fn validate_resolved(&self) -> Result<(), ConfigError>;
+
+    /// Tagged enum objects identified by dotted object path and tag field.
+    /// A changed tag replaces that object's fields and their source attribution.
+    /// Ordinary objects and unchanged variants retain recursive merge behavior.
+    fn configuration_variant_tags() -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
 }
 
 impl ValidateResolvedConfig for SolverConfig {
     fn validate_resolved(&self) -> Result<(), ConfigError> {
         self.validate()
+    }
+    fn configuration_variant_tags() -> &'static [(&'static str, &'static str)] {
+        &[
+            ("target", "target"),
+            ("subspace", "subspace"),
+            ("precision.escalation", "mode"),
+        ]
     }
 }
 
@@ -229,6 +250,7 @@ where
             "",
             layer.source,
             &mut resolved_paths,
+            T::configuration_variant_tags(),
         )?;
     }
 
@@ -262,6 +284,7 @@ where
         .collect::<Result<Vec<_>, ConfigResolutionError>>()?;
 
     Ok(EffectiveConfiguration {
+        algorithm_semantics: CONFIGURATION_RESOLUTION_SEMANTICS.to_owned(),
         resolved,
         canonical_json,
         digest,
@@ -283,9 +306,25 @@ fn merge_values(
     prefix: &str,
     source: ConfigSource,
     resolved_paths: &mut BTreeMap<String, ConfigSource>,
+    variant_tags: &[(&str, &str)],
 ) -> Result<(), ConfigResolutionError> {
     match (target, incoming) {
         (Value::Object(target), Value::Object(incoming)) => {
+            if variant_tags.iter().any(|(path, tag)| {
+                *path == prefix
+                    && target
+                        .get(*tag)
+                        .and_then(Value::as_str)
+                        .zip(incoming.get(*tag).and_then(Value::as_str))
+                        .is_some_and(|(before, after)| before != after)
+            }) {
+                target.clear();
+                remove_recorded_subtree(resolved_paths, prefix);
+            }
+            if incoming.is_empty() && target.is_empty() && !prefix.is_empty() {
+                remove_recorded_subtree(resolved_paths, prefix);
+                resolved_paths.insert(prefix.to_owned(), source);
+            }
             for (key, value) in incoming {
                 let path = if prefix.is_empty() {
                     key.clone()
@@ -297,10 +336,15 @@ fn merge_values(
                         .entry(key)
                         .or_insert_with(|| Value::Object(Map::new()));
                     if !child.is_object() {
+                        remove_recorded_subtree(resolved_paths, &path);
                         *child = Value::Object(Map::new());
+                    } else if value.as_object().is_some_and(|object| !object.is_empty()) {
+                        // A previously empty object is no longer a leaf.
+                        resolved_paths.remove(&path);
                     }
-                    merge_values(child, value, &path, source, resolved_paths)?;
+                    merge_values(child, value, &path, source, resolved_paths, variant_tags)?;
                 } else {
+                    remove_recorded_subtree(resolved_paths, &path);
                     target.insert(key, value);
                     resolved_paths.insert(path, source);
                 }
@@ -313,9 +357,17 @@ fn merge_values(
     }
 }
 
+fn remove_recorded_subtree(paths: &mut BTreeMap<String, ConfigSource>, prefix: &str) {
+    let descendants = format!("{prefix}.");
+    paths.retain(|path, _| path != prefix && !path.starts_with(&descendants));
+}
+
 fn collect_leaf_paths(value: &Value) -> BTreeSet<String> {
     fn recurse(value: &Value, prefix: &str, output: &mut BTreeSet<String>) {
         if let Value::Object(object) = value {
+            if object.is_empty() && !prefix.is_empty() {
+                output.insert(prefix.to_owned());
+            }
             for (key, child) in object {
                 let path = if prefix.is_empty() {
                     key.clone()
@@ -335,6 +387,9 @@ fn collect_leaf_paths(value: &Value) -> BTreeSet<String> {
     output
 }
 
+/// Sort object keys while preserving array order and string spelling. Native
+/// numbers retain serde_json's pinned formatter semantics; this is a representation
+/// identity, not a normalization of mathematically equivalent inputs.
 pub(crate) fn canonical_json(value: &Value) -> Result<String, ConfigResolutionError> {
     fn write(value: &Value, output: &mut String) -> Result<(), ConfigResolutionError> {
         match value {

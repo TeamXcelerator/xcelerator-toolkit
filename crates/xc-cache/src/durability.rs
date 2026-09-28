@@ -197,12 +197,12 @@ pub fn assess_durability(
                 DurabilityCopyRejectionReason::Revoked,
                 "copy or its evidence is revoked".to_owned(),
             ))
-        } else if !accepted_ids.insert(copy.copy_id.clone()) {
+        } else if accepted_ids.contains(&copy.copy_id) {
             Some((
                 DurabilityCopyRejectionReason::DuplicateCopyId,
                 "copy identity is duplicated".to_owned(),
             ))
-        } else if !accepted_locators.insert(copy.locator.clone()) {
+        } else if accepted_locators.contains(&copy.locator) {
             Some((
                 DurabilityCopyRejectionReason::DuplicateLocator,
                 "copy locator is duplicated".to_owned(),
@@ -218,13 +218,17 @@ pub fn assess_durability(
             });
             continue;
         }
+        accepted_ids.insert(copy.copy_id.clone());
+        accepted_locators.insert(copy.locator.clone());
         failure_domains.insert(copy.failure_domain.clone());
         archive_copy_present |= copy.location == ArtifactCopyLocation::Archive;
         accepted_copy_ids.push(copy.copy_id.clone());
     }
     accepted_copy_ids.sort();
-    let verified_copy_count = u32::try_from(accepted_copy_ids.len()).unwrap_or(u32::MAX);
-    let independent_failure_domain_count = u32::try_from(failure_domains.len()).unwrap_or(u32::MAX);
+    let verified_copy_count = u32::try_from(accepted_copy_ids.len())
+        .map_err(|_| CacheError::ResourceLimit("verified copy count exceeds u32".to_owned()))?;
+    let independent_failure_domain_count = u32::try_from(failure_domains.len())
+        .map_err(|_| CacheError::ResourceLimit("failure-domain count exceeds u32".to_owned()))?;
     let mut deficits = Vec::new();
     if verified_copy_count < policy.minimum_verified_copies {
         deficits.push(format!(
@@ -368,9 +372,19 @@ pub fn plan_local_prune(
             "prune candidate and durability policy name different artifact families".to_owned(),
         ));
     }
+    // Removing one locator removes every alias of that declared copy. Counting
+    // another ID at the same locator would invent a surviving durable copy.
+    let mut removed_locators = copies
+        .iter()
+        .filter(|copy| copy.copy_id == candidate.copy_id)
+        .map(|copy| copy.locator.clone())
+        .collect::<BTreeSet<_>>();
+    removed_locators.insert(candidate.local_path.to_string_lossy().into_owned());
     let retained_copies = copies
         .iter()
-        .filter(|copy| copy.copy_id != candidate.copy_id)
+        .filter(|copy| {
+            copy.copy_id != candidate.copy_id && !removed_locators.contains(&copy.locator)
+        })
         .cloned()
         .collect::<Vec<_>>();
     let durability_after_removal = assess_durability(
@@ -738,5 +752,37 @@ mod tests {
         .unwrap();
         assert!(!plan.removable);
         assert!(plan.reasons.len() >= 6);
+    }
+    #[test]
+    fn exhaustive_rejected_locator_does_not_reserve_a_copy_id() {
+        let first = copy("a", ArtifactCopyLocation::WorkstationLocal, "one");
+        let mut rejected = copy("b", ArtifactCopyLocation::WorkstationLocal, "two");
+        rejected.locator = first.locator.clone();
+        let accepted = copy("b", ArtifactCopyLocation::WorkstationLocal, "two");
+        let assessment = assess_durability(
+            &durability_policy(DurabilityClass::Recomputable, 2, 2),
+            &digest(b"payload"),
+            &[first, rejected, accepted],
+        )
+        .unwrap();
+        assert!(assessment.satisfied);
+        assert_eq!(assessment.verified_copy_count, 2);
+    }
+    #[test]
+    fn exhaustive_prune_cannot_count_an_alias_of_the_removed_copy() {
+        let candidate = candidate();
+        let mut removed = copy("local", ArtifactCopyLocation::WorkstationLocal, "one");
+        removed.locator = candidate.local_path.to_string_lossy().into_owned();
+        let mut alias = removed.clone();
+        alias.copy_id = "alias".into();
+        let plan = plan_local_prune(
+            &prune_policy(),
+            &durability_policy(DurabilityClass::Recomputable, 1, 1),
+            &candidate,
+            &[removed, alias],
+        )
+        .unwrap();
+        assert!(!plan.removable);
+        assert_eq!(plan.durability_after_removal.verified_copy_count, 0);
     }
 }

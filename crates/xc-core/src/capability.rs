@@ -4,6 +4,11 @@
 //! a weaker scalar backend, solver route, assurance level, cache mode, or
 //! publication target. Accepted reports are safe to persist before expensive
 //! computation or remote mutation begins.
+//!
+//! Acceptance establishes installed capability and a plan, not execution
+//! evidence. Different registered algorithm families alone do not establish
+//! independent numerical results: execution must check seeds, shared decisive
+//! intermediates, target identity, and agreement before granting CrossChecked.
 
 use crate::provenance::CacheValidationMode;
 use crate::{AssuranceLevel, ConfigDigest, ResourceEstimate, ResourcePolicy};
@@ -52,6 +57,7 @@ pub enum PublicationAuthorityMode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PublicationAuthority {
     /// Stable, non-secret principal identifier.
     pub principal: String,
@@ -99,6 +105,12 @@ pub struct SolverCapability {
     pub operator_representations: BTreeSet<String>,
     pub target_kinds: BTreeSet<String>,
     pub generalized: bool,
+    /// Whether this route returns eigenvectors, rather than only eigenvalues.
+    #[serde(default)]
+    pub delivers_eigenvectors: bool,
+    /// Maximum supported eigenpair count; None permits any admitted positive count.
+    #[serde(default)]
+    pub maximum_eigenpairs: Option<usize>,
     pub maximum_assurance: AssuranceLevel,
     pub checkpoint_supported: bool,
 }
@@ -119,11 +131,23 @@ pub struct PreflightRequest {
     pub operator_representation: String,
     pub target_kind: String,
     pub generalized: bool,
+    /// Require eigenvectors from every selected execution route.
+    #[serde(default)]
+    pub require_eigenvectors: bool,
+    /// Requested count, when this preflight describes an eigenpair computation.
+    #[serde(default)]
+    pub requested_eigenpairs: Option<usize>,
     pub primary_solver: String,
     pub independent_solver: Option<String>,
     pub requested_assurance: AssuranceLevel,
     pub certification_route: Option<String>,
     pub certification_claim: Option<String>,
+    /// Whether the certification claim requires complex enclosures; serialized
+    /// requests must state this requirement explicitly.
+    pub complex_claim: bool,
+    /// Whether the selected solver must support restart checkpoints.
+    #[serde(default)]
+    pub checkpoint_requested: bool,
     pub cache_mode: CacheAccessMode,
     pub cache_policy_digest: Option<ConfigDigest>,
     pub cache_validation_mode: Option<CacheValidationMode>,
@@ -144,7 +168,10 @@ pub enum PreflightFailureCode {
     UnsupportedSolver,
     UnsupportedOperatorRepresentation,
     UnsupportedTarget,
+    UnsupportedEigenvectors,
+    UnsupportedEigenpairCount,
     UnsupportedGeneralizedProblem,
+    UnsupportedCheckpoint,
     InsufficientAssuranceCapability,
     MissingIndependentRoute,
     NonIndependentRoute,
@@ -286,13 +313,16 @@ impl CapabilityCatalog {
                         ),
                     );
                 }
-                if request.precision_bits > 64 && !scalar.arbitrary_precision && !scalar.exact {
+                if scalar.maximum_precision_bits.is_none()
+                    && !scalar.arbitrary_precision
+                    && !scalar.exact
+                {
                     fail(
                         &mut failures,
                         PreflightFailureCode::UnsupportedPrecision,
                         format!(
-                            "backend {:?} cannot satisfy {}-bit production precision",
-                            scalar.id, request.precision_bits
+                            "fixed-precision backend {:?} must declare its significand precision limit",
+                            scalar.id
                         ),
                     );
                 }
@@ -337,7 +367,7 @@ impl CapabilityCatalog {
                         );
                     } else {
                         evidence_plan.push(format!(
-                            "compare independent solver routes {} and {}",
+                            "compare solver routes {} and {} after verifying execution independence (seeds and decisive intermediates), requested target identity, and numerical agreement",
                             request.primary_solver, independent.id
                         ));
                     }
@@ -389,9 +419,14 @@ impl CapabilityCatalog {
                             ),
                         );
                     }
-                    if scalar
-                        .is_some_and(|scalar| !scalar.rigorous_real_enclosures && !scalar.exact)
-                    {
+                    if scalar.is_some_and(|scalar| {
+                        !scalar.exact
+                            && if request.complex_claim {
+                                !scalar.rigorous_complex_enclosures
+                            } else {
+                                !scalar.rigorous_real_enclosures
+                            }
+                    }) {
                         fail(
                             &mut failures,
                             PreflightFailureCode::NonRigorousCertificationBackend,
@@ -505,7 +540,7 @@ fn validate_cache_policy(
         fail(
             failures,
             PreflightFailureCode::InsufficientCacheValidation,
-            "enabled cache access requires Fast or Full validation",
+            "enabled cache access requires Fast, Root, or Full validation",
         );
     }
     if request.requested_assurance == AssuranceLevel::Certified
@@ -573,6 +608,38 @@ fn validate_solver(
                 "{role} solver {:?} does not support target {:?}",
                 solver.id, request.target_kind
             ),
+        );
+    }
+    if request.require_eigenvectors && !solver.delivers_eigenvectors {
+        fail(
+            failures,
+            PreflightFailureCode::UnsupportedEigenvectors,
+            format!(
+                "{role} solver {:?} returns eigenvalues without eigenvectors",
+                solver.id
+            ),
+        );
+    }
+    if request.requested_eigenpairs.is_some_and(|count| {
+        count == 0
+            || solver
+                .maximum_eigenpairs
+                .is_some_and(|maximum| count > maximum)
+    }) {
+        fail(
+            failures,
+            PreflightFailureCode::UnsupportedEigenpairCount,
+            format!(
+                "{role} solver {:?} cannot deliver the requested eigenpair count {:?}",
+                solver.id, request.requested_eigenpairs
+            ),
+        );
+    }
+    if request.checkpoint_requested && !solver.checkpoint_supported {
+        fail(
+            failures,
+            PreflightFailureCode::UnsupportedCheckpoint,
+            format!("{role} solver {:?} does not support checkpoints", solver.id),
         );
     }
     if request.generalized && !solver.generalized {
@@ -756,6 +823,8 @@ mod tests {
                     operator_representations: set(&["dense"]),
                     target_kinds: set(&["algebraic_smallest"]),
                     generalized: false,
+                    delivers_eigenvectors: true,
+                    maximum_eigenpairs: None,
                     maximum_assurance: AssuranceLevel::Certified,
                     checkpoint_supported: false,
                 },
@@ -766,6 +835,8 @@ mod tests {
                     operator_representations: set(&["dense"]),
                     target_kinds: set(&["algebraic_smallest"]),
                     generalized: false,
+                    delivers_eigenvectors: true,
+                    maximum_eigenpairs: None,
                     maximum_assurance: AssuranceLevel::Certified,
                     checkpoint_supported: true,
                 },
@@ -787,11 +858,15 @@ mod tests {
             operator_representation: "dense".to_owned(),
             target_kind: "algebraic_smallest".to_owned(),
             generalized: false,
+            require_eigenvectors: true,
+            requested_eigenpairs: Some(1),
             primary_solver: "dense_qr".to_owned(),
             independent_solver: None,
             requested_assurance: AssuranceLevel::Computed,
             certification_route: None,
             certification_claim: None,
+            complex_claim: false,
+            checkpoint_requested: false,
             cache_mode: CacheAccessMode::ReadOnly,
             cache_policy_digest: Some(ConfigDigest("c".repeat(64))),
             cache_validation_mode: Some(CacheValidationMode::Full),
@@ -889,11 +964,13 @@ mod tests {
         request.independent_solver = Some("sturm".to_owned());
         request.certification_route = Some("interval_inertia".to_owned());
         request.certification_claim = Some("selected_eigenvalue".to_owned());
-        let report = catalog().preflight(&request);
-        assert!(report
-            .failures
-            .iter()
-            .any(|failure| { failure.code == PreflightFailureCode::InsufficientCacheValidation }));
+        for mode in [CacheValidationMode::Fast, CacheValidationMode::Root] {
+            request.cache_validation_mode = Some(mode);
+            let report = catalog().preflight(&request);
+            assert!(report.failures.iter().any(|failure| {
+                failure.code == PreflightFailureCode::InsufficientCacheValidation
+            }));
+        }
     }
 
     #[test]
@@ -953,5 +1030,117 @@ mod tests {
             .failures
             .iter()
             .any(|failure| { failure.code == PreflightFailureCode::NonIndependentRoute }));
+    }
+    #[test]
+    fn fixed_precision_backend_uses_its_declared_significand_limit() {
+        let mut c = catalog();
+        // A fixed 113-bit backend need not advertise arbitrary precision.
+        c.scalar_backends[0].maximum_precision_bits = Some(113);
+        let mut request = base_request();
+        request.precision_bits = 100;
+        assert!(c.preflight(&request).accepted);
+        request.precision_bits = 114;
+        assert!(!c.preflight(&request).accepted);
+        c.scalar_backends[0].maximum_precision_bits = None;
+        request.precision_bits = 53;
+        assert!(!c.preflight(&request).accepted);
+    }
+    #[test]
+    fn explicit_checkpoint_and_complex_requirements_are_enforced() {
+        let mut request = base_request();
+        request.checkpoint_requested = true;
+        let mut catalog = catalog();
+        for solver in &mut catalog.solvers {
+            solver.checkpoint_supported = false;
+        }
+        assert!(catalog
+            .preflight(&request)
+            .failures
+            .iter()
+            .any(|f| f.code == PreflightFailureCode::UnsupportedCheckpoint));
+        request.checkpoint_requested = false;
+        request.requested_assurance = AssuranceLevel::Certified;
+        request.certification_route = Some("test_complex".into());
+        request.certification_claim = Some("complex_root_count".into());
+        request.complex_claim = true;
+        for scalar in &mut catalog.scalar_backends {
+            scalar.exact = false;
+            scalar.rigorous_real_enclosures = true;
+            scalar.rigorous_complex_enclosures = false;
+        }
+        catalog.certification_routes.push(CertificationCapability {
+            id: "test_complex".into(),
+            scalar_backends: [request.scalar_backend.clone()].into_iter().collect(),
+            claim_kinds: ["complex_root_count".into()].into_iter().collect(),
+        });
+        assert!(catalog
+            .preflight(&request)
+            .failures
+            .iter()
+            .any(|f| f.code == PreflightFailureCode::NonRigorousCertificationBackend));
+    }
+    #[test]
+    fn serialized_preflight_cannot_omit_the_complex_requirement() {
+        let mut request = base_request();
+        request.requested_assurance = AssuranceLevel::Certified;
+        request.complex_claim = true;
+        request.certification_route = Some("interval_inertia".into());
+        request.certification_claim = Some("complex_eigenvalue_enclosure".into());
+        let mut catalog = catalog();
+        catalog.scalar_backends[0].rigorous_real_enclosures = true;
+        catalog.certification_routes[0].scalar_backends = set(&["f64"]);
+        catalog.certification_routes[0].claim_kinds = set(&["complex_eigenvalue_enclosure"]);
+        assert!(catalog
+            .preflight(&request)
+            .failures
+            .iter()
+            .any(|f| f.code == PreflightFailureCode::NonRigorousCertificationBackend));
+        let mut encoded = serde_json::to_value(&request).unwrap();
+        assert!(
+            serde_json::from_value::<PreflightRequest>(encoded.clone())
+                .unwrap()
+                .complex_claim
+        );
+        encoded.as_object_mut().unwrap().remove("complex_claim");
+        assert!(serde_json::from_value::<PreflightRequest>(encoded).is_err());
+    }
+    #[test]
+    fn publication_authority_rejects_unknown_fields_and_preserves_valid_documents() {
+        let valid = serde_json::json!({
+            "principal": "test-owner",
+            "mode": "owner_direct",
+            "allowed_targets": ["public"],
+            "allowed_repositories": ["example/manufactured"],
+            "policy_digest": "a".repeat(64)
+        });
+        let authority: PublicationAuthority = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(authority.principal, "test-owner");
+        assert_eq!(authority.mode, PublicationAuthorityMode::OwnerDirect);
+        assert!(authority
+            .allowed_targets
+            .contains(&PublicationTarget::Public));
+        assert!(authority
+            .allowed_repositories
+            .contains("example/manufactured"));
+        assert_eq!(serde_json::to_value(&authority).unwrap(), valid);
+        for unknown in ["policy_digset", "unexpected"] {
+            let mut malformed = valid.clone();
+            malformed
+                .as_object_mut()
+                .unwrap()
+                .insert(unknown.into(), serde_json::json!("extra"));
+            let error = serde_json::from_value::<PublicationAuthority>(malformed).unwrap_err();
+            assert!(error.to_string().contains("unknown field"));
+        }
+        let mut nested = serde_json::to_value(PublicationPreflightRequest {
+            target: PublicationTarget::Public,
+            private_repository: None,
+            public_repository: Some("example/manufactured".into()),
+            authority: Some(authority),
+        })
+        .unwrap();
+        assert!(serde_json::from_value::<PublicationPreflightRequest>(nested.clone()).is_ok());
+        nested["authority"]["allowed_repositores"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<PublicationPreflightRequest>(nested).is_err());
     }
 }

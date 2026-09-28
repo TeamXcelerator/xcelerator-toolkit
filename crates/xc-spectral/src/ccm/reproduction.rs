@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use xc_cache::ContentDigest;
 use xc_core::{ConfigDigest, ExecutionFingerprint, SolverProvenance};
 
-const SOLVER_ID: &str = "ccm_f64_tau_symmetric_eigen_v1";
+const SOLVER_ID: &str = "ccm_f64_tau_symmetric_eigen_original_dyadic_secular_signs_v4";
 
 /// Complete mathematical configuration for the reproducible f64 CCM route.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -29,6 +29,17 @@ impl CcmF64ObservationConfig {
             || self.finite_scope_statement.trim().is_empty()
         {
             bail!("invalid reproducible f64 CCM observation configuration");
+        }
+        let dimension = self
+            .n_modes
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(1))
+            .context("CCM observation dimension overflow")?;
+        let entries = dimension
+            .checked_mul(dimension)
+            .context("CCM observation matrix size overflow")?;
+        if entries as u128 * 64 > (8u128 << 30) {
+            bail!("saved f64 CCM observation exceeds the 8 GiB workspace budget");
         }
         Ok(())
     }
@@ -50,13 +61,16 @@ pub struct CcmF64NumericalObservation {
 }
 
 impl CcmF64NumericalObservation {
-    fn validate_for(&self, config: &CcmF64ObservationConfig) -> Result<()> {
-        if self.normalized_even_source.len() != 2 * config.n_modes + 1
+    fn validate_values(&self) -> Result<()> {
+        if self.normalized_even_source.is_empty()
+            || self.normalized_even_source.len().is_multiple_of(2)
+            || self.normalized_even_source.iter().all(|x| *x == 0.0)
             || self
                 .normalized_even_source
                 .iter()
                 .chain(&self.eigenvalues_positive)
                 .any(|value| !value.is_finite())
+            || self.eigenvalues_positive.iter().any(|x| *x <= 0.0)
             || !self.weil_minimum_eigenvalue.is_finite()
             || self
                 .eigenvalues_positive
@@ -68,7 +82,23 @@ impl CcmF64NumericalObservation {
         Ok(())
     }
 
+    fn validate_for(&self, config: &CcmF64ObservationConfig) -> Result<()> {
+        config.validate()?;
+        self.validate_values()?;
+        if config.n_modes.checked_mul(2).and_then(|n| n.checked_add(1))
+            != Some(self.normalized_even_source.len())
+            || self
+                .normalized_even_source
+                .iter()
+                .zip(self.normalized_even_source.iter().rev())
+                .any(|(a, b)| a != b)
+        {
+            bail!("CCM observation source has invalid shape or even symmetry");
+        }
+        Ok(())
+    }
     pub fn digest(&self) -> Result<ContentDigest> {
+        self.validate_values()?;
         let bytes = serde_json::to_vec(self).context("serialize CCM numerical observation")?;
         Ok(ContentDigest::sha256(&bytes))
     }
@@ -114,10 +144,18 @@ pub struct CcmF64ReproductionReport {
     pub schema_version: u32,
     pub original_numerical_digest: ContentDigest,
     pub reproduced_numerical_digest: ContentDigest,
+    /// Equality of the two caller-supplied fingerprints; host facts are not attested here.
     pub execution_fingerprints_match: bool,
+    /// Older reports omit this field; absence does not establish the current scope.
+    #[serde(default = "unspecified_legacy_execution_fingerprint_scope")]
+    pub execution_fingerprint_scope: String,
     pub numerically_identical: bool,
     pub reproduced_elapsed_seconds: f64,
     pub finite_scope_statement: String,
+}
+
+fn unspecified_legacy_execution_fingerprint_scope() -> String {
+    "unspecified_legacy_scope".to_owned()
 }
 
 fn solver_configuration() -> serde_json::Value {
@@ -202,8 +240,9 @@ pub fn run_saved_ccm_f64_observation(
 /// report.
 ///
 /// # Assurance and validity
-/// A successful report proves exact reproduction of this finite observation in
-/// the recorded environment. It does not certify an HP result, a limiting
+/// A successful report proves exact reproduction of this finite numerical payload.
+/// Both fingerprints are caller declarations; this function does not observe or
+/// attest the current executable, libraries, hardware, or recorded environment. It does not certify an HP result, a limiting
 /// operator, RH, or any other infinite-dimensional claim.
 ///
 /// # Cache effects
@@ -240,6 +279,8 @@ pub fn reproduce_saved_ccm_f64_observation(
         original_numerical_digest: saved.numerical_digest.clone(),
         reproduced_numerical_digest,
         execution_fingerprints_match: true,
+        execution_fingerprint_scope: "caller_supplied_declarations; current_host_not_observed"
+            .into(),
         numerically_identical: true,
         reproduced_elapsed_seconds,
         finite_scope_statement: saved.configuration.finite_scope_statement.clone(),
@@ -270,6 +311,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn exhaustive_reproduction_configuration_rejects_wrapped_dimensions() {
+        let mut c = configuration();
+        c.n_modes = usize::MAX;
+        assert!(c.validate().is_err());
+    }
+    #[test]
+    fn exhaustive_reproduction_validation_never_panics_on_public_dimension() {
+        let mut c = configuration();
+        c.n_modes = usize::MAX;
+        let n = CcmF64NumericalObservation {
+            eigenvalues_positive: vec![1.0],
+            weil_minimum_eigenvalue: 1.0,
+            normalized_even_source: vec![1.0],
+        };
+        assert!(std::panic::catch_unwind(|| n.validate_for(&c)).is_ok_and(|x| x.is_err()));
+    }
+    #[test]
+    fn exhaustive_reproduction_digest_rejects_nonfinite_json_null_collapse() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let n = CcmF64NumericalObservation {
+                eigenvalues_positive: vec![1.0],
+                weil_minimum_eigenvalue: value,
+                normalized_even_source: vec![1.0],
+            };
+            assert!(n.digest().is_err());
+        }
+    }
+    #[test]
+    fn exhaustive_reproduction_positive_spectrum_rejects_zero_and_negative_roots() {
+        for value in [0.0, -1.0] {
+            let n = CcmF64NumericalObservation {
+                eigenvalues_positive: vec![value],
+                weil_minimum_eigenvalue: 1.0,
+                normalized_even_source: vec![1.0; 5],
+            };
+            assert!(n.validate_for(&configuration()).is_err());
+        }
+    }
     fn provenance(config: &CcmF64ObservationConfig) -> SolverProvenance {
         let fingerprint = ExecutionFingerprint {
             schema_version: 1,
@@ -329,6 +409,42 @@ mod tests {
         assert_eq!(
             report.original_numerical_digest,
             report.reproduced_numerical_digest
+        );
+    }
+
+    #[test]
+    fn legacy_reproduction_report_has_explicit_unspecified_scope() {
+        let digest = ContentDigest::sha256(b"legacy finite payload");
+        let report = CcmF64ReproductionReport {
+            schema_version: 1,
+            original_numerical_digest: digest.clone(),
+            reproduced_numerical_digest: digest,
+            execution_fingerprints_match: true,
+            execution_fingerprint_scope: "caller_supplied_declarations; current_host_not_observed"
+                .into(),
+            numerically_identical: true,
+            reproduced_elapsed_seconds: 0.0,
+            finite_scope_statement: "finite stored numerical payload".into(),
+        };
+        let mut value = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            serde_json::from_value::<CcmF64ReproductionReport>(value.clone()).unwrap(),
+            report
+        );
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_fingerprint_scope");
+        let legacy: CcmF64ReproductionReport = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            legacy.execution_fingerprint_scope,
+            "unspecified_legacy_scope"
+        );
+        assert!(legacy.execution_fingerprints_match);
+        assert!(legacy.numerically_identical);
+        assert_eq!(
+            legacy.original_numerical_digest,
+            report.original_numerical_digest
         );
     }
 

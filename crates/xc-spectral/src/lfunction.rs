@@ -1,75 +1,165 @@
 // Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.®)
 // All rights reserved. See LICENSE in the repository root.
 
-//! L-function specifications for the generalized CCM construction.
+//! Validated real Dirichlet characters and prime-power twist data.
 //!
-//! This module extends the CCM construction (originally defined for the
-//! Riemann zeta function) to general L-functions in the Selberg class.
-//! For Phase 4, we focus on Dirichlet L-functions L(s, χ) where χ is
-//! a Dirichlet character modulo q.
+//! A character modulo q is periodic, vanishes exactly on nonunits, and is
+//! completely multiplicative with chi(1) = 1. This module supports real
+//! characters with values in {-1, 0, 1}, including principal and imprimitive
+//! characters. The modulus need not be the primitive conductor.
 //!
-//! ## Mathematical setup
+//! For Re(s) > 1, the defining absolutely convergent identities are
+//! `L(s, chi) = product_p (1 - chi(p) p^(-s))^(-1)` and
+//! `-L'(s, chi)/L(s, chi) = sum_n chi(n) Lambda(n) n^(-s)`.
+//! Thus a prime-power contribution at n = p^j, j >= 1, receives the exact
+//! factor chi(p)^j; it vanishes when p divides q. Exponent zero instead gives
+//! chi(1) = 1, including at those primes.
 //!
-//! For a Dirichlet character χ mod q, the L-function is
-//!
-//! ```text
-//! L(s, χ) = ∏_p (1 − χ(p) p^{-s})^{-1}
-//! ```
-//!
-//! Its logarithmic derivative gives the twisted von Mangoldt function:
-//!
-//! ```text
-//! −L'(s,χ)/L(s,χ) = Σ_n χ(n) Λ(n) n^{-s}
-//! ```
-//!
-//! where Λ(n) = log p if n = p^k, else 0.
-//!
-//! The CCM Weil quadratic form's prime-power sum becomes
-//!
-//! ```text
-//! W_p^χ(V_n, V_m) = Σ_{k = p^j ≤ λ²} χ(p)^j · log(p) · k^{-1/2} · q(U_n, U_m)(log k)
-//! ```
-//!
-//! with the convention χ(p)^j = 0 if gcd(p, q) > 1 (i.e. χ(p) = 0).
-//!
-//! ## Stage 1 scope
-//!
-//! For Stage 1 we restrict to **real characters** so the matrix stays
-//! real-symmetric (matches existing infrastructure). Real characters
-//! mod q are exactly the Kronecker symbols (Legendre symbol mod p
-//! for prime p, plus a few others). All χ(n) ∈ {-1, 0, +1}.
-//!
-//! Examples:
-//! - χ_0 mod 1: trivial character, χ(n) = 1 for all n. Recovers ζ.
-//! - χ_3: Legendre (n/3). χ(0) = 0, χ(1) = 1, χ(2) = -1.
-//! - χ_4: real quadratic character mod 4. χ(1) = 1, χ(3) = -1.
-//! - χ_5 (real): Legendre (n/5). χ(0)=0, χ(1)=1, χ(2)=-1, χ(3)=-1, χ(4)=1.
-//! - χ_7 (real): Legendre (n/7). χ values: 0, 1, 1, -1, 1, -1, -1.
+//! These are character data and enumeration utilities. They do not assemble
+//! a generalized CCM operator, conductor/gamma terms, pole corrections, or a
+//! functional equation. Such an assembly must distinguish primitive conductors
+//! from moduli and principal characters from the modulus-one zeta character.
 
 use serde::{Deserialize, Serialize};
 
-/// Specification of a Dirichlet L-function via its character data.
+/// Validated real character data for a Dirichlet L-function.
 ///
-/// The character is given by its values χ(0), χ(1), …, χ(q-1). Values
-/// repeat with period q: χ(n) = χ(n mod q). For real characters all
-/// values are in {-1, 0, 1}; for complex characters they're roots of
-/// unity and we'd need a Float64-typed variant (Stage 4).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Mathematical fields are immutable after construction. Use [`Self::new`]
+/// for custom characters; deserialization applies the same validation.
+#[derive(Debug, Clone, Serialize)]
 pub struct LFunctionSpec {
-    /// Modulus of the character. `χ(n)` has period `modulus`.
-    pub modulus: u64,
-    /// Character values χ(0), χ(1), …, χ(modulus - 1).
-    /// For Stage 1 (real characters) all values are in {-1, 0, 1},
-    /// stored as i8 to keep things compact.
-    pub chi: Vec<i8>,
-    /// Parity: 0 = even (χ(-1) = +1), 1 = odd (χ(-1) = -1).
-    /// Determines the gamma factor in the functional equation.
-    pub parity: u8,
-    /// A short human-readable label (e.g. "zeta", "chi_3", "chi_5_real").
+    modulus: u64,
+    chi: Vec<i8>,
+    parity: u8,
+    /// A descriptive label; it does not determine any mathematical property.
     pub label: String,
 }
 
+impl<'de> Deserialize<'de> for LFunctionSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireSpec {
+            modulus: u64,
+            chi: Vec<i8>,
+            parity: u8,
+            label: String,
+        }
+        let raw = WireSpec::deserialize(deserializer)?;
+        Self::new(raw.modulus, raw.chi, raw.parity, raw.label).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Validate a homomorphism on the unit group by adjoining one generator at a
+/// time. Each new coset is checked once; the closing power relation ensures
+/// the extension is well-defined. Nonunits are checked separately below.
+fn validate_real_character(modulus: u64, chi: &[i8], parity: u8) -> anyhow::Result<()> {
+    use anyhow::{ensure, Context};
+    ensure!(modulus > 0, "character modulus must be positive");
+    let q = usize::try_from(modulus).context("character modulus exceeds platform capacity")?;
+    ensure!(
+        chi.len() == q,
+        "character table length must equal its modulus"
+    );
+    ensure!(parity <= 1, "character parity must be zero or one");
+    fn gcd(mut a: u64, mut b: u64) -> u64 {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    }
+    for (n, &value) in chi.iter().enumerate() {
+        ensure!(
+            (-1..=1).contains(&value),
+            "character values must be -1, 0, or 1"
+        );
+        ensure!(
+            (value != 0) == (gcd(n as u64, modulus) == 1),
+            "character must vanish exactly on nonunits (residue {n})"
+        );
+    }
+    let identity = 1 % q;
+    ensure!(
+        chi[identity] == 1,
+        "character must take value one at the identity"
+    );
+    ensure!(
+        chi[q - 1] == if parity == 0 { 1 } else { -1 },
+        "character parity disagrees with its value at minus one"
+    );
+    let mut seen = Vec::new();
+    seen.try_reserve_exact(q)
+        .context("character validation membership allocation failed")?;
+    seen.resize(q, false);
+    let mut members = Vec::new();
+    members
+        .try_reserve_exact(q)
+        .context("character validation subgroup allocation failed")?;
+    members.push(identity);
+    seen[identity] = true;
+    let product = |a: usize, b: usize| ((a as u128 * b as u128) % modulus as u128) as usize;
+    for generator in 0..q {
+        if chi[generator] == 0 || seen[generator] {
+            continue;
+        }
+        let old_len = members.len();
+        let mut power = generator;
+        let mut character_power = chi[generator];
+        while !seen[power] {
+            for i in 0..old_len {
+                let h = members[i];
+                let residue = product(h, power);
+                ensure!(
+                    chi[residue] == chi[h] * character_power,
+                    "character is not multiplicative (residue {residue})"
+                );
+                seen[residue] = true;
+                members.push(residue);
+            }
+            power = product(power, generator);
+            character_power *= chi[generator];
+        }
+        ensure!(
+            chi[power] == character_power,
+            "character violates a generator power relation"
+        );
+    }
+    Ok(())
+}
+
 impl LFunctionSpec {
+    /// Construct a real Dirichlet character, validating its complete table.
+    ///
+    /// Requires a positive modulus, exactly that many entries, zeros precisely
+    /// at nonunits, values +/-1 at units, complete multiplicativity, and parity
+    /// agreeing with chi(-1). Validation takes O(q log q) Euclidean work and
+    /// O(q) storage; queries then take constant time. This does not assert
+    /// primitivity or identify the primitive conductor.
+    pub fn new(modulus: u64, chi: Vec<i8>, parity: u8, label: String) -> anyhow::Result<Self> {
+        validate_real_character(modulus, &chi, parity)?;
+        Ok(Self {
+            modulus,
+            chi,
+            parity,
+            label,
+        })
+    }
+
+    /// Period of the character; this need not equal its primitive conductor.
+    pub fn modulus(&self) -> u64 {
+        self.modulus
+    }
+
+    /// Exact immutable values at residues 0 through q - 1.
+    pub fn values(&self) -> &[i8] {
+        &self.chi
+    }
+
+    /// Zero for chi(-1) = +1, one for chi(-1) = -1.
+    pub fn parity(&self) -> u8 {
+        self.parity
+    }
+
     /// The trivial character mod 1 — recovers L(s, χ_0) = ζ(s).
     pub fn riemann_zeta() -> Self {
         Self {
@@ -163,11 +253,15 @@ impl LFunctionSpec {
         self.chi_at(n) as f64
     }
 
-    /// Compute χ(p^j) = χ(p)^j as an exact integer in `{-1, 0, +1}`.
+    /// Compute chi(p^j) exactly. The base need not be prime.
+    /// Exponent zero returns chi(1) = 1 for every base, including zero.
     #[inline]
     // Keep remainder arithmetic for the Rust 1.85 MSRV.
     #[allow(unknown_lints, clippy::manual_is_multiple_of)]
     pub fn chi_at_prime_power(&self, p: u64, j: u32) -> i8 {
+        if j == 0 {
+            return 1;
+        }
         let chi_p = self.chi_at(p);
         if chi_p == 0 {
             0
@@ -179,7 +273,7 @@ impl LFunctionSpec {
         }
     }
 
-    /// Compute χ(p^j) = χ(p)^j. Returns 0 if χ(p) = 0.
+    /// Compute chi(p^j); returns zero for positive j when chi(p) = 0.
     #[inline]
     pub fn chi_at_prime_power_f64(&self, p: u64, j: u32) -> f64 {
         self.chi_at_prime_power(p, j) as f64
@@ -190,12 +284,14 @@ impl LFunctionSpec {
         self.chi.iter().all(|&c| (-1..=1).contains(&c))
     }
 
-    /// True iff χ is the trivial (principal) character — i.e. recovers ζ.
+    /// True exactly for the modulus-one character, which recovers zeta.
+    /// Principal characters at larger moduli have missing Euler factors and
+    /// therefore return false here.
     pub fn is_trivial(&self) -> bool {
         self.modulus == 1
     }
 
-    /// True iff χ is even (χ(-1) = +1). Determines gamma factor.
+    /// True iff chi(-1) = +1. This does not itself assemble a gamma factor.
     pub fn is_even(&self) -> bool {
         self.parity == 0
     }
@@ -212,6 +308,11 @@ impl LFunctionSpec {
 /// This design keeps the enumerator precision-agnostic: the same `(n, p, j)`
 /// triples work for both f64 (`chi_at_prime_power_f64`) and HP
 /// (`Float::with_val(prec, spec.chi_at_prime_power(p, j))`).
+///
+/// # Panics
+/// Has the same capacity/allocation failure contract as
+/// [`crate::ccm::prime_powers_up_to`]. For a checked path, use
+/// [`crate::ccm::try_prime_powers_up_to`] and apply this character afterward.
 pub fn prime_powers_up_to_chi(bound: u64, _spec: &LFunctionSpec) -> Vec<(u64, u64, u32)> {
     crate::ccm::prime_powers_up_to(bound)
 }

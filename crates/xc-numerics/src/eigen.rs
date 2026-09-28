@@ -12,9 +12,8 @@
 //!
 //! - **Symmetric tridiagonal QR** with implicit Wilkinson shifts: the
 //!   classical algorithm (Wilkinson 1965; Press et al. NumRec §11.3).
-//!   Convergence threshold is `2^-(prec - 16)`, so at HP-1000 (≈3338 bits)
-//!   we converge to ~10⁻¹⁰⁰⁰ off-diagonal magnitudes. Truly dynamic in
-//!   working precision.
+//!   Deflation uses `2^-prec` times the adjacent diagonal magnitudes.
+//!   This is a working-precision approximation, not an eigenvalue enclosure.
 //!
 //! - **Shifted inverse iteration** for one eigenvector at a known
 //!   eigenvalue: applies LU + back-substitution at the shifted matrix.
@@ -30,16 +29,43 @@ use rayon::prelude::*;
 use rug::{ops::Pow, Assign, Float};
 use xc_core::EigenpairDiagnostics;
 
-use crate::linalg::{lu_factor, lu_solve, normalize_l2};
+#[path = "eigen_recovery.rs"]
+mod recovery;
+#[path = "eigen_sturm.rs"]
+mod sturm;
+pub use recovery::{
+    dense_symmetric_eigenpair_at_index_hp, dense_symmetric_eigenvector_for_value_detailed_hp,
+    tridiag_eigenvector_for_value_detailed_hp, HpEigenvectorRecovery, HpEigenvectorRecoveryFailure,
+    DENSE_EIGENVECTOR_SEMANTICS,
+};
 
-/// Convergence threshold for the symmetric tridiagonal QR algorithm.
-/// Scales naturally with HP precision: at `prec` bits, this is `2^-(prec-16)`,
-/// giving 16 guard bits below the working precision.
+/// Arithmetic identity for retained QR results.
+pub const TRIDIAG_QR_SEMANTICS: &str = "tridiag-qr-working-unit-deflation-exponent-safe-hypot-v3";
+
+/// Relative working-unit threshold for symmetric tridiagonal QR deflation.
 fn qr_tolerance(prec: u32) -> Float {
     let two = Float::with_val(prec, 2);
-    let exponent = -((prec as i32) - 16);
+    let exponent = -(prec as i32);
     two.pow(exponent)
 }
+
+/// A user work budget ended before the selected interval met its width.
+/// Increasing arithmetic precision does not increase this budget.
+#[derive(Debug)]
+pub struct SelectedEigenvalueIterationLimit {
+    pub index: usize,
+    pub maximum_iterations: usize,
+}
+impl std::fmt::Display for SelectedEigenvalueIterationLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "selected eigenvalue {} exhausted {} bisection iterations",
+            self.index, self.maximum_iterations
+        )
+    }
+}
+impl std::error::Error for SelectedEigenvalueIterationLimit {}
 
 /// Sweep count at which QR reports slow convergence without changing the
 /// arithmetic sequence or stopping the solve.
@@ -90,7 +116,10 @@ fn hp_one(prec: u32) -> Float {
 /// `diag` has length `n`, `off_diag` has length `n-1`. The matrix is
 /// `T[i,i] = diag[i]`, `T[i+1,i] = T[i,i+1] = off_diag[i]`.
 ///
-/// Returns eigenvalues sorted ascending.
+/// Returns finite eigenvalues sorted ascending, each at `prec` bits.
+/// Precision must exceed 32 bits. Nonfinite inputs or nonrepresentable QR
+/// intermediates return errors. The input is rounded to the requested precision;
+/// computed eigenvalues require separate residual and state-selection checks.
 ///
 /// Algorithm: implicit-shift QR for symmetric tridiagonal matrices,
 /// following the classical formulation in *Numerical Recipes* §11.3
@@ -116,10 +145,17 @@ pub fn tridiag_eigenvalues_hp_with_options(
             "max_iterations_per_eigenvalue must be greater than zero"
         ));
     }
+    validate_hp_eigen_precision(prec)?;
     let n = diag.len();
     if n == 0 {
+        if !off_diag.is_empty() {
+            return Err(anyhow!(
+                "an empty HP tridiagonal matrix requires no couplings"
+            ));
+        }
         return Ok(Vec::new());
     }
+    validate_hp_tridiagonal(diag, off_diag, prec)?;
     if off_diag.len() != n - 1 {
         return Err(anyhow!(
             "off_diag length {} should be {} (= diag length - 1)",
@@ -129,8 +165,11 @@ pub fn tridiag_eigenvalues_hp_with_options(
     }
     // Working copies; algorithm mutates these in place.
     // Pad e with one trailing zero so e[m] is always valid for m up to n-1.
-    let mut d: Vec<Float> = diag.to_vec();
-    let mut e: Vec<Float> = off_diag.to_vec();
+    let mut d: Vec<Float> = diag.iter().map(|v| Float::with_val(prec, v)).collect();
+    let mut e: Vec<Float> = off_diag.iter().map(|v| Float::with_val(prec, v)).collect();
+    if d.iter().chain(&e).any(|v| !v.is_finite()) {
+        return Err(anyhow!("HP QR inputs overflow at the requested precision"));
+    }
     e.push(hp_zero(prec)); // sentinel; index n-1 is always 0
 
     let tol = qr_tolerance(prec);
@@ -149,7 +188,6 @@ pub fn tridiag_eigenvalues_hp_with_options(
     let mut sc_abs_em = hp_zero(prec);
     let mut sc_g = hp_zero(prec);
     let mut sc_two_el = hp_zero(prec);
-    let mut sc_r_sq_outer = hp_zero(prec);
     let mut sc_r_outer = hp_zero(prec);
     let mut sc_signed_r = hp_zero(prec);
     let mut sc_g_plus_sr = hp_zero(prec);
@@ -157,9 +195,6 @@ pub fn tridiag_eigenvalues_hp_with_options(
     let mut sc_shifted_diag = hp_zero(prec);
     let mut sc_f = hp_zero(prec);
     let mut sc_b = hp_zero(prec);
-    let mut sc_f_sq = hp_zero(prec);
-    let mut sc_g_sq = hp_zero(prec);
-    let mut sc_r_sq = hp_zero(prec);
     let mut sc_new_r = hp_zero(prec);
     let mut sc_term1 = hp_zero(prec);
     let mut sc_term2 = hp_zero(prec);
@@ -184,6 +219,11 @@ pub fn tridiag_eigenvalues_hp_with_options(
                 // threshold = sc_dd · tol
                 sc_threshold.assign(&sc_dd);
                 sc_threshold *= &tol;
+                if !sc_dd.is_finite() || !sc_threshold.is_finite() {
+                    return Err(anyhow!(
+                        "HP QR deflation arithmetic exceeds the finite exponent range"
+                    ));
+                }
                 // abs_em = |e[m]|
                 sc_abs_em.assign(e[m].clone().abs());
                 if sc_abs_em <= sc_threshold {
@@ -222,15 +262,19 @@ pub fn tridiag_eigenvalues_hp_with_options(
             // e[l] is non-negligible at this point (we just established m > l),
             // so sc_two_el is non-zero.
             sc_g /= &sc_two_el;
+            if !sc_two_el.is_finite() || !sc_g.is_finite() {
+                return Err(anyhow!(
+                    "HP QR shift arithmetic exceeds the finite exponent range"
+                ));
+            }
 
-            // sc_r_outer = sqrt(g² + 1)
-            sc_r_sq_outer.assign(&sc_g);
-            sc_r_sq_outer *= &sc_g;
-            sc_r_sq_outer += 1u32;
-            // rug::Float doesn't have sqrt_mut for in-place sqrt as of v1.30
-            // in our usage; we accept one allocation here per outer
-            // iteration (not per inner step), which is amortized.
-            sc_r_outer.assign(sc_r_sq_outer.clone().sqrt());
+            // MPFR hypot avoids overflow/underflow of separately squared operands.
+            sc_r_outer.assign(sc_g.clone().hypot(&hp_one(prec)));
+            if !sc_r_outer.is_finite() {
+                return Err(anyhow!(
+                    "HP QR shift norm exceeds the finite exponent range"
+                ));
+            }
 
             // sc_signed_r = sign(g) · r ; if g is zero, treat as positive sign
             if sc_g.is_sign_negative() {
@@ -270,14 +314,15 @@ pub fn tridiag_eigenvalues_hp_with_options(
                 sc_b.assign(&c);
                 sc_b *= &e[i];
 
-                // r = sqrt(f² + g²)
-                sc_f_sq.assign(&sc_f);
-                sc_f_sq *= &sc_f;
-                sc_g_sq.assign(&g);
-                sc_g_sq *= &g;
-                sc_r_sq.assign(&sc_f_sq);
-                sc_r_sq += &sc_g_sq;
-                sc_new_r.assign(sc_r_sq.clone().sqrt());
+                // Compute the finite norm without squaring exponent-extreme entries.
+                sc_new_r.assign(sc_f.clone().hypot(&g));
+                if !sc_new_r.is_finite()
+                    || (sc_new_r.is_zero() && (!sc_f.is_zero() || !g.is_zero()))
+                {
+                    return Err(anyhow!(
+                        "HP QR rotation norm exceeds the representable exponent range"
+                    ));
+                }
 
                 e[i + 1].assign(&sc_new_r);
 
@@ -322,6 +367,9 @@ pub fn tridiag_eigenvalues_hp_with_options(
                 g.assign(&c);
                 g *= &sc_sweep_r;
                 g -= &sc_b;
+                if [&d[i + 1], &g, &p, &s, &c].iter().any(|v| !v.is_finite()) {
+                    return Err(anyhow!("HP QR rotation produced a nonfinite value"));
+                }
             }
 
             if !converged_early {
@@ -333,8 +381,11 @@ pub fn tridiag_eigenvalues_hp_with_options(
         }
     }
 
-    // Sort ascending.
-    d.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if d.iter().any(|v| !v.is_finite()) {
+        return Err(anyhow!("HP QR produced a nonfinite eigenvalue"));
+    }
+    // Sort only finite values; NaN is never treated as an ordering tie.
+    d.sort_by(|a, b| a.partial_cmp(b).expect("finite eigenvalues"));
     Ok(d)
 }
 
@@ -367,6 +418,8 @@ pub struct HpSelectedTridiagonalEigenpair {
     pub eigenvector: Vec<Float>,
     pub residual_norm: Float,
     pub diagnostics: EigenpairDiagnostics<Float>,
+    /// Directed angle evidence for this returned vector and exact stored matrix.
+    pub recovery: HpEigenvectorRecovery,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -403,59 +456,26 @@ pub struct HpSelectedTridiagonalEigenpairOptions {
     pub precision_bits: u32,
 }
 
+fn validate_hp_eigen_precision(prec: u32) -> Result<()> {
+    if prec <= 32 || prec > rug::float::prec_max().min(i32::MAX as u32) {
+        return Err(anyhow!(
+            "HP eigen precision must exceed 32 bits and fit the supported exponent arithmetic"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_hp_tridiagonal(diag: &[Float], off_diag: &[Float], prec: u32) -> Result<()> {
     if diag.is_empty() || off_diag.len() + 1 != diag.len() {
         return Err(anyhow!(
             "HP tridiagonal problem requires off_diag.len() + 1 == diag.len() > 0"
         ));
     }
-    if prec <= 32 {
-        return Err(anyhow!("HP tridiagonal precision must exceed 32 bits"));
-    }
+    validate_hp_eigen_precision(prec)?;
     if diag.iter().chain(off_diag).any(|value| !value.is_finite()) {
         return Err(anyhow!("HP tridiagonal entries must be finite"));
     }
     Ok(())
-}
-
-fn sturm_sign_changes_for_block_hp(
-    diag: &[Float],
-    off_diag: &[Float],
-    threshold: &Float,
-    start: usize,
-    end: usize,
-    prec: u32,
-) -> usize {
-    let mut previous_nonzero_sign = 1i8;
-    let mut changes = 0usize;
-    let mut record_sign = |value: &Float| {
-        if value.is_zero() {
-            return;
-        }
-        let sign = if value.is_sign_negative() { -1 } else { 1 };
-        if sign != previous_nonzero_sign {
-            changes += 1;
-        }
-        previous_nonzero_sign = sign;
-    };
-
-    let mut previous_polynomial = hp_one(prec);
-    let mut current_polynomial = Float::with_val(prec, &diag[start]);
-    current_polynomial -= threshold;
-    record_sign(&current_polynomial);
-    for index in start + 1..end {
-        let mut next_polynomial = Float::with_val(prec, &diag[index]);
-        next_polynomial -= threshold;
-        next_polynomial *= &current_polynomial;
-        let mut coupling = Float::with_val(prec, &off_diag[index - 1]);
-        coupling *= Float::with_val(prec, &off_diag[index - 1]);
-        coupling *= &previous_polynomial;
-        next_polynomial -= coupling;
-        record_sign(&next_polynomial);
-        previous_polynomial = current_polynomial;
-        current_polynomial = next_polynomial;
-    }
-    changes
 }
 
 fn tridiag_sturm_count_below_hp_unchecked(
@@ -463,29 +483,17 @@ fn tridiag_sturm_count_below_hp_unchecked(
     off_diag: &[Float],
     threshold: &Float,
     prec: u32,
-) -> usize {
-    let mut count = 0usize;
-    let mut block_start = 0usize;
-    for boundary in 1..=diag.len() {
-        if boundary == diag.len() || off_diag[boundary - 1].is_zero() {
-            count += sturm_sign_changes_for_block_hp(
-                diag,
-                off_diag,
-                threshold,
-                block_start,
-                boundary,
-                prec,
-            );
-            block_start = boundary;
-        }
-    }
-    count
+) -> Result<usize> {
+    sturm::count(diag, off_diag, threshold, prec)
 }
 
-/// Count eigenvalues strictly below an HP threshold through the characteristic
-/// polynomial Sturm sequence. Exact zero couplings split independent blocks,
-/// so diagonal and reducible tridiagonal matrices retain strict semantics even
-/// when the threshold equals an eigenvalue.
+/// Count eigenvalues strictly below the exact stored HP threshold.
+/// Directed MPFR determinant intervals must prove every sign or exact zero.
+/// Exact zero couplings split independent blocks. The initial guard precision
+/// exceeds every input precision by 32 bits. The adaptive cap is the greater
+/// of source+64+2*n and 4*(source+32), limited to 1,000,000 bits.
+/// Unresolved signs or nonrepresentable interval arithmetic return errors.
+/// This count concerns the exact stored matrix, not matrix-assembly uncertainty.
 pub fn tridiag_sturm_count_below_hp(
     diag: &[Float],
     off_diag: &[Float],
@@ -496,9 +504,7 @@ pub fn tridiag_sturm_count_below_hp(
     if !threshold.is_finite() {
         return Err(anyhow!("HP Sturm threshold must be finite"));
     }
-    Ok(tridiag_sturm_count_below_hp_unchecked(
-        diag, off_diag, threshold, prec,
-    ))
+    tridiag_sturm_count_below_hp_unchecked(diag, off_diag, threshold, prec)
 }
 
 fn tridiag_gershgorin_bounds_hp(diag: &[Float], off_diag: &[Float], prec: u32) -> (Float, Float) {
@@ -539,9 +545,11 @@ fn tridiag_gershgorin_bounds_hp(diag: &[Float], off_diag: &[Float], prec: u32) -
 }
 
 /// Compute only the inclusive algebraic index range `[first_index,last_index]`
-/// of a symmetric tridiagonal matrix. This is an HP computed route: endpoint
-/// counts and precision-stagnation checks are retained, but rigorous claims
-/// still require interval counts from `xc-certify`.
+/// of the exact stored symmetric tridiagonal matrix. Endpoint counts use
+/// directed interval signs, and returned widths are checked with rounding up.
+/// Unresolved signs, arithmetic limits or precision stagnation return errors.
+/// These enclosures do not include matrix-assembly or reduction uncertainty;
+/// eigenvectors and their residuals still require separate validation.
 pub fn tridiag_selected_eigenvalues_hp(
     diag: &[Float],
     off_diag: &[Float],
@@ -569,10 +577,20 @@ pub fn tridiag_selected_eigenvalues_hp(
     }
     let tolerance = Float::with_val(prec, absolute_tolerance);
     let (global_lower, global_upper) = tridiag_gershgorin_bounds_hp(diag, off_diag, prec);
+    if !global_lower.is_finite() || !global_upper.is_finite() || global_lower >= global_upper {
+        return Err(anyhow!(
+            "HP Gershgorin bounds exceed the finite representable range"
+        ));
+    }
+    if !tolerance.is_finite() || tolerance <= 0 {
+        return Err(anyhow!(
+            "HP tolerance is not representable at working precision"
+        ));
+    }
     let global_lower_count =
-        tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &global_lower, prec);
+        tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &global_lower, prec)?;
     let global_upper_count =
-        tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &global_upper, prec);
+        tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &global_upper, prec)?;
     if global_lower_count != 0 || global_upper_count != diag.len() {
         return Err(anyhow!(
             "HP Gershgorin bracket failed count reconciliation: [{global_lower_count}, {global_upper_count}] for dimension {}",
@@ -592,26 +610,26 @@ pub fn tridiag_selected_eigenvalues_hp(
             let mut upper_count = global_upper_count;
             let mut iterations = 0usize;
             loop {
-                let mut width = upper.clone();
-                width -= &lower;
-                if width <= tolerance {
+                let (width, _) = Float::with_val_round(prec, &upper - &lower, rug::float::Round::Up);
+                if width <= *absolute_tolerance {
                     break;
                 }
                 if iterations == maximum_iterations {
-                    return Err(anyhow!(
-                        "HP Sturm bisection did not enclose eigenvalue {index} within the requested tolerance after {maximum_iterations} iterations"
-                    ));
+                    return Err(SelectedEigenvalueIterationLimit { index, maximum_iterations }.into());
                 }
-                let mut midpoint = lower.clone();
-                midpoint += &upper;
-                midpoint /= 2u32;
+                // Half-sum avoids overflow when both finite endpoints are large.
+                let mut midpoint = lower.clone() / 2u32;
+                midpoint += upper.clone() / 2u32;
+                if !midpoint.is_finite() || midpoint < lower || midpoint > upper {
+                    return Err(anyhow!("HP Sturm midpoint is outside the finite bracket"));
+                }
                 if midpoint == lower || midpoint == upper {
                     return Err(anyhow!(
                         "HP Sturm bisection stagnated at {prec} bits for eigenvalue {index}; precision escalation is required"
                     ));
                 }
                 let midpoint_count =
-                    tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &midpoint, prec);
+                    tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &midpoint, prec)?;
                 if midpoint_count <= index {
                     lower = midpoint;
                     lower_count = midpoint_count;
@@ -657,78 +675,98 @@ pub fn tridiag_selected_eigenvalues_hp(
     })
 }
 
+// Bound ||T||_2 by ||T||_infinity for symmetric T. The search bracket's
+// absolute padding is not matrix data and must not relax residual acceptance.
+fn tridiag_matrix_scale_hp(diag: &[Float], off_diag: &[Float], prec: u32) -> Result<Float> {
+    use rug::{float::Round, ops::AddAssignRound};
+    let mut scale = hp_zero(prec);
+    for i in 0..diag.len() {
+        let (mut row, _) = Float::with_val_round(prec, diag[i].clone().abs(), Round::Up);
+        if i > 0 {
+            row.add_assign_round(off_diag[i - 1].clone().abs(), Round::Up);
+        }
+        if i + 1 < diag.len() {
+            row.add_assign_round(off_diag[i].clone().abs(), Round::Up);
+        }
+        if !row.is_finite() {
+            return Err(anyhow!(
+                "selected-eigenpair matrix norm bound is unrepresentable"
+            ));
+        }
+        if row > scale {
+            scale = row;
+        }
+    }
+    // Only the exactly zero matrix needs an arbitrary positive normalization.
+    if scale.is_zero() {
+        scale.assign(1);
+    }
+    Ok(scale)
+}
+
 fn tridiag_rayleigh_and_residual_hp(
     diag: &[Float],
     off_diag: &[Float],
     vector: &[Float],
     matrix_scale: &Float,
     prec: u32,
-) -> (Float, EigenpairDiagnostics<Float>) {
-    let mut numerator = hp_zero(prec);
+) -> Result<(Float, EigenpairDiagnostics<Float>)> {
+    if !matrix_scale.is_finite() || matrix_scale <= &0 || vector.iter().any(|x| !x.is_finite()) {
+        return Err(anyhow!("invalid selected-eigenpair diagnostic domain"));
+    }
     let mut denominator = hp_zero(prec);
-    for index in 0..diag.len() {
-        let mut square = Float::with_val(prec, &vector[index]);
-        square *= &vector[index];
-        denominator += &square;
-        square *= &diag[index];
-        numerator += square;
-        if index + 1 < diag.len() {
-            let mut cross = Float::with_val(prec, &vector[index]);
-            cross *= &vector[index + 1];
-            cross *= &off_diag[index];
-            cross *= 2u32;
-            numerator += cross;
+    let mut numerator = hp_zero(prec);
+    let mut actions = Vec::with_capacity(diag.len());
+    for i in 0..diag.len() {
+        denominator += Float::with_val(prec, &vector[i] * &vector[i]);
+        let mut action = Float::with_val(prec, &diag[i] / matrix_scale) * &vector[i];
+        if i > 0 {
+            action += Float::with_val(prec, &off_diag[i - 1] / matrix_scale) * &vector[i - 1];
         }
+        if i + 1 < diag.len() {
+            action += Float::with_val(prec, &off_diag[i] / matrix_scale) * &vector[i + 1];
+        }
+        numerator += Float::with_val(prec, &vector[i] * &action);
+        actions.push(action);
     }
-    let mut eigenvalue = numerator;
-    eigenvalue /= &denominator;
-
-    let mut residual_squared = hp_zero(prec);
-    let mut action_squared = hp_zero(prec);
-    for index in 0..diag.len() {
-        let mut action = Float::with_val(prec, &diag[index]);
-        action *= &vector[index];
-        if index > 0 {
-            let mut term = Float::with_val(prec, &off_diag[index - 1]);
-            term *= &vector[index - 1];
-            action += term;
-        }
-        if index + 1 < diag.len() {
-            let mut term = Float::with_val(prec, &off_diag[index]);
-            term *= &vector[index + 1];
-            action += term;
-        }
-        let mut action_square = action.clone();
-        action_square *= &action;
-        action_squared += action_square;
-        let mut expected = eigenvalue.clone();
-        expected *= &vector[index];
-        action -= expected;
-        action *= action.clone();
-        residual_squared += action;
+    if !denominator.is_finite() || denominator <= 0 {
+        return Err(anyhow!("invalid recovered vector norm"));
     }
-    let absolute_residual = residual_squared.sqrt();
+    let scaled_value = Float::with_val(prec, numerator / &denominator);
+    let eigenvalue = Float::with_val(prec, &scaled_value * matrix_scale);
+    let mut residual = ScaledSquareSum::new(prec);
+    let mut action_norm = ScaledSquareSum::new(prec);
+    for (action, component) in actions.iter().zip(vector) {
+        action_norm.add(action)?;
+        residual.add(&Float::with_val(
+            prec,
+            action - Float::with_val(prec, &scaled_value * component),
+        ))?;
+    }
+    let residual = residual.norm()?;
+    let action_norm = action_norm.norm()?;
+    let absolute_residual = Float::with_val(prec, &residual * matrix_scale);
+    if !eigenvalue.is_finite()
+        || !absolute_residual.is_finite()
+        || (!residual.is_zero() && absolute_residual.is_zero())
+        || (!scaled_value.is_zero() && eigenvalue.is_zero())
+    {
+        return Err(anyhow!(
+            "selected-eigenpair diagnostic rescaling is unrepresentable"
+        ));
+    }
     let vector_norm = denominator.clone().sqrt();
-    let action_norm = action_squared.sqrt();
-    let mut eigenvalue_scale = eigenvalue.clone().abs();
-    eigenvalue_scale *= &vector_norm;
-    let mut relative_denominator = action_norm;
-    relative_denominator += &eigenvalue_scale;
-    let mut relative_residual = absolute_residual.clone();
-    if !relative_denominator.is_zero() {
-        relative_residual /= relative_denominator;
-    }
-    let mut backward_denominator = Float::with_val(prec, matrix_scale);
-    backward_denominator *= &vector_norm;
-    backward_denominator += eigenvalue_scale;
-    let mut scaled_backward_error = absolute_residual.clone();
-    if !backward_denominator.is_zero() {
-        scaled_backward_error /= backward_denominator;
-    }
-    let mut orthogonality_error = denominator;
-    orthogonality_error -= 1u32;
-    orthogonality_error.abs_mut();
-    (
+    let eigenvalue_scale = Float::with_val(prec, scaled_value.abs() * &vector_norm);
+    let relative_denominator = Float::with_val(prec, action_norm + &eigenvalue_scale);
+    let relative_residual = if relative_denominator.is_zero() {
+        residual.clone()
+    } else {
+        Float::with_val(prec, &residual / relative_denominator)
+    };
+    let backward_denominator = Float::with_val(prec, vector_norm + eigenvalue_scale);
+    let scaled_backward_error = Float::with_val(prec, &residual / backward_denominator);
+    let orthogonality_error = Float::with_val(prec, denominator - 1).abs();
+    Ok((
         eigenvalue,
         EigenpairDiagnostics {
             absolute_residual,
@@ -736,12 +774,21 @@ fn tridiag_rayleigh_and_residual_hp(
             scaled_backward_error,
             orthogonality_error,
         },
-    )
+    ))
 }
 
+/// Bind a computed vector to an algebraic index of the exact stored matrix.
+/// For symmetric T, dist(rho, spectrum(T)) <= ||T v-rho v||_2/||v||_2.
+/// Directed arithmetic encloses that residual ball; Sturm counts must isolate
+/// exactly the requested index in the whole ball, including both endpoints.
 /// Recover HP eigenvectors only for selected values whose endpoint counts
 /// establish a one-dimensional eigenspace. Multiplicities are coalesced into
-/// cluster records and never assigned arbitrary individual vectors.
+/// cluster records and never assigned arbitrary individual vectors. Residual
+/// acceptance uses directed bounds on the returned vector's residual and
+/// separation from all other indices. The original requested eigenvalue
+/// enclosure and the separate vector-angle evidence are both retained.
+/// Unresolved index or multiplicity,
+/// unrepresentable bounds, or failed recovery return errors.
 pub fn tridiag_selected_eigenpairs_hp(
     diag: &[Float],
     off_diag: &[Float],
@@ -754,7 +801,7 @@ pub fn tridiag_selected_eigenpairs_hp(
             "selected HP eigenvector recovery requires a positive step limit"
         ));
     }
-    let spectrum = tridiag_selected_eigenvalues_hp(
+    let mut spectrum = tridiag_selected_eigenvalues_hp(
         diag,
         off_diag,
         options.first_index,
@@ -766,17 +813,7 @@ pub fn tridiag_selected_eigenpairs_hp(
     let mut items = Vec::with_capacity(spectrum.enclosures.len());
     let mut vector_recoveries = 0usize;
     let mut inverse_iteration_runs = 0usize;
-    let (matrix_lower, matrix_upper) = tridiag_gershgorin_bounds_hp(diag, off_diag, prec);
-    let mut matrix_scale = matrix_lower.abs();
-    let upper_scale = matrix_upper.abs();
-    if upper_scale > matrix_scale {
-        matrix_scale = upper_scale;
-    }
-    if matrix_scale < 1 {
-        matrix_scale.assign(1);
-    }
-    let mut residual_target = Float::with_val(prec, 2).pow(-((prec / 2) as i32));
-    residual_target *= &matrix_scale;
+    let matrix_scale = tridiag_matrix_scale_hp(diag, off_diag, prec)?;
     for enclosure in &spectrum.enclosures {
         let cluster_dimension = enclosure
             .upper_count
@@ -811,42 +848,27 @@ pub fn tridiag_selected_eigenpairs_hp(
             continue;
         }
 
-        let mut shift = enclosure.lower.clone();
-        shift += &enclosure.upper;
-        shift /= 2u32;
-        let mut eigenvector =
-            tridiag_eigenvector_for_value_hp(diag, off_diag, &shift, prec, eigenvector_options)?;
-        inverse_iteration_runs += 1;
-        let (mut eigenvalue, mut diagnostics) =
-            tridiag_rayleigh_and_residual_hp(diag, off_diag, &eigenvector, &matrix_scale, prec);
-        if diagnostics.absolute_residual > residual_target && eigenvector_options.early_termination
-        {
-            let retry_options = TridiagEigvecOptions {
-                early_termination: false,
-                ..eigenvector_options
-            };
-            eigenvector =
-                tridiag_eigenvector_for_value_hp(diag, off_diag, &eigenvalue, prec, retry_options)?;
-            inverse_iteration_runs += 1;
-            (eigenvalue, diagnostics) =
-                tridiag_rayleigh_and_residual_hp(diag, off_diag, &eigenvector, &matrix_scale, prec);
-        }
-        if diagnostics.absolute_residual > residual_target {
-            return Err(anyhow!(
-                "HP inverse iteration did not meet the residual target for selected index {}: residual={}, target={}",
-                enclosure.index,
-                diagnostics.absolute_residual,
-                residual_target
-            ));
-        }
-        if eigenvalue < enclosure.lower || eigenvalue > enclosure.upper {
-            return Err(anyhow!(
-                "HP inverse-iteration Rayleigh value escaped the selected enclosure for index {}",
+        let recovery = recovery::tridiagonal_at_index(
+            diag,
+            off_diag,
+            enclosure.index,
+            prec,
+            eigenvector_options,
+        )
+        .map_err(|e| {
+            e.context(format!(
+                "selected index {} recovery failed",
                 enclosure.index
-            ));
-        }
+            ))
+        })?;
+        let eigenvector = recovery.eigenvector.clone();
+        let eigenvalue = recovery.eigenvalue.clone();
+        let (_, diagnostics) =
+            tridiag_rayleigh_and_residual_hp(diag, off_diag, &eigenvector, &matrix_scale, prec)?;
+        spectrum.sturm_evaluations += 2;
         vector_recoveries += 1;
-        let residual_norm = diagnostics.absolute_residual.clone();
+        inverse_iteration_runs += 1;
+        let residual_norm = recovery.residual_upper_bound.clone();
         items.push(HpSelectedTridiagonalItem::SimpleEigenpair(Box::new(
             HpSelectedTridiagonalEigenpair {
                 enclosure: enclosure.clone(),
@@ -854,6 +876,7 @@ pub fn tridiag_selected_eigenpairs_hp(
                 eigenvector,
                 residual_norm,
                 diagnostics,
+                recovery,
             },
         )));
     }
@@ -871,19 +894,16 @@ pub fn tridiag_selected_eigenpairs_hp(
 
 /// Solver choice for the inner LU step in shifted inverse iteration.
 ///
-/// Both solvers produce eigenvectors that satisfy `T·v = λ·v` to working
-/// precision, on the same tridiagonal input. The choice is purely
-/// architectural: cost, memory, scaling.
+/// Both banded names use corrected interleaved pivots. Convergence and
+/// residuals require verification. Historical defective arithmetic requires
+/// a pinned older revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TridiagSolver {
-    /// Banded LU on the tridiagonal directly (Thomas with partial
-    /// pivoting via `linalg::tridiag_lu_factor_hp`). O(n) factor,
-    /// O(n) per-step solve, O(n) memory. Historical replay only: this
-    /// route has a known later-pivot RHS defect. Use BandedInterleaved
-    /// for new explicit analyses and record the distinct semantics.
+    /// Compatibility name for the corrected O(n) interleaved-pivot route.
+    /// Its semantics ID matches BandedInterleaved; v1 arithmetic is not used.
     Banded,
     /// Corrected adjacent-pivot RHS solve, O(n) storage and work per step.
-    /// Explicitly distinct from historical Banded for retained-output identity.
+    /// Explicit name for the same corrected arithmetic as Banded.
     BandedInterleaved,
     /// Dense LU after explicitly densifying `(T - λI + ε·I)` to an
     /// `n × n` matrix. O(n³) factor, O(n²) per-step solve, O(n²)
@@ -899,17 +919,18 @@ impl TridiagSolver {
     /// Bind this value into any new retained algorithm identity.
     pub fn semantics_id(self) -> &'static str {
         match self {
-            Self::Banded => "tridiag-lu-final-permutation-v1",
-            Self::BandedInterleaved => crate::linalg::TRIDIAG_PIVOTED_SOLVE_SEMANTICS,
-            Self::Dense => "dense-pivoted-lu-v1",
+            Self::Banded | Self::BandedInterleaved => {
+                "tridiag-interleaved-requested-source-rounding-exact-count-scaling-directed-index-gap-angle-v10"
+            }
+            Self::Dense => "tridiag-dense-requested-source-rounding-exact-count-scaling-directed-index-gap-angle-v10",
         }
     }
 }
 
 /// Options for `tridiag_eigenvector_for_value_hp`.
 ///
-/// `Default::default()` preserves the historical Banded route for replay.
-/// New analyses should select BandedInterleaved explicitly and independently
+/// `Default::default()` selects the corrected BandedInterleaved route.
+/// New analyses must still independently
 /// check the recovered vector's residual and branch eligibility.
 #[derive(Debug, Clone, Copy)]
 pub struct TridiagEigvecOptions {
@@ -918,10 +939,11 @@ pub struct TridiagEigvecOptions {
     /// usually finishes much earlier (typically 20–50 steps for
     /// well-conditioned inputs with widely-separated eigenvalues).
     pub max_steps: usize,
-    /// Stop the iteration as soon as the |⟨v_k, v_{k-1}⟩| convergence
-    /// proxy stops moving by more than the working-precision
-    /// threshold (`2^-(prec-32)`). Set to `false` for a conservative
-    /// full-`max_steps` run with bit-identical output across calls.
+    /// Stop once the directed residual/separation bound meets the working
+    /// accuracy target or its explicit returned-vector rounding floor.
+    /// The report states the actual angle bound; this is not a claim that all
+    /// requested arithmetic bits are accurate eigenvector bits.
+    /// Set false to run the full deterministic step budget.
     pub early_termination: bool,
     /// Inner solver for the LU step. See `TridiagSolver`.
     pub solver: TridiagSolver,
@@ -932,18 +954,20 @@ impl Default for TridiagEigvecOptions {
         Self {
             max_steps: 200,
             early_termination: true,
-            solver: TridiagSolver::Banded,
+            solver: TridiagSolver::BandedInterleaved,
         }
     }
 }
 
 /// Find the eigenvector of a symmetric tridiagonal matrix corresponding
 /// to the (already-known) eigenvalue `eigenvalue` via shifted inverse
-/// iteration on `(T - λI + ε·I)`, where `ε = 2^-(prec - 32)` is a small
-/// shift that prevents singularity.
+/// iteration on `(T - λI + ε·I)`, where the perturbation is
+/// `2^-(prec - 32)` times the maximum matrix/target magnitude. This
+/// reduces exact singularity risk; it does not guarantee convergence or prove
+/// that the supplied value is an eigenvalue.
 ///
-/// The default options preserve historical Banded arithmetic. For new
-/// explicit analyses choose BandedInterleaved and record its identity. Callers who
+/// The default options use the corrected BandedInterleaved arithmetic.
+/// Banded is a compatibility alias for that same corrected route. Callers who
 /// need bit-identical, deterministic-step-count output across runs
 /// should set `early_termination=false`. Callers who want to
 /// cross-validate against the dense LU path should set
@@ -975,208 +999,55 @@ pub fn tridiag_eigenvector_for_value_hp(
     prec: u32,
     opts: TridiagEigvecOptions,
 ) -> Result<Vec<Float>> {
-    let phase_start = std::time::Instant::now();
-    let n = diag.len();
-    if n == 0 {
-        return Err(anyhow!("empty matrix"));
-    }
-    if off_diag.len() != n - 1 {
+    tridiag_eigenvector_with_shift_error(diag, off_diag, eigenvalue, prec, opts, None, false)
+}
+
+/// Recover a vector when the requested eigenvalue has a supplied absolute
+/// uncertainty bound. The caller is responsible for establishing that bound.
+/// It may identify a unique member but cannot relax the residual/angle gate.
+/// Ambiguous uncertainty spanning multiple members returns an error.
+pub fn tridiag_eigenvector_for_value_with_uncertainty_hp(
+    diag: &[Float],
+    off_diag: &[Float],
+    eigenvalue: &Float,
+    eigenvalue_uncertainty: &Float,
+    prec: u32,
+    opts: TridiagEigvecOptions,
+) -> Result<Vec<Float>> {
+    if !eigenvalue_uncertainty.is_finite() || eigenvalue_uncertainty < &0 {
         return Err(anyhow!(
-            "off_diag length {} should be {}",
-            off_diag.len(),
-            n - 1
+            "eigenvalue uncertainty must be finite and nonnegative"
         ));
     }
+    tridiag_eigenvector_with_shift_error(
+        diag,
+        off_diag,
+        eigenvalue,
+        prec,
+        opts,
+        Some(eigenvalue_uncertainty),
+        false,
+    )
+}
 
-    // Build the shifted system. The two solver paths diverge here: the
-    // dense path materializes a full n×n matrix (O(n²) memory), while
-    // the banded path stores three short vectors of length ≈n (O(n)
-    // memory). After this branch, the inverse-iteration loop is
-    // identical except for the solve call.
-    let two = Float::with_val(prec, 2);
-    let epsilon: Float = two.pow(-((prec as i32) - 32));
-    let log_tag = match opts.solver {
-        TridiagSolver::Banded => "[HP eigvec/banded]",
-        TridiagSolver::BandedInterleaved => "[HP eigvec/banded-interleaved-v2]",
-        TridiagSolver::Dense => "[HP eigvec]",
-    };
-
-    enum Factored {
-        Dense(crate::linalg::LuFactors),
-        Banded(crate::linalg::TridiagLuFactors),
-    }
-
-    let factored = match opts.solver {
-        TridiagSolver::Dense => {
-            // Densify (T - λI + ε·I).
-            let build_start = std::time::Instant::now();
-            let mut a = vec![hp_zero(prec); n * n];
-            for i in 0..n {
-                let mut entry = diag[i].clone();
-                entry -= eigenvalue;
-                entry += &epsilon;
-                a[i * n + i] = entry;
-            }
-            for i in 0..(n - 1) {
-                a[i * n + (i + 1)] = off_diag[i].clone();
-                a[(i + 1) * n + i] = off_diag[i].clone();
-            }
-            crate::hp_debug!(
-                "{} dense matrix built in {:.1}s (N={}, prec={} bits)",
-                log_tag,
-                build_start.elapsed().as_secs_f64(),
-                n,
-                prec
-            );
-
-            let lu_start = std::time::Instant::now();
-            let lu = lu_factor(&a, n)?;
-            crate::hp_debug!(
-                "{} LU factor done in {:.1}s",
-                log_tag,
-                lu_start.elapsed().as_secs_f64()
-            );
-            Factored::Dense(lu)
-        }
-        TridiagSolver::Banded | TridiagSolver::BandedInterleaved => {
-            // Build the shifted tridiagonal in three short vectors.
-            // Length n + 2(n-1) = 3n-2 HP entries — a few KB at HP-1000
-            // vs the ~26 GB the dense form would need at N=8001.
-            let build_start = std::time::Instant::now();
-            let mut shifted_diag: Vec<Float> = Vec::with_capacity(n);
-            for d in diag.iter() {
-                let mut entry = d.clone();
-                entry -= eigenvalue;
-                entry += &epsilon;
-                shifted_diag.push(entry);
-            }
-            // Symmetric tridiagonal: lower and upper off-diagonals are
-            // equal. The banded LU factorizer accepts asymmetric input,
-            // so we pass both copies.
-            let lower: Vec<Float> = off_diag.to_vec();
-            let upper: Vec<Float> = off_diag.to_vec();
-            crate::hp_debug!(
-                "{} tridiagonal shifted matrix built in {:.3}s (N={}, prec={} bits)",
-                log_tag,
-                build_start.elapsed().as_secs_f64(),
-                n,
-                prec
-            );
-
-            let lu_start = std::time::Instant::now();
-            let factors = crate::linalg::tridiag_lu_factor_hp(&lower, &shifted_diag, &upper, prec)?;
-            crate::hp_debug!(
-                "{} tridiag LU factor done in {:.3}s",
-                log_tag,
-                lu_start.elapsed().as_secs_f64()
-            );
-            Factored::Banded(factors)
-        }
-    };
-
-    // Initial guess: a Gaussian centered at the middle, all in HP.
-    // Each entry independent → parallel construction.
-    let mut v: Vec<Float> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let center = (n as i64) / 2;
-            let j = (i as i64) - center;
-            let half = ((n as i64) / 2).max(1);
-            let mut x = Float::with_val(prec, j);
-            x /= half;
-            let mut x_sq = x.clone();
-            x_sq *= &x;
-            x_sq /= 2u32;
-            let mut arg = hp_zero(prec);
-            arg -= &x_sq;
-            arg.exp()
-        })
-        .collect();
-    normalize_l2(&mut v);
-
-    let conv_thresh = if opts.early_termination {
-        Some(Float::with_val(prec, 2).pow(-((prec as i32) - 32)))
-    } else {
-        None
-    };
-
-    // Track the previous |⟨v_k, v_{k-1}⟩| as a cheap O(n) convergence
-    // proxy. (Strict Rayleigh quotient would re-walk the matrix every
-    // step at O(n²); this is good enough since the LU solve already
-    // dominates per-step cost at production sizes.)
-    let mut prev_dot = hp_zero(prec);
-    let iter_start = std::time::Instant::now();
-    let mut completed_steps = 0usize;
-
-    for step in 0..opts.max_steps {
-        // Solve (T - λI + ε·I) y = v_k. Banded is O(n); dense is O(n²).
-        let mut new_v = match &factored {
-            Factored::Dense(lu) => lu_solve(lu, &v, n, prec),
-            Factored::Banded(factors) => {
-                if opts.solver == TridiagSolver::BandedInterleaved {
-                    crate::linalg::tridiag_lu_solve_pivoted_hp(factors, &v, prec)?
-                } else {
-                    crate::linalg::tridiag_lu_solve_hp(factors, &v, prec)?
-                }
-            }
-        };
-        normalize_l2(&mut new_v);
-
-        if let Some(thresh) = conv_thresh.as_ref() {
-            let mut dot = hp_zero(prec);
-            for i in 0..n {
-                let mut t = v[i].clone();
-                t *= &new_v[i];
-                dot += &t;
-            }
-            dot = dot.abs();
-            if step > 2 {
-                let mut diff = dot.clone();
-                diff -= &prev_dot;
-                diff = diff.abs();
-                if diff < *thresh {
-                    v = new_v;
-                    completed_steps = step + 1;
-                    crate::hp_debug!(
-                        "{} inverse iteration converged at step {}/{} on N={} (elapsed {:.3}s, total {:.3}s)",
-                        log_tag, completed_steps, opts.max_steps, n,
-                        iter_start.elapsed().as_secs_f64(),
-                        phase_start.elapsed().as_secs_f64()
-                    );
-                    break;
-                }
-            }
-            prev_dot = dot;
-        }
-
-        v = new_v;
-        completed_steps = step + 1;
-        if completed_steps % 25 == 0 {
-            crate::hp_debug!(
-                "{} inverse iteration {}/{} on N={} (elapsed {:.3}s, total {:.3}s)",
-                log_tag,
-                completed_steps,
-                opts.max_steps,
-                n,
-                iter_start.elapsed().as_secs_f64(),
-                phase_start.elapsed().as_secs_f64()
-            );
-        }
-    }
-
-    if completed_steps % 25 != 0 {
-        crate::hp_debug!(
-            "{} inverse iteration {}/{} done on N={} (elapsed {:.3}s, total {:.3}s)",
-            log_tag,
-            completed_steps,
-            opts.max_steps,
-            n,
-            iter_start.elapsed().as_secs_f64(),
-            phase_start.elapsed().as_secs_f64()
-        );
-    }
-
-    Ok(v)
+fn tridiag_eigenvector_with_shift_error(
+    diag: &[Float],
+    off_diag: &[Float],
+    eigenvalue: &Float,
+    prec: u32,
+    opts: TridiagEigvecOptions,
+    shift_error: Option<&Float>,
+    _roundoff_shift: bool,
+) -> Result<Vec<Float>> {
+    Ok(tridiag_eigenvector_for_value_detailed_hp(
+        diag,
+        off_diag,
+        eigenvalue,
+        shift_error,
+        prec,
+        opts,
+    )?
+    .eigenvector)
 }
 
 // ===========================================================================
@@ -1213,6 +1084,11 @@ fn apply_householder_trailing_update_hp(
         });
 }
 
+/// Reduce a finite, exactly symmetric stored matrix with the scaled,
+/// opposite-sign Householder algorithm. Input entries are rounded once to
+/// `prec` bits before arithmetic; this general API permits explicit working
+/// precision reduction. Use [`householder_tridiag_hp_stable`] to reject
+/// down-rounding instead. Results are computed points, not certificates.
 pub fn householder_tridiag_hp(
     a: &[Float],
     n: usize,
@@ -1227,7 +1103,20 @@ fn householder_tridiag_hp_impl(
     prec: u32,
     accumulate_q: bool,
 ) -> Result<(Vec<Float>, Vec<Float>, Vec<Float>)> {
-    householder_tridiag_hp_route(a, n, prec, accumulate_q, false)
+    validate_hp_eigen_precision(prec)?;
+    if prec > 1_000_000 || n == 0 || n.checked_mul(n) != Some(a.len()) {
+        return Err(anyhow!(
+            "invalid Householder shape or unsupported analysis precision"
+        ));
+    }
+    if a.iter().any(|x| !x.is_finite())
+        || (0..n).any(|i| (0..i).any(|j| a[i * n + j] != a[j * n + i]))
+    {
+        return Err(anyhow!(
+            "Householder requires finite exactly symmetric storage"
+        ));
+    }
+    householder_tridiag_hp_route(a, n, prec, accumulate_q)
 }
 
 /// Stable route identity; distinct from historical same-sign reflector sources.
@@ -1244,7 +1133,7 @@ pub fn householder_tridiag_hp_stable(
     prec: u32,
 ) -> Result<(Vec<Float>, Vec<Float>, Vec<Float>)> {
     validate_stable_symmetric_input(a, n, prec)?;
-    householder_tridiag_hp_route(a, n, prec, true, true)
+    householder_tridiag_hp_route(a, n, prec, true)
 }
 
 /// The same stable reduction, omitting the n-by-n Q allocation and updates.
@@ -1255,7 +1144,7 @@ pub fn dense_symmetric_tridiagonal_hp_stable(
     prec: u32,
 ) -> Result<(Vec<Float>, Vec<Float>)> {
     validate_stable_symmetric_input(a, n, prec)?;
-    let (d, e, _) = householder_tridiag_hp_route(a, n, prec, false, true)?;
+    let (d, e, _) = householder_tridiag_hp_route(a, n, prec, false)?;
     Ok((d, e))
 }
 
@@ -1303,7 +1192,7 @@ fn validate_stable_symmetric_input(a: &[Float], n: usize, prec: u32) -> Result<(
 
 /// Independently evaluate a supplied reduction against the original matrix.
 /// Frobenius residuals use scaled sum-of-squares; no full residual matrix is
-/// allocated. Cost is O(n^3) arithmetic and O(1) extra scalar storage beyond
+/// allocated. Cost is O(n^3) arithmetic and O(n) extra scalar storage beyond
 /// the supplied arrays. This does not rerun Householder and can check retained
 /// legacy Q/T data. Results are computed diagnostics, not interval certificates.
 pub fn assess_symmetric_reduction_hp(
@@ -1469,16 +1358,16 @@ fn householder_tridiag_hp_route(
     n: usize,
     prec: u32,
     accumulate_q: bool,
-    stable: bool,
 ) -> Result<(Vec<Float>, Vec<Float>, Vec<Float>)> {
     if n == 0 || n.checked_mul(n) != Some(a.len()) {
         return Err(anyhow!("invalid Householder matrix dimension or length"));
     }
-    let mut h: Vec<Float> = if stable {
-        a.iter().map(|x| Float::with_val(prec, x)).collect()
-    } else {
-        a.to_vec()
-    };
+    let mut h: Vec<Float> = a.iter().map(|x| Float::with_val(prec, x)).collect();
+    if h.iter().any(|x| !x.is_finite()) {
+        return Err(anyhow!(
+            "Householder input precision conversion is unrepresentable"
+        ));
+    }
 
     // Q starts as identity; we apply each Householder reflection from the
     // right as we go, accumulating into Q. (Equivalently, store Householder
@@ -1501,7 +1390,7 @@ fn householder_tridiag_hp_route(
         // Pull out the column-k subdiagonal portion: x = h[k+1..n, k].
         let m = n - k - 1; // length of subdiagonal portion
         let mut x: Vec<Float> = (0..m).map(|i| h[(k + 1 + i) * n + k].clone()).collect();
-        let column_scale = if stable {
+        let column_scale = {
             let scale = x
                 .iter()
                 .map(|v| v.clone().abs())
@@ -1516,9 +1405,7 @@ fn householder_tridiag_hp_route(
             for v in &mut x {
                 *v /= &scale;
             }
-            Some(scale)
-        } else {
-            None
+            scale
         };
 
         // ‖x‖ via parallel reduction.
@@ -1538,20 +1425,15 @@ fn householder_tridiag_hp_route(
             continue;
         }
 
-        // Legacy: v=x-sign(x0)*norm. Stable: v=x+sign(x0)*norm on
-        // a scaled column. The resulting off-diagonal has the opposite sign
-        // in the stable route; changing only v or only T would break AQ=QT.
+        // v=x+sign(x0)*norm on a scaled column. The resulting off-diagonal
+        // has the opposite sign; changing only v or only T would break AQ=QT.
         let alpha_signed = if x[0].is_sign_negative() {
             -alpha.clone()
         } else {
             alpha.clone()
         };
         let mut v = x;
-        if stable {
-            v[0] += &alpha_signed;
-        } else {
-            v[0] -= &alpha_signed;
-        }
+        v[0] += &alpha_signed;
 
         // ‖v‖² via parallel reduction.
         let v_norm_terms: Vec<Float> = v
@@ -1569,8 +1451,8 @@ fn householder_tridiag_hp_route(
 
         // Householder reflection: H = I - 2·v·vᵀ/‖v‖²
         // Apply H from both sides to the trailing (n-k-1) × (n-k-1) sub-block of h.
-        // Symmetric update: h ← h - v·pᵀ - p·vᵀ + (vᵀ·p / ‖v‖²) · v·vᵀ
-        //                       (i.e., h ← H h H = h - 2·v·(p - β·v)ᵀ - 2·(p - β·v)·vᵀ )
+        // With p = (2/‖v‖²) h_sub v, the exact expansion is
+        // H h_sub H = h_sub - v pᵀ - p vᵀ + (2 vᵀp/‖v‖²) v vᵀ.
         // We use the standard form:
         //   p = (2/‖v‖²) · h_sub · v
         //   β = (vᵀ p) / ‖v‖²
@@ -1606,7 +1488,7 @@ fn householder_tridiag_hp_route(
             .collect();
 
         // With p=2*A*v/(v^T*v), q=p-(v^T*p)/(v^T*v)*v gives
-        // H*A*H=A-v*q^T-q*v^T. The same update serves both conventions.
+        // H*A*H=A-v*q^T-q*v^T.
 
         // vᵀ p — parallel reduce.
         let vt_p_terms: Vec<Float> = (0..m)
@@ -1644,14 +1526,9 @@ fn householder_tridiag_hp_route(
         // additional m-by-m MPFR matrix while preserving the old cell order.
         apply_householder_trailing_update_hp(&mut h, n, k, &v, &q_vec);
 
-        let new_off_diag = if let Some(scale) = column_scale {
-            let mut value = -alpha_signed;
-            value *= scale;
-            value
-        } else {
-            alpha_signed
-        };
-        if stable && !new_off_diag.is_finite() {
+        let mut new_off_diag = -alpha_signed;
+        new_off_diag *= column_scale;
+        if !new_off_diag.is_finite() {
             return Err(anyhow!("nonfinite Householder off-diagonal"));
         }
         h[(k + 1) * n + k] = new_off_diag.clone();
@@ -1692,12 +1569,11 @@ fn householder_tridiag_hp_route(
     let diag: Vec<Float> = (0..n).map(|i| h[i * n + i].clone()).collect();
     let off_diag: Vec<Float> = (0..(n - 1)).map(|i| h[(i + 1) * n + i].clone()).collect();
 
-    if stable
-        && diag
-            .iter()
-            .chain(&off_diag)
-            .chain(&q)
-            .any(|x| !x.is_finite())
+    if diag
+        .iter()
+        .chain(&off_diag)
+        .chain(&q)
+        .any(|x| !x.is_finite())
     {
         return Err(anyhow!("nonfinite stable Householder output"));
     }
@@ -1708,182 +1584,19 @@ fn householder_tridiag_hp_route(
 // Top-level: dense symmetric eigendecomposition
 // ===========================================================================
 
-/// Diagnostics from the independent cyclic Jacobi eigensolver.
-#[derive(Clone, Debug)]
-pub struct JacobiEigenvaluesHp {
-    pub eigenvalues: Vec<Float>,
-    pub sweeps: usize,
-    pub rotations: usize,
-    pub maximum_off_diagonal: Float,
-}
-
-/// Independent HP eigenvalue route for a dense real symmetric matrix.
-///
-/// This cyclic Jacobi implementation acts directly on the dense matrix and
-/// shares neither Householder reduction nor tridiagonal QR with
-/// [`dense_symmetric_eigenvalues_hp`]. All rotations, stopping tests, and
-/// sorting remain in `rug::Float`; there is no f64 seed or conversion.
-/// `max_sweeps` is an explicit resource bound and zero is rejected.
-pub fn dense_symmetric_eigenvalues_jacobi_hp(
-    input: &[Float],
-    n: usize,
-    prec: u32,
-    max_sweeps: usize,
-) -> Result<JacobiEigenvaluesHp> {
-    if n == 0 || input.len() != n * n {
-        return Err(anyhow!(
-            "Jacobi eigensolver requires a nonempty n-by-n matrix"
-        ));
-    }
-    if prec <= 32 || max_sweeps == 0 {
-        return Err(anyhow!(
-            "Jacobi eigensolver requires precision above 32 bits and at least one sweep"
-        ));
-    }
-    if input.iter().any(|value| !value.is_finite()) {
-        return Err(anyhow!("Jacobi eigensolver matrix entries must be finite"));
-    }
-    for row in 0..n {
-        for column in 0..row {
-            if input[row * n + column] != input[column * n + row] {
-                return Err(anyhow!(
-                    "Jacobi eigensolver requires exact symmetric storage at ({row}, {column})"
-                ));
-            }
-        }
-    }
-
-    let mut matrix: Vec<Float> = input
-        .iter()
-        .map(|value| Float::with_val(prec, value))
-        .collect();
-    let mut scale = Float::with_val(prec, 1);
-    for value in &matrix {
-        let magnitude = value.clone().abs();
-        if magnitude > scale {
-            scale = magnitude;
-        }
-    }
-    let mut tolerance = Float::with_val(prec, 2);
-    tolerance = tolerance.pow(-((prec as i32) - 16));
-    tolerance *= &scale;
-    let zero = Float::with_val(prec, 0);
-    let one = Float::with_val(prec, 1);
-    let mut rotations = 0usize;
-
-    for sweep in 0..max_sweeps {
-        let before = maximum_off_diagonal_hp(&matrix, n, prec);
-        if before <= tolerance {
-            let mut eigenvalues: Vec<Float> = (0..n)
-                .map(|index| matrix[index * n + index].clone())
-                .collect();
-            eigenvalues.sort_by(|left, right| left.partial_cmp(right).unwrap());
-            return Ok(JacobiEigenvaluesHp {
-                eigenvalues,
-                sweeps: sweep,
-                rotations,
-                maximum_off_diagonal: before,
-            });
-        }
-        for p in 0..n - 1 {
-            for q in p + 1..n {
-                let apq = matrix[p * n + q].clone();
-                if apq.clone().abs() <= tolerance {
-                    continue;
-                }
-                let app = matrix[p * n + p].clone();
-                let aqq = matrix[q * n + q].clone();
-                let mut tau = aqq.clone();
-                tau -= &app;
-                let mut two_apq = apq.clone();
-                two_apq *= 2u32;
-                tau /= two_apq;
-
-                let mut root = tau.clone();
-                root *= &tau;
-                root += &one;
-                root = root.sqrt();
-                let mut denominator = tau.clone().abs();
-                denominator += root;
-                let mut tangent = one.clone();
-                tangent /= denominator;
-                if tau < zero {
-                    tangent = -tangent;
-                }
-                let mut cosine = tangent.clone();
-                cosine *= &tangent;
-                cosine += &one;
-                cosine = cosine.sqrt();
-                cosine.recip_mut();
-                let mut sine = tangent.clone();
-                sine *= &cosine;
-
-                for k in 0..n {
-                    if k == p || k == q {
-                        continue;
-                    }
-                    let akp = matrix[k * n + p].clone();
-                    let akq = matrix[k * n + q].clone();
-                    let mut new_kp = cosine.clone();
-                    new_kp *= &akp;
-                    let mut term = sine.clone();
-                    term *= &akq;
-                    new_kp -= term;
-                    let mut new_kq = sine.clone();
-                    new_kq *= akp;
-                    let mut term = cosine.clone();
-                    term *= akq;
-                    new_kq += term;
-                    matrix[k * n + p].assign(&new_kp);
-                    matrix[p * n + k].assign(new_kp);
-                    matrix[k * n + q].assign(&new_kq);
-                    matrix[q * n + k].assign(new_kq);
-                }
-                let mut diagonal_change = tangent;
-                diagonal_change *= &apq;
-                matrix[p * n + p].assign(app - &diagonal_change);
-                matrix[q * n + q].assign(aqq + &diagonal_change);
-                matrix[p * n + q].assign(&zero);
-                matrix[q * n + p].assign(&zero);
-                rotations += 1;
-            }
-        }
-        let after = maximum_off_diagonal_hp(&matrix, n, prec);
-        if after <= tolerance {
-            let mut eigenvalues: Vec<Float> = (0..n)
-                .map(|index| matrix[index * n + index].clone())
-                .collect();
-            eigenvalues.sort_by(|left, right| left.partial_cmp(right).unwrap());
-            return Ok(JacobiEigenvaluesHp {
-                eigenvalues,
-                sweeps: sweep + 1,
-                rotations,
-                maximum_off_diagonal: after,
-            });
-        }
-    }
-    let maximum = maximum_off_diagonal_hp(&matrix, n, prec);
-    Err(anyhow!(
-        "cyclic Jacobi failed to converge after {max_sweeps} sweeps; maximum off-diagonal is {maximum}"
-    ))
-}
-
-fn maximum_off_diagonal_hp(matrix: &[Float], n: usize, prec: u32) -> Float {
-    let mut maximum = Float::with_val(prec, 0);
-    for row in 0..n {
-        for column in 0..row {
-            let magnitude = matrix[row * n + column].clone().abs();
-            if magnitude > maximum {
-                maximum = magnitude;
-            }
-        }
-    }
-    maximum
-}
+#[path = "jacobi.rs"]
+mod jacobi;
+pub use jacobi::{
+    dense_symmetric_eigendecomposition_jacobi_hp, dense_symmetric_eigenvalues_jacobi_hp,
+    JacobiEigendecompositionHp, JacobiEigenvaluesHp, JACOBI_SEMANTICS,
+};
 
 /// Eigenvalues (only) of a dense symmetric matrix at HP precision.
 ///
-/// Pipeline: Householder tridiagonalization → tridiagonal QR.
+/// Pipeline: scaled opposite-sign Householder tridiagonalization → tridiagonal QR.
+/// Inputs are rounded once to `prec` bits. Precision must be 33..=1_000_000;
+/// finite, exactly symmetric square storage is required. The returned points
+/// carry no small-eigenvalue relative-accuracy or sign guarantee.
 /// Returns eigenvalues sorted ascending. Eigenvectors are not computed
 /// to save memory at HP scale.
 pub fn dense_symmetric_eigenvalues_hp(a: &[Float], n: usize, prec: u32) -> Result<Vec<Float>> {
@@ -1891,7 +1604,7 @@ pub fn dense_symmetric_eigenvalues_hp(a: &[Float], n: usize, prec: u32) -> Resul
     tridiag_eigenvalues_hp(&diag, &off_diag, prec)
 }
 
-/// Reduce a dense symmetric HP matrix to its deterministic tridiagonal form
+/// Reduce a dense symmetric HP matrix by scaled opposite-sign reflections
 /// without accumulating the orthogonal basis. The returned diagonal and
 /// off-diagonal are exactly those consumed by [`dense_symmetric_eigenvalues_hp`].
 pub fn dense_symmetric_tridiagonal_hp(
@@ -1915,44 +1628,10 @@ pub fn dense_symmetric_eigenvector_for_value_hp(
     prec: u32,
     max_steps: usize,
 ) -> Result<Vec<Float>> {
-    let two = Float::with_val(prec, 2);
-    let epsilon: Float = two.pow(-((prec as i32) - 32));
-
-    // Build (A - λI + εI).
-    let mut shifted: Vec<Float> = a.to_vec();
-    for i in 0..n {
-        shifted[i * n + i] -= eigenvalue;
-        shifted[i * n + i] += &epsilon;
-    }
-
-    let lu = lu_factor(&shifted, n)?;
-
-    // Initial guess: Gaussian-shaped, all in HP. Parallel construction.
-    let mut v: Vec<Float> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let center = (n as i64) / 2;
-            let j = (i as i64) - center;
-            let half = ((n as i64) / 2).max(1);
-            let mut x = Float::with_val(prec, j);
-            x /= half;
-            let mut x_sq = x.clone();
-            x_sq *= &x;
-            x_sq /= 2u32;
-            let mut arg = hp_zero(prec);
-            arg -= &x_sq;
-            arg.exp()
-        })
-        .collect();
-    normalize_l2(&mut v);
-
-    for _ in 0..max_steps {
-        let mut new_v = lu_solve(&lu, &v, n, prec);
-        normalize_l2(&mut new_v);
-        v = new_v;
-    }
-
-    Ok(v)
+    Ok(
+        dense_symmetric_eigenvector_for_value_detailed_hp(a, n, eigenvalue, prec, max_steps)?
+            .eigenvector,
+    )
 }
 
 // ===========================================================================
@@ -2184,12 +1863,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(simple.vector_recoveries, 2);
+        for item in &simple.items {
+            if let HpSelectedTridiagonalItem::SimpleEigenpair(pair) = item {
+                // Exact rational replay of the returned vector/value, independent of point diagnostics.
+                let v: Vec<_> = pair
+                    .eigenvector
+                    .iter()
+                    .map(|x| x.to_rational().unwrap())
+                    .collect();
+                let lambda = pair.eigenvalue.to_rational().unwrap();
+                let norm_sq = v
+                    .iter()
+                    .fold(rug::Rational::from(0), |sum, x| sum + x.clone() * x);
+                let residual_sq = (0..v.len()).fold(rug::Rational::from(0), |sum, i| {
+                    let mut action: rug::Rational = v[i].clone() * 2 - lambda.clone() * &v[i];
+                    if i > 0 {
+                        action -= &v[i - 1];
+                    }
+                    if i + 1 < v.len() {
+                        action -= &v[i + 1];
+                    }
+                    sum + action.clone() * action
+                });
+                let bound = pair.residual_norm.to_rational().unwrap();
+                assert!(residual_sq <= bound.clone() * bound * norm_sq);
+            }
+        }
+
         assert!(
             simple.items.iter().all(|item| matches!(
                 item,
                 HpSelectedTridiagonalItem::SimpleEigenpair(pair)
                     if pair.residual_norm < hp(prec, "1e-40")
-                        && pair.diagnostics.absolute_residual == pair.residual_norm
+                        && pair.diagnostics.absolute_residual < hp(prec, "1e-40")
                         && pair.diagnostics.relative_residual < hp(prec, "1e-40")
                         && pair.diagnostics.scaled_backward_error < hp(prec, "1e-40")
                         && pair.diagnostics.orthogonality_error < hp(prec, "1e-40")
@@ -2985,6 +2691,21 @@ mod tests {
                 new_a[*j * n + col] = new_jc;
             }
             a = new_a;
+        }
+
+        // Separate rounded left/right products differ by roundoff. Verify
+        // that discrepancy before storing an exactly symmetric test matrix.
+        // The 2^-240 bound is far below the 1e-50 spectral tolerance below.
+        let symmetry_tolerance = Float::with_val(prec, 1) >> 240_i32;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let discrepancy = Float::with_val(prec, &a[i * n + j] - &a[j * n + i]);
+                assert!(discrepancy.abs() < symmetry_tolerance);
+                let mut average = Float::with_val(prec, &a[i * n + j] + &a[j * n + i]);
+                average /= 2;
+                a[i * n + j] = average.clone();
+                a[j * n + i] = average;
+            }
         }
 
         // Run our eigensolver.

@@ -256,16 +256,33 @@ implementation byte for byte, including accepted prefixes before a pivot stop.
 Failures in speculative future-row entries are inspected only when that row
 is reached, so they cannot pre-empt an earlier pivot stop.
 
-Two-moment/cancellation-enabled requests retain semantics
-`ccm-retained-even-prefix-moments-checked-exports-v2`, with the new policy omitted
-from their serialization. Extended policies use v3 and include both flags in
-their identities. Old serialized plans do not silently acquire third-moment
-work: resolve a fresh Ultra plan or set the policy explicitly. Historical v1
-and v2 scalar observations remain readable; missing new data is never invented.
+Current two-moment/cancellation-enabled requests use semantics
+`ccm-retained-even-prefix-moments-checked-exports-v8`; extended policies use v9
+and include both policy flags in their identities. These versions add directed,
+scaled export checks and exact full source replay on cache reuse. Historical
+v1, v2, and v3 scalar observations remain readable with their original labels;
+reading them does not upgrade their export assurance. Old serialized plans
+do not silently acquire third-moment work: resolve a fresh Ultra plan or set
+the policy explicitly.
 
 Fresh Ultra requests reuse compatible matrix/eigenstate parents and compute
-new v3 children when computation is allowed. `RequireReuse` remains strict.
-Source, root and retained-reduction identities are unchanged by this extension.
+new v9 children when computation is allowed. `RequireReuse` remains strict and
+replays all numerical fields from the supplied points in O(D^3) arithmetic.
+Source and root identities are unchanged. The separate retained-reduction
+replay repair advances its child identity to `ccm-retained-reduction-v0.15.1-v3`.
 Both public and private shards use their existing generic artifact envelopes;
 no new artifact kind or shard schema is required. Large ladders still need
 explicit source, precision, memory and runtime planning.
+
+Historical observation admission is explicit: v1, v2, v3, v6, v7, v8, and v9
+are readable under their stored labels; v4 and v5 are rejected. Current execution
+writes v8/v9. Historical reading is not numerical requalification; unsupported
+exports must be recomputed from retained source points rather than relabeled.
+
+For a two-mode fit, `resolved` means the algebraic point construction succeeded;
+it does not promise working-precision relative accuracy in either inferred mode.
+Writing r = mu2/mu1, relative moment perturbations of scale u can amplify to order
+u/r^2 in the smaller inverse mode as r approaches zero. Near equal modes, the
+square-root discriminant introduces sensitivity of order sqrt(u). A small trace
+closure residual alone does not bound either mode's error. These remain model
+estimates, and no spectral or continuum certification follows from this status.

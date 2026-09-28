@@ -13,13 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use xc_core::{CancellationToken, ResourcePolicy};
-
-static STAGING_TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -380,7 +377,10 @@ pub fn stage_publication_discoverability(
     let receipt_digest = receipt.digest()?;
     let unique_payload_bytes_added = newly_committed_payload_bytes(target)?;
     let immutable_metadata_bytes_added = newly_committed_metadata_bytes(metadata)?
-        .saturating_add(newly_committed_batch_record_bytes(target)?);
+        .checked_add(newly_committed_batch_record_bytes(target)?)
+        .ok_or_else(|| {
+            CacheError::ResourceLimit("publication metadata bytes exceed u64".to_owned())
+        })?;
     let (ledger, ledger_bytes, metadata_bytes_added, capacity) = build_updated_ledger(
         journal,
         target,
@@ -397,31 +397,27 @@ pub fn stage_publication_discoverability(
     let ledger_digest = ContentDigest::sha256(&ledger_bytes);
     ledger.validate()?;
     let mut staged_bytes = 0u64;
+    // These three local projections are mutable until a discoverability plan
+    // is recorded. A ref-conflict discards that plan before rebuilding them.
+    // Immutable payload and metadata staging still rejects every replacement.
+    let replace_uncommitted = journal.targets[&destination]
+        .discoverability_commit
+        .is_none();
+    let mut stage_projection = |path: &str, bytes: &[u8]| {
+        stage_bytes_inner(
+            staging_root,
+            path,
+            bytes,
+            resources,
+            cancellation,
+            &mut staged_bytes,
+            replace_uncommitted,
+        )
+    };
     let mut files = vec![
-        stage_bytes(
-            staging_root,
-            &index_path,
-            &index_bytes,
-            resources,
-            cancellation,
-            &mut staged_bytes,
-        )?,
-        stage_bytes(
-            staging_root,
-            DEFAULT_CAPACITY_LEDGER_PATH,
-            &ledger_bytes,
-            resources,
-            cancellation,
-            &mut staged_bytes,
-        )?,
-        stage_bytes(
-            staging_root,
-            &receipt.repository_path(),
-            &receipt_bytes,
-            resources,
-            cancellation,
-            &mut staged_bytes,
-        )?,
+        stage_projection(&index_path, &index_bytes)?,
+        stage_projection(DEFAULT_CAPACITY_LEDGER_PATH, &ledger_bytes)?,
+        stage_projection(&receipt.repository_path(), &receipt_bytes)?,
     ];
     canonicalize_file_sequence(&mut files);
     match &journal.targets[&destination].discoverability_commit {
@@ -455,7 +451,7 @@ pub fn stage_publication_discoverability(
     })
 }
 
-fn validate_bundle(
+pub(crate) fn validate_bundle(
     journal: &PublicationTransactionJournal,
     destination: PublicationDestination,
     bundle: &PublicationMetadataBundle,
@@ -524,6 +520,7 @@ fn validate_bundle(
             AttestationKind::Validation | AttestationKind::Certification
         ) || (attestation.subject_digest != manifest_digest
             && attestation.subject_digest != journal.payload_digest)
+            || attestation.policy_digest != journal.policy_digest
             || attestation.producer_toolkit_version != bundle.manifest.producer_toolkit_version
         {
             return Err(CacheError::InvalidManifest(
@@ -610,9 +607,12 @@ fn build_updated_ledger(
     let mut ledger_size = 0u64;
     for _ in 0..16 {
         let metadata_bytes_added = immutable_metadata_bytes_added
-            .saturating_add(index_bytes)
-            .saturating_add(receipt_bytes)
-            .saturating_add(ledger_size);
+            .checked_add(index_bytes)
+            .and_then(|total| total.checked_add(receipt_bytes))
+            .and_then(|total| total.checked_add(ledger_size))
+            .ok_or_else(|| {
+                CacheError::ResourceLimit("publication ledger metadata bytes exceed u64".to_owned())
+            })?;
         let evidence = CapacityReconciliationEvidence {
             schema_version: 1,
             transaction_id: &journal.transaction_id,
@@ -627,13 +627,22 @@ fn build_updated_ledger(
         let mut ledger = base.clone();
         ledger.first_seen_immutable_payload_bytes = ledger
             .first_seen_immutable_payload_bytes
-            .saturating_add(unique_payload_bytes_added);
+            .checked_add(unique_payload_bytes_added)
+            .ok_or_else(|| {
+                CacheError::ResourceLimit("publication ledger component exceeds u64".to_owned())
+            })?;
         ledger.manifest_index_receipt_bytes = ledger
             .manifest_index_receipt_bytes
-            .saturating_add(metadata_bytes_added);
+            .checked_add(metadata_bytes_added)
+            .ok_or_else(|| {
+                CacheError::ResourceLimit("publication ledger component exceeds u64".to_owned())
+            })?;
         ledger.estimated_history_bytes = ledger
             .estimated_history_bytes
-            .saturating_add(projected_history_bytes);
+            .checked_add(projected_history_bytes)
+            .ok_or_else(|| {
+                CacheError::ResourceLimit("publication ledger component exceeds u64".to_owned())
+            })?;
         ledger.last_reconciled_commit = target.expected_head.clone();
         ledger.reconciliation_digest = canonical_digest(&evidence)?;
         ledger.validate()?;
@@ -679,7 +688,12 @@ fn newly_committed_payload_bytes(
             sizes
                 .get(digest)
                 .copied()
-                .map(|size| total.saturating_add(size))
+                .map(|size| {
+                    total.checked_add(size).ok_or_else(|| {
+                        CacheError::ResourceLimit("publication byte total exceeds u64".to_owned())
+                    })
+                })
+                .transpose()?
                 .ok_or_else(|| {
                     CacheError::InvalidManifest(
                         "new payload accounting names an unknown digest".to_owned(),
@@ -703,7 +717,12 @@ fn newly_committed_metadata_bytes(
             sizes
                 .get(digest)
                 .copied()
-                .map(|size| total.saturating_add(size))
+                .map(|size| {
+                    total.checked_add(size).ok_or_else(|| {
+                        CacheError::ResourceLimit("publication byte total exceeds u64".to_owned())
+                    })
+                })
+                .transpose()?
                 .ok_or_else(|| {
                     CacheError::InvalidManifest(
                         "new metadata accounting names an unknown digest".to_owned(),
@@ -720,7 +739,11 @@ fn newly_committed_batch_record_bytes(
         .iter()
         .filter_map(|batch| batch.record_commit.as_ref())
         .try_fold(0u64, |total, record| {
-            newly_committed_metadata_bytes(record).map(|bytes| total.saturating_add(bytes))
+            total
+                .checked_add(newly_committed_metadata_bytes(record)?)
+                .ok_or_else(|| {
+                    CacheError::ResourceLimit("publication record bytes exceed u64".to_owned())
+                })
         })
 }
 
@@ -751,6 +774,27 @@ fn stage_bytes(
     cancellation: &CancellationToken,
     staged_bytes: &mut u64,
 ) -> Result<TransportPart, CacheError> {
+    stage_bytes_inner(
+        root,
+        repository_path,
+        bytes,
+        resources,
+        cancellation,
+        staged_bytes,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stage_bytes_inner(
+    root: &Path,
+    repository_path: &str,
+    bytes: &[u8],
+    resources: &ResourcePolicy,
+    cancellation: &CancellationToken,
+    staged_bytes: &mut u64,
+    replace_uncommitted: bool,
+) -> Result<TransportPart, CacheError> {
     if !normalized_relative_path(repository_path)
         || bytes.is_empty()
         || bytes.len() as u64 >= GITHUB_HARD_FILE_BOUNDARY_BYTES
@@ -762,7 +806,11 @@ fn stage_bytes(
     cancellation
         .check()
         .map_err(|error| CacheError::Cancelled(error.to_string()))?;
-    let next_total = staged_bytes.saturating_add(bytes.len() as u64);
+    let next_total = staged_bytes
+        .checked_add(bytes.len() as u64)
+        .ok_or_else(|| {
+            CacheError::ResourceLimit("publication staging bytes exceed u64".to_owned())
+        })?;
     if resources
         .maximum_memory_bytes
         .is_some_and(|maximum| bytes.len() as u64 > maximum)
@@ -780,23 +828,15 @@ fn stage_bytes(
     let destination = resolve_staging_path(root, repository_path)?;
     let digest = ContentDigest::sha256(bytes);
     if destination.exists() {
-        verify_existing_file(&destination, bytes.len() as u64, &digest, cancellation)?;
+        if replace_uncommitted {
+            crate::atomic_replace(&destination, bytes)?;
+        } else {
+            verify_existing_file(&destination, bytes.len() as u64, &digest, cancellation)?;
+        }
     } else {
         let parent = destination.parent().unwrap_or(root);
-        let name = destination
-            .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("metadata"))
-            .to_string_lossy();
-        let sequence = STAGING_TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(
-            ".{name}.xc-stage-{}-{sequence}",
-            std::process::id()
-        ));
+        let (temporary, mut file) = crate::create_private_sibling_file(parent, "stage")?;
         let result = (|| {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary)?;
             file.write_all(bytes)?;
             file.sync_all()?;
             drop(file);
@@ -838,7 +878,15 @@ pub(crate) fn stage_publication_bytes(
     )
 }
 
-fn resolve_staging_path(root: &Path, repository_path: &str) -> Result<PathBuf, CacheError> {
+pub(crate) fn resolve_staging_path(
+    root: &Path,
+    repository_path: &str,
+) -> Result<PathBuf, CacheError> {
+    if !normalized_relative_path(repository_path) {
+        return Err(CacheError::InvalidManifest(
+            "invalid publication staging path".into(),
+        ));
+    }
     fs::create_dir_all(root)?;
     if fs::symlink_metadata(root)?.file_type().is_symlink() {
         return Err(CacheError::InvalidManifest(
@@ -865,7 +913,7 @@ fn resolve_staging_path(root: &Path, repository_path: &str) -> Result<PathBuf, C
     Ok(path)
 }
 
-fn verify_existing_file(
+pub(crate) fn verify_existing_file(
     path: &Path,
     expected_size: u64,
     expected_digest: &ContentDigest,
@@ -1243,6 +1291,39 @@ mod tests {
             .join("private")
             .join("receipt.json")
             .is_file());
+        let mut refreshed_index = index_document.clone();
+        refreshed_index.source.revision = "head-3".to_owned();
+        let mut refreshed_ledger = ledger_document.clone();
+        refreshed_ledger.source.revision = "head-3".to_owned();
+        refreshed_ledger.value.estimated_history_bytes += 123;
+        let refreshed_bytes = canonical_json_bytes(&refreshed_ledger.value).unwrap();
+        refreshed_ledger.source.size_bytes = refreshed_bytes.len() as u64;
+        refreshed_ledger.source.content_digest = ContentDigest::sha256(&refreshed_bytes);
+        journal
+            .targets
+            .get_mut(&PublicationDestination::Private)
+            .unwrap()
+            .discard_planned_discoverability_after_conflict("head-3".to_owned())
+            .unwrap();
+        let replanned = stage_publication_discoverability(
+            &root,
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+            &mut journal,
+            PublicationDestination::Private,
+            &bundle,
+            &refreshed_index,
+            &refreshed_ledger,
+            124,
+            500,
+            true,
+        )
+        .unwrap();
+        assert!(replanned.capacity.accepted);
+        let rewritten: CapacityLedger =
+            serde_json::from_slice(&fs::read(root.join(DEFAULT_CAPACITY_LEDGER_PATH)).unwrap())
+                .unwrap();
+        assert_eq!(rewritten.estimated_history_bytes, 623);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1374,5 +1455,24 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, CacheError::PermissionDenied(_)));
         assert!(!root.exists());
+    }
+    #[test]
+    fn audit_staging_rejects_total_byte_overflow_before_writing() {
+        let root = temporary_root("audit-staging-overflow");
+        let mut total = u64::MAX;
+        let result = stage_bytes(
+            &root,
+            "file.json",
+            b"x",
+            &ResourcePolicy {
+                maximum_permanent_disk_bytes: None,
+                ..Default::default()
+            },
+            &CancellationToken::new(),
+            &mut total,
+        );
+        let _ = fs::remove_dir_all(&root);
+        assert!(result.is_err());
+        assert_eq!(total, u64::MAX);
     }
 }

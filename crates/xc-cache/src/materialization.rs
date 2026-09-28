@@ -345,6 +345,7 @@ fn materialize_resolved_remote_artifact_inner(
                 package_size_bytes: verification.package_size_bytes,
                 package_digest: verification.package_digest.clone(),
                 package_path: package_path.to_owned(),
+                created_new: false,
             },
             verification,
             MaterializationTimings {
@@ -452,10 +453,12 @@ fn materialize_resolved_remote_artifact_inner(
     let verification = match verified {
         Ok(verification) => verification,
         Err(error) => {
-            if matches!(
-                &error,
-                CacheError::DigestMismatch { .. } | CacheError::InvalidManifest(_)
-            ) {
+            if package.created_new
+                && matches!(
+                    &error,
+                    CacheError::DigestMismatch { .. } | CacheError::InvalidManifest(_)
+                )
+            {
                 let _ = fs::remove_file(package_path);
             }
             return Err(error);
@@ -518,7 +521,11 @@ fn projected_new_local_bytes(
     package_bytes: u64,
 ) -> Result<u64, CacheError> {
     let mut projected = package_bytes;
+    let mut physical_paths = BTreeSet::new();
     for part in &encoding.ordered_parts {
+        if !physical_paths.insert(&part.repository_path) {
+            continue;
+        }
         if !normalized_relative_path(&part.repository_path) {
             return Err(CacheError::InvalidManifest(format!(
                 "transport part path {:?} is unsafe",
@@ -1100,5 +1107,27 @@ mod tests {
             "failed repair must not leak quarantine files outside accounting"
         );
         let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn audit_projection_counts_repeated_physical_parts_once() {
+        let root = std::env::temp_dir().join(format!("xc-audit-projection-{}", std::process::id()));
+        let part = crate::TransportPart {
+            sequence: 0,
+            repository_path: "objects/repeated".into(),
+            size_bytes: 4,
+            content_digest: ContentDigest::sha256(b"ABCD"),
+        };
+        let mut repeat = part.clone();
+        repeat.sequence = 1;
+        let encoding = crate::TransportEncodingRecord {
+            schema_version: 2,
+            canonical_payload_digest: ContentDigest::sha256(b"logical"),
+            encoder_profile: crate::CURRENT_DETERMINISTIC_ZIP64_PROFILE.into(),
+            package_size_bytes: 8,
+            package_digest: ContentDigest::sha256(b"ABCDABCD"),
+            ordered_parts: vec![part, repeat],
+            reconstruction: "concatenate".into(),
+        };
+        assert_eq!(projected_new_local_bytes(&encoding, &root, 8).unwrap(), 12);
     }
 }

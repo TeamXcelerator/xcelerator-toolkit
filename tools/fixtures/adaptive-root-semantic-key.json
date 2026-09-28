@@ -1,0 +1,45 @@
+{
+  "source": "independent oracle generated outside the repository",
+  "source_sha256": "1b83e3ddb3bb6e26884c9ce3e6b55b01bd7a3797a47c438784485270b700f0ae",
+  "semantic_key": {
+    "algorithm_semantics": "halley+adaptive_root_precision_v1",
+    "artifact_kind": "ccm_root_discovery_window",
+    "mathematical_semantics_version": "ccm-root-discovery-v0.15.2-v2",
+    "normalization": null,
+    "resolved_mathematical_parameters": {
+      "accuracy_guard_bits": 64,
+      "completeness": "complete_requested_window_point_source",
+      "convergence_confirmation": "directed_local_root_sign_witness_at_stored_point_v2",
+      "discovery_method": "exact_point_numerator_exact_window_v1",
+      "discovery_mode": "independent",
+      "first_root_index": 1,
+      "force_even": true,
+      "lambda_squared": "13",
+      "maximum_extra_precision_bits": 4096,
+      "n_modes": 10,
+      "pole_geometry": "exact_stored_mpfr_pole_points",
+      "precision_bits": 144,
+      "precision_escalation_rule": "double_extra_bits_from_64_bit_quantum_v1",
+      "reference_seeds_used": false,
+      "residual_arithmetic": "guarded_point_difference_quotient_exact_sum_v2",
+      "root_count": 2,
+      "root_precision_policy": "adaptive_v1",
+      "secular_source_content_digest": "c6fa2e1723af9469b6022f545e11391c230785c6a5b65d9a210726141c95074c",
+      "solver": "halley",
+      "solver_steps": 2000,
+      "source_accuracy_scope": "exact_stored_point_source",
+      "starting_points": [
+        "14.1347251417346937904609252764003314870210080",
+        "21.0220396387715559649230913849503736943237672"
+      ],
+      "target_precision_bits": 80,
+      "verification_precision_bits": 64
+    },
+    "schema_version": 1,
+    "source_data_identities": {
+      "ccm_secular_source": "c6fa2e1723af9469b6022f545e11391c230785c6a5b65d9a210726141c95074c"
+    },
+    "subspace": "even",
+    "target": "positive_ccm_spectral_roots"
+  }
+}

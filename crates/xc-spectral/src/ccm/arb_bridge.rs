@@ -2,11 +2,17 @@
 
 use anyhow::{bail, Result};
 use rug::Float;
-use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use xc_numerics::mpfr_interval::MpfrInterval;
+
+// FLINT slong follows the machine word width, including LLP64 Windows where
+// C long is only 32 bits. The C bridge asserts this ABI contract at compile time.
+type FlintSLong = isize;
 
 unsafe extern "C" {
     fn xc_arb_flint_version() -> *const c_char;
+    #[cfg(test)]
+    fn xc_arb_slong_size() -> usize;
     fn xc_arb_complex_digamma_interval(
         out_re_lower: *mut c_void,
         out_re_upper: *mut c_void,
@@ -16,7 +22,7 @@ unsafe extern "C" {
         in_re_upper: *const c_void,
         in_im_lower: *const c_void,
         in_im_upper: *const c_void,
-        precision: c_long,
+        precision: FlintSLong,
     );
     fn xc_arb_complex_trigamma_interval(
         out_re_lower: *mut c_void,
@@ -27,17 +33,17 @@ unsafe extern "C" {
         in_re_upper: *const c_void,
         in_im_lower: *const c_void,
         in_im_upper: *const c_void,
-        precision: c_long,
+        precision: FlintSLong,
     );
     fn xc_flint_rational_polynomial_root_count(
-        out_count: *mut c_long,
+        out_count: *mut FlintSLong,
         out_square_free: *mut c_int,
         out_lowers: *mut *mut c_void,
         out_uppers: *mut *mut c_void,
-        output_capacity: c_long,
-        output_precision: c_long,
+        output_capacity: FlintSLong,
+        output_precision: FlintSLong,
         coefficients: *const *const c_char,
-        coefficient_count: c_long,
+        coefficient_count: FlintSLong,
         lower: *const c_char,
         upper: *const c_char,
     ) -> c_int;
@@ -48,7 +54,10 @@ pub fn rational_polynomial_root_count(
     lower: &rug::Rational,
     upper: &rug::Rational,
 ) -> Result<(usize, bool)> {
-    if coefficients_ascending.len() < 2 || lower >= upper {
+    if coefficients_ascending.len() < 2
+        || lower >= upper
+        || coefficients_ascending.iter().skip(1).all(|x| x == &0)
+    {
         bail!("FLINT root count requires a nonconstant polynomial and lower < upper");
     }
     let encoded = coefficients_ascending
@@ -61,7 +70,7 @@ pub fn rational_polynomial_root_count(
         .collect::<Vec<_>>();
     let lower = CString::new(lower.to_string())?;
     let upper = CString::new(upper.to_string())?;
-    let mut count: c_long = 0;
+    let mut count: FlintSLong = 0;
     let mut square_free: c_int = 0;
     let status = unsafe {
         xc_flint_rational_polynomial_root_count(
@@ -72,7 +81,7 @@ pub fn rational_polynomial_root_count(
             0,
             128,
             pointers.as_ptr(),
-            pointers.len() as c_long,
+            FlintSLong::try_from(pointers.len())?,
             lower.as_ptr(),
             upper.as_ptr(),
         )
@@ -88,14 +97,40 @@ pub fn rational_polynomial_root_count(
     }
 }
 
+#[derive(Debug)]
+struct RootIsolationFailure {
+    status: i32,
+}
+impl std::fmt::Display for RootIsolationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "FLINT/Arb exact root isolation failed with status {}",
+            self.status
+        )
+    }
+}
+impl std::error::Error for RootIsolationFailure {}
+pub(in crate::ccm) fn isolation_needs_more_precision(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RootIsolationFailure>()
+        .is_some_and(|failure| matches!(failure.status, 2 | 6))
+}
+
 pub fn rational_polynomial_real_roots(
     coefficients_ascending: &[rug::Rational],
     lower: &rug::Rational,
     upper: &rug::Rational,
     precision_bits: u32,
 ) -> Result<(Vec<MpfrInterval>, bool)> {
-    if coefficients_ascending.len() < 2 || lower >= upper || precision_bits <= 64 {
-        bail!("FLINT root isolation requires a nonconstant polynomial, lower < upper, and HP precision");
+    if coefficients_ascending.len() < 2
+        || lower >= upper
+        || !(65..=1_000_000).contains(&precision_bits)
+        || coefficients_ascending.iter().skip(1).all(|x| x == &0)
+    {
+        bail!(
+            "FLINT root isolation requires a nonconstant polynomial, lower < upper, and HP precision"
+        );
     }
     let encoded = coefficients_ascending
         .iter()
@@ -122,7 +157,7 @@ pub fn rational_polynomial_real_roots(
         .iter_mut()
         .map(|value| value.as_raw_mut().cast())
         .collect::<Vec<*mut c_void>>();
-    let mut count: c_long = 0;
+    let mut count: FlintSLong = 0;
     let mut square_free: c_int = 0;
     let status = unsafe {
         xc_flint_rational_polynomial_root_count(
@@ -130,16 +165,16 @@ pub fn rational_polynomial_real_roots(
             &mut square_free,
             lower_pointers.as_mut_ptr(),
             upper_pointers.as_mut_ptr(),
-            capacity as c_long,
-            precision_bits as c_long,
+            FlintSLong::try_from(capacity)?,
+            checked_ffi_precision(precision_bits)?,
             pointers.as_ptr(),
-            pointers.len() as c_long,
+            FlintSLong::try_from(pointers.len())?,
             lower_text.as_ptr(),
             upper_text.as_ptr(),
         )
     };
     if status != 0 || count < 0 || count as usize > capacity {
-        bail!("FLINT/Arb exact root isolation failed with status {status}");
+        return Err(RootIsolationFailure { status }.into());
     }
     lowers.truncate(count as usize);
     uppers.truncate(count as usize);
@@ -156,6 +191,8 @@ fn evaluate(
     imaginary: &MpfrInterval,
     trigamma: bool,
 ) -> Result<(MpfrInterval, MpfrInterval)> {
+    real.validate()?;
+    imaginary.validate()?;
     if real.precision() != imaginary.precision() {
         bail!("Arb complex input intervals have different precision");
     }
@@ -179,7 +216,7 @@ fn evaluate(
             real.upper().as_raw().cast(),
             imaginary.lower().as_raw().cast(),
             imaginary.upper().as_raw().cast(),
-            precision as c_long,
+            checked_ffi_precision(precision)?,
         );
     }
     Ok((
@@ -213,6 +250,13 @@ pub fn complex_trigamma(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_count_width_matches_compiled_flint_slong() {
+        assert_eq!(std::mem::size_of::<FlintSLong>(), unsafe {
+            xc_arb_slong_size()
+        });
+    }
 
     #[test]
     fn real_digamma_and_trigamma_have_expected_signs() {
@@ -263,8 +307,8 @@ unsafe extern "C" {
         zih: *const c_void,
         cutoff: *const c_char,
         coefficients: *const *const c_void,
-        count: c_long,
-        precision: c_long,
+        count: FlintSLong,
+        precision: FlintSLong,
     ) -> std::ffi::c_int;
     fn xc_arb_argument(
         lo: *mut c_void,
@@ -273,7 +317,7 @@ unsafe extern "C" {
         rh: *const c_void,
         il: *const c_void,
         ih: *const c_void,
-        precision: c_long,
+        precision: FlintSLong,
     );
 }
 pub(crate) fn finite_transform(
@@ -282,6 +326,11 @@ pub(crate) fn finite_transform(
     re: &MpfrInterval,
     im: &MpfrInterval,
 ) -> Result<(MpfrInterval, MpfrInterval, MpfrInterval, MpfrInterval)> {
+    re.validate()?;
+    im.validate()?;
+    if coefficients.iter().any(|value| !value.is_finite()) {
+        bail!("finite transform coefficients must be finite");
+    }
     if re.precision() != im.precision()
         || coefficients.is_empty()
         || coefficients.len().is_multiple_of(2)
@@ -315,8 +364,8 @@ pub(crate) fn finite_transform(
             im.upper().as_raw().cast(),
             c.as_ptr(),
             pointers.as_ptr(),
-            pointers.len() as c_long,
-            p as c_long,
+            FlintSLong::try_from(pointers.len())?,
+            checked_ffi_precision(p)?,
         )
     };
     if status != 1 {
@@ -330,6 +379,11 @@ pub(crate) fn finite_transform(
     ))
 }
 pub(crate) fn argument(re: &MpfrInterval, im: &MpfrInterval) -> Result<MpfrInterval> {
+    re.validate()?;
+    im.validate()?;
+    if re.contains_zero() && im.contains_zero() {
+        bail!("complex argument is undefined at zero");
+    }
     if re.precision() != im.precision() {
         bail!("argument precision mismatch");
     }
@@ -344,7 +398,7 @@ pub(crate) fn argument(re: &MpfrInterval, im: &MpfrInterval) -> Result<MpfrInter
             re.upper().as_raw().cast(),
             im.lower().as_raw().cast(),
             im.upper().as_raw().cast(),
-            p as c_long,
+            checked_ffi_precision(p)?,
         );
     }
     Ok(MpfrInterval::new(lo, hi)?)
@@ -386,9 +440,11 @@ mod finite_transform_failure_tests {
                 .unwrap();
                 let enclosure = finite_transform("13", &coefficients, &re, &im).unwrap();
                 for interval in [&enclosure.0, &enclosure.1, &enclosure.2, &enclosure.3] {
-                    assert!(Float::with_val(p, interval.upper()) - interval.lower()
-                        < Float::with_val(p, &radius) * 100,
-                        "near-carrier enclosure lost useful precision: mode={mode}, radius=2^-{radius_bits}");
+                    assert!(
+                        Float::with_val(p, interval.upper()) - interval.lower()
+                            < Float::with_val(p, &radius) * 100,
+                        "near-carrier enclosure lost useful precision: mode={mode}, radius=2^-{radius_bits}"
+                    );
                 }
                 for x in [re.lower(), &center, re.upper()] {
                     for y in [im.lower(), &imaginary_center, im.upper()] {
@@ -405,8 +461,10 @@ mod finite_transform_failure_tests {
                             (&enclosure.2, &point.2),
                             (&enclosure.3, &point.3),
                         ] {
-                            assert!(outer.lower() <= inner.lower() && outer.upper() >= inner.upper(),
-                                "near-carrier rectangle does not contain independent scalar enclosure");
+                            assert!(
+                                outer.lower() <= inner.lower() && outer.upper() >= inner.upper(),
+                                "near-carrier rectangle does not contain independent scalar enclosure"
+                            );
                         }
                     }
                 }
@@ -479,10 +537,14 @@ mod finite_transform_failure_tests {
                     (&enclosure.2, &point.2),
                     (&enclosure.3, &point.3),
                 ] {
-                    assert!(outer.lower() <= inner.lower() && outer.upper() >= inner.upper(),
+                    assert!(
+                        outer.lower() <= inner.lower() && outer.upper() >= inner.upper(),
                         "rectangle=({left},{right},{bottom},{top}), point={j}; outer=[{},{}], point=[{},{}]",
-                        outer.lower().to_string_radix(10,Some(12)), outer.upper().to_string_radix(10,Some(12)),
-                        inner.lower().to_string_radix(10,Some(12)), inner.upper().to_string_radix(10,Some(12)));
+                        outer.lower().to_string_radix(10, Some(12)),
+                        outer.upper().to_string_radix(10, Some(12)),
+                        inner.lower().to_string_radix(10, Some(12)),
+                        inner.upper().to_string_radix(10, Some(12))
+                    );
                 }
             }
         }
@@ -503,4 +565,11 @@ mod finite_transform_failure_tests {
         .is_err());
         assert!(finite_transform("9", &[Float::with_val(192, 1)], &z, &z).is_ok());
     }
+}
+
+// A u32 precision may exceed signed FLINT slong on a 32-bit target.
+// Preserve the checked conversion on every supported target.
+#[allow(clippy::unnecessary_fallible_conversions)]
+fn checked_ffi_precision(precision: u32) -> anyhow::Result<FlintSLong> {
+    Ok(FlintSLong::try_from(precision)?)
 }

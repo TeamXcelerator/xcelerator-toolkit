@@ -23,10 +23,13 @@ pub const BUNDLED_ZETA_ZEROS_RESOURCE: &str = "xc-zeta/data/zeta_zeros_1000x2500
 
 /// Exact bytes of the first 1,000 positive ordinates at 2,500 decimal digits.
 ///
-/// The ordinates were computed with rigorous Arb interval arithmetic. Their
-/// leading 1,000 digits were independently cross-checked against Odlyzko's
-/// standard tabulation; that tabulation is validation evidence, not the source
-/// of these 2,500-digit values.
+/// The recorded production attribution is rigorous Arb interval arithmetic;
+/// this loader does not replay that computation. Odlyzko's published
+/// [high-precision table](https://www-users.cse.umn.edu/~odlyzko/zeta_tables/)
+/// covers the first 100 zeros, so it cannot support a 1,000-digit cross-check
+/// of all 1,000 records. An independent check verified all records to 300
+/// fractional digits using PARI/GP and 71 selected records at all 2,500 digits;
+/// those finite checks do not certify every digit of every record.
 pub const BUNDLED_ZETA_ZEROS_JSON: &[u8] = include_bytes!("../data/zeta_zeros_1000x2500.json");
 
 /// SHA-256 of the exact canonical bundled bytes, invariant across checkouts.
@@ -135,7 +138,7 @@ pub fn first_n_strings(path: &Path, n: usize) -> Result<Vec<String>> {
     first_n_strings_from_bytes(&data, n, &path.display().to_string())
 }
 
-/// Load the first n zero imaginary parts truncated to f64.
+/// Load the first n zero imaginary parts rounded to finite f64 values.
 pub fn first_n_f64(path: &Path, n: usize) -> Result<Vec<f64>> {
     let strings = first_n_strings(path, n)?;
     let mut out = Vec::with_capacity(strings.len());
@@ -143,21 +146,37 @@ pub fn first_n_f64(path: &Path, n: usize) -> Result<Vec<f64>> {
         let v: f64 = s
             .parse()
             .map_err(|e| anyhow!("Failed to parse zero {:?}: {}", s, e))?;
+        if !v.is_finite() {
+            return Err(anyhow!(
+                "Reference zero is not finite at binary64 precision"
+            ));
+        }
         out.push(v);
     }
     Ok(out)
 }
 
 /// Load the first n zero imaginary parts as `rug::Float` at the given
-/// precision (in bits).
+/// precision (in bits). Values are rounded from the supplied finite decimal
+/// strings; requesting more precision does not add verified ordinate digits or
+/// establish that these supplied points are roots.
 #[cfg(feature = "hp")]
 pub fn first_n_hp(path: &Path, n: usize, prec: u32) -> Result<Vec<rug::Float>> {
+    if !(1..=1_000_000).contains(&prec) {
+        return Err(anyhow!("Reference-zero precision must be in 1..=1000000"));
+    }
     let strings = first_n_strings(path, n)?;
     let mut out = Vec::with_capacity(strings.len());
     for s in strings {
         let parsed =
             rug::Float::parse(&s).map_err(|e| anyhow!("Failed to parse zero {:?}: {}", s, e))?;
-        out.push(rug::Float::with_val(prec, parsed));
+        let value = rug::Float::with_val(prec, parsed);
+        if !value.is_finite() {
+            return Err(anyhow!(
+                "Reference zero is not finite at requested precision"
+            ));
+        }
+        out.push(value);
     }
     Ok(out)
 }

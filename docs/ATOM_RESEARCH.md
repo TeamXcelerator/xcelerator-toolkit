@@ -1,4 +1,4 @@
-﻿# Large atom tables, finite cutoff studies, and research queries
+ï»¿# Large atom tables, finite cutoff studies, and research queries
 
 Ultra requests the weighted-tail, band-reconstruction and tail-model diagnostics.
 Their optional atom policy adds the measurements below when the corresponding
@@ -138,3 +138,80 @@ producers now use extended semantics v4; resolution diagnostics retain v3.
 Historical payloads and receipts are preserved. Backfill can add these children
 from retained primary sources and authenticated external inputs. Old receipts
 are not relabeled, and missing atoms are not synthesized.
+
+
+## Signed finite bands: stored points and bounded contractions (v20)
+
+Coordinates, signed weights, scoring roots, borrowed energy and atom cutoffs are
+decoded at the external input's declared precision before promotion. Cutoff rows
+echo that decoded point. Recurrence checkpoints bind both that precision and the
+v4 normalized-recurrence and exact-contraction algorithm; retained reports use semantics v20. Archived
+reports retain their original revision and do not inherit repaired arithmetic.
+
+Each weighted contraction computes the exact sum of products of its finite binary
+inputs and rounds the sum once. Binary mantissas are multiplied and accumulated
+at a precision derived from the exponent span and number of terms, so intermediate
+overflow or cancellation cannot silently erase a representable contraction.
+The exact span is capped at 8,000,000 bits. Half the working budget remaining
+after resident-vector/Jacobi estimates is reserved for arithmetic; the other half
+limits in-memory basis retention. Scratch estimates cover numerical buffers,
+not total process or scheduler memory. Exceeding a bound produces unresolved
+diagnostics. Authenticated disk checkpoints preserve the bounded basis workflow.
+
+Inverse moments use a relative model-root scale and directed, normalized sums
+with up to 4,096 guard bits. Their error criterion is absolute error relative to
+the sum of absolute terms; severe cancellation does not imply relative accuracy
+in a tiny result. Zero or unresolved roots and unrepresentable outputs withhold
+the moments while retaining the computed model roots.
+
+The twice-reorthogonalized Stieltjes recurrence and symmetric eigensolve remain
+point calculations. Exact contractions do not make the entire recurrence exact,
+certify positive definiteness of the original model, enclose root errors, or
+establish any omitted-tail, source-selection, convergence or RH premise.
+
+The recurrence normalizes coordinates by a common binary power and weights by
+a positive common even binary power before vector updates. Model roots and
+recurrence diagnostics are restored in their respective coordinate dimensions.
+This prevents x*q from losing a finite singleton root before contraction.
+Common scaling itself must preserve every nonzero point exactly; otherwise the
+model is explicitly unresolved. Unrepresentable diagnostic outputs remain an
+explicit arithmetic limitation even when another model quantity is finite.
+
+The request fields prefixed `signed_band_` describe the supplied signed-atom
+path. They do not assert that the separate polynomial-tail-form adapter uses
+the Stieltjes recurrence or its inverse-moment arithmetic.
+
+
+## State, form and polynomial adapter arithmetic (v21)
+
+State selection rejects zero eigenvectors and orders only the supplied candidates.
+It trusts their parity labels and does not establish completeness or eigenpair
+validity. Even and odd parity expansion require exactly the sector dimension of
+finite coefficients and return every coefficient at the requested precision.
+The factors 1/sqrt(2) use point arithmetic at that precision.
+
+Form decomposition computes the exact numerator and positive denominator of each
+Rayleigh quotient in the actual stored binary matrix and vector entries. One final
+division rounds the value; a signed component includes its integer coefficient
+before that division. The reconstructed total is the rounded exact sum of the
+reported signed points, and the cancellation residual compares that point with
+the reported total point. These diagnostics are not source-error enclosures.
+The supported input/output precision is at most 1,000,000 bits, with output at
+least 64 bits. Exact contractions have an 8,000,000-bit span limit and an 8 GiB
+numerical-buffer budget. Nonfinite inputs, zero vectors, unrepresentable outputs
+and exhausted arithmetic budgets fail explicitly.
+
+The separate polynomial-tail-form adapter writes root endpoints outward in
+decimal and uses a safe midpoint. Its first three inverse moments use exact
+Newton identities from the actual rounded polynomial coefficients, not rounded
+root midpoints. For coefficients c0,c1,c2,c3 in ascending order they are
+-c1/c0, (c1^2-2*c0*c2)/c0^2, and
+(-c1^3+3*c0*c1*c2-3*c0^2*c3)/c0^3. Missing higher coefficients are zero.
+The adapter requires a nonzero constant and complete simple real-root coverage;
+otherwise it withholds these moments. A partial finite-model status remains
+partial. The exact arithmetic uses the same span bound and the requested working
+budget. The polynomial-specific request fields distinguish this arithmetic from
+the signed-atom recurrence. Semantics v21 prevents cache identity reuse with the
+older algorithm; archived v20 and earlier records retain their original meaning.
+None of these changes turns a finite rounded model into a certificate of CCM
+roots, omitted-tail control, convergence or RH.

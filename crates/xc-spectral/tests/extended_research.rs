@@ -214,7 +214,32 @@ fn signed_reference_channels_keep_cancellation_and_closure_separate() {
     near(&v["value_signed_total"], -0.1, 1e-14);
     near(&v["value_unfitted_interior"], 0.02, 1e-14);
     near(&v["value_remaining_tail"], 0.17, 1e-14);
-    assert!(number(&v["value_reference_closure_defect"]).abs() < 1e-50);
+    // These three decimal strings were built at 192 bits but the input
+    // explicitly declares 128-bit points. Their independently rounded closure
+    // is nonzero; compare against those points, not the pre-rounding formula.
+    let point = |text: &str| {
+        Float::with_val(
+            512,
+            Float::with_val(i.precision_bits, Float::parse(text).unwrap()),
+        )
+    };
+    let jet = &i.reference_jets[0];
+    let expected = point(&jet.reference_full.value)
+        - point(&jet.reference_window.value)
+        - point(&jet.exterior_tail.value);
+    assert_ne!(expected, 0);
+    // Report decimals round-trip at the declared report precision. Decode that
+    // point before exact promotion; the decimal spelling is not the dyadic.
+    assert_eq!(
+        Float::with_val(
+            512,
+            Float::with_val(
+                r.working_precision_bits,
+                Float::parse(&v["value_reference_closure_defect"]).unwrap()
+            )
+        ),
+        expected
+    );
 }
 #[test]
 fn arithmetic_split_closes_and_preserves_signed_energy_ratios() {
@@ -834,7 +859,7 @@ fn missing_error_source_does_not_become_a_certificate() {
 }
 
 #[test]
-fn cluster_workspace_limit_keeps_operator_and_coupling() {
+fn cluster_tiny_workspace_limit_withholds_unfunded_vector_arithmetic() {
     let (s, _, m) = fixture();
     let mut options = ExtensionOptions::for_source(&s);
     options.maximum_working_bytes = Some(1);
@@ -851,13 +876,9 @@ fn cluster_workspace_limit_keeps_operator_and_coupling() {
     .unwrap()
     .value
     .data;
-    assert_eq!(r.outcome, "partial_unresolved");
-    assert!(r.reason.unwrap().contains("workspace budget"));
-    assert!(r
-        .rows
-        .iter()
-        .all(|r| r.values.contains_key("coupling_gram")
-            && !r.values.contains_key("effective_operator")));
+    assert_eq!(r.outcome, "unresolved");
+    assert!(r.reason.unwrap().contains("working-byte budget"));
+    assert!(r.values.is_empty() && r.rows.is_empty());
 }
 
 #[test]

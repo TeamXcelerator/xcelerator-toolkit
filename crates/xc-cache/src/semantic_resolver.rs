@@ -50,6 +50,7 @@ pub struct RemoteSemanticQuery {
 
 impl RemoteSemanticQuery {
     pub fn validate(&self) -> Result<ContentDigest, CacheError> {
+        self.current_toolkit_version.validate()?;
         if self.family.trim().is_empty()
             || self.accepted_publication_policy_digests.is_empty()
             || self
@@ -139,10 +140,18 @@ pub struct ResolvedRemoteArtifact {
     pub dependencies: Vec<ResolvedRemoteArtifact>,
 }
 
+pub const REMOTE_RESOLUTION_SEMANTICS: &str = "remote-semantic-root-consumption-minima-v2";
+
+fn historical_resolution_semantics() -> String {
+    "remote-semantic-closure-consumption-minima-v1".to_owned()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticResolutionReport {
     pub schema_version: u32,
+    #[serde(default = "historical_resolution_semantics")]
+    pub algorithm_semantics: String,
     pub semantic_digest: ContentDigest,
     pub resolved_semantic_key: SemanticKeyEnvelope,
     pub selected: Option<ResolvedRemoteArtifact>,
@@ -233,7 +242,8 @@ pub fn resolve_remote_semantic_artifact(
     };
     let selected = resolve_identity(&mut context, &query.family, &semantic_digest, None, 0)?;
     Ok(SemanticResolutionReport {
-        schema_version: 1,
+        schema_version: 2,
+        algorithm_semantics: REMOTE_RESOLUTION_SEMANTICS.to_owned(),
         semantic_digest,
         resolved_semantic_key: query.semantic_key.clone(),
         selected,
@@ -264,6 +274,7 @@ fn resolve_identity(
             &overlay.topology_source.branch,
         ) {
             Ok(revision) => revision,
+            Err(error @ CacheError::Cancelled(_)) => return Err(error),
             Err(error) => {
                 reject(
                     context,
@@ -314,6 +325,7 @@ fn resolve_identity(
             )
         }) {
             Ok(topology) => topology,
+            Err(error @ CacheError::Cancelled(_)) => return Err(error),
             Err(error) => {
                 reject(
                     context,
@@ -423,6 +435,7 @@ fn resolve_identity(
             let authorized_repository = format!("{}/{}", endpoint.owner, endpoint.repository);
             let revision = match context.remote.read_ref(&repository, &endpoint.branch) {
                 Ok(revision) => revision,
+                Err(error @ CacheError::Cancelled(_)) => return Err(error),
                 Err(error) => {
                     reject(
                         context,
@@ -471,6 +484,7 @@ fn resolve_identity(
                         )
                     }) {
                     Ok(index) => index,
+                    Err(error @ CacheError::Cancelled(_)) => return Err(error),
                     Err(error) => {
                         reject(
                             context,
@@ -531,7 +545,7 @@ fn resolve_identity(
             }
             for entry in candidates {
                 if let Some((stage, reason)) =
-                    entry_rejection(context.query, &entry, expected.as_ref())
+                    entry_rejection(context.query, &entry, expected.as_ref(), depth)
                 {
                     reject(
                         context,
@@ -597,6 +611,7 @@ fn resolve_identity(
                     &entry,
                 ) {
                     Ok(artifact) => return Ok(Some(artifact)),
+                    Err(error @ CacheError::Cancelled(_)) => return Err(error),
                     Err(error) => reject(
                         context,
                         overlay,
@@ -641,7 +656,7 @@ fn resolve_candidate(
             entry.disposition
         )));
     }
-    if entry.achieved_assurance < context.query.minimum_assurance {
+    if depth == 0 && entry.achieved_assurance < context.query.minimum_assurance {
         return Err(CacheError::InvalidManifest(format!(
             "candidate assurance {:?} is below {:?}",
             entry.achieved_assurance, context.query.minimum_assurance
@@ -652,8 +667,9 @@ fn resolve_candidate(
             "candidate requires a newer toolkit reader".to_owned(),
         ));
     }
-    let family_policy =
-        crate::artifact_compatibility_policy(family, &context.query.semantic_key.artifact_kind)?;
+    // The manifest below enforces its own kind-specific policy. A dependency
+    // must not inherit the root query's unrelated artifact-kind floor.
+    let family_policy = crate::artifact_family_compatibility_policy(family)?;
     if entry.producer_toolkit_version < family_policy.minimum_producer_version {
         return Err(CacheError::InvalidManifest(format!(
             "candidate producer toolkit {} precedes the family floor {}",
@@ -710,7 +726,8 @@ fn resolve_candidate(
             "canonical manifest does not match its index entry or reader compatibility".to_owned(),
         ));
     }
-    if !context.query.allowed_scalar_backends.is_empty()
+    if depth == 0
+        && !context.query.allowed_scalar_backends.is_empty()
         && !context
             .query
             .allowed_scalar_backends
@@ -721,20 +738,23 @@ fn resolve_candidate(
             manifest.value.canonical_payload.scalar_backend
         )));
     }
-    if context.query.minimum_precision_bits.is_some_and(|minimum| {
-        manifest.value.canonical_payload.precision_bits.unwrap_or(0) < minimum
-    }) {
+    if depth == 0
+        && context.query.minimum_precision_bits.is_some_and(|minimum| {
+            manifest.value.canonical_payload.precision_bits.unwrap_or(0) < minimum
+        })
+    {
         return Err(CacheError::InvalidManifest(
             "candidate precision is below the consumption policy".to_owned(),
         ));
     }
-    if context
-        .query
-        .required_configuration_digest
-        .as_ref()
-        .is_some_and(|required| {
-            required != &manifest.value.resolved_mathematical_configuration_digest
-        })
+    if depth == 0
+        && context
+            .query
+            .required_configuration_digest
+            .as_ref()
+            .is_some_and(|required| {
+                required != &manifest.value.resolved_mathematical_configuration_digest
+            })
     {
         return Err(CacheError::InvalidManifest(
             "candidate resolved configuration does not match consumption policy".to_owned(),
@@ -975,7 +995,10 @@ fn resolve_candidate(
     let dependencies_result = (|| {
         let mut dependencies = Vec::new();
         for dependency in &manifest.value.canonical_payload.dependencies {
-            context.dependency_count = context.dependency_count.saturating_add(1);
+            context.dependency_count =
+                context.dependency_count.checked_add(1).ok_or_else(|| {
+                    CacheError::ResourceLimit("dependency count exceeds u64".to_owned())
+                })?;
             if context.dependency_count > context.query.maximum_dependency_count {
                 return Err(CacheError::ResourceLimit(format!(
                     "dependency count exceeds {}",
@@ -990,7 +1013,9 @@ fn resolve_candidate(
                     manifest_digest: &dependency.manifest_digest,
                     payload_digest: &dependency.payload_digest,
                 }),
-                depth.saturating_add(1),
+                depth.checked_add(1).ok_or_else(|| {
+                    CacheError::ResourceLimit("dependency depth exceeds u32".to_owned())
+                })?,
             )?
             .ok_or_else(|| {
                 CacheError::NotFound(format!(
@@ -1075,6 +1100,7 @@ fn entry_rejection(
     query: &RemoteSemanticQuery,
     entry: &ShardIndexEntry,
     expected: Option<&ExpectedArtifact<'_>>,
+    depth: u32,
 ) -> Option<(ResolutionRejectionStage, String)> {
     if entry.disposition == ArtifactDisposition::Revoked
         || entry.disposition == ArtifactDisposition::Quarantined
@@ -1088,7 +1114,7 @@ fn entry_rejection(
             ),
         ));
     }
-    if entry.achieved_assurance < query.minimum_assurance {
+    if depth == 0 && entry.achieved_assurance < query.minimum_assurance {
         return Some((
             ResolutionRejectionStage::Assurance,
             format!(
@@ -1172,6 +1198,7 @@ mod tests {
     use xc_core::{AssuranceLevel, PublicationAuthorityMode};
 
     struct MemoryRemote {
+        cancel_on_read: bool,
         heads: BTreeMap<(String, String), String>,
         documents: BTreeMap<(String, String, String), Vec<u8>>,
         reads: Mutex<Vec<String>>,
@@ -1203,6 +1230,9 @@ mod tests {
             cancellation: &CancellationToken,
             writer: &mut dyn Write,
         ) -> Result<RemoteReadReport, CacheError> {
+            if self.cancel_on_read {
+                return Err(CacheError::Cancelled("audit cancellation".to_owned()));
+            }
             cancellation
                 .check()
                 .map_err(|error| CacheError::Cancelled(error.to_string()))?;
@@ -1571,6 +1601,7 @@ mod tests {
         }];
         Fixture {
             remote: MemoryRemote {
+                cancel_on_read: false,
                 heads: BTreeMap::from([
                     ((topology_repository, "main".to_owned()), topology_revision),
                     ((shard_repository, "main".to_owned()), shard_revision),
@@ -1605,6 +1636,7 @@ mod tests {
                 validation_mode: xc_core::CacheValidationMode::Fast,
                 validation_outcome: xc_core::CacheValidationOutcome::Passed,
                 validation_detail: None,
+                root_materialization: None,
                 materialization: None,
             })
             .unwrap();
@@ -1646,6 +1678,40 @@ mod tests {
     }
 
     #[test]
+    fn metadata_resolution_cannot_be_reported_as_passed_payload_validation() {
+        let fixture = fixture(false);
+        let report = resolve_remote_semantic_artifact(
+            &fixture.remote,
+            &CancellationToken::new(),
+            &fixture.query,
+            &fixture.overlays,
+        )
+        .unwrap();
+        for mode in [
+            xc_core::CacheValidationMode::Root,
+            xc_core::CacheValidationMode::Full,
+        ] {
+            let result =
+                crate::record_remote_cache_access(crate::RemoteCacheAccessProvenanceRequest {
+                    operation: "ccm.resolve",
+                    family: &fixture.query.family,
+                    overlays: &fixture.overlays,
+                    resolution: &report,
+                    reuse_disposition: xc_core::CacheReuseDisposition::InspectedOnly,
+                    validation_mode: mode,
+                    validation_outcome: xc_core::CacheValidationOutcome::Passed,
+                    validation_detail: None,
+                    root_materialization: None,
+                    materialization: None,
+                });
+            assert!(
+                result.is_err(),
+                "metadata alone must not be labeled as checked payload bytes"
+            );
+        }
+    }
+
+    #[test]
     fn active_semantic_revocation_excludes_candidate_with_reason_and_replacement() {
         let fixture = fixture(true);
         let report = resolve_remote_semantic_artifact(
@@ -1666,6 +1732,7 @@ mod tests {
                 validation_mode: xc_core::CacheValidationMode::Fast,
                 validation_outcome: xc_core::CacheValidationOutcome::Failed,
                 validation_detail: Some("no admissible candidate".to_owned()),
+                root_materialization: None,
                 materialization: None,
             })
             .unwrap();
@@ -1761,5 +1828,60 @@ mod tests {
             dependencies: vec![dependency],
         };
         assert!(envelope.validate().is_err());
+    }
+    #[test]
+    fn exhaustive_remote_cancellation_is_not_a_cache_miss() {
+        let mut f = fixture(false);
+        f.remote.cancel_on_read = true;
+        assert!(matches!(
+            resolve_remote_semantic_artifact(
+                &f.remote,
+                &CancellationToken::new(),
+                &f.query,
+                &f.overlays
+            ),
+            Err(CacheError::Cancelled(_))
+        ));
+    }
+    #[test]
+    fn exhaustive_dependency_compatibility_uses_the_dependency_kind() {
+        let mut f = fixture(false);
+        let artifact = resolve_remote_semantic_artifact(
+            &f.remote,
+            &CancellationToken::new(),
+            &f.query,
+            &f.overlays,
+        )
+        .unwrap()
+        .selected
+        .unwrap();
+        f.query.semantic_key.artifact_kind = "ccm_state_geometry_analysis".to_owned();
+        let cancellation = CancellationToken::new();
+        let mut context = ResolutionContext {
+            remote: &f.remote,
+            cancellation: &cancellation,
+            query: &f.query,
+            overlays: &f.overlays,
+            rejections: vec![],
+            revocations: BTreeMap::new(),
+            active_dependencies: BTreeSet::new(),
+            dependency_count: 0,
+        };
+        let resolved = resolve_identity(
+            &mut context,
+            "ccm",
+            &f.semantic_digest,
+            Some(ExpectedArtifact {
+                manifest_digest: &artifact.index.manifest_digest,
+                payload_digest: &artifact.index.canonical_payload_digest,
+            }),
+            1,
+        )
+        .unwrap();
+        assert!(
+            resolved.is_some(),
+            "parent rejected against unrelated root kind: {:?}",
+            context.rejections
+        );
     }
 }

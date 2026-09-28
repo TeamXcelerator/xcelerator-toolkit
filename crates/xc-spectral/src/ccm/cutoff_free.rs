@@ -7,13 +7,13 @@
 //! components separately for cancellation audit.
 
 use super::arb_bridge::{backend_version, complex_digamma, complex_trigamma};
-use super::prime_powers_up_to;
+use super::try_prime_powers_up_to;
 use anyhow::{bail, Context, Result};
 use rug::{Float, Rational};
 use xc_cache::{sha256_hex, ContentDigest};
 use xc_certify::exact::{
-    build_portable_interval_inertia_certificate, interval_record, interval_symmetric_ldlt_inertia,
-    IntervalInertiaResult,
+    build_portable_interval_inertia_certificate_mpfr, interval_record,
+    interval_symmetric_ldlt_inertia_mpfr, IntervalInertiaResult,
 };
 use xc_certify::PortableIntervalInertiaCertificate;
 use xc_numerics::interval::RationalInterval;
@@ -23,6 +23,9 @@ use xc_numerics::mpfr_interval::MpfrInterval;
 /// Old inertia records may remain readable as records, but are not evidence
 /// for this assembly. Sector certificates independently version their schema.
 pub const ASSEMBLY_SEMANTICS: &str = "ccm-cutoff-free-zero-endpoint-aggregate-primes-v0.15.0-v1";
+
+/// Schema-2 inertia arithmetic; independent of the unchanged assembly identity.
+pub const INERTIA_SEMANTICS: &str = "mpfr-directed-interval-ldlt-v1";
 
 /// Deterministic conservative analytic-tail budget, with no floating-point
 /// estimate of log(c). For c >= 2 and b=floor(log2(c)), the common special-value
@@ -62,11 +65,18 @@ impl CutoffFreeConfig {
         if self.integer_cutoff_c <= 1 {
             bail!("cutoff-free CCM requires integer c > 1");
         }
-        if self.precision_bits < 64 {
-            bail!("cutoff-free CCM requires at least 64 bits of precision");
+        if !(64..=1_000_000).contains(&self.precision_bits) {
+            bail!("cutoff-free CCM precision must be in 64..=1000000 bits");
         }
         if self.geometric_terms == 0 {
             bail!("cutoff-free CCM requires at least one geometric correction term");
+        }
+        if usize::try_from(self.integer_cutoff_c)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .is_none_or(|n| n > isize::MAX as usize)
+        {
+            bail!("cutoff-free CCM prime sieve bound exceeds platform capacity");
         }
         let dimension = self.modes.checked_mul(2).and_then(|n| n.checked_add(1));
         if dimension.and_then(|n| n.checked_mul(n)).is_none()
@@ -78,11 +88,26 @@ impl CutoffFreeConfig {
         Ok(())
     }
 
+    /// Checked dimension for configurations received from external callers.
+    pub fn checked_dimension(&self) -> Result<usize> {
+        self.modes
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("cutoff-free CCM dimension overflows"))
+    }
+
+    /// Return 2*N+1. Panics if an unvalidated configuration overflows usize;
+    /// use `checked_dimension` for externally supplied configurations.
     pub fn dimension(&self) -> usize {
-        2 * self.modes + 1
+        self.checked_dimension()
+            .expect("cutoff-free CCM dimension overflows")
     }
 }
 
+/// Assembly produced by [`assemble`]. Public fields remain readable for consumers.
+/// Mutating any field invalidates its private assembly binding; certificate and
+/// evidence methods reject the changed object. Arbitrary interval matrices can
+/// instead use the generic exact-inertia APIs without a CCM assembly claim.
 #[derive(Clone, Debug)]
 pub struct CutoffFreeMatrix {
     pub config: CutoffFreeConfig,
@@ -91,6 +116,7 @@ pub struct CutoffFreeMatrix {
     pub wr: Vec<RationalInterval>,
     pub wp: Vec<RationalInterval>,
     pub tau: Vec<RationalInterval>,
+    assembly_binding: ContentDigest,
 }
 
 impl CutoffFreeMatrix {
@@ -99,13 +125,78 @@ impl CutoffFreeMatrix {
     }
 
     pub fn certify_inertia(&self) -> Result<IntervalInertiaResult> {
-        interval_symmetric_ldlt_inertia(&self.tau, self.dimension()).map_err(anyhow::Error::from)
+        self.validate_assembly()?;
+        interval_symmetric_ldlt_inertia_mpfr(
+            &self.tau,
+            self.dimension(),
+            self.config.precision_bits,
+        )
+        .map_err(anyhow::Error::from)
+    }
+
+    /// Check dimensions, exact component reconstruction, symmetry, and the
+    /// immutable binding recorded by the assembler. This establishes provenance
+    /// within this process; generic portable inertia replay alone checks only
+    /// the matrix endpoints, not the special-function assembly theorem.
+    pub fn validate_assembly(&self) -> Result<()> {
+        self.validate_structure()?;
+        if self.current_assembly_binding()? != self.assembly_binding {
+            bail!("cutoff-free CCM assembly was modified after construction");
+        }
+        Ok(())
+    }
+
+    fn validate_structure(&self) -> Result<()> {
+        self.config.validate()?;
+        let dimension = self.config.checked_dimension()?;
+        let count = dimension
+            .checked_mul(dimension)
+            .ok_or_else(|| anyhow::anyhow!("cutoff-free CCM matrix size overflows"))?;
+        if self.scalar_backend.is_empty()
+            || [&self.w02, &self.wr, &self.wp, &self.tau]
+                .iter()
+                .any(|values| values.len() != count)
+        {
+            bail!("cutoff-free CCM component shape or backend is invalid");
+        }
+        for row in 0..dimension {
+            for column in row..dimension {
+                let index = row * dimension + column;
+                let transpose = column * dimension + row;
+                for values in [&self.w02, &self.wr, &self.wp, &self.tau] {
+                    if values[index] != values[transpose] {
+                        bail!("cutoff-free CCM component is not exactly symmetric");
+                    }
+                }
+                let reconstructed = self.w02[index].sub(&self.wr[index]).sub(&self.wp[index]);
+                if self.tau[index].lower() > reconstructed.lower()
+                    || self.tau[index].upper() < reconstructed.upper()
+                {
+                    bail!("cutoff-free CCM tau does not enclose its component reconstruction");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn current_assembly_binding(&self) -> Result<ContentDigest> {
+        let evidence = (
+            "ccm-cutoff-free-in-memory-assembly-binding-v1",
+            self.component_digest_unchecked()?,
+            self.tau.iter().map(interval_record).collect::<Vec<_>>(),
+        );
+        Ok(ContentDigest::sha256(&serde_json::to_vec(&evidence)?))
     }
 
     /// Digest of the exact `W02`, `WR`, and `Wp` interval records used to
     /// assemble this matrix.  Derived certificates can bind the same
     /// component evidence without first running a full inertia proof.
     pub fn component_evidence_digest(&self) -> Result<ContentDigest> {
+        self.validate_assembly()?;
+        self.component_digest_unchecked()
+    }
+
+    fn component_digest_unchecked(&self) -> Result<ContentDigest> {
         let component_evidence = (
             ASSEMBLY_SEMANTICS,
             self.config.integer_cutoff_c,
@@ -123,13 +214,15 @@ impl CutoffFreeMatrix {
     }
 
     pub fn portable_inertia_certificate(&self) -> Result<PortableIntervalInertiaCertificate> {
-        build_portable_interval_inertia_certificate(
+        self.validate_assembly()?;
+        build_portable_interval_inertia_certificate_mpfr(
             &self.tau,
             self.dimension(),
             self.config.precision_bits,
             self.scalar_backend.clone(),
-            self.component_evidence_digest()?,
+            self.component_digest_unchecked()?,
             std::collections::BTreeMap::from([
+                ("inertia_semantics".to_owned(), INERTIA_SEMANTICS.to_owned()),
                 (
                     "assembly_semantics".to_owned(),
                     ASSEMBLY_SEMANTICS.to_owned(),
@@ -306,7 +399,7 @@ pub fn assemble(config: &CutoffFreeConfig) -> Result<CutoffFreeMatrix> {
         .add(&MpfrInterval::euler_gamma(p));
 
     let prime_data: Vec<(MpfrInterval, MpfrInterval, MpfrInterval)> =
-        prime_powers_up_to(config.integer_cutoff_c)
+        try_prime_powers_up_to(config.integer_cutoff_c)?
             .into_iter()
             .map(|(power, prime, _)| {
                 let power_value = MpfrInterval::from_u64(power, p);
@@ -407,14 +500,18 @@ pub fn assemble(config: &CutoffFreeConfig) -> Result<CutoffFreeMatrix> {
         }
     }
 
-    Ok(CutoffFreeMatrix {
+    let mut matrix = CutoffFreeMatrix {
         config: config.clone(),
         scalar_backend: format!("system-flint-arb-{}", backend_version()),
         w02,
         wr,
         wp,
         tau,
-    })
+        assembly_binding: ContentDigest::sha256(b"unsealed"),
+    };
+    matrix.validate_structure()?;
+    matrix.assembly_binding = matrix.current_assembly_binding()?;
+    Ok(matrix)
 }
 
 pub fn certify(config: &CutoffFreeConfig) -> Result<(CutoffFreeMatrix, IntervalInertiaResult)> {
@@ -552,7 +649,7 @@ mod endpoint_regression {
         for n in -3_i64..=3 {
             for m in -3_i64..=3 {
                 let mut direct = zero.clone();
-                for (power, prime, _) in prime_powers_up_to(13) {
+                for (power, prime, _) in super::super::prime_powers_up_to(13) {
                     let x = MpfrInterval::from_u64(power, p).ln().unwrap();
                     let phase = |mode: i64| {
                         pi.mul(&two)

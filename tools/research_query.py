@@ -4,7 +4,7 @@ This is a derived navigation index, not numerical verification. No network acces
 """
 import argparse, hashlib, json, re, sqlite3
 from pathlib import Path
-DECIMAL = re.compile(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$')
+DECIMAL = re.compile(r'^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$')
 def parse_field_policy(text):
     rules = []
     for index, line in enumerate(text.splitlines(), 1):
@@ -52,6 +52,8 @@ def rows(path, packet):
                 yield dict(base, ordinal=ordinal, ordinal_scope=scope, observable=name, value=value, outcome=outcome, notes=notes)
 
 def build(inputs, database, maximum_bytes=64 << 20):
+    if type(maximum_bytes) is not int or maximum_bytes <= 0:
+        raise ValueError('input byte limit must be a positive integer')
     if database.exists():
         raise ValueError('Output database already exists; choose a new filename.')
     connection = sqlite3.connect(database)
@@ -65,10 +67,12 @@ def build(inputs, database, maximum_bytes=64 << 20):
     try:
         for path in paths:
             digest = None
+            connection.execute('savepoint packet')
             try:
                 if path.stat().st_size > maximum_bytes:
                     raise ValueError('input byte limit exceeded; use compact capture summaries')
-                raw = path.read_bytes()
+                with path.open('rb') as stream:
+                    raw = stream.read(maximum_bytes + 1)
                 if len(raw) > maximum_bytes:
                     raise ValueError('input grew past byte limit')
                 digest = hashlib.sha256(raw).hexdigest()
@@ -77,13 +81,24 @@ def build(inputs, database, maximum_bytes=64 << 20):
                     raise ValueError('not an object report')
                 n = 0
                 for row in rows(path, packet):
+                    for field in ('N','P','ordinal'):
+                        value = row[field]
+                        if value is not None and (type(value) is not int or not 0 <= value <= (1 << 63) - 1):
+                            raise ValueError(f'{field} must be an exact nonnegative SQLite integer')
+                    for field in ('C','kind','observable','outcome','value'):
+                        if row[field] is not None and not isinstance(row[field],str):
+                            raise ValueError(f'{field} must be text')
                     row['packet_sha256'] = digest
                     connection.execute('insert into measurements values (?,?,?,?,?,?,?,?,?)', tuple(row[k] for k in ('C','N','P','ordinal','kind','observable','outcome','value')) + (json.dumps(row, separators=(',',':')),))
                     n += 1
-                count += n
                 connection.execute('insert into inventory values (?,?,?,?)',(str(path),digest,'indexed' if n else 'unassessed',None if n else 'no recognized scalar rows'))
             except (OSError, ValueError, TypeError, AttributeError) as error:
+                connection.execute('rollback to packet')
+                connection.execute('release packet')
                 connection.execute('insert into inventory values (?,?,?,?)',(str(path),digest,'unassessed',str(error)))
+            else:
+                connection.execute('release packet')
+                count += n
         connection.execute('create index lookup on measurements (C,N,P,ordinal,observable)')
         connection.execute("update metadata set value='complete' where key='status'")
         connection.commit()

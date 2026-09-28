@@ -113,8 +113,14 @@ impl RationalInterval {
     /// The returned endpoints are exact rationals with denominator
     /// `2^fraction_bits`.  Integer square roots are taken only after outward
     /// rounding the scaled rational endpoints, so this operation does not
-    /// depend on a floating-point square-root implementation.
+    /// depend on a floating-point square-root implementation. `fraction_bits`
+    /// is limited to 0..=1000000 before exponent arithmetic or allocation.
     pub fn sqrt_nonnegative(&self, fraction_bits: u32) -> Result<Self, IntervalError> {
+        if fraction_bits > 1_000_000 {
+            return Err(IntervalError::Invalid(
+                "square-root dyadic precision must be at most 1000000 bits".to_owned(),
+            ));
+        }
         if self.lower < 0 {
             return Err(IntervalError::Invalid(
                 "square-root interval has a negative lower endpoint".to_owned(),
@@ -534,9 +540,42 @@ pub fn exact_sturm_root_count(
     })
 }
 
+fn polynomial_square_free_part(coefficients: &[Rational]) -> Result<Vec<Rational>, IntervalError> {
+    let original = trim_polynomial(coefficients.to_vec());
+    let mut first = original.clone();
+    let mut second = polynomial_derivative(&first);
+    while !(second.len() == 1 && second[0] == 0) {
+        let remainder = polynomial_remainder(&first, &second)?;
+        first = second;
+        second = remainder;
+    }
+    let divisor = normalize_polynomial_positive(first);
+    let mut remainder = original;
+    let mut quotient = vec![Rational::from(0); remainder.len() - divisor.len() + 1];
+    while !(remainder.len() == 1 && remainder[0] == 0) && remainder.len() >= divisor.len() {
+        let shift = remainder.len() - divisor.len();
+        let factor = remainder.last().unwrap().clone() / divisor.last().unwrap();
+        quotient[shift] += factor.clone();
+        for (i, c) in divisor.iter().enumerate() {
+            remainder[shift + i] -= c.clone() * &factor;
+        }
+        remainder = trim_polynomial(remainder);
+    }
+    if remainder.iter().any(|x| x != &0) {
+        return Err(IntervalError::Invalid(
+            "polynomial gcd division was not exact".into(),
+        ));
+    }
+    Ok(normalize_polynomial_positive(quotient))
+}
+
 /// Isolate every distinct real root in an open rational interval by exact
-/// Sturm subdivision. The returned intervals are ordered, disjoint, contain
-/// one distinct root each, and have width at most `target_width`.
+/// Sturm subdivision. Returned intervals are ordered with disjoint interiors,
+/// contain one distinct root each, and have width at most `target_width`.
+/// Adjacent closed intervals may share an endpoint, which is not a root.
+/// Repeated factors are removed exactly by dividing by gcd(p,p'); each
+/// distinct root is isolated once, including when repeated roots lie outside
+/// the requested interval. This API does not report multiplicities.
 pub fn exact_sturm_isolate_roots(
     coefficients_ascending: &[Rational],
     lower: Rational,
@@ -550,11 +589,13 @@ pub fn exact_sturm_isolate_roots(
         ));
     }
     let initial = exact_sturm_root_count(coefficients_ascending, lower.clone(), upper.clone())?;
-    if !initial.square_free {
-        return Err(IntervalError::Inconclusive(
-            "Sturm isolation polynomial has unresolved repeated roots".to_owned(),
-        ));
-    }
+    let square_free;
+    let coefficients_ascending = if initial.square_free {
+        coefficients_ascending
+    } else {
+        square_free = polynomial_square_free_part(coefficients_ascending)?;
+        &square_free
+    };
     let mut pending = vec![(lower, upper, initial.distinct_real_roots, 0usize)];
     let mut isolated = Vec::with_capacity(initial.distinct_real_roots);
     while let Some((left, right, count, depth)) = pending.pop() {
@@ -765,6 +806,27 @@ fn complex_midpoint(start: &ComplexRational, end: &ComplexRational) -> ComplexRa
     ComplexRational { real, imaginary }
 }
 
+/// Explicit resource limits for exact contour subdivision. Exceeding any
+/// limit returns Inconclusive; it never produces a partial zero count.
+#[derive(Clone, Copy, Debug)]
+pub struct ContourWorkBudget {
+    pub maximum_accepted_cells: usize,
+    pub maximum_segment_evaluations: usize,
+    pub maximum_depth: usize,
+}
+impl Default for ContourWorkBudget {
+    fn default() -> Self {
+        Self {
+            maximum_accepted_cells: 16384,
+            maximum_segment_evaluations: 65536,
+            maximum_depth: 4096,
+        }
+    }
+}
+pub const EXACT_ROOT_ISOLATION_SEMANTICS: &str = "exact-sturm-distinct-square-free-quotient-v2";
+pub const CONTOUR_COUNT_SEMANTICS: &str = "exact-contour-explicit-cell-evaluation-depth-budget-v2";
+
+#[allow(clippy::too_many_arguments)]
 fn enclose_polynomial_contour_segment(
     coefficients_ascending: &[ComplexRational],
     start: &ComplexRational,
@@ -773,46 +835,56 @@ fn enclose_polynomial_contour_segment(
     maximum_depth: usize,
     cells: &mut Vec<PolynomialContourCell>,
     vertices: &mut Vec<ComplexRational>,
+    budget: &ContourWorkBudget,
+    evaluations: &mut usize,
 ) -> Result<(), IntervalError> {
-    let enclosure = evaluate_complex_polynomial_ball(
-        coefficients_ascending,
-        &complex_segment_ball(start, end),
-    )?;
-    if enclosure.excludes_zero() {
-        cells.push(PolynomialContourCell {
-            domain_start: start.clone(),
-            domain_end: end.clone(),
-            image_start: evaluate_complex_polynomial_exact(coefficients_ascending, start)?,
-            image_end: evaluate_complex_polynomial_exact(coefficients_ascending, end)?,
-            image_enclosure: enclosure,
-        });
-        vertices.push(end.clone());
-        return Ok(());
+    // An explicit stack preserves left-to-right traversal without turning a
+    // caller's subdivision budget into unbounded call-stack recursion.
+    let mut pending = vec![(start.clone(), end.clone(), depth)];
+    while let Some((start, end, cell_depth)) = pending.pop() {
+        if *evaluations >= budget.maximum_segment_evaluations
+            || cells.len() >= budget.maximum_accepted_cells
+            || cell_depth > budget.maximum_depth
+        {
+            return Err(IntervalError::Inconclusive(
+                "exact contour work budget exhausted".into(),
+            ));
+        }
+        *evaluations += 1;
+        let enclosure = evaluate_complex_polynomial_ball(
+            coefficients_ascending,
+            &complex_segment_ball(&start, &end),
+        )?;
+        let image_start = evaluate_complex_polynomial_exact(coefficients_ascending, &start)?;
+        let image_end = evaluate_complex_polynomial_exact(coefficients_ascending, &end)?;
+        if (image_start.real == 0 && image_start.imaginary == 0)
+            || (image_end.real == 0 && image_end.imaginary == 0)
+        {
+            return Err(IntervalError::Inconclusive(
+                "polynomial has a zero on a contour subdivision vertex".to_owned(),
+            ));
+        }
+        if enclosure.excludes_zero() {
+            cells.push(PolynomialContourCell {
+                domain_start: start,
+                domain_end: end.clone(),
+                image_start,
+                image_end,
+                image_enclosure: enclosure,
+            });
+            vertices.push(end);
+            continue;
+        }
+        if cell_depth >= maximum_depth {
+            return Err(IntervalError::Inconclusive(
+                "contour image could not exclude zero within subdivision budget".to_owned(),
+            ));
+        }
+        let midpoint = complex_midpoint(&start, &end);
+        pending.push((midpoint.clone(), end, cell_depth + 1));
+        pending.push((start, midpoint, cell_depth + 1));
     }
-    if depth >= maximum_depth {
-        return Err(IntervalError::Inconclusive(format!(
-            "polynomial contour image still contains zero after {maximum_depth} subdivisions"
-        )));
-    }
-    let midpoint = complex_midpoint(start, end);
-    enclose_polynomial_contour_segment(
-        coefficients_ascending,
-        start,
-        &midpoint,
-        depth + 1,
-        maximum_depth,
-        cells,
-        vertices,
-    )?;
-    enclose_polynomial_contour_segment(
-        coefficients_ascending,
-        &midpoint,
-        end,
-        depth + 1,
-        maximum_depth,
-        cells,
-        vertices,
-    )
+    Ok(())
 }
 
 fn exact_polygon_winding_about_zero(vertices: &[ComplexRational]) -> Result<i64, IntervalError> {
@@ -856,6 +928,30 @@ pub fn certify_polynomial_zero_count_on_rectangle(
     rectangle: RationalContourRectangle,
     maximum_subdivision_depth: usize,
 ) -> Result<PolynomialContourCount, IntervalError> {
+    certify_polynomial_zero_count_on_rectangle_with_budget(
+        coefficients_ascending,
+        rectangle,
+        maximum_subdivision_depth,
+        &ContourWorkBudget::default(),
+    )
+}
+/// Same proof as the convenience entry point with explicit resource admission.
+pub fn certify_polynomial_zero_count_on_rectangle_with_budget(
+    coefficients_ascending: &[ComplexRational],
+    rectangle: RationalContourRectangle,
+    maximum_subdivision_depth: usize,
+    budget: &ContourWorkBudget,
+) -> Result<PolynomialContourCount, IntervalError> {
+    if maximum_subdivision_depth > budget.maximum_depth
+        || budget.maximum_depth > 1_000_000
+        || budget.maximum_accepted_cells == 0
+        || budget.maximum_segment_evaluations == 0
+    {
+        return Err(IntervalError::Inconclusive(
+            "contour request exceeds explicit resource limits".into(),
+        ));
+    }
+    let mut segment_evaluations = 0usize;
     if coefficients_ascending.is_empty()
         || coefficients_ascending
             .iter()
@@ -866,6 +962,13 @@ pub fn certify_polynomial_zero_count_on_rectangle(
             "contour count requires a nonzero polynomial and positive subdivision depth".to_owned(),
         ));
     }
+    // Public fields can bypass the constructor; revalidate at certification.
+    let rectangle = RationalContourRectangle::new(
+        rectangle.real_lower,
+        rectangle.real_upper,
+        rectangle.imaginary_lower,
+        rectangle.imaginary_upper,
+    )?;
     let contour = rectangle.counterclockwise_vertices();
     let mut cells = Vec::new();
     let mut argument_vertices = vec![evaluate_complex_polynomial_exact(
@@ -882,6 +985,8 @@ pub fn certify_polynomial_zero_count_on_rectangle(
             maximum_subdivision_depth,
             &mut cells,
             &mut domain_vertices,
+            budget,
+            &mut segment_evaluations,
         )?;
         for vertex in domain_vertices {
             argument_vertices.push(evaluate_complex_polynomial_exact(

@@ -454,7 +454,7 @@ impl GitReadTransportRequest {
                 "read-only Git transport temporary_root is required",
             ));
         }
-        Ok(GitCliRemoteStore::new(
+        Ok(GitCliRemoteStore::new_read_session(
             &self.temporary_root,
             self.temporary_root.join("read-only-staging"),
             "Xcelerator read-only resolver",
@@ -849,6 +849,7 @@ fn find_artifact(request: &CacheFindRequest) -> Result<(), CliError> {
             CacheValidationOutcome::Failed
         },
         validation_detail: None,
+        root_materialization: None,
         materialization: None,
     })?;
     write_success(
@@ -888,6 +889,7 @@ fn inspect_artifact(request: &CacheFindRequest) -> Result<(), CliError> {
             CacheValidationOutcome::Failed
         },
         validation_detail: None,
+        root_materialization: None,
         materialization: None,
     })?;
     write_success(
@@ -1011,6 +1013,7 @@ fn validate_artifact(request: &CacheValidateRequest) -> Result<(), CliError> {
             CacheValidationOutcome::Failed
         },
         validation_detail: None,
+        root_materialization: None,
         materialization: materialization.as_ref(),
     })?;
     write_success(
@@ -1493,15 +1496,18 @@ fn fetch_artifact(request: &CacheFetchRequest) -> Result<(), CliError> {
         } else {
             CacheReuseDisposition::InspectedOnly
         },
-        validation_mode: ProvenanceValidationMode::Full,
+        validation_mode: ProvenanceValidationMode::Root,
         validation_outcome: if materialization.is_some() {
             CacheValidationOutcome::Passed
         } else {
             CacheValidationOutcome::Failed
         },
-        validation_detail: Some(
-            "root artifact transport and canonical payload validation".to_owned(),
-        ),
+        validation_detail: Some(if materialization.is_some() {
+            "root artifact transport and canonical payload validated; dependency payload closure not validated".to_owned()
+        } else {
+            "no admissible artifact resolved; payload verification was not performed".to_owned()
+        }),
+        root_materialization: materialization.as_ref(),
         materialization: None,
     })?;
     write_success(
@@ -2378,6 +2384,48 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn read_transport_cleans_only_its_owned_session() {
+        let root = std::env::temp_dir().join(format!(
+            "xc-cli-reader-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("keep.txt"), b"caller-owned artifact").unwrap();
+        let request = GitReadTransportRequest {
+            temporary_root: root.clone(),
+            resources: ResourcePolicy::default(),
+        };
+        let first = request.open().unwrap();
+        let second = request.open().unwrap();
+        let sessions = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_dir() && path.file_name().unwrap() != "read-only-staging")
+            .collect::<Vec<_>>();
+        assert_eq!(sessions.len(), 2);
+        for session in &sessions {
+            fs::write(session.join("owned-pack"), b"disposable transport fixture").unwrap();
+        }
+        first.finish_read_session().unwrap();
+        assert_eq!(sessions.iter().filter(|path| path.exists()).count(), 1);
+        assert_eq!(
+            fs::read(root.join("keep.txt")).unwrap(),
+            b"caller-owned artifact"
+        );
+        drop(second);
+        assert!(sessions.iter().all(|path| !path.exists()));
+        assert_eq!(
+            fs::read(root.join("keep.txt")).unwrap(),
+            b"caller-owned artifact"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

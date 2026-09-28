@@ -3,10 +3,23 @@
 import argparse,hashlib,json,os,re,subprocess,time
 from pathlib import Path
 
+if not __debug__:
+    raise RuntimeError("benchmark_band_recovery.py requires Python without -O so acceptance checks execute")
+
+def local_environment():
+    """Keep synthetic acceptance runs independent of ambient research/cache settings."""
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(("XC_RESEARCH_", "XC_CACHE_", "XC_PUBLISH_"))}
+    env.update(XC_CACHE_REMOTE="none", XC_PUBLISH_TARGET="none", XC_PUBLISH_EXECUTE="false")
+    return env
+
+
 def main():
  p=argparse.ArgumentParser(description=__doc__);p.add_argument('binary',type=Path);p.add_argument('--output',type=Path,required=True);p.add_argument('--atoms',type=int,default=4096);p.add_argument('--degree',type=int,default=24);a=p.parse_args()
- binary=a.binary.resolve();root=a.output.resolve();root.mkdir(parents=True,exist_ok=False)
+ binary=a.binary.resolve();root=a.output.resolve()
  if not 6<=a.degree<a.atoms:raise ValueError('require 6 <= degree < atoms')
+ if not binary.is_file():raise ValueError('backfill binary must be an existing file')
+ root.mkdir(parents=True,exist_ok=False)
  def enc(x):return json.dumps(x,separators=(',',':')).encode()
  def sha(x):return hashlib.sha256(x).hexdigest()
  payload=enc(dict(schema_version=3,lambda_squared='9',n_modes=1,precision_bits=192,force_even=True,eigenvalue='3',eigenvector=['0','1','0']))
@@ -22,7 +35,7 @@ def main():
  def plan(name):
   path=root/(name+'.json');path.write_bytes(enc(dict(schema_version=1,approved_payload_digests=[digest],cache_root='cache-budget' if name in ['limited','raised'] else 'cache-'+name,jobs=[dict(id='band',task=task)])));return path
  def run(name,workers,checkpoint,stop=False,budget=None):
-  env=dict(os.environ,XC_RESEARCH_CHECKPOINT_DIR=str(root/checkpoint),XC_RESEARCH_SUMMARY_DIR=str(root/('summaries-'+name)),RAYON_NUM_THREADS=str(workers))
+  env=dict(local_environment(),XC_RESEARCH_CHECKPOINT_DIR=str(root/checkpoint),XC_RESEARCH_SUMMARY_DIR=str(root/('summaries-'+name)),RAYON_NUM_THREADS=str(workers))
   if budget is not None:env['XC_RESEARCH_BASIS_BYTES']=str(budget)
   start=time.perf_counter();proc=subprocess.Popen([str(binary),str(plan(name)),str(root/('out-'+name))],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,env=env)
   killed=False

@@ -111,12 +111,7 @@ impl CcmCapturePlan {
         let ultra = level == CcmCaptureLevel::Ultra;
         Ok(Self {
             schema_version: 1,
-            semantics: if ultra {
-                CAPTURE_PLAN_SEMANTICS
-            } else {
-                LEGACY_CAPTURE_PLAN_SEMANTICS
-            }
-            .into(),
+            semantics: CAPTURE_PLAN_SEMANTICS.into(),
             level,
             source_even_dimension,
             sector_eigenpairs: match level {
@@ -151,8 +146,9 @@ impl CcmCapturePlan {
     /// Request a projection using explicitly supplied finite reference inputs.
     /// The caller must also configure RetainedCcmRun::set_research_inputs.
     pub fn with_reference_projection(mut self) -> Result<Self> {
-        if !self.capture_retained_research {
-            bail!("reference projection requires a current Ultra plan");
+        self.validate()?;
+        if self.semantics != CAPTURE_PLAN_SEMANTICS {
+            bail!("reference projection builder requires a current capture plan; historical recipes are immutable");
         }
         self.capture_reference_projection = true;
         self.validate()?;
@@ -213,7 +209,9 @@ impl CcmCapturePlan {
             ]
             .contains(&self.semantics.as_str())
             || (self.semantics == LEGACY_CAPTURE_PLAN_SEMANTICS && self.capture_state_geometry)
-            || (self.capture_reference_projection && !self.capture_retained_research)
+            || (self.capture_reference_projection
+                && self.semantics != CAPTURE_PLAN_SEMANTICS
+                && !self.capture_retained_research)
             || (![
                 CAPTURE_PLAN_SEMANTICS,
                 RUN_ONCE_CAPTURE_PLAN_SEMANTICS,

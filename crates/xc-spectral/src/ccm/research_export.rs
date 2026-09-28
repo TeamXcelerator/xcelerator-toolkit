@@ -137,7 +137,13 @@ mod tests {
             assert!(matches!(kind, "prefix" | "indexed") && !prefix.is_empty());
             assert!(!policy.scalar_field(&format!("{prefix}{}", "9".repeat(100))));
         }
-        for name in ["tail_", "tail_+1", "tail_١", "tail_energy_lift"] {
+        for name in [
+            "tail_",
+            "tail_+1",
+            "tail_١",
+            "tail_energy_lift",
+            "lattice_gram_pivot_ratio",
+        ] {
             assert!(policy.scalar_field(name), "{name}");
         }
     }

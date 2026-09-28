@@ -144,6 +144,12 @@ where
 }
 
 /// Execute HP work under one explicit, validated scheduling policy.
+///
+/// `FullParallel` propagates a callback panic; `SafeCapped` joins a scoped
+/// worker and converts its panic into `HpRuntimeError` (without retaining the
+/// payload). Both restore the previous policy during unwinding. Active policy
+/// is thread-local and does not propagate to threads created by the callback;
+/// resolve scheduling plans before dispatch and pass them explicitly to workers.
 pub fn run_hp_with_policy<F, R>(policy: &HpRuntimePolicy, f: F) -> Result<R, HpRuntimeError>
 where
     F: FnOnce() -> R + Send,
@@ -210,8 +216,8 @@ fn gl_root_parallel_platform_supported() -> bool {
     }
 }
 
-/// Bind the exact runtime policy into provenance before any HP work begins,
-/// then execute under that same policy.
+/// Execute under the exact runtime policy and commit that policy to provenance
+/// only after platform admission succeeds. Refusal leaves provenance unchanged.
 pub fn run_hp_with_provenance<F, R>(
     policy: &HpRuntimePolicy,
     full_parallel_threads: usize,
@@ -222,12 +228,15 @@ where
     F: FnOnce() -> R + Send,
     R: Send,
 {
-    provenance
+    let mut admitted = provenance.clone();
+    admitted
         .record_hp_runtime_policy(policy.clone(), full_parallel_threads)
         .map_err(|error| HpRuntimeError {
             message: error.to_string(),
         })?;
-    run_hp_with_policy(policy, f)
+    let value = run_hp_with_policy(policy, f)?;
+    *provenance = admitted;
+    Ok(value)
 }
 
 fn with_active_policy<F, R>(policy: &HpRuntimePolicy, f: F) -> R

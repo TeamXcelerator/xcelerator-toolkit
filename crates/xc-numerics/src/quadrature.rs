@@ -13,15 +13,24 @@
 //! Remote local/private/public resolution belongs exclusively to the managed
 //! cache fabric exposed by `gauss_legendre_nodes_via_cache`.
 //!
-//! `CacheMode` selects how far down this list a lookup goes:
+//! `CacheMode` selects local cache behavior:
 //! - `Off`          — no cache read or write; always compute.
-//! - `JsonOnly`     — step (1) only.
+//! - `JsonOnly`     — deprecated compatibility name; computes without reads or writes.
 //! - `JsonZip`      — local compressed cache (**default**).
 //!
 //! `gauss_legendre_nodes(n, prec, mode)` takes the `CacheMode`
 //! explicitly; pass `CacheMode::default()` for standard local behavior.
 //!
-//! New computes write only the compressed representation.
+//! New computes write only the compressed representation. Every reused HP rule
+//! passes the full O(n^2) Legendre/node/weight check. Legacy standalone files
+//! establish numerical compatibility, not bit-for-bit producer authenticity:
+//! accepted values may differ from a fresh rule within the explicit validation
+//! tolerances. Managed identities bind generation semantics, but are not by
+//! themselves proof that an untrusted producer executed that algorithm.
+//! HP rule accuracy is absolute at the working scale, not uniformly relative
+//! in small endpoint weights. Their relative sensitivity grows with order; an
+//! odd central node need not be exactly zero. Orders unresolved at the selected
+//! precision fail validation rather than imply a certified rule.
 
 /// Machine-readable quadrature artifact decomposition. Nodes and weights are
 /// independent of downstream integrands and can be reused wherever order,
@@ -61,6 +70,12 @@ pub fn gauss_legendre_64pt_f64<F: Fn(f64) -> f64>(f: F, a: f64, b: f64) -> f64 {
     gauss_legendre_npt_f64(f, a, b, 64)
 }
 
+#[path = "binary64_triple_sum.rs"]
+mod binary64_triple_sum;
+/// Accumulate the exact products of stored binary64 weights, samples and
+/// half-width, then round their sum once to nearest-even binary64.
+pub const GAUSS_LEGENDRE_ACCUMULATION_SEMANTICS: &str = "gauss-legendre-exact-stored-triple-sum-v2";
+
 /// Approximates an integral with an `n`-point Gauss--Legendre rule.
 ///
 /// # Mathematical semantics
@@ -69,13 +84,14 @@ pub fn gauss_legendre_64pt_f64<F: Fn(f64) -> f64>(f: F, a: f64, b: f64) -> f64 {
 /// arithmetic; it does not prove an error bound for a general integrand.
 ///
 /// # Precision
-/// Nodes, weights, function values, and accumulation all use binary64. Choose
+/// Nodes, weights, and function values use binary64. Products and accumulation
+/// are exact for those stored values, with one final nearest-even rounding. Choose
 /// an HP quadrature route when binary64 rounding is not an explicit policy.
 ///
 /// # Failure states
-/// This convenience function has no typed error channel. Non-finite bounds or
-/// integrand values propagate through binary64 arithmetic, and callers must
-/// validate them when such values are inadmissible.
+/// This convenience function returns NaN for invalid order, nonfinite bounds
+/// or samples, and unrepresentable arithmetic. Use
+/// [`try_gauss_legendre_npt_f64`] for an explicit error. Positive order is required.
 ///
 /// # Assurance and validity
 /// The result is exploratory unless independently cross-checked or enclosed by
@@ -87,24 +103,79 @@ pub fn gauss_legendre_64pt_f64<F: Fn(f64) -> f64>(f: F, a: f64, b: f64) -> f64 {
 /// # Example
 /// Compiled example: `crates/xc-numerics/examples/quadrature.rs`.
 pub fn gauss_legendre_npt_f64<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, n: usize) -> f64 {
-    let (nodes, weights) = gl_nodes_weights_f64(n);
-    let mid = 0.5 * (a + b);
-    let half = 0.5 * (b - a);
-    let mut sum = 0.0_f64;
-    for i in 0..n {
-        let x = mid + half * nodes[i];
-        sum += weights[i] * f(x);
+    try_gauss_legendre_npt_f64(f, a, b, n).unwrap_or(f64::NAN)
+}
+
+/// Checked computed quadrature. Reversed finite bounds give an oriented
+/// integral; equal finite bounds return zero. Invalid order, nonfinite samples,
+/// or unrepresentable intermediate arithmetic are explicit errors. This does
+/// not bound discretization error or callback error.
+pub fn try_gauss_legendre_npt_f64<F: Fn(f64) -> f64>(
+    f: F,
+    a: f64,
+    b: f64,
+    n: usize,
+) -> anyhow::Result<f64> {
+    anyhow::ensure!(
+        a.is_finite() && b.is_finite(),
+        "quadrature bounds must be finite"
+    );
+    let (nodes, weights) = try_gl_nodes_weights_f64(n)?;
+    if a == b {
+        return Ok(0.0);
     }
-    sum * half
+    // Keep ordinary arithmetic unchanged. Half-sums/differences handle cases
+    // where only the unscaled sum/difference exceeds binary64's range.
+    let sum = a + b;
+    let difference = b - a;
+    let mid = if sum.is_finite() {
+        0.5 * sum
+    } else {
+        0.5 * a + 0.5 * b
+    };
+    let half = if difference.is_finite() {
+        0.5 * difference
+    } else {
+        0.5 * b - 0.5 * a
+    };
+    anyhow::ensure!(half != 0.0, "quadrature half-width is unrepresentable");
+    let mut sum = binary64_triple_sum::TripleSum::new();
+    for (node, weight) in nodes.into_iter().zip(weights) {
+        let x = mid + half * node;
+        anyhow::ensure!(
+            x.is_finite() && x >= a.min(b) && x <= a.max(b),
+            "quadrature node is unrepresentable or outside the interval"
+        );
+        let sample = f(x);
+        anyhow::ensure!(sample.is_finite(), "quadrature sample must be finite");
+        sum.add([weight, sample, half])?;
+    }
+    sum.finish()
 }
 
 /// Compute n-point Gauss-Legendre nodes and weights on `[-1, 1]` at f64.
+/// Accuracy is absolute at the working scale; small endpoint weights lose
+/// relative accuracy as order grows. This computed rule is not a certified
+/// uniform relative-error enclosure.
 ///
 /// The nodes are in descending order, with weights in the same order. Callers that need to set up
 /// a variable-integrand integral (e.g. a complex-valued integrand with
 /// multiple accumulator sums) can call this directly rather than using
 /// [`gauss_legendre_npt_f64`], which takes a single closure.
+/// Panics for invalid order or a nonrepresentable rule; use
+/// [`try_gl_nodes_weights_f64`] for an explicit error.
 pub fn gl_nodes_weights_f64(n: usize) -> (Vec<f64>, Vec<f64>) {
+    try_gl_nodes_weights_f64(n).expect("valid representable Gauss-Legendre rule required")
+}
+
+/// Checked native node/weight construction for positive order. Newton roots
+/// remain computed approximations, not certified root enclosures.
+pub fn try_gl_nodes_weights_f64(n: usize) -> anyhow::Result<(Vec<f64>, Vec<f64>)> {
+    let denominator = n.checked_mul(4).and_then(|value| value.checked_add(2));
+    anyhow::ensure!(
+        n > 0 && denominator.is_some_and(|value| (value as u64) <= (1_u64 << 53)),
+        "quadrature order must be positive with exactly representable recurrence indices"
+    );
     let mut nodes = vec![0.0_f64; n];
     let mut weights = vec![0.0_f64; n];
     for k in 0..n {
@@ -117,7 +188,13 @@ pub fn gl_nodes_weights_f64(n: usize) -> (Vec<f64>, Vec<f64>) {
         nodes[k] = x;
         weights[k] = 2.0 / ((1.0 - x * x) * pn_prime * pn_prime);
     }
-    (nodes, weights)
+    anyhow::ensure!(
+        nodes.iter().all(|x| x.is_finite() && x.abs() < 1.0)
+            && weights.iter().all(|w| w.is_finite() && *w > 0.0)
+            && nodes.windows(2).all(|pair| pair[0] > pair[1]),
+        "Gauss-Legendre iteration produced an invalid rule"
+    );
+    Ok((nodes, weights))
 }
 
 fn legendre_p_deriv_f64(n: usize, x: f64) -> (f64, f64) {
@@ -172,7 +249,9 @@ mod hp {
         pub nodes: Vec<Float>,
         pub weights: Vec<Float>,
         pub cache_access: CacheAccessProvenance,
-        pub artifact_manifest: xc_cache::ArtifactManifest,
+        /// Present only when this rule was reused or written to the cache.
+        /// Disabled and nonwriting cache misses return no persisted identity.
+        pub artifact_manifest: Option<xc_cache::ArtifactManifest>,
     }
 
     fn portable_table(n: usize, prec: u32, table: GlTable) -> PortableGlTable {
@@ -185,11 +264,35 @@ mod hp {
         }
     }
 
+    fn validate_gl_domain(n: usize, prec: u32) -> Result<(), CacheError> {
+        if n == 0
+            || !(16..=1_000_000).contains(&prec)
+            || n.checked_mul(4)
+                .and_then(|n| n.checked_add(2))
+                .and_then(|n| i64::try_from(n).ok())
+                .is_none()
+        {
+            return Err(CacheError::InvalidManifest(
+                "GL requires positive representable order and precision 16..=1000000".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn full_cache_check(nodes: &[Float], weights: &[Float], prec: u32) -> Option<String> {
+        match check_gauss_legendre_rule_hp(nodes, weights, prec, nodes.len()) {
+            Ok(check) if check.checks_passed => None,
+            Ok(_) => Some("Gauss-Legendre root or derivative-weight identity mismatch".into()),
+            Err(error) => Some(error.to_string()),
+        }
+    }
+
     fn decode_portable_table(
         table: &PortableGlTable,
         n: usize,
         prec: u32,
     ) -> Result<GlTable, CacheError> {
+        validate_gl_domain(n, prec)?;
         if table.schema_version != 1
             || table.order != n
             || table.precision_bits != prec
@@ -220,7 +323,7 @@ mod hp {
             .iter()
             .map(|value| parse(value))
             .collect::<Result<_, _>>()?;
-        if let Some(reason) = cache_structural_check(&nodes, &weights, prec) {
+        if let Some(reason) = full_cache_check(&nodes, &weights, prec) {
             return Err(CacheError::InvalidManifest(format!(
                 "quadrature payload failed structural validation: {reason}"
             )));
@@ -245,8 +348,9 @@ mod hp {
     /// never silently falls through to a fresh computation.
     ///
     /// # Assurance and validity
-    /// Reused and fresh rules must pass weight-sum, first-moment, and mirror-identity
-    /// checks at the requested precision before they are returned.
+    /// Reused and fresh rules must pass structural moments and every Legendre
+    /// root/derivative-weight identity before return. Validation costs O(n^2)
+    /// point arithmetic and does not establish an interval certificate.
     ///
     /// # Cache effects
     /// Behavior is entirely controlled by `cache`. `PreferReuse` may write only when
@@ -298,12 +402,7 @@ mod hp {
                 gl_performance_metadata_scheduled(n, precision_bits, root_schedule)
             })
         };
-        if n == 0 || precision_bits < 16 {
-            return Err(CacheError::InvalidManifest(
-                "quadrature order must be positive and precision must be at least 16 bits"
-                    .to_owned(),
-            ));
-        }
+        validate_gl_domain(n, precision_bits)?;
         let semantic_key = SemanticKeyEnvelope {
             schema_version: 1,
             artifact_kind: "gauss_legendre_rule".to_owned(),
@@ -350,7 +449,7 @@ mod hp {
                     xc_core::performance_stage_with("quadrature.gl.construct", || {
                         gl_performance_metadata_scheduled(n, precision_bits, root_schedule)
                     });
-                let table = gauss_legendre_compute_scheduled(n, precision_bits, root_schedule);
+                let table = gauss_legendre_compute_scheduled(n, precision_bits, root_schedule)?;
                 drop(performance_construct);
                 let performance_encode =
                     xc_core::performance_stage_with("quadrature.gl.portable_encode", || {
@@ -379,14 +478,7 @@ mod hp {
             });
         let (nodes, weights) = decode_portable_table(&resolved.value, n, precision_bits)?;
         drop(performance_decode);
-        let artifact_manifest = resolved
-            .produced_manifest
-            .or(resolved.reused_manifest)
-            .ok_or_else(|| {
-                CacheError::InvalidManifest(
-                    "enabled quadrature cache execution returned no artifact manifest".to_owned(),
-                )
-            })?;
+        let artifact_manifest = resolved.produced_manifest.or(resolved.reused_manifest);
         Ok(CachedQuadratureRule {
             nodes,
             weights,
@@ -460,7 +552,8 @@ mod hp {
         Float::with_val(prec, 2).pow(-((prec as i32) - 8))
     }
 
-    /// Verify the three classical structural identities of a Gauss-
+    /// Screen finite interior ordered nodes, positive weights, symmetry, and
+    /// even moments through degree six, including the classical Gauss-
     /// Legendre node/weight pair on `[-1, 1]`:
     ///
     ///   1. Σ w_i = 2 (length of [-1, 1])
@@ -468,7 +561,7 @@ mod hp {
     ///   3. Antisymmetry: nodes[i] + nodes[n-1-i] = 0,
     ///      weights[i] - weights[n-1-i] = 0
     ///
-    /// Returns `None` if all three identities hold within
+    /// Returns `None` if every structural identity holds within
     /// `cache_structural_tol(prec)`. Returns `Some(reason)` describing
     /// the first identity that fails, with both magnitudes in the
     /// reason string for diagnostic purposes.
@@ -594,7 +687,54 @@ mod hp {
     /// module docs for the lookup order. Pass `CacheMode::default()`
     /// for the standard local behavior. Use `gauss_legendre_nodes_via_cache`
     /// when managed local/private/public resolution is required.
+    /// # Panics
+    /// Panics on invalid order/precision or failed generation/validation.
+    /// Use the fallible managed API when errors must be returned.
+    /// Nodes are strictly ascending, with corresponding positive weights.
     pub fn gauss_legendre_nodes(n: usize, prec: u32, mode: CacheMode) -> (Vec<Float>, Vec<Float>) {
+        gauss_legendre_nodes_impl(
+            n,
+            prec,
+            mode,
+            crate::hp_runtime::GlRootSchedule::serial(),
+            true,
+        )
+        .expect("valid finite HP Gauss-Legendre rule required")
+    }
+
+    /// Schedule-aware compatibility-cache entry point used by the CCM batch
+    /// planner. The scheduling decision has already been made by the owner.
+    #[doc(hidden)]
+    /// # Panics
+    /// Panics on invalid order/precision or failed generation/validation.
+    pub fn gauss_legendre_nodes_scheduled(
+        n: usize,
+        prec: u32,
+        mode: CacheMode,
+        root_schedule: crate::hp_runtime::GlRootSchedule,
+    ) -> (Vec<Float>, Vec<Float>) {
+        gauss_legendre_nodes_impl(n, prec, mode, root_schedule, false)
+            .expect("valid finite HP Gauss-Legendre rule required")
+    }
+
+    /// Checked scheduled resolver. Numerical failures propagate to the owning batch.
+    #[doc(hidden)]
+    pub fn try_gauss_legendre_nodes_scheduled(
+        n: usize,
+        prec: u32,
+        mode: CacheMode,
+        root_schedule: crate::hp_runtime::GlRootSchedule,
+    ) -> Result<GlTable, CacheError> {
+        gauss_legendre_nodes_impl(n, prec, mode, root_schedule, false)
+    }
+
+    /// Checked compatibility-cache resolver; root/weight identities are checked
+    /// on both fresh and reused rules. These are point checks, not certificates.
+    pub fn try_gauss_legendre_nodes(
+        n: usize,
+        prec: u32,
+        mode: CacheMode,
+    ) -> Result<GlTable, CacheError> {
         gauss_legendre_nodes_impl(
             n,
             prec,
@@ -604,25 +744,14 @@ mod hp {
         )
     }
 
-    /// Schedule-aware compatibility-cache entry point used by the CCM batch
-    /// planner. The scheduling decision has already been made by the owner.
-    #[doc(hidden)]
-    pub fn gauss_legendre_nodes_scheduled(
-        n: usize,
-        prec: u32,
-        mode: CacheMode,
-        root_schedule: crate::hp_runtime::GlRootSchedule,
-    ) -> (Vec<Float>, Vec<Float>) {
-        gauss_legendre_nodes_impl(n, prec, mode, root_schedule, false)
-    }
-
     fn gauss_legendre_nodes_impl(
         n: usize,
         prec: u32,
         mode: CacheMode,
         root_schedule: crate::hp_runtime::GlRootSchedule,
         top_level: bool,
-    ) -> (Vec<Float>, Vec<Float>) {
+    ) -> Result<GlTable, CacheError> {
+        validate_gl_domain(n, prec)?;
         let mut performance_resolve = if top_level {
             xc_core::performance_top_level_stage_with("quadrature.gl.resolve_compatibility", || {
                 gl_performance_metadata_scheduled(n, prec, root_schedule)
@@ -635,7 +764,7 @@ mod hp {
         if mode != CacheMode::Off {
             if let Some(cached) = load_gl_cache(n, prec, mode) {
                 performance_resolve.set_cache_disposition("reused");
-                return cached;
+                return Ok(cached);
             }
         }
         performance_resolve.set_cache_disposition("computed");
@@ -643,7 +772,7 @@ mod hp {
             xc_core::performance_stage_with("quadrature.gl.construct", || {
                 gl_performance_metadata_scheduled(n, prec, root_schedule)
             });
-        let result = gauss_legendre_compute_scheduled(n, prec, root_schedule);
+        let result = gauss_legendre_compute_scheduled(n, prec, root_schedule)?;
         drop(performance_construct);
         if mode != CacheMode::Off {
             let performance_store =
@@ -653,7 +782,7 @@ mod hp {
             save_gl_cache(n, prec, &result.0, &result.1, mode);
             drop(performance_store);
         }
-        result
+        Ok(result)
     }
 
     fn gl_performance_metadata(n: usize, precision_bits: u32) -> xc_core::PerformanceStageMetadata {
@@ -734,7 +863,19 @@ mod hp {
     /// Parse the GL cache JSON into HP node and weight vectors.
     /// Expects schema_version 1 envelope format. Returns `None` on any
     /// structural mismatch or a stale `toolkit_version`.
-    fn parse_gl_json(data: &str, n: usize, prec: u32) -> Option<(Vec<Float>, Vec<Float>)> {
+    #[cfg(test)]
+    fn parse_gl_json(data: &str, n: usize, prec: u32) -> Option<GlTable> {
+        let table = parse_gl_envelope_unchecked(data, n, prec)?;
+        if full_cache_check(&table.0, &table.1, prec).is_some() {
+            return None;
+        }
+        Some(table)
+    }
+
+    // Untrusted decoded values for the verifier's error classification. A
+    // production result must pass full_cache_check before it can be returned.
+    fn parse_gl_envelope_unchecked(data: &str, n: usize, prec: u32) -> Option<GlTable> {
+        validate_gl_domain(n, prec).ok()?;
         let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
         let obj = parsed.as_object()?;
         if obj.get("schema_version")?.as_u64()? != 1
@@ -824,16 +965,9 @@ mod hp {
             return None;
         }
         match load_from_zip(&zip_path, n, prec) {
-            Some((parsed, _json_string)) => {
-                if let Some(reason) = cache_structural_check(&parsed.0, &parsed.1, prec) {
-                    warn_cache_skip(&zip_path, &reason);
-                    None
-                } else {
-                    Some(parsed)
-                }
-            }
-            None => {
-                warn_cache_skip(&zip_path, "zip open / decompress / shape parse failed");
+            Ok((table, _)) => Some(table),
+            Err(error) => {
+                warn_cache_skip(&zip_path, &error.reason());
                 None
             }
         }
@@ -850,26 +984,94 @@ mod hp {
         parse_gl_json(data, n, prec)
     }
 
-    /// Read a zip cache file. Expects the archive to contain exactly one
-    /// entry whose name matches the uncompressed JSON filename
-    /// (`prec{prec}_npts{n}.json`).
-    ///
-    /// Returns the parsed `(nodes, weights)` plus the raw JSON string,
-    /// so the caller can write the decompressed copy to disk without
-    /// re-serializing.
-    fn load_from_zip(zip_path: &std::path::Path, n: usize, prec: u32) -> Option<(GlTable, String)> {
+    #[derive(Debug)]
+    enum GlCacheReadError {
+        Load(String),
+        Stale { found: String, minimum: String },
+        Numerical(String),
+    }
+    impl GlCacheReadError {
+        fn reason(&self) -> String {
+            match self {
+                Self::Load(reason) => reason.clone(),
+                Self::Stale { found, minimum } => {
+                    format!("stale toolkit version {found}; minimum {minimum}")
+                }
+                Self::Numerical(reason) => format!("numerical rule validation failed: {reason}"),
+            }
+        }
+    }
+    // Runtime and verifier use exactly the same container, version, envelope,
+    // and full numerical acceptance path.
+    fn load_from_zip(
+        zip_path: &std::path::Path,
+        n: usize,
+        prec: u32,
+    ) -> Result<(GlTable, String), GlCacheReadError> {
+        let data = read_gl_zip_payload(zip_path, n, prec).ok_or_else(|| {
+            GlCacheReadError::Load(
+                "ZIP container, entry identity, decoding, or decoded-size check failed".to_owned(),
+            )
+        })?;
+        let value: serde_json::Value = serde_json::from_str(&data)
+            .map_err(|e| GlCacheReadError::Load(format!("JSON parse failed: {e}")))?;
+        let version = value
+            .get("toolkit_version")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                GlCacheReadError::Load("toolkit_version is absent or not a string".to_owned())
+            })?;
+        let minimum = effective_min_version();
+        if version_is_older(version, &minimum) {
+            return Err(GlCacheReadError::Stale {
+                found: version.to_owned(),
+                minimum,
+            });
+        }
+        let table = parse_gl_envelope_unchecked(&data, n, prec).ok_or_else(|| {
+            GlCacheReadError::Load(
+                "GL envelope identity, shape, domain, or decimal parse failed".to_owned(),
+            )
+        })?;
+        if let Some(reason) = full_cache_check(&table.0, &table.1, prec) {
+            return Err(GlCacheReadError::Numerical(reason));
+        }
+        Ok((table, data))
+    }
+
+    fn read_gl_zip_payload(zip_path: &std::path::Path, n: usize, prec: u32) -> Option<String> {
         use std::io::Read;
+        let maximum_bytes = (n as u64)
+            .checked_mul(2)?
+            .checked_mul(u64::from(prec).checked_add(128)?)?
+            .checked_add(4096)?;
         let file = std::fs::File::open(zip_path).ok()?;
+        if file.metadata().ok()?.len() > maximum_bytes.checked_add(65536)? {
+            return None;
+        }
         let mut archive = zip::ZipArchive::new(file).ok()?;
         if archive.len() != 1 {
             return None;
         }
         let entry_name = format!("prec{}_npts{}.json", prec, n);
         let mut entry = archive.by_name(&entry_name).ok()?;
+        // A scalar needs fewer than `prec` decimal characters plus sign and
+        // exponent overhead. Bound both the ZIP header and actual expansion;
+        // do not trust a compressed file to dictate an unbounded allocation.
+
+        if entry.size() > maximum_bytes {
+            return None;
+        }
         let mut data = String::new();
-        entry.read_to_string(&mut data).ok()?;
-        let parsed = parse_gl_json(&data, n, prec)?;
-        Some((parsed, data))
+        entry
+            .by_ref()
+            .take(maximum_bytes.checked_add(1)?)
+            .read_to_string(&mut data)
+            .ok()?;
+        if data.len() as u64 > maximum_bytes {
+            return None;
+        }
+        Some(data)
     }
 
     fn save_gl_cache(n: usize, prec: u32, nodes: &[Float], weights: &[Float], mode: CacheMode) {
@@ -930,20 +1132,24 @@ mod hp {
                     return;
                 }
             }
-            let _ = std::fs::write(&zip_path, &buf);
+            if let Err(error) = xc_cache::atomic_replace_cache_file(&zip_path, &buf) {
+                eprintln!("quadrature cache write failed: {error}");
+            }
         }
     }
 
     #[cfg(test)]
     pub(super) fn gauss_legendre_compute(n: usize, prec: u32) -> (Vec<Float>, Vec<Float>) {
         gauss_legendre_compute_scheduled(n, prec, crate::hp_runtime::GlRootSchedule::serial())
+            .expect("valid test GL rule")
     }
 
     fn gauss_legendre_compute_scheduled(
         n: usize,
         prec: u32,
         root_schedule: crate::hp_runtime::GlRootSchedule,
-    ) -> (Vec<Float>, Vec<Float>) {
+    ) -> Result<GlTable, CacheError> {
+        validate_gl_domain(n, prec)?;
         let pi_v = pi(prec);
         let one = Float::with_val(prec, 1);
         let four_n_plus_two = fl_i(prec, (4 * n + 2) as i64);
@@ -976,8 +1182,22 @@ mod hp {
                 })
                 .collect::<Vec<_>>()
         };
+        if combined
+            .iter()
+            .any(|(x, w)| !x.is_finite() || !w.is_finite())
+        {
+            return Err(CacheError::InvalidManifest(
+                "GL Newton arithmetic is nonfinite".into(),
+            ));
+        }
         combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        combined.into_iter().unzip()
+        let result: GlTable = combined.into_iter().unzip();
+        if let Some(reason) = full_cache_check(&result.0, &result.1, prec) {
+            return Err(CacheError::InvalidManifest(format!(
+                "fresh GL rule failed validation: {reason}"
+            )));
+        }
+        Ok(result)
     }
 
     fn gauss_legendre_root(
@@ -1103,69 +1323,93 @@ mod hp {
         (p1, deriv)
     }
 
-    /// Computed full-rule diagnostics, separate from the cheap cache read screen.
+    /// Computed full-rule diagnostics, also required at cache/read boundaries.
     #[derive(Clone, Debug)]
     pub struct GaussLegendreRuleCheckHp {
         pub order: usize,
         pub precision_bits: u32,
+        /// Largest absolute Legendre polynomial residual (legacy diagnostic).
         pub maximum_legendre_residual: Float,
+        /// Largest relative derivative-weight defect (legacy diagnostic).
         pub maximum_relative_weight_defect: Float,
+        /// Largest Newton correction |P_n(x)/P_n'(x)|, the node's distance
+        /// to its Legendre root to first order.
+        pub maximum_node_correction: Float,
+        /// Largest |w - 2/((1-x^2) P_n'(x)^2)|.
+        pub maximum_weight_error: Float,
         pub tolerance: Float,
         pub checks_passed: bool,
     }
 
     /// Check every Legendre root and derivative-weight identity in O(n^2)
     /// arithmetic. The explicit order budget is enforced before recurrence
-    /// work. This point-arithmetic check is not an interval certificate.
+    /// work. The Newton-correction estimate and absolute derivative-weight
+    /// defect must each be at most 16 * 2^-prec. These are point-arithmetic
+    /// diagnostics, not a root-distance bound or a correct-rounding certificate.
     pub fn check_gauss_legendre_rule_hp(
         nodes: &[Float],
         weights: &[Float],
         prec: u32,
         maximum_order: usize,
     ) -> anyhow::Result<GaussLegendreRuleCheckHp> {
-        if !(64..=1_000_000).contains(&prec)
+        if !(16..=1_000_000).contains(&prec)
             || nodes.len() > maximum_order
             || nodes.is_empty()
             || nodes.iter().chain(weights).any(|x| x.prec() > prec)
         {
-            anyhow::bail!("invalid GL precision/order budget or down-rounded input");
+            anyhow::bail!(
+                "invalid GL precision/order budget or input precision exceeds declared precision"
+            );
         }
         if let Some(reason) = cache_structural_check(nodes, weights, prec) {
             anyhow::bail!(reason);
         }
         let n = nodes.len();
-        let mut root_max = Float::with_val(prec, 0);
-        let mut weight_max = Float::with_val(prec, 0);
-        for (x, w) in nodes.iter().zip(weights) {
-            let (pn, dpn) = legendre_p_and_deriv(n, x, prec);
-            let residual = pn.abs();
-            if !residual.is_finite() || !dpn.is_finite() {
+        validate_gl_domain(n, prec)?;
+        let guard = prec + 64;
+        let mut root_max = Float::with_val(guard, 0);
+        let mut relative_weight_max = Float::with_val(guard, 0);
+        let mut correction_max = Float::with_val(guard, 0);
+        let mut weight_max = Float::with_val(guard, 0);
+        for (source_x, source_w) in nodes.iter().zip(weights) {
+            let x = Float::with_val(guard, source_x);
+            let (pn, dpn) = legendre_p_and_deriv(n, &x, guard);
+            if !pn.is_finite() || !dpn.is_finite() || dpn.is_zero() {
                 anyhow::bail!("nonfinite GL recurrence");
             }
-            if residual > root_max {
-                root_max = residual;
-            }
-            let mut defect = Float::with_val(prec, 1);
-            defect -= x.clone().square();
-            defect *= dpn.square();
-            defect *= w;
-            defect /= 2;
-            defect -= 1;
-            let defect = defect.abs();
-            if !defect.is_finite() {
+            // A per-node scale: |P_n'| ranges from about sqrt(n) inside the
+            // interval to n^2/2 at its ends, so |P_n| alone is not comparable.
+            root_max = root_max.max(&pn.clone().abs());
+            let correction = Float::with_val(guard, &pn / &dpn).abs();
+            let mut formula = Float::with_val(guard, 1);
+            formula -= x.clone().square();
+            formula *= dpn.square();
+            let mut relative_defect = Float::with_val(guard, &formula * source_w);
+            relative_defect /= 2;
+            relative_defect -= 1;
+            relative_weight_max = relative_weight_max.max(&relative_defect.abs());
+            let formula = Float::with_val(guard, 2) / formula;
+            let error = Float::with_val(guard, source_w - &formula).abs();
+            if !correction.is_finite() || !error.is_finite() {
                 anyhow::bail!("nonfinite GL weight check");
             }
-            if defect > weight_max {
-                weight_max = defect;
+            if correction > correction_max {
+                correction_max = correction;
+            }
+            if error > weight_max {
+                weight_max = error;
             }
         }
-        let tolerance = cache_structural_tol(prec);
+        // Correctly rounded tables measure below 2 * 2^-prec on both counts.
+        let tolerance = Float::with_val(guard, 16) >> prec;
         Ok(GaussLegendreRuleCheckHp {
             order: n,
             precision_bits: prec,
-            checks_passed: root_max < tolerance && weight_max < tolerance,
+            checks_passed: correction_max <= tolerance && weight_max <= tolerance,
             maximum_legendre_residual: root_max,
-            maximum_relative_weight_defect: weight_max,
+            maximum_relative_weight_defect: relative_weight_max,
+            maximum_node_correction: correction_max,
+            maximum_weight_error: weight_max,
             tolerance,
         })
     }
@@ -1174,10 +1418,13 @@ mod hp {
     // Public cache-verification API
     // ===========================================================================
 
+    pub const GL_CACHE_ADMISSION_SEMANTICS: &str =
+        "gl-zip-runtime-aligned-version-envelope-full-rule-admission-v2";
+
     /// Per-file outcome from `verify_gl_cache_dir`.
     #[derive(Debug, Clone)]
     pub enum CacheFileStatus {
-        /// File loaded and passed all structural identity checks.
+        /// File loaded and passed structural and full Legendre node/weight checks.
         Ok {
             path: std::path::PathBuf,
             n: usize,
@@ -1197,8 +1444,16 @@ mod hp {
             prec: u32,
             reason: String,
         },
+        /// A valid version string is older than the active producer floor.
+        Stale {
+            path: std::path::PathBuf,
+            n: usize,
+            prec: u32,
+            found_version: String,
+            minimum_version: String,
+        },
         /// File loaded successfully but failed at least one of the GL
-        /// structural identities (Σw=2, Σx·w=0, antisymmetry).
+        /// structural identities or the full Legendre node/weight validation.
         StructurallyInvalid {
             path: std::path::PathBuf,
             n: usize,
@@ -1234,7 +1489,8 @@ mod hp {
                 .filter(|s| {
                     matches!(
                         s,
-                        CacheFileStatus::LoadFailed { .. }
+                        CacheFileStatus::Stale { .. }
+                            | CacheFileStatus::LoadFailed { .. }
                             | CacheFileStatus::StructurallyInvalid { .. }
                     )
                 })
@@ -1246,7 +1502,8 @@ mod hp {
             self.statuses.iter().filter(|s| {
                 matches!(
                     s,
-                    CacheFileStatus::LoadFailed { .. }
+                    CacheFileStatus::Stale { .. }
+                        | CacheFileStatus::LoadFailed { .. }
                         | CacheFileStatus::StructurallyInvalid { .. }
                 )
             })
@@ -1269,8 +1526,9 @@ mod hp {
         Some((n, prec))
     }
 
-    /// Walk the given cache directory and structurally verify every
-    /// `prec{P}_npts{N}.json[.zip]` file in it. Returns a per-file
+    /// Walk the directory and apply runtime admission to every
+    /// `prec{P}_npts{N}.json.zip` file. Plain JSON is skipped because the runtime
+    /// does not read it. Returns a per-file
     /// status report; does not mutate any files (corrupt files are
     /// not deleted).
     ///
@@ -1323,42 +1581,35 @@ mod hp {
                 }
             };
 
-            // Load the file.
-            let parsed: Option<(Vec<Float>, Vec<Float>)> = if name.ends_with(".json.zip") {
-                load_from_zip(&path, n, prec).map(|(p, _)| p)
-            } else {
-                std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|data| parse_gl_json(&data, n, prec))
-            };
-
-            let (nodes, weights) = match parsed {
-                Some(p) => p,
-                None => {
-                    statuses.push(CacheFileStatus::LoadFailed {
-                        path: path.clone(),
-                        n,
-                        prec,
-                        reason: "parse / decompress failed".to_string(),
-                    });
-                    continue;
-                }
-            };
-
-            // Structural identity check.
-            match cache_structural_check(&nodes, &weights, prec) {
-                None => {
-                    statuses.push(CacheFileStatus::Ok { path, n, prec });
-                }
-                Some(reason) => {
-                    statuses.push(CacheFileStatus::StructurallyInvalid {
-                        path,
-                        n,
-                        prec,
-                        reason,
-                    });
-                }
+            if !name.ends_with(".json.zip") {
+                statuses.push(CacheFileStatus::Skipped {
+                    path,
+                    reason: "plain JSON is not read by the runtime ZIP-only cache".to_owned(),
+                });
+                continue;
             }
+            statuses.push(match load_from_zip(&path, n, prec) {
+                Ok(_) => CacheFileStatus::Ok { path, n, prec },
+                Err(GlCacheReadError::Stale { found, minimum }) => CacheFileStatus::Stale {
+                    path,
+                    n,
+                    prec,
+                    found_version: found,
+                    minimum_version: minimum,
+                },
+                Err(GlCacheReadError::Load(reason)) => CacheFileStatus::LoadFailed {
+                    path,
+                    n,
+                    prec,
+                    reason,
+                },
+                Err(GlCacheReadError::Numerical(reason)) => CacheFileStatus::StructurallyInvalid {
+                    path,
+                    n,
+                    prec,
+                    reason,
+                },
+            });
         }
 
         Ok(CacheVerifyReport {
@@ -1371,14 +1622,45 @@ mod hp {
 #[cfg(feature = "hp")]
 pub use hp::{
     check_gauss_legendre_rule_hp, gauss_legendre_nodes, gauss_legendre_nodes_scheduled,
-    gauss_legendre_nodes_via_cache, gauss_legendre_nodes_via_cache_scheduled, verify_gl_cache_dir,
+    gauss_legendre_nodes_via_cache, gauss_legendre_nodes_via_cache_scheduled,
+    try_gauss_legendre_nodes, try_gauss_legendre_nodes_scheduled, verify_gl_cache_dir,
     CacheFileStatus, CacheMode, CacheVerifyReport, CachedQuadratureRule, GaussLegendreRuleCheckHp,
-    QuadratureCacheRequest,
+    QuadratureCacheRequest, GL_CACHE_ADMISSION_SEMANTICS,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "hp")]
+    #[test]
+    fn hp_cache_rejects_non_gaussian_rule_with_matching_low_moments() {
+        use rug::Float;
+        let p = 256;
+        let a = Float::with_val(p, rug::Rational::from((3, 4))).sqrt();
+        let b = Float::with_val(p, rug::Rational::from((1, 7))).sqrt();
+        let wa = Float::with_val(p, rug::Rational::from((256, 765)));
+        let wb = Float::with_val(p, rug::Rational::from((49, 85)));
+        let nodes = vec![-a.clone(), -b.clone(), Float::with_val(p, 0), b, a];
+        let weights = vec![
+            wa.clone(),
+            wb.clone(),
+            Float::with_val(p, rug::Rational::from((8, 45))),
+            wb,
+            wa,
+        ];
+        // This positive symmetric five-node rule integrates degrees 0..=7
+        // exactly, but not degree 8: it is not the five-node Gaussian rule.
+        assert!(
+            hp::cache_structural_check(&nodes, &weights, p).is_none(),
+            "counterexample must pass the old cheap screen"
+        );
+        let payload = serde_json::json!({"schema_version":1,"toolkit_version":env!("CARGO_PKG_VERSION"),"n_pts":5,"precision_bits":p,"nodes":nodes.iter().map(Float::to_string).collect::<Vec<_>>(),"weights":weights.iter().map(Float::to_string).collect::<Vec<_>>()});
+        assert!(
+            hp::parse_gl_json_for_test(&payload.to_string(), 5, p).is_none(),
+            "cache accepted a non-Gaussian rule"
+        );
+    }
 
     #[cfg(feature = "hp")]
     #[test]
@@ -1749,6 +2031,39 @@ mod hp_cache_tests {
         bad.swap(0, 1);
         assert!(hp::cache_structural_check(&bad, &weights, p).is_some());
         assert!(hp::cache_structural_check(&[], &[], p).is_some());
+    }
+
+    #[test]
+    fn rule_validation_rejects_symmetric_mass_preserving_interior_corruption() {
+        // Interior nodes have |P_n'| near sqrt(n), not n^2/2. The former
+        // n^2-scaled tolerance accepted a central pair moved by 1e-13
+        // (about 1.8e6 ulp at 64 bits) and weights traded between neighbors,
+        // which keep symmetry and mass.
+        let (n, p) = (500, 64);
+        let check = |x: &[Float], w: &[Float], order: usize, precision: u32| {
+            hp::check_gauss_legendre_rule_hp(x, w, precision, order)
+                .map(|report| report.checks_passed)
+                .unwrap_or(false)
+        };
+        let (nodes, weights) = hp::gauss_legendre_nodes(n, p, hp::CacheMode::Off);
+        assert!(check(&nodes, &weights, n, p));
+        let (low, high) = (n / 2 - 1, n / 2);
+        let shift = Float::with_val(p, 1e-13);
+        let mut bad = nodes.clone();
+        bad[low] -= &shift;
+        bad[high] += &shift;
+        assert!(!check(&bad, &weights, n, p));
+        let delta = Float::with_val(p, &weights[high] * 3e-12);
+        let mut bad = weights.clone();
+        bad[low] += &delta;
+        bad[high] += &delta;
+        bad[low - 1] -= &delta;
+        bad[high + 1] -= &delta;
+        assert!(!check(&nodes, &bad, n, p));
+        for (order, precision) in [(1952, 64), (64, 256), (300, 1024)] {
+            let (x, w) = hp::gauss_legendre_nodes(order, precision, hp::CacheMode::Off);
+            assert!(check(&x, &w, order, precision), "n={order}, p={precision}");
+        }
     }
 
     /// Real small GL rules exercise cache paths without weakening validation.
@@ -2346,6 +2661,22 @@ mod hp_cache_tests {
     #[test]
     fn verify_gl_cache_dir_reports_per_file_status() {
         use hp::CacheFileStatus;
+        fn write_zip(path: &std::path::Path, data: &str) {
+            use std::io::Write;
+            let mut archive = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+            let name = path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .strip_suffix(".zip")
+                .unwrap();
+            archive
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(data.as_bytes()).unwrap();
+            archive.finish().unwrap();
+        }
 
         let temp = fresh_temp_dir("verify_dir");
         let _guard = CacheRootGuard::enter(&temp);
@@ -2368,8 +2699,8 @@ mod hp_cache_tests {
             "weights": ws,
         })
         .to_string();
-        let valid_path = cache_dir.join("prec64_npts4.json");
-        std::fs::write(&valid_path, valid_json).unwrap();
+        let valid_path = cache_dir.join("prec64_npts4.json.zip");
+        write_zip(&valid_path, &valid_json);
 
         // 2. Structurally-invalid file: valid envelope but nodes/weights
         //    are all zeros → fails Σw=2 identity.
@@ -2384,16 +2715,16 @@ mod hp_cache_tests {
             "weights": bad_ws,
         })
         .to_string();
-        let bad_path = cache_dir.join("prec64_npts5.json");
-        std::fs::write(&bad_path, bad_json).unwrap();
+        let bad_path = cache_dir.join("prec64_npts5.json.zip");
+        write_zip(&bad_path, &bad_json);
 
         // 3. Unrecognized filename — should be reported as Skipped.
         let skipped_path = cache_dir.join("not_a_cache_file.txt");
         std::fs::write(&skipped_path, "irrelevant").unwrap();
 
         // 4. File matching the pattern but malformed JSON.
-        let malformed_path = cache_dir.join("prec64_npts3.json");
-        std::fs::write(&malformed_path, "{").unwrap();
+        let malformed_path = cache_dir.join("prec64_npts3.json.zip");
+        write_zip(&malformed_path, "{");
 
         let report = hp::verify_gl_cache_dir(&cache_dir).unwrap();
         assert_eq!(report.directory, cache_dir);
@@ -2411,6 +2742,7 @@ mod hp_cache_tests {
         let mut saw_loadfail = false;
         for s in &report.statuses {
             match s {
+                CacheFileStatus::Stale { .. } => panic!("unexpected stale fixture"),
                 CacheFileStatus::Ok { path, n, prec } => {
                     assert_eq!(path, &valid_path);
                     assert_eq!(*n, 4);
@@ -2475,10 +2807,12 @@ mod cache_envelope_regression {
 
     #[test]
     fn mislabeled_cache_envelopes_are_rejected_before_numeric_decode() {
+        let (nodes, weights) = hp::gauss_legendre_nodes(2, 128, hp::CacheMode::Off);
         let good = serde_json::json!({
             "schema_version": 1, "toolkit_version": hp::toolkit_version_for_test(),
             "n_pts": 2, "precision_bits": 128,
-            "nodes": ["-0.5", "0.5"], "weights": ["1", "1"]
+            "nodes": nodes.iter().map(rug::Float::to_string).collect::<Vec<_>>(),
+            "weights": weights.iter().map(rug::Float::to_string).collect::<Vec<_>>()
         });
         assert!(hp::parse_gl_json_for_test(&good.to_string(), 2, 128).is_some());
         for (field, value) in [("schema_version", 2), ("n_pts", 3), ("precision_bits", 64)] {

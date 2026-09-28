@@ -32,14 +32,23 @@ pub fn bisect_f64<F: Fn(f64) -> f64>(
     if !fa.is_finite() || !fb.is_finite() {
         return None;
     }
-    if fa == 0.0 || fa.abs() < tol {
+    if fa == 0.0 {
         return Some(a);
     }
-    if fb == 0.0 || fb.abs() < tol {
+    if fb == 0.0 {
         return Some(b);
     }
     if fa.is_sign_positive() == fb.is_sign_positive() {
         return None;
+    }
+    // A small nonzero value is not a sign-change bracket. Only apply the
+    // residual tolerance after existence follows from the caller's continuity
+    // premise and opposite endpoint signs.
+    if fa.abs() < tol {
+        return Some(a);
+    }
+    if fb.abs() < tol {
+        return Some(b);
     }
 
     // Same-sign subtraction cannot overflow; opposite-sign halving avoids
@@ -75,6 +84,15 @@ pub fn bisect_f64<F: Fn(f64) -> f64>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn residual_tolerance_does_not_invent_an_unbracketed_root() {
+        for value in [-1e-200, 1e-200] {
+            assert!(bisect_f64(&|_| value, 0.0, 1.0, 1e-10, 100).is_none());
+            assert!(bisect_f64(&|_| value, 0.0, 0.0, 1e-10, 100).is_none());
+        }
+        assert_eq!(bisect_f64(&|x| x - 0.25, 0.0, 1.0, 0.5, 100), Some(0.0));
+    }
 
     #[test]
     fn invalid_evaluations_never_become_roots() {

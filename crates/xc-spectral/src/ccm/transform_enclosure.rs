@@ -1,5 +1,8 @@
 //! Certified enclosures of a finite retained Fourier transform. This is not a
 //! statement of convergence, RH, or accuracy of an uncertified source state.
+/// Fourier sign shared by retained-root complex and enclosed contour producers.
+pub(crate) const FOURIER_SEMANTICS: &str = "retained_fourier_minus_sign_at_original_coordinates_v1";
+
 use super::{
     extended_research::*, research_completion::CompletionInputs, retained_evidence::*,
     state_geometry::RetainedState,
@@ -12,6 +15,7 @@ pub(crate) fn analyze(
     _roots: Option<&RetainedRoots>,
     o: &ExtensionOptions,
     _i: Option<&CompletionInputs>,
+    _source_precision: u32,
 ) -> Result<ExtendedAnalysis> {
     Ok(missing(report("transform_enclosure",s,o),"Arb feature required for outward-enclosed complex transforms; point samples remain available"))
 }
@@ -33,9 +37,58 @@ mod certified {
             Float::with_val_round(p, Float::parse(s)?, Round::Up).0,
         )?)
     }
-    fn bounds(out: &mut std::collections::BTreeMap<String, String>, name: &str, x: &I) {
-        put(out, &format!("{name}_lower"), x.lower());
-        put(out, &format!("{name}_upper"), x.upper());
+    fn bounds(
+        out: &mut std::collections::BTreeMap<String, String>,
+        name: &str,
+        x: &I,
+    ) -> Result<()> {
+        x.validate()?;
+        let digits = Some((u64::from(x.precision()) * 30103 / 100000 + 10) as usize);
+        out.insert(
+            format!("{name}_lower"),
+            x.lower().to_string_radix_round(10, digits, Round::Down),
+        );
+        out.insert(
+            format!("{name}_upper"),
+            x.upper().to_string_radix_round(10, digits, Round::Up),
+        );
+        Ok(())
+    }
+    #[test]
+    fn serialized_bounds_enclose_exact_dyadic_endpoints() {
+        use std::collections::BTreeMap;
+        fn exact_decimal(s: &str) -> rug::Rational {
+            use rug::{ops::Pow, Integer, Rational};
+            let mut parts = s.split(['e', 'E']);
+            let body = parts.next().unwrap();
+            let exponent = parts.next().unwrap_or("0").parse::<i32>().unwrap();
+            let places = body.split_once('.').map_or(0, |(_, f)| f.len() as i32);
+            let digits = body.replace('.', "").parse::<Integer>().unwrap();
+            let scale = exponent - places;
+            let power = Integer::from(10).pow(scale.unsigned_abs());
+            if scale >= 0 {
+                Rational::from(digits * power)
+            } else {
+                Rational::from((digits, power))
+            }
+        }
+        let mut checked = 0;
+        for p in [64, 128, 256] {
+            for shift in [-5000i32, 0, 5000] {
+                for sign in [-1i32, 1] {
+                    let x = ((Float::with_val(p, 1) / 3u32) << shift) * sign;
+                    let interval = I::point(x.clone());
+                    let mut output = BTreeMap::new();
+                    bounds(&mut output, "value", &interval).unwrap();
+                    let lower = exact_decimal(&output["value_lower"]);
+                    let upper = exact_decimal(&output["value_upper"]);
+                    let exact = x.to_rational().unwrap();
+                    assert!(lower <= exact && exact <= upper);
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 18);
     }
     fn widen(x: &I, error: &I) -> Result<I> {
         Ok(x.add(&I::new(-error.upper().clone(), error.upper().clone())?))
@@ -48,7 +101,12 @@ mod certified {
         ))
     }
     fn pair(s: &RetainedState, re: &I, im: &I) -> Result<(I, I, I, I)> {
-        arb_bridge::finite_transform(&s.cutoff, &s.coefficients, re, im)
+        // The bridge is the existing plus-sign finite Fourier kernel.
+        // Reflect its box and reverse its derivative to evaluate exp(-i*z*x)
+        // at the original reported coordinates, including the entire contour.
+        let (vr, vi, dr, di) =
+            arb_bridge::finite_transform(&s.cutoff, &s.coefficients, &re.neg(), &im.neg())?;
+        Ok((vr, vi, dr.neg(), di.neg()))
     }
 
     /// Residual-to-angle inequality against the replayed, isolated finite ground.
@@ -59,19 +117,27 @@ mod certified {
         o: &ExtensionOptions,
         c: &super::super::sector_gap_certificate::PortableCcmSectorGapCertificate,
     ) -> Result<I> {
+        // External certificates must bind their matrix to the named CCM
+        // assembly; a self-consistent proof for another matrix is insufficient.
+        let _stage = Stage::new("exact source certificate replay and reassembly");
+        let check = super::super::sector_gap_certificate::verify_portable_ccm_sector_gap_certificate_with_reassembly(c);
+        if !check.valid {
+            bail!("source certificate verification failed: {:?}", check.errors);
+        }
+        state_error_from_verified_matrix(s, o, c)
+    }
+
+    pub(super) fn state_error_from_verified_matrix(
+        s: &RetainedState,
+        o: &ExtensionOptions,
+        c: &super::super::sector_gap_certificate::PortableCcmSectorGapCertificate,
+    ) -> Result<I> {
         if c.lambda_squared != s.cutoff
             || c.n_modes != s.modes
             || !c.certifies_finite_ground_state_simple
             || c.certified_finite_ground_parity != "even"
         {
             bail!("source certificate does not isolate this finite even ground");
-        }
-        // A seal authenticates no trust decision. Replay the portable proof each time.
-        let _stage = Stage::new("exact source certificate replay");
-        let check =
-            super::super::sector_gap_certificate::verify_portable_ccm_sector_gap_certificate(c);
-        if !check.valid {
-            bail!("source certificate verification failed: {:?}", check.errors);
         }
         let p = o.working_precision_bits;
         let n = s.coefficients.len();
@@ -118,7 +184,10 @@ mod certified {
         if angle.upper() >= &1 {
             bail!("source residual does not resolve a finite ground angle");
         }
-        Ok(I::from_i64(2, p).sqrt()?.mul(&angle))
+        // The residual inequality bounds the error from above; it supplies no
+        // positive lower bound, even when the trial energy is inexact.
+        let upper_bound = I::from_i64(2, p).sqrt()?.mul(&angle);
+        Ok(I::new(Float::with_val(p, 0), upper_bound.upper().clone())?)
     }
     type SegmentEnclosure = (I, I, I, I, I);
     #[derive(Clone)]
@@ -156,6 +225,7 @@ mod certified {
         roots: Option<&RetainedRoots>,
         o: &ExtensionOptions,
         input: Option<&CompletionInputs>,
+        source_precision: u32,
     ) -> Result<ExtendedAnalysis> {
         let mut out = report("transform_enclosure", s, o);
         let p = o.working_precision_bits;
@@ -165,7 +235,7 @@ mod certified {
         if let Some(c) = input.and_then(|i| i.sector_certificate.as_ref()) {
             match state_error(s, o, c) {
                 Ok(e) => {
-                    bounds(&mut out.values, "unit_state_l2_error", &e);
+                    bounds(&mut out.values, "unit_state_l2_error", &e)?;
                     source_error = Some(e);
                     out.reason=Some(format!("source certificate replayed; conditional on {} and the certificate's recorded cutoff-free assembly enclosure; no infinite source error claim",c.parity_invariance_premise));
                 }
@@ -181,7 +251,11 @@ mod certified {
                     .points
                     .iter()
                     .filter_map(|x| x.value.as_deref())
-                    .filter_map(|x| scalar(x, p).ok())
+                    .filter_map(|x| {
+                        scalar(x, r.dataset.precision_bits)
+                            .ok()
+                            .map(|v| Float::with_val(p, v))
+                    })
                     .max_by(Float::total_cmp)
             })
             .unwrap_or_else(|| Float::with_val(p, 1))
@@ -197,10 +271,15 @@ mod certified {
         let policy = input.and_then(|i| i.contour.as_ref()).unwrap_or(&default);
         // Contour endpoints are the exact dyadic numbers serialized below. No
         // claim is made about a subtly different decimal rectangle.
-        let left = scalar(&policy.left, p)?;
-        let right = scalar(&policy.right, p)?;
-        let bottom = scalar(&policy.bottom, p)?;
-        let top = scalar(&policy.top, p)?;
+        let owner = if input.and_then(|i| i.contour.as_ref()).is_some() {
+            source_precision
+        } else {
+            p
+        };
+        let left = Float::with_val(p, scalar(&policy.left, owner)?);
+        let right = Float::with_val(p, scalar(&policy.right, owner)?);
+        let bottom = Float::with_val(p, scalar(&policy.bottom, owner)?);
+        let top = Float::with_val(p, scalar(&policy.top, owner)?);
         for (name, v) in [
             ("contour_left", &left),
             ("contour_right", &right),
@@ -224,8 +303,8 @@ mod certified {
         };
         let zero = I::from_i64(0, p);
         let anchor = evaluate(&zero, &zero)?;
-        bounds(&mut out.values, "origin_real", &anchor.0);
-        bounds(&mut out.values, "origin_imaginary", &anchor.1);
+        bounds(&mut out.values, "origin_real", &anchor.0)?;
+        bounds(&mut out.values, "origin_imaginary", &anchor.1)?;
         let vertices = [
             (left.clone(), bottom.clone()),
             (right.clone(), bottom),
@@ -244,7 +323,9 @@ mod certified {
         let mut unresolved_count = 0usize;
         let pi = I::pi(p);
         let store = Checkpoints::new(&(
-            "finite-contour-segments-v1",
+            "finite-contour-segments-minus-fourier-v4-source-error-hull",
+            FOURIER_SEMANTICS,
+            source_precision,
             &s.manifest.content_digest,
             o,
             input,
@@ -301,7 +382,7 @@ mod certified {
                         ("derivative_imaginary", di),
                         ("argument_increment", turn.clone()),
                     ] {
-                        bounds(&mut rr.values, name, &v);
+                        bounds(&mut rr.values, name, &v)?;
                     }
                     angle = angle.add(&turn);
                     rr.notes.push("Arb encloses the entire segment image in a convex rectangle excluding zero; endpoint argument increment is unambiguous".into());
@@ -326,7 +407,7 @@ mod certified {
             }
             out.rows.push(rr);
         }
-        bounds(&mut out.values, "contour_argument_sum", &angle);
+        bounds(&mut out.values, "contour_argument_sum", &angle)?;
         put(
             &mut out.values,
             "unresolved_segments",
@@ -334,7 +415,7 @@ mod certified {
         );
         if unresolved_count == 0 {
             let winding = angle.div(&pi.mul(&I::from_i64(2, p)))?;
-            bounds(&mut out.values, "winding", &winding);
+            bounds(&mut out.values, "winding", &winding)?;
             let lower = winding.lower().clone().ceil();
             let upper = winding.upper().clone().floor();
             if lower == upper && lower >= 0 {
@@ -365,7 +446,13 @@ mod certified {
                     &Float::with_val(p, point.ordinal),
                 );
                 if let Some(t) = &point.value {
-                    let re = decimal(t, p)?;
+                    let re = I::from_float(&scalar(t, roots.dataset.precision_bits)?, p)?;
+                    save_arithmetic_enclosure(&mut rr.values, "t", &re, p)?;
+                    put(
+                        &mut rr.values,
+                        "input_point_precision_bits",
+                        &Float::with_val(p, roots.dataset.precision_bits),
+                    );
                     let (vr, vi, dr, di) = evaluate(&re, &zero)?;
                     for (name, v) in [
                         ("value_real", &vr),
@@ -373,12 +460,12 @@ mod certified {
                         ("derivative_real", &dr),
                         ("derivative_imaginary", &di),
                     ] {
-                        bounds(&mut rr.values, name, v);
+                        bounds(&mut rr.values, name, v)?;
                     }
                     match cdiv(&(vr, vi), &anchor_pair) {
                         Ok((nr, ni)) => {
-                            bounds(&mut rr.values, "normalized_real", &nr);
-                            bounds(&mut rr.values, "normalized_imaginary", &ni);
+                            bounds(&mut rr.values, "normalized_real", &nr)?;
+                            bounds(&mut rr.values, "normalized_imaginary", &ni)?;
                         }
                         Err(_) => {
                             rr.outcome = "unresolved_denominator".into();
@@ -394,7 +481,7 @@ mod certified {
                 out.rows.push(rr);
             }
         }
-        out.convention=if source_error.is_some(){"Arb finite transform and derivative enclosures with verified finite-matrix residual/gap source allowance; inherited parity and matrix-assembly premises; signed unit coefficient normalization; argument-principle count only when every segment is certified"}else{"Arb exact retained dyadic coefficient function, unit coefficient norm; log(C) and carriers enclosed; no eigenstate/assembly accuracy claim; argument-principle count only when every segment is certified"}.into();
+        out.convention=if source_error.is_some(){"exp(-i*z*x); Arb finite transform and derivative enclosures with verified finite-matrix residual/gap source allowance; inherited parity and matrix-assembly premises; signed unit coefficient normalization; argument-principle count only when every segment is certified"}else{"exp(-i*z*x); Arb exact retained dyadic coefficient function, unit coefficient norm; log(C) and carriers enclosed; no eigenstate/assembly accuracy claim; argument-principle count only when every segment is certified"}.into();
         for row in &mut out.rows {
             if row.outcome == "point_measurement" {
                 row.outcome = "certified_finite_enclosure".into();
@@ -410,9 +497,26 @@ mod certified {
 pub(crate) use certified::analyze;
 
 #[cfg(all(test, feature = "arb"))]
-pub(crate) fn test_source_error(
+pub(crate) fn test_source_error_with_reassembly(
     s: &RetainedState,
     c: &super::sector_gap_certificate::PortableCcmSectorGapCertificate,
 ) -> Result<xc_numerics::mpfr_interval::MpfrInterval> {
     certified::state_error(s, &ExtensionOptions::for_source(s), c)
+}
+
+#[cfg(all(test, feature = "arb"))]
+pub(crate) fn test_source_error(
+    s: &RetainedState,
+    c: &super::sector_gap_certificate::PortableCcmSectorGapCertificate,
+) -> Result<xc_numerics::mpfr_interval::MpfrInterval> {
+    // Exact manufactured-matrix controls exercise the residual/gap inequality
+    // independently of CCM assembly. This helper exists only in unit tests.
+    let check = super::sector_gap_certificate::verify_portable_ccm_sector_gap_certificate(c);
+    if !check.valid {
+        anyhow::bail!(
+            "recorded test matrix verification failed: {:?}",
+            check.errors
+        );
+    }
+    certified::state_error_from_verified_matrix(s, &ExtensionOptions::for_source(s), c)
 }

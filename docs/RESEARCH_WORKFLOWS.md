@@ -119,7 +119,11 @@ resolution evidence records effective bandwidth and discarded-tail diagnostics
 at thresholds `1e-15`, `1e-30`, and `1e-45`, plus same-rule Q/2Q refinement for
 every uniform-grid rule. It continues to 4Q only when the Q/2Q relative
 difference exceeds `1e-8`; Gauss--Legendre stays the independent-family
-cross-check in the target-distance artifact and is not doubled. The residual
+cross-check in the target-distance artifact and is not doubled. The returned
+`resolution_tolerance_met` applies to the actual Q values; the separate
+`resolution_ladder_tolerance_met` applies to the final attempted adjacent pair.
+A passing 2Q/4Q comparison therefore does not mark an unresolved Q value as
+resolved. Both flags describe empirical agreement, not certified error. The residual
 analysis records signed and one-sided residual mass under those same rules and
 uses the already-retained profile samples for signs, extrema, and strict
 sign-change brackets. It does not change the integration rule or perform
@@ -149,6 +153,8 @@ pole interval. This is inexpensive point-source analysis rather than
 certification. On a reuse-first rerun, a missing child is populated from the
 retained parents; reuse replays the term sum and derivative from the exact
 secular source before accepting the child.
+
+Implementation status: requested forward-accuracy certification for prime-power and u-flow response observables is planned. Current captures provide point derivatives and backward residual checks; complete error propagation through eigenstate uncertainty and moving-pole cancellation remains unimplemented.
 
 `ccm_prime_power_response_analysis` is also retained in `ccm-evidence`, but only
 when `capture_prime_power_response` is explicitly true (the builder
@@ -276,9 +282,10 @@ the three diagnostic artifacts without rerunning the eigensolve. Legacy
 unbound identities remain historical and are not accepted as current parents.
 Residual backfill still
 performs the requested signed quadrature against the retained coefficients.
-During a fresh maximum capture, resolution evidence reuses Q eigenfunction
-values in 2Q and 2Q values in conditional 4Q only when the MPFR abscissae are
-exactly identical. This applies to nested left, right, and trapezoid grids in
+During a fresh maximum capture, resolution evidence reuses 2Q eigenfunction
+values in conditional 4Q only when the MPFR abscissae are exactly identical.
+The initial Q pass is not reused: resolution replay starts from retained
+coefficients, whose rounding can differ from the original in-memory values. This applies to nested left, right, and trapezoid grids in
 either `u` or `log(u)`; midpoint grids are evaluated independently.
 
 ## Library-level normal use

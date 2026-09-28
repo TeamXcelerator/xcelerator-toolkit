@@ -38,10 +38,17 @@ mod arb_bridge;
 #[cfg(feature = "arb")]
 pub mod cutoff_free;
 
+#[cfg_attr(
+    not(test),
+    deprecated(
+        note = "Legacy templates do not construct production CCM semantic keys; use managed CCM APIs for production artifact reuse."
+    )
+)]
 pub mod artifacts;
 pub mod convergence;
 
 pub mod capture;
+mod native_secular;
 #[cfg(feature = "hp")]
 pub mod prefix;
 pub mod rank_one;
@@ -60,10 +67,12 @@ pub mod window;
 ///   no representation error. This is the correct path for the publication
 ///   configs (13, 100, 1000, etc.).
 ///
-/// - `is_integer = false`: uses `value_f64` formatted to 17
-///   significant figures and parsed into HP via string conversion.
-///   Gives ~17 digits of accuracy on L = ln(λ²). Used for
-///   convergence-formula research (dense sweeps in the low-λ² region).
+/// - `is_integer = false`: uses the decimal `format!("{:.17e}", value_f64)`
+///   (18 significant digits) as the HP cutoff. This decimal differs from both
+///   a caller's original decimal and the exact binary64 value. Its error is
+///   amplified in relative terms by `ln(lambda^2)` near one; no fixed number of
+///   accurate logarithm digits is promised. Use `hp::ExactLambdaSquaredHp`
+///   and `hp::localized_weil_form_exact_hp` for an exact decimal cutoff.
 ///
 /// Having both values always available allows optimizations: the u64
 /// is always used for prime sieving (`prime_powers_up_to(value_u64)`),
@@ -146,14 +155,17 @@ impl LambdaSq {
     /// Parse a filename fragment back into a `LambdaSq`.
     /// `"13"` → integer(13), `"12p5"` → fractional(12.5).
     pub fn from_filename_str(s: &str) -> Option<Self> {
-        if s.contains('p') {
+        let parsed = if s.contains('p') {
             let f_str = s.replace('p', ".");
             let v: f64 = f_str.parse().ok()?;
-            Some(LambdaSq::fractional(v))
+            if !v.is_finite() {
+                return None;
+            }
+            LambdaSq::fractional(v)
         } else {
-            let v: u64 = s.parse().ok()?;
-            Some(LambdaSq::integer(v))
-        }
+            LambdaSq::integer(s.parse().ok()?)
+        };
+        (parsed.filename_str() == s).then_some(parsed)
     }
 }
 
@@ -178,7 +190,8 @@ impl CcmParams {
     }
 
     /// Construct with an explicit fractional λ² value (e.g. 12.5, 2.7).
-    /// Uses the float path for HP promotion (~17 digits of accuracy on L).
+    /// HP uses the 18-significant-digit scientific decimal of this binary64
+    /// value. See [`LambdaSq`] for the precision and near-one limitations.
     pub fn from_lambda_sq_fractional(lambda_sq: f64, n_modes: usize) -> Self {
         Self {
             lambda_sq: LambdaSq::fractional(lambda_sq),
@@ -199,14 +212,35 @@ impl CcmParams {
         self.lambda_sq.value_f64.ln()
     }
     /// Matrix dimension `2N+1`.
+    ///
+    /// # Panics
+    /// Panics if the dimension cannot be represented by `usize`.
     pub fn matrix_size(&self) -> usize {
-        2 * self.n_modes + 1
+        self.n_modes
+            .checked_mul(2)
+            .and_then(|size| size.checked_add(1))
+            .expect("CCM matrix dimension 2N+1 must fit usize")
     }
 
     /// Map a centered basis index `n ∈ [-N, N]` to the row/column
     /// position in the row-major matrix (`n = 0` → position `N`).
+    ///
+    /// # Panics
+    /// Panics if the matrix dimension is unrepresentable or `n` is outside
+    /// the centered basis.
     pub fn idx(&self, n: i64) -> usize {
-        (n + self.n_modes as i64) as usize
+        self.matrix_size();
+        let magnitude =
+            usize::try_from(n.unsigned_abs()).expect("CCM basis index magnitude must fit usize");
+        assert!(
+            magnitude <= self.n_modes,
+            "CCM basis index must lie in [-N, N]"
+        );
+        if n < 0 {
+            self.n_modes - magnitude
+        } else {
+            self.n_modes + magnitude
+        }
     }
 }
 
@@ -227,7 +261,7 @@ pub struct CcmResult {
 }
 
 impl CcmResult {
-    /// Positive finite `D_log` spectral roots.
+    /// Positive sign-change roots of the admitted binary64 stored state.
     ///
     /// These are distinct from eigenvalues of the Tau/Weil quadratic form.
     pub fn spectral_roots(&self) -> &[f64] {
@@ -241,46 +275,31 @@ impl CcmResult {
 /// for computing `log p` themselves at the appropriate precision (HP via
 /// `Float::with_val(prec, p).ln()`, f64 via `(p as f64).ln()`). This
 /// keeps `prime_powers_up_to` precision-agnostic so HP code paths never
-/// receive an f64-truncated logarithm.
+/// receive an f64-truncated logarithm. Panics on unrepresentable or unavailable
+/// sieve/output capacity; use [`try_prime_powers_up_to`] to propagate errors.
 pub fn prime_powers_up_to(bound: u64) -> Vec<(u64, u64, u32)> {
-    if bound < 2 {
-        return Vec::new();
-    }
-    let n = bound as usize;
-    let mut sieve = vec![true; n + 1];
-    sieve[0] = false;
-    if n >= 1 {
-        sieve[1] = false;
-    }
-    let mut p = 2usize;
-    while p * p <= n {
-        if sieve[p] {
-            let mut q = p * p;
-            while q <= n {
-                sieve[q] = false;
-                q += p;
-            }
-        }
-        p += 1;
-    }
+    try_prime_powers_up_to(bound).expect("representable and allocatable prime-power sieve required")
+}
+
+/// Checked prime-power enumeration. The integer multiplication is bounded
+/// before evaluation; sieve and output capacity errors are propagated.
+pub fn try_prime_powers_up_to(bound: u64) -> Result<Vec<(u64, u64, u32)>> {
     let mut out = Vec::new();
-    for (p, &is_prime) in sieve.iter().enumerate().skip(2) {
-        if !is_prime {
-            continue;
-        }
-        let mut q: u64 = p as u64;
-        let mut j: u32 = 1;
+    for p in xc_numerics::primes::try_sieve_primes(bound)? {
+        let mut q = p;
+        let mut j = 1;
         while q <= bound {
-            out.push((q, p as u64, j));
-            if q > bound / (p as u64) {
+            out.try_reserve(1)?;
+            out.push((q, p, j));
+            if q > bound / p {
                 break;
             }
-            q *= p as u64;
+            q *= p;
             j += 1;
         }
     }
     out.sort_unstable_by_key(|&(n, _, _)| n);
-    out
+    Ok(out)
 }
 
 /// Euler-Mascheroni constant γ ≈ 0.5772. Used in the archimedean
@@ -306,8 +325,8 @@ pub const DEFAULT_BISECT_TOL: f64 = 1e-12;
 pub const DEFAULT_BISECT_MAX_ITER: usize = 200;
 
 /// Binary64 exploratory even-sector computation. Matrix integration scales
-/// with the highest Fourier mode. Near-degenerate states and tiny boundary
-/// sums can still be unresolved at binary64 precision; no certified root
+/// with the highest Fourier mode. Near-degenerate states and unresolved boundary
+/// sums return an error requesting the HP route; no certified root
 /// ordinal, spectral sign, or continuum ground selection is supplied.
 pub fn run_f64(params: &CcmParams) -> Result<CcmResult> {
     use nalgebra::SymmetricEigen;
@@ -334,15 +353,49 @@ pub fn run_f64(params: &CcmParams) -> Result<CcmResult> {
                     + tau[(n - i, n - j)]);
         }
     }
-    let eig = SymmetricEigen::new(even);
-    let (eps_n, idx_min) = eig
+    if even.iter().any(|entry| !entry.is_finite()) {
+        return Err(anyhow!("CCM even projection contains a nonfinite entry"));
+    }
+    let budget = 4096_usize
+        .checked_mul(n + 1)
+        .ok_or_else(|| anyhow!("CCM eigensolve budget overflow"))?;
+    let mut eig = SymmetricEigen::try_new(even.clone(), f64::EPSILON, budget)
+        .ok_or_else(|| anyhow!("CCM even eigensolve did not converge"))?;
+    if eig
         .eigenvalues
         .iter()
-        .enumerate()
-        .min_by(|a, b| a.1.total_cmp(b.1))
-        .map(|(i, &v)| (v, i))
-        .ok_or_else(|| anyhow!("empty spectrum"))?;
-    let sector_state = eig.eigenvectors.column(idx_min);
+        .chain(eig.eigenvectors.iter())
+        .any(|entry| !entry.is_finite())
+    {
+        return Err(anyhow!("CCM even eigensolve returned nonfinite values"));
+    }
+    // The library QR can attach a tiny eigenvalue to another column; complete
+    // the basis so the ascending values are paired with their own vectors.
+    let values = xc_numerics::symmetric_f64::complete_symmetric_eigensystem_f64(
+        even.as_slice(),
+        n + 1,
+        eig.eigenvectors.as_mut_slice(),
+    )?;
+    let eps_n = values[0];
+    // This is an explicit numerical admission policy, not an assembly-error
+    // certificate. A small residual alone cannot identify a vector within a
+    // cluster. Reserve separation well above a dimension-scaled binary64
+    // eigensolver floor before using the selected vector as a secular source.
+    let spectral_scale = values.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
+    let relative_floor = 16.0 * (n + 1) as f64 * f64::EPSILON;
+    let relative_gap = if values.len() == 1 {
+        1.0
+    } else if spectral_scale > 0.0 {
+        values[1] / spectral_scale - values[0] / spectral_scale
+    } else {
+        0.0
+    };
+    if !relative_gap.is_finite() || relative_gap <= 1024.0 * relative_floor {
+        return Err(anyhow!(
+            "CCM even ground state unresolved in binary64: insufficient spectral separation; use the HP route"
+        ));
+    }
+    let sector_state = eig.eigenvectors.column(0);
     let mut xi = vec![0.0_f64; 2 * n + 1];
     xi[n] = sector_state[0];
     for j in 1..=n {
@@ -353,12 +406,28 @@ pub fn run_f64(params: &CcmParams) -> Result<CcmResult> {
 
     // Normalize: Σ ξ_j = √L.
     let sum_xi: f64 = xi.iter().sum();
-    if sum_xi.abs() < EIGENVECTOR_SUM_THRESHOLD {
-        return Err(anyhow!("Sum of eigenvector components is ~0"));
+    let sum_abs: f64 = xi.iter().map(|x| x.abs()).sum();
+    let sum_roundoff =
+        (xi.len() as f64 * f64::EPSILON) / (1.0 - xi.len() as f64 * f64::EPSILON) * sum_abs;
+    // Normalizing a small sum also amplifies state uncertainty. Use the
+    // same numerical separation policy in this linear functional, whose
+    // Euclidean operator norm is sqrt(full_dimension).
+    let sum_state_uncertainty = (xi.len() as f64).sqrt() * relative_floor / relative_gap;
+    if !sum_xi.is_finite()
+        || sum_xi.abs()
+            <= (32.0 * (sum_roundoff + sum_state_uncertainty)).max(EIGENVECTOR_SUM_THRESHOLD)
+    {
+        return Err(anyhow!(
+            "CCM boundary sum unresolved in binary64; use the HP route"
+        ));
     }
     let scale = l.sqrt() / sum_xi;
     for v in xi.iter_mut() {
+        let nonzero = *v != 0.0;
         *v *= scale;
+        if !v.is_finite() || (nonzero && *v == 0.0) {
+            return Err(anyhow!("CCM state normalization is outside binary64 range"));
+        }
     }
 
     let eigenvalues_pos =
@@ -389,6 +458,7 @@ fn build_tau_f64(params: &CcmParams, l: f64, lambda_sq_int: u64) -> Result<nalge
         || l <= 0.0
         || !params.lambda_squared().is_finite()
         || params.lambda_squared() <= 1.0
+        || (params.lambda_sq.is_integer && params.lambda_squared() != lambda_sq_int as f64)
         || (!params.lambda_sq.is_integer && params.lambda_squared().floor() as u64 != lambda_sq_int)
     {
         return Err(anyhow!(
@@ -399,25 +469,31 @@ fn build_tau_f64(params: &CcmParams, l: f64, lambda_sq_int: u64) -> Result<nalge
         .checked_mul(2)
         .and_then(|v| v.checked_add(1))
         .ok_or_else(|| anyhow!("CCM matrix dimension overflow"))?;
+    let count = dim
+        .checked_mul(dim)
+        .ok_or_else(|| anyhow!("CCM matrix size overflow"))?;
     let quadrature_order = n_max
         .checked_mul(3)
         .and_then(|v| v.checked_add(32))
         .ok_or_else(|| anyhow!("CCM quadrature order overflow"))?
         .max(64);
     // Resolve one rule for the entire matrix. Fixed GL64 aliases higher modes.
-    let (nodes, weights) = xc_numerics::quadrature::gl_nodes_weights_f64(quadrature_order);
+    let (nodes, weights) = xc_numerics::quadrature::try_gl_nodes_weights_f64(quadrature_order)?;
     let quadrature: Vec<(f64, f64)> = nodes
         .iter()
         .zip(&weights)
         .map(|(&node, &weight)| (0.5 * l * (1.0 + node), 0.5 * l * weight))
         .collect();
-    let mut tau = DMatrix::<f64>::zeros(dim, dim);
+    let mut entries = Vec::new();
+    entries.try_reserve_exact(count)?;
+    entries.resize(count, 0.0);
+    let mut tau = DMatrix::<f64>::from_vec(dim, dim, entries);
 
     let kappa = (4.0 * std::f64::consts::PI * (0.5 * l).tanh()).ln() + EULER_GAMMA;
     let sinh2_l_over_4 = (l / 4.0).sinh().powi(2);
     let sixteen_pi2 = 16.0 * std::f64::consts::PI * std::f64::consts::PI;
     let l2 = l * l;
-    let prime_powers = prime_powers_up_to(lambda_sq_int);
+    let prime_powers = try_prime_powers_up_to(lambda_sq_int)?;
 
     for n in -(n_max as i64)..=(n_max as i64) {
         for m in -(n_max as i64)..=(n_max as i64) {
@@ -477,20 +553,36 @@ fn build_tau_f64(params: &CcmParams, l: f64, lambda_sq_int: u64) -> Result<nalge
                 wp_sum += log_p * (k as f64).powf(-0.5) * q;
             }
 
-            tau[(params.idx(n), params.idx(m))] = w02 - wr - wp_sum;
+            let entry = w02 - wr - wp_sum;
+            if !entry.is_finite() {
+                return Err(anyhow!("CCM matrix entry is not finite"));
+            }
+            tau[(params.idx(n), params.idx(m))] = entry;
         }
     }
     Ok(tau)
 }
 
-/// Discover positive sign-change roots of the even-state secular function
-/// `R(t) = ξ_0 + 2t Σ ξ_j/(t-j²)`, including the interval below the first pole.
+/// Search for positive sign-change roots of the even-state secular function
+/// `R(t) = ξ_0 + 2t Σ ξ_j/(t-j²)`, returned as ascending physical ordinates.
 ///
-/// This exploratory search does not prove completeness: signed residues can
-/// produce multiple roots per pole gap, and the final exterior window is finite.
-/// `tol` controls absolute residual or t-bracket width, not physical-ordinate
-/// error or comparison accuracy against a Riemann zero. For complete root counts
-/// use the HP certified discovery route.
+/// Signed residues can place any number of roots in one pole gap or beyond the
+/// last pole, so each window, including the one below the first pole and the
+/// whole exterior, is subdivided using binary64 root-exclusion and
+/// monotonicity estimates. This exploratory route does not certify completeness.
+/// Roots that binary64 cannot
+/// separate return an error rather than being dropped; a root within one
+/// binary64 spacing of a pole is reported at that spacing.
+/// Inputs must be finite, exactly even, and have nonzero component sum, as
+/// required by the CCM quotient. A common nonzero state scale is normalized out.
+/// `tol` is positive and controls absolute/relative t-bracket width; only a zero
+/// of the exact stored-dyadic secular sum can short-circuit that test. Exhausted work,
+/// nonfinite evaluations and unrepresentable physical ordinates return errors.
+/// These point brackets do not certify physical-ordinate error or a comparison
+/// against a Riemann zero. Signs and zeros use exact rational evaluation of the
+/// supplied dyadic source under an exact common power-of-two scale; heuristic exclusion does not prove completeness.
+/// More than 4096 active poles exceeds the explicit work budget. For certified
+/// counts use HP certified discovery.
 pub fn solve_spectrum_f64(
     xi: &[f64],
     n_max: usize,
@@ -498,47 +590,7 @@ pub fn solve_spectrum_f64(
     tol: f64,
     max_iter: usize,
 ) -> Result<Vec<f64>> {
-    let expected = n_max.checked_mul(2).and_then(|v| v.checked_add(1));
-    if expected != Some(xi.len())
-        || xi.iter().any(|x| !x.is_finite())
-        || !l.is_finite()
-        || l <= 0.0
-        || !tol.is_finite()
-        || tol < 0.0
-    {
-        return Err(anyhow!("invalid f64 secular state, length, or tolerance"));
-    }
-    if n_max == 0 {
-        return Ok(Vec::new());
-    }
-    let xi_pos: Vec<f64> = (0..=n_max).map(|j| xi[j + n_max]).collect();
-
-    let f = |t: f64| -> f64 {
-        let mut acc = xi_pos[0];
-        let mut sum = 0.0_f64;
-        for (j, &xij) in xi_pos.iter().enumerate().skip(1) {
-            sum += xij / (t - (j as f64).powi(2));
-        }
-        acc += 2.0 * t * sum;
-        acc
-    };
-
-    let mut roots = Vec::with_capacity(n_max);
-    for k in 0..=n_max {
-        let lo = (k as f64).powi(2);
-        let hi = ((k + 1) as f64).powi(2);
-        let eps = INTEGRAND_SINGULARITY_GUARD * (hi - lo);
-        let a = lo + eps;
-        let b = if k == n_max {
-            lo + 1e6 * (lo + 1.0)
-        } else {
-            hi - eps
-        };
-        if let Some(t) = xc_numerics::root_finding::bisect_f64(&f, a, b, tol, max_iter) {
-            roots.push((2.0 * std::f64::consts::PI / l) * t.sqrt());
-        }
-    }
-    Ok(roots)
+    native_secular::solve(xi, n_max, l, tol, max_iter)
 }
 
 // Reference Riemann-zero literals below are quoted at published precision
@@ -637,16 +689,61 @@ mod tests {
     }
 
     #[test]
+    fn native_even_ritz_values_match_independent_defining_integral_matrices() {
+        let oracle: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/native_ccm_oracle.json"))
+                .unwrap();
+        let mut checked = 0;
+        for case in oracle["ritz_cases"].as_array().unwrap() {
+            let cutoff = case["cutoff"].as_u64().unwrap();
+            let modes = case["modes"].as_u64().unwrap() as usize;
+            let params = CcmParams::from_lambda_sq_integer(cutoff, modes);
+            let tau = build_tau_f64(&params, params.log_length(), cutoff).unwrap();
+            // Form the orthonormal reflection embedding independently of
+            // run_f64, so rejected state normalization cannot skip an oracle.
+            let mut q = nalgebra::DMatrix::<f64>::zeros(2 * modes + 1, modes + 1);
+            q[(modes, 0)] = 1.0;
+            for j in 1..=modes {
+                q[(modes - j, j)] = 1.0 / 2.0_f64.sqrt();
+                q[(modes + j, j)] = 1.0 / 2.0_f64.sqrt();
+            }
+            let even = q.transpose() * tau * q;
+            let eig = nalgebra::SymmetricEigen::new(even);
+            let minimum = eig
+                .eigenvalues
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min);
+            let expected = case["even_minimum"]
+                .as_str()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap();
+            assert!(
+                (minimum - expected).abs() < 2e-12 * (1.0 + expected.abs()),
+                "C={cutoff} N={modes}: matrix eigenvalue={minimum}, reference={expected}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 24);
+    }
+
+    #[test]
     fn f64_selected_even_state_has_a_small_full_matrix_residual() {
-        let params = CcmParams::from_lambda_sq_integer(13, 32);
+        // This source has a resolved even state in binary64. The former
+        // cutoff-13/N=32 fixture has an unresolved gap and is checked below.
+        let params = CcmParams::from_lambda_sq_integer(2, 20);
         let result = run_f64(&params).unwrap();
-        let matrix = build_tau_f64(&params, params.log_length(), 13).unwrap();
+        let matrix = build_tau_f64(&params, params.log_length(), 2).unwrap();
         let xi = nalgebra::DVector::from_column_slice(&result.xi);
         let residual = &matrix * &xi - result.weil_min_eigenvalue * &xi;
         assert!(residual.norm() / xi.norm() < 1e-11);
         for j in 0..=params.n_modes {
             assert_eq!(result.xi[params.n_modes + j], result.xi[params.n_modes - j]);
         }
+        let unresolved = CcmParams::from_lambda_sq_integer(13, 32);
+        let error = run_f64(&unresolved).unwrap_err();
+        assert!(error.to_string().contains("unresolved in binary64"));
     }
 
     #[test]
@@ -659,6 +756,88 @@ mod tests {
         assert!((roots[0] - 1.0 / 3.0_f64.sqrt()).abs() < 1e-13);
         assert!(solve_spectrum_f64(&[f64::NAN; 3], 1, 1.0, 1e-14, 200).is_err());
         assert!(solve_spectrum_f64(&[1.0], 1, 1.0, 1e-14, 200).is_err());
+    }
+
+    /// Solve with L = 2π, so each returned ordinate is √t.
+    fn secular_roots_in_t(positive: &[f64]) -> Vec<f64> {
+        let n = positive.len() - 1;
+        let xi = positive[1..]
+            .iter()
+            .rev()
+            .chain(positive)
+            .copied()
+            .collect::<Vec<_>>();
+        solve_spectrum_f64(&xi, n, 2.0 * std::f64::consts::PI, 1e-14, 200)
+            .unwrap()
+            .iter()
+            .map(|ordinate| ordinate * ordinate)
+            .collect()
+    }
+
+    fn assert_roots(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len(), "{actual:?} vs {expected:?}");
+        for (a, e) in actual.iter().zip(expected) {
+            assert!(
+                (a - e).abs() <= 1e-10 * e.abs(),
+                "{actual:?} vs {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn f64_secular_search_finds_two_roots_in_one_pole_gap() {
+        // R(t) = -10 + 1/(t-1) - 1/(t-4): both gap ends are +inf, so the
+        // former one-bisection-per-gap search found no bracket and dropped
+        // both roots of t^2 - 5t + 4.3 = 0.
+        let roots = secular_roots_in_t(&[-10.75, 0.5, -0.125]);
+        let d = 7.8_f64.sqrt();
+        assert_roots(&roots, &[(5.0 - d) / 2.0, (5.0 + d) / 2.0]);
+    }
+
+    #[test]
+    fn f64_secular_search_finds_every_exterior_root() {
+        // R(t) = 1 - 20/(t-1) + 1/(t-4): +inf after the last pole and 1 at
+        // infinity, with two roots t = 12 -/+ sqrt(61) beyond the last pole.
+        let roots = secular_roots_in_t(&[20.75, -10.0, 0.125]);
+        let d = 61.0_f64.sqrt();
+        assert_roots(&roots, &[12.0 - d, 12.0 + d]);
+    }
+
+    #[test]
+    fn f64_secular_search_handles_zero_constant_and_tiny_residues() {
+        // xi_0 = 0: R(t) = t(2/(t-1) + 2/(t-4)); t = 0 is not positive.
+        assert_roots(&secular_roots_in_t(&[0.0, 1.0, 1.0]), &[2.5]);
+        // R(t) = 1 + 1/(t-1) - 1e-6/(t-4) has roots t^2 - (4+1e-6)t + 1e-6 = 0,
+        // one just below 1 in the first window and one hugging the weak pole.
+        let roots = secular_roots_in_t(&[2.5e-7, 0.5, -1.25e-7]);
+        let (b, c) = (4.0_f64 + 1e-6, 1e-6);
+        let d = (b * b - 4.0 * c).sqrt();
+        let large = (b + d) / 2.0;
+        assert_eq!(roots.len(), 2, "{roots:?}");
+        assert!((roots[0] - c / large).abs() < 1e-13, "{roots:?}");
+        assert!((roots[1] - large).abs() < 1e-12, "{roots:?}");
+    }
+
+    #[test]
+    fn f64_ccm_rejects_an_unresolved_boundary_normalization() {
+        // C=5,N=20 once exposed a mismatched QR column. Correct column pairing
+        // alone is insufficient: the independent finite-root oracle still
+        // shows large tail errors when its boundary sum is unresolved.
+        let error = run_f64(&CcmParams::from_lambda_sq_integer(5, 20))
+            .expect_err("binary64 must reject an unresolved source");
+        assert!(error.to_string().contains("unresolved in binary64"));
+    }
+
+    #[test]
+    fn f64_ccm_rejects_unresolved_states_before_root_discovery() {
+        for modes in [8, 20] {
+            let error = run_f64(&CcmParams::from_lambda_sq_integer(13, modes))
+                .expect_err("unresolved state must not become a root source");
+            assert!(error.to_string().contains("unresolved in binary64"));
+        }
+        let result = run_f64(&CcmParams::from_lambda_sq_integer(2, 20)).unwrap();
+        assert!(!result.eigenvalues_pos.is_empty());
+        assert!(result.eigenvalues_pos.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
@@ -797,7 +976,7 @@ mod tests {
     }
 
     /// solve_spectrum_f64 with a simple ξ that has known structure.
-    /// If ξ_0 = 0 and ξ_1 = 1 (all others zero), then
+    /// If ξ_0 = 0 and ξ_1 = ξ_{-1} = 1 (all others zero), then
     /// R(t) = 0 + 2t · [1/(t - 1)] = 2t/(t-1).
     /// This has a zero at t = 0 (outside our search range) and no zero
     /// in (1, 4), (4, 9), etc. — the function is always positive for t > 1.
@@ -807,7 +986,11 @@ mod tests {
         let n_max = 3;
         let l = 13.0_f64.ln();
         let mut xi = vec![0.0_f64; 2 * n_max + 1];
-        xi[n_max + 1] = 1.0; // ξ_1 = 1
+        xi[n_max + 1] = 1.0; // an unpaired mode is not an even state
+        assert!(
+            solve_spectrum_f64(&xi, n_max, l, DEFAULT_BISECT_TOL, DEFAULT_BISECT_MAX_ITER).is_err()
+        );
+        xi[n_max - 1] = 1.0; // reflected pair: ξ_1 = ξ_{-1} = 1
         let roots =
             solve_spectrum_f64(&xi, n_max, l, DEFAULT_BISECT_TOL, DEFAULT_BISECT_MAX_ITER).unwrap();
         // R(t) = 2t/(t-1) for t > 1 is always positive, so no sign changes.
@@ -906,6 +1089,8 @@ mod transform_enclosure;
 pub mod research_cohort;
 #[cfg(feature = "hp")]
 pub mod research_prepare;
+#[cfg(feature = "hp")]
+mod research_prepare_math;
 #[cfg(feature = "hp")]
 mod research_target;
 

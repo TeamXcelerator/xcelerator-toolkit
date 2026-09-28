@@ -2,37 +2,47 @@
 // All rights reserved. See LICENSE in the repository root.
 //
 
-//! Mellin-side investigation: CCM vs naive Mellin truncation.
-//!
-//! Tests how much of the CCM construction's accuracy is captured by
-//! integral transforms of ξ_λ. Result: not much. CCM gives 55-460
-//! matching digits; naive Mellin truncation gives < 1 digit; ξ-weighted
-//! Mellin gives ~2.6× over naive. The construction's power is algebraic.
-//! Tests whether the CCM construction's eigenvalues relate to zeros of
-//! the truncated completed eta function Λ_λ(s) = ∫_{λ⁻¹}^{λ} t^{s-1} ω(t) dt,
-//! or to zeros of the ξ_λ-weighted variant G(s) = ∫ f_λ(u) ω(u) u^{s-1} du.
-//!
-//! ## Background
-//!
-//! Yakaboylu (2408.15135) shows that the full completed eta function
-//! Λ(s) = ∫_0^∞ t^{s-1} ω(t) dt = Γ(s+1)·η(s) has zeros at the
-//! nontrivial Riemann zeros (plus periodic eta zeros). The truncated
-//! version Λ_λ(s) should approximate Λ(s) as λ → ∞, with its zeros
-//! approaching the Riemann zeros.
-//!
-//! The question: do the zeros of Λ_λ(s) match our CCM eigenvalues?
-//! If yes, we have a direct Mellin-side bridge.
+//! Point quadrature and real-part crossing diagnostics for truncated and
+//! eigenfunction-weighted completed eta transforms. The analytic kernel is
+//! omega(t)=t*exp(t)/(1+exp(t))^2 and its full Mellin transform is
+//! Gamma(s+1)*eta(s) on its domain of convergence. A crossing of Re(G) on the
+//! critical line does not establish G=0. Quadrature, truncation, state accuracy,
+//! and comparisons with Riemann zeros require separate validation.
+//! Endpoint terms can dominate the real-part crossings, with a characteristic
+//! spacing pi/log(lambda); this is not an exact general spacing law or evidence
+//! for zeta zeros. The u-variable rule may converge slowly at large lambda:
+//! increasing arithmetic precision alone does not control quadrature error.
+
+mod transforms;
+use transforms::*;
+mod crossings;
+pub use crossings::*;
+
+/// Algorithm identity for stable eta evaluation and checked real-part scans.
+pub const MELLIN_SEMANTICS_VERSION: &str = "eta-range-scaled-real-crossings-v4";
 
 /// ω(t) = t·e^t / (1 + e^t)² — the kernel of the completed eta function.
 /// Well-behaved for t > 0; decays exponentially for large t.
 #[inline]
 pub fn omega_f64(t: f64) -> f64 {
-    if t > 500.0 {
-        // For very large t: ω(t) ≈ t·e^{-t}
-        return t * (-t).exp();
+    if !t.is_finite() {
+        return f64::NAN;
     }
-    let et = t.exp();
-    t * et / (1.0 + et).powi(2)
+    let magnitude = t.abs();
+    if magnitude == 0.0 {
+        return t;
+    }
+    let exponential = (-magnitude).exp();
+    // A subnormal exponential can lose most of its significant bits before
+    // multiplication restores a normal result. Split the exponential so the
+    // only possibly subnormal multiplication is the final one.
+    let numerator = if exponential < f64::MIN_POSITIVE {
+        let half_exponential = (-0.5 * magnitude).exp();
+        (magnitude * half_exponential) * half_exponential
+    } else {
+        magnitude * exponential
+    };
+    (numerator / (1.0 + exponential).powi(2)).copysign(t)
 }
 
 /// Evaluate the truncated completed eta function at complex s = σ + it:
@@ -42,13 +52,26 @@ pub fn omega_f64(t: f64) -> f64 {
 /// Uses Gauss-Legendre quadrature at f64.
 /// Returns (real part, imaginary part).
 pub fn truncated_lambda_f64(s_re: f64, s_im: f64, lambda: f64, n_quad: usize) -> (f64, f64) {
+    try_truncated_lambda_f64(s_re, s_im, lambda, n_quad).unwrap_or((f64::NAN, f64::NAN))
+}
+
+/// Checked point quadrature. Rejects invalid domains and nonfinite arithmetic.
+/// This does not certify quadrature or truncation error.
+pub fn try_truncated_lambda_f64(
+    s_re: f64,
+    s_im: f64,
+    lambda: f64,
+    n_quad: usize,
+) -> anyhow::Result<(f64, f64)> {
+    validate_transform_f64(s_re, s_im, lambda, n_quad)?;
+
     // Gauss-Legendre on [λ⁻¹, λ] mapped from [-1, 1].
     let a = 1.0 / lambda;
     let b = lambda;
-    let mid = 0.5 * (a + b);
+    let mid = a.midpoint(b);
     let half = 0.5 * (b - a);
 
-    let (nodes, weights) = xc_numerics::quadrature::gl_nodes_weights_f64(n_quad);
+    let (nodes, weights) = xc_numerics::quadrature::try_gl_nodes_weights_f64(n_quad)?;
 
     let mut sum_re = 0.0_f64;
     let mut sum_im = 0.0_f64;
@@ -57,17 +80,20 @@ pub fn truncated_lambda_f64(s_re: f64, s_im: f64, lambda: f64, n_quad: usize) ->
         let w = weights[i] * half;
         // u^{s-1} = u^{σ-1} · exp(i·t·ln u)
         let ln_u = u.ln();
-        let u_pow_re = u.powf(s_re - 1.0); // u^{σ-1}
+        let common = mellin_amplitude_f64(s_re, u);
         let phase = s_im * ln_u;
         let cos_phase = phase.cos();
         let sin_phase = phase.sin();
-        let omega_u = omega_f64(u);
-        let integrand_re = u_pow_re * cos_phase * omega_u;
-        let integrand_im = u_pow_re * sin_phase * omega_u;
+        let integrand_re = common * cos_phase;
+        let integrand_im = common * sin_phase;
         sum_re += w * integrand_re;
         sum_im += w * integrand_im;
     }
-    (sum_re, sum_im)
+    anyhow::ensure!(
+        sum_re.is_finite() && sum_im.is_finite(),
+        "nonfinite Mellin quadrature result"
+    );
+    Ok((sum_re, sum_im))
 }
 
 /// Evaluate the ξ_λ-weighted Mellin transform at complex s:
@@ -88,14 +114,48 @@ pub fn xi_weighted_mellin_f64(
     n_modes: usize,
     n_quad: usize,
 ) -> (f64, f64) {
-    let l = (lambda * lambda).ln();
+    try_xi_weighted_mellin_f64(s_re, s_im, lambda, xi, n_modes, n_quad)
+        .unwrap_or((f64::NAN, f64::NAN))
+}
+
+/// Checked point quadrature. Rejects invalid domains and nonfinite arithmetic.
+/// This does not certify quadrature or truncation error.
+/// The full 2N+1 coefficient vector must be finite and exactly even.
+pub fn try_xi_weighted_mellin_f64(
+    s_re: f64,
+    s_im: f64,
+    lambda: f64,
+    xi: &[f64], // length 2N+1, indexed j = -N..N with xi[N] = ξ_0
+    n_modes: usize,
+    n_quad: usize,
+) -> anyhow::Result<(f64, f64)> {
+    validate_transform_f64(s_re, s_im, lambda, n_quad)?;
+    anyhow::ensure!(lambda > 1.0, "weighted Mellin requires lambda > 1");
+    let length = n_modes
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("Mellin mode dimension overflow"))?;
+    anyhow::ensure!(
+        xi.len() == length && n_modes <= (1u64 << 53) as usize,
+        "Mellin coefficient shape or index range"
+    );
+    anyhow::ensure!(
+        xi.iter().all(|v| v.is_finite()),
+        "Mellin coefficients must be finite at the working precision"
+    );
+    anyhow::ensure!(
+        (0..n_modes).all(|n| xi[n] == xi[length - 1 - n]),
+        "Mellin cosine reconstruction requires an exactly even vector"
+    );
+
+    let l = 2.0 * lambda.ln();
     let inv_sqrt_l = 1.0 / l.sqrt();
     let a = 1.0 / lambda;
     let b = lambda;
-    let mid = 0.5 * (a + b);
+    let mid = a.midpoint(b);
     let half = 0.5 * (b - a);
 
-    let (nodes, weights) = xc_numerics::quadrature::gl_nodes_weights_f64(n_quad);
+    let (nodes, weights) = xc_numerics::quadrature::try_gl_nodes_weights_f64(n_quad)?;
 
     let xi_0 = xi[n_modes];
     let xi_pos: Vec<f64> = (1..=n_modes).map(|n| xi[n_modes + n]).collect();
@@ -107,7 +167,7 @@ pub fn xi_weighted_mellin_f64(
         let w = weights[i] * half;
 
         // f_λ(u) via cosine reconstruction
-        let phase_base = 2.0 * std::f64::consts::PI * (lambda * u).ln() / l;
+        let phase_base = 2.0 * std::f64::consts::PI * (lambda.ln() + u.ln()) / l;
         let mut f_val = xi_0;
         for n in 1..=n_modes {
             f_val += 2.0 * xi_pos[n - 1] * (n as f64 * phase_base).cos();
@@ -116,81 +176,21 @@ pub fn xi_weighted_mellin_f64(
 
         // u^{s-1} · ω(u)
         let ln_u = u.ln();
-        let u_pow_re = u.powf(s_re - 1.0);
+        let common = mellin_amplitude_f64(s_re, u);
         let phase = s_im * ln_u;
         let cos_phase = phase.cos();
         let sin_phase = phase.sin();
-        let omega_u = omega_f64(u);
 
-        let integrand_re = f_val * u_pow_re * cos_phase * omega_u;
-        let integrand_im = f_val * u_pow_re * sin_phase * omega_u;
+        let integrand_re = f_val * common * cos_phase;
+        let integrand_im = f_val * common * sin_phase;
         sum_re += w * integrand_re;
         sum_im += w * integrand_im;
     }
-    (sum_re, sum_im)
-}
-
-/// Find zeros of a complex function on the critical line Re(s) = 1/2
-/// by scanning Im(s) and looking for sign changes in the real part.
-/// Returns approximate locations of zeros.
-///
-/// The scan evaluations are computed in parallel via rayon.
-/// `eval_fn` must be `Sync` (true for pure-math closures with no
-/// shared mutable state).
-pub fn scan_critical_line_zeros_f64<F>(
-    eval_fn: &F,
-    t_min: f64,
-    t_max: f64,
-    n_scan: usize,
-) -> Vec<f64>
-where
-    F: Fn(f64, f64) -> (f64, f64) + Sync,
-{
-    use rayon::prelude::*;
-    // Full parallelism is the explicit default. Safe-capped HP workflows use
-    // hp_runtime::run_hp_with_policy; no process environment is read before the
-    // parallel scan fires — see xc_numerics::hp_runtime module docs.
-    let dt = (t_max - t_min) / (n_scan as f64);
-
-    // Parallel scan: evaluate Re(eval_fn(0.5, t_i)) at each grid point.
-    let re_values: Vec<f64> = (0..=n_scan)
-        .into_par_iter()
-        .map(|i| {
-            let t = t_min + (i as f64) * dt;
-            eval_fn(0.5, t).0
-        })
-        .collect();
-
-    // Sequential scan for sign changes (cheap), then per-zero bisection.
-    // Bisections themselves are sequential but only happen at sign changes
-    // (typically O(N/log N) of them, not all N).
-    let mut zeros = Vec::new();
-    for i in 1..=n_scan {
-        if re_values[i - 1] * re_values[i] < 0.0 {
-            let prev_t = t_min + ((i - 1) as f64) * dt;
-            let t = t_min + (i as f64) * dt;
-            let zero_t = bisect_zero_f64(eval_fn, prev_t, t, 50);
-            zeros.push(zero_t);
-        }
-    }
-    zeros
-}
-
-fn bisect_zero_f64<F>(eval_fn: &F, mut a: f64, mut b: f64, max_iter: usize) -> f64
-where
-    F: Fn(f64, f64) -> (f64, f64) + Sync,
-{
-    for _ in 0..max_iter {
-        let mid = 0.5 * (a + b);
-        let (fa, _) = eval_fn(0.5, a);
-        let (fm, _) = eval_fn(0.5, mid);
-        if fa * fm < 0.0 {
-            b = mid;
-        } else {
-            a = mid;
-        }
-    }
-    0.5 * (a + b)
+    anyhow::ensure!(
+        sum_re.is_finite() && sum_im.is_finite(),
+        "nonfinite Mellin quadrature result"
+    );
+    Ok((sum_re, sum_im))
 }
 
 // Reference Riemann-zero literals below are quoted at published precision
@@ -292,7 +292,10 @@ mod tests {
             55.0,
             5000,
         );
-        eprintln!("\nΛ_λ zeros on critical line (λ = √13 ≈ {:.4}):", lambda);
+        eprintln!(
+            "\nΛ_λ real-part crossings on critical line (λ = √13 ≈ {:.4}):",
+            lambda
+        );
         eprintln!(
             "{:>5} {:>15} {:>15} {:>12}",
             "k", "Λ_λ zero", "Riemann zero", "difference"
@@ -308,10 +311,16 @@ mod tests {
                 eprintln!("{:>5} {:>15} {:>15.6} {:>12}", i + 1, "NOT FOUND", rz, "—");
             }
         }
-        eprintln!("Total zeros found in [5, 55]: {}", zeros.len());
+        eprintln!(
+            "Total real-part crossings found in [5, 55]: {}",
+            zeros.len()
+        );
         // At λ=√13, the truncation is severe (interval [0.277, 3.606]).
         // We may not find all zeros. Just check we find at least some.
-        assert!(!zeros.is_empty(), "should find at least one zero");
+        assert!(
+            !zeros.is_empty(),
+            "should find at least one real-part crossing"
+        );
     }
 
     /// Same scan at λ = 10 (λ² = 100) — larger interval, should be closer.
@@ -340,7 +349,7 @@ mod tests {
             40.0,
             3000,
         );
-        eprintln!("\nΛ_λ zeros on critical line (λ = 10):");
+        eprintln!("\nΛ_λ real-part crossings on critical line (λ = 10):");
         eprintln!(
             "{:>5} {:>15} {:>15} {:>12}",
             "k", "Λ_λ zero", "Riemann zero", "difference"
@@ -356,18 +365,17 @@ mod tests {
                 eprintln!("{:>5} {:>15} {:>15.6} {:>12}", i + 1, "NOT FOUND", rz, "—");
             }
         }
-        eprintln!("Total zeros found in [10, 40]: {}", zeros.len());
-        // At λ=10, should find zeros close to Riemann zeros.
-        let first_riemann = 14.134725141734695;
-        let closest_to_first = zeros
-            .iter()
-            .map(|&z| (z - first_riemann).abs())
-            .fold(f64::INFINITY, f64::min);
-        assert!(
-            closest_to_first < 0.5,
-            "should find a zero within 0.5 of 14.13 (closest was {:.4})",
-            closest_to_first
+        eprintln!(
+            "Total real-part crossings found in [10, 40]: {}",
+            zeros.len()
         );
+        // Check the actual claimed quantity, not proximity to unrelated zeros.
+        assert!(!zeros.is_empty());
+        for t in zeros {
+            assert!((10.0..=40.0).contains(&t));
+            let (real, imaginary) = truncated_lambda_f64(0.5, t, lambda, 300);
+            assert!(real.abs() <= 1e-8 * (1.0 + imaginary.abs()));
+        }
     }
 
     /// Idea 2: ξ_λ-weighted Mellin G(s) = ∫ f_λ(u)·ω(u)·u^{s-1} du.
@@ -412,7 +420,7 @@ mod tests {
             5000,
         );
 
-        eprintln!("\nG(s) = ∫ f_λ·ω·u^{{s-1}} zeros on critical line (λ = √13):");
+        eprintln!("\nG(s) = ∫ f_λ·ω·u^{{s-1}} real-part crossings on critical line (λ = √13):");
         eprintln!(
             "{:>5} {:>15} {:>15} {:>12}",
             "k", "G zero", "Riemann zero", "difference"
@@ -428,9 +436,12 @@ mod tests {
                 eprintln!("{:>5} {:>15} {:>15.6} {:>12}", i + 1, "NOT FOUND", rz, "—");
             }
         }
-        eprintln!("Total G zeros found in [5, 55]: {}", zeros.len());
+        eprintln!("Total Re(G) crossings found in [5, 55]: {}", zeros.len());
         // Just check it runs and finds some zeros.
-        assert!(!zeros.is_empty(), "should find at least one zero");
+        assert!(
+            !zeros.is_empty(),
+            "should find at least one real-part crossing"
+        );
     }
 
     /// Fast test for xi_weighted_mellin_f64 with a synthetic flat ξ vector.
@@ -479,35 +490,47 @@ mod tests {
 // High-precision Mellin computation (requires ccm-rug feature)
 // ===========================================================================
 
-/// HP version of the eta kernel `ω(t) = t·eᵗ / (1 + eᵗ)²`.
-///
-/// All arithmetic at the precision of `t`. The asymptotic branch
-/// `t·e^{-t}` is taken when `t > 500` to avoid `e^t` overflow at modest
-/// HP precisions (the truncated branch agrees with the closed form to
-/// ~`-2t/ln 10` decimal digits, far below working precision for any
-/// `t > 500`).
+/// Stable HP eta kernel at the precision of t. The exact identity using
+/// exp(-|t|) avoids positive-exponential overflow and a fixed asymptotic cutoff.
+/// This is a computed point value, not an error enclosure.
 #[cfg(feature = "hp")]
 pub fn omega_hp(t: &rug::Float) -> rug::Float {
     use rug::Float;
     let prec = t.prec();
-    let large_threshold = Float::with_val(prec, 500);
-    if t > &large_threshold {
-        // ω(t) ≈ t·e^{-t}
-        let mut neg_t = t.clone();
-        neg_t = -neg_t;
-        let mut v = t.clone();
-        v *= &neg_t.exp();
-        return v;
+    let Some(guard) = prec
+        .checked_add(64)
+        .filter(|p| *p <= rug::float::prec_max())
+    else {
+        return Float::with_val(prec, rug::float::Special::Nan);
+    };
+    if !t.is_finite() {
+        return Float::with_val(prec, rug::float::Special::Nan);
     }
-    let one = Float::with_val(prec, 1);
-    let et = t.clone().exp();
-    let mut denom = et.clone();
-    denom += &one;
-    denom.square_mut();
-    let mut v = t.clone();
-    v *= &et;
-    v /= &denom;
-    v
+    if t.is_zero() {
+        return t.clone();
+    }
+    let magnitude = Float::with_val(guard, t).abs();
+    let exponential = (-magnitude.clone()).exp();
+    let mut numerator =
+        if exponential.is_zero() || exponential.get_exp() == Some(rug::float::exp_min()) {
+            // MPFR underflow can round a nonzero exponential to its minimum
+            // positive value. Split the exponential before that rounding loses
+            // information; the final product alone approaches the exponent limit.
+            let half_exponential = (-magnitude.clone() / 2u32).exp();
+            let mut product = Float::with_val(guard, &magnitude * &half_exponential);
+            product *= half_exponential;
+            product
+        } else {
+            Float::with_val(guard, &magnitude * &exponential)
+        };
+    let mut denominator = exponential;
+    denominator += 1u32;
+    denominator.square_mut();
+    numerator /= denominator;
+    if t.is_sign_negative() {
+        numerator = -numerator;
+    }
+    Float::with_val(prec, numerator)
 }
 
 /// HP version of the ξ_λ-weighted Mellin transform.
@@ -528,11 +551,56 @@ pub fn xi_weighted_mellin_hp(
     gl_nodes: &[rug::Float],
     gl_weights: &[rug::Float],
 ) -> (rug::Float, rug::Float) {
-    use rug::ops::Pow;
+    try_xi_weighted_mellin_hp(s_re, s_im, lambda, xi_hp, n_modes, gl_nodes, gl_weights)
+        .unwrap_or_else(|_| {
+            (
+                rug::Float::with_val(lambda.prec(), rug::float::Special::Nan),
+                rug::Float::with_val(lambda.prec(), rug::float::Special::Nan),
+            )
+        })
+}
+
+/// Checked point quadrature. Rejects invalid domains and nonfinite arithmetic.
+/// This does not certify quadrature or truncation error.
+/// Validates the supplied GL rule in O(n^2) arithmetic on each call.
+/// The full 2N+1 coefficient vector must be finite and exactly even.
+#[cfg(feature = "hp")]
+pub fn try_xi_weighted_mellin_hp(
+    s_re: &rug::Float,
+    s_im: &rug::Float,
+    lambda: &rug::Float,
+    xi_hp: &[rug::Float],
+    n_modes: usize,
+    gl_nodes: &[rug::Float],
+    gl_weights: &[rug::Float],
+) -> anyhow::Result<(rug::Float, rug::Float)> {
+    validate_transform_hp(s_re, s_im, lambda, gl_nodes, gl_weights)?;
+    anyhow::ensure!(
+        lambda > &rug::Float::with_val(lambda.prec(), 1),
+        "weighted Mellin requires lambda > 1"
+    );
+    let length = n_modes
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("Mellin mode dimension overflow"))?;
+    anyhow::ensure!(
+        xi_hp.len() == length && n_modes <= u32::MAX as usize,
+        "Mellin coefficient shape or index range"
+    );
+    anyhow::ensure!(
+        xi_hp
+            .iter()
+            .all(|v| v.is_finite() && v.prec() == lambda.prec()),
+        "Mellin coefficients must be finite at the working precision"
+    );
+    anyhow::ensure!(
+        (0..n_modes).all(|n| xi_hp[n] == xi_hp[length - 1 - n]),
+        "Mellin cosine reconstruction requires an exactly even vector"
+    );
+
     use rug::Float;
 
     let prec = lambda.prec();
-    let one = Float::with_val(prec, 1);
     let pi_v = Float::with_val(prec, rug::float::Constant::Pi);
     let two_pi = {
         let mut v = pi_v.clone();
@@ -565,8 +633,8 @@ pub fn xi_weighted_mellin_hp(
     let b = lambda.clone();
     let mid = {
         let mut v = a.clone();
-        v += &b;
         v /= 2u32;
+        v += Float::with_val(prec, &b / 2u32);
         v
     };
     let half_range = {
@@ -594,9 +662,9 @@ pub fn xi_weighted_mellin_hp(
 
         // f_λ(u) = (1/√L) [ξ_0 + 2 Σ_{n=1}^N ξ_n cos(2π n log(λu)/L)]
         let log_lambda_u = {
-            let mut v = lambda.clone();
-            v *= &u;
-            v.ln()
+            let mut v = lambda.clone().ln();
+            v += u.clone().ln();
+            v
         };
         let phase_base = {
             let mut v = two_pi.clone();
@@ -616,18 +684,8 @@ pub fn xi_weighted_mellin_hp(
         }
         f_val *= &inv_sqrt_l;
 
-        // ω(u) = u·eᵘ/(1+eᵘ)²
-        let omega_u = omega_hp(&u);
-
-        // u^{s-1} = u^{σ-1} · exp(i·t·ln u)
-        // Real part: u^{σ-1} · cos(t·ln u)
-        // Imag part: u^{σ-1} · sin(t·ln u)
         let ln_u = u.clone().ln();
-        let u_pow_sigma_minus_1 = {
-            let mut exp = s_re.clone();
-            exp -= &one;
-            u.clone().pow(exp)
-        };
+        let amplitude = mellin_amplitude_hp(s_re, &u);
         let phase_u = {
             let mut v = s_im.clone();
             v *= &ln_u;
@@ -638,8 +696,7 @@ pub fn xi_weighted_mellin_hp(
 
         // integrand = f_val * ω(u) * u^{s-1}
         let mut common = f_val;
-        common *= &omega_u;
-        common *= &u_pow_sigma_minus_1;
+        common *= &amplitude;
 
         let mut re_term = common.clone();
         re_term *= &cos_phase;
@@ -652,7 +709,11 @@ pub fn xi_weighted_mellin_hp(
         sum_im += &im_term;
     }
 
-    (sum_re, sum_im)
+    anyhow::ensure!(
+        sum_re.is_finite() && sum_im.is_finite(),
+        "nonfinite Mellin quadrature result"
+    );
+    Ok((sum_re, sum_im))
 }
 
 /// HP version of the truncated Λ_λ (unweighted, for comparison).
@@ -670,11 +731,30 @@ pub fn truncated_lambda_hp(
     gl_nodes: &[rug::Float],
     gl_weights: &[rug::Float],
 ) -> (rug::Float, rug::Float) {
-    use rug::ops::Pow;
+    try_truncated_lambda_hp(s_re, s_im, lambda, gl_nodes, gl_weights).unwrap_or_else(|_| {
+        (
+            rug::Float::with_val(lambda.prec(), rug::float::Special::Nan),
+            rug::Float::with_val(lambda.prec(), rug::float::Special::Nan),
+        )
+    })
+}
+
+/// Checked point quadrature. Rejects invalid domains and nonfinite arithmetic.
+/// This does not certify quadrature or truncation error.
+/// Validates the supplied GL rule in O(n^2) arithmetic on each call.
+#[cfg(feature = "hp")]
+pub fn try_truncated_lambda_hp(
+    s_re: &rug::Float,
+    s_im: &rug::Float,
+    lambda: &rug::Float,
+    gl_nodes: &[rug::Float],
+    gl_weights: &[rug::Float],
+) -> anyhow::Result<(rug::Float, rug::Float)> {
+    validate_transform_hp(s_re, s_im, lambda, gl_nodes, gl_weights)?;
+
     use rug::Float;
 
     let prec = lambda.prec();
-    let one = Float::with_val(prec, 1);
 
     let n_quad = gl_nodes.len();
     let nodes = gl_nodes;
@@ -688,8 +768,8 @@ pub fn truncated_lambda_hp(
     let b = lambda.clone();
     let mid = {
         let mut v = a.clone();
-        v += &b;
         v /= 2u32;
+        v += Float::with_val(prec, &b / 2u32);
         v
     };
     let half_range = {
@@ -710,16 +790,7 @@ pub fn truncated_lambda_hp(
         let mut w = weights[i].clone();
         w *= &half_range;
 
-        // ω(u)
-        let omega_u = omega_hp(&u);
-
-        // u^{s-1}
         let ln_u = u.clone().ln();
-        let u_pow = {
-            let mut exp = s_re.clone();
-            exp -= &one;
-            u.clone().pow(exp)
-        };
         let phase_u = {
             let mut v = s_im.clone();
             v *= &ln_u;
@@ -728,8 +799,7 @@ pub fn truncated_lambda_hp(
         let cos_phase = phase_u.clone().cos();
         let sin_phase = phase_u.sin();
 
-        let mut common = omega_u;
-        common *= &u_pow;
+        let common = mellin_amplitude_hp(s_re, &u);
 
         let mut re_term = common.clone();
         re_term *= &cos_phase;
@@ -742,133 +812,11 @@ pub fn truncated_lambda_hp(
         sum_im += &im_term;
     }
 
-    (sum_re, sum_im)
-}
-
-/// Find zeros of an HP complex-valued function on the critical line
-/// Re(s) = 1/2 by scanning Im(s) and bisecting where the real part
-/// changes sign.
-///
-/// `eval_fn` is invoked with HP `(s_re, s_im)` and returns the HP
-/// `(Re, Im)` of the function value. The scan grid is `n_scan + 1`
-/// equally-spaced points in `[t_min, t_max]`. After detecting sign
-/// changes the brackets are refined by bisection in HP for `bisect_iter`
-/// iterations.
-///
-/// All arithmetic is in HP at `prec` bits — no f64 round-trip on the
-/// scan grid or the bisection. Results are HP `Float`s; cast to f64 at
-/// the boundary if the consumer needs an f64 view.
-///
-/// The scan evaluations are computed in parallel via rayon.
-#[cfg(feature = "hp")]
-pub fn scan_critical_line_zeros_hp<F>(
-    eval_fn: &F,
-    t_min: &rug::Float,
-    t_max: &rug::Float,
-    n_scan: usize,
-    bisect_iter: usize,
-) -> Vec<rug::Float>
-where
-    F: Fn(&rug::Float, &rug::Float) -> (rug::Float, rug::Float) + Sync,
-{
-    // Zero-overhead full-parallel default. Safe-capped callers explicitly
-    // wrap this workflow with run_hp_with_policy and record the policy.
-    xc_numerics::hp_runtime::run_hp(|| {
-        scan_critical_line_zeros_hp_inner(eval_fn, t_min, t_max, n_scan, bisect_iter)
-    })
-}
-
-#[cfg(feature = "hp")]
-fn scan_critical_line_zeros_hp_inner<F>(
-    eval_fn: &F,
-    t_min: &rug::Float,
-    t_max: &rug::Float,
-    n_scan: usize,
-    bisect_iter: usize,
-) -> Vec<rug::Float>
-where
-    F: Fn(&rug::Float, &rug::Float) -> (rug::Float, rug::Float) + Sync,
-{
-    use rayon::prelude::*;
-    use rug::Float;
-
-    let prec = t_min.prec().max(t_max.prec());
-    // half = 1/2 built from integers — no f64 round-trip.
-    let half = {
-        let mut v = Float::with_val(prec, 1);
-        v /= 2u32;
-        v
-    };
-    let mut dt = t_max.clone();
-    dt -= t_min;
-    dt /= Float::with_val(prec, n_scan as i64);
-
-    // Parallel scan: evaluate Re(eval_fn(0.5, t_i)) at each grid point.
-    let re_values: Vec<Float> = (0..=n_scan)
-        .into_par_iter()
-        .map(|i| {
-            let mut t = dt.clone();
-            t *= Float::with_val(prec, i as i64);
-            t += t_min;
-            let (re, _) = eval_fn(&half, &t);
-            re
-        })
-        .collect();
-
-    // Sequential scan for sign changes (cheap), then per-zero bisection.
-    let mut zeros = Vec::new();
-    for i in 1..=n_scan {
-        let prev = &re_values[i - 1];
-        let curr = &re_values[i];
-        let opposite_signs = (prev.is_sign_negative() != curr.is_sign_negative())
-            && !prev.is_zero()
-            && !curr.is_zero();
-        if !opposite_signs {
-            continue;
-        }
-        let mut a = dt.clone();
-        a *= Float::with_val(prec, (i - 1) as i64);
-        a += t_min;
-        let mut b = dt.clone();
-        b *= Float::with_val(prec, i as i64);
-        b += t_min;
-        let zero = bisect_zero_hp(eval_fn, &half, a, b, bisect_iter, prec);
-        zeros.push(zero);
-    }
-    zeros
-}
-
-#[cfg(feature = "hp")]
-fn bisect_zero_hp<F>(
-    eval_fn: &F,
-    sigma: &rug::Float,
-    mut a: rug::Float,
-    mut b: rug::Float,
-    max_iter: usize,
-    prec: u32,
-) -> rug::Float
-where
-    F: Fn(&rug::Float, &rug::Float) -> (rug::Float, rug::Float) + Sync,
-{
-    use rug::Float;
-    for _ in 0..max_iter {
-        let mut mid = a.clone();
-        mid += &b;
-        mid /= 2u32;
-        let (fa, _) = eval_fn(sigma, &a);
-        let (fm, _) = eval_fn(sigma, &mid);
-        let opposite =
-            (fa.is_sign_negative() != fm.is_sign_negative()) && !fa.is_zero() && !fm.is_zero();
-        if opposite {
-            b = mid;
-        } else {
-            a = mid;
-        }
-    }
-    let mut out = Float::with_val(prec, &a);
-    out += &b;
-    out /= 2u32;
-    out
+    anyhow::ensure!(
+        sum_re.is_finite() && sum_im.is_finite(),
+        "nonfinite Mellin quadrature result"
+    );
+    Ok((sum_re, sum_im))
 }
 
 #[cfg(all(test, feature = "hp"))]
@@ -904,7 +852,7 @@ mod hp_tests {
     /// Verify the truncated form matches the asymptotic form to high
     /// precision for large t (where eᵗ + 1 ≈ eᵗ).
     #[test]
-    fn omega_hp_asymptotic_branch_is_continuous() {
+    fn omega_hp_agrees_with_large_t_asymptotic_at_modest_precision() {
         let prec = 200;
         // Direct test: ω at t=499 should be ≈ 499·e^{-499} (truncated branch
         // gives the same value to high precision because eᵗ + 1 ≈ eᵗ for
@@ -1011,11 +959,10 @@ mod hp_tests {
         assert!(im_diff.abs() < tol);
     }
 
-    /// HP scan_critical_line_zeros should locate the first Riemann zero
-    /// near t = 14.13 in Λ_λ for λ = 50.
+    /// Check crossings of the quadrature real part, not complex or zeta zeros.
     #[test]
     #[ignore = "HP GL quadrature + parallel scan — GMP arena exhaustion in long debug test runs on WSL2; run with: RAYON_NUM_THREADS=2 cargo test --features hp -- --include-ignored --test-threads=1"]
-    fn scan_critical_line_zeros_hp_finds_first_riemann_zero() {
+    fn scan_real_crossings_hp_checks_the_claimed_component() {
         let prec = 100;
         let lambda = Float::with_val(prec, 50);
         let t_min = Float::with_val(prec, 10);
@@ -1038,32 +985,14 @@ mod hp_tests {
             30,
         );
 
-        let target = Float::with_val(
-            prec,
-            Float::parse("14.134725141734693790457251983").unwrap(),
-        );
-        let closest = zeros
-            .iter()
-            .map(|z| {
-                let mut d = z.clone();
-                d -= &target;
-                d.abs()
-            })
-            .min_by(|a, b| a.total_cmp(b));
-        let closest = closest.expect("should find at least one zero");
-        let tol = {
-            let mut v = Float::with_val(prec, 1);
-            v /= 2u32;
-            v
-        };
-        assert!(
-            closest < tol,
-            "should find zero within 0.5 of 14.13; closest |diff| = {} (zeros: {:?})",
-            xc_numerics::fmt::display_hp(&closest, 6),
-            zeros
-                .iter()
-                .map(|z| xc_numerics::fmt::display_hp(z, 8))
-                .collect::<Vec<_>>()
-        );
+        assert!(!zeros.is_empty());
+        for t in zeros {
+            assert!(t >= t_min && t <= t_max);
+            let (real, imaginary) =
+                truncated_lambda_hp(&Float::with_val(prec, 0.5), &t, &lambda, &nodes, &weights);
+            let tolerance =
+                Float::with_val(prec, 1e-7) * (Float::with_val(prec, 1) + imaginary.abs());
+            assert!(real.abs() <= tolerance);
+        }
     }
 }

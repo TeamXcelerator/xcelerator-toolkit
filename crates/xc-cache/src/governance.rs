@@ -453,11 +453,17 @@ fn valid_git_revision(revision: &str) -> bool {
 fn collect_leaves<'a>(prefix: &str, value: &'a Value, output: &mut Vec<(String, &'a Value)>) {
     match value {
         Value::Object(values) => {
+            if values.is_empty() {
+                output.push((prefix.to_owned(), value));
+            }
             for (key, value) in values {
                 collect_leaves(&format!("{prefix}.{key}"), value, output);
             }
         }
         Value::Array(values) => {
+            if values.is_empty() {
+                output.push((prefix.to_owned(), value));
+            }
             for (index, value) in values.iter().enumerate() {
                 collect_leaves(&format!("{prefix}[{index}]"), value, output);
             }
@@ -766,5 +772,22 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("authority mode"));
+    }
+    #[test]
+    fn audit_sanitizer_requires_allowlist_for_empty_containers() {
+        let profile = PublicSanitizerProfile {
+            allowed_repository_names: BTreeSet::from(["owner/repo".into()]),
+            ..Default::default()
+        };
+        for value in [serde_json::json!({}), serde_json::json!([])] {
+            assert!(
+                !profile
+                    .inspect(
+                        &BTreeMap::from([("unexpected".into(), value)]),
+                        "owner/repo"
+                    )
+                    .accepted
+            );
+        }
     }
 }

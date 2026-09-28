@@ -61,6 +61,7 @@ fn public_solver_and_certificate_workflow() -> Result<(), Box<dyn std::error::Er
     };
     bundle.refresh_certificate_id()?;
     let verification = verify_bundle(&bundle);
+    assert!(!verification.mathematical_claim_verified);
     assert!(verification.valid, "{verification:?}");
 
     #[cfg(feature = "hp")]
@@ -89,6 +90,15 @@ fn verify_portable_exact_certificate() -> Result<(), Box<dyn std::error::Error>>
     )?;
     let report = verify_portable_interval_inertia_certificate(&certificate);
     assert!(report.valid, "{report:?}");
+    let directed = xc_certify::exact::build_portable_interval_inertia_certificate_mpfr(
+        &matrix, 2, 256, "directed_mpfr",
+        ContentDigest::sha256(b"external exact assembly evidence"),
+        BTreeMap::from([("problem".to_owned(), "positive diagonal".to_owned())]),
+        vec!["finite two-dimensional claim".to_owned()],
+    )?;
+    assert_eq!(directed.schema_version, 2);
+    assert!(verify_portable_interval_inertia_certificate(&directed).valid);
+
     Ok(())
 }
 

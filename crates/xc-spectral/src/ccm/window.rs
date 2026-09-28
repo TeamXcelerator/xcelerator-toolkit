@@ -4,6 +4,8 @@
 //! caller may compare certified or cross-checked roots with references only
 //! after discovery and ordering are complete.
 
+mod window_math;
+
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::f64::consts::PI;
@@ -43,6 +45,8 @@ pub struct CcmPublicationClaimArtifact {
 }
 
 impl CcmPublicationClaimArtifact {
+    /// Validate claim structure and certificate identifier syntax only; this
+    /// function does not load or verify a convergence certificate.
     pub fn validate(&self) -> Result<(), WindowError> {
         if self.schema_version != 1 || self.claims.is_empty() {
             return Err(WindowError::InvalidRequest(
@@ -83,7 +87,7 @@ impl CcmPublicationClaimArtifact {
                         || claim
                             .convergence_certificate_id
                             .as_ref()
-                            .is_none_or(|identifier| identifier.trim().is_empty())
+                            .is_none_or(|identifier| !is_lower_hex_digest(identifier))
                     {
                         return Err(WindowError::InvalidRequest(
                             "continuum-certified CCM claims require Certified assurance and a convergence certificate"
@@ -111,7 +115,7 @@ impl CcmPublicationClaimArtifact {
                 CcmContinuumStatus::FiniteSequenceEvidence,
             ),
             (
-                "Continuum-certified claims",
+                "Caller-declared continuum-certified claims (certificate not replayed)",
                 CcmContinuumStatus::ContinuumCertified,
             ),
         ] {
@@ -270,7 +274,7 @@ pub fn minimum_modes_for_height(lambda_sq: f64, height: f64) -> Result<usize, Wi
             "height must be finite and nonnegative".to_owned(),
         ));
     }
-    Ok((height * lambda_sq.ln() / (2.0 * PI)).ceil() as usize)
+    window_math::minimum_modes(lambda_sq, height)
 }
 
 pub fn spectral_reach(
@@ -337,13 +341,14 @@ pub fn estimate_nth_zero_height(index: usize) -> Result<f64, WindowError> {
 /// Plans the finite CCM window needed for a requested zero target.
 ///
 /// # Mathematical semantics
-/// Converts a first-count, index-range, or height target into a conservative
-/// finite mode count, spectral reach, working precision, and explicit guards.
+/// Converts a first-count, index-range, or height target into an estimated
+/// height, a finite mode count for that height, and a precision recommendation.
 /// It plans an observation; it does not use reference zeros as solver seeds.
 ///
 /// # Precision
 /// Decimal target and guard digits determine the recommended binary precision.
-/// This binary64 planning calculation does not perform the later HP solve.
+/// Exact rational enclosures resolve finite reach and digit-to-bit ceilings.
+/// Height prediction remains a binary64 asymptotic estimate; no HP solve occurs.
 ///
 /// # Failure states
 /// Non-finite or nonpositive parameters, empty targets, invalid ranges, and
@@ -365,16 +370,33 @@ pub fn plan_observation(
     target_digits: u32,
     guard_digits: u32,
 ) -> Result<ObservationPlan, WindowError> {
+    CcmObservationRequest::independent(
+        target.clone(),
+        target_digits,
+        lambda_sq,
+        1,
+        64,
+        AssuranceLevel::Computed,
+    )
+    .validate()?;
+    if target_digits == 0 {
+        return Err(WindowError::InvalidRequest(
+            "target digits must be positive".into(),
+        ));
+    }
     let estimated_height = match target {
         ZeroTarget::FirstK { count } => estimate_nth_zero_height(*count)?,
         ZeroTarget::IndexRange { last, .. } => estimate_nth_zero_height(*last)?,
-        ZeroTarget::HeightWindow { upper, .. } => parse_finite(upper, "upper height")?,
+        ZeroTarget::HeightWindow { lower, upper } => parse_finite(lower, "lower height")?
+            .abs()
+            .max(parse_finite(upper, "upper height")?.abs()),
         ZeroTarget::SymmetricHeightWindow { height } => parse_finite(height, "height")?,
     };
     let minimum_modes_for_reach = minimum_modes_for_height(lambda_sq, estimated_height)?;
-    let decimal_digits = target_digits.saturating_add(guard_digits);
     let recommended_precision_bits =
-        ((decimal_digits as f64) * std::f64::consts::LOG2_10).ceil() as u32;
+        u32::try_from(window_math::precision_bits(target_digits, guard_digits)?).map_err(|_| {
+            WindowError::InvalidRequest("recommended precision does not fit the plan schema".into())
+        })?;
     let plan = ObservationPlan {
         estimated_height,
         minimum_modes_for_reach,
@@ -499,11 +521,11 @@ pub struct CcmFirstKObservationPlan {
     pub finite_planning_statement: String,
 }
 
-fn recommended_precision_bits(request: &CcmFirstKPlanningRequest) -> u64 {
-    let decimal_digits = request
-        .target_uniform_digits
-        .saturating_add(request.precision_guard_digits);
-    (((decimal_digits as f64) * std::f64::consts::LOG2_10).ceil() as u64).max(64)
+fn recommended_precision_bits(request: &CcmFirstKPlanningRequest) -> Result<u64, WindowError> {
+    window_math::precision_bits(
+        request.target_uniform_digits,
+        request.precision_guard_digits,
+    )
 }
 
 fn validate_first_k_plan(plan: &CcmFirstKObservationPlan) -> Result<f64, WindowError> {
@@ -534,8 +556,18 @@ fn validate_first_k_plan(plan: &CcmFirstKObservationPlan) -> Result<f64, WindowE
                 "minimum mode count does not fit the plan schema".to_owned(),
             )
         })?;
-    let precision_bits = recommended_precision_bits(&plan.request);
-    let expected_height = estimated_height.to_string();
+    let precision_bits = recommended_precision_bits(&plan.request)?;
+    // libm evaluations can differ by a few ulps across supported platforms.
+    // Permit only a tiny relative perturbation and replay every integer safety
+    // decision at the retained height as well as this platform's estimate.
+    let retained_height = parse_finite(&plan.estimated_height, "estimated height")?;
+    let height_matches = retained_height > 0.0
+        && window_math::within_scaled_distance(
+            retained_height,
+            estimated_height,
+            8.0 * f64::EPSILON,
+        )?
+        && minimum_modes_for_height(lambda_squared, retained_height)? as u64 == minimum_modes;
     let expected_reach_margin = plan
         .selected
         .n_modes
@@ -552,7 +584,7 @@ fn validate_first_k_plan(plan: &CcmFirstKObservationPlan) -> Result<f64, WindowE
                 "selected CCM precision is below the recommendation".to_owned(),
             )
         })?;
-    if plan.estimated_height != expected_height
+    if !height_matches
         || plan.minimum_modes_for_reach != minimum_modes
         || plan.reach_margin_modes != expected_reach_margin
         || plan.reach_margin_modes < plan.request.minimum_reach_margin_modes
@@ -592,7 +624,7 @@ pub fn plan_first_k_ccm_observation(
         WindowError::InvalidRequest("requested root count does not fit this platform".to_owned())
     })?;
     let estimated_height = estimate_nth_zero_height(requested_roots)?;
-    let recommended_precision_bits = recommended_precision_bits(&request);
+    let recommended_precision_bits = recommended_precision_bits(&request)?;
     let mut eligible = Vec::new();
     let mut rejected_candidates = Vec::new();
     let mut identifiers = std::collections::BTreeSet::new();
@@ -611,7 +643,7 @@ pub fn plan_first_k_ccm_observation(
                     )
                 },
             )?;
-        let required_modes = minimum_modes.saturating_add(request.minimum_reach_margin_modes);
+        let required_modes = minimum_modes.checked_add(request.minimum_reach_margin_modes);
         let mut reasons = Vec::new();
         if candidate.calibrated_root_count < request.requested_roots {
             reasons.push("calibrated root-count range is too small".to_owned());
@@ -619,11 +651,13 @@ pub fn plan_first_k_ccm_observation(
         if candidate.calibrated_uniform_digits < request.target_uniform_digits {
             reasons.push("calibrated uniform-digit range is too small".to_owned());
         }
-        if candidate.n_modes < required_modes {
-            reasons.push(format!(
-                "mode count {} is below reach requirement {required_modes}",
+        match required_modes {
+            Some(required) if candidate.n_modes < required => reasons.push(format!(
+                "mode count {} is below reach requirement {required}",
                 candidate.n_modes
-            ));
+            )),
+            None => reasons.push("reach requirement exceeds the mode-count range".into()),
+            _ => {}
         }
         if candidate.precision_bits < recommended_precision_bits {
             reasons.push(format!(
@@ -655,7 +689,7 @@ pub fn plan_first_k_ccm_observation(
                 "no calibrated CCM candidate satisfies the requested safety margins".to_owned(),
             )
         })?;
-    Ok(CcmFirstKObservationPlan {
+    let plan = CcmFirstKObservationPlan {
         schema_version: 1,
         request,
         selected: selected.clone(),
@@ -667,7 +701,9 @@ pub fn plan_first_k_ccm_observation(
         rejected_candidates,
         finite_planning_statement: "calibrated finite CCM configuration proposal; achieved K, D_min, reach, and assurance require post-run verification"
             .to_owned(),
-    })
+    };
+    validate_first_k_plan(&plan)?;
+    Ok(plan)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -679,6 +715,8 @@ pub struct CcmObservationPlanVerification {
     pub configuration_matches: bool,
     pub root_target_met: bool,
     pub uniform_digit_target_met: bool,
+    /// The modes reach the asymptotic height estimate used by this plan. This
+    /// does not prove coverage of the actual Kth zero or root completeness.
     pub spectral_reach_verified: bool,
     pub accepted: bool,
     pub reasons: Vec<String>,
@@ -706,8 +744,13 @@ pub fn verify_first_k_ccm_observation_plan(
         && measured.n_modes
             >= plan
                 .minimum_modes_for_reach
-                .saturating_add(plan.request.minimum_reach_margin_modes);
+                .checked_add(plan.request.minimum_reach_margin_modes)
+                .ok_or_else(|| WindowError::InvalidRequest("reach requirement overflows".into()))?;
     let mut reasons = Vec::new();
+    if !measured_completion_succeeded(&measured) {
+        reasons
+            .push("measured completion status does not establish a successful observation".into());
+    }
     if !configuration_matches {
         reasons.push("measured effective configuration differs from the plan".to_owned());
     }
@@ -976,6 +1019,13 @@ pub struct CcmResearchSequence {
     pub finite_scope_statement: String,
 }
 
+fn measured_completion_succeeded(row: &ConvergenceTableRow) -> bool {
+    matches!(
+        row.completion_status.as_str(),
+        "converged" | "cross_checked" | "certified" | "certified_stored_point_source"
+    )
+}
+
 fn measured_minimum_digits(row: &ConvergenceTableRow) -> Result<u32, WindowError> {
     row.minimum_accuracy_digits.parse::<u32>().map_err(|error| {
         WindowError::InvalidRequest(format!(
@@ -1001,6 +1051,7 @@ pub fn build_ccm_research_sequence(
     let mut previous_k = 0;
     let mut previous_target = 0;
     let mut previous_measured = None;
+    let mut measured_strictly_increases = true;
     let mut failure = None;
     for (offset, observation) in observations.iter().enumerate() {
         let expected_index = offset as u64 + 1;
@@ -1030,6 +1081,12 @@ pub fn build_ccm_research_sequence(
             ));
         }
         let measured_digits = measured_minimum_digits(measured)?;
+        if !measured_completion_succeeded(measured) && failure.is_none() {
+            failure = Some((
+                expected_index,
+                "measured completion status does not establish a successful observation".into(),
+            ));
+        }
         if measured_digits < target.uniform_accuracy_target_digits && failure.is_none() {
             failure = Some((
                 expected_index,
@@ -1039,9 +1096,10 @@ pub fn build_ccm_research_sequence(
                 ),
             ));
         }
-        if previous_measured.is_some_and(|previous| measured_digits <= previous)
-            && failure.is_none()
-        {
+        if previous_measured.is_some_and(|previous| measured_digits <= previous) {
+            measured_strictly_increases = false;
+        }
+        if !measured_strictly_increases && failure.is_none() {
             failure = Some((
                 expected_index,
                 format!(
@@ -1072,10 +1130,7 @@ pub fn build_ccm_research_sequence(
         observations,
         windows_strictly_increase: true,
         accuracy_targets_strictly_increase: true,
-        measured_minimum_accuracy_strictly_increases: matches!(
-            &outcome,
-            CcmResearchSequenceOutcome::Achieved
-        ),
+        measured_minimum_accuracy_strictly_increases: measured_strictly_increases,
         outcome,
         finite_scope_statement: "finite measured CCM sequence; no finite trend establishes a K-to-infinity or continuum limit"
             .to_owned(),
@@ -1187,6 +1242,8 @@ pub fn convergence_table_row(
         median_accuracy_digits: median,
         index_penalty_digits: penalty.to_string(),
         completion_status: completion_status.to_owned(),
+        accuracy_scope: "caller_attested_root_records".to_owned(),
+        source_weights_digest: None,
     })
 }
 
@@ -1258,47 +1315,11 @@ impl SecularFunctionF64 {
     }
 
     pub fn evaluate(&self, x: f64) -> Result<f64, WindowError> {
-        if !x.is_finite() {
-            return Err(WindowError::EvaluationFailed(
-                "evaluation point must be finite".to_owned(),
-            ));
-        }
-        let mut value = 0.0;
-        for (&pole, &weight) in self.poles.iter().zip(&self.weights) {
-            let denominator = x - pole;
-            if denominator == 0.0 {
-                return Err(WindowError::EvaluationFailed(
-                    "evaluation point coincides with a pole".to_owned(),
-                ));
-            }
-            value += weight / denominator;
-        }
-        if value.is_finite() {
-            Ok(value)
-        } else {
-            Err(WindowError::EvaluationFailed(
-                "secular evaluation produced a non-finite value".to_owned(),
-            ))
-        }
+        window_math::secular(&self.poles, &self.weights, x, false)
     }
 
     pub fn derivative(&self, x: f64) -> Result<f64, WindowError> {
-        if !x.is_finite() {
-            return Err(WindowError::EvaluationFailed(
-                "evaluation point must be finite".to_owned(),
-            ));
-        }
-        let mut value = 0.0;
-        for (&pole, &weight) in self.poles.iter().zip(&self.weights) {
-            let denominator = x - pole;
-            if denominator == 0.0 {
-                return Err(WindowError::EvaluationFailed(
-                    "evaluation point coincides with a pole".to_owned(),
-                ));
-            }
-            value -= weight / (denominator * denominator);
-        }
-        Ok(value)
+        window_math::secular(&self.poles, &self.weights, x, true)
     }
 }
 
@@ -1307,6 +1328,7 @@ pub struct DiscoveryOptionsF64 {
     pub subdivisions_per_pole_interval: usize,
     pub bisection_iterations: usize,
     pub pole_margin_fraction: f64,
+    /// Bracket width tolerance, scaled by max(1, |lower|, |upper|).
     pub zero_tolerance: f64,
 }
 
@@ -1329,22 +1351,7 @@ pub fn discover_roots_f64(
     upper: f64,
     options: &DiscoveryOptionsF64,
 ) -> Result<Vec<CcmRootRecord>, WindowError> {
-    if !lower.is_finite() || !upper.is_finite() || lower >= upper {
-        return Err(WindowError::InvalidRequest(
-            "discovery range must have finite lower < upper".to_owned(),
-        ));
-    }
-    if options.subdivisions_per_pole_interval == 0
-        || options.bisection_iterations == 0
-        || !(0.0..0.1).contains(&options.pole_margin_fraction)
-        || !options.zero_tolerance.is_finite()
-        || options.zero_tolerance <= 0.0
-    {
-        return Err(WindowError::InvalidRequest(
-            "invalid discovery options".to_owned(),
-        ));
-    }
-
+    validate_native_discovery(secular, lower, upper, options)?;
     let mut boundaries = vec![lower];
     boundaries.extend(
         secular
@@ -1354,42 +1361,69 @@ pub fn discover_roots_f64(
             .filter(|pole| *pole > lower && *pole < upper),
     );
     boundaries.push(upper);
-    boundaries.sort_by(f64::total_cmp);
-    boundaries.dedup_by(|a, b| *a == *b);
-
     let mut roots = Vec::new();
     for pair in boundaries.windows(2) {
-        let interval_width = pair[1] - pair[0];
-        if interval_width <= 0.0 {
+        let width = pair[1] - pair[0];
+        let fraction = options.pole_margin_fraction;
+        let margin = if width.is_finite() {
+            fraction * width
+        } else {
+            fraction * pair[1] - fraction * pair[0]
+        };
+        let is_pole = |x: f64| {
+            secular
+                .poles()
+                .binary_search_by(|p| p.partial_cmp(&x).unwrap())
+                .is_ok()
+        };
+        let left = if is_pole(pair[0]) {
+            (pair[0] + margin).max(pair[0].next_up())
+        } else {
+            pair[0]
+        };
+        let right = if is_pole(pair[1]) {
+            (pair[1] - margin).min(pair[1].next_down())
+        } else {
+            pair[1]
+        };
+        if !left.is_finite() || !right.is_finite() || left >= right {
             continue;
         }
-        let margin = (options.pole_margin_fraction * interval_width)
-            .max(f64::EPSILON * pair[0].abs().max(pair[1].abs()).max(1.0));
-        let left = pair[0] + margin;
-        let right = pair[1] - margin;
-        if left >= right {
-            continue;
-        }
-        let subdivisions = options.subdivisions_per_pole_interval;
         let mut x0 = left;
         let mut f0 = secular.evaluate(x0)?;
-        for step in 1..=subdivisions {
-            let x1 = left + (right - left) * step as f64 / subdivisions as f64;
+        for step in 1..=options.subdivisions_per_pole_interval {
+            let t = step as f64 / options.subdivisions_per_pole_interval as f64;
+            let x1 = if step == options.subdivisions_per_pole_interval {
+                right
+            } else if left.is_sign_positive() == right.is_sign_positive() {
+                left + (right - left) * t
+            } else {
+                (1.0 - t) * left + t * right
+            };
+            if x1 <= x0 {
+                continue;
+            }
             let f1 = secular.evaluate(x1)?;
             if f0 == 0.0 || f1 == 0.0 || f0.is_sign_positive() != f1.is_sign_positive() {
                 let (mut a, mut b, mut fa) = if f0 == 0.0 {
-                    (
-                        x0 - options.zero_tolerance,
-                        x0 + options.zero_tolerance,
-                        secular.evaluate(x0 - options.zero_tolerance)?,
-                    )
+                    (x0, x0, f0)
+                } else if f1 == 0.0 {
+                    (x1, x1, f1)
                 } else {
                     (x0, x1, f0)
                 };
                 for _ in 0..options.bisection_iterations {
-                    let midpoint = a + 0.5 * (b - a);
+                    if window_math::within_scaled_distance(a, b, options.zero_tolerance)? {
+                        break;
+                    }
+                    let midpoint = a.midpoint(b);
+                    if midpoint == a || midpoint == b {
+                        break;
+                    }
                     let fm = secular.evaluate(midpoint)?;
-                    if fm.abs() <= options.zero_tolerance || b - a <= options.zero_tolerance {
+                    // secular.evaluate rounds an exact rational sum and rejects
+                    // nonzero-to-zero underflow, so zero identifies an exact root.
+                    if fm == 0.0 {
                         a = midpoint;
                         b = midpoint;
                         break;
@@ -1401,43 +1435,31 @@ pub fn discover_roots_f64(
                         fa = fm;
                     }
                 }
-                let midpoint = a + 0.5 * (b - a);
-                if roots.iter().all(|root: &CcmRootRecord| {
-                    root.midpoint.parse::<f64>().map_or(true, |prior| {
-                        (prior - midpoint).abs() > 10.0 * options.zero_tolerance
-                    })
-                }) {
-                    roots.push(CcmRootRecord {
-                        positive_index: None,
-                        midpoint: format!("{midpoint:.17e}"),
-                        enclosure: Some(DecimalInterval {
-                            lower: format!("{a:.17e}"),
-                            upper: format!("{b:.17e}"),
-                        }),
-                        residual_bound: secular
-                            .evaluate(midpoint)
-                            .ok()
-                            .map(|value| format!("{:.17e}", value.abs())),
-                        derivative_magnitude: secular
-                            .derivative(midpoint)
-                            .ok()
-                            .map(|value| format!("{:.17e}", value.abs())),
-                        conditioning: secular
-                            .derivative(midpoint)
-                            .ok()
-                            .filter(|value| *value != 0.0)
-                            .map(|value| format!("{:.17e}", value.abs().recip())),
-                        isolation_distance: Some(format!("{:.17e}", (b - a).abs())),
-                        nearest_left_pole: Some(format!("{:.17e}", pair[0])),
-                        nearest_right_pole: Some(format!("{:.17e}", pair[1])),
-                        precision_bits: 53,
-                        precision_history_bits: vec![53],
-                        certified_digits: None,
-                        status: RootStatus::Discovered,
-                        discovery_method: "pole_aware_sign_change_bisection_f64".to_owned(),
-                        crosscheck_method: None,
-                        reference_comparison_digits: None,
-                    });
+                if !window_math::within_scaled_distance(a, b, options.zero_tolerance)? {
+                    return Err(WindowError::EvaluationFailed("root bracket did not reach the requested width within binary64 resolution and iteration limits".into()));
+                }
+                let midpoint = a.midpoint(b);
+                let mut duplicate = false;
+                for prior in &roots {
+                    let prior: &CcmRootRecord = prior;
+                    if window_math::within_distance(
+                        parse_finite(&prior.midpoint, "prior root")?,
+                        midpoint,
+                        options.zero_tolerance,
+                        10,
+                    )? {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if !duplicate {
+                    roots.push(native_discovery_record(
+                        secular,
+                        a,
+                        b,
+                        midpoint,
+                        "pole_aware_sign_change_bisection_f64",
+                    )?);
                 }
             }
             x0 = x1;
@@ -1445,18 +1467,110 @@ pub fn discover_roots_f64(
         }
     }
     roots.sort_by(|a, b| {
-        let a = a.midpoint.parse::<f64>().unwrap_or(f64::NAN);
-        let b = b.midpoint.parse::<f64>().unwrap_or(f64::NAN);
-        a.total_cmp(&b)
+        a.midpoint
+            .parse::<f64>()
+            .unwrap()
+            .total_cmp(&b.midpoint.parse::<f64>().unwrap())
     });
-    for (index, root) in roots
-        .iter_mut()
-        .filter(|root| root.midpoint.parse::<f64>().is_ok_and(|value| value > 0.0))
-        .enumerate()
-    {
-        root.positive_index = Some(index + 1);
-    }
     Ok(roots)
+}
+
+fn validate_native_discovery(
+    secular: &SecularFunctionF64,
+    lower: f64,
+    upper: f64,
+    options: &DiscoveryOptionsF64,
+) -> Result<(), WindowError> {
+    let work = secular
+        .poles
+        .len()
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(options.subdivisions_per_pole_interval))
+        .and_then(|n| n.checked_mul(options.bisection_iterations));
+    if !lower.is_finite()
+        || !upper.is_finite()
+        || lower >= upper
+        || options.subdivisions_per_pole_interval == 0
+        || options.bisection_iterations == 0
+        || options.subdivisions_per_pole_interval > 1_000_000
+        || options.bisection_iterations > 100_000
+        || work.is_none_or(|n| n > 100_000_000)
+        || !(0.0..0.1).contains(&options.pole_margin_fraction)
+        || !options.zero_tolerance.is_finite()
+        || options.zero_tolerance <= 0.0
+        || secular.weights.iter().all(|w| *w == 0.0)
+    {
+        return Err(WindowError::InvalidRequest(
+            "invalid or excessive native discovery request, or identically zero secular function"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+// Formatting is shared; the two discovery algorithms remain independent.
+// Neither a local bracket nor a second available route establishes a global
+// ordinal, uniqueness/completeness, or an actually performed cross-check.
+fn native_discovery_record(
+    secular: &SecularFunctionF64,
+    lower: f64,
+    upper: f64,
+    midpoint: f64,
+    method: &str,
+) -> Result<CcmRootRecord, WindowError> {
+    let exact = |x| {
+        xc_core::DecimalLiteral::from_f64_exact(x)
+            .map(|d| d.to_string())
+            .map_err(|e| WindowError::EvaluationFailed(e.to_string()))
+    };
+    let residual = secular.evaluate(midpoint).ok().map(f64::abs);
+    // The source sum is rounded once to nearest. One upward binary64 step
+    // therefore bounds its exact magnitude; a zero source sum is exact.
+    let residual_upper = residual
+        .map(|v| if v == 0.0 { v } else { v.next_up() })
+        .filter(|v| v.is_finite());
+    let derivative = secular
+        .derivative(midpoint)
+        .ok()
+        .map(f64::abs)
+        .filter(|v| v.is_finite());
+    let conditioning = derivative
+        .filter(|v| *v > 0.0)
+        .map(f64::recip)
+        .filter(|v| v.is_finite() && *v > 0.0);
+    let width = upper - lower;
+    Ok(CcmRootRecord {
+        positive_index: None,
+        midpoint: exact(midpoint)?,
+        enclosure: Some(DecimalInterval {
+            lower: exact(lower)?,
+            upper: exact(upper)?,
+        }),
+        residual_bound: residual_upper.map(exact).transpose()?,
+        derivative_magnitude: derivative.map(exact).transpose()?,
+        conditioning: conditioning.map(exact).transpose()?,
+        isolation_distance: width.is_finite().then(|| exact(width)).transpose()?,
+        nearest_left_pole: secular
+            .poles()
+            .iter()
+            .rev()
+            .find(|p| **p < midpoint)
+            .map(|p| exact(*p))
+            .transpose()?,
+        nearest_right_pole: secular
+            .poles()
+            .iter()
+            .find(|p| **p > midpoint)
+            .map(|p| exact(*p))
+            .transpose()?,
+        precision_bits: 53,
+        precision_history_bits: vec![53],
+        certified_digits: None,
+        status: RootStatus::Discovered,
+        discovery_method: method.into(),
+        crosscheck_method: None,
+        reference_comparison_digits: None,
+    })
 }
 
 fn parse_finite(value: &str, name: &str) -> Result<f64, WindowError> {
@@ -1475,6 +1589,276 @@ fn parse_finite(value: &str, name: &str) -> Result<f64, WindowError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audit_window_rational(value: &str) -> num_rational::BigRational {
+        use num_rational::BigRational as Q;
+        let (m, e) = value
+            .split_once(['e', 'E'])
+            .map_or((value, 0), |(m, e)| (m, e.parse::<i32>().unwrap()));
+        let fraction = m.split_once('.').map_or(0, |(_, f)| f.len() as i32);
+        Q::from_integer(m.replace('.', "").parse().unwrap())
+            * Q::from_integer(10.into()).pow(e - fraction)
+    }
+    fn audit_window_third(scale: f64, tolerance: f64) {
+        use num_rational::BigRational as Q;
+        // Exact stored numerator is scale*(3*x+1), with root -1/3.
+        let f = SecularFunctionF64::new(vec![-1.0, 1.0], vec![scale, 2.0 * scale]).unwrap();
+        let options = DiscoveryOptionsF64 {
+            zero_tolerance: tolerance,
+            ..Default::default()
+        };
+        let roots = discover_roots_f64(&f, -0.9, 0.9, &options).unwrap();
+        assert_eq!(roots.len(), 1);
+        let interval = roots[0].enclosure.as_ref().unwrap();
+        let root = Q::new((-1).into(), 3.into());
+        let lo = audit_window_rational(&interval.lower);
+        let hi = audit_window_rational(&interval.upper);
+        assert!(lo <= root && root <= hi, "false enclosure {interval:?}");
+        assert!(hi - lo <= Q::from_float(tolerance).unwrap());
+    }
+    #[test]
+    fn exhaustive_native_window_tiny_weights_preserve_root_enclosure() {
+        audit_window_third(1e-100, 1e-13);
+    }
+    #[test]
+    fn exhaustive_native_window_width_stop_preserves_root_enclosure() {
+        audit_window_third(1.0, 1e-3);
+    }
+    fn audit_window_positive() -> SecularFunctionF64 {
+        SecularFunctionF64::new(vec![-1.0, 1.0], vec![2.0, 1.0]).unwrap()
+    }
+    #[test]
+    fn exhaustive_native_window_direct_does_not_invent_global_ordinal() {
+        let roots =
+            discover_roots_f64(&audit_window_positive(), 0.2, 0.8, &Default::default()).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].positive_index, None);
+    }
+    #[test]
+    fn exhaustive_native_window_adapter_does_not_invent_global_ordinal() {
+        let roots = discover_roots_with_xc_root_f64(
+            &audit_window_positive(),
+            0.2,
+            0.8,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].positive_index, None);
+    }
+    fn audit_window_neighbors(roots: Vec<CcmRootRecord>) {
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            audit_window_rational(roots[0].nearest_left_pole.as_ref().unwrap()),
+            audit_window_rational("-1")
+        );
+        assert_eq!(
+            audit_window_rational(roots[0].nearest_right_pole.as_ref().unwrap()),
+            audit_window_rational("1")
+        );
+    }
+    #[test]
+    fn exhaustive_native_window_direct_records_actual_poles() {
+        audit_window_neighbors(
+            discover_roots_f64(&audit_window_positive(), 0.2, 0.8, &Default::default()).unwrap(),
+        );
+    }
+    #[test]
+    fn exhaustive_native_window_adapter_records_actual_poles() {
+        audit_window_neighbors(
+            discover_roots_with_xc_root_f64(
+                &audit_window_positive(),
+                0.2,
+                0.8,
+                &Default::default(),
+            )
+            .unwrap(),
+        );
+    }
+    #[test]
+    fn exhaustive_native_window_narrow_search_is_not_discarded() {
+        let f = SecularFunctionF64::new(vec![-4e-100, 4e-100], vec![1.0, 1.0]).unwrap();
+        let roots = discover_roots_f64(
+            &f,
+            -1e-100,
+            1e-100,
+            &DiscoveryOptionsF64 {
+                zero_tolerance: 1e-110,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            audit_window_rational(&roots[0].midpoint),
+            audit_window_rational("0")
+        );
+    }
+    #[test]
+    fn exhaustive_native_window_large_finite_bracket_remains_searchable() {
+        let f = SecularFunctionF64::new(vec![-f64::MAX, f64::MAX], vec![1.0, 1.0]).unwrap();
+        let roots =
+            discover_roots_f64(&f, -f64::MAX / 2.0, f64::MAX / 2.0, &Default::default()).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            audit_window_rational(&roots[0].midpoint),
+            audit_window_rational("0")
+        );
+    }
+    fn audit_window_tiny_slope() -> SecularFunctionF64 {
+        SecularFunctionF64::new(vec![-2.0, 2.0], vec![1e-310, 1e-310]).unwrap()
+    }
+    #[test]
+    fn exhaustive_native_window_direct_does_not_emit_infinite_conditioning() {
+        let roots =
+            discover_roots_f64(&audit_window_tiny_slope(), -0.5, 0.5, &Default::default()).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert!(roots[0].conditioning.is_none());
+    }
+    #[test]
+    fn exhaustive_native_window_adapter_does_not_emit_infinite_conditioning() {
+        let roots = discover_roots_with_xc_root_f64(
+            &audit_window_tiny_slope(),
+            -0.5,
+            0.5,
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(roots.iter().all(|r| r.conditioning.is_none()));
+    }
+    #[test]
+    fn exhaustive_native_window_planner_rejects_overflowed_margin() {
+        let candidate = planner_candidate("overflow", u64::MAX, u64::MAX, 50);
+        assert!(plan_first_k_ccm_observation(
+            CcmFirstKPlanningRequest {
+                requested_roots: 50,
+                target_uniform_digits: 20,
+                precision_guard_digits: 10,
+                minimum_reach_margin_modes: u64::MAX
+            },
+            &[candidate]
+        )
+        .is_err());
+    }
+    #[test]
+    fn exhaustive_native_window_plan_rejects_failed_measurement() {
+        let plan = plan_first_k_ccm_observation(
+            CcmFirstKPlanningRequest {
+                requested_roots: 10,
+                target_uniform_digits: 8,
+                precision_guard_digits: 10,
+                minimum_reach_margin_modes: 0,
+            },
+            &[planner_candidate("eligible", 80, 160, 50)],
+        )
+        .unwrap();
+        let mut row = research_observation(1, 10, 8, 20).measured;
+        row.n_modes = 80;
+        row.precision_bits = 160;
+        row.completion_status = "failed".into();
+        assert!(
+            !verify_first_k_ccm_observation_plan(&plan, row)
+                .unwrap()
+                .accepted
+        );
+    }
+    #[test]
+    fn exhaustive_native_window_sequence_rejects_failed_measurement() {
+        let mut observations = vec![
+            research_observation(1, 10, 8, 12),
+            research_observation(2, 25, 14, 20),
+        ];
+        observations[1].measured.completion_status = "failed".into();
+        assert!(matches!(
+            build_ccm_research_sequence(observations).unwrap().outcome,
+            CcmResearchSequenceOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn exhaustive_native_window_exact_rational_family_checks_endpoints_and_residual_bounds() {
+        use num_rational::BigRational as Q;
+        use num_traits::Signed;
+        for power in [-900, 0, 900] {
+            let scale = 2.0f64.powi(power);
+            for left_weight in 1..=7 {
+                for right_weight in 1..=7 {
+                    let weights = [
+                        scale * f64::from(left_weight),
+                        scale * f64::from(right_weight),
+                    ];
+                    let f = SecularFunctionF64::new(vec![-scale, scale], weights.to_vec()).unwrap();
+                    let tolerance = scale.min(1.0) * 1e-13;
+                    let roots = discover_roots_f64(
+                        &f,
+                        -0.99 * scale,
+                        0.99 * scale,
+                        &DiscoveryOptionsF64 {
+                            zero_tolerance: tolerance,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(roots.len(), 1);
+                    let root = &roots[0];
+                    let enclosure = root.enclosure.as_ref().unwrap();
+                    let lower = audit_window_rational(&enclosure.lower);
+                    let upper = audit_window_rational(&enclosure.upper);
+                    let c = Q::from_float(scale).unwrap();
+                    let expected = &c
+                        * Q::new(
+                            (left_weight - right_weight).into(),
+                            (left_weight + right_weight).into(),
+                        );
+                    assert!(lower <= expected && expected <= upper);
+                    let width_scale = Q::from_integer(1.into()).max(lower.abs()).max(upper.abs());
+                    assert!(&upper - &lower <= Q::from_float(tolerance).unwrap() * width_scale);
+                    let midpoint = audit_window_rational(&root.midpoint);
+                    // Independent closed numerator of the two-pole rational function.
+                    let numerator = Q::from_float(weights[0] + weights[1]).unwrap() * &midpoint
+                        + Q::from_float(weights[1] - weights[0]).unwrap() * &c;
+                    let exact = (numerator / (&midpoint * &midpoint - &c * &c)).abs();
+                    assert!(audit_window_rational(root.residual_bound.as_ref().unwrap()) >= exact);
+                    assert_eq!(root.positive_index, None);
+                    assert_eq!(root.crosscheck_method, None);
+                }
+            }
+        }
+    }
+    #[test]
+    fn exhaustive_native_window_exterior_roots_and_explicit_limits() {
+        let f = SecularFunctionF64::new(vec![-1.0, 1.0], vec![2.0, -1.0]).unwrap();
+        for roots in [
+            discover_roots_f64(&f, 2.0, 4.0, &Default::default()).unwrap(),
+            discover_roots_with_xc_root_f64(&f, 2.0, 4.0, &Default::default()).unwrap(),
+        ] {
+            assert_eq!(roots.len(), 1);
+            assert_eq!(
+                audit_window_rational(&roots[0].midpoint),
+                audit_window_rational("3")
+            );
+            assert_eq!(roots[0].nearest_right_pole, None);
+            assert_eq!(roots[0].crosscheck_method, None);
+        }
+        for options in [
+            DiscoveryOptionsF64 {
+                subdivisions_per_pole_interval: usize::MAX,
+                ..Default::default()
+            },
+            DiscoveryOptionsF64 {
+                bisection_iterations: 1,
+                ..Default::default()
+            },
+            DiscoveryOptionsF64 {
+                zero_tolerance: f64::from_bits(1),
+                ..Default::default()
+            },
+        ] {
+            assert!(discover_roots_f64(&audit_window_positive(), 0.2, 0.8, &options).is_err());
+        }
+        let zero = SecularFunctionF64::new(vec![-1.0, 1.0], vec![0.0, 0.0]).unwrap();
+        assert!(discover_roots_f64(&zero, -0.9, 0.9, &Default::default()).is_err());
+    }
 
     #[test]
     fn observation_requests_default_to_independent_discovery() {
@@ -1532,7 +1916,7 @@ mod tests {
                     continuum_status: CcmContinuumStatus::ContinuumCertified,
                     assurance: AssuranceLevel::Certified,
                     finite_context: None,
-                    convergence_certificate_id: Some("sha256:convergence-proof".to_owned()),
+                    convergence_certificate_id: Some("a".repeat(64)),
                 },
             ],
         };
@@ -1541,7 +1925,9 @@ mod tests {
         let rendered = decoded.render_markdown().unwrap();
         let finite = rendered.find("## Finite configurations").unwrap();
         let sequence = rendered.find("## Finite sequence evidence").unwrap();
-        let continuum = rendered.find("## Continuum-certified claims").unwrap();
+        let continuum = rendered
+            .find("## Caller-declared continuum-certified claims")
+            .unwrap();
         assert!(finite < sequence && sequence < continuum);
         assert!(rendered[finite..sequence].contains("finite-plunge"));
         assert!(!rendered[finite..sequence].contains("continuum-limit"));
@@ -1639,6 +2025,8 @@ mod tests {
                 median_accuracy_digits: measured.to_string(),
                 index_penalty_digits: "0".to_owned(),
                 completion_status: "certified".to_owned(),
+                accuracy_scope: "caller_attested_root_records".into(),
+                source_weights_digest: None,
             },
             limiting_reason: None,
         }
@@ -1658,6 +2046,21 @@ mod tests {
         let decoded: CcmResearchSequence =
             serde_json::from_slice(&serde_json::to_vec(&sequence).unwrap()).unwrap();
         verify_ccm_research_sequence(&decoded).unwrap();
+    }
+
+    #[test]
+    fn measured_growth_is_independent_of_requested_target_success() {
+        let sequence = build_ccm_research_sequence(vec![
+            research_observation(1, 10, 8, 5),
+            research_observation(2, 25, 14, 6),
+        ])
+        .unwrap();
+        assert!(matches!(
+            sequence.outcome,
+            CcmResearchSequenceOutcome::Failed { .. }
+        ));
+        assert!(sequence.measured_minimum_accuracy_strictly_increases);
+        verify_ccm_research_sequence(&sequence).unwrap();
     }
 
     #[test]
@@ -1758,6 +2161,8 @@ mod tests {
             median_accuracy_digits: "24".to_owned(),
             index_penalty_digits: "3".to_owned(),
             completion_status: "certified".to_owned(),
+            accuracy_scope: "caller_attested_root_records".into(),
+            source_weights_digest: None,
         };
         let verification = verify_first_k_ccm_observation_plan(&plan, measured.clone()).unwrap();
         assert!(verification.accepted);
@@ -1795,6 +2200,8 @@ mod tests {
             median_accuracy_digits: "24".to_owned(),
             index_penalty_digits: "3".to_owned(),
             completion_status: "certified".to_owned(),
+            accuracy_scope: "caller_attested_root_records".into(),
+            source_weights_digest: None,
         };
         assert!(verify_first_k_ccm_observation_plan(&plan, measured).is_err());
     }
@@ -1877,8 +2284,15 @@ mod tests {
         // The count is supplied as separate evidence, not derived from the
         // discovered vector inside reconciliation.
         let mut reconciled = reconcile_window_roots(&discovered, 2, true, 1e-12).unwrap();
-        assert_eq!(reconciled.completeness, WindowCompleteness::Certified);
+        assert_eq!(reconciled.completeness, WindowCompleteness::CountMatched);
         assert_eq!(reconciled.isolated_unique_roots, 2);
+        // Independent algebra: the numerator 3*x^2-1 has exactly one
+        // positive root. Discovery itself supplies no global ordinal.
+        for root in &mut reconciled.roots {
+            if root.midpoint.parse::<f64>().unwrap() > 0.0 {
+                root.positive_index = Some(1);
+            }
+        }
         compare_ordered_roots_to_references(&mut reconciled.roots, &[1.0 / 3.0_f64.sqrt()])
             .unwrap();
         let positive = reconciled
@@ -1915,7 +2329,10 @@ pub struct WindowReconciliation {
 ///
 /// The count is an input from a distinct route; it is never inferred from the
 /// candidate list.  Ordering, duplicates, index gaps, and overlapping
-/// enclosures fail closed before completeness can be reported.
+/// enclosures fail closed before completeness can be reported. Certified
+/// completeness additionally requires every supplied root status to be Certified;
+/// those caller attestations must come from prior certificate verification.
+/// This function checks consistency, not the mathematical proofs themselves.
 pub fn reconcile_window_roots(
     roots: &[CcmRootRecord],
     independently_counted_roots: usize,
@@ -1930,33 +2347,61 @@ pub fn reconcile_window_roots(
             "window reconciliation requires a positive independent count and tolerance".to_owned(),
         ));
     }
+    use std::cmp::Ordering;
+    use xc_core::DecimalLiteral;
+    let invalid = |e: &dyn std::fmt::Display| WindowError::InvalidRequest(e.to_string());
+    let decimal = |s: &str| DecimalLiteral::new(s).map_err(|e| invalid(&e));
+    let zero = decimal("0")?;
+    let tolerance = decimal(&window_math::tolerance_decimal(duplicate_tolerance)?)?;
     let mut ordered = roots.to_vec();
     for root in &ordered {
-        parse_finite(&root.midpoint, "root midpoint")?;
+        let midpoint = decimal(&root.midpoint)?;
+        let positive = midpoint.cmp_numeric(&zero).map_err(|e| invalid(&e))? == Ordering::Greater;
+        if root.positive_index == Some(0) || (root.positive_index.is_some() && !positive) {
+            return Err(WindowError::InvalidRequest(
+                "positive root indices require a positive midpoint and a one-based index".into(),
+            ));
+        }
+        if let Some(interval) = &root.enclosure {
+            interval.validate_order().map_err(|e| invalid(&e))?;
+            if midpoint
+                .cmp_numeric(&decimal(&interval.lower)?)
+                .map_err(|e| invalid(&e))?
+                == Ordering::Less
+                || midpoint
+                    .cmp_numeric(&decimal(&interval.upper)?)
+                    .map_err(|e| invalid(&e))?
+                    == Ordering::Greater
+            {
+                return Err(WindowError::InvalidRequest(
+                    "root midpoint is outside its enclosure".into(),
+                ));
+            }
+        }
     }
     ordered.sort_by(|left, right| {
-        let left = left.midpoint.parse::<f64>().expect("validated midpoint");
-        let right = right.midpoint.parse::<f64>().expect("validated midpoint");
-        left.total_cmp(&right)
+        decimal(&left.midpoint)
+            .unwrap()
+            .cmp_numeric(&decimal(&right.midpoint).unwrap())
+            .expect("validated decimal ordering")
     });
 
     let mut duplicate_count = 0usize;
     for index in 1..ordered.len() {
-        let left_midpoint = ordered[index - 1]
-            .midpoint
-            .parse::<f64>()
-            .expect("validated midpoint");
-        let right_midpoint = ordered[index]
-            .midpoint
-            .parse::<f64>()
-            .expect("validated midpoint");
+        let left_midpoint = decimal(&ordered[index - 1].midpoint)?;
+        let right_midpoint = decimal(&ordered[index].midpoint)?;
         let interval_overlap = match (&ordered[index - 1].enclosure, &ordered[index].enclosure) {
             (Some(left), Some(right)) => !left
                 .is_disjoint_from(right)
                 .map_err(|error| WindowError::EvaluationFailed(error.to_string()))?,
             _ => false,
         };
-        if interval_overlap || right_midpoint - left_midpoint <= duplicate_tolerance {
+        if interval_overlap
+            || right_midpoint
+                .cmp_sum(&left_midpoint, &tolerance)
+                .map_err(|e| invalid(&e))?
+                != Ordering::Greater
+        {
             ordered[index].status = RootStatus::Duplicate;
             duplicate_count += 1;
         }
@@ -1973,8 +2418,9 @@ pub fn reconcile_window_roots(
         .count();
     let skipped_index_count = declared_indices
         .windows(2)
-        .map(|pair| pair[1].saturating_sub(pair[0] + 1))
-        .sum::<usize>();
+        .map(|pair| pair[1].saturating_sub(pair[0]).saturating_sub(1))
+        .try_fold(0usize, |sum, gap| sum.checked_add(gap))
+        .ok_or_else(|| WindowError::InvalidRequest("root index-gap count overflows".into()))?;
     if crossover_count > 0 {
         for root in ordered
             .iter_mut()
@@ -1991,20 +2437,8 @@ pub fn reconcile_window_roots(
         }
     }
 
-    for (index, root) in ordered
-        .iter_mut()
-        .filter(|root| {
-            root.midpoint
-                .parse::<f64>()
-                .is_ok_and(|midpoint| midpoint > 0.0)
-                && root.status != RootStatus::Duplicate
-                && root.status != RootStatus::Crossover
-                && root.status != RootStatus::Skipped
-        })
-        .enumerate()
-    {
-        root.positive_index = Some(index + 1);
-    }
+    // The caller's declared indices are evidence, not positions in this window.
+    // Preserve them and leave missing indices unknown.
     let isolated_unique_roots = ordered
         .iter()
         .filter(|root| {
@@ -2032,12 +2466,22 @@ pub fn reconcile_window_roots(
     let count_matches = isolated_unique_roots == independently_counted_roots;
     let completeness = if has_unresolved || !count_matches {
         WindowCompleteness::Inconclusive
-    } else if count_is_certified {
+    } else if count_is_certified
+        && ordered
+            .iter()
+            .all(|root| root.status == RootStatus::Certified)
+    {
         WindowCompleteness::Certified
     } else {
         WindowCompleteness::CountMatched
     };
     let mut diagnostics = Vec::new();
+    if count_is_certified && completeness == WindowCompleteness::CountMatched {
+        diagnostics.push(
+            "independent count is certified, but candidate root locations are not all certified"
+                .into(),
+        );
+    }
     if duplicate_count > 0 {
         diagnostics.push(format!(
             "detected {duplicate_count} duplicate/overlapping roots"
@@ -2070,6 +2514,12 @@ pub fn reconcile_window_roots(
 
 /// Compare only after reference-free discovery and ordering.  References are
 /// never accepted as seeds by this function and cannot change an enclosure.
+/// Comparison digits describe the displacement between stored points, not
+/// accuracy of the supplied references. With `hp`, the midpoint is decoded at
+/// its declared precision and subtraction/logarithm precede binary64 output
+/// conversion. Without `hp`, only 53-bit midpoint records are supported.
+/// Infinity denotes equality of the decoded midpoint and exact binary64
+/// reference; it is not a certificate of equality with a true zeta zero.
 pub fn compare_ordered_roots_to_references(
     roots: &mut [CcmRootRecord],
     positive_reference_values: &[f64],
@@ -2086,16 +2536,93 @@ pub fn compare_ordered_roots_to_references(
         let Some(index) = root.positive_index else {
             continue;
         };
-        let Some(reference) = positive_reference_values.get(index - 1) else {
+        let offset = index.checked_sub(1).ok_or_else(|| {
+            WindowError::InvalidRequest("positive root indices are one-based".into())
+        })?;
+        let Some(reference) = positive_reference_values.get(offset) else {
             continue;
         };
-        let midpoint = parse_finite(&root.midpoint, "root midpoint")?;
-        let error = (midpoint - reference).abs();
-        root.reference_comparison_digits = Some(if error == 0.0 {
-            f64::INFINITY
-        } else {
-            -error.log10()
-        });
+        if !(53..=1_000_000).contains(&root.precision_bits) {
+            return Err(WindowError::InvalidRequest(
+                "root comparison requires 53..=1,000,000 declared precision bits".into(),
+            ));
+        }
+        #[cfg(feature = "hp")]
+        let digits = {
+            use rug::{float::Round, Float};
+            let parse = || {
+                Float::parse(&root.midpoint).map_err(|e| {
+                    WindowError::InvalidRequest(format!("invalid root midpoint decimal: {e}"))
+                })
+            };
+            let midpoint = Float::with_val(root.precision_bits, parse()?);
+            let declared_zero = xc_core::DecimalLiteral::new(&root.midpoint)
+                .and_then(|value| value.canonical())
+                .map_err(|e| WindowError::InvalidRequest(e.to_string()))?
+                .as_str()
+                == "0";
+            if !midpoint.is_finite()
+                || (midpoint.is_zero() && !declared_zero)
+                || (midpoint.get_exp() == Some(rug::float::exp_min())
+                    && Float::with_val_round(root.precision_bits, parse()?, Round::Zero)
+                        .0
+                        .is_zero())
+            {
+                return Err(WindowError::InvalidRequest(
+                    "root midpoint is outside its declared finite point range".into(),
+                ));
+            }
+            let reference = Float::with_val(53, *reference);
+            if midpoint == reference {
+                f64::INFINITY
+            } else {
+                let error = Float::with_val(root.precision_bits + 64, &midpoint - &reference).abs();
+                if !error.is_finite() || error.is_zero() {
+                    return Err(WindowError::EvaluationFailed(
+                        "root comparison displacement exceeds the finite arithmetic range".into(),
+                    ));
+                }
+                let digits = -error.log10().to_f64();
+                if !digits.is_finite() {
+                    return Err(WindowError::EvaluationFailed(
+                        "root comparison digit count exceeds binary64 output range".into(),
+                    ));
+                }
+                digits
+            }
+        };
+        #[cfg(not(feature = "hp"))]
+        let digits = {
+            if root.precision_bits != 53 {
+                return Err(WindowError::InvalidRequest(
+                    "root comparison of more than 53 bits requires the hp feature".into(),
+                ));
+            }
+            let midpoint = parse_finite(&root.midpoint, "root midpoint")?;
+            if midpoint == 0.0
+                && xc_core::DecimalLiteral::new(&root.midpoint)
+                    .and_then(|value| value.canonical())
+                    .map_err(|e| WindowError::InvalidRequest(e.to_string()))?
+                    .as_str()
+                    != "0"
+            {
+                return Err(WindowError::InvalidRequest(
+                    "root midpoint underflows binary64; use the hp feature".into(),
+                ));
+            }
+            let error = (midpoint - reference).abs();
+            if !error.is_finite() {
+                return Err(WindowError::EvaluationFailed(
+                    "root comparison displacement exceeds binary64 range".into(),
+                ));
+            }
+            if error == 0.0 {
+                f64::INFINITY
+            } else {
+                -error.log10()
+            }
+        };
+        root.reference_comparison_digits = Some(digits);
     }
     Ok(())
 }
@@ -2129,6 +2656,7 @@ pub fn discover_roots_with_xc_root_f64(
     upper: f64,
     options: &DiscoveryOptionsF64,
 ) -> Result<Vec<CcmRootRecord>, WindowError> {
+    validate_native_discovery(secular, lower, upper, options)?;
     let generic_options = xc_root::PoleAwareDiscoveryOptionsF64 {
         subdivisions_per_interval: options.subdivisions_per_pole_interval,
         pole_margin_fraction: options.pole_margin_fraction,
@@ -2142,63 +2670,19 @@ pub fn discover_roots_with_xc_root_f64(
     };
     let generic =
         xc_root::discover_pole_aware_sign_changes_f64(secular, lower, upper, &generic_options)
-            .map_err(|error| WindowError::EvaluationFailed(error.to_string()))?;
-
-    let mut boundaries = vec![lower];
-    boundaries.extend(
-        secular
-            .poles()
-            .iter()
-            .copied()
-            .filter(|pole| *pole > lower && *pole < upper),
-    );
-    boundaries.push(upper);
-
-    let mut records = Vec::with_capacity(generic.len());
-    for root in generic {
-        let neighboring = boundaries
-            .windows(2)
-            .find(|window| root.midpoint > window[0] && root.midpoint < window[1]);
-        records.push(CcmRootRecord {
-            positive_index: None,
-            midpoint: format!("{:.17e}", root.midpoint),
-            enclosure: Some(root.decimal_interval()),
-            residual_bound: Some(format!("{:.17e}", root.residual)),
-            derivative_magnitude: root
-                .derivative_magnitude
-                .map(|value| format!("{:.17e}", value)),
-            conditioning: root
-                .derivative_magnitude
-                .filter(|value| *value != 0.0)
-                .map(|value| format!("{:.17e}", value.abs().recip())),
-            isolation_distance: Some(format!(
-                "{:.17e}",
-                (root.bracket.upper - root.bracket.lower).abs()
-            )),
-            nearest_left_pole: neighboring.map(|window| format!("{:.17e}", window[0])),
-            nearest_right_pole: neighboring.map(|window| format!("{:.17e}", window[1])),
-            precision_bits: 53,
-            precision_history_bits: vec![53],
-            certified_digits: None,
-            status: RootStatus::Discovered,
-            discovery_method: "xc_root_pole_aware_sign_change_bisection_f64".to_owned(),
-            crosscheck_method: Some("direct_ccm_pole_aware_sign_change_bisection_f64".to_owned()),
-            reference_comparison_digits: None,
-        });
-    }
-    records.sort_by(|left, right| {
-        let left = left.midpoint.parse::<f64>().unwrap_or(f64::NAN);
-        let right = right.midpoint.parse::<f64>().unwrap_or(f64::NAN);
-        left.total_cmp(&right)
-    });
-    for (index, root) in records
-        .iter_mut()
-        .filter(|root| root.midpoint.parse::<f64>().is_ok_and(|value| value > 0.0))
-        .enumerate()
-    {
-        root.positive_index = Some(index + 1);
-    }
-    Ok(records)
+            .map_err(|e| WindowError::EvaluationFailed(e.to_string()))?;
+    generic
+        .into_iter()
+        .map(|root| {
+            native_discovery_record(
+                secular,
+                root.bracket.lower,
+                root.bracket.upper,
+                root.midpoint,
+                "xc_root_pole_aware_sign_change_bisection_f64",
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2217,3 +2701,140 @@ mod xc_root_adapter_tests {
         assert!((left - right).abs() < 1e-12);
     }
 }
+
+#[cfg(test)]
+mod audit_window_contracts {
+    use super::*;
+    fn root(
+        status: RootStatus,
+        midpoint: &str,
+        lower: &str,
+        upper: &str,
+        index: Option<usize>,
+    ) -> CcmRootRecord {
+        CcmRootRecord {
+            positive_index: index,
+            midpoint: midpoint.into(),
+            enclosure: Some(DecimalInterval {
+                lower: lower.into(),
+                upper: upper.into(),
+            }),
+            residual_bound: Some("0".into()),
+            derivative_magnitude: Some("1".into()),
+            conditioning: None,
+            isolation_distance: None,
+            nearest_left_pole: None,
+            nearest_right_pole: None,
+            precision_bits: 256,
+            precision_history_bits: vec![256],
+            certified_digits: None,
+            status,
+            discovery_method: "synthetic-attestation".into(),
+            crosscheck_method: None,
+            reference_comparison_digits: None,
+        }
+    }
+    #[test]
+    fn planning_rejects_overflow_and_invalid_targets_and_covers_negative_windows() {
+        assert!(minimum_modes_for_height(4.0, f64::MAX).is_err());
+        assert!(spectral_reach(4.0, usize::MAX, f64::MAX).is_err());
+        let tiny = f64::from_bits(1);
+        let near_one = f64::from_bits(1.0f64.to_bits() + 1);
+        assert_eq!(minimum_modes_for_height(near_one, tiny).unwrap(), 1);
+        assert!(!spectral_reach(near_one, 0, tiny).unwrap().reaches_window);
+        for target in [
+            ZeroTarget::FirstK { count: 0 },
+            ZeroTarget::IndexRange { first: 0, last: 10 },
+            ZeroTarget::IndexRange {
+                first: 20,
+                last: 10,
+            },
+            ZeroTarget::HeightWindow {
+                lower: "100".into(),
+                upper: "10".into(),
+            },
+            ZeroTarget::SymmetricHeightWindow { height: "0".into() },
+        ] {
+            assert!(plan_observation(4.0, &target, 10, 10).is_err());
+        }
+        let target = ZeroTarget::HeightWindow {
+            lower: "-100".into(),
+            upper: "10".into(),
+        };
+        let plan = plan_observation(4.0, &target, 10, 10).unwrap();
+        assert_eq!(plan.estimated_height, 100.0);
+        assert_eq!(
+            plan.minimum_modes_for_reach,
+            minimum_modes_for_height(4.0, 100.0).unwrap()
+        );
+        assert!(plan_observation(4.0, &target, u32::MAX, u32::MAX).is_err());
+        assert!(plan_observation(4.0, &target, 0, 10).is_err());
+    }
+    #[test]
+    fn native_secular_public_api_preserves_representable_results_and_rejects_range_loss() {
+        let f = SecularFunctionF64::new(vec![-1e308], vec![1e308]).unwrap();
+        assert_eq!(f.evaluate(1e308).unwrap(), 0.5);
+        let f = SecularFunctionF64::new(vec![0.], vec![1e300]).unwrap();
+        let derivative = f.derivative(1e200).unwrap();
+        assert!(derivative < 0. && (derivative / (-1e-100) - 1.).abs() < 1e-15);
+        let f = SecularFunctionF64::new(vec![0.], vec![1.]).unwrap();
+        assert!(f.derivative(1e-200).is_err());
+        assert!(f.derivative(1e308).is_err());
+        assert!(f.evaluate(0.).is_err());
+        assert!(f.derivative(f64::INFINITY).is_err());
+    }
+    #[test]
+    fn reconciliation_keeps_root_assurance_and_validates_every_interval() {
+        for status in [
+            RootStatus::Discovered,
+            RootStatus::Refined,
+            RootStatus::CrossChecked,
+        ] {
+            let report =
+                reconcile_window_roots(&[root(status, "0.5", "0", "1", Some(7))], 1, true, 1e-12)
+                    .unwrap();
+            assert_eq!(report.completeness, WindowCompleteness::CountMatched);
+            assert_eq!(report.roots[0].positive_index, Some(7));
+        }
+        let report = reconcile_window_roots(
+            &[root(RootStatus::Certified, "0.5", "0", "1", None)],
+            1,
+            true,
+            1e-12,
+        )
+        .unwrap();
+        assert_eq!(report.completeness, WindowCompleteness::Certified);
+        assert_eq!(report.roots[0].positive_index, None);
+        for bad in [
+            root(RootStatus::Certified, "0.5", "1", "0", Some(1)),
+            root(RootStatus::Certified, "1000", "0", "1", Some(1)),
+            root(RootStatus::Certified, "0.5", "0", "1", Some(0)),
+        ] {
+            assert!(reconcile_window_roots(&[bad], 1, true, 1e-12).is_err());
+        }
+        let x = "1.000000000000000000000000000001";
+        let values = [
+            root(RootStatus::Certified, "1", "1", "1", Some(1)),
+            root(RootStatus::Certified, x, x, x, Some(2)),
+        ];
+        let report = reconcile_window_roots(&values, 2, true, 1e-31).unwrap();
+        assert_eq!(report.completeness, WindowCompleteness::Certified);
+        assert_eq!(report.duplicate_count, 0);
+        let reversed = [
+            root(RootStatus::Certified, "1", "1", "1", Some(usize::MAX)),
+            root(RootStatus::Certified, "2", "2", "2", Some(usize::MAX - 1)),
+        ];
+        assert_eq!(
+            reconcile_window_roots(&reversed, 2, true, 1e-12)
+                .unwrap()
+                .completeness,
+            WindowCompleteness::Inconclusive
+        );
+        let mut invalid = [root(RootStatus::Discovered, "1", "1", "1", Some(0))];
+        assert!(compare_ordered_roots_to_references(&mut invalid, &[1.]).is_err());
+    }
+}
+
+#[cfg(test)]
+#[path = "window/window_regression_tests.rs"]
+mod window_regression_tests;

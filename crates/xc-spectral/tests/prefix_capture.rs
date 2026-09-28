@@ -558,6 +558,24 @@ fn prefix_observable_adapter_keeps_parent_and_estimate_semantics() {
         assert!(observations.iter().all(|v| v.resolution == resolution));
     }
     assert!(prefix_observations(&report, PrefixObservable::InverseCubeTrace, &resolution).is_err());
+    for (source, semantics) in [
+        (
+            &report,
+            "ccm-retained-even-prefix-moments-checked-exports-v2",
+        ),
+        (
+            &extended,
+            "ccm-retained-even-prefix-moments-checked-exports-v3",
+        ),
+    ] {
+        let mut archived = source.clone();
+        archived.semantics = semantics.into();
+        let bytes = serde_json::to_vec(&archived).unwrap();
+        assert!(
+            prefix_observations(&archived, PrefixObservable::InverseTrace, &resolution).is_ok()
+        );
+        assert_eq!(serde_json::to_vec(&archived).unwrap(), bytes);
+    }
     let mut old = serde_json::to_value(&report).unwrap();
     old["semantics"] = LEGACY_PREFIX_SEMANTICS.into();
     for row in old["ladder"]["rows"].as_array_mut().unwrap() {

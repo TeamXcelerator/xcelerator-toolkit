@@ -136,8 +136,12 @@ fn moving_responses(
 /// retained L2 tangent vectors, at the original MPFR working precision.
 /// Authentication includes raw payload hashes, canonical identities, the exact
 /// eigenpair dependency, and the shared numerical configuration. Already-corrected
-/// v3/v4 sources require byte-exact replay. A root-only repair never promotes
-/// legacy u-flow actions and tangents to the stable-derivative v4 identity.
+/// Supported replay identities are exactly prime v0.15.0-v3, v0.15.2-v2,
+/// exact-event-edge-v3; and u-flow v0.15.0-v3, v0.15.1-v4, v0.15.2-v3,
+/// plus the current u-flow identity. Version suffixes are not ordered aliases.
+/// These sources require byte-exact replay without changing their identity.
+/// A root-only repair never promotes legacy actions/tangents to stable derivatives
+/// or certifies source-matrix isolation; that requires the original matrix and Q.
 pub fn repair_retained_response(
     response: &LocalShardJson,
     eigenpair: &LocalShardJson,
@@ -166,15 +170,26 @@ pub fn repair_retained_response(
         ),
         _ => bail!("unsupported retained response kind"),
     };
-    let stable_flow = semantic.artifact_kind == "ccm_u_flow_response_analysis"
-        && semantic.mathematical_semantics_version == U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS;
+    let preserved_version = match semantic.artifact_kind.as_str() {
+        "ccm_prime_power_response_analysis" => {
+            semantic.mathematical_semantics_version == "ccm-prime-power-response-v0.15.2-v2"
+                || semantic.mathematical_semantics_version
+                    == PRIME_POWER_RESPONSE_MATHEMATICAL_SEMANTICS
+        }
+        "ccm_u_flow_response_analysis" => {
+            semantic.mathematical_semantics_version == "ccm-u-flow-response-v0.15.1-v4"
+                || semantic.mathematical_semantics_version == "ccm-u-flow-response-v0.15.2-v3"
+                || semantic.mathematical_semantics_version == U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS
+        }
+        _ => false,
+    };
     if semantic.mathematical_semantics_version != old_version
         && semantic.mathematical_semantics_version != new_version
-        && !stable_flow
+        && !preserved_version
     {
         bail!("unsupported response semantics; schema-1 responses do not retain repair inputs");
     }
-    let was_current = semantic.mathematical_semantics_version == new_version || stable_flow;
+    let was_current = semantic.mathematical_semantics_version == new_version || preserved_version;
     let metadata: serde_json::Value = serde_json::from_slice(&response.payload)?;
     let bits = state.precision_bits;
     let dimension = state
@@ -207,14 +222,10 @@ pub fn repair_retained_response(
     }
     drop(metadata);
     let xi = finite_vector(&state.eigenvector, dimension, bits)?;
-    let norm = deterministic_l2_norm_hp(&xi, bits);
+    let norm = deterministic_l2_norm_hp(&xi, bits)?;
     if !norm.is_finite() || norm.is_zero() {
         bail!("invalid retained eigenstate norm");
     }
-    let unit = xi
-        .iter()
-        .map(|x| Float::with_val(bits, x) / &norm)
-        .collect::<Vec<_>>();
     let params = match state.lambda_squared.parse::<u64>() {
         Ok(c) => CcmParams::from_lambda_sq_integer(c, state.n_modes),
         Err(_) => {
@@ -224,11 +235,42 @@ pub fn repair_retained_response(
     if lambda_squared_cache_identity(&params) != state.lambda_squared {
         bail!("unsupported retained cutoff identity");
     }
-    let l = log_lambda_sq_hp(&params, bits);
+    let current_geometry = semantic.mathematical_semantics_version
+        == PRIME_POWER_RESPONSE_MATHEMATICAL_SEMANTICS
+        || semantic.mathematical_semantics_version == "ccm-prime-power-response-v0.15.2-v2"
+        || semantic.mathematical_semantics_version == "ccm-u-flow-response-v0.15.2-v3"
+        || semantic.mathematical_semantics_version == U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS;
+    // These epochs store correctly rounded xi_i / sqrt(sum xi_j^2), not a
+    // quotient by the separately rounded norm. Preserve the historical
+    // construction for earlier epochs rather than silently changing their model.
+    let unit = if current_geometry {
+        response_point_math::unit_state(&xi, bits)?
+    } else {
+        xi.iter()
+            .map(|x| Float::with_val(bits, x) / &norm)
+            .collect::<Vec<_>>()
+    };
+    let l = if current_geometry {
+        log_lambda_sq_hp(&params, bits)?
+    } else {
+        lambda_squared_value_hp(&params, bits)?.ln()
+    };
     if !l.is_finite() || l <= 0 {
         bail!("invalid retained cutoff");
     }
-    let (poles, pole_velocities) = ccm_secular_poles_and_u_velocities(&l, state.n_modes, bits);
+    let (poles, pole_velocities) = if current_geometry {
+        ccm_secular_poles_and_u_velocities(&l, state.n_modes, bits)?
+    } else {
+        // Frozen arithmetic of the retained legacy model: a root-only repair
+        // must not silently replace its poles or tangent convention.
+        let spacing = pi(bits) * 2u32 / &l;
+        let velocity = -spacing.clone() / &l;
+        let poles = secular_poles(&spacing, state.n_modes, bits);
+        let velocities = (-(state.n_modes as i64)..=state.n_modes as i64)
+            .map(|k| Float::with_val(bits, &velocity) * k)
+            .collect();
+        (poles, velocities)
+    };
     let payload = if semantic.artifact_kind == "ccm_prime_power_response_analysis" {
         let mut data: PortablePrimePowerResponseAnalysis =
             serde_json::from_slice(&response.payload)?;
@@ -238,7 +280,7 @@ pub fn repair_retained_response(
                 bail!("invalid retained response shape");
             }
             let tangent = finite_vector(&event.l2_eigenvector_velocity_response, dimension, bits)?;
-            if lossless_hp_decimal(&deterministic_l2_norm_hp(&tangent, bits))
+            if lossless_hp_decimal(&deterministic_l2_norm_hp(&tangent, bits)?)
                 != event.l2_eigenvector_velocity_response_norm
             {
                 bail!("retained tangent norm mismatch");
@@ -261,7 +303,7 @@ pub fn repair_retained_response(
             }
             let tangent =
                 finite_vector(&channel.l2_eigenvector_velocity_response, dimension, bits)?;
-            if lossless_hp_decimal(&deterministic_l2_norm_hp(&tangent, bits))
+            if lossless_hp_decimal(&deterministic_l2_norm_hp(&tangent, bits)?)
                 != channel.l2_eigenvector_velocity_response_norm
             {
                 bail!("retained tangent norm mismatch");
@@ -286,7 +328,7 @@ pub fn repair_retained_response(
     if was_current && response.payload != payload {
         bail!("current response failed exact retained replay");
     }
-    if !stable_flow {
+    if !was_current {
         semantic.mathematical_semantics_version = new_version.into();
     }
     Ok(RepairedResponse {
@@ -398,6 +440,7 @@ pub(super) fn check_fresh_response_repair(
     eigenvalue: &Float,
 ) {
     let state = PortableWeilEigenpair {
+        stored_state_resolution: None,
         schema_version: 3,
         lambda_squared: prime.lambda_squared.clone(),
         n_modes: prime.n_modes,
@@ -446,6 +489,69 @@ pub(super) fn check_fresh_response_repair(
         stable_replay.semantic_key.mathematical_semantics_version,
         U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS
     );
+    // The exact-quadrant epoch changes analytic actions, not the decimal-log
+    // geometry or the root-only replay of previously retained v0.15.2 tangents.
+    let prior_quadrants = fixture_source(
+        "ccm_u_flow_response_analysis",
+        "ccm-u-flow-response-v0.15.2-v3",
+        fresh_flow.clone(),
+        vec![dep.clone()],
+    );
+    let prior_replay = repair_retained_response(&prior_quadrants, &state).unwrap();
+    assert_eq!(prior_replay.payload, fresh_flow);
+    assert_eq!(
+        prior_replay.semantic_key.mathematical_semantics_version,
+        "ccm-u-flow-response-v0.15.2-v3"
+    );
+    let current_prime = fixture_source(
+        "ccm_prime_power_response_analysis",
+        PRIME_POWER_RESPONSE_MATHEMATICAL_SEMANTICS,
+        fresh_prime.clone(),
+        vec![dep.clone()],
+    );
+    let current_replay = repair_retained_response(&current_prime, &state).unwrap();
+    assert_eq!(current_replay.payload, fresh_prime);
+    assert_eq!(
+        current_replay.semantic_key.mathematical_semantics_version,
+        PRIME_POWER_RESPONSE_MATHEMATICAL_SEMANTICS
+    );
+    // Recreate the historical isolation shape: root-only repair must preserve
+    // these fields and their older identity without claiming source assurance.
+    for isolation in [&mut prime.spectral_isolation, &mut flow.spectral_isolation] {
+        isolation.source_matrix_eigenvalue_allowance.clear();
+        isolation.isolation_method = "even_sector_indices_0_1_disjoint_hp_sturm_enclosures".into();
+    }
+    let fresh_prime = serde_json::to_vec(&prime).unwrap();
+    let fresh_flow = serde_json::to_vec(&flow).unwrap();
+    for (kind, version, bytes) in [
+        (
+            "ccm_prime_power_response_analysis",
+            "ccm-prime-power-response-v0.15.0-v3",
+            &fresh_prime,
+        ),
+        (
+            "ccm_u_flow_response_analysis",
+            "ccm-u-flow-response-v0.15.0-v3",
+            &fresh_flow,
+        ),
+        (
+            "ccm_u_flow_response_analysis",
+            "ccm-u-flow-response-v0.15.1-v4",
+            &fresh_flow,
+        ),
+    ] {
+        let archived = fixture_source(kind, version, bytes.clone(), vec![dep.clone()]);
+        let replay = repair_retained_response(&archived, &state).unwrap();
+        assert_eq!(&replay.payload, bytes);
+        assert_eq!(replay.semantic_key.mathematical_semantics_version, version);
+        assert!(
+            !serde_json::from_slice::<serde_json::Value>(&replay.payload).unwrap()
+                ["spectral_isolation"]
+                .as_object()
+                .unwrap()
+                .contains_key("source_matrix_eigenvalue_allowance")
+        );
+    }
     for event in &mut prime.events {
         for x in event.root_velocity_responses.iter_mut().flatten() {
             *x = "123".into();
@@ -529,6 +635,170 @@ pub(super) fn check_fresh_response_repair(
         assert!(
             repair_retained_response(&invalid, &state).is_err(),
             "shape mismatch must fail"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nontrivial_producer_response_roundtrips() {
+        let mut observed_double_rounding_difference = false;
+        for bits in [64, 192] {
+            for params in [
+                CcmParams::from_lambda_sq_integer(11, 1),
+                CcmParams::from_lambda_sq_fractional(10.5, 1),
+            ] {
+                let cfg = HighPrecConfig {
+                    precision_bits: bits,
+                    quad_points: 24,
+                    ..HighPrecConfig::for_decimal_digits(20)
+                };
+                let l = log_lambda_sq_hp(&params, bits).unwrap();
+                // A=38I-vv^T, v=(3,1,3): exact even ground 19, other
+                // eigenvalues 38. Its irrational norm exposes double rounding.
+                let v = [3, 1, 3];
+                let xi = v.map(|x| Float::with_val(bits, x));
+                let tau = (0..9)
+                    .map(|k| {
+                        Float::with_val(
+                            bits,
+                            if k / 3 == k % 3 {
+                                38 - v[k / 3] * v[k % 3]
+                            } else {
+                                -v[k / 3] * v[k % 3]
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let eigenvalue = Float::with_val(bits, 19);
+                let unit = response_unit_state(&xi, bits).unwrap();
+                let norm = deterministic_l2_norm_hp(&xi, bits).unwrap();
+                let old_unit = xi
+                    .iter()
+                    .map(|x| Float::with_val(bits, x) / &norm)
+                    .collect::<Vec<_>>();
+                observed_double_rounding_difference |= unit != old_unit;
+                let (poles, _) = ccm_secular_poles_and_u_velocities(&l, 1, bits).unwrap();
+                // The exact source numerator is 7z^2-spacing^2.
+                let root = Float::with_val(bits, &poles[2]) / Float::with_val(bits, 7).sqrt();
+                let roots = vec![EigenvalueResult::Converged(RootRefinement {
+                    value: root,
+                    diagnostics: RootRefinementDiagnostics {
+                        iterations: 1,
+                        final_correction: Float::with_val(bits, 0),
+                        residual: Float::with_val(bits, 0),
+                        achieved_decimal_digits: Float::with_val(bits, 10),
+                    },
+                })];
+                let manifest =
+                    fixture_source("ccm_tau_matrix", "test", b"{}".to_vec(), vec![]).manifest;
+                let preparation =
+                    compute_response_spectral_preparation(&params, &cfg, &tau).unwrap();
+                let selection = root_selection_digest(&roots).unwrap();
+                let mut prime = compute_prime_power_response_analysis(
+                    &params,
+                    &cfg,
+                    &l,
+                    &tau,
+                    &eigenvalue,
+                    &xi,
+                    &roots,
+                    1,
+                    &manifest,
+                    &manifest,
+                    &manifest,
+                    &manifest,
+                    &selection,
+                    &preparation,
+                )
+                .unwrap();
+                let actions = compute_u_flow_velocity_actions(&params, &cfg, &l, &unit).unwrap();
+                let mut flow = compute_u_flow_response_analysis(
+                    &params,
+                    &cfg,
+                    &l,
+                    &tau,
+                    &eigenvalue,
+                    &xi,
+                    &roots,
+                    1,
+                    &manifest,
+                    &manifest,
+                    &manifest,
+                    &manifest,
+                    &selection,
+                    &actions,
+                    &preparation,
+                )
+                .unwrap();
+                let state = PortableWeilEigenpair {
+                    stored_state_resolution: None,
+                    schema_version: 3,
+                    lambda_squared: prime.lambda_squared.clone(),
+                    n_modes: 1,
+                    precision_bits: bits,
+                    force_even: true,
+                    parity_policy: prime.parity_policy,
+                    eigenstate_route: legacy_eigenstate_route_name(),
+                    eigenvalue: eigenvalue.to_string(),
+                    eigenvector: xi.iter().map(Float::to_string).collect(),
+                    inverse_iteration: PortableInverseIterationDiagnostics {
+                        configured_step_limit: 1,
+                        unshifted_steps: 1,
+                        unshifted_converged: true,
+                        final_relative_rayleigh_change: Some("0".into()),
+                        shifted_refinement: "not_attempted".into(),
+                        final_relative_residual_norm: "0".into(),
+                    },
+                    shift_invert_krylov: None,
+                };
+                let state = fixture_source(
+                    "ccm_weil_eigenpair",
+                    "test-state",
+                    serde_json::to_vec(&state).unwrap(),
+                    vec![],
+                );
+                prime.eigenpair_content_digest = state.manifest.content_digest.0.clone();
+                flow.eigenpair_content_digest = state.manifest.content_digest.0.clone();
+                let canonical = authenticate(&state).unwrap();
+                let dep = xc_cache::PayloadDependencyIdentity {
+                    artifact_family: "weil-states".into(),
+                    semantic_digest: canonical.semantic_digest,
+                    manifest_digest: state.canonical_manifest_digest.clone(),
+                    payload_digest: canonical.payload_digest,
+                };
+                for (kind, version, bytes) in [
+                    (
+                        "ccm_prime_power_response_analysis",
+                        PRIME_POWER_RESPONSE_MATHEMATICAL_SEMANTICS,
+                        serde_json::to_vec(&prime).unwrap(),
+                    ),
+                    (
+                        "ccm_u_flow_response_analysis",
+                        U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS,
+                        serde_json::to_vec(&flow).unwrap(),
+                    ),
+                    (
+                        "ccm_u_flow_response_analysis",
+                        "ccm-u-flow-response-v0.15.2-v3",
+                        serde_json::to_vec(&flow).unwrap(),
+                    ),
+                ] {
+                    let source = fixture_source(kind, version, bytes.clone(), vec![dep.clone()]);
+                    let replay = repair_retained_response(&source, &state).unwrap();
+                    assert_eq!(replay.payload, bytes);
+                    assert_eq!(replay.semantic_key.mathematical_semantics_version, version);
+                    let unbound = fixture_source(kind, version, bytes, vec![]);
+                    assert!(repair_retained_response(&unbound, &state).is_err());
+                }
+            }
+        }
+        assert!(
+            observed_double_rounding_difference,
+            "fixture must distinguish producer from historical normalization"
         );
     }
 }

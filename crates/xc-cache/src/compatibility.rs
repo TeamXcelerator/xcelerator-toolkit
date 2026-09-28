@@ -36,6 +36,8 @@ pub fn artifact_family_compatibility_policy(
         "ccm-matrices" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
         "weil-states" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
         "prolate" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
+        // Reserved schema support; numerical producers remain separately opt-in.
+        "maynard-tao" => ("0.15.2", "0.15.2", None, SCHEMA_V1),
         "ccm-roots" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
         "ccm-evidence" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
         // Eigenfunction profiles and target-distance measurements. Introduced
@@ -70,6 +72,7 @@ pub fn artifact_compatibility_policy(
     artifact_kind: &str,
 ) -> Result<ArtifactFamilyCompatibilityPolicy, CacheError> {
     let minimum_producer = match artifact_kind {
+        "maynard_basis" | "maynard_moment_table" | "maynard_operator" | "maynard_candidate" | "maynard_bound" | "maynard_certificate" => "0.15.2",
         "gauss_legendre_rule" => "0.13.0",
         "quadrature_rule" => "0.13.0",
         "quadrature_reference_table" => "0.13.0",
@@ -209,6 +212,28 @@ impl ArtifactFamilyCompatibilityPolicy {
         minimum_reader: &ToolkitVersion,
         maximum_reader: Option<&ToolkitVersion>,
     ) -> Result<(), CacheError> {
+        for version in [
+            producer,
+            minimum_reader,
+            &self.minimum_producer_version,
+            &self.minimum_reader_version,
+        ]
+        .into_iter()
+        .chain(maximum_reader)
+        .chain(self.maximum_reader_version.as_ref())
+        {
+            version.validate()?;
+        }
+        if maximum_reader.is_some_and(|maximum| maximum < minimum_reader)
+            || self
+                .maximum_reader_version
+                .as_ref()
+                .is_some_and(|maximum| maximum < &self.minimum_reader_version)
+        {
+            return Err(CacheError::InvalidManifest(
+                "reader compatibility window is reversed".into(),
+            ));
+        }
         if !self
             .accepted_manifest_schema_versions
             .contains(&schema_version)
@@ -225,11 +250,12 @@ impl ArtifactFamilyCompatibilityPolicy {
             )));
         }
         if minimum_reader < &self.minimum_reader_version
-            || maximum_reader.is_some_and(|maximum| {
-                self.maximum_reader_version
-                    .as_ref()
-                    .is_some_and(|policy_maximum| maximum > policy_maximum)
-            })
+            || self
+                .maximum_reader_version
+                .as_ref()
+                .is_some_and(|policy_maximum| {
+                    maximum_reader.is_none_or(|maximum| maximum > policy_maximum)
+                })
         {
             return Err(CacheError::InvalidManifest(format!(
                 "reader compatibility is outside the {:?} family policy",

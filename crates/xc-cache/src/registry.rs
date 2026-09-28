@@ -74,6 +74,8 @@ pub struct CcmEigenpairContinuationEntry {
 
 impl CcmEigenpairContinuationEntry {
     pub fn validate(&self) -> Result<(), CacheError> {
+        self.producer_toolkit_version.validate()?;
+        self.minimum_reader_version.validate()?;
         if self.n_modes == 0
             || !matches!(
                 self.eigenstate_route.as_str(),
@@ -166,6 +168,7 @@ impl CcmEigenpairContinuationIndex {
     ) -> Result<Vec<crate::ArtifactKey>, CacheError> {
         self.validate()?;
         query.validate()?;
+        current_toolkit_version.validate()?;
         if self.lambda_squared != query.lambda_squared
             || self.precision_bits != query.precision_bits
             || self.force_even != query.force_even
@@ -334,11 +337,10 @@ impl TopologyRegistry {
                 "topology registry requires a schema and policy digest".to_owned(),
             ));
         }
-        if self.generation > 0
-            && self
-                .previous_registry_digest
-                .as_ref()
-                .is_some_and(|digest| !digest.validate())
+        if self
+            .previous_registry_digest
+            .as_ref()
+            .is_some_and(|digest| !digest.validate())
         {
             return Err(CacheError::InvalidManifest(
                 "topology registry has an invalid predecessor digest".to_owned(),
@@ -475,6 +477,8 @@ pub struct ShardIndexEntry {
 
 impl ShardIndexEntry {
     pub fn validate(&self) -> Result<(), CacheError> {
+        self.producer_toolkit_version.validate()?;
+        self.minimum_reader_version.validate()?;
         if [
             &self.semantic_digest,
             &self.canonical_payload_digest,
@@ -706,6 +710,13 @@ impl ShardIndexPartition {
         semantic_digest: &ContentDigest,
         incoming: &ToolkitVersion,
     ) -> Result<(), CacheError> {
+        self.validate()?;
+        incoming.validate()?;
+        if !semantic_digest.validate() {
+            return Err(CacheError::InvalidManifest(
+                "invalid producer semantic identity".to_owned(),
+            ));
+        }
         if let Some(newer) = self.entries.iter().find(|entry| {
             &entry.semantic_digest == semantic_digest
                 && &entry.producer_toolkit_version > incoming
@@ -765,15 +776,28 @@ impl CapacityLedger {
                 "capacity ledger identity or limits are invalid".to_owned(),
             ));
         }
+        self.checked_accounted_bytes()?;
         Ok(())
     }
 
+    /// Saturating estimate. Exact after `validate`; use `checked_accounted_bytes` for unchecked input.
     pub fn accounted_bytes(&self) -> u64 {
         self.first_seen_immutable_payload_bytes
             .saturating_add(self.manifest_index_receipt_bytes)
             .saturating_add(self.estimated_history_bytes)
             .saturating_add(self.emergency_reserve_bytes)
             .saturating_add(self.abandoned_reachable_bytes)
+    }
+
+    pub fn checked_accounted_bytes(&self) -> Result<u64, CacheError> {
+        self.first_seen_immutable_payload_bytes
+            .checked_add(self.manifest_index_receipt_bytes)
+            .and_then(|n| n.checked_add(self.estimated_history_bytes))
+            .and_then(|n| n.checked_add(self.emergency_reserve_bytes))
+            .and_then(|n| n.checked_add(self.abandoned_reachable_bytes))
+            .ok_or_else(|| {
+                CacheError::ResourceLimit("capacity ledger accounted bytes exceed u64".to_owned())
+            })
     }
 
     pub fn assess_addition(
@@ -783,11 +807,14 @@ impl CapacityLedger {
         projected_history_bytes: u64,
     ) -> Result<CapacityAdmission, CacheError> {
         self.validate()?;
-        let current = self.accounted_bytes();
+        let current = self.checked_accounted_bytes()?;
         let projected = current
-            .saturating_add(unique_payload_bytes)
-            .saturating_add(metadata_bytes)
-            .saturating_add(projected_history_bytes);
+            .checked_add(unique_payload_bytes)
+            .and_then(|n| n.checked_add(metadata_bytes))
+            .and_then(|n| n.checked_add(projected_history_bytes))
+            .ok_or_else(|| {
+                CacheError::ResourceLimit("capacity ledger projected bytes exceed u64".to_owned())
+            })?;
         let accepted = projected <= self.hard_capacity_bytes;
         let remaining = self.hard_capacity_bytes.saturating_sub(projected);
         Ok(CapacityAdmission {

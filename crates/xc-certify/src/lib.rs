@@ -7,6 +7,9 @@
 //! dimensions, hashes, enclosure ordering, exact rational inequalities, and
 //! completeness metadata without rerunning the discovery solve.
 
+#[cfg(feature = "hp")]
+mod interval_inertia;
+
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -16,6 +19,10 @@ use xc_cache::{sha256_hex, ArtifactKey, ContentDigest, ToolkitVersion};
 use xc_core::{
     ApproximationLedger, ArtifactCitationMetadata, AssuranceLevel, DecimalLiteral, SolverProvenance,
 };
+
+/// Claim-specific record presence and structural verification semantics.
+pub const CERTIFICATE_BUNDLE_VERIFICATION_SEMANTICS: &str =
+    "certificate-bundle-required-proof-records-v2";
 
 pub fn certification_artifact_reuse_plan() -> xc_core::ArtifactReusePlan {
     use xc_core::{ArtifactReuseNode, ArtifactReusePlan};
@@ -34,7 +41,7 @@ pub fn certification_artifact_reuse_plan() -> xc_core::ArtifactReusePlan {
     ArtifactReusePlan {
         schema_version: 1,
         domain: "certification".to_owned(),
-        semantics_version: "certificate-v0.13.0-v1".to_owned(),
+        semantics_version: CERTIFICATE_BUNDLE_VERIFICATION_SEMANTICS.to_owned(),
         artifacts: vec![
             node(
                 "canonical_claim_inputs",
@@ -138,9 +145,10 @@ impl DecimalInterval {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExactRationalRecord {
-    /// Canonical integer numerator, base 10.
+    /// Base-10 integer numerator. Producers emit canonical reduced records;
+    /// syntax validation also accepts leading zeros and unreduced fractions.
     pub numerator: String,
-    /// Canonical positive integer denominator, base 10.
+    /// Base-10 positive integer denominator; see numerator syntax policy.
     pub denominator: String,
 }
 
@@ -199,6 +207,15 @@ impl CertificationErrorBudget {
         let mut observed = std::collections::BTreeSet::new();
         for component in &self.components {
             component.absolute_bound.validate_syntax()?;
+            if component.absolute_bound.numerator.starts_with('-')
+                && component.absolute_bound.numerator[1..]
+                    .bytes()
+                    .any(|b| b != b'0')
+            {
+                return Err(CertificateError::Invalid(
+                    "absolute error bounds must be nonnegative".into(),
+                ));
+            }
             if !component.evidence_digest.validate() || component.method.trim().is_empty() {
                 return Err(CertificateError::Invalid(
                     "certification error component lacks evidence or method".to_owned(),
@@ -271,6 +288,11 @@ pub struct InertiaCertificate {
 /// Self-contained exact-endpoint interval-inertia proof. The matrix entries
 /// include assembly uncertainty; an independent HP verifier reconstructs the
 /// intervals and reruns interval LDL^T without access to the producer state.
+/// Schema 1 replays the historical exact-rational recurrence. Schema 2 replays
+/// directed MPFR interval arithmetic at `precision_bits`, with exact dyadic
+/// pivot records. Schema 3 retains schema-1 pivots when conclusive and adds
+/// scale-independent determinant/row-norm 2x2 bounds when needed. No schema
+/// discards input assembly uncertainty.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PortableIntervalInertiaCertificate {
     pub schema_version: u32,
@@ -316,7 +338,7 @@ impl PortableIntervalInertiaCertificate {
     }
 
     pub fn validate_structure(&self) -> Result<(), CertificateError> {
-        if self.schema_version == 0
+        if !matches!(self.schema_version, 1..=3)
             || self.dimension == 0
             || self.matrix_row_major.len() != self.dimension.saturating_mul(self.dimension)
         {
@@ -325,6 +347,7 @@ impl PortableIntervalInertiaCertificate {
             ));
         }
         if self.precision_bits < 32
+            || (self.schema_version == 2 && self.precision_bits > 1_000_000)
             || self.scalar_backend.trim().is_empty()
             || self.configuration.is_empty()
         {
@@ -332,7 +355,12 @@ impl PortableIntervalInertiaCertificate {
                 "portable inertia certificate lacks a valid precision or backend".to_owned(),
             ));
         }
-        if self.positive + self.negative + self.zero_or_unresolved != self.dimension {
+        if self
+            .positive
+            .checked_add(self.negative)
+            .and_then(|n| n.checked_add(self.zero_or_unresolved))
+            != Some(self.dimension)
+        {
             return Err(CertificateError::Invalid(
                 "portable inertia counts do not sum to the matrix dimension".to_owned(),
             ));
@@ -402,6 +430,10 @@ pub enum IntervalEigenvalueCountResult {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExactSelectedEigenvalueEnclosure {
+    /// None denotes historical exact-rational pivots. Some(p) binds replay to
+    /// directed MPFR interval inertia at precisely p bits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inertia_precision_bits: Option<u32>,
     pub dimension: usize,
     pub matrix_digest: ContentDigest,
     pub requested_index: usize,
@@ -444,7 +476,12 @@ pub struct ExactSpectralGapCertificate {
 
 impl InertiaCertificate {
     pub fn validate(&self) -> Result<(), CertificateError> {
-        if self.positive + self.negative + self.zero_or_unresolved != self.dimension {
+        if self
+            .positive
+            .checked_add(self.negative)
+            .and_then(|n| n.checked_add(self.zero_or_unresolved))
+            != Some(self.dimension)
+        {
             return Err(CertificateError::Invalid(
                 "inertia counts do not sum to matrix dimension".to_owned(),
             ));
@@ -454,16 +491,24 @@ impl InertiaCertificate {
                 "certificate precision is implausibly small".to_owned(),
             ));
         }
-        if !self.matrix_digest.validate() {
+        if !self.matrix_digest.validate()
+            || self
+                .pivot_enclosures_digest
+                .as_ref()
+                .is_some_and(|digest| !digest.validate())
+        {
             return Err(CertificateError::Invalid(
-                "matrix digest is not a valid SHA-256 digest".to_owned(),
+                "matrix or pivot digest is not a valid SHA-256 digest".to_owned(),
             ));
         }
         Ok(())
     }
 
     pub fn certifies_positive_definite(&self) -> bool {
-        self.positive == self.dimension && self.negative == 0 && self.zero_or_unresolved == 0
+        self.dimension > 0
+            && self.positive == self.dimension
+            && self.negative == 0
+            && self.zero_or_unresolved == 0
     }
 }
 
@@ -483,9 +528,18 @@ impl EigenvalueEnclosure {
                 "eigenvalue enclosure index range is reversed".to_owned(),
             ));
         }
-        if self.multiplicity_lower == 0 || self.multiplicity_lower > self.multiplicity_upper {
+        // The ordered index range names exactly last-first+1 eigenvalues.
+        let count = (self.last_index - self.first_index)
+            .checked_add(1)
+            .ok_or_else(|| {
+                CertificateError::Invalid("indexed eigenvalue count overflows usize".to_owned())
+            })?;
+        if self.multiplicity_lower == 0
+            || self.multiplicity_lower > count
+            || count > self.multiplicity_upper
+        {
             return Err(CertificateError::Invalid(
-                "invalid multiplicity bounds".to_owned(),
+                "multiplicity bounds do not contain the indexed eigenvalue count".to_owned(),
             ));
         }
         self.interval.validate_order()
@@ -524,10 +578,25 @@ impl SpectralGapCertificate {
                 "gap lower bound must be strictly positive".to_owned(),
             ));
         }
-        // Portable structural verification proves separation and positivity.
-        // Verifying that an arbitrary decimal bound is no larger than the exact
-        // endpoint difference belongs to the active exact/ball backend and its
-        // evidence digest; it must not be approximated through f64 here.
+        // Eigenvalues indexed between the clusters would lie inside the gap.
+        if self.lower_cluster.last_index.checked_add(1) != Some(self.upper_cluster.first_index) {
+            return Err(CertificateError::VerificationFailed(
+                "gap clusters are not adjacent in the ordered spectrum".into(),
+            ));
+        }
+        let lower_upper = DecimalLiteral::new(self.lower_cluster.interval.upper.clone())
+            .map_err(|e| CertificateError::Invalid(e.to_string()))?;
+        let upper_lower = DecimalLiteral::new(self.upper_cluster.interval.lower.clone())
+            .map_err(|e| CertificateError::Invalid(e.to_string()))?;
+        if upper_lower
+            .cmp_sum(&lower_upper, &bound)
+            .map_err(|e| CertificateError::Invalid(e.to_string()))?
+            == Ordering::Less
+        {
+            return Err(CertificateError::VerificationFailed(
+                "claimed gap exceeds the ordered endpoint separation".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -642,7 +711,7 @@ impl CertificateBundle {
             )));
         }
         for input in &self.inputs {
-            if !input.content_digest.validate() {
+            if !input.content_digest.validate() || !input.key.parameters_digest.validate() {
                 return Err(CertificateError::Invalid(
                     "input artifact contains an invalid digest".to_owned(),
                 ));
@@ -659,6 +728,30 @@ impl CertificateBundle {
         }
         for record in self.exact_records.values() {
             record.validate_syntax()?;
+        }
+        if self
+            .evidence_digests
+            .values()
+            .any(|digest| !digest.validate())
+        {
+            return Err(CertificateError::Invalid(
+                "certificate evidence contains an invalid digest".to_owned(),
+            ));
+        }
+        let missing_record = match self.claim {
+            CertificateClaim::MatrixInertia => self.inertia.is_none(),
+            CertificateClaim::EigenvalueEnclosure => self.eigenvalue_enclosures.is_empty(),
+            CertificateClaim::SpectralGap => self.spectral_gap.is_none(),
+            CertificateClaim::RootCount
+            | CertificateClaim::RootIsolation
+            | CertificateClaim::SpectralWindowCompleteness
+            | CertificateClaim::GeneralizedRayleighLowerBound => true,
+            _ => false,
+        };
+        if missing_record {
+            return Err(CertificateError::VerificationFailed(
+                "certificate claim lacks its required record".to_owned(),
+            ));
         }
         if matches!(self.claim, CertificateClaim::PositiveDefiniteMatrix)
             && !self
@@ -677,7 +770,13 @@ impl CertificateBundle {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VerificationReport {
+    /// Whether the encoded structure and checked internal relationships pass.
+    /// This does not assert that evidence has been independently replayed.
     pub valid: bool,
+    /// True only after mathematical evidence replay. `verify_bundle` performs
+    /// structural checks and therefore always sets this field to false.
+    #[serde(default)]
+    pub mathematical_claim_verified: bool,
     pub checks: Vec<String>,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
@@ -700,9 +799,11 @@ pub struct VerificationReport {
 /// `valid = false`; malformed input is never accepted with warnings alone.
 ///
 /// # Assurance and validity
-/// A valid report establishes only the encoded finite claim under its recorded
-/// assumptions. It does not turn finite spectral evidence into an infinite-
-/// dimensional theorem.
+/// A valid report establishes the encoded structure and internal relationships,
+/// not the truth of supplied inertia counts, eigenvalue enclosures, or external
+/// evidence. `mathematical_claim_verified` is false for this structural route.
+/// Use a claim-specific exact/interval verifier to replay the mathematical
+/// evidence; an identifier or well-formed declaration is not such a replay.
 ///
 /// # Cache effects
 /// Verification is pure with respect to the cache. Publication and reuse must
@@ -714,7 +815,8 @@ pub fn verify_bundle(bundle: &CertificateBundle) -> VerificationReport {
     match bundle.validate_structure() {
         Ok(()) => VerificationReport {
             valid: true,
-            checks: vec!["certificate structure and claim-specific invariants verified".to_owned()],
+            mathematical_claim_verified: false,
+            checks: vec!["certificate structure, digest, and supported record relationships verified; mathematical claim not replayed".to_owned()],
             warnings: bundle
                 .assumptions
                 .iter()
@@ -724,6 +826,7 @@ pub fn verify_bundle(bundle: &CertificateBundle) -> VerificationReport {
         },
         Err(error) => VerificationReport {
             valid: false,
+            mathematical_claim_verified: false,
             checks: Vec::new(),
             warnings: Vec::new(),
             errors: vec![error.to_string()],
@@ -775,6 +878,7 @@ pub mod exact {
             .map_err(|error| CertificateError::Invalid(error.to_string()))
     }
 
+    /// Build a schema-3 exact-rational proof with scale-independent 2x2 fallback.
     pub fn build_portable_interval_inertia_certificate(
         matrix: &[RationalInterval],
         dimension: usize,
@@ -784,12 +888,66 @@ pub mod exact {
         configuration: std::collections::BTreeMap<String, String>,
         notes: Vec<String>,
     ) -> Result<PortableIntervalInertiaCertificate, CertificateError> {
+        build_portable_interval_inertia_with_schema(
+            matrix,
+            dimension,
+            precision_bits,
+            scalar_backend,
+            assembly_evidence_digest,
+            configuration,
+            notes,
+            3,
+        )
+    }
+
+    /// Build a schema-2 proof with outward MPFR Schur updates at the declared precision.
+    pub fn build_portable_interval_inertia_certificate_mpfr(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        precision_bits: u32,
+        scalar_backend: impl Into<String>,
+        assembly_evidence_digest: ContentDigest,
+        configuration: std::collections::BTreeMap<String, String>,
+        notes: Vec<String>,
+    ) -> Result<PortableIntervalInertiaCertificate, CertificateError> {
+        build_portable_interval_inertia_with_schema(
+            matrix,
+            dimension,
+            precision_bits,
+            scalar_backend,
+            assembly_evidence_digest,
+            configuration,
+            notes,
+            2,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_portable_interval_inertia_with_schema(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        precision_bits: u32,
+        scalar_backend: impl Into<String>,
+        assembly_evidence_digest: ContentDigest,
+        configuration: std::collections::BTreeMap<String, String>,
+        notes: Vec<String>,
+        schema_version: u32,
+    ) -> Result<PortableIntervalInertiaCertificate, CertificateError> {
         if !assembly_evidence_digest.validate() {
             return Err(CertificateError::Invalid(
                 "assembly evidence digest is invalid".to_owned(),
             ));
         }
-        let inertia = interval_symmetric_ldlt_inertia(matrix, dimension)?;
+        let inertia = match schema_version {
+            1 => interval_symmetric_ldlt_inertia_impl(matrix, dimension, false)?,
+            3 => interval_symmetric_ldlt_inertia(matrix, dimension)?,
+            2 => interval_symmetric_ldlt_inertia_mpfr(matrix, dimension, precision_bits)?,
+            _ => {
+                return Err(CertificateError::Invalid(
+                    "unsupported inertia schema".into(),
+                ))
+            }
+        };
         let (positive, negative, zero_or_unresolved, pivots) = match inertia {
             IntervalInertiaResult::Conclusive {
                 positive,
@@ -805,7 +963,7 @@ pub mod exact {
             } => (positive, negative, zero_or_unresolved, pivot_enclosures),
         };
         let mut certificate = PortableIntervalInertiaCertificate {
-            schema_version: 1,
+            schema_version,
             certificate_id: ContentDigest("00".repeat(32)),
             toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).map_err(|error| {
                 CertificateError::Invalid(format!("invalid toolkit package version: {error}"))
@@ -838,7 +996,25 @@ pub mod exact {
             .iter()
             .map(parse_interval)
             .collect::<Result<Vec<_>, _>>()?;
-        let recomputed = interval_symmetric_ldlt_inertia(&matrix, certificate.dimension)?;
+        let recomputed = match certificate.schema_version {
+            1 => interval_symmetric_ldlt_inertia_with_budget(
+                &matrix,
+                certificate.dimension,
+                false,
+                false,
+            )?,
+            3 => interval_symmetric_ldlt_inertia(&matrix, certificate.dimension)?,
+            2 => interval_symmetric_ldlt_inertia_mpfr(
+                &matrix,
+                certificate.dimension,
+                certificate.precision_bits,
+            )?,
+            _ => {
+                return Err(CertificateError::Invalid(
+                    "unsupported inertia replay schema".into(),
+                ))
+            }
+        };
         let (positive, negative, unresolved, pivots) = match recomputed {
             IntervalInertiaResult::Conclusive {
                 positive,
@@ -880,6 +1056,7 @@ pub mod exact {
         match verify_portable_interval_inertia_exact(certificate) {
             Ok(()) => VerificationReport {
                 valid: true,
+                mathematical_claim_verified: true,
                 checks: vec![
                     "certificate and matrix digests verified".to_owned(),
                     "exact matrix endpoint ordering and symmetry verified".to_owned(),
@@ -891,6 +1068,7 @@ pub mod exact {
             },
             Err(error) => VerificationReport {
                 valid: false,
+                mathematical_claim_verified: false,
                 checks: Vec::new(),
                 warnings: Vec::new(),
                 errors: vec![error.to_string()],
@@ -941,6 +1119,7 @@ pub mod exact {
         dimension: usize,
         first: usize,
         second: usize,
+        scale_invariant: bool,
     ) -> Result<Option<CertifiedTwoByTwoPivot>, CertificateError> {
         let a = &matrix[first * dimension + first];
         let b = &matrix[first * dimension + second];
@@ -958,12 +1137,12 @@ pub mod exact {
             ))
         })?;
         let trace = a.add(c);
-        let lower_eigenvalue = trace.sub(&root).div(&two).map_err(|error| {
+        let mut lower_eigenvalue = trace.sub(&root).div(&two).map_err(|error| {
             CertificateError::VerificationFailed(format!(
                 "interval 2x2 lower eigenvalue enclosure failed: {error}"
             ))
         })?;
-        let upper_eigenvalue = trace.add(&root).div(&two).map_err(|error| {
+        let mut upper_eigenvalue = trace.add(&root).div(&two).map_err(|error| {
             CertificateError::VerificationFailed(format!(
                 "interval 2x2 upper eigenvalue enclosure failed: {error}"
             ))
@@ -971,7 +1150,39 @@ pub mod exact {
         let has_strict_sign =
             |value: &RationalInterval| value.is_strictly_positive() || value.is_strictly_negative();
         if !has_strict_sign(&lower_eigenvalue) || !has_strict_sign(&upper_eigenvalue) {
-            return Ok(None);
+            if !scale_invariant {
+                return Ok(None);
+            }
+            // For every symmetric matrix in the box, |lambda| <= M by the
+            // row-sum norm. |lambda_1 lambda_2|=|det| then supplies the other
+            // eigenvalue's positive distance from zero, without a fixed grid.
+            let magnitude =
+                |x: &RationalInterval| x.lower().clone().abs().max(x.upper().clone().abs());
+            let bound = (magnitude(a) + magnitude(b)).max(magnitude(c) + magnitude(b));
+            if bound == 0 {
+                return Ok(None);
+            }
+            let separation = if determinant.is_strictly_negative() {
+                -determinant.upper().clone() / &bound
+            } else {
+                determinant.lower().clone() / &bound
+            };
+            let positive = RationalInterval::new(separation.clone(), bound.clone())
+                .map_err(|e| CertificateError::VerificationFailed(e.to_string()))?;
+            let negative = RationalInterval::new(-bound, -separation)
+                .map_err(|e| CertificateError::VerificationFailed(e.to_string()))?;
+            if determinant.is_strictly_negative() {
+                lower_eigenvalue = negative;
+                upper_eigenvalue = positive;
+            } else if trace.is_strictly_positive() {
+                lower_eigenvalue = positive.clone();
+                upper_eigenvalue = positive;
+            } else if trace.is_strictly_negative() {
+                lower_eigenvalue = negative.clone();
+                upper_eigenvalue = negative;
+            } else {
+                return Ok(None);
+            }
         }
         let inverse_11 = c.div(&determinant).map_err(|error| {
             CertificateError::VerificationFailed(format!(
@@ -1014,7 +1225,30 @@ pub mod exact {
         }
     }
 
+    /// Fixed-precision, outward-rounded interval LDL^T with symmetric 1x1/2x2
+    /// pivoting. Every Schur update encloses its exact interval counterpart.
+    /// Return explicit inconclusive inertia if no pivot has a certified sign;
+    /// arithmetic range failures return an error. Precision must be 32..=1000000.
+    /// This route limits significand growth; it does not guarantee that a
+    /// particular matrix is resolvable at the requested precision.
+    pub fn interval_symmetric_ldlt_inertia_mpfr(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        precision_bits: u32,
+    ) -> Result<IntervalInertiaResult, CertificateError> {
+        super::interval_inertia::inertia(matrix, dimension, precision_bits).map_err(|error| {
+            CertificateError::VerificationFailed(format!("MPFR interval inertia: {error}"))
+        })
+    }
+
     /// Rigorous interval LDL^T inertia with deterministic symmetric 1x1
+    /// pivoting and exact-rational admission limits. At input/pivot boundaries,
+    /// each retained rational endpoint is limited to 262144 numerator-plus-
+    /// denominator bits and their total to 67108864 bits. Exceeding either
+    /// returns Inconclusive. These are not a hard peak-memory guarantee:
+    /// temporary products between checks and allocation headers are excluded.
+    /// The MPFR route bounds significand growth for larger problems.
+    /// Deterministic symmetric 1x1
     /// pivoting. At each Schur-complement step the first remaining diagonal
     /// enclosure with a strict sign is selected and moved by a congruent row
     /// and column permutation. When no signed diagonal exists, the first 2x2
@@ -1024,6 +1258,40 @@ pub mod exact {
     pub fn interval_symmetric_ldlt_inertia(
         matrix: &[RationalInterval],
         dimension: usize,
+    ) -> Result<IntervalInertiaResult, CertificateError> {
+        interval_symmetric_ldlt_inertia_impl(matrix, dimension, true)
+    }
+
+    fn exact_interval_workspace_admitted(matrix: &[RationalInterval]) -> bool {
+        let mut total = 0u128;
+        for entry in matrix {
+            for x in [entry.lower(), entry.upper()] {
+                let bits = u128::from(x.numer().significant_bits())
+                    + u128::from(x.denom().significant_bits());
+                if bits > 262_144 {
+                    return false;
+                }
+                total += bits;
+                if total > 67_108_864 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn interval_symmetric_ldlt_inertia_impl(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        scale_invariant: bool,
+    ) -> Result<IntervalInertiaResult, CertificateError> {
+        interval_symmetric_ldlt_inertia_with_budget(matrix, dimension, scale_invariant, true)
+    }
+    fn interval_symmetric_ldlt_inertia_with_budget(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        scale_invariant: bool,
+        enforce_budget: bool,
     ) -> Result<IntervalInertiaResult, CertificateError> {
         if dimension == 0 || matrix.len() != dimension.saturating_mul(dimension) {
             return Err(CertificateError::Invalid(format!(
@@ -1040,12 +1308,25 @@ pub mod exact {
                 }
             }
         }
+
+        if enforce_budget && !exact_interval_workspace_admitted(matrix) {
+            return Ok(IntervalInertiaResult::Inconclusive { pivot_index:0, positive:0,
+                negative:0, zero_or_unresolved:dimension, pivot_enclosures:vec![matrix[0].clone()],
+                reason:"exact interval workspace exceeds endpoint/aggregate budget; use MPFR interval inertia".into() });
+        }
         let mut schur = matrix.to_vec();
         let mut pivots = Vec::with_capacity(dimension);
         let mut positive = 0usize;
         let mut negative = 0usize;
         let mut pivot_index = 0usize;
         while pivot_index < dimension {
+            if enforce_budget && !exact_interval_workspace_admitted(&schur) {
+                pivots.push(schur[pivot_index * dimension + pivot_index].clone());
+                return Ok(IntervalInertiaResult::Inconclusive { pivot_index, positive, negative,
+                    zero_or_unresolved:dimension-pivot_index, pivot_enclosures:pivots,
+                    reason:"exact interval Schur growth exceeds endpoint/aggregate budget; use MPFR interval inertia".into() });
+            }
+
             let selected = (pivot_index..dimension).find(|&candidate| {
                 let diagonal = &schur[candidate * dimension + candidate];
                 diagonal.is_strictly_positive() || diagonal.is_strictly_negative()
@@ -1082,7 +1363,9 @@ pub mod exact {
             let mut selected_block = None;
             'search: for first in pivot_index..dimension {
                 for second in first + 1..dimension {
-                    if certify_two_by_two_pivot(&schur, dimension, first, second)?.is_some() {
+                    if certify_two_by_two_pivot(&schur, dimension, first, second, scale_invariant)?
+                        .is_some()
+                    {
                         selected_block = Some((first, second));
                         break 'search;
                     }
@@ -1103,8 +1386,14 @@ pub mod exact {
             symmetric_swap(&mut schur, dimension, pivot_index, first);
             let adjusted_second = if second == pivot_index { first } else { second };
             symmetric_swap(&mut schur, dimension, pivot_index + 1, adjusted_second);
-            let block = certify_two_by_two_pivot(&schur, dimension, pivot_index, pivot_index + 1)?
-                .expect("selected 2x2 interval pivot remains valid after symmetric permutation");
+            let block = certify_two_by_two_pivot(
+                &schur,
+                dimension,
+                pivot_index,
+                pivot_index + 1,
+                scale_invariant,
+            )?
+            .expect("selected 2x2 interval pivot remains valid after symmetric permutation");
             for eigenvalue in [&block.lower_eigenvalue, &block.upper_eigenvalue] {
                 pivots.push(eigenvalue.clone());
                 if eigenvalue.is_strictly_positive() {
@@ -1147,6 +1436,42 @@ pub mod exact {
         threshold: &Rational,
         boundary_name: &str,
     ) -> Result<EigenvalueCountBoundaryCertificate, (String, String)> {
+        eigenvalue_count_boundary_impl(matrix, dimension, threshold, boundary_name, true)
+    }
+    fn eigenvalue_count_boundary_impl(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        threshold: &Rational,
+        boundary_name: &str,
+        scale_invariant: bool,
+    ) -> Result<EigenvalueCountBoundaryCertificate, (String, String)> {
+        eigenvalue_count_boundary_route(
+            matrix,
+            dimension,
+            threshold,
+            boundary_name,
+            scale_invariant,
+            true,
+            None,
+        )
+    }
+    fn eigenvalue_count_boundary_route(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        threshold: &Rational,
+        boundary_name: &str,
+        scale_invariant: bool,
+        enforce_budget: bool,
+        precision: Option<u32>,
+    ) -> Result<EigenvalueCountBoundaryCertificate, (String, String)> {
+        // Validate before cloning or computing any diagonal offset. In a
+        // valid n*n allocation, every offset is at most n*n - 1.
+        if dimension == 0 || dimension.checked_mul(dimension) != Some(matrix.len()) {
+            return Err((
+                boundary_name.to_owned(),
+                "eigenvalue count requires a nonempty square matrix".to_owned(),
+            ));
+        }
         let mut shifted = matrix.to_vec();
         let threshold_interval = RationalInterval::point(threshold.clone());
         for diagonal in 0..dimension {
@@ -1155,7 +1480,20 @@ pub mod exact {
                 *entry = entry.sub(&threshold_interval);
             }
         }
-        match interval_symmetric_ldlt_inertia(&shifted, dimension) {
+        let result = match precision {
+            Some(p) => {
+                super::interval_inertia::inertia_stable(&shifted, dimension, p).map_err(|e| {
+                    CertificateError::VerificationFailed(format!("MPFR selected inertia: {e}"))
+                })
+            }
+            None => interval_symmetric_ldlt_inertia_with_budget(
+                &shifted,
+                dimension,
+                scale_invariant,
+                enforce_budget,
+            ),
+        };
+        match result {
             Ok(IntervalInertiaResult::Conclusive {
                 positive,
                 negative,
@@ -1323,6 +1661,13 @@ pub mod exact {
         certificate: &ExactSelectedEigenvalueEnclosure,
         matrix: &[RationalInterval],
     ) -> VerificationReport {
+        verify_selected_interval_eigenvalue_enclosure_with_policy(certificate, matrix, true)
+    }
+    fn verify_selected_interval_eigenvalue_enclosure_with_policy(
+        certificate: &ExactSelectedEigenvalueEnclosure,
+        matrix: &[RationalInterval],
+        allow_historical_replay: bool,
+    ) -> VerificationReport {
         let verify = || -> Result<(), CertificateError> {
             let (lower, upper) = validate_selected_eigenvalue_enclosure(certificate)?;
             if matrix.len() != certificate.dimension.saturating_mul(certificate.dimension)
@@ -1334,16 +1679,49 @@ pub mod exact {
                 ));
             }
             let replay_boundary = |threshold: &Rational, name: &str| {
-                eigenvalue_count_boundary(matrix, certificate.dimension, threshold, name).map_err(
-                    |(boundary, reason)| {
-                        CertificateError::VerificationFailed(format!(
-                            "{boundary} shifted-inertia replay was inconclusive: {reason}"
-                        ))
-                    },
+                eigenvalue_count_boundary_route(
+                    matrix,
+                    certificate.dimension,
+                    threshold,
+                    name,
+                    true,
+                    true,
+                    certificate.inertia_precision_bits,
                 )
+                .map_err(|(boundary, reason)| {
+                    CertificateError::VerificationFailed(format!(
+                        "{boundary} shifted-inertia replay was inconclusive: {reason}"
+                    ))
+                })
             };
-            if replay_boundary(&lower, "lower")? != certificate.lower_boundary
-                || replay_boundary(&upper, "upper")? != certificate.upper_boundary
+            let matches_boundary = |threshold: &Rational,
+                                    name: &str,
+                                    recorded: &EigenvalueCountBoundaryCertificate|
+             -> Result<bool, CertificateError> {
+                if replay_boundary(threshold, name).is_ok_and(|value| &value == recorded) {
+                    return Ok(true);
+                }
+                if certificate.inertia_precision_bits.is_some() || !allow_historical_replay {
+                    return Ok(false);
+                }
+                // Historical exact evidence is replayed with the original
+                // arithmetic and original resource behavior. New producer
+                // budgets must not invalidate a previously retained proof.
+                Ok([true, false].into_iter().any(|scale_invariant| {
+                    eigenvalue_count_boundary_route(
+                        matrix,
+                        certificate.dimension,
+                        threshold,
+                        name,
+                        scale_invariant,
+                        false,
+                        None,
+                    )
+                    .is_ok_and(|value| &value == recorded)
+                }))
+            };
+            if !matches_boundary(&lower, "lower", &certificate.lower_boundary)?
+                || !matches_boundary(&upper, "upper", &certificate.upper_boundary)?
             {
                 return Err(CertificateError::VerificationFailed(
                     "selected-eigenvalue shifted-inertia replay differs from recorded boundaries"
@@ -1355,6 +1733,7 @@ pub mod exact {
         match verify() {
             Ok(()) => VerificationReport {
                 valid: true,
+                mathematical_claim_verified: true,
                 checks: vec![
                     "selected index, enclosure, and multiplicity structure verified".to_owned(),
                     "exact interval-matrix digest verified".to_owned(),
@@ -1365,6 +1744,7 @@ pub mod exact {
             },
             Err(error) => VerificationReport {
                 valid: false,
+                mathematical_claim_verified: false,
                 checks: Vec::new(),
                 warnings: Vec::new(),
                 errors: vec![error.to_string()],
@@ -1377,7 +1757,11 @@ pub mod exact {
         enclosure: &ExactSelectedEigenvalueEnclosure,
     ) -> Result<PortableSelectedEigenvalueCertificate, CertificateError> {
         let portable = PortableSelectedEigenvalueCertificate {
-            schema_version: 1,
+            schema_version: if enclosure.inertia_precision_bits.is_some() {
+                2
+            } else {
+                3
+            },
             matrix_row_major: matrix.iter().map(interval_record).collect(),
             enclosure: enclosure.clone(),
         };
@@ -1396,9 +1780,13 @@ pub mod exact {
     pub fn verify_portable_selected_eigenvalue_certificate(
         portable: &PortableSelectedEigenvalueCertificate,
     ) -> VerificationReport {
-        if portable.schema_version != 1 {
+        if !matches!(portable.schema_version, 1..=3)
+            || ((portable.schema_version == 2)
+                != portable.enclosure.inertia_precision_bits.is_some())
+        {
             return VerificationReport {
                 valid: false,
+                mathematical_claim_verified: false,
                 checks: Vec::new(),
                 warnings: Vec::new(),
                 errors: vec!["unsupported portable selected-eigenvalue schema".to_owned()],
@@ -1414,20 +1802,151 @@ pub mod exact {
             Err(error) => {
                 return VerificationReport {
                     valid: false,
+                    mathematical_claim_verified: false,
                     checks: Vec::new(),
                     warnings: Vec::new(),
                     errors: vec![error.to_string()],
                 };
             }
         };
-        verify_selected_interval_eigenvalue_enclosure(&portable.enclosure, &matrix)
+        verify_selected_interval_eigenvalue_enclosure_with_policy(
+            &portable.enclosure,
+            &matrix,
+            portable.schema_version == 1,
+        )
     }
 
     /// Enclose the zero-based algebraically ordered eigenvalue selected by
     /// `requested_index`. Every bisection decision is an exact-rational
-    /// shifted-inertia proof. A boundary whose interval LDL^T pivot contains
-    /// zero is reported as inconclusive instead of being perturbed.
+    /// shifted-inertia proof. Unresolved interior midpoints use a bounded set
+    /// of other exact interior splits. Original endpoints are never perturbed.
     pub fn certify_selected_interval_eigenvalue(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        requested_index: usize,
+        lower: Rational,
+        upper: Rational,
+        target_width: Rational,
+        maximum_bisection_steps: usize,
+    ) -> SelectedEigenvalueEnclosureResult {
+        certify_selected_interval_eigenvalue_route(
+            matrix,
+            dimension,
+            requested_index,
+            lower,
+            upper,
+            target_width,
+            maximum_bisection_steps,
+            None,
+        )
+    }
+    /// Directed MPFR shifted-inertia certification of an exact-endpoint interval
+    /// matrix. The result records arithmetic precision for independent replay.
+    /// No exact-rational Schur growth occurs; unresolved pivots remain explicit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn certify_selected_interval_eigenvalue_mpfr(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        requested_index: usize,
+        lower: Rational,
+        upper: Rational,
+        target_width: Rational,
+        maximum_bisection_steps: usize,
+        precision_bits: u32,
+    ) -> SelectedEigenvalueEnclosureResult {
+        certify_selected_interval_eigenvalue_route(
+            matrix,
+            dimension,
+            requested_index,
+            lower,
+            upper,
+            target_width,
+            maximum_bisection_steps,
+            Some(precision_bits),
+        )
+    }
+    pub fn certify_interval_matrix_eigenvalues_below_mpfr(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        threshold: Rational,
+        p: u32,
+    ) -> IntervalEigenvalueCountResult {
+        match eigenvalue_count_boundary_route(
+            matrix,
+            dimension,
+            &threshold,
+            "upper",
+            true,
+            true,
+            Some(p),
+        ) {
+            Ok(upper_boundary) => IntervalEigenvalueCountResult::Conclusive {
+                certificate: IntervalEigenvalueCountCertificate {
+                    dimension,
+                    eigenvalue_count: upper_boundary.count_below,
+                    lower_boundary: None,
+                    upper_boundary,
+                    interval_semantics: "(-infinity, upper)".into(),
+                },
+            },
+            Err((boundary, reason)) => {
+                IntervalEigenvalueCountResult::Inconclusive { boundary, reason }
+            }
+        }
+    }
+    pub fn certify_interval_matrix_eigenvalues_in_open_interval_mpfr(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        lower: Rational,
+        upper: Rational,
+        p: u32,
+    ) -> IntervalEigenvalueCountResult {
+        if lower >= upper {
+            return IntervalEigenvalueCountResult::Inconclusive {
+                boundary: "configuration".into(),
+                reason: "lower must precede upper".into(),
+            };
+        }
+        let run = || -> Result<IntervalEigenvalueCountCertificate, (String, String)> {
+            let lower_boundary = eigenvalue_count_boundary_route(
+                matrix,
+                dimension,
+                &lower,
+                "lower",
+                true,
+                true,
+                Some(p),
+            )?;
+            let upper_boundary = eigenvalue_count_boundary_route(
+                matrix,
+                dimension,
+                &upper,
+                "upper",
+                true,
+                true,
+                Some(p),
+            )?;
+            let eigenvalue_count = upper_boundary
+                .count_below
+                .checked_sub(lower_boundary.count_below)
+                .ok_or_else(|| ("reconciliation".into(), "counts decreased".into()))?;
+            Ok(IntervalEigenvalueCountCertificate {
+                dimension,
+                lower_boundary: Some(lower_boundary),
+                upper_boundary,
+                eigenvalue_count,
+                interval_semantics: "(lower, upper)".into(),
+            })
+        };
+        match run() {
+            Ok(certificate) => IntervalEigenvalueCountResult::Conclusive { certificate },
+            Err((boundary, reason)) => {
+                IntervalEigenvalueCountResult::Inconclusive { boundary, reason }
+            }
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn certify_selected_interval_eigenvalue_route(
         matrix: &[RationalInterval],
         dimension: usize,
         requested_index: usize,
@@ -1435,8 +1954,10 @@ pub mod exact {
         mut upper: Rational,
         target_width: Rational,
         maximum_bisection_steps: usize,
+        precision: Option<u32>,
     ) -> SelectedEigenvalueEnclosureResult {
-        if dimension == 0
+        if precision.is_some_and(|p| !(32..=1_000_000).contains(&p))
+            || dimension == 0
             || matrix.len() != dimension.saturating_mul(dimension)
             || requested_index >= dimension
             || lower >= upper
@@ -1449,15 +1970,16 @@ pub mod exact {
             };
         }
 
-        let mut lower_boundary = match eigenvalue_count_boundary(matrix, dimension, &lower, "lower")
-        {
+        let boundary = |x: &Rational, name: &str| {
+            eigenvalue_count_boundary_route(matrix, dimension, x, name, true, true, precision)
+        };
+        let mut lower_boundary = match boundary(&lower, "lower") {
             Ok(boundary) => boundary,
             Err((boundary, reason)) => {
                 return SelectedEigenvalueEnclosureResult::Inconclusive { boundary, reason };
             }
         };
-        let mut upper_boundary = match eigenvalue_count_boundary(matrix, dimension, &upper, "upper")
-        {
+        let mut upper_boundary = match boundary(&upper, "upper") {
             Ok(boundary) => boundary,
             Err((boundary, reason)) => {
                 return SelectedEigenvalueEnclosureResult::Inconclusive { boundary, reason };
@@ -1485,17 +2007,23 @@ pub mod exact {
                     ),
                 };
             }
-            let midpoint = (lower.clone() + upper.clone()) / 2;
-            let midpoint_boundary =
-                match eigenvalue_count_boundary(matrix, dimension, &midpoint, "midpoint") {
-                    Ok(boundary) => boundary,
-                    Err((boundary, reason)) => {
-                        return SelectedEigenvalueEnclosureResult::Inconclusive {
-                            boundary,
-                            reason,
-                        };
-                    }
+            // A midpoint can itself be an eigenvalue. Try a bounded set of
+            // exact interior splits without perturbing any certified boundary.
+            let width = upper.clone() - lower.clone();
+            let mut admitted = None;
+            for denominator in [2, 3, 5, 7, 11, 13, 17, 19] {
+                let point = lower.clone() + width.clone() / denominator;
+                if let Ok(proof) = boundary(&point, "interior split") {
+                    admitted = Some((point, proof));
+                    break;
+                }
+            }
+            let Some((midpoint, midpoint_boundary)) = admitted else {
+                return SelectedEigenvalueEnclosureResult::Inconclusive {
+                    boundary: "interior splits".into(),
+                    reason: "all bounded exact interior split proofs were unresolved".into(),
                 };
+            };
             if midpoint_boundary.count_below <= requested_index {
                 lower = midpoint;
                 lower_boundary = midpoint_boundary;
@@ -1532,6 +2060,7 @@ pub mod exact {
         };
         SelectedEigenvalueEnclosureResult::Conclusive {
             certificate: Box::new(ExactSelectedEigenvalueEnclosure {
+                inertia_precision_bits: precision,
                 dimension,
                 matrix_digest,
                 requested_index,
@@ -1583,14 +2112,17 @@ pub mod exact {
     }
 
     /// Verify an exact gap record from its two already replayable cluster
-    /// certificates. Matrix-boundary replay remains available through
-    /// `verify_selected_interval_eigenvalue_enclosure`.
+    /// certificates. This checks the exact gap arithmetic and declared identities;
+    /// it does not replay the matrix boundaries, and reports
+    /// `mathematical_claim_verified=false`. Use `verify_exact_spectral_gap_with_matrix`
+    /// to include both matrix-boundary replays.
     pub fn verify_exact_spectral_gap_certificate(
         certificate: &ExactSpectralGapCertificate,
     ) -> VerificationReport {
         match certify_exact_spectral_gap(&certificate.lower_cluster, &certificate.upper_cluster) {
             Ok(recomputed) if recomputed == *certificate => VerificationReport {
                 valid: true,
+                mathematical_claim_verified: false,
                 checks: vec![
                     "cluster structure, adjacency, and common matrix identity verified".to_owned(),
                     "strictly positive exact gap lower bound recomputed".to_owned(),
@@ -1600,17 +2132,42 @@ pub mod exact {
             },
             Ok(_) => VerificationReport {
                 valid: false,
+                mathematical_claim_verified: false,
                 checks: Vec::new(),
                 warnings: Vec::new(),
                 errors: vec!["spectral-gap lower bound differs from exact recomputation".to_owned()],
             },
             Err(error) => VerificationReport {
                 valid: false,
+                mathematical_claim_verified: false,
                 checks: Vec::new(),
                 warnings: Vec::new(),
                 errors: vec![error.to_string()],
             },
         }
+    }
+
+    /// Replay both source-matrix eigenvalue certificates and the exact gap.
+    /// Unlike the algebra-only gap check, success verifies the finite claim
+    /// against the supplied exact-endpoint interval matrix.
+    pub fn verify_exact_spectral_gap_with_matrix(
+        certificate: &ExactSpectralGapCertificate,
+        matrix: &[RationalInterval],
+    ) -> VerificationReport {
+        for cluster in [&certificate.lower_cluster, &certificate.upper_cluster] {
+            let report = verify_selected_interval_eigenvalue_enclosure(cluster, matrix);
+            if !report.valid {
+                return report;
+            }
+        }
+        let mut report = verify_exact_spectral_gap_certificate(certificate);
+        report.mathematical_claim_verified = report.valid;
+        if report.valid {
+            report
+                .checks
+                .push("both cluster boundaries replayed against the supplied matrix".into());
+        }
+        report
     }
 
     pub fn combined_certification_error_bound(
@@ -1725,6 +2282,94 @@ pub mod exact {
         }
         Ok(())
     }
+    #[cfg(test)]
+    mod pivots_tests {
+        use super::*;
+        #[test]
+        fn exact_endpoint_resource_guard_precedes_elimination() {
+            let huge = RationalInterval::point(Rational::from(rug::Integer::from(1) << 300_000u32));
+            assert!(matches!(
+                interval_symmetric_ldlt_inertia(&[huge], 1).unwrap(),
+                IntervalInertiaResult::Inconclusive { .. }
+            ));
+        }
+
+        #[test]
+        fn schur_growth_returns_inconclusive_at_next_pivot() {
+            let small = RationalInterval::point(Rational::from((
+                rug::Integer::from(1),
+                rug::Integer::from(1) << 200_000u32,
+            )));
+            let big = RationalInterval::point(Rational::from(rug::Integer::from(1) << 100_000u32));
+            let one = RationalInterval::point(Rational::from(1));
+            assert!(matches!(
+                interval_symmetric_ldlt_inertia(&[small, big.clone(), big, one], 2).unwrap(),
+                IntervalInertiaResult::Inconclusive {
+                    pivot_index: 1,
+                    positive: 1,
+                    ..
+                }
+            ));
+        }
+        #[test]
+        fn scaled_exchange_blocks_have_scale_independent_inertia() {
+            for shift in [-1024i32, -258, 0, 258, 1024] {
+                let value = if shift < 0 {
+                    Rational::from((
+                        rug::Integer::from(1),
+                        rug::Integer::from(1) << shift.unsigned_abs(),
+                    ))
+                } else {
+                    Rational::from(rug::Integer::from(1) << shift as u32)
+                };
+                let z = RationalInterval::point(Rational::from(0));
+                let x = RationalInterval::point(value);
+                let matrix = [z.clone(), x.clone(), x, z];
+                match interval_symmetric_ldlt_inertia(&matrix, 2).unwrap() {
+                    IntervalInertiaResult::Conclusive {
+                        positive, negative, ..
+                    } => assert_eq!((positive, negative), (1, 1)),
+                    other => panic!("unresolved scaled exchange block: {other:?}"),
+                }
+            }
+        }
+        #[test]
+        fn old_inconclusive_portable_record_replays_with_frozen_schema() {
+            let z = RationalInterval::point(Rational::from(0));
+            let x = RationalInterval::point(Rational::from((
+                rug::Integer::from(1),
+                rug::Integer::from(1) << 258u32,
+            )));
+            let matrix = [z.clone(), x.clone(), x, z];
+            let args = std::collections::BTreeMap::from([("test".into(), "legacy".into())]);
+            let legacy = build_portable_interval_inertia_with_schema(
+                &matrix,
+                2,
+                128,
+                "exact",
+                ContentDigest("11".repeat(32)),
+                args.clone(),
+                vec![],
+                1,
+            )
+            .unwrap();
+            assert_eq!(legacy.zero_or_unresolved, 2);
+            assert!(verify_portable_interval_inertia_certificate(&legacy).valid);
+            let current = build_portable_interval_inertia_certificate(
+                &matrix,
+                2,
+                128,
+                "exact",
+                ContentDigest("11".repeat(32)),
+                args,
+                vec![],
+            )
+            .unwrap();
+            assert_eq!(current.schema_version, 3);
+            assert_eq!((current.positive, current.negative), (1, 1));
+            assert!(verify_portable_interval_inertia_certificate(&current).valid);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1796,6 +2441,26 @@ mod tests {
         };
         bundle.refresh_certificate_id().unwrap();
         assert!(bundle.validate_structure().is_ok());
+        for claim in [
+            CertificateClaim::RootCount,
+            CertificateClaim::RootIsolation,
+            CertificateClaim::SpectralWindowCompleteness,
+            CertificateClaim::GeneralizedRayleighLowerBound,
+        ] {
+            let mut missing = bundle.clone();
+            missing.claim = claim;
+            missing.inertia = None;
+            missing.refresh_certificate_id().unwrap();
+            let report = verify_bundle(&missing);
+            assert!(
+                !report.valid,
+                "unsupported claim cannot verify without a proof record"
+            );
+            assert!(report
+                .errors
+                .iter()
+                .any(|message| message.contains("required record")));
+        }
 
         let uncited_id = bundle.certificate_id.clone();
         bundle
@@ -2244,7 +2909,7 @@ mod exact_inertia_tests {
     }
 
     #[test]
-    fn selected_eigenvalue_boundary_collision_is_inconclusive() {
+    fn selected_eigenvalue_boundary_collision_uses_a_proven_interior_split() {
         let point = |value| RationalInterval::point(Rational::from((value, 1)));
         let zero = point(0);
         let matrix = vec![
@@ -2267,11 +2932,17 @@ mod exact_inertia_tests {
             Rational::from((1, 100)),
             32,
         );
-        assert!(matches!(
-            result,
-            SelectedEigenvalueEnclosureResult::Inconclusive { ref boundary, .. }
-                if boundary == "midpoint"
-        ));
+        let SelectedEigenvalueEnclosureResult::Conclusive {
+            certificate: enclosure,
+        } = result
+        else {
+            panic!("exact midpoint collision should not block a separated eigenvalue");
+        };
+        assert!(
+            crate::exact::parse(&enclosure.lower).unwrap() <= 3
+                && crate::exact::parse(&enclosure.upper).unwrap() >= 3
+        );
+        assert!(verify_selected_interval_eigenvalue_enclosure(&enclosure, &matrix).valid);
     }
 
     #[test]

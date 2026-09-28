@@ -48,6 +48,7 @@ type VerifiedDigestCache = BTreeMap<(PathBuf, String, u64), (ContentDigest, Loos
 pub struct GitCliRemoteStore {
     git_executable: OsString,
     temporary_root: PathBuf,
+    read_session_parent: Option<PathBuf>,
     staged_parts_roots: Vec<PathBuf>,
     author_name: String,
     author_email: String,
@@ -105,7 +106,122 @@ impl Drop for DiskReservation {
     }
 }
 
+// Distinct publication attempts must never deliberately reuse a commit identity:
+// Git can bypass an expected-old lease when the requested new ref is already
+// advertised as current. OS entropy makes concurrent identical requests distinct.
+fn publication_attempt_nonce() -> Result<String, CacheError> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        CacheError::Io(format!("publication attempt entropy unavailable: {error}"))
+    })?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+impl Drop for GitCliRemoteStore {
+    fn drop(&mut self) {
+        if self.read_session_parent.is_some() {
+            if let Err(error) = self.cleanup_read_session() {
+                eprintln!("Git read-session cleanup failed: {error}");
+            }
+        }
+    }
+}
+
+fn git_compatible_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        if let Some(Component::Prefix(prefix)) = path.components().next() {
+            let mut ordinary = match prefix.kind() {
+                Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+                Prefix::VerbatimUNC(server, share) => {
+                    let mut root = PathBuf::from("\\\\");
+                    root.push(server);
+                    root.push(share);
+                    root
+                }
+                _ => return path.to_path_buf(),
+            };
+            for component in path.components().skip(2) {
+                ordinary.push(component.as_os_str());
+            }
+            return ordinary;
+        }
+    }
+    path.to_path_buf()
+}
+
 impl GitCliRemoteStore {
+    /// Open a disposable read transport in an exclusively owned child of the
+    /// supplied temporary root. Only that child is removed on Drop; caller
+    /// siblings and requested payload destinations are retained. Publication
+    /// transports should use `new` with their explicit journal lifecycle.
+    pub fn new_read_session(
+        temporary_root: impl Into<PathBuf>,
+        staged_parts_root: impl Into<PathBuf>,
+        author_name: impl Into<String>,
+        author_email: impl Into<String>,
+    ) -> Result<Self, CacheError> {
+        let temporary_root = temporary_root.into();
+        fs::create_dir_all(&temporary_root)?;
+        let parent = fs::canonicalize(temporary_root)?;
+        let owned = loop {
+            let candidate = crate::private_sibling_candidate(&parent, "git-reader")?;
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        // Git for Windows does not accept Rust's canonical verbatim path syntax.
+        // Retain the canonical parent for cleanup identity checks, using the
+        // equivalent ordinary absolute path only at the subprocess boundary.
+        let git_owned = git_compatible_path(&owned);
+        match Self::new(&git_owned, staged_parts_root, author_name, author_email) {
+            Ok(mut store) => {
+                store.read_session_parent = Some(parent);
+                Ok(store)
+            }
+            Err(error) => {
+                if let Err(cleanup) = fs::remove_dir_all(&owned) {
+                    return Err(CacheError::Io(format!(
+                        "Git reader construction failed: {error}; owned-session cleanup failed: {cleanup}"
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Finish an exclusively owned read session and return cleanup errors.
+    /// Caller-owned/resumable publication roots are never removed by this API.
+    pub fn finish_read_session(self) -> Result<(), CacheError> {
+        if self.read_session_parent.is_none() {
+            return Err(CacheError::InvalidTransition(
+                "transport is not an owned read session".to_owned(),
+            ));
+        }
+        self.cleanup_read_session()
+    }
+
+    fn cleanup_read_session(&self) -> Result<(), CacheError> {
+        let Some(parent) = &self.read_session_parent else {
+            return Ok(());
+        };
+        if !self.temporary_root.exists() {
+            return Ok(());
+        }
+        let metadata = fs::symlink_metadata(&self.temporary_root)?;
+        if metadata.file_type().is_symlink()
+            || fs::canonicalize(&self.temporary_root)?.parent() != Some(parent.as_path())
+        {
+            return Err(CacheError::InvalidManifest(
+                "Git read-session cleanup root changed identity".to_owned(),
+            ));
+        }
+        self.cleanup_all_sessions()
+    }
+
     pub fn new(
         temporary_root: impl Into<PathBuf>,
         staged_parts_root: impl Into<PathBuf>,
@@ -114,7 +230,8 @@ impl GitCliRemoteStore {
     ) -> Result<Self, CacheError> {
         let store = Self {
             git_executable: OsString::from("git"),
-            temporary_root: temporary_root.into(),
+            temporary_root: git_compatible_path(&temporary_root.into()),
+            read_session_parent: None,
             staged_parts_roots: vec![staged_parts_root.into()],
             author_name: author_name.into(),
             author_email: author_email.into(),
@@ -189,6 +306,10 @@ impl GitCliRemoteStore {
     pub fn with_resource_policy(mut self, resources: ResourcePolicy) -> Self {
         self.resources = resources;
         self
+    }
+
+    pub(crate) fn set_resource_policy(&mut self, resources: ResourcePolicy) {
+        self.resources = resources;
     }
 
     /// Explicit cleanup after a receipt-complete or deliberately abandoned
@@ -422,6 +543,7 @@ impl GitCliRemoteStore {
             &[],
         )?;
         if local.status.success() {
+            self.enforce_transport_disk_budget(0)?;
             return Ok(session);
         }
         if self.resources.maximum_transfer_bytes == Some(0) {
@@ -449,6 +571,8 @@ impl GitCliRemoteStore {
             &[],
         )?;
         self.disable_implicit_lazy_fetch(&session)?;
+        drop(_disk_reservation);
+        self.enforce_transport_disk_budget(0)?;
         Ok(session)
     }
 
@@ -553,20 +677,51 @@ impl GitCliRemoteStore {
     fn blob_reservation_bytes(
         &self,
         object: &ResolvedBlobObject,
-        fallback_maximum_bytes: u64,
+        maximum_bytes: u64,
     ) -> Result<u64, CacheError> {
-        if object
-            .size_bytes
-            .is_some_and(|size| size >= crate::GITHUB_HARD_FILE_BOUNDARY_BYTES)
+        if maximum_bytes == 0
+            || object.size_bytes.is_some_and(|size| {
+                size > maximum_bytes || size >= crate::GITHUB_HARD_FILE_BOUNDARY_BYTES
+            })
         {
             return Err(CacheError::ResourceLimit(format!(
-                "Git blob {} is at or above the GitHub hard file boundary",
+                "Git blob {} exceeds its permitted size",
                 object.object_id
             )));
         }
+        // A promised blob's true size is unknown until hydration. Reserve the
+        // full admitted file boundary, even for a smaller caller output limit.
         Ok(object
             .size_bytes
-            .unwrap_or_else(|| fallback_maximum_bytes.min(crate::GITHUB_HARD_FILE_BOUNDARY_BYTES)))
+            .unwrap_or(crate::GITHUB_HARD_FILE_BOUNDARY_BYTES))
+    }
+    fn local_blob_size(
+        &self,
+        session: &Path,
+        object_id: &str,
+        maximum_bytes: u64,
+    ) -> Result<u64, CacheError> {
+        let output = run_git(
+            &self.git_executable,
+            Some(session),
+            [
+                OsString::from("cat-file"),
+                OsString::from("-s"),
+                OsString::from(object_id),
+            ],
+            &[],
+        )?;
+        let bytes = String::from_utf8(output.stdout)
+            .map_err(|error| CacheError::Io(format!("Git blob size is not UTF-8: {error}")))?
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| CacheError::Io(format!("Git blob size is invalid: {error}")))?;
+        if bytes > maximum_bytes || bytes >= crate::GITHUB_HARD_FILE_BOUNDARY_BYTES {
+            return Err(CacheError::ResourceLimit(format!(
+                "Git blob {object_id} exceeds its permitted size"
+            )));
+        }
+        Ok(bytes)
     }
 
     fn hydrate_blob_size(
@@ -580,26 +735,15 @@ impl GitCliRemoteStore {
     ) -> Result<u64, CacheError> {
         let reservation = self.blob_reservation_bytes(object, fallback_maximum_bytes)?;
         self.ensure_blob_available(session, repository, &object.object_id, reservation)?;
-        let size_output = run_git(
-            &self.git_executable,
-            Some(session),
-            [
-                OsString::from("cat-file"),
-                OsString::from("-s"),
-                OsString::from(&object.object_id),
-            ],
-            &[],
-        )?;
-        let size_bytes = String::from_utf8(size_output.stdout)
-            .map_err(|error| CacheError::Io(format!("git cat-file size was non-UTF8: {error}")))?
-            .trim()
-            .parse::<u64>()
-            .map_err(|error| CacheError::Io(format!("git cat-file size was invalid: {error}")))?;
-        if size_bytes >= crate::GITHUB_HARD_FILE_BOUNDARY_BYTES {
-            return Err(CacheError::ResourceLimit(format!(
-                "Git blob {} is at or above the GitHub hard file boundary",
-                object.object_id
-            )));
+        let size_bytes =
+            self.local_blob_size(session, &object.object_id, fallback_maximum_bytes)?;
+        if object
+            .size_bytes
+            .is_some_and(|expected| expected != size_bytes)
+        {
+            return Err(CacheError::InvalidManifest(
+                "hydrated blob size changed from its advertised size".into(),
+            ));
         }
         object.size_bytes = Some(size_bytes);
         self.remember_blob_object(repository, revision, path, object.clone());
@@ -793,6 +937,7 @@ impl GitCliRemoteStore {
             }
             arguments.extend([
                 OsString::from("hash-object"),
+                OsString::from("--no-filters"),
                 OsString::from("-w"),
                 OsString::from("--"),
             ]);
@@ -811,6 +956,15 @@ impl GitCliRemoteStore {
                 missing[start..end].len(),
             )?;
             for ((key, _), object_id) in missing[start..end].iter().zip(object_ids) {
+                // The path may change after staged_part_path validated it. Bind
+                // the prepared identity to the immutable bytes Git actually read.
+                let actual = self.digest_local_blob(&session, &object_id, key.2)?;
+                if actual != key.1 {
+                    return Err(CacheError::DigestMismatch {
+                        expected: key.1.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
                 resolved.insert(key.clone(), object_id);
             }
             start = end;
@@ -1090,6 +1244,11 @@ impl GitCliRemoteStore {
         session: &Path,
         request: &RemoteCommitRequest,
     ) -> Result<String, CacheError> {
+        let nonce = publication_attempt_nonce()?;
+        let message = format!(
+            "{}\n\nXcelerator-Publication-Attempt: {nonce}",
+            request.message
+        );
         let mut leaves = self.read_tree_leaves(session, &request.expected_head)?;
         for path in &request.delete_paths {
             validate_relative_git_path(path)?;
@@ -1131,7 +1290,7 @@ impl GitCliRemoteStore {
                 OsString::from("-p"),
                 OsString::from(&request.expected_head),
                 OsString::from("-m"),
-                OsString::from(&request.message),
+                OsString::from(&message),
             ],
             &author_environment,
         )?;
@@ -1143,10 +1302,12 @@ impl GitCliRemoteStore {
         session: &Path,
         request: &RemoteRefCreationRequest,
     ) -> Result<String, CacheError> {
-        let index_name = format!(
-            "publication-root-index-{}",
-            ContentDigest::sha256(format!("{}:{}", request.branch, request.message).as_bytes())
+        let nonce = publication_attempt_nonce()?;
+        let message = format!(
+            "{}\n\nXcelerator-Publication-Attempt: {nonce}",
+            request.message
         );
+        let index_name = format!("publication-root-index-{nonce}");
         let index_path = session.parent().unwrap_or(session).join(index_name);
         let index_environment = [(OsStr::new("GIT_INDEX_FILE"), index_path.as_os_str())];
         let result = (|| {
@@ -1193,7 +1354,7 @@ impl GitCliRemoteStore {
                     OsString::from("commit-tree"),
                     OsString::from(tree),
                     OsString::from("-m"),
-                    OsString::from(&request.message),
+                    OsString::from(&message),
                 ],
                 &author_environment,
             )?;
@@ -1201,6 +1362,157 @@ impl GitCliRemoteStore {
         })();
         let _ = fs::remove_file(index_path);
         result
+    }
+    fn digest_local_blob(
+        &self,
+        session: &Path,
+        object_id: &str,
+        size_bytes: u64,
+    ) -> Result<ContentDigest, CacheError> {
+        validate_revision(object_id)?;
+        let mut child = Command::new(&self.git_executable)
+            .arg("--no-replace-objects")
+            .arg("-C")
+            .arg(session)
+            .args(["cat-file", "blob"])
+            .arg(object_id)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| CacheError::Io(format!("failed to launch git cat-file: {error}")))?;
+        let mut stdout = child.stdout.take().ok_or_else(|| {
+            CacheError::Io("git cat-file did not provide a readable stream".into())
+        })?;
+        let mut hasher = Sha256::new();
+        let mut observed = 0u64;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        let result = (|| {
+            loop {
+                let count = stdout.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                observed = observed.checked_add(count as u64).ok_or_else(|| {
+                    CacheError::ResourceLimit("Git blob byte count exceeds u64".into())
+                })?;
+                if observed > size_bytes {
+                    return Err(CacheError::ResourceLimit(format!(
+                        "Git blob exceeded its declared {size_bytes}-byte size"
+                    )));
+                }
+                hasher.update(&buffer[..count]);
+            }
+            Ok::<(), CacheError>(())
+        })();
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        let status = child.wait()?;
+        result?;
+        if !status.success() {
+            return Err(CacheError::Io(format!(
+                "git cat-file failed with status {status} for object {object_id}"
+            )));
+        }
+        if observed != size_bytes {
+            return Err(CacheError::InvalidManifest(format!(
+                "Git blob read {observed} bytes, expected {size_bytes}"
+            )));
+        }
+        Ok(ContentDigest(format!("{:x}", hasher.finalize())))
+    }
+
+    fn immutable_path_identity(
+        &self,
+        repository: &str,
+        revision: &str,
+        path: &str,
+        expected_size: Option<u64>,
+    ) -> Result<Option<(ContentDigest, u64)>, CacheError> {
+        let _gate = self
+            .session_gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some((session, mut object)) = self.resolve_blob_object(repository, revision, path)?
+        else {
+            return Ok(None);
+        };
+        if let (Some(expected), Some(actual)) = (expected_size, object.size_bytes) {
+            if expected != actual {
+                return Err(CacheError::InvalidManifest(format!(
+                    "committed part declares {expected} bytes, actual object has {actual}"
+                )));
+            }
+        }
+        let maximum_bytes = self
+            .resources
+            .maximum_transfer_bytes
+            .unwrap_or(DEFAULT_IMMUTABLE_DIGEST_BLOB_LIMIT_BYTES);
+        if maximum_bytes == 0 {
+            return Err(CacheError::ResourceLimit(
+                "immutable path digest exceeds the zero transfer budget".to_owned(),
+            ));
+        }
+        if object.size_bytes.is_some_and(|size| size > maximum_bytes) {
+            return Err(CacheError::ResourceLimit(format!(
+                "immutable path digest requires more than the {maximum_bytes}-byte limit"
+            )));
+        }
+        let size_bytes = self.hydrate_blob_size(
+            &session,
+            repository,
+            revision,
+            path,
+            &mut object,
+            maximum_bytes,
+        )?;
+        if expected_size.is_some_and(|expected| expected != size_bytes) {
+            return Err(CacheError::InvalidManifest(format!(
+                "committed part size {size_bytes} differs from its declared size"
+            )));
+        }
+        if size_bytes > maximum_bytes {
+            return Err(CacheError::ResourceLimit(format!(
+                "immutable path digest requires {size_bytes} bytes above the {maximum_bytes}-byte limit"
+            )));
+        }
+        let started = Instant::now();
+        let key = (session.clone(), object.object_id.clone(), size_bytes);
+        let loose = session
+            .join("objects")
+            .join(&object.object_id[..2])
+            .join(&object.object_id[2..]);
+        let stamp = loose_object_stamp(&loose);
+        if let Some((digest, previous_stamp)) = self
+            .verified_blob_digests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            if stamp == Some(previous_stamp) {
+                self.publication_event("destination_verification",started.elapsed(),serde_json::json!({"bytes":size_bytes,"reused_verified_bytes":size_bytes,"success":true}));
+                return Ok(Some((digest, size_bytes)));
+            }
+        }
+        let digest = self.digest_local_blob(&session, &object.object_id, size_bytes)?;
+        if let Some(stamp) = stamp.filter(|stamp| Some(*stamp) == loose_object_stamp(&loose)) {
+            let mut cache = self
+                .verified_blob_digests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= 8192 {
+                cache.clear();
+            }
+            cache.insert(key, (digest.clone(), stamp));
+        }
+        self.publication_event(
+            "destination_verification",
+            started.elapsed(),
+            serde_json::json!({"bytes":size_bytes,"reused_verified_bytes":0,"success":true}),
+        );
+        Ok(Some((digest, size_bytes)))
     }
 }
 
@@ -1234,125 +1546,8 @@ impl RemoteGitStore for GitCliRemoteStore {
         revision: &str,
         path: &str,
     ) -> Result<Option<ContentDigest>, CacheError> {
-        let _gate = self
-            .session_gate
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some((session, mut object)) = self.resolve_blob_object(repository, revision, path)?
-        else {
-            return Ok(None);
-        };
-        let maximum_bytes = self
-            .resources
-            .maximum_transfer_bytes
-            .unwrap_or(DEFAULT_IMMUTABLE_DIGEST_BLOB_LIMIT_BYTES);
-        if maximum_bytes == 0 {
-            return Err(CacheError::ResourceLimit(
-                "immutable path digest exceeds the zero transfer budget".to_owned(),
-            ));
-        }
-        if object.size_bytes.is_some_and(|size| size > maximum_bytes) {
-            return Err(CacheError::ResourceLimit(format!(
-                "immutable path digest requires more than the {maximum_bytes}-byte limit"
-            )));
-        }
-        let size_bytes = self.hydrate_blob_size(
-            &session,
-            repository,
-            revision,
-            path,
-            &mut object,
-            maximum_bytes,
-        )?;
-        if size_bytes > maximum_bytes {
-            return Err(CacheError::ResourceLimit(format!(
-                "immutable path digest requires {size_bytes} bytes above the {maximum_bytes}-byte limit"
-            )));
-        }
-        let started = Instant::now();
-        let key = (session.clone(), object.object_id.clone(), size_bytes);
-        let loose = session
-            .join("objects")
-            .join(&object.object_id[..2])
-            .join(&object.object_id[2..]);
-        let stamp = loose_object_stamp(&loose);
-        if let Some((digest, previous_stamp)) = self
-            .verified_blob_digests
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .cloned()
-        {
-            if stamp == Some(previous_stamp) {
-                self.publication_event("destination_verification",started.elapsed(),serde_json::json!({"bytes":size_bytes,"reused_verified_bytes":size_bytes,"success":true}));
-                return Ok(Some(digest));
-            }
-        }
-        let mut child = Command::new(&self.git_executable)
-            .arg("-C")
-            .arg(&session)
-            .args(["cat-file", "blob"])
-            .arg(&object.object_id)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| CacheError::Io(format!("failed to launch git cat-file: {error}")))?;
-        let mut stdout = child.stdout.take().ok_or_else(|| {
-            CacheError::Io("git cat-file did not provide a readable stream".to_owned())
-        })?;
-        let mut hasher = Sha256::new();
-        let mut observed = 0u64;
-        let mut buffer = vec![0u8; 1024 * 1024];
-        let result = (|| {
-            loop {
-                let count = stdout.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                observed = observed.checked_add(count as u64).ok_or_else(|| {
-                    CacheError::ResourceLimit("immutable path digest exceeds u64".to_owned())
-                })?;
-                if observed > size_bytes {
-                    return Err(CacheError::ResourceLimit(format!(
-                        "immutable path digest exceeded its declared {size_bytes}-byte size"
-                    )));
-                }
-                hasher.update(&buffer[..count]);
-            }
-            Ok::<(), CacheError>(())
-        })();
-        if result.is_err() {
-            let _ = child.kill();
-        }
-        let status = child.wait()?;
-        result?;
-        if !status.success() {
-            return Err(CacheError::Io(format!(
-                "git cat-file failed with status {status} for {path:?}"
-            )));
-        }
-        if observed != size_bytes {
-            return Err(CacheError::InvalidManifest(format!(
-                "immutable path digest read {observed} bytes, expected {size_bytes}"
-            )));
-        }
-        let digest = ContentDigest(format!("{:x}", hasher.finalize()));
-        if let Some(stamp) = stamp.filter(|stamp| Some(*stamp) == loose_object_stamp(&loose)) {
-            let mut cache = self
-                .verified_blob_digests
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if cache.len() >= 8192 {
-                cache.clear();
-            }
-            cache.insert(key, (digest.clone(), stamp));
-        }
-        self.publication_event(
-            "destination_verification",
-            started.elapsed(),
-            serde_json::json!({"bytes":size_bytes,"reused_verified_bytes":0,"success":true}),
-        );
-        Ok(Some(digest))
+        self.immutable_path_identity(repository, revision, path, None)
+            .map(|value| value.map(|(digest, _)| digest))
     }
 
     fn read_committed_path(
@@ -1427,7 +1622,16 @@ impl RemoteGitStore for GitCliRemoteStore {
             let mut stdout = child.stdout.take().ok_or_else(|| {
                 CacheError::Io("git cat-file did not provide a readable stream".to_owned())
             })?;
-            let buffer_size = effective_maximum.saturating_add(1).min(1024 * 1024) as usize;
+            let buffer_size = effective_maximum
+                .saturating_add(1)
+                .min(1024 * 1024)
+                .min(self.resources.maximum_memory_bytes.unwrap_or(u64::MAX))
+                as usize;
+            if buffer_size == 0 {
+                return Err(CacheError::ResourceLimit(
+                    "Git read has zero memory budget".to_owned(),
+                ));
+            }
             let mut buffer = vec![0u8; buffer_size];
             let mut hasher = Sha256::new();
             let mut size_bytes = 0u64;
@@ -1463,6 +1667,7 @@ impl RemoteGitStore for GitCliRemoteStore {
                 "git cat-file failed with status {status} for {path:?}"
             )));
         }
+        self.enforce_transport_disk_budget(0)?;
         Ok(crate::RemoteReadReport {
             repository_path: path.to_owned(),
             revision: revision.to_owned(),
@@ -1494,10 +1699,19 @@ impl RemoteGitStore for GitCliRemoteStore {
                     "prefetched remote path limit must be positive".to_owned(),
                 ));
             }
+            let effective_maximum = self
+                .resources
+                .maximum_transfer_bytes
+                .map_or(path.maximum_bytes, |limit| path.maximum_bytes.min(limit));
+            if effective_maximum == 0 {
+                return Err(CacheError::ResourceLimit(
+                    "prefetch exceeds zero transfer budget".into(),
+                ));
+            }
             requested_paths
                 .entry(path.repository_path.clone())
-                .and_modify(|maximum| *maximum = (*maximum).min(path.maximum_bytes))
-                .or_insert(path.maximum_bytes);
+                .and_modify(|maximum| *maximum = (*maximum).min(effective_maximum))
+                .or_insert(effective_maximum);
         }
 
         // Object-database mutations are serialized per repository. Separate
@@ -1589,9 +1803,6 @@ impl RemoteGitStore for GitCliRemoteStore {
             })?;
             missing.push(object_id);
         }
-        if missing.is_empty() {
-            return Ok(());
-        }
         let _disk_reservation = self.enforce_transport_disk_budget(projected_bytes)?;
 
         // Keep command lines bounded for future encodings with many parts,
@@ -1617,6 +1828,40 @@ impl RemoteGitStore for GitCliRemoteStore {
                 "git fetch reported success but blob {object_id} is still absent from the session"
             )));
         }
+        // Validate every requested object, including objects already present.
+        // Prefetch is successful only if each declared limit and the total
+        // admitted payload budget hold after hydration.
+        let mut measured = BTreeMap::new();
+        for (path, maximum) in &requested_paths {
+            let mut object = self
+                .cached_blob_object(repository, revision, path)
+                .ok_or_else(|| CacheError::Io("prefetched object identity disappeared".into()))?;
+            let size = self.local_blob_size(&session, &object.object_id, *maximum)?;
+            if object.size_bytes.is_some_and(|expected| expected != size) {
+                return Err(CacheError::InvalidManifest(
+                    "prefetched blob size changed".into(),
+                ));
+            }
+            measured.insert(object.object_id.clone(), size);
+            object.size_bytes = Some(size);
+            self.remember_blob_object(repository, revision, path, object);
+        }
+        let total = measured.values().try_fold(0u64, |sum, size| {
+            sum.checked_add(*size)
+                .ok_or_else(|| CacheError::ResourceLimit("prefetched size exceeds u64".into()))
+        })?;
+        if self
+            .resources
+            .maximum_transfer_bytes
+            .is_some_and(|limit| total > limit)
+        {
+            return Err(CacheError::ResourceLimit(
+                "prefetched payload total exceeds transfer budget".into(),
+            ));
+        }
+        // Git manages its network pack exchange internally. These are payload
+        // admission and temporary-disk checks, not a byte-exact network quota.
+        self.enforce_transport_disk_budget(0)?;
         Ok(())
     }
 
@@ -1794,6 +2039,12 @@ impl RemoteGitStore for GitCliRemoteStore {
             &session,
             vec![
                 OsString::from("push"),
+                // A preliminary read plus a fast-forward push is not CAS: the
+                // destination may rewind or disappear between those operations.
+                OsString::from(format!(
+                    "--force-with-lease=refs/heads/{}:{}",
+                    request.branch, request.expected_head
+                )),
                 OsString::from("origin"),
                 OsString::from(format!("{commit_id}:refs/heads/{}", request.branch)),
             ],
@@ -1852,6 +2103,7 @@ impl RemoteGitStore for GitCliRemoteStore {
             &session,
             vec![
                 OsString::from("push"),
+                OsString::from(format!("--force-with-lease=refs/heads/{}:", request.branch)),
                 OsString::from("origin"),
                 OsString::from(format!("{commit_id}:refs/heads/{}", request.branch)),
             ],
@@ -1933,11 +2185,14 @@ impl RemoteGitStore for GitCliRemoteStore {
             let commit_id = self.commit_tree(&session, commit)?;
             commit_ids.insert(commit.branch.clone(), commit_id);
         }
-        let mut arguments = vec![
-            OsString::from("push"),
-            OsString::from("--atomic"),
-            OsString::from("origin"),
-        ];
+        let mut arguments = vec![OsString::from("push"), OsString::from("--atomic")];
+        arguments.extend(request.commits.iter().map(|commit| {
+            OsString::from(format!(
+                "--force-with-lease=refs/heads/{}:{}",
+                commit.branch, commit.expected_head
+            ))
+        }));
+        arguments.push(OsString::from("origin"));
         arguments.extend(request.commits.iter().map(|commit| {
             OsString::from(format!(
                 "{}:refs/heads/{}",
@@ -1974,11 +2229,18 @@ impl RemoteGitStore for GitCliRemoteStore {
         revision: &str,
         part: &TransportPart,
     ) -> Result<(), CacheError> {
-        match self.immutable_path_digest(repository, revision, &part.repository_path)? {
-            Some(actual) if actual == part.content_digest => Ok(()),
-            Some(actual) => Err(CacheError::DigestMismatch {
-                expected: part.content_digest.to_string(),
-                actual: actual.to_string(),
+        match self.immutable_path_identity(
+            repository,
+            revision,
+            &part.repository_path,
+            Some(part.size_bytes),
+        )? {
+            Some((actual, size)) if actual == part.content_digest && size == part.size_bytes => {
+                Ok(())
+            }
+            Some((actual, size)) => Err(CacheError::DigestMismatch {
+                expected: format!("{} ({} bytes)", part.content_digest, part.size_bytes),
+                actual: format!("{actual} ({size} bytes)"),
             }),
             None => Err(CacheError::NotFound(format!(
                 "verified remote part {:?} at {revision}",
@@ -2543,14 +2805,7 @@ fn validate_revision(revision: &str) -> Result<(), CacheError> {
 }
 
 fn validate_relative_git_path(path: &str) -> Result<(), CacheError> {
-    if path.is_empty()
-        || path.starts_with('/')
-        || path.starts_with('\\')
-        || path.contains('\\')
-        || path
-            .split('/')
-            .any(|component| component.is_empty() || component == "." || component == "..")
-    {
+    if !crate::protocol::normalized_relative_path(path) {
         return Err(CacheError::InvalidManifest(format!(
             "Git path {path:?} is not a normalized relative path"
         )));
@@ -2579,7 +2834,7 @@ fn digest_file(path: &Path) -> Result<(ContentDigest, u64), CacheError> {
 /// Sum the bytes under `path`. Git sessions in other threads rename and
 /// remove temporary pack files while this walks, so an entry that vanishes
 /// between listing and measurement simply contributes nothing.
-fn directory_size_bytes(path: &Path) -> Result<u64, CacheError> {
+pub(crate) fn directory_size_bytes(path: &Path) -> Result<u64, CacheError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -3435,9 +3690,9 @@ mod tests {
             )
             .unwrap();
         let current = directory_size_bytes(&bounded_transport).unwrap();
-        // The caller supplies the exact retained part size, so an unhydrated
-        // promised blob reserves that bound rather than 100 MB.
-        let headroom = 1024 * 1024;
+        // A caller limit does not establish the actual size of an unhydrated
+        // promised blob. One admitted blob plus metadata fits this budget.
+        let headroom = crate::GITHUB_HARD_FILE_BOUNDARY_BYTES + 1024 * 1024;
         let store = store.with_resource_policy(ResourcePolicy {
             maximum_temporary_disk_bytes: Some(current + headroom),
             ..ResourcePolicy::default()
@@ -3821,11 +4076,535 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    fn exhaustive_git_identical_commit_race(atomic: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temporary_root(if atomic {
+            "git-identical-atomic"
+        } else {
+            "git-identical-single"
+        });
+        fs::create_dir_all(&root).unwrap();
+        let (repository, expected, _) = seeded_remote(&root, "same-commit", b"source");
+        let wrapper = root.join("fixed-date-git.sh");
+        let dates = "export GIT_AUTHOR_DATE='2001-01-01T00:00:00 +0000'\nexport GIT_COMMITTER_DATE='2001-01-01T00:00:00 +0000'\n";
+        fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nset -e\n{dates}exec git \"$@\"\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            root.join("staging"),
+            "Local Audit",
+            "audit@example.invalid",
+        )
+        .unwrap()
+        .with_git_executable(wrapper.clone().into_os_string());
+        let session = store.fetch_revision(&repository, &expected).unwrap();
+        fs::create_dir_all(root.join("staging")).unwrap();
+        fs::write(root.join("staging/payload.part"), b"new payload").unwrap();
+        let payload = TransportPart {
+            sequence: 0,
+            repository_path: "payload.part".into(),
+            size_bytes: 11,
+            content_digest: ContentDigest::sha256(b"new payload"),
+        };
+        let request = |branch: &str| RemoteCommitRequest {
+            repository: repository.clone(),
+            branch: branch.into(),
+            expected_head: expected.clone(),
+            message: "identical concurrent attempt".into(),
+            parts: vec![payload.clone()],
+            delete_paths: vec![],
+        };
+        let candidate = store.commit_tree(&session, &request("main")).unwrap();
+        assert!(test_git(
+            Some(&session),
+            &[
+                "push",
+                "origin",
+                &format!("{expected}:refs/heads/coordination")
+            ]
+        ));
+        let quoted = format!("'{}'", session.to_str().unwrap().replace('\'', "'\\''"));
+        fs::write(&wrapper,format!("#!/bin/sh\nset -e\n{dates}for arg in \"$@\"; do\n if [ \"$arg\" = push ]; then\n git -C {quoted} push origin {candidate}:refs/heads/main\n break\n fi\ndone\nexec git \"$@\"\n")).unwrap();
+        if atomic {
+            let result = store.compare_and_swap_commits_atomically(&AtomicRemoteCommitRequest {
+                repository: repository.clone(),
+                commits: vec![request("main"), request("coordination")],
+            });
+            assert!(
+                !matches!(result, Ok(AtomicCompareAndSwapResult::Committed { .. })),
+                "stale identical candidate bypassed atomic lease: {result:?}"
+            );
+            assert_eq!(
+                store.read_ref(&repository, "coordination").unwrap(),
+                expected
+            );
+        } else {
+            let result = store.compare_and_swap_commit(&request("main"));
+            assert!(
+                !matches!(result, Ok(CompareAndSwapResult::Committed { .. })),
+                "stale identical candidate bypassed lease: {result:?}"
+            );
+        }
+        assert_eq!(store.read_ref(&repository, "main").unwrap(), candidate);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn exhaustive_git_identical_single_race() {
+        exhaustive_git_identical_commit_race(false);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn exhaustive_git_identical_atomic_race() {
+        exhaustive_git_identical_commit_race(true);
+    }
+    #[test]
+    fn exhaustive_git_blob_known_bound_and_unknown_reservation() {
+        let root = temporary_root("git-blob-bounds");
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            root.join("staging"),
+            "Audit",
+            "audit@example.invalid",
+        )
+        .unwrap();
+        let object = ResolvedBlobObject {
+            object_id: "a".repeat(40),
+            size_bytes: Some(20),
+        };
+        assert!(store.blob_reservation_bytes(&object, 10).is_err());
+        let object = ResolvedBlobObject {
+            object_id: "b".repeat(40),
+            size_bytes: None,
+        };
+        assert_eq!(
+            store.blob_reservation_bytes(&object, 10).unwrap(),
+            crate::GITHUB_HARD_FILE_BOUNDARY_BYTES
+        );
+    }
+    #[test]
+    fn exhaustive_git_prefetch_rejects_oversized_unknown_blob() {
+        let root = temporary_root("git-prefetch-oversize");
+        fs::create_dir_all(&root).unwrap();
+        let (repository, revision, path) =
+            seeded_remote(&root, "oversize", b"twenty bytes payload");
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            root.join("staging"),
+            "Audit",
+            "audit@example.invalid",
+        )
+        .unwrap();
+        let result = store.prefetch_committed_paths(
+            &repository,
+            &revision,
+            &[crate::RemotePathPrefetch {
+                repository_path: path,
+                maximum_bytes: 3,
+            }],
+            &CancellationToken::new(),
+        );
+        assert!(
+            matches!(result, Err(CacheError::ResourceLimit(_))),
+            "prefetch accepted oversized blob: {result:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn exhaustive_git_paths_reject_control_and_alternate_streams() {
+        for path in ["file:stream", "a\0b", "dir/a\nb"] {
+            assert!(
+                validate_relative_git_path(path).is_err(),
+                "accepted nonportable path {path:?}"
+            );
+        }
+    }
     #[test]
     fn unsafe_ref_and_path_inputs_are_rejected() {
         assert!(validate_branch("--force").is_err());
         assert!(validate_branch("main..evil").is_err());
         assert!(validate_relative_git_path("../secret").is_err());
         assert!(validate_relative_git_path("C:\\secret").is_err());
+    }
+    #[cfg(unix)]
+    fn exhaustive_git_expected_revision_race(atomic: bool, delete: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(test_git(None, &["--version"]));
+        let root = temporary_root("git-expected-revision-race");
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::create_dir(&root).unwrap();
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let staging = root.join("staging");
+        assert!(test_git(
+            None,
+            &["init", "--bare", remote.to_str().unwrap()]
+        ));
+        assert!(test_git(None, &["init", seed.to_str().unwrap()]));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.name", "Local Audit"]
+        ));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.email", "audit@example.invalid"]
+        ));
+        assert!(test_git(
+            Some(&seed),
+            &["commit", "--allow-empty", "-m", "ancestor"]
+        ));
+        let ancestor = test_git_stdout(Some(&seed), &["rev-parse", "HEAD"]);
+        assert!(test_git(
+            Some(&seed),
+            &["commit", "--allow-empty", "-m", "expected"]
+        ));
+        let expected = test_git_stdout(Some(&seed), &["rev-parse", "HEAD"]);
+        assert!(test_git(
+            Some(&seed),
+            &[
+                "push",
+                remote.to_str().unwrap(),
+                "HEAD:refs/heads/main",
+                "HEAD:refs/heads/coordination"
+            ]
+        ));
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("payload.part"), b"retained source").unwrap();
+        let part = TransportPart {
+            sequence: 0,
+            repository_path: "payload.part".into(),
+            size_bytes: 15,
+            content_digest: ContentDigest::sha256(b"retained source"),
+        };
+        let wrapper = root.join("race-git.sh");
+        let quoted_remote = format!("'{}'", remote.to_str().unwrap().replace('\'', "'\\''"));
+        let mutation = if delete {
+            "update-ref -d refs/heads/main".into()
+        } else {
+            format!("update-ref refs/heads/main {ancestor}")
+        };
+        fs::write(&wrapper,format!("#!/bin/sh\nset -e\nfor arg in \"$@\"; do\n  if [ \"$arg\" = push ]; then\n    git -C {quoted_remote} {mutation}\n    break\n  fi\ndone\nexec git \"$@\"\n")).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            &staging,
+            "Local Audit",
+            "audit@example.invalid",
+        )
+        .unwrap()
+        .with_git_executable(wrapper.into_os_string());
+        let repository = remote.to_str().unwrap().to_owned();
+        let request = |branch: &str| RemoteCommitRequest {
+            repository: repository.clone(),
+            branch: branch.into(),
+            expected_head: expected.clone(),
+            message: "publish local audit fixture".into(),
+            parts: vec![part.clone()],
+            delete_paths: vec![],
+        };
+        if atomic {
+            let outcome = store.compare_and_swap_commits_atomically(&AtomicRemoteCommitRequest {
+                repository: repository.clone(),
+                commits: vec![request("main"), request("coordination")],
+            });
+            assert!(
+                !matches!(outcome, Ok(AtomicCompareAndSwapResult::Committed { .. })),
+                "stale multi-ref request was committed: {outcome:?}"
+            );
+            assert_eq!(
+                store.read_ref(&repository, "coordination").unwrap(),
+                expected,
+                "atomic rejection must preserve the other branch"
+            );
+        } else {
+            let outcome = store.compare_and_swap_commit(&request("main"));
+            assert!(
+                !matches!(outcome, Ok(CompareAndSwapResult::Committed { .. })),
+                "stale request was committed: {outcome:?}"
+            );
+        }
+        if delete {
+            assert!(matches!(
+                store.read_ref(&repository, "main"),
+                Err(CacheError::NotFound(_))
+            ));
+        } else {
+            assert_eq!(store.read_ref(&repository, "main").unwrap(), ancestor);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn exhaustive_git_expected_revision_single_rewind() {
+        exhaustive_git_expected_revision_race(false, false);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn exhaustive_git_expected_revision_atomic_rewind() {
+        exhaustive_git_expected_revision_race(true, false);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn exhaustive_git_expected_revision_single_deletion() {
+        exhaustive_git_expected_revision_race(false, true);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn exhaustive_git_expected_revision_atomic_deletion() {
+        exhaustive_git_expected_revision_race(true, true);
+    }
+    #[cfg(unix)]
+    fn exhaustive_git_blob_identity_import_race(changed_size: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temporary_root("git-import-source-identity");
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::create_dir(&root).unwrap();
+        let remote = root.join("remote.git");
+        assert!(test_git(
+            None,
+            &["init", "--bare", remote.to_str().unwrap()]
+        ));
+        let staging = root.join("staging");
+        fs::create_dir(&staging).unwrap();
+        let path = staging.join("payload.part");
+        let original = b"original payload";
+        fs::write(&path, original).unwrap();
+        let replacement = if changed_size {
+            "replacement with another size"
+        } else {
+            "replaced payload"
+        };
+        let quoted = format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+        let wrapper = root.join("replace-git.sh");
+        fs::write(&wrapper,format!("#!/bin/sh\nset -e\nfor arg in \"$@\"; do\n if [ \"$arg\" = hash-object ]; then\n  printf '%s' '{replacement}' > {quoted}\n  break\n fi\ndone\nexec git \"$@\"\n")).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            &staging,
+            "Local Audit",
+            "audit@example.invalid",
+        )
+        .unwrap()
+        .with_git_executable(wrapper.into_os_string());
+        let part = TransportPart {
+            sequence: 0,
+            repository_path: "payload.part".into(),
+            size_bytes: original.len() as u64,
+            content_digest: ContentDigest::sha256(original),
+        };
+        let result = store.prepare_staged_parts(remote.to_str().unwrap(), &[part]);
+        assert!(
+            result.is_err(),
+            "Git imported changed bytes under the original digest: {result:?}"
+        );
+        assert!(
+            store.prepared_blob_oids.lock().unwrap().is_empty(),
+            "failed import must not retain a prepared identity"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn exhaustive_git_blob_identity_same_size_import_race() {
+        exhaustive_git_blob_identity_import_race(false);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn exhaustive_git_blob_identity_changed_size_import_race() {
+        exhaustive_git_blob_identity_import_race(true);
+    }
+    #[test]
+    fn exhaustive_git_blob_identity_verification_binds_declared_size() {
+        let root = temporary_root("git-verified-part-size");
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::create_dir(&root).unwrap();
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        let staging = root.join("staging");
+        fs::create_dir(&staging).unwrap();
+        assert!(test_git(
+            None,
+            &["init", "--bare", remote.to_str().unwrap()]
+        ));
+        assert!(test_git(None, &["init", seed.to_str().unwrap()]));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.name", "Local Audit"]
+        ));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.email", "audit@example.invalid"]
+        ));
+        let payload = b"retained exact bytes";
+        fs::write(seed.join("payload.part"), payload).unwrap();
+        assert!(test_git(Some(&seed), &["add", "payload.part"]));
+        assert!(test_git(Some(&seed), &["commit", "-m", "source"]));
+        assert!(test_git(
+            Some(&seed),
+            &["push", remote.to_str().unwrap(), "HEAD:refs/heads/main"]
+        ));
+        let head = test_git_stdout(Some(&seed), &["rev-parse", "HEAD"]);
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            staging,
+            "Local Audit",
+            "audit@example.invalid",
+        )
+        .unwrap();
+        let mut part = TransportPart {
+            sequence: 0,
+            repository_path: "payload.part".into(),
+            size_bytes: payload.len() as u64,
+            content_digest: ContentDigest::sha256(payload),
+        };
+        store
+            .verify_committed_part(remote.to_str().unwrap(), &head, &part)
+            .unwrap();
+        for size in [0, part.size_bytes - 1, part.size_bytes + 1, u64::MAX] {
+            part.size_bytes = size;
+            assert!(
+                store
+                    .verify_committed_part(remote.to_str().unwrap(), &head, &part)
+                    .is_err(),
+                "wrong declared size {size} passed verification"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn git_blob_identity_stream_uses_exact_object_and_bounded_size() {
+        let root = temporary_root("git-exact-blob-stream");
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::create_dir(&root).unwrap();
+        let staging = root.join("staging");
+        fs::create_dir(&staging).unwrap();
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            staging,
+            "Local Audit",
+            "audit@example.invalid",
+        )
+        .unwrap();
+        let session = root.join("objects.git");
+        assert!(test_git(
+            None,
+            &["init", "--bare", session.to_str().unwrap()]
+        ));
+        let write = |bytes: &[u8]| {
+            let output = run_git_with_input(
+                OsStr::new("git"),
+                Some(&session),
+                [
+                    OsString::from("hash-object"),
+                    OsString::from("-w"),
+                    OsString::from("--stdin"),
+                ],
+                &[],
+                bytes,
+            )
+            .unwrap();
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let original = write(b"original");
+        let replacement = write(b"replaced");
+        assert!(test_git(
+            Some(&session),
+            &["replace", &original, &replacement]
+        ));
+        assert_eq!(
+            store.digest_local_blob(&session, &original, 8).unwrap(),
+            ContentDigest::sha256(b"original")
+        );
+        assert!(store.digest_local_blob(&session, &original, 7).is_err());
+        assert!(store.digest_local_blob(&session, &original, 9).is_err());
+        assert!(store
+            .digest_local_blob(&session, &"0".repeat(40), 8)
+            .is_err());
+        let empty = write(b"");
+        assert_eq!(
+            store.digest_local_blob(&session, &empty, 0).unwrap(),
+            ContentDigest::sha256(b"")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn git_blob_identity_import_preserves_crlf_under_git_conversion_settings() {
+        let root = temporary_root("git-exact-blob-line-endings");
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::create_dir(&root).unwrap();
+        let staging = root.join("staging");
+        fs::create_dir(&staging).unwrap();
+        let bytes = b"first\r\nsecond\r\n";
+        fs::write(staging.join("data.txt"), bytes).unwrap();
+        let remote = root.join("remote.git");
+        assert!(test_git(
+            None,
+            &["init", "--bare", remote.to_str().unwrap()]
+        ));
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            staging,
+            "Local Audit",
+            "audit@example.invalid",
+        )
+        .unwrap();
+        let session = store.ensure_session(remote.to_str().unwrap()).unwrap();
+        assert!(test_git(
+            Some(&session),
+            &["config", "core.autocrlf", "true"]
+        ));
+        let part = TransportPart {
+            sequence: 0,
+            repository_path: "data.txt".into(),
+            size_bytes: bytes.len() as u64,
+            content_digest: ContentDigest::sha256(bytes),
+        };
+        store
+            .prepare_staged_parts(remote.to_str().unwrap(), std::slice::from_ref(&part))
+            .unwrap();
+        let oid = store
+            .prepared_blob_oids
+            .lock()
+            .unwrap()
+            .get(&(
+                session.clone(),
+                part.content_digest.clone(),
+                part.size_bytes,
+            ))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            store
+                .digest_local_blob(&session, &oid, part.size_bytes)
+                .unwrap(),
+            part.content_digest
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn owned_read_session_supports_git_and_removes_only_its_child() {
+        let root = temporary_root("owned-reader-git-path");
+        fs::create_dir_all(&root).unwrap();
+        let sibling = root.join("keep.txt");
+        fs::write(&sibling, b"preserve").unwrap();
+        let store = GitCliRemoteStore::new_read_session(
+            &root,
+            root.join("parts"),
+            "test",
+            "test@example.invalid",
+        )
+        .unwrap();
+        let session = store
+            .ensure_session("https://example.invalid/fixture.git")
+            .unwrap();
+        assert!(session.join("HEAD").is_file());
+        store.finish_read_session().unwrap();
+        assert_eq!(fs::read(sibling).unwrap(), b"preserve");
+        fs::remove_dir_all(root).unwrap();
     }
 }

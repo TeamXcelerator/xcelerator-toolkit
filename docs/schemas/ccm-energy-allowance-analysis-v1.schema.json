@@ -18,7 +18,30 @@
       "const": 1
     },
     "semantics": {
-      "const": "ccm-retained-research-observations-v1"
+      "enum": [
+        "ccm-retained-research-observations-v1",
+        "ccm-retained-research-observations-v2",
+        "ccm-retained-research-observations-v3",
+        "ccm-retained-research-observations-v4",
+        "ccm-retained-research-observations-v5",
+        "ccm-retained-research-observations-v6",
+        "ccm-retained-research-observations-v7",
+        "ccm-retained-research-observations-v8",
+        "ccm-retained-research-observations-v9",
+        "ccm-retained-research-observations-v10",
+        "ccm-retained-research-observations-v11",
+        "ccm-retained-research-observations-v12",
+        "ccm-retained-research-observations-v13",
+        "ccm-retained-research-observations-v14",
+        "ccm-retained-research-observations-v15",
+        "ccm-retained-research-observations-v16",
+        "ccm-retained-research-observations-v17",
+        "ccm-retained-research-observations-v18",
+        "ccm-retained-research-observations-v19",
+        "ccm-retained-research-observations-v20",
+        "ccm-retained-research-observations-v21",
+        "ccm-retained-research-observations-v22"
+      ]
     },
     "kind": {
       "const": "ccm_energy_allowance_analysis"
@@ -54,13 +77,13 @@
               },
               "parameters_digest": {
                 "type": "string",
-                "pattern": "^[0-9a-f]{64}$"
+                "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
               }
             }
           },
           "content_digest": {
             "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
+            "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
           },
           "required_quality": {
             "enum": [
@@ -142,12 +165,12 @@
               "type": "array",
               "items": {
                 "type": "string",
-                "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
               }
             },
             "relative_tolerance": {
               "type": "string",
-              "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+              "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
             },
             "maximum_working_bytes": {
               "anyOf": [
@@ -166,7 +189,7 @@
           "anyOf": [
             {
               "type": "string",
-              "pattern": "^[0-9a-f]{64}$"
+              "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
             },
             {
               "type": "null"
@@ -184,6 +207,30 @@
         },
         "allowance_interpretation": {
           "const": "trial-energy-scale-v1"
+        },
+        "resource_admission": {
+          "const": "resolved_working_bytes_v1"
+        },
+        "duplicate_coordinate_policy": {
+          "const": "all_ambiguous_members_withheld_v2"
+        },
+        "ladder_positivity_policy": {
+          "const": "all_required_recurrence_steps_including_failed_v2"
+        },
+        "source_unit_arithmetic": {
+          "enum": [
+            "binary_scaled_hypot_checked_v1",
+            "binary_scaled_hypot_checked_range_v2"
+          ]
+        },
+        "allowance_arithmetic": {
+          "const": "declared_points_separate_binary_scales_intervals_v1"
+        },
+        "maximum_allowance_guard_bits": {
+          "const": 4096
+        },
+        "allowance_output": {
+          "const": "midpoints_with_outward_decimal_enclosures_v1"
         }
       }
     },
@@ -230,7 +277,7 @@
         },
         "lambda_squared": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
         },
         "n_modes": {
           "type": "integer",
@@ -248,13 +295,16 @@
           "type": "string"
         },
         "assurance": {
-          "const": "point_diagnostics_only; external_inputs_and_allowances_not_certified; no_RH_or_ground_selection_premise"
+          "enum": [
+            "point_diagnostics_only; external_inputs_and_allowances_not_certified; no_RH_or_ground_selection_premise",
+            "finite_stored_point_arithmetic_enclosures; conditional block expressions; external block bounds and hypotheses not certified"
+          ]
         },
         "values": {
           "type": "object",
           "additionalProperties": {
             "type": "string",
-            "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+            "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
           }
         },
         "rows": {
@@ -296,7 +346,7 @@
                 "type": "object",
                 "additionalProperties": {
                   "type": "string",
-                  "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                  "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
                 }
               },
               "notes": {
@@ -369,6 +419,328 @@
                   "conditional_energy_allowance",
                   "conditional_vector_allowance",
                   "trial_energy_magnitude"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v4",
+              "ccm-retained-research-observations-v5",
+              "ccm-retained-research-observations-v6",
+              "ccm-retained-research-observations-v7",
+              "ccm-retained-research-observations-v8",
+              "ccm-retained-research-observations-v9",
+              "ccm-retained-research-observations-v10",
+              "ccm-retained-research-observations-v11",
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "required": [
+              "source_unit_arithmetic"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "required": [
+              "source_unit_arithmetic"
+            ],
+            "properties": {
+              "source_unit_arithmetic": {
+                "const": "binary_scaled_hypot_checked_range_v2"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "request": {
+            "properties": {
+              "source_unit_arithmetic": {
+                "enum": [
+                  "binary_scaled_hypot_checked_v1"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "required": [
+              "allowance_arithmetic",
+              "maximum_allowance_guard_bits",
+              "allowance_output"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "assurance": {
+                "const": "finite_stored_point_arithmetic_enclosures; conditional block expressions; external block bounds and hypotheses not certified"
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "data": {
+            "properties": {
+              "assurance": {
+                "const": "point_diagnostics_only; external_inputs_and_allowances_not_certified; no_RH_or_ground_selection_premise"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          },
+          "data": {
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "conditional_bound_expression",
+                  "sufficient_bound_unavailable"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "values": {
+                "required": [
+                  "upper_trial_energy",
+                  "low_block_lower_bound",
+                  "high_block_lower_bound",
+                  "cross_block_norm_bound",
+                  "denominator",
+                  "upper_trial_energy_lower",
+                  "upper_trial_energy_upper",
+                  "low_block_lower_bound_lower",
+                  "low_block_lower_bound_upper",
+                  "high_block_lower_bound_lower",
+                  "high_block_lower_bound_upper",
+                  "cross_block_norm_bound_lower",
+                  "cross_block_norm_bound_upper",
+                  "denominator_lower",
+                  "denominator_upper",
+                  "arithmetic_precision_bits"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          },
+          "data": {
+            "properties": {
+              "outcome": {
+                "const": "conditional_bound_expression"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "values": {
+                "required": [
+                  "conditional_energy_allowance",
+                  "conditional_vector_allowance",
+                  "trial_energy_magnitude",
+                  "conditional_energy_allowance_lower",
+                  "conditional_energy_allowance_upper",
+                  "conditional_vector_allowance_lower",
+                  "conditional_vector_allowance_upper",
+                  "trial_energy_magnitude_lower",
+                  "trial_energy_magnitude_upper"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v12",
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          },
+          "data": {
+            "properties": {
+              "values": {
+                "required": [
+                  "allowance_to_trial_energy_magnitude"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "properties": {
+              "values": {
+                "required": [
+                  "allowance_to_trial_energy_magnitude",
+                  "allowance_below_trial_energy_magnitude",
+                  "scale_comparison_resolved",
+                  "allowance_to_trial_energy_magnitude_lower",
+                  "allowance_to_trial_energy_magnitude_upper",
+                  "allowance_below_trial_energy_magnitude_lower",
+                  "allowance_below_trial_energy_magnitude_upper",
+                  "scale_comparison_resolved_lower",
+                  "scale_comparison_resolved_upper"
                 ]
               }
             }

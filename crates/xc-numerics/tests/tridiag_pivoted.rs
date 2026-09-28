@@ -57,14 +57,14 @@ fn check(d: &[i32], l: &[i32], u: &[i32]) -> bool {
     true
 }
 #[test]
-fn later_pivot_uses_interleaved_rhs_and_preserves_the_old_route() {
+fn later_pivot_uses_interleaved_rhs_in_both_public_routes() {
     let factors =
         tridiag_lu_factor_hp(&[f(1), f(1)], &[f(2), f(1), f(1)], &[f(1), f(1)], 256).unwrap();
     let b = vec![f(3), f(3), f(2)];
     let correct = tridiag_lu_solve_pivoted_hp(&factors, &b, 256).unwrap();
     assert_eq!(correct, vec![f(1), f(1), f(1)]);
-    let historical = tridiag_lu_solve_hp(&factors, &b, 256).unwrap();
-    assert_ne!(historical, correct);
+    let ordinary = tridiag_lu_solve_hp(&factors, &b, 256).unwrap();
+    assert_eq!(ordinary, correct);
 }
 #[test]
 fn independent_dense_and_known_solution_checks_cover_pivot_patterns() {
@@ -111,14 +111,18 @@ fn thousand_dimension_solve_needs_only_banded_storage() {
 }
 
 #[test]
-fn explicit_eigenvector_route_matches_dense_and_has_distinct_identity() {
+fn both_banded_eigenvector_names_match_dense_and_corrected_identity() {
     use xc_numerics::eigen::*;
     let diag = vec![f(2), f(1), f(1)];
     let off = vec![f(1), f(1)];
     let eig = tridiag_eigenvalues_hp(&diag, &off, 256).unwrap();
     for lambda in &eig {
         let mut vectors = vec![];
-        for solver in [TridiagSolver::Dense, TridiagSolver::BandedInterleaved] {
+        for solver in [
+            TridiagSolver::Dense,
+            TridiagSolver::BandedInterleaved,
+            TridiagSolver::Banded,
+        ] {
             vectors.push(
                 tridiag_eigenvector_for_value_hp(
                     &diag,
@@ -134,13 +138,14 @@ fn explicit_eigenvector_route_matches_dense_and_has_distinct_identity() {
                 .unwrap(),
             );
         }
+        assert_eq!(vectors[1], vectors[2]);
         let mut overlap = f(0);
         for (a, b) in vectors[0].iter().zip(&vectors[1]) {
             overlap += Float::with_val(256, a * b);
         }
         assert!(Float::with_val(256, overlap.abs() - 1).abs() < Float::with_val(256, 2).pow(-180));
     }
-    assert_ne!(
+    assert_eq!(
         TridiagSolver::Banded.semantics_id(),
         TridiagSolver::BandedInterleaved.semantics_id()
     );

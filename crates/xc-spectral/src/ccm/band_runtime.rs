@@ -7,27 +7,11 @@ use serde::Serialize;
 use std::{collections::VecDeque, path::PathBuf};
 use xc_numerics::prefix::lossless_decimal as dec;
 
-/// Fixed block boundaries and fixed final reduction order, independent of workers.
-pub(crate) fn inner(a: &[Float], b: &[Float], w: &[Float], p: u32) -> Float {
-    const BLOCK: usize = 512;
-    let sums = a
-        .par_chunks(BLOCK)
-        .zip(b.par_chunks(BLOCK))
-        .zip(w.par_chunks(BLOCK))
-        .map(|((a, b), w)| {
-            let mut sum = Float::with_val(p, 0);
-            let mut term = Float::with_val(p, 0);
-            for ((a, b), w) in a.iter().zip(b).zip(w) {
-                term.assign(a);
-                term *= b;
-                term *= w;
-                sum += &term;
-            }
-            sum
-        })
-        .collect::<Vec<_>>();
-    sums.into_iter().fold(Float::with_val(p, 0), |s, x| s + x)
-}
+#[path = "band_runtime/exact_arithmetic.rs"]
+mod exact_arithmetic;
+#[cfg(feature = "arb")]
+pub(crate) use exact_arithmetic::polynomial_inverse_moments;
+pub(crate) use exact_arithmetic::{inner, inverse_moments, rayleigh};
 pub(crate) fn subtract(v: &mut [Float], q: &[Float], c: &Float, p: u32) {
     v.par_chunks_mut(512)
         .zip(q.par_chunks(512))
@@ -168,7 +152,7 @@ mod tests {
                 .num_threads(workers)
                 .build()
                 .unwrap()
-                .install(|| inner(&a, &one, &one, 128))
+                .install(|| inner(&a, &one, &one, 128, 1 << 28).unwrap())
         };
         assert_eq!(run(1), run(4));
         assert_eq!(run(1), Float::with_val(128, 2048 * 2049 / 2));

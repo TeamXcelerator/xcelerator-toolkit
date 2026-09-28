@@ -3,8 +3,8 @@
 use crate::{
     AttestationEnvelope, CacheError, CanonicalArtifactManifest, CapacityLedger, ContentDigest,
     PayloadBatchRecord, PublicationDestination, PublicationReceipt, RemoteDocument, RemoteGitStore,
-    RemotePathListReport, RemoteShardReader, RepositoryPublicationBatch, ShardIndexEntry,
-    ShardIndexPartition, TransportEncodingRecord, DEFAULT_CAPACITY_LEDGER_PATH,
+    RemotePathListReport, RepositoryPublicationBatch, ShardIndexEntry, ShardIndexPartition,
+    TransportEncodingRecord, DEFAULT_CAPACITY_LEDGER_PATH,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -192,7 +192,6 @@ pub fn audit_remote_shard(
         &mut issues,
     )?;
     let mut originals = BTreeMap::<(String, String), ShardIndexPartition>::new();
-    let mut index_sources = BTreeMap::<String, ContentDigest>::new();
     for path in paths_with_suffix(&listings["indexes"], ".json") {
         match read_json::<ShardIndexPartition>(
             remote,
@@ -233,7 +232,6 @@ pub fn audit_remote_shard(
                         "duplicate index partition identity",
                     );
                 }
-                index_sources.insert(path.clone(), document.source.content_digest);
             }
             Err(error) if recoverable_document_error(&error) => issue(
                 &mut issues,
@@ -306,6 +304,8 @@ pub fn audit_remote_shard(
                 || manifest.value.semantic_digest != entry.semantic_digest
                 || manifest.value.payload_digest != entry.canonical_payload_digest
                 || manifest.value.transport_digests != entry.transport_digests
+                || manifest.value.producer_toolkit_version != entry.producer_toolkit_version
+                || manifest.value.minimum_reader_version != entry.minimum_reader_version
             {
                 issue(
                     &mut issues,
@@ -461,23 +461,20 @@ pub fn audit_remote_shard(
                     }
                     Err(error) => return Err(error),
                 };
-                let index_digest = &index_sources[&index_path];
                 if document.value.validate().is_err()
                     || document.value.digest().as_ref() != Ok(&document.source.content_digest)
                     || document.value.transaction_id != entry.publication_transaction_id
                     || document.value.shard_id != shard_id
                     || document.value.branch != branch
+                    || !repository_matches_authorized(repository, &document.value.authorized_repository)
                     || document.value.semantic_digest != entry.semantic_digest
                     || document.value.canonical_payload_digest != entry.canonical_payload_digest
                     || document.value.manifest_digest != entry.manifest_digest
                     || !entry
                         .transport_digests
                         .contains(&document.value.transport_digest)
-                    || document
-                        .value
-                        .discoverability_subject_digests
-                        .get(&index_path)
-                        != Some(index_digest)
+                    // The mutable index may have advanced after this immutable receipt.
+                    || !document.value.discoverability_subject_digests.contains_key(&index_path)
                     || document.value.metadata_file_digests.get(&manifest_path)
                         != Some(&entry.manifest_digest)
                 {
@@ -1212,12 +1209,21 @@ fn read_json<T: DeserializeOwned>(
             "shard audit metadata budget exhausted".to_owned(),
         ));
     }
-    let document = RemoteShardReader::new(remote, policy.maximum_document_bytes.min(remaining))?
-        .read_json(repository, revision, path, cancellation)?;
+    let mut bytes = Vec::new();
+    let source = remote.read_committed_path(
+        repository,
+        revision,
+        path,
+        policy.maximum_document_bytes.min(remaining),
+        cancellation,
+        &mut bytes,
+    )?;
+    // Invalid JSON still consumed the bounded transfer budget.
     *metadata_bytes = metadata_bytes
-        .checked_add(document.source.size_bytes)
+        .checked_add(source.size_bytes)
         .ok_or_else(|| CacheError::ResourceLimit("audit metadata bytes exceed u64".to_owned()))?;
-    Ok(document)
+    let value = serde_json::from_slice(&bytes)?;
+    Ok(RemoteDocument { source, value })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1284,10 +1290,10 @@ fn canonical_payload_object_path(path: &str) -> bool {
     };
     digest.len() == 64
         && prefix.len() == 2
-        && prefix == &digest[..2]
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && prefix == &digest[..2]
 }
 
 fn report_unreferenced(
@@ -1829,5 +1835,131 @@ mod tests {
             issue.kind == ShardAuditIssueKind::InvalidPayloadBatchRecord
                 && issue.repository_path.as_deref() == Some(record_path.as_str())
         }));
+    }
+    #[test]
+    fn exhaustive_audit_unicode_object_names_do_not_panic() {
+        let name = format!("a\u{20ac}{}", "b".repeat(60));
+        assert_eq!(name.len(), 64);
+        assert!(!canonical_payload_object_path(&format!(
+            "objects/sha256/aa/{name}.part"
+        )));
+    }
+    #[test]
+    fn exhaustive_audit_malformed_json_consumes_the_metadata_budget() {
+        let remote = MemoryRemote {
+            revision: "revision".into(),
+            paths: BTreeMap::from([("broken.json".into(), b"invalid".to_vec())]),
+        };
+        let mut budget = policy();
+        budget.maximum_total_metadata_bytes = 7;
+        let mut consumed = 0;
+        let result = read_json::<serde_json::Value>(
+            &remote,
+            "team/shard",
+            "revision",
+            "broken.json",
+            &budget,
+            &CancellationToken::new(),
+            &mut consumed,
+        );
+        assert!(matches!(result, Err(CacheError::Serialization(_))));
+        assert_eq!(consumed, 7);
+        assert!(matches!(
+            read_json::<serde_json::Value>(
+                &remote,
+                "team/shard",
+                "revision",
+                "broken.json",
+                &budget,
+                &CancellationToken::new(),
+                &mut consumed
+            ),
+            Err(CacheError::ResourceLimit(_))
+        ));
+    }
+    #[test]
+    fn exhaustive_audit_receipt_survives_later_index_disposition_update() {
+        let mut remote = fixture();
+        let path = remote
+            .paths
+            .keys()
+            .find(|p| p.starts_with("indexes/"))
+            .unwrap()
+            .clone();
+        let mut index: ShardIndexPartition = serde_json::from_slice(&remote.paths[&path]).unwrap();
+        index.entries[0].disposition = ArtifactDisposition::Deprecated;
+        index.validate().unwrap();
+        insert_document(&mut remote.paths, &path, &index);
+        let report = audit_remote_shard(
+            &remote,
+            "team/shard",
+            "main",
+            &remote.revision,
+            "fixture-001",
+            &policy(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            report.complete_artifact_count, 1,
+            "a current index may change after an immutable receipt: {:?}",
+            report.issues
+        );
+    }
+    #[test]
+    fn exhaustive_audit_index_reader_version_must_match_manifest() {
+        let mut remote = repository_batch_fixture();
+        let path = remote
+            .paths
+            .keys()
+            .find(|p| p.starts_with("indexes/"))
+            .unwrap()
+            .clone();
+        let mut index: ShardIndexPartition = serde_json::from_slice(&remote.paths[&path]).unwrap();
+        index.entries[0].minimum_reader_version = ToolkitVersion::parse("0.13.1").unwrap();
+        insert_document(&mut remote.paths, &path, &index);
+        let report = audit_remote_shard(
+            &remote,
+            "team/shard",
+            "main",
+            &remote.revision,
+            "fixture-001",
+            &policy(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(report.complete_artifact_count, 0);
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.kind == ShardAuditIssueKind::InvalidManifest));
+    }
+    #[test]
+    fn exhaustive_audit_receipt_must_name_the_audited_repository() {
+        let mut remote = fixture();
+        let path = remote
+            .paths
+            .keys()
+            .find(|p| p.ends_with("/receipt.json"))
+            .unwrap()
+            .clone();
+        let mut receipt: PublicationReceipt = serde_json::from_slice(&remote.paths[&path]).unwrap();
+        receipt.authorized_repository = "different/repository".into();
+        insert_document(&mut remote.paths, &path, &receipt);
+        let report = audit_remote_shard(
+            &remote,
+            "team/shard",
+            "main",
+            &remote.revision,
+            "fixture-001",
+            &policy(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(report.complete_artifact_count, 0);
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.kind == ShardAuditIssueKind::InvalidReceipt));
     }
 }

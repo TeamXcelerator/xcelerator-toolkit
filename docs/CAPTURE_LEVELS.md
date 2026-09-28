@@ -63,10 +63,11 @@ other levels. An explicit policy can omit innovation cancellation or retain
 the historical two-moment capture. The policy enters the plan and child identity.
 Old serialized plans keep their old policy; they are not silently expanded.
 
-Extended policies use prefix semantics v3. Compatible retained matrices and
-eigenstates can be reused while computing the new child; `RequireReuse` fails
-until that requested child exists. The legacy two-moment policy retains v2
-identity and byte reuse. Exact nesting comparisons require explicit smaller
+Extended policies use prefix semantics v10; the two-moment policy uses v8.
+Both apply directed, scaled export checks and replay all numerical fields on
+cache reuse. Compatible retained matrices and eigenstates can be reused while
+computing the new child; `RequireReuse` fails until that requested child exists.
+Historical v1/v2/v3 observations keep their original labels and assurance. Exact nesting comparisons require explicit smaller
 sources through the retained-prefix example. See [prefix convergence](PREFIX_CONVERGENCE.md).
 
 Use `with_prefix_working_precision(512)` to analyze retained 256-bit source
@@ -143,10 +144,16 @@ for applications that need to control each phase themselves.
 `CaptureReceipt::is_complete()` reports completion of requested acquisition
 outcomes. A completed diagnostic report can contain failed exports or an
 unresolved numerical result. Inspect those fields separately. In particular,
-`resolution_tolerance_met` is `Some(false)` when the uniform-grid ladder is
-exhausted, `Some(true)` when applicable refinements pass, and `None` when no
-applicable refinement was requested. These are empirical checks, not rigorous
-error bounds.
+`CcmTargetDistanceHp::resolution_tolerance_met` describes the distances
+actually returned at Q: `Some(true)` requires every applicable Q/2Q comparison
+to pass, and `Some(false)` means at least one fails. The separate
+`resolution_ladder_tolerance_met` describes the last attempted adjacent pair,
+which may be 2Q/4Q. A passing later pair does not qualify the returned Q value.
+Both are `None` when no applicable refinement was requested. The capture
+diagnostic labels these scopes separately and retains the original evidence
+under `retained_evidence`. These are empirical agreement checks, not rigorous
+error bounds. Earlier reports with a single passing flag require inspection
+of their retained Q/2Q comparison before interpreting the Q-resolution value.
 
 Upgrading a Cargo dependency does not implement these application steps. A
 preexisting `--ultra` flag must be checked against this contract. Rebuild from
@@ -158,7 +165,7 @@ before scheduling a larger campaign.
 | Facility | How it is requested in v0.15.1 |
 |---|---|
 | Retained reduction similarity/orthogonality report | Supply `RetainedReductionRequest` to `execute_with_receipt_and_reduction` to execute and record it; the standalone `check_retained_reduction_via_cache` API also remains available |
-| Full Gauss--Legendre rule verification | Call `check_gauss_legendre_rule_hp` with an order budget; ordinary reads apply cheaper screens |
+| Full Gauss--Legendre rule verification | Every ordinary HP cache read performs the full O(n^2) check; `check_gauss_legendre_rule_hp` also exposes it with an explicit order budget |
 | Root and sector certificates | Request the corresponding certification APIs explicitly |
 | Additional prefix checkpoints and overlap eigenstates | Set checkpoints and supply their retained sources explicitly |
 | Frozen hypothesis scoring and replication packets | `evaluate_hypothesis_packet` retains selected bytes; `persist_hypothesis_evaluation` replay-checks and caches the packet with exact source dependencies |

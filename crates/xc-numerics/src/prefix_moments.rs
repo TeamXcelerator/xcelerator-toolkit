@@ -1,9 +1,11 @@
 //! Optional third inverse moment of the retained innovation Gram matrix.
 //! The two-mode fit is a model, never an identification of the full spectrum.
 use super::{lossless_decimal, PairwiseScratch};
+use crate::mpfr_interval::MpfrInterval as I;
 use anyhow::{bail, Result};
 use rayon::prelude::*;
-use rug::{Assign, Float};
+use rug::{ops::Pow, Assign, Float};
+pub const TWO_MODE_MOMENT_SEMANTICS: &str = "two-mode-directed-domain-conditioning-indicator-v2";
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -22,6 +24,7 @@ pub struct ThirdInverseMoment {
 #[serde(rename_all = "snake_case")]
 pub enum TwoModeMomentStatus {
     SingleDimension,
+    /// Algebraic point fit succeeded; neither conditioning nor relative accuracy is certified.
     Resolved,
     UnresolvedSeparation,
     OutsideTwoModeRange,
@@ -30,6 +33,9 @@ pub enum TwoModeMomentStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TwoModeMomentFit {
+    /// Computed u_p/r_fit^2 sensitivity indicator, not an error certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditioning_indicator: Option<String>,
     pub status: TwoModeMomentStatus,
     pub smallest_eigenvalue_estimate: Option<String>,
     pub second_eigenvalue_estimate: Option<String>,
@@ -40,6 +46,7 @@ pub struct TwoModeMomentFit {
 impl TwoModeMomentFit {
     fn unresolved(status: TwoModeMomentStatus) -> Self {
         Self {
+            conditioning_indicator: None,
             status,
             smallest_eigenvalue_estimate: None,
             second_eigenvalue_estimate: None,
@@ -63,6 +70,7 @@ pub(super) fn fit_two_modes(
         let mut closure = t1.clone() - &cube_root;
         closure /= t1;
         return TwoModeMomentFit {
+            conditioning_indicator: None,
             status: TwoModeMomentStatus::SingleDimension,
             smallest_eigenvalue_estimate: Some(lossless_decimal(
                 &(Float::with_val(p, 1) / cube_root),
@@ -81,8 +89,23 @@ pub(super) fn fit_two_modes(
     if q == 1 {
         return TwoModeMomentFit::unresolved(TwoModeMomentStatus::UnresolvedSeparation);
     }
-    if q.clone().square() < Float::with_val(p, 0.5) {
+    // Compare q^2=T3^2/T2^3 without a rounded square-root boundary.
+    // Overlap with the equal-mode boundary cannot establish OutsideTwoModeRange.
+    let domain = (|| -> std::result::Result<I, crate::interval::IntervalError> {
+        let two = I::from_float(t2, p)?;
+        I::from_float(t3, p)?.square().div(&two.square().mul(&two))
+    })();
+    let Ok(q_squared) = domain else {
+        return TwoModeMomentFit::unresolved(TwoModeMomentStatus::UnresolvedArithmetic);
+    };
+    if q_squared.validate().is_err() {
+        return TwoModeMomentFit::unresolved(TwoModeMomentStatus::UnresolvedArithmetic);
+    }
+    if q_squared.upper() < &Float::with_val(p, 0.5) {
         return TwoModeMomentFit::unresolved(TwoModeMomentStatus::OutsideTwoModeRange);
+    }
+    if q_squared.lower() <= &Float::with_val(p, 0.5) || q_squared.upper() >= &1 {
+        return TwoModeMomentFit::unresolved(TwoModeMomentStatus::UnresolvedSeparation);
     }
     // For s=mu1+mu2, x=s/sqrt(T2) is the root in [1,sqrt(2)] of
     // x^3-3x+2q=0. This branch is 2*cos(acos(-q)/3).
@@ -107,7 +130,12 @@ pub(super) fn fit_two_modes(
     }
     let mut closure = t1.clone() - &total;
     closure /= t1;
+    let ratio = Float::with_val(p, &mu2 / &mu1);
+    let guard = p.saturating_add(64).min(1_000_000);
+    let sensitivity =
+        Float::with_val(guard, 2).pow(-(p as i32)) / Float::with_val(guard, &ratio).square();
     TwoModeMomentFit {
+        conditioning_indicator: Some(lossless_decimal(&sensitivity)),
         status: TwoModeMomentStatus::Resolved,
         smallest_eigenvalue_estimate: Some(lossless_decimal(&(Float::with_val(p, 1) / &mu1))),
         second_eigenvalue_estimate: Some(lossless_decimal(&(Float::with_val(p, 1) / &mu2))),

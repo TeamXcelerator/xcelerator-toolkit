@@ -152,6 +152,8 @@ pub struct ResourceEstimate {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ResourceViolation {
     pub resource: ResourceKind,
+    /// Saturated lower bound if a sum of independently supplied components
+    /// exceeds u64::MAX. The original components remain in the report estimate.
     pub estimated: u64,
     pub maximum: u64,
     pub unit: String,
@@ -159,6 +161,15 @@ pub struct ResourceViolation {
 
 impl Display for ResourceViolation {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.resource == ResourceKind::Memory
+            && self.estimated == u64::MAX
+            && self.maximum == u64::MAX
+        {
+            return write!(
+                f,
+                "estimated memory component sum exceeds u64::MAX bytes and the policy ceiling"
+            );
+        }
         write!(
             f,
             "estimated {} {} {} exceeds policy {} {}",
@@ -182,6 +193,10 @@ impl ResourcePolicy {
         let mut violations = Vec::new();
         let mut unestimated = Vec::new();
 
+        let memory_overflow = estimate
+            .resident_memory_bytes
+            .zip(estimate.temporary_memory_bytes)
+            .is_some_and(|(resident, temporary)| resident.checked_add(temporary).is_none());
         let memory = match (
             estimate.resident_memory_bytes,
             estimate.temporary_memory_bytes,
@@ -199,6 +214,16 @@ impl ResourcePolicy {
             &mut violations,
             &mut unestimated,
         );
+        // Saturation is already greater than every smaller ceiling. At the
+        // largest representable ceiling, retain the strict overflow decision.
+        if memory_overflow && self.maximum_memory_bytes == Some(u64::MAX) {
+            violations.push(ResourceViolation {
+                resource: ResourceKind::Memory,
+                estimated: u64::MAX,
+                maximum: u64::MAX,
+                unit: "bytes".to_owned(),
+            });
+        }
         assess_u64(
             ResourceKind::TemporaryDisk,
             estimate.temporary_disk_bytes,
@@ -385,13 +410,16 @@ impl CancellationToken {
     }
 
     pub fn state(&self) -> CancellationState {
+        self.enforce_wall_deadline();
+        // cancel() writes both fields while holding this lock. Read the pair
+        // under that same lock so a concurrent cancellation cannot split it.
+        let reason = self
+            .reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         CancellationState {
-            requested: self.is_cancelled(),
-            reason: self
-                .reason
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone(),
+            requested: self.requested.load(Ordering::Acquire),
+            reason: reason.clone(),
         }
     }
 

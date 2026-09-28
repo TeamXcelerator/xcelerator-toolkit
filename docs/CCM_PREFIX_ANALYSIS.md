@@ -87,7 +87,7 @@ belong to `ccm-evidence` in both public and private catalogs. Public diagnostics
 require authenticated public parents and explicit source-publication eligibility;
 historical private children fail closed. Registration does not publish payloads.
 `check_retained_reduction_via_cache` adds source-bound, budgeted reduction checks
-without rebuilding the source. The new kind has producer/reader floor 0.15.0;
+without rebuilding the source. The kind has producer floor 0.15.0 and current producer requires reader 0.15.1;
 ordinary numerical artifact kind floors remain unchanged.
 
 Prefixes retain their largest-parent identity. They are not labeled as
@@ -112,7 +112,16 @@ from the decoded vectors. Generic cancellation-sensitive generator identities
 can use the same callback API. Passing a component/serialization screen is not
 an independent matrix-assembly cross-check or interval certificate.
 
-The current export gate uses scaled backward errors. It does not guarantee
+The current export gate uses directed upper bounds on
+`||A v-b||_2 / (||A||_F ||v||_2 + ||b||_2)` for the actual stored points.
+Exact binary scaling before norms and residual squaring prevents hidden
+underflow; eigenpair checks enclose the exact stored `lambda*v` product.
+Decoded norm-one checks and serialized error bounds round outward.
+Unsupported exponent spans are unresolved. Default/extended prefix identities
+are v8/v9, with minimum reader 0.15.1. Warm cache reuse requires an exact full
+report replay, including all moments and exports, at O(D^3) arithmetic cost.
+This uses retained inputs without rebuilding Tau matrices or eigenstates.
+The export gate uses backward errors. It does not guarantee
 relative forward accuracy of a deeply cancelled eigenvalue or identify a branch
 inside an unresolved cluster. The explicit retained source identity, vector
 preservation screen, and residual-matrix label must accompany every use.
@@ -173,3 +182,22 @@ cancellation explicitly. New Ultra plans select full capture. See
 [third-moment formulas, residual expansion and compatibility](PREFIX_CONVERGENCE.md).
 The factorization, independent innovation solves and moment accumulation now
 run in separate phases while preserving the legacy arithmetic and report bytes.
+
+
+### Retained-reduction cache replay (0.15.1)
+
+The prior retained-reduction reader checked shape, finite values, ordering,
+and self-reported residuals. A synthetic cache for diag(2,3) could return
+fabricated eigenvalues -999,-998 and a zero source norm with a passing verdict.
+The current reader recomputes the complete report from the retained matrix
+and requires exact equality, including Q-based diagnostics and the spectrum.
+Warm reuse therefore costs O(d^3). Fresh ordinary results use a process-local
+content seal; explicit verification modes replay. Canonical parent bindings
+remain required, and the original matrix is never reconstructed or replaced.
+
+The new child identity is `ccm-retained-reduction-v0.15.1-v3`, with minimum
+reader 0.15.1. The Householder calculation and payload's computed diagnostic
+assurance are unchanged. This is numerical replay, not an interval spectrum,
+positivity, branch, construction, or continuum certificate. Historical objects
+need fresh replay; this synthetic counterexample establishes no historical
+incidence.

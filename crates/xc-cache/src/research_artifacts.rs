@@ -161,7 +161,7 @@ impl CapturedDiagnostic {
         value: &T,
         sources: Vec<ArtifactManifest>,
     ) -> Result<Self, CacheError> {
-        let value = serde_json::to_value(value).map_err(|e| invalid(e.to_string()))?;
+        let value = xc_core::finite_json::to_value(value).map_err(|e| invalid(e.to_string()))?;
         xc_core::validate_secret_free(&value, "capture measurement")
             .map_err(|e| invalid(e.to_string()))?;
         Ok(Self { value, sources })
@@ -230,7 +230,7 @@ pub fn research_source_dependencies(
     let mut dependencies = Vec::new();
     for m in manifests {
         m.validate()?;
-        if m.quality.admissible_rank() < CacheQuality::Validated.admissible_rank() {
+        if !m.quality.satisfies(CacheQuality::Validated) {
             return Err(invalid("research source quality is below validated"));
         }
         dependencies.push(DependencyRef {
@@ -417,7 +417,7 @@ where
     P: Serialize,
     F: FnMut(&str) -> Result<CapturedDiagnostic, CaptureFailure>,
 {
-    let resolved_plan = serde_json::to_value(plan).map_err(|e| invalid(e.to_string()))?;
+    let resolved_plan = xc_core::finite_json::to_value(plan).map_err(|e| invalid(e.to_string()))?;
     xc_core::validate_secret_free(&resolved_plan, "capture plan")
         .map_err(|e| invalid(e.to_string()))?;
     let mut receipt = CaptureReceipt::new(&resolved_plan, requested.clone())
@@ -666,7 +666,7 @@ fn validate_managed_dependencies(
             ));
         }
         for dependency in dependencies.iter().filter(|d| identity(d) == actual) {
-            if source.quality.admissible_rank() < dependency.required_quality.admissible_rank() {
+            if !source.quality.satisfies(dependency.required_quality) {
                 return Err(invalid(
                     "managed research canonical source quality mismatch",
                 ));
@@ -769,7 +769,7 @@ mod tests {
             .unwrap();
             record.validate().unwrap();
             assert!(record.measurements.contains_key("next"));
-            if quality.admissible_rank() >= CacheQuality::Validated.admissible_rank() {
+            if quality.satisfies(CacheQuality::Validated) {
                 assert!(record.receipt.is_complete(), "{quality:?}");
                 assert_eq!(
                     record.source_dependencies[0].required_quality,

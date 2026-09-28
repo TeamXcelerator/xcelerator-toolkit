@@ -265,14 +265,24 @@ pub fn evaluate_large_corpus_acceptance(
             "large-corpus evidence must audit every routed shard".to_owned(),
         ));
     }
-    let corpus_logical_payload_bytes = observations
-        .iter()
-        .map(|observation| observation.logical_payload_bytes)
-        .sum::<u64>();
-    let sum_shard_unique_payload_bytes = observations
-        .iter()
-        .map(|observation| observation.unique_payload_bytes)
-        .sum::<u64>();
+    let corpus_logical_payload_bytes =
+        observations.iter().try_fold(0_u64, |sum, observation| {
+            sum.checked_add(observation.logical_payload_bytes)
+                .ok_or_else(|| {
+                    CacheError::ResourceLimit(
+                        "corpus logical_payload_bytes total exceeds u64".to_owned(),
+                    )
+                })
+        })?;
+    let sum_shard_unique_payload_bytes =
+        observations.iter().try_fold(0_u64, |sum, observation| {
+            sum.checked_add(observation.unique_payload_bytes)
+                .ok_or_else(|| {
+                    CacheError::ResourceLimit(
+                        "corpus unique_payload_bytes total exceeds u64".to_owned(),
+                    )
+                })
+        })?;
     if corpus_logical_payload_bytes < minimum_corpus_logical_bytes {
         return Err(CacheError::ResourceLimit(format!(
             "observed corpus has {corpus_logical_payload_bytes} logical bytes, below required {minimum_corpus_logical_bytes}"
@@ -650,5 +660,69 @@ mod tests {
             62_000_000_000,
         )
         .is_err());
+    }
+    #[test]
+    fn exhaustive_large_corpus_logical_total_overflow_returns_error() {
+        let mut observations = vec![
+            observation(
+                "restricted-shard-001",
+                62_000_000_000,
+                58_000_000_000,
+                98_000_000_000,
+                100_000_000,
+                100_000_000,
+            ),
+            observation(
+                "restricted-shard-002",
+                5_000_000_000,
+                4_000_000_000,
+                60_000_000_000,
+                1_000_000_000,
+                1_000_000_000,
+            ),
+        ];
+        let retrieval = SelectiveRetrievalObservation {
+            shard_id: "restricted-shard-001".to_owned(),
+            semantic_digest: ContentDigest::sha256(b"selected-configuration"),
+            manifest_digest: ContentDigest::sha256(b"selected-manifest"),
+            transport_digest: ContentDigest::sha256(b"selected-transport"),
+            receipt_digest: ContentDigest::sha256(b"selected-receipt"),
+            selected_logical_payload_bytes: 750_000_000,
+            metadata_bytes_read: 2_000_000,
+            payload_bytes_downloaded: 740_000_000,
+            reused_verified_part_bytes: 10_000_000,
+            peak_local_bytes: 1_500_000_000,
+            persistent_full_clone_bytes: 0,
+            decoded_payload_verified: true,
+        };
+        let publication = LargeCorpusPublicationObservation {
+            shard_id: "restricted-shard-002".to_owned(),
+            semantic_digest: ContentDigest::sha256(b"new-configuration"),
+            receipt_digest: ContentDigest::sha256(b"new-receipt"),
+            newly_committed_payload_bytes: 1_800_000_000,
+            newly_committed_metadata_bytes: 10_000_000,
+            projected_history_bytes: 20_000_000,
+            batch_payload_bytes: vec![1_000_000_000, 800_000_000],
+            maximum_part_bytes: 90 * 1024 * 1024,
+            accounted_before_bytes: 62_000_000_000,
+            accounted_after_bytes: 63_830_000_000,
+            persistent_full_clone_bytes: 0,
+            remote_payload_verified: true,
+            remote_receipt_verified: true,
+        };
+        observations[0].logical_payload_bytes = u64::MAX;
+        observations[1].logical_payload_bytes = 1;
+        assert!(matches!(
+            evaluate_large_corpus_acceptance(
+                &topology(),
+                "large-corpus",
+                CacheVisibility::Private,
+                &observations,
+                &retrieval,
+                &publication,
+                1
+            ),
+            Err(CacheError::ResourceLimit(_))
+        ));
     }
 }

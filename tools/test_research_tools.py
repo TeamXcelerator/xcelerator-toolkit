@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline regression tests for compact research navigation and operational summaries."""
 import hashlib,json,sqlite3,tempfile,unittest
+from contextlib import closing
 from pathlib import Path
 import research_query,publication_summary,prepare_atom_chunks
 
@@ -43,4 +44,189 @@ class Tools(unittest.TestCase):
    for c in p['band_chunks']:
     raw=(output/c['relative_path']).read_bytes();self.assertEqual(hashlib.sha256(raw).hexdigest(),c['sha256']);self.assertEqual(json.loads(raw.splitlines()[0]),row)
    with self.assertRaises(FileExistsError):prepare_atom_chunks.prepare(source,output,'band')
+class ExhaustiveTools(unittest.TestCase):
+ def test_exhaustive_packet_failure_rolls_back_prior_scalar_rows(self):
+  with tempfile.TemporaryDirectory() as t:
+   root=Path(t);packet=root/'partial.json';packet.write_text(json.dumps(dict(values={'good':'1'},rows=[dict(values=['bad'])])))
+   database=root/'index.sqlite';self.assertEqual(research_query.build([packet],database),0)
+   with closing(sqlite3.connect(database)) as c:
+    self.assertEqual(c.execute('select count(*) from measurements').fetchone()[0],0)
+    self.assertEqual(c.execute('select status from inventory').fetchone()[0],'unassessed')
+ def test_exhaustive_index_dimensions_do_not_use_sqlite_lossy_coercion(self):
+  for value in ['9007199254740993.0',1.5,True,1<<100]:
+   with self.subTest(value=value),tempfile.TemporaryDirectory() as t:
+    root=Path(t);packet=root/'report.json';packet.write_text(json.dumps(dict(n_modes=value,values={'energy':'1'})))
+    database=root/'index.sqlite';self.assertEqual(research_query.build([packet],database),0)
+    with closing(sqlite3.connect(database)) as c:
+     self.assertEqual(c.execute('select count(*) from measurements').fetchone()[0],0)
+     self.assertEqual(c.execute('select status from inventory').fetchone()[0],'unassessed')
+ def test_exhaustive_decimal_navigation_uses_ascii_grammar(self):
+  records=list(research_query.rows(Path('report.json'),dict(values={'ascii':'1.25e-10','unicode':'١.٢٥'})))
+  self.assertEqual([row['observable'] for row in records],['ascii'])
+ def test_exhaustive_atom_kind_rejected_before_output_creation(self):
+  with tempfile.TemporaryDirectory() as t:
+   root=Path(t);source=root/'atoms.jsonl';source.write_text(json.dumps(dict(ordinal=1,coordinate='1',weight='2',family='zero',partition='all'))+'\n')
+   output=root/'chunks'
+   with self.assertRaises(ValueError):prepare_atom_chunks.prepare(source,output,'unknown')
+   self.assertFalse(output.exists())
+ def test_exhaustive_malformed_publication_event_does_not_mutate_statistics(self):
+  with tempfile.TemporaryDirectory() as t:
+   p=Path(t)/'attempt.jsonl';p.write_text(json.dumps(dict(schema_version=1,phase='bad',elapsed_seconds=-1,details={'bytes':10}))+'\n')
+   result=publication_summary.summarize([p])['attempts'][0]
+   self.assertEqual(result['phases'],{});self.assertEqual(len(result['malformed']),1)
+ def test_exhaustive_nonobject_publication_event_is_reported(self):
+  with tempfile.TemporaryDirectory() as t:
+   p=Path(t)/'attempt.jsonl';p.write_text('[]\n')
+   result=publication_summary.summarize([p])['attempts'][0]
+   self.assertEqual(result['phases'],{});self.assertEqual(len(result['malformed']),1)
+ def test_exhaustive_publication_aggregate_overflow_and_bool_bytes(self):
+  with tempfile.TemporaryDirectory() as t:
+   p=Path(t)/'attempt.jsonl';p.write_text('\n'.join(json.dumps(dict(schema_version=1,phase='phase',elapsed_seconds=1e308,details={'bytes':True})) for _ in range(2))+'\n')
+   result=publication_summary.summarize([p])['attempts'][0]
+   self.assertEqual(result['phases']['phase']['seconds'],1e308)
+   self.assertEqual(result['phases']['phase']['calls'],1)
+   self.assertEqual(result['phases']['phase']['byte_counters'],{})
+   self.assertEqual(len(result['malformed']),1)
+
+import contextlib
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+import benchmark_publication_import as benchmark
+
+class PublicationImportIdentity(unittest.TestCase):
+    def invoke(self, source, digest, output):
+        with patch.object(sys,"argv",["benchmark_publication_import.py","--part",str(source),"--sha256",digest,"--output",str(output)]), contextlib.redirect_stdout(io.StringIO()):
+            benchmark.main()
+
+    def mutation_check(self, replacement):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);source=root/"input.bin";source.write_bytes(b"original retained evidence")
+            digest=hashlib.sha256(source.read_bytes()).hexdigest();output=root/"audit"
+            actual_run=subprocess.run;mutated=False
+            def mutate_after_verification(command,*args,**kwargs):
+                nonlocal mutated
+                if command[:2]==["git","init"] and not mutated:
+                    source.write_bytes(replacement);mutated=True
+                return actual_run(command,*args,**kwargs)
+            with patch.object(benchmark.subprocess,"run",side_effect=mutate_after_verification):
+                with self.assertRaisesRegex(SystemExit,"Imported.*digest|Imported.*size"):
+                    self.invoke(source,digest,output)
+            self.assertTrue(mutated)
+            self.assertFalse((output/"results.json").exists())
+
+    def test_same_length_source_replacement_is_not_reported_as_verified(self):
+        self.mutation_check(b"modified retained evidence")
+
+    def test_size_change_is_not_reported_with_stale_input_digest(self):
+        self.mutation_check(b"different source bytes with a changed length")
+
+    def test_four_policies_retain_verified_content_and_completion(self):
+        for payload in [b"", b"retained evidence\0" * 1000]:
+            with self.subTest(size=len(payload)), tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);source=root/"input.bin";source.write_bytes(payload)
+                digest=hashlib.sha256(payload).hexdigest();output=root/"audit"
+                self.invoke(source,digest,output)
+                report=json.loads((output/"results.json").read_text())
+                self.assertTrue(report["complete"])
+                self.assertEqual(report["input_bytes"],len(payload))
+                self.assertEqual(report["input_sha256"],digest)
+                self.assertEqual(len(report["rows"]),4)
+                for index,row in enumerate(report["rows"]):
+                    imported=subprocess.check_output(["git","-C",str(output/("repo-"+str(index))),"cat-file","blob",row["oid"]])
+                    self.assertEqual(imported,payload)
+
+    def test_invalid_or_wrong_digest_creates_no_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);source=root/"input.bin";source.write_bytes(b"evidence")
+            for digest in ["", "A"*64, "a"*63, "a"*64+"\n", "a"*64]:
+                output=root/"audit"
+                with self.assertRaises(SystemExit): self.invoke(source,digest,output)
+                self.assertFalse(output.exists())
+
+    def test_later_replacement_keeps_only_incomplete_verified_rows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);source=root/"input.bin";payload=b"original";source.write_bytes(payload)
+            digest=hashlib.sha256(payload).hexdigest();output=root/"audit"
+            actual_run=subprocess.run
+            def mutate(command,*args,**kwargs):
+                if command[:2]==["git","init"] and str(command[-1]).endswith("repo-2"):
+                    source.write_bytes(b"modified")
+                return actual_run(command,*args,**kwargs)
+            with patch.object(benchmark.subprocess,"run",side_effect=mutate):
+                with self.assertRaises(SystemExit):self.invoke(source,digest,output)
+            report=json.loads((output/"results.json").read_text())
+            self.assertFalse(report["complete"])
+            self.assertEqual(len(report["rows"]),2)
+            self.assertEqual(report["input_sha256"],digest)
+
+    def test_fingerprint_counts_bytes_and_enforces_limit(self):
+        data=b"a"*((1<<20)+1)
+        digest,size=benchmark.fingerprint(io.BytesIO(data),len(data))
+        self.assertEqual(digest,hashlib.sha256(data).hexdigest())
+        self.assertEqual(size,len(data))
+        with self.assertRaises(SystemExit):benchmark.fingerprint(io.BytesIO(data),len(data)-1)
+
+
+class OperationalQualificationGuards(unittest.TestCase):
+    def test_band_recovery_rejects_optimized_python_before_writes(self):
+        self.optimized_guard("benchmark_band_recovery.py","--output")
+    def test_backfill_acceptance_rejects_optimized_python_before_writes(self):
+        self.optimized_guard("test_research_backfill.py","--packets")
+    def optimized_guard(self,tool,option):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);output=root/"output";script=Path(__file__).resolve().parent/tool
+            result=subprocess.run([sys.executable,"-O",str(script),str(root/"absent-binary"),option,str(output)],capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn("requires Python without -O",result.stderr)
+            self.assertFalse(output.exists())
+    def test_band_arguments_fail_before_output_creation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);output=root/"output";script=Path(__file__).resolve().parent/"benchmark_band_recovery.py"
+            result=subprocess.run([sys.executable,str(script),sys.executable,"--output",str(output),"--degree","5"],capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertFalse(output.exists())
+
+
+class OperationalEnvironmentGuards(unittest.TestCase):
+    def test_synthetic_tools_clear_ambient_research_and_publication_configuration(self):
+        import benchmark_band_recovery, test_research_backfill
+        settings={"XC_RESEARCH_BASIS_BYTES":"1","XC_RESEARCH_SUMMARY_DIR":"outside",
+                  "XC_RESEARCH_CHECKPOINT_DIR":"outside", "XC_CACHE_ROOT":"outside",
+                  "XC_CACHE_REMOTE":"remote", "XC_PUBLISH_EXECUTE":"true",
+                  "PATH":os.environ.get("PATH","")}
+        with patch.dict(os.environ,settings,clear=True):
+            for module in [benchmark_band_recovery,test_research_backfill]:
+                env=module.local_environment()
+                self.assertFalse(any(k.startswith("XC_RESEARCH_") for k in env))
+                self.assertNotIn("XC_CACHE_ROOT",env)
+                self.assertEqual(env["XC_CACHE_REMOTE"],"none")
+                self.assertEqual(env["XC_PUBLISH_TARGET"],"none")
+                self.assertEqual(env["XC_PUBLISH_EXECUTE"],"false")
+                self.assertEqual(env["PATH"],settings["PATH"])
+
+
+
+
+class AtomLineBoundary(unittest.TestCase):
+ def test_limit_applies_to_normalized_line(self):
+  with tempfile.TemporaryDirectory() as temp:
+   root=Path(temp); source=root/'input.jsonl'
+   row=json.dumps(dict(coordinate='1',signed_weight='1',family=''))
+   for size,accepted in [(1<<20,False),((1<<20)-1,True)]:
+    source.write_bytes((row[:-2]+'x'*(size-len(row))+row[-2:]).encode('ascii'))
+    output=root/str(size)
+    if accepted:
+     result=prepare_atom_chunks.prepare(source,output,'band')
+     self.assertEqual(result['maximum_input_bytes'],1<<20)
+    else:
+     with self.assertRaisesRegex(ValueError,'normalized atom line'):prepare_atom_chunks.prepare(source,output,'band')
+
 if __name__=='__main__':unittest.main()

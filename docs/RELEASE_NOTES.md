@@ -1,5 +1,139 @@
 # Release notes
 
+## Unreleased: full-toolkit integrity repairs
+
+The full-toolkit review identified additional formula, rounding, validation and
+API-contract defects. These repairs align CCM discovery pole spacing with
+refinement, apply the CCM basis phase before Sonin compression, make mixed energy
+component selection explicit, and decide resolution acceptance from losslessly
+retained measurements with conservative arithmetic. Changed discovery, resolution
+and energy identities prevent reuse under obsolete request semantics.
+
+Root discovery preserves sampled endpoint zeros. Native Maynard adapters reject
+nonzero exact values lost during binary64 conversion or action arithmetic.
+Shift-invert callbacks must return finite values at the required precision.
+Eigenpair reports distinguish residual convergence, local Ritz separation and
+full-space numerical target ordering; none implies a new interval certificate.
+
+Cache repairs enforce dependency quality and revocation across reuse paths,
+reject cycles, bind capacity to the actual repository, and account for ledger
+bytes before admission. Root-only payload checks report Root; Full validation
+requires a completed matching dependency closure. Reader sessions clean their
+owned temporary Git state, with measured resource checks after fetch. Cache
+writes and staging metadata use atomic replacement and bounded decoding.
+
+Assurance requires explicit accepted comparison evidence for CrossChecked.
+Quadrature callers handle an optional persisted manifest. Archive receipts use
+valid calendar timestamps, exact fractional ordering and artifact-bound
+provenance digests. Independent PARI/GP eigenvalue fixtures are restored.
+
+Historical research outputs require replay where affected; this repair does not certify
+all past results or establish universal numerical correctness.
+
+## 0.15.2 (2026-09-28)
+
+Adaptive root cache validation replays its directed witness at the recorded
+verification precision and binds the stored correction to that verified value.
+This fixes valid high-cancellation root replays being rejected and inconsistent
+correction diagnostics being accepted. Automatic polynomial preparation streams
+exact head coefficients, preserving its rounding checks while avoiding excessive
+aggregate coefficient storage.
+
+Release source digests now include Cargo configuration and toolchain files.
+Development/test builds disable incremental compilation and debug information
+by default, retaining their assertions and overflow checks.
+
+The consolidated release also includes the following repairs. Native symmetric eigensystems pair eigenvalues with their own columns
+and verify residuals and orthogonality. HP inverse iteration checks the requested
+eigenvalue pairing and retries with a smaller shift; retained solver semantics
+advance to the pairing-aware v4/v5 identities. Selected eigenvector recovery
+carries the validated Sturm interval uncertainty through residual and pairing
+checks; recovery for a supplied point eigenvalue retains its strict gate.
+Generalized solvers use successive
+iterates for stability and report inadequate dense backward accuracy as approximate.
+The dense generalized reference exposes a configurable backward-error tolerance.
+
+Quadrature validation checks per-node Newton corrections and absolute weight
+defects while preserving the earlier diagnostic fields. Gap certificates require
+adjacent, consistently indexed clusters and reject index-count overflow. Native
+CCM root discovery searches multiple roots per pole gap and the exterior window;
+its binary64 estimates remain exploratory and do not certify completeness.
+
+Conditional tail energy perturbation budgets now use exact stored Gram algebra
+and upward rounding. They assume the supplied tail spectral-norm error and do
+not include numerical eigensolve or source assembly error. Publication metadata
+also binds the actual source-content hash, including uncommitted changes, beside
+the Git base revision.
+
+Logarithms are rounded from the exact declared cutoff, including cutoffs close
+to one. Roots, conditioning, and point-source certificates share one documented
+stored-length and pole-spacing convention; new certificate schemas and cache
+identities reject obsolete arithmetic. Legacy response repair preserves its
+original pole geometry. Finite tail-model matrix products retain cancellation.
+
+Finite matrix assembly now uses directed transcendental bounds and exact stored
+component sums. Integral, prime, and Tau cache identities require v0.15.2;
+standalone Tau files require schema 3 and the current arithmetic stamp.
+Automatic polynomial preparation uses convention v4, correctly rounded point
+stages, and an exact dyadic head-plus-tail decomposition. Representation precision
+may increase to preserve that decomposition; this does not add source accuracy.
+
+Publication attempts now carry fresh OS-backed identifiers so concurrent identical
+commits cannot silently bypass an expected-revision lease. Blob prefetch checks
+per-path and aggregate payload limits, and prepared publication inputs are
+revalidated before staging. Git payload admission limits are distinct from a
+byte-exact network traffic quota.
+
+U-flow derivatives now retain directed bounds through component summation,
+with exact symmetry grouping to preserve canceled components. Retained matrix
+admission rejects invalid precision stamps, mutable sources and overflowing
+shapes. A checked certificate root-selection accessor is available.
+
+Prime response actions and research aggregate-prime matrices now use directed
+transcendental bounds with exact coefficient grouping and final rounding checks.
+Exact-cutoff research aggregate-prime edges remain zero, and small near-edge
+contributions are preserved. HP matrix components instead use their documented
+stored-length point stages; these contracts are distinct.
+Affected response/research identities require v0.15.2; unresolved rounding and
+resource exhaustion return errors. These point guarantees do not certify
+quadrature truncation or total operator source error.
+
+This release collects mathematics, precision, validation, and cache-integrity
+repairs. Local optimized HP/Arb and native Windows qualification included 20
+isolated numerical tests and the 401-by-401, 9,000-bit cutoff-free certificate,
+covering 103 repaired reproduced failure cases and 3,901 exact-rational or
+directed-reference cases.
+The recovered original fixtures were subsequently replayed, and the live
+historical-fixture check verifies rejection of an actively revoked manifest.
+Native Windows HP/FLINT and 32-bit execution remain unqualified.
+Successful finite checks do not establish a universal defect-free guarantee.
+
+Repairs include exact-source boundary handling, robust eigenvalue and root
+calculations, correctly rounded response arithmetic, conservative residual
+acceptance, retained artifact identity checks, and Git blob/size and revision
+validation. Numerical outputs and cache arithmetic identities can change.
+Existing evidence is preserved; historical payloads are not relabeled as
+results of the corrected algorithms. See [numerical compatibility](NUMERICAL_COMPATIBILITY.md).
+
+Default HP independent root discovery now isolates the exact stored rational
+source throughout the requested finite window. Exact decimal endpoint membership,
+repeated-root rejection, representable distinct seeds, and root assignment checks
+replace the sampled scan; old discovery payloads cannot satisfy the new identity.
+
+Standalone Tau and eigenvector saves validate shape, finite values, and source
+precision before replacing data. Compressed parts have verified immutable content
+identities; a manifest and file locks coordinate complete generations. Compatible legacy ZIP
+inputs remain readable when no new generation is present; obsolete numerical
+arithmetic identities require recomputation. Obsolete generations
+are retained for reader safety and may require offline disk cleanup.
+
+Research Schur and root-transfer reports use schema 2 and identify their exact
+stored-point arithmetic. Schur prefixes are bounded to 256 directions with a
+64 Mbit rational workspace budget. Outputs can change where previous arithmetic
+lost input bits or cancellation terms. Exact finite algebra does not bound source
+assembly error or certify continuum claims. Saved f64 observations now reject
+wrapped dimensions, nonfinite digest inputs, and nonpositive spectral entries.
+
 ## 0.15.1
 
 Generic Gaussian target series now use a remaining-tail bound for each
@@ -29,10 +163,9 @@ revocation of the named manifest instead of bypassing them through old batch pro
 
 The f64 archimedean origin guard now uses the correct off-diagonal limit
 `-1/L`, with direct-integrand and quadrature-reachability regressions. The
-guard is inactive for integer cutoffs `C>=2`, including Claim 1a, but can be
+guard is inactive for integer cutoffs `C>=2` but can be
 reached at fractional cutoffs near 1. That origin-limit fix did not change
-the HP matrix builder; separate HP formula corrections are tracked by the
-full mathematics audit.
+the HP matrix builder.
 
 Checkpoint I/O is quiet by default, with stage heartbeats and errors retained.
 Comparison discovery follows authenticated published factor/sector ancestry.
@@ -65,7 +198,7 @@ Windows CRLF-based identities. No old artifact is relabeled or deleted.
 Complete qualification enforces committed sources and raw-byte checks, and both
 compact-export consumers reject malformed field policies consistently.
 
-Audit hardening applies parent visibility uniformly at publication routing, binds
+Hardening applies parent visibility uniformly at publication routing, binds
 local checkpoints to source/build identity, always replays supplied source certificates,
 and distinguishes finite enclosures in receipt coverage. Scoring-root ordering/count,
 Arb failure paths, frozen input bytes and same-size Git-object mutations are checked.
@@ -497,7 +630,7 @@ publication.
   reporting a missing dependency after computation. Historical inventories
   are read once per shard revision and remain bounded. Regression tests cover
   both the reused-parent/unstaged-grandparent shape and the superseded-index
-  dependency that interrupted the Claim 2b HP-1000 sweep.
+  dependency that interrupted an HP-1000 sweep.
 - Reopened publication staging is completed rather than trusted: closure
   walks traverse the dependencies of already-staged artifacts and suppress
   only their re-recording, so a staging directory left by an interrupted or

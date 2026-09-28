@@ -1,196 +1,246 @@
 // Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.®)
 // All rights reserved. See LICENSE in the repository root.
 
-//! Suzuki screw function `g(t)` (arXiv:2606.09096), high-precision.
-//!
-//! ```text
-//!   g(t) = −4(e^{t/2}+e^{−t/2}−2)
-//!        + Σ_{n ≤ exp|t|} (Λ(n)/n)(|t|−log n)
-//!        − (|t|/2)(ψ(1/4) − log π)
-//!        − (1/4)(Φ(1,2,1/4) − e^{−|t|/2} Φ(e^{−2|t|},2,1/4))
-//! ```
-//! with `Λ` von Mangoldt, `ψ` digamma, `Φ` Hurwitz–Lerch zeta. Closed-form
-//! constants (all HP, from rug): `ψ(1/4) = −γ − π/2 − 3 ln 2`,
-//! `Φ(1,2,1/4) = π² + 8·G` (G = Catalan).
-//!
-//! This is the continuous kernel of the localized Weil-form convolution
-//! operator `G_a` in Suzuki's framework. It is provided for direct study
-//! of the screw function (e.g. verifying the large-`|t|` prime-sum
-//! asymptotic `S(t) ≈ ½t² − γ|t|`).
-//!
-//! NOTE on the plunge eigenvalue `λ_a` (the CCM floor `D_Primes = −log₁₀ λ_a`):
-//! it is **not** computed here by Nyström/quadrature of `g`. Resolving an
-//! exponentially small eigenvalue requires HP-*exact* matrix entries, which
-//! kernel quadrature cannot deliver (its `~1/n²` error swamps `λ_a ~ 10^{−500}`
-//! and breaks positivity). The plunge is computed by the HP-exact Galerkin
-//! Weil form in [`crate::ccm::hp::weil_spectrum_hp`] (the same operator,
-//! `A_a` = Friedrichs extension of the localized Weil form, Suzuki Thm 1.1),
-//! which additionally supports an archimedean-only mode (prime sum off) for
-//! the prefactor decomposition test.
+//! Computed Suzuki screw function g=-Psi, Suzuki (2023), Eq. (1.1):
+//! <https://doi.org/10.1112/jlms.12785>. Prime weights are Lambda(n)/sqrt(n).
+//! The evaluator is a finite-precision point calculation, not an enclosure.
+//! Its cached prime support covers |t| <= 2*a_max. Near zero a convergent
+//! expansion isolates the t*log(t) cusp; the direct Lerch series is used away
+//! from zero with an explicit geometric tail stopping test.
 
-use rug::float::Constant;
-use rug::ops::Pow;
+use crate::ccm::try_prime_powers_up_to;
+use anyhow::{bail, Result};
+use rug::float::{Constant, Round};
+use rug::ops::{DivAssignRound, MulAssignRound};
 use rug::Float;
 
-use crate::ccm::prime_powers_up_to;
+/// Earlier v1 code incorrectly used Lambda(n)/n and silently truncated the
+/// Lerch sum. Results from that kernel do not represent Suzuki's function.
+pub const SCREW_SEMANTICS_VERSION: &str = "suzuki-sqrt-prime-cusp-v2";
 
-/// Precomputed screw-function evaluator at a fixed precision, valid for
-/// `|t| ≤ 2·a_max` (caches the von Mangoldt terms with `n ≤ e^{2 a_max}`).
 pub struct ScrewKernel {
     prec: u32,
-    /// `−(ψ(1/4) − log π)/2`, the coefficient of `|t|`.
+    output_prec: u32,
+    maximum_argument: Float,
     dig_coef: Float,
-    /// `Φ(1,2,1/4) = π² + 8·Catalan`.
     phi1: Float,
-    /// von Mangoldt support: `(n = p^k, log p)` for `n ≤ e^{2 a_max}`.
+    cusp_coef: Float,
     vm: Vec<(u64, Float)>,
 }
 
 impl ScrewKernel {
-    /// Build the evaluator at `prec` bits. `a_max = log λ_max`; primes up to
-    /// `e^{2 a_max}` (= `λ_max²`) are enumerated for the von Mangoldt sum.
-    /// (`a_max` only sizes the prime list — an integer count — so f64 is fine
-    /// here; all kernel arithmetic is HP.)
+    /// Construct the point evaluator; panics on an invalid domain.
+    /// Use `try_new` for fallible construction.
     pub fn new(a_max: f64, prec: u32) -> Self {
+        Self::try_new(a_max, prec).expect("valid screw-function domain required")
+    }
+
+    pub fn try_new(a_max: f64, output_prec: u32) -> Result<Self> {
+        if !a_max.is_finite() || a_max < 0.0 || !(32..=1_000_000).contains(&output_prec) {
+            bail!("screw kernel requires finite nonnegative support and precision 32..=1000000");
+        }
+        let prec = output_prec + 64;
+        let maximum_argument: Float = Float::with_val(prec, a_max) * 2u32;
+        let mut limit: Float = maximum_argument.clone();
+        limit.exp_round(Round::Up);
+        let bound = limit
+            .to_integer_round(Round::Up)
+            .and_then(|(n, _)| n.to_u64())
+            .ok_or_else(|| anyhow::anyhow!("screw prime support exceeds u64 range"))?;
+        if usize::try_from(bound)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .is_none()
+        {
+            bail!("screw prime support exceeds the platform index range");
+        }
         let pi = Float::with_val(prec, Constant::Pi);
         let ln2 = Float::with_val(prec, Constant::Log2);
         let euler = Float::with_val(prec, Constant::Euler);
-        let catalan = Float::with_val(prec, Constant::Catalan);
-
-        // ψ(1/4) = −γ − π/2 − 3 ln2
-        let mut psi_quarter = -Float::with_val(prec, &euler);
-        {
-            let mut half_pi = Float::with_val(prec, &pi);
-            half_pi /= 2u32;
-            psi_quarter -= &half_pi;
-        }
-        {
-            let mut three_ln2 = Float::with_val(prec, &ln2);
-            three_ln2 *= 3u32;
-            psi_quarter -= &three_ln2;
-        }
-        // dig_coef = −(ψ(1/4) − log π)/2
-        let ln_pi = Float::with_val(prec, &pi).ln();
-        let mut dig_coef = Float::with_val(prec, &psi_quarter);
-        dig_coef -= &ln_pi;
-        dig_coef /= -2i32;
-
-        // Φ(1,2,1/4) = π² + 8·Catalan
-        let mut phi1 = Float::with_val(prec, &pi);
-        phi1 *= &pi;
-        {
-            let mut eight_g = Float::with_val(prec, &catalan);
-            eight_g *= 8u32;
-            phi1 += &eight_g;
-        }
-
-        // von Mangoldt terms n = p^k ≤ e^{2 a_max} = λ_max²
-        let bound = (a_max * 2.0).exp().floor() as u64 + 1;
-        let vm: Vec<(u64, Float)> = prime_powers_up_to(bound)
+        let mut dig_coef = Float::with_val(prec, &pi / 2);
+        dig_coef += &euler;
+        dig_coef += Float::with_val(prec, ln2 * 3);
+        dig_coef += pi.clone().ln();
+        dig_coef /= 2;
+        let mut phi1 = Float::with_val(prec, &pi * &pi);
+        phi1 += Float::with_val(prec, Constant::Catalan) * 8;
+        let mut cusp_coef = Float::with_val(prec, &pi * 2).ln();
+        cusp_coef += euler;
+        cusp_coef -= 1;
+        cusp_coef /= 2;
+        let vm = try_prime_powers_up_to(bound)?
             .into_iter()
-            .map(|(pk, p, _k)| (pk, Float::with_val(prec, p).ln()))
+            .map(|(n, p, _)| (n, Float::with_val(prec, p).ln()))
             .collect();
-
-        ScrewKernel {
+        Ok(Self {
             prec,
+            output_prec,
+            maximum_argument,
             dig_coef,
             phi1,
+            cusp_coef,
             vm,
-        }
+        })
     }
 
-    /// Hurwitz–Lerch `Φ(z,2,1/4) = Σ_{k≥0} z^k/(k+1/4)²` for `0 ≤ z < 1`,
-    /// summed to working precision.
-    fn lerch_phi2(&self, z: &Float) -> Float {
-        let prec = self.prec;
-        let mut sum = Float::with_val(prec, 0);
-        let mut zpow = Float::with_val(prec, 1); // z^k
-        let tol = Float::with_val(prec, 2).pow(-((prec as i32) + 8));
-        let mut k: u64 = 0;
-        let max_terms: u64 = 50_000_000;
-        loop {
-            let mut denom = Float::with_val(prec, k);
-            denom += Float::with_val(prec, 0.25);
-            denom *= Float::with_val(prec, &denom);
-            let mut term = Float::with_val(prec, &zpow);
-            term /= &denom;
-            sum += &term;
-            zpow *= z;
-            k += 1;
-            if term.abs() < tol && k > 4 {
-                break;
-            }
-            if k >= max_terms {
-                break;
-            }
+    /// Evaluate with explicit support, arithmetic, and convergence errors.
+    pub fn try_eval(&self, t: &Float) -> Result<Float> {
+        if !t.is_finite() || t.clone().abs() > self.maximum_argument {
+            bail!("screw argument is nonfinite or outside the cached prime support");
         }
-        sum
-    }
-
-    /// Evaluate `g(t)` at working precision. Even in `t`.
-    pub fn eval(&self, t: &Float) -> Float {
-        let prec = self.prec;
-        let at = Float::with_val(prec, t).abs();
+        let at = Float::with_val(self.prec, t).abs();
         if at.is_zero() {
-            return Float::with_val(prec, 0);
+            return Ok(Float::with_val(self.output_prec, 0));
         }
-
-        // arch = −4(2 cosh(|t|/2) − 2)
-        let mut half = Float::with_val(prec, &at);
-        half /= 2u32;
-        let cosh = half.cosh();
-        let mut arch = Float::with_val(prec, &cosh);
-        arch *= 2u32;
-        arch -= 2u32;
-        arch *= -4i32;
-
-        // prime sum: Σ_{n ≤ e^{|t|}} (log p / n)(|t| − log n)
-        let limit = Float::with_val(prec, &at).exp();
-        let mut psum = Float::with_val(prec, 0);
+        let mut g = if at <= 0.5 {
+            self.local_cusp(&at)?
+        } else {
+            self.direct_archimedean(&at)?
+        };
+        let limit = at.clone().exp();
         for (n, logp) in &self.vm {
-            let nf = Float::with_val(prec, *n);
+            let nf = Float::with_val(self.prec, *n);
             if nf > limit {
                 break;
             }
-            let mut term = Float::with_val(prec, logp);
-            term /= &nf;
-            let mut bracket = Float::with_val(prec, &at);
-            bracket -= Float::with_val(prec, *n).ln();
-            term *= &bracket;
-            psum += &term;
+            let mut term = Float::with_val(self.prec, logp / nf.clone().sqrt());
+            term *= Float::with_val(self.prec, &at - nf.ln());
+            g += term;
         }
-
-        // digamma linear term
-        let mut dig = Float::with_val(prec, &self.dig_coef);
-        dig *= &at;
-
-        // Lerch term
-        let mut z = Float::with_val(prec, &at);
-        z *= -2i32;
-        z = z.exp();
-        let phi2 = self.lerch_phi2(&z);
-        let mut em = Float::with_val(prec, &at);
-        em /= -2i32;
-        em = em.exp();
-        let mut lerch = Float::with_val(prec, &self.phi1);
-        {
-            let mut t2 = Float::with_val(prec, &em);
-            t2 *= &phi2;
-            lerch -= &t2;
+        if !g.is_finite() {
+            bail!("screw arithmetic is outside the finite exponent range");
         }
-        lerch /= -4i32;
+        let output = Float::with_val(self.output_prec, g);
+        if !output.is_finite() {
+            bail!("screw output cannot be represented");
+        }
+        Ok(output)
+    }
 
-        let mut g = arch;
-        g += &psum;
-        g += &dig;
-        g += &lerch;
-        g
+    /// Compatibility point API. An invalid/out-of-support/unresolved evaluation
+    /// returns NaN; callers requiring an error description should use try_eval.
+    pub fn eval(&self, t: &Float) -> Float {
+        self.try_eval(t)
+            .unwrap_or_else(|_| Float::with_val(self.output_prec, rug::float::Special::Nan))
+    }
+
+    fn pole_term(&self, t: &Float) -> Float {
+        // -8(cosh(t/2)-1) = -16*sinh(t/4)^2, avoiding cancellation at zero.
+        let mut value = Float::with_val(self.prec, t / 4).sinh();
+        value.square_mut();
+        value *= -16;
+        value
+    }
+
+    fn direct_archimedean(&self, t: &Float) -> Result<Float> {
+        let z = Float::with_val(self.prec, t * -2).exp();
+        if !(0..1).contains(&z) {
+            bail!("invalid direct Lerch argument");
+        }
+        let one = Float::with_val(self.prec, 1);
+        let gap = Float::with_val_round(self.prec, &one - &z, Round::Down).0;
+        let tolerance = Float::with_val(self.prec, 1) >> (self.output_prec + 24);
+        let mut sum = Float::with_val(self.prec, 0);
+        let mut power = one.clone();
+        let mut power_upper = one;
+        let mut converged = false;
+        for k in 0..50_000_000u64 {
+            let denominator = Float::with_val(self.prec, k) + Float::with_val(self.prec, 0.25);
+            let denominator = denominator.square();
+            sum += Float::with_val(self.prec, &power / denominator);
+            power *= &z;
+            power_upper.mul_assign_round(&z, Round::Up);
+            let next_denominator =
+                Float::with_val(self.prec, k + 1) + Float::with_val(self.prec, 0.25);
+            let next_denominator = next_denominator.square();
+            let mut tail = power_upper.clone();
+            tail.div_assign_round(next_denominator, Round::Up);
+            tail.div_assign_round(&gap, Round::Up);
+            if tail <= tolerance {
+                converged = true;
+                break;
+            }
+        }
+        if !converged {
+            bail!("Lerch series exhausted its term budget before establishing the tail tolerance");
+        }
+        let exponential = Float::with_val(self.prec, t / -2).exp();
+        let mut lerch = Float::with_val(self.prec, exponential * sum);
+        lerch -= &self.phi1;
+        lerch /= 4;
+        let mut value = self.pole_term(t);
+        value += Float::with_val(self.prec, t * &self.dig_coef);
+        value += lerch;
+        Ok(value)
+    }
+
+    fn local_cusp(&self, t: &Float) -> Result<Float> {
+        // H(z)=z*exp(-z/2)/(1-exp(-2z))=sum h_n*z^n.
+        // H is analytic on |z|<=1 with |H|<2 there. Cauchy's estimate gives
+        // |h_n|<=2. Integrating H(t)/t twice and matching Suzuki's linear
+        // term gives g_arch=t*log(t)/2+A*t+pole+sum h_n*t^(n+1)/(n*(n+1)).
+        // At 0<t<=1/2, the remainder after n is bounded by
+        // 2*t^(n+2)/((n+1)*(n+2)*(1-t)). This controls truncation, not all
+        // rounding errors of the computed point evaluation.
+        let one = Float::with_val(self.prec, 1);
+        let gap = Float::with_val_round(self.prec, &one - t, Round::Down).0;
+        let mut target = Float::with_val(self.prec, 1) >> (self.output_prec + 24);
+        target.mul_assign_round(t, Round::Down);
+        if target.is_zero() {
+            bail!("local screw tolerance is outside the exponent range");
+        }
+        let mut power_upper = Float::with_val_round(self.prec, t * t, Round::Up).0;
+        let mut terms = 0usize;
+        for n in 1..=50_000usize {
+            power_upper.mul_assign_round(t, Round::Up);
+            let mut tail = power_upper.clone();
+            tail *= 2;
+            tail.div_assign_round(((n + 1) * (n + 2)) as u64, Round::Up);
+            tail.div_assign_round(&gap, Round::Up);
+            if tail <= target {
+                terms = n;
+                break;
+            }
+        }
+        if terms == 0 {
+            bail!("local screw expansion exhausted its term budget");
+        }
+        let mut h = vec![Float::with_val(self.prec, 0.5)];
+        let mut q = vec![Float::with_val(self.prec, 2)];
+        let mut numerator = Float::with_val(self.prec, 1);
+        let mut power = Float::with_val(self.prec, t * t);
+        let mut correction = Float::with_val(self.prec, 0);
+        for n in 1..=terms {
+            numerator /= -((2 * n) as i64);
+            let mut qn = q[n - 1].clone();
+            qn *= -2;
+            qn /= (n + 1) as u64;
+            q.push(qn);
+            let mut hn = numerator.clone();
+            for j in 1..=n {
+                hn -= Float::with_val(self.prec, &q[j] * &h[n - j]);
+            }
+            hn /= 2;
+            let mut term = Float::with_val(self.prec, &hn * &power);
+            term /= (n * (n + 1)) as u64;
+            correction += term;
+            h.push(hn);
+            power *= t;
+        }
+        let mut value = t.clone().ln();
+        value /= 2;
+        value += &self.cusp_coef;
+        value *= t;
+        value += self.pole_term(t);
+        value += correction;
+        Ok(value)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rug::ops::Pow;
 
     fn hp(prec: u32, s: &str) -> Float {
         Float::with_val(prec, Float::parse(s).unwrap())
@@ -209,13 +259,14 @@ mod tests {
 
     #[test]
     fn screw_matches_reference_values() {
-        // Reference values from an independent mpmath implementation (dps 45).
+        // Suzuki Eq. (1.1), checked independently with mpmath at 110 digits.
+        // The old reference implemented the same incorrect 1/n prime weight.
         let prec = 200;
         let k = ScrewKernel::new(2.0, prec);
         let cases = [
             ("0.1", "-0.05313043381777025410005234409146544184755"),
-            ("1.3", "-0.1791568325469816597486516426489133658077"),
-            ("2.5", "-1.67642704153778873062948748617520315582"),
+            ("1.3", "-0.038051765345468303856907782341990310938341428574467447142839022070640833355433078883929453694652"),
+            ("2.5", "-0.048434868673898385098113853248465872741517281005273632964992079581229773638501528956611409456007"),
         ];
         for (t_s, ref_s) in cases {
             let g = k.eval(&hp(prec, t_s));

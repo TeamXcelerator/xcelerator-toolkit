@@ -1,0 +1,2954 @@
+{
+  "method": "Independent Python Fraction finite block formulas, exact rational comparisons and dyadic inputs; decimal reference strings computed at 200 dps. External block premises not certified.",
+  "cases": [
+    {
+      "input": {
+        "upper_trial_energy": "2",
+        "low_block_lower_bound": "1",
+        "high_block_lower_bound": "6",
+        "cross_block_norm_bound": "3"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "2.0",
+        "low_block_lower_bound": "1.0",
+        "high_block_lower_bound": "6.0",
+        "cross_block_norm_bound": "3.0",
+        "denominator": "4.0",
+        "conditional_energy_allowance": "2.25",
+        "conditional_vector_allowance": "0.75",
+        "trial_energy_magnitude": "2.0",
+        "allowance_to_trial_energy_magnitude": "1.125",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "2",
+          "1"
+        ],
+        "low_block_lower_bound": [
+          "1",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "6",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "3",
+          "1"
+        ],
+        "denominator": [
+          "4",
+          "1"
+        ],
+        "conditional_energy_allowance": [
+          "9",
+          "4"
+        ],
+        "conditional_vector_allowance": [
+          "3",
+          "4"
+        ],
+        "trial_energy_magnitude": [
+          "2",
+          "1"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "9",
+          "8"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0",
+        "low_block_lower_bound": "0",
+        "high_block_lower_bound": "1",
+        "cross_block_norm_bound": "1"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "0.0",
+        "low_block_lower_bound": "0.0",
+        "high_block_lower_bound": "1.0",
+        "cross_block_norm_bound": "1.0",
+        "denominator": "1.0",
+        "conditional_energy_allowance": "1.0",
+        "conditional_vector_allowance": "1.0",
+        "trial_energy_magnitude": "0.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "0",
+          "1"
+        ],
+        "low_block_lower_bound": [
+          "0",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "1",
+          "1"
+        ],
+        "denominator": [
+          "1",
+          "1"
+        ],
+        "conditional_energy_allowance": [
+          "1",
+          "1"
+        ],
+        "conditional_vector_allowance": [
+          "1",
+          "1"
+        ],
+        "trial_energy_magnitude": [
+          "0",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-1",
+        "low_block_lower_bound": "-2",
+        "high_block_lower_bound": "0",
+        "cross_block_norm_bound": "1"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-1.0",
+        "low_block_lower_bound": "-2.0",
+        "high_block_lower_bound": "0.0",
+        "cross_block_norm_bound": "1.0",
+        "denominator": "1.0",
+        "conditional_energy_allowance": "1.0",
+        "conditional_vector_allowance": "1.0",
+        "trial_energy_magnitude": "1.0",
+        "allowance_to_trial_energy_magnitude": "1.0",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-1",
+          "1"
+        ],
+        "low_block_lower_bound": [
+          "-2",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "0",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "1",
+          "1"
+        ],
+        "denominator": [
+          "1",
+          "1"
+        ],
+        "conditional_energy_allowance": [
+          "1",
+          "1"
+        ],
+        "conditional_vector_allowance": [
+          "1",
+          "1"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "1",
+        "low_block_lower_bound": "0",
+        "high_block_lower_bound": "2",
+        "cross_block_norm_bound": "1"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "1.0",
+        "low_block_lower_bound": "0.0",
+        "high_block_lower_bound": "2.0",
+        "cross_block_norm_bound": "1.0",
+        "denominator": "1.0",
+        "conditional_energy_allowance": "1.0",
+        "conditional_vector_allowance": "1.0",
+        "trial_energy_magnitude": "1.0",
+        "allowance_to_trial_energy_magnitude": "1.0",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "1",
+          "1"
+        ],
+        "low_block_lower_bound": [
+          "0",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "2",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "1",
+          "1"
+        ],
+        "denominator": [
+          "1",
+          "1"
+        ],
+        "conditional_energy_allowance": [
+          "1",
+          "1"
+        ],
+        "conditional_vector_allowance": [
+          "1",
+          "1"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "1",
+        "low_block_lower_bound": "0",
+        "high_block_lower_bound": "1",
+        "cross_block_norm_bound": "1"
+      },
+      "valid_margin": false,
+      "reference": {
+        "upper_trial_energy": "1.0",
+        "low_block_lower_bound": "0.0",
+        "high_block_lower_bound": "1.0",
+        "cross_block_norm_bound": "1.0",
+        "denominator": "0.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "1",
+          "1"
+        ],
+        "low_block_lower_bound": [
+          "0",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "1",
+          "1"
+        ],
+        "denominator": [
+          "0",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "2",
+        "low_block_lower_bound": "0",
+        "high_block_lower_bound": "1",
+        "cross_block_norm_bound": "1"
+      },
+      "valid_margin": false,
+      "reference": {
+        "upper_trial_energy": "2.0",
+        "low_block_lower_bound": "0.0",
+        "high_block_lower_bound": "1.0",
+        "cross_block_norm_bound": "1.0",
+        "denominator": "-1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "2",
+          "1"
+        ],
+        "low_block_lower_bound": [
+          "0",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "1",
+          "1"
+        ],
+        "denominator": [
+          "-1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0",
+        "low_block_lower_bound": "-1",
+        "high_block_lower_bound": "1",
+        "cross_block_norm_bound": "0"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "0.0",
+        "low_block_lower_bound": "-1.0",
+        "high_block_lower_bound": "1.0",
+        "cross_block_norm_bound": "0.0",
+        "denominator": "1.0",
+        "conditional_energy_allowance": "0.0",
+        "conditional_vector_allowance": "0.0",
+        "trial_energy_magnitude": "0.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "0",
+          "1"
+        ],
+        "low_block_lower_bound": [
+          "-1",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "0",
+          "1"
+        ],
+        "denominator": [
+          "1",
+          "1"
+        ],
+        "conditional_energy_allowance": [
+          "0",
+          "1"
+        ],
+        "conditional_vector_allowance": [
+          "0",
+          "1"
+        ],
+        "trial_energy_magnitude": [
+          "0",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "1",
+        "low_block_lower_bound": "0",
+        "high_block_lower_bound": "2",
+        "cross_block_norm_bound": "0.9999999999999999999999999999992111390947789881945882714347172137703267935648909769952297210693359375"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "1.0",
+        "low_block_lower_bound": "0.0",
+        "high_block_lower_bound": "2.0",
+        "cross_block_norm_bound": "0.9999999999999999999999999999992111390947789881945882714347172137703267935648909769952297210693359375",
+        "denominator": "1.0",
+        "conditional_energy_allowance": "0.9999999999999999999999999999984222781895579763891765428694350498421813732439526683968648201510959340252168721167133101116614789698834035383441183944823125713616956966589555122482124716",
+        "conditional_vector_allowance": "0.9999999999999999999999999999992111390947789881945882714347172137703267935648909769952297210693359375",
+        "trial_energy_magnitude": "1.0",
+        "allowance_to_trial_energy_magnitude": "0.9999999999999999999999999999984222781895579763891765428694350498421813732439526683968648201510959340252168721167133101116614789698834035383441183944823125713616956966589555122482124716",
+        "allowance_below_trial_energy_magnitude": "1.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "1",
+          "1"
+        ],
+        "low_block_lower_bound": [
+          "0",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "2",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "1267650600228229401496703205375",
+          "1267650600228229401496703205376"
+        ],
+        "denominator": [
+          "1",
+          "1"
+        ],
+        "conditional_energy_allowance": [
+          "1606938044258990275541962092338627301321746534979799428890625",
+          "1606938044258990275541962092341162602522202993782792835301376"
+        ],
+        "conditional_vector_allowance": [
+          "1267650600228229401496703205375",
+          "1267650600228229401496703205376"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "1606938044258990275541962092338627301321746534979799428890625",
+          "1606938044258990275541962092341162602522202993782792835301376"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "1",
+        "low_block_lower_bound": "0",
+        "high_block_lower_bound": "2",
+        "cross_block_norm_bound": "1"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "1.0",
+        "low_block_lower_bound": "0.0",
+        "high_block_lower_bound": "2.0",
+        "cross_block_norm_bound": "1.0",
+        "denominator": "1.0",
+        "conditional_energy_allowance": "1.0",
+        "conditional_vector_allowance": "1.0",
+        "trial_energy_magnitude": "1.0",
+        "allowance_to_trial_energy_magnitude": "1.0",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "1",
+          "1"
+        ],
+        "low_block_lower_bound": [
+          "0",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "2",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "1",
+          "1"
+        ],
+        "denominator": [
+          "1",
+          "1"
+        ],
+        "conditional_energy_allowance": [
+          "1",
+          "1"
+        ],
+        "conditional_vector_allowance": [
+          "1",
+          "1"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "1",
+        "low_block_lower_bound": "0",
+        "high_block_lower_bound": "2",
+        "cross_block_norm_bound": "1.0000000000000000000000000000007888609052210118054117285652827862296732064351090230047702789306640625"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "1.0",
+        "low_block_lower_bound": "0.0",
+        "high_block_lower_bound": "2.0",
+        "cross_block_norm_bound": "1.0000000000000000000000000000007888609052210118054117285652827862296732064351090230047702789306640625",
+        "denominator": "1.0",
+        "conditional_energy_allowance": "1.0000000000000000000000000000015777218104420236108234571305661947608741989843887604159459358737521840252168721167133101116614789698834035383441183944823125713616956966589555122482124716",
+        "conditional_vector_allowance": "1.0000000000000000000000000000007888609052210118054117285652827862296732064351090230047702789306640625",
+        "trial_energy_magnitude": "1.0",
+        "allowance_to_trial_energy_magnitude": "1.0000000000000000000000000000015777218104420236108234571305661947608741989843887604159459358737521840252168721167133101116614789698834035383441183944823125713616956966589555122482124716",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "1",
+          "1"
+        ],
+        "low_block_lower_bound": [
+          "0",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "2",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "1267650600228229401496703205377",
+          "1267650600228229401496703205376"
+        ],
+        "denominator": [
+          "1",
+          "1"
+        ],
+        "conditional_energy_allowance": [
+          "1606938044258990275541962092343697903722659452585786241712129",
+          "1606938044258990275541962092341162602522202993782792835301376"
+        ],
+        "conditional_vector_allowance": [
+          "1267650600228229401496703205377",
+          "1267650600228229401496703205376"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "1606938044258990275541962092343697903722659452585786241712129",
+          "1606938044258990275541962092341162602522202993782792835301376"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "1",
+        "low_block_lower_bound": "0",
+        "high_block_lower_bound": "1.000000000000000000000000000000000000752316384526264005099991383822237233803945956334136013765601092018187046051025390625",
+        "cross_block_norm_bound": "0.000000000000000000867361737988403547205962240695953369140625"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "1.0",
+        "low_block_lower_bound": "0.0",
+        "high_block_lower_bound": "1.000000000000000000000000000000000000752316384526264005099991383822237233803945956334136013765601092018187046051025390625",
+        "cross_block_norm_bound": "0.000000000000000000867361737988403547205962240695953369140625",
+        "denominator": "0.000000000000000000000000000000000000752316384526264005099991383822237233803945956334136013765601092018187046051025390625",
+        "conditional_energy_allowance": "1.0",
+        "conditional_vector_allowance": "1152921504606846976.0",
+        "trial_energy_magnitude": "1.0",
+        "allowance_to_trial_energy_magnitude": "1.0",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "1",
+          "1"
+        ],
+        "low_block_lower_bound": [
+          "0",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "1329227995784915872903807060280344577",
+          "1329227995784915872903807060280344576"
+        ],
+        "cross_block_norm_bound": [
+          "1",
+          "1152921504606846976"
+        ],
+        "denominator": [
+          "1",
+          "1329227995784915872903807060280344576"
+        ],
+        "conditional_energy_allowance": [
+          "1",
+          "1"
+        ],
+        "conditional_vector_allowance": [
+          "1152921504606846976",
+          "1"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.375",
+        "low_block_lower_bound": "-3.75",
+        "high_block_lower_bound": "1",
+        "cross_block_norm_bound": "2.125"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "0.375",
+        "low_block_lower_bound": "-3.75",
+        "high_block_lower_bound": "1.0",
+        "cross_block_norm_bound": "2.125",
+        "denominator": "0.625",
+        "conditional_energy_allowance": "7.225",
+        "conditional_vector_allowance": "3.4",
+        "trial_energy_magnitude": "0.375",
+        "allowance_to_trial_energy_magnitude": "19.266666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666667",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "3",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-15",
+          "4"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "17",
+          "8"
+        ],
+        "denominator": [
+          "5",
+          "8"
+        ],
+        "conditional_energy_allowance": [
+          "289",
+          "40"
+        ],
+        "conditional_vector_allowance": [
+          "17",
+          "5"
+        ],
+        "trial_energy_magnitude": [
+          "3",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "289",
+          "15"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.75",
+        "low_block_lower_bound": "-3",
+        "high_block_lower_bound": "0",
+        "cross_block_norm_bound": "1.875"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.75",
+        "low_block_lower_bound": "-3.0",
+        "high_block_lower_bound": "0.0",
+        "cross_block_norm_bound": "1.875",
+        "denominator": "0.75",
+        "conditional_energy_allowance": "4.6875",
+        "conditional_vector_allowance": "2.5",
+        "trial_energy_magnitude": "0.75",
+        "allowance_to_trial_energy_magnitude": "6.25",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-3",
+          "4"
+        ],
+        "low_block_lower_bound": [
+          "-3",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "0",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "15",
+          "8"
+        ],
+        "denominator": [
+          "3",
+          "4"
+        ],
+        "conditional_energy_allowance": [
+          "75",
+          "16"
+        ],
+        "conditional_vector_allowance": [
+          "5",
+          "2"
+        ],
+        "trial_energy_magnitude": [
+          "3",
+          "4"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "25",
+          "4"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.625",
+        "low_block_lower_bound": "-2",
+        "high_block_lower_bound": "1.625",
+        "cross_block_norm_bound": "1.5"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "0.625",
+        "low_block_lower_bound": "-2.0",
+        "high_block_lower_bound": "1.625",
+        "cross_block_norm_bound": "1.5",
+        "denominator": "1.0",
+        "conditional_energy_allowance": "2.25",
+        "conditional_vector_allowance": "1.5",
+        "trial_energy_magnitude": "0.625",
+        "allowance_to_trial_energy_magnitude": "3.6",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "5",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-2",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "13",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "3",
+          "2"
+        ],
+        "denominator": [
+          "1",
+          "1"
+        ],
+        "conditional_energy_allowance": [
+          "9",
+          "4"
+        ],
+        "conditional_vector_allowance": [
+          "3",
+          "2"
+        ],
+        "trial_energy_magnitude": [
+          "5",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "18",
+          "5"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.625",
+        "low_block_lower_bound": "-1.25",
+        "high_block_lower_bound": "0.25",
+        "cross_block_norm_bound": "1"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.625",
+        "low_block_lower_bound": "-1.25",
+        "high_block_lower_bound": "0.25",
+        "cross_block_norm_bound": "1.0",
+        "denominator": "0.875",
+        "conditional_energy_allowance": "1.1428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571429",
+        "conditional_vector_allowance": "1.1428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571428571429",
+        "trial_energy_magnitude": "0.625",
+        "allowance_to_trial_energy_magnitude": "1.8285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714286",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-5",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-5",
+          "4"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "4"
+        ],
+        "cross_block_norm_bound": [
+          "1",
+          "1"
+        ],
+        "denominator": [
+          "7",
+          "8"
+        ],
+        "conditional_energy_allowance": [
+          "8",
+          "7"
+        ],
+        "conditional_vector_allowance": [
+          "8",
+          "7"
+        ],
+        "trial_energy_magnitude": [
+          "5",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "64",
+          "35"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.25",
+        "low_block_lower_bound": "-4",
+        "high_block_lower_bound": "1.5",
+        "cross_block_norm_bound": "2.375"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "0.25",
+        "low_block_lower_bound": "-4.0",
+        "high_block_lower_bound": "1.5",
+        "cross_block_norm_bound": "2.375",
+        "denominator": "1.25",
+        "conditional_energy_allowance": "4.5125",
+        "conditional_vector_allowance": "1.9",
+        "trial_energy_magnitude": "0.25",
+        "allowance_to_trial_energy_magnitude": "18.05",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "1",
+          "4"
+        ],
+        "low_block_lower_bound": [
+          "-4",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "3",
+          "2"
+        ],
+        "cross_block_norm_bound": [
+          "19",
+          "8"
+        ],
+        "denominator": [
+          "5",
+          "4"
+        ],
+        "conditional_energy_allowance": [
+          "361",
+          "80"
+        ],
+        "conditional_vector_allowance": [
+          "19",
+          "10"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "4"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "361",
+          "20"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.125",
+        "low_block_lower_bound": "-2",
+        "high_block_lower_bound": "0",
+        "cross_block_norm_bound": "0"
+      },
+      "valid_margin": false,
+      "reference": {
+        "upper_trial_energy": "0.125",
+        "low_block_lower_bound": "-2.0",
+        "high_block_lower_bound": "0.0",
+        "cross_block_norm_bound": "0.0",
+        "denominator": "-0.125"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "1",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-2",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "0",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "0",
+          "1"
+        ],
+        "denominator": [
+          "-1",
+          "8"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.25",
+        "low_block_lower_bound": "-0.75",
+        "high_block_lower_bound": "0.625",
+        "cross_block_norm_bound": "1.5"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.25",
+        "low_block_lower_bound": "-0.75",
+        "high_block_lower_bound": "0.625",
+        "cross_block_norm_bound": "1.5",
+        "denominator": "0.875",
+        "conditional_energy_allowance": "2.5714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714",
+        "conditional_vector_allowance": "1.7142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857143",
+        "trial_energy_magnitude": "0.25",
+        "allowance_to_trial_energy_magnitude": "10.285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714286",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-1",
+          "4"
+        ],
+        "low_block_lower_bound": [
+          "-3",
+          "4"
+        ],
+        "high_block_lower_bound": [
+          "5",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "3",
+          "2"
+        ],
+        "denominator": [
+          "7",
+          "8"
+        ],
+        "conditional_energy_allowance": [
+          "18",
+          "7"
+        ],
+        "conditional_vector_allowance": [
+          "12",
+          "7"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "4"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "72",
+          "7"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.875",
+        "low_block_lower_bound": "-3.75",
+        "high_block_lower_bound": "-0.5",
+        "cross_block_norm_bound": "2"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.875",
+        "low_block_lower_bound": "-3.75",
+        "high_block_lower_bound": "-0.5",
+        "cross_block_norm_bound": "2.0",
+        "denominator": "0.375",
+        "conditional_energy_allowance": "10.666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666667",
+        "conditional_vector_allowance": "5.3333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+        "trial_energy_magnitude": "0.875",
+        "allowance_to_trial_energy_magnitude": "12.19047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-7",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-15",
+          "4"
+        ],
+        "high_block_lower_bound": [
+          "-1",
+          "2"
+        ],
+        "cross_block_norm_bound": [
+          "2",
+          "1"
+        ],
+        "denominator": [
+          "3",
+          "8"
+        ],
+        "conditional_energy_allowance": [
+          "32",
+          "3"
+        ],
+        "conditional_vector_allowance": [
+          "16",
+          "3"
+        ],
+        "trial_energy_magnitude": [
+          "7",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "256",
+          "21"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.875",
+        "low_block_lower_bound": "-4",
+        "high_block_lower_bound": "2.25",
+        "cross_block_norm_bound": "0.125"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "0.875",
+        "low_block_lower_bound": "-4.0",
+        "high_block_lower_bound": "2.25",
+        "cross_block_norm_bound": "0.125",
+        "denominator": "1.375",
+        "conditional_energy_allowance": "0.011363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636364",
+        "conditional_vector_allowance": "0.090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909",
+        "trial_energy_magnitude": "0.875",
+        "allowance_to_trial_energy_magnitude": "0.012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987012987",
+        "allowance_below_trial_energy_magnitude": "1.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "7",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-4",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "9",
+          "4"
+        ],
+        "cross_block_norm_bound": [
+          "1",
+          "8"
+        ],
+        "denominator": [
+          "11",
+          "8"
+        ],
+        "conditional_energy_allowance": [
+          "1",
+          "88"
+        ],
+        "conditional_vector_allowance": [
+          "1",
+          "11"
+        ],
+        "trial_energy_magnitude": [
+          "7",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "1",
+          "77"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.875",
+        "low_block_lower_bound": "-2.25",
+        "high_block_lower_bound": "0.375",
+        "cross_block_norm_bound": "2.25"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.875",
+        "low_block_lower_bound": "-2.25",
+        "high_block_lower_bound": "0.375",
+        "cross_block_norm_bound": "2.25",
+        "denominator": "1.25",
+        "conditional_energy_allowance": "4.05",
+        "conditional_vector_allowance": "1.8",
+        "trial_energy_magnitude": "0.875",
+        "allowance_to_trial_energy_magnitude": "4.6285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714286",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-7",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-9",
+          "4"
+        ],
+        "high_block_lower_bound": [
+          "3",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "9",
+          "4"
+        ],
+        "denominator": [
+          "5",
+          "4"
+        ],
+        "conditional_energy_allowance": [
+          "81",
+          "20"
+        ],
+        "conditional_vector_allowance": [
+          "9",
+          "5"
+        ],
+        "trial_energy_magnitude": [
+          "7",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "162",
+          "35"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.875",
+        "low_block_lower_bound": "-0.5",
+        "high_block_lower_bound": "1.125",
+        "cross_block_norm_bound": "0"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "0.875",
+        "low_block_lower_bound": "-0.5",
+        "high_block_lower_bound": "1.125",
+        "cross_block_norm_bound": "0.0",
+        "denominator": "0.25",
+        "conditional_energy_allowance": "0.0",
+        "conditional_vector_allowance": "0.0",
+        "trial_energy_magnitude": "0.875",
+        "allowance_to_trial_energy_magnitude": "0.0",
+        "allowance_below_trial_energy_magnitude": "1.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "7",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-1",
+          "2"
+        ],
+        "high_block_lower_bound": [
+          "9",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "0",
+          "1"
+        ],
+        "denominator": [
+          "1",
+          "4"
+        ],
+        "conditional_energy_allowance": [
+          "0",
+          "1"
+        ],
+        "conditional_vector_allowance": [
+          "0",
+          "1"
+        ],
+        "trial_energy_magnitude": [
+          "7",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.5",
+        "low_block_lower_bound": "-2",
+        "high_block_lower_bound": "0.5",
+        "cross_block_norm_bound": "1.5"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.5",
+        "low_block_lower_bound": "-2.0",
+        "high_block_lower_bound": "0.5",
+        "cross_block_norm_bound": "1.5",
+        "denominator": "1.0",
+        "conditional_energy_allowance": "2.25",
+        "conditional_vector_allowance": "1.5",
+        "trial_energy_magnitude": "0.5",
+        "allowance_to_trial_energy_magnitude": "4.5",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-1",
+          "2"
+        ],
+        "low_block_lower_bound": [
+          "-2",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "2"
+        ],
+        "cross_block_norm_bound": [
+          "3",
+          "2"
+        ],
+        "denominator": [
+          "1",
+          "1"
+        ],
+        "conditional_energy_allowance": [
+          "9",
+          "4"
+        ],
+        "conditional_vector_allowance": [
+          "3",
+          "2"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "2"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "9",
+          "2"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.5",
+        "low_block_lower_bound": "-3",
+        "high_block_lower_bound": "0.5",
+        "cross_block_norm_bound": "1.625"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.5",
+        "low_block_lower_bound": "-3.0",
+        "high_block_lower_bound": "0.5",
+        "cross_block_norm_bound": "1.625",
+        "denominator": "1.0",
+        "conditional_energy_allowance": "2.640625",
+        "conditional_vector_allowance": "1.625",
+        "trial_energy_magnitude": "0.5",
+        "allowance_to_trial_energy_magnitude": "5.28125",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-1",
+          "2"
+        ],
+        "low_block_lower_bound": [
+          "-3",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "2"
+        ],
+        "cross_block_norm_bound": [
+          "13",
+          "8"
+        ],
+        "denominator": [
+          "1",
+          "1"
+        ],
+        "conditional_energy_allowance": [
+          "169",
+          "64"
+        ],
+        "conditional_vector_allowance": [
+          "13",
+          "8"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "2"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "169",
+          "32"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.375",
+        "low_block_lower_bound": "-1",
+        "high_block_lower_bound": "0.25",
+        "cross_block_norm_bound": "2"
+      },
+      "valid_margin": false,
+      "reference": {
+        "upper_trial_energy": "0.375",
+        "low_block_lower_bound": "-1.0",
+        "high_block_lower_bound": "0.25",
+        "cross_block_norm_bound": "2.0",
+        "denominator": "-0.125"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "3",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-1",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "4"
+        ],
+        "cross_block_norm_bound": [
+          "2",
+          "1"
+        ],
+        "denominator": [
+          "-1",
+          "8"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.5",
+        "low_block_lower_bound": "-2.5",
+        "high_block_lower_bound": "-0.25",
+        "cross_block_norm_bound": "2.125"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.5",
+        "low_block_lower_bound": "-2.5",
+        "high_block_lower_bound": "-0.25",
+        "cross_block_norm_bound": "2.125",
+        "denominator": "0.25",
+        "conditional_energy_allowance": "18.0625",
+        "conditional_vector_allowance": "8.5",
+        "trial_energy_magnitude": "0.5",
+        "allowance_to_trial_energy_magnitude": "36.125",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-1",
+          "2"
+        ],
+        "low_block_lower_bound": [
+          "-5",
+          "2"
+        ],
+        "high_block_lower_bound": [
+          "-1",
+          "4"
+        ],
+        "cross_block_norm_bound": [
+          "17",
+          "8"
+        ],
+        "denominator": [
+          "1",
+          "4"
+        ],
+        "conditional_energy_allowance": [
+          "289",
+          "16"
+        ],
+        "conditional_vector_allowance": [
+          "17",
+          "2"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "2"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "289",
+          "8"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.5",
+        "low_block_lower_bound": "-1.5",
+        "high_block_lower_bound": "0.125",
+        "cross_block_norm_bound": "0.125"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.5",
+        "low_block_lower_bound": "-1.5",
+        "high_block_lower_bound": "0.125",
+        "cross_block_norm_bound": "0.125",
+        "denominator": "0.625",
+        "conditional_energy_allowance": "0.025",
+        "conditional_vector_allowance": "0.2",
+        "trial_energy_magnitude": "0.5",
+        "allowance_to_trial_energy_magnitude": "0.05",
+        "allowance_below_trial_energy_magnitude": "1.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-1",
+          "2"
+        ],
+        "low_block_lower_bound": [
+          "-3",
+          "2"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "1",
+          "8"
+        ],
+        "denominator": [
+          "5",
+          "8"
+        ],
+        "conditional_energy_allowance": [
+          "1",
+          "40"
+        ],
+        "conditional_vector_allowance": [
+          "1",
+          "5"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "2"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "1",
+          "20"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.875",
+        "low_block_lower_bound": "-1",
+        "high_block_lower_bound": "0.375",
+        "cross_block_norm_bound": "1.625"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.875",
+        "low_block_lower_bound": "-1.0",
+        "high_block_lower_bound": "0.375",
+        "cross_block_norm_bound": "1.625",
+        "denominator": "1.25",
+        "conditional_energy_allowance": "2.1125",
+        "conditional_vector_allowance": "1.3",
+        "trial_energy_magnitude": "0.875",
+        "allowance_to_trial_energy_magnitude": "2.4142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857143",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-7",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-1",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "3",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "13",
+          "8"
+        ],
+        "denominator": [
+          "5",
+          "4"
+        ],
+        "conditional_energy_allowance": [
+          "169",
+          "80"
+        ],
+        "conditional_vector_allowance": [
+          "13",
+          "10"
+        ],
+        "trial_energy_magnitude": [
+          "7",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "169",
+          "70"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.25",
+        "low_block_lower_bound": "-2",
+        "high_block_lower_bound": "-0.5",
+        "cross_block_norm_bound": "0"
+      },
+      "valid_margin": false,
+      "reference": {
+        "upper_trial_energy": "-0.25",
+        "low_block_lower_bound": "-2.0",
+        "high_block_lower_bound": "-0.5",
+        "cross_block_norm_bound": "0.0",
+        "denominator": "-0.25"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-1",
+          "4"
+        ],
+        "low_block_lower_bound": [
+          "-2",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "-1",
+          "2"
+        ],
+        "cross_block_norm_bound": [
+          "0",
+          "1"
+        ],
+        "denominator": [
+          "-1",
+          "4"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.25",
+        "low_block_lower_bound": "-3.75",
+        "high_block_lower_bound": "1.125",
+        "cross_block_norm_bound": "0.125"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.25",
+        "low_block_lower_bound": "-3.75",
+        "high_block_lower_bound": "1.125",
+        "cross_block_norm_bound": "0.125",
+        "denominator": "1.375",
+        "conditional_energy_allowance": "0.011363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636364",
+        "conditional_vector_allowance": "0.090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909090909",
+        "trial_energy_magnitude": "0.25",
+        "allowance_to_trial_energy_magnitude": "0.045454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545454545455",
+        "allowance_below_trial_energy_magnitude": "1.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-1",
+          "4"
+        ],
+        "low_block_lower_bound": [
+          "-15",
+          "4"
+        ],
+        "high_block_lower_bound": [
+          "9",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "1",
+          "8"
+        ],
+        "denominator": [
+          "11",
+          "8"
+        ],
+        "conditional_energy_allowance": [
+          "1",
+          "88"
+        ],
+        "conditional_vector_allowance": [
+          "1",
+          "11"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "4"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "1",
+          "22"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.75",
+        "low_block_lower_bound": "-3",
+        "high_block_lower_bound": "0.5",
+        "cross_block_norm_bound": "0.625"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.75",
+        "low_block_lower_bound": "-3.0",
+        "high_block_lower_bound": "0.5",
+        "cross_block_norm_bound": "0.625",
+        "denominator": "1.25",
+        "conditional_energy_allowance": "0.3125",
+        "conditional_vector_allowance": "0.5",
+        "trial_energy_magnitude": "0.75",
+        "allowance_to_trial_energy_magnitude": "0.41666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666667",
+        "allowance_below_trial_energy_magnitude": "1.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-3",
+          "4"
+        ],
+        "low_block_lower_bound": [
+          "-3",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "2"
+        ],
+        "cross_block_norm_bound": [
+          "5",
+          "8"
+        ],
+        "denominator": [
+          "5",
+          "4"
+        ],
+        "conditional_energy_allowance": [
+          "5",
+          "16"
+        ],
+        "conditional_vector_allowance": [
+          "1",
+          "2"
+        ],
+        "trial_energy_magnitude": [
+          "3",
+          "4"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "5",
+          "12"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.625",
+        "low_block_lower_bound": "-3",
+        "high_block_lower_bound": "0.25",
+        "cross_block_norm_bound": "2"
+      },
+      "valid_margin": false,
+      "reference": {
+        "upper_trial_energy": "0.625",
+        "low_block_lower_bound": "-3.0",
+        "high_block_lower_bound": "0.25",
+        "cross_block_norm_bound": "2.0",
+        "denominator": "-0.375"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "5",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-3",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "4"
+        ],
+        "cross_block_norm_bound": [
+          "2",
+          "1"
+        ],
+        "denominator": [
+          "-3",
+          "8"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.75",
+        "low_block_lower_bound": "-3.75",
+        "high_block_lower_bound": "0.5",
+        "cross_block_norm_bound": "0.875"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.75",
+        "low_block_lower_bound": "-3.75",
+        "high_block_lower_bound": "0.5",
+        "cross_block_norm_bound": "0.875",
+        "denominator": "1.25",
+        "conditional_energy_allowance": "0.6125",
+        "conditional_vector_allowance": "0.7",
+        "trial_energy_magnitude": "0.75",
+        "allowance_to_trial_energy_magnitude": "0.81666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666667",
+        "allowance_below_trial_energy_magnitude": "1.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-3",
+          "4"
+        ],
+        "low_block_lower_bound": [
+          "-15",
+          "4"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "2"
+        ],
+        "cross_block_norm_bound": [
+          "7",
+          "8"
+        ],
+        "denominator": [
+          "5",
+          "4"
+        ],
+        "conditional_energy_allowance": [
+          "49",
+          "80"
+        ],
+        "conditional_vector_allowance": [
+          "7",
+          "10"
+        ],
+        "trial_energy_magnitude": [
+          "3",
+          "4"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "49",
+          "60"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.875",
+        "low_block_lower_bound": "-1.25",
+        "high_block_lower_bound": "1.625",
+        "cross_block_norm_bound": "1.25"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "0.875",
+        "low_block_lower_bound": "-1.25",
+        "high_block_lower_bound": "1.625",
+        "cross_block_norm_bound": "1.25",
+        "denominator": "0.75",
+        "conditional_energy_allowance": "2.0833333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+        "conditional_vector_allowance": "1.6666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666667",
+        "trial_energy_magnitude": "0.875",
+        "allowance_to_trial_energy_magnitude": "2.380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952380952381",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "7",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-5",
+          "4"
+        ],
+        "high_block_lower_bound": [
+          "13",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "5",
+          "4"
+        ],
+        "denominator": [
+          "3",
+          "4"
+        ],
+        "conditional_energy_allowance": [
+          "25",
+          "12"
+        ],
+        "conditional_vector_allowance": [
+          "5",
+          "3"
+        ],
+        "trial_energy_magnitude": [
+          "7",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "50",
+          "21"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.375",
+        "low_block_lower_bound": "0",
+        "high_block_lower_bound": "1",
+        "cross_block_norm_bound": "1.375"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "0.375",
+        "low_block_lower_bound": "0.0",
+        "high_block_lower_bound": "1.0",
+        "cross_block_norm_bound": "1.375",
+        "denominator": "0.625",
+        "conditional_energy_allowance": "3.025",
+        "conditional_vector_allowance": "2.2",
+        "trial_energy_magnitude": "0.375",
+        "allowance_to_trial_energy_magnitude": "8.0666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666667",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "3",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "0",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "11",
+          "8"
+        ],
+        "denominator": [
+          "5",
+          "8"
+        ],
+        "conditional_energy_allowance": [
+          "121",
+          "40"
+        ],
+        "conditional_vector_allowance": [
+          "11",
+          "5"
+        ],
+        "trial_energy_magnitude": [
+          "3",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "121",
+          "15"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.125",
+        "low_block_lower_bound": "-0.25",
+        "high_block_lower_bound": "1.125",
+        "cross_block_norm_bound": "0.25"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.125",
+        "low_block_lower_bound": "-0.25",
+        "high_block_lower_bound": "1.125",
+        "cross_block_norm_bound": "0.25",
+        "denominator": "1.25",
+        "conditional_energy_allowance": "0.05",
+        "conditional_vector_allowance": "0.2",
+        "trial_energy_magnitude": "0.125",
+        "allowance_to_trial_energy_magnitude": "0.4",
+        "allowance_below_trial_energy_magnitude": "1.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-1",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-1",
+          "4"
+        ],
+        "high_block_lower_bound": [
+          "9",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "1",
+          "4"
+        ],
+        "denominator": [
+          "5",
+          "4"
+        ],
+        "conditional_energy_allowance": [
+          "1",
+          "20"
+        ],
+        "conditional_vector_allowance": [
+          "1",
+          "5"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "2",
+          "5"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "1",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.125",
+        "low_block_lower_bound": "-3.25",
+        "high_block_lower_bound": "-0.25",
+        "cross_block_norm_bound": "0.5"
+      },
+      "valid_margin": false,
+      "reference": {
+        "upper_trial_energy": "0.125",
+        "low_block_lower_bound": "-3.25",
+        "high_block_lower_bound": "-0.25",
+        "cross_block_norm_bound": "0.5",
+        "denominator": "-0.375"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "1",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-13",
+          "4"
+        ],
+        "high_block_lower_bound": [
+          "-1",
+          "4"
+        ],
+        "cross_block_norm_bound": [
+          "1",
+          "2"
+        ],
+        "denominator": [
+          "-3",
+          "8"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.875",
+        "low_block_lower_bound": "-3.5",
+        "high_block_lower_bound": "1.375",
+        "cross_block_norm_bound": "1.375"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "0.875",
+        "low_block_lower_bound": "-3.5",
+        "high_block_lower_bound": "1.375",
+        "cross_block_norm_bound": "1.375",
+        "denominator": "0.5",
+        "conditional_energy_allowance": "3.78125",
+        "conditional_vector_allowance": "2.75",
+        "trial_energy_magnitude": "0.875",
+        "allowance_to_trial_energy_magnitude": "4.3214285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "7",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-7",
+          "2"
+        ],
+        "high_block_lower_bound": [
+          "11",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "11",
+          "8"
+        ],
+        "denominator": [
+          "1",
+          "2"
+        ],
+        "conditional_energy_allowance": [
+          "121",
+          "32"
+        ],
+        "conditional_vector_allowance": [
+          "11",
+          "4"
+        ],
+        "trial_energy_magnitude": [
+          "7",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "121",
+          "28"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.25",
+        "low_block_lower_bound": "-4",
+        "high_block_lower_bound": "-0.125",
+        "cross_block_norm_bound": "1.25"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.25",
+        "low_block_lower_bound": "-4.0",
+        "high_block_lower_bound": "-0.125",
+        "cross_block_norm_bound": "1.25",
+        "denominator": "0.125",
+        "conditional_energy_allowance": "12.5",
+        "conditional_vector_allowance": "10.0",
+        "trial_energy_magnitude": "0.25",
+        "allowance_to_trial_energy_magnitude": "50.0",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-1",
+          "4"
+        ],
+        "low_block_lower_bound": [
+          "-4",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "-1",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "5",
+          "4"
+        ],
+        "denominator": [
+          "1",
+          "8"
+        ],
+        "conditional_energy_allowance": [
+          "25",
+          "2"
+        ],
+        "conditional_vector_allowance": [
+          "10",
+          "1"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "4"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "50",
+          "1"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.875",
+        "low_block_lower_bound": "-2.75",
+        "high_block_lower_bound": "-0.125",
+        "cross_block_norm_bound": "0.875"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.875",
+        "low_block_lower_bound": "-2.75",
+        "high_block_lower_bound": "-0.125",
+        "cross_block_norm_bound": "0.875",
+        "denominator": "0.75",
+        "conditional_energy_allowance": "1.0208333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+        "conditional_vector_allowance": "1.1666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666667",
+        "trial_energy_magnitude": "0.875",
+        "allowance_to_trial_energy_magnitude": "1.1666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666667",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-7",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-11",
+          "4"
+        ],
+        "high_block_lower_bound": [
+          "-1",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "7",
+          "8"
+        ],
+        "denominator": [
+          "3",
+          "4"
+        ],
+        "conditional_energy_allowance": [
+          "49",
+          "48"
+        ],
+        "conditional_vector_allowance": [
+          "7",
+          "6"
+        ],
+        "trial_energy_magnitude": [
+          "7",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "7",
+          "6"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.375",
+        "low_block_lower_bound": "-2.25",
+        "high_block_lower_bound": "1.25",
+        "cross_block_norm_bound": "2"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "0.375",
+        "low_block_lower_bound": "-2.25",
+        "high_block_lower_bound": "1.25",
+        "cross_block_norm_bound": "2.0",
+        "denominator": "0.875",
+        "conditional_energy_allowance": "4.5714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714285714",
+        "conditional_vector_allowance": "2.2857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857142857",
+        "trial_energy_magnitude": "0.375",
+        "allowance_to_trial_energy_magnitude": "12.19047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619047619",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "3",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-9",
+          "4"
+        ],
+        "high_block_lower_bound": [
+          "5",
+          "4"
+        ],
+        "cross_block_norm_bound": [
+          "2",
+          "1"
+        ],
+        "denominator": [
+          "7",
+          "8"
+        ],
+        "conditional_energy_allowance": [
+          "32",
+          "7"
+        ],
+        "conditional_vector_allowance": [
+          "16",
+          "7"
+        ],
+        "trial_energy_magnitude": [
+          "3",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "256",
+          "21"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.75",
+        "low_block_lower_bound": "-3",
+        "high_block_lower_bound": "-0.875",
+        "cross_block_norm_bound": "0.875"
+      },
+      "valid_margin": false,
+      "reference": {
+        "upper_trial_energy": "-0.75",
+        "low_block_lower_bound": "-3.0",
+        "high_block_lower_bound": "-0.875",
+        "cross_block_norm_bound": "0.875",
+        "denominator": "-0.125"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-3",
+          "4"
+        ],
+        "low_block_lower_bound": [
+          "-3",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "-7",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "7",
+          "8"
+        ],
+        "denominator": [
+          "-1",
+          "8"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.25",
+        "low_block_lower_bound": "-3.5",
+        "high_block_lower_bound": "0.875",
+        "cross_block_norm_bound": "1.375"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.25",
+        "low_block_lower_bound": "-3.5",
+        "high_block_lower_bound": "0.875",
+        "cross_block_norm_bound": "1.375",
+        "denominator": "1.125",
+        "conditional_energy_allowance": "1.6805555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555555556",
+        "conditional_vector_allowance": "1.2222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+        "trial_energy_magnitude": "0.25",
+        "allowance_to_trial_energy_magnitude": "6.7222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-1",
+          "4"
+        ],
+        "low_block_lower_bound": [
+          "-7",
+          "2"
+        ],
+        "high_block_lower_bound": [
+          "7",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "11",
+          "8"
+        ],
+        "denominator": [
+          "9",
+          "8"
+        ],
+        "conditional_energy_allowance": [
+          "121",
+          "72"
+        ],
+        "conditional_vector_allowance": [
+          "11",
+          "9"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "4"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "121",
+          "18"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0.25",
+        "low_block_lower_bound": "-3",
+        "high_block_lower_bound": "0.875",
+        "cross_block_norm_bound": "0.875"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "0.25",
+        "low_block_lower_bound": "-3.0",
+        "high_block_lower_bound": "0.875",
+        "cross_block_norm_bound": "0.875",
+        "denominator": "0.625",
+        "conditional_energy_allowance": "1.225",
+        "conditional_vector_allowance": "1.4",
+        "trial_energy_magnitude": "0.25",
+        "allowance_to_trial_energy_magnitude": "4.9",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "1",
+          "4"
+        ],
+        "low_block_lower_bound": [
+          "-3",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "7",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "7",
+          "8"
+        ],
+        "denominator": [
+          "5",
+          "8"
+        ],
+        "conditional_energy_allowance": [
+          "49",
+          "40"
+        ],
+        "conditional_vector_allowance": [
+          "7",
+          "5"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "4"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "49",
+          "10"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.375",
+        "low_block_lower_bound": "-2",
+        "high_block_lower_bound": "-0.5",
+        "cross_block_norm_bound": "0"
+      },
+      "valid_margin": false,
+      "reference": {
+        "upper_trial_energy": "-0.375",
+        "low_block_lower_bound": "-2.0",
+        "high_block_lower_bound": "-0.5",
+        "cross_block_norm_bound": "0.0",
+        "denominator": "-0.125"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-3",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-2",
+          "1"
+        ],
+        "high_block_lower_bound": [
+          "-1",
+          "2"
+        ],
+        "cross_block_norm_bound": [
+          "0",
+          "1"
+        ],
+        "denominator": [
+          "-1",
+          "8"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.25",
+        "low_block_lower_bound": "-3.5",
+        "high_block_lower_bound": "1",
+        "cross_block_norm_bound": "1.375"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.25",
+        "low_block_lower_bound": "-3.5",
+        "high_block_lower_bound": "1.0",
+        "cross_block_norm_bound": "1.375",
+        "denominator": "1.25",
+        "conditional_energy_allowance": "1.5125",
+        "conditional_vector_allowance": "1.1",
+        "trial_energy_magnitude": "0.25",
+        "allowance_to_trial_energy_magnitude": "6.05",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-1",
+          "4"
+        ],
+        "low_block_lower_bound": [
+          "-7",
+          "2"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "1"
+        ],
+        "cross_block_norm_bound": [
+          "11",
+          "8"
+        ],
+        "denominator": [
+          "5",
+          "4"
+        ],
+        "conditional_energy_allowance": [
+          "121",
+          "80"
+        ],
+        "conditional_vector_allowance": [
+          "11",
+          "10"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "4"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "121",
+          "20"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "-0.125",
+        "low_block_lower_bound": "-0.5",
+        "high_block_lower_bound": "0.125",
+        "cross_block_norm_bound": "1.25"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "-0.125",
+        "low_block_lower_bound": "-0.5",
+        "high_block_lower_bound": "0.125",
+        "cross_block_norm_bound": "1.25",
+        "denominator": "0.25",
+        "conditional_energy_allowance": "6.25",
+        "conditional_vector_allowance": "5.0",
+        "trial_energy_magnitude": "0.125",
+        "allowance_to_trial_energy_magnitude": "50.0",
+        "allowance_below_trial_energy_magnitude": "0.0",
+        "scale_comparison_resolved": "1.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "-1",
+          "8"
+        ],
+        "low_block_lower_bound": [
+          "-1",
+          "2"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "5",
+          "4"
+        ],
+        "denominator": [
+          "1",
+          "4"
+        ],
+        "conditional_energy_allowance": [
+          "25",
+          "4"
+        ],
+        "conditional_vector_allowance": [
+          "5",
+          "1"
+        ],
+        "trial_energy_magnitude": [
+          "1",
+          "8"
+        ],
+        "allowance_to_trial_energy_magnitude": [
+          "50",
+          "1"
+        ],
+        "allowance_below_trial_energy_magnitude": [
+          "0",
+          "1"
+        ],
+        "scale_comparison_resolved": [
+          "1",
+          "1"
+        ]
+      }
+    },
+    {
+      "input": {
+        "upper_trial_energy": "0",
+        "low_block_lower_bound": "-3.75",
+        "high_block_lower_bound": "0.125",
+        "cross_block_norm_bound": "1.125"
+      },
+      "valid_margin": true,
+      "reference": {
+        "upper_trial_energy": "0.0",
+        "low_block_lower_bound": "-3.75",
+        "high_block_lower_bound": "0.125",
+        "cross_block_norm_bound": "1.125",
+        "denominator": "0.125",
+        "conditional_energy_allowance": "10.125",
+        "conditional_vector_allowance": "9.0",
+        "trial_energy_magnitude": "0.0"
+      },
+      "exact_reference": {
+        "upper_trial_energy": [
+          "0",
+          "1"
+        ],
+        "low_block_lower_bound": [
+          "-15",
+          "4"
+        ],
+        "high_block_lower_bound": [
+          "1",
+          "8"
+        ],
+        "cross_block_norm_bound": [
+          "9",
+          "8"
+        ],
+        "denominator": [
+          "1",
+          "8"
+        ],
+        "conditional_energy_allowance": [
+          "81",
+          "8"
+        ],
+        "conditional_vector_allowance": [
+          "9",
+          "1"
+        ],
+        "trial_energy_magnitude": [
+          "0",
+          "1"
+        ]
+      }
+    }
+  ]
+}

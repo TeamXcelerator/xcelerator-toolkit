@@ -7,7 +7,8 @@ use crate::{
     PublicationTargetState, PublicationTransactionJournal, RemoteCommitRequest, RemoteGitStore,
 };
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
+use std::fs;
+#[cfg(test)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use xc_core::{CancellationToken, ResourcePolicy};
@@ -35,23 +36,23 @@ impl PublicationJournalStore {
         journal.validate()?;
         let directory = self.transaction_directory(&journal.transaction_id)?;
         fs::create_dir_all(&directory)?;
-        let sequence = next_checkpoint_sequence(&directory)?;
-        let digest = journal.digest()?;
-        let checkpoint = JournalCheckpoint {
-            schema_version: 1,
-            sequence,
-            journal_digest: digest.clone(),
-            journal: journal.clone(),
-        };
-        let path = directory.join(format!("{sequence:020}-{}.json", digest.0));
-        let bytes = serde_json::to_vec_pretty(&checkpoint)?;
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        Ok(path)
+        crate::with_record_update_lock(&directory.join("sequence"), || {
+            let sequence = next_checkpoint_sequence(&directory)?;
+            let digest = journal.digest()?;
+            let checkpoint = JournalCheckpoint {
+                schema_version: 1,
+                sequence,
+                journal_digest: digest.clone(),
+                journal: journal.clone(),
+            };
+            let path = directory.join(format!("{sequence:020}-{}.json", digest.0));
+            let bytes = serde_json::to_vec_pretty(&checkpoint)?;
+            let temporary = crate::write_private_sibling_file(&directory, "checkpoint", &bytes)?;
+            let published = fs::hard_link(&temporary, &path);
+            let _ = fs::remove_file(&temporary);
+            published?;
+            Ok(path)
+        })
     }
 
     pub fn load_latest(
@@ -94,7 +95,12 @@ impl PublicationJournalStore {
             ))
         })?;
         let checkpoint: JournalCheckpoint = serde_json::from_slice(&fs::read(path)?)?;
-        if checkpoint.schema_version != 1
+        let expected_name = format!(
+            "{:020}-{}.json",
+            checkpoint.sequence, checkpoint.journal_digest.0
+        );
+        if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str())
+            || checkpoint.schema_version != 1
             || checkpoint.journal.transaction_id != transaction_id
             || checkpoint.journal.digest()? != checkpoint.journal_digest
         {
@@ -176,7 +182,9 @@ pub fn execute_next_payload_batch(
         &target.permission_evidence.principal,
         &target.authorized_repository,
     )?;
-    let refreshed_permission = target.permission_evidence != *authenticated_session.evidence();
+    // Preserve the authorization bound into any already planned receipt.
+    let refreshed_permission = target.discoverability_commit.is_none()
+        && target.permission_evidence != *authenticated_session.evidence();
     if refreshed_permission {
         journal
             .targets
@@ -396,10 +404,7 @@ pub fn execute_next_payload_batch(
         });
     }
 
-    let pending_unique_payload_bytes = missing
-        .iter()
-        .map(|part| part.size_bytes)
-        .fold(0u64, u64::saturating_add);
+    let pending_unique_payload_bytes = crate::publication::unique_transport_blob_bytes(&missing)?;
     revalidate_publication_capacity(
         remote,
         journal,
@@ -435,6 +440,8 @@ pub fn execute_next_payload_batch(
                 .parts
                 .iter()
                 .map(|part| part.content_digest.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
                 .collect();
             journal
                 .targets
@@ -923,5 +930,70 @@ mod tests {
         assert!(matches!(result, Err(CacheError::PermissionDenied(_))));
         assert_eq!(*remote.calls.lock().unwrap(), 0);
         let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn audit_publisher_handles_same_blob_at_distinct_paths() {
+        let remote = FakeRemote::new();
+        *remote.conflict_once.lock().unwrap() = false;
+        let mut journal = journal();
+        let target = journal
+            .targets
+            .get_mut(&PublicationDestination::Private)
+            .unwrap();
+        target.batches.truncate(1);
+        let mut alias = target.batches[0].plan.parts[0].clone();
+        alias.repository_path = "objects/alias.part".into();
+        alias.sequence = 1;
+        target.batches[0].plan.payload_bytes += alias.size_bytes;
+        target.batches[0].plan.parts.push(alias);
+        let root = temporary_root("audit-publisher-blob-alias");
+        let checkpoints = PublicationJournalStore::new(&root);
+        let result = execute_next_payload_batch(
+            &remote,
+            &checkpoints,
+            &CancellationToken::new(),
+            &authenticated_session(),
+            &PublicationFinalizationPolicy::default(),
+            &root.join("staging"),
+            &ResourcePolicy::default(),
+            &mut journal,
+            PublicationDestination::Private,
+        );
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            result.is_ok(),
+            "a valid plan must not fail after its remote commit: {result:?}"
+        );
+        let batch = &journal.targets[&PublicationDestination::Private].batches[0];
+        assert_eq!(batch.newly_committed_digests.len(), 1);
+        assert_eq!(batch.state, PublicationBatchState::PayloadVerified);
+    }
+    #[test]
+    fn audit_concurrent_journal_saves_have_distinct_sequences() {
+        let root = temporary_root("audit-journal-concurrent");
+        let store = PublicationJournalStore::new(&root);
+        let journal = journal();
+        store.save(&journal).unwrap();
+        let barrier = std::sync::Barrier::new(16);
+        let results = std::thread::scope(|scope| {
+            let handles = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        store.save(&journal)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let successful = results.iter().filter(|r| r.is_ok()).count();
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            successful, 16,
+            "concurrent checkpoints must not collide: {results:?}"
+        );
     }
 }

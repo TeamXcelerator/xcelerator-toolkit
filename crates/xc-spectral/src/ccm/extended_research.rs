@@ -1,18 +1,33 @@
 //! Additional source-bound point diagnostics. External reference values are data,
 //! never executable target definitions. No new primary eigensolve is available.
 use super::retained_evidence::{
-    center, dot, managed, matrix_ancestry, norm2, orientation, precision, scalar, solve_small,
-    transform_terms, ResearchRecord, RetainedMatrix, RetainedRoots,
+    managed, matrix_ancestry, point, precision, scalar, solve_gram_checked, transform_terms,
+    ResearchRecord, RetainedMatrix, RetainedRoots,
 };
 use super::state_geometry::RetainedState;
 use anyhow::{bail, Result};
 use rayon::prelude::*;
-use rug::{float::Constant, ops::Pow, Float};
+use rug::{float::Constant, Float};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use xc_cache::*;
 use xc_numerics::prefix::lossless_decimal as dec;
+
+#[path = "extended_research/allowance_math.rs"]
+mod allowance_math;
+#[path = "extended_research/atom_math.rs"]
+pub(super) mod atom_math;
+#[path = "extended_research/cluster_math.rs"]
+mod cluster_math;
+#[path = "extended_research/compactness_math.rs"]
+mod compactness_math;
+#[path = "extended_research/directional_math.rs"]
+mod directional_math;
+#[path = "extended_research/energy_math.rs"]
+mod energy_math;
+#[path = "extended_research/weighted_math.rs"]
+mod weighted_math;
 
 pub const INPUT_KIND: &str = "ccm_external_research_source";
 pub const DIAGNOSTICS: &[&str] = &[
@@ -66,7 +81,7 @@ pub struct ExtensionOptions {
 impl ExtensionOptions {
     pub fn for_source(s: &RetainedState) -> Self {
         Self {
-            working_precision_bits: s.precision.saturating_add(64),
+            working_precision_bits: s.precision.saturating_add(64).min(1_000_000),
             maximum_rows: 100_000,
             maximum_directional_rows: 16,
             maximum_estimated_output_bytes: 256 * 1024 * 1024,
@@ -209,6 +224,9 @@ pub struct ExternalResearchInputs {
     pub target: Option<SampledReference>,
     #[serde(default)]
     pub reference_jets: Vec<ReferenceJet>,
+    /// Explicit arithmetic-energy operators. When nonempty, these take
+    /// precedence over `run_once.component_actions`; the two representations
+    /// are alternatives and are not added together.
     #[serde(default)]
     pub components: Vec<OperatorComponent>,
     #[serde(default)]
@@ -237,6 +255,16 @@ pub struct ExternalResearchInputs {
     pub energy_allowance: Option<EnergyAllowance>,
 }
 impl ExternalResearchInputs {
+    fn arithmetic_component_count(&self) -> usize {
+        if self.components.is_empty() {
+            self.run_once
+                .as_ref()
+                .map_or(0, |inputs| inputs.component_actions.len())
+        } else {
+            self.components.len()
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         precision(self.precision_bits)?;
         if self.schema_version != 1
@@ -510,7 +538,19 @@ pub struct ExtendedAnalysis {
     pub values: BTreeMap<String, String>,
     pub rows: Vec<AnalysisRow>,
 }
-const ASSURANCE:&str="point_diagnostics_only; external_inputs_and_allowances_not_certified; no_RH_or_ground_selection_premise";
+const WEIGHTED_PROFILE_ASSURANCE: &str = "finite_grid_arithmetic_enclosures; exact stored source/reference points; excludes source-construction and quadrature errors; no continuum or limit claim";
+const DIRECTIONAL_ASSURANCE: &str = "finite_stored_point_arithmetic_enclosures; response ratios conditional on root, simple-minimum and displacement hypotheses; no source-error or ground-selection certificate";
+const TRANSPORT_ASSURANCE: &str = "finite_stored_point_arithmetic_enclosures; inherited directional intervals; conditional root/displacement hypotheses; no source-error or root certificate";
+const COMPLEX_ASSURANCE: &str = "finite_stored_point_arithmetic_enclosures; exact cutoff and retained ordinates; samples do not certify contour counts, roots or source errors";
+const OPERATOR_CLUSTER_ASSURANCE: &str = "finite_stored_point_arithmetic_enclosures; numerical selected subspace only; no full-declared-span, source-error or spectral-selection certificate";
+const TRANSFER_ASSURANCE: &str = "finite_stored_point_arithmetic_enclosures; projected retained state only; external comparison source not certified; no convergence claim";
+const CONSISTENCY_ASSURANCE: &str = "finite_stored_point_arithmetic_enclosures; common signed unit-state convention and source independence remain external premises";
+const OBSERVATION_ASSURANCE: &str = "finite_stored_point_arithmetic_enclosures; conditional finite-support L2 transport; external state-error premise not certified";
+const COMPARISON_ASSURANCE: &str = "finite_stored_point_arithmetic_enclosures; external comparison source and selection premises not certified; no convergence claim";
+const RESOLUTION_ASSURANCE: &str = "finite_stored_point_arithmetic_enclosures; conditional root distance bounds; external source errors and target isolation or curvature hypotheses not certified";
+const ALLOWANCE_ASSURANCE: &str = "finite_stored_point_arithmetic_enclosures; conditional block expressions; external block bounds and hypotheses not certified";
+const ENERGY_ASSURANCE: &str = "finite_stored_point_arithmetic_enclosures; excludes source-construction and operator-model errors; no ground-selection or convergence claim";
+const ASSURANCE: &str = "point_diagnostics_only; external_inputs_and_allowances_not_certified; no_RH_or_ground_selection_premise";
 pub(super) fn report(id: &str, s: &RetainedState, o: &ExtensionOptions) -> ExtendedAnalysis {
     ExtendedAnalysis {
         diagnostic: id.into(),
@@ -525,6 +565,30 @@ pub(super) fn report(id: &str, s: &RetainedState, o: &ExtensionOptions) -> Exten
                 .into(),
         assurance: if id == "transform_enclosure" {
             "finite_retained_function_enclosures; source_scope_explicit; no_infinite_limit_claim"
+        } else if id == "directional_response" {
+            DIRECTIONAL_ASSURANCE
+        } else if id == "root_transport" {
+            TRANSPORT_ASSURANCE
+        } else if id == "complex_transform" {
+            COMPLEX_ASSURANCE
+        } else if id == "operator_cluster" {
+            OPERATOR_CLUSTER_ASSURANCE
+        } else if id == "finite_section_transfer" {
+            TRANSFER_ASSURANCE
+        } else if id == "consistency" {
+            CONSISTENCY_ASSURANCE
+        } else if id == "observable_budget" {
+            OBSERVATION_ASSURANCE
+        } else if id == "configuration_comparison" {
+            COMPARISON_ASSURANCE
+        } else if id == "resolution_budget" {
+            RESOLUTION_ASSURANCE
+        } else if id == "energy_allowance" {
+            ALLOWANCE_ASSURANCE
+        } else if id == "arithmetic_energy" {
+            ENERGY_ASSURANCE
+        } else if id == "weighted_reference_projection" {
+            WEIGHTED_PROFILE_ASSURANCE
         } else {
             ASSURANCE
         }
@@ -558,13 +622,8 @@ pub(super) fn unresolved(mut r: ExtendedAnalysis, reason: &str) -> ExtendedAnaly
 pub(super) fn coeffs(v: &[String], p: u32) -> Result<Vec<Float>> {
     v.iter().map(|x| scalar(x, p)).collect()
 }
-pub(super) fn source_unit(s: &RetainedState, p: u32) -> Vec<Float> {
-    let scale =
-        Float::with_val(p, orientation(&s.coefficients, p)) / norm2(&s.coefficients, p).sqrt();
-    s.coefficients
-        .iter()
-        .map(|v| Float::with_val(p, v) * &scale)
-        .collect()
+pub(super) fn source_unit(s: &RetainedState, p: u32) -> Result<Vec<Float>> {
+    compactness_math::unit(&s.coefficients, p)
 }
 pub(super) fn evaluate(v: &[Float], x: &Float, l: &Float, p: u32) -> (Float, Float) {
     let n = v.len() / 2;
@@ -586,79 +645,58 @@ pub(super) fn evaluate(v: &[Float], x: &Float, l: &Float, p: u32) -> (Float, Flo
 fn compactness(s: &RetainedState, o: &ExtensionOptions) -> Result<ExtendedAnalysis> {
     let mut r = report("compactness", s, o);
     let p = o.working_precision_bits;
-    let l = scalar(&s.cutoff, p)?.ln();
-    let pi = Float::with_val(p, Constant::Pi);
-    let v = source_unit(s, p);
-    let scale = Float::with_val(p, 1) / l.clone().sqrt();
-    let f0 = Float::with_val(p, &v[s.modes]) * &l * &scale;
-    let mut m2 = Float::with_val(p, &v[s.modes]) * l.clone().pow(3u32) / 12u32;
-    let mut m4 = Float::with_val(p, &v[s.modes]) * l.clone().pow(5u32) / 80u32;
-    for (i, a) in v.iter().enumerate() {
-        let j = i as i64 - s.modes as i64;
-        if j == 0 {
-            continue;
-        }
-        let q = Float::with_val(p, &pi) * j;
-        let q2 = q.square();
-        m2 += Float::with_val(p, a) * l.clone().pow(3u32) / (Float::with_val(p, &q2) * 2u32);
-        m4 += Float::with_val(p, a)
-            * l.clone().pow(5u32)
-            * (Float::with_val(p, 1) / (Float::with_val(p, &q2) * 4u32)
-                - Float::with_val(p, 3) / (q2.square() * 2u32));
+    // Conservative additional scratch estimate includes the maximum retry guard.
+    // It does not purport to bound the host process or an independently held matrix.
+    let scratch = 32u64
+        * (s.coefficients.len() as u64 + 64)
+        * ((u64::from(p.max(s.precision)) + 4096).div_ceil(8) + 128);
+    if o.maximum_working_bytes.is_some_and(|limit| scratch > limit) {
+        return Ok(unresolved(
+            r,
+            "compactness arithmetic scratch estimate exceeds explicit working-byte budget",
+        ));
     }
-    m2 *= &scale;
-    m4 *= &scale;
-    put(&mut r.values, "transform_origin", &f0);
-    put(&mut r.values, "transform_second_derivative", &(-m2.clone()));
-    put(&mut r.values, "transform_fourth_derivative", &m4);
-    let guard = Float::with_val(p, 1) >> (p - 32);
-    if f0.clone().abs() > guard {
-        put(
-            &mut r.values,
-            "sigma",
-            &(m2 / (Float::with_val(p, &f0) * 2u32)),
-        );
+    let measured =
+        match compactness_math::measure(&s.coefficients, &s.cutoff, &o.exponential_rates, p) {
+            Ok(measured) => measured,
+            Err(error) => {
+                return Ok(unresolved(
+                    r,
+                    &format!("finite moment arithmetic unresolved: {error}; no zero inferred"),
+                ))
+            }
+        };
+    put(&mut r.values, "transform_origin", &measured.origin);
+    put(
+        &mut r.values,
+        "transform_second_derivative",
+        &measured.second,
+    );
+    put(
+        &mut r.values,
+        "transform_fourth_derivative",
+        &measured.fourth,
+    );
+    put(
+        &mut r.values,
+        "arithmetic_precision_bits",
+        &Float::with_val(p, measured.arithmetic_precision),
+    );
+    if let Some(sigma) = measured.sigma {
+        put(&mut r.values, "sigma", &sigma);
     } else {
         r.outcome = "partial_unresolved".into();
-        r.reason = Some("origin denominator unresolved; sigma omitted".into());
+        r.reason = Some("origin transform is exactly zero; sigma is undefined".into());
     }
-    let rates = coeffs(&o.exponential_rates, p)?;
-    // Exact finite Fourier integration. Compute the autocorrelation once and
-    // reuse it for every weight, avoiding O(grid*N) transcendental quadrature.
-    let correlations = (0..v.len())
-        .into_par_iter()
-        .map(|lag| dot(&v[lag..], &v[..v.len() - lag], p))
-        .collect::<Vec<_>>();
-    for (i, a) in rates.iter().enumerate() {
-        let mut sum = Float::with_val(p, 0);
-        let mut absolute = Float::with_val(p, 0);
-        if a == &0 {
-            sum = correlations[0].clone();
-            absolute = sum.clone().abs();
-        } else {
-            let b = Float::with_val(p, a) * 2u32;
-            let endpoint = (Float::with_val(p, a) * &l).exp();
-            for (lag, c) in correlations.iter().enumerate() {
-                let omega = Float::with_val(p, Constant::Pi) * (2 * lag) / &l;
-                let sign = if lag.is_multiple_of(2) { 1 } else { -1 };
-                let kernel: Float =
-                    Float::with_val(p, &b) * 2u32 * (Float::with_val(p, &endpoint) - sign)
-                        / (b.clone().square() + omega.square())
-                        / &l;
-                let term: Float =
-                    Float::with_val(p, c) * kernel * if lag == 0 { 1u32 } else { 2u32 };
-                sum += &term;
-                absolute += term.abs();
-            }
-        }
+    for (i, value) in measured.weighted.into_iter().enumerate() {
         let mut rr = row(i + 1, "finite_exponential_weighted_norm_squared");
-        put(&mut rr.values, "rate", a);
-        put(&mut rr.values, "analytic_integral", &sum);
-        put(&mut rr.values, "sum_absolute_terms", &absolute);
-        rr.notes.push("analytic finite Fourier integral; arithmetic/source error not enclosed; no infinite-support conclusion".into());
+        put(&mut rr.values, "rate", &value.rate);
+        put(&mut rr.values, "analytic_integral", &value.value);
+        put(&mut rr.values, "sum_absolute_terms", &value.absolute_terms);
+        rr.notes.push("point accepted when directed finite-state arithmetic enclosures agree after rounding; source construction error and infinite-support behavior are not enclosed".into());
         r.rows.push(rr);
     }
-    r.convention="unit_L2_dx; signed origin derivatives from analytic Fourier moments; exp(2*a*abs(x)) norm from coefficient autocorrelation; finite support".into();
+    r.convention = "unit_L2_dx; finite Fourier origin moments and exp(2*a*abs(x)) norm; directed arithmetic enclosures agree at requested rounding; source construction errors excluded".into();
     Ok(r)
 }
 fn weighted_projection(
@@ -666,8 +704,9 @@ fn weighted_projection(
     o: &ExtensionOptions,
     i: Option<&ExternalResearchInputs>,
 ) -> Result<ExtendedAnalysis> {
+    use rug::float::Round;
     let mut r = report("weighted_reference_projection", s, o);
-    let Some(t) = i.and_then(|i| i.target.as_ref()) else {
+    let Some((input, t)) = i.and_then(|i| i.target.as_ref().map(|t| (i, t))) else {
         return Ok(missing(
             r,
             "external sampled target and projection convention required",
@@ -684,116 +723,111 @@ fn weighted_projection(
         ));
     }
     let p = o.working_precision_bits;
-    let l = scalar(&s.cutoff, p)?.ln();
-    let mut v = s
-        .coefficients
-        .iter()
-        .map(|x| Float::with_val(p, x))
-        .collect::<Vec<_>>();
-    let c = center(&v, p);
-    put(&mut r.values, "source_raw_center", &c);
-    put(
-        &mut r.values,
-        "reference_raw_normalizer",
-        &scalar(&t.raw_normalizer, p)?,
-    );
-    if c.clone().abs() <= Float::with_val(p, 1) >> (p - 32) {
-        return Ok(unresolved(r, "source center normalization unresolved"));
-    }
-    for a in &mut v {
-        *a /= &c;
-    }
-    let target = coeffs(&t.values, p)?;
-    if (Float::with_val(p, &target[0]) - 1u32).abs()
-        > Float::with_val(p, 1) >> (i.unwrap().precision_bits / 2)
-    {
+    let base = p.max(s.precision).max(input.precision_bits);
+    let scratch = 64u64
+        * (s.coefficients.len() as u64
+            + (t.basis_values.len() as u64 + 6) * (t.values.len() as u64)
+            + 64)
+        * ((u64::from(base) + 4096).div_ceil(8) + 128);
+    if o.maximum_working_bytes.is_some_and(|limit| scratch > limit) {
         return Ok(unresolved(
             r,
-            "reference values must be normalized to target(1)=1",
+            "weighted profile scratch estimate exceeds explicit working-byte budget",
         ));
     }
+    // These decimals denote stored source points, not exact real parameters.
+    let target = coeffs(&t.values, input.precision_bits)?;
     let basis = t
         .basis_values
         .iter()
-        .map(|v| coeffs(v, p))
+        .map(|v| coeffs(v, input.precision_bits))
         .collect::<Result<Vec<_>>>()?;
-    let b = basis.len();
-    let n = t.intervals;
-    let h = Float::with_val(p, &l) / (2 * n);
-    let rows = (0..=n)
-        .into_par_iter()
-        .map(|j| {
-            let x = Float::with_val(p, j) * &h;
-            let (actual, _) = evaluate(&v, &x, &l, p);
-            let difference = actual - &target[j];
-            let weight = (Float::with_val(p, &x) / 2u32).exp() * &h
-                / if j == 0 || j == n { 2u32 } else { 1u32 };
-            (difference, weight)
-        })
-        .collect::<Vec<_>>();
-    let mut gram = vec![Float::with_val(p, 0); b * b];
-    let mut rhs = vec![Float::with_val(p, 0); b];
-    let mut l1 = Float::with_val(p, 0);
-    let mut l2 = Float::with_val(p, 0);
-    let mut signed = Float::with_val(p, 0);
-    for (j, (d, w)) in rows.iter().enumerate() {
-        l1 += d.clone().abs() * w;
-        l2 += d.clone().square() * w;
-        signed += Float::with_val(p, d) * w;
-        for a in 0..b {
-            rhs[a] += Float::with_val(p, &basis[a][j]) * d * w;
-            for k in 0..b {
-                gram[a * b + k] += Float::with_val(p, &basis[a][j]) * &basis[k][j] * w;
-            }
-        }
+    let fixed = t
+        .fixed_second_component
+        .as_ref()
+        .map(|v| scalar(v, input.precision_bits))
+        .transpose()?;
+    if target[0] != 1 {
+        return Ok(unresolved(
+            r,
+            "reference source point must be normalized to target(1)=1 exactly",
+        ));
     }
-    r.convention="f(1)=target(1)=1; x=log(u); 0<=x<=log(C)/2; exp(x/2)dx=du/sqrt(u); nonorthogonal_raw_basis; composite_trapezoid".into();
-    put(&mut r.values, "weighted_l1", &l1);
-    put(&mut r.values, "weighted_l2_squared", &l2);
-    put(&mut r.values, "signed_integral", &signed);
-    for a in 0..b {
-        put(&mut r.values, &format!("rhs_{a}"), &rhs[a]);
-        for k in 0..b {
-            put(&mut r.values, &format!("gram_{a}_{k}"), &gram[a * b + k]);
+    let measured = match weighted_math::measure(
+        &s.coefficients,
+        &s.cutoff,
+        &target,
+        &basis,
+        fixed.as_ref(),
+        p,
+    ) {
+        Ok(measured) => measured,
+        Err(error) => {
+            return Ok(unresolved(
+                r,
+                &format!("weighted profile unresolved: {error}"),
+            ))
         }
+    };
+    for (name, bound) in measured.values {
+        bound.validate()?;
+        let middle = bound.midpoint_point();
+        let mid = Float::with_val(p, middle.lower());
+        let lo = Float::with_val_round(p, bound.lower(), Round::Down).0;
+        let hi = Float::with_val_round(p, bound.upper(), Round::Up).0;
+        if !mid.is_finite()
+            || !lo.is_finite()
+            || !hi.is_finite()
+            || (mid.is_zero() && !middle.lower().is_zero())
+        {
+            bail!("weighted profile report value exceeds requested output range");
+        }
+        put(&mut r.values, &name, &mid);
+        // Directed decimal strings retain outwardness as real decimals too.
+        let digits = Some((u64::from(p) * 30103 / 100000 + 10) as usize);
+        r.values.insert(
+            format!("{name}_lower"),
+            lo.to_string_radix_round(10, digits, Round::Down),
+        );
+        r.values.insert(
+            format!("{name}_upper"),
+            hi.to_string_radix_round(10, digits, Round::Up),
+        );
     }
-    if b > 0 {
-        if let Some((fit, pivot)) = solve_small(&gram, &rhs, p) {
-            put(&mut r.values, "minimum_pivot", &pivot);
-            let mut residual = Float::with_val(p, 0);
-            for (j, (d, w)) in rows.iter().enumerate() {
-                let mut rem = d.clone();
-                for a in 0..b {
-                    rem -= Float::with_val(p, &fit[a]) * &basis[a][j];
-                }
-                residual += rem.square() * w;
-            }
-            put(&mut r.values, "fit_residual_norm_squared", &residual);
-            for (a, f) in fit.iter().enumerate() {
-                put(&mut r.values, &format!("a_{a}"), f);
-            }
-            if let Some(fixed) = &t.fixed_second_component {
-                let fixed = scalar(fixed, p)?;
-                put(&mut r.values, "fixed_second_component", &fixed);
-                put(
-                    &mut r.values,
-                    "b2",
-                    &(Float::with_val(p, &fit[1]) - &fixed * &fit[0]),
-                );
-                if fit[0].clone().abs() > Float::with_val(p, 1) >> (p - 32) {
-                    put(
-                        &mut r.values,
-                        "b_effective",
-                        &(Float::with_val(p, &fit[1]) / &fit[0]),
-                    );
-                }
-            }
-        } else {
-            r.outcome = "rank_or_precision_unresolved".into();
-            r.reason = Some("nonorthogonal Gram system unresolved".into());
-        }
+    put(
+        &mut r.values,
+        "reference_raw_normalizer",
+        &Float::with_val(p, scalar(&t.raw_normalizer, input.precision_bits)?),
+    );
+    if let Some(fixed) = fixed {
+        put(
+            &mut r.values,
+            "fixed_second_component",
+            &Float::with_val(p, fixed),
+        );
+    }
+    put(
+        &mut r.values,
+        "arithmetic_precision_bits",
+        &Float::with_val(p, measured.arithmetic_precision),
+    );
+    r.convention="f(1)=target(1)=1; x=j*log(C)/(2n); exp(x/2)dx; finite composite trapezoid; independently scaled raw basis; each measured field is an enclosure midpoint with outward decimal lower/upper fields; pivot uses scaled Gram units".into();
+    r.assurance = WEIGHTED_PROFILE_ASSURANCE.into();
+    if !measured.fit_resolved {
+        r.outcome = "rank_or_precision_unresolved".into();
+        r.reason = Some(
+            "finite interval Gram solve unresolved within 4096 guard bits; fit fields withheld"
+                .into(),
+        );
+    } else if t.fixed_second_component.is_some() && !r.values.contains_key("b_effective") {
+        r.reason = Some("b_effective withheld because a_0 enclosure contains zero".into());
     }
     Ok(r)
+}
+
+// Range-checked point division; this is not a forward-error enclosure.
+fn signed_channel_quotient(a: &Float, b: &Float, p: u32) -> Result<Float> {
+    point::quotient(a, b, p)
 }
 
 fn signed_transforms(
@@ -808,19 +842,40 @@ fn signed_transforms(
             "external reference window/full/tail jets required",
         ));
     };
+    // Decimal input text denotes a binary point at the declared input precision.
+    // Promote that existing point; changing output precision cannot redefine it.
     let p = o.working_precision_bits;
-    let l = scalar(&s.cutoff, p)?.ln();
-    let unit = source_unit(s, p);
-    let c = center(&unit, p) / l.clone().sqrt();
-    if c.clone().abs() <= Float::with_val(p, 1) >> (p - 32) {
-        return Ok(unresolved(r, "center normalization unresolved"));
+    let input_point =
+        |text: &str| -> Result<Float> { point::output(&scalar(text, i.precision_bits)?, p) };
+    let normalization_precision = p + 64;
+    let l = super::retained_evidence::finite_math::rounded_log_cutoff(
+        &s.cutoff,
+        normalization_precision,
+    )?;
+    let c = point::unit_center(&s.coefficients, normalization_precision)?;
+    if c.is_zero() {
+        return Ok(unresolved(
+            r,
+            "center-one normalization requires a nonzero exact stored center",
+        ));
     }
+    let c = signed_channel_quotient(&c, &l.sqrt(), normalization_precision)?;
     r.convention="center_one; exp(i*t*x); interior=actual-reference_window; signed_total=interior-exterior_tail; reference_full=window+tail; all channels kept".into();
+    put(
+        &mut r.values,
+        "arithmetic_precision_bits",
+        &Float::with_val(p, p),
+    );
+    put(
+        &mut r.values,
+        "normalization_precision_bits",
+        &Float::with_val(p, normalization_precision),
+    );
     r.rows = i
         .reference_jets
         .par_iter()
         .map(|a| -> Result<_> {
-            let t = scalar(&a.t, p)?;
+            let t = input_point(&a.t)?;
             let (v, d, abs, absd) = transform_terms(s, &t, p)?;
             let mut rr = row(a.ordinal, "reference_ordinate");
             put(&mut rr.values, "t", &t);
@@ -852,18 +907,18 @@ fn signed_transforms(
                         .collect::<Vec<_>>(),
                 ),
             ] {
-                let actual = value / &c;
-                let window = scalar(w, p)?;
-                let full = scalar(f, p)?;
-                let tail = scalar(tail, p)?;
-                let inside = Float::with_val(p, &actual) - &window;
-                let total = Float::with_val(p, &inside) - &tail;
-                let closure = Float::with_val(p, &full) - &window - &tail;
-                let mut fitted = Float::with_val(p, 0);
+                let actual = signed_channel_quotient(&value, &c, p)?;
+                let window = input_point(w)?;
+                let full = input_point(f)?;
+                let tail = input_point(tail)?;
+                let inside = point::sum(&[actual.clone(), -window.clone()], p)?;
+                let total = point::sum(&[actual.clone(), -window.clone(), -tail.clone()], p)?;
+                let closure = point::sum(&[full.clone(), -window.clone(), -tail.clone()], p)?;
+                let mut unfitted_terms = vec![actual.clone(), -window.clone()];
                 for (k, a) in fit.iter().enumerate() {
-                    let v = scalar(a, p)?;
+                    let v = input_point(a)?;
                     put(&mut rr.values, &format!("{name}_fitted_{k}"), &v);
-                    fitted += v;
+                    unfitted_terms.push(-v);
                 }
                 for (label, val) in [
                     ("actual", &actual),
@@ -879,9 +934,9 @@ fn signed_transforms(
                 put(
                     &mut rr.values,
                     &format!("{name}_unfitted_interior"),
-                    &(Float::with_val(p, &inside) - fitted),
+                    &point::sum(&unfitted_terms, p)?,
                 );
-                let scale = inside.clone().abs() + tail.clone().abs();
+                let scale = point::sum(&[inside.clone().abs(), tail.clone().abs()], p)?;
                 put(
                     &mut rr.values,
                     &format!("{name}_sum_absolute_channels"),
@@ -891,28 +946,32 @@ fn signed_transforms(
                     put(
                         &mut rr.values,
                         &format!("{name}_cancellation_digits"),
-                        &(scale / total.clone().abs())
-                            .log10()
+                        &point::sum(&[scale.clone().log10(), -total.clone().abs().log10()], p)?
                             .max(&Float::with_val(p, 0)),
                     );
                 }
                 if let Some(e) = end {
-                    let e = scalar(e, p)?;
+                    let e = input_point(e)?;
                     put(&mut rr.values, &format!("{name}_endpoint_tail_part"), &e);
                     put(
                         &mut rr.values,
                         &format!("{name}_remaining_tail"),
-                        &(tail - e),
+                        &point::sum(&[tail, -e], p)?,
                     );
                 }
-                let numerical_floor =
-                    (Float::with_val(p, &absolute) / c.clone().abs() + 1u32) >> (p - 32);
+                let numerical_floor = point::sum(
+                    &[
+                        signed_channel_quotient(&absolute, &c.clone().abs(), p)?,
+                        Float::with_val(p, 1),
+                    ],
+                    p,
+                )? >> (p - 32);
                 if total.clone().abs() <= numerical_floor {
                     rr.outcome = "cancellation_limited".into();
                 }
             }
             rr.notes.push(
-                "supplied reference point jets; no infinite-tail or source-error certification"
+                "declared-precision reference points promoted without reinterpretation; each signed channel uses one rounded sum; cancellation_limited is a point-arithmetic heuristic, not an error bound; no infinite-tail or source-error certification"
                     .into(),
             );
             Ok(rr)
@@ -920,48 +979,34 @@ fn signed_transforms(
         .collect::<Result<Vec<_>>>()?;
     Ok(r)
 }
-struct ParsedOperator {
-    diagonal: Vec<Float>,
-    dense: Vec<Float>,
-    rank: Vec<(Float, Vec<Float>)>,
-}
-impl ParsedOperator {
-    fn from(c: &OperatorComponent, p: u32) -> Result<Self> {
-        Ok(Self {
-            diagonal: coeffs(&c.diagonal, p)?,
-            dense: coeffs(&c.dense, p)?,
-            rank: c
-                .rank_one
-                .iter()
-                .map(|r| Ok((scalar(&r.weight, p)?, coeffs(&r.vector, p)?)))
-                .collect::<Result<Vec<_>>>()?,
-        })
+pub(super) fn save_arithmetic_enclosure(
+    map: &mut BTreeMap<String, String>,
+    name: &str,
+    value: &xc_numerics::mpfr_interval::MpfrInterval,
+    p: u32,
+) -> Result<()> {
+    use rug::float::Round;
+    value.validate()?;
+    let middle = value.midpoint_point();
+    let mid = point::output(middle.lower(), p)?;
+    let lo = Float::with_val_round(p, value.lower(), Round::Down).0;
+    let hi = Float::with_val_round(p, value.upper(), Round::Up).0;
+    if !lo.is_finite() || !hi.is_finite() {
+        bail!("energy enclosure output exceeds finite range")
     }
-    fn action(&self, v: &[Float], p: u32) -> Vec<Float> {
-        let n = v.len();
-        let mut out = if self.dense.is_empty() {
-            vec![Float::with_val(p, 0); n]
-        } else {
-            self.dense.par_chunks(n).map(|r| dot(r, v, p)).collect()
-        };
-        for (a, (d, x)) in out.iter_mut().zip(self.diagonal.iter().zip(v)) {
-            *a += Float::with_val(p, d) * x;
-        }
-        for (weight, q) in &self.rank {
-            let factor = dot(q, v, p) * weight;
-            for (a, q) in out.iter_mut().zip(q) {
-                *a += Float::with_val(p, q) * &factor;
-            }
-        }
-        out
-    }
+    put(map, name, &mid);
+    let digits = Some((u64::from(p) * 30103 / 100000 + 10) as usize);
+    map.insert(
+        format!("{name}_lower"),
+        lo.to_string_radix_round(10, digits, Round::Down),
+    );
+    map.insert(
+        format!("{name}_upper"),
+        hi.to_string_radix_round(10, digits, Round::Up),
+    );
+    Ok(())
 }
-pub(super) fn matvec(m: &RetainedMatrix<'_>, v: &[Float], p: u32) -> Vec<Float> {
-    m.entries
-        .par_chunks(v.len())
-        .map(|r| dot(r, v, p))
-        .collect()
-}
+
 fn arithmetic_energy(
     s: &RetainedState,
     m: Option<&RetainedMatrix<'_>>,
@@ -975,127 +1020,96 @@ fn arithmetic_energy(
                 .as_ref()
                 .is_some_and(|r| !r.component_actions.is_empty())
     }) else {
-        return Ok(missing(r,"explicit arithmetic component operators required; total Tau does not identify the split"));
+        return Ok(missing(
+            r,
+            "explicit arithmetic component operators required; total Tau does not identify the split",
+        ));
     };
     let Some(m) = m else {
         return Ok(missing(r, "retained Tau required for component closure"));
     };
     let p = o.working_precision_bits;
-    let v = source_unit(s, p);
-    let av = matvec(m, &v, p);
-    let total = dot(&v, &av, p);
-    let mut combined = vec![Float::with_val(p, 0); v.len()];
-    let mut sum = Float::with_val(p, 0);
-    let mut absolute = Float::with_val(p, 0);
-    let mut actions = i
-        .components
-        .iter()
-        .map(|c| {
-            Ok((
-                c.label.clone(),
-                c.source_digest.clone(),
-                ParsedOperator::from(c, p)?.action(&v, p),
-                "external operator".to_string(),
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if i.components.is_empty() {
-        if let Some(inputs) = &i.run_once {
-            for c in &inputs.component_actions {
-                actions.push((
-                    c.label.clone(),
-                    c.source_digest.clone(),
-                    coeffs(&c.action, p)?,
-                    c.convention.clone(),
-                ));
-            }
-        }
+    let count = m.entries.len() as u64
+        + s.coefficients.len() as u64 * 256
+        + i.components
+            .iter()
+            .map(|c| {
+                (c.diagonal.len()
+                    + c.dense.len()
+                    + c.rank_one.iter().map(|r| r.vector.len() + 1).sum::<usize>())
+                    as u64
+            })
+            .sum::<u64>();
+    let scratch = count
+        .checked_mul(64)
+        .and_then(|n| n.checked_mul((u64::from(p) + 4096).div_ceil(8) + 128))
+        .ok_or_else(|| anyhow::anyhow!("arithmetic energy scratch estimate overflow"))?;
+    if o.maximum_working_bytes.is_some_and(|limit| scratch > limit) {
+        return Ok(unresolved(
+            r,
+            "arithmetic energy scratch estimate exceeds explicit working-byte budget",
+        ));
     }
-    for (k, (label, digest, action, convention)) in actions.into_iter().enumerate() {
-        let e = dot(&v, &action, p);
-        let mut rr = row(k + 1, label);
-        put(&mut rr.values, "energy", &e);
-        rr.notes
-            .push(format!("source {}; {}", digest.0, convention));
-        sum += &e;
-        absolute += e.abs();
-        for (a, b) in combined.iter_mut().zip(action) {
-            *a += b;
-        }
-        r.rows.push(rr);
+    let Some(measured) = energy_math::measure(s, m, i, p)? else {
+        return Ok(unresolved(
+            r,
+            "arithmetic energy enclosures unresolved within 4096 guard bits; measurements withheld",
+        ));
+    };
+    for (name, value) in &measured.values {
+        save_arithmetic_enclosure(&mut r.values, name, value, p)?;
     }
-    let residual = combined
-        .iter()
-        .zip(&av)
-        .map(|(a, b)| (Float::with_val(p, a) - b).square())
-        .fold(Float::with_val(p, 0), |a, b| a + b)
-        .sqrt();
-    put(&mut r.values, "total_tau_energy", &total);
-    put(&mut r.values, "sum_component_energy", &sum);
-    put(&mut r.values, "sum_absolute_component_energy", &absolute);
     put(
         &mut r.values,
-        "energy_closure_defect",
-        &(Float::with_val(p, &sum) - &total),
+        "arithmetic_precision_bits",
+        &Float::with_val(p, measured.arithmetic_precision),
     );
-    put(&mut r.values, "operator_action_closure_norm", &residual);
+    for (k, energy) in measured.energies.iter().enumerate() {
+        let (label, digest, convention) = if let Some(c) = i.components.get(k) {
+            (
+                &c.label,
+                &c.source_digest,
+                "external operator on exact stored coefficients",
+            )
+        } else {
+            let c = &i.run_once.as_ref().unwrap().component_actions[k];
+            (&c.label, &c.source_digest, c.convention.as_str())
+        };
+        let mut rr = row(k + 1, label);
+        save_arithmetic_enclosure(&mut rr.values, "energy", energy, p)?;
+        rr.notes
+            .push(format!("source {}; {}", digest.0, convention));
+        r.rows.push(rr);
+    }
     r.convention = if i.components_are_complete {
         "caller_declares_complete_component_sum; measured_action_closure"
     } else {
         "partial_component_sum; remaining_Tau_action_explicit"
     }
     .into();
-    let e = scalar(&s.eigenvalue, p)?;
-    put(&mut r.values, "retained_weil_energy", &e);
-    let trial = if let Some(c) = i
-        .target
-        .as_ref()
-        .and_then(|t| t.trial_coefficients.as_ref())
-    {
-        let mut q = coeffs(c, p)?;
-        let norm = norm2(&q, p);
-        if norm == 0 {
-            None
-        } else {
-            let scale = norm.sqrt();
-            for x in &mut q {
-                *x /= &scale;
-            }
-            let energy = dot(&q, &matvec(m, &q, p), p);
-            put(&mut r.values, "finite_projected_trial_energy", &energy);
-            Some(energy)
-        }
-    } else {
-        None
-    };
-    if let Some(d) = &i.deficit {
-        let d = scalar(d, p)?;
-        put(&mut r.values, "reference_deficit", &d);
-        if d > 0 {
-            put(
-                &mut r.values,
-                "signed_weil_over_deficit",
-                &(Float::with_val(p, &e) / &d),
-            );
-            if let Some(trial) = &trial {
-                put(
-                    &mut r.values,
-                    "signed_trial_over_deficit",
-                    &(Float::with_val(p, trial) / &d),
-                );
-            }
-        } else {
-            r.outcome = "partial_unresolved".into();
-            r.reason = Some("nonpositive reference deficit; deficit ratios omitted".into());
-        }
+    if i.deficit.is_some() {
+        r.convention.push_str(&format!(
+            "; reference_deficit_kind={}",
+            i.deficit_kind.as_deref().unwrap_or("unspecified")
+        ));
     }
-    if e != 0 {
-        if let Some(t) = trial {
-            put(&mut r.values, "signed_trial_over_weil", &(t / e));
-        }
+    let mut reasons = Vec::new();
+    if measured.zero_trial {
+        reasons.push("zero trial vector has no Rayleigh quotient; trial fields omitted");
+    }
+    if i.deficit
+        .as_ref()
+        .is_some_and(|d| scalar(d, i.precision_bits).is_ok_and(|d| d <= 0))
+    {
+        reasons.push("nonpositive reference deficit; deficit ratios omitted");
+    }
+    if !reasons.is_empty() {
+        r.outcome = "partial_unresolved".into();
+        r.reason = Some(reasons.join("; "));
     }
     Ok(r)
 }
+
 fn directional(
     s: &RetainedState,
     m: Option<&RetainedMatrix<'_>>,
@@ -1121,29 +1135,29 @@ fn directional(
         ));
     }
     let p = o.working_precision_bits;
-    let v = source_unit(s, p);
-    let l = scalar(&s.cutoff, p)?.ln();
-    let two_pi = Float::with_val(p, Constant::Pi) * 2u32;
-    let e = scalar(&s.eigenvalue, p)?;
-    let mut ops = input
-        .map(|i| &i.perturbations[..])
-        .unwrap_or(&[])
-        .iter()
-        .map(|c| Ok((&c.label, ParsedOperator::from(c, p)?.action(&v, p))))
-        .collect::<Result<Vec<_>>>()?;
-    if let Some(inputs) = input.and_then(|i| i.run_once.as_ref()) {
-        for a in &inputs.derivative_actions {
-            if ops.iter().any(|(label, _)| *label == &a.label) {
-                bail!("duplicate derivative action label");
-            }
-            ops.push((&a.label, coeffs(&a.action, p)?));
+    if let Some(limit) = o.maximum_working_bytes {
+        let input_bytes = input
+            .map(serde_json::to_vec)
+            .transpose()?
+            .map_or(0, |v| v.len());
+        let cells = (m.entries.len() as u128
+            + input_bytes as u128
+            + 32 * s.coefficients.len() as u128
+            + 256)
+            * 16;
+        let estimate = cells * (u128::from(p + 4096).div_ceil(8) + 64);
+        if estimate > u128::from(limit) {
+            return Ok(unresolved(
+                r,
+                "directional maximum-guard scratch estimate exceeds explicit working-byte budget",
+            ));
         }
     }
     // Explicit arithmetic work budget. Every omitted row remains in the report.
     let limit = o.maximum_directional_rows;
-    r.convention="even finite state; tau=(t*log(C)/(2*pi))^2; x=(tau-j^2)^-1*v-v*(v^T(tau-j^2)^-1*v); kappa=x^T(Tau-EI)x; response ratios conditional on simple-minimum/displacement/root hypotheses".into();
+    r.convention="even finite state; tau=(t*log(C)/(2*pi))^2; x=(tau-j^2)^-1*v-v*(v^T(tau-j^2)^-1*v); kappa=x^T(Tau-EI)x; response ratios conditional on simple-minimum/root/source hypotheses and measured ||(A-E)z-c*P*R*1||/||(A-E)z||<=2^(-source_precision/2), c least-squares; this numerical rule does not prove exact displacement".into();
     let checkpoints = super::capture_runtime::Checkpoints::new(&(
-        "directional-rows-v2",
+        "directional-rows-v4-displacement-rule",
         &s.manifest.content_digest,
         &m.manifest.content_digest,
         &roots.manifest.content_digest,
@@ -1167,77 +1181,44 @@ fn directional(
                 rr.outcome = "missing_input".into();
                 return Ok(rr);
             };
-            let t = scalar(t, p)?;
-            let tau = (Float::with_val(p, &t) * &l / &two_pi).square();
-            put(&mut rr.values, "t", &t);
-            put(&mut rr.values, "tau", &tau);
-            let floor = (tau.clone().abs() + 1u32) >> (p - 32);
-            let mut rv = Vec::with_capacity(v.len());
-            for (idx, a) in v.iter().enumerate() {
-                let j = idx.abs_diff(s.modes);
-                let denominator = Float::with_val(p, &tau) - j * j;
-                if denominator.clone().abs() <= floor {
+            let measured = match directional_math::measure(
+                s,
+                m,
+                input,
+                t,
+                roots.dataset.precision_bits,
+                p,
+            )? {
+                directional_math::Outcome::Measured(value) => value,
+                directional_math::Outcome::Carrier => {
                     rr.outcome = "carrier_or_unresolved".into();
+                    rr.notes.push("zero retained point lies on the central carrier; projected resolvent undefined".into());
                     return Ok(rr);
                 }
-                rv.push(Float::with_val(p, a) / denominator);
+                directional_math::Outcome::GuardExhausted => {
+                    rr.outcome = "cancellation_limited".into();
+                    rr.notes.push("carrier separation or arithmetic width unresolved within 4096 guard bits; measurements withheld".into());
+                    return Ok(rr);
+                }
+            };
+            for (name, value) in &measured.values {
+                save_arithmetic_enclosure(&mut rr.values, name, value, p)?;
             }
-            let root_condition = rv.iter().fold(Float::with_val(p, 0), |mut a, b| {
-                a += b;
-                a
-            });
-            let root_scale = rv
-                .iter()
-                .fold(Float::with_val(p, 0), |a, b| a + b.clone().abs());
-            let root_resolved = root_condition.clone().abs()
-                <= (root_scale + 1u32) >> (s.precision.saturating_sub(32));
-            let vr = dot(&v, &rv, p);
-            let x = rv
-                .iter()
-                .zip(&v)
-                .map(|(a, b)| Float::with_val(p, a) - Float::with_val(p, &vr) * b)
-                .collect::<Vec<_>>();
-            let ax = matvec(m, &x, p);
-            let x2 = norm2(&x, p);
-            let k = dot(&x, &ax, p) - Float::with_val(p, &e) * &x2;
-            put(&mut rr.values, "directional_energy", &k);
-            put(&mut rr.values, "direction_norm_squared", &x2);
-            put(&mut rr.values, "orthogonality_defect", &dot(&x, &v, p));
-            put(&mut rr.values, "rational_root_condition", &root_condition);
-            let guard = (dot(
-                &x.iter().map(|v| v.clone().abs()).collect::<Vec<_>>(),
-                &ax.iter().map(|v| v.clone().abs()).collect::<Vec<_>>(),
-                p,
-            ) + Float::with_val(p, &e).abs() * &x2
-                + 1u32)
-                >> (p - 32);
-            if k.clone().abs() <= guard {
+            put(
+                &mut rr.values,
+                "arithmetic_precision_bits",
+                &Float::with_val(p, measured.precision),
+            );
+            if !measured.denominator_resolved {
                 rr.outcome = "unresolved_denominator".into();
             }
-            for (label, action) in &ops {
-                let forcing = dot(&x, action, p);
-                put(&mut rr.values, &format!("forcing_{label}"), &forcing);
-                if k.clone().abs() > guard && root_resolved {
-                    put(
-                        &mut rr.values,
-                        &format!("conditional_tau_response_{label}"),
-                        &(-forcing / &k),
-                    );
-                }
-            }
-            if !root_resolved {
+            if !measured.root_rule_met || !measured.has_actions || !measured.displacement_rule_met {
                 if rr.outcome == "point_measurement" {
                     rr.outcome = "channels_resolved_budget_unassessed".into();
                 }
-                rr.notes.push("point does not resolve the unshifted rational root condition; response ratios withheld".into());
+                rr.notes.push("root proximity or displacement-alignment rule not met, or perturbation actions unavailable; response ratios withheld".into());
             }
-            if ops.is_empty() {
-                if rr.outcome == "point_measurement" {
-                    rr.outcome = "channels_resolved_budget_unassessed".into();
-                }
-                rr.notes
-                    .push("perturbation operators unavailable; forcing ratios not computed".into());
-            }
+            rr.notes.push("finite stored-point arithmetic bounds only; the root proximity and displacement-alignment thresholds are numerical rules, not a root, minimum, exact displacement or spectral-gap certificate".into());
             rr.notes.push(format!(
                 "source root status {}; point energy is not a spectral-gap certificate",
                 point.source_status
@@ -1261,105 +1242,96 @@ pub(crate) fn weighted_tail_base(
     };
     let p = o.working_precision_bits;
     r.convention = format!(
-        "{}; caller-declared partitions; finite supplied atoms only; {}",
+        "{}; caller-declared partitions; finite supplied atoms only; {}; numeric atoms/checkpoints decoded at declared source precision; exact dyadic masses and directed inverse-moment arithmetic",
         i.atom_coordinate.as_deref().unwrap(),
         i.atom_coverage.as_deref().unwrap()
     );
-    let mut checkpoints = coeffs(&i.tail_checkpoints, p)?;
+    let mut checkpoints = i
+        .tail_checkpoints
+        .iter()
+        .map(|x| scalar(x, i.precision_bits))
+        .collect::<Result<Vec<_>>>()?;
     if checkpoints.is_empty() {
         for a in &i.atoms {
-            checkpoints.push(scalar(&a.coordinate, p)?);
+            checkpoints.push(scalar(&a.coordinate, i.precision_bits)?);
         }
-        checkpoints.sort_by(|a, b| a.total_cmp(b));
+        checkpoints.sort_by(Float::total_cmp);
         checkpoints.dedup();
-        let all = checkpoints;
-        checkpoints = all
-            .iter()
+        let count = checkpoints.len();
+        checkpoints = checkpoints
+            .into_iter()
             .enumerate()
-            .filter(|(k, _)| (*k + 1).is_power_of_two() || *k + 1 == all.len())
-            .map(|(_, v)| v.clone())
+            .filter(|(k, _)| (*k + 1).is_power_of_two() || *k + 1 == count)
+            .map(|(_, v)| v)
             .collect();
     }
-    checkpoints.sort_by(|a, b| a.total_cmp(b));
+    checkpoints.sort_by(Float::total_cmp);
     checkpoints.dedup();
     if checkpoints.iter().any(|x| x < &0) {
         bail!("tail checkpoints must be nonnegative");
     }
-    let mut families: BTreeMap<(String, String), Vec<(Float, Float)>> = BTreeMap::new();
+    let mut families: BTreeMap<(String, String), Vec<atom_math::Atom>> = BTreeMap::new();
     for a in &i.atoms {
         families
             .entry((a.family.clone(), a.partition.clone()))
             .or_default()
-            .push((scalar(&a.coordinate, p)?, scalar(&a.weight, p)?));
+            .push(atom_math::Atom {
+                coordinate: scalar(&a.coordinate, i.precision_bits)?,
+                weight: scalar(&a.weight, i.precision_bits)?,
+            });
     }
-    for ((family, partition), mut atoms) in families {
-        atoms.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut pos = 0;
-        let mut mass = Float::with_val(p, 0);
-        let mut abs = Float::with_val(p, 0);
-        let mut moments = vec![Float::with_val(p, 0); 3];
-        let mut inverse_defined = true;
-        let total = atoms.iter().fold(Float::with_val(p, 0), |mut s, (_, w)| {
-            s += w;
-            s
-        });
-        for cutoff in &checkpoints {
-            while pos < atoms.len() && &atoms[pos].0 <= cutoff {
-                let (x, w) = &atoms[pos];
-                mass += w;
-                abs += w.clone().abs();
-                if x == &0 {
-                    inverse_defined &= w == &0;
-                } else {
-                    let inverse = Float::with_val(p, 1) / x;
-                    let mut term = Float::with_val(p, w);
-                    for m in &mut moments {
-                        term *= &inverse;
-                        *m += &term;
-                    }
-                }
-                pos += 1;
+    for ((family, partition), atoms) in families {
+        if let Some(limit) = o.maximum_working_bytes {
+            if atom_math::scratch_bytes(&atoms, checkpoints.len(), p)? > limit {
+                return Ok(unresolved(
+                    r,
+                    "finite atom per-group scratch estimate exceeds explicit working-byte budget",
+                ));
             }
+        }
+        let rows = atom_math::tail(&atoms, &checkpoints, p)?;
+        for value in rows {
             let mut rr = row(r.rows.len() + 1, format!("{family}/{partition}"));
-            put(&mut rr.values, "cutoff", cutoff);
-            put(&mut rr.values, "included_mass", &mass);
-            put(&mut rr.values, "included_absolute_mass", &abs);
+            put(&mut rr.values, "cutoff", &value.cutoff);
+            put(&mut rr.values, "included_mass", &value.mass);
             put(
                 &mut rr.values,
-                "remaining_supplied_mass",
-                &(Float::with_val(p, &total) - &mass),
+                "included_absolute_mass",
+                &value.absolute_mass,
             );
-            put(&mut rr.values, "included_count", &Float::with_val(p, pos));
-            for (k, m) in moments.iter().enumerate() {
-                if inverse_defined {
+            put(&mut rr.values, "remaining_supplied_mass", &value.remaining);
+            put(
+                &mut rr.values,
+                "included_count",
+                &Float::with_val(p, value.count),
+            );
+            put(
+                &mut rr.values,
+                "arithmetic_precision_bits",
+                &Float::with_val(p, value.arithmetic_precision),
+            );
+            if let Some(moments) = value.moments {
+                for (j, value) in moments.iter().enumerate() {
                     put(
                         &mut rr.values,
-                        &format!("weighted_inverse_moment_{}", k + 1),
-                        m,
+                        &format!("weighted_inverse_moment_{}", j + 1),
+                        value,
                     );
                 }
-            }
-            if !inverse_defined {
+            } else {
                 rr.outcome = "unresolved_denominator".into();
-                rr.notes.push("inverse moments undefined: the included lattice origin has nonzero mass; origin retained in mass and count".into());
+                r.outcome = "partial_unresolved".into();
+                if let Some(reason) = value.reason {
+                    rr.notes.push(reason);
+                }
             }
-            rr.notes.push(
-                "unprovided infinite tail not bounded; known-zero geometry remains an input".into(),
-            );
+            rr.notes.push("unprovided infinite tail not bounded; known-zero geometry remains an input; finite arithmetic excludes source construction error".into());
             r.rows.push(rr);
         }
     }
     Ok(r)
 }
-fn padded_unit(v: &[Float], modes: usize, p: u32) -> Vec<Float> {
-    let mut result = vec![Float::with_val(p, 0); 2 * modes + 1];
-    let offset = modes - v.len() / 2;
-    let n = norm2(v, p).sqrt();
-    for (j, v) in v.iter().enumerate() {
-        result[offset + j] = Float::with_val(p, v) / &n;
-    }
-    result
-}
+
 fn cluster(
     s: &RetainedState,
     o: &ExtensionOptions,
@@ -1381,59 +1353,57 @@ fn cluster(
         .max()
         .unwrap()
         .max(s.modes);
-    let v = padded_unit(&s.coefficients, modes, p);
-    let q = i
+    let vectors = 1 + i.cluster.len() + i.previous_cluster.len();
+    let scratch = (8u64 * (vectors as u64) * (2 * modes as u64 + 1) + 8192)
+        * ((u64::from(p) + 4096).div_ceil(8) + 128);
+    if o.maximum_working_bytes.is_some_and(|limit| scratch > limit) {
+        return Ok(unresolved(
+            r,
+            "finite cluster scratch estimate exceeds explicit working-byte budget",
+        ));
+    }
+    let current = i
         .cluster
         .iter()
-        .map(|c| Ok(padded_unit(&coeffs(&c.coefficients, p)?, modes, p)))
+        .map(|c| coeffs(&c.coefficients, c.precision_bits))
         .collect::<Result<Vec<_>>>()?;
-    let b = q.len();
-    let mut gram = Vec::with_capacity(b * b);
-    let mut rhs = Vec::with_capacity(b);
-    for a in &q {
-        rhs.push(dot(a, &v, p));
-        for b in &q {
-            gram.push(dot(a, b, p));
+    let previous = i
+        .previous_cluster
+        .iter()
+        .map(|c| coeffs(&c.coefficients, c.precision_bits))
+        .collect::<Result<Vec<_>>>()?;
+    let measured = cluster_math::measure(&s.coefficients, &current, &previous, p)?;
+    put(
+        &mut r.values,
+        "arithmetic_precision_bits",
+        &Float::with_val(p, measured.arithmetic_precision),
+    );
+    for (a, overlap) in measured.overlaps.iter().enumerate() {
+        put(&mut r.values, &format!("source_overlap_{a}"), overlap);
+        for k in 0..current.len() {
+            put(
+                &mut r.values,
+                &format!("gram_{a}_{k}"),
+                &measured.gram[a * current.len() + k],
+            );
         }
     }
-    for a in 0..b {
-        put(&mut r.values, &format!("source_overlap_{a}"), &rhs[a]);
-        for k in 0..b {
-            put(&mut r.values, &format!("gram_{a}_{k}"), &gram[a * b + k]);
-        }
-    }
-    if let Some((coeff, pivot)) = solve_small(&gram, &rhs, p) {
-        let mut residual = v.clone();
-        for (a, c) in q.iter().zip(&coeff) {
-            for (x, y) in residual.iter_mut().zip(a) {
-                *x -= Float::with_val(p, c) * y;
-            }
-        }
-        put(
-            &mut r.values,
-            "source_cluster_leakage_squared",
-            &norm2(&residual, p),
-        );
+    if let (Some(leakage), Some(pivot)) = (measured.leakage, measured.minimum_pivot) {
+        put(&mut r.values, "source_cluster_leakage_squared", &leakage);
         put(&mut r.values, "minimum_gram_pivot", &pivot);
     } else {
         r.outcome = "rank_or_precision_unresolved".into();
-        r.reason = Some("cluster Gram system unresolved".into());
+        r.reason = Some("unit-column Gram rank or 4096-bit precision budget unresolved; no exact-rank assertion".into());
     }
-    let old = i
-        .previous_cluster
-        .iter()
-        .map(|c| Ok(padded_unit(&coeffs(&c.coefficients, p)?, modes, p)))
-        .collect::<Result<Vec<_>>>()?;
-    for (a, v) in q.iter().enumerate() {
+    for (a, overlaps) in measured.previous.into_iter().enumerate() {
         let mut rr = row(a + 1, "current_cluster_vector");
-        put(
-            &mut rr.values,
-            "eigenvalue",
-            &scalar(&i.cluster[a].eigenvalue, p)?,
+        let eigen = Float::with_val(
+            p,
+            scalar(&i.cluster[a].eigenvalue, i.cluster[a].precision_bits)?,
         );
+        put(&mut rr.values, "eigenvalue", &eigen);
         let mut matches = Vec::new();
-        for (b, u) in old.iter().enumerate() {
-            let overlap = dot(v, u, p);
+        for (b, overlap) in overlaps.into_iter().enumerate() {
             put(&mut rr.values, &format!("previous_overlap_{b}"), &overlap);
             matches.push((b, overlap.abs()));
         }
@@ -1446,37 +1416,74 @@ fn cluster(
                 &Float::with_val(p, *best),
             );
             if matches.len() > 1 {
-                put(
-                    &mut rr.values,
-                    "match_margin",
-                    &(Float::with_val(p, overlap) - &matches[1].1),
-                );
+                let margin = point::sum(&[overlap.clone(), -matches[1].1.clone()], p)?;
+                if margin == 0 {
+                    rr.notes.push("overlap tie at reported precision; lowest previous index retained; no unique match established".into());
+                }
+                put(&mut rr.values, "match_margin", &margin);
             }
         }
-        rr.notes.push("cross-N zero-padding in the same cutoff Fourier basis; overlap matching does not certify branch identity".into());
+        rr.notes.push("cross-N zero-padding at common support; original vector signs retained; point overlap matching does not certify branch identity".into());
         r.rows.push(rr);
     }
     if let Some([low, high]) = &i.cluster_boundary_eigenvalues {
-        let low = scalar(low, p)?;
-        let high = scalar(high, p)?;
-        put(&mut r.values, "declared_boundary_gap", &(high - low));
+        let low = scalar(low, i.precision_bits)?;
+        let high = scalar(high, i.precision_bits)?;
+        put(
+            &mut r.values,
+            "declared_boundary_gap",
+            &point::sum(&[high, -low], p)?,
+        );
     }
-    r.convention="unit coefficient norm; common-cutoff Fourier embedding; nonorthogonal cluster Gram projection; externally retained vector points".into();
+    r.convention="unit coefficient norm; same-support Fourier embedding; guarded point nonorthogonal projection; minimum pivot refers to unit-column Gram; source points decoded at own precision; no construction-error or rank certificate".into();
     Ok(r)
 }
+
 fn resolution(
     s: &RetainedState,
     roots: Option<&RetainedRoots>,
     o: &ExtensionOptions,
     input: Option<&ExternalResearchInputs>,
 ) -> Result<ExtendedAnalysis> {
+    use super::retained_evidence::{
+        finite_math::{abs, decimal},
+        transform_math,
+    };
+    use xc_numerics::mpfr_interval::MpfrInterval as I;
+    // Named allowances use outward upper endpoints, while the paired endpoints
+    // retain the enclosure of the conditional expression itself.
+    fn upper(map: &mut BTreeMap<String, String>, name: &str, x: &I, p: u32) -> Result<()> {
+        save_arithmetic_enclosure(map, name, x, p)?;
+        map.insert(name.into(), map[&format!("{name}_upper")].clone());
+        Ok(())
+    }
     let mut r = report("resolution_budget", s, o);
     let p = o.working_precision_bits;
     let reference = input.map(|i| i.reference_jets.as_slice()).unwrap_or(&[]);
     if reference.is_empty() && roots.is_none() {
         return Ok(missing(r, "retained roots or reference ordinates required"));
     }
-    let points: Vec<(usize, Option<String>, String)> = if reference.is_empty() {
+    let scratch = (8 * s.coefficients.len() as u64 + 256) * (u64::from(p + 4096).div_ceil(8) + 64);
+    if o.maximum_working_bytes.is_some_and(|limit| scratch > limit) {
+        return Ok(unresolved(
+            r,
+            "resolution maximum-guard scratch exceeds explicit working-byte budget",
+        ));
+    }
+    let Some(curvature) = transform_math::curvature(&s.cutoff, p)? else {
+        return Ok(unresolved(
+            r,
+            "finite curvature unresolved within 4096 guard bits",
+        ));
+    };
+    upper(&mut r.values, "finite_curvature_expression", &curvature, p)?;
+    let point_precision = if reference.is_empty() {
+        roots.unwrap().dataset.precision_bits
+    } else {
+        input.unwrap().precision_bits
+    };
+    let external_precision = input.map_or(p, |i| i.precision_bits);
+    let points: Vec<_> = if reference.is_empty() {
         roots
             .unwrap()
             .dataset
@@ -1496,25 +1503,43 @@ fn resolution(
             })
             .collect()
     };
-    let l = scalar(&s.cutoff, p)?.ln();
-    let curvature = (l.clone().pow(5u32) / 80u32).sqrt();
-    let tol = scalar(&o.relative_tolerance, p)?;
+
     let mut qualifying = 0usize;
     let mut contiguous = true;
-    let mut previous = None;
+    let mut previous: Option<usize> = None;
     for (ordinal, t, status) in points {
-        let mut rr = row(ordinal, status.clone());
+        let mut rr = row(ordinal, status);
         let Some(t) = t else {
             rr.outcome = "missing_input".into();
             contiguous = false;
             r.rows.push(rr);
             continue;
         };
-        let t = scalar(&t, p)?;
+        let t = scalar(&t, point_precision)?;
+        let measured = if reference.is_empty() {
+            transform_math::measure_root(s, &t, p)?
+        } else {
+            transform_math::measure(s, &t, p)?
+        };
+        let Some(m) = measured else {
+            rr.outcome = "cancellation_limited".into();
+            rr.notes.push("finite transform enclosure unresolved within 4096 guard bits; all budget claims withheld".into());
+            contiguous = false;
+            r.rows.push(rr);
+            continue;
+        };
+        let work = m.precision;
+        let ti = I::from_float(&t, work)?;
+        save_arithmetic_enclosure(&mut rr.values, "t", &ti, p)?;
+        put(
+            &mut rr.values,
+            "arithmetic_precision_bits",
+            &Float::with_val(p, work),
+        );
         let neighbors = reference
             .iter()
             .filter(|j| j.ordinal.abs_diff(ordinal) == 1)
-            .map(|j| Ok((j.ordinal, scalar(&j.t, p)?)))
+            .map(|j| Ok((j.ordinal, scalar(&j.t, external_precision)?)))
             .collect::<Result<Vec<_>>>()?;
         let ordered = neighbors.iter().all(|(index, value)| {
             if *index < ordinal {
@@ -1524,48 +1549,64 @@ fn resolution(
             }
         });
         let spacing = if ordered {
-            neighbors
-                .iter()
-                .map(|(_, v)| (Float::with_val(p, v) - &t).abs())
-                .min_by(Float::total_cmp)
+            let mut spacing: Option<I> = None;
+            for (_, v) in &neighbors {
+                let difference = abs(&I::from_float(v, work)?.sub(&ti))?;
+                spacing = Some(if let Some(old) = spacing {
+                    I::new(
+                        old.lower().clone().min(difference.lower()),
+                        old.upper().clone().min(difference.upper()),
+                    )?
+                } else {
+                    difference
+                });
+            }
+            spacing.filter(I::is_strictly_positive)
         } else {
-            rr.notes.push(
-                "reference neighbors are not strictly ordered; spacing ratios withheld".into(),
-            );
+            rr.notes.push("reference neighbors are not strictly ordered at their declared precision; spacing ratios withheld".into());
             None
         };
-        put(
+        save_arithmetic_enclosure(
             &mut rr.values,
             "supplied_adjacent_reference_count",
-            &Float::with_val(p, neighbors.len()),
-        );
+            &I::from_u64(neighbors.len() as u64, work),
+            p,
+        )?;
         if let Some(gap) = &spacing {
-            put(&mut rr.values, "reference_neighbor_spacing", gap);
+            save_arithmetic_enclosure(&mut rr.values, "reference_neighbor_spacing", gap, p)?;
             rr.notes.push("spacing uses supplied adjacent reference ordinals; no zeta identification is inferred".into());
         }
         if let Some(j) = reference.iter().find(|j| j.ordinal == ordinal) {
             if let Some(join) = j.matched_root_ordinal {
-                if let Some(point) = roots
-                    .and_then(|r| r.dataset.points.iter().find(|v| v.ordinal == join))
-                    .and_then(|v| v.value.as_ref())
-                {
-                    let delta = scalar(point, p)? - &t;
-                    put(
+                if let Some((root, value)) = roots.and_then(|root| {
+                    root.dataset
+                        .points
+                        .iter()
+                        .find(|v| v.ordinal == join)
+                        .and_then(|v| v.value.as_ref())
+                        .map(|v| (root, v))
+                }) {
+                    let delta =
+                        I::from_float(&scalar(value, root.dataset.precision_bits)?, work)?.sub(&ti);
+                    save_arithmetic_enclosure(
                         &mut rr.values,
                         "matched_retained_root_ordinal",
-                        &Float::with_val(p, join),
-                    );
-                    put(
+                        &I::from_u64(join as u64, work),
+                        p,
+                    )?;
+                    save_arithmetic_enclosure(
                         &mut rr.values,
                         "matched_root_reference_displacement",
                         &delta,
-                    );
+                        p,
+                    )?;
                     if let Some(gap) = &spacing {
-                        put(
+                        save_arithmetic_enclosure(
                             &mut rr.values,
                             "spacing_normalized_displacement",
-                            &(delta / gap),
-                        );
+                            &delta.div(gap)?,
+                            p,
+                        )?;
                     }
                     rr.notes.push("root join declared by caller and bound to retained source; not certified zero identification".into());
                 } else {
@@ -1575,89 +1616,109 @@ fn resolution(
                 }
             }
         }
-        let (f, d, a, ad) = transform_terms(s, &t, p)?;
-        put(&mut rr.values, "t", &t);
-        put(&mut rr.values, "transform", &f);
-        put(&mut rr.values, "derivative", &d);
-        put(&mut rr.values, "absolute_value_terms", &a);
-        put(&mut rr.values, "absolute_derivative_terms", &ad);
-        let gf = (Float::with_val(p, &a) + 1u32) >> (p - 32);
-        let gd = (Float::with_val(p, &ad) + 1u32) >> (p - 32);
-        if d.clone().abs() <= gd {
+        for (name, value) in [
+            ("transform", &m.value),
+            ("derivative", &m.derivative),
+            ("absolute_value_terms", &m.absolute_terms),
+            ("absolute_derivative_terms", &m.absolute_derivative_terms),
+        ] {
+            save_arithmetic_enclosure(&mut rr.values, name, value, p)?;
+        }
+        if m.derivative.contains_zero() {
             rr.outcome = "unresolved_derivative".into();
         } else {
-            put(
-                &mut rr.values,
-                "point_newton_correction",
-                &(-Float::with_val(p, &f) / &d),
-            );
+            let newton = m.value.neg().div(&m.derivative)?;
+            save_arithmetic_enclosure(&mut rr.values, "point_newton_correction", &newton, p)?;
             if let Some(gap) = &spacing {
-                put(
+                save_arithmetic_enclosure(
                     &mut rr.values,
                     "spacing_normalized_newton_correction",
-                    &(-Float::with_val(p, &f) / &d / gap),
-                );
+                    &newton.div(gap)?,
+                    p,
+                )?;
             }
-            rr.outcome = if f.clone().abs() <= gf {
+            rr.outcome = if m.value.contains_zero() {
                 "cancellation_limited"
             } else {
                 "channels_resolved_budget_unassessed"
             }
             .into();
             if let Some(j) = reference.iter().find(|j| j.ordinal == ordinal) {
-                // Error allowances refer to unit-L2 actual transform channels here.
-                if let (Some(value_error), Some(derivative_error), Some(radius)) = (
+                if let (Some(ev), Some(ed), Some(h)) = (
                     &j.source_value_error,
                     &j.source_derivative_error,
                     &j.root_separation_radius,
                 ) {
-                    let ev = scalar(value_error, p)?;
-                    let ed = scalar(derivative_error, p)?;
-                    let h = scalar(radius, p)?;
-                    let slope = d.clone().abs() - &ed - &gd - &curvature * &h;
-                    put(&mut rr.values, "declared_source_value_error", &ev);
-                    put(&mut rr.values, "declared_source_derivative_error", &ed);
+                    let ev = I::from_float(&scalar(ev, external_precision)?, work)?;
+                    let ed = I::from_float(&scalar(ed, external_precision)?, work)?;
+                    let h = I::from_float(&scalar(h, external_precision)?, work)?;
+                    let numerator = abs(&m.value)?.add(&ev);
+                    let slope = abs(&m.derivative)?.sub(&ed).sub(&m.curvature.mul(&h));
+                    for (name, value) in [
+                        ("declared_source_value_error", &ev),
+                        ("declared_source_derivative_error", &ed),
+                        ("declared_radius", &h),
+                        ("conditional_slope_margin", &slope),
+                        ("conditional_value_numerator", &numerator),
+                    ] {
+                        save_arithmetic_enclosure(&mut rr.values, name, value, p)?;
+                    }
                     if let Some(tail) = &j.tail_value_error {
-                        put(
+                        save_arithmetic_enclosure(
                             &mut rr.values,
                             "declared_reference_tail_error",
-                            &scalar(tail, p)?,
-                        );
+                            &I::from_float(&scalar(tail, external_precision)?, work)?,
+                            p,
+                        )?;
                     }
-                    let numerator = f.clone().abs() + ev + &gf;
-                    put(&mut rr.values, "declared_radius", &h);
-                    put(&mut rr.values, "conditional_slope_margin", &slope);
-                    if h > 0 && slope > 0 {
-                        let bound = numerator / &slope;
-                        put(
+                    if h.is_strictly_positive() && slope.is_strictly_positive() {
+                        let bound = numerator.div(&slope)?;
+                        upper(
                             &mut rr.values,
                             "conditional_root_distance_allowance",
                             &bound,
-                        );
+                            p,
+                        )?;
                         if let Some(gap) = &spacing {
-                            put(
+                            upper(
                                 &mut rr.values,
                                 "spacing_normalized_conditional_allowance",
-                                &(Float::with_val(p, &bound) / gap),
-                            );
+                                &bound.div(gap)?,
+                                p,
+                            )?;
                         }
-                        rr.outcome = if bound <= Float::with_val(p, &h) * &tol {
+                        let target = h.mul(&decimal(&o.relative_tolerance, work)?);
+                        save_arithmetic_enclosure(
+                            &mut rr.values,
+                            "conditional_budget_target",
+                            &target,
+                            p,
+                        )?;
+                        // Include the final outward decimal serialization in the
+                        // decision, including exact-equality boundary cases.
+                        let advertised =
+                            decimal(&rr.values["conditional_root_distance_allowance"], work)?;
+                        let advertised_target =
+                            decimal(&rr.values["conditional_budget_target_lower"], work)?;
+                        rr.outcome = if advertised.upper() <= advertised_target.lower() {
                             "conditional_budget_met"
-                        } else {
+                        } else if bound.lower() > target.upper() {
                             "conditional_budget_not_met"
+                        } else {
+                            "conditional_budget_unresolved"
                         }
                         .into();
                     } else {
                         rr.outcome = "conditional_budget_unresolved".into();
                     }
-                    rr.notes.push("conditional on supplied absolute source errors, valid curvature and isolation interval; supplied bounds not certified here".into());
+                    rr.notes.push("conditional on supplied absolute source errors and an isolated root within the declared radius with this curvature bound; those target hypotheses are not certified here".into());
                 }
             }
         }
-        if previous.is_none() && ordinal != 1 || previous.is_some_and(|x| ordinal != x + 1) {
-            contiguous = false;
-        }
-        if rr.outcome != "conditional_budget_met" {
+        if previous.is_none() && ordinal != 1
+            || previous.is_some_and(|x| x.checked_add(1) != Some(ordinal))
+            || rr.outcome != "conditional_budget_met"
+        {
             contiguous = false;
         }
         if contiguous {
@@ -1671,11 +1732,16 @@ fn resolution(
         "conditional_contiguous_prefix",
         &Float::with_val(p, qualifying),
     );
-    put(&mut r.values, "relative_tolerance", &tol);
-    put(&mut r.values, "finite_curvature_expression", &curvature);
-    r.convention="unit_L2_dx actual transform; retained-root ordinals are not zeta ordinals; conditional finite-source radius budget; not minimum-N law".into();
+    save_arithmetic_enclosure(
+        &mut r.values,
+        "relative_tolerance",
+        &decimal(&o.relative_tolerance, p)?,
+        p,
+    )?;
+    r.convention="unit_L2_dx finite transform arithmetic enclosures; exact decimal cutoff and original stored points; retained-root ordinals are not zeta ordinals; conditional finite-source radius budget; not minimum-N law".into();
     Ok(r)
 }
+
 fn allowance(
     s: &RetainedState,
     o: &ExtensionOptions,
@@ -1689,59 +1755,42 @@ fn allowance(
         ));
     };
     let p = o.working_precision_bits;
-    let u = scalar(&a.upper_trial_energy, p)?;
-    let b = scalar(&a.low_block_lower_bound, p)?;
-    let mu = scalar(&a.high_block_lower_bound, p)?;
-    let h = scalar(&a.cross_block_norm_bound, p)?;
-    let d = Float::with_val(p, &mu) - &u;
-    for (name, v) in [
-        ("upper_trial_energy", &u),
-        ("low_block_lower_bound", &b),
-        ("high_block_lower_bound", &mu),
-        ("cross_block_norm_bound", &h),
-        ("denominator", &d),
-    ] {
-        put(&mut r.values, name, v);
+    if o.maximum_working_bytes
+        .is_some_and(|limit| 128 * (u64::from(p + 4096).div_ceil(8) + 64) > limit)
+    {
+        return Ok(unresolved(
+            r,
+            "allowance maximum-guard scratch exceeds explicit working-byte budget",
+        ));
     }
-    if d > 0 {
-        let energy_allowance = h.clone().square() / &d;
-        put(
-            &mut r.values,
-            "conditional_energy_allowance",
-            &energy_allowance,
-        );
-        put(&mut r.values, "conditional_vector_allowance", &(h / d));
-        r.outcome = "conditional_bound_expression".into();
-        // Compare scales without implying a relative error bound for an
-        // eigenvalue. U is a declared trial upper energy, not ground truth.
-        let magnitude = u.abs();
-        put(&mut r.values, "trial_energy_magnitude", &magnitude);
-        if magnitude > 0 {
-            put(
-                &mut r.values,
-                "allowance_to_trial_energy_magnitude",
-                &(Float::with_val(p, &energy_allowance) / &magnitude),
-            );
-            let below = energy_allowance < magnitude;
-            put(
-                &mut r.values,
-                "allowance_below_trial_energy_magnitude",
-                &Float::with_val(p, u32::from(below)),
-            );
-            r.reason = Some(if below {
-                "allowance is smaller than the trial energy magnitude; scale comparison only, not a relative eigenvalue error certificate"
-            } else {
-                "non-informative at the trial energy scale: allowance is at least the trial energy magnitude; not evidence of relative energy accuracy"
-            }.into());
-        } else {
-            r.reason = Some("trial energy is zero; relative scale comparison unavailable; no division by the trial energy performed".into());
-        }
-    } else {
+    let Some(measured) = allowance_math::measure(a, input.unwrap().precision_bits, p)? else {
+        return Ok(unresolved(
+            r,
+            "allowance arithmetic width unresolved within 4096 guard bits",
+        ));
+    };
+    for (name, value) in &measured.values {
+        save_arithmetic_enclosure(&mut r.values, name, value, p)?;
+    }
+    put(
+        &mut r.values,
+        "arithmetic_precision_bits",
+        &Float::with_val(p, measured.precision),
+    );
+    if !measured.valid_margin {
         r.outcome = "sufficient_bound_unavailable".into();
-        r.reason = Some(
-            "high block lower bound is not above trial upper energy; no division performed".into(),
-        );
+        r.reason=Some("high block lower bound is not above trial upper energy at declared input precision; no division performed".into());
+    } else {
+        r.outcome = "conditional_bound_expression".into();
+        r.reason=Some(if measured.zero_trial {
+            "trial energy is zero; relative scale comparison unavailable; no division by trial energy performed"
+        } else {match measured.below {
+            Some(true)=>"allowance is smaller than the trial energy magnitude; scale comparison only, not a relative eigenvalue error certificate",
+            Some(false)=>"non-informative at the trial energy scale: allowance is at least the trial energy magnitude; not evidence of relative energy accuracy",
+            None=>"strict comparison with trial energy magnitude remains unresolved: arithmetic enclosures overlap; below-scale flag is not established, not a claim of greater-than or equality",
+        }}.into());
     }
+
     r.convention="conditional H^2/(mu-U) and H/(mu-U); externally declared block bounds and hypotheses; not a certificate".into();
     Ok(r)
 }
@@ -1791,6 +1840,14 @@ pub fn capture_extended(
 ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ExtendedAnalysis>>> {
     let kind =
         artifact_kind(id).ok_or_else(|| anyhow::anyhow!("unknown extended research diagnostic"))?;
+    let resource_policy = super::capture_runtime::CaptureResourcePolicy::from_environment()?;
+    let mut effective_options = options.clone();
+    effective_options.maximum_working_bytes = Some(
+        options
+            .maximum_working_bytes
+            .unwrap_or(resource_policy.maximum_working_bytes),
+    );
+    let options = &effective_options;
     options.validate(s)?;
     if let Some(i) = input {
         i.matches(s)?;
@@ -1868,11 +1925,7 @@ pub fn capture_extended(
         "compactness" => options.exponential_rates.len(),
         "weighted_reference_projection" | "energy_allowance" => 0,
         "signed_transform" => input.map_or(0, |i| i.reference_jets.len()),
-        "arithmetic_energy" => input.map_or(0, |i| {
-            i.components
-                .len()
-                .max(i.run_once.as_ref().map_or(0, |r| r.component_actions.len()))
-        }),
+        "arithmetic_energy" => input.map_or(0, ExternalResearchInputs::arithmetic_component_count),
         "directional_response" => roots.map_or(0, |r| r.dataset.points.len()),
         "weighted_tail" => tail_rows,
         "spectral_cluster" => input.map_or(0, |i| i.cluster.len()),
@@ -1919,14 +1972,91 @@ pub fn capture_extended(
     let budget_exceeded = (id == "weighted_tail" && tail_rows > options.maximum_rows)
         || estimated_rows > options.maximum_rows
         || estimated_rows as u64
-            * (8192 + 64 * (u64::from(options.working_precision_bits) / 3 + 32))
+            * (8192
+                + (if id == "resolution_budget" { 96 } else { 64 })
+                    * (u64::from(options.working_precision_bits) / 3 + 32))
             > options.maximum_estimated_output_bytes;
 
     let result = managed(
         kind,
         {
-            let mut request = json!({"semantics":if id == "transform_enclosure" { "extended-retained-diagnostics-v3" } else if matches!(id,"band_reconstruction"|"tail_operator"|"weighted_tail") { "extended-retained-diagnostics-v4" } else if id == "resolution_budget" { "extended-retained-diagnostics-v3" } else { "extended-retained-diagnostics-v2" },"expected_rows":if matches!(id,"transform_enclosure"|"operator_cluster"|"finite_section_transfer"|"configuration_comparison"|"weighted_tail"|"band_reconstruction"|"tail_operator") { None } else { Some(estimated_rows) },"diagnostic":id,"options":options,"external_input_digest":input_digest,"state_selection_policy":s.selection_policy,"state_manifest_tags":s.manifest.tags});
+            let mut request = json!({"semantics":if id == "transform_enclosure" { "extended-retained-diagnostics-v5-minus-fourier-source-error-hull" } else if matches!(id,"band_reconstruction"|"tail_operator"|"weighted_tail") { "extended-retained-diagnostics-v4" } else if id == "resolution_budget" { "extended-retained-diagnostics-v3" } else { "extended-retained-diagnostics-v2" },"expected_rows":if matches!(id,"transform_enclosure"|"operator_cluster"|"finite_section_transfer"|"configuration_comparison"|"weighted_tail"|"band_reconstruction"|"tail_operator") { None } else { Some(estimated_rows) },"diagnostic":id,"options":options,"external_input_digest":input_digest,"state_selection_policy":s.selection_policy,"state_manifest_tags":s.manifest.tags});
+            if id == "configuration_comparison" {
+                request["duplicate_coordinate_policy"] = json!("all_ambiguous_members_withheld_v2");
+            }
+            if matches!(id, "observable_budget" | "tail_operator") {
+                request["declared_error_semantics"] = json!("exact_decimal_upper_bound_v2");
+            }
             if id == "band_reconstruction" {
+                request["ladder_positivity_policy"] =
+                    json!("all_required_recurrence_steps_including_failed_v2");
+            }
+            request["source_unit_arithmetic"] = json!("binary_scaled_hypot_checked_range_v2");
+            request["resource_admission"] = json!("resolved_working_bytes_v1");
+            if id == "complex_transform" {
+                request["maximum_parallel_rows"] = json!(resource_policy.root_block_rows);
+                request["workspace_admission"] = json!("configured_row_block_bound_v1");
+            }
+            if id == "band_reconstruction" {
+                request["exact_contraction_admission"] = json!("all_block_workspace_bound_v1");
+            }
+            if id == "weighted_reference_projection" {
+                request["weighted_profile_arithmetic"] =
+                    json!("stored_points_combined_difference_interval_gram_unresolved_v2");
+                request["maximum_weighted_profile_guard_bits"] = json!(4096);
+                request["weighted_profile_output"] =
+                    json!("midpoint_with_outward_decimal_enclosures_v1");
+            }
+            if id == "directional_response" {
+                request["directional_arithmetic"] =
+                    json!("stored_points_projected_resolvent_displacement_checked_v2");
+                request["maximum_directional_guard_bits"] = json!(4096);
+                request["directional_output"] =
+                    json!("midpoints_with_outward_decimal_enclosures_v1");
+                request["root_point_precision"] = json!("declared_payload_precision_v1");
+            }
+            if id == "arithmetic_energy" {
+                request["energy_arithmetic"] =
+                    json!("stored_points_scaled_quadratic_intervals_deficit_kind_v2");
+                request["component_selection"] =
+                    json!("explicit_operators_else_compact_actions_v1");
+                request["maximum_energy_guard_bits"] = json!(4096);
+                request["energy_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
+            }
+            if id == "signed_transform" {
+                request["signed_channel_arithmetic"] =
+                    json!("exact_cutoff_center_declared_points_checked_channels_v3");
+            }
+            if id == "spectral_cluster" {
+                request["cluster_arithmetic"] = json!("stored_points_scaled_unit_checked_gram_v3");
+                request["maximum_cluster_guard_bits"] = json!(4096);
+                request["cluster_precision_policy"] = json!("unit_column_pivot_proxy_v1");
+            }
+            if id == "weighted_tail" {
+                request["atom_arithmetic"] = json!("stored_points_exact_mass_directed_moments_v2");
+                request["atom_coordinate_serialization"] = json!("promoted_source_point_v1");
+                request["maximum_atom_guard_bits"] = json!(4096);
+                request["maximum_atom_exponent_span_bits"] = json!(1_000_000);
+            }
+            if id == "compactness" {
+                request["compactness_arithmetic"] =
+                    json!("directed_enclosure_agreed_rounding_or_unresolved_v2");
+                request["maximum_additional_guard_bits"] = json!(4096);
+            }
+            if id == "band_reconstruction" {
+                request["polynomial_band_arithmetic"] =
+                    json!("stored_polynomial_exact_newton_inverse_moments_v1");
+                request["polynomial_root_output"] =
+                    json!("outward_root_bounds_and_safe_midpoints_v1");
+                request["polynomial_root_window"] =
+                    json!("common_binary_scale_exact_rational_cauchy_v2");
+                request["maximum_polynomial_band_exact_bits"] = json!(8_000_000);
+                request["signed_band_arithmetic"] =
+                    json!("declared_points_normalized_recurrence_exact_contractions_v1");
+                request["maximum_signed_band_exact_bits"] = json!(8_000_000);
+                request["signed_band_inverse_arithmetic"] =
+                    json!("relative_zero_guard_scaled_directed_sums_v1");
+                request["maximum_signed_band_inverse_guard_bits"] = json!(4096);
                 request["basis_disk_budget_bytes"] = json!(super::band_runtime::disk_budget()?);
                 request["checkpoint_block_budget_bytes"] = json!(
                     super::capture_runtime::CaptureResourcePolicy::from_environment()?
@@ -1940,10 +2070,110 @@ pub fn capture_extended(
                 request["arb_available"] = json!(cfg!(feature = "arb"));
             }
             if id == "transform_enclosure" {
-                request["enclosure_algorithm"] = json!("centered-taylor-48-integral-remainder-v2");
+                request["enclosure_fourier_semantics"] =
+                    json!(super::transform_enclosure::FOURIER_SEMANTICS);
+                request["enclosure_algorithm"] =
+                    json!("centered-taylor-48-integral-remainder-minus-fourier-v4-stored-points");
+                request["enclosure_point_precision"] =
+                    json!("declared_payload_and_external_precision_v1");
+                request["enclosure_decimal_output"] = json!("outward_endpoints_v1");
+            }
+            if matches!(id, "tail_operator" | "band_reconstruction") {
+                request["tail_model_checkpoint_arithmetic"] =
+                    json!("finite-tail-model-original-matrix-dense-source-recovery-v8");
+                request["tail_model_householder_arithmetic"] =
+                    json!(xc_numerics::eigen::STABLE_HOUSEHOLDER_SEMANTICS);
+                request["tail_model_qr_arithmetic"] =
+                    json!(xc_numerics::eigen::TRIDIAG_QR_SEMANTICS);
+                request["tail_model_vector_recovery_arithmetic"] =
+                    json!(xc_numerics::eigen::DENSE_EIGENVECTOR_SEMANTICS);
+                request["tail_model_arithmetic"] =
+                    json!("declared_points_exact_dyadic_recipe_forms_v2");
+                request["maximum_tail_form_exact_bits"] = json!(8_000_000);
+            }
+            if id == "root_transport" {
+                request["transport_arithmetic"] =
+                    json!("exact_cutoff_stored_points_directional_intervals_v1");
+                request["transport_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
+                request["maximum_transport_guard_bits"] = json!(4096);
+            }
+            if id == "tail_operator" {
+                request["model_linear_algebra_arithmetic"] =
+                    json!("exact_stored_dot_product_stages_and_tail_bound_v0.15.2-v2");
+                request["l2_normalization_arithmetic"] =
+                    json!(xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2);
+            }
+            if matches!(
+                id,
+                "signed_transform"
+                    | "resolution_budget"
+                    | "observable_budget"
+                    | "configuration_comparison"
+            ) {
+                request["transform_arithmetic"] =
+                    json!("exact_cutoff_stored_points_directed_sinc_v1");
+                request["maximum_transform_guard_bits"] = json!(4096);
+            }
+            if id == "resolution_budget" {
+                request["resolution_arithmetic"] =
+                    json!("exact_decimal_tolerance_original_point_conditional_distance_v2");
+                request["resolution_output"] =
+                    json!("outward_allowance_upper_endpoints_with_expression_enclosures_v1");
+            }
+            if id == "finite_section_transfer" {
+                request["finite_transfer_arithmetic"] =
+                    json!("original_points_scaled_prefix_shifted_residual_v1");
+                request["finite_transfer_output"] =
+                    json!("midpoints_with_outward_decimal_enclosures_v1");
+                request["maximum_finite_transfer_guard_bits"] = json!(4096);
+            }
+            if id == "consistency" {
+                request["consistency_arithmetic"] =
+                    json!("original_points_scaled_action_difference_v1");
+                request["consistency_output"] =
+                    json!("midpoints_with_outward_decimal_enclosures_v1");
+                request["maximum_consistency_guard_bits"] = json!(4096);
+            }
+            if id == "complex_transform" {
+                request["complex_fourier_semantics"] =
+                    json!(super::transform_enclosure::FOURIER_SEMANTICS);
+                request["complex_arithmetic"] =
+                    json!("exact_cutoff_original_points_directed_entire_minus_sinc_v2");
+                request["complex_point_construction"] =
+                    json!("original_probes_exact_affine_contour_minus_fourier_v2");
+                request["complex_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
+                request["maximum_complex_guard_bits"] = json!(4096);
+                request["complex_root_point_precision"] = json!("declared_payload_precision_v1");
+            }
+            if id == "operator_cluster" {
+                request["cluster_operator_arithmetic"] =
+                    json!("original_points_shift_before_interval_projection_lu_v1");
+                request["cluster_operator_output"] =
+                    json!("midpoints_with_outward_decimal_enclosures_v1");
+                request["maximum_cluster_operator_guard_bits"] = json!(4096);
+
+                request["cluster_basis_arithmetic"] =
+                    json!("original_points_unit_columns_before_rank_threshold_v1");
+            }
+            if id == "observable_budget" {
+                request["observation_arithmetic"] =
+                    json!("original_points_directed_l2_transport_v1");
+                request["observation_output"] =
+                    json!("allowance_upper_margin_lower_with_expression_enclosures_v1");
+            }
+            if id == "configuration_comparison" {
+                request["comparison_arithmetic"] =
+                    json!("original_points_scaled_overlap_shifted_residual_v1");
+                request["comparison_output"] =
+                    json!("midpoints_with_outward_decimal_enclosures_v1");
+                request["maximum_comparison_guard_bits"] = json!(4096);
             }
             if id == "energy_allowance" {
                 request["allowance_interpretation"] = json!("trial-energy-scale-v1");
+                request["allowance_arithmetic"] =
+                    json!("declared_points_separate_binary_scales_intervals_v1");
+                request["maximum_allowance_guard_bits"] = json!(4096);
+                request["allowance_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
             }
             request
         },
@@ -1952,7 +2182,10 @@ pub fn capture_extended(
         || {
             let _stage = super::capture_runtime::Stage::new(format!("{id} compute"));
             if budget_exceeded {
-                return Ok(unresolved(report(id,s,options),"row/output resource budget exceeded; retry this diagnostic with explicit limits"));
+                return Ok(unresolved(
+                    report(id, s, options),
+                    "row/output resource budget exceeded; retry this diagnostic with explicit limits",
+                ));
             }
             match id {
                 "compactness" => compactness(s, options),
@@ -1988,6 +2221,30 @@ pub fn capture_extended(
                 || r.assurance
                     != if id == "transform_enclosure" {
                         "finite_retained_function_enclosures; source_scope_explicit; no_infinite_limit_claim"
+                    } else if id == "directional_response" {
+                        DIRECTIONAL_ASSURANCE
+                    } else if id == "root_transport" {
+                        TRANSPORT_ASSURANCE
+                    } else if id == "complex_transform" {
+                        COMPLEX_ASSURANCE
+                    } else if id == "operator_cluster" {
+                        OPERATOR_CLUSTER_ASSURANCE
+                    } else if id == "finite_section_transfer" {
+                        TRANSFER_ASSURANCE
+                    } else if id == "consistency" {
+                        CONSISTENCY_ASSURANCE
+                    } else if id == "observable_budget" {
+                        OBSERVATION_ASSURANCE
+                    } else if id == "configuration_comparison" {
+                        COMPARISON_ASSURANCE
+                    } else if id == "resolution_budget" {
+                        RESOLUTION_ASSURANCE
+                    } else if id == "energy_allowance" {
+                        ALLOWANCE_ASSURANCE
+                    } else if id == "arithmetic_energy" {
+                        ENERGY_ASSURANCE
+                    } else if id == "weighted_reference_projection" {
+                        WEIGHTED_PROFILE_ASSURANCE
                     } else {
                         ASSURANCE
                     }
@@ -2025,6 +2282,56 @@ pub fn capture_extended(
             {
                 scalar(v, options.working_precision_bits)?;
             }
+            if id == "root_transport" {
+                for row in &r.rows {
+                    let fields = [
+                        "component_forcing_sum",
+                        "absolute_component_forcing_sum",
+                        "forcing_closure_defect",
+                        "support_motion",
+                        "operator_motion",
+                        "conditional_total_physical_velocity",
+                        "retained_secular_pole_motion",
+                        "retained_total_velocity",
+                        "retained_transport_additivity_defect",
+                    ];
+                    if fields.iter().any(|name| row.values.contains_key(*name)) {
+                        let work = scalar(
+                            row.values
+                                .get("transport_arithmetic_precision_bits")
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("missing transport arithmetic precision")
+                                })?,
+                            options.working_precision_bits,
+                        )?;
+                        if work < options.working_precision_bits + 64
+                            || work > options.working_precision_bits + 4096
+                        {
+                            bail!("invalid transport arithmetic precision");
+                        }
+                    }
+                    for name in fields {
+                        if let Some(value) = row.values.get(name) {
+                            let lo = scalar(
+                                row.values.get(&format!("{name}_lower")).ok_or_else(|| {
+                                    anyhow::anyhow!("missing transport lower endpoint")
+                                })?,
+                                options.working_precision_bits,
+                            )?;
+                            let hi = scalar(
+                                row.values.get(&format!("{name}_upper")).ok_or_else(|| {
+                                    anyhow::anyhow!("missing transport upper endpoint")
+                                })?,
+                                options.working_precision_bits,
+                            )?;
+                            let mid = scalar(value, options.working_precision_bits)?;
+                            if lo > mid || mid > hi {
+                                bail!("invalid transport enclosure");
+                            }
+                        }
+                    }
+                }
+            }
             for row in &r.rows {
                 if (row.outcome == "certified_finite_enclosure" && id != "transform_enclosure")
                     || row.ordinal == 0
@@ -2048,6 +2355,629 @@ pub fn capture_extended(
                     bail!("invalid extended research row");
                 }
             }
+            if id == "complex_transform"
+                && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
+            {
+                let p = options.working_precision_bits;
+                let check = |values: &BTreeMap<String, String>| -> Result<()> {
+                    let used = scalar(
+                        values.get("arithmetic_precision_bits").ok_or_else(|| {
+                            anyhow::anyhow!("missing complex arithmetic precision")
+                        })?,
+                        p,
+                    )?;
+                    if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                        bail!("invalid complex arithmetic precision");
+                    }
+                    for (name, value) in values {
+                        if name == "arithmetic_precision_bits"
+                            || name.ends_with("_lower")
+                            || name.ends_with("_upper")
+                        {
+                            continue;
+                        }
+                        let lo = values
+                            .get(&format!("{name}_lower"))
+                            .ok_or_else(|| anyhow::anyhow!("missing complex lower bound"))?;
+                        let hi = values
+                            .get(&format!("{name}_upper"))
+                            .ok_or_else(|| anyhow::anyhow!("missing complex upper bound"))?;
+                        let point = scalar(value, p)?;
+                        let low =
+                            Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
+                        let high =
+                            Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
+                        if low > point || high < point {
+                            bail!("complex point outside enclosure");
+                        }
+                    }
+                    Ok(())
+                };
+                check(&r.values)?;
+                if !r.values.contains_key("normalization_anchor") {
+                    bail!("complex normalization anchor missing");
+                }
+                let count = roots.map_or(0, |roots| roots.dataset.points.len());
+                let probes = 5 * (count + 1);
+                if r.rows.len() != probes + 65 {
+                    bail!("complex retained-ordinal or contour row count mismatch");
+                }
+                for (index, row) in r.rows.iter().enumerate() {
+                    check(&row.values)?;
+                    if row.ordinal != index + 1
+                        || row.label
+                            != if index < probes {
+                                "complex_transform_sample"
+                            } else {
+                                "contour_sample"
+                            }
+                    {
+                        bail!("complex row order or label mismatch");
+                    }
+                    let ordinal = if index >= probes || index < 5 {
+                        0
+                    } else {
+                        roots.unwrap().dataset.points[index / 5 - 1].ordinal
+                    };
+                    if scalar(
+                        row.values
+                            .get("input_ordinal")
+                            .ok_or_else(|| anyhow::anyhow!("missing complex input ordinal"))?,
+                        p,
+                    )? != ordinal
+                    {
+                        bail!("complex input ordinal mismatch");
+                    }
+                    if index < probes {
+                        if scalar(
+                            row.values.get("z_im").ok_or_else(|| {
+                                anyhow::anyhow!("missing complex imaginary coordinate")
+                            })?,
+                            p,
+                        )? != Float::with_val(p, [-4, -1, 0, 1, 4][index % 5]) / 4u32
+                        {
+                            bail!("complex sample offset mismatch");
+                        }
+                        let t = if index < 5 {
+                            Some(Float::with_val(p, 0))
+                        } else {
+                            let roots = roots.unwrap();
+                            roots.dataset.points[index / 5 - 1]
+                                .value
+                                .as_ref()
+                                .map(|value| scalar(value, roots.dataset.precision_bits))
+                                .transpose()?
+                        };
+                        if let Some(t) = t {
+                            if scalar(
+                                row.values.get("z_re").ok_or_else(|| {
+                                    anyhow::anyhow!("missing complex real coordinate")
+                                })?,
+                                p,
+                            )? != t
+                            {
+                                bail!("complex original root point mismatch");
+                            }
+                            if row.outcome == "missing_input" {
+                                bail!("complex present ordinate marked missing");
+                            }
+                        } else {
+                            if row.outcome != "missing_input"
+                                || row.values.contains_key("z_re")
+                                || row.values.contains_key("value_re")
+                            {
+                                bail!("complex missing ordinate contract mismatch");
+                            }
+                            continue;
+                        }
+                    }
+                    if row.outcome == "cancellation_limited" {
+                        if row.values.contains_key("value_re") || row.notes.is_empty() {
+                            bail!("complex unresolved arithmetic contract mismatch");
+                        }
+                        continue;
+                    }
+                    for name in [
+                        "z_re",
+                        "z_im",
+                        "value_re",
+                        "value_im",
+                        "derivative_re",
+                        "derivative_im",
+                        "sum_absolute_terms",
+                        "normalization_denominator_resolved",
+                        "log_derivative_denominator_resolved",
+                    ] {
+                        if !row.values.contains_key(name) {
+                            bail!("complex core measurement missing");
+                        }
+                    }
+                    let mut complete = true;
+                    for (flag, name) in [
+                        ("normalization_denominator_resolved", "normalized"),
+                        ("log_derivative_denominator_resolved", "log_derivative"),
+                    ] {
+                        let flag = scalar(&row.values[flag], p)?;
+                        if flag != 0 && flag != 1 {
+                            bail!("invalid complex ratio flag");
+                        }
+                        let present = flag == 1;
+                        complete &= present;
+                        for part in ["re", "im"] {
+                            if row.values.contains_key(&format!("{name}_{part}")) != present {
+                                bail!("complex ratio presence mismatch");
+                            }
+                        }
+                    }
+                    if row.outcome
+                        != if complete {
+                            "point_measurement"
+                        } else {
+                            "unresolved_denominator"
+                        }
+                    {
+                        bail!("complex ratio outcome mismatch");
+                    }
+                }
+                let a = &r.rows[probes].values;
+                let b = &r.rows[probes + 64].values;
+                for name in [
+                    "z_re",
+                    "z_im",
+                    "z_re_lower",
+                    "z_re_upper",
+                    "z_im_lower",
+                    "z_im_upper",
+                ] {
+                    if a.get(name) != b.get(name) {
+                        bail!("complex contour is not closed");
+                    }
+                }
+                let partial = r.rows.iter().any(|row| row.outcome != "point_measurement");
+                if r.outcome
+                    != if partial {
+                        "partial_unresolved"
+                    } else {
+                        "point_measurement"
+                    }
+                    || (partial && r.reason.as_ref().is_none_or(|v| v.is_empty()))
+                {
+                    bail!("complex aggregate completion mismatch");
+                }
+            }
+            if id == "operator_cluster"
+                && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
+            {
+                let p = options.working_precision_bits;
+                let check = |values: &BTreeMap<String, String>| -> Result<()> {
+                    let used = scalar(
+                        values.get("arithmetic_precision_bits").ok_or_else(|| {
+                            anyhow::anyhow!("missing cluster arithmetic precision")
+                        })?,
+                        p,
+                    )?;
+                    if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                        bail!("invalid cluster arithmetic precision");
+                    }
+                    for (name, value) in values {
+                        if name == "arithmetic_precision_bits"
+                            || name.ends_with("_lower")
+                            || name.ends_with("_upper")
+                        {
+                            continue;
+                        }
+                        let lo = values
+                            .get(&format!("{name}_lower"))
+                            .ok_or_else(|| anyhow::anyhow!("missing cluster lower bound"))?;
+                        let hi = values
+                            .get(&format!("{name}_upper"))
+                            .ok_or_else(|| anyhow::anyhow!("missing cluster upper bound"))?;
+                        let point = scalar(value, p)?;
+                        let low =
+                            Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
+                        let high =
+                            Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
+                        if low > point || high < point {
+                            bail!("cluster point outside enclosure");
+                        }
+                    }
+                    Ok(())
+                };
+                check(&r.values)?;
+                for name in [
+                    "subspace_dimension",
+                    "retained_energy_shift",
+                    "source_leakage_squared",
+                    "estimated_factorization_workspace_bytes",
+                    "column_selection_threshold",
+                    "discarded_reference_columns",
+                ] {
+                    if !r.values.contains_key(name) {
+                        bail!("cluster report core field missing");
+                    }
+                }
+                let b = scalar(&r.values["subspace_dimension"], p)?
+                    .to_integer()
+                    .and_then(|v| v.to_usize())
+                    .ok_or_else(|| anyhow::anyhow!("invalid cluster dimension"))?;
+                if b == 0
+                    || b > s.coefficients.len()
+                    || scalar(&r.values["subspace_dimension"], p)? != b
+                    || r.rows.len() != b * b
+                {
+                    bail!("cluster row shape mismatch");
+                }
+                for index in 0..b {
+                    if !r
+                        .values
+                        .contains_key(&format!("selected_input_column_{index}"))
+                    {
+                        bail!("cluster selected-column identity missing");
+                    }
+                }
+                for (k, row) in r.rows.iter().enumerate() {
+                    check(&row.values)?;
+                    for name in ["row", "column", "compressed_operator", "coupling_gram"] {
+                        if !row.values.contains_key(name) {
+                            bail!("cluster row core field missing");
+                        }
+                    }
+                    if row.ordinal != k + 1
+                        || scalar(&row.values["row"], p)? != k / b
+                        || scalar(&row.values["column"], p)? != k % b
+                    {
+                        bail!("cluster row coordinates mismatch");
+                    }
+                    let complete = r.outcome == "point_measurement";
+                    if (complete && row.outcome != "point_measurement")
+                        || (!complete && row.outcome != "unresolved_denominator")
+                    {
+                        bail!("cluster row completion mismatch");
+                    }
+                    for name in [
+                        "signed_complement_feedback",
+                        "effective_operator",
+                        "solve_relative_residual",
+                    ] {
+                        if row.values.contains_key(name) != complete {
+                            bail!("cluster feedback completion mismatch");
+                        }
+                    }
+                }
+            }
+            if matches!(id, "finite_section_transfer" | "consistency")
+                && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
+            {
+                let p = options.working_precision_bits;
+                let check = |values: &BTreeMap<String, String>| -> Result<()> {
+                    let used = scalar(
+                        values.get("arithmetic_precision_bits").ok_or_else(|| {
+                            anyhow::anyhow!("missing transfer/consistency precision")
+                        })?,
+                        p,
+                    )?;
+                    if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                        bail!("invalid transfer/consistency precision");
+                    }
+                    for (name, value) in values {
+                        if name == "arithmetic_precision_bits"
+                            || name.ends_with("_lower")
+                            || name.ends_with("_upper")
+                        {
+                            continue;
+                        }
+                        let lo = values.get(&format!("{name}_lower")).ok_or_else(|| {
+                            anyhow::anyhow!("missing transfer/consistency lower bound")
+                        })?;
+                        let hi = values.get(&format!("{name}_upper")).ok_or_else(|| {
+                            anyhow::anyhow!("missing transfer/consistency upper bound")
+                        })?;
+                        let point = scalar(value, p)?;
+                        let low =
+                            Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
+                        let high =
+                            Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
+                        if low > point || high < point {
+                            bail!("transfer/consistency point outside enclosure");
+                        }
+                    }
+                    Ok(())
+                };
+                if id == "finite_section_transfer" {
+                    check(&r.values)?;
+                    if r.rows.len() != s.modes + 1 {
+                        bail!("finite-section prefix count mismatch");
+                    }
+                    if let Some(c) = input
+                        .and_then(|i| i.run_once.as_ref())
+                        .and_then(|i| i.comparison.as_ref())
+                    {
+                        for name in [
+                            "comparison_block_frobenius_difference",
+                            "comparison_precision_bits",
+                        ] {
+                            if !r.values.contains_key(name) {
+                                bail!("finite-section comparison measurement missing");
+                            }
+                        }
+                        let mut nonzero = false;
+                        for value in &c.coefficients {
+                            nonzero |= !scalar(value, c.precision_bits)?.is_zero();
+                        }
+                        if nonzero
+                            != r.values
+                                .contains_key("comparison_state_signed_block_defect")
+                        {
+                            bail!("finite-section signed comparison denominator contract mismatch");
+                        }
+                    }
+                }
+                for (k, row) in r.rows.iter().enumerate() {
+                    if row.values.is_empty() {
+                        if id == "finite_section_transfer"
+                            || !["missing_input", "cancellation_limited"]
+                                .contains(&row.outcome.as_str())
+                        {
+                            bail!("transfer/consistency measurements missing");
+                        }
+                        continue;
+                    }
+                    check(&row.values)?;
+                    let core: &[&str] = if id == "finite_section_transfer" {
+                        &[
+                            "n_modes",
+                            "retained_mass",
+                            "omitted_mass",
+                            "low_residual_squared",
+                            "high_forcing_squared",
+                            "truncated_energy",
+                        ]
+                    } else {
+                        &["action_difference_norm", "signed_energy_difference"]
+                    };
+                    for name in core {
+                        if !row.values.contains_key(*name) {
+                            bail!("transfer/consistency core field missing");
+                        }
+                    }
+                    if id == "finite_section_transfer"
+                        && (row.ordinal != k + 1 || scalar(&row.values["n_modes"], p)? != k)
+                    {
+                        bail!("finite-section prefix order mismatch");
+                    }
+                }
+            }
+            if matches!(id, "observable_budget" | "configuration_comparison")
+                && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
+            {
+                let p = options.working_precision_bits;
+                let check = |values: &BTreeMap<String, String>| -> Result<()> {
+                    let used = scalar(
+                        values.get("arithmetic_precision_bits").ok_or_else(|| {
+                            anyhow::anyhow!("missing comparison/observation precision")
+                        })?,
+                        p,
+                    )?;
+                    if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                        bail!("invalid comparison/observation precision");
+                    }
+                    for (name, value) in values {
+                        if name == "arithmetic_precision_bits"
+                            || name.ends_with("_lower")
+                            || name.ends_with("_upper")
+                        {
+                            continue;
+                        }
+                        let lo = values.get(&format!("{name}_lower")).ok_or_else(|| {
+                            anyhow::anyhow!("missing comparison/observation lower bound")
+                        })?;
+                        let hi = values.get(&format!("{name}_upper")).ok_or_else(|| {
+                            anyhow::anyhow!("missing comparison/observation upper bound")
+                        })?;
+                        let point = scalar(value, p)?;
+                        let low =
+                            Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
+                        let high =
+                            Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
+                        if low > point || high < point {
+                            bail!("comparison/observation point outside enclosure");
+                        }
+                        if id == "observable_budget" {
+                            if name.ends_with("_lower_margin") && value != lo {
+                                bail!("observation margin is not an outward lower endpoint");
+                            }
+                            if [
+                                "declared_origin_error",
+                                "conditional_value_error",
+                                "conditional_derivative_error",
+                            ]
+                            .contains(&name.as_str())
+                                && value != hi
+                            {
+                                bail!("observation error is not an outward upper endpoint");
+                            }
+                        }
+                    }
+                    Ok(())
+                };
+                if id == "observable_budget" {
+                    check(&r.values)?;
+                    for name in ["transform_origin", "origin_absolute_terms"] {
+                        if !r.values.contains_key(name) {
+                            bail!("observation origin channel missing");
+                        }
+                    }
+                    if input
+                        .and_then(|i| i.run_once.as_ref())
+                        .and_then(|i| i.uncertainty.as_ref())
+                        .is_some()
+                    {
+                        for name in [
+                            "declared_unit_state_l2_error",
+                            "declared_origin_error",
+                            "conditional_origin_lower_margin",
+                        ] {
+                            if !r.values.contains_key(name) {
+                                bail!("observation source-error channel missing");
+                            }
+                        }
+                    }
+                }
+                for row in &r.rows {
+                    if row.values.is_empty() {
+                        if ![
+                            "missing_input",
+                            "budget_limited",
+                            "cancellation_limited",
+                            "unresolved_denominator",
+                        ]
+                        .contains(&row.outcome.as_str())
+                        {
+                            bail!("comparison/observation row measurements missing");
+                        }
+                        continue;
+                    }
+                    check(&row.values)?;
+                    let core: &[&str] = if id == "observable_budget" {
+                        &[
+                            "t",
+                            "value",
+                            "derivative",
+                            "absolute_value_terms",
+                            "absolute_derivative_terms",
+                        ]
+                    } else {
+                        &[
+                            "comparison_C",
+                            "comparison_N",
+                            "comparison_P",
+                            "signed_energy_difference",
+                        ]
+                    };
+                    for name in core {
+                        if !row.values.contains_key(*name) {
+                            bail!("comparison/observation core field missing");
+                        }
+                    }
+                    if id == "observable_budget"
+                        && input
+                            .and_then(|i| i.run_once.as_ref())
+                            .and_then(|i| i.uncertainty.as_ref())
+                            .is_some()
+                    {
+                        for name in [
+                            "declared_unit_state_l2_error",
+                            "conditional_value_error",
+                            "conditional_derivative_error",
+                            "conditional_slope_lower_margin",
+                        ] {
+                            if !row.values.contains_key(name) {
+                                bail!("observation root error channel missing");
+                            }
+                        }
+                    }
+                }
+            }
+            if id == "resolution_budget"
+                && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
+            {
+                validate_resolution_report(r, options.working_precision_bits)?;
+            }
+            if id == "directional_response" {
+                for row in &r.rows {
+                    if row.values.is_empty() {
+                        if ![
+                            "missing_input",
+                            "budget_limited",
+                            "carrier_or_unresolved",
+                            "cancellation_limited",
+                        ]
+                        .contains(&row.outcome.as_str())
+                        {
+                            bail!("directional measurements missing");
+                        }
+                        continue;
+                    }
+                    let p = options.working_precision_bits;
+                    for name in [
+                        "t",
+                        "tau",
+                        "directional_energy",
+                        "direction_norm_squared",
+                        "orthogonality_defect",
+                        "rational_root_condition",
+                        "root_condition_tolerance",
+                        "arithmetic_precision_bits",
+                    ] {
+                        if !row.values.contains_key(name) {
+                            bail!("missing directional field");
+                        }
+                    }
+                    let used = scalar(&row.values["arithmetic_precision_bits"], p)?;
+                    if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                        bail!("invalid directional arithmetic precision");
+                    }
+                    for (name, value) in &row.values {
+                        if name == "arithmetic_precision_bits"
+                            || name.ends_with("_lower")
+                            || name.ends_with("_upper")
+                        {
+                            continue;
+                        }
+                        let lo = row.values.get(&format!("{name}_lower")).ok_or_else(|| {
+                            anyhow::anyhow!("missing directional lower enclosure")
+                        })?;
+                        let hi = row.values.get(&format!("{name}_upper")).ok_or_else(|| {
+                            anyhow::anyhow!("missing directional upper enclosure")
+                        })?;
+                        let point = scalar(value, p)?;
+                        if scalar(lo, p)? > point || scalar(hi, p)? < point {
+                            bail!("directional point outside enclosure");
+                        }
+                    }
+                }
+            }
+            if id == "energy_allowance"
+                && [
+                    "conditional_bound_expression",
+                    "sufficient_bound_unavailable",
+                ]
+                .contains(&r.outcome.as_str())
+            {
+                let p = options.working_precision_bits;
+                let used = r
+                    .values
+                    .get("arithmetic_precision_bits")
+                    .ok_or_else(|| anyhow::anyhow!("missing allowance arithmetic precision"))?;
+                let used = scalar(used, p)?;
+                if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                    bail!("invalid allowance arithmetic precision");
+                }
+                for (name, value) in &r.values {
+                    if name == "arithmetic_precision_bits"
+                        || name.ends_with("_lower")
+                        || name.ends_with("_upper")
+                    {
+                        continue;
+                    }
+                    let lo = r
+                        .values
+                        .get(&format!("{name}_lower"))
+                        .ok_or_else(|| anyhow::anyhow!("missing allowance lower enclosure"))?;
+                    let hi = r
+                        .values
+                        .get(&format!("{name}_upper"))
+                        .ok_or_else(|| anyhow::anyhow!("missing allowance upper enclosure"))?;
+                    let point = scalar(value, p)?;
+                    // Directed parsing tests the actual decimal endpoint against
+                    // the report's stored binary point without nearest-rounding slack.
+                    let lo = Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
+                    let hi = Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
+                    if lo > point || hi < point {
+                        bail!("allowance point outside enclosure");
+                    }
+                }
+            }
             if r.outcome != "missing_input" && r.outcome != "unresolved" {
                 let expected: Option<Vec<usize>> = match id {
                     "compactness" => Some((1..=options.exponential_rates.len()).collect()),
@@ -2064,13 +2994,9 @@ pub fn capture_extended(
                             roots.map(|r| r.dataset.points.iter().map(|r| r.ordinal).collect())
                         }
                     }
-                    "arithmetic_energy" => input.map(|i| {
-                        (1..=i
-                            .components
-                            .len()
-                            .max(i.run_once.as_ref().map_or(0, |r| r.component_actions.len())))
-                            .collect()
-                    }),
+                    "arithmetic_energy" => {
+                        input.map(|i| (1..=i.arithmetic_component_count()).collect())
+                    }
                     "spectral_cluster" => input.map(|i| (1..=i.cluster.len()).collect()),
                     _ => None,
                 };
@@ -2089,7 +3015,15 @@ pub fn capture_extended(
                     "weighted_reference_projection" if r.outcome == "point_measurement" => {
                         &["weighted_l1", "weighted_l2_squared", "signed_integral"]
                     }
+                    "signed_transform" => {
+                        &["arithmetic_precision_bits", "normalization_precision_bits"]
+                    }
                     "arithmetic_energy" => &[
+                        "arithmetic_precision_bits",
+                        "total_tau_energy_lower",
+                        "total_tau_energy_upper",
+                        "energy_closure_defect_lower",
+                        "energy_closure_defect_upper",
                         "total_tau_energy",
                         "sum_component_energy",
                         "sum_absolute_component_energy",
@@ -2113,6 +3047,47 @@ pub fn capture_extended(
                 if required.iter().any(|k| !r.values.contains_key(*k)) {
                     bail!("extended report missing required measurements");
                 }
+                if id == "arithmetic_energy" {
+                    let p = options.working_precision_bits;
+                    let used = scalar(&r.values["arithmetic_precision_bits"], p)?;
+                    if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                        bail!("invalid arithmetic energy guard precision");
+                    }
+                    for values in
+                        std::iter::once(&r.values).chain(r.rows.iter().map(|row| &row.values))
+                    {
+                        for (name, value) in values {
+                            if name == "arithmetic_precision_bits"
+                                || name.ends_with("_lower")
+                                || name.ends_with("_upper")
+                            {
+                                continue;
+                            }
+                            let lower = values
+                                .get(&format!("{name}_lower"))
+                                .ok_or_else(|| anyhow::anyhow!("missing energy lower enclosure"))?;
+                            let upper = values
+                                .get(&format!("{name}_upper"))
+                                .ok_or_else(|| anyhow::anyhow!("missing energy upper enclosure"))?;
+                            let point = scalar(value, p)?;
+                            if scalar(lower, p)? > point || scalar(upper, p)? < point {
+                                bail!("energy point lies outside its reported enclosure");
+                            }
+                        }
+                    }
+                }
+                if id == "signed_transform"
+                    && (scalar(
+                        &r.values["arithmetic_precision_bits"],
+                        options.working_precision_bits,
+                    )? != options.working_precision_bits
+                        || scalar(
+                            &r.values["normalization_precision_bits"],
+                            options.working_precision_bits,
+                        )? != options.working_precision_bits + 64)
+                {
+                    bail!("signed transform arithmetic precision disagrees with input points");
+                }
                 if id == "energy_allowance" && r.outcome == "conditional_bound_expression" {
                     for name in [
                         "conditional_energy_allowance",
@@ -2133,6 +3108,7 @@ pub fn capture_extended(
                     if [
                         "allowance_to_trial_energy_magnitude",
                         "allowance_below_trial_energy_magnitude",
+                        "scale_comparison_resolved",
                     ]
                     .iter()
                     .any(|name| r.values.contains_key(*name) != nonzero)
@@ -2153,4 +3129,135 @@ pub fn capture_extended(
             .or(result.reused_manifest.as_ref()),
     );
     Ok(result)
+}
+
+#[cfg(test)]
+mod exhaustive_resumed_contract {
+    use super::*;
+    #[test]
+    fn exhaustive_resumed_signed_channel_rejects_partial_underflow() {
+        let p = 128;
+        let tiny = Float::with_val(p, 1) << (rug::float::exp_min() - 1);
+        assert!(signed_channel_quotient(&tiny, &Float::with_val(p, 1.5), p).is_err());
+    }
+}
+
+fn validate_resolution_report(r: &ExtendedAnalysis, p: u32) -> Result<()> {
+    let check = |values: &BTreeMap<String, String>, skip: &[&str]| -> Result<()> {
+        for (name, value) in values {
+            if skip.contains(&name.as_str()) || name.ends_with("_lower") || name.ends_with("_upper")
+            {
+                continue;
+            }
+            let lo = values
+                .get(&format!("{name}_lower"))
+                .ok_or_else(|| anyhow::anyhow!("missing resolution lower enclosure"))?;
+            let hi = values
+                .get(&format!("{name}_upper"))
+                .ok_or_else(|| anyhow::anyhow!("missing resolution upper enclosure"))?;
+            let point = scalar(value, p)?;
+            let lo = Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
+            let hi = Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
+            if lo > point || hi < point {
+                bail!("resolution point outside enclosure");
+            }
+        }
+        Ok(())
+    };
+    check(&r.values, &["conditional_contiguous_prefix"])?;
+    let mut prefix = 0usize;
+    let mut contiguous = true;
+    for row in &r.rows {
+        if row.values.is_empty() {
+            if !["missing_input", "cancellation_limited"].contains(&row.outcome.as_str()) {
+                bail!("resolution measurements missing");
+            }
+        } else {
+            for name in [
+                "t",
+                "transform",
+                "derivative",
+                "absolute_value_terms",
+                "absolute_derivative_terms",
+                "arithmetic_precision_bits",
+            ] {
+                if !row.values.contains_key(name) {
+                    bail!("missing resolution core field");
+                }
+            }
+            let used = scalar(&row.values["arithmetic_precision_bits"], p)?;
+            if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                bail!("invalid resolution arithmetic precision");
+            }
+            check(&row.values, &["arithmetic_precision_bits"])?;
+            if row.outcome == "conditional_budget_met" {
+                for name in [
+                    "conditional_root_distance_allowance",
+                    "conditional_slope_margin",
+                    "declared_radius",
+                    "conditional_budget_target",
+                    "declared_source_value_error",
+                    "declared_source_derivative_error",
+                    "conditional_value_numerator",
+                ] {
+                    if !row.values.contains_key(name) {
+                        bail!("missing conditional resolution field");
+                    }
+                }
+                use super::retained_evidence::finite_math::decimal;
+                let bound = decimal(&row.values["conditional_root_distance_allowance"], p + 64)?;
+                let target = decimal(&row.values["conditional_budget_target_lower"], p + 64)?;
+                if bound.lower() < &0
+                    || bound.upper() > target.lower()
+                    || scalar(&row.values["conditional_slope_margin_lower"], p)? <= 0
+                    || scalar(&row.values["declared_radius_lower"], p)? <= 0
+                {
+                    bail!("inconsistent conditional resolution qualification");
+                }
+            }
+        }
+        if prefix.checked_add(1) != Some(row.ordinal) || row.outcome != "conditional_budget_met" {
+            contiguous = false;
+        }
+        if contiguous {
+            prefix = row.ordinal;
+        }
+    }
+    if scalar(
+        r.values
+            .get("conditional_contiguous_prefix")
+            .ok_or_else(|| anyhow::anyhow!("missing conditional resolution prefix"))?,
+        p,
+    )? != prefix
+    {
+        bail!("inconsistent conditional resolution prefix");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod exhaustive_resumed_resolution_validation_contract {
+    use super::*;
+    #[test]
+    fn exhaustive_resumed_resolution_missing_prefix_returns_error() {
+        let report = ExtendedAnalysis {
+            diagnostic: "resolution_budget".into(),
+            outcome: "point_measurement".into(),
+            reason: None,
+            lambda_squared: "9".into(),
+            n_modes: 0,
+            source_precision_bits: 128,
+            working_precision_bits: 128,
+            convention: "fixture".into(),
+            assurance: RESOLUTION_ASSURANCE.into(),
+            values: BTreeMap::new(),
+            rows: vec![],
+        };
+        let result = std::panic::catch_unwind(|| validate_resolution_report(&report, 128));
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "missing prefix must fail without panicking"
+        );
+    }
 }

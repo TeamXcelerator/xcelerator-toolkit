@@ -117,6 +117,7 @@ impl CanonicalPayloadEnvelope {
                 "canonical payload identity is incomplete".to_owned(),
             ));
         }
+        self.checked_logical_size_bytes()?;
         let mut previous_path: Option<&str> = None;
         for item in &self.ordered_items {
             if !normalized_relative_path(&item.normalized_path)
@@ -162,6 +163,17 @@ impl CanonicalPayloadEnvelope {
         Ok(())
     }
 
+    /// Exact total for arbitrary envelopes, rejecting an unrepresentable sum.
+    pub fn checked_logical_size_bytes(&self) -> Result<u64, CacheError> {
+        self.ordered_items.iter().try_fold(0u64, |total, item| {
+            total.checked_add(item.size_bytes).ok_or_else(|| {
+                CacheError::ResourceLimit("canonical payload sizes exceed u64".to_owned())
+            })
+        })
+    }
+
+    /// Saturating size estimate; exact after `validate` succeeds. Use
+    /// `checked_logical_size_bytes` when handling an unvalidated envelope.
     pub fn logical_size_bytes(&self) -> u64 {
         self.ordered_items
             .iter()
@@ -403,6 +415,30 @@ impl ArtifactState {
                 "Certified assurance requires a complete artifact".to_owned(),
             ));
         }
+        if self.achieved_assurance != ArtifactAssuranceState::Unchecked
+            && self.assurance_history.is_empty()
+        {
+            return Err(CacheError::InvalidManifest(
+                "achieved assurance requires a recorded evidence transition".to_owned(),
+            ));
+        }
+        let mut previous = Some(ArtifactAssuranceState::Unchecked);
+        for transition in &self.assurance_history {
+            if transition.to <= transition.from
+                || !transition.evidence_digest.validate()
+                || previous.is_some_and(|level| level != transition.from)
+            {
+                return Err(CacheError::InvalidManifest(
+                    "assurance history must be increasing, connected and digest-bound".to_owned(),
+                ));
+            }
+            previous = Some(transition.to);
+        }
+        if previous.is_some_and(|level| level != self.achieved_assurance) {
+            return Err(CacheError::InvalidManifest(
+                "assurance history does not end at achieved assurance".to_owned(),
+            ));
+        }
         for location in &self.locations {
             if location.locator.trim().is_empty() {
                 return Err(CacheError::InvalidManifest(
@@ -452,6 +488,7 @@ impl ArtifactState {
         next: ArtifactAssuranceState,
         evidence_digest: ContentDigest,
     ) -> Result<(), CacheError> {
+        self.validate()?;
         if !evidence_digest.validate() {
             return Err(CacheError::InvalidTransition(
                 "assurance transition evidence digest is invalid".to_owned(),
@@ -557,17 +594,13 @@ pub struct AttestationEnvelope {
 
 impl AttestationEnvelope {
     pub fn digest(&self) -> Result<ContentDigest, CacheError> {
+        self.producer_toolkit_version.validate()?;
         if self.schema_version == 0
             || self.actor.trim().is_empty()
             || self.source_revision.trim().is_empty()
             || !self.subject_digest.validate()
             || !self.policy_digest.validate()
             || !self.execution_fingerprint_digest.validate()
-            || self
-                .producer_toolkit_version
-                .prerelease
-                .as_ref()
-                .is_some_and(|value| value.trim().is_empty())
             || self.dependency_versions.is_empty()
             || self
                 .dependency_versions
@@ -690,6 +723,9 @@ pub(crate) fn canonical_digest<T: Serialize>(value: &T) -> Result<ContentDigest,
     Ok(ContentDigest::sha256(&canonical_json_bytes(value)?))
 }
 
+/// Sort object keys while preserving array order and string spelling. Native
+/// numbers retain serde_json's pinned formatter semantics; this is a representation
+/// identity, not a normalization of mathematically equivalent inputs.
 pub(crate) fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, CacheError> {
     xc_core::validate_secret_free(value, "canonical cache record")
         .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
@@ -753,6 +789,8 @@ pub(crate) fn normalized_relative_path(path: &str) -> bool {
         && !path.starts_with('/')
         && !path.starts_with('\\')
         && !path.contains('\\')
+        && !path.contains(':')
+        && !path.chars().any(char::is_control)
         && !path
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
@@ -1040,9 +1078,14 @@ mod tests {
     fn locations_and_publication_never_change_assurance() {
         let mut state = ArtifactState {
             completion: ArtifactCompletionState::Complete,
-            achieved_assurance: ArtifactAssuranceState::Computed,
             ..ArtifactState::default()
         };
+        state
+            .promote_assurance(
+                ArtifactAssuranceState::Computed,
+                ContentDigest::sha256(b"completed evidence"),
+            )
+            .unwrap();
         state
             .record_location(ArtifactLocation {
                 kind: ArtifactLocationKind::Workstation,
@@ -1069,9 +1112,14 @@ mod tests {
     fn publication_targets_advance_independently() {
         let mut state = ArtifactState {
             completion: ArtifactCompletionState::Complete,
-            achieved_assurance: ArtifactAssuranceState::CrossChecked,
             ..ArtifactState::default()
         };
+        state
+            .promote_assurance(
+                ArtifactAssuranceState::CrossChecked,
+                ContentDigest::sha256(b"completed evidence"),
+            )
+            .unwrap();
         for destination in [
             PublicationDestination::Private,
             PublicationDestination::Public,

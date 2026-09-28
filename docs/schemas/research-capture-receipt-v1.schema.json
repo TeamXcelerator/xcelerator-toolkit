@@ -39,7 +39,7 @@
       "properties": {
         "plan_digest": {
           "type": "string",
-          "pattern": "^[0-9a-f]{64}$"
+          "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
         },
         "outcomes": {
           "type": "object",
@@ -79,7 +79,7 @@
                         },
                         "digest": {
                           "type": "string",
-                          "pattern": "^[0-9a-f]{64}$"
+                          "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
                         },
                         "description": {
                           "type": "string",
@@ -187,13 +187,13 @@
                     },
                     "parameters_digest": {
                       "type": "string",
-                      "pattern": "^[0-9a-f]{64}$"
+                      "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
                     }
                   }
                 },
                 "content_digest": {
                   "type": "string",
-                  "pattern": "^[0-9a-f]{64}$"
+                  "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
                 },
                 "required_quality": {
                   "const": "validated"
@@ -234,13 +234,13 @@
               },
               "parameters_digest": {
                 "type": "string",
-                "pattern": "^[0-9a-f]{64}$"
+                "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
               }
             }
           },
           "content_digest": {
             "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
+            "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
           },
           "required_quality": {
             "const": "validated"

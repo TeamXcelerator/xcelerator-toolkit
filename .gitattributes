@@ -15,3 +15,6 @@ tools/*.py text eol=lf
 *.toml text eol=lf
 *.md text eol=lf
 *.lock text eol=lf
+
+# Audit log hashes bind raw captured bytes, including Windows line endings.
+*.tar.gz binary

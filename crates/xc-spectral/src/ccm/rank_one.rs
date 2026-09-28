@@ -3,7 +3,7 @@
 
 //! Independent finite rank-one realization of the CCM spectral operator.
 //!
-//! This implements CCM Lemma 5.4 directly.  For centered integer-frequency
+//! The algebraic construction is the one in CCM Lemma 5.4. For centered integer-frequency
 //! diagonal `D`, normalized state `xi` with `<eta,xi>=1`, and
 //! `eta=(1,...,1)`, the rank-one operator is
 //!
@@ -14,11 +14,18 @@
 //! it does not evaluate or find zeros of the secular function.  Consequently
 //! it can serve as the matrix-side route in an independence report while the
 //! pole-aware secular solver remains the source-side route.
+//!
+//! A real state with nonzero eta pairing defines the quotient algebraically.
+//! The native route does not establish the additional positive-metric and
+//! radical hypotheses needed for the lemma's self-adjointness conclusion.
+//! HP metric checks use explicit numerical tolerances, not interval proofs.
+//! Neither point spectrum certifies continuum or zeta-zero claims.
+
+pub(super) mod arithmetic;
 
 use nalgebra::DMatrix;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::f64::consts::PI;
 use std::fmt::{Display, Formatter};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -65,13 +72,18 @@ impl FiniteRankOneOperatorF64 {
                 "state coefficients must be finite".to_owned(),
             ));
         }
-        let sum = state.iter().sum::<f64>();
-        if !sum.is_finite() || sum.abs() <= f64::EPSILON {
+        if state.len() as u128 > (1u128 << 53)
+            || (state.len() - 1).checked_mul(state.len() - 1).is_none()
+        {
             return Err(RankOneError::InvalidState(
-                "state must have a nonzero eta pairing".to_owned(),
+                "quotient dimensions or integer frequencies are unrepresentable".into(),
             ));
         }
-        let normalized_state = state.iter().map(|value| value / sum).collect::<Vec<_>>();
+        use num_rational::BigRational as Q;
+        use num_traits::ToPrimitive;
+        let scaled = arithmetic::exact_scaled_state_f64(state)?;
+        let pairing: Q = scaled.iter().map(|v| Q::from_float(*v).unwrap()).sum();
+        let normalized_state = arithmetic::normalized_state_f64(state)?;
         let quotient_pivot = normalized_state
             .iter()
             .enumerate()
@@ -92,27 +104,34 @@ impl FiniteRankOneOperatorF64 {
         let quotient_dimension = state.len() - 1;
         let mut quotient_matrix = DMatrix::<f64>::zeros(quotient_dimension, quotient_dimension);
 
-        // Apply D' to every coordinate section vector with pivot coordinate
-        // zero, then subtract its pivot component along xi to return to the
-        // same section.  This is a quotient construction, not a secular
-        // determinant evaluation.
-        let centered_index = |index: usize| index as isize - centered_modes as isize;
-        for (column, &source_index) in quotient_indices.iter().enumerate() {
-            let source_frequency = centered_index(source_index) as f64;
-            let mut image = Vec::with_capacity(state.len());
-            for (row, &xi_row) in normalized_state.iter().enumerate() {
-                let frequency = centered_index(row) as f64;
-                let diagonal_action = if row == source_index {
-                    source_frequency
+        // In the section x_p=0, subtracting the image's pivot component
+        // along xi gives Q_ij = delta_ij*d_i - (d_i-d_p)*xi_i.
+        // Cancel the pivot symbolically before arithmetic: the two separate
+        // terms can overflow even when this final matrix entry is finite.
+        let frequency = |index: usize| (index as isize - centered_modes as isize) as f64;
+        for (row, &target_index) in quotient_indices.iter().enumerate() {
+            let difference = (target_index as isize - quotient_pivot as isize) as f64;
+            for (column, &source_index) in quotient_indices.iter().enumerate() {
+                let diagonal = if target_index == source_index {
+                    frequency(target_index)
                 } else {
                     0.0
                 };
-                image.push(diagonal_action - frequency * xi_row);
-            }
-            let quotient_multiple = image[quotient_pivot] / pivot_value;
-            for (row, &target_index) in quotient_indices.iter().enumerate() {
-                quotient_matrix[(row, column)] =
-                    image[target_index] - quotient_multiple * normalized_state[target_index];
+                // Construct the quotient of the supplied dyadics, rather than
+                // the quotient of a componentwise-rounded normalized state.
+                let exact = Q::from_float(diagonal).expect("exact integer diagonal")
+                    - Q::from_float(difference).expect("exact integer difference")
+                        * Q::from_float(scaled[target_index]).expect("finite source coefficient")
+                        / &pairing;
+                let value = exact.to_f64().filter(|v| v.is_finite()).ok_or_else(|| {
+                    RankOneError::InvalidState("quotient matrix is outside binary64 range".into())
+                })?;
+                if !value.is_finite() {
+                    return Err(RankOneError::InvalidState(
+                        "quotient matrix is outside binary64 range".into(),
+                    ));
+                }
+                quotient_matrix[(row, column)] = value;
             }
         }
 
@@ -128,6 +147,9 @@ impl FiniteRankOneOperatorF64 {
         self.centered_modes
     }
 
+    /// Rounded normalized coefficients for inspection. The quotient matrix
+    /// is formed separately from exact ratios of the supplied dyadics, with
+    /// one final rounding per entry; Schur eigenvalues remain point estimates.
     pub fn normalized_state(&self) -> &[f64] {
         &self.normalized_state
     }
@@ -147,7 +169,44 @@ impl FiniteRankOneOperatorF64 {
                 "imaginary tolerance must be finite and positive".to_owned(),
             ));
         }
-        let eigenvalues = self.quotient_matrix.clone().complex_eigenvalues();
+        let scale = self
+            .quotient_matrix
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        if scale == 0.0 {
+            return Ok(vec![0.0; self.quotient_matrix.nrows()]);
+        }
+        let mut matrix = self.quotient_matrix.clone();
+        for value in matrix.iter_mut() {
+            let original = *value;
+            *value /= scale;
+            if !value.is_finite() || (*value == 0.0 && original != 0.0) {
+                return Err(RankOneError::InvalidState(
+                    "quotient scaling loses representable matrix data".into(),
+                ));
+            }
+        }
+        let iterations = 4096usize
+            .checked_mul(matrix.nrows())
+            .ok_or_else(|| RankOneError::InvalidState("Schur iteration bound overflows".into()))?;
+        let schur = nalgebra::linalg::Schur::try_new(matrix, f64::EPSILON, iterations).ok_or_else(
+            || {
+                RankOneError::InvalidState(
+                    "bounded quotient Schur iteration did not converge".into(),
+                )
+            },
+        )?;
+        let mut eigenvalues = schur.complex_eigenvalues();
+        for value in eigenvalues.iter_mut() {
+            value.re *= scale;
+            value.im *= scale;
+            if !value.re.is_finite() || !value.im.is_finite() {
+                return Err(RankOneError::InvalidState(
+                    "quotient spectrum is outside binary64 range".into(),
+                ));
+            }
+        }
         let maximum_imaginary_part = eigenvalues
             .iter()
             .map(|value| value.im.abs())
@@ -173,12 +232,10 @@ impl FiniteRankOneOperatorF64 {
                 "log length must be finite and positive".to_owned(),
             ));
         }
-        let scale = 2.0 * PI / log_length;
-        Ok(self
-            .spectrum(imaginary_tolerance)?
+        self.spectrum(imaginary_tolerance)?
             .into_iter()
-            .map(|value| scale * value)
-            .collect())
+            .map(|value| arithmetic::ordinate_f64(value, log_length))
+            .collect()
     }
 }
 
@@ -225,7 +282,7 @@ pub fn compare_independent_routes_f64(
         .map(|(left, right)| (left - right).abs())
         .fold(0.0_f64, f64::max);
     Ok(IndependentRouteComparisonF64 {
-        matrix_route: "finite_rank_one_quotient_dense_spectrum_f64",
+        matrix_route: "finite_rank_one_original_dyadic_quotient_dense_spectrum_f64_v2",
         source_route: "pole_aware_secular_root_finding_f64",
         compared_roots: rank_one_values.len(),
         maximum_absolute_difference,
@@ -289,7 +346,9 @@ pub fn compare_three_semantic_evaluators_f64(
         source.independence_class(),
         zero.independence_class(),
     ];
-    if routes[0] == routes[1]
+    if routes.iter().any(|value| value.trim().is_empty())
+        || classes.iter().any(|value| value.trim().is_empty())
+        || routes[0] == routes[1]
         || routes[0] == routes[2]
         || routes[1] == routes[2]
         || classes[0] == classes[1]
@@ -297,7 +356,7 @@ pub fn compare_three_semantic_evaluators_f64(
         || classes[1] == classes[2]
     {
         return Err(RankOneError::Comparison(
-            "three-route comparison requires distinct route and independence-class identities"
+            "three-route comparison requires nonempty distinct route and independence-class identities"
                 .to_owned(),
         ));
     }
@@ -421,6 +480,7 @@ pub fn verify_three_route_semantic_comparison_f64(
     }
     xc_certify::VerificationReport {
         valid: errors.is_empty(),
+        mathematical_claim_verified: false,
         checks: if errors.is_empty() {
             vec!["finite Guinand-Weil matrix/source/zero evidence replayed".to_owned()]
         } else {
@@ -462,7 +522,11 @@ pub mod hp {
     /// `ker(eta)`, the metric matrix is `G=B^T T B` and the operator form is
     /// `H=B^T T D B`.  A Cholesky congruence reduces `H v=lambda G v` to a
     /// symmetric standard eigenproblem, independently of secular root
-    /// evaluation.
+    /// evaluation. Output eigenvalue precision is `state[0].prec()` (33 through
+    /// 1000000 bits); preceding arithmetic uses 32 guard bits above the largest
+    /// input precision. Every source entry retains its stored binary value.
+    /// The source matrix must be exactly symmetric, and validation tolerance
+    /// must be finite and positive. These are point checks, not certification.
     pub fn spectrum_from_weil_metric(
         weil_matrix: &[Float],
         state: &[Float],
@@ -473,38 +537,50 @@ pub mod hp {
         let dimension = state.len();
         if dimension < 3
             || dimension.is_multiple_of(2)
-            || weil_matrix.len() != dimension.saturating_mul(dimension)
+            || dimension.checked_mul(dimension) != Some(weil_matrix.len())
         {
             return Err(hp_invalid(
                 "HP Weil metric requires an odd state dimension and a matching square matrix",
             ));
         }
         let precision = state[0].prec();
+        if !(33..=1_000_000).contains(&precision) {
+            return Err(hp_invalid(
+                "HP rank-one output precision must be in 33..=1000000 bits",
+            ));
+        }
+        let maximum_precision = state
+            .iter()
+            .chain(weil_matrix)
+            .chain([smallest_eigenvalue, log_length, validation_tolerance])
+            .map(Float::prec)
+            .max()
+            .expect("validated state dimension");
+        if maximum_precision > 1_000_000 {
+            return Err(hp_invalid(
+                "HP rank-one source precision exceeds 1000000 bits",
+            ));
+        }
+        let working = maximum_precision + 32;
         if state.iter().any(|value| !value.is_finite())
             || weil_matrix.iter().any(|value| !value.is_finite())
             || !smallest_eigenvalue.is_finite()
             || !log_length.is_finite()
             || log_length <= &Float::with_val(precision, 0)
+            || !validation_tolerance.is_finite()
             || validation_tolerance <= &Float::with_val(precision, 0)
         {
             return Err(hp_invalid("HP rank-one inputs must be finite and valid"));
         }
 
-        let mut state_sum = Float::with_val(precision, 0);
-        for value in state {
-            state_sum += value;
+        for row in 0..dimension {
+            for column in 0..row {
+                if weil_matrix[row * dimension + column] != weil_matrix[column * dimension + row] {
+                    return Err(hp_invalid("source Weil metric must be exactly symmetric"));
+                }
+            }
         }
-        if state_sum.is_zero() {
-            return Err(hp_invalid("HP state must have nonzero eta pairing"));
-        }
-        let normalized_state = state
-            .iter()
-            .map(|value| {
-                let mut normalized = value.clone();
-                normalized /= &state_sum;
-                normalized
-            })
-            .collect::<Vec<_>>();
+        let normalized_state = super::arithmetic::normalized_state_hp(state, working)?;
         let quotient_pivot = normalized_state
             .iter()
             .enumerate()
@@ -522,18 +598,27 @@ pub mod hp {
             .collect::<Vec<_>>();
         let quotient_dimension = dimension - 1;
 
-        let mut centered = weil_matrix.to_vec();
+        let mut centered = weil_matrix
+            .iter()
+            .map(|value| Float::with_val(working, value))
+            .collect::<Vec<_>>();
         for diagonal in 0..dimension {
             centered[diagonal * dimension + diagonal] -= smallest_eigenvalue;
         }
 
-        let mut maximum_kernel_residual = Float::with_val(precision, 0);
+        if centered.iter().any(|value| !value.is_finite()) {
+            return Err(hp_invalid("shifted Weil metric is outside the MPFR range"));
+        }
+        let mut maximum_kernel_residual = Float::with_val(working, 0);
         for row in 0..dimension {
-            let mut residual = Float::with_val(precision, 0);
+            let mut residual = Float::with_val(working, 0);
             for column in 0..dimension {
                 let mut term = centered[row * dimension + column].clone();
                 term *= &normalized_state[column];
                 residual += term;
+            }
+            if !residual.is_finite() {
+                return Err(hp_invalid("state residual is nonfinite"));
             }
             let absolute = residual.abs();
             if absolute > maximum_kernel_residual {
@@ -549,8 +634,8 @@ pub mod hp {
 
         let centered_frequency =
             |index: usize| -> isize { index as isize - (dimension / 2) as isize };
-        let mut metric = vec![Float::with_val(precision, 0); quotient_dimension.pow(2)];
-        let mut operator = vec![Float::with_val(precision, 0); quotient_dimension.pow(2)];
+        let mut metric = vec![Float::with_val(working, 0); quotient_dimension.pow(2)];
+        let mut operator = vec![Float::with_val(working, 0); quotient_dimension.pow(2)];
         for (row, &row_index) in quotient_indices.iter().enumerate() {
             for (column, &column_index) in quotient_indices.iter().enumerate() {
                 let mut g = centered[row_index * dimension + column_index].clone();
@@ -582,25 +667,25 @@ pub mod hp {
             validation_tolerance,
             "quotient operator form",
         )?;
-        let lower = cholesky(&metric, quotient_dimension, precision)?;
-        let transformed = cholesky_congruence(&lower, &operator, quotient_dimension, precision);
+        let lower = cholesky(&metric, quotient_dimension, working)?;
+        let transformed = cholesky_congruence(&lower, &operator, quotient_dimension, working)?;
         let dimensionless_values = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(
             &transformed,
             quotient_dimension,
             precision,
         )
         .map_err(|error| hp_invalid(format!("HP quotient eigensolve failed: {error}")))?;
-        let mut scale = Float::with_val(precision, rug::float::Constant::Pi);
-        scale *= 2u32;
-        scale /= log_length;
+        if dimensionless_values.len() != quotient_dimension
+            || dimensionless_values.iter().any(|value| !value.is_finite())
+        {
+            return Err(hp_invalid(
+                "HP quotient spectrum is incomplete or nonfinite",
+            ));
+        }
         let ordinates = dimensionless_values
             .iter()
-            .map(|value| {
-                let mut ordinate = value.clone();
-                ordinate *= &scale;
-                ordinate
-            })
-            .collect();
+            .map(|value| super::arithmetic::ordinate_hp(value, log_length, working, precision))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(HpRankOneSpectrum {
             dimensionless_values,
             ordinates,
@@ -609,7 +694,7 @@ pub mod hp {
             maximum_kernel_residual,
             maximum_metric_asymmetry,
             maximum_operator_asymmetry,
-            method: "finite_rank_one_weil_metric_cholesky_congruence_hp",
+            method: "finite_rank_one_weil_metric_guarded_cholesky_congruence_hp_v3",
         })
     }
 
@@ -619,19 +704,32 @@ pub mod hp {
         tolerance: &Float,
         name: &str,
     ) -> Result<Float, RankOneError> {
-        let precision = tolerance.prec();
+        if matrix.iter().any(|value| !value.is_finite()) {
+            return Err(hp_invalid(format!("{name} contains nonfinite entries")));
+        }
+        let precision = matrix[0].prec();
         let mut maximum = Float::with_val(precision, 0);
         for row in 0..dimension {
             for column in row + 1..dimension {
                 let mut difference = matrix[row * dimension + column].clone();
                 difference -= &matrix[column * dimension + row];
                 difference.abs_mut();
+                if !difference.is_finite() {
+                    return Err(hp_invalid(format!("{name} asymmetry is nonfinite")));
+                }
                 if difference > maximum {
                     maximum = difference;
                 }
                 let mut average = matrix[row * dimension + column].clone();
                 average += &matrix[column * dimension + row];
                 average /= 2u32;
+                if !average.is_finite() {
+                    average = matrix[row * dimension + column].clone() / 2u32
+                        + matrix[column * dimension + row].clone() / 2u32;
+                }
+                if !average.is_finite() {
+                    return Err(hp_invalid(format!("{name} symmetrization is nonfinite")));
+                }
                 matrix[row * dimension + column] = average.clone();
                 matrix[column * dimension + row] = average;
             }
@@ -660,7 +758,7 @@ pub mod hp {
                     value -= term;
                 }
                 if row == column {
-                    if value <= 0 {
+                    if !value.is_finite() || value <= 0 {
                         return Err(hp_invalid(format!(
                             "quotient Weil metric is not positive definite at Cholesky pivot {row}"
                         )));
@@ -668,6 +766,9 @@ pub mod hp {
                     lower[row * dimension + column] = value.sqrt();
                 } else {
                     value /= &lower[column * dimension + column];
+                    if !value.is_finite() {
+                        return Err(hp_invalid("Cholesky factor is nonfinite"));
+                    }
                     lower[row * dimension + column] = value;
                 }
             }
@@ -680,7 +781,7 @@ pub mod hp {
         operator: &[Float],
         dimension: usize,
         precision: u32,
-    ) -> Vec<Float> {
+    ) -> Result<Vec<Float>, RankOneError> {
         let mut left_solved = vec![Float::with_val(precision, 0); dimension * dimension];
         for row in 0..dimension {
             for column in 0..dimension {
@@ -691,6 +792,9 @@ pub mod hp {
                     value -= term;
                 }
                 value /= &lower[row * dimension + row];
+                if !value.is_finite() {
+                    return Err(hp_invalid("left congruence solve is nonfinite"));
+                }
                 left_solved[row * dimension + column] = value;
             }
         }
@@ -704,6 +808,9 @@ pub mod hp {
                     value -= term;
                 }
                 value /= &lower[column * dimension + column];
+                if !value.is_finite() {
+                    return Err(hp_invalid("right congruence solve is nonfinite"));
+                }
                 transformed[row * dimension + column] = value;
             }
         }
@@ -712,11 +819,18 @@ pub mod hp {
                 let mut average = transformed[row * dimension + column].clone();
                 average += &transformed[column * dimension + row];
                 average /= 2u32;
+                if !average.is_finite() {
+                    average = transformed[row * dimension + column].clone() / 2u32
+                        + transformed[column * dimension + row].clone() / 2u32;
+                }
                 transformed[row * dimension + column] = average.clone();
                 transformed[column * dimension + row] = average;
             }
         }
-        transformed
+        if transformed.iter().any(|value| !value.is_finite()) {
+            return Err(hp_invalid("symmetric congruence is nonfinite"));
+        }
+        Ok(transformed)
     }
 }
 

@@ -5,6 +5,18 @@
 //! input radius using the global Lipschitz bound `|sin'|, |cos'| <= 1`.
 //! This avoids assumptions about argument reduction while retaining narrow
 //! enclosures for the high-precision point intervals used by CCM.
+//!
+//! Finite intervals are the supported domain. Infallible arithmetic preserves
+//! the existing API and returns an invalid NaN interval if a finite enclosure
+//! cannot be represented or operand precisions differ. Such a value must never establish a proof: call
+//! `validate()` at certificate boundaries. Sign/subset predicates fail closed,
+//! and fallible arithmetic returns an error for invalid operands or results.
+//! Constructors with a raw precision argument follow MPFR and panic outside its
+//! supported precision range; `from_float` is the checked alternative.
+//! `with_precision` intentionally requires at least 32 bits, the ball-backend
+//! policy, while exact construction can represent lower MPFR precisions.
+//! `point`, `midpoint_point`, `to_rational_interval`, and compatibility `intersection` require valid
+//! inputs and can panic; use checked construction/intersection at boundaries.
 
 use crate::interval::{IntervalError, RationalInterval};
 use rug::float::{Constant, Round};
@@ -31,43 +43,84 @@ impl MpfrInterval {
         Ok(Self { lower, upper })
     }
 
+    /// Check the finite, ordered, equal-precision enclosure contract.
+    pub fn validate(&self) -> Result<(), IntervalError> {
+        if !self.lower.is_finite()
+            || !self.upper.is_finite()
+            || self.lower > self.upper
+            || self.lower.prec() != self.upper.prec()
+        {
+            return Err(IntervalError::Invalid(
+                "invalid or unrepresentable MPFR interval".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn invalid(precision: u32) -> Self {
+        let nan = Float::with_val(precision, rug::float::Special::Nan);
+        Self {
+            lower: nan.clone(),
+            upper: nan,
+        }
+    }
+
+    fn arithmetic_result(lower: Float, upper: Float) -> Self {
+        let precision = lower.prec();
+        Self::new(lower, upper).unwrap_or_else(|_| Self::invalid(precision))
+    }
+
+    /// Enclose the exact stored Float when changing precision, including reduction.
+    pub fn from_float(value: &Float, precision: u32) -> Result<Self, IntervalError> {
+        if !value.is_finite()
+            || !(rug::float::prec_min()..=rug::float::prec_max()).contains(&precision)
+        {
+            return Err(IntervalError::Invalid(
+                "finite Float and supported precision required".into(),
+            ));
+        }
+        let (lower, _) = Float::with_val_round(precision, value, Round::Down);
+        let (upper, _) = Float::with_val_round(precision, value, Round::Up);
+        Self::new(lower, upper)
+    }
+
     /// Enclose the exact integer even when its significand exceeds `precision`.
     pub fn from_i64(value: i64, precision: u32) -> Self {
         let (lower, _) = Float::with_val_round(precision, value, Round::Down);
         let (upper, _) = Float::with_val_round(precision, value, Round::Up);
-        Self { lower, upper }
+        Self::arithmetic_result(lower, upper)
     }
 
     /// Enclose the exact integer even when its significand exceeds `precision`.
     pub fn from_u64(value: u64, precision: u32) -> Self {
         let (lower, _) = Float::with_val_round(precision, value, Round::Down);
         let (upper, _) = Float::with_val_round(precision, value, Round::Up);
-        Self { lower, upper }
+        Self::arithmetic_result(lower, upper)
     }
 
     pub fn from_rational(value: &Rational, precision: u32) -> Self {
         let (lower, _) = Float::with_val_round(precision, value, Round::Down);
         let (upper, _) = Float::with_val_round(precision, value, Round::Up);
-        Self { lower, upper }
+        Self::arithmetic_result(lower, upper)
     }
 
+    /// A singleton containing an exact stored finite Float.
+    ///
+    /// Panics for a nonfinite value; use `from_float` for fallible construction.
     pub fn point(value: Float) -> Self {
-        Self {
-            lower: value.clone(),
-            upper: value,
-        }
+        Self::new(value.clone(), value).expect("finite MPFR point required")
     }
 
     pub fn pi(precision: u32) -> Self {
         let (lower, _) = Float::with_val_round(precision, Constant::Pi, Round::Down);
         let (upper, _) = Float::with_val_round(precision, Constant::Pi, Round::Up);
-        Self { lower, upper }
+        Self::arithmetic_result(lower, upper)
     }
 
     pub fn euler_gamma(precision: u32) -> Self {
         let (lower, _) = Float::with_val_round(precision, Constant::Euler, Round::Down);
         let (upper, _) = Float::with_val_round(precision, Constant::Euler, Round::Up);
-        Self { lower, upper }
+        Self::arithmetic_result(lower, upper)
     }
 
     pub fn precision(&self) -> u32 {
@@ -77,7 +130,8 @@ impl MpfrInterval {
     /// Re-enclose both endpoints at a requested MPFR precision using outward
     /// rounding. This is valid for either precision escalation or reduction.
     pub fn with_precision(&self, precision: u32) -> Result<Self, IntervalError> {
-        if precision < 32 {
+        self.validate()?;
+        if !(32..=rug::float::prec_max()).contains(&precision) {
             return Err(IntervalError::Invalid(
                 "MPFR interval precision must be at least 32 bits".to_owned(),
             ));
@@ -96,11 +150,12 @@ impl MpfrInterval {
     }
 
     pub fn contains_zero(&self) -> bool {
-        self.lower <= 0 && self.upper >= 0
+        // An invalid value cannot prove exclusion of zero.
+        self.validate().is_err() || (self.lower <= 0 && self.upper >= 0)
     }
 
     pub fn is_strictly_positive(&self) -> bool {
-        self.lower > 0
+        self.validate().is_ok() && self.lower > 0
     }
 
     pub fn width(&self) -> Float {
@@ -111,13 +166,40 @@ impl MpfrInterval {
 
     pub fn midpoint_point(&self) -> Self {
         let p = self.precision();
-        let (sum, _) = Float::with_val_round(p, &self.lower + &self.upper, Round::Nearest);
-        let (midpoint, _) = Float::with_val_round(p, sum / 2, Round::Nearest);
+        self.validate().expect("finite interval midpoint required");
+        // Same-sign subtraction cannot overflow. Opposite-sign half-sums
+        // cannot overflow, and clamping handles exponent-floor rounding.
+        let midpoint = if self.lower.is_sign_negative() == self.upper.is_sign_negative() {
+            let difference = Float::with_val(p, &self.upper - &self.lower);
+            Float::with_val(p, &self.lower + difference / 2)
+        } else {
+            Float::with_val(p, self.lower.clone() / 2 + self.upper.clone() / 2)
+        };
+        let midpoint = if midpoint < self.lower {
+            self.lower.clone()
+        } else if midpoint > self.upper {
+            self.upper.clone()
+        } else {
+            midpoint
+        };
         Self::point(midpoint)
     }
 
+    /// Panics on invalid operands; use `try_intersection` at proof boundaries.
     pub fn intersection(&self, other: &Self) -> Option<Self> {
-        self.require_same_precision(other);
+        self.try_intersection(other)
+            .expect("valid MPFR intersection operands required")
+    }
+
+    /// Distinguish invalid arithmetic from a proved empty intersection.
+    pub fn try_intersection(&self, other: &Self) -> Result<Option<Self>, IntervalError> {
+        self.validate()?;
+        other.validate()?;
+        if self.precision() != other.precision() {
+            return Err(IntervalError::Invalid(
+                "MPFR interval precision mismatch".into(),
+            ));
+        }
         let lower = if self.lower >= other.lower {
             self.lower.clone()
         } else {
@@ -128,41 +210,49 @@ impl MpfrInterval {
         } else {
             other.upper.clone()
         };
-        (lower <= upper).then_some(Self { lower, upper })
+        Ok((lower <= upper).then_some(Self { lower, upper }))
     }
 
     pub fn is_subset_of(&self, other: &Self) -> bool {
-        self.require_same_precision(other);
-        self.lower >= other.lower && self.upper <= other.upper
+        self.precision() == other.precision()
+            && self.validate().is_ok()
+            && other.validate().is_ok()
+            && self.lower >= other.lower
+            && self.upper <= other.upper
     }
 
     pub fn is_interior_subset_of(&self, other: &Self) -> bool {
-        self.require_same_precision(other);
-        self.lower > other.lower && self.upper < other.upper
-    }
-
-    fn require_same_precision(&self, other: &Self) {
-        assert_eq!(
-            self.precision(),
-            other.precision(),
-            "MPFR interval precision mismatch"
-        );
+        self.precision() == other.precision()
+            && self.validate().is_ok()
+            && other.validate().is_ok()
+            && self.lower > other.lower
+            && self.upper < other.upper
     }
 
     pub fn add(&self, other: &Self) -> Self {
-        self.require_same_precision(other);
+        if self.precision() != other.precision()
+            || self.validate().is_err()
+            || other.validate().is_err()
+        {
+            return Self::invalid(self.precision());
+        }
         let p = self.precision();
         let (lower, _) = Float::with_val_round(p, &self.lower + &other.lower, Round::Down);
         let (upper, _) = Float::with_val_round(p, &self.upper + &other.upper, Round::Up);
-        Self { lower, upper }
+        Self::arithmetic_result(lower, upper)
     }
 
     pub fn sub(&self, other: &Self) -> Self {
-        self.require_same_precision(other);
+        if self.precision() != other.precision()
+            || self.validate().is_err()
+            || other.validate().is_err()
+        {
+            return Self::invalid(self.precision());
+        }
         let p = self.precision();
         let (lower, _) = Float::with_val_round(p, &self.lower - &other.upper, Round::Down);
         let (upper, _) = Float::with_val_round(p, &self.upper - &other.lower, Round::Up);
-        Self { lower, upper }
+        Self::arithmetic_result(lower, upper)
     }
 
     pub fn neg(&self) -> Self {
@@ -173,7 +263,12 @@ impl MpfrInterval {
     }
 
     pub fn mul(&self, other: &Self) -> Self {
-        self.require_same_precision(other);
+        if self.precision() != other.precision()
+            || self.validate().is_err()
+            || other.validate().is_err()
+        {
+            return Self::invalid(self.precision());
+        }
         let p = self.precision();
         let pairs = [
             (&self.lower, &other.lower),
@@ -189,7 +284,7 @@ impl MpfrInterval {
         }
         let lower = lower_values.into_iter().min_by(Float::total_cmp).unwrap();
         let upper = upper_values.into_iter().max_by(Float::total_cmp).unwrap();
-        Self { lower, upper }
+        Self::arithmetic_result(lower, upper)
     }
 
     pub fn square(&self) -> Self {
@@ -203,16 +298,14 @@ impl MpfrInterval {
                 abs_upper
             };
             let (upper, _) = Float::with_val_round(p, &maximum * &maximum, Round::Up);
-            Self {
-                lower: Float::with_val(p, 0),
-                upper,
-            }
+            Self::arithmetic_result(Float::with_val(p, 0), upper)
         } else {
             self.mul(self)
         }
     }
 
     pub fn reciprocal(&self) -> Result<Self, IntervalError> {
+        self.validate()?;
         if self.contains_zero() {
             return Err(IntervalError::DivisionByZeroInterval);
         }
@@ -220,11 +313,20 @@ impl MpfrInterval {
         let one = Float::with_val(p, 1);
         let (lower, _) = Float::with_val_round(p, &one / &self.upper, Round::Down);
         let (upper, _) = Float::with_val_round(p, &one / &self.lower, Round::Up);
-        Ok(Self { lower, upper })
+        Self::new(lower, upper)
     }
 
     pub fn div(&self, other: &Self) -> Result<Self, IntervalError> {
-        Ok(self.mul(&other.reciprocal()?))
+        self.validate()?;
+        other.validate()?;
+        if self.precision() != other.precision() {
+            return Err(IntervalError::Invalid(
+                "MPFR interval precision mismatch".into(),
+            ));
+        }
+        let result = self.mul(&other.reciprocal()?);
+        result.validate()?;
+        Ok(result)
     }
 
     pub fn exp(&self) -> Self {
@@ -232,10 +334,11 @@ impl MpfrInterval {
         lower.exp_round(Round::Down);
         let mut upper = self.upper.clone();
         upper.exp_round(Round::Up);
-        Self { lower, upper }
+        Self::arithmetic_result(lower, upper)
     }
 
     pub fn ln(&self) -> Result<Self, IntervalError> {
+        self.validate()?;
         if self.lower <= 0 {
             return Err(IntervalError::Invalid(
                 "logarithm interval is not strictly positive".to_owned(),
@@ -245,10 +348,11 @@ impl MpfrInterval {
         lower.ln_round(Round::Down);
         let mut upper = self.upper.clone();
         upper.ln_round(Round::Up);
-        Ok(Self { lower, upper })
+        Self::new(lower, upper)
     }
 
     pub fn sqrt(&self) -> Result<Self, IntervalError> {
+        self.validate()?;
         if self.lower < 0 {
             return Err(IntervalError::Invalid(
                 "square-root interval has a negative lower endpoint".to_owned(),
@@ -258,7 +362,7 @@ impl MpfrInterval {
         lower.sqrt_round(Round::Down);
         let mut upper = self.upper.clone();
         upper.sqrt_round(Round::Up);
-        Ok(Self { lower, upper })
+        Self::new(lower, upper)
     }
 
     pub fn atan(&self) -> Self {
@@ -266,13 +370,15 @@ impl MpfrInterval {
         lower.atan_round(Round::Down);
         let mut upper = self.upper.clone();
         upper.atan_round(Round::Up);
-        Self { lower, upper }
+        Self::arithmetic_result(lower, upper)
     }
 
     fn lipschitz_trig(&self, sine: bool) -> Self {
         let p = self.precision();
-        let (sum, _) = Float::with_val_round(p, &self.lower + &self.upper, Round::Nearest);
-        let (midpoint, _) = Float::with_val_round(p, sum / 2, Round::Nearest);
+        if self.validate().is_err() {
+            return Self::invalid(p);
+        }
+        let midpoint = self.midpoint_point().lower;
         let (left_radius, _) = Float::with_val_round(p, &midpoint - &self.lower, Round::Up);
         let (right_radius, _) = Float::with_val_round(p, &self.upper - &midpoint, Round::Up);
         let radius = if left_radius >= right_radius {
@@ -280,6 +386,11 @@ impl MpfrInterval {
         } else {
             right_radius
         };
+        // A radius of two already covers the full range of either function.
+        // Avoid expensive argument reduction when it cannot improve this bound.
+        if radius >= 2 {
+            return Self::arithmetic_result(Float::with_val(p, -1), Float::with_val(p, 1));
+        }
         let mut lower = midpoint.clone();
         let mut upper = midpoint;
         if sine {
@@ -289,8 +400,10 @@ impl MpfrInterval {
             lower.cos_round(Round::Down);
             upper.cos_round(Round::Up);
         }
-        lower = Float::with_val_round(p, lower - &radius, Round::Down).0;
-        upper = Float::with_val_round(p, upper + &radius, Round::Up).0;
+        // Borrow both operands: an owned left operand is rounded to nearest in
+        // place before the directed conversion can apply.
+        lower = Float::with_val_round(p, &lower - &radius, Round::Down).0;
+        upper = Float::with_val_round(p, &upper + &radius, Round::Up).0;
         let minus_one = Float::with_val(p, -1);
         let one = Float::with_val(p, 1);
         if lower < minus_one {
@@ -299,7 +412,7 @@ impl MpfrInterval {
         if upper > one {
             upper = one;
         }
-        Self { lower, upper }
+        Self::arithmetic_result(lower, upper)
     }
 
     pub fn sin(&self) -> Self {
@@ -310,16 +423,24 @@ impl MpfrInterval {
         self.lipschitz_trig(false)
     }
 
+    /// Compatibility conversion; panics on invalid endpoints. Use the checked
+    /// variant at arithmetic and artifact boundaries.
     pub fn to_rational_interval(&self) -> RationalInterval {
-        RationalInterval::new(
-            self.lower
-                .to_rational()
-                .expect("finite MPFR lower endpoint"),
-            self.upper
-                .to_rational()
-                .expect("finite MPFR upper endpoint"),
-        )
-        .expect("ordered MPFR endpoints")
+        self.try_to_rational_interval()
+            .expect("valid finite MPFR endpoints required")
+    }
+    /// Convert finite, ordered, equal-precision stored endpoints exactly.
+    pub fn try_to_rational_interval(&self) -> Result<RationalInterval, IntervalError> {
+        self.validate()?;
+        let lower = self
+            .lower
+            .to_rational()
+            .ok_or_else(|| IntervalError::Invalid("nonfinite MPFR lower endpoint".into()))?;
+        let upper = self
+            .upper
+            .to_rational()
+            .ok_or_else(|| IntervalError::Invalid("nonfinite MPFR upper endpoint".into()))?;
+        RationalInterval::new(lower, upper)
     }
 }
 
@@ -339,7 +460,7 @@ pub struct MpfrBallContext {
 
 impl MpfrBallContext {
     pub fn new(precision_bits: u32) -> Result<Self, IntervalError> {
-        if precision_bits < 32 {
+        if !(32..=rug::float::prec_max()).contains(&precision_bits) {
             return Err(IntervalError::Invalid(
                 "MPFR ball precision must be at least 32 bits".to_owned(),
             ));
@@ -383,7 +504,20 @@ pub struct MpfrComplexBall {
 }
 
 impl MpfrComplexBall {
+    pub fn validate(&self) -> Result<(), IntervalError> {
+        self.real.validate()?;
+        self.imaginary.validate()?;
+        if self.real.precision() != self.imaginary.precision() {
+            return Err(IntervalError::Invalid(
+                "complex ball component precision mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn new(real: MpfrInterval, imaginary: MpfrInterval) -> Result<Self, IntervalError> {
+        real.validate()?;
+        imaginary.validate()?;
         if real.precision() != imaginary.precision() {
             return Err(IntervalError::Invalid(
                 "complex ball components must have equal precision".to_owned(),
@@ -393,7 +527,9 @@ impl MpfrComplexBall {
     }
 
     pub fn point(real: Float, imaginary: Float) -> Result<Self, IntervalError> {
-        Self::new(MpfrInterval::point(real), MpfrInterval::point(imaginary))
+        let real = MpfrInterval::from_float(&real, real.prec())?;
+        let imaginary = MpfrInterval::from_float(&imaginary, imaginary.prec())?;
+        Self::new(real, imaginary)
     }
 
     pub fn precision(&self) -> u32 {
@@ -416,10 +552,12 @@ impl MpfrComplexBall {
     }
 
     pub fn excludes_zero(&self) -> bool {
-        !self.real.contains_zero() || !self.imaginary.contains_zero()
+        self.validate().is_ok() && (!self.real.contains_zero() || !self.imaginary.contains_zero())
     }
 
     fn require_compatible(&self, other: &Self) -> Result<(), IntervalError> {
+        self.validate()?;
+        other.validate()?;
         if self.precision() != other.precision() {
             return Err(IntervalError::Invalid(format!(
                 "complex ball precision mismatch: {} != {}",
@@ -474,7 +612,9 @@ impl MpfrComplexBall {
     }
 
     pub fn reciprocal(&self) -> Result<Self, IntervalError> {
+        self.validate()?;
         let denominator = self.modulus_squared();
+        denominator.validate()?;
         if denominator.contains_zero() {
             return Err(IntervalError::DivisionByZeroInterval);
         }
@@ -498,6 +638,7 @@ impl MpfrComplexBall {
     }
 
     pub fn powu(&self, exponent: u32) -> Result<Self, IntervalError> {
+        self.validate()?;
         let precision = self.precision();
         let mut result = Self::point(Float::with_val(precision, 1), Float::with_val(precision, 0))?;
         let mut factor = self.clone();
@@ -519,6 +660,10 @@ pub fn evaluate_complex_polynomial_mpfr(
     coefficients_ascending: &[MpfrComplexBall],
     argument: &MpfrComplexBall,
 ) -> Result<MpfrComplexBall, IntervalError> {
+    argument.validate()?;
+    for coefficient in coefficients_ascending {
+        coefficient.validate()?;
+    }
     let Some(highest) = coefficients_ascending.last() else {
         return Err(IntervalError::Invalid(
             "complex polynomial must contain at least one coefficient".to_owned(),
@@ -542,6 +687,20 @@ pub fn evaluate_complex_polynomial_mpfr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_complex_components_cannot_establish_zero_exclusion() {
+        // Reproduce the invalid component produced by an infallible rational
+        // constructor outside MPFR's finite range without allocating a giant
+        // integer. Either invalid component invalidates the rectangle.
+        let invalid = MpfrInterval::invalid(64);
+        let positive = MpfrInterval::from_i64(1, 64);
+        for (real, imaginary) in [(invalid.clone(), positive.clone()), (positive, invalid)] {
+            let ball = MpfrComplexBall { real, imaginary };
+            assert!(ball.validate().is_err());
+            assert!(!ball.excludes_zero());
+        }
+    }
 
     #[test]
     fn integer_constructors_enclose_exact_inputs_at_every_supported_precision() {

@@ -16,6 +16,19 @@ use xc_operator::{
     SymmetricOperator,
 };
 
+mod acceptance;
+#[cfg(feature = "hp")]
+mod orthogonal;
+
+// MPFR has no subnormal band: underflow can round to its smallest nonzero
+// value instead of zero. Conservatively refuse inexact arithmetic throughout
+// the lowest exponent bin. Exact operations there, including cancellation,
+// remain admissible. This avoids constructing enormous exact rationals near
+// the process's exponent limit or reading mutable thread-local status flags.
+fn inexact_at_mpfr_floor(value: &Float, rounding: std::cmp::Ordering) -> bool {
+    rounding != std::cmp::Ordering::Equal && value.get_exp() == Some(rug::float::exp_min())
+}
+
 pub fn mk_artifact_reuse_plan() -> xc_core::ArtifactReusePlan {
     use xc_core::{ArtifactReuseNode, ArtifactReusePlan};
     let node = |kind: &str, dependencies: &[&str], invalidated_by: &[&str]| ArtifactReuseNode {
@@ -152,33 +165,76 @@ impl MultiIndex {
     }
 }
 
+/// Reference enumeration is bounded to 256 MiB of estimated resident index,
+/// orbit and lookup storage. Large-k spaces require a different basis engine.
+fn reference_index_budget(k: usize, degree: usize) -> Result<usize, MkError> {
+    let total = k
+        .checked_add(degree)
+        .ok_or_else(|| MkError::InvalidProblem("multi-index cardinality overflow".into()))?;
+    let mut count = 1u128;
+    let order = k.min(degree);
+    let bytes_per_index = 8u128 * (k as u128) + 192;
+    let limit = (256u128 << 20) / bytes_per_index;
+    for j in 1..=order {
+        count = count
+            .checked_mul((total - order + j) as u128)
+            .ok_or_else(|| {
+                MkError::InvalidProblem("multi-index cardinality exceeds reference budget".into())
+            })?
+            / (j as u128);
+        if count > limit {
+            return Err(MkError::InvalidProblem(
+                "multi-index/orbit reference storage exceeds 256 MiB; use a compact large-k basis"
+                    .into(),
+            ));
+        }
+    }
+    if count > limit {
+        return Err(MkError::InvalidProblem(
+            "reference index storage exceeds 256 MiB".into(),
+        ));
+    }
+    usize::try_from(count)
+        .map_err(|_| MkError::InvalidProblem("index count exceeds platform size".into()))
+}
 pub fn enumerate_multi_indices(k: usize, degree: usize) -> Result<Vec<MultiIndex>, MkError> {
+    if u32::try_from(degree).is_err() {
+        return Err(MkError::InvalidProblem(
+            "degree exceeds the u32 exponent schema".into(),
+        ));
+    }
     if k == 0 {
         return Err(MkError::InvalidProblem("k must be positive".to_owned()));
     }
-    fn recurse(
-        position: usize,
-        k: usize,
-        remaining: usize,
-        current: &mut Vec<u32>,
-        output: &mut Vec<MultiIndex>,
-    ) {
-        if position + 1 == k {
-            for value in 0..=remaining {
-                current.push(value as u32);
-                output.push(MultiIndex(current.clone()));
-                current.pop();
+    let count = reference_index_budget(k, degree)?;
+    // Enumerate lexicographically without one stack frame per variable.
+    let mut current = Vec::<u32>::new();
+    current.try_reserve_exact(k).map_err(|error| {
+        MkError::InvalidProblem(format!("multi-index storage cannot be allocated: {error}"))
+    })?;
+    current.resize(k, 0);
+    let mut total = 0usize;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(count)
+        .map_err(|e| MkError::InvalidProblem(format!("index allocation: {e}")))?;
+    loop {
+        output.push(MultiIndex(current.clone()));
+        let mut advanced = false;
+        for position in (0..k).rev() {
+            if total < degree {
+                current[position] += 1;
+                total += 1;
+                advanced = true;
+                break;
             }
-            return;
+            total -= current[position] as usize;
+            current[position] = 0;
         }
-        for value in 0..=remaining {
-            current.push(value as u32);
-            recurse(position + 1, k, remaining - value, current, output);
-            current.pop();
+        if !advanced {
+            break;
         }
     }
-    let mut output = Vec::new();
-    recurse(0, k, degree, &mut Vec::with_capacity(k), &mut output);
     output.sort_by(|a, b| {
         a.total_degree()
             .cmp(&b.total_degree())
@@ -202,14 +258,33 @@ pub struct MkMonomialReference {
 
 impl MkMonomialReference {
     pub fn new(k: usize, degree: usize) -> Result<Self, MkError> {
+        // Largest factorial index in J is k+1+2D; the numerator uses 2D+2.
+        let twice_degree = degree
+            .checked_mul(2)
+            .ok_or_else(|| MkError::InvalidProblem("degree arithmetic overflow".into()))?;
+        let denominator_maximum = k.checked_add(1).and_then(|v| v.checked_add(twice_degree));
+        let numerator_maximum = twice_degree.checked_add(2);
+        let maximum = denominator_maximum
+            .zip(numerator_maximum)
+            .map(|(a, b)| a.max(b))
+            .filter(|v| v.checked_add(1).is_some())
+            .ok_or_else(|| MkError::InvalidProblem("factorial index overflow".into()))?;
+        // log2(n!) <= n*ceil(log2 n); storing all factorials adds at most
+        // (n+1) times that bound, plus GMP object overhead.
+        let logarithm = usize::BITS - maximum.max(1).leading_zeros();
+        let factorial_bytes =
+            (maximum as u128 + 1) * (maximum as u128 * u128::from(logarithm) / 8 + 64);
+        if factorial_bytes > (256u128 << 20) {
+            return Err(MkError::InvalidProblem(
+                "factorial reference table exceeds 256 MiB".into(),
+            ));
+        }
         let indices = enumerate_multi_indices(k, degree)?;
-        // Largest factorial index in J is k + 1 + 2D; numerator uses 2D + 2.
-        let maximum = (k + 1 + 2 * degree).max(2 * degree + 2);
         let mut factorials = Vec::with_capacity(maximum + 1);
         let mut current = Integer::from(1);
         factorials.push(current.clone());
         for n in 1..=maximum {
-            current *= n as u32;
+            current *= n;
             factorials.push(current.clone());
         }
         Ok(Self {
@@ -244,7 +319,7 @@ impl MkMonomialReference {
         self.check_indices(a, b)?;
         let mut numerator = Integer::from(1);
         for i in 0..self.k {
-            numerator *= self.factorial((a.0[i] + b.0[i]) as usize);
+            numerator *= self.factorial(a.0[i] as usize + b.0[i] as usize);
         }
         let denominator = self
             .factorial(self.k + a.total_degree() + b.total_degree())
@@ -270,7 +345,7 @@ impl MkMonomialReference {
         let mut numerator = self.factorial(am + bm + 2).clone();
         for i in 0..self.k {
             if i != distinguished_axis {
-                numerator *= self.factorial((a.0[i] + b.0[i]) as usize);
+                numerator *= self.factorial(a.0[i] as usize + b.0[i] as usize);
             }
         }
         let mut denominator = Integer::from((am + 1) as u64);
@@ -308,19 +383,17 @@ impl MkMonomialReference {
     }
 
     pub fn dense_i_f64(&self) -> Result<Vec<f64>, MkError> {
-        Ok(self
-            .dense_i_exact()?
-            .into_iter()
-            .map(|value| value.to_f64())
-            .collect())
+        self.dense_i_exact()?
+            .iter()
+            .map(checked_rational_f64)
+            .collect()
     }
 
     pub fn dense_j_total_f64(&self) -> Result<Vec<f64>, MkError> {
-        Ok(self
-            .dense_j_total_exact()?
-            .into_iter()
-            .map(|value| value.to_f64())
-            .collect())
+        self.dense_j_total_exact()?
+            .iter()
+            .map(checked_rational_f64)
+            .collect()
     }
 
     pub fn quadratic_i(&self, coefficients: &[Rational]) -> Result<Rational, MkError> {
@@ -394,15 +467,25 @@ impl MkMonomialReference {
                 actual: x.len().min(y.len()),
             });
         }
+        if x.iter().any(|value| !value.is_finite()) {
+            return Err(MkError::InvalidProblem(
+                "streamed action input must be finite".into(),
+            ));
+        }
         for (row, yi) in y.iter_mut().enumerate() {
             let mut sum = 0.0;
             for (col, &xj) in x.iter().enumerate() {
-                sum += self
-                    .j_total_entry(&self.indices[row], &self.indices[col])?
-                    .to_f64()
-                    * xj;
+                let coefficient = checked_rational_f64(
+                    &self.j_total_entry(&self.indices[row], &self.indices[col])?,
+                )?;
+                sum += checked_f64_product(coefficient, xj)?;
             }
             *yi = sum;
+        }
+        if y.iter().any(|value| !value.is_finite()) {
+            return Err(MkError::InvalidProblem(
+                "streamed action produced nonfinite arithmetic".into(),
+            ));
         }
         Ok(())
     }
@@ -414,15 +497,24 @@ impl MkMonomialReference {
                 actual: x.len().min(y.len()),
             });
         }
+        if x.iter().any(|value| !value.is_finite()) {
+            return Err(MkError::InvalidProblem(
+                "streamed action input must be finite".into(),
+            ));
+        }
         for (row, yi) in y.iter_mut().enumerate() {
             let mut sum = 0.0;
             for (col, &xj) in x.iter().enumerate() {
-                sum += self
-                    .i_entry(&self.indices[row], &self.indices[col])?
-                    .to_f64()
-                    * xj;
+                let coefficient =
+                    checked_rational_f64(&self.i_entry(&self.indices[row], &self.indices[col])?)?;
+                sum += checked_f64_product(coefficient, xj)?;
             }
             *yi = sum;
+        }
+        if y.iter().any(|value| !value.is_finite()) {
+            return Err(MkError::InvalidProblem(
+                "streamed action produced nonfinite arithmetic".into(),
+            ));
         }
         Ok(())
     }
@@ -465,6 +557,20 @@ impl MkMonomialReference {
             return Err(MkError::InvalidProblem(
                 "multi-index dimension does not match k".to_owned(),
             ));
+        }
+        for index in [a, b] {
+            if index
+                .0
+                .iter()
+                .try_fold(self.degree, |remaining, &power| {
+                    remaining.checked_sub(power as usize)
+                })
+                .is_none()
+            {
+                return Err(MkError::InvalidProblem(
+                    "multi-index exceeds the declared finite degree".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -547,6 +653,56 @@ impl IntegerPartition {
     }
 }
 
+fn partition_counts_with_budget(k: usize, degree: usize) -> Result<Vec<u128>, MkError> {
+    let fail = || {
+        MkError::InvalidProblem("partition reference storage/work exceeds its 256 MiB or 16 million-step admission budget".into())
+    };
+    let width = degree.checked_add(1).ok_or_else(fail)?;
+    if k == 0
+        || width as u128 * 16 > (256u128 << 20)
+        || degree as u128 * k.min(degree) as u128 > 16_000_000
+    {
+        return Err(fail());
+    }
+    let bytes_per_partition = 96u128 + 4 * k.min(degree) as u128;
+    let limit = (256u128 << 20) / bytes_per_partition;
+    let mut counts = vec![0u128; width];
+    counts[0] = 1;
+    // Conjugating Ferrers diagrams identifies length<=k with largest part<=k.
+    for part in 1..=k.min(degree) {
+        for total in part..=degree {
+            counts[total] = counts[total]
+                .saturating_add(counts[total - part])
+                .min(limit + 1);
+        }
+    }
+    let mut cumulative = 0u128;
+    for count in &mut counts {
+        cumulative = cumulative.saturating_add(*count);
+        *count = cumulative;
+    }
+    if cumulative > limit {
+        return Err(fail());
+    }
+    Ok(counts)
+}
+
+fn sector_reference_budget(
+    dimension: usize,
+    copies: usize,
+    products: usize,
+) -> Result<(), MkError> {
+    let n = dimension as u128;
+    if n * n * 128 * (copies as u128) > (256u128 << 20)
+        || n * n * n * (products as u128) > 32_000_000
+    {
+        return Err(MkError::InvalidProblem(
+            "exact sector storage/work exceeds 256 MiB or 32 million rational multiply-adds".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Enumerate every partition of total degree at most `degree` with at most
 /// `k` positive parts. Ordering is by total degree and then lexicographic part
 /// sequence, and is therefore stable across runs.
@@ -554,9 +710,18 @@ pub fn enumerate_integer_partitions(
     k: usize,
     degree: usize,
 ) -> Result<Vec<IntegerPartition>, MkError> {
+    if u32::try_from(degree).is_err() {
+        return Err(MkError::InvalidProblem(
+            "degree exceeds the u32 exponent schema".into(),
+        ));
+    }
     if k == 0 {
         return Err(MkError::InvalidProblem("k must be positive".to_owned()));
     }
+
+    let counts = partition_counts_with_budget(k, degree)?;
+    let admitted = usize::try_from(counts[degree])
+        .map_err(|_| MkError::InvalidProblem("partition count exceeds platform size".into()))?;
 
     fn recurse(
         remaining: usize,
@@ -572,20 +737,23 @@ pub fn enumerate_integer_partitions(
         if current.len() == maximum_length {
             return;
         }
-        for part in (1..=remaining.min(maximum_part)).rev() {
+        let slots = maximum_length - current.len();
+        let minimum_part = remaining.div_ceil(slots);
+        for part in (minimum_part..=remaining.min(maximum_part)).rev() {
             current.push(part as u32);
             recurse(remaining - part, part, maximum_length, current, output);
             current.pop();
         }
     }
 
-    let mut output = vec![IntegerPartition(Vec::new())];
+    let mut output = Vec::with_capacity(admitted);
+    output.push(IntegerPartition(Vec::new()));
     for total_degree in 1..=degree {
         recurse(
             total_degree,
             total_degree,
             k,
-            &mut Vec::with_capacity(k),
+            &mut Vec::with_capacity(k.min(total_degree)),
             &mut output,
         );
     }
@@ -725,19 +893,17 @@ impl MkSymmetricReference {
     }
 
     pub fn dense_i_f64(&self) -> Result<Vec<f64>, MkError> {
-        Ok(self
-            .dense_i_exact()?
-            .into_iter()
-            .map(|value| value.to_f64())
-            .collect())
+        self.dense_i_exact()?
+            .iter()
+            .map(checked_rational_f64)
+            .collect()
     }
 
     pub fn dense_j_total_f64(&self) -> Result<Vec<f64>, MkError> {
-        Ok(self
-            .dense_j_total_exact()?
-            .into_iter()
-            .map(|value| value.to_f64())
-            .collect())
+        self.dense_j_total_exact()?
+            .iter()
+            .map(checked_rational_f64)
+            .collect()
     }
 
     /// Embed symmetric orbit coefficients into the complete monomial basis.
@@ -815,6 +981,9 @@ impl MkSymmetricReference {
 
     /// Stream the exact symmetric `I` entries into an MPFR matrix-vector
     /// product at `precision_bits` without storing the dense form.
+    /// Exponent-range loss is rejected. At the lowest MPFR exponent, only
+    /// exact operations are admitted; inexact results there are conservatively
+    /// rejected even when they remain nonzero.
     pub fn apply_i_hp(
         &self,
         x: &[Float],
@@ -828,6 +997,7 @@ impl MkSymmetricReference {
 
     /// Stream the exact symmetric total-`J` entries into an MPFR
     /// matrix-vector product at `precision_bits` without dense storage.
+    /// Uses the same conservative exponent-floor policy as [`Self::apply_i_hp`].
     pub fn apply_j_total_hp(
         &self,
         x: &[Float],
@@ -887,12 +1057,23 @@ impl MkSymmetricReference {
                 actual: x.len().min(y.len()),
             });
         }
+        if x.iter().any(|value| !value.is_finite()) {
+            return Err(MkError::InvalidProblem(
+                "streamed action input must be finite".into(),
+            ));
+        }
         for (row, output) in y.iter_mut().enumerate() {
             let mut sum = 0.0;
             for (column, coefficient) in x.iter().enumerate() {
-                sum += entry(row, column)?.to_f64() * coefficient;
+                sum +=
+                    checked_f64_product(checked_rational_f64(&entry(row, column)?)?, *coefficient)?;
             }
             *output = sum;
+        }
+        if y.iter().any(|value| !value.is_finite()) {
+            return Err(MkError::InvalidProblem(
+                "streamed action produced nonfinite arithmetic".into(),
+            ));
         }
         Ok(())
     }
@@ -907,7 +1088,7 @@ impl MkSymmetricReference {
     where
         F: FnMut(usize, usize) -> Result<Rational, MkError>,
     {
-        if precision_bits <= 32 {
+        if precision_bits <= 32 || precision_bits > rug::float::prec_max() {
             return Err(MkError::InvalidProblem(
                 "MPFR streamed actions require precision above 32 bits".to_owned(),
             ));
@@ -926,11 +1107,51 @@ impl MkSymmetricReference {
         for (row, output) in y.iter_mut().enumerate() {
             let mut sum = Float::with_val(precision_bits, 0);
             for (column, coefficient) in x.iter().enumerate() {
-                let mut term = Float::with_val(precision_bits, entry(row, column)?);
-                term *= coefficient;
-                sum += term;
+                let exact_entry = entry(row, column)?;
+                let (term, entry_rounding) =
+                    Float::with_val_round(precision_bits, &exact_entry, Round::Nearest);
+                if !term.is_finite()
+                    || (term.is_zero() && exact_entry != 0)
+                    || inexact_at_mpfr_floor(&term, entry_rounding)
+                {
+                    return Err(MkError::InvalidProblem(
+                        "exact entry exceeded the MPFR range or required inexact exponent-floor rounding".into(),
+                    ));
+                }
+                let nonzero_product = !term.is_zero() && !coefficient.is_zero();
+                let (term, product_rounding) =
+                    Float::with_val_round(precision_bits, &term * coefficient, Round::Nearest);
+                if !term.is_finite()
+                    || (term.is_zero() && nonzero_product)
+                    || inexact_at_mpfr_floor(&term, product_rounding)
+                {
+                    return Err(MkError::InvalidProblem(
+                        "streamed action term exceeded the MPFR range or required inexact exponent-floor rounding"
+                            .into(),
+                    ));
+                }
+                let previous = sum.clone();
+                let (next_sum, sum_rounding) =
+                    Float::with_val_round(precision_bits, &sum + &term, Round::Nearest);
+                sum = next_sum;
+                // Preserve exact cancellation. A rounded zero with unequal
+                // opposite summands is exponent underflow, not a zero action.
+                if !sum.is_finite()
+                    || (sum.is_zero() && previous != -term)
+                    || inexact_at_mpfr_floor(&sum, sum_rounding)
+                {
+                    return Err(MkError::InvalidProblem(
+                        "streamed action accumulation exceeded the MPFR range or required inexact exponent-floor rounding"
+                            .into(),
+                    ));
+                }
             }
             *output = sum;
+        }
+        if y.iter().any(|value| !value.is_finite()) {
+            return Err(MkError::InvalidProblem(
+                "streamed action produced nonfinite arithmetic".into(),
+            ));
         }
         Ok(())
     }
@@ -963,7 +1184,7 @@ impl MkSymmetricReference {
         for row in 0..self.dimension() {
             let mut row_sum = 0.0;
             for column in 0..self.dimension() {
-                let rounded = entry(row, column)?.to_f64().abs();
+                let rounded = checked_rational_f64(&entry(row, column)?)?.abs();
                 row_sum = next_up_f64(row_sum + next_up_f64(rounded));
             }
             bound = bound.max(row_sum);
@@ -991,6 +1212,30 @@ impl MkSymmetricReference {
         }
         Ok(bound)
     }
+}
+
+// Binary64 is a rounded diagnostic route. Losing a nonzero exact entry (or
+// a nonzero action term) to zero destroys its declared metric/operator domain.
+fn checked_rational_f64(value: &Rational) -> Result<f64, MkError> {
+    let rounded = value.to_f64();
+    if !rounded.is_finite() || (rounded == 0.0 && value != &0) {
+        return Err(MkError::InvalidProblem(
+            "exact entry is outside the nonzero finite binary64 range; use the HP or exact route"
+                .into(),
+        ));
+    }
+    Ok(rounded)
+}
+
+fn checked_f64_product(left: f64, right: f64) -> Result<f64, MkError> {
+    let product = left * right;
+    if !product.is_finite() || (product == 0.0 && left != 0.0 && right != 0.0) {
+        return Err(MkError::InvalidProblem(
+            "streamed action term overflowed or underflowed binary64; use the HP or exact route"
+                .into(),
+        ));
+    }
+    Ok(product)
 }
 
 fn next_up_f64(value: f64) -> f64 {
@@ -1072,6 +1317,9 @@ pub struct MkThreeRouteAcceptanceRecord {
     pub dense_residual_norm: String,
     pub adaptive_attempt_precisions: Vec<u32>,
     pub candidate_coefficients: Vec<ExactRationalRecord>,
+    /// Exact stored coefficients of the independent dense state, required for replay.
+    #[serde(default)]
+    pub dense_coefficients: Vec<ExactRationalRecord>,
     pub candidate_certificate: MkSymmetricRayleighCertificate,
     pub candidate_absolute_difference: String,
     pub exact_source_forms: bool,
@@ -1100,13 +1348,22 @@ pub fn verify_mk_three_route_acceptance(
     record: &MkThreeRouteAcceptanceRecord,
     options: &MkThreeRouteAcceptanceOptions,
 ) -> Result<(), MkError> {
-    if record.schema_version != 1
+    acceptance::validate_three_options(options)?;
+    if record.schema_version != 3
         || record.k != options.k
         || record.degree != options.degree
         || record.precision_bits != options.precision_bits
         || !record.exact_source_forms
-        || record.matrix_free_route != "adaptive_matrix_free_generalized_rayleigh_ritz_hp"
-        || record.dense_route != "dense_generalized_cholesky_whitening_hp"
+        || !matches!(
+            record.matrix_free_route.as_str(),
+            "adaptive_exact_i_orthogonal_streamed_j_hp"
+                | "adaptive_exact_i_orthogonal_streamed_j_fresh_images_bounded_records_hp_v4"
+        )
+        || !matches!(
+            record.dense_route.as_str(),
+            "dense_generalized_cholesky_whitening_hp"
+                | "dense_generalized_cholesky_whitening_bounded_record_hp_v4"
+        )
         || record.certification_route != "exact_rational_candidate_rayleigh_quotient"
     {
         return Err(MkError::InvalidProblem(
@@ -1133,36 +1390,7 @@ pub fn verify_mk_three_route_acceptance(
             "stored M_k candidate certificate does not match exact replay".to_owned(),
         ));
     }
-    for (value, bound, name) in [
-        (
-            &record.eigenvalue_absolute_difference,
-            &options.eigenvalue_agreement_tolerance,
-            "dense/matrix-free eigenvalue difference",
-        ),
-        (
-            &record.one_minus_metric_overlap_squared,
-            &options.overlap_tolerance,
-            "metric overlap difference",
-        ),
-        (
-            &record.candidate_absolute_difference,
-            &options.candidate_quotient_agreement_tolerance,
-            "candidate quotient difference",
-        ),
-    ] {
-        let value = xc_core::DecimalLiteral::new(value.clone())
-            .map_err(|error| MkError::InvalidProblem(error.to_string()))?;
-        if value
-            .cmp_numeric(bound)
-            .map_err(|error| MkError::InvalidProblem(error.to_string()))?
-            == std::cmp::Ordering::Greater
-        {
-            return Err(MkError::InvalidProblem(format!(
-                "{name} exceeds its acceptance bound"
-            )));
-        }
-    }
-    Ok(())
+    acceptance::verify_three(record, &reference, options)
 }
 
 /// Execute exact-source dense HP, streamed matrix-free HP, and exact rational
@@ -1174,12 +1402,12 @@ pub fn run_mk_three_route_acceptance(
     use xc_core::{EigenTarget, PrecisionEscalation, PrecisionPolicy};
     use xc_operator::GeneralizedEigenProblem;
     use xc_solver::{
-        cross_check_generalized_hp_reports, solve_dense_generalized_whitening_hp,
-        solve_matrix_free_generalized_adaptive_hp, AdaptiveGeneralizedExtremeOptionsHp,
-        AdaptiveGeneralizedExtremeResultHp, DenseGeneralizedProblemHp, GeneralizedExtremeConfigHp,
-        HpCrossCheckTolerance,
+        solve_dense_generalized_whitening_hp, solve_matrix_free_generalized_adaptive_hp,
+        AdaptiveGeneralizedExtremeOptionsHp, AdaptiveGeneralizedExtremeResultHp,
+        DenseGeneralizedProblemHp, GeneralizedExtremeConfigHp,
     };
 
+    acceptance::validate_three_options(options)?;
     if options.precision_bits <= 64
         || options.initial_precision_bits <= 32
         || options.initial_precision_bits > options.precision_bits
@@ -1191,6 +1419,11 @@ pub fn run_mk_three_route_acceptance(
         ));
     }
     let reference = MkSymmetricReference::new(options.k, options.degree)?;
+    if reference.dimension() > 128 {
+        return Err(MkError::InvalidProblem(
+            "exact I-orthogonal acceptance is limited to 128 symmetric directions".into(),
+        ));
+    }
     let dense_j: Vec<Float> = reference
         .dense_j_total_exact()?
         .iter()
@@ -1201,8 +1434,8 @@ pub fn run_mk_three_route_acceptance(
         .iter()
         .map(|value| Float::with_val(options.precision_bits, value))
         .collect();
-    let operator = MkSymmetricJOperatorHp::new(&reference, options.precision_bits)?;
-    let metric = MkSymmetricIMetricHp::new(&reference, options.precision_bits)?;
+    let operator = orthogonal::Coordinates::new(&reference, options.precision_bits)?;
+    let metric = orthogonal::Identity(reference.dimension());
     let problem = GeneralizedEigenProblem::new(&operator, &metric)
         .map_err(|error| MkError::InvalidProblem(error.to_string()))?;
     let escalation = if options.initial_precision_bits == options.precision_bits {
@@ -1228,7 +1461,7 @@ pub fn run_mk_three_route_acceptance(
         },
     )
     .map_err(|error| MkError::InvalidProblem(error.to_string()))?;
-    let (matrix_free, attempts) = match adaptive {
+    let (mut matrix_free, mut attempts) = match adaptive {
         AdaptiveGeneralizedExtremeResultHp::Converged { result, attempts } => (*result, attempts),
         AdaptiveGeneralizedExtremeResultHp::Inconclusive {
             attempts, reason, ..
@@ -1238,6 +1471,36 @@ pub fn run_mk_three_route_acceptance(
             )))
         }
     };
+    if matrix_free.eigenvalue.prec() < options.precision_bits {
+        let final_config = GeneralizedExtremeConfigHp {
+            target: EigenTarget::AlgebraicLargest,
+            precision_bits: options.precision_bits,
+            absolute_residual_tolerance: options.absolute_residual_tolerance.clone(),
+            scaled_backward_error_tolerance: options.scaled_backward_error_tolerance.clone(),
+            ritz_value_stability_tolerance: options.ritz_value_stability_tolerance.clone(),
+            maximum_iterations: options.maximum_iterations,
+            minimum_iterations: 2,
+        };
+        matrix_free = xc_solver::MatrixFreeGeneralizedRayleighRitzHp
+            .solve_with_initial_vector(&problem, &final_config, &matrix_free.eigenvector)
+            .map_err(|error| MkError::InvalidProblem(error.to_string()))?;
+        attempts.push(xc_solver::GeneralizedPrecisionAttemptHp {
+            precision_bits: options.precision_bits,
+            status: matrix_free.status.clone(),
+            iterations: matrix_free.iterations,
+            operator_applications: matrix_free.operator_applications,
+            metric_applications: matrix_free.metric_applications,
+            residual_norm: Some(matrix_free.residual_norm.to_string()),
+            scaled_backward_error: Some(matrix_free.scaled_backward_error.to_string()),
+            reason: "fresh warm-started solve at the declared exact-source acceptance precision"
+                .into(),
+        });
+        if matrix_free.status != xc_core::ResultStatus::Converged {
+            return Err(MkError::InvalidProblem(
+                "declared-precision M_k route remained inconclusive".into(),
+            ));
+        }
+    }
     let dense_problem = DenseGeneralizedProblemHp::new(&dense_j, &dense_i, reference.dimension())
         .map_err(|error| MkError::InvalidProblem(error.to_string()))?;
     let dense = solve_dense_generalized_whitening_hp(
@@ -1253,26 +1516,18 @@ pub fn run_mk_three_route_acceptance(
         },
     )
     .map_err(|error| MkError::InvalidProblem(error.to_string()))?;
-    let checked = cross_check_generalized_hp_reports(
-        &problem,
-        &matrix_free,
-        &dense,
-        &HpCrossCheckTolerance {
-            eigenvalue_absolute: options.eigenvalue_agreement_tolerance.clone(),
-            one_minus_overlap_squared: options.overlap_tolerance.clone(),
-        },
-    )
-    .map_err(|error| MkError::InvalidProblem(error.to_string()))?;
-    let coefficients = matrix_free
-        .eigenvector
+    // Lift from the computed symbolic I-orthogonal coordinates. The exact
+    // original-source verifier below checks normalization, residual, overlap,
+    // and an upper bound for the algebraically largest generalized eigenvalue.
+    let mut lifted = operator.lift_unit(&matrix_free.eigenvector, options.precision_bits)?;
+    acceptance::compact_candidate(&mut lifted, options.precision_bits)?;
+    let mut dense_vector = dense.eigenvector.clone();
+    acceptance::compact_candidate(&mut dense_vector, options.precision_bits)?;
+    let coefficients = lifted
         .iter()
-        .map(|value| {
-            value.to_rational().ok_or_else(|| {
-                MkError::InvalidProblem(
-                    "MPFR candidate coefficient could not be converted to an exact rational"
-                        .to_owned(),
-                )
-            })
+        .map(|x| {
+            x.to_rational()
+                .ok_or_else(|| MkError::InvalidProblem("nonfinite lifted candidate".into()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let candidate_certificate = reference.certificate(&coefficients)?;
@@ -1290,16 +1545,16 @@ pub fn run_mk_three_route_acceptance(
             "exact candidate quotient differs from the HP optimum by {candidate_difference}"
         )));
     }
-    let record = MkThreeRouteAcceptanceRecord {
-        schema_version: 1,
+    let mut record = MkThreeRouteAcceptanceRecord {
+        schema_version: 3,
         k: options.k,
         degree: options.degree,
         symmetric_dimension: reference.dimension(),
         precision_bits: options.precision_bits,
         matrix_free_eigenvalue: matrix_free.eigenvalue.to_string(),
         dense_eigenvalue: dense.eigenvalue.to_string(),
-        eigenvalue_absolute_difference: checked.eigenvalue_absolute_difference.to_string(),
-        one_minus_metric_overlap_squared: checked.one_minus_metric_overlap_squared.to_string(),
+        eigenvalue_absolute_difference: "0".into(),
+        one_minus_metric_overlap_squared: "0".into(),
         matrix_free_residual_norm: matrix_free.residual_norm.to_string(),
         dense_residual_norm: dense.residual_norm.to_string(),
         adaptive_attempt_precisions: attempts
@@ -1307,13 +1562,24 @@ pub fn run_mk_three_route_acceptance(
             .map(|attempt| attempt.precision_bits)
             .collect(),
         candidate_coefficients: coefficients.iter().map(exact_record).collect(),
+        dense_coefficients: dense_vector
+            .iter()
+            .map(|value| {
+                value
+                    .to_rational()
+                    .map(|r| exact_record(&r))
+                    .ok_or_else(|| MkError::InvalidProblem("nonfinite dense M_k state".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         candidate_certificate,
         candidate_absolute_difference: candidate_difference.to_string(),
         exact_source_forms: true,
-        matrix_free_route: "adaptive_matrix_free_generalized_rayleigh_ritz_hp".to_owned(),
-        dense_route: "dense_generalized_cholesky_whitening_hp".to_owned(),
+        matrix_free_route:
+            "adaptive_exact_i_orthogonal_streamed_j_fresh_images_bounded_records_hp_v4".to_owned(),
+        dense_route: "dense_generalized_cholesky_whitening_bounded_record_hp_v4".to_owned(),
         certification_route: "exact_rational_candidate_rayleigh_quotient".to_owned(),
     };
+    acceptance::refresh_three(&mut record, &reference, options)?;
     verify_mk_three_route_acceptance(&record, options)?;
     Ok(record)
 }
@@ -1347,7 +1613,10 @@ pub struct MkScaleAcceptanceRecord {
     pub exact_candidate_coefficients: Vec<ExactRationalRecord>,
     pub exact_certificate: MkSymmetricRayleighCertificate,
     pub quotient_absolute_difference: String,
+    /// Nominal significand payload for three working vectors, excluding scalar
+    /// and container overhead and allocator rounding; not peak resident memory.
     pub streamed_working_vector_bytes: u64,
+    /// The same payload model for two dense forms.
     pub equivalent_dense_forms_bytes: u64,
     pub operator_representation: String,
     pub metric_representation: String,
@@ -1388,7 +1657,8 @@ pub fn verify_mk_scale_acceptance(
     record: &MkScaleAcceptanceRecord,
     options: &MkScaleAcceptanceOptions,
 ) -> Result<(), MkError> {
-    if record.schema_version != 1
+    acceptance::validate_precision(options.precision_bits)?;
+    if record.schema_version != 2
         || record.k != 5
         || record.source_degree != 3
         || record.historical_dense_degree_limit != options.historical_dense_degree_limit
@@ -1415,6 +1685,23 @@ pub fn verify_mk_scale_acceptance(
             actual: record.exact_candidate_coefficients.len(),
         });
     }
+    let scalar_bytes = u64::from(options.precision_bits).div_ceil(8);
+    let dimension = u64::try_from(reference.dimension())
+        .map_err(|_| MkError::InvalidProblem("scale dimension exceeds u64".into()))?;
+    let streamed_bytes = dimension
+        .checked_mul(3)
+        .and_then(|v| v.checked_mul(scalar_bytes));
+    let dense_bytes = dimension
+        .checked_mul(dimension)
+        .and_then(|v| v.checked_mul(2))
+        .and_then(|v| v.checked_mul(scalar_bytes));
+    if streamed_bytes != Some(record.streamed_working_vector_bytes)
+        || dense_bytes != Some(record.equivalent_dense_forms_bytes)
+    {
+        return Err(MkError::InvalidProblem(
+            "scale record storage estimates differ from dimension and precision".into(),
+        ));
+    }
     let coefficients = record
         .exact_candidate_coefficients
         .iter()
@@ -1439,18 +1726,7 @@ pub fn verify_mk_scale_acceptance(
             "scale candidate does not exceed the required exact lower bound".to_owned(),
         ));
     }
-    let difference = xc_core::DecimalLiteral::new(record.quotient_absolute_difference.clone())
-        .map_err(|error| MkError::InvalidProblem(error.to_string()))?;
-    if difference
-        .cmp_numeric(&options.quotient_agreement_tolerance)
-        .map_err(|error| MkError::InvalidProblem(error.to_string()))?
-        == std::cmp::Ordering::Greater
-    {
-        return Err(MkError::InvalidProblem(
-            "matrix-free quotient disagrees with the exact certificate".to_owned(),
-        ));
-    }
-    Ok(())
+    acceptance::verify_scale(record, &quotient, options)
 }
 
 /// Run the published exact `M_5` witness in a strictly larger symmetric degree
@@ -1460,6 +1736,7 @@ pub fn verify_mk_scale_acceptance(
 pub fn run_mk_scale_acceptance(
     options: &MkScaleAcceptanceOptions,
 ) -> Result<MkScaleAcceptanceRecord, MkError> {
+    acceptance::validate_precision(options.precision_bits)?;
     if options.target_degree <= options.historical_dense_degree_limit
         || options.historical_dense_degree_limit < 3
         || options.precision_bits <= 64
@@ -1508,8 +1785,8 @@ pub fn run_mk_scale_acceptance(
     difference.abs_mut();
     let scalar_bytes = u64::from(options.precision_bits).div_ceil(8);
     let dimension = reference.dimension() as u64;
-    let record = MkScaleAcceptanceRecord {
-        schema_version: 1,
+    let mut record = MkScaleAcceptanceRecord {
+        schema_version: 2,
         k: 5,
         source_degree: 3,
         historical_dense_degree_limit: options.historical_dense_degree_limit,
@@ -1537,6 +1814,7 @@ pub fn run_mk_scale_acceptance(
             other => format!("{other:?}"),
         },
     };
+    acceptance::refresh_scale(&mut record, options)?;
     verify_mk_scale_acceptance(&record, options)?;
     Ok(record)
 }
@@ -1609,7 +1887,11 @@ impl LinearOperator<f64> for MkSymmetricJOperatorF64<'_> {
 impl SymmetricOperator<f64> for MkSymmetricJOperatorF64<'_> {}
 
 /// Matrix-free f64 discovery adapter for the positive-definite symmetric `I`
-/// metric on the declared finite symmetric polynomial space.
+/// metric on the declared finite symmetric polynomial space. Construction fails
+/// if an exact nonzero entry is lost to zero or becomes nonfinite in binary64.
+/// Actions also reject nonzero product underflow; use the HP or exact route
+/// when the native range is insufficient. This adapter is not a certificate
+/// of the positive definiteness of an independently rounded dense matrix.
 pub struct MkSymmetricIMetricF64<'a> {
     reference: &'a MkSymmetricReference,
     norm_bound: f64,
@@ -2323,12 +2605,23 @@ impl MkApproximationCertificate {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MkAccelerationBasis {
+    #[serde(rename = "symmetric_orbit_sum_v1")]
+    SymmetricOrbitSum,
+}
+
+pub const MK_ACCELERATION_PREFLIGHT_SEMANTICS: &str = "mk_acceleration_exact_form_basis_replay_v2";
+pub const MK_SECTOR_LOOKUP_SEMANTICS: &str = "mk_sector_lookup_canonical_partition_v2";
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MkOperatorAcceleration {
     ExactStreamed,
     ExactSumFactorized,
     DegreeDifferenceBand {
+        form: MkSymmetricForm,
+        basis: MkAccelerationBasis,
         half_width: usize,
         certificate: Option<MkApproximationCertificate>,
     },
@@ -2352,6 +2645,8 @@ pub fn validate_mk_acceleration(
             Ok(())
         }
         MkOperatorAcceleration::DegreeDifferenceBand {
+            form,
+            basis: MkAccelerationBasis::SymmetricOrbitSum,
             half_width,
             certificate,
         } => {
@@ -2366,9 +2661,26 @@ pub fn validate_mk_acceleration(
                 k,
                 degree,
                 "degree-difference band",
-            )
+            )?;
+            if assurance == MkAssuranceMode::Certified {
+                let reference = MkSymmetricReference::new(k, degree)?;
+                let declared = certificate.as_ref().expect("required above");
+                if MkCertifiedDegreeBandAction::construct(&reference, *form, *half_width)?
+                    .certificate
+                    != *declared
+                {
+                    return Err(MkError::InvalidProblem("degree-band assurance requires exact omitted-entry certificate replay for its declared form and basis".into()));
+                }
+            }
+            Ok(())
         }
         MkOperatorAcceleration::LowRank { rank, certificate } => {
+            if assurance == MkAssuranceMode::Certified {
+                return Err(MkError::InvalidProblem(
+                    "certified low-rank action has no implemented source-bound error verifier"
+                        .into(),
+                ));
+            }
             if *rank == 0 {
                 return Err(MkError::InvalidProblem(
                     "low-rank acceleration rank must be positive".to_owned(),
@@ -2551,6 +2863,8 @@ impl MkCertifiedDegreeBandAction {
 
     pub fn acceleration(&self) -> MkOperatorAcceleration {
         MkOperatorAcceleration::DegreeDifferenceBand {
+            form: self.form,
+            basis: MkAccelerationBasis::SymmetricOrbitSum,
             half_width: self.half_width,
             certificate: Some(self.certificate.clone()),
         }
@@ -2651,6 +2965,24 @@ pub fn build_adaptive_symmetric_spaces(
         ));
     }
     let mut history = Vec::new();
+    let final_degree = policy.maximum_degree.min(
+        policy
+            .initial_degree
+            .saturating_add(policy.maximum_generations.saturating_sub(1)),
+    );
+    let counts = partition_counts_with_budget(policy.k, final_degree)?;
+    let bytes_per_partition = 96u128 + 4 * policy.k.min(final_degree) as u128;
+    let total_entries = counts[policy.initial_degree..=final_degree]
+        .iter()
+        .try_fold(0u128, |sum, count| sum.checked_add(3 * count))
+        .ok_or_else(|| {
+            MkError::InvalidProblem("adaptive partition history size overflow".into())
+        })?;
+    if total_entries * bytes_per_partition > (256u128 << 20) {
+        return Err(MkError::InvalidProblem(
+            "adaptive partition history exceeds 256 MiB".into(),
+        ));
+    }
     let initial_basis = enumerate_integer_partitions(policy.k, policy.initial_degree)?;
     history.push(AdaptiveSpaceGeneration {
         generation: 0,
@@ -2725,6 +3057,22 @@ pub fn prolong_symmetric_warm_start(
             expected: parent_basis.len(),
             actual: parent_coefficients.len(),
         });
+    }
+    if parent_coefficients.iter().any(|value| !value.is_finite()) {
+        return Err(MkError::InvalidProblem(
+            "warm-start coefficients must be finite".into(),
+        ));
+    }
+    for basis in [parent_basis, child_basis] {
+        let mut seen = std::collections::BTreeSet::new();
+        for partition in basis {
+            partition.validate(usize::MAX)?;
+            if !seen.insert(partition) {
+                return Err(MkError::InvalidProblem(
+                    "warm-start bases must contain distinct canonical partitions".into(),
+                ));
+            }
+        }
     }
     let child_positions = child_basis
         .iter()
@@ -2979,6 +3327,7 @@ impl MkSectorProjector {
         sector: MkPermutationSector,
     ) -> Result<Self, MkError> {
         let partition = sector.partition(reference.k())?;
+        sector_reference_budget(reference.dimension(), 2, 2)?;
         let permutations = enumerate_permutations(reference.k())?;
         let group_order = permutations.len();
         let representation_dimension = representation_dimension(&partition)?;
@@ -3085,6 +3434,7 @@ impl MkSectorProjector {
 
     pub fn verify_exact(&self) -> Result<(), MkError> {
         let dimension = self.ambient_dimension();
+        sector_reference_budget(dimension, 2, 2)?;
         for row in 0..dimension {
             for column in 0..dimension {
                 if self.matrix[row * dimension + column] != self.matrix[column * dimension + row] {
@@ -3119,6 +3469,7 @@ impl MkSectorProjector {
             ));
         }
         let dimension = self.ambient_dimension();
+        sector_reference_budget(dimension, 2, 1)?;
         for row in 0..dimension {
             for column in 0..dimension {
                 let mut product = Rational::from((0, 1));
@@ -3186,7 +3537,12 @@ impl MkSectorCoverageReport {
     pub fn sector_dimension(&self, sector: &MkPermutationSector) -> Option<usize> {
         self.sector_dimensions
             .iter()
-            .find(|entry| &entry.sector == sector)
+            .find(
+                |entry| match (entry.sector.partition(self.k), sector.partition(self.k)) {
+                    (Ok(left), Ok(right)) => left == right,
+                    _ => false,
+                },
+            )
             .map(|entry| entry.dimension)
     }
 }
@@ -3216,6 +3572,14 @@ pub fn exact_sector_coverage(
             }
         })
         .collect::<Vec<_>>();
+    let count = sectors.len();
+    sector_reference_budget(
+        reference.dimension(),
+        count.saturating_add(1),
+        count
+            .saturating_mul(2)
+            .saturating_add(count.saturating_mul(count.saturating_sub(1)) / 2),
+    )?;
     let projectors = sectors
         .into_iter()
         .map(|sector| MkSectorProjector::new(reference, sector))
@@ -3843,7 +4207,7 @@ mod tests {
                 absolute_residual_tolerance: DecimalLiteral::new("1e-45").unwrap(),
                 scaled_backward_error_tolerance: DecimalLiteral::new("1e-45").unwrap(),
                 ritz_value_stability_tolerance: DecimalLiteral::new("1e-45").unwrap(),
-                maximum_iterations: 5_000,
+                maximum_iterations: 10_000,
                 minimum_iterations: 2,
                 precision: PrecisionPolicy {
                     initial_bits: 64,
@@ -3896,7 +4260,7 @@ mod tests {
                 absolute_residual_tolerance: DecimalLiteral::new("1e-45").unwrap(),
                 scaled_backward_error_tolerance: DecimalLiteral::new("1e-45").unwrap(),
                 ritz_value_stability_tolerance: DecimalLiteral::new("1e-45").unwrap(),
-                maximum_iterations: 5_000,
+                maximum_iterations: 10_000,
                 minimum_iterations: 2,
             },
         )
@@ -3911,7 +4275,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(checked.assurance, xc_core::AssuranceLevel::CrossChecked);
+        // Agreement of stored reports does not itself establish registered independent provenance.
+        assert_eq!(checked.assurance, xc_core::AssuranceLevel::Computed);
         assert!(checked.eigenvalue_absolute_difference < Float::with_val(precision, 1e-35));
         assert!(checked.one_minus_metric_overlap_squared < Float::with_val(precision, 1e-35));
     }
@@ -4054,6 +4419,8 @@ mod tests {
     #[test]
     fn certified_acceleration_rejects_unproved_degree_band() {
         let band = MkOperatorAcceleration::DegreeDifferenceBand {
+            form: MkSymmetricForm::IMetric,
+            basis: MkAccelerationBasis::SymmetricOrbitSum,
             half_width: 2,
             certificate: None,
         };
@@ -4066,6 +4433,8 @@ mod tests {
         let bound = Rational::from((1, 1_000_000));
         let rounding = Rational::from((1, 10_000_000));
         let certified_band = MkOperatorAcceleration::DegreeDifferenceBand {
+            form: MkSymmetricForm::IMetric,
+            basis: MkAccelerationBasis::SymmetricOrbitSum,
             half_width: 2,
             certificate: Some(MkApproximationCertificate {
                 construction: "validated shell-tail enclosure".to_owned(),
@@ -4078,7 +4447,10 @@ mod tests {
                 validation_digest: "sha256:fixture".to_owned(),
             }),
         };
-        validate_mk_acceleration(&certified_band, MkAssuranceMode::Certified, 4, 6).unwrap();
+        assert!(
+            validate_mk_acceleration(&certified_band, MkAssuranceMode::Certified, 4, 6).is_err(),
+            "self-declared degree-band metadata cannot certify omitted entries"
+        );
     }
 
     #[test]
@@ -4337,5 +4709,56 @@ mod tests {
                 .sum::<usize>(),
             reference.dimension()
         );
+    }
+}
+
+#[cfg(test)]
+mod reference_guards_tests {
+    use super::*;
+    #[test]
+    fn combinatorial_reference_requests_fail_before_enumeration() {
+        assert!(enumerate_multi_indices(105, 11).is_err());
+        assert!(MkMonomialReference::new(105, 11).is_err());
+        assert!(MkSymmetricReference::new(105, 11).is_err());
+        assert_eq!(enumerate_multi_indices(3, 3).unwrap().len(), 20);
+        assert!(MkMonomialReference::new(1_000_000, 0).is_err());
+    }
+    #[test]
+    fn certified_acceleration_replays_the_actual_omitted_entries() {
+        let reference = MkSymmetricReference::new(2, 3).unwrap();
+        let action =
+            MkCertifiedDegreeBandAction::construct(&reference, MkSymmetricForm::JTotal, 1).unwrap();
+        let valid = MkOperatorAcceleration::DegreeDifferenceBand {
+            form: MkSymmetricForm::JTotal,
+            basis: MkAccelerationBasis::SymmetricOrbitSum,
+            half_width: 1,
+            certificate: Some(action.certificate.clone()),
+        };
+        validate_mk_acceleration(&valid, MkAssuranceMode::Certified, 2, 3).unwrap();
+        let mut forged = action.certificate;
+        forged.rigorous_operator_error_bound = exact_record(&Rational::from(0));
+        forged.validation_digest = "self assertion".into();
+        assert!(validate_mk_acceleration(
+            &MkOperatorAcceleration::DegreeDifferenceBand {
+                form: MkSymmetricForm::IMetric,
+                basis: MkAccelerationBasis::SymmetricOrbitSum,
+                half_width: 1,
+                certificate: Some(forged.clone())
+            },
+            MkAssuranceMode::Certified,
+            2,
+            3
+        )
+        .is_err());
+        assert!(validate_mk_acceleration(
+            &MkOperatorAcceleration::LowRank {
+                rank: 1,
+                certificate: Some(forged)
+            },
+            MkAssuranceMode::Certified,
+            2,
+            3
+        )
+        .is_err());
     }
 }

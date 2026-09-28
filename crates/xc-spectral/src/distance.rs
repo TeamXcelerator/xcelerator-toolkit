@@ -14,7 +14,10 @@
 //! The program objective is `lim_{λ→∞} lim_{N→∞} d(N, λ) = 0`, with the limits
 //! in that order: the eigenfunction must first stabilize in `N` at fixed `λ`.
 //!
-//! `f_{N,λ}` is the even CCM ground-state eigenfunction reconstructed from its
+//! `f_{N,λ}` is the canonical even CCM eigenfunction reconstructed from its
+//! zero-shift, smallest-magnitude selected state. Ground-state ordering requires
+//! separate spectral evidence; the eigen-residual alone does not establish it.
+//! It is reconstructed from its
 //! `V_n` coefficients and normalized so `f_{N,λ}(1) = 1`. Since the target is normalized at `1`
 //! exactly (see [`crate::target`]), the integrand of `d` vanishes at the left
 //! endpoint.
@@ -27,10 +30,15 @@
 //! records the full convention it was computed under. A number separated from
 //! its convention is not comparable and should not be reported.
 //!
-//! `α` is an explicit parameter, never an assumption. `α = 1/2` is the
-//! exponent corresponding to uniform convergence on the full critical strip,
-//! while `α < 1/2` corresponds to uniform convergence only on compact
-//! substrips; which one a study wants is the caller's to state.
+//! `α` is explicit. On `u >= 1`, increasing `α` decreases the weight and
+//! weakens this norm; decreasing `α` strengthens it. Any inference about a
+//! transform additionally needs its convention, symmetry, and tail integrability.
+//! For example, for an inversion-even residual `g(1/u)=g(u)` and
+//! `T(s)=integral_0^infinity g(u) u^s du/u`, splitting at one gives
+//! `|T(s)| <= 2*integral_1^infinity |g(u)| u^-α du` when
+//! `|Re(s)| <= 1-α`. Thus `α=1/2` controls that centered half-width strip,
+//! while `1/2 < α < 1` controls narrower strips under these assumptions.
+//! A finite-cutoff distance alone supplies neither the tail bound nor convergence.
 //!
 //! # Cache effects
 //!
@@ -40,6 +48,11 @@
 //! `capture_*` functions are the exception and exist precisely to persist:
 //! they retain their results as `ccm-distance` artifacts through the supplied
 //! cache context.
+
+mod weighted_sample;
+
+#[cfg(test)]
+mod crossing_contract_tests;
 
 use anyhow::Result;
 use xc_numerics::grid_integral::{uniform_grid_integral_f64, GridVariable, UniformGridScheme};
@@ -177,7 +190,7 @@ fn integrate_f64<G: Fn(f64) -> f64>(
             steps,
         } => uniform_grid_integral_f64(g, 1.0, lambda, steps, scheme, variable),
         WeightedIntegrationRule::GaussLegendre { points, variable } => {
-            let (nodes, weights) = xc_numerics::quadrature::gl_nodes_weights_f64(points);
+            let (nodes, weights) = xc_numerics::quadrature::try_gl_nodes_weights_f64(points)?;
             let (lo, hi) = match variable {
                 GridVariable::U => (1.0_f64, lambda),
                 GridVariable::LogU => (0.0_f64, lambda.ln()),
@@ -236,8 +249,24 @@ pub fn weighted_alpha_distance_f64<F: Fn(f64) -> f64, G: Fn(f64) -> f64>(
 ) -> Result<WeightedGridValueF64> {
     validate_lambda_alpha(lambda, alpha)?;
     rule.validate()?;
-    let integrand = |u: f64| (f(u) - g(u)).abs() * u.powf(-alpha);
-    let value = integrate_f64(integrand, lambda, rule)?;
+    let failure = EvaluationFailure::default();
+    let nonzero_sample = std::cell::Cell::new(false);
+    let integrand = |u: f64| {
+        failure.capture(
+            || {
+                let value = weighted_sample::native(f(u), g(u), u, alpha)?.abs();
+                nonzero_sample.set(nonzero_sample.get() || value != 0.0);
+                Ok(value)
+            },
+            || f64::NAN,
+        )
+    };
+    let result = integrate_f64(integrand, lambda, rule);
+    let value = failure.finish(result)?;
+    anyhow::ensure!(
+        value != 0.0 || !nonzero_sample.get(),
+        "nonzero weighted quadrature underflowed to zero"
+    );
     anyhow::ensure!(
         value.is_finite(),
         "distance evaluation produced a nonfinite value"
@@ -293,35 +322,104 @@ pub struct WeilEigenfunctionF64 {
     raw_at_one: f64,
 }
 
+pub(crate) fn validate_even_basis_f64(xi: &[f64], n_modes: usize, lambda: f64) -> Result<()> {
+    anyhow::ensure!(
+        n_modes.checked_mul(2).and_then(|n| n.checked_add(1)) == Some(xi.len()),
+        "full V_n vector must have exactly 2N+1 entries"
+    );
+    anyhow::ensure!(
+        lambda.is_finite() && lambda > 1.0,
+        "even reconstruction requires finite lambda > 1"
+    );
+    anyhow::ensure!(
+        xi.iter().all(|v| v.is_finite()),
+        "Fourier coefficients must be finite"
+    );
+    anyhow::ensure!(
+        (1..=n_modes).all(|n| xi[n_modes - n] == xi[n_modes + n]),
+        "cosine reconstruction requires an exactly even full coefficient vector"
+    );
+    Ok(())
+}
+
+pub(crate) fn log_length_f64(lambda: f64) -> f64 {
+    let square = lambda * lambda;
+    if square.is_finite() {
+        square.ln()
+    } else {
+        2.0 * lambda.ln()
+    }
+}
+
+pub(crate) fn log_product_f64(left: f64, right: f64) -> f64 {
+    let product = left * right;
+    // A positive subnormal product can already have lost most of its bits.
+    // Taking its logarithm cannot recover them; sum the logarithms instead.
+    if product.is_normal() && product > 0.0 {
+        product.ln()
+    } else {
+        left.ln() + right.ln()
+    }
+}
+
 impl WeilEigenfunctionF64 {
     /// Build from the full `2N+1` `V_n` coefficient vector.
     ///
     /// Uses `ξ₀` and the positive-index coefficients, which is exact for the
     /// even eigenfunctions this measurement concerns.
     pub fn from_v_basis(xi: &[f64], n_modes: usize, lambda: f64) -> Result<Self> {
-        if xi.len() != 2 * n_modes + 1 {
-            anyhow::bail!(
-                "xi has wrong length: got {}, expected 2N+1 = {}",
-                xi.len(),
-                2 * n_modes + 1
-            );
-        }
-        if !lambda.is_finite() || lambda <= 1.0 {
-            anyhow::bail!("eigenfunction reconstruction needs λ > 1 (got {lambda})");
-        }
+        validate_even_basis_f64(xi, n_modes, lambda)?;
         let mut candidate = Self {
             xi_zero: xi[n_modes],
             xi_positive: xi[n_modes + 1..].to_vec(),
             lambda,
-            log_lambda_sq: (lambda * lambda).ln(),
+            log_lambda_sq: log_length_f64(lambda),
             raw_at_one: 1.0,
         };
+        // A common power of two cancels in f_raw(u)/f_raw(1). Rescale
+        // extreme inputs before summation; ordinary-range serial arithmetic
+        // stays unchanged. Reject lost nonzero coefficients explicitly.
+        let maximum = xi.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let bound = candidate
+            .xi_positive
+            .iter()
+            .fold(candidate.xi_zero.abs(), |sum, v| sum + 2.0 * v.abs());
+        if maximum > 0.0 && (!bound.is_finite() || maximum < 2.0_f64.powi(-500)) {
+            let exponent = (((maximum.to_bits() >> 52) & 0x7ff) as i32 - 1023).max(-1022);
+            let scale = 2.0_f64.powi(exponent);
+            for value in std::iter::once(&mut candidate.xi_zero).chain(&mut candidate.xi_positive) {
+                let original = *value;
+                *value /= scale;
+                anyhow::ensure!(
+                    value.is_finite() && (*value != 0.0 || original == 0.0),
+                    "coefficient range cannot be preserved during normalization"
+                );
+            }
+        }
         let raw_at_one = candidate.raw_eval(1.0);
         if !raw_at_one.is_finite() || raw_at_one == 0.0 {
             anyhow::bail!(
                 "eigenfunction cannot be normalized: f_raw(1) = {raw_at_one}; \
                  the f(1) = 1 convention requires a nonzero value at u = 1"
             );
+        }
+        for value in std::iter::once(&candidate.xi_zero).chain(&candidate.xi_positive) {
+            let normalized = value / raw_at_one;
+            anyhow::ensure!(
+                normalized.is_finite() && (normalized != 0.0 || *value == 0.0),
+                "normalized coefficient is outside the binary64 range"
+            );
+            if normalized.is_subnormal() {
+                // Subnormal division may retain a nonzero value after losing
+                // most of its significand. Admit it only when it is exact.
+                use num_rational::BigRational;
+                let exact = BigRational::from_float(*value).expect("finite coefficient")
+                    / BigRational::from_float(raw_at_one).expect("finite nonzero normalization");
+                anyhow::ensure!(
+                    BigRational::from_float(normalized).expect("finite quotient") == exact,
+                    "normalized coefficient loses precision below the normal binary64 range"
+                );
+            }
         }
         candidate.raw_at_one = raw_at_one;
         Ok(candidate)
@@ -335,9 +433,9 @@ impl WeilEigenfunctionF64 {
     /// it is what makes them usable without reimplementing the reconstruction.
     /// The coefficients are mirrored into the full `2N+1` layout and passed
     /// through the same constructor as any other `V_n` vector, so the two
-    /// paths cannot drift apart. Normalization is reapplied and is a no-op for
-    /// already-normalized input, which also means unnormalized coefficients
-    /// are accepted and normalized rather than silently mis-scaled.
+    /// paths use the same formula. Normalization is reapplied, so unnormalized
+    /// input is accepted. Rounded coefficient division and renormalization can
+    /// change low bits; this is not a bit-identical replay contract.
     pub fn from_normalized_coefficients(coefficients: &[f64], lambda: f64) -> Result<Self> {
         if coefficients.is_empty() {
             anyhow::bail!("eigenfunction needs at least the j = 0 coefficient");
@@ -353,7 +451,11 @@ impl WeilEigenfunctionF64 {
     }
 
     fn raw_eval(&self, u: f64) -> f64 {
-        let phase_base = 2.0 * std::f64::consts::PI * (self.lambda * u).ln() / self.log_lambda_sq;
+        if !u.is_finite() || u <= 0.0 {
+            return f64::NAN;
+        }
+        let phase_base =
+            2.0 * std::f64::consts::PI * log_product_f64(self.lambda, u) / self.log_lambda_sq;
         let mut acc = self.xi_zero;
         for (k, xi) in self.xi_positive.iter().enumerate() {
             acc += 2.0 * xi * ((k + 1) as f64 * phase_base).cos();
@@ -388,13 +490,11 @@ impl WeilEigenfunctionF64 {
 
 /// Where the target residual changes sign on `(1, λ]`, sampled on a grid.
 ///
-/// Each interior sign change is a derivative kink of the distance integrand
-/// its absolute value. Gauss--Legendre earns its spectral convergence only on smooth
-/// integrands, so a positive crossing count is the concrete signal that a
-/// Gauss--Legendre distance for this configuration converges algebraically
-/// rather than spectrally, and that a composite uniform rule may be the more
-/// trustworthy comparison. A zero count means the integrand is smooth and
-/// Gauss--Legendre is at its best.
+/// Opposite nonzero residual signs bracket a sign change if the profiles are
+/// continuous. Exact-zero samples between them are retained inside the bracket.
+/// A simple sign-changing zero can create a kink in the absolute residual, but
+/// sampled signs alone do not establish differentiability or a quadrature
+/// convergence rate. Multiple crossings within a cell can remain undetected.
 ///
 /// `u = 1` is excluded: both profiles equal `1`, so the difference vanishes
 /// there by construction rather than by a crossing.
@@ -402,8 +502,7 @@ impl WeilEigenfunctionF64 {
 pub struct TargetCrossingReportF64 {
     /// Sample points examined on `(1, λ]`.
     pub samples: usize,
-    /// Sign of the target residual at the first sample right of `u = 1`; `0` if it
-    /// vanishes there to within the detection threshold.
+    /// First nonzero sampled residual sign; zero if every sampled residual is zero.
     pub initial_sign: i8,
     /// Brackets `(u_left, u_right)` straddling each detected sign change.
     /// A crossing between two samples is detected; one that occurs and
@@ -418,8 +517,8 @@ impl TargetCrossingReportF64 {
         self.brackets.len()
     }
 
-    /// Whether the integrand appears smooth at this sampling resolution, and
-    /// therefore whether Gauss--Legendre retains its spectral advantage.
+    /// Whether no sign change was detected at this sampling resolution.
+    /// This compatibility name does not certify smoothness or convergence.
     pub fn integrand_appears_smooth(&self) -> bool {
         self.brackets.is_empty()
     }
@@ -440,13 +539,25 @@ pub fn target_crossings_f64<F: Fn(f64) -> f64>(
     }
     let target = crate::target::TargetEvaluatorF64::from_environment()?;
     target.validate_lambda(lambda)?;
-    let difference = |u: f64| -> Result<f64> { Ok(f(u) - target.try_value(u)?) };
+    let difference = |u: f64| -> Result<f64> {
+        let profile = f(u);
+        anyhow::ensure!(
+            profile.is_finite(),
+            "crossing profile sample must be finite"
+        );
+        let residual = profile - target.try_value(u)?;
+        anyhow::ensure!(residual.is_finite(), "crossing residual must be finite");
+        Ok(residual)
+    };
     let (lo, hi) = match variable {
         GridVariable::U => (1.0_f64, lambda),
         GridVariable::LogU => (0.0_f64, lambda.ln()),
     };
     let step = (hi - lo) / samples as f64;
     let point = |index: usize| {
+        if index == samples {
+            return lambda;
+        }
         let t = lo + step * index as f64;
         match variable {
             GridVariable::U => t,
@@ -455,11 +566,17 @@ pub fn target_crossings_f64<F: Fn(f64) -> f64>(
     };
     let mut brackets = Vec::new();
     let mut initial_sign = 0_i8;
-    let mut previous: Option<(f64, f64)> = None;
+    let mut previous: Option<(f64, i8)> = None;
+    let mut previous_grid_point = 1.0;
     // Start at index 1: index 0 is u = 1, where the difference vanishes by
     // construction and carries no sign information.
     for index in 1..=samples {
         let u = point(index);
+        anyhow::ensure!(
+            u.is_finite() && u > previous_grid_point && u <= lambda,
+            "crossing grid requires distinct increasing points in (1, lambda]"
+        );
+        previous_grid_point = u;
         let value = difference(u)?;
         let sign = if value > 0.0 {
             1_i8
@@ -471,19 +588,14 @@ pub fn target_crossings_f64<F: Fn(f64) -> f64>(
         if initial_sign == 0 {
             initial_sign = sign;
         }
-        if let Some((previous_u, previous_value)) = previous {
-            let previous_sign = if previous_value > 0.0 {
-                1_i8
-            } else if previous_value < 0.0 {
-                -1
-            } else {
-                0
-            };
-            if previous_sign != 0 && sign != 0 && previous_sign != sign {
-                brackets.push((previous_u, u));
+        if sign != 0 {
+            if let Some((previous_u, previous_sign)) = previous {
+                if previous_sign != sign {
+                    brackets.push((previous_u, u));
+                }
             }
+            previous = Some((u, sign));
         }
-        previous = Some((u, value));
     }
     Ok(TargetCrossingReportF64 {
         samples,
@@ -534,15 +646,6 @@ pub mod hp {
         }
         Ok(())
     }
-
-    /// `u^{−α}` as `exp(−α ln u)`, valid for `u ≥ 1`.
-    fn weight(u: &Float, alpha: &Float, working: u32) -> Float {
-        let mut exponent = Float::with_val(working, u.clone().ln());
-        exponent *= alpha;
-        exponent.neg_assign();
-        exponent.exp()
-    }
-    use rug::ops::NegAssign;
 
     /// Gauss--Legendre tables shared across the measurements of one capture
     /// call, keyed by `(points, working_precision)`.
@@ -604,14 +707,24 @@ pub mod hp {
             Ok(())
         }
 
-        fn get_or_build(&mut self, points: usize, working: u32) -> &(Vec<Float>, Vec<Float>) {
-            self.0.entry((points, working)).or_insert_with(|| {
-                xc_numerics::quadrature::gauss_legendre_nodes(
+        fn get_or_build(
+            &mut self,
+            points: usize,
+            working: u32,
+        ) -> Result<&(Vec<Float>, Vec<Float>)> {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.0.entry((points, working))
+            {
+                entry.insert(xc_numerics::quadrature::try_gauss_legendre_nodes(
                     points,
                     working,
                     xc_numerics::quadrature::CacheMode::Off,
-                )
-            })
+                )?);
+            }
+            Ok(self
+                .0
+                .get(&(points, working))
+                .expect("inserted checked table"))
         }
     }
 
@@ -628,7 +741,8 @@ pub mod hp {
         prec: u32,
         tables: Option<&mut SharedGlTables>,
     ) -> Result<Float> {
-        let working = prec.saturating_add(GUARD_BITS);
+        validate_reconstruction_precision(prec)?;
+        let working = prec + GUARD_BITS;
         match rule {
             WeightedIntegrationRule::UniformGrid {
                 scheme,
@@ -642,15 +756,15 @@ pub mod hp {
                 let built;
                 let (nodes, weights): (&Vec<Float>, &Vec<Float>) = match tables {
                     Some(tables) => {
-                        let table = tables.get_or_build(points, working);
+                        let table = tables.get_or_build(points, working)?;
                         (&table.0, &table.1)
                     }
                     None => {
-                        built = xc_numerics::quadrature::gauss_legendre_nodes(
+                        built = xc_numerics::quadrature::try_gauss_legendre_nodes(
                             points,
                             working,
                             xc_numerics::quadrature::CacheMode::Off,
-                        );
+                        )?;
                         (&built.0, &built.1)
                     }
                 };
@@ -664,21 +778,29 @@ pub mod hp {
                         Float::with_val(working, lambda).ln(),
                     ),
                 };
+                anyhow::ensure!(
+                    lo.is_finite() && hi.is_finite() && hi > lo,
+                    "HP quadrature bounds collapse or overflow at working precision"
+                );
                 let mut mid = Float::with_val(working, &lo + &hi);
                 mid /= 2u32;
                 let mut half = Float::with_val(working, &hi - &lo);
                 half /= 2u32;
+                anyhow::ensure!(
+                    mid.is_finite() && half.is_finite() && half > 0,
+                    "HP quadrature midpoint or half width is unrepresentable"
+                );
                 let mut sum = Float::with_val(working, 0u32);
                 for (node, weight_value) in nodes.iter().zip(weights.iter()) {
                     let mut point = half.clone();
                     point *= node;
                     point += &mid;
                     let mut term = match variable {
-                        GridVariable::U => g(&point),
+                        GridVariable::U => Float::with_val(working, g(&point)),
                         // du = u dt under u = e^t.
                         GridVariable::LogU => {
                             let u = point.exp();
-                            g(&u) * u
+                            Float::with_val(working, g(&u)) * u
                         }
                     };
                     term *= weight_value;
@@ -745,17 +867,36 @@ pub mod hp {
         prec: u32,
         tables: Option<&mut SharedGlTables>,
     ) -> Result<WeightedGridValueHp> {
+        validate_reconstruction_precision(prec)?;
         validate_lambda_alpha(lambda, alpha)?;
         rule.validate()?;
         let working = prec.saturating_add(GUARD_BITS);
         let alpha_working = Float::with_val(working, alpha);
+        let failure = super::EvaluationFailure::default();
+        let nonzero_sample = std::cell::Cell::new(false);
         let integrand = |u: &Float| {
-            let mut difference = f(u);
-            difference -= g(u);
-            difference.abs_mut();
-            difference * weight(u, &alpha_working, working)
+            failure.capture(
+                || {
+                    let value = super::weighted_sample::high_precision(
+                        &f(u),
+                        &g(u),
+                        u,
+                        &alpha_working,
+                        working,
+                    )?
+                    .abs();
+                    nonzero_sample.set(nonzero_sample.get() || !value.is_zero());
+                    Ok(value)
+                },
+                || Float::with_val(working, f64::NAN),
+            )
         };
-        let value = integrate_with(integrand, lambda, rule, prec, tables)?;
+        let result = integrate_with(integrand, lambda, rule, prec, tables);
+        let value = failure.finish(result)?;
+        anyhow::ensure!(
+            !value.is_zero() || !nonzero_sample.get(),
+            "nonzero weighted quadrature underflowed to zero"
+        );
         anyhow::ensure!(
             value.is_finite(),
             "distance evaluation produced a nonfinite value"
@@ -763,7 +904,7 @@ pub mod hp {
         Ok(WeightedGridValueHp {
             value,
             lambda: Float::with_val(prec, lambda),
-            alpha: Float::with_val(prec, alpha),
+            alpha: Float::with_val(prec.saturating_add(GUARD_BITS), alpha),
             rule,
             precision_bits: prec,
         })
@@ -840,6 +981,7 @@ pub mod hp {
         tables: Option<&mut SharedGlTables>,
         expected_target_digest: Option<&str>,
     ) -> Result<Float> {
+        validate_reconstruction_precision(prec)?;
         validate_lambda_alpha(lambda, alpha)?;
         rule.validate()?;
         let working = prec.saturating_add(GUARD_BITS);
@@ -853,12 +995,18 @@ pub mod hp {
         let alpha_working = Float::with_val(working, alpha);
         let failure = super::EvaluationFailure::default();
         let integrand = |u: &Float| {
-            let mut residual = f(u);
-            residual -= failure.capture(
-                || target.try_value(u),
+            failure.capture(
+                || {
+                    super::weighted_sample::high_precision(
+                        &f(u),
+                        &target.try_value(u)?,
+                        u,
+                        &alpha_working,
+                        working,
+                    )
+                },
                 || Float::with_val(working, f64::NAN),
-            );
-            residual * weight(u, &alpha_working, working)
+            )
         };
         let result = integrate_with(integrand, lambda, rule, prec, tables);
         let value = failure.finish(result)?;
@@ -883,6 +1031,60 @@ pub mod hp {
         working: u32,
     }
 
+    pub(crate) fn validate_reconstruction_precision(prec: u32) -> Result<()> {
+        anyhow::ensure!(
+            (32..=1_000_000).contains(&prec),
+            "reconstruction precision must be in 32..=1000000 bits"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn validate_even_basis(
+        xi: &[Float],
+        n_modes: usize,
+        lambda: &Float,
+        prec: u32,
+    ) -> Result<()> {
+        validate_reconstruction_precision(prec)?;
+        anyhow::ensure!(
+            n_modes <= u32::MAX as usize
+                && n_modes.checked_mul(2).and_then(|n| n.checked_add(1)) == Some(xi.len()),
+            "full V_n vector must have representable 2N+1 shape"
+        );
+        anyhow::ensure!(
+            lambda.is_finite() && lambda > &1,
+            "even reconstruction requires finite lambda > 1"
+        );
+        anyhow::ensure!(
+            xi.iter().all(Float::is_finite),
+            "Fourier coefficients must be finite"
+        );
+        anyhow::ensure!(
+            (1..=n_modes).all(|n| xi[n_modes - n] == xi[n_modes + n]),
+            "cosine reconstruction requires an exactly even full coefficient vector"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn log_length(lambda: &Float, prec: u32) -> Float {
+        let value = Float::with_val(prec, lambda);
+        let square = value.clone().square();
+        if square.is_finite() {
+            square.ln()
+        } else {
+            value.ln() * 2u32
+        }
+    }
+
+    pub(crate) fn log_product(left: &Float, right: &Float, prec: u32) -> Float {
+        let product = Float::with_val(prec, left * right);
+        if product.is_finite() && product > 0 {
+            product.ln()
+        } else {
+            Float::with_val(prec, left).ln() + Float::with_val(prec, right).ln()
+        }
+    }
+
     impl WeilEigenfunction {
         /// Build from the full `2N+1` `V_n` coefficient vector at `prec` bits.
         pub fn from_v_basis(
@@ -891,22 +1093,10 @@ pub mod hp {
             lambda: &Float,
             prec: u32,
         ) -> Result<Self> {
-            if xi.len() != 2 * n_modes + 1 {
-                anyhow::bail!(
-                    "xi has wrong length: got {}, expected 2N+1 = {}",
-                    xi.len(),
-                    2 * n_modes + 1
-                );
-            }
-            if !lambda.is_finite() || *lambda <= 1u32 {
-                anyhow::bail!(
-                    "eigenfunction reconstruction needs λ > 1 (got {})",
-                    lambda.to_f64()
-                );
-            }
+            validate_even_basis(xi, n_modes, lambda, prec)?;
             let working = prec.saturating_add(GUARD_BITS);
             let lambda = Float::with_val(working, lambda);
-            let log_lambda_sq = lambda.clone().square().ln();
+            let log_lambda_sq = log_length(&lambda, working);
             let mut candidate = Self {
                 xi_zero: Float::with_val(working, &xi[n_modes]),
                 xi_positive: xi[n_modes + 1..]
@@ -918,6 +1108,35 @@ pub mod hp {
                 raw_at_one: Float::with_val(working, 1u32),
                 working,
             };
+            let maximum = xi
+                .iter()
+                .map(|v| v.clone().abs())
+                .max_by(|a, b| a.partial_cmp(b).expect("validated finite coefficients"))
+                .expect("validated nonempty vector");
+            let bound = candidate
+                .xi_positive
+                .iter()
+                .fold(candidate.xi_zero.clone().abs(), |sum, v| {
+                    sum + v.clone().abs() * 2u32
+                });
+            if let Some(exponent) = maximum.get_exp() {
+                if !bound.is_finite() || exponent < rug::float::exp_min() / 2 {
+                    let scale = Float::with_val(working, 1) << (exponent - 1);
+                    let rescale = |original: &Float| -> Result<Float> {
+                        let value = Float::with_val(working, original / &scale);
+                        anyhow::ensure!(
+                            value.is_finite() && (!value.is_zero() || original.is_zero()),
+                            "coefficient range cannot be preserved during normalization"
+                        );
+                        Ok(value)
+                    };
+                    candidate.xi_zero = rescale(&xi[n_modes])?;
+                    candidate.xi_positive = xi[n_modes + 1..]
+                        .iter()
+                        .map(rescale)
+                        .collect::<Result<_>>()?;
+                }
+            }
             let raw_at_one = candidate.raw_eval(&Float::with_val(working, 1u32));
             if !raw_at_one.is_finite() || raw_at_one == 0u32 {
                 anyhow::bail!(
@@ -925,6 +1144,25 @@ pub mod hp {
                      the f(1) = 1 convention requires a nonzero value at u = 1",
                     raw_at_one.to_f64()
                 );
+            }
+            for value in std::iter::once(&candidate.xi_zero).chain(&candidate.xi_positive) {
+                let normalized = Float::with_val(working, value / &raw_at_one);
+                anyhow::ensure!(
+                    normalized.is_finite() && (!normalized.is_zero() || value.is_zero()),
+                    "normalized coefficient is outside the MPFR range"
+                );
+                if normalized.get_exp() == Some(rug::float::exp_min()) {
+                    let toward_zero = Float::with_val_round(
+                        working,
+                        value / &raw_at_one,
+                        rug::float::Round::Zero,
+                    )
+                    .0;
+                    anyhow::ensure!(
+                        !toward_zero.is_zero(),
+                        "normalized coefficient loses precision below the MPFR exponent range"
+                    );
+                }
             }
             candidate.raw_at_one = raw_at_one;
             Ok(candidate)
@@ -938,13 +1176,15 @@ pub mod hp {
         /// [`super::WeilEigenfunctionF64::from_normalized_coefficients`]. The
         /// coefficients are mirrored into the full `2N+1` layout and passed
         /// through the same constructor as any other `V_n` vector, so the
-        /// retained artifact and a freshly solved eigenstate cannot drift
-        /// apart.
+        /// retained artifact and a freshly solved eigenstate use the same
+        /// formula. Rounded coefficient division and renormalization can change
+        /// low bits; this is not a bit-identical replay contract.
         pub fn from_normalized_coefficients(
             coefficients: &[Float],
             lambda: &Float,
             prec: u32,
         ) -> Result<Self> {
+            validate_reconstruction_precision(prec)?;
             if coefficients.is_empty() {
                 anyhow::bail!("eigenfunction needs at least the j = 0 coefficient");
             }
@@ -953,10 +1193,10 @@ pub mod hp {
             let mut xi: Vec<Float> = (0..(2 * n_modes + 1))
                 .map(|_| Float::with_val(working, 0u32))
                 .collect();
-            xi[n_modes] = Float::with_val(working, &coefficients[0]);
+            xi[n_modes] = coefficients[0].clone();
             for (k, value) in coefficients[1..].iter().enumerate() {
-                xi[n_modes + k + 1] = Float::with_val(working, value);
-                xi[n_modes - k - 1] = Float::with_val(working, value);
+                xi[n_modes + k + 1] = value.clone();
+                xi[n_modes - k - 1] = value.clone();
             }
             Self::from_v_basis(&xi, n_modes, lambda, prec)
         }
@@ -979,10 +1219,13 @@ pub mod hp {
         /// requiring `Sync` on it triggers an internal compiler error in
         /// rustc 1.95.0 (see the note on `integrate_with`).
         fn raw_eval(&self, u: &Float) -> Float {
+            if !u.is_finite() || u <= &0 {
+                return Float::with_val(self.working, rug::float::Special::Nan);
+            }
             use rayon::prelude::*;
 
             let two_pi = Float::with_val(self.working, Constant::Pi) * 2u32;
-            let mut phase_base = Float::with_val(self.working, &self.lambda * u).ln();
+            let mut phase_base = log_product(&self.lambda, u, self.working);
             phase_base *= two_pi;
             phase_base /= &self.log_lambda_sq;
             let terms: Vec<Float> = self
@@ -1016,9 +1259,10 @@ pub mod hp {
         ///
         /// Already divided by `f_raw(1)`, so evaluating the even cosine sum
         /// with these directly yields `f`. The negative indices are omitted
-        /// because the eigenfunction is even. This is the lossless form of the
-        /// eigenfunction: from it any rule, resolution, or abscissa can be
-        /// recomputed exactly, which a sampled profile cannot support.
+        /// because the eigenfunction is even. These rounded coefficients permit
+        /// evaluation at new abscissae and resolutions without interpolation of
+        /// a sampled profile. Division rounds, so they do not promise exact
+        /// reconstruction of the original floating-point evaluation bits.
         pub fn normalized_coefficients(&self) -> Vec<Float> {
             let mut coefficients = Vec::with_capacity(self.xi_positive.len() + 1);
             let mut zero = self.xi_zero.clone();
@@ -1040,18 +1284,15 @@ pub mod hp {
 
     /// Where the target residual changes sign on `(1, λ]`, sampled at high precision.
     ///
-    /// HP counterpart of [`super::TargetCrossingReportF64`]. Crossing
-    /// detection belongs at working precision as much as the distance does:
-    /// the question it answers — whether the absolute residual has an interior derivative
-    /// kink, and therefore whether a Gauss--Legendre distance converges
-    /// spectrally or only algebraically — is about the same eigenfunction the
-    /// campaign measures at 500 to 7000 bits.
+    /// HP counterpart of [`super::TargetCrossingReportF64`]. These are sampled
+    /// sign-change diagnostics for the working-precision profile, including
+    /// exact-zero samples between opposite signs. They do not establish
+    /// smoothness, enumerate every crossing or certify quadrature convergence.
     #[derive(Clone, Debug)]
     pub struct TargetCrossingReport {
         /// Sample points examined on `(1, λ]`.
         pub samples: usize,
-        /// Sign of the target residual at the first sample right of `u = 1`; `0` if it
-        /// vanishes there.
+        /// First nonzero sampled residual sign; zero if every sampled residual is zero.
         pub initial_sign: i8,
         /// Brackets `(u_left, u_right)` straddling each detected sign change.
         pub brackets: Vec<(Float, Float)>,
@@ -1063,9 +1304,8 @@ pub mod hp {
             self.brackets.len()
         }
 
-        /// Whether the integrand appears smooth at this sampling resolution,
-        /// and therefore whether Gauss--Legendre retains its spectral
-        /// advantage.
+        /// Whether no sign change was detected at this sampling resolution.
+        /// This compatibility name does not certify smoothness or convergence.
         pub fn integrand_appears_smooth(&self) -> bool {
             self.brackets.is_empty()
         }
@@ -1090,7 +1330,10 @@ pub mod hp {
         if samples < 2 {
             anyhow::bail!("crossing detection needs at least two samples");
         }
-        let working = prec.saturating_add(GUARD_BITS);
+        let working = prec
+            .checked_add(GUARD_BITS)
+            .filter(|bits| prec > 0 && *bits <= 1_000_000)
+            .ok_or_else(|| anyhow::anyhow!("crossing precision must be in 1..=999936 bits"))?;
         let target = crate::target::hp::TargetEvaluator::from_environment(working)?;
         target.validate_lambda(lambda)?;
         let (lo, hi) = match variable {
@@ -1104,21 +1347,36 @@ pub mod hp {
             ),
         };
         let mut step = Float::with_val(working, &hi - &lo);
-        step /= samples as u32;
+        step /= samples;
 
         let mut brackets = Vec::new();
         let mut initial_sign = 0_i8;
         let mut previous: Option<(Float, i8)> = None;
+        let mut previous_grid_point = Float::with_val(working, 1);
         for index in 1..=samples {
             let mut point = step.clone();
-            point *= index as u32;
+            point *= index;
             point += &lo;
-            let u = match variable {
-                GridVariable::U => point,
-                GridVariable::LogU => point.exp(),
+            let u = if index == samples {
+                lambda.clone()
+            } else {
+                match variable {
+                    GridVariable::U => point,
+                    GridVariable::LogU => point.exp(),
+                }
             };
+            anyhow::ensure!(
+                u.is_finite() && u > previous_grid_point && &u <= lambda,
+                "crossing grid requires distinct increasing points in (1, lambda]"
+            );
+            previous_grid_point = u.clone();
             let mut difference = f(&u);
+            anyhow::ensure!(
+                difference.is_finite(),
+                "crossing profile sample must be finite"
+            );
             difference -= target.try_value(&u)?;
+            anyhow::ensure!(difference.is_finite(), "crossing residual must be finite");
             let sign = match difference.cmp0() {
                 Some(std::cmp::Ordering::Greater) => 1_i8,
                 Some(std::cmp::Ordering::Less) => -1,
@@ -1127,12 +1385,14 @@ pub mod hp {
             if initial_sign == 0 {
                 initial_sign = sign;
             }
-            if let Some((previous_u, previous_sign)) = &previous {
-                if *previous_sign != 0 && sign != 0 && *previous_sign != sign {
-                    brackets.push((previous_u.clone(), u.clone()));
+            if sign != 0 {
+                if let Some((previous_u, previous_sign)) = &previous {
+                    if *previous_sign != sign {
+                        brackets.push((previous_u.clone(), u.clone()));
+                    }
                 }
+                previous = Some((u, sign));
             }
-            previous = Some((u, sign));
         }
         Ok(TargetCrossingReport {
             samples,
@@ -1154,15 +1414,22 @@ pub mod hp {
         /// convention. Report them together: the spread between rules is the
         /// convention sensitivity of the measurement.
         pub distances: Vec<WeightedGridValueHp>,
-        /// All requested uniform-grid refinements met their fixed tolerance.
-        /// None means no applicable refinement was requested; false is retained evidence.
+        /// Every returned uniform-grid value at the requested Q agreed with
+        /// its 2Q refinement under the fixed policy. A successful 2Q/4Q
+        /// continuation cannot make this true for the returned Q value.
+        /// This is empirical adjacent-grid agreement, not an integral error bound.
+        /// None means no applicable refinement was requested.
         pub resolution_tolerance_met: Option<bool>,
+        /// Every rule's final attempted adjacent pair (Q/2Q or 2Q/4Q) met
+        /// the policy. This does not qualify the returned Q values when
+        /// `resolution_tolerance_met` is false.
+        pub resolution_ladder_tolerance_met: Option<bool>,
     }
 
     /// Measure `d(N, λ)` end to end for one CCM configuration.
     ///
     /// Computes (or resolves from cache, reuse-first) the even-parity Weil
-    /// ground state for `params`, expands it out of the sector basis via
+    /// selected state for `params`, expands it out of the sector basis via
     /// [`crate::ccm::hp::expand_even_sector_vector`], normalizes to
     /// `f(1) = 1`, and integrates against the runtime target under the stated
     /// quadrature convention.
@@ -1190,10 +1457,11 @@ pub mod hp {
             eigenvalue: resolved.eigenvalue,
             distances: vec![distance],
             resolution_tolerance_met: None,
+            resolution_ladder_tolerance_met: None,
         })
     }
 
-    /// The even Weil ground state for one configuration, reconstructed as a
+    /// The canonical even Weil selected state, reconstructed as a
     /// normalized eigenfunction.
     pub(crate) struct ResolvedGroundEigenfunction {
         pub eigenfunction: WeilEigenfunction,
@@ -1209,11 +1477,7 @@ pub mod hp {
     ) -> Result<ResolvedGroundEigenfunction> {
         let prec = cfg.precision_bits;
         let working = prec.saturating_add(GUARD_BITS);
-        let lambda_sq = if params.lambda_sq.is_integer {
-            Float::with_val(working, params.lambda_sq.value_u64)
-        } else {
-            Float::with_val(working, params.lambda_sq.value_f64)
-        };
+        let lambda_sq = crate::ccm::hp::lambda_squared_value_hp(params, working)?;
         if lambda_sq <= 1u32 {
             anyhow::bail!(
                 "weighted distances integrate over [1, lambda] and need lambda^2 > 1 (got {})",
@@ -1237,7 +1501,7 @@ pub mod hp {
         })
     }
 
-    /// Resolve (or compute, reuse-first) the even Weil ground state and
+    /// Resolve (or compute, reuse-first) the canonical even Weil selected state and
     /// reconstruct its normalized eigenfunction.
     ///
     /// Callers evaluating several rules or several quantities against one
@@ -1251,11 +1515,7 @@ pub mod hp {
         let working = cfg.precision_bits.saturating_add(GUARD_BITS);
         // Follow the documented LambdaSq promotion rule so an integer λ² stays
         // exact instead of round-tripping through f64.
-        let lambda_sq = if params.lambda_sq.is_integer {
-            Float::with_val(working, params.lambda_sq.value_u64)
-        } else {
-            Float::with_val(working, params.lambda_sq.value_f64)
-        };
+        let lambda_sq = crate::ccm::hp::lambda_squared_value_hp(params, working)?;
         if lambda_sq <= 1u32 {
             anyhow::bail!(
                 "weighted distances integrate over [1, λ] and need λ² > 1 (got {})",
@@ -1264,7 +1524,7 @@ pub mod hp {
         }
         let mut even_cfg = cfg.clone();
         even_cfg.set_parity_policy(crate::ccm::hp::CcmParityPolicy::EvenSector);
-        let state = crate::ccm::hp::build_source(params, &even_cfg)?;
+        let state = crate::ccm::hp::build_source_read_only(params, &even_cfg)?;
         ground_eigenfunction_from_canonical_state(
             params,
             &even_cfg,
@@ -1378,9 +1638,9 @@ pub mod hp {
         pub f_values: Vec<String>,
         /// Normalized `V_n` coefficients for `j = 0 … N`, already divided by
         /// `f_raw(1)`; negative indices are omitted because the eigenfunction
-        /// is even. These are lossless: a consumer can evaluate `f` at any
-        /// abscissa and therefore apply any integration rule at any
-        /// resolution, rather than being limited to the rules captured here.
+        /// is even. A consumer can evaluate the rounded coefficient expansion
+        /// at new abscissae and resolutions. This avoids sampled-profile
+        /// interpolation but does not guarantee identical floating-point bits.
         pub normalized_coefficients: Vec<String>,
     }
 
@@ -1443,7 +1703,9 @@ pub mod hp {
         /// One-sided `j = 0 ... N` L1 norm beyond the effective bandwidth.
         pub discarded_one_sided_l1: String,
         /// Conservative pointwise contribution bound after restoring the
-        /// factor two on every positive-index cosine coefficient.
+        /// factor two on every positive-index cosine coefficient. This bounds
+        /// the retained coefficients rounded to `precision_bits`; it does not
+        /// enclose errors in the original eigenstate or its normalization.
         pub discarded_cosine_pointwise_bound: String,
         /// Weighted coefficient L2 norm of the discarded even cosine series:
         /// `sqrt(c_0^2 + 2 sum_{n>0} c_n^2)` over discarded indices.
@@ -1475,11 +1737,14 @@ pub mod hp {
         /// described as accepted because `tolerance_met` can remain false
         /// after the maximum 4Q continuation.
         pub final_resolution: usize,
+        /// Agreement of the last attempted adjacent pair only. If 4Q was
+        /// required, this verdict does not qualify the original Q distance.
         pub tolerance_met: bool,
     }
 
-    /// First-class evidence that a retained target-distance grid resolves the
-    /// represented coefficient state under a fixed, versioned policy.
+    /// Same-rule refinement measurements under a fixed, versioned policy.
+    /// The final-pair verdict is distinct from agreement of the original Q
+    /// measurement with 2Q. Neither is a certified integral error bound.
     #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
     pub struct PortableDistanceResolutionEvidence {
@@ -1706,6 +1971,9 @@ pub mod hp {
         use crate::deviation::hp::project;
         use crate::deviation::DeviationMetric;
 
+        if !(32..=1_000_000).contains(&prec) {
+            anyhow::bail!("deviation decomposition precision is unsupported");
+        }
         if profile.u_values.len() != profile.f_values.len() {
             anyhow::bail!(
                 "retained profile has {} abscissae and {} values",
@@ -1721,8 +1989,11 @@ pub mod hp {
             let parsed = Float::parse(text)
                 .map_err(|error| anyhow::anyhow!("invalid retained {field}: {error}"))?;
             let value = Float::with_val(prec, parsed);
-            if !value.is_finite() {
-                anyhow::bail!("retained {field} must be finite");
+            if !value.is_finite()
+                || (value.is_zero()
+                    && xc_core::DecimalLiteral::new(text)?.canonical()?.as_str() != "0")
+            {
+                anyhow::bail!("retained {field} is outside the finite exponent range");
             }
             Ok(value)
         };
@@ -1743,7 +2014,7 @@ pub mod hp {
         {
             let u = parse(u_text, &format!("profile abscissa {index}"))?;
             let f = parse(f_text, &format!("profile value {index}"))?;
-            let mut d = f;
+            let mut d = Float::with_val(working, &f);
             d -= target.try_value(&u)?;
             reference.push(target.auxiliary_value(&u)?);
             deviation.push(d);
@@ -1782,21 +2053,133 @@ pub mod hp {
         })
     }
 
+    // Preserve the exponent used by weighted evaluation, including guard bits.
+    // Short display decimals and requested-precision rounding can alias weights.
+    fn alpha_identity(alpha: &Float, prec: u32) -> String {
+        Float::with_val(prec.saturating_add(GUARD_BITS), alpha).to_string()
+    }
+
+    #[cfg(test)]
+    mod exhaustive_resumed_precision_contract {
+        use super::*;
+        use rug::{ops::Pow, Rational};
+
+        // Parse the emitted base-ten number as an exact rational, without
+        // introducing another floating-point rounding step into the oracle.
+        fn exact_decimal(text: &str) -> Rational {
+            let (mantissa, exponent) = text.split_once('e').unwrap_or((text, "0"));
+            let fractional_digits = mantissa.split_once('.').map_or(0, |(_, f)| f.len());
+            let numerator = Integer::from_str_radix(&mantissa.replace('.', ""), 10).unwrap();
+            let power = exponent.parse::<i32>().unwrap() - fractional_digits as i32;
+            if power >= 0 {
+                Rational::from(numerator * Integer::from(10).pow(power as u32))
+            } else {
+                Rational::from((numerator, Integer::from(10).pow((-power) as u32)))
+            }
+        }
+
+        #[test]
+        fn exhaustive_resumed_tail_bound_encloses_exact_cosine_tail() {
+            let p = 128;
+            for mantissa in 1..=256 {
+                let coefficient = Float::with_val(p, mantissa) >> 200_u32;
+                let coefficients = [Float::with_val(p, 0), coefficient.clone()];
+                let exact = coefficient.to_rational().unwrap() * 2;
+                for evidence in coefficient_tail_evidence(&coefficients, p).unwrap() {
+                    assert_eq!(evidence.effective_bandwidth, None);
+                    let bound = exact_decimal(&evidence.discarded_cosine_pointwise_bound);
+                    assert!(
+                        bound >= exact,
+                        "mantissa {mantissa}: {} is below {exact}",
+                        evidence.discarded_cosine_pointwise_bound
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn exhaustive_resumed_tail_bound_retains_tiny_positive_terms() {
+            let p = 128;
+            let first = Float::with_val(p, 1) >> 50_u32;
+            let second = Float::with_val(p, 1) >> 400_u32;
+            let exact = (first.to_rational().unwrap() + second.to_rational().unwrap()) * 2;
+            let evidence =
+                coefficient_tail_evidence(&[Float::with_val(p, 0), first, second], p).unwrap();
+            assert_eq!(evidence[0].effective_bandwidth, None);
+            assert!(exact_decimal(&evidence[0].discarded_cosine_pointwise_bound) >= exact);
+        }
+
+        #[test]
+        fn exhaustive_resumed_alpha_identity_distinguishes_adjacent_weights() {
+            let p = 128;
+            for bits in [p, p + GUARD_BITS] {
+                let alpha = Float::with_val(bits, 1);
+                let mut adjacent = alpha.clone();
+                adjacent.next_up();
+                assert_ne!(
+                    alpha_identity(&alpha, p),
+                    alpha_identity(&adjacent, p),
+                    "aliased {bits}-bit weights"
+                );
+            }
+        }
+
+        #[test]
+        fn exhaustive_resumed_weighted_result_keeps_actual_alpha() {
+            let p = 128;
+            let mut alpha = Float::with_val(p + GUARD_BITS, 1);
+            alpha.next_up();
+            let value = weighted_alpha_norm(
+                |_| Float::with_val(p, 1),
+                &Float::with_val(p, 2),
+                &alpha,
+                WeightedIntegrationRule::UniformGrid {
+                    scheme: UniformGridScheme::Trapezoid,
+                    variable: GridVariable::U,
+                    steps: 2,
+                },
+                p,
+            )
+            .unwrap();
+            assert_eq!(value.alpha, alpha);
+        }
+    }
+
     fn retained_decimal(value: &Float, prec: u32) -> String {
         Float::with_val(prec, value).to_string()
     }
 
     pub(crate) fn decimal(value: &Float, prec: u32) -> String {
-        let digits = ((f64::from(prec) * std::f64::consts::LOG10_2) as usize).max(20);
-        value.to_string_radix(10, Some(digits))
+        retained_decimal(value, prec)
+    }
+
+    #[cfg(test)]
+    mod cutoff_contract {
+        use super::*;
+
+        #[test]
+        fn canonical_fractional_cutoff_is_shared_with_matrix_assembly() {
+            let mut cfg = crate::ccm::hp::HighPrecConfig::for_decimal_digits(60);
+            cfg.precision_bits = 256;
+            for cutoff in [1.1, 13.1, 12.5] {
+                let params = crate::ccm::CcmParams::from_lambda_sq_fractional(cutoff, 0);
+                let text = format!("{cutoff:.17e}");
+                let expected = Float::with_val(320, Float::parse(&text).unwrap()).sqrt();
+                let source = ground_eigenfunction_from_canonical_state(
+                    &params,
+                    &cfg,
+                    &Float::with_val(256, 1),
+                    &[Float::with_val(256, 1)],
+                )
+                .unwrap();
+                assert_eq!(source.lambda, expected, "fractional cutoff {cutoff}");
+                assert_eq!(lambda_squared_identity(&params), text);
+            }
+        }
     }
 
     fn lambda_squared_identity(params: &crate::ccm::CcmParams) -> String {
-        if params.lambda_sq.is_integer {
-            params.lambda_sq.value_u64.to_string()
-        } else {
-            format!("{:?}", params.lambda_sq.value_f64)
-        }
+        crate::ccm::hp::lambda_squared_cache_identity(params)
     }
 
     /// Sample the eigenfunction on the profile grid used for a measurement.
@@ -1813,35 +2196,93 @@ pub mod hp {
         variable: GridVariable,
         prec: u32,
     ) -> (Vec<Float>, Vec<Float>) {
-        let working = prec.saturating_add(GUARD_BITS);
-        let one = Float::with_val(working, 1u32);
-        let (lo, hi) = match variable {
-            GridVariable::U => (one.clone(), Float::with_val(working, lambda)),
-            GridVariable::LogU => (
-                Float::with_val(working, 0u32),
-                Float::with_val(working, lambda).ln(),
-            ),
-        };
-        let mut step = Float::with_val(working, &hi - &lo);
-        step /= steps as u32;
         let mut u_values = Vec::with_capacity(steps + 1);
         let mut f_values = Vec::with_capacity(steps + 1);
-        for index in 0..=steps {
-            let mut point = step.clone();
-            point *= index as u32;
-            point += &lo;
-            let u = match variable {
-                GridVariable::U => point,
-                GridVariable::LogU => point.exp(),
-            };
+        for u in profile_abscissae(lambda, steps, variable, prec) {
             f_values.push(Float::with_val(prec, eigenfunction.eval(&u)));
             u_values.push(Float::with_val(prec, u));
         }
         (u_values, f_values)
     }
 
+    // Callers validate a positive u32 step count, supported precision and lambda>1.
+    fn profile_abscissae(
+        lambda: &Float,
+        steps: usize,
+        variable: GridVariable,
+        prec: u32,
+    ) -> impl Iterator<Item = Float> {
+        let working = prec.saturating_add(GUARD_BITS);
+        let upper = Float::with_val(working, lambda);
+        let (lo, hi) = match variable {
+            GridVariable::U => (Float::with_val(working, 1), upper.clone()),
+            GridVariable::LogU => (Float::with_val(working, 0), upper.clone().ln()),
+        };
+        let step = Float::with_val(working, &hi - &lo) / steps as u32;
+        (0..=steps).map(move |index| {
+            if index == 0 {
+                return Float::with_val(working, 1);
+            }
+            if index == steps {
+                return upper.clone();
+            }
+            let point = Float::with_val(working, &step * index as u32) + &lo;
+            match variable {
+                GridVariable::U => point,
+                GridVariable::LogU => point.exp(),
+            }
+        })
+    }
+
     fn invalid_retained_payload(detail: impl Into<String>) -> xc_cache::CacheError {
         xc_cache::CacheError::InvalidManifest(detail.into())
+    }
+
+    #[cfg(test)]
+    mod exhaustive_resumed_retained_contract {
+        use super::*;
+
+        #[test]
+        fn exhaustive_resumed_profile_binds_grid_endpoints_and_normalization() {
+            let base = PortableEigenfunctionProfile {
+                schema_version: 1,
+                lambda_squared: "4".into(),
+                n_modes: 0,
+                precision_bits: 128,
+                grid_variable: GridVariable::U.as_str().into(),
+                sample_count: 3,
+                normalization: "f(1)=1".into(),
+                u_values: vec!["1".into(), "1.5".into(), "2".into()],
+                f_values: vec!["1".into(); 3],
+                normalized_coefficients: vec!["1".into()],
+            };
+            let check = |profile: &PortableEigenfunctionProfile| {
+                validate_portable_eigenfunction_profile(profile, "4", 0, 128, GridVariable::U, 2)
+            };
+            assert!(check(&base).is_ok());
+            let mut results = Vec::new();
+            for case in 0..4 {
+                let mut bad = base.clone();
+                match case {
+                    0 => bad.u_values[0] = "0.5".into(),
+                    1 => bad.u_values[2] = "3".into(),
+                    2 => bad.u_values[1] = "1.25".into(),
+                    _ => bad.f_values[0] = "2".into(),
+                }
+                results.push(check(&bad).is_err());
+            }
+            assert_eq!(results, vec![true; 4]);
+        }
+        #[test]
+        fn exhaustive_resumed_retained_decimal_rejects_nonzero_underflow() {
+            for text in ["1e-400000000", "-1e-400000000"] {
+                assert!(parse_retained_float(text, 128, "fixture").is_err());
+            }
+            assert_eq!(
+                parse_retained_float("-0e-400000000", 128, "fixture").unwrap(),
+                0
+            );
+        }
     }
 
     fn parse_retained_float(
@@ -1849,6 +2290,11 @@ pub mod hp {
         precision_bits: u32,
         field: &str,
     ) -> std::result::Result<Float, xc_cache::CacheError> {
+        if !(32..=1_000_000).contains(&precision_bits) {
+            return Err(invalid_retained_payload(
+                "retained scalar precision must be in 32..=1000000 bits",
+            ));
+        }
         let parsed = Float::parse(text).map_err(|error| {
             invalid_retained_payload(format!("invalid retained {field} decimal: {error}"))
         })?;
@@ -1857,6 +2303,18 @@ pub mod hp {
             return Err(invalid_retained_payload(format!(
                 "retained {field} must be finite"
             )));
+        }
+        if value.is_zero() {
+            let exact = xc_core::DecimalLiteral::new(text)
+                .and_then(|literal| literal.canonical())
+                .map_err(|_| {
+                    invalid_retained_payload(format!("invalid retained {field} decimal"))
+                })?;
+            if exact.as_str() != "0" {
+                return Err(invalid_retained_payload(format!(
+                    "retained {field} underflows the working exponent range"
+                )));
+            }
         }
         Ok(value)
     }
@@ -1869,6 +2327,14 @@ pub mod hp {
         variable: GridVariable,
         profile_steps: usize,
     ) -> std::result::Result<(), xc_cache::CacheError> {
+        if !(32..=1_000_000).contains(&precision_bits)
+            || profile_steps == 0
+            || u32::try_from(profile_steps).is_err()
+        {
+            return Err(invalid_retained_payload(
+                "unsupported retained profile precision or grid size",
+            ));
+        }
         let expected_samples = profile_steps.checked_add(1).ok_or_else(|| {
             invalid_retained_payload("CCM eigenfunction profile sample count overflows usize")
         })?;
@@ -1891,18 +2357,40 @@ pub mod hp {
             ));
         }
 
+        let cutoff = Float::parse(lambda_squared).map_err(|error| {
+            invalid_retained_payload(format!("invalid profile cutoff: {error}"))
+        })?;
+        let cutoff = Float::with_val(precision_bits + GUARD_BITS, cutoff);
+        if !cutoff.is_finite() || cutoff <= 1 {
+            return Err(invalid_retained_payload(
+                "profile cutoff must be finite and exceed one",
+            ));
+        }
+        let lambda = cutoff.sqrt();
         let mut previous_u: Option<Float> = None;
-        for value in &artifact.u_values {
+        for (value, expected) in artifact.u_values.iter().zip(profile_abscissae(
+            &lambda,
+            profile_steps,
+            variable,
+            precision_bits,
+        )) {
             let u = parse_retained_float(value, precision_bits, "profile abscissa")?;
-            if u <= 0u32 || previous_u.as_ref().is_some_and(|previous| &u <= previous) {
+            if u != Float::with_val(precision_bits, expected)
+                || previous_u.as_ref().is_some_and(|previous| &u <= previous)
+            {
                 return Err(invalid_retained_payload(
-                    "CCM eigenfunction profile abscissae must be positive and strictly ascending",
+                    "CCM eigenfunction profile abscissae do not match their declared grid",
                 ));
             }
             previous_u = Some(u);
         }
-        for value in &artifact.f_values {
-            parse_retained_float(value, precision_bits, "profile value")?;
+        for (index, value) in artifact.f_values.iter().enumerate() {
+            let value = parse_retained_float(value, precision_bits, "profile value")?;
+            if index == 0 && value != 1 {
+                return Err(invalid_retained_payload(
+                    "CCM eigenfunction profile violates f(1)=1",
+                ));
+            }
         }
         for value in &artifact.normalized_coefficients {
             parse_retained_float(value, precision_bits, "normalized coefficient")?;
@@ -1938,8 +2426,7 @@ pub mod hp {
             || artifact.lambda_squared != lambda_squared
             || artifact.n_modes != n_modes
             || artifact.precision_bits != precision_bits
-            || (artifact.alpha != decimal(alpha, precision_bits)
-                && artifact.alpha != retained_decimal(alpha, precision_bits))
+            || artifact.alpha != alpha_identity(alpha, precision_bits)
             || (artifact.eigenvalue != decimal(expected_eigenvalue, precision_bits)
                 && artifact.eigenvalue != retained_decimal(expected_eigenvalue, precision_bits))
             || artifact.measurements.len() != rules.len()
@@ -2014,7 +2501,12 @@ pub mod hp {
         steps: usize,
         prec: u32,
     ) -> Vec<Float> {
-        let working = prec.saturating_add(GRID_GUARD_BITS);
+        // integrate_with supplies its lower endpoint at prec+GUARD_BITS;
+        // the grid primitive preserves the maximum endpoint precision.
+        let working = prec
+            .saturating_add(GRID_GUARD_BITS)
+            .max(prec.saturating_add(GUARD_BITS))
+            .max(lambda.prec());
         let (lo, hi) = match variable {
             GridVariable::U => (
                 Float::with_val(working, 1u32),
@@ -2026,28 +2518,38 @@ pub mod hp {
             ),
         };
         let mut h = Float::with_val(working, &hi - &lo);
-        h /= steps as u32;
-        let point = |i: f64| {
-            let mut x = h.clone();
-            x *= Float::with_val(working, i);
-            x += &lo;
-            x
+        h /= steps;
+        let point = |index: usize, midpoint: bool| {
+            let mut offset = Float::with_val(working, index);
+            if midpoint {
+                offset += Float::with_val(working, 1) / 2;
+            }
+            let mut t = if !midpoint && index == steps {
+                hi.clone()
+            } else {
+                offset *= &h;
+                offset += &lo;
+                offset.max(&lo).min(&hi)
+            };
+            if variable == GridVariable::LogU {
+                t = if t == lo {
+                    Float::with_val(working, 1)
+                } else if t == hi {
+                    Float::with_val(working, lambda)
+                } else {
+                    t.exp().max(&Float::with_val(working, 1)).min(lambda)
+                };
+            }
+            t
         };
-        let mut offsets: Vec<f64> = match scheme {
-            UniformGridScheme::LeftRiemann => (0..steps).map(|i| i as f64).collect(),
-            UniformGridScheme::RightRiemann => (1..=steps).map(|i| i as f64).collect(),
-            UniformGridScheme::Midpoint => (0..steps).map(|i| i as f64 + 0.5).collect(),
-            UniformGridScheme::Trapezoid => (1..steps).map(|i| i as f64).collect(),
-        };
-        let mut points: Vec<Float> = Vec::with_capacity(offsets.len() + 2);
-        if scheme == UniformGridScheme::Trapezoid {
-            points.push(Float::with_val(working, &lo));
-            points.push(Float::with_val(working, &hi));
-        }
-        points.extend(offsets.drain(..).map(point));
-        match variable {
-            GridVariable::U => points,
-            GridVariable::LogU => points.into_iter().map(|t| t.exp()).collect(),
+        match scheme {
+            UniformGridScheme::LeftRiemann => (0..steps).map(|i| point(i, false)).collect(),
+            UniformGridScheme::RightRiemann => (1..=steps).map(|i| point(i, false)).collect(),
+            UniformGridScheme::Midpoint => (0..steps).map(|i| point(i, true)).collect(),
+            UniformGridScheme::Trapezoid => std::iter::once(point(0, false))
+                .chain(std::iter::once(point(steps, false)))
+                .chain((1..steps).map(|i| point(i, false)))
+                .collect(),
         }
     }
 
@@ -2152,6 +2654,97 @@ pub mod hp {
         }
     }
 
+    fn coefficient_tail_evidence(
+        coefficients: &[Float],
+        precision_bits: u32,
+    ) -> Result<Vec<PortableCoefficientTailEvidence>> {
+        use rug::{float::Round, ops::AddAssignRound};
+        anyhow::ensure!(
+            !coefficients.is_empty() && coefficients.iter().all(Float::is_finite),
+            "coefficient-tail evidence requires finite retained coefficients"
+        );
+        let working = precision_bits.saturating_add(GUARD_BITS);
+        let mut coefficient_tail = Vec::with_capacity(RESOLUTION_EVIDENCE_THRESHOLD_DECADES.len());
+        for threshold_decades in RESOLUTION_EVIDENCE_THRESHOLD_DECADES {
+            let threshold_text = format!("1e-{threshold_decades}");
+            let threshold = resolution_threshold(&threshold_text, precision_bits)?;
+            let effective_bandwidth = coefficients
+                .iter()
+                .rposition(|coefficient| coefficient.clone().abs() > threshold);
+            let discarded_start = effective_bandwidth.map_or(0, |index| index + 1);
+            let mut one_sided_l1 = Float::with_val(working, 0u32);
+            let mut pointwise_bound = Float::with_val(working, 0u32);
+            let mut cosine_l2_squared = Float::with_val(working, 0u32);
+            for (index, coefficient) in coefficients.iter().enumerate().skip(discarded_start) {
+                let magnitude = coefficient.clone().abs();
+                one_sided_l1 += &magnitude;
+                let mut pointwise_term = magnitude;
+                if index > 0 {
+                    pointwise_term *= 2u32;
+                }
+                pointwise_bound.add_assign_round(pointwise_term, Round::Up);
+
+                let mut squared = Float::with_val(working, coefficient * coefficient);
+                if index > 0 {
+                    squared *= 2u32;
+                }
+                cosine_l2_squared += squared;
+            }
+            coefficient_tail.push(PortableCoefficientTailEvidence {
+                threshold: threshold_text,
+                effective_bandwidth,
+                discarded_one_sided_l1: decimal(&one_sided_l1, precision_bits),
+                // Both accumulation and serialization round outward. Ordinary
+                // decimal formatting can make an upper bound too small.
+                discarded_cosine_pointwise_bound: Float::with_val_round(
+                    precision_bits,
+                    &pointwise_bound,
+                    Round::Up,
+                )
+                .0
+                .to_string_radix_round(
+                    10,
+                    Some(
+                        2 + (f64::from(precision_bits) * std::f64::consts::LOG10_2).ceil() as usize,
+                    ),
+                    Round::Up,
+                ),
+                discarded_cosine_l2: decimal(&cosine_l2_squared.sqrt(), precision_bits),
+            });
+        }
+        Ok(coefficient_tail)
+    }
+
+    fn resolution_threshold(text: &str, p: u32) -> Result<Float> {
+        let value = Float::with_val_round(p, Float::parse(text)?, rug::float::Round::Down).0;
+        anyhow::ensure!(
+            value.is_finite() && value > 0,
+            "invalid resolution threshold"
+        );
+        Ok(value)
+    }
+
+    #[cfg(test)]
+    mod renewed_boundary_contract {
+        use super::*;
+        #[test]
+        fn resolution_acceptance_cannot_round_up_to_half() {
+            assert!(
+                resolution_threshold("0.499999999999999999999999999999999999999", 64).unwrap()
+                    < 0.5
+            );
+        }
+        #[test]
+        fn resolution_acceptance_cannot_round_down_an_excess_discrepancy() {
+            let p = 64;
+            let coarser = Float::with_val(p, Float::parse("1.0000000100000005").unwrap());
+            let finer = Float::with_val(p, 1);
+            let exact_difference = coarser.to_rational().unwrap() - 1;
+            assert!(exact_difference * 100_000_000u32 > 1);
+            assert!(!resolution_tolerance_met(&coarser, &finer, p));
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn compute_distance_resolution_evidence(
         eigenfunction: &WeilEigenfunction,
@@ -2207,53 +2800,14 @@ pub mod hp {
         {
             anyhow::bail!("resolution evidence has the wrong base-sample count");
         }
-        let working = precision_bits.saturating_add(GUARD_BITS);
         let coefficients = eigenfunction
             .normalized_coefficients()
             .into_iter()
             .map(|coefficient| Float::with_val(precision_bits, coefficient))
             .collect::<Vec<_>>();
         let n_modes = coefficients.len() - 1;
-        let mut coefficient_tail = Vec::with_capacity(RESOLUTION_EVIDENCE_THRESHOLD_DECADES.len());
-        for threshold_decades in RESOLUTION_EVIDENCE_THRESHOLD_DECADES {
-            let threshold_text = format!("1e-{threshold_decades}");
-            let parsed = Float::parse(&threshold_text)
-                .map_err(|error| anyhow::anyhow!("invalid resolution threshold: {error}"))?;
-            let threshold = Float::with_val(precision_bits, parsed);
-            let effective_bandwidth = coefficients
-                .iter()
-                .rposition(|coefficient| coefficient.clone().abs() > threshold);
-            let discarded_start = effective_bandwidth.map_or(0, |index| index + 1);
-            let mut one_sided_l1 = Float::with_val(working, 0u32);
-            let mut pointwise_bound = Float::with_val(working, 0u32);
-            let mut cosine_l2_squared = Float::with_val(working, 0u32);
-            for (index, coefficient) in coefficients.iter().enumerate().skip(discarded_start) {
-                let magnitude = coefficient.clone().abs();
-                one_sided_l1 += &magnitude;
-                let mut pointwise_term = magnitude;
-                if index > 0 {
-                    pointwise_term *= 2u32;
-                }
-                pointwise_bound += pointwise_term;
+        let coefficient_tail = coefficient_tail_evidence(&coefficients, precision_bits)?;
 
-                let mut squared = Float::with_val(working, coefficient * coefficient);
-                if index > 0 {
-                    squared *= 2u32;
-                }
-                cosine_l2_squared += squared;
-            }
-            coefficient_tail.push(PortableCoefficientTailEvidence {
-                threshold: threshold_text,
-                effective_bandwidth,
-                discarded_one_sided_l1: decimal(&one_sided_l1, precision_bits),
-                discarded_cosine_pointwise_bound: decimal(&pointwise_bound, precision_bits),
-                discarded_cosine_l2: decimal(&cosine_l2_squared.sqrt(), precision_bits),
-            });
-        }
-
-        let tolerance_parsed = Float::parse(RESOLUTION_EVIDENCE_RELATIVE_TOLERANCE)
-            .map_err(|error| anyhow::anyhow!("invalid resolution tolerance: {error}"))?;
-        let tolerance = Float::with_val(precision_bits, tolerance_parsed);
         let mut refinements = Vec::new();
         for (rule_index, (rule, base_distance)) in rules
             .iter()
@@ -2308,8 +2862,8 @@ pub mod hp {
                 &twice_distance.value,
                 precision_bits,
             );
-            let q_to_2q_absolute_text = decimal(&q_to_2q_absolute, precision_bits);
-            let q_to_2q_relative_text = decimal(&q_to_2q_relative, precision_bits);
+            let q_to_2q_absolute_text = retained_decimal(&q_to_2q_absolute, precision_bits);
+            let q_to_2q_relative_text = retained_decimal(&q_to_2q_relative, precision_bits);
 
             let (
                 four_times_resolution,
@@ -2317,13 +2871,19 @@ pub mod hp {
                 final_absolute,
                 final_relative,
                 final_resolution,
-            ) = if q_to_2q_relative <= tolerance {
+                tolerance_met,
+            ) = if resolution_tolerance_met(
+                &base_distance.value,
+                &twice_distance.value,
+                precision_bits,
+            ) {
                 (
                     None,
                     None,
                     q_to_2q_absolute,
                     q_to_2q_relative,
                     twice_resolution,
+                    true,
                 )
             } else {
                 let four_resolution = steps
@@ -2363,27 +2923,31 @@ pub mod hp {
                 );
                 (
                     Some(four_resolution),
-                    Some(decimal(&four_distance.value, precision_bits)),
+                    Some(retained_decimal(&four_distance.value, precision_bits)),
                     absolute,
                     relative,
                     four_resolution,
+                    resolution_tolerance_met(
+                        &twice_distance.value,
+                        &four_distance.value,
+                        precision_bits,
+                    ),
                 )
             };
-            let tolerance_met = final_relative <= tolerance;
             refinements.push(PortableRuleResolutionEvidence {
                 rule_family: rule.family().to_owned(),
                 quadrature_rule: rule.rule().to_owned(),
                 grid_variable: variable.as_str().to_owned(),
                 base_resolution: steps,
-                base_distance: decimal(&base_distance.value, precision_bits),
+                base_distance: retained_decimal(&base_distance.value, precision_bits),
                 twice_resolution,
-                twice_distance: decimal(&twice_distance.value, precision_bits),
+                twice_distance: retained_decimal(&twice_distance.value, precision_bits),
                 q_to_2q_absolute_difference: q_to_2q_absolute_text,
                 q_to_2q_relative_difference: q_to_2q_relative_text,
                 four_times_resolution,
                 four_times_distance,
-                final_absolute_difference: decimal(&final_absolute, precision_bits),
-                final_relative_difference: decimal(&final_relative, precision_bits),
+                final_absolute_difference: retained_decimal(&final_absolute, precision_bits),
+                final_relative_difference: retained_decimal(&final_relative, precision_bits),
                 final_resolution,
                 tolerance_met,
             });
@@ -2398,7 +2962,7 @@ pub mod hp {
             lambda_squared: lambda_squared.to_owned(),
             n_modes,
             precision_bits,
-            alpha: decimal(alpha, precision_bits),
+            alpha: alpha_identity(alpha, precision_bits),
             normalization: "f(1)=1".to_owned(),
             coefficient_count: coefficients.len(),
             coefficient_tail,
@@ -2409,6 +2973,31 @@ pub mod hp {
             zero_denominator_fallback: "absolute_difference".to_owned(),
             refinements,
         })
+    }
+
+    // Conservative decision on the retained binary point measurements. Display
+    // tolerances for serialized differences must never decide this verdict.
+    fn resolution_tolerance_met(coarser: &Float, finer: &Float, p: u32) -> bool {
+        use rug::float::Round;
+        let working = p.saturating_add(GUARD_BITS);
+        let coarser = &Float::with_val(p, coarser);
+        let finer = &Float::with_val(p, finer);
+        let (larger, smaller) = if coarser >= finer {
+            (coarser, finer)
+        } else {
+            (finer, coarser)
+        };
+        let absolute_upper = Float::with_val_round(working, larger - smaller, Round::Up).0;
+        let scaled_upper =
+            Float::with_val_round(working, &absolute_upper * 100_000_000u32, Round::Up).0;
+        if !scaled_upper.is_finite() {
+            return false;
+        }
+        if finer.is_zero() {
+            scaled_upper <= 1
+        } else {
+            scaled_upper <= *finer
+        }
     }
 
     pub(crate) fn validate_portable_distance_resolution_evidence(
@@ -2433,7 +3022,7 @@ pub mod hp {
             || artifact.lambda_squared != lambda_squared
             || artifact.n_modes != n_modes
             || artifact.precision_bits != precision_bits
-            || artifact.alpha != decimal(alpha, precision_bits)
+            || artifact.alpha != alpha_identity(alpha, precision_bits)
             || artifact.normalization != "f(1)=1"
             || artifact.coefficient_count != expected_coefficients
             || artifact.coefficient_tail.len() != RESOLUTION_EVIDENCE_THRESHOLD_DECADES.len()
@@ -2479,11 +3068,6 @@ pub mod hp {
             }
         }
 
-        let tolerance = parse_retained_float(
-            RESOLUTION_EVIDENCE_RELATIVE_TOLERANCE,
-            precision_bits,
-            "resolution tolerance",
-        )?;
         for (entry, rule) in artifact.refinements.iter().zip(uniform_rules) {
             let twice_resolution = rule
                 .resolution()
@@ -2540,7 +3124,7 @@ pub mod hp {
                                     right: &str,
                                     absolute: &str,
                                     relative: &str|
-             -> std::result::Result<(), xc_cache::CacheError> {
+             -> std::result::Result<bool, xc_cache::CacheError> {
                 let left = parse_retained_float(left, precision_bits, "refinement distance")?;
                 let right = parse_retained_float(right, precision_bits, "refinement distance")?;
                 let (expected_absolute, expected_relative) =
@@ -2568,29 +3152,26 @@ pub mod hp {
                         "refinement discrepancies do not follow from retained distances",
                     ));
                 }
-                Ok(())
+                Ok(resolution_tolerance_met(&left, &right, precision_bits))
             };
-            check_difference(
+            let q_to_2q_met = check_difference(
                 &entry.base_distance,
                 &entry.twice_distance,
                 &entry.q_to_2q_absolute_difference,
                 &entry.q_to_2q_relative_difference,
             )?;
-            if let Some(four) = &entry.four_times_distance {
+            let final_met = if let Some(four) = &entry.four_times_distance {
                 check_difference(
                     &entry.twice_distance,
                     four,
                     &entry.final_absolute_difference,
                     &entry.final_relative_difference,
-                )?;
-            }
+                )?
+            } else {
+                q_to_2q_met
+            };
 
-            let q_to_2q_relative = parse_retained_float(
-                &entry.q_to_2q_relative_difference,
-                precision_bits,
-                "Q-to-2Q relative difference",
-            )?;
-            let continued = q_to_2q_relative > tolerance;
+            let continued = !q_to_2q_met;
             match (
                 continued,
                 entry.four_times_resolution,
@@ -2619,12 +3200,7 @@ pub mod hp {
                     ));
                 }
             }
-            let final_relative = parse_retained_float(
-                &entry.final_relative_difference,
-                precision_bits,
-                "final relative difference",
-            )?;
-            if entry.tolerance_met != (final_relative <= tolerance) {
+            if entry.tolerance_met != final_met {
                 return Err(invalid_retained_payload(
                     "CCM resolution-evidence tolerance verdict is inconsistent",
                 ));
@@ -2785,18 +3361,8 @@ pub mod hp {
                     Float::with_val(source.precision_bits, &absolute)
                 };
             }
-            // Derive the one-sided masses from the values *as retained*, not
-            // from the wider working-precision originals.
-            //
-            // `decimal` emits `precision_bits * log10(2)` digits, which is two
-            // short of an exact round trip, so `parse(decimal(x))` differs from
-            // `x` in the low bits. The reader recomputes
-            // `(absolute +/- signed)/2` from the parsed decimals and requires
-            // the result to reproduce the retained strings exactly, so deriving
-            // here from the unrounded values leaves a quadruple that cannot
-            // validate. Rounding through the retained text first makes the
-            // stored four values self-consistent under the reader's own
-            // arithmetic.
+            // Use exact round-trip decimals of the retained p-bit masses.
+            // The dependent one-sided values use those same stored inputs.
             let absolute_text = decimal(&absolute, source.precision_bits);
             let signed_text = decimal(&signed, source.precision_bits);
             let retained = |text: &str, field: &str| -> Result<Float> {
@@ -2833,7 +3399,7 @@ pub mod hp {
             lambda_squared: source.lambda_squared.to_owned(),
             n_modes: source.eigenfunction.normalized_coefficients().len() - 1,
             precision_bits: source.precision_bits,
-            alpha: decimal(source.alpha, source.precision_bits),
+            alpha: alpha_identity(source.alpha, source.precision_bits),
             normalization: "f(1)=1".to_owned(),
             sampling_grid_variable: source.sampling_variable.as_str().to_owned(),
             sample_count: source.u_values.len(),
@@ -2890,7 +3456,7 @@ pub mod hp {
             || artifact.lambda_squared != lambda_squared
             || artifact.n_modes != n_modes
             || artifact.precision_bits != precision_bits
-            || artifact.alpha != decimal(alpha, precision_bits)
+            || artifact.alpha != alpha_identity(alpha, precision_bits)
             || artifact.normalization != "f(1)=1"
             || artifact.sampling_grid_variable != variable.as_str()
             || artifact.sample_count != expected_samples
@@ -3037,13 +3603,7 @@ pub mod hp {
         precision_bits: u32,
     ) -> Result<DecodedRetainedDistanceSource> {
         let parse = |text: &str, field: &str| -> Result<Float> {
-            let parsed = Float::parse(text)
-                .map_err(|error| anyhow::anyhow!("invalid retained {field}: {error}"))?;
-            let value = Float::with_val(precision_bits, parsed);
-            if !value.is_finite() {
-                anyhow::bail!("retained {field} must be finite");
-            }
-            Ok(value)
+            Ok(parse_retained_float(text, precision_bits, field)?)
         };
         let coefficients = profile
             .normalized_coefficients
@@ -3069,7 +3629,7 @@ pub mod hp {
                 Ok(WeightedGridValueHp {
                     value: parse(&measurement.distance_to_target, "target distance")?,
                     lambda: Float::with_val(precision_bits, lambda),
-                    alpha: Float::with_val(precision_bits, alpha),
+                    alpha: Float::with_val(precision_bits.saturating_add(GUARD_BITS), alpha),
                     rule: *rule,
                     precision_bits,
                 })
@@ -3116,7 +3676,9 @@ pub mod hp {
     /// first-class `ccm_distance_resolution_evidence` artifact. The evidence
     /// records coefficient-tail diagnostics and same-rule Q/2Q refinement,
     /// continuing deterministically to 4Q only when the declared tolerance
-    /// is not met.
+    /// is not met. Returned distances remain at the requested Q. Their
+    /// `resolution_tolerance_met` verdict uses Q/2Q; the separate
+    /// `resolution_ladder_tolerance_met` describes the last attempted pair.
     pub fn capture_ccm_distance_with_resolution_evidence_via_cache(
         params: &crate::ccm::CcmParams,
         cfg: &crate::ccm::hp::HighPrecConfig,
@@ -3320,11 +3882,7 @@ pub mod hp {
         let prec = cfg.precision_bits;
         let working = prec.saturating_add(GUARD_BITS);
         let lambda_sq_identity = lambda_squared_identity(params);
-        let lambda_sq = if params.lambda_sq.is_integer {
-            Float::with_val(working, params.lambda_sq.value_u64)
-        } else {
-            Float::with_val(working, params.lambda_sq.value_f64)
-        };
+        let lambda_sq = crate::ccm::hp::lambda_squared_value_hp(params, working)?;
         if lambda_sq <= 1u32 {
             anyhow::bail!("profile requires lambda_squared > 1");
         }
@@ -3335,23 +3893,25 @@ pub mod hp {
         let profile_key = SemanticKeyEnvelope {
             schema_version: 1,
             artifact_kind: "ccm_eigenfunction_profile".to_owned(),
-            mathematical_semantics_version: "ccm-eigenfunction-profile-lossless-v0.15.0-v1"
-                .to_owned(),
+            mathematical_semantics_version:
+                "ccm-eigenfunction-profile-checked-grid-and-coefficients-v0.15.1-v4".to_owned(),
             resolved_mathematical_parameters: serde_json::json!({
+                "uniform_grid_arithmetic": xc_numerics::grid_integral::UNIFORM_GRID_SEMANTICS,
                 "lambda_squared": lambda_sq_identity,
                 "n_modes": params.n_modes,
                 "precision_bits": prec,
                 "grid_variable": variable.as_str(),
                 "profile_steps": profile_steps,
                 "eigenpair_content_digest": eigenpair_content_digest,
-                "definition": "even CCM ground eigenfunction sampled on [1, lambda]"
+                "definition": "canonical even CCM smallest-magnitude eigenfunction sampled on [1, lambda]"
             }),
             normalization: Some("f(1)=1".to_owned()),
-            target: Some("finite_ccm_even_ground_eigenfunction".to_owned()),
+            target: Some("finite_ccm_even_selected_eigenfunction".to_owned()),
             subspace: Some("even".to_owned()),
             source_data_identities: BTreeMap::new(),
             algorithm_semantics: Some(
-                "even_cosine_reconstruction_from_canonical_weil_eigenpair_v2".to_owned(),
+                "even_cosine_reconstruction_from_canonical_weil_eigenpair_range_checked_v4"
+                    .to_owned(),
             ),
         };
         let profile_logical_key = format!(
@@ -3505,11 +4065,7 @@ pub mod hp {
         let target_spec = crate::target::TargetProfileSpec::from_environment()?;
         let target_definition_digest = target_spec.digest()?;
         let lambda_sq_identity = lambda_squared_identity(params);
-        let lambda_sq = if params.lambda_sq.is_integer {
-            Float::with_val(working, params.lambda_sq.value_u64)
-        } else {
-            Float::with_val(working, params.lambda_sq.value_f64)
-        };
+        let lambda_sq = crate::ccm::hp::lambda_squared_value_hp(params, working)?;
         if lambda_sq <= 1u32 {
             anyhow::bail!(
                 "distance capture integrates over [1, λ] and needs λ² > 1 (got {})",
@@ -3669,7 +4225,7 @@ pub mod hp {
             lambda_squared: lambda_sq_identity.clone(),
             n_modes: params.n_modes,
             precision_bits: prec,
-            alpha: retained_decimal(alpha, prec),
+            alpha: alpha_identity(alpha, prec),
             measurements: rules
                 .iter()
                 .zip(state.distances.iter().zip(&state.norm_values))
@@ -3726,27 +4282,30 @@ pub mod hp {
                 )
             };
         let mut resolution_tolerance_met = None;
+        let mut resolution_ladder_tolerance_met = None;
 
         let profile_key = SemanticKeyEnvelope {
             schema_version: 1,
             artifact_kind: "ccm_eigenfunction_profile".to_owned(),
-            mathematical_semantics_version: "ccm-eigenfunction-profile-lossless-v0.15.0-v1"
-                .to_owned(),
+            mathematical_semantics_version:
+                "ccm-eigenfunction-profile-checked-grid-and-coefficients-v0.15.1-v4".to_owned(),
             resolved_mathematical_parameters: serde_json::json!({
+                "uniform_grid_arithmetic": xc_numerics::grid_integral::UNIFORM_GRID_SEMANTICS,
                 "lambda_squared": lambda_sq_identity,
                 "n_modes": params.n_modes,
                 "precision_bits": prec,
                 "grid_variable": variable.as_str(),
                 "profile_steps": profile_steps,
                 "eigenpair_content_digest": eigenpair_content_digest,
-                "definition": "even CCM ground eigenfunction sampled on [1, lambda]"
+                "definition": "canonical even CCM smallest-magnitude eigenfunction sampled on [1, lambda]"
             }),
             normalization: Some("f(1)=1".to_owned()),
-            target: Some("finite_ccm_even_ground_eigenfunction".to_owned()),
+            target: Some("finite_ccm_even_selected_eigenfunction".to_owned()),
             subspace: Some("even".to_owned()),
             source_data_identities: BTreeMap::new(),
             algorithm_semantics: Some(
-                "even_cosine_reconstruction_from_canonical_weil_eigenpair_v2".to_owned(),
+                "even_cosine_reconstruction_from_canonical_weil_eigenpair_range_checked_v4"
+                    .to_owned(),
             ),
         };
         let profile_logical_key = format!(
@@ -3783,15 +4342,17 @@ pub mod hp {
         let distance_key = SemanticKeyEnvelope {
             schema_version: 1,
             artifact_kind: "ccm_target_distance".to_owned(),
-            mathematical_semantics_version: "ccm-runtime-target-distance-lossless-v0.15.0-v1"
-                .to_owned(),
+            mathematical_semantics_version:
+                "ccm-runtime-target-distance-exact-weight-checked-coefficients-v0.15.1-v4"
+                    .to_owned(),
             resolved_mathematical_parameters: serde_json::json!({
+                "uniform_grid_arithmetic": xc_numerics::grid_integral::UNIFORM_GRID_SEMANTICS,
                 "target_definition_digest": target_definition_digest,
                 "lambda_squared": lambda_sq_identity,
                 "n_modes": params.n_modes,
                 "precision_bits": prec,
                 "eigenpair_content_digest": eigenpair_content_digest,
-                "alpha": decimal(alpha, prec),
+                "alpha": alpha_identity(alpha, prec),
                 "rules": rules
                     .iter()
                     .map(|rule| {
@@ -3867,15 +4428,16 @@ pub mod hp {
         let evidence_key = SemanticKeyEnvelope {
             schema_version: 1,
             artifact_kind: "ccm_distance_resolution_evidence".to_owned(),
-            mathematical_semantics_version: "ccm-runtime-target-resolution-evidence-v0.14.1-v3"
+            mathematical_semantics_version: "ccm-runtime-target-resolution-evidence-roundtrip-tail-v7"
                 .to_owned(),
             resolved_mathematical_parameters: serde_json::json!({
+                "uniform_grid_arithmetic": xc_numerics::grid_integral::UNIFORM_GRID_SEMANTICS,
                 "target_definition_digest": target_definition_digest,
                 "lambda_squared": lambda_sq_identity,
                 "n_modes": params.n_modes,
                 "precision_bits": prec,
                 "eigenpair_content_digest": eigenpair_content_digest,
-                "alpha": decimal(alpha, prec),
+                "alpha": alpha_identity(alpha, prec),
                 "uniform_grid_rules": uniform_rule_parameters,
                 "coefficient_thresholds": RESOLUTION_EVIDENCE_THRESHOLD_DECADES
                     .iter()
@@ -3892,7 +4454,7 @@ pub mod hp {
             subspace: Some("even".to_owned()),
             source_data_identities: BTreeMap::new(),
             algorithm_semantics: Some(
-                "canonical_eigenpair_coefficient_tail_and_same_uniform_rule_q_2q_conditional_4q_v2"
+                "canonical_eigenpair_roundtrip_outward_tail_and_retained_point_q_2q_conditional_4q_v5"
                     .to_owned(),
             ),
         };
@@ -3942,15 +4504,16 @@ pub mod hp {
         let residual_key = SemanticKeyEnvelope {
             schema_version: 1,
             artifact_kind: "ccm_target_residual_analysis".to_owned(),
-            mathematical_semantics_version: "ccm-runtime-target-residual-analysis-v0.14.1-v3"
-                .to_owned(),
+            mathematical_semantics_version:
+                "ccm-runtime-target-residual-analysis-roundtrip-exact-weight-v6".to_owned(),
             resolved_mathematical_parameters: serde_json::json!({
+                "uniform_grid_arithmetic": xc_numerics::grid_integral::UNIFORM_GRID_SEMANTICS,
                 "target_definition_digest": target_definition_digest,
                 "lambda_squared": lambda_sq_identity,
                 "n_modes": params.n_modes,
                 "precision_bits": prec,
                 "eigenpair_content_digest": eigenpair_content_digest,
-                "alpha": decimal(alpha, prec),
+                "alpha": alpha_identity(alpha, prec),
                 "rules": rules
                     .iter()
                     .map(|rule| serde_json::json!({
@@ -3973,7 +4536,7 @@ pub mod hp {
             subspace: Some("even".to_owned()),
             source_data_identities: BTreeMap::new(),
             algorithm_semantics: Some(
-                "canonical_eigenpair_profile_sampled_sign_structure_and_same_rule_signed_mass_v2"
+                "canonical_eigenpair_roundtrip_profile_sign_structure_and_same_rule_signed_mass_v3"
                     .to_owned(),
             ),
         };
@@ -4007,9 +4570,10 @@ pub mod hp {
         let decomposition_key = SemanticKeyEnvelope {
             schema_version: 1,
             artifact_kind: "ccm_deviation_decomposition".to_owned(),
-            mathematical_semantics_version: "ccm-runtime-target-decomposition-v0.14.1-v4"
+            mathematical_semantics_version: "ccm-runtime-target-decomposition-roundtrip-v7"
                 .to_owned(),
             resolved_mathematical_parameters: serde_json::json!({
+                "uniform_grid_arithmetic": xc_numerics::grid_integral::UNIFORM_GRID_SEMANTICS,
                 "target_definition_digest": target_definition_digest,
                 "lambda_squared": lambda_sq_identity,
                 "n_modes": params.n_modes,
@@ -4020,6 +4584,8 @@ pub mod hp {
                 "auxiliary_parameter_condition":
                     "runtime specification fixes the auxiliary endpoint",
                 "quadrature_rule": DEVIATION_QUADRATURE_RULE,
+                "projection_arithmetic": crate::deviation::hp::PROJECTION_ARITHMETIC_V2,
+                "deviation_subtraction": "promote_retained_f_before_guard_precision_target_subtraction_v2",
                 "sign_convention": DEVIATION_SIGN_CONVENTION,
                 "metrics": [
                     crate::deviation::DeviationMetric::FactorWeighted.as_str(),
@@ -4032,7 +4598,7 @@ pub mod hp {
             subspace: Some("even".to_owned()),
             source_data_identities: BTreeMap::new(),
             algorithm_semantics: Some(
-                "canonical_eigenpair_profile_grid_trapezoid_projection_onto_runtime_auxiliary_profile_v2".to_owned(),
+                "canonical_eigenpair_roundtrip_profile_trapezoid_projection_onto_runtime_auxiliary_profile_v4".to_owned(),
             ),
         };
         let decomposition_logical_key = format!(
@@ -4117,7 +4683,7 @@ pub mod hp {
         let bind_key = |key: &SemanticKeyEnvelope, dependencies: &[DependencyRef]| {
             let mut key = key.clone();
             key.mathematical_semantics_version =
-                format!("{}-retained-parents-v0.15.0-v1", key.artifact_kind);
+                format!("{}-retained-parents-v3", key.mathematical_semantics_version);
             key.resolved_mathematical_parameters["retained_parent_dependencies"] =
                 serde_json::json!(dependencies);
             key
@@ -4218,7 +4784,10 @@ pub mod hp {
                     structural_resolution_evidence_check,
                 )?;
                 structural_resolution_evidence_check(&resolved_evidence.value)?;
-                resolution_tolerance_met = resolution_verdict(&resolved_evidence.value);
+                resolution_tolerance_met =
+                    resolution_verdict(&resolved_evidence.value, &resolved_distance.value)?;
+                resolution_ladder_tolerance_met =
+                    resolution_ladder_verdict(&resolved_evidence.value);
                 check_measurement_dependencies(&resolved_evidence, &child_dependencies)?;
             }
 
@@ -4275,16 +4844,14 @@ pub mod hp {
 
             // Full hit: decode the measurement from the retained artifact.
             let parse = |text: &str| -> Result<Float> {
-                let parsed = Float::parse(text)
-                    .map_err(|error| anyhow::anyhow!("invalid retained decimal: {error}"))?;
-                Ok(Float::with_val(prec, parsed))
+                Ok(parse_retained_float(text, prec, "cached measurement")?)
             };
             let mut distances = Vec::with_capacity(rules.len());
             for (rule, entry) in rules.iter().zip(&resolved_distance.value.measurements) {
                 distances.push(WeightedGridValueHp {
                     value: parse(&entry.distance_to_target)?,
                     lambda: Float::with_val(prec, &lambda),
-                    alpha: Float::with_val(prec, alpha),
+                    alpha: Float::with_val(prec.saturating_add(GUARD_BITS), alpha),
                     rule: *rule,
                     precision_bits: prec,
                 });
@@ -4295,6 +4862,7 @@ pub mod hp {
                 eigenvalue: parse(&resolved_distance.value.eigenvalue)?,
                 distances,
                 resolution_tolerance_met,
+                resolution_ladder_tolerance_met,
             });
         }
 
@@ -4384,7 +4952,9 @@ pub mod hp {
                     Ok(())
                 },
             )?;
-            resolution_tolerance_met = resolution_verdict(&resolved_evidence.value);
+            resolution_tolerance_met =
+                resolution_verdict(&resolved_evidence.value, &resolved_distance.value)?;
+            resolution_ladder_tolerance_met = resolution_ladder_verdict(&resolved_evidence.value);
             check_measurement_dependencies(&resolved_evidence, &child_dependencies)?;
             if resolved_evidence.value != evidence_payload {
                 anyhow::bail!(
@@ -4463,13 +5033,66 @@ pub mod hp {
             )?
             .distances,
             resolution_tolerance_met,
+            resolution_ladder_tolerance_met,
         })
     }
 
-    fn resolution_verdict(evidence: &PortableDistanceResolutionEvidence) -> Option<bool> {
+    // Recompute the returned-Q verdict from the retained point values, not
+    // displayed differences or the last-pair Boolean. Bind it to the exact
+    // measurement that the public result decodes, including warm cache reads.
+    fn resolution_verdict(
+        evidence: &PortableDistanceResolutionEvidence,
+        distance: &PortableTargetDistance,
+    ) -> Result<Option<bool>> {
+        let measurements = distance
+            .measurements
+            .iter()
+            .filter(|measurement| measurement.rule_family == "uniform_grid")
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            evidence.target_definition_digest == distance.target_definition_digest
+                && evidence.lambda_squared == distance.lambda_squared
+                && evidence.n_modes == distance.n_modes
+                && evidence.precision_bits == distance.precision_bits
+                && evidence.alpha == distance.alpha
+                && evidence.refinements.len() == measurements.len(),
+            "resolution verdict does not match the returned distance identity"
+        );
+        if measurements.is_empty() {
+            return Ok(None);
+        }
+        let p = evidence.precision_bits;
+        let mut all_met = true;
+        for (entry, measurement) in evidence.refinements.iter().zip(measurements) {
+            anyhow::ensure!(
+                entry.rule_family == measurement.rule_family
+                    && entry.quadrature_rule == measurement.quadrature_rule
+                    && entry.grid_variable == measurement.grid_variable
+                    && entry.base_resolution == measurement.resolution,
+                "resolution verdict does not match the returned distance rule"
+            );
+            let reported =
+                parse_retained_float(&measurement.distance_to_target, p, "reported distance")?;
+            let base = parse_retained_float(&entry.base_distance, p, "resolution base distance")?;
+            let twice = parse_retained_float(&entry.twice_distance, p, "twice-refined distance")?;
+            anyhow::ensure!(
+                base == reported,
+                "resolution verdict does not match the returned Q distance"
+            );
+            all_met &= resolution_tolerance_met(&reported, &twice, p);
+        }
+        Ok(Some(all_met))
+    }
+
+    fn resolution_ladder_verdict(evidence: &PortableDistanceResolutionEvidence) -> Option<bool> {
         (!evidence.refinements.is_empty())
             .then(|| evidence.refinements.iter().all(|r| r.tolerance_met))
     }
+    #[cfg(test)]
+    mod resolution_contract {
+        include!("distance/resolution_contracts.rs");
+    }
+
     fn measurement_dependency<T: Serialize>(
         result: &xc_cache::ArtifactExecutionCacheResult<T>,
         key: &xc_cache::SemanticKeyEnvelope,
@@ -4526,6 +5149,52 @@ pub mod hp {
         pub resolution: usize,
         /// `D_α(N, M; λ)` under this rule.
         pub distance: String,
+    }
+
+    fn portable_rule_distance(
+        rule: WeightedIntegrationRule,
+        value: &Float,
+        prec: u32,
+    ) -> PortableRuleDistance {
+        PortableRuleDistance {
+            rule_family: rule.family().to_owned(),
+            quadrature_rule: rule.rule().to_owned(),
+            grid_variable: rule.variable().as_str().to_owned(),
+            resolution: rule.resolution(),
+            distance: retained_decimal(value, prec),
+        }
+    }
+
+    #[cfg(test)]
+    mod portable_distance_contract {
+        use super::*;
+        use rug::ops::Pow;
+        #[test]
+        fn every_stored_distance_bit_round_trips_for_all_rule_families() {
+            for p in [64, 128, 256] {
+                let mut value = Float::with_val(p, 1);
+                value += Float::with_val(p, 2).pow(1 - p as i32);
+                for rule in [
+                    WeightedIntegrationRule::UniformGrid {
+                        scheme: UniformGridScheme::Trapezoid,
+                        variable: GridVariable::U,
+                        steps: 19,
+                    },
+                    WeightedIntegrationRule::GaussLegendre {
+                        points: 12,
+                        variable: GridVariable::LogU,
+                    },
+                ] {
+                    let payload = portable_rule_distance(rule, &value, p);
+                    let encoded = serde_json::to_vec(&payload).unwrap();
+                    let decoded: PortableRuleDistance = serde_json::from_slice(&encoded).unwrap();
+                    assert_eq!(
+                        Float::with_val(p, Float::parse(&decoded.distance).unwrap()),
+                        value
+                    );
+                }
+            }
+        }
     }
 
     /// Portable inter-discretization distances for one `λ²`.
@@ -4668,13 +5337,7 @@ pub mod hp {
 
         let mut measurements = Vec::with_capacity(rules.len());
         for (rule, distance) in rules.iter().zip(&measurement.distances) {
-            measurements.push(PortableRuleDistance {
-                rule_family: rule.family().to_owned(),
-                quadrature_rule: rule.rule().to_owned(),
-                grid_variable: rule.variable().as_str().to_owned(),
-                resolution: rule.resolution(),
-                distance: decimal(&distance.value, prec),
-            });
+            measurements.push(portable_rule_distance(*rule, &distance.value, prec));
         }
         let payload = PortableDiscretizationDistance {
             schema_version: 1,
@@ -4682,22 +5345,24 @@ pub mod hp {
             n_modes: lower.n_modes,
             m_modes: higher.n_modes,
             precision_bits: prec,
-            alpha: decimal(alpha, prec),
+            alpha: alpha_identity(alpha, prec),
             measurements,
         };
 
         let semantic_key = SemanticKeyEnvelope {
             schema_version: 1,
             artifact_kind: "ccm_discretization_distance".to_owned(),
-            mathematical_semantics_version: "ccm-discretization-distance-v0.14.1-v2".to_owned(),
+            mathematical_semantics_version: "ccm-discretization-distance-roundtrip-pinned-grid-v6"
+                .to_owned(),
             resolved_mathematical_parameters: serde_json::json!({
+                "uniform_grid_arithmetic": xc_numerics::grid_integral::UNIFORM_GRID_SEMANTICS,
                 "lambda_squared": lambda_sq_identity,
                 "n_modes": lower.n_modes,
                 "m_modes": higher.n_modes,
                 "precision_bits": prec,
                 "lower_eigenpair_content_digest": lower_eigenpair_content_digest,
                 "higher_eigenpair_content_digest": higher_eigenpair_content_digest,
-                "alpha": decimal(alpha, prec),
+                "alpha": alpha_identity(alpha, prec),
                 "rules": rules
                     .iter()
                     .map(|rule| {
@@ -4829,6 +5494,12 @@ mod tests {
             f_values,
             normalized_coefficients: Vec::new(),
         };
+        for precision in [0, 31, 1_000_001] {
+            assert!(hp::compute_deviation_decomposition_payload(&profile, precision).is_err());
+        }
+        let mut underflowed = profile.clone();
+        underflowed.f_values[0] = "1e-400000000".to_owned();
+        assert!(hp::compute_deviation_decomposition_payload(&underflowed, PREC).is_err());
         let good = hp::compute_deviation_decomposition_payload(&profile, PREC).unwrap();
         let samples = good.sample_count;
         let check = |a: &hp::PortableDeviationDecomposition| {
@@ -5205,9 +5876,8 @@ mod tests {
     }
 
     /// A profile that never crosses the target reports no sign change, and one
-    /// that crosses reports a bracket containing it. The count is what decides
-    /// whether Gauss-Legendre keeps its spectral advantage for a
-    /// configuration, so it must not be inferred or assumed.
+    /// that crosses reports a sampled bracket containing it. This checks
+    /// the finite diagnostic, not smoothness or a quadrature convergence rate.
     #[test]
     fn target_crossings_detect_sign_changes_and_bracket_them() {
         let lambda = 4.0_f64;
@@ -5245,6 +5915,7 @@ mod tests {
         let mut xi = vec![0.0_f64; 5];
         xi[2] = 2.0; // ξ₀
         xi[3] = 1.0; // ξ₁ contributes 2·(−1)·1 = −2 at u = 1
+        xi[1] = xi[3];
         assert!(WeilEigenfunctionF64::from_v_basis(&xi, 2, 4.0).is_err());
     }
 
@@ -5288,6 +5959,11 @@ mod tests {
                 let mut v = Float::with_val(PREC, (k as i64 % 17) - 8);
                 v /= Float::with_val(PREC, (k + 3) as u32);
                 xi.push(v);
+            }
+            // Preserve the serial reference's center/positive coefficients,
+            // and supply their required exact reflection in the negative half.
+            for j in 1..=n_modes {
+                xi[n_modes - j] = xi[n_modes + j].clone();
             }
             let ef = WeilEigenfunction::from_v_basis(&xi, n_modes, &lambda, PREC).ok()?;
             let step = Float::with_val(PREC, &lambda - Float::with_val(PREC, 1u32)) / POINTS as u32;
@@ -5781,7 +6457,7 @@ mod tests {
                 lambda_squared: "4".to_owned(),
                 n_modes: 2,
                 precision_bits: prec,
-                alpha: hp::decimal(&alpha, prec),
+                alpha: Float::with_val(prec + 64, &alpha).to_string(),
                 measurements: vec![hp::PortableRuleMeasurement {
                     rule_family: rule.family().to_owned(),
                     quadrature_rule: rule.rule().to_owned(),
@@ -6065,6 +6741,109 @@ mod tests {
                 },
             )
             .expect("a freshly computed residual analysis must satisfy its own validator");
+        }
+
+        #[test]
+        fn residual_diagnostics_retain_every_stored_bit() {
+            for prec in [164, 264] {
+                let lambda = Float::with_val(prec, 3u32);
+                let alpha = Float::with_val(prec, 0.5);
+
+                // Equal nonzero cosine coefficients give a strongly oscillating
+                // normalized profile that crosses the benign runtime test target.
+                let n_modes = 4usize;
+                let xi = vec![Float::with_val(prec, 1u32); 2 * n_modes + 1];
+                let eigenfunction =
+                    hp::WeilEigenfunction::from_v_basis(&xi, n_modes, &lambda, prec).unwrap();
+
+                let rules = [WeightedIntegrationRule::UniformGrid {
+                    scheme: UniformGridScheme::Trapezoid,
+                    variable: GridVariable::U,
+                    steps: 64,
+                }];
+                let base_distances = rules
+                    .iter()
+                    .map(|rule| {
+                        hp::distance_to_target(
+                            |u: &Float| eigenfunction.eval(u),
+                            &lambda,
+                            &alpha,
+                            *rule,
+                            prec,
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let u_values = (0..=16)
+                    .map(|index| {
+                        let mut u = Float::with_val(prec, &lambda - 1u32);
+                        u *= index;
+                        u /= 16u32;
+                        u += 1u32;
+                        u
+                    })
+                    .collect::<Vec<_>>();
+                let f_values = u_values
+                    .iter()
+                    .map(|u| eigenfunction.eval(u))
+                    .collect::<Vec<_>>();
+
+                let analysis =
+                    hp::compute_target_residual_analysis(hp::TargetResidualAnalysisSource {
+                        eigenfunction: &eigenfunction,
+                        lambda: &lambda,
+                        alpha: &alpha,
+                        rules: &rules,
+                        base_distances: &base_distances,
+                        precomputed_signed_residuals: None,
+                        target_definition_digest: &test_target_digest(),
+                        lambda_squared: "9",
+                        sampling_variable: GridVariable::U,
+                        precision_bits: prec,
+                        u_values: &u_values,
+                        f_values: &f_values,
+                    })
+                    .unwrap();
+
+                // The case is only meaningful if the residual really is two-sided.
+                let measurement = &analysis.measurements[0];
+                assert_eq!(
+                    measurement.absolute_residual_mass,
+                    base_distances[0].value.to_string()
+                );
+                let decoded = Float::with_val(
+                    prec,
+                    Float::parse(&measurement.absolute_residual_mass).unwrap(),
+                );
+                assert_eq!(decoded, base_distances[0].value);
+                assert_ne!(
+                    measurement.negative_residual_mass, "0",
+                    "probe profile does not cross the target; the regression would not bite"
+                );
+                assert_ne!(
+                    measurement.positive_residual_mass, "0",
+                    "probe profile does not cross the target; the regression would not bite"
+                );
+                assert_ne!(
+                    measurement.absolute_residual_mass, measurement.signed_residual_mass,
+                    "a snapped one-sided residual would not exercise the halving"
+                );
+
+                hp::validate_portable_target_residual_analysis(
+                    &analysis,
+                    hp::TargetResidualAnalysisValidationRequest {
+                        target_definition_digest: &test_target_digest(),
+                        lambda_squared: "9",
+                        n_modes,
+                        precision_bits: prec,
+                        alpha: &alpha,
+                        rules: &rules,
+                        variable: GridVariable::U,
+                        profile_steps: 16,
+                    },
+                )
+                .expect("a freshly computed residual analysis must satisfy its own validator");
+            }
         }
 
         /// The residual artifact exposes the directional information hidden

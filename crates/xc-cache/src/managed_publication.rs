@@ -25,7 +25,7 @@ pub const MANAGED_VALIDATOR_ID: &str = "toolkit-integrated-validation-v1";
 fn producer_source_revision() -> Result<String, CacheError> {
     let revision = option_env!("XC_SOURCE_REVISION").ok_or_else(|| {
         CacheError::InvalidManifest(
-            "author publication requires an exact toolkit Git revision; build from a Git checkout or set XC_SOURCE_REVISION to the full commit hash".to_owned(),
+            "author publication requires a toolkit Git base revision; build from a Git checkout or set XC_SOURCE_REVISION to the full commit hash".to_owned(),
         )
     })?;
     if revision.len() != 40
@@ -103,34 +103,71 @@ fn advance_capacity_ledger_for_repository_batch(
     sequence: u64,
     expected_head: &str,
     parts: &[TransportPart],
-) -> Result<(), CacheError> {
-    let payload_bytes_added = parts
-        .iter()
-        .filter(|part| part.repository_path.starts_with("objects/"))
-        .map(|part| part.size_bytes)
-        .sum::<u64>();
-    let metadata_bytes_added = parts
-        .iter()
-        .filter(|part| !part.repository_path.starts_with("objects/"))
-        .map(|part| part.size_bytes)
-        .sum::<u64>();
-    let admission = ledger.assess_addition(payload_bytes_added, metadata_bytes_added, 0)?;
-    if !admission.accepted {
-        return Err(CacheError::ResourceLimit(format!(
-            "shard capacity admission failed before batch {sequence}: {}",
-            admission.reasons.join("; ")
-        )));
+) -> Result<Vec<u8>, CacheError> {
+    ledger.validate()?;
+    let sum_parts = |payload: bool| {
+        parts
+            .iter()
+            .filter(|part| part.repository_path.starts_with("objects/") == payload)
+            .try_fold(0u64, |sum, part| {
+                sum.checked_add(part.size_bytes).ok_or_else(|| {
+                    CacheError::ResourceLimit("batch part byte sum exceeds u64".to_owned())
+                })
+            })
+    };
+    let payload_bytes_added = sum_parts(true)?;
+    let part_metadata_bytes = sum_parts(false)?;
+    let base_digest = canonical_digest(ledger)?;
+    let mut ledger_size = 0u64;
+    // The metadata total contains this very document. Its serialized length
+    // changes at decimal digit boundaries, so solve that size before admission.
+    for _ in 0..16 {
+        let metadata_bytes_added =
+            part_metadata_bytes
+                .checked_add(ledger_size)
+                .ok_or_else(|| {
+                    CacheError::ResourceLimit("batch metadata byte sum exceeds u64".to_owned())
+                })?;
+        let mut candidate = ledger.clone();
+        candidate.first_seen_immutable_payload_bytes = candidate
+            .first_seen_immutable_payload_bytes
+            .checked_add(payload_bytes_added)
+            .ok_or_else(|| {
+                CacheError::ResourceLimit("batch payload accounting exceeds u64".to_owned())
+            })?;
+        candidate.manifest_index_receipt_bytes = candidate
+            .manifest_index_receipt_bytes
+            .checked_add(metadata_bytes_added)
+            .ok_or_else(|| {
+                CacheError::ResourceLimit("batch metadata accounting exceeds u64".to_owned())
+            })?;
+        candidate.last_reconciled_commit = expected_head.to_owned();
+        candidate.reconciliation_digest = canonical_digest(&serde_json::json!({
+            "transaction_id": transaction_id, "sequence": sequence,
+            "expected_head": expected_head, "base_ledger_digest": base_digest,
+            "payload_bytes_added": payload_bytes_added,
+            "metadata_bytes_added": metadata_bytes_added,
+        }))?;
+        candidate.validate()?;
+        let bytes = crate::protocol::canonical_json_bytes(&candidate)?;
+        let actual_size = bytes.len() as u64;
+        if actual_size == ledger_size {
+            let admission = ledger.assess_addition(payload_bytes_added, metadata_bytes_added, 0)?;
+            if !admission.accepted {
+                return Err(CacheError::ResourceLimit(format!(
+                    "shard capacity admission failed before batch {sequence}: {}",
+                    admission.reasons.join("; ")
+                )));
+            }
+            // A failure above leaves the caller's ledger unchanged.
+            *ledger = candidate;
+            return Ok(bytes);
+        }
+        ledger_size = actual_size;
     }
-    ledger.first_seen_immutable_payload_bytes = ledger
-        .first_seen_immutable_payload_bytes
-        .saturating_add(payload_bytes_added);
-    ledger.manifest_index_receipt_bytes = ledger
-        .manifest_index_receipt_bytes
-        .saturating_add(metadata_bytes_added);
-    ledger.last_reconciled_commit = expected_head.to_owned();
-    ledger.reconciliation_digest =
-        ContentDigest::sha256(format!("{transaction_id}:{sequence}:{expected_head}").as_bytes());
-    ledger.validate()
+    Err(CacheError::InvalidManifest(
+        "batch ledger byte accounting did not converge".to_owned(),
+    ))
 }
 
 fn prune_unreferenced_current_tree(
@@ -292,11 +329,53 @@ fn preflight_producer_monotonicity(
         .ensure_monotonic_producer(semantic_digest, producer_toolkit_version)
 }
 
+fn validate_prepared_publication(
+    prepared: &ManagedPreparedArtifactPublication,
+) -> Result<(), CacheError> {
+    let journal = prepared.coordinated.journal.as_ref().ok_or_else(|| {
+        CacheError::InvalidTransition("managed publication has no authorized journal".into())
+    })?;
+    journal.validate()?;
+    let destinations = journal.targets.keys().copied().collect::<Vec<_>>();
+    if !prepared.coordinated.authorized()
+        || prepared.bundles.keys().copied().collect::<Vec<_>>() != destinations
+        || prepared
+            .coordinated
+            .target_reports
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+            != destinations
+        || prepared.policy.digest()? != journal.policy_digest
+        || prepared.topology.digest()? != prepared.coordinated.topology_digest
+    {
+        return Err(CacheError::InvalidManifest(
+            "prepared publication no longer matches its authorized identities and targets".into(),
+        ));
+    }
+    for (destination, bundle) in &prepared.bundles {
+        crate::publication_staging::validate_bundle(journal, *destination, bundle)?;
+        crate::publication_staging::validate_public_documents(
+            journal,
+            *destination,
+            bundle,
+            (*destination == PublicationDestination::Public).then_some(&prepared.policy.sanitizer),
+        )?;
+        if bundle.encoding.digest()? != prepared.coordinated.transport_digest {
+            return Err(CacheError::InvalidManifest(
+                "prepared transport identity changed".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn completed_remote_publication(
     prepared: &ManagedPreparedArtifactPublication,
     remotes: &BTreeMap<PublicationDestination, &dyn crate::RemoteGitStore>,
     cancellation: &xc_core::CancellationToken,
 ) -> Result<Option<ManagedPublicationExecutionReport>, CacheError> {
+    validate_prepared_publication(prepared)?;
     let journal = prepared.coordinated.journal.as_ref().ok_or_else(|| {
         CacheError::InvalidTransition(
             "managed publication has no authorized transaction journal".to_owned(),
@@ -689,7 +768,9 @@ fn stage_family_document(
             });
         }
     } else {
-        std::fs::write(&target, &bytes)?;
+        // A terminated write must not expose an incomplete immutable document.
+        // Existing differing bytes remain an error and are never repaired here.
+        crate::atomic_replace(&target, &bytes)?;
     }
     files.entry(path.clone()).or_insert(TransportPart {
         sequence: 0,
@@ -1556,22 +1637,25 @@ fn execute_family_batch_publication(
             }
             eprintln!(
                 "publication family {}: batch {}/{} checked in {:.3}s; {} existing bytes reused, {} new or updated bytes",
-                first.family, batch_number, total_batches, batch_started.elapsed().as_secs_f64(),
-                reused_bytes, commit_parts.iter().map(|part| part.size_bytes).sum::<u64>()
+                first.family,
+                batch_number,
+                total_batches,
+                batch_started.elapsed().as_secs_f64(),
+                reused_bytes,
+                commit_parts.iter().map(|part| part.size_bytes).sum::<u64>()
             );
             remote.publication_event("batch_checked",batch_started.elapsed(),serde_json::json!({"batch":batch_number,"planned_batches":total_batches,"reused_bytes":reused_bytes,"scheduled_bytes":commit_parts.iter().map(|p|p.size_bytes).sum::<u64>()}));
             if commit_parts.is_empty() {
                 remote.publication_event("batch_reused",batch_started.elapsed(),serde_json::json!({"batch":batch_number,"remaining_batches":total_batches-batch_number as usize}));
                 continue;
             }
-            advance_capacity_ledger_for_repository_batch(
+            let ledger_bytes = advance_capacity_ledger_for_repository_batch(
                 &mut ledger,
                 &batch.batch_id,
                 batch_plan.sequence,
                 &current_head,
                 &commit_parts,
             )?;
-            let ledger_bytes = crate::protocol::canonical_json_bytes(&ledger)?;
             let ledger_target = staging_root.join(crate::DEFAULT_CAPACITY_LEDGER_PATH);
             if let Some(parent) = ledger_target.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -1620,7 +1704,7 @@ fn execute_family_batch_publication(
                     } => {
                         return Err(CacheError::InvalidTransition(format!(
                             "family batch publication conflicted at {remote_head}"
-                        )))
+                        )));
                     }
                 }
             }
@@ -2426,6 +2510,9 @@ fn exact_destination_dependency_exists_in_shard(
 fn collect_leaf_paths(prefix: &str, value: &Value, paths: &mut BTreeSet<String>) {
     match value {
         Value::Object(map) => {
+            if map.is_empty() {
+                paths.insert(prefix.to_owned());
+            }
             for (key, value) in map {
                 let path = if prefix.is_empty() {
                     key.clone()
@@ -2436,6 +2523,9 @@ fn collect_leaf_paths(prefix: &str, value: &Value, paths: &mut BTreeSet<String>)
             }
         }
         Value::Array(values) => {
+            if values.is_empty() {
+                paths.insert(prefix.to_owned());
+            }
             for (index, value) in values.iter().enumerate() {
                 collect_leaf_paths(&format!("{prefix}[{index}]"), value, paths);
             }
@@ -2581,12 +2671,22 @@ fn prepare_managed_artifact_publication_for_targets(
         subject_digest: public_manifest.digest()?,
         actor: context.principal.clone(),
         policy_digest: placeholder_policy,
-        execution_fingerprint_digest: canonical_digest(&draft.source_artifact_key)?,
+        execution_fingerprint_digest: canonical_digest(&(
+            "toolkit-source-bound-execution-v2",
+            &draft.source_artifact_key,
+            env!("XC_SOURCE_TREE_DIGEST"),
+        ))?,
         producer_toolkit_version: public_manifest.producer_toolkit_version.clone(),
-        dependency_versions: BTreeMap::from([(
-            "xcelerator-toolkit".to_owned(),
-            env!("CARGO_PKG_VERSION").to_owned(),
-        )]),
+        dependency_versions: BTreeMap::from([
+            (
+                "xcelerator-toolkit".to_owned(),
+                env!("CARGO_PKG_VERSION").to_owned(),
+            ),
+            (
+                "xcelerator-toolkit-source-sha256".to_owned(),
+                env!("XC_SOURCE_TREE_DIGEST").to_owned(),
+            ),
+        ]),
         source_revision,
         event_unix_seconds: context.event_unix_seconds,
         location: None,
@@ -2836,6 +2936,10 @@ pub fn execute_prepared_managed_artifact_publication(
     receipt_verified_at_unix_seconds: u64,
     replace_existing_semantic: bool,
 ) -> Result<ManagedPublicationExecutionReport, CacheError> {
+    cancellation
+        .check()
+        .map_err(|error| CacheError::Cancelled(error.to_string()))?;
+    validate_prepared_publication(prepared)?;
     if receipt_verified_at_unix_seconds == 0 {
         return Err(CacheError::InvalidManifest(
             "managed publication receipt time must be positive".to_owned(),
@@ -2870,31 +2974,35 @@ pub fn execute_prepared_managed_artifact_publication(
                 PublicationDestination::Public => "public",
             });
         for part in &prepared.bundles[&destination].encoding.ordered_parts {
-            let source = part
-                .repository_path
-                .split('/')
-                .fold(staging_root.to_owned(), |path, component| {
-                    path.join(component)
-                });
-            let target = part
-                .repository_path
-                .split('/')
-                .fold(target_root.clone(), |path, component| path.join(component));
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
+            let source = crate::publication_staging::resolve_staging_path(
+                staging_root,
+                &part.repository_path,
+            )?;
+            crate::publication_staging::verify_existing_file(
+                &source,
+                part.size_bytes,
+                &part.content_digest,
+                cancellation,
+            )?;
+            let target = crate::publication_staging::resolve_staging_path(
+                &target_root,
+                &part.repository_path,
+            )?;
+            match std::fs::symlink_metadata(&target) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if std::fs::hard_link(&source, &target).is_err() {
+                        std::fs::copy(&source, &target)?;
+                    }
+                }
+                Err(error) => return Err(error.into()),
             }
-            if !target.exists() && std::fs::hard_link(&source, &target).is_err() {
-                std::fs::copy(&source, &target)?;
-            }
-            let bytes = std::fs::read(&target)?;
-            if bytes.len() as u64 != part.size_bytes
-                || ContentDigest::sha256(&bytes) != part.content_digest
-            {
-                return Err(CacheError::DigestMismatch {
-                    expected: part.content_digest.to_string(),
-                    actual: ContentDigest::sha256(&bytes).to_string(),
-                });
-            }
+            crate::publication_staging::verify_existing_file(
+                &target,
+                part.size_bytes,
+                &part.content_digest,
+                cancellation,
+            )?;
         }
         target_staging_roots.insert(destination, target_root);
     }
@@ -4913,6 +5021,9 @@ mod tests {
 
     #[test]
     fn managed_publication_embeds_a_full_source_commit() {
+        let tree = env!("XC_SOURCE_TREE_DIGEST");
+        assert_eq!(tree.len(), 64);
+        assert!(tree.bytes().all(|b| b.is_ascii_hexdigit()));
         let revision = producer_source_revision().unwrap();
         assert_eq!(revision.len(), 40);
         assert!(revision
@@ -5216,7 +5327,7 @@ mod tests {
                 content_digest: ContentDigest::sha256(b"manifest"),
             },
         ];
-        advance_capacity_ledger_for_repository_batch(
+        let first_bytes = advance_capacity_ledger_for_repository_batch(
             &mut capacity,
             &transaction,
             0,
@@ -5225,7 +5336,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(capacity.first_seen_immutable_payload_bytes, 90);
-        assert_eq!(capacity.manifest_index_receipt_bytes, 10);
+        assert_eq!(
+            capacity.manifest_index_receipt_bytes,
+            10 + first_bytes.len() as u64
+        );
+        assert_eq!(
+            first_bytes,
+            crate::protocol::canonical_json_bytes(&capacity).unwrap()
+        );
         let first_reconciliation = capacity.reconciliation_digest.clone();
 
         let second = vec![TransportPart {
@@ -5234,7 +5352,7 @@ mod tests {
             size_bytes: 12,
             content_digest: ContentDigest::sha256(b"index"),
         }];
-        advance_capacity_ledger_for_repository_batch(
+        let second_bytes = advance_capacity_ledger_for_repository_batch(
             &mut capacity,
             &transaction,
             1,
@@ -5243,9 +5361,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(capacity.first_seen_immutable_payload_bytes, 90);
-        assert_eq!(capacity.manifest_index_receipt_bytes, 22);
+        assert_eq!(
+            capacity.manifest_index_receipt_bytes,
+            22 + first_bytes.len() as u64 + second_bytes.len() as u64
+        );
+        assert_eq!(
+            second_bytes,
+            crate::protocol::canonical_json_bytes(&capacity).unwrap()
+        );
         assert_eq!(capacity.last_reconciled_commit, "b".repeat(40));
         assert_ne!(capacity.reconciliation_digest, first_reconciliation);
+    }
+
+    #[test]
+    fn repository_batch_ledger_self_bytes_gate_capacity_without_partial_mutation() {
+        let mut capacity = ledger("private-test-0001", &"a".repeat(40));
+        capacity.warning_reserve_bytes = 0;
+        capacity.hard_capacity_bytes = 10;
+        let before = capacity.clone();
+        let parts = [TransportPart {
+            sequence: 0,
+            repository_path: "manifests/a.json".into(),
+            size_bytes: 10,
+            content_digest: ContentDigest::sha256(b"fixture"),
+        }];
+        assert!(advance_capacity_ledger_for_repository_batch(
+            &mut capacity,
+            &ContentDigest::sha256(b"transaction"),
+            0,
+            &"a".repeat(40),
+            &parts
+        )
+        .is_err());
+        assert_eq!(capacity, before);
+        let oversized = [
+            TransportPart {
+                size_bytes: u64::MAX,
+                ..parts[0].clone()
+            },
+            parts[0].clone(),
+        ];
+        assert!(advance_capacity_ledger_for_repository_batch(
+            &mut capacity,
+            &ContentDigest::sha256(b"transaction"),
+            0,
+            &"a".repeat(40),
+            &oversized
+        )
+        .is_err());
+        assert_eq!(capacity, before);
     }
 
     #[test]
@@ -5432,6 +5596,42 @@ mod tests {
                 &remote as &dyn RemoteGitStore,
             ),
         ]);
+        let mut missing_bundle = prepared.clone();
+        missing_bundle.bundles.clear();
+        let invalid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute_prepared_managed_artifact_publication(
+                &mut missing_bundle,
+                &remote_map,
+                &checkpoints,
+                &CancellationToken::new(),
+                &sessions,
+                &staging,
+                &ResourcePolicy::default(),
+                40,
+                123,
+                false,
+            )
+        }));
+        assert!(
+            matches!(invalid, Ok(Err(_))),
+            "mutable prepared bundle must be rejected without a panic"
+        );
+        let mut invalid_journal = prepared.clone();
+        invalid_journal
+            .coordinated
+            .journal
+            .as_mut()
+            .unwrap()
+            .semantic_digest
+            .0
+            .clear();
+        let invalid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            completed_remote_publication(&invalid_journal, &remote_map, &CancellationToken::new())
+        }));
+        assert!(
+            matches!(invalid, Ok(Err(_))),
+            "invalid completed-publication identity must be rejected without a panic"
+        );
         let report = execute_prepared_managed_artifact_publication(
             &mut prepared,
             &remote_map,
@@ -5482,8 +5682,14 @@ mod tests {
             .targets
             .values_mut()
         {
-            target.permission_evidence.evidence_digest =
-                ContentDigest::sha256(b"refreshed authorization evidence");
+            let evidence = &mut target.permission_evidence;
+            evidence.verified_at_unix_seconds += 1;
+            evidence.evidence_digest = canonical_digest(&serde_json::json!({
+                "provider_id":evidence.provider_id,"principal":evidence.principal,
+                "repository":evidence.repository,"visibility":evidence.visibility,
+                "permission":evidence.permission,"verified_at_unix_seconds":evidence.verified_at_unix_seconds
+            })).unwrap();
+            evidence.validate().unwrap();
         }
         let resumed =
             completed_remote_publication(&prepared, &remote_map, &CancellationToken::new())
@@ -5550,5 +5756,49 @@ mod tests {
         }
         assert_eq!(principals.len(), 1);
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod family_document_contract {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn interrupted_private_write_does_not_wedge_immutable_document_retries() {
+        let root = crate::test_support::temporary_root("xc-family-document-interruption");
+        let relative = "manifests/fresh-audit.json";
+        let target = root.join(relative);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        // Model interruption before atomic rename with the actual sibling
+        // allocator: the private bytes are partial, the public name is absent.
+        let (interrupted, mut file) =
+            crate::create_private_sibling_file(target.parent().unwrap(), "replace").unwrap();
+        file.write_all(b"{\"incomplete\":").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let bytes = br#"{"fixture":"complete"}"#.to_vec();
+        let mut files = BTreeMap::new();
+        stage_family_document(&root, relative.into(), bytes.clone(), &mut files).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[relative].size_bytes, bytes.len() as u64);
+        assert_eq!(
+            files[relative].content_digest,
+            ContentDigest::sha256(&bytes)
+        );
+        let before = files.clone();
+        // Exact retries are idempotent and conflicting immutable data is never
+        // overwritten by the atomic helper.
+        stage_family_document(&root, relative.into(), bytes.clone(), &mut files).unwrap();
+        assert_eq!(files, before);
+        assert!(matches!(
+            stage_family_document(&root, relative.into(), b"conflict".to_vec(), &mut files),
+            Err(CacheError::DigestMismatch { .. })
+        ));
+        assert_eq!(files, before);
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        assert_eq!(std::fs::read(interrupted).unwrap(), b"{\"incomplete\":");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

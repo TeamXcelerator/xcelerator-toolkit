@@ -4,7 +4,8 @@ import argparse,hashlib,json
 from pathlib import Path
 
 def prepare(source,destination,kind,chunk_rows=10000,maximum_bytes=8<<30):
-    if chunk_rows<=0 or maximum_bytes<=0:raise ValueError('limits must be positive')
+    if kind not in ('band','weighted'):raise ValueError('kind must be band or weighted')
+    if type(chunk_rows) is not int or type(maximum_bytes) is not int or chunk_rows<=0 or maximum_bytes<=0:raise ValueError('limits must be positive integers')
     destination.mkdir(parents=True,exist_ok=False)
     fields={'coordinate','signed_weight','family'} if kind=='band' else {'ordinal','coordinate','weight','family','partition'}
     chunks=[];writer=None;total=0;count=0;chunk_count=0;digest=None;size=0
@@ -23,7 +24,9 @@ def prepare(source,destination,kind,chunk_rows=10000,maximum_bytes=8<<30):
                 if not isinstance(value,dict) or set(value)!=fields:raise ValueError('atom row has incorrect fields')
                 if not all(isinstance(value[k],str) for k in fields-{'ordinal'}):raise ValueError('atom scalar and label fields must be strings')
                 if kind=='weighted' and (type(value['ordinal']) is not int or value['ordinal']<=0):raise ValueError('ordinal must be a positive integer')
-                line=line.rstrip(b'\r\n')+b'\n';total+=len(line)
+                line=line.rstrip(b'\r\n')+b'\n'
+                if len(line)>1<<20:raise ValueError('normalized atom line exceeds 1 MiB')
+                total+=len(line)
                 if total>maximum_bytes:raise ValueError('input byte budget exceeded')
                 if writer is None:
                     writer=(destination/f'part-{len(chunks):06d}.jsonl').open('xb');digest=hashlib.sha256();size=0;chunk_count=0

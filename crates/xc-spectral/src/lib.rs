@@ -15,14 +15,15 @@
 //!   to disk for re-runs at the same `(λ², n_grid, prec)`.
 //! - **`mellin`**: Truncated completed eta function `Λ_λ(s)` and
 //!   `ξ`-weighted variants on the critical line, with parallelized
-//!   zero scanners.
+//!   zero scanners. Complex-zero validation is planned; the available scans
+//!   return real-part crossings of the finite truncated transform.
 //! - **`yakaboylu`**: Yakaboylu's Hilbert–Pólya framework. The
 //!   `V_R(s, s')` matrix element, W-positivity tests on the critical
 //!   line, indefiniteness on synthetic off-line zeros. f64 + HP
 //!   tiers.
 //! - **`lfunction`**: Dirichlet L-function character specs (`χ₃, χ₄,
-//!   χ₅, χ₇`) and twisted prime-power enumeration. Used to extend
-//!   the CCM construction to non-trivial L-functions.
+//!   χ₅, χ₇`) and twisted prime-power enumeration. A generalized CCM
+//!   assembly for nontrivial L-functions is planned, not implemented.
 //!
 //! The HP tier is gated behind the `hp` feature.
 

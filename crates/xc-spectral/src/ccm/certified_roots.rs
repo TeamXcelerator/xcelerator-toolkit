@@ -6,10 +6,12 @@
 //! sign, monotonicity and the one-sided pole limits give an independent count
 //! of exactly one root in every open interval between adjacent poles.
 
+pub(in crate::ccm) mod boundary;
+
 use anyhow::{bail, Context, Result};
 #[cfg(feature = "arb")]
 use rug::ops::Pow;
-use rug::{Float, Integer, Rational};
+use rug::{float::Round, ops::MulAssignRound, Float, Integer, Rational};
 use serde::{Deserialize, Serialize};
 use xc_cache::ContentDigest;
 use xc_core::ConvergenceTableRow;
@@ -21,7 +23,8 @@ use xc_numerics::interval::{
 };
 use xc_numerics::mpfr_interval::MpfrInterval;
 use xc_root::{
-    interval_newton_hp, IntervalNewtonOptions, IntervalRootCertificate, IntervalRootStatus,
+    interval_newton_hp, verify_interval_root_certificate_hp, IntervalNewtonOptions,
+    IntervalRootCertificate, IntervalRootEndpointEncoding, IntervalRootStatus,
     RealIntervalFunctionHp, RootError,
 };
 
@@ -32,19 +35,30 @@ pub struct CertifiedSecularFunction {
 }
 
 impl CertifiedSecularFunction {
+    /// Build a finite rational function with shared point stages: L=RN(p)(ln(c)),
+    /// spacing=RN(p)(2*pi/L), and poles=RN(p)(index*spacing). Certificates refer to those
+    /// stored MPFR poles and supplied residues, not exact transcendental poles
+    /// or the continuum spectral problem. For analytic pole enclosures, supply
+    /// directed intervals through `from_intervals` instead.
     pub fn from_integer_ccm_state(
         integer_cutoff_c: u64,
         modes: usize,
         weights: &[Float],
         precision_bits: u32,
     ) -> Result<Self> {
-        if integer_cutoff_c <= 1 || weights.len() != 2 * modes + 1 {
+        boundary::shape(modes, weights.len(), precision_bits)?;
+        if integer_cutoff_c <= 1
+            || modes.checked_mul(2).and_then(|n| n.checked_add(1)) != Some(weights.len())
+            || i64::try_from(modes).is_err()
+            || !(32..=1_000_000).contains(&precision_bits)
+        {
             bail!("CCM secular source requires c > 1 and exactly 2N+1 weights");
         }
-        let log_c = Float::with_val(precision_bits, integer_cutoff_c).ln();
-        let mut spacing = Float::with_val(precision_bits, rug::float::Constant::Pi);
-        spacing *= 2;
-        spacing /= log_c;
+        let log_c = super::retained_evidence::finite_math::rounded_log_cutoff(
+            &integer_cutoff_c.to_string(),
+            precision_bits,
+        )?;
+        let spacing = boundary::rounded_spacing(&log_c, precision_bits)?;
         let poles = (-(modes as i64)..=(modes as i64))
             .map(|index| {
                 let mut pole = spacing.clone();
@@ -63,14 +77,15 @@ impl CertifiedSecularFunction {
         if poles.is_empty() || poles.len() != weights.len() {
             bail!("finite secular source needs equal nonempty pole and weight arrays");
         }
-        let poles: Vec<_> = poles
+        boundary::source_budget(poles.len(), precision_bits)?;
+        let poles = poles
             .iter()
-            .map(|value| MpfrInterval::point(Float::with_val(precision_bits, value)))
-            .collect();
-        let weights: Vec<_> = weights
+            .map(|value| MpfrInterval::from_float(value, precision_bits))
+            .collect::<Result<Vec<_>, _>>()?;
+        let weights = weights
             .iter()
-            .map(|value| MpfrInterval::point(Float::with_val(precision_bits, value)))
-            .collect();
+            .map(|value| MpfrInterval::from_float(value, precision_bits))
+            .collect::<Result<Vec<_>, _>>()?;
         Self::from_intervals(poles, weights)
     }
 
@@ -78,7 +93,11 @@ impl CertifiedSecularFunction {
         if poles.is_empty() || poles.len() != weights.len() {
             bail!("finite secular source needs equal nonempty pole and weight arrays");
         }
+        for value in poles.iter().chain(&weights) {
+            value.validate()?;
+        }
         let precision = poles[0].precision();
+        boundary::source_budget(poles.len(), precision)?;
         if poles
             .iter()
             .chain(&weights)
@@ -105,6 +124,22 @@ impl CertifiedSecularFunction {
         self.poles[0].precision()
     }
 
+    fn with_precision(&self, precision: u32) -> Result<Self> {
+        if precision < self.precision_bits() || precision > 1_000_000 {
+            bail!("finite secular proof precision must retain the source precision");
+        }
+        Self::from_intervals(
+            self.poles
+                .iter()
+                .map(|x| x.with_precision(precision))
+                .collect::<Result<Vec<_>, _>>()?,
+            self.weights
+                .iter()
+                .map(|x| x.with_precision(precision))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+    }
+
     pub fn isolate(
         &self,
         candidate: &MpfrInterval,
@@ -119,21 +154,27 @@ impl CertifiedSecularFunction {
     /// Discover and certify the unique root in one adjacent-pole interval.
     ///
     /// The bracket is obtained only from pole geometry and interval signs;
-    /// no reference ordinate or point-solver seed participates.
+    /// no reference ordinate or point-solver seed participates. All residue
+    /// intervals must have one strict sign, which proves uniqueness throughout
+    /// the open pole gap. Use an exact-count window route for mixed-sign sources.
     pub fn certify_pole_interval(
         &self,
         left_pole: usize,
         bisection_steps: usize,
         options: &IntervalNewtonOptions,
     ) -> Result<IntervalRootCertificate> {
-        if left_pole + 1 >= self.poles.len() || bisection_steps == 0 {
+        if left_pole >= self.poles.len() - 1 || bisection_steps == 0 {
             bail!("pole-interval certification needs an adjacent pole pair and bisection steps");
         }
+        self.monotone_count_between_poles(left_pole, left_pole + 1)?;
         let precision = self.precision_bits();
         let left_boundary = self.poles[left_pole].upper();
         let right_boundary = self.poles[left_pole + 1].lower();
         let mut margin = Float::with_val(precision, right_boundary - left_boundary);
         margin /= 1024;
+        if !margin.is_finite() || margin <= 0 {
+            bail!("pole separation margin is unrepresentable");
+        }
         let mut lower = Float::with_val(precision, left_boundary + &margin);
         let mut upper = Float::with_val(precision, right_boundary - &margin);
         let mut lower_value = self
@@ -148,9 +189,10 @@ impl CertifiedSecularFunction {
             bail!("finite secular pole interval lacks strict opposite endpoint signs");
         }
         for _ in 0..bisection_steps {
-            let mut midpoint = lower.clone();
-            midpoint += &upper;
-            midpoint /= 2;
+            let midpoint = MpfrInterval::new(lower.clone(), upper.clone())?
+                .midpoint_point()
+                .lower()
+                .clone();
             let midpoint_value = self
                 .evaluate_interval(&MpfrInterval::point(midpoint.clone()))
                 .map_err(anyhow::Error::from)?;
@@ -166,7 +208,68 @@ impl CertifiedSecularFunction {
                 upper = midpoint;
             }
         }
-        self.isolate(&MpfrInterval::new(lower, upper)?, options)
+        let certificate = self.isolate(&MpfrInterval::new(lower, upper)?, options)?;
+        self.retain_replayable_newton_box(certificate, options)
+    }
+
+    /// A uniqueness witness from an earlier Newton iterate need not remain a
+    /// strict inclusion on the last, rounded contraction. Retain an independently
+    /// replayable box without exceeding the requested width or crossing a pole.
+    fn retain_replayable_newton_box(
+        &self,
+        mut certificate: IntervalRootCertificate,
+        options: &IntervalNewtonOptions,
+    ) -> Result<IntervalRootCertificate> {
+        if certificate.status != IntervalRootStatus::CertifiedUnique {
+            return Ok(certificate);
+        }
+        if certificate.schema_version == 2 {
+            if !verify_interval_root_certificate_hp(self, &certificate)? {
+                bail!("finite secular root witness does not replay");
+            }
+            return Ok(certificate);
+        }
+        let precision = certificate.precision_bits;
+        let tolerance = options.validate(precision).map_err(anyhow::Error::from)?;
+        let mut enclosure = MpfrInterval::new(
+            parse_endpoint(&certificate.lower, precision)?,
+            parse_endpoint(&certificate.upper, precision)?,
+        )?;
+        for attempt in 0..=8 {
+            if self.overlaps_pole(&enclosure) || enclosure.width() > tolerance {
+                break;
+            }
+            let derivative = self
+                .derivative_interval(&enclosure)
+                .map_err(anyhow::Error::from)?;
+            if !derivative.contains_zero() {
+                let midpoint = enclosure.midpoint_point();
+                let value = self
+                    .evaluate_interval(&midpoint)
+                    .map_err(anyhow::Error::from)?;
+                let image = midpoint.sub(&value.div(&derivative)?);
+                if image.is_interior_subset_of(&enclosure) {
+                    if attempt != 0 {
+                        certificate.lower = serialize_float(enclosure.lower(), precision);
+                        certificate.upper = serialize_float(enclosure.upper(), precision);
+                    }
+                    return Ok(certificate);
+                }
+            }
+            let width = enclosure.width();
+            let mut lower =
+                Float::with_val_round(precision, enclosure.lower() - &width, Round::Down).0;
+            let mut upper =
+                Float::with_val_round(precision, enclosure.upper() + &width, Round::Up).0;
+            // Includes point/underflowed-width cases and guarantees progress.
+            lower.next_down();
+            upper.next_up();
+            if !lower.is_finite() || !upper.is_finite() {
+                break;
+            }
+            enclosure = MpfrInterval::new(lower, upper)?;
+        }
+        bail!("finite secular root has no replayable strict Newton box within the requested width")
     }
 
     fn overlaps_pole(&self, argument: &MpfrInterval) -> bool {
@@ -203,6 +306,13 @@ impl CertifiedSecularFunction {
     }
 
     fn exact_numerator_data(&self) -> Result<(Vec<Rational>, Vec<Rational>)> {
+        boundary::rational_budget(
+            self.poles
+                .iter()
+                .chain(&self.weights)
+                .flat_map(|x| [x.lower(), x.upper()]),
+            self.poles.len(),
+        )?;
         let point = |interval: &MpfrInterval| -> Result<Rational> {
             if interval.lower() != interval.upper() {
                 bail!("exact numerator count requires point poles and residues");
@@ -298,9 +408,10 @@ impl CertifiedSecularFunction {
         isolation_bits: u32,
         options: &IntervalNewtonOptions,
     ) -> Result<SecularWindowCertificate> {
-        if isolation_bits < 16 {
-            bail!("exact numerator isolation requires at least 16 width bits");
-        }
+        boundary::isolation(isolation_bits, self.precision_bits())?;
+        options
+            .validate(self.precision_bits())
+            .map_err(anyhow::Error::from)?;
         let (poles, numerator) = self.exact_numerator_data()?;
         if first_pole >= last_pole || last_pole >= poles.len() {
             bail!("exact numerator window needs an ordered in-range pole span");
@@ -325,6 +436,12 @@ impl CertifiedSecularFunction {
             .collect::<Result<Vec<_>>>()?;
         let count = self.exact_numerator_count_between_poles(first_pole, last_pole)?;
         let reconciliation = reconcile_complete_window(&roots, &count)?;
+        if !reconciliation.complete {
+            bail!(
+                "exact Sturm window failed interval-Newton reconciliation: {}",
+                reconciliation.reason
+            );
+        }
         Ok(SecularWindowCertificate {
             roots,
             count,
@@ -389,7 +506,12 @@ impl CertifiedSecularFunction {
         })
     }
 
-    /// Reference-free production isolation through exact FLINT/Arb root balls
+    /// Reference-free production isolation through exact FLINT/Arb root balls.
+    /// The subsequent exact count repeats the same FLINT/Arb engine; it is
+    /// not an independent-backend oracle. Interval-Newton uniqueness replay
+    /// is a separate verification step. Reconciliation checks agreement of
+    /// these retained results without claiming backend independence.
+    /// Production isolation through exact FLINT/Arb root balls
     /// followed by the independent interval-Newton proof for the original
     /// rational secular function.
     #[cfg(feature = "arb")]
@@ -400,19 +522,25 @@ impl CertifiedSecularFunction {
         isolation_bits: u32,
         options: &IntervalNewtonOptions,
     ) -> Result<SecularWindowCertificate> {
-        if isolation_bits < 16 || isolation_bits >= self.precision_bits() {
-            bail!("FLINT numerator isolation width must fit below the source precision");
-        }
+        boundary::isolation(isolation_bits, self.precision_bits())?;
+        options
+            .validate(self.precision_bits())
+            .map_err(anyhow::Error::from)?;
         let (poles, _) = self.exact_numerator_data()?;
         if first_pole >= last_pole || last_pole >= poles.len() {
             bail!("FLINT numerator window needs an ordered in-range pole span");
         }
-        self.certify_flint_numerator_rational_window(
+        let mut window = self.certify_flint_numerator_rational_window(
             &poles[first_pole],
             &poles[last_pole],
             isolation_bits,
             options,
-        )
+        )?;
+        // The rational-window primitive has no pole-span designation. This
+        // wrapper supplies the same exact span metadata as the count API.
+        window.count.pole_count = last_pole - first_pole + 1;
+        window.count.open_intervals_counted = last_pole - first_pole;
+        Ok(window)
     }
 
     /// Isolate and certify every real root in an arbitrary exact rational
@@ -426,6 +554,10 @@ impl CertifiedSecularFunction {
         isolation_bits: u32,
         options: &IntervalNewtonOptions,
     ) -> Result<SecularWindowCertificate> {
+        boundary::isolation(isolation_bits, self.precision_bits())?;
+        options
+            .validate(self.precision_bits())
+            .map_err(anyhow::Error::from)?;
         let (_, numerator) = self.exact_numerator_data()?;
         if lower_bound >= upper_bound {
             bail!("FLINT numerator window requires lower < upper");
@@ -441,9 +573,8 @@ impl CertifiedSecularFunction {
         }
         let target_width = Float::with_val(self.precision_bits(), 2).pow(-(isolation_bits as i32));
         for candidate in &candidates {
-            let width =
-                Float::with_val(self.precision_bits(), candidate.upper() - candidate.lower());
-            if width > target_width {
+            let width = candidate.width();
+            if !width.is_finite() || width > target_width {
                 bail!("Arb root enclosure did not meet the requested absolute width");
             }
         }
@@ -454,18 +585,38 @@ impl CertifiedSecularFunction {
         });
         let count = self.exact_flint_numerator_count_in_window(lower_bound, upper_bound)?;
         if count.certified_root_count != candidates.len() || count.square_free != square_free {
-            bail!("FLINT root isolation disagrees with its independent exact count");
+            bail!("FLINT root isolation disagrees with a repeated exact count from the same FLINT/Arb engine");
         }
-        let roots = candidates
-            .into_iter()
-            .map(|candidate| {
-                let mut lower = candidate.lower().clone();
-                lower -= &target_width;
-                let mut upper = candidate.upper().clone();
-                upper += &target_width;
-                self.isolate(&MpfrInterval::new(lower, upper)?, options)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let roots = candidates.into_iter().map(|candidate| {
+            let mut failure = String::new();
+            let mut previous_precision = 0;
+            for guard in [0_u32, 64, 256, 1024, 4096] {
+                let work = self.precision_bits().saturating_add(guard).min(1_000_000);
+                if work == previous_precision { continue; }
+                previous_precision = work;
+                let promoted = self.with_precision(work)?;
+                let lower = Float::with_val_round(work, candidate.lower() - &target_width, Round::Down).0;
+                let upper = Float::with_val_round(work, candidate.upper() + &target_width, Round::Up).0;
+                let mut refined_options = options.clone();
+                if guard > 0 {
+                    let fine_width = Float::with_val(work, 1) >> work.saturating_sub(16);
+                    let requested = options.validate(work)?;
+                    if fine_width < requested {
+                        refined_options.width_tolerance = xc_core::DecimalLiteral::new(
+                            fine_width.to_string_radix_round(10, None, Round::Down))?;
+                    }
+                }
+                let root = promoted.isolate(&MpfrInterval::new(lower, upper)?, &refined_options)?;
+                let (lower, upper) = exact_root_bounds(&root)?;
+                if root.status == IntervalRootStatus::CertifiedUnique
+                    && lower > *lower_bound && upper < *upper_bound
+                {
+                    return Ok(root);
+                }
+                failure = format!("proof precision {work}: {:?}; enclosure does not establish open-window membership",root.status);
+            }
+            bail!("finite secular window boundary remains unresolved within the proof precision budget: {failure}")
+        }).collect::<Result<Vec<_>>>()?;
         let reconciliation = reconcile_complete_window(&roots, &count)?;
         if !reconciliation.complete {
             bail!(
@@ -646,6 +797,26 @@ pub struct RootCountReconciliation {
     pub reason: String,
 }
 
+/// Schema-2 certificates historically stored an over-specific explanation.
+/// Accept that exact legacy annotation only after every mathematical field
+/// agrees with a fresh reconciliation. It is not an additional verified claim.
+fn reconciliation_matches_replay(
+    stored: &RootCountReconciliation,
+    replay: &RootCountReconciliation,
+) -> bool {
+    if stored == replay {
+        return true;
+    }
+    if !replay.complete
+        || stored.reason != "every monotonic pole interval has one disjoint certified unique root"
+    {
+        return false;
+    }
+    let mut canonical = stored.clone();
+    canonical.reason.clone_from(&replay.reason);
+    canonical == *replay
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SecularWindowCertificate {
     pub roots: Vec<IntervalRootCertificate>,
@@ -699,7 +870,8 @@ pub struct ProductionFirstPositiveCcmRootCertificate {
     pub source_weights_digest: ContentDigest,
     pub window: SecularWindowCertificate,
     pub preceding_window_count: SecularCountCertificate,
-    pub following_window_count: SecularCountCertificate,
+    /// Absent when the selected prefix ends at the final retained pole (schema 3).
+    pub following_window_count: Option<SecularCountCertificate>,
     pub reference_seeds_used: bool,
     pub discovery_method: String,
     pub count_method: String,
@@ -759,9 +931,26 @@ pub struct ProductionIndependentCcmRootCertificate {
 }
 
 impl ProductionIndependentCcmRootCertificate {
+    /// Return the selected range without panicking on malformed public fields.
+    /// This checks slice bounds; use the certificate validators for source truth.
+    pub fn try_selected_roots(&self) -> Result<&[IntervalRootCertificate]> {
+        let end = self
+            .selected_root_offset
+            .checked_add(self.selected_root_count)
+            .context("selected root range overflows usize")?;
+        self.window
+            .roots
+            .get(self.selected_root_offset..end)
+            .context("selected root range is outside the certificate window")
+    }
+    /// Access a previously validated selected range.
+    ///
+    /// # Panics
+    /// Panics if public selection fields are outside the stored root window.
+    /// Use [`Self::try_selected_roots`] when reading unvalidated data.
     pub fn selected_roots(&self) -> &[IntervalRootCertificate] {
-        &self.window.roots
-            [self.selected_root_offset..self.selected_root_offset + self.selected_root_count]
+        self.try_selected_roots()
+            .expect("validated selected root range required")
     }
 }
 
@@ -771,6 +960,13 @@ pub fn production_ccm_source_weights_digest(
     weights: &[Float],
     precision_bits: u32,
 ) -> Result<ContentDigest> {
+    boundary::source_budget(weights.len(), precision_bits)?;
+    if weights
+        .iter()
+        .any(|w| !w.is_finite() || w.prec() > precision_bits)
+    {
+        bail!("source-weight digest requires finite points without precision loss");
+    }
     let serialized = weights
         .iter()
         .map(|weight| serialize_float(&Float::with_val(precision_bits, weight), precision_bits))
@@ -779,16 +975,22 @@ pub fn production_ccm_source_weights_digest(
 }
 
 /// Validate the identity, source binding, target accounting, and isolated-root
-/// structure of a persisted independent CCM certificate without repeating the
+/// structure and per-root numerical witnesses of a persisted independent CCM
+/// certificate without repeating the
 /// expensive FLINT root census. This is the cache-read validation boundary;
 /// `verify_production_independent_ccm_root_certificate` remains the explicit
-/// full numerical replay operation. That function is `arb`-gated, so this is
+/// full count replay operation. That function is `arb`-gated, so this is
 /// deliberately not an intra-doc link: it would not resolve in an `hp`-only
 /// documentation build.
 pub fn validate_production_independent_ccm_root_certificate_structure(
     certificate: &ProductionIndependentCcmRootCertificate,
 ) -> Result<()> {
-    if certificate.schema_version != 1
+    boundary::shape(
+        certificate.modes,
+        certificate.source_weights.len(),
+        certificate.precision_bits,
+    )?;
+    if certificate.schema_version != 2
         || certificate.integer_cutoff_c <= 1
         || certificate.modes == 0
         || certificate.precision_bits <= 64
@@ -828,6 +1030,26 @@ pub fn validate_production_independent_ccm_root_certificate_structure(
     if selected_end > certificate.window.roots.len() {
         bail!("independent CCM selected certificate range leaves its certified window");
     }
+    let first = certificate
+        .positive_roots_before_window
+        .checked_add(certificate.selected_root_offset)
+        .and_then(|n| n.checked_add(1))
+        .context("first selected ordinal overflows")?;
+    let last = first
+        .checked_add(certificate.selected_root_count - 1)
+        .context("last selected ordinal overflows")?;
+    if certificate.first_selected_positive_index != Some(first)
+        || certificate.last_selected_positive_index != Some(last)
+    {
+        bail!("selected ordinals do not match preceding count and window offset");
+    }
+    for weight in &certificate.source_weights {
+        if parse_endpoint(weight, certificate.precision_bits)?.is_zero() {
+            bail!("finite secular weights must be nonzero");
+        }
+    }
+    let lower_bound = boundary::rational_text(&certificate.lower_bound)?;
+    let upper_bound = boundary::rational_text(&certificate.upper_bound)?;
     let expected_indices = match &certificate.target {
         IndependentCcmRootTarget::Prefix { count } => {
             if *count != certificate.selected_root_count {
@@ -843,9 +1065,15 @@ pub fn validate_production_independent_ccm_root_certificate_structure(
             Some((*first, *last))
         }
         IndependentCcmRootTarget::PositiveHeightWindow { lower, upper } => {
-            let lower = parse_endpoint(lower, certificate.precision_bits)?;
-            let upper = parse_endpoint(upper, certificate.precision_bits)?;
-            if lower <= 0 || lower >= upper {
+            let lower = boundary::decimal(lower)?;
+            let upper = boundary::decimal(upper)?;
+            if lower <= 0
+                || lower >= upper
+                || lower != lower_bound
+                || upper != upper_bound
+                || certificate.selected_root_offset != 0
+                || certificate.selected_root_count != certificate.window.roots.len()
+            {
                 bail!("independent CCM height certificate target is invalid");
             }
             match certificate.first_selected_positive_index {
@@ -866,40 +1094,29 @@ pub fn validate_production_independent_ccm_root_certificate_structure(
     {
         bail!("independent CCM certificate ordinal assignment is inconsistent");
     }
-    let lower_bound = Rational::from(
-        Rational::parse(&certificate.lower_bound)
-            .context("parse independent CCM exact lower discovery bound")?,
-    );
-    let upper_bound = Rational::from(
-        Rational::parse(&certificate.upper_bound)
-            .context("parse independent CCM exact upper discovery bound")?,
-    );
     if lower_bound < 0 || lower_bound >= upper_bound {
         bail!("independent CCM certificate discovery bounds are invalid");
     }
+    let weights = certificate
+        .source_weights
+        .iter()
+        .map(|x| parse_endpoint(x, certificate.precision_bits))
+        .collect::<Result<Vec<_>>>()?;
+    let source = CertifiedSecularFunction::from_integer_ccm_state(
+        certificate.integer_cutoff_c,
+        certificate.modes,
+        &weights,
+        certificate.precision_bits,
+    )?;
     for root in &certificate.window.roots {
-        if root.precision_bits != certificate.precision_bits
-            || root.status != IntervalRootStatus::CertifiedUnique
-            || !root.uniqueness_witnessed
-        {
-            bail!("independent CCM certificate contains a non-unique root enclosure");
-        }
-        let lower = parse_endpoint(&root.lower, root.precision_bits)?;
-        let upper = parse_endpoint(&root.upper, root.precision_bits)?;
-        let lower_exact = lower
-            .to_rational()
-            .context("convert certified CCM root lower endpoint to an exact rational")?;
-        let upper_exact = upper
-            .to_rational()
-            .context("convert certified CCM root upper endpoint to an exact rational")?;
-        if lower_exact <= lower_bound || lower_exact >= upper_exact || upper_exact >= upper_bound {
+        replay_root(&source, root, Some(&certificate.interval_newton))?;
+        let (lower, upper) = exact_root_bounds(root)?;
+        if lower <= lower_bound || lower > upper || upper >= upper_bound {
             bail!("independent CCM root enclosure leaves its certified bounds");
         }
     }
     for pair in certificate.window.roots.windows(2) {
-        let precision = pair[0].precision_bits.max(pair[1].precision_bits);
-        if parse_endpoint(&pair[0].upper, precision)? >= parse_endpoint(&pair[1].lower, precision)?
-        {
+        if exact_root_bounds(&pair[0])?.1 >= exact_root_bounds(&pair[1])?.0 {
             bail!("independent CCM root enclosures are not strictly ordered and disjoint");
         }
     }
@@ -995,6 +1212,8 @@ pub struct RootReferenceComparisonRecord {
     pub enclosure_lower: String,
     pub enclosure_upper: String,
     pub reference_ordinate: String,
+    /// Round-trip encoding of an upward bound for the difference between the
+    /// computed midpoint and the stored reference (comparison schema 2).
     pub absolute_midpoint_error: String,
     pub measured_agreement_digits: u32,
     pub reference_inside_enclosure: bool,
@@ -1002,6 +1221,9 @@ pub struct RootReferenceComparisonRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Schema 2 decodes every scalar at its owning precision and uses an upward
+/// bound for the stored midpoint difference and conservative digit counts.
+/// Schema 1 comparisons must be recomputed before current verification.
 pub struct PostDiscoveryReferenceComparison {
     pub schema_version: u32,
     pub root_certificate_digest: ContentDigest,
@@ -1028,10 +1250,7 @@ fn parse_source_weights(certificate: &FirstPositiveCcmRootCertificate) -> Result
     certificate
         .source_weights
         .iter()
-        .map(|weight| {
-            let parsed = Float::parse(weight).context("parse stored CCM source weight")?;
-            Ok(Float::with_val(certificate.precision_bits, parsed))
-        })
+        .map(|weight| parse_endpoint(weight, certificate.precision_bits))
         .collect()
 }
 
@@ -1042,13 +1261,16 @@ pub fn certify_first_positive_ccm_roots(
     weights: &[Float],
     options: &FirstPositiveCcmRootOptions,
 ) -> Result<FirstPositiveCcmRootCertificate> {
+    boundary::shape(options.modes, weights.len(), options.precision_bits)?;
     if options.requested_roots == 0
         || options.requested_roots > options.modes
         || weights.len() != 2 * options.modes + 1
         || options.precision_bits <= 64
         || options.pole_interval_bisection_steps == 0
     {
-        bail!("first-positive CCM root request has invalid count, source dimension, precision, or bisection policy");
+        bail!(
+            "first-positive CCM root request has invalid count, source dimension, precision, or bisection policy"
+        );
     }
     let source = CertifiedSecularFunction::from_integer_ccm_state(
         options.integer_cutoff_c,
@@ -1092,7 +1314,7 @@ pub fn certify_first_positive_ccm_roots(
         })
         .collect::<Vec<_>>();
     Ok(FirstPositiveCcmRootCertificate {
-        schema_version: 1,
+        schema_version: 2,
         integer_cutoff_c: options.integer_cutoff_c,
         modes: options.modes,
         requested_roots: options.requested_roots,
@@ -1114,7 +1336,12 @@ pub fn certify_first_positive_ccm_roots(
 pub fn verify_first_positive_ccm_root_certificate(
     certificate: &FirstPositiveCcmRootCertificate,
 ) -> Result<()> {
-    if certificate.schema_version != 1
+    boundary::shape(
+        certificate.modes,
+        certificate.source_weights.len(),
+        certificate.precision_bits,
+    )?;
+    if certificate.schema_version != 2
         || certificate.integer_cutoff_c <= 1
         || certificate.precision_bits <= 64
         || certificate.requested_roots == 0
@@ -1151,42 +1378,16 @@ pub fn verify_first_positive_ccm_root_certificate(
         bail!("first-positive CCM root certificate count does not replay from its source");
     }
     for (offset, root) in certificate.roots.iter().enumerate() {
-        if root.precision_bits != certificate.precision_bits
-            || root.status != IntervalRootStatus::CertifiedUnique
-            || !root.uniqueness_witnessed
-        {
-            bail!("first-positive CCM root has invalid precision or uniqueness status");
-        }
-        let enclosure = MpfrInterval::new(
-            parse_endpoint(&root.lower, root.precision_bits)?,
-            parse_endpoint(&root.upper, root.precision_bits)?,
-        )?;
+        replay_root(&source, root, None)?;
+        let enclosure = decoded_root_interval(root)?;
         let left_pole = &source.poles()[certificate.modes + offset];
         let right_pole = &source.poles()[certificate.modes + offset + 1];
         if enclosure.lower() <= left_pole.upper() || enclosure.upper() >= right_pole.lower() {
             bail!("first-positive CCM root enclosure leaves its assigned pole interval");
         }
-        let derivative = source
-            .derivative_interval(&enclosure)
-            .map_err(anyhow::Error::from)?;
-        if derivative.contains_zero() {
-            bail!("first-positive CCM root derivative enclosure contains zero");
-        }
-        let midpoint = enclosure.midpoint_point();
-        let midpoint_value = source
-            .evaluate_interval(&midpoint)
-            .map_err(anyhow::Error::from)?;
-        let newton_image = midpoint.sub(
-            &midpoint_value
-                .div(&derivative)
-                .context("replay stored CCM root interval Newton image")?,
-        );
-        if !newton_image.is_interior_subset_of(&enclosure) {
-            bail!("first-positive CCM root uniqueness enclosure does not replay");
-        }
     }
     let replay = reconcile_complete_window(&certificate.roots, &certificate.independent_count)?;
-    if !replay.complete || replay != certificate.reconciliation {
+    if !replay.complete || !reconciliation_matches_replay(&certificate.reconciliation, &replay) {
         bail!("first-positive CCM root certificate fails order/count reconciliation");
     }
     if certificate.roots.iter().any(|root| {
@@ -1213,6 +1414,7 @@ pub fn certify_production_first_positive_ccm_roots(
     isolation_bits: u32,
     interval_newton: &IntervalNewtonOptions,
 ) -> Result<ProductionFirstPositiveCcmRootCertificate> {
+    boundary::shape(modes, weights.len(), precision_bits)?;
     if integer_cutoff_c <= 1
         || modes == 0
         || requested_roots == 0
@@ -1254,19 +1456,31 @@ pub fn certify_production_first_positive_ccm_roots(
         }
     }
     let last_pole = high;
-    let preceding_window_count =
-        source.exact_flint_numerator_count_between_poles(first_pole, last_pole - 1)?;
+    let preceding_window_count = if last_pole == first_pole + 1 {
+        SecularCountCertificate {
+            pole_count: 1,
+            open_intervals_counted: 0,
+            certified_root_count: 0,
+            residue_sign: "not_required".into(),
+            method: "empty open pole span".into(),
+            square_free: true,
+        }
+    } else {
+        source.exact_flint_numerator_count_between_poles(first_pole, last_pole - 1)?
+    };
     let exact_count = source.exact_flint_numerator_count_between_poles(first_pole, last_pole)?;
     if preceding_window_count.certified_root_count >= requested_roots
         || exact_count.certified_root_count != requested_roots
-        || last_pole >= maximum_pole
     {
         bail!(
             "smallest production CCM pole boundary does not isolate exactly the requested prefix"
         );
     }
-    let following_window_count =
-        source.exact_flint_numerator_count_between_poles(first_pole, last_pole + 1)?;
+    let following_window_count = if last_pole < maximum_pole {
+        Some(source.exact_flint_numerator_count_between_poles(first_pole, last_pole + 1)?)
+    } else {
+        None
+    };
     let window = source.certify_flint_numerator_window(
         first_pole,
         last_pole,
@@ -1284,7 +1498,7 @@ pub fn certify_production_first_positive_ccm_roots(
         .map(|weight| serialize_float(&Float::with_val(precision_bits, weight), precision_bits))
         .collect::<Vec<_>>();
     Ok(ProductionFirstPositiveCcmRootCertificate {
-        schema_version: 1,
+        schema_version: 3,
         integer_cutoff_c,
         modes,
         requested_roots,
@@ -1311,7 +1525,13 @@ pub fn certify_production_first_positive_ccm_roots(
 pub fn verify_production_first_positive_ccm_root_certificate(
     certificate: &ProductionFirstPositiveCcmRootCertificate,
 ) -> Result<()> {
-    if certificate.schema_version != 1
+    boundary::shape(
+        certificate.modes,
+        certificate.source_weights.len(),
+        certificate.precision_bits,
+    )?;
+    if !matches!(certificate.schema_version, 2 | 3)
+        || (certificate.schema_version == 2 && certificate.following_window_count.is_none())
         || certificate.reference_seeds_used
         || certificate.first_pole != certificate.modes
         || certificate.source_weights.len() != 2 * certificate.modes + 1
@@ -1327,14 +1547,9 @@ pub fn verify_production_first_positive_ccm_root_certificate(
     let weights = certificate
         .source_weights
         .iter()
-        .map(|weight| {
-            Ok(Float::with_val(
-                certificate.precision_bits,
-                Float::parse(weight).context("parse production CCM source weight")?,
-            ))
-        })
+        .map(|weight| parse_endpoint(weight, certificate.precision_bits))
         .collect::<Result<Vec<_>>>()?;
-    let replay = certify_production_first_positive_ccm_roots(
+    let mut replay = certify_production_first_positive_ccm_roots(
         &weights,
         certificate.integer_cutoff_c,
         certificate.modes,
@@ -1343,6 +1558,43 @@ pub fn verify_production_first_positive_ccm_root_certificate(
         certificate.isolation_bits,
         &certificate.interval_newton,
     )?;
+    let source = CertifiedSecularFunction::from_integer_ccm_state(
+        certificate.integer_cutoff_c,
+        certificate.modes,
+        &weights,
+        certificate.precision_bits,
+    )?;
+    for root in &certificate.window.roots {
+        replay_root(&source, root, Some(&certificate.interval_newton))?;
+        let (lower, upper) = exact_root_bounds(root)?;
+        let window_lower = source.poles()[certificate.first_pole]
+            .upper()
+            .to_rational()
+            .context("finite first pole")?;
+        let window_upper = source.poles()[certificate.last_pole]
+            .lower()
+            .to_rational()
+            .context("finite last pole")?;
+        if lower <= window_lower || upper >= window_upper {
+            bail!("production root enclosure leaves the replayed pole window");
+        }
+    }
+    if !reconcile_complete_window(&certificate.window.roots, &replay.window.count)?.complete {
+        bail!("production first-positive CCM root certificates do not reconcile with the replayed count");
+    }
+    replay.window.roots.clone_from(&certificate.window.roots);
+    // Schema 2 always retained a following span; numerical replay is unchanged.
+    replay.schema_version = certificate.schema_version;
+    if reconciliation_matches_replay(
+        &certificate.window.reconciliation,
+        &replay.window.reconciliation,
+    ) {
+        replay
+            .window
+            .reconciliation
+            .reason
+            .clone_from(&certificate.window.reconciliation.reason);
+    }
     if &replay != certificate {
         bail!("production first-positive CCM certificate does not replay from its source");
     }
@@ -1351,10 +1603,8 @@ pub fn verify_production_first_positive_ccm_root_certificate(
 
 #[cfg(feature = "arb")]
 fn parse_discovery_boundary(text: &str, precision_bits: u32) -> Result<Rational> {
-    let parsed = Float::parse(text).context("parse independent CCM discovery boundary")?;
-    Float::with_val(precision_bits, parsed)
-        .to_rational()
-        .context("convert independent CCM discovery boundary to an exact rational")
+    boundary::source_budget(1, precision_bits)?;
+    boundary::decimal(text)
 }
 
 #[cfg(feature = "arb")]
@@ -1385,6 +1635,7 @@ pub fn certify_production_independent_ccm_roots(
     isolation_bits: u32,
     interval_newton: &IntervalNewtonOptions,
 ) -> Result<ProductionIndependentCcmRootCertificate> {
+    boundary::shape(modes, weights.len(), precision_bits)?;
     if integer_cutoff_c <= 1
         || modes == 0
         || weights.len() != 2 * modes + 1
@@ -1513,7 +1764,7 @@ pub fn certify_production_independent_ccm_roots(
         .map(|weight| serialize_float(&Float::with_val(precision_bits, weight), precision_bits))
         .collect::<Vec<_>>();
     Ok(ProductionIndependentCcmRootCertificate {
-        schema_version: 1,
+        schema_version: 2,
         integer_cutoff_c,
         modes,
         precision_bits,
@@ -1547,7 +1798,13 @@ pub fn certify_production_independent_ccm_roots(
 pub fn verify_production_independent_ccm_root_certificate(
     certificate: &ProductionIndependentCcmRootCertificate,
 ) -> Result<()> {
-    if certificate.schema_version != 1
+    validate_production_independent_ccm_root_certificate_structure(certificate)?;
+    boundary::shape(
+        certificate.modes,
+        certificate.source_weights.len(),
+        certificate.precision_bits,
+    )?;
+    if certificate.schema_version != 2
         || certificate.reference_seeds_used
         || certificate.source_weights.len() != 2 * certificate.modes + 1
         || !certificate.source_weights_digest.validate()
@@ -1565,14 +1822,9 @@ pub fn verify_production_independent_ccm_root_certificate(
     let weights = certificate
         .source_weights
         .iter()
-        .map(|weight| {
-            Ok(Float::with_val(
-                certificate.precision_bits,
-                Float::parse(weight).context("parse independent CCM source weight")?,
-            ))
-        })
+        .map(|weight| parse_endpoint(weight, certificate.precision_bits))
         .collect::<Result<Vec<_>>>()?;
-    let replay = certify_production_independent_ccm_roots(
+    let mut replay = certify_production_independent_ccm_roots(
         &weights,
         certificate.integer_cutoff_c,
         certificate.modes,
@@ -1581,6 +1833,19 @@ pub fn verify_production_independent_ccm_root_certificate(
         certificate.isolation_bits,
         &certificate.interval_newton,
     )?;
+    replay.window.roots.clone_from(&certificate.window.roots);
+    // Schema 2 always retained a following span; numerical replay is unchanged.
+    replay.schema_version = certificate.schema_version;
+    if reconciliation_matches_replay(
+        &certificate.window.reconciliation,
+        &replay.window.reconciliation,
+    ) {
+        replay
+            .window
+            .reconciliation
+            .reason
+            .clone_from(&certificate.window.reconciliation.reason);
+    }
     if &replay != certificate {
         bail!("production independent CCM certificate does not replay from its source");
     }
@@ -1588,15 +1853,17 @@ pub fn verify_production_independent_ccm_root_certificate(
 }
 
 fn certified_decimal_digits(root: &IntervalRootCertificate) -> Result<u32> {
-    let lower = parse_endpoint(&root.lower, root.precision_bits)?;
-    let upper = parse_endpoint(&root.upper, root.precision_bits)?;
-    let mut width = Float::with_val(root.precision_bits, upper - lower);
-    if width <= 0 {
-        bail!("certified CCM root enclosure must have positive width");
+    let (lower, upper) = exact_root_bounds(root)?;
+    let mut width = Float::with_val_round(root.precision_bits, upper - lower, Round::Up).0;
+    if width.is_zero() {
+        return Ok(100_000);
+    }
+    if !width.is_finite() || width < 0 {
+        bail!("certified CCM root enclosure must have nonnegative width");
     }
     let mut digits = 0_u32;
     while width <= 1 && digits < 100_000 {
-        width *= 10;
+        width.mul_assign_round(10, Round::Up);
         if width <= 1 {
             digits += 1;
         }
@@ -1605,7 +1872,9 @@ fn certified_decimal_digits(root: &IntervalRootCertificate) -> Result<u32> {
 }
 
 /// Convert a verified finite-root certificate into the fixed publication dataset
-/// row. Accuracy is measured from certified enclosure widths, never from a
+/// row. Digit counts are conservative: directed arithmetic may undercount at
+/// a rounding boundary, but cannot round an excessive width into acceptance.
+/// Accuracy is measured from certified enclosure widths, never from a
 /// post-discovery reference comparison.
 pub fn first_positive_certificate_convergence_row(
     sequence_index: u64,
@@ -1644,7 +1913,9 @@ pub fn first_positive_certificate_convergence_row(
         minimum_accuracy_digits: minimum.to_string(),
         median_accuracy_digits: median,
         index_penalty_digits: index_penalty.to_string(),
-        completion_status: "certified".to_owned(),
+        completion_status: "certified_stored_point_source".to_owned(),
+        accuracy_scope: "exact_stored_point_secular_source".to_owned(),
+        source_weights_digest: Some(certificate.source_weights_digest.0.clone()),
     })
 }
 
@@ -1659,10 +1930,10 @@ fn measured_agreement_digits(error: &Float, precision_bits: u32) -> u32 {
     if error == &0 {
         return ((precision_bits as f64) * std::f64::consts::LOG10_2).floor() as u32;
     }
-    let mut scaled = Float::with_val(precision_bits, error);
+    let mut scaled = Float::with_val_round(precision_bits, error, Round::Up).0;
     let mut digits = 0_u32;
     while scaled <= 1 && digits < 100_000 {
-        scaled *= 10;
+        scaled.mul_assign_round(10, Round::Up);
         if scaled <= 1 {
             digits += 1;
         }
@@ -1682,33 +1953,17 @@ pub fn compare_first_positive_roots_to_references(
     if references.positive_ordinates.len() < certificate.requested_roots {
         bail!("reference-zero dataset does not cover the certified root window");
     }
-    let precision = certificate.precision_bits.max(references.precision_bits);
     let records = certificate
         .roots
         .iter()
         .zip(&references.positive_ordinates)
         .enumerate()
         .map(|(offset, (root, reference))| {
-            let lower = parse_endpoint(&root.lower, precision)?;
-            let upper = parse_endpoint(&root.upper, precision)?;
-            let reference_value = parse_endpoint(reference, precision)?;
-            let mut midpoint = Float::with_val(precision, &lower + &upper);
-            midpoint /= 2;
-            let mut error = Float::with_val(precision, midpoint - &reference_value);
-            error.abs_mut();
-            Ok(RootReferenceComparisonRecord {
-                positive_index: offset + 1,
-                enclosure_lower: root.lower.clone(),
-                enclosure_upper: root.upper.clone(),
-                reference_ordinate: reference.clone(),
-                absolute_midpoint_error: serialize_float(&error, precision),
-                measured_agreement_digits: measured_agreement_digits(&error, precision),
-                reference_inside_enclosure: reference_value >= lower && reference_value <= upper,
-            })
+            reference_comparison_record(root, reference, references.precision_bits, offset + 1)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(PostDiscoveryReferenceComparison {
-        schema_version: 1,
+        schema_version: 2,
         root_certificate_digest: first_positive_certificate_digest(certificate)?,
         source_weights_digest: certificate.source_weights_digest.clone(),
         reference_dataset_digest: references.dataset_digest.clone(),
@@ -1725,7 +1980,7 @@ pub fn verify_post_discovery_reference_comparison(
     references: &ReferenceZeroDataset,
 ) -> Result<()> {
     let replay = compare_first_positive_roots_to_references(certificate, references)?;
-    if comparison.schema_version != 1
+    if comparison.schema_version != 2
         || comparison.reference_influenced_discovery
         || comparison.records.len() != certificate.requested_roots
         || &replay != comparison
@@ -1748,7 +2003,6 @@ pub fn compare_production_first_positive_roots_to_references(
     if references.positive_ordinates.len() < certificate.requested_roots {
         bail!("reference-zero dataset does not cover the production root window");
     }
-    let precision = certificate.precision_bits.max(references.precision_bits);
     let records = certificate
         .window
         .roots
@@ -1756,26 +2010,11 @@ pub fn compare_production_first_positive_roots_to_references(
         .zip(&references.positive_ordinates)
         .enumerate()
         .map(|(offset, (root, reference))| {
-            let lower = parse_endpoint(&root.lower, precision)?;
-            let upper = parse_endpoint(&root.upper, precision)?;
-            let reference_value = parse_endpoint(reference, precision)?;
-            let mut midpoint = Float::with_val(precision, &lower + &upper);
-            midpoint /= 2;
-            let mut error = Float::with_val(precision, midpoint - &reference_value);
-            error.abs_mut();
-            Ok(RootReferenceComparisonRecord {
-                positive_index: offset + 1,
-                enclosure_lower: root.lower.clone(),
-                enclosure_upper: root.upper.clone(),
-                reference_ordinate: reference.clone(),
-                absolute_midpoint_error: serialize_float(&error, precision),
-                measured_agreement_digits: measured_agreement_digits(&error, precision),
-                reference_inside_enclosure: reference_value >= lower && reference_value <= upper,
-            })
+            reference_comparison_record(root, reference, references.precision_bits, offset + 1)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(PostDiscoveryReferenceComparison {
-        schema_version: 1,
+        schema_version: 2,
         root_certificate_digest: ContentDigest::sha256(&serde_json::to_vec(certificate)?),
         source_weights_digest: certificate.source_weights_digest.clone(),
         reference_dataset_digest: references.dataset_digest.clone(),
@@ -1793,7 +2032,7 @@ pub fn verify_production_post_discovery_reference_comparison(
     references: &ReferenceZeroDataset,
 ) -> Result<()> {
     let replay = compare_production_first_positive_roots_to_references(certificate, references)?;
-    if comparison.schema_version != 1
+    if comparison.schema_version != 2
         || comparison.reference_influenced_discovery
         || comparison.records.len() != certificate.requested_roots
         || &replay != comparison
@@ -1821,33 +2060,17 @@ pub fn compare_production_independent_roots_to_references(
     if references.positive_ordinates.len() < last {
         bail!("reference-zero dataset does not cover the independent production window");
     }
-    let precision = certificate.precision_bits.max(references.precision_bits);
     let records = certificate
-        .selected_roots()
+        .try_selected_roots()?
         .iter()
         .zip(&references.positive_ordinates[first - 1..last])
         .enumerate()
         .map(|(offset, (root, reference))| {
-            let lower = parse_endpoint(&root.lower, precision)?;
-            let upper = parse_endpoint(&root.upper, precision)?;
-            let reference_value = parse_endpoint(reference, precision)?;
-            let mut midpoint = Float::with_val(precision, &lower + &upper);
-            midpoint /= 2;
-            let mut error = Float::with_val(precision, midpoint - &reference_value);
-            error.abs_mut();
-            Ok(RootReferenceComparisonRecord {
-                positive_index: first + offset,
-                enclosure_lower: root.lower.clone(),
-                enclosure_upper: root.upper.clone(),
-                reference_ordinate: reference.clone(),
-                absolute_midpoint_error: serialize_float(&error, precision),
-                measured_agreement_digits: measured_agreement_digits(&error, precision),
-                reference_inside_enclosure: reference_value >= lower && reference_value <= upper,
-            })
+            reference_comparison_record(root, reference, references.precision_bits, first + offset)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(PostDiscoveryReferenceComparison {
-        schema_version: 1,
+        schema_version: 2,
         root_certificate_digest: ContentDigest::sha256(&serde_json::to_vec(certificate)?),
         source_weights_digest: certificate.source_weights_digest.clone(),
         reference_dataset_digest: references.dataset_digest.clone(),
@@ -1872,10 +2095,142 @@ pub fn verify_production_independent_post_discovery_comparison(
 }
 
 fn parse_endpoint(text: &str, precision: u32) -> Result<Float> {
+    if !(32..=1_000_000).contains(&precision) {
+        bail!("certified endpoint precision must be in 32..=1000000");
+    }
+    if text.len() > 1_048_576 {
+        bail!("certified scalar exceeds input budget");
+    }
+    let literal = xc_core::DecimalLiteral::new(text)?;
     let parsed = Float::parse(text).context("parse certified root endpoint")?;
-    Ok(Float::with_val(precision, parsed))
+    let value = Float::with_val(precision, parsed);
+    if !value.is_finite() || (value.is_zero() && literal.canonical()?.as_str() != "0") {
+        bail!("certified endpoint is outside the finite MPFR range");
+    }
+    Ok(value)
 }
 
+fn exact_root_bounds(root: &IntervalRootCertificate) -> Result<(Rational, Rational)> {
+    if !(32..=1_000_000).contains(&root.precision_bits) {
+        bail!("invalid certified root precision");
+    }
+    let pair = match (root.schema_version, root.endpoint_encoding) {
+        (1, IntervalRootEndpointEncoding::StoredBinaryNearestV1) => {
+            let lower = parse_endpoint(&root.lower, root.precision_bits)?;
+            let upper = parse_endpoint(&root.upper, root.precision_bits)?;
+            boundary::rational_point_vector_budget([&lower, &upper].into_iter())?;
+            (
+                lower.to_rational().context("finite root lower bound")?,
+                upper.to_rational().context("finite root upper bound")?,
+            )
+        }
+        (2, IntervalRootEndpointEncoding::OutwardDecimalV2) => (
+            boundary::decimal(&root.lower)?,
+            boundary::decimal(&root.upper)?,
+        ),
+        _ => bail!("unsupported certified root endpoint schema"),
+    };
+    if pair.0 > pair.1 {
+        bail!("certified root endpoints are reversed");
+    }
+    Ok(pair)
+}
+
+fn decoded_root_interval(root: &IntervalRootCertificate) -> Result<MpfrInterval> {
+    let (lower, upper) = exact_root_bounds(root)?;
+    Ok(MpfrInterval::new(
+        Float::with_val_round(root.precision_bits, lower, Round::Down).0,
+        Float::with_val_round(root.precision_bits, upper, Round::Up).0,
+    )?)
+}
+
+fn replay_root(
+    source: &CertifiedSecularFunction,
+    root: &IntervalRootCertificate,
+    options: Option<&IntervalNewtonOptions>,
+) -> Result<()> {
+    if root.precision_bits < source.precision_bits()
+        || root.precision_bits > source.precision_bits().saturating_add(4096).min(1_000_000)
+        || root.status != IntervalRootStatus::CertifiedUnique
+        || !root.uniqueness_witnessed
+    {
+        bail!("finite secular root has invalid proof precision or uniqueness status");
+    }
+    let (lower, upper) = exact_root_bounds(root)?;
+    if lower > upper {
+        bail!("finite secular root proof endpoints are reversed");
+    }
+    if let Some(options) = options {
+        options.validate(root.precision_bits)?;
+        if upper.clone() - lower.clone() > boundary::decimal(options.width_tolerance.as_str())? {
+            bail!("finite secular root enclosure exceeds its recorded width tolerance");
+        }
+    }
+    let promoted = source.with_precision(root.precision_bits)?;
+    let enclosure = decoded_root_interval(root)?;
+    if promoted.overlaps_pole(&enclosure) {
+        bail!("finite secular root enclosure overlaps a pole");
+    }
+    if root.schema_version == 2 {
+        if !verify_interval_root_certificate_hp(&promoted, root)? {
+            bail!("finite secular root witness does not replay");
+        }
+    } else {
+        if root.uniqueness_witness.is_some() {
+            bail!("legacy finite root carries incompatible witness metadata");
+        }
+        let derivative = promoted.derivative_interval(&enclosure)?;
+        if derivative.contains_zero() {
+            bail!("finite secular root derivative includes zero");
+        }
+        let midpoint = enclosure.midpoint_point();
+        let image = midpoint.sub(&promoted.evaluate_interval(&midpoint)?.div(&derivative)?);
+        if !image.is_interior_subset_of(&enclosure) {
+            bail!("finite secular root strict Newton inclusion does not replay");
+        }
+    }
+    Ok(())
+}
+
+fn reference_comparison_record(
+    root: &IntervalRootCertificate,
+    reference: &str,
+    reference_precision: u32,
+    positive_index: usize,
+) -> Result<RootReferenceComparisonRecord> {
+    let precision = root.precision_bits.max(reference_precision);
+    let enclosure = decoded_root_interval(root)?.with_precision(precision)?;
+    let reference_value = parse_endpoint(reference, reference_precision)?;
+    let midpoint = enclosure.midpoint_point();
+    let (high, low) = if midpoint.lower() >= &reference_value {
+        (midpoint.lower(), &reference_value)
+    } else {
+        (&reference_value, midpoint.lower())
+    };
+    let error = Float::with_val_round(precision, high - low, Round::Up).0;
+    if !error.is_finite() {
+        bail!("reference midpoint difference exceeds the finite MPFR range");
+    }
+    Ok(RootReferenceComparisonRecord {
+        positive_index,
+        enclosure_lower: root.lower.clone(),
+        enclosure_upper: root.upper.clone(),
+        reference_ordinate: reference.to_owned(),
+        absolute_midpoint_error: serialize_float(&error, precision),
+        measured_agreement_digits: measured_agreement_digits(&error, precision),
+        reference_inside_enclosure: {
+            let (lower, upper) = exact_root_bounds(root)?;
+            let reference = reference_value
+                .to_rational()
+                .context("finite reference point")?;
+            reference >= lower && reference <= upper
+        },
+    })
+}
+
+/// Check the structure, ordering and count agreement of supplied certificates.
+/// This does not replay their source mathematics: uniqueness and the independent
+/// count remain caller-supplied premises. Every stored enclosure must be valid.
 pub fn reconcile_complete_window(
     roots: &[IntervalRootCertificate],
     count: &SecularCountCertificate,
@@ -1883,16 +2238,11 @@ pub fn reconcile_complete_window(
     let all_unique = roots.iter().all(|root| {
         root.status == IntervalRootStatus::CertifiedUnique && root.uniqueness_witnessed
     });
-    let mut ordered_and_disjoint = true;
-    for pair in roots.windows(2) {
-        let precision = pair[0].precision_bits.max(pair[1].precision_bits);
-        let left_upper = parse_endpoint(&pair[0].upper, precision)?;
-        let right_lower = parse_endpoint(&pair[1].lower, precision)?;
-        if left_upper >= right_lower {
-            ordered_and_disjoint = false;
-            break;
-        }
-    }
+    let enclosures = roots
+        .iter()
+        .map(exact_root_bounds)
+        .collect::<Result<Vec<_>>>()?;
+    let ordered_and_disjoint = enclosures.windows(2).all(|pair| pair[0].1 < pair[1].0);
     let counts_agree = roots.len() == count.certified_root_count;
     let complete = all_unique && ordered_and_disjoint && counts_agree;
     Ok(RootCountReconciliation {
@@ -1901,13 +2251,13 @@ pub fn reconcile_complete_window(
         independently_counted_roots: count.certified_root_count,
         ordered_and_disjoint,
         reason: if complete {
-            "every monotonic pole interval has one disjoint certified unique root".to_owned()
+            "all supplied roots are individually certified unique, their enclosures are ordered and disjoint, and their count matches the supplied independent count".to_owned()
         } else if !all_unique {
             "at least one isolated candidate lacks a uniqueness certificate".to_owned()
         } else if !ordered_and_disjoint {
             "certified root enclosures overlap or are not ordered".to_owned()
         } else {
-            "isolated root count differs from the independent monotone count".to_owned()
+            "isolated root count differs from the supplied independent count".to_owned()
         },
     })
 }
@@ -1920,6 +2270,92 @@ mod tests {
         CcmResearchSequenceOutcome, CcmResearchTarget,
     };
     use xc_core::DecimalLiteral;
+
+    #[test]
+    fn outward_root_endpoints_contain_exact_rational_root_and_replay() {
+        for precision in [80u32, 128] {
+            let poles = [Float::with_val(precision, 0), Float::with_val(precision, 1)];
+            let weights = [Float::with_val(precision, 1), Float::with_val(precision, 2)];
+            let source =
+                CertifiedSecularFunction::from_point_data(&poles, &weights, precision).unwrap();
+            let candidate = MpfrInterval::new(
+                Float::with_val(precision, Rational::from((1, 4))),
+                Float::with_val(precision, Rational::from((1, 2))),
+            )
+            .unwrap();
+            let options = IntervalNewtonOptions {
+                width_tolerance: DecimalLiteral::new("1e-20").unwrap(),
+                maximum_iterations: 40,
+            };
+            let certificate = source.isolate(&candidate, &options).unwrap();
+            let (lower, upper) = exact_root_bounds(&certificate).unwrap();
+            assert!(lower <= Rational::from((1, 3)) && upper >= Rational::from((1, 3)));
+            replay_root(&source, &certificate, Some(&options)).unwrap();
+            let mut fake = certificate.clone();
+            fake.lower = "0.34".into();
+            fake.upper = "0.35".into();
+            assert!(replay_root(&source, &fake, None).is_err());
+        }
+    }
+
+    #[cfg(feature = "arb")]
+    #[test]
+    fn cached_mixed_sign_root_witness_rejects_fabricated_and_widened_boxes() {
+        let p = 256;
+        let weights = [-1, 1, 4, -4, -5, -2, 2, -2, -1, -4, -5, 3, -1, -1, 3, 2, 4]
+            .map(|x| Float::with_val(p, x));
+        let options = IntervalNewtonOptions {
+            width_tolerance: DecimalLiteral::new("1e-50").unwrap(),
+            maximum_iterations: 40,
+        };
+        let certificate = certify_production_independent_ccm_roots(
+            &weights,
+            13,
+            8,
+            &IndependentCcmRootTarget::IndexRange { first: 1, last: 3 },
+            p,
+            40,
+            &options,
+        )
+        .unwrap();
+        validate_production_independent_ccm_root_certificate_structure(&certificate).unwrap();
+        verify_production_independent_ccm_root_certificate(&certificate).unwrap();
+        let mut fake = certificate.clone();
+        fake.window.roots[0].lower = "2.5".into();
+        fake.window.roots[0].upper = "2.500000000000000000000000000000000000000000000000001".into();
+        assert!(validate_production_independent_ccm_root_certificate_structure(&fake).is_err());
+        let mut wide = certificate.clone();
+        wide.window.roots[0].lower = "1".into();
+        wide.window.roots[0].upper = "4.8".into();
+        assert!(validate_production_independent_ccm_root_certificate_structure(&wide).is_err());
+    }
+
+    #[cfg(feature = "arb")]
+    #[test]
+    fn height_window_near_root_promotes_proof_without_changing_source() {
+        for p in [80u32, 256] {
+            let weights = [-1, 1, 4, -4, -5, -2, 2, -2, -1, -4, -5, 3, -1, -1, 3, 2, 4]
+                .map(|x| Float::with_val(p, x));
+            let options = IntervalNewtonOptions {
+                width_tolerance: DecimalLiteral::new("1e-10").unwrap(),
+                maximum_iterations: 40,
+            };
+            let target = IndependentCcmRootTarget::PositiveHeightWindow {
+                lower: "3.89006533256502547362763243520353".into(),
+                upper: "11.1".into(),
+            };
+            let certificate =
+                certify_production_independent_ccm_roots(&weights, 13, 8, &target, p, 40, &options)
+                    .unwrap();
+            assert_eq!(certificate.precision_bits, p);
+            assert_eq!(certificate.first_selected_positive_index, Some(2));
+            validate_production_independent_ccm_root_certificate_structure(&certificate).unwrap();
+            verify_production_independent_ccm_root_certificate(&certificate).unwrap();
+            if p == 80 {
+                assert!(certificate.window.roots[0].precision_bits > p);
+            }
+        }
+    }
 
     fn synthetic_source(precision: u32) -> CertifiedSecularFunction {
         let poles = [-1, 0, 1]
@@ -2082,6 +2518,39 @@ mod tests {
             assert!(flint_certificate.count.square_free);
             assert!(flint_certificate.reconciliation.complete);
         }
+    }
+
+    #[cfg(feature = "arb")]
+    #[test]
+    fn fallible_selected_roots_rejects_overflow_and_out_of_window_fields() {
+        let p = 128;
+        let options = IntervalNewtonOptions {
+            width_tolerance: DecimalLiteral::new("1e-15").unwrap(),
+            maximum_iterations: 30,
+        };
+        let mut c = certify_production_independent_ccm_roots(
+            &vec![Float::with_val(p, 1); 3],
+            13,
+            1,
+            &IndependentCcmRootTarget::Prefix { count: 1 },
+            p,
+            48,
+            &options,
+        )
+        .unwrap();
+        assert_eq!(c.try_selected_roots().unwrap(), c.selected_roots());
+        for (offset, count) in [
+            (usize::MAX, 1),
+            (0, usize::MAX),
+            (c.window.roots.len() + 1, 0),
+        ] {
+            c.selected_root_offset = offset;
+            c.selected_root_count = count;
+            assert!(c.try_selected_roots().is_err());
+        }
+        c.selected_root_offset = c.window.roots.len();
+        c.selected_root_count = 0;
+        assert!(c.try_selected_roots().unwrap().is_empty());
     }
 
     #[cfg(feature = "arb")]
@@ -2285,5 +2754,407 @@ mod tests {
         let mut tampered = decoded;
         tampered.roots.swap(0, 1);
         assert!(verify_first_positive_ccm_root_certificate(&tampered).is_err());
+    }
+}
+
+#[cfg(test)]
+mod independent_boundary_audit_tests {
+    use super::*;
+    #[test]
+    fn certified_digits_do_not_round_an_excess_width_into_one_tenth() {
+        let p = 64;
+        let lower = Float::with_val(p, 1) >> 100u32;
+        let upper = Float::with_val(p, Rational::from((1, 10)));
+        let exact_width = upper.to_rational().unwrap() - lower.to_rational().unwrap();
+        assert!(exact_width > Rational::from((1, 10)));
+        let root = IntervalRootCertificate {
+            schema_version: 1,
+            endpoint_encoding: xc_root::IntervalRootEndpointEncoding::StoredBinaryNearestV1,
+            uniqueness_witness: None,
+            lower: serialize_float(&lower, p),
+            upper: serialize_float(&upper, p),
+            precision_bits: p,
+            iterations: 1,
+            status: IntervalRootStatus::CertifiedUnique,
+            uniqueness_witnessed: true,
+            reason: "synthetic width fixture".into(),
+        };
+        assert_eq!(certified_decimal_digits(&root).unwrap(), 0);
+    }
+    #[test]
+    fn measured_digits_do_not_round_an_excess_error_into_one_tenth() {
+        let error = Float::with_val(64, Rational::from((1, 10)));
+        assert!(error.to_rational().unwrap() > Rational::from((1, 10)));
+        assert_eq!(measured_agreement_digits(&error, 64), 0);
+    }
+    #[test]
+    fn certified_width_subtraction_itself_must_round_upward() {
+        let p = 66;
+        let lower = Float::with_val(p, -1) >> 71u32;
+        let upper = Float::with_val(p, Rational::from((1, 10)));
+        assert!(upper.to_rational().unwrap() < Rational::from((1, 10)));
+        let exact_width = upper.to_rational().unwrap() - lower.to_rational().unwrap();
+        assert!(exact_width > Rational::from((1, 10)));
+        let root = IntervalRootCertificate {
+            schema_version: 1,
+            endpoint_encoding: xc_root::IntervalRootEndpointEncoding::StoredBinaryNearestV1,
+            uniqueness_witness: None,
+            lower: serialize_float(&lower, p),
+            upper: serialize_float(&upper, p),
+            precision_bits: p,
+            iterations: 1,
+            status: IntervalRootStatus::CertifiedUnique,
+            uniqueness_witnessed: true,
+            reason: "cross-zero subtraction fixture".into(),
+        };
+        assert_eq!(certified_decimal_digits(&root).unwrap(), 0);
+    }
+    #[test]
+    fn decimal_digit_bounds_never_exceed_an_exact_rational_oracle() {
+        use rug::ops::Pow;
+        for p in [64, 80, 128, 256, 512] {
+            for k in 1..=24u32 {
+                let threshold = Rational::from((1, Integer::from(10).pow(k)));
+                for round in [Round::Down, Round::Nearest, Round::Up] {
+                    let error = Float::with_val_round(p, &threshold, round).0;
+                    let mut exact = error.to_rational().unwrap();
+                    let mut expected = 0;
+                    while exact <= 1 {
+                        exact *= 10;
+                        if exact <= 1 {
+                            expected += 1;
+                        }
+                    }
+                    assert!(measured_agreement_digits(&error, p) <= expected);
+                    let root = IntervalRootCertificate {
+                        schema_version: 1,
+                        endpoint_encoding:
+                            xc_root::IntervalRootEndpointEncoding::StoredBinaryNearestV1,
+                        uniqueness_witness: None,
+                        lower: "0".into(),
+                        upper: serialize_float(&error, p),
+                        precision_bits: p,
+                        iterations: 1,
+                        status: IntervalRootStatus::CertifiedUnique,
+                        uniqueness_witnessed: true,
+                        reason: "exact arithmetic fixture".into(),
+                    };
+                    assert!(certified_decimal_digits(&root).unwrap() <= expected);
+                }
+            }
+        }
+        for (text, digits) in [("1", 0), ("0.125", 0), ("0.0625", 1), ("0.0078125", 2)] {
+            let value = Float::with_val(128, Float::parse(text).unwrap());
+            assert_eq!(measured_agreement_digits(&value, 128), digits);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "arb"))]
+mod exhaustive_certificate_contract {
+    use super::*;
+
+    #[test]
+    fn exhaustive_certificate_exact_boundary_and_resource_controls() {
+        for p in [64, 128, 256, 512] {
+            for (text, expected) in [
+                ("0", Rational::from(0)),
+                ("-0.125", Rational::from((-1, 8))),
+                ("+001.2300e2", Rational::from(123)),
+                (
+                    "1e-1000",
+                    Rational::from((Integer::from(1), Integer::from(10).pow(1000))),
+                ),
+            ] {
+                assert_eq!(parse_discovery_boundary(text, p).unwrap(), expected);
+            }
+        }
+        for text in ["NaN", "inf", "1e1000001", "1e-1000001"] {
+            assert!(boundary::decimal(text).is_err());
+        }
+        assert!(boundary::shape(usize::MAX, 1, 128).is_err());
+        // The maximum accepted shape stays below the 8 GiB workspace screen.
+        assert!(boundary::source_budget(8193, 1_000_000).is_ok());
+        assert!(boundary::source_budget(8194, 1_000_000).is_err());
+        assert!(boundary::source_budget(8193, 1_000_001).is_err());
+        assert!(boundary::isolation(u32::MAX, 128).is_err());
+        let huge = Float::with_val(128, 1) << 700_000_000i32;
+        let source = CertifiedSecularFunction::from_point_data(
+            &[-huge.clone(), huge],
+            &[Float::with_val(128, 1), Float::with_val(128, 1)],
+            128,
+        )
+        .unwrap();
+        assert!(source.exact_numerator_data().is_err());
+        let point = Float::with_val(64, Rational::from((1, 3)));
+        assert_eq!(
+            production_ccm_source_weights_digest(std::slice::from_ref(&point), 256).unwrap(),
+            production_ccm_source_weights_digest(&[Float::with_val(256, &point)], 256).unwrap()
+        );
+        assert!(
+            production_ccm_source_weights_digest(&[Float::with_val(256, &point)], 128).is_err()
+        );
+    }
+    #[cfg(feature = "arb")]
+    #[test]
+    fn terminal_first_positive_prefix_replays() {
+        for p in [128, 256] {
+            let n = 2;
+            let weights = vec![Float::with_val(p, 1); 2 * n + 1];
+            let certificate =
+                certify_production_first_positive_ccm_roots(&weights, 13, n, n, p, 32, &options())
+                    .unwrap();
+            assert_eq!(certificate.schema_version, 3);
+            assert!(certificate.following_window_count.is_none());
+            verify_production_first_positive_ccm_root_certificate(&certificate).unwrap();
+        }
+    }
+    #[test]
+    fn incomplete_exact_sturm_window_returns_error() {
+        let p = 128;
+        let source = CertifiedSecularFunction::from_point_data(
+            &[
+                Float::with_val(p, 0),
+                Float::with_val(p, 1),
+                Float::with_val(p, 2),
+            ],
+            &[
+                Float::with_val(p, 1),
+                Float::with_val(p, 1),
+                Float::with_val(p, 1),
+            ],
+            p,
+        )
+        .unwrap();
+        let options = IntervalNewtonOptions {
+            width_tolerance: xc_core::DecimalLiteral::new("1e-30").unwrap(),
+            maximum_iterations: 1,
+        };
+        assert!(source
+            .certify_exact_numerator_window(0, 2, 8, &options)
+            .is_err());
+    }
+    #[test]
+    fn exhaustive_certificate_valid_prefix_and_exact_height_controls_replay() {
+        for p in [128, 192, 256] {
+            for n in [2, 3, 4] {
+                let weights = vec![Float::with_val(p, 1); 2 * n + 1];
+                let prefix = certify_production_first_positive_ccm_roots(
+                    &weights,
+                    13,
+                    n,
+                    1,
+                    p,
+                    32,
+                    &options(),
+                )
+                .unwrap();
+                assert_eq!(prefix.preceding_window_count.certified_root_count, 0);
+                verify_production_first_positive_ccm_root_certificate(&prefix).unwrap();
+                let target = IndependentCcmRootTarget::PositiveHeightWindow {
+                    lower: "1".into(),
+                    upper: "2".into(),
+                };
+                let c = certify_production_independent_ccm_roots(
+                    &weights,
+                    13,
+                    n,
+                    &target,
+                    p,
+                    32,
+                    &options(),
+                )
+                .unwrap();
+                validate_production_independent_ccm_root_certificate_structure(&c).unwrap();
+                verify_production_independent_ccm_root_certificate(&c).unwrap();
+                assert_eq!(c.lower_bound, "1");
+                assert_eq!(c.upper_bound, "2");
+                let mut missing = c.clone();
+                missing.first_selected_positive_index = None;
+                assert!(
+                    validate_production_independent_ccm_root_certificate_structure(&missing)
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    fn options() -> IntervalNewtonOptions {
+        IntervalNewtonOptions {
+            width_tolerance: xc_core::DecimalLiteral::new("1e-30").unwrap(),
+            maximum_iterations: 30,
+        }
+    }
+    fn fixture() -> ProductionIndependentCcmRootCertificate {
+        static SOURCE: std::sync::OnceLock<ProductionIndependentCcmRootCertificate> =
+            std::sync::OnceLock::new();
+        SOURCE
+            .get_or_init(|| {
+                certify_production_independent_ccm_roots(
+                    &vec![Float::with_val(192, 1); 7],
+                    13,
+                    3,
+                    &IndependentCcmRootTarget::Prefix { count: 2 },
+                    192,
+                    64,
+                    &options(),
+                )
+                .unwrap()
+            })
+            .clone()
+    }
+    #[test]
+    fn exhaustive_certificate_preceding_count_binds_selected_ordinal() {
+        let mut c = fixture();
+        c.positive_roots_before_window = 7;
+        assert!(validate_production_independent_ccm_root_certificate_structure(&c).is_err());
+    }
+    #[test]
+    fn exhaustive_certificate_selection_offset_binds_selected_ordinal() {
+        let mut c = fixture();
+        c.target = IndependentCcmRootTarget::Prefix { count: 1 };
+        c.selected_root_offset = 1;
+        c.selected_root_count = 1;
+        c.last_selected_positive_index = Some(1);
+        assert!(validate_production_independent_ccm_root_certificate_structure(&c).is_err());
+    }
+    #[test]
+    fn exhaustive_certificate_height_target_binds_discovery_window() {
+        let mut c = fixture();
+        c.target = IndependentCcmRootTarget::PositiveHeightWindow {
+            lower: "100".into(),
+            upper: "101".into(),
+        };
+        assert!(validate_production_independent_ccm_root_certificate_structure(&c).is_err());
+    }
+    #[test]
+    fn exhaustive_certificate_structure_rejects_nonfinite_weights() {
+        let mut c = fixture();
+        c.source_weights[0] = "NaN".into();
+        c.source_weights_digest = weights_digest(&c.source_weights).unwrap();
+        assert!(validate_production_independent_ccm_root_certificate_structure(&c).is_err());
+    }
+    #[test]
+    fn exhaustive_certificate_shape_overflow_is_fallible() {
+        let mut c = fixture();
+        c.modes = usize::MAX;
+        assert!(std::panic::catch_unwind(|| {
+            validate_production_independent_ccm_root_certificate_structure(&c)
+        })
+        .is_ok_and(|r| r.is_err()));
+    }
+    fn simple() -> CertifiedSecularFunction {
+        CertifiedSecularFunction::from_point_data(
+            &[Float::with_val(192, -4), Float::with_val(192, 4)],
+            &vec![Float::with_val(192, 1); 2],
+            192,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn exhaustive_certificate_rational_window_rejects_wrapped_isolation_bits() {
+        assert!(simple()
+            .certify_flint_numerator_rational_window(
+                &Rational::from(-3),
+                &Rational::from(3),
+                u32::MAX,
+                &options()
+            )
+            .is_err());
+    }
+    #[test]
+    fn exhaustive_certificate_rational_window_negation_cannot_panic() {
+        assert!(
+            std::panic::catch_unwind(|| simple().certify_flint_numerator_rational_window(
+                &Rational::from(-3),
+                &Rational::from(3),
+                1 << 31,
+                &options()
+            ))
+            .is_ok_and(|r| r.is_err())
+        );
+    }
+    #[test]
+    fn exhaustive_certificate_weight_digest_checks_precision_before_allocation() {
+        assert!(
+            std::panic::catch_unwind(|| production_ccm_source_weights_digest(
+                &[Float::with_val(128, 1)],
+                0
+            ))
+            .is_ok_and(|r| r.is_err())
+        );
+    }
+    #[test]
+    fn exhaustive_certificate_weight_digest_rejects_nonfinite_source() {
+        assert!(production_ccm_source_weights_digest(
+            &[Float::with_val(128, rug::float::Special::Nan)],
+            128
+        )
+        .is_err());
+    }
+    #[test]
+    fn exhaustive_certificate_decimal_discovery_boundary_is_exact() {
+        let value = parse_discovery_boundary(
+            "1.000000000000000000000000000000000000000000000000000000000001",
+            128,
+        )
+        .unwrap();
+        assert_eq!(
+            value,
+            Rational::from(1) + Rational::from((Integer::from(1), Integer::from(10).pow(60)))
+        );
+    }
+    #[test]
+    fn exhaustive_certificate_first_adjacent_positive_interval_is_supported() {
+        let result = certify_production_first_positive_ccm_roots(
+            &vec![Float::with_val(192, 1); 5],
+            13,
+            2,
+            1,
+            192,
+            64,
+            &options(),
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+    #[test]
+    fn exhaustive_certificate_point_constructor_checks_resource_precision() {
+        assert!(CertifiedSecularFunction::from_point_data(
+            &[Float::with_val(64, -1), Float::with_val(64, 1)],
+            &vec![Float::with_val(64, 1); 2],
+            1_000_001
+        )
+        .is_err());
+    }
+}
+#[cfg(test)]
+mod exhaustive_certificate_pole_stage {
+    use super::*;
+    #[test]
+    fn exhaustive_certificate_poles_preserve_declared_common_spacing_stages() {
+        for p in [32, 64, 128, 256] {
+            for c in [3u64, 5, 13, 1009] {
+                let source = CertifiedSecularFunction::from_integer_ccm_state(
+                    c,
+                    3,
+                    &vec![Float::with_val(p, 1); 7],
+                    p,
+                )
+                .unwrap();
+                for k in 1..=3 {
+                    let length = Float::with_val(p, Float::with_val(2048, c).ln());
+                    let spacing = Float::with_val(
+                        p,
+                        Float::with_val(2048, rug::float::Constant::Pi) * 2u32 / length,
+                    );
+                    let pole = Float::with_val(2048, spacing) * k;
+                    assert_eq!(
+                        source.poles[3 + k].lower(),
+                        &Float::with_val(p, pole),
+                        "p={p}, C={c}, k={k}"
+                    );
+                }
+            }
+        }
     }
 }

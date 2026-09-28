@@ -24,8 +24,10 @@ pub struct ShiftInvertFactorizationDescriptorHp {
 }
 
 impl ShiftInvertFactorizationDescriptorHp {
-    fn validate(&self, working_precision_bits: u32) -> Result<(), SolverError> {
-        if self.id.trim().is_empty()
+    pub(super) fn validate(&self, working_precision_bits: u32) -> Result<(), SolverError> {
+        if !(33..=1_000_000).contains(&working_precision_bits)
+            || !(33..=1_000_000).contains(&self.factorization_precision_bits)
+            || self.id.trim().is_empty()
             || self.dimension == 0
             || self.factorization_precision_bits < working_precision_bits
         {
@@ -63,6 +65,8 @@ impl ShiftInvertFactorizationDescriptorHp {
 /// Application of a previously prepared inverse of `A - shift I`.
 /// Implementations may be dense, sparse, or matrix-free, but must disclose
 /// whether the action is exact at its factorization precision or bounded.
+/// A successful action must leave every output finite and represented with at
+/// least `working_precision_bits`; invalid output is a solver error, not rank loss.
 pub trait ShiftInvertSolveHp: Send + Sync {
     fn descriptor(&self) -> ShiftInvertFactorizationDescriptorHp;
     fn solve_shifted(
@@ -102,10 +106,10 @@ impl DenseShiftInvertFactoryHp {
         if id.trim().is_empty()
             || dimension == 0
             || matrix.len() != dimension.saturating_mul(dimension)
-            || source_precision_bits <= 32
+            || !(33..=1_000_000).contains(&source_precision_bits)
         {
             return Err(SolverError::InvalidConfiguration(
-                "dense shift-invert factory requires a nonempty id, square positive matrix, and source precision above 32 bits"
+                "dense shift-invert factory requires a nonempty id, square positive matrix, and source precision in 33..=1000000 bits"
                     .to_owned(),
             ));
         }
@@ -133,7 +137,9 @@ impl ShiftInvertFactoryHp for DenseShiftInvertFactoryHp {
         &self,
         precision_bits: u32,
     ) -> Result<Box<dyn ShiftInvertSolveHp>, SolverError> {
-        if precision_bits > self.source_precision_bits {
+        if !(33..=1_000_000).contains(&precision_bits)
+            || precision_bits > self.source_precision_bits
+        {
             return Err(SolverError::InvalidConfiguration(format!(
                 "requested factorization precision {precision_bits} exceeds retained source precision {}",
                 self.source_precision_bits
@@ -174,10 +180,10 @@ impl DenseShiftInvertFactorizationHp {
     ) -> Result<Self, SolverError> {
         if dimension == 0
             || matrix.len() != dimension.saturating_mul(dimension)
-            || precision_bits <= 32
+            || !(33..=1_000_000).contains(&precision_bits)
         {
             return Err(SolverError::InvalidConfiguration(
-                "dense shift-invert factorization requires a square positive matrix and precision above 32 bits"
+                "dense shift-invert factorization requires a square positive matrix and precision in 33..=1000000 bits"
                     .to_owned(),
             ));
         }
@@ -195,10 +201,12 @@ impl DenseShiftInvertFactorizationHp {
         shift: DecimalLiteral,
         precision_bits: u32,
     ) -> Result<Self, SolverError> {
-        if dimension == 0 || lu.len() != dimension.saturating_mul(dimension) || precision_bits <= 32
+        if dimension == 0
+            || lu.len() != dimension.saturating_mul(dimension)
+            || !(33..=1_000_000).contains(&precision_bits)
         {
             return Err(SolverError::InvalidConfiguration(
-                "dense shift-invert factorization requires a square positive matrix and precision above 32 bits"
+                "dense shift-invert factorization requires a square positive matrix and precision in 33..=1000000 bits"
                     .to_owned(),
             ));
         }
@@ -326,13 +334,23 @@ impl ShiftInvertSolveHp for DenseShiftInvertFactorizationHp {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockShiftInvertConfigHp {
+    /// Interval selects at most `requested_eigenpairs` observed Ritz values
+    /// inside the interval nearest its midpoint; it does not count or enumerate
+    /// every eigenvalue in the interval.
     pub target: EigenTarget,
     pub precision_bits: u32,
     pub requested_eigenpairs: usize,
     pub guard_eigenpairs: usize,
+    /// Absolute residual in operator units; acceptance is this OR the scaled
+    /// backward-error tolerance, followed by the separate stability guards.
+    /// Scaling the operator without scaling this tolerance changes acceptance.
     pub absolute_residual_tolerance: DecimalLiteral,
+    /// Dimensionless residual normalized by the computed action norms.
     pub scaled_backward_error_tolerance: DecimalLiteral,
+    /// Maximum absolute |lambda_new-lambda_old| in eigenvalue units.
+    /// This is iterate agreement, not an eigenvalue error bound.
     pub ritz_value_stability_tolerance: DecimalLiteral,
+    /// Absolute projected gap tolerance in eigenvalue/target-distance units.
     pub boundary_cluster_tolerance: DecimalLiteral,
     pub maximum_iterations: usize,
     pub minimum_iterations: usize,
@@ -345,9 +363,16 @@ pub struct AdaptiveBlockShiftInvertOptionsHp {
     pub target: EigenTarget,
     pub requested_eigenpairs: usize,
     pub guard_eigenpairs: usize,
+    /// Absolute residual in operator units; acceptance is this OR the scaled
+    /// backward-error tolerance, followed by the separate stability guards.
+    /// Scaling the operator without scaling this tolerance changes acceptance.
     pub absolute_residual_tolerance: DecimalLiteral,
+    /// Dimensionless residual normalized by the computed action norms.
     pub scaled_backward_error_tolerance: DecimalLiteral,
+    /// Maximum absolute |lambda_new-lambda_old| in eigenvalue units.
+    /// This is iterate agreement, not an eigenvalue error bound.
     pub ritz_value_stability_tolerance: DecimalLiteral,
+    /// Absolute projected gap tolerance in eigenvalue/target-distance units.
     pub boundary_cluster_tolerance: DecimalLiteral,
     pub maximum_iterations: usize,
     pub minimum_iterations: usize,
@@ -364,7 +389,12 @@ pub struct BlockShiftInvertPrecisionAttemptHp {
     pub operator_applications: usize,
     pub shifted_solves: usize,
     pub factorizations: usize,
+    /// Maximum over requested simple pairs; absent if an unresolved boundary
+    /// cluster hides any requested vector. Guards do not enter this value.
     pub maximum_requested_residual_norm: Option<String>,
+    /// Maximum over every retained pair and unresolved cluster, including guards.
+    #[serde(default)]
+    pub maximum_retained_residual_norm: Option<String>,
     pub maximum_orthogonality_error: Option<String>,
     pub reason: String,
 }
@@ -390,6 +420,7 @@ pub struct ShiftInvertEigenpairHp {
     pub scaled_backward_error: Float,
     pub target_distance: Float,
     pub diagnostics: super::EigenpairDiagnostics<Float>,
+    pub stopping_evidence: super::HpResidualAcceptance,
 }
 
 #[derive(Clone, Debug)]
@@ -407,11 +438,21 @@ pub struct ShiftInvertBoundaryClusterHp {
 }
 
 #[derive(Clone, Debug)]
+/// Convergence concerns retained Ritz residuals and stability. The projected
+/// boundary cannot exclude an unvisited eigenspace or establish multiplicity.
 pub struct BlockShiftInvertReportHp {
+    /// True only after a full-space projection; false means global target
+    /// selection and completeness remain unverified, even when Converged.
+    pub global_target_ordering_established: bool,
     pub target: EigenTarget,
     pub requested_eigenpairs: usize,
+    /// Number selected inside the target; requested_eigenpairs is an upper bound for intervals.
+    pub selected_eigenpairs: usize,
+    pub interval_count_evidence: Option<super::BoundaryCountEvidenceHp>,
+    pub algorithm: String,
     pub retained_eigenpairs: Vec<ShiftInvertEigenpairHp>,
     pub boundary_cluster: Option<ShiftInvertBoundaryClusterHp>,
+    pub effective_boundary_cluster_tolerance: Float,
     pub iterations: usize,
     pub operator_applications: usize,
     pub shifted_solves: usize,
@@ -443,10 +484,7 @@ fn zero(precision: u32) -> Float {
 }
 
 fn parse_finite(value: &DecimalLiteral, precision: u32, name: &str) -> Result<Float, SolverError> {
-    let parsed = Float::parse(value.as_str()).map_err(|error| {
-        SolverError::InvalidConfiguration(format!("failed to parse {name}: {error}"))
-    })?;
-    let parsed = Float::with_val(precision, parsed);
+    let parsed = super::hp_parse_literal(value, precision)?;
     if !parsed.is_finite() {
         return Err(SolverError::InvalidConfiguration(format!(
             "{name} must be finite"
@@ -456,17 +494,11 @@ fn parse_finite(value: &DecimalLiteral, precision: u32, name: &str) -> Result<Fl
 }
 
 fn parse_positive(
-    value: &DecimalLiteral,
+    value: &xc_core::DecimalLiteral,
     precision: u32,
     name: &str,
 ) -> Result<Float, SolverError> {
-    let parsed = parse_finite(value, precision, name)?;
-    if parsed <= 0 {
-        return Err(SolverError::InvalidConfiguration(format!(
-            "{name} must be positive"
-        )));
-    }
-    Ok(parsed)
+    super::hp_positive_threshold(value, precision, name, rug::float::Round::Down)
 }
 
 fn parse_nonnegative(
@@ -494,11 +526,21 @@ fn dot(left: &[Float], right: &[Float], precision: u32) -> Float {
 }
 
 fn norm(vector: &[Float], precision: u32) -> Float {
-    dot(vector, vector, precision).sqrt()
+    super::hp_norm(vector, precision)
 }
 
 fn add_orthonormal(candidate: Vec<Float>, basis: &mut Vec<Vec<Float>>, precision: u32) -> bool {
     let mut candidate = candidate;
+    // Rank is invariant under nonzero scalar rescaling. Normalize before
+    // projection so the rejection threshold measures relative loss of rank.
+    let original_norm = norm(&candidate, precision);
+    if !original_norm.is_finite() || original_norm.is_zero() {
+        return false;
+    }
+    for value in &mut candidate {
+        *value = Float::with_val(precision, &*value);
+        *value /= &original_norm;
+    }
     for _ in 0..2 {
         for vector in basis.iter() {
             let projection = dot(vector, &candidate, precision);
@@ -529,16 +571,40 @@ fn target_shift(
         EigenTarget::SmallestMagnitude => Ok((zero(precision), None)),
         EigenTarget::ClosestTo { shift } => Ok((parse_finite(shift, precision, "target shift")?, None)),
         EigenTarget::Interval { lower, upper } => {
-            let lower = parse_finite(lower, precision, "interval lower")?;
-            let upper = parse_finite(upper, precision, "interval upper")?;
-            if lower >= upper {
+            target
+                .validate()
+                .map_err(|error| SolverError::InvalidConfiguration(error.to_string()))?;
+            // The factorization shift is a point approximation to the interval
+            // midpoint. Selection is a separate exact-decimal requirement:
+            // round inward so an exterior Ritz point cannot pass membership.
+            let lower_point = parse_finite(lower, precision, "interval lower")?;
+            let upper_point = parse_finite(upper, precision, "interval upper")?;
+            let midpoint = xc_numerics::mpfr_interval::MpfrInterval::new(
+                lower_point, upper_point,
+            )
+            .map_err(|error| SolverError::InvalidConfiguration(error.to_string()))?
+            .midpoint_point()
+            .lower()
+            .clone();
+            let lower = Float::with_val_round(
+                precision,
+                Float::parse(lower.as_str()).map_err(|error| {
+                    SolverError::InvalidConfiguration(error.to_string())
+                })?,
+                rug::float::Round::Up,
+            ).0;
+            let upper = Float::with_val_round(
+                precision,
+                Float::parse(upper.as_str()).map_err(|error| {
+                    SolverError::InvalidConfiguration(error.to_string())
+                })?,
+                rug::float::Round::Down,
+            ).0;
+            if !lower.is_finite() || !upper.is_finite() || lower > upper {
                 return Err(SolverError::InvalidConfiguration(
-                    "shift-invert interval must have lower < upper".to_owned(),
+                    "shift-invert interval contains no finite coordinate at the working precision".to_owned(),
                 ));
             }
-            let mut midpoint = lower.clone();
-            midpoint += &upper;
-            midpoint /= 2;
             Ok((midpoint, Some((lower, upper))))
         }
         other => Err(SolverError::UnsupportedTarget(format!(
@@ -601,7 +667,7 @@ impl BlockShiftInvertSolverHp {
         let retained = config
             .requested_eigenpairs
             .saturating_add(config.guard_eigenpairs);
-        if config.precision_bits <= 32
+        if !(33..=1_000_000).contains(&config.precision_bits)
             || dimension == 0
             || retained > dimension
             || config.requested_eigenpairs == 0
@@ -611,10 +677,30 @@ impl BlockShiftInvertSolverHp {
             || config.maximum_projected_sweeps == 0
         {
             return Err(SolverError::InvalidConfiguration(
-                "HP block shift-invert requires positive dimensions/counts, a guard for partial selection, precision above 32 bits, and valid iteration bounds"
+                "HP block shift-invert requires positive dimensions/counts, a guard for partial selection, precision in 33..=1000000 bits, and valid iteration bounds"
                     .to_owned(),
             ));
         }
+        // Retain old directions together with inverse corrections. Account for
+        // the complete bounded union and projected eigensolve before allocation.
+        let maximum_trial = retained.saturating_mul(2).min(dimension);
+        let scalar_bytes = u128::from(config.precision_bits).div_ceil(8) + 40;
+        let working_entries = 12u128
+            .saturating_mul(dimension as u128)
+            .saturating_mul(retained as u128)
+            .saturating_add(
+                6u128
+                    .saturating_mul(maximum_trial as u128)
+                    .saturating_mul(maximum_trial as u128),
+            );
+        let working_bytes = working_entries.saturating_mul(scalar_bytes);
+        if working_bytes > 1024u128 * 1024 * 1024 {
+            return Err(SolverError::InvalidConfiguration(
+                "block shifted-inverse union exceeds the 1 GiB working-memory admission limit"
+                    .into(),
+            ));
+        }
+        let mut maximum_trial_dimension = 0usize;
         let descriptor = shifted_solver.descriptor();
         descriptor.validate(config.precision_bits)?;
         if descriptor.dimension != dimension {
@@ -622,13 +708,40 @@ impl BlockShiftInvertSolverHp {
                 "shifted solver and operator dimensions differ".to_owned(),
             ));
         }
-        let (shift, interval) = target_shift(&config.target, config.precision_bits)?;
+        let (mut shift, interval) = target_shift(&config.target, config.precision_bits)?;
         let declared_shift = parse_finite(
             &descriptor.shift,
             config.precision_bits,
             "factorization shift",
         )?;
-        if declared_shift != shift {
+        let matches = if let EigenTarget::Interval { lower, upper } = &config.target {
+            // Verify the mathematical decimal midpoint before rounding it once.
+            // Averaging separately rounded endpoints can differ by one ulp.
+            let canonical = descriptor
+                .shift
+                .canonical()
+                .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
+            let negative = DecimalLiteral::new(
+                if let Some(unsigned) = canonical.as_str().strip_prefix('-') {
+                    unsigned.to_owned()
+                } else {
+                    format!("-{}", canonical.as_str())
+                },
+            )
+            .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
+            let zero = DecimalLiteral::new("0").expect("zero literal");
+            let exact = zero
+                .cmp_sum_many(&[lower, upper, &negative, &negative])
+                .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?
+                == std::cmp::Ordering::Equal;
+            if exact {
+                shift = declared_shift.clone();
+            }
+            exact
+        } else {
+            declared_shift == shift
+        };
+        if !matches {
             return Err(SolverError::InvalidConfiguration(
                 "factorization shift does not match the target shift or interval midpoint"
                     .to_owned(),
@@ -649,17 +762,16 @@ impl BlockShiftInvertSolverHp {
             config.precision_bits,
             "Ritz-value stability tolerance",
         )?;
-        let cluster_tolerance = parse_positive(
+        let cluster_tolerance = super::hp_positive_threshold(
             &config.boundary_cluster_tolerance,
             config.precision_bits,
             "boundary cluster tolerance",
+            rug::float::Round::Up,
         )?;
         let mut basis = Vec::with_capacity(retained);
         for column in 0..retained {
             let candidate = (0..dimension)
-                .map(|row| {
-                    Float::with_val(config.precision_bits, (row + 1).pow((column + 1) as u32))
-                })
+                .map(|row| Float::with_val(config.precision_bits, row + 1).pow((column + 1) as u32))
                 .collect();
             let _ = add_orthonormal(candidate, &mut basis, config.precision_bits);
         }
@@ -681,43 +793,67 @@ impl BlockShiftInvertSolverHp {
         let mut shifted_solves = 0usize;
         for iteration in 1..=config.maximum_iterations {
             check_solver_cancellation(cancellation)?;
-            let mut inverse_basis = Vec::with_capacity(retained);
+            let mut inverse_basis: Vec<Vec<Float>> = Vec::with_capacity(maximum_trial);
             for vector in &basis {
                 let mut solved = vec![zero(config.precision_bits); dimension];
                 shifted_solver.solve_shifted(vector, &mut solved, config.precision_bits)?;
                 shifted_solves += 1;
+                if solved
+                    .iter()
+                    .any(|value| !value.is_finite() || value.prec() < config.precision_bits)
+                {
+                    return Err(SolverError::NumericalBreakdown(
+                        "shifted solve returned nonfinite or insufficient-precision output"
+                            .to_owned(),
+                    ));
+                }
+                // Remove the dominant inverse component before normalization;
+                // its magnitude must not erase a useful smaller correction.
+                for _ in 0..2 {
+                    for q in &inverse_basis {
+                        let coefficient = dot(q, &solved, config.precision_bits);
+                        for (x, b) in solved.iter_mut().zip(q) {
+                            *x -= Float::with_val(config.precision_bits, b * &coefficient);
+                        }
+                    }
+                }
                 let _ = add_orthonormal(solved, &mut inverse_basis, config.precision_bits);
             }
-            if inverse_basis.len() != retained {
-                return Err(SolverError::NumericalBreakdown(
-                    "shift-invert block lost rank before convergence".to_owned(),
+            for old in &basis {
+                if inverse_basis.len() == maximum_trial {
+                    break;
+                }
+                let _ = add_orthonormal(old.clone(), &mut inverse_basis, config.precision_bits);
+            }
+            if inverse_basis.len() < retained {
+                return Err(SolverError::PrecisionExhausted(
+                    "shift-invert union cannot resolve the retained rank".into(),
                 ));
             }
-            let mut applied = Vec::with_capacity(retained);
+            let trial_dimension = inverse_basis.len();
+            maximum_trial_dimension = maximum_trial_dimension.max(trial_dimension);
+            let mut applied = Vec::with_capacity(trial_dimension);
             for vector in &inverse_basis {
-                let mut output = vec![zero(config.precision_bits); dimension];
-                operator.apply(vector, &mut output)?;
-                for value in &mut output {
-                    *value = Float::with_val(config.precision_bits, &*value);
-                }
+                let output = super::hp_checked_action(operator, vector, config.precision_bits)?;
                 operator_applications += 1;
                 applied.push(output);
             }
-            let mut projected = vec![zero(config.precision_bits); retained * retained];
-            for row in 0..retained {
+            let mut projected =
+                vec![zero(config.precision_bits); trial_dimension * trial_dimension];
+            for row in 0..trial_dimension {
                 for column in 0..=row {
                     let value = dot(&inverse_basis[row], &applied[column], config.precision_bits);
-                    projected[row * retained + column] = value.clone();
-                    projected[column * retained + row] = value;
+                    projected[row * trial_dimension + column] = value.clone();
+                    projected[column * trial_dimension + row] = value;
                 }
             }
             let (values, vectors) = symmetric_jacobi_eigensystem(
                 &projected,
-                retained,
+                trial_dimension,
                 config.precision_bits,
                 config.maximum_projected_sweeps,
             )?;
-            let mut order: Vec<usize> = (0..retained).collect();
+            let mut order: Vec<usize> = (0..trial_dimension).collect();
             order.sort_by(|left, right| {
                 let left_inside = interval.as_ref().is_none_or(|(lower, upper)| {
                     values[*left] >= *lower && values[*left] <= *upper
@@ -733,22 +869,22 @@ impl BlockShiftInvertSolverHp {
                         .unwrap_or(Ordering::Equal)
                 })
             });
-            let mut states = Vec::with_capacity(retained);
-            for index in order {
+            let mut states = Vec::with_capacity(trial_dimension);
+            for index in order.into_iter().take(retained) {
                 let mut vector = vec![zero(config.precision_bits); dimension];
-                let mut applied_vector = vec![zero(config.precision_bits); dimension];
-                for column in 0..retained {
+                for column in 0..trial_dimension {
                     let coefficient = &vectors[index][column];
                     for row in 0..dimension {
                         let mut contribution = inverse_basis[column][row].clone();
                         contribution *= coefficient;
                         vector[row] += contribution;
-                        let mut applied_contribution = applied[column][row].clone();
-                        applied_contribution *= coefficient;
-                        applied_vector[row] += applied_contribution;
                     }
                 }
-                let value = values[index].clone();
+                let applied_vector =
+                    super::hp_checked_action(operator, &vector, config.precision_bits)?;
+                operator_applications += 1;
+                let value = dot(&vector, &applied_vector, config.precision_bits)
+                    / dot(&vector, &vector, config.precision_bits);
                 let residual: Vec<Float> = applied_vector
                     .iter()
                     .zip(&vector)
@@ -760,15 +896,13 @@ impl BlockShiftInvertSolverHp {
                         result
                     })
                     .collect();
-                let residual_norm = norm(&residual, config.precision_bits);
-                let mut scale = norm(&applied_vector, config.precision_bits);
-                let mut value_scale = value.clone().abs();
-                value_scale *= norm(&vector, config.precision_bits);
-                scale += value_scale;
-                let mut backward_error = residual_norm.clone();
-                if !scale.is_zero() {
-                    backward_error /= scale;
-                }
+                let (residual_norm, backward_error) = super::hp_residual_measures(
+                    &residual,
+                    &applied_vector,
+                    &vector,
+                    &value,
+                    config.precision_bits,
+                )?;
                 let target_distance = distance(&value, &shift, config.precision_bits);
                 states.push(RitzState {
                     vector,
@@ -783,10 +917,9 @@ impl BlockShiftInvertSolverHp {
                 .as_ref()
                 .map(|previous| {
                     let mut maximum = zero(config.precision_bits);
-                    for index in 0..config.requested_eigenpairs {
-                        let mut change = states[index].value.clone();
-                        change -= &previous[index];
-                        change.abs_mut();
+                    for index in 0..retained {
+                        let change =
+                            super::hp_ritz_change(&states[index].value, &previous[index], None);
                         if change > maximum {
                             maximum = change;
                         }
@@ -796,28 +929,84 @@ impl BlockShiftInvertSolverHp {
                 .unwrap_or_else(|| {
                     Float::with_val(config.precision_bits, rug::float::Special::Infinity)
                 });
-            let requested_inside = interval.as_ref().is_none_or(|(lower, upper)| {
-                states
-                    .iter()
-                    .take(config.requested_eigenpairs)
-                    .all(|state| state.value >= *lower && state.value <= *upper)
-            });
-            let residuals_converged = requested_inside
-                && states
-                    .iter()
-                    .take(config.requested_eigenpairs)
-                    .all(|state| {
-                        state.residual_norm <= absolute_tolerance
-                            || state.backward_error <= backward_tolerance
+            let mut selected_eigenpairs =
+                interval
+                    .as_ref()
+                    .map_or(config.requested_eigenpairs, |(lower, upper)| {
+                        states
+                            .iter()
+                            .take_while(|state| state.value >= *lower && state.value <= *upper)
+                            .count()
+                            .min(config.requested_eigenpairs)
                     });
+            let residuals_converged = states.iter().all(|state| {
+                state.residual_norm <= absolute_tolerance
+                    || state.backward_error <= backward_tolerance
+            });
             let converged = iteration >= config.minimum_iterations
                 && residuals_converged
                 && maximum_stability <= stability_tolerance;
             if converged || iteration == config.maximum_iterations {
+                let cluster_tolerance = super::hp_effective_cluster_tolerance(
+                    &cluster_tolerance,
+                    states.iter().map(|state| &state.value),
+                    dimension,
+                    config.precision_bits,
+                );
+                let interval_selection_requires_count = selected_eigenpairs
+                    < config.requested_eigenpairs
+                    && matches!(config.target, EigenTarget::Interval { .. });
+                let mut interval_count_evidence = None;
+                if interval_selection_requires_count {
+                    if let EigenTarget::Interval { lower, upper } = &config.target {
+                        let mut proof = super::hp_boundary_count::interval_count(
+                            operator,
+                            lower,
+                            upper,
+                            selected_eigenpairs,
+                            config.precision_bits,
+                        )?;
+                        if let super::BoundaryCountEvidenceHp::CountMismatch { observed, .. } =
+                            proof
+                        {
+                            // Endpoint roots may have rounded Ritz points just outside.
+                            // Exact source counts determine capacity, never a widened point test.
+                            selected_eigenpairs = observed.min(config.requested_eigenpairs);
+                            proof = super::hp_boundary_count::interval_count(
+                                operator,
+                                lower,
+                                upper,
+                                observed,
+                                config.precision_bits,
+                            )?;
+                        }
+                        if proof.establishes_requested_count()
+                            && selected_eigenpairs > 0
+                            && selected_eigenpairs < states.len()
+                        {
+                            let values: Vec<_> =
+                                states.iter().map(|state| state.value.clone()).collect();
+                            let prefix = super::hp_boundary_count::boundary_count(
+                                operator,
+                                &EigenTarget::ClosestTo {
+                                    shift: descriptor.shift.clone(),
+                                },
+                                selected_eigenpairs,
+                                &values,
+                                &cluster_tolerance,
+                                config.precision_bits,
+                            )?;
+                            if !prefix.establishes_requested_count() {
+                                proof = prefix;
+                            }
+                        }
+                        interval_count_evidence = Some(proof);
+                    }
+                }
                 let mut boundary_cluster = None;
-                if config.requested_eigenpairs < retained {
-                    let requested = config.requested_eigenpairs - 1;
-                    let guard = config.requested_eigenpairs;
+                if selected_eigenpairs > 0 && selected_eigenpairs < retained {
+                    let requested = selected_eigenpairs - 1;
+                    let guard = selected_eigenpairs;
                     let mut gap = states[guard].distance.clone();
                     gap -= &states[requested].distance;
                     gap.abs_mut();
@@ -864,7 +1053,7 @@ impl BlockShiftInvertSolverHp {
                         boundary_cluster = Some(ShiftInvertBoundaryClusterHp {
                             first_retained_position: first,
                             last_retained_position: last,
-                            requested_members: config.requested_eigenpairs - first,
+                            requested_members: selected_eigenpairs - first,
                             dimension: cluster_dimension,
                             basis: states[first..=last]
                                 .iter()
@@ -892,6 +1081,16 @@ impl BlockShiftInvertSolverHp {
                             .is_some_and(|range| range.contains(position))
                     })
                     .map(|(position, state)| ShiftInvertEigenpairHp {
+                        stopping_evidence: super::hp_residual_acceptance(
+                            &state.applied,
+                            &state.vector,
+                            &state.value,
+                            &state.residual_norm,
+                            &state.backward_error,
+                            &absolute_tolerance,
+                            &backward_tolerance,
+                            config.precision_bits,
+                        ),
                         eigenvalue: state.value.clone(),
                         eigenvector: state.vector.clone(),
                         residual_norm: state.residual_norm.clone(),
@@ -905,7 +1104,18 @@ impl BlockShiftInvertSolverHp {
                         },
                     })
                     .collect();
-                let (status, termination) = if converged && boundary_cluster.is_some() {
+                let incomplete_interval_count = interval_selection_requires_count
+                    && !interval_count_evidence
+                        .as_ref()
+                        .is_some_and(|proof| proof.establishes_requested_count());
+                let (status, termination) = if converged && incomplete_interval_count {
+                    (
+                        ResultStatus::UnresolvedEigenspace,
+                        TerminationReason::UnresolvedEigenspace,
+                    )
+                } else if converged && selected_eigenpairs == 0 {
+                    (ResultStatus::Converged, TerminationReason::EmptySelection)
+                } else if converged && boundary_cluster.is_some() {
                     (
                         ResultStatus::UnresolvedCluster,
                         TerminationReason::UnresolvedCluster,
@@ -913,7 +1123,14 @@ impl BlockShiftInvertSolverHp {
                 } else if converged {
                     (
                         ResultStatus::Converged,
-                        TerminationReason::BackwardErrorTolerance,
+                        super::hp_block_termination(
+                            states
+                                .iter()
+                                .take(selected_eigenpairs)
+                                .map(|state| (&state.residual_norm, &state.backward_error)),
+                            &absolute_tolerance,
+                            &backward_tolerance,
+                        ),
                     )
                 } else {
                     (
@@ -921,16 +1138,12 @@ impl BlockShiftInvertSolverHp {
                         TerminationReason::MaximumIterations,
                     )
                 };
-                let bytes_per_value = u64::from(config.precision_bits).div_ceil(8);
-                let estimated_peak_memory_bytes = 5u64
-                    .saturating_mul(retained as u64)
-                    .saturating_mul(dimension as u64)
-                    .saturating_mul(bytes_per_value);
+                let estimated_peak_memory_bytes = working_bytes as u64;
                 let performance = SolverPerformanceTelemetry {
                     operator_applications: operator_applications as u64,
                     metric_applications: 0,
                     preconditioner_applications: 0,
-                    factorizations: 1,
+                    factorizations: 0,
                     iterations: iteration as u64,
                     precision_escalations: 0,
                     estimated_peak_memory_bytes,
@@ -939,14 +1152,22 @@ impl BlockShiftInvertSolverHp {
                 let mut provenance = SolverProvenance::current_package("rug_mpfr");
                 provenance.precision_bits = Some(config.precision_bits);
                 return Ok(BlockShiftInvertReportHp {
+                    global_target_ordering_established: maximum_trial_dimension == dimension
+                        || interval_count_evidence
+                            .as_ref()
+                            .is_some_and(|proof| proof.establishes_requested_count()),
                     target: config.target.clone(),
                     requested_eigenpairs: config.requested_eigenpairs,
+                    selected_eigenpairs,
+                    interval_count_evidence,
+                    algorithm: "block_shift_invert_union_fresh_images_guard_counts_hp_v3".into(),
                     retained_eigenpairs,
                     boundary_cluster,
+                    effective_boundary_cluster_tolerance: cluster_tolerance,
                     iterations: iteration,
                     operator_applications,
                     shifted_solves,
-                    factorizations: 1,
+                    factorizations: 0,
                     projected_diagonalizations: iteration,
                     maximum_orthogonality_error,
                     maximum_ritz_value_stability: maximum_stability,
@@ -966,6 +1187,26 @@ impl BlockShiftInvertSolverHp {
             "HP block shift-invert exhausted its iteration loop".to_owned(),
         ))
     }
+}
+
+fn maximum_requested_shift_invert_residual(report: &BlockShiftInvertReportHp) -> Option<String> {
+    if report
+        .boundary_cluster
+        .as_ref()
+        .is_some_and(|c| c.requested_members != 0)
+    {
+        return None;
+    }
+    if report.retained_eigenpairs.len() < report.selected_eigenpairs {
+        return None;
+    }
+    report
+        .retained_eigenpairs
+        .iter()
+        .take(report.selected_eigenpairs)
+        .map(|pair| &pair.residual_norm)
+        .max_by(|a, b| a.total_cmp(b))
+        .map(ToString::to_string)
 }
 
 fn maximum_shift_invert_residual(report: &BlockShiftInvertReportHp) -> Option<String> {
@@ -1025,7 +1266,7 @@ pub fn solve_block_shift_invert_adaptive_hp(
         .initial_bits
         .saturating_add(options.precision.guard_bits)
         .min(options.precision.maximum_bits);
-    if precision_bits <= 32 {
+    if !(33..=1_000_000).contains(&precision_bits) {
         return Err(SolverError::InvalidConfiguration(
             "adaptive HP shift-invert precision must exceed 32 bits after guard bits".to_owned(),
         ));
@@ -1046,17 +1287,20 @@ pub fn solve_block_shift_invert_adaptive_hp(
             minimum_iterations: options.minimum_iterations,
             maximum_projected_sweeps: options.maximum_projected_sweeps,
         };
+        let mut completed_factorizations = 0;
         let outcome = factory
             .factor_at_precision(precision_bits)
             .and_then(|factorization| {
+                completed_factorizations = 1;
                 BlockShiftInvertSolverHp.solve(operator, factorization.as_ref(), &config)
             });
         match outcome {
             Ok(mut result) => {
+                result.factorizations = completed_factorizations;
                 let converged = result.status == ResultStatus::Converged;
                 let reason = match &result.status {
                     ResultStatus::Converged => {
-                        "all residual, backward-error, stability, interval, and boundary checks passed"
+                        "each requested residual or backward-error check, stability, interval, and boundary checks passed"
                             .to_owned()
                     }
                     ResultStatus::UnresolvedCluster => {
@@ -1072,7 +1316,10 @@ pub fn solve_block_shift_invert_adaptive_hp(
                     operator_applications: result.operator_applications,
                     shifted_solves: result.shifted_solves,
                     factorizations: result.factorizations,
-                    maximum_requested_residual_norm: maximum_shift_invert_residual(&result),
+                    maximum_requested_residual_norm: maximum_requested_shift_invert_residual(
+                        &result,
+                    ),
+                    maximum_retained_residual_norm: maximum_shift_invert_residual(&result),
                     maximum_orthogonality_error: Some(
                         result.maximum_orthogonality_error.to_string(),
                     ),
@@ -1088,18 +1335,39 @@ pub fn solve_block_shift_invert_adaptive_hp(
                 last_result = Some(Box::new(result));
             }
             Err(error @ SolverError::InvalidConfiguration(_))
-            | Err(error @ SolverError::UnsupportedTarget(_)) => return Err(error),
-            Err(error) => attempts.push(BlockShiftInvertPrecisionAttemptHp {
-                precision_bits,
-                status: ResultStatus::InsufficientPrecision,
-                iterations: 0,
-                operator_applications: 0,
-                shifted_solves: 0,
-                factorizations: 1,
-                maximum_requested_residual_norm: None,
-                maximum_orthogonality_error: None,
-                reason: error.to_string(),
-            }),
+            | Err(error @ SolverError::UnsupportedTarget(_))
+            | Err(error @ SolverError::Cancelled(_)) => return Err(error),
+            Err(error @ SolverError::PrecisionExhausted(_)) => {
+                attempts.push(BlockShiftInvertPrecisionAttemptHp {
+                    precision_bits,
+                    status: ResultStatus::InsufficientPrecision,
+                    iterations: 0,
+                    operator_applications: 0,
+                    shifted_solves: 0,
+                    factorizations: completed_factorizations,
+                    maximum_requested_residual_norm: None,
+                    maximum_retained_residual_norm: None,
+                    maximum_orthogonality_error: None,
+                    reason: error.to_string(),
+                })
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                attempts.push(BlockShiftInvertPrecisionAttemptHp {
+                    precision_bits,
+                    status: ResultStatus::Failed,
+                    iterations: 0,
+                    operator_applications: 0,
+                    shifted_solves: 0,
+                    factorizations: completed_factorizations,
+                    maximum_requested_residual_norm: None,
+                    maximum_retained_residual_norm: None,
+                    maximum_orthogonality_error: None,
+                    reason: error.to_string(),
+                });
+                return Ok(AdaptiveBlockShiftInvertResultHp::Inconclusive { last_result, attempts,
+                    reason: format!("execution failed without evidence that precision escalation remedies it: {reason}") });
+            }
         }
         let Some(next_bits) = options.precision.next_bits(precision_bits) else {
             if let Some(result) = last_result.as_mut() {
@@ -1149,6 +1417,55 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_requested_residual_excludes_guard_and_unresolved_cluster() {
+        let p = 192;
+        let matrix = diagonal(p, &[0.1, 2.0, 7.0]);
+        let operator =
+            DenseSymmetricHp::new("residual-scope", 3, matrix.clone(), p, &zero(p)).unwrap();
+        let factor = DenseShiftInvertFactorizationHp::factor(
+            "residual-scope",
+            3,
+            &matrix,
+            DecimalLiteral::new("0").unwrap(),
+            p,
+        )
+        .unwrap();
+        let mut cfg = config(EigenTarget::SmallestMagnitude);
+        cfg.requested_eigenpairs = 1;
+        cfg.guard_eigenpairs = 2;
+        let mut report = BlockShiftInvertSolverHp
+            .solve(&operator, &factor, &cfg)
+            .unwrap();
+        report.retained_eigenpairs[0].residual_norm = Float::with_val(p, 1) / 1024u32;
+        report.retained_eigenpairs[1].residual_norm = Float::with_val(p, 1);
+        assert_eq!(
+            maximum_requested_shift_invert_residual(&report),
+            Some((Float::with_val(p, 1) / 1024u32).to_string())
+        );
+        assert_eq!(
+            maximum_shift_invert_residual(&report),
+            Some(Float::with_val(p, 1).to_string())
+        );
+        report.boundary_cluster = Some(ShiftInvertBoundaryClusterHp {
+            first_retained_position: 0,
+            last_retained_position: 1,
+            requested_members: 1,
+            dimension: 2,
+            basis: vec![],
+            projected_operator: vec![],
+            minimum_target_distance: zero(p),
+            maximum_target_distance: zero(p),
+            boundary_distance_gap: zero(p),
+            maximum_residual_norm: Float::with_val(p, 2),
+        });
+        assert_eq!(maximum_requested_shift_invert_residual(&report), None);
+        assert_eq!(
+            maximum_shift_invert_residual(&report),
+            Some(Float::with_val(p, 2).to_string())
+        );
+    }
+
+    #[test]
     fn block_shift_invert_finds_near_zero_pairs_without_full_spectrum() {
         let precision = 192;
         let values = [-3.0, -0.2, 0.1, 2.0, 7.0];
@@ -1192,12 +1509,12 @@ mod tests {
             assert!(pair.diagnostics.orthogonality_error <= report.maximum_orthogonality_error);
         }
         assert!(report.shifted_solves > 0);
-        assert_eq!(report.factorizations, 1);
+        assert_eq!(report.factorizations, 0);
         assert_eq!(
             report.performance.operator_applications,
             report.operator_applications as u64
         );
-        assert_eq!(report.performance.factorizations, 1);
+        assert_eq!(report.performance.factorizations, 0);
         assert_eq!(report.performance.iterations, report.iterations as u64);
         assert_eq!(report.performance.precision_escalations, 0);
         assert_eq!(
@@ -1474,5 +1791,174 @@ mod tests {
             .solve_shifted(&right_hand_side, &mut owned_solution, precision)
             .unwrap();
         assert_eq!(owned_solution, borrowed_solution);
+    }
+}
+
+#[cfg(test)]
+mod tolerance_boundary_contract {
+    use super::*;
+    #[test]
+    fn acceptance_threshold_cannot_round_up_to_one() {
+        let threshold =
+            xc_core::DecimalLiteral::new("0.999999999999999999999999999999999999999999").unwrap();
+        // 1 exceeds the exact requested threshold, even though nearest
+        // rounding at 64 bits makes the two values indistinguishable.
+        assert!(parse_positive(&threshold, 64, "acceptance tolerance").unwrap() < 1);
+    }
+}
+
+#[cfg(test)]
+mod hp_seed_range_contract {
+    use super::*;
+    #[test]
+    fn sixteen_vector_block_does_not_compute_hp_seed_powers_as_machine_integers() {
+        let p = 256;
+        let n = 16;
+        let data = (0..n * n)
+            .map(|i| Float::with_val(p, usize::from(i / n == i % n)))
+            .collect::<Vec<_>>();
+        let operator = xc_operator::DenseSymmetricHp::new(
+            "identity",
+            n,
+            data.clone(),
+            p,
+            &Float::with_val(p, 0),
+        )
+        .unwrap();
+        let factor = DenseShiftInvertFactorizationHp::factor(
+            "identity inverse",
+            n,
+            &data,
+            DecimalLiteral::new("0").unwrap(),
+            p,
+        )
+        .unwrap();
+        let tolerance = DecimalLiteral::new("1e-40").unwrap();
+        let config = BlockShiftInvertConfigHp {
+            target: EigenTarget::SmallestMagnitude,
+            precision_bits: p,
+            requested_eigenpairs: 15,
+            guard_eigenpairs: 1,
+            absolute_residual_tolerance: tolerance.clone(),
+            scaled_backward_error_tolerance: tolerance.clone(),
+            ritz_value_stability_tolerance: tolerance.clone(),
+            boundary_cluster_tolerance: tolerance,
+            maximum_iterations: 1,
+            minimum_iterations: 1,
+            maximum_projected_sweeps: 100,
+        };
+        let report = BlockShiftInvertSolverHp
+            .solve(&operator, &factor, &config)
+            .unwrap();
+        assert!(report.retained_eigenpairs.is_empty());
+        let cluster = report.boundary_cluster.expect("repeated identity spectrum");
+        assert_eq!(cluster.dimension, n);
+        assert_eq!(cluster.basis.len(), n);
+        let tolerance = Float::with_val(p, 1) >> 160u32;
+        assert!(cluster.maximum_residual_norm < tolerance);
+        for (i, value) in cluster.projected_operator.iter().enumerate() {
+            let expected = usize::from(i / n == i % n);
+            assert!((Float::with_val(p, value) - expected).abs() < tolerance);
+        }
+    }
+}
+
+#[cfg(test)]
+mod exact_interval_target_tests {
+    use super::*;
+    use xc_operator::DenseSymmetricHp;
+
+    fn target(lower: &str, upper: &str) -> EigenTarget {
+        EigenTarget::Interval {
+            lower: DecimalLiteral::new(lower).unwrap(),
+            upper: DecimalLiteral::new(upper).unwrap(),
+        }
+    }
+    fn scalar_report(lower: &str, upper: &str, shift: &str) -> BlockShiftInvertReportHp {
+        let p = 64;
+        let matrix = vec![Float::with_val(p, 1)];
+        let operator = DenseSymmetricHp::new("exact-one", 1, matrix.clone(), p, &zero(p)).unwrap();
+        let factor = DenseShiftInvertFactorizationHp::factor(
+            "exact-scalar-factor",
+            1,
+            &matrix,
+            DecimalLiteral::new(shift).unwrap(),
+            p,
+        )
+        .unwrap();
+        let config = BlockShiftInvertConfigHp {
+            target: target(lower, upper),
+            precision_bits: p,
+            requested_eigenpairs: 1,
+            guard_eigenpairs: 0,
+            absolute_residual_tolerance: DecimalLiteral::new("1e-15").unwrap(),
+            scaled_backward_error_tolerance: DecimalLiteral::new("1e-15").unwrap(),
+            ritz_value_stability_tolerance: DecimalLiteral::new("1e-15").unwrap(),
+            boundary_cluster_tolerance: DecimalLiteral::new("1e-12").unwrap(),
+            maximum_iterations: 3,
+            minimum_iterations: 2,
+            maximum_projected_sweeps: 20,
+        };
+        BlockShiftInvertSolverHp
+            .solve(&operator, &factor, &config)
+            .unwrap()
+    }
+    #[test]
+    fn upper_decimal_boundary_cannot_admit_one_from_outside() {
+        let report = scalar_report(
+            "0",
+            "0.999999999999999999999999999999",
+            "0.4999999999999999999999999999995",
+        );
+        assert_eq!(report.retained_eigenpairs[0].eigenvalue, 1);
+        assert_ne!(report.status, ResultStatus::Converged);
+    }
+    #[test]
+    fn lower_decimal_boundary_cannot_admit_one_from_outside() {
+        let report = scalar_report(
+            "1.000000000000000000000000000001",
+            "2",
+            "1.5000000000000000000000000000005",
+        );
+        assert_eq!(report.retained_eigenpairs[0].eigenvalue, 1);
+        assert_ne!(report.status, ResultStatus::Converged);
+    }
+    #[test]
+    fn exact_closed_endpoints_remain_admitted() {
+        for (lo, hi, shift) in [("0", "1", "0.5"), ("1", "2", "1.5")] {
+            let report = scalar_report(lo, hi, shift);
+            assert_eq!(report.status, ResultStatus::Converged);
+            assert_eq!(report.retained_eigenpairs[0].eigenvalue, 1);
+            assert_eq!(report.retained_eigenpairs[0].residual_norm, 0);
+        }
+    }
+    #[test]
+    fn finite_large_interval_has_a_finite_midpoint() {
+        let p = 64;
+        let lo = Float::with_val(p, 1) << (rug::float::exp_max() - 1);
+        let hi = Float::with_val(p, &lo * 1.5);
+        assert!(lo.is_finite() && hi.is_finite());
+        let (mid, _) = target_shift(&target(&lo.to_string(), &hi.to_string()), p).unwrap();
+        assert!(mid.is_finite() && mid >= lo && mid <= hi);
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_rank_contract {
+    use super::*;
+    #[test]
+    fn rank_is_invariant_under_nonzero_power_of_two_scaling() {
+        for exponent in [-200i32, 0, 200] {
+            let scale = Float::with_val(128, 2).pow(exponent);
+            let candidate = vec![scale.clone(), scale];
+            let mut basis = vec![vec![Float::with_val(128, 1), Float::with_val(128, 0)]];
+            assert!(
+                add_orthonormal(candidate, &mut basis, 128),
+                "scale exponent {exponent}"
+            );
+            assert_eq!(basis.len(), 2);
+            assert!(basis[1][0].clone().abs() < Float::with_val(128, 2).pow(-100));
+            assert_eq!(basis[1][1], 1);
+        }
     }
 }

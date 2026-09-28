@@ -89,7 +89,7 @@ fn verify(evidence: &ProductionFirstFiftyEvidence) -> Result<()> {
     if evidence.schema_version != 1
         || evidence.toolkit_version != env!("CARGO_PKG_VERSION")
         || evidence.source_method != "xc_spectral::ccm::hp::build_source"
-        || evidence.source_cache_mode != "off_pure_compute"
+        || evidence.source_cache_mode != "managed_source_cache_environment; standalone_cache_off"
         || evidence.source_reference_seed_count != 0
         || evidence.reference_resource != BUNDLED_ZETA_ZEROS_RESOURCE
         || bundled_digest.to_string() != REFERENCE_SHA256
@@ -128,7 +128,7 @@ fn generate(output_path: &Path) -> Result<()> {
         schema_version: 1,
         toolkit_version: env!("CARGO_PKG_VERSION").to_owned(),
         source_method: "xc_spectral::ccm::hp::build_source".to_owned(),
-        source_cache_mode: "off_pure_compute".to_owned(),
+        source_cache_mode: "managed_source_cache_environment; standalone_cache_off".to_owned(),
         source_reference_seed_count: 0,
         source_result,
         certificate,

@@ -86,10 +86,16 @@ struct BootstrapFamily {
 }
 
 /// Read-only GitHub layer routed by one visibility-specific bootstrap registry.
+/// Transport files belong to an exclusively created session and are removed on
+/// drop. Returned transport paths remain valid only while this store is alive;
+/// callers retaining artifacts must adopt their verified bytes into a durable store.
 pub struct GitHubBootstrapCacheStore {
     name: String,
     owner: String,
     root: PathBuf,
+    inventory_root: PathBuf,
+    materialization_gate: Mutex<()>,
+    cancellation: CancellationToken,
     visibility: CacheVisibility,
     required: bool,
     remote: GitCliRemoteStore,
@@ -104,6 +110,30 @@ pub struct GitHubBootstrapCacheStore {
     historical_batches: Mutex<HistoricalBatchCache>,
     metadata_documents: Mutex<MetadataDocumentCache>,
     revocation_partitions: Mutex<HashMap<MetadataDocumentKey, Option<RevocationIndexPartition>>>,
+}
+
+impl Drop for GitHubBootstrapCacheStore {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup_session() {
+            eprintln!("cache reader session cleanup failed: {error}");
+        }
+    }
+}
+
+// One inadmissible manifest must not suppress a later valid entry in the same
+// shard. Transport, cancellation, and other operational failures still propagate.
+fn first_admissible_candidate<T>(
+    candidates: impl IntoIterator<Item = ShardIndexEntry>,
+    mut materialize: impl FnMut(ShardIndexEntry) -> Result<Option<T>, CacheError>,
+) -> Result<Option<T>, CacheError> {
+    for entry in candidates {
+        match materialize(entry) {
+            Ok(Some(value)) => return Ok(Some(value)),
+            Ok(None) | Err(CacheError::InvalidManifest(_)) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
 }
 
 impl GitHubBootstrapCacheStore {
@@ -131,18 +161,54 @@ impl GitHubBootstrapCacheStore {
         let owner = owner.into();
         let root = root.into();
         fs::create_dir_all(&root)?;
+        let inventory_root = fs::canonicalize(&root)?;
+        let sessions = inventory_root.join("sessions");
+        fs::create_dir_all(&sessions)?;
+        let sessions_metadata = fs::symlink_metadata(&sessions)?;
+        if !sessions_metadata.is_dir()
+            || sessions_metadata.file_type().is_symlink()
+            || fs::canonicalize(&sessions)? != sessions
+        {
+            return Err(CacheError::InvalidManifest(
+                "reader sessions parent must be an unchanged regular directory".to_owned(),
+            ));
+        }
+        let root = loop {
+            let candidate = crate::private_sibling_candidate(&sessions, "reader")?;
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let remote = match GitCliRemoteStore::new(
+            root.join("git"),
+            root.join("parts"),
+            "Xcelerator cache reader",
+            "cache-reader@localhost",
+        ) {
+            Ok(remote) => remote,
+            Err(error) => {
+                // This directory was exclusively created above and is not yet
+                // exposed to any caller. No preexisting cache is removed.
+                if let Err(cleanup) = fs::remove_dir_all(&root) {
+                    return Err(CacheError::Io(format!(
+                        "reader construction failed: {error}; owned-session cleanup failed: {cleanup}"
+                    )));
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
             name: format!("github-{}", visibility_name(visibility)),
             owner,
             visibility,
             required,
-            remote: GitCliRemoteStore::new(
-                root.join("git"),
-                root.join("parts"),
-                "Xcelerator cache reader",
-                "cache-reader@localhost",
-            )?,
+            remote,
             root,
+            inventory_root,
+            materialization_gate: Mutex::new(()),
+            cancellation: CancellationToken::for_policy(&ResourcePolicy::default()),
             resources: ResourcePolicy::default(),
             resolved: Mutex::new(HashMap::new()),
             verified_transports: Mutex::new(HashMap::new()),
@@ -157,9 +223,54 @@ impl GitHubBootstrapCacheStore {
         })
     }
 
+    fn check_session_disk_budget(&self, additional: u64) -> Result<(), CacheError> {
+        let total = crate::git_transport::directory_size_bytes(&self.root)?
+            .checked_add(additional)
+            .ok_or_else(|| {
+                CacheError::ResourceLimit("reader session disk size exceeds u64".to_owned())
+            })?;
+        if [
+            self.resources.maximum_temporary_disk_bytes,
+            self.resources.maximum_permanent_disk_bytes,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|limit| total > limit)
+        {
+            return Err(CacheError::ResourceLimit(format!(
+                "reader session requires {total} retained bytes above its configured disk limit"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Explicitly finish this reader and report cleanup failures. Drop also
+    /// attempts cleanup, but cannot return an error to the caller.
+    pub fn finish(self) -> Result<(), CacheError> {
+        self.cleanup_session()
+    }
+
+    fn cleanup_session(&self) -> Result<(), CacheError> {
+        if self.root.exists() {
+            let metadata = fs::symlink_metadata(&self.root)?;
+            let sessions = self.inventory_root.join("sessions");
+            if metadata.file_type().is_symlink()
+                || fs::canonicalize(&self.root)?.parent() != Some(sessions.as_path())
+            {
+                return Err(CacheError::InvalidManifest(
+                    "reader cleanup root changed identity".to_owned(),
+                ));
+            }
+            self.remote.cleanup_all_sessions()?;
+            fs::remove_dir_all(&self.root)?;
+        }
+        Ok(())
+    }
+
     /// Apply the same resource limits to transport and payload materialization.
     pub fn with_resource_policy(mut self, resources: ResourcePolicy) -> Self {
-        self.remote = self.remote.with_resource_policy(resources.clone());
+        self.remote.set_resource_policy(resources.clone());
+        self.cancellation = CancellationToken::for_policy(&resources);
         self.resources = resources;
         self
     }
@@ -252,7 +363,7 @@ impl GitHubBootstrapCacheStore {
             &self.owner,
             self.visibility,
             family,
-            &CancellationToken::new(),
+            &self.cancellation,
         )?;
         self.family_topologies
             .lock()
@@ -285,7 +396,7 @@ impl GitHubBootstrapCacheStore {
             revision,
             path,
             16 * 1024 * 1024,
-            &CancellationToken::new(),
+            &self.cancellation,
             &mut bytes,
         )?;
         let value = serde_json::from_slice(&bytes)?;
@@ -334,7 +445,7 @@ impl GitHubBootstrapCacheStore {
             "transactions/batches",
             100_000,
             16 * 1024 * 1024,
-            &CancellationToken::new(),
+            &self.cancellation,
         )?;
         let suffix = format!("/{visibility_name}.json");
         let mut batches = Vec::new();
@@ -516,22 +627,33 @@ impl GitHubBootstrapCacheStore {
                 .filter(|entry| entry.minimum_reader_version <= current)
                 .cloned()
                 .collect::<Vec<_>>();
-            candidates.sort_by_key(|entry| {
-                std::cmp::Reverse((entry.achieved_assurance, entry.manifest_digest.clone()))
+            let kind_policy = crate::artifact_compatibility_policy(family, &key.kind)?;
+            candidates.retain(|entry| {
+                entry.producer_toolkit_version >= kind_policy.minimum_producer_version
             });
-            for entry in candidates {
+            candidates.sort_by(|left, right| {
+                right
+                    .producer_toolkit_version
+                    .cmp(&left.producer_toolkit_version)
+                    .then_with(|| right.achieved_assurance.cmp(&left.achieved_assurance))
+                    .then_with(|| left.manifest_digest.cmp(&right.manifest_digest))
+            });
+            let resolved = first_admissible_candidate(candidates, |entry| {
                 if self.entry_is_revoked(&repository, &revision, shard, &entry)? {
-                    continue;
+                    return Ok(None);
                 }
-                return self.materialize_indexed_entry(
-                    repository,
-                    revision,
+                self.materialize_indexed_entry(
+                    repository.clone(),
+                    revision.clone(),
                     family,
                     shard,
                     &key.parameters_digest,
                     entry,
-                    index_source,
-                );
+                    index_source.clone(),
+                )
+            })?;
+            if resolved.is_some() {
+                return Ok(resolved);
             }
             // Explicit policy in a newer shard cannot be undone by falling
             // back to an older copy, including revocation-only rejections.
@@ -691,7 +813,8 @@ impl GitHubBootstrapCacheStore {
                 index_source,
             )?;
             let Some(resolved) = resolved else {
-                continue;
+                // Explicit rejection cannot be bypassed through an older shard.
+                return Ok(None);
             };
             if resolved.manifest.semantic_digest != identity.semantic_digest
                 || resolved.manifest.digest()? != identity.manifest_digest
@@ -773,6 +896,14 @@ impl GitHubBootstrapCacheStore {
             &manifest_path,
             transport_digest,
         )?;
+        if self.has_active_revocation(
+            &repository,
+            &revision,
+            RevocationScope::Policy,
+            &batch.policy_digest,
+        )? {
+            return Ok(None);
+        }
         let resolved = ResolvedRemoteArtifact {
             family: family.to_owned(),
             semantic_digest: semantic_digest.clone(),
@@ -802,7 +933,7 @@ impl GitHubBootstrapCacheStore {
         Ok(query
             .repository_path()?
             .split('/')
-            .fold(self.root.join("derived"), |path, component| {
+            .fold(self.inventory_root.join("derived"), |path, component| {
                 path.join(component)
             }))
     }
@@ -962,7 +1093,11 @@ impl GitHubBootstrapCacheStore {
         let quality = match resolved.index.achieved_assurance {
             ArtifactAssuranceState::Certified => CacheQuality::Certified,
             ArtifactAssuranceState::CrossChecked => CacheQuality::CrossChecked,
-            _ => CacheQuality::Validated,
+            ArtifactAssuranceState::Unchecked => CacheQuality::Staged,
+            // These are operational reader/producer checks, not certification.
+            ArtifactAssuranceState::StructurallyValidated | ArtifactAssuranceState::Computed => {
+                CacheQuality::Validated
+            }
         };
         let mut tags = BTreeMap::new();
         tags.insert(
@@ -1108,7 +1243,7 @@ impl CacheStore for GitHubBootstrapCacheStore {
             }
         }
         drop(resolved);
-        let cancellation = CancellationToken::new();
+        let cancellation = self.cancellation.clone();
         let repository_count = batches.len();
         let prepared_path_count = batches.values().map(BTreeMap::len).sum::<usize>();
         let prepared_bytes = batches
@@ -1132,7 +1267,8 @@ impl CacheStore for GitHubBootstrapCacheStore {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(4)
-            .clamp(1, 8);
+            .clamp(1, 8)
+            .min(self.resources.maximum_threads.unwrap_or(8).max(1));
         let started = Instant::now();
         let performance = xc_core::performance_stage_with("cache.remote.prefetch", || {
             xc_core::PerformanceStageMetadata {
@@ -1238,7 +1374,10 @@ impl CacheStore for GitHubBootstrapCacheStore {
         let inventory_path = query.repository_path()?;
         let cache_identity = (
             CCM_EIGENPAIR_CONTINUATION_ARTIFACT_KIND.to_owned(),
-            format!("{inventory_path}#lt-{}", query.maximum_n_modes),
+            format!(
+                "{inventory_path}#lt-{}#take-{maximum_keys}",
+                query.maximum_n_modes
+            ),
         );
         if let Some(cached) = self
             .discovered_keys
@@ -1309,6 +1448,33 @@ impl CacheStore for GitHubBootstrapCacheStore {
             .get(&Self::resolved_key(manifest)?)
             .cloned()
             .ok_or_else(|| CacheError::NotFound(manifest.content_digest.to_string()))?;
+        let _materialization = self
+            .materialization_gate
+            .lock()
+            .map_err(|_| CacheError::Io("reader materialization lock poisoned".to_owned()))?;
+        let missing = missing_local_transport_paths(&self.root, &resolved.encoding)?;
+        let additional = missing.iter().try_fold(0u64, |total, part| {
+            total.checked_add(part.maximum_bytes).ok_or_else(|| {
+                CacheError::ResourceLimit("reader retained size exceeds u64".to_owned())
+            })
+        })?;
+        let package_missing = !regular_file_has_exact_size(
+            &self
+                .root
+                .join("packages")
+                .join(format!("{}.zip", resolved.encoding.digest()?.0)),
+            resolved.encoding.package_size_bytes,
+        )?;
+        let additional = additional
+            .checked_add(if package_missing {
+                resolved.encoding.package_size_bytes
+            } else {
+                0
+            })
+            .ok_or_else(|| {
+                CacheError::ResourceLimit("reader retained size exceeds u64".to_owned())
+            })?;
+        self.check_session_disk_budget(additional)?;
         let package = self
             .root
             .join("packages")
@@ -1323,9 +1489,10 @@ impl CacheStore for GitHubBootstrapCacheStore {
             &self.root.join("parts"),
             &package,
             &self.resources,
-            &CancellationToken::new(),
+            &self.cancellation,
             writer,
         )?;
+        self.check_session_disk_budget(0)?;
         {
             // A reconstruction verified every part in this process. A package
             // reuse did not touch the parts, so they are offered unverified
@@ -1456,13 +1623,500 @@ fn visibility_name(visibility: CacheVisibility) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn exhaustive_resumed_continuation_discovery_expands_after_a_short_request() {
+        let root = fresh_fixture_root("xc-bootstrap-continuation-budget");
+        let store = GitHubBootstrapCacheStore::new(
+            "fixture",
+            root.join("store"),
+            CacheVisibility::Public,
+            true,
+        )
+        .unwrap();
+        let query = CcmEigenpairContinuationQuery {
+            lambda_squared: "13".into(),
+            maximum_n_modes: 30,
+            precision_bits: 128,
+            force_even: true,
+        };
+        let entry = |n_modes| crate::CcmEigenpairContinuationEntry {
+            n_modes,
+            eigenstate_route: "shift_invert_krylov".into(),
+            logical_key: format!("audit/{n_modes}"),
+            semantic_digest: ContentDigest::sha256(format!("semantic-{n_modes}").as_bytes()),
+            manifest_digest: ContentDigest::sha256(format!("manifest-{n_modes}").as_bytes()),
+            achieved_assurance: ArtifactAssuranceState::Computed,
+            disposition: ArtifactDisposition::Active,
+            producer_toolkit_version: crate::current_toolkit_version().unwrap(),
+            minimum_reader_version: crate::current_toolkit_version().unwrap(),
+        };
+        let inventory =
+            CcmEigenpairContinuationIndex::rebuild(&query, vec![entry(10), entry(20)]).unwrap();
+        let inventory_path = store.local_continuation_inventory_path(&query).unwrap();
+        fs::create_dir_all(inventory_path.parent().unwrap()).unwrap();
+        fs::write(inventory_path, serde_json::to_vec(&inventory).unwrap()).unwrap();
+        let family = family_for_artifact_kind(CCM_EIGENPAIR_CONTINUATION_ARTIFACT_KIND).unwrap();
+        let shard = crate::bootstrap_topology::BootstrapShard {
+            authorized_repository: "fixture/shard".into(),
+            repository_url: "fixture-shard".into(),
+            shard_id: "fixture-001".into(),
+            sequence: 1,
+            writable: true,
+        };
+        // A local-only fixture; no readable remote shards and no network calls.
+        store.family_topologies.lock().unwrap().insert(
+            family.into(),
+            crate::bootstrap_topology::BootstrapFamilyTopology {
+                family: family.into(),
+                visibility: CacheVisibility::Public,
+                current_writable: shard,
+                readable_shards: vec![],
+            },
+        );
+        let first = store.ccm_eigenpair_continuation_keys(&query, 1).unwrap();
+        let second = store.ccm_eigenpair_continuation_keys(&query, 2).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(
+            second.len(),
+            2,
+            "a smaller cached query suppressed a valid continuation state"
+        );
+    }
+    fn fresh_fixture_root(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "{label}-{}-{stamp}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&root) {
+                Ok(()) => return root,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create fresh fixture directory: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn full_provenance_requires_every_materialized_child_payload_identity() {
+        let root = fresh_fixture_root("xc-full-provenance-child-identity");
+        let store = GitHubBootstrapCacheStore::public("fixture", root.join("store")).unwrap();
+        let child = resolved_fixture(&root, "provenance-child", Vec::new());
+        let child_identity = PayloadDependencyIdentity {
+            artifact_family: child.family.clone(),
+            semantic_digest: child.semantic_digest.clone(),
+            manifest_digest: child.manifest.digest().unwrap(),
+            payload_digest: child.manifest.payload_digest.clone(),
+        };
+        let mut parent = resolved_fixture(&root, "provenance-parent", vec![child_identity.clone()]);
+        parent.dependencies = vec![child];
+        let dependencies_root = root.join("dependencies");
+        let child_package = dependencies_root
+            .join(&child_identity.semantic_digest.0)
+            .join(format!("{}.zip", child_identity.manifest_digest.0));
+        fs::create_dir_all(child_package.parent().unwrap()).unwrap();
+        fs::copy(root.join("provenance-child.zip"), &child_package).unwrap();
+        // Both canonical ZIP packages already exist, so the real closure
+        // materializer verifies their bytes without any remote operation.
+        let closure = materialize_resolved_remote_artifact_closure(
+            &store.remote,
+            &parent,
+            &root.join("parts"),
+            &dependencies_root,
+            &root.join("provenance-parent.zip"),
+            &ResourcePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(closure.dependency_count, 1);
+        assert_eq!(closure.artifacts_dependency_first.len(), 2);
+        assert!(closure
+            .artifacts_dependency_first
+            .iter()
+            .all(|artifact| artifact.reused_verified_package && artifact.part_fetch.is_none()));
+        let resolution = SemanticResolutionReport {
+            schema_version: 2,
+            algorithm_semantics: crate::semantic_resolver::REMOTE_RESOLUTION_SEMANTICS.to_owned(),
+            semantic_digest: parent.semantic_digest.clone(),
+            resolved_semantic_key: parent.manifest.semantic_key.clone(),
+            selected: Some(parent),
+            rejections: Vec::new(),
+        };
+        // Only overlay names are consumed by provenance conversion. Network
+        // admission is outside this local, already-materialized report test.
+        let overlays = vec![RemoteResolverOverlay {
+            name: "fixture-local".into(),
+            visibility: CacheVisibility::Public,
+            topology_source: RemoteTopologySource::default(),
+            topology_trust: TopologyTrustPolicy {
+                minimum_generation: 0,
+                pinned_registry_digest: None,
+                required_trust_anchor: None,
+            },
+            fabric_trust: RemoteFabricTrustPolicy {
+                schema_version: 1,
+                approved_trust_anchor_ids: Default::default(),
+                approved_policy_digests: Default::default(),
+                repositories: Vec::new(),
+            },
+            network: CacheNetworkRegistry {
+                schema_version: 1,
+                repositories: Vec::new(),
+            },
+        }];
+        let record = |materialization: &RemoteArtifactClosureMaterializationReport| {
+            record_remote_cache_access(RemoteCacheAccessProvenanceRequest {
+                operation: "fixture.full-provenance",
+                family: "ccm-matrices",
+                overlays: &overlays,
+                resolution: &resolution,
+                reuse_disposition: xc_core::CacheReuseDisposition::InspectedOnly,
+                validation_mode: xc_core::CacheValidationMode::Full,
+                validation_outcome: xc_core::CacheValidationOutcome::Passed,
+                validation_detail: None,
+                root_materialization: None,
+                materialization: Some(materialization),
+            })
+        };
+        assert_eq!(record(&closure).unwrap().validated_artifacts.len(), 2);
+        let mut wrong_payload = closure.clone();
+        wrong_payload.artifacts_dependency_first[0].canonical_payload_digest =
+            ContentDigest::sha256(b"not the admitted child payload");
+        assert!(
+            record(&wrong_payload).is_err(),
+            "Full provenance must reject an internally inconsistent child payload identity"
+        );
+        let mut omitted = closure.clone();
+        omitted.artifacts_dependency_first.remove(0);
+        omitted.dependency_count = 0;
+        assert!(
+            record(&omitted).is_err(),
+            "Full provenance must include every child"
+        );
+        let mut duplicated = closure.clone();
+        duplicated
+            .artifacts_dependency_first
+            .insert(0, closure.artifacts_dependency_first[0].clone());
+        duplicated.dependency_count = 2;
+        assert!(
+            record(&duplicated).is_err(),
+            "duplicates must not inflate a completed closure"
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn complete_bootstrap_metadata_is_admitted_then_blocked_by_policy_revocation() {
+        let root = fresh_fixture_root("xc-bootstrap-complete-policy-revocation");
+        let artifact = resolved_fixture(&root, "policy-record", Vec::new());
+        let identity = PayloadDependencyIdentity {
+            artifact_family: artifact.family.clone(),
+            semantic_digest: artifact.semantic_digest.clone(),
+            manifest_digest: artifact.manifest.digest().unwrap(),
+            payload_digest: artifact.manifest.payload_digest.clone(),
+        };
+        let key = ArtifactKey {
+            kind: artifact.manifest.semantic_key.artifact_kind.clone(),
+            logical_key: "complete-policy-fixture".into(),
+            parameters_digest: identity.semantic_digest.clone(),
+        };
+        let shard = crate::bootstrap_topology::BootstrapShard {
+            authorized_repository: "fixture/shard".into(),
+            repository_url: "fixture-shard".into(),
+            shard_id: "fixture-001".into(),
+            sequence: 1,
+            writable: true,
+        };
+        let revision = "a".repeat(40);
+        let manifest_path =
+            bootstrap_manifest_path(&identity.semantic_digest, &identity.manifest_digest);
+        let transport_digest = artifact.encoding.digest().unwrap();
+        let encoding_path = format!(
+            "encodings/{}/{}.json",
+            &identity.payload_digest.0[..2],
+            transport_digest.0,
+        );
+        for visibility in [CacheVisibility::Private, CacheVisibility::Public] {
+            for indexed in [false, true] {
+                let store =
+                    GitHubBootstrapCacheStore::new("fixture", root.join("store"), visibility, true)
+                        .unwrap();
+                store.family_topologies.lock().unwrap().insert(
+                    identity.artifact_family.clone(),
+                    crate::bootstrap_topology::BootstrapFamilyTopology {
+                        family: identity.artifact_family.clone(),
+                        visibility,
+                        current_writable: shard.clone(),
+                        readable_shards: vec![shard.clone()],
+                    },
+                );
+                store
+                    .shard_revisions
+                    .lock()
+                    .unwrap()
+                    .insert(shard.repository_url.clone(), revision.clone());
+                // Every lookup is answered locally, including absent revocations.
+                for prefix in 0..=255u8 {
+                    store.revocation_partitions.lock().unwrap().insert(
+                        (
+                            shard.repository_url.clone(),
+                            revision.clone(),
+                            format!("{prefix:02x}"),
+                        ),
+                        None,
+                    );
+                }
+                let destination = if visibility == CacheVisibility::Private {
+                    PublicationDestination::Private
+                } else {
+                    PublicationDestination::Public
+                };
+                let batch = RepositoryPublicationBatch::new(
+                    destination,
+                    &identity.artifact_family,
+                    "fixture-author",
+                    &shard.authorized_repository,
+                    "main",
+                    ContentDigest::sha256(b"complete-bootstrap-policy"),
+                    (visibility == CacheVisibility::Private).then_some(1),
+                    vec![RepositoryBatchArtifact {
+                        semantic_digest: identity.semantic_digest.clone(),
+                        canonical_payload_digest: identity.payload_digest.clone(),
+                        manifest_digest: identity.manifest_digest.clone(),
+                        transport_digest: transport_digest.clone(),
+                        manifest_path: manifest_path.clone(),
+                        achieved_assurance: artifact.index.achieved_assurance,
+                        producer_toolkit_version: artifact.index.producer_toolkit_version.clone(),
+                        provenance_evidence_digests: vec![ContentDigest::sha256(
+                            b"fixture evidence",
+                        )],
+                    }],
+                    1,
+                )
+                .unwrap();
+                let mut entry = artifact.index.clone();
+                entry.publication_transaction_id = batch.batch_id.0.clone();
+                let partition = ShardIndexPartition::rebuild(
+                    identity.artifact_family.clone(),
+                    identity.semantic_digest.0[..2].to_owned(),
+                    if indexed { vec![entry] } else { vec![] },
+                )
+                .unwrap();
+                let batch_bytes = canonical_json_bytes(&batch).unwrap();
+                let batch_source = RemoteReadReport {
+                    repository_path: batch.repository_path(),
+                    revision: revision.clone(),
+                    size_bytes: batch_bytes.len() as u64,
+                    content_digest: ContentDigest::sha256(&batch_bytes),
+                };
+                assert_eq!(batch_source.content_digest, batch.digest().unwrap());
+                store.historical_batches.lock().unwrap().insert(
+                    (shard.repository_url.clone(), revision.clone()),
+                    vec![(batch.clone(), batch_source)],
+                );
+                let documents = [
+                    (
+                        format!(
+                            "indexes/{}/{}.json",
+                            identity.artifact_family,
+                            &identity.semantic_digest.0[..2]
+                        ),
+                        canonical_json_bytes(&partition).unwrap(),
+                    ),
+                    (
+                        manifest_path.clone(),
+                        canonical_json_bytes(&artifact.manifest).unwrap(),
+                    ),
+                    (
+                        encoding_path.clone(),
+                        canonical_json_bytes(&artifact.encoding).unwrap(),
+                    ),
+                    (batch.repository_path(), batch_bytes),
+                ];
+                for (path, bytes) in documents {
+                    let source = RemoteReadReport {
+                        repository_path: path.clone(),
+                        revision: revision.clone(),
+                        size_bytes: bytes.len() as u64,
+                        content_digest: ContentDigest::sha256(&bytes),
+                    };
+                    let mut metadata = store.metadata_documents.lock().unwrap();
+                    metadata.retained_bytes += bytes.len() as u64;
+                    metadata.documents.insert(
+                        (shard.repository_url.clone(), revision.clone(), path),
+                        (Arc::from(bytes), source),
+                    );
+                }
+                // This positive control reaches valid encoding and batch proof.
+                // A missing later document must not masquerade as revocation.
+                let accepted = store.resolve_identity(&identity).unwrap().expect(
+                    "complete current or historical metadata must be admitted before revocation",
+                );
+                assert_eq!(
+                    accepted.manifest.digest().unwrap(),
+                    identity.manifest_digest
+                );
+                assert_eq!(accepted.encoding, artifact.encoding);
+                assert!(matches!(
+                    accepted.receipt,
+                    RemotePublicationEvidence::RepositoryBatch(_)
+                ));
+                if indexed {
+                    assert!(store.resolve(&key).unwrap().is_some());
+                }
+                let policy_partition = RevocationIndexPartition {
+                    schema_version: 1,
+                    identity_prefix: batch.policy_digest.0[..2].to_owned(),
+                    records: vec![RevocationRecord {
+                        schema_version: 1,
+                        scope: RevocationScope::Policy,
+                        identity_digest: batch.policy_digest.clone(),
+                        reason: "publication policy withdrawn in complete fixture".into(),
+                        effective_unix_seconds: 0,
+                        replacement_digest: None,
+                        incident_reference: None,
+                        authorizing_evidence_digest: ContentDigest::sha256(b"policy withdrawal"),
+                    }],
+                };
+                policy_partition.validate().unwrap();
+                store.revocation_partitions.lock().unwrap().insert(
+                    (
+                        shard.repository_url.clone(),
+                        revision.clone(),
+                        policy_partition.identity_prefix.clone(),
+                    ),
+                    Some(policy_partition),
+                );
+                assert!(store.resolve_identity(&identity).unwrap().is_none(),
+                    "policy-revoked {visibility:?} indexed={indexed} exact record remained available");
+                if indexed {
+                    assert!(
+                        store.resolve(&key).unwrap().is_none(),
+                        "policy-revoked {visibility:?} key remained available"
+                    );
+                }
+                // A newer shard's rejection must not be undone by an older
+                // otherwise-valid copy of the exact same artifact identity.
+                let older = crate::bootstrap_topology::BootstrapShard {
+                    authorized_repository: "fixture/older-shard".into(),
+                    repository_url: "fixture-older-shard".into(),
+                    shard_id: "fixture-000".into(),
+                    sequence: 0,
+                    writable: false,
+                };
+                store
+                    .shard_revisions
+                    .lock()
+                    .unwrap()
+                    .insert(older.repository_url.clone(), revision.clone());
+                for prefix in 0..=255u8 {
+                    store.revocation_partitions.lock().unwrap().insert(
+                        (
+                            older.repository_url.clone(),
+                            revision.clone(),
+                            format!("{prefix:02x}"),
+                        ),
+                        None,
+                    );
+                }
+                let older_batch = RepositoryPublicationBatch::new(
+                    destination,
+                    &identity.artifact_family,
+                    "fixture-author",
+                    &older.authorized_repository,
+                    "main",
+                    batch.policy_digest.clone(),
+                    (visibility == CacheVisibility::Private).then_some(1),
+                    batch.artifacts.clone(),
+                    1,
+                )
+                .unwrap();
+                let mut older_entry = artifact.index.clone();
+                older_entry.publication_transaction_id = older_batch.batch_id.0.clone();
+                let older_index = ShardIndexPartition::rebuild(
+                    identity.artifact_family.clone(),
+                    identity.semantic_digest.0[..2].to_owned(),
+                    vec![older_entry],
+                )
+                .unwrap();
+                for (path, bytes) in [
+                    (
+                        format!(
+                            "indexes/{}/{}.json",
+                            identity.artifact_family,
+                            &identity.semantic_digest.0[..2]
+                        ),
+                        canonical_json_bytes(&older_index).unwrap(),
+                    ),
+                    (
+                        manifest_path.clone(),
+                        canonical_json_bytes(&artifact.manifest).unwrap(),
+                    ),
+                    (
+                        encoding_path.clone(),
+                        canonical_json_bytes(&artifact.encoding).unwrap(),
+                    ),
+                    (
+                        older_batch.repository_path(),
+                        canonical_json_bytes(&older_batch).unwrap(),
+                    ),
+                ] {
+                    let source = RemoteReadReport {
+                        repository_path: path.clone(),
+                        revision: revision.clone(),
+                        size_bytes: bytes.len() as u64,
+                        content_digest: ContentDigest::sha256(&bytes),
+                    };
+                    let mut metadata = store.metadata_documents.lock().unwrap();
+                    metadata.retained_bytes += bytes.len() as u64;
+                    metadata.documents.insert(
+                        (older.repository_url.clone(), revision.clone(), path),
+                        (Arc::from(bytes), source),
+                    );
+                }
+                store
+                    .family_topologies
+                    .lock()
+                    .unwrap()
+                    .get_mut(&identity.artifact_family)
+                    .unwrap()
+                    .readable_shards = vec![older.clone()];
+                assert!(
+                    store.resolve_identity(&identity).unwrap().is_some(),
+                    "older-shard control must be independently admissible"
+                );
+                store
+                    .family_topologies
+                    .lock()
+                    .unwrap()
+                    .get_mut(&identity.artifact_family)
+                    .unwrap()
+                    .readable_shards = vec![shard.clone(), older];
+                assert!(store.resolve_identity(&identity).unwrap().is_none(),
+                    "older shard resurrected a Policy-revoked exact identity: {visibility:?} indexed={indexed}");
+                if indexed {
+                    assert!(
+                        store.resolve(&key).unwrap().is_none(),
+                        "older shard resurrected a Policy-revoked key: {visibility:?}"
+                    );
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn bootstrap_revocations_block_active_and_unindexed_historical_reads() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-bootstrap-revocation-audit-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).unwrap();
+        let root = fresh_fixture_root("xc-bootstrap-revocation-audit");
         let artifact = resolved_fixture(&root, "revoked-history", Vec::new());
         let identity = PayloadDependencyIdentity {
             artifact_family: artifact.manifest.artifact_family.clone(),
@@ -1559,7 +2213,7 @@ mod tests {
                             schema_version: 1,
                             scope: *scope,
                             identity_digest: digest.clone(),
-                            reason: "audit counterexample".into(),
+                            reason: "counterexample".into(),
                             effective_unix_seconds: 0,
                             replacement_digest: None,
                             incident_reference: None,
@@ -1605,6 +2259,67 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_rejects_symlinked_sessions_parent_without_mutating_target() {
+        let root = crate::test_support::temporary_root("fresh-reader-symlink-parent");
+        let inventory = root.join("inventory");
+        let target = root.join("outside-inventory");
+        fs::create_dir_all(&inventory).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep.txt"), b"unrelated retained data").unwrap();
+        std::os::unix::fs::symlink(&target, inventory.join("sessions")).unwrap();
+
+        let result = GitHubBootstrapCacheStore::public("fixture-owner", &inventory);
+        let rejected = matches!(result, Err(CacheError::InvalidManifest(_)));
+        drop(result);
+        let entries = fs::read_dir(&target)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        let retained = fs::read(target.join("keep.txt")).unwrap();
+        // The target and link are both inside this exclusively owned fixture.
+        // Remove the link explicitly before removing the fixture directories.
+        fs::remove_file(inventory.join("sessions")).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(
+            rejected,
+            "symlinked session parent must fail before creating a reader"
+        );
+        assert_eq!(entries, vec![std::ffi::OsString::from("keep.txt")]);
+        assert_eq!(retained, b"unrelated retained data");
+    }
+
+    #[test]
+    fn reader_sessions_are_owned_and_unchecked_metadata_stays_staged() {
+        let root = crate::test_support::temporary_root("fresh-reader-session-lifetime");
+        fs::create_dir_all(&root).unwrap();
+        let first = GitHubBootstrapCacheStore::public("fixture-owner", root.join("store")).unwrap();
+        let second =
+            GitHubBootstrapCacheStore::public("fixture-owner", root.join("store")).unwrap();
+        let first_root = first.root.clone();
+        let second_root = second.root.clone();
+        assert_ne!(first_root, second_root);
+        fs::write(first_root.join("retained-part"), b"owned first session").unwrap();
+        fs::write(second_root.join("retained-part"), b"owned second session").unwrap();
+        let mut artifact = resolved_fixture(&root, "unchecked", Vec::new());
+        artifact.index.achieved_assurance = ArtifactAssuranceState::Unchecked;
+        let key = ArtifactKey {
+            kind: "ccm_tau_matrix".into(),
+            logical_key: "unchecked".into(),
+            parameters_digest: artifact.semantic_digest.clone(),
+        };
+        let adapter = first.adapter_manifest_for(key, &artifact).unwrap();
+        assert_eq!(adapter.quality, CacheQuality::Staged);
+        first.finish().unwrap();
+        assert!(!first_root.exists());
+        assert!(second_root.join("retained-part").exists());
+        drop(second);
+        assert!(!second_root.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     /// A resolved remote artifact whose payload bytes are fixed and whose
     /// canonical closure is the caller's. Two calls with different closures
@@ -1771,11 +2486,7 @@ mod tests {
 
     #[test]
     fn exact_identity_stops_at_explicit_rejection_before_historical_fallback() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-bootstrap-rejected-identity-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).unwrap();
+        let root = fresh_fixture_root("xc-bootstrap-rejected-identity");
         let artifact = resolved_fixture(&root, "rejected", Vec::new());
         let identity = PayloadDependencyIdentity {
             artifact_family: artifact.manifest.artifact_family.clone(),
@@ -2281,8 +2992,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "authenticated historical-identity acceptance against the private shard"]
-    fn superseded_claim_1a_matrix_resolves_by_exact_historical_identity() {
+    #[ignore = "authenticated revoked historical-identity rejection against the private shard"]
+    fn revoked_claim_1a_matrix_is_rejected_by_exact_historical_identity() {
         let root = std::env::temp_dir().join("xc-private-historical-identity-acceptance");
         let store = GitHubBootstrapCacheStore::private("TeamXcelerator", root).unwrap();
         let identity = PayloadDependencyIdentity {
@@ -2297,23 +3008,22 @@ mod tests {
                 "cdcdd08618047bcccf4667800d6dbc3eb6cffe41e34fd4cc5fd3029f9a1e2175".to_owned(),
             ),
         };
-        let resolved = store
-            .resolve_identity(&identity)
-            .unwrap()
-            .expect("historical matrix remains published");
-        assert_eq!(
-            resolved.manifest.digest().unwrap(),
-            identity.manifest_digest
-        );
-        assert_eq!(resolved.manifest.payload_digest, identity.payload_digest);
-
-        let candidates = store.identity_candidates(&identity).unwrap();
-        assert_eq!(candidates.len(), 1);
-        let payload = store.read_payload(&candidates[0]).unwrap();
-        assert_eq!(
-            ContentDigest::sha256(&payload),
-            candidates[0].content_digest
-        );
+        // This exact historical manifest was revoked for incomplete source
+        // dependencies. Prove that the revocation exists before checking that
+        // resolution refuses it, so a missing repository cannot pass this test.
+        let repository =
+            "https://github.com/TeamXcelerator/xcelerator-cache-private-ccm-matrices-0001.git";
+        let revision = store.shard_revision(repository).unwrap();
+        assert!(store
+            .has_active_revocation(
+                repository,
+                &revision,
+                RevocationScope::Manifest,
+                &identity.manifest_digest,
+            )
+            .unwrap());
+        assert!(store.resolve_identity(&identity).unwrap().is_none());
+        assert!(store.identity_candidates(&identity).unwrap().is_empty());
     }
 
     fn assert_claim_1a_resolves(
@@ -2349,6 +3059,31 @@ mod tests {
                 assert_eq!(json["n_modes"], 120);
             }
         }
+    }
+    #[test]
+    fn candidate_rejection_tries_next_and_operational_errors_propagate() {
+        let entry = bootstrap_batch_fixture().entry;
+        let mut calls = 0;
+        let result = first_admissible_candidate(vec![entry.clone(), entry.clone()], |_| {
+            calls += 1;
+            if calls == 1 {
+                Err(CacheError::InvalidManifest(
+                    "below compatibility floor".into(),
+                ))
+            } else {
+                Ok(Some(7))
+            }
+        })
+        .unwrap();
+        assert_eq!(result, Some(7));
+        let missing: Option<u32> = first_admissible_candidate(vec![entry.clone()], |_| {
+            Err(CacheError::InvalidManifest("inadmissible".into()))
+        })
+        .unwrap();
+        assert_eq!(missing, None);
+        let operational: Result<Option<u32>, _> =
+            first_admissible_candidate(vec![entry], |_| Err(CacheError::Io("offline".into())));
+        assert!(operational.is_err());
     }
 }
 

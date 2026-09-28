@@ -389,6 +389,7 @@ impl PublicationReceipt {
             || self.semantic_digest != journal.semantic_digest
             || self.canonical_payload_digest != journal.payload_digest
             || self.manifest_digest != journal.target_manifest_digests[&destination]
+            || self.policy_digest != journal.policy_digest
             || self.policy_id != audit.policy_id
             || self.authority_mode != audit.authority_mode
             || self.validation_evidence_digests != audit.validation_evidence_digests
@@ -458,6 +459,65 @@ impl PublicationReceipt {
         {
             return Err(CacheError::InvalidManifest(
                 "publication receipt batch records do not match the journal".to_owned(),
+            ));
+        }
+        let mut expected_results = Vec::new();
+        for batch in &target.batches {
+            if batch.state != crate::PublicationBatchState::RemoteVerified {
+                return Err(CacheError::InvalidManifest(
+                    "receipt claims an unverified payload batch".to_owned(),
+                ));
+            }
+            expected_results.push(RemoteCommitVerificationResult {
+                phase: "payload_batch".to_owned(),
+                sequence: batch.plan.sequence,
+                commit_id: batch.commit_id.clone().ok_or_else(|| {
+                    CacheError::InvalidManifest("verified payload has no commit".to_owned())
+                })?,
+                verified: true,
+                content_digests: batch
+                    .plan
+                    .parts
+                    .iter()
+                    .map(|part| part.content_digest.clone())
+                    .collect(),
+            });
+            if !batch.newly_committed_digests.is_empty() {
+                let record = batch.record_commit.as_ref().ok_or_else(|| {
+                    CacheError::InvalidManifest("receipt batch record is absent".to_owned())
+                })?;
+                if record.state != PublicationCommitState::RemoteVerified {
+                    return Err(CacheError::InvalidManifest(
+                        "receipt batch record is not verified".to_owned(),
+                    ));
+                }
+                expected_results.push(RemoteCommitVerificationResult {
+                    phase: "payload_batch_record".to_owned(),
+                    sequence: batch.plan.sequence,
+                    commit_id: record.commit_id.clone().ok_or_else(|| {
+                        CacheError::InvalidManifest(
+                            "verified batch record has no commit".to_owned(),
+                        )
+                    })?,
+                    verified: true,
+                    content_digests: vec![record.files[0].content_digest.clone()],
+                });
+            }
+        }
+        expected_results.push(RemoteCommitVerificationResult {
+            phase: "immutable_metadata".to_owned(),
+            sequence: 0,
+            commit_id: self.metadata_commit_id.clone(),
+            verified: true,
+            content_digests: metadata
+                .files
+                .iter()
+                .map(|file| file.content_digest.clone())
+                .collect(),
+        });
+        if self.remote_verification_results != expected_results {
+            return Err(CacheError::InvalidManifest(
+                "receipt verification claims do not match the journal".to_owned(),
             ));
         }
         Ok(())
@@ -803,7 +863,11 @@ fn refresh_live_permission(
         &target.permission_evidence.principal,
         &target.authorized_repository,
     )?;
-    if target.permission_evidence != *authenticated_session.evidence() {
+    // Fresh authority gates this action; a planned immutable receipt retains
+    // the original permission evidence it already binds.
+    if target.discoverability_commit.is_none()
+        && target.permission_evidence != *authenticated_session.evidence()
+    {
         journal
             .targets
             .get_mut(&destination)
@@ -913,6 +977,8 @@ fn execute_metadata_commit(
                             .parts
                             .iter()
                             .map(|file| file.content_digest.clone())
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
                             .collect(),
                     )?;
                 target.expected_head = commit_id.clone();
@@ -1044,6 +1110,8 @@ fn execute_discoverability_commit(
                             .parts
                             .iter()
                             .map(|file| file.content_digest.clone())
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
                             .collect(),
                     )?;
                 target.expected_head = commit_id.clone();
@@ -1265,9 +1333,20 @@ pub(crate) fn revalidate_publication_capacity(
         .flat_map(|batch| &batch.newly_committed_digests)
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .map(|digest| part_sizes.get(digest).copied().unwrap_or(0))
-        .fold(0u64, u64::saturating_add)
-        .saturating_add(pending_unique_payload_bytes);
+        .try_fold(0u64, |total, digest| {
+            let size = part_sizes.get(digest).ok_or_else(|| {
+                CacheError::InvalidManifest(
+                    "capacity accounting contains an unknown payload".to_owned(),
+                )
+            })?;
+            total.checked_add(*size).ok_or_else(|| {
+                CacheError::ResourceLimit("publication payload bytes exceed u64".to_owned())
+            })
+        })?
+        .checked_add(pending_unique_payload_bytes)
+        .ok_or_else(|| {
+            CacheError::ResourceLimit("pending publication payload bytes exceed u64".to_owned())
+        })?;
     let metadata_bytes = target
         .batches
         .iter()
@@ -1280,8 +1359,11 @@ pub(crate) fn revalidate_publication_capacity(
                 .chain(target.discoverability_commit.iter())
                 .flat_map(|commit| &commit.files),
         )
-        .map(|file| file.size_bytes)
-        .fold(0u64, u64::saturating_add);
+        .try_fold(0u64, |total, file| {
+            total.checked_add(file.size_bytes).ok_or_else(|| {
+                CacheError::ResourceLimit("publication metadata bytes exceed u64".to_owned())
+            })
+        })?;
     let admission = ledger.assess_addition(
         unique_payload_bytes,
         metadata_bytes,
@@ -1802,5 +1884,127 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, CacheError::NoWritableShard(_)));
         assert_eq!(remote.read_ref("memory", "main").unwrap(), "head-0");
+    }
+    fn audit_verified_receipt_fixture() -> (PublicationTransactionJournal, PublicationReceipt) {
+        let (_, mut journal, _) = fixture();
+        let target = journal
+            .targets
+            .get_mut(&PublicationDestination::Private)
+            .unwrap();
+        target
+            .plan_metadata_commit(vec![TransportPart {
+                sequence: 0,
+                repository_path: "manifests/test.json".into(),
+                size_bytes: 4,
+                content_digest: ContentDigest::sha256(b"test"),
+            }])
+            .unwrap();
+        target
+            .metadata_commit
+            .as_mut()
+            .unwrap()
+            .mark_reused("metadata-head")
+            .unwrap();
+        target.mark_remote_verified().unwrap();
+        let receipt = PublicationReceipt::from_verified_metadata(
+            &journal,
+            PublicationDestination::Private,
+            ContentDigest::sha256(b"transport"),
+            BTreeMap::from([("indexes/test.json".into(), ContentDigest::sha256(b"index"))]),
+            1,
+        )
+        .unwrap();
+        (journal, receipt)
+    }
+    #[test]
+    fn audit_receipt_cannot_rebind_publication_policy() {
+        let (journal, mut receipt) = audit_verified_receipt_fixture();
+        receipt.policy_digest = ContentDigest::sha256(b"other-policy");
+        assert!(receipt
+            .validate_for_transaction(&journal, PublicationDestination::Private)
+            .is_err());
+    }
+    #[test]
+    fn audit_receipt_verification_claims_must_match_the_journal() {
+        let (journal, mut receipt) = audit_verified_receipt_fixture();
+        receipt.remote_verification_results[0].content_digests =
+            vec![ContentDigest::sha256(b"different-bytes")];
+        assert!(receipt
+            .validate_for_transaction(&journal, PublicationDestination::Private)
+            .is_err());
+    }
+    #[test]
+    fn exhaustive_finalizer_permission_refresh_preserves_planned_receipt() {
+        let (remote, mut journal, session) = fixture();
+        let checkpoints = checkpoint_store("exhaustive-permission-refresh");
+        let destination = PublicationDestination::Private;
+        journal
+            .targets
+            .get_mut(&destination)
+            .unwrap()
+            .plan_metadata_commit(vec![
+                remote.stage("manifests/manifest.json", b"manifest".to_vec())
+            ])
+            .unwrap();
+        execute_next_finalization_step(
+            &remote,
+            &checkpoints,
+            &CancellationToken::new(),
+            &session,
+            &PublicationFinalizationPolicy::default(),
+            &mut journal,
+            destination,
+        )
+        .unwrap();
+        let receipt = PublicationReceipt::from_verified_metadata(
+            &journal,
+            destination,
+            ContentDigest::sha256(b"transport-record"),
+            BTreeMap::from([(
+                "indexes/ccm/aa.json".to_owned(),
+                ContentDigest::sha256(b"index"),
+            )]),
+            123,
+        )
+        .unwrap();
+        let (receipt_file, bytes) = receipt.as_transport_file(1).unwrap();
+        remote
+            .staged
+            .lock()
+            .unwrap()
+            .insert(receipt_file.repository_path.clone(), bytes);
+        let index = remote.stage("indexes/ccm/aa.json", b"index".to_vec());
+        plan_discoverability_commit(
+            &mut journal,
+            destination,
+            vec![index, receipt_file],
+            &receipt,
+        )
+        .unwrap();
+        let fresh = AuthenticatedGitHubSession::verified_for_test(
+            "test-owner",
+            "team/private",
+            RepositoryPermission::Admin,
+        );
+        assert_ne!(session.evidence(), fresh.evidence());
+        refresh_live_permission(&checkpoints, &fresh, &mut journal, destination).unwrap();
+        receipt
+            .validate_for_transaction(&journal, destination)
+            .unwrap();
+        crate::execute_next_payload_batch(
+            &remote,
+            &checkpoints,
+            &CancellationToken::new(),
+            &fresh,
+            &PublicationFinalizationPolicy::default(),
+            &std::env::temp_dir(),
+            &xc_core::ResourcePolicy::default(),
+            &mut journal,
+            destination,
+        )
+        .unwrap();
+        receipt
+            .validate_for_transaction(&journal, destination)
+            .unwrap();
     }
 }

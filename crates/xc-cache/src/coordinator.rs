@@ -553,6 +553,8 @@ pub fn coordinate_publication(
     network.validate()?;
     encoding.validate()?;
     let transport_digest = encoding.digest()?;
+    let unique_payload_bytes =
+        crate::publication::unique_transport_blob_bytes(&encoding.ordered_parts)?;
     let batches = plan_publication_batches(&encoding.ordered_parts, transport_policy)?;
     let destinations = target_destinations(target);
     if destinations.is_empty()
@@ -578,6 +580,11 @@ pub fn coordinate_publication(
 
     for destination in destinations.iter().copied() {
         let input = &target_inputs[&destination];
+        if input.authorization.destination != destination {
+            return Err(CacheError::InvalidManifest(
+                "publication authorization destination does not match its target".to_owned(),
+            ));
+        }
         let authorization = authorize_target_publication(
             policy,
             &input.candidate,
@@ -629,7 +636,7 @@ pub fn coordinate_publication(
                 ledgers,
                 family,
                 visibility,
-                encoding.package_size_bytes,
+                unique_payload_bytes,
                 input.projected_metadata_bytes,
                 input.projected_history_bytes,
             ) {
@@ -1451,6 +1458,57 @@ mod tests {
         assert_eq!(
             validation.validated_targets[&PublicationDestination::Private],
             "private-001"
+        );
+    }
+    #[test]
+    fn audit_coordinator_binds_authorization_to_public_destination() {
+        let policy = policy();
+        let mut public = input(&policy, PublicationDestination::Public);
+        public.authorization.destination = PublicationDestination::Private;
+        public.candidate.achieved_assurance = ArtifactAssuranceState::Computed;
+        public
+            .candidate
+            .validator_evidence
+            .retain(|e| e.validator_id == "manifest");
+        public.candidate.public_metadata.insert(
+            "unexpected_private_field".into(),
+            json!("retained privately"),
+        );
+        let inputs = BTreeMap::from([
+            (
+                PublicationDestination::Private,
+                input(&policy, PublicationDestination::Private),
+            ),
+            (PublicationDestination::Public, public),
+        ]);
+        let result = coordinate_publication(
+            "ccm",
+            PublicationTarget::Both,
+            &policy,
+            &topology(&policy),
+            &TopologyTrustPolicy {
+                minimum_generation: 1,
+                pinned_registry_digest: None,
+                required_trust_anchor: Some("release-key".into()),
+            },
+            &network(),
+            &BTreeMap::from([
+                ("private-001".into(), ledger("private-001")),
+                ("public-001".into(), ledger("public-001")),
+            ]),
+            &encoding(),
+            &TransportPolicy {
+                maximum_file_bytes_exclusive: 100,
+                split_part_bytes: 90,
+                maximum_batch_payload_bytes: 100,
+                maximum_pending_batches: 1,
+            },
+            &inputs,
+            &authenticated_sessions(),
+        );
+        assert!(
+            result.as_ref().is_err() || !result.as_ref().unwrap().authorized(),
+            "public destination cannot use private validation policy: {result:?}"
         );
     }
 }

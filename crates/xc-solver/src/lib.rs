@@ -7,6 +7,8 @@
 //! implementations.  They are never a silent replacement for an HP request.
 //! The same result contracts are intended for the HP and certified backends.
 
+mod exact_sturm_f64;
+
 use nalgebra::{DMatrix, SymmetricEigen};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -24,9 +26,15 @@ use xc_core::{
 use xc_operator::{GeneralizedEigenProblem, OperatorError, OperatorMetadata, SymmetricOperator};
 
 #[cfg(feature = "hp-reference")]
+mod hp_boundary_count;
+#[cfg(feature = "hp-reference")]
+pub use hp_boundary_count::{BoundaryCountEvidenceHp, HP_KRYLOV_COUNT_SEMANTICS};
+#[cfg(feature = "hp-reference")]
 mod hp_generalized;
 #[cfg(feature = "hp-reference")]
 pub use hp_generalized::*;
+#[cfg(feature = "hp-reference")]
+mod hp_generalized_crosscheck;
 #[cfg(feature = "hp-reference")]
 mod hp_generalized_dense;
 #[cfg(feature = "hp-reference")]
@@ -54,7 +62,13 @@ pub enum SolverError {
     UnsupportedTarget(String),
     Operator(OperatorError),
     NumericalBreakdown(String),
+    /// The producer established a precision-dependent resolution or rank limit.
+    PrecisionExhausted(String),
     NonConvergence(String),
+    /// A fixed work budget ended; precision escalation does not enlarge it.
+    IterationBudgetExhausted(String),
+    /// A one-vector comparison cannot establish agreement of a non-simple eigenspace.
+    UnresolvedEigenspace(String),
     CrossCheckDisagreement(String),
     Cancelled(String),
 }
@@ -68,7 +82,16 @@ impl Display for SolverError {
             Self::UnsupportedTarget(message) => write!(f, "unsupported target: {message}"),
             Self::Operator(error) => Display::fmt(error, f),
             Self::NumericalBreakdown(message) => write!(f, "numerical breakdown: {message}"),
+            Self::PrecisionExhausted(message) => {
+                write!(f, "working precision exhausted: {message}")
+            }
             Self::NonConvergence(message) => write!(f, "solver did not converge: {message}"),
+            Self::IterationBudgetExhausted(message) => {
+                write!(f, "solver work budget exhausted: {message}")
+            }
+            Self::UnresolvedEigenspace(message) => {
+                write!(f, "eigenspace comparison is unresolved: {message}")
+            }
             Self::CrossCheckDisagreement(message) => {
                 write!(f, "independent solvers disagree: {message}")
             }
@@ -108,12 +131,21 @@ pub struct SolverPerformanceTelemetry {
     pub elapsed_nanoseconds: u128,
 }
 
+/// A residual/backward-error report for an approximate eigenpair. `Converged`
+/// describes those stopping tests; it does not establish a requested global
+/// extremum when the iteration has only visited a proper invariant subspace.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EigenpairReportF64 {
+    /// Full-space numerical selection was performed. This is computed ordering
+    /// evidence, not an interval certificate. Missing legacy evidence is false.
+    #[serde(default)]
+    pub global_target_ordering_established: bool,
     pub eigenvalue: f64,
     pub eigenvector: Vec<f64>,
     pub residual_norm: f64,
     pub relative_residual: f64,
+    /// Image-based ratio ||Av-lambda v|| / (||Av||+|lambda| ||v||).
+    /// This conservative computable scale does not use a caller's norm upper bound.
     pub scaled_backward_error: f64,
     pub iterations: usize,
     pub operator_applications: usize,
@@ -159,7 +191,7 @@ impl<'a> SymmetricProblemF64<'a> {
     }
 }
 
-pub trait EigenSolverF64: Send + Sync {
+pub trait EigenSolverF64: Send + Sync + std::any::Any {
     fn name(&self) -> &'static str;
 
     fn solve(
@@ -187,17 +219,89 @@ fn check_solver_cancellation(cancellation: &CancellationToken) -> Result<(), Sol
         .map_err(|error| SolverError::Cancelled(error.to_string()))
 }
 
+// Native routes act on the supplied operator. They do not construct a
+// requested parity/basis restriction and cannot supply more than 53 bits.
+fn validate_native_solver_config(config: &SolverConfig) -> Result<(), SolverError> {
+    config
+        .validate()
+        .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
+    if config.subspace != xc_core::Subspace::Full {
+        return Err(SolverError::UnsupportedTarget(
+            "native solver requires an already reduced operator with Full subspace".into(),
+        ));
+    }
+    let working = config
+        .precision
+        .initial_working_bits()
+        .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
+    if working > f64::MANTISSA_DIGITS {
+        return Err(SolverError::InvalidConfiguration(format!(
+            "native solver has 53 significand bits; requested {working} working bits require an HP route"
+        )));
+    }
+    Ok(())
+}
+
+// Bound every native dense/Ritz eigendecomposition and validate its actual
+// arithmetic. The library QR can pair tiny eigenvalues with the wrong columns
+// and lose 2x2 eigenvector accuracy, so its orthogonal basis is completed by
+// Jacobi rotations: values come back ascending, each with its own column.
+fn checked_symmetric_decomposition_f64(
+    matrix: DMatrix<f64>,
+) -> Result<SymmetricEigen<f64, nalgebra::Dyn>, SolverError> {
+    let n = matrix.nrows();
+    if n == 0 || matrix.ncols() != n || matrix.iter().any(|v| !v.is_finite()) {
+        return Err(SolverError::NumericalBreakdown(
+            "symmetric eigendecomposition requires a finite nonempty square matrix".into(),
+        ));
+    }
+    let mut result = SymmetricEigen::try_new(matrix.clone(), f64::EPSILON, n.saturating_mul(128))
+        .ok_or_else(|| {
+        SolverError::NonConvergence("native symmetric QR exceeded its iteration budget".into())
+    })?;
+    if result
+        .eigenvalues
+        .iter()
+        .chain(result.eigenvectors.iter())
+        .any(|v| !v.is_finite())
+    {
+        return Err(SolverError::NumericalBreakdown(
+            "native symmetric eigendecomposition produced nonfinite values".into(),
+        ));
+    }
+    let values = xc_numerics::symmetric_f64::complete_symmetric_eigensystem_f64(
+        matrix.as_slice(),
+        n,
+        result.eigenvectors.as_mut_slice(),
+    )
+    .map_err(|error| SolverError::NumericalBreakdown(error.to_string()))?;
+    result.eigenvalues = nalgebra::DVector::from_vec(values);
+    Ok(result)
+}
+
 fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 fn norm(x: &[f64]) -> f64 {
-    dot(x, x).sqrt()
+    if x.iter().any(|v| !v.is_finite()) {
+        return f64::NAN;
+    }
+    let squared = dot(x, x);
+    if squared.is_normal() {
+        return squared.sqrt();
+    }
+    let maximum = x.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+    if maximum == 0.0 {
+        return 0.0;
+    }
+    let scaled_square: f64 = x.iter().map(|v| (v / maximum).powi(2)).sum();
+    maximum * scaled_square.sqrt()
 }
 
 fn normalize(x: &mut [f64]) -> Result<(), SolverError> {
     let n = norm(x);
-    if !n.is_finite() || n <= f64::MIN_POSITIVE {
+    if !n.is_finite() || n <= 0.0 {
         return Err(SolverError::NumericalBreakdown(
             "cannot normalize a zero or non-finite vector".to_owned(),
         ));
@@ -225,25 +329,63 @@ fn evaluate_eigenpair(
     vector: &[f64],
     workspace: &mut [f64],
 ) -> Result<(f64, f64, f64, f64), SolverError> {
+    if vector.len() != operator.dimension()
+        || workspace.len() != vector.len()
+        || vector.is_empty()
+        || vector.iter().any(|v| !v.is_finite())
+    {
+        return Err(SolverError::NumericalBreakdown(
+            "invalid eigenpair diagnostic vector".into(),
+        ));
+    }
     operator.apply(vector, workspace)?;
     let eigenvalue = dot(vector, workspace) / dot(vector, vector);
     let vector_norm = norm(vector);
-    let mut residual_sq = 0.0;
-    let mut applied_sq = 0.0;
-    for (av, v) in workspace.iter().zip(vector) {
-        let r = av - eigenvalue * v;
-        residual_sq += r * r;
-        applied_sq += av * av;
+    let residuals: Vec<_> = workspace
+        .iter()
+        .zip(vector)
+        .map(|(av, v)| av - eigenvalue * v)
+        .collect();
+    let residual = norm(&residuals);
+    let applied_norm = norm(workspace);
+    if !eigenvalue.is_finite()
+        || !vector_norm.is_finite()
+        || vector_norm == 0.0
+        || !residual.is_finite()
+        || !applied_norm.is_finite()
+    {
+        return Err(SolverError::NumericalBreakdown(
+            "eigenpair diagnostic arithmetic is not finite".into(),
+        ));
     }
-    let residual = residual_sq.sqrt();
-    let applied_norm = applied_sq.sqrt();
-    let relative =
-        residual / (applied_norm + eigenvalue.abs() * vector_norm).max(f64::MIN_POSITIVE);
-    let norm_bound = operator
-        .norm_bound()
-        .unwrap_or(applied_norm / vector_norm.max(f64::MIN_POSITIVE));
-    let backward = residual
-        / (norm_bound * vector_norm + eigenvalue.abs() * vector_norm).max(f64::MIN_POSITIVE);
+    // Preserve ordinary arithmetic, but never floor a nonzero denominator
+    // to MIN_POSITIVE or divide by an overflowing intermediate sum/product.
+    let ratio = |a: f64, b: f64, factor: f64| -> Result<f64, SolverError> {
+        let denominator = a + b * factor;
+        let value = if denominator.is_normal() {
+            residual / denominator
+        } else {
+            let scale = a.max(b);
+            if scale == 0.0 {
+                if residual == 0.0 {
+                    0.0
+                } else {
+                    f64::NAN
+                }
+            } else {
+                (residual / scale) / (a / scale + (b / scale) * factor)
+            }
+        };
+        if !value.is_finite() || (value == 0.0 && residual != 0.0) {
+            Err(SolverError::NumericalBreakdown(
+                "eigenpair diagnostic ratio is not representable".into(),
+            ))
+        } else {
+            Ok(value)
+        }
+    };
+    let relative = ratio(applied_norm, eigenvalue.abs(), vector_norm)?;
+    let backward = relative;
     Ok((eigenvalue, residual, relative, backward))
 }
 
@@ -259,25 +401,28 @@ fn supported_extreme(target: &EigenTarget) -> Result<bool, SolverError> {
 }
 
 fn stopping_thresholds_f64(config: &SolverConfig) -> Result<(f64, f64), SolverError> {
-    let absolute = config
-        .stopping
-        .absolute_residual
-        .parse_f64()
-        .map_err(|error| {
-            SolverError::InvalidConfiguration(format!(
-                "absolute_residual is not representable by the f64 reference solver: {error}"
-            ))
-        })?;
-    let backward = config
-        .stopping
-        .scaled_backward_error
-        .parse_f64()
-        .map_err(|error| {
-            SolverError::InvalidConfiguration(format!(
-                "scaled_backward_error is not representable by the f64 reference solver: {error}"
-            ))
-        })?;
-    Ok((absolute, backward))
+    fn downward(literal: &xc_core::DecimalLiteral) -> Result<f64, SolverError> {
+        let invalid =
+            |error: xc_core::ConfigError| SolverError::InvalidConfiguration(error.to_string());
+        let mut value = literal.parse_f64().map_err(invalid)?;
+        // Every finite binary64 value has a terminating decimal expansion
+        // with at most 1074 fractional digits. Compare that exact expansion,
+        // not Display's shortest round-trip approximation, to the request.
+        let exact = xc_core::DecimalLiteral::from_f64_exact(value).map_err(invalid)?;
+        if exact.cmp_numeric(literal).map_err(invalid)? == std::cmp::Ordering::Greater {
+            value = value.next_down();
+        }
+        if !value.is_finite() || value <= 0. {
+            return Err(SolverError::InvalidConfiguration(
+                "positive native stopping tolerance is outside the supported range".into(),
+            ));
+        }
+        Ok(value)
+    }
+    Ok((
+        downward(&config.stopping.absolute_residual)?,
+        downward(&config.stopping.scaled_backward_error)?,
+    ))
 }
 
 /// Deterministic shifted power iteration.  The transformation `b I ± A`
@@ -288,7 +433,7 @@ pub struct ShiftedPowerSolverF64;
 
 impl EigenSolverF64 for ShiftedPowerSolverF64 {
     fn name(&self) -> &'static str {
-        "shifted_power_f64"
+        "shifted_power_image_residual_f64_v2"
     }
 
     fn solve(
@@ -306,9 +451,7 @@ impl EigenSolverF64 for ShiftedPowerSolverF64 {
         cancellation: &CancellationToken,
     ) -> Result<EigenpairReportF64, SolverError> {
         check_solver_cancellation(cancellation)?;
-        config
-            .validate()
-            .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
+        validate_native_solver_config(config)?;
         let largest = supported_extreme(&config.target)?;
         let (absolute_residual, backward_tolerance) = stopping_thresholds_f64(config)?;
         let n = problem.operator.dimension();
@@ -332,7 +475,10 @@ impl EigenSolverF64 for ShiftedPowerSolverF64 {
         let mut ax = vec![0.0; n];
         let mut transformed = vec![0.0; n];
         let sign = if largest { 1.0 } else { -1.0 };
-        let shift = bound + f64::EPSILON * bound.max(1.0);
+        // ((1 + eps) I +/- A/b) has the same eigenvectors as b I +/- A,
+        // without an absolute shift floor or an overflowing shifted image.
+        let iteration_scale = if bound == 0.0 { 1.0 } else { bound };
+        let shift = 1.0 + f64::EPSILON;
         let mut applications = 0usize;
 
         for iteration in 1..=config.stopping.maximum_iterations {
@@ -340,7 +486,7 @@ impl EigenSolverF64 for ShiftedPowerSolverF64 {
             problem.operator.apply(&x, &mut ax)?;
             applications += 1;
             for i in 0..n {
-                transformed[i] = shift * x[i] + sign * ax[i];
+                transformed[i] = shift * x[i] + sign * (ax[i] / iteration_scale);
             }
             normalize(&mut transformed)?;
             std::mem::swap(&mut x, &mut transformed);
@@ -353,6 +499,7 @@ impl EigenSolverF64 for ShiftedPowerSolverF64 {
                 && (residual <= absolute_residual || backward <= backward_tolerance)
             {
                 let report = EigenpairReportF64 {
+                    global_target_ordering_established: n == 1,
                     eigenvalue: lambda,
                     eigenvector: x,
                     residual_norm: residual,
@@ -419,7 +566,7 @@ impl LanczosSolverF64 {
                 t[(i + 1, i)] = betas[i];
             }
         }
-        let decomposition = SymmetricEigen::new(t);
+        let decomposition = checked_symmetric_decomposition_f64(t)?;
         let index = if largest {
             (0..m)
                 .max_by(|&a, &b| {
@@ -458,7 +605,7 @@ impl LanczosSolverF64 {
 
 impl EigenSolverF64 for LanczosSolverF64 {
     fn name(&self) -> &'static str {
-        "lanczos_full_reorthogonalization_f64"
+        "lanczos_full_reorthogonalization_image_residual_f64_v2"
     }
 
     fn solve(
@@ -476,9 +623,7 @@ impl EigenSolverF64 for LanczosSolverF64 {
         cancellation: &CancellationToken,
     ) -> Result<EigenpairReportF64, SolverError> {
         check_solver_cancellation(cancellation)?;
-        config
-            .validate()
-            .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
+        validate_native_solver_config(config)?;
         let largest = supported_extreme(&config.target)?;
         let (absolute_residual, backward_tolerance) = stopping_thresholds_f64(config)?;
         let n = problem.operator.dimension();
@@ -502,6 +647,14 @@ impl EigenSolverF64 for LanczosSolverF64 {
             check_solver_cancellation(cancellation)?;
             problem.operator.apply(&q, &mut z)?;
             applications += 1;
+            // A breakdown tolerance has the same units as A*q. In particular,
+            // a tiny but nonzero matrix must not be compared to a unit floor.
+            let breakdown_scale = norm(&z);
+            if !breakdown_scale.is_finite() || breakdown_scale < 0.0 {
+                return Err(SolverError::NumericalBreakdown(
+                    "invalid Lanczos breakdown scale".into(),
+                ));
+            }
             if iteration > 1 {
                 for i in 0..n {
                     z[i] -= beta_prev * q_prev[i];
@@ -523,6 +676,11 @@ impl EigenSolverF64 for LanczosSolverF64 {
                 }
             }
             let beta = norm(&z);
+            if !alpha.is_finite() || !beta.is_finite() {
+                return Err(SolverError::NumericalBreakdown(
+                    "non-finite Lanczos recurrence coefficient".into(),
+                ));
+            }
             alphas.push(alpha);
 
             let (_ritz_theta, vector) = self.ritz_pair(&alphas, &betas, &basis, largest)?;
@@ -534,6 +692,7 @@ impl EigenSolverF64 for LanczosSolverF64 {
                 && (residual <= absolute_residual || backward <= backward_tolerance)
             {
                 let report = EigenpairReportF64 {
+                    global_target_ordering_established: basis.len() == n,
                     eigenvalue: lambda,
                     eigenvector: vector,
                     residual_norm: residual,
@@ -555,10 +714,10 @@ impl EigenSolverF64 for LanczosSolverF64 {
                 return Ok(report);
             }
 
-            let breakdown_threshold =
-                f64::EPSILON.sqrt() * problem.operator.norm_bound().unwrap_or(1.0).max(1.0);
-            if !beta.is_finite() || beta <= breakdown_threshold {
+            let breakdown_threshold = f64::EPSILON.sqrt() * breakdown_scale;
+            if beta <= breakdown_threshold {
                 let report = EigenpairReportF64 {
+                    global_target_ordering_established: basis.len() == n,
                     eigenvalue: lambda,
                     eigenvector: vector,
                     residual_norm: residual,
@@ -611,8 +770,12 @@ pub struct BlockExtremeConfigF64 {
     pub target: EigenTarget,
     pub requested_count: usize,
     pub block_size: usize,
+    /// Absolute residual tolerance in operator units; accepted as an alternative
+    /// to the dimensionless scaled backward-error tolerance.
     pub absolute_residual_tolerance: f64,
     pub scaled_backward_error_tolerance: f64,
+    /// |lambda_new-lambda_old| / max(1, |lambda_new|, |lambda_old|).
+    /// The unit floor makes this absolute for small eigenvalues.
     pub ritz_value_stability_tolerance: f64,
     pub cluster_absolute_tolerance: f64,
     pub cluster_relative_tolerance: f64,
@@ -729,6 +892,9 @@ pub struct InvariantSubspaceF64 {
 
 /// Result of a block selected-extreme solve. The returned count can exceed the
 /// request when the requested boundary falls inside a detected cluster.
+/// Residual convergence and a separated Ritz boundary do not establish global
+/// target ordering for a proper subspace. Even full-space identification here
+/// is computed evidence; a rigorous index requires separate certification.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BlockEigenReportF64 {
     pub target: EigenTarget,
@@ -736,6 +902,15 @@ pub struct BlockEigenReportF64 {
     pub returned_count: usize,
     pub block_size: usize,
     pub invariant_subspaces: Vec<InvariantSubspaceF64>,
+    /// Separation among the Ritz values in the visited subspace only.
+    #[serde(default)]
+    pub ritz_boundary_separation_established: bool,
+    /// Full-space numerical selection was performed; this is not a certificate.
+    #[serde(default)]
+    pub global_target_ordering_established: bool,
+    /// The requested boundary is separated in a full-space numerical solve.
+    /// Legacy reports predate the explicit ordering field and must not be used
+    /// to infer global ordering unless that field is also true.
     pub target_boundary_separation_established: bool,
     pub maximum_residual_norm: f64,
     pub maximum_scaled_backward_error: f64,
@@ -752,7 +927,8 @@ pub struct BlockEigenReportF64 {
     pub provenance: SolverProvenance,
 }
 
-pub const BLOCK_SUBSPACE_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+// Version 3 uses relative rank tests and exact dyadic stability/cluster gates.
+pub const BLOCK_SUBSPACE_CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 
 /// Complete deterministic continuation state for bounded-memory block
 /// subspace iteration.  The retained basis never exceeds the configured
@@ -791,7 +967,7 @@ impl BlockSubspaceCheckpointF64 {
         reorthogonalization_passes: usize,
     ) -> Result<(), SolverError> {
         if self.schema_version != BLOCK_SUBSPACE_CHECKPOINT_SCHEMA_VERSION
-            || self.algorithm != "block_subspace_iteration_rayleigh_ritz_f64"
+            || self.algorithm != "block_subspace_iteration_image_residual_f64_v2"
         {
             return Err(SolverError::InvalidConfiguration(
                 "block checkpoint schema or algorithm is incompatible".to_owned(),
@@ -931,6 +1107,13 @@ fn orthonormalize_block(
                 candidate.len()
             )));
         }
+        let initial_norm = norm(&candidate);
+        if !initial_norm.is_finite() || initial_norm == 0.0 {
+            continue;
+        }
+        for value in &mut candidate {
+            *value /= initial_norm;
+        }
         for _ in 0..passes.max(1) {
             for vector in &basis {
                 let projection = dot(vector, &candidate);
@@ -968,10 +1151,69 @@ fn block_orthogonality_defect(basis: &[Vec<f64>]) -> f64 {
     defect
 }
 
+// Arithmetic helpers for the native block route. These remain point estimates,
+// but an intermediate overflow/underflow must not turn a residual into zero.
+fn symmetric_average_f64(left: f64, right: f64) -> Result<f64, SolverError> {
+    if !left.is_finite() || !right.is_finite() {
+        return Err(SolverError::NumericalBreakdown(
+            "projected operator contains non-finite arithmetic".into(),
+        ));
+    }
+    let sum = left + right;
+    Ok(if sum.is_finite() {
+        0.5 * sum
+    } else {
+        0.5 * left + 0.5 * right
+    })
+}
+
+fn residual_ratio_f64(residual: f64, bound: f64, eigenvalue_abs: f64) -> Result<f64, SolverError> {
+    if !residual.is_finite()
+        || !bound.is_finite()
+        || bound < 0.0
+        || !eigenvalue_abs.is_finite()
+        || eigenvalue_abs < 0.0
+    {
+        return Err(SolverError::NumericalBreakdown(
+            "invalid block residual arithmetic".into(),
+        ));
+    }
+    let denominator = bound + eigenvalue_abs;
+    let ratio = if denominator.is_normal() {
+        residual / denominator
+    } else {
+        let scale = bound.max(eigenvalue_abs);
+        if scale == 0.0 && residual == 0.0 {
+            0.0
+        } else {
+            (residual / scale) / (bound / scale + eigenvalue_abs / scale)
+        }
+    };
+    if !ratio.is_finite() || (ratio == 0.0 && residual != 0.0) {
+        return Err(SolverError::NumericalBreakdown(
+            "block residual ratio is not representable".into(),
+        ));
+    }
+    Ok(ratio)
+}
+
+fn native_ritz_stable(current: f64, previous: f64, tolerance: f64) -> bool {
+    exact_sturm_f64::difference_at_most_scaled(
+        current,
+        previous,
+        tolerance,
+        current.abs().max(previous.abs()).max(1.0),
+    )
+}
+
 fn same_cluster(left: f64, right: f64, config: &BlockExtremeConfigF64) -> bool {
-    (left - right).abs()
-        <= config.cluster_absolute_tolerance
-            + config.cluster_relative_tolerance * left.abs().max(right.abs())
+    exact_sturm_f64::difference_at_most_sum_scaled(
+        left,
+        right,
+        config.cluster_absolute_tolerance,
+        config.cluster_relative_tolerance,
+        left.abs().max(right.abs()),
+    )
 }
 
 /// Deterministic block subspace iteration with repeated orthogonalization and
@@ -1092,13 +1334,11 @@ impl BlockSubspaceIterationF64 {
                 "operator norm bound must be finite and nonnegative".to_owned(),
             ));
         }
-        let shift = norm_bound + norm_bound.max(1.0) * f64::EPSILON.sqrt();
-        if !shift.is_finite() {
-            return Err(SolverError::InvalidConfiguration(
-                "operator norm bound is too large to construct a finite shifted iteration"
-                    .to_owned(),
-            ));
-        }
+        // A positive scalar multiple leaves the iterated subspace unchanged.
+        // Normalize by the operator bound BEFORE adding the shift: an absolute
+        // floor would erase small A, while b*I +/- A may overflow for large A.
+        let iteration_scale = if norm_bound == 0.0 { 1.0 } else { norm_bound };
+        let shift = 1.0 + f64::EPSILON.sqrt();
         let transform_sign = if config.target == EigenTarget::AlgebraicLargest {
             1.0
         } else {
@@ -1193,7 +1433,7 @@ impl BlockSubspaceIterationF64 {
                 problem.operator.apply(vector, &mut applied)?;
                 applications += 1;
                 for (value, source) in applied.iter_mut().zip(vector) {
-                    *value = shift * source + transform_sign * *value;
+                    *value = shift * source + transform_sign * (*value / iteration_scale);
                 }
                 transformed.push(applied);
             }
@@ -1229,7 +1469,11 @@ impl BlockSubspaceIterationF64 {
                 });
             converged = iteration >= config.minimum_iterations
                 && residual_converged
-                && final_stability <= config.ritz_value_stability_tolerance;
+                && previous_values.as_ref().is_some_and(|previous| {
+                    state.values.iter().zip(previous).all(|(&current, &prior)| {
+                        native_ritz_stable(current, prior, config.ritz_value_stability_tolerance)
+                    })
+                });
             previous_values = Some(state.values.clone());
             basis.clone_from(&state.vectors);
             final_state = Some(state);
@@ -1240,7 +1484,7 @@ impl BlockSubspaceIterationF64 {
                 if let Some(sink) = checkpoint_sink.as_deref_mut() {
                     let checkpoint = BlockSubspaceCheckpointF64 {
                         schema_version: BLOCK_SUBSPACE_CHECKPOINT_SCHEMA_VERSION,
-                        algorithm: "block_subspace_iteration_rayleigh_ritz_f64".to_owned(),
+                        algorithm: "block_subspace_iteration_image_residual_f64_v2".to_owned(),
                         operator_identity: operator_identity
                             .expect("checkpoint identity was validated")
                             .to_owned(),
@@ -1303,12 +1547,12 @@ impl BlockSubspaceIterationF64 {
             for column in 0..=row {
                 let left = dot(&basis[row], &applied_basis[column]);
                 let right = dot(&basis[column], &applied_basis[row]);
-                let value = 0.5 * (left + right);
+                let value = symmetric_average_f64(left, right)?;
                 projected[(row, column)] = value;
                 projected[(column, row)] = value;
             }
         }
-        let decomposition = SymmetricEigen::new(projected);
+        let decomposition = checked_symmetric_decomposition_f64(projected)?;
         let mut indices: Vec<usize> = (0..count).collect();
         indices.sort_by(|left, right| {
             let order =
@@ -1319,7 +1563,6 @@ impl BlockSubspaceIterationF64 {
                 order
             }
         });
-        let norm_bound = operator.norm_bound().unwrap_or(0.0);
         let mut values = Vec::with_capacity(count);
         let mut vectors = Vec::with_capacity(count);
         let mut applied_vectors = Vec::with_capacity(count);
@@ -1351,16 +1594,18 @@ impl BlockSubspaceIterationF64 {
                     *component = -*component;
                 }
             }
-            let residual = applied
+            if !value.is_finite() {
+                return Err(SolverError::NumericalBreakdown(
+                    "Rayleigh-Ritz extraction produced a non-finite eigenvalue".into(),
+                ));
+            }
+            let residual_vector: Vec<_> = applied
                 .iter()
                 .zip(&vector)
-                .map(|(av, x)| {
-                    let value = av - value * x;
-                    value * value
-                })
-                .sum::<f64>()
-                .sqrt();
-            let backward = residual / (norm_bound + value.abs()).max(f64::MIN_POSITIVE);
+                .map(|(av, x)| av - value * x)
+                .collect();
+            let residual = norm(&residual_vector);
+            let backward = residual_ratio_f64(residual, norm(&applied), value.abs())?;
             values.push(value);
             vectors.push(vector);
             applied_vectors.push(applied);
@@ -1420,18 +1665,20 @@ impl BlockSubspaceIterationF64 {
             let mut projected = vec![0.0; cluster_dimension * cluster_dimension];
             for row in 0..cluster_dimension {
                 for column in 0..=row {
-                    let value = 0.5
-                        * (dot(&basis[row], &state.applied_vectors[first + column])
-                            + dot(&basis[column], &state.applied_vectors[first + row]));
+                    let value = symmetric_average_f64(
+                        dot(&basis[row], &state.applied_vectors[first + column]),
+                        dot(&basis[column], &state.applied_vectors[first + row]),
+                    )?;
                     projected[row * cluster_dimension + column] = value;
                     projected[column * cluster_dimension + row] = value;
                 }
             }
-            let residual_frobenius_norm = state.residual_norms[first..last]
-                .iter()
-                .map(|value| value * value)
-                .sum::<f64>()
-                .sqrt();
+            let residual_frobenius_norm = norm(&state.residual_norms[first..last]);
+            if !residual_frobenius_norm.is_finite() {
+                return Err(SolverError::NumericalBreakdown(
+                    "block residual Frobenius norm is not representable".into(),
+                ));
+            }
             let maximum_residual_norm = state.residual_norms[first..last]
                 .iter()
                 .copied()
@@ -1444,6 +1691,13 @@ impl BlockSubspaceIterationF64 {
                 .iter()
                 .copied()
                 .fold(f64::NEG_INFINITY, f64::max);
+            let lower = minimum_value - residual_frobenius_norm;
+            let upper = maximum_value + residual_frobenius_norm;
+            if !lower.is_finite() || !upper.is_finite() {
+                return Err(SolverError::NumericalBreakdown(
+                    "block residual spectral window is not representable".into(),
+                ));
+            }
             invariant_subspaces.push(InvariantSubspaceF64 {
                 dimension: cluster_dimension,
                 ritz_values: state.values[first..last].to_vec(),
@@ -1452,8 +1706,8 @@ impl BlockSubspaceIterationF64 {
                 maximum_residual_norm,
                 residual_frobenius_norm,
                 spectral_window: ResidualSpectralWindowF64 {
-                    lower: minimum_value - residual_frobenius_norm,
-                    upper: maximum_value + residual_frobenius_norm,
+                    lower,
+                    upper,
                     rigorous: false,
                 },
                 individual_vectors_resolved: cluster_dimension == 1,
@@ -1485,10 +1739,15 @@ impl BlockSubspaceIterationF64 {
                 ResultStatus::Converged,
                 TerminationReason::BackwardErrorTolerance,
             )
-        } else {
+        } else if maximum_residual_norm <= config.absolute_residual_tolerance {
             (
                 ResultStatus::Converged,
                 TerminationReason::ResidualTolerance,
+            )
+        } else {
+            (
+                ResultStatus::Converged,
+                TerminationReason::ResidualOrBackwardErrorTolerance,
             )
         };
         let scalar_vectors = 6u64
@@ -1503,7 +1762,10 @@ impl BlockSubspaceIterationF64 {
             returned_count,
             block_size: config.block_size,
             invariant_subspaces,
-            target_boundary_separation_established: boundary_separation_established,
+            ritz_boundary_separation_established: boundary_separation_established,
+            global_target_ordering_established: config.block_size == operator_dimension,
+            target_boundary_separation_established: boundary_separation_established
+                && config.block_size == operator_dimension,
             maximum_residual_norm,
             maximum_scaled_backward_error,
             ritz_value_stability: stability,
@@ -1511,7 +1773,7 @@ impl BlockSubspaceIterationF64 {
             iterations,
             operator_applications: applications,
             estimated_peak_memory_bytes: scalar_vectors.saturating_mul(8),
-            algorithm: "block_subspace_iteration_rayleigh_ritz_f64".to_owned(),
+            algorithm: "block_subspace_iteration_image_residual_f64_v2".to_owned(),
             seed_source,
             status,
             termination,
@@ -1546,6 +1808,51 @@ mod block_subspace_tests {
     }
 
     #[test]
+    fn block_arithmetic_preserves_range_and_rejects_nonfinite_inputs() {
+        // Exact exponent scaling supplies independent dimensionless references.
+        let scale = 2.0f64.powi(-537);
+        assert!((norm(&[1.25 * scale; 2]) / scale - 1.25 * 2.0f64.sqrt()).abs() < 1e-15);
+        let tiny = f64::from_bits(1);
+        assert!((residual_ratio_f64(tiny, tiny, 2.0 * tiny).unwrap() - 1.0 / 3.0).abs() < 1e-15);
+        assert!(
+            (residual_ratio_f64(f64::MAX / 4.0, f64::MAX, f64::MAX).unwrap() - 0.125).abs() < 1e-15
+        );
+        assert_eq!(symmetric_average_f64(f64::MAX, f64::MAX).unwrap(), f64::MAX);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(residual_ratio_f64(bad, 1.0, 1.0).is_err());
+            assert!(symmetric_average_f64(bad, 1.0).is_err());
+        }
+        assert!(residual_ratio_f64(tiny, f64::MAX, f64::MAX).is_err());
+    }
+
+    #[test]
+    fn block_checkpoint_rejects_prior_arithmetic_version() {
+        let operator = DiagonalF64::new("old-checkpoint", vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+        let problem = SymmetricProblemF64::new(&operator);
+        let config = block_config(EigenTarget::AlgebraicLargest, 1, 2);
+        let solver = BlockSubspaceIterationF64::default();
+        let mut stop = StopAtIteration { iteration: 1 };
+        let BlockSolveOutcomeF64::Checkpointed { mut checkpoint } = solver
+            .solve_checkpointed(
+                &problem,
+                &config,
+                "old-arithmetic",
+                None,
+                None,
+                &mut stop,
+                &CancellationToken::new(),
+            )
+            .unwrap()
+        else {
+            panic!("expected checkpoint")
+        };
+        checkpoint.schema_version = 1;
+        assert!(checkpoint
+            .validate_compatibility(&problem, &config, "old-arithmetic", 2)
+            .is_err());
+    }
+
+    #[test]
     fn block_iteration_returns_several_extremes_without_materializing() {
         let operator = DiagonalF64::new("diagonal", vec![-3.0, -1.0, 2.0, 4.0, 7.0, 11.0]).unwrap();
         let problem = SymmetricProblemF64::new(&operator);
@@ -1554,7 +1861,9 @@ mod block_subspace_tests {
             .unwrap();
 
         assert_eq!(report.status, ResultStatus::Converged);
-        assert!(report.target_boundary_separation_established);
+        assert!(report.ritz_boundary_separation_established);
+        assert!(!report.global_target_ordering_established);
+        assert!(!report.target_boundary_separation_established);
         assert_eq!(report.returned_count, 3);
         let values: Vec<f64> = report
             .invariant_subspaces
@@ -1779,6 +2088,7 @@ mod block_subspace_tests {
 #[derive(Clone, Debug)]
 pub struct DenseReferenceSolverF64 {
     pub maximum_dimension: usize,
+    /// Relative to the largest absolute materialized entry; no unit scale floor.
     pub symmetry_tolerance: f64,
 }
 
@@ -1793,7 +2103,7 @@ impl Default for DenseReferenceSolverF64 {
 
 impl EigenSolverF64 for DenseReferenceSolverF64 {
     fn name(&self) -> &'static str {
-        "dense_materialized_reference_f64"
+        "dense_materialized_image_residual_reference_f64_v2"
     }
 
     fn solve(
@@ -1811,13 +2121,20 @@ impl EigenSolverF64 for DenseReferenceSolverF64 {
         cancellation: &CancellationToken,
     ) -> Result<EigenpairReportF64, SolverError> {
         check_solver_cancellation(cancellation)?;
-        config
-            .validate()
-            .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
+        validate_native_solver_config(config)?;
         let largest = supported_extreme(&config.target)?;
         let (absolute_residual, backward_tolerance) = stopping_thresholds_f64(config)?;
         let n = problem.operator.dimension();
-        if n == 0 || n > self.maximum_dimension {
+        if !self.symmetry_tolerance.is_finite() || self.symmetry_tolerance < 0.0 {
+            return Err(SolverError::InvalidConfiguration(
+                "symmetry tolerance must be finite and nonnegative".into(),
+            ));
+        }
+        let shape_valid = n
+            .checked_mul(n)
+            .and_then(|count| count.checked_mul(std::mem::size_of::<f64>()))
+            .is_some_and(|bytes| bytes <= isize::MAX as usize);
+        if n == 0 || n > self.maximum_dimension || !shape_valid {
             return Err(SolverError::InvalidConfiguration(format!(
                 "dense reference dimension {n} is outside 1..={}",
                 self.maximum_dimension
@@ -1830,25 +2147,36 @@ impl EigenSolverF64 for DenseReferenceSolverF64 {
             check_solver_cancellation(cancellation)?;
             e[j] = 1.0;
             problem.operator.apply(&e, &mut column)?;
+            if column.iter().any(|v| !v.is_finite()) {
+                return Err(SolverError::NumericalBreakdown(
+                    "materialized operator contains nonfinite entries".into(),
+                ));
+            }
             e[j] = 0.0;
             for i in 0..n {
                 matrix[(i, j)] = column[i];
             }
         }
+        let symmetry_scale = matrix.iter().map(|x| x.abs()).fold(0.0f64, f64::max);
         for i in 0..n {
             check_solver_cancellation(cancellation)?;
             for j in 0..i {
-                if (matrix[(i, j)] - matrix[(j, i)]).abs() > self.symmetry_tolerance {
+                if !exact_sturm_f64::difference_at_most_scaled(
+                    matrix[(i, j)],
+                    matrix[(j, i)],
+                    self.symmetry_tolerance,
+                    symmetry_scale,
+                ) {
                     return Err(SolverError::NumericalBreakdown(format!(
                         "materialized operator is not symmetric at ({i}, {j})"
                     )));
                 }
-                let average = 0.5 * (matrix[(i, j)] + matrix[(j, i)]);
+                let average = symmetric_average_f64(matrix[(i, j)], matrix[(j, i)])?;
                 matrix[(i, j)] = average;
                 matrix[(j, i)] = average;
             }
         }
-        let decomposition = SymmetricEigen::new(matrix);
+        let decomposition = checked_symmetric_decomposition_f64(matrix)?;
         let index = if largest {
             (0..n)
                 .max_by(|&a, &b| {
@@ -1889,6 +2217,7 @@ impl EigenSolverF64 for DenseReferenceSolverF64 {
             )
         };
         let report = EigenpairReportF64 {
+            global_target_ordering_established: true,
             eigenvalue: lambda,
             eigenvector: vector,
             residual_norm: residual,
@@ -1907,6 +2236,57 @@ impl EigenSolverF64 for DenseReferenceSolverF64 {
     }
 }
 
+fn require_independent_solver_routes(
+    primary: SolverRoute,
+    independent: SolverRoute,
+    precision_bits: u32,
+) -> Result<(), SolverError> {
+    let assessment = xc_core::assess_route_independence(
+        &primary.evidence(precision_bits, None),
+        &independent.evidence(precision_bits, None),
+        &xc_core::IndependenceDeclaration {
+            intended_claim: "agreement on the requested ordered eigenpair".into(),
+            rationale: "distinct registered solver formulations with no shared decisive seed"
+                .into(),
+            accepted_shared_inputs: BTreeSet::new(),
+        },
+    );
+    if !assessment.independent {
+        return Err(SolverError::CrossCheckDisagreement(format!(
+            "solver routes are not independent: {}",
+            assessment.reasons.join("; ")
+        )));
+    }
+    Ok(())
+}
+
+fn native_implementation_route(solver: &dyn EigenSolverF64) -> Result<SolverRoute, SolverError> {
+    let implementation = solver.type_id();
+    if implementation == std::any::TypeId::of::<DenseReferenceSolverF64>() {
+        Ok(SolverRoute::DenseFullSpectrumReference)
+    } else if implementation == std::any::TypeId::of::<ShiftedPowerSolverF64>() {
+        Ok(SolverRoute::ShiftedPowerExtremeReference)
+    } else if implementation == std::any::TypeId::of::<LanczosSolverF64>() {
+        Ok(SolverRoute::LanczosExtremeReference)
+    } else {
+        Err(SolverError::CrossCheckDisagreement(
+            "unregistered concrete solver implementation cannot establish executable-route independence".into(),
+        ))
+    }
+}
+
+pub const NATIVE_CROSSCHECK_SEMANTICS: &str = "native_concrete_routes_fresh_image_agreement_v2";
+
+/// Compare converged finite reports from caller-selected independent routes.
+/// Registered implementation identities and structured route evidence must
+/// establish independence, and at least one route must establish full-space
+/// target ordering. The accepted report is the ordered route when only one
+/// has ordering evidence. Agreement alone does not certify residuals, state selection,
+/// or a mathematical eigenvalue. Vector overlap is diagnostic only, allowing
+/// different bases in a repeated eigenspace. `tolerance` is relative to the
+/// larger of both eigenvalue magnitudes and the operator's norm bound. Acceptance
+/// also requires agreement at the scale of freshly applied normalized vectors,
+/// so a loose caller-provided norm bound cannot weaken numerical agreement.
 pub fn cross_check_f64(
     primary: &dyn EigenSolverF64,
     independent: &dyn EigenSolverF64,
@@ -1938,15 +2318,102 @@ pub fn cross_check_f64_controlled(
             "cross-check tolerance must be finite and positive".to_owned(),
         ));
     }
-    let mut a = primary.solve_controlled(problem, config, cancellation)?;
+    // Concrete Rust type provenance is checked before caller-supplied execution.
+    let primary_route = native_implementation_route(primary)?;
+    let independent_route = native_implementation_route(independent)?;
+    require_independent_solver_routes(primary_route, independent_route, 53)?;
+    let a = primary.solve_controlled(problem, config, cancellation)?;
     check_solver_cancellation(cancellation)?;
     let b = independent.solve_controlled(problem, config, cancellation)?;
     check_solver_cancellation(cancellation)?;
-    let scale = a.eigenvalue.abs().max(b.eigenvalue.abs()).max(1.0);
+    a.validate_finite()?;
+    b.validate_finite()?;
+    if primary.name().trim().is_empty()
+        || independent.name().trim().is_empty()
+        || primary.name() == independent.name()
+    {
+        return Err(SolverError::InvalidConfiguration("cross-check requires distinct identified routes; the caller must establish their independence".into()));
+    }
+    if primary.name() != a.algorithm || independent.name() != b.algorithm {
+        return Err(SolverError::CrossCheckDisagreement(
+            "solver wrapper identity does not match its reported implementation".into(),
+        ));
+    }
+    if !a.global_target_ordering_established && !b.global_target_ordering_established {
+        return Err(SolverError::CrossCheckDisagreement(
+            "neither route establishes the requested global target ordering".into(),
+        ));
+    }
+    for report in [&a, &b] {
+        if report.status != ResultStatus::Converged
+            || report.eigenvector.len() != problem.operator.dimension()
+            || report.eigenvector.is_empty()
+            || report.residual_norm < 0.0
+            || report.relative_residual < 0.0
+            || report.scaled_backward_error < 0.0
+        {
+            return Err(SolverError::CrossCheckDisagreement("cross-check requires converged reports with matching dimensions and nonnegative diagnostics".into()));
+        }
+    }
+    let normalize_report = |values: &[f64]| -> Result<Vec<f64>, SolverError> {
+        let maximum = values.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+        if maximum == 0.0 {
+            return Err(SolverError::CrossCheckDisagreement(
+                "cross-check received a zero eigenvector".into(),
+            ));
+        }
+        let mut scaled: Vec<_> = values.iter().map(|v| v / maximum).collect();
+        let length = norm(&scaled);
+        for v in &mut scaled {
+            *v /= length;
+        }
+        Ok(scaled)
+    };
+    let av = normalize_report(&a.eigenvector)?;
+    let bv = normalize_report(&b.eigenvector)?;
+    // A unit floor made the tolerance absolute below magnitude one, so
+    // disagreeing eigenvalues of any small-norm operator were cross-checked.
+    let operator_scale = problem
+        .operator
+        .norm_bound()
+        .filter(|bound| bound.is_finite() && *bound > 0.0)
+        .unwrap_or(0.0);
+    let scale = a
+        .eigenvalue
+        .abs()
+        .max(b.eigenvalue.abs())
+        .max(operator_scale);
+    let mut a_image = vec![0.0; av.len()];
+    let mut b_image = vec![0.0; bv.len()];
+    problem.operator.apply(&av, &mut a_image)?;
+    problem.operator.apply(&bv, &mut b_image)?;
+    let image_scale = a
+        .eigenvalue
+        .abs()
+        .max(b.eigenvalue.abs())
+        .max(norm(&a_image))
+        .max(norm(&b_image));
+    if !image_scale.is_finite() {
+        return Err(SolverError::NumericalBreakdown(
+            "nonfinite cross-check action scale".into(),
+        ));
+    }
     let difference = (a.eigenvalue - b.eigenvalue).abs();
-    let overlap = dot(&a.eigenvector, &b.eigenvector).abs();
+    if !difference.is_finite() {
+        return Err(SolverError::CrossCheckDisagreement(
+            "cross-check difference exceeds finite binary64 range".into(),
+        ));
+    }
+    let overlap = dot(&av, &bv).abs().min(1.0);
     let overlap_sq = overlap * overlap;
-    if difference > tolerance * scale {
+    if !exact_sturm_f64::difference_at_most_scaled(a.eigenvalue, b.eigenvalue, tolerance, scale)
+        || !exact_sturm_f64::difference_at_most_scaled(
+            a.eigenvalue,
+            b.eigenvalue,
+            tolerance,
+            image_scale,
+        )
+    {
         return Err(SolverError::CrossCheckDisagreement(format!(
             "{} returned {:.17e}, {} returned {:.17e}; difference {:.3e} exceeds {:.3e}",
             primary.name(),
@@ -1957,10 +2424,15 @@ pub fn cross_check_f64_controlled(
             tolerance * scale
         )));
     }
-    a.assurance = AssuranceLevel::CrossChecked;
+    let (mut accepted, independent_report) = if a.global_target_ordering_established {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    accepted.assurance = AssuranceLevel::CrossChecked;
     Ok(CrossCheckedEigenpairF64 {
-        accepted: a,
-        independent: b,
+        accepted,
+        independent: independent_report,
         eigenvalue_difference: difference,
         vector_overlap_squared: overlap_sq,
         tolerance,
@@ -2016,10 +2488,8 @@ mod tests {
         let applied_norm = applied_sq.sqrt();
         let expected_relative = expected_residual
             / (applied_norm + expected_value.abs() * vector_norm).max(f64::MIN_POSITIVE);
-        let norm_bound = operator.norm_bound().unwrap();
         let expected_backward = expected_residual
-            / (norm_bound * vector_norm + expected_value.abs() * vector_norm)
-                .max(f64::MIN_POSITIVE);
+            / (applied_norm + expected_value.abs() * vector_norm).max(f64::MIN_POSITIVE);
 
         let mut optimized_image = [0.0; 3];
         let (value, residual, relative, backward) =
@@ -2082,6 +2552,111 @@ mod tests {
                 Err(SolverError::InvalidConfiguration(_))
             ));
         }
+    }
+
+    #[test]
+    fn tiny_native_residual_is_not_erased_by_squaring() {
+        let operator = DiagonalF64::new("tiny", vec![1e-200, 2e-200]).unwrap();
+        let vector = [std::f64::consts::FRAC_1_SQRT_2; 2];
+        let (value, residual, relative, _) =
+            evaluate_eigenpair(&operator, &vector, &mut [0.0; 2]).unwrap();
+        assert!((value / 1e-200 - 1.5).abs() < 1e-14);
+        assert!(
+            (residual / 1e-200 - 0.5).abs() < 1e-14,
+            "nonzero residual was erased: {residual}"
+        );
+        assert!(relative > 0.1);
+        let mut settings = config(EigenTarget::AlgebraicSmallest);
+        settings.stopping.absolute_residual = xc_core::DecimalLiteral::new("1e-250").unwrap();
+        settings.stopping.scaled_backward_error = xc_core::DecimalLiteral::new("1e-20").unwrap();
+        settings.stopping.maximum_iterations = 2;
+        // With the scale-correct shift, the two-eigenvalue example legitimately
+        // converges in two steps: the unwanted extreme is nearly annihilated.
+        let report = ShiftedPowerSolverF64
+            .solve(&SymmetricProblemF64::new(&operator), &settings)
+            .unwrap();
+        assert!((report.eigenvalue / 1e-200 - 1.0).abs() < 1e-14);
+        let scaled_residual = report
+            .eigenvector
+            .iter()
+            .enumerate()
+            .map(|(i, x)| ((i as f64 + 1.0 - report.eigenvalue / 1e-200) * x).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!(scaled_residual / 3.0 <= 1e-20);
+        // A third distinct eigenvalue prevents that annihilation; two steps
+        // must still reject convergence instead of squaring the residual away.
+        let three = DiagonalF64::new("tiny-three", vec![1e-200, 2e-200, 3e-200]).unwrap();
+        assert!(ShiftedPowerSolverF64
+            .solve(&SymmetricProblemF64::new(&three), &settings)
+            .is_err());
+    }
+
+    #[test]
+    fn native_crosscheck_rejects_malformed_reports() {
+        struct BadReport;
+        impl EigenSolverF64 for BadReport {
+            fn name(&self) -> &'static str {
+                "malformed-fixture"
+            }
+            fn solve(
+                &self,
+                problem: &SymmetricProblemF64<'_>,
+                config: &SolverConfig,
+            ) -> Result<EigenpairReportF64, SolverError> {
+                let mut report = DenseReferenceSolverF64::default().solve(problem, config)?;
+                report.eigenvalue = f64::NAN;
+                Ok(report)
+            }
+        }
+        let operator = DiagonalF64::new("diag", vec![1.0, 2.0]).unwrap();
+        assert!(cross_check_f64(
+            &BadReport,
+            &DenseReferenceSolverF64::default(),
+            &SymmetricProblemF64::new(&operator),
+            &config(EigenTarget::AlgebraicSmallest),
+            1e-10
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn native_crosscheck_rejects_renamed_implementation_and_checks_small_scale() {
+        // Two reports ten percent apart on a norm-2e-12 operator passed the
+        // former max(|lambda|, 1) scale as a 1e-13 absolute difference.
+        struct Offset(f64);
+        impl EigenSolverF64 for Offset {
+            fn name(&self) -> &'static str {
+                "offset-fixture"
+            }
+            fn solve(
+                &self,
+                problem: &SymmetricProblemF64<'_>,
+                config: &SolverConfig,
+            ) -> Result<EigenpairReportF64, SolverError> {
+                let mut report = DenseReferenceSolverF64::default().solve(problem, config)?;
+                report.eigenvalue *= self.0;
+                Ok(report)
+            }
+        }
+        let operator = DiagonalF64::new("small", vec![1e-12, 2e-12]).unwrap();
+        let problem = SymmetricProblemF64::new(&operator);
+        let target = config(EigenTarget::AlgebraicSmallest);
+        let dense = DenseReferenceSolverF64::default();
+        assert!(cross_check_f64(&Offset(1.1), &dense, &problem, &target, 1e-8).is_err());
+        // Matching numbers from a renamed copy are still not independent.
+        assert!(cross_check_f64(&Offset(1.0), &dense, &problem, &target, 1e-8).is_err());
+        let mut precise = target;
+        precise.stopping.absolute_residual = xc_core::DecimalLiteral::new("1e-25").unwrap();
+        precise.stopping.scaled_backward_error = xc_core::DecimalLiteral::new("1e-13").unwrap();
+        assert!(cross_check_f64(
+            &LanczosSolverF64::default(),
+            &dense,
+            &problem,
+            &precise,
+            1e-8
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2231,7 +2806,16 @@ pub fn solve_tridiagonal_selected_hp(
         maximum_iterations,
         precision_bits,
     )
-    .map_err(|error| SolverError::NonConvergence(error.to_string()))
+    .map_err(|error| {
+        if error
+            .downcast_ref::<xc_numerics::eigen::SelectedEigenvalueIterationLimit>()
+            .is_some()
+        {
+            SolverError::IterationBudgetExhausted(error.to_string())
+        } else {
+            SolverError::NonConvergence(error.to_string())
+        }
+    })
 }
 
 /// Execute selected value isolation followed by residual-verified banded HP
@@ -2260,7 +2844,16 @@ pub fn solve_tridiagonal_selected_eigenpairs_hp(
         problem.off_diagonal,
         options,
     )
-    .map_err(|error| SolverError::NonConvergence(error.to_string()))
+    .map_err(|error| {
+        if error
+            .downcast_ref::<xc_numerics::eigen::SelectedEigenvalueIterationLimit>()
+            .is_some()
+        {
+            SolverError::IterationBudgetExhausted(error.to_string())
+        } else {
+            SolverError::NonConvergence(error.to_string())
+        }
+    })
 }
 
 #[cfg(feature = "hp-reference")]
@@ -2346,25 +2939,27 @@ pub fn solve_tridiagonal_selected_eigenpairs_adaptive_hp(
             options.precision.maximum_bits
         )));
     }
-    let parsed_tolerance = rug::Float::parse(options.absolute_tolerance.as_str())
-        .map(|value| rug::Float::with_val(options.precision.maximum_bits, value))
-        .map_err(|error| {
-            SolverError::InvalidConfiguration(format!(
-                "failed to parse adaptive HP tolerance: {error}"
-            ))
-        })?;
     let mut precision_bits = options
         .precision
-        .initial_bits
-        .saturating_add(options.precision.guard_bits)
-        .min(options.precision.maximum_bits);
+        .initial_working_bits()
+        .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
+    if !(33..=1_000_000).contains(&precision_bits) || options.precision.maximum_bits > 1_000_000 {
+        return Err(SolverError::InvalidConfiguration(
+            "adaptive selected precision must be in 33..=1000000 bits".into(),
+        ));
+    }
     let mut attempts = Vec::new();
     let mut last_result = None;
     loop {
         let attempt_options = HpSelectedTridiagonalEigenpairOptions {
             first_index: options.first_index,
             last_index: options.last_index,
-            absolute_tolerance: rug::Float::with_val(precision_bits, &parsed_tolerance),
+            absolute_tolerance: hp_positive_threshold(
+                &options.absolute_tolerance,
+                precision_bits,
+                "selected eigenvalue tolerance",
+                rug::float::Round::Down,
+            )?,
             maximum_bisection_iterations: options.maximum_bisection_iterations,
             eigenvector_options: options.eigenvector_options,
             precision_bits,
@@ -2398,6 +2993,21 @@ pub fn solve_tridiagonal_selected_eigenpairs_adaptive_hp(
                     });
                 }
                 last_result = Some(Box::new(result));
+            }
+            Err(error @ SolverError::IterationBudgetExhausted(_)) => {
+                attempts.push(HpSelectedPrecisionAttempt {
+                    precision_bits,
+                    status: ResultStatus::Inconclusive,
+                    selected_items: 0,
+                    vector_recoveries: 0,
+                    inverse_iteration_runs: 0,
+                    reason: error.to_string(),
+                });
+                return Ok(HpAdaptiveSelectedTridiagonalResult::Inconclusive {
+                    last_result,
+                    attempts,
+                    reason: error.to_string(),
+                });
             }
             Err(error @ SolverError::InvalidConfiguration(_)) => return Err(error),
             Err(error) => attempts.push(HpSelectedPrecisionAttempt {
@@ -2469,13 +3079,80 @@ fn hp_parse_literal(
     literal: &xc_core::DecimalLiteral,
     precision_bits: u32,
 ) -> Result<rug::Float, SolverError> {
-    let parsed = rug::Float::parse(literal.as_str()).map_err(|error| {
-        SolverError::InvalidConfiguration(format!(
-            "failed to parse HP decimal literal {:?}: {error}",
-            literal.as_str()
-        ))
-    })?;
-    Ok(rug::Float::with_val(precision_bits, parsed))
+    literal
+        .validate()
+        .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
+    hp_parse_string(literal.as_str(), precision_bits)
+}
+
+#[cfg(feature = "hp-reference")]
+fn hp_parse_literal_round(
+    literal: &xc_core::DecimalLiteral,
+    precision_bits: u32,
+    round: rug::float::Round,
+) -> Result<rug::Float, SolverError> {
+    // Retain the common syntax, precision, finite range and nonzero checks.
+    hp_parse_literal(literal, precision_bits)?;
+    let parsed = rug::Float::parse(literal.as_str())
+        .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
+    let value = rug::Float::with_val_round(precision_bits, parsed, round).0;
+    if !value.is_finite()
+        || (value.is_zero()
+            && literal
+                .canonical()
+                .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?
+                .as_str()
+                != "0")
+    {
+        return Err(SolverError::InvalidConfiguration(
+            "directed HP scalar is outside the supported range".into(),
+        ));
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "hp-reference")]
+fn hp_positive_threshold(
+    literal: &xc_core::DecimalLiteral,
+    precision_bits: u32,
+    name: &str,
+    round: rug::float::Round,
+) -> Result<rug::Float, SolverError> {
+    let value = hp_parse_literal_round(literal, precision_bits, round)?;
+    if value <= 0 {
+        return Err(SolverError::InvalidConfiguration(format!(
+            "{name} must be positive"
+        )));
+    }
+    Ok(value)
+}
+
+#[cfg(feature = "hp-reference")]
+fn hp_checked_action<O>(
+    operator: &O,
+    vector: &[rug::Float],
+    precision_bits: u32,
+) -> Result<Vec<rug::Float>, SolverError>
+where
+    O: xc_operator::LinearOperator<rug::Float> + ?Sized,
+{
+    let mut output = vec![hp_zero(precision_bits); vector.len()];
+    operator.apply(vector, &mut output)?;
+    for value in &mut output {
+        if value.prec() < precision_bits {
+            return Err(SolverError::InvalidConfiguration(format!(
+                "HP operator returned {}-bit arithmetic for a {precision_bits}-bit solve",
+                value.prec()
+            )));
+        }
+        reprecision_hp_value(value, precision_bits);
+        if !value.is_finite() {
+            return Err(SolverError::NumericalBreakdown(
+                "HP operator action is nonfinite at the requested precision".into(),
+            ));
+        }
+    }
+    Ok(output)
 }
 
 #[cfg(feature = "hp-reference")]
@@ -2486,8 +3163,190 @@ fn hp_norm(values: &[rug::Float], precision_bits: u32) -> rug::Float {
         square *= value;
         sum += square;
     }
+    if sum.is_finite() && !sum.is_zero() {
+        sum.sqrt_mut();
+        return sum;
+    }
+    if values.iter().any(|v| !v.is_finite()) {
+        return rug::Float::with_val(precision_bits, rug::float::Special::Nan);
+    }
+    let maximum = values
+        .iter()
+        .map(|v| v.clone().abs())
+        .max_by(|a, b| a.partial_cmp(b).unwrap())
+        .unwrap_or_else(|| hp_zero(precision_bits));
+    if maximum.is_zero() {
+        return maximum;
+    }
+    sum = hp_zero(precision_bits);
+    for value in values {
+        let mut scaled = rug::Float::with_val(precision_bits, value / &maximum);
+        scaled.square_mut();
+        sum += scaled;
+    }
     sum.sqrt_mut();
+    sum *= maximum;
     sum
+}
+
+/// The actual computed scale and individual stopping tests for a stored Ritz pair.
+/// The working-unit scale is one binary working unit times the image denominator,
+/// not a rigorous error bound for matrix assembly or an arbitrary callback.
+#[cfg(feature = "hp-reference")]
+#[derive(Clone, Debug)]
+pub struct HpResidualAcceptance {
+    pub absolute_residual_tolerance: rug::Float,
+    pub scaled_backward_error_tolerance: rug::Float,
+    pub image_norm_denominator: rug::Float,
+    pub working_unit_scale: Option<rug::Float>,
+    pub absolute_residual_passed: bool,
+    pub scaled_backward_error_passed: bool,
+}
+
+#[cfg(feature = "hp-reference")]
+#[allow(clippy::too_many_arguments)]
+fn hp_residual_acceptance(
+    left: &[rug::Float],
+    right: &[rug::Float],
+    eigenvalue: &rug::Float,
+    residual: &rug::Float,
+    backward: &rug::Float,
+    absolute_tolerance: &rug::Float,
+    backward_tolerance: &rug::Float,
+    p: u32,
+) -> HpResidualAcceptance {
+    let denominator = hp_norm(left, p) + eigenvalue.clone().abs() * hp_norm(right, p);
+    let unit = rug::Float::with_val(p, &denominator) >> p;
+    HpResidualAcceptance {
+        absolute_residual_tolerance: absolute_tolerance.clone(),
+        scaled_backward_error_tolerance: backward_tolerance.clone(),
+        working_unit_scale: (!unit.is_zero() || denominator.is_zero()).then_some(unit),
+        image_norm_denominator: denominator,
+        absolute_residual_passed: residual <= absolute_tolerance,
+        scaled_backward_error_passed: backward <= backward_tolerance,
+    }
+}
+
+/// A conservative working-scale cluster floor. This reports unresolved point
+/// resolution; it never replaces the source-bound multiplicity count.
+#[cfg(feature = "hp-reference")]
+fn hp_effective_cluster_tolerance<'a>(
+    requested: &rug::Float,
+    values: impl Iterator<Item = &'a rug::Float>,
+    dimension: usize,
+    p: u32,
+) -> rug::Float {
+    let mut scale = rug::Float::with_val(p, 0);
+    for value in values {
+        let a = value.clone().abs();
+        if a > scale {
+            scale = a;
+        }
+    }
+    scale >>= p;
+    scale *= dimension.saturating_mul(8);
+    if scale > *requested {
+        scale
+    } else {
+        requested.clone()
+    }
+}
+
+/// Computed Euclidean residual and relative residual for stored images.
+/// This is point arithmetic, not a bound on operator application error.
+#[cfg(feature = "hp-reference")]
+fn hp_residual_measures(
+    residual: &[rug::Float],
+    left_image: &[rug::Float],
+    right_image: &[rug::Float],
+    eigenvalue: &rug::Float,
+    precision_bits: u32,
+) -> Result<(rug::Float, rug::Float), SolverError> {
+    let invalid = || {
+        SolverError::NumericalBreakdown(
+            "HP residual diagnostics are nonfinite or outside the representable range".into(),
+        )
+    };
+    if residual.is_empty()
+        || residual.len() != left_image.len()
+        || residual.len() != right_image.len()
+        || !eigenvalue.is_finite()
+    {
+        return Err(invalid());
+    }
+    let residual_norm = hp_norm(residual, precision_bits);
+    let left_norm = hp_norm(left_image, precision_bits);
+    let right_norm = hp_norm(right_image, precision_bits);
+    for (values, norm) in [
+        (residual, &residual_norm),
+        (left_image, &left_norm),
+        (right_image, &right_norm),
+    ] {
+        if !norm.is_finite() || (norm.is_zero() && values.iter().any(|v| !v.is_zero())) {
+            return Err(invalid());
+        }
+    }
+    if right_norm.is_zero() {
+        return Err(invalid());
+    }
+    let mut scale = eigenvalue.clone().abs();
+    scale *= right_norm;
+    scale += left_norm;
+    if !scale.is_finite() || (scale.is_zero() && !residual_norm.is_zero()) {
+        return Err(invalid());
+    }
+    let mut relative = residual_norm.clone();
+    if !scale.is_zero() {
+        relative /= scale;
+    }
+    if !relative.is_finite() || (relative.is_zero() && !residual_norm.is_zero()) {
+        return Err(invalid());
+    }
+    Ok((residual_norm, relative))
+}
+
+#[cfg(feature = "hp-reference")]
+fn hp_ritz_change(
+    current: &rug::Float,
+    previous: &rug::Float,
+    scale: Option<&rug::Float>,
+) -> rug::Float {
+    use rug::{float::Round, Float};
+    let precision = current.prec();
+    let difference = if current >= previous {
+        Float::with_val_round(precision, current - previous, Round::Up).0
+    } else {
+        Float::with_val_round(precision, previous - current, Round::Up).0
+    };
+    if let Some(scale) = scale {
+        Float::with_val_round(precision, &difference / scale, Round::Up).0
+    } else {
+        difference
+    }
+}
+
+#[cfg(feature = "hp-reference")]
+fn hp_block_termination<'a>(
+    diagnostics: impl IntoIterator<Item = (&'a rug::Float, &'a rug::Float)>,
+    absolute_tolerance: &rug::Float,
+    backward_tolerance: &rug::Float,
+) -> TerminationReason {
+    let (all_absolute, all_backward) =
+        diagnostics
+            .into_iter()
+            .fold((true, true), |(absolute, backward), (residual, error)| {
+                (
+                    absolute && residual <= absolute_tolerance,
+                    backward && error <= backward_tolerance,
+                )
+            });
+    if all_backward {
+        TerminationReason::BackwardErrorTolerance
+    } else if all_absolute {
+        TerminationReason::ResidualTolerance
+    } else {
+        TerminationReason::ResidualOrBackwardErrorTolerance
+    }
 }
 
 #[cfg(feature = "hp-reference")]
@@ -2501,7 +3360,8 @@ fn hp_matvec(
         .map(|row| {
             let mut sum = hp_zero(precision_bits);
             for column in 0..dimension {
-                let mut term = matrix[row * dimension + column].clone();
+                let mut term =
+                    rug::Float::with_val(precision_bits, &matrix[row * dimension + column]);
                 term *= &vector[column];
                 sum += term;
             }
@@ -2513,6 +3373,26 @@ fn hp_matvec(
 #[cfg(feature = "hp-reference")]
 fn hp_decimal(value: &rug::Float, significant_digits: usize) -> String {
     value.to_string_radix(10, Some(significant_digits))
+}
+
+#[cfg(feature = "hp-reference")]
+fn map_hp_recovery_error(
+    failure: Option<&xc_numerics::eigen::HpEigenvectorRecoveryFailure>,
+    message: String,
+) -> SolverError {
+    use xc_numerics::eigen::HpEigenvectorRecoveryFailure;
+    match failure {
+        Some(HpEigenvectorRecoveryFailure::InvalidConfiguration(message)) => {
+            SolverError::InvalidConfiguration(message.clone())
+        }
+        Some(HpEigenvectorRecoveryFailure::UnresolvedEigenspace(message)) => {
+            SolverError::UnresolvedEigenspace(message.clone())
+        }
+        Some(HpEigenvectorRecoveryFailure::IterationLimit { .. }) => {
+            SolverError::IterationBudgetExhausted(message)
+        }
+        None => SolverError::NumericalBreakdown(message),
+    }
 }
 
 /// Run the established dense HP full-spectrum route behind the new typed
@@ -2535,7 +3415,7 @@ pub fn solve_dense_reference_hp_controlled(
 ) -> Result<EigenpairReportHp, SolverError> {
     use rug::Float;
     use xc_numerics::eigen::{
-        dense_symmetric_eigenvalues_hp, dense_symmetric_eigenvector_for_value_hp,
+        dense_symmetric_eigenpair_at_index_hp, dense_symmetric_eigenvalues_hp,
     };
 
     check_solver_cancellation(cancellation)?;
@@ -2548,7 +3428,10 @@ pub fn solve_dense_reference_hp_controlled(
                 .to_owned(),
         ));
     }
-    let precision_bits = config.precision.initial_bits;
+    let precision_bits = config
+        .precision
+        .initial_working_bits()
+        .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
     let eigenvalues =
         dense_symmetric_eigenvalues_hp(problem.matrix, problem.dimension, precision_bits)
             .map_err(|error| SolverError::NumericalBreakdown(error.to_string()))?;
@@ -2599,15 +3482,16 @@ pub fn solve_dense_reference_hp_controlled(
             ))
         }
     };
-    let eigenvalue = eigenvalues[index].clone();
-    let eigenvector = dense_symmetric_eigenvector_for_value_hp(
+    let recovered = dense_symmetric_eigenpair_at_index_hp(
         problem.matrix,
         problem.dimension,
-        &eigenvalue,
+        index,
         precision_bits,
         config.stopping.maximum_iterations,
     )
-    .map_err(|error| SolverError::NumericalBreakdown(error.to_string()))?;
+    .map_err(|error| map_hp_recovery_error(error.downcast_ref(), error.to_string()))?;
+    let eigenvalue = recovered.eigenvalue;
+    let eigenvector = recovered.eigenvector;
     check_solver_cancellation(cancellation)?;
 
     let applied = hp_matvec(
@@ -2630,12 +3514,27 @@ pub fn solve_dense_reference_hp_controlled(
     let residual_norm = hp_norm(&residual, precision_bits);
     let applied_norm = hp_norm(&applied, precision_bits);
     let vector_norm = hp_norm(&eigenvector, precision_bits);
+    if [&residual_norm, &applied_norm, &vector_norm, &eigenvalue]
+        .iter()
+        .any(|v| !v.is_finite())
+        || vector_norm.is_zero()
+        || (residual_norm.is_zero() && residual.iter().any(|v| !v.is_zero()))
+    {
+        return Err(SolverError::NumericalBreakdown(
+            "invalid HP eigenpair diagnostic norm".into(),
+        ));
+    }
     let mut eigenvalue_abs = eigenvalue.clone();
     eigenvalue_abs.abs_mut();
 
     let mut denominator = eigenvalue_abs.clone();
     denominator *= &vector_norm;
     denominator += &applied_norm;
+    if !denominator.is_finite() {
+        return Err(SolverError::NumericalBreakdown(
+            "HP relative diagnostic denominator overflow".into(),
+        ));
+    }
     let relative_residual = if denominator.is_zero() {
         residual_norm.clone()
     } else {
@@ -2662,6 +3561,11 @@ pub fn solve_dense_reference_hp_controlled(
     let mut eigen_term = eigenvalue_abs;
     eigen_term *= &vector_norm;
     backward_denominator += eigen_term;
+    if !backward_denominator.is_finite() {
+        return Err(SolverError::NumericalBreakdown(
+            "HP backward diagnostic denominator overflow".into(),
+        ));
+    }
     let scaled_backward_error = if backward_denominator.is_zero() {
         residual_norm.clone()
     } else {
@@ -2669,14 +3573,29 @@ pub fn solve_dense_reference_hp_controlled(
         value /= backward_denominator;
         value
     };
+    if [&relative_residual, &scaled_backward_error]
+        .iter()
+        .any(|v| !v.is_finite() || (v.is_zero() && !residual_norm.is_zero()))
+    {
+        return Err(SolverError::NumericalBreakdown(
+            "HP diagnostic ratio is not representable".into(),
+        ));
+    }
     let mut orthogonality_error = vector_norm.clone();
     orthogonality_error *= &vector_norm;
     orthogonality_error -= 1u32;
     orthogonality_error.abs_mut();
 
-    let residual_tolerance = hp_parse_literal(&config.stopping.absolute_residual, precision_bits)?;
-    let backward_tolerance =
-        hp_parse_literal(&config.stopping.scaled_backward_error, precision_bits)?;
+    let residual_tolerance = hp_parse_literal_round(
+        &config.stopping.absolute_residual,
+        precision_bits,
+        rug::float::Round::Down,
+    )?;
+    let backward_tolerance = hp_parse_literal_round(
+        &config.stopping.scaled_backward_error,
+        precision_bits,
+        rug::float::Round::Down,
+    )?;
     let (status, termination) = if scaled_backward_error <= backward_tolerance {
         (
             ResultStatus::Converged,
@@ -2690,7 +3609,7 @@ pub fn solve_dense_reference_hp_controlled(
     } else {
         (
             ResultStatus::Approximate,
-            TerminationReason::MaximumIterations,
+            TerminationReason::MaximumPrecision,
         )
     };
 
@@ -2715,7 +3634,10 @@ pub fn solve_dense_reference_hp_controlled(
         scaled_backward_error: hp_decimal(&scaled_backward_error, decimal_digits),
         diagnostics,
         precision_bits,
-        algorithm: "xc_numerics_dense_householder_qr_reference_hp".to_owned(),
+        algorithm: format!(
+            "dense_reference_hp_v3:{}",
+            xc_numerics::eigen::DENSE_EIGENVECTOR_SEMANTICS
+        ),
         status,
         termination,
         assurance: AssuranceLevel::Computed,
@@ -2892,75 +3814,60 @@ impl<'a> TridiagonalProblemF64<'a> {
         self.diagonal.len()
     }
 
+    /// Outward binary64 Gershgorin bounds for valid finite inputs. An
+    /// unrepresentable bound is infinite; `bisect_index` reports that limit.
+    /// Public fields are revalidated so malformed values do not cause indexing panics.
     pub fn gershgorin_bounds(&self) -> (f64, f64) {
+        if Self::new(self.diagonal, self.off_diagonal).is_err() {
+            return (f64::NEG_INFINITY, f64::INFINITY);
+        }
         let mut lower = f64::INFINITY;
         let mut upper = f64::NEG_INFINITY;
         for index in 0..self.dimension() {
-            let mut radius = 0.0;
+            let mut radius = 0.0_f64;
             if index > 0 {
-                radius += self.off_diagonal[index - 1].abs();
+                radius = (radius + self.off_diagonal[index - 1].abs()).next_up();
             }
             if index + 1 < self.dimension() {
-                radius += self.off_diagonal[index].abs();
+                radius = (radius + self.off_diagonal[index].abs()).next_up();
             }
-            lower = lower.min(self.diagonal[index] - radius);
-            upper = upper.max(self.diagonal[index] + radius);
+            lower = lower.min((self.diagonal[index] - radius).next_down());
+            upper = upper.max((self.diagonal[index] + radius).next_up());
         }
-        let padding = f64::EPSILON.sqrt() * lower.abs().max(upper.abs()).max(1.0);
-        (lower - padding, upper + padding)
+        (lower, upper)
     }
 
-    /// Number of eigenvalues strictly below `threshold`, computed from the
-    /// signs of the symmetric LDL^T pivots.
+    /// Exact number of eigenvalues strictly below the stored finite binary64
+    /// threshold. Dyadic input values are scaled to integers and their Sturm
+    /// determinant sequence is evaluated without a floating-point pivot floor.
+    ///
+    /// This validation-scale path trades speed for exact counts. Integer size
+    /// grows with dimension and input exponent spread; it is not the large HP
+    /// production solver. It certifies only the exact stored finite matrix.
     pub fn sturm_count_below(&self, threshold: f64) -> Result<usize, SolverError> {
+        Self::new(self.diagonal, self.off_diagonal)?;
         if !threshold.is_finite() {
             return Err(SolverError::InvalidConfiguration(
                 "Sturm threshold must be finite".to_owned(),
             ));
         }
-        let scale = self
-            .diagonal
-            .iter()
-            .chain(self.off_diagonal)
-            .map(|value| value.abs())
-            .fold(1.0, f64::max);
-        let pivot_floor = f64::MIN_POSITIVE.max(f64::EPSILON * scale);
-        let mut negative = 0usize;
-        let mut pivot = self.diagonal[0] - threshold;
-        if pivot < 0.0 {
-            negative += 1;
-        }
-        if pivot.abs() < pivot_floor {
-            pivot = if pivot.is_sign_negative() {
-                -pivot_floor
-            } else {
-                pivot_floor
-            };
-        }
-        for index in 1..self.dimension() {
-            let off = self.off_diagonal[index - 1];
-            pivot = self.diagonal[index] - threshold - off * off / pivot;
-            if pivot < 0.0 {
-                negative += 1;
-            }
-            if pivot.abs() < pivot_floor {
-                pivot = if pivot.is_sign_negative() {
-                    -pivot_floor
-                } else {
-                    pivot_floor
-                };
-            }
-        }
-        Ok(negative)
+        Ok(exact_sturm_f64::count_below(
+            self.diagonal,
+            self.off_diagonal,
+            threshold,
+        ))
     }
 
     /// Enclose the zero-based `index`-th algebraically ordered eigenvalue.
+    /// On success, the exact difference of the stored endpoints is at most
+    /// `absolute_tolerance`; an unrepresentable requested width is an error.
     pub fn bisect_index(
         &self,
         index: usize,
         absolute_tolerance: f64,
         maximum_iterations: usize,
     ) -> Result<(f64, f64), SolverError> {
+        Self::new(self.diagonal, self.off_diagonal)?;
         if index >= self.dimension() {
             return Err(SolverError::InvalidConfiguration(format!(
                 "eigenvalue index {index} is outside 0..{}",
@@ -2978,15 +3885,33 @@ impl<'a> TridiagonalProblemF64<'a> {
             ));
         }
         let (mut lower, mut upper) = self.gershgorin_bounds();
+        if !lower.is_finite() || !upper.is_finite() {
+            return Err(SolverError::NumericalBreakdown(
+                "Gershgorin bounds exceed the finite binary64 range".to_owned(),
+            ));
+        }
         for _ in 0..maximum_iterations {
-            let midpoint = lower + 0.5 * (upper - lower);
+            if exact_sturm_f64::bracket_width_at_most(lower, upper, absolute_tolerance) {
+                return Ok((lower, upper));
+            }
+            let midpoint = if lower <= 0.0 && upper >= 0.0 {
+                0.5 * lower + 0.5 * upper
+            } else {
+                lower + 0.5 * (upper - lower)
+            };
+            if midpoint <= lower || midpoint >= upper {
+                return Err(SolverError::NonConvergence(
+                    "binary64 eigenvalue bracket stagnated above the requested tolerance"
+                        .to_owned(),
+                ));
+            }
             let count = self.sturm_count_below(midpoint)?;
             if count <= index {
                 lower = midpoint;
             } else {
                 upper = midpoint;
             }
-            if upper - lower <= absolute_tolerance {
+            if exact_sturm_f64::bracket_width_at_most(lower, upper, absolute_tolerance) {
                 return Ok((lower, upper));
             }
         }
@@ -3095,8 +4020,12 @@ pub trait GeneralizedPreconditionerF64: Send + Sync {
 #[serde(deny_unknown_fields)]
 pub struct GeneralizedExtremeConfigF64 {
     pub target: EigenTarget,
+    /// Absolute residual tolerance in operator units; accepted as an alternative
+    /// to the dimensionless scaled backward-error tolerance.
     pub absolute_residual_tolerance: f64,
     pub scaled_backward_error_tolerance: f64,
+    /// |lambda_new-lambda_old| / max(1, |lambda_new|, |lambda_old|).
+    /// The unit floor makes this absolute for small eigenvalues.
     pub ritz_value_stability_tolerance: f64,
     pub maximum_iterations: usize,
     pub minimum_iterations: usize,
@@ -3148,6 +4077,10 @@ pub struct MatrixFreeGeneralizedEigenpairReportF64 {
     pub scaled_backward_error: f64,
     pub metric_normalization_error: f64,
     pub ritz_value_stability: f64,
+    /// False for exact stationary/full-space acceptance before a second iterate.
+    /// A frozen-vector re-evaluation is never counted as stability evidence.
+    #[serde(default)]
+    pub ritz_value_stability_observed: bool,
     pub target_ordering_established_by_full_space_projection: bool,
     pub iterations: usize,
     pub operator_applications: usize,
@@ -3184,8 +4117,19 @@ fn combine_vectors(coefficients: &[f64], vectors: &[&[f64]]) -> Vec<f64> {
 }
 
 fn normalize_generalized_iterate(iterate: &mut GeneralizedIterateF64) -> Result<(), SolverError> {
+    if iterate
+        .vector
+        .iter()
+        .chain(&iterate.applied_operator)
+        .chain(&iterate.applied_metric)
+        .any(|v| !v.is_finite())
+    {
+        return Err(SolverError::NumericalBreakdown(
+            "generalized iterate contains nonfinite values".into(),
+        ));
+    }
     let metric_norm_sq = dot(&iterate.vector, &iterate.applied_metric);
-    if !metric_norm_sq.is_finite() || metric_norm_sq <= f64::MIN_POSITIVE {
+    if !metric_norm_sq.is_finite() || metric_norm_sq <= 0.0 {
         return Err(SolverError::NumericalBreakdown(
             "generalized iterate has nonpositive or non-finite metric norm".to_owned(),
         ));
@@ -3212,6 +4156,86 @@ fn normalize_generalized_iterate(iterate: &mut GeneralizedIterateF64) -> Result<
     Ok(())
 }
 
+fn generalized_symmetric_decomposition_f64(
+    mut matrix: DMatrix<f64>,
+) -> Result<SymmetricEigen<f64, nalgebra::Dyn>, SolverError> {
+    let invalid = || {
+        SolverError::NumericalBreakdown(
+            "generalized whitening/eigendecomposition produced invalid arithmetic".into(),
+        )
+    };
+    let n = matrix.nrows();
+    if n == 0 || matrix.ncols() != n || matrix.iter().any(|v| !v.is_finite()) {
+        return Err(invalid());
+    }
+    // C is mathematically symmetric. Average computed roundoff asymmetry;
+    // the final residual is evaluated against the original A and B.
+    for row in 0..n {
+        for column in 0..row {
+            let a = matrix[(row, column)];
+            let b = matrix[(column, row)];
+            let average = if (a + b).is_finite() {
+                (a + b) / 2.0
+            } else {
+                a / 2.0 + b / 2.0
+            };
+            matrix[(row, column)] = average;
+            matrix[(column, row)] = average;
+        }
+    }
+    let result = checked_symmetric_decomposition_f64(matrix)?;
+    if result
+        .eigenvalues
+        .iter()
+        .chain(result.eigenvectors.iter())
+        .any(|v| !v.is_finite())
+    {
+        return Err(invalid());
+    }
+    Ok(result)
+}
+
+fn generalized_residual_measures_f64(
+    residual: &[f64],
+    ax: &[f64],
+    bx: &[f64],
+    eigenvalue: f64,
+) -> Result<(f64, f64), SolverError> {
+    let invalid = || {
+        SolverError::NumericalBreakdown(
+            "generalized residual diagnostic is not finite or representable".into(),
+        )
+    };
+    if residual.is_empty()
+        || ax.len() != residual.len()
+        || bx.len() != residual.len()
+        || !eigenvalue.is_finite()
+    {
+        return Err(invalid());
+    }
+    let r = norm(residual);
+    let a = norm(ax);
+    let b = norm(bx);
+    if !r.is_finite() || !a.is_finite() || !b.is_finite() || b == 0.0 {
+        return Err(invalid());
+    }
+    let denominator = a + eigenvalue.abs() * b;
+    let relative = if denominator.is_finite() && denominator > 0.0 {
+        r / denominator
+    } else {
+        let scale = a.max(eigenvalue.abs());
+        if scale == 0.0 && r == 0.0 {
+            0.0
+        } else {
+            (r / scale) / (a / scale + (eigenvalue.abs() / scale) * b)
+        }
+    };
+    if !relative.is_finite() || (relative == 0.0 && r != 0.0) {
+        return Err(invalid());
+    }
+    Ok((r, relative))
+}
+
 fn projected_generalized_extreme(
     projected_operator: DMatrix<f64>,
     projected_metric: DMatrix<f64>,
@@ -3230,7 +4254,7 @@ fn projected_generalized_extreme(
         )
     })?;
     let whitened = &inverse_lower * projected_operator * inverse_lower.transpose();
-    let decomposition = SymmetricEigen::new(whitened);
+    let decomposition = generalized_symmetric_decomposition_f64(whitened)?;
     let index = if largest {
         (0..decomposition.eigenvalues.len())
             .max_by(|left, right| {
@@ -3246,6 +4270,11 @@ fn projected_generalized_extreme(
     };
     let whitened_vector = decomposition.eigenvectors.column(index).into_owned();
     let coefficients = inverse_lower.transpose() * whitened_vector;
+    if coefficients.iter().any(|v| !v.is_finite()) {
+        return Err(SolverError::NumericalBreakdown(
+            "generalized projected vector is nonfinite".into(),
+        ));
+    }
     Ok(coefficients.iter().copied().collect())
 }
 
@@ -3326,8 +4355,38 @@ impl MatrixFreeLobpcgF64 {
         let mut direction: Option<GeneralizedIterateF64> = None;
         let mut previous_value: Option<f64> = None;
         let mut last_projected_dimension = 0usize;
+        let mut operator_applications = 1;
+        let mut metric_applications = 1;
+        let mut projected_factorizations = 0;
+        let mut preconditioner_applications = 0;
+        // Count performed operations at their call sites; iteration count is
+        // not the definition of operator, metric, or factorization work.
+        #[allow(clippy::explicit_counter_loop)]
         for iteration in 1..=config.maximum_iterations {
             check_solver_cancellation(cancellation)?;
+            // Reapply the stored vectors, replacing recurrence images before
+            // either projection or acceptance. Linear-combination updates can
+            // accumulate a residual floor that does not belong to the vector.
+            problem
+                .operator
+                .apply(&current.vector, &mut current.applied_operator)?;
+            operator_applications += 1;
+            problem
+                .metric
+                .apply(&current.vector, &mut current.applied_metric)?;
+            metric_applications += 1;
+            if let Some(previous_direction) = &mut direction {
+                problem.operator.apply(
+                    &previous_direction.vector,
+                    &mut previous_direction.applied_operator,
+                )?;
+                operator_applications += 1;
+                problem.metric.apply(
+                    &previous_direction.vector,
+                    &mut previous_direction.applied_metric,
+                )?;
+                metric_applications += 1;
+            }
             let denominator = dot(&current.vector, &current.applied_metric);
             if !denominator.is_finite() || denominator <= 0.0 {
                 return Err(SolverError::NumericalBreakdown(
@@ -3341,12 +4400,12 @@ impl MatrixFreeLobpcgF64 {
                 .zip(&current.applied_metric)
                 .map(|(operator_value, metric_value)| operator_value - eigenvalue * metric_value)
                 .collect();
-            let residual_norm = norm(&residual);
-            let applied_operator_norm = norm(&current.applied_operator);
-            let applied_metric_norm = norm(&current.applied_metric);
-            let relative_residual = residual_norm
-                / (applied_operator_norm + eigenvalue.abs() * applied_metric_norm)
-                    .max(f64::MIN_POSITIVE);
+            let (residual_norm, relative_residual) = generalized_residual_measures_f64(
+                &residual,
+                &current.applied_operator,
+                &current.applied_metric,
+                eigenvalue,
+            )?;
             let scaled_backward_error = relative_residual;
             let metric_normalization_error = (denominator - 1.0).abs();
             let stability = previous_value
@@ -3354,11 +4413,16 @@ impl MatrixFreeLobpcgF64 {
                     (eigenvalue - previous).abs() / eigenvalue.abs().max(previous.abs()).max(1.0)
                 })
                 .unwrap_or(f64::INFINITY);
+            // Stability is evidence from an actual projected update, including
+            // exact-residual warm starts; minimum_iterations is never bypassed.
+            let residuals_converged = residual_norm <= config.absolute_residual_tolerance
+                || scaled_backward_error <= config.scaled_backward_error_tolerance;
             let converged = iteration >= config.minimum_iterations
                 && (residual_norm <= config.absolute_residual_tolerance
                     || scaled_backward_error <= config.scaled_backward_error_tolerance)
-                && (stability <= config.ritz_value_stability_tolerance
-                    || last_projected_dimension == dimension);
+                && previous_value.is_some_and(|previous| {
+                    native_ritz_stable(eigenvalue, previous, config.ritz_value_stability_tolerance)
+                });
             if converged || iteration == config.maximum_iterations {
                 let (status, termination) = if converged {
                     if scaled_backward_error <= config.scaled_backward_error_tolerance {
@@ -3386,23 +4450,28 @@ impl MatrixFreeLobpcgF64 {
                     relative_residual,
                     scaled_backward_error,
                     metric_normalization_error,
-                    ritz_value_stability: stability,
+                    // Keep portable JSON finite; zero is only a placeholder
+                    // when the separate observation flag is false.
+                    ritz_value_stability: if previous_value.is_some() {
+                        stability
+                    } else {
+                        0.0
+                    },
+                    ritz_value_stability_observed: previous_value.is_some(),
                     target_ordering_established_by_full_space_projection: last_projected_dimension
                         == dimension,
                     iterations: iteration,
-                    operator_applications: iteration,
-                    metric_applications: iteration,
-                    projected_factorizations: iteration - 1,
-                    preconditioner_applications: if preconditioner.is_some() {
-                        iteration - 1
-                    } else {
-                        0
-                    },
-                    retained_subspace_vectors: if direction.is_some() { 3 } else { 2 },
+                    operator_applications,
+                    metric_applications,
+                    projected_factorizations,
+                    preconditioner_applications,
+                    retained_subspace_vectors: (if direction.is_some() { 3 } else { 2 })
+                        .min(dimension),
                     estimated_peak_memory_bytes: (20u64)
                         .saturating_mul(dimension as u64)
                         .saturating_mul(8),
-                    algorithm: "matrix_free_lobpcg_single_f64".to_owned(),
+                    algorithm: "matrix_free_lobpcg_fresh_images_real_stationary_updates_f64_v4"
+                        .to_owned(),
                     seed_source: seed_source.to_owned(),
                     metric_validity_evidence:
                         "positive_definite_metric_trait_and_projected_cholesky".to_owned(),
@@ -3414,9 +4483,55 @@ impl MatrixFreeLobpcgF64 {
                 });
             }
 
+            if dimension == 1 {
+                let coefficients = projected_generalized_extreme(
+                    DMatrix::from_element(1, 1, dot(&current.vector, &current.applied_operator)),
+                    DMatrix::from_element(1, 1, dot(&current.vector, &current.applied_metric)),
+                    config.target == EigenTarget::AlgebraicLargest,
+                )?;
+                let mut next = GeneralizedIterateF64 {
+                    vector: current.vector.iter().map(|x| x * coefficients[0]).collect(),
+                    applied_operator: current
+                        .applied_operator
+                        .iter()
+                        .map(|x| x * coefficients[0])
+                        .collect(),
+                    applied_metric: current
+                        .applied_metric
+                        .iter()
+                        .map(|x| x * coefficients[0])
+                        .collect(),
+                };
+                normalize_generalized_iterate(&mut next)?;
+                current = next;
+                previous_value = Some(eigenvalue);
+                last_projected_dimension = 1;
+                projected_factorizations += 1;
+                continue;
+            }
             let mut search_vector = vec![0.0; dimension];
-            if let Some(preconditioner) = preconditioner {
+            if residuals_converged {
+                // A residual-converged iterate still needs an actual update
+                // to observe stability. Use an independent coordinate trial.
+                direction = None;
+                let coordinate = (0..dimension)
+                    .map(|offset| (iteration - 1 + offset) % dimension)
+                    .find(|j| {
+                        current
+                            .vector
+                            .iter()
+                            .enumerate()
+                            .any(|(k, x)| k != *j && *x != 0.0)
+                    })
+                    .ok_or_else(|| {
+                        SolverError::NumericalBreakdown(
+                            "no independent stationary complement".into(),
+                        )
+                    })?;
+                search_vector[coordinate] = 1.0;
+            } else if let Some(preconditioner) = preconditioner {
                 preconditioner.apply(&residual, &mut search_vector)?;
+                preconditioner_applications += 1;
             } else {
                 search_vector.clone_from(&residual);
             }
@@ -3427,6 +4542,7 @@ impl MatrixFreeLobpcgF64 {
             }
             let mut search_metric = vec![0.0; dimension];
             problem.metric.apply(&search_vector, &mut search_metric)?;
+            metric_applications += 1;
             let unprojected_search_metric_norm_sq = dot(&search_vector, &search_metric);
             if !unprojected_search_metric_norm_sq.is_finite()
                 || unprojected_search_metric_norm_sq <= f64::MIN_POSITIVE
@@ -3511,6 +4627,8 @@ impl MatrixFreeLobpcgF64 {
                     projected_metric[(column, row)] = metric_value;
                 }
             }
+            operator_applications += 1;
+            projected_factorizations += 1;
             let coefficients = projected_generalized_extreme(
                 projected_operator,
                 projected_metric,
@@ -3575,56 +4693,66 @@ impl<'a> DenseGeneralizedProblemF64<'a> {
         dimension: usize,
         symmetry_tolerance: f64,
     ) -> Result<Self, SolverError> {
-        let expected = dimension.saturating_mul(dimension);
-        if dimension == 0 || operator.len() != expected || metric.len() != expected {
-            return Err(SolverError::InvalidConfiguration(format!(
-                "generalized dense matrices must both contain {expected} entries"
-            )));
-        }
         if !symmetry_tolerance.is_finite() || symmetry_tolerance < 0.0 {
             return Err(SolverError::InvalidConfiguration(
-                "symmetry tolerance must be finite and nonnegative".to_owned(),
+                "symmetry tolerance must be finite and nonnegative".into(),
             ));
         }
-        if operator
-            .iter()
-            .chain(metric)
-            .any(|value| !value.is_finite())
+        let problem = Self {
+            operator,
+            metric,
+            dimension,
+        };
+        problem.validate()?;
+        Ok(problem)
+    }
+
+    /// Require finite, exactly symmetric storage and a positive square shape.
+    /// Positive definiteness is checked numerically during Cholesky, not here.
+    pub fn validate(&self) -> Result<(), SolverError> {
+        let n = self.dimension;
+        if n == 0
+            || n.checked_mul(n) != Some(self.operator.len())
+            || self.metric.len() != self.operator.len()
         {
             return Err(SolverError::InvalidConfiguration(
-                "generalized dense entries must be finite".to_owned(),
+                "generalized dense matrices have invalid shape".into(),
             ));
         }
-        for row in 0..dimension {
-            for column in 0..row {
-                for (name, matrix) in [("operator", operator), ("metric", metric)] {
-                    if (matrix[row * dimension + column] - matrix[column * dimension + row]).abs()
-                        > symmetry_tolerance
-                    {
-                        return Err(SolverError::InvalidConfiguration(format!(
-                            "{name} is not symmetric at ({row}, {column})"
-                        )));
+        for matrix in [self.operator, self.metric] {
+            if matrix.iter().any(|v| !v.is_finite()) {
+                return Err(SolverError::InvalidConfiguration(
+                    "generalized dense entries must be finite".into(),
+                ));
+            }
+            for row in 0..n {
+                for column in 0..row {
+                    if matrix[row * n + column] != matrix[column * n + row] {
+                        return Err(SolverError::InvalidConfiguration(
+                            "generalized dense entries must be exactly symmetric".into(),
+                        ));
                     }
                 }
             }
         }
-        Ok(Self {
-            operator,
-            metric,
-            dimension,
-        })
+        Ok(())
     }
 }
 
+/// Cholesky-whitened dense reference. Whitening is not backward stable for an
+/// ill-conditioned metric, so the result is `Converged` only when its scaled
+/// backward error `|Ax - lambda Bx| / (|Ax| + |lambda| |Bx|)` meets the tolerance.
 #[derive(Clone, Debug)]
 pub struct DenseGeneralizedReferenceSolverF64 {
     pub maximum_dimension: usize,
+    pub scaled_backward_error_tolerance: f64,
 }
 
 impl Default for DenseGeneralizedReferenceSolverF64 {
     fn default() -> Self {
         Self {
             maximum_dimension: 2048,
+            scaled_backward_error_tolerance: 1e-12,
         }
     }
 }
@@ -3648,6 +4776,14 @@ impl DenseGeneralizedReferenceSolverF64 {
 
         check_solver_cancellation(cancellation)?;
         let largest = supported_extreme(target)?;
+        problem.validate()?;
+        if !self.scaled_backward_error_tolerance.is_finite()
+            || self.scaled_backward_error_tolerance <= 0.0
+        {
+            return Err(SolverError::InvalidConfiguration(
+                "generalized dense backward-error tolerance must be finite and positive".to_owned(),
+            ));
+        }
         let n = problem.dimension;
         if n > self.maximum_dimension {
             return Err(SolverError::InvalidConfiguration(format!(
@@ -3670,7 +4806,7 @@ impl DenseGeneralizedReferenceSolverF64 {
         })?;
         check_solver_cancellation(cancellation)?;
         let whitened = &inverse_lower * operator.clone() * inverse_lower.transpose();
-        let decomposition = SymmetricEigen::new(whitened);
+        let decomposition = generalized_symmetric_decomposition_f64(whitened)?;
         check_solver_cancellation(cancellation)?;
         let index = if largest {
             (0..n)
@@ -3698,16 +4834,31 @@ impl DenseGeneralizedReferenceSolverF64 {
         let bx = &metric * &x;
         let denominator = (x.transpose() * &bx)[(0, 0)];
         let eigenvalue = (x.transpose() * &ax)[(0, 0)] / denominator;
-        let residual = ax - bx * eigenvalue;
-        let residual_norm = residual.norm();
+        if !denominator.is_finite() || denominator <= 0.0 {
+            return Err(SolverError::NumericalBreakdown(
+                "generalized Rayleigh denominator is invalid".into(),
+            ));
+        }
+        let residual = &ax - &bx * eigenvalue;
+        let (residual_norm, backward_error) = generalized_residual_measures_f64(
+            residual.as_slice(),
+            ax.as_slice(),
+            bx.as_slice(),
+            eigenvalue,
+        )?;
         let metric_norm_error = (denominator - 1.0).abs();
+        let status = if backward_error <= self.scaled_backward_error_tolerance {
+            ResultStatus::Converged
+        } else {
+            ResultStatus::Approximate
+        };
         Ok(GeneralizedEigenpairReportF64 {
             eigenvalue,
             eigenvector: x.iter().copied().collect(),
             residual_norm,
             metric_norm_error,
-            algorithm: "dense_cholesky_whitened_generalized_reference_f64".to_owned(),
-            status: ResultStatus::Converged,
+            algorithm: "dense_cholesky_whitened_generalized_reference_f64_v2".to_owned(),
+            status,
             assurance: AssuranceLevel::Computed,
             provenance: SolverProvenance::current_package("f64"),
         })
@@ -3717,6 +4868,106 @@ impl DenseGeneralizedReferenceSolverF64 {
 #[cfg(test)]
 mod generalized_reference_tests {
     use super::*;
+
+    #[test]
+    fn whitened_reference_reports_approximate_when_backward_error_fails() {
+        // Metric condition number about 5e12: whitening returned a residual
+        // near 709 (relative eigenvalue error 1.4e-4) and reported Converged.
+        let operator = [
+            -0.41273380552487193,
+            -0.3864069059005937,
+            0.13519410323961334,
+            0.2574795313636188,
+            -0.28645749404743004,
+            -0.3974729854585808,
+            -0.3864069059005937,
+            0.7781012587036382,
+            0.2102849435489973,
+            -0.29919540302092984,
+            0.7845729071890382,
+            0.7864643294524561,
+            0.13519410323961334,
+            0.2102849435489973,
+            -0.9338020277232124,
+            -0.2927585002628015,
+            0.08654124848273104,
+            -0.7882120404837613,
+            0.2574795313636188,
+            -0.29919540302092984,
+            -0.2927585002628015,
+            -0.7505410819383027,
+            0.18841437891266866,
+            -0.28829972970416584,
+            -0.28645749404743004,
+            0.7845729071890382,
+            0.08654124848273104,
+            0.18841437891266866,
+            -0.7571457271796815,
+            -0.17700870892989895,
+            -0.3974729854585808,
+            0.7864643294524561,
+            -0.7882120404837613,
+            -0.28829972970416584,
+            -0.17700870892989895,
+            -0.7432760861978043,
+        ];
+        let metric = [
+            2.3962601867548288,
+            0.15602728836631333,
+            1.2224482356530937,
+            -0.2869233820366388,
+            -0.1875536274618723,
+            -0.5084455911381273,
+            0.15602728836631333,
+            2.377614535139449,
+            0.30956284397280315,
+            -0.09514475975852507,
+            1.2190111004396407,
+            -0.5303756913017842,
+            1.2224482356530937,
+            0.30956284397280315,
+            3.0094420814517284,
+            -0.8123129997359173,
+            -0.23479947436886042,
+            0.5470044151918012,
+            -0.2869233820366388,
+            -0.09514475975852507,
+            -0.8123129997359173,
+            3.83858808970441,
+            0.42495453305553754,
+            -0.4985793243108785,
+            -0.1875536274618723,
+            1.2190111004396407,
+            -0.23479947436886042,
+            0.42495453305553754,
+            1.3768392787627177,
+            -1.3213864055358115,
+            -0.5084455911381273,
+            -0.5303756913017842,
+            0.5470044151918012,
+            -0.4985793243108785,
+            -1.3213864055358115,
+            2.0012558281878756,
+        ];
+        let problem = DenseGeneralizedProblemF64::new(&operator, &metric, 6, 0.0).unwrap();
+        let solver = DenseGeneralizedReferenceSolverF64::default();
+        let result = solver
+            .solve(&problem, &EigenTarget::AlgebraicSmallest)
+            .unwrap();
+        assert_eq!(result.status, ResultStatus::Approximate);
+        let identity = [1.0, 0.0, 0.0, 1.0];
+        let diagonal = [1.0, 0.0, 0.0, 2.0];
+        let easy = DenseGeneralizedProblemF64::new(&diagonal, &identity, 2, 0.0).unwrap();
+        let result = solver.solve(&easy, &EigenTarget::AlgebraicLargest).unwrap();
+        assert_eq!(result.status, ResultStatus::Converged);
+        assert!(DenseGeneralizedReferenceSolverF64 {
+            scaled_backward_error_tolerance: f64::NAN,
+            ..solver
+        }
+        .solve(&easy, &EigenTarget::AlgebraicLargest)
+        .is_err());
+    }
+
     use xc_operator::{
         DenseSymmetricF64, DiagonalF64, LinearOperator, OperatorMetadata, PositiveDefiniteMetric,
         SymmetricOperator,
@@ -3822,8 +5073,11 @@ mod generalized_reference_tests {
             assert!((matrix_free.eigenvalue - dense.eigenvalue).abs() < 1e-10);
             assert!(matrix_free.residual_norm < 1e-10);
             assert!(matrix_free.metric_normalization_error < 1e-12);
-            assert_eq!(matrix_free.operator_applications, matrix_free.iterations);
-            assert_eq!(matrix_free.metric_applications, matrix_free.iterations);
+            assert!(matrix_free.operator_applications >= 2 * matrix_free.iterations);
+            assert_eq!(
+                matrix_free.metric_applications,
+                matrix_free.operator_applications
+            );
             assert!(matrix_free.projected_factorizations < matrix_free.iterations);
         }
     }
@@ -3992,14 +5246,30 @@ impl SolverRoute {
     }
 
     pub fn evidence(self, precision_bits: u32, thread_count: Option<usize>) -> RouteEvidence {
+        // These are identities of deterministic seed constructions, not random
+        // numbers. Shared starts are decisive for an iterative target claim.
+        let seed = match self {
+            Self::ShiftedPowerExtremeReference
+            | Self::LanczosExtremeReference
+            | Self::MatrixFreeGeneralizedLobpcg => Some(1),
+            Self::HpBlockGeneralizedLobpcg | Self::HpBlockShiftInvert => Some(2),
+            Self::HpThickRestartLanczos => Some(3),
+            Self::BlockSubspaceExtremeReference => Some(4),
+            Self::HpMatrixFreeGeneralizedRayleighRitz => Some(5),
+            _ => None,
+        };
+        let decisive_intermediates = seed
+            .into_iter()
+            .map(|id| format!("xc-solver:deterministic-seed-construction:{id}"))
+            .collect();
         RouteEvidence {
             route_id: self.id().to_owned(),
             algorithm_family: self.algorithm_family().to_owned(),
             formulation: self.formulation().to_owned(),
             implementation_id: format!("xc-solver@{}:{}", env!("CARGO_PKG_VERSION"), self.id()),
-            decisive_intermediates: BTreeSet::new(),
+            decisive_intermediates,
             precision_bits: Some(precision_bits),
-            seed: None,
+            seed,
             thread_count,
             evidence_digest: None,
         }
@@ -4008,6 +5278,8 @@ impl SolverRoute {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SolverPlan {
+    #[serde(default)]
+    pub semantics_id: String,
     pub primary: SolverRoute,
     pub independent_crosscheck: Option<SolverRoute>,
     pub requested_assurance: AssuranceLevel,
@@ -4033,6 +5305,10 @@ pub struct SolverPlannerInput {
 
 impl SolverPlannerInput {
     pub fn validate(&self) -> Result<(), SolverError> {
+        let working_bits = self
+            .precision
+            .initial_working_bits()
+            .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
         if self.dimension == 0 {
             return Err(SolverError::InvalidConfiguration(
                 "solver planner dimension must be positive".to_owned(),
@@ -4062,7 +5338,10 @@ impl SolverPlannerInput {
                 )));
             }
         }
-        if self.generalized && self.requested_eigenpairs != 1 && self.precision.initial_bits <= 64 {
+        if self.generalized
+            && self.requested_eigenpairs != 1
+            && working_bits <= f64::MANTISSA_DIGITS
+        {
             return Err(SolverError::UnsupportedTarget(
                 "installed f64 generalized routes currently accept exactly one algebraic extreme"
                     .to_owned(),
@@ -4144,7 +5423,11 @@ pub struct DomainSolverPlan {
 /// Compiled example: `crates/xc-solver/examples/plan.rs`.
 pub fn plan_symmetric_eigenproblem(input: &SolverPlannerInput) -> Result<SolverPlan, SolverError> {
     input.validate()?;
-    let hp_requested = input.precision.initial_bits > 64;
+    let working_bits = input
+        .precision
+        .initial_working_bits()
+        .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
+    let hp_requested = working_bits > f64::MANTISSA_DIGITS;
     let selected_target = input.requested_eigenpairs > 1
         || matches!(
             &input.target,
@@ -4171,6 +5454,15 @@ pub fn plan_symmetric_eigenproblem(input: &SolverPlannerInput) -> Result<SolverP
         ));
     }
 
+    if !hp_requested
+        && input.assurance != AssuranceLevel::Certified
+        && (!algebraic_extreme || (input.generalized && input.requested_eigenpairs > 1))
+    {
+        return Err(SolverError::UnsupportedTarget(
+            "no installed native eigenpair route implements this target and count; selected Sturm values remain available through the values API".into(),
+        ));
+    }
+
     let primary = if input.assurance == AssuranceLevel::Certified {
         SolverRoute::CertifiedInertiaPlanned
     } else if input.generalized {
@@ -4180,7 +5472,9 @@ pub fn plan_symmetric_eigenproblem(input: &SolverPlannerInput) -> Result<SolverP
             } else {
                 SolverRoute::HpMatrixFreeGeneralizedRayleighRitz
             }
-        } else if input.matrix_materialized {
+        } else if input.matrix_materialized
+            && input.structure == xc_operator::MatrixStructure::Dense
+        {
             SolverRoute::DenseGeneralizedWhiteningReference
         } else {
             SolverRoute::MatrixFreeGeneralizedLobpcg
@@ -4190,21 +5484,21 @@ pub fn plan_symmetric_eigenproblem(input: &SolverPlannerInput) -> Result<SolverP
             (xc_operator::MatrixStructure::Tridiagonal, true, _) if hp_tridiagonal_index_target => {
                 SolverRoute::HpTridiagonalSturmSelected
             }
-            (xc_operator::MatrixStructure::Tridiagonal, false, true) => {
-                SolverRoute::TridiagonalSturmSelected
-            }
-            (xc_operator::MatrixStructure::Tridiagonal, false, false) => {
-                SolverRoute::TridiagonalFullSpectrumReference
-            }
             (_, true, _) if interior_target => SolverRoute::HpBlockShiftInvert,
             (_, true, _) if algebraic_extreme && input.requested_eigenpairs < input.dimension => {
                 SolverRoute::HpThickRestartLanczos
             }
-            (xc_operator::MatrixStructure::Dense, true, _) if input.matrix_materialized => {
+            (xc_operator::MatrixStructure::Dense, true, _)
+                if input.matrix_materialized
+                    && input.requested_eigenpairs == 1
+                    && !matches!(input.target, EigenTarget::IndexRange { .. }) =>
+            {
                 SolverRoute::HpDenseReference
             }
             (_, true, _) => SolverRoute::HpSelectedSpectrumPlanned,
-            (xc_operator::MatrixStructure::Dense, false, _) if input.matrix_materialized => {
+            (xc_operator::MatrixStructure::Dense, false, _)
+                if input.matrix_materialized && input.requested_eigenpairs == 1 =>
+            {
                 SolverRoute::DenseFullSpectrumReference
             }
             (_, false, _) if input.requested_eigenpairs > 1 && algebraic_extreme => {
@@ -4215,24 +5509,26 @@ pub fn plan_symmetric_eigenproblem(input: &SolverPlannerInput) -> Result<SolverP
         }
     };
 
+    if primary == SolverRoute::HpSelectedSpectrumPlanned {
+        return Err(SolverError::UnsupportedTarget(
+            "no installed HP eigenpair executor supports this structure, target, and count".into(),
+        ));
+    }
     let crosscheck_candidate = match primary {
         SolverRoute::DenseFullSpectrumReference => Some(SolverRoute::LanczosExtremeReference),
         SolverRoute::TridiagonalFullSpectrumReference => {
             Some(SolverRoute::TridiagonalSturmSelected)
         }
-        SolverRoute::TridiagonalSturmSelected => {
-            Some(SolverRoute::TridiagonalFullSpectrumReference)
-        }
-        SolverRoute::LanczosExtremeReference => Some(SolverRoute::ShiftedPowerExtremeReference),
-        SolverRoute::ShiftedPowerExtremeReference => Some(SolverRoute::LanczosExtremeReference),
-        SolverRoute::BlockSubspaceExtremeReference => input
-            .matrix_materialized
-            .then_some(SolverRoute::DenseFullSpectrumReference),
+        SolverRoute::TridiagonalSturmSelected => None,
+        // These share a decisive seed and cannot independently resolve an
+        // unvisited eigenspace. No automatic cross-check is available here.
+        SolverRoute::LanczosExtremeReference | SolverRoute::ShiftedPowerExtremeReference => None,
+        SolverRoute::BlockSubspaceExtremeReference => None,
         SolverRoute::DenseGeneralizedWhiteningReference => {
             Some(SolverRoute::MatrixFreeGeneralizedLobpcg)
         }
-        SolverRoute::MatrixFreeGeneralizedLobpcg => input
-            .matrix_materialized
+        SolverRoute::MatrixFreeGeneralizedLobpcg => (input.matrix_materialized
+            && input.structure == xc_operator::MatrixStructure::Dense)
             .then_some(SolverRoute::DenseGeneralizedWhiteningReference),
         SolverRoute::HpDenseReference => Some(SolverRoute::HpSelectedSpectrumPlanned),
         SolverRoute::HpTridiagonalFullSpectrumReference => {
@@ -4261,17 +5557,32 @@ pub fn plan_symmetric_eigenproblem(input: &SolverPlannerInput) -> Result<SolverP
             .matrix_materialized
             .then_some(SolverRoute::HpDenseReference),
     };
+    let crosscheck_candidate = crosscheck_candidate.filter(|route| {
+        match route {
+            SolverRoute::HpDenseReference | SolverRoute::HpDenseGeneralizedWhiteningReference => {
+                input.structure == xc_operator::MatrixStructure::Dense
+                    && input.requested_eigenpairs == 1
+                    && !matches!(
+                        input.target,
+                        EigenTarget::IndexRange { .. } | EigenTarget::Interval { .. }
+                    )
+            }
+            // The full tridiagonal reference delivers values only.
+            SolverRoute::HpTridiagonalFullSpectrumReference => false,
+            _ => true,
+        }
+    });
     let independent_crosscheck = (input.assurance == AssuranceLevel::CrossChecked)
         .then_some(crosscheck_candidate)
         .flatten();
 
-    let mut precision_schedule_bits = vec![input.precision.initial_bits];
+    let mut precision_schedule_bits = vec![working_bits];
     if input.assurance != AssuranceLevel::Computed {
         let repeat = input
             .precision
-            .next_bits(input.precision.initial_bits)
+            .next_bits(working_bits)
             .unwrap_or(input.precision.maximum_bits);
-        if repeat > input.precision.initial_bits {
+        if repeat > working_bits {
             precision_schedule_bits.push(repeat);
         }
     }
@@ -4323,6 +5634,7 @@ pub fn plan_symmetric_eigenproblem(input: &SolverPlannerInput) -> Result<SolverP
     }
 
     Ok(SolverPlan {
+        semantics_id: "executable_eigenpair_vector_count_plan_v2".into(),
         primary,
         independent_crosscheck,
         requested_assurance: input.assurance,
@@ -4345,10 +5657,18 @@ fn estimate_solver_resources(
     requires_factorization: bool,
 ) -> ResourceEstimate {
     let dimension = u64::try_from(input.dimension).unwrap_or(u64::MAX);
-    let scalar_bytes = u64::from(input.precision.initial_bits)
-        .saturating_add(7)
-        .saturating_div(8)
-        .max(8);
+    // Include Float headers, allocator bookkeeping and limb-rounded mantissas.
+    // Plan through the maximum scheduled precision; this is an admission
+    // estimate, not an operating-system peak measurement.
+    let scalar_bytes = if input.precision.maximum_bits <= f64::MANTISSA_DIGITS {
+        8
+    } else {
+        64u64.saturating_add(
+            u64::from(input.precision.maximum_bits)
+                .div_ceil(64)
+                .saturating_mul(8),
+        )
+    };
     let vector_bytes = dimension.saturating_mul(scalar_bytes);
     let matrix_bytes = dimension
         .saturating_mul(dimension)
@@ -4359,12 +5679,14 @@ fn estimate_solver_resources(
         20
     };
     let resident_memory_bytes = if requires_materialization {
-        matrix_bytes.saturating_add(6u64.saturating_mul(vector_bytes))
+        (if input.generalized { 3u64 } else { 2u64 })
+            .saturating_mul(matrix_bytes)
+            .saturating_add(6u64.saturating_mul(vector_bytes))
     } else {
         iterative_vector_count.saturating_mul(vector_bytes)
     };
-    let temporary_memory_bytes = if requires_factorization {
-        Some(matrix_bytes)
+    let temporary_memory_bytes = if requires_factorization || requires_materialization {
+        Some(4u64.saturating_mul(matrix_bytes))
     } else {
         Some(4u64.saturating_mul(vector_bytes))
     };
@@ -4454,6 +5776,11 @@ pub fn plan_and_preflight_symmetric_eigenproblem(
             "requested thread count must be positive".to_owned(),
         ));
     }
+    input.validate()?;
+    let working_bits = input
+        .precision
+        .initial_working_bits()
+        .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
     let fingerprint_digest = context
         .execution_fingerprint
         .digest()
@@ -4473,7 +5800,7 @@ pub fn plan_and_preflight_symmetric_eigenproblem(
             .execution_fingerprint
             .precision
             .working_precision_bits
-            != input.precision.initial_bits
+            != working_bits
         || context.execution_fingerprint.thread_policy.thread_count != context.requested_threads
     {
         return Err(SolverError::InvalidConfiguration(
@@ -4487,10 +5814,14 @@ pub fn plan_and_preflight_symmetric_eigenproblem(
         effective_config_digest: context.effective_config_digest.clone(),
         platform: context.platform.clone(),
         scalar_backend: context.scalar_backend.clone(),
-        precision_bits: input.precision.initial_bits,
+        precision_bits: working_bits,
         operator_representation: operator_representation(&input.structure).to_owned(),
         target_kind: target_kind(&input.target).to_owned(),
         generalized: input.generalized,
+        require_eigenvectors: true,
+        requested_eigenpairs: Some(input.requested_eigenpairs),
+        complex_claim: false,
+        checkpoint_requested: false,
         primary_solver: plan.primary.id().to_owned(),
         independent_solver: plan
             .independent_crosscheck
@@ -4508,16 +5839,12 @@ pub fn plan_and_preflight_symmetric_eigenproblem(
     };
     let preflight = catalog.preflight(&request);
     let resource_alternatives = solver_resource_alternatives(input, context, &plan, &preflight)?;
-    let primary_evidence = plan.primary.evidence(
-        input.precision.initial_bits,
-        Some(context.requested_threads),
-    );
-    let independent_evidence = plan.independent_crosscheck.map(|route| {
-        route.evidence(
-            input.precision.initial_bits,
-            Some(context.requested_threads),
-        )
-    });
+    let primary_evidence = plan
+        .primary
+        .evidence(working_bits, Some(context.requested_threads));
+    let independent_evidence = plan
+        .independent_crosscheck
+        .map(|route| route.evidence(working_bits, Some(context.requested_threads)));
     Ok(PreflightedSolverPlan {
         plan,
         preflight,
@@ -4547,10 +5874,19 @@ fn solver_resource_alternatives(
         matrix_free_input.structure = xc_operator::MatrixStructure::MatrixFree;
         matrix_free_input.matrix_materialized = false;
         if let Ok(matrix_free_plan) = plan_symmetric_eigenproblem(&matrix_free_input) {
-            if context
-                .resources
-                .assess(matrix_free_plan.resource_estimate.clone())
-                .feasible
+            let catalog = installed_solver_capability_catalog();
+            let installed =
+                |route: SolverRoute| catalog.solvers.iter().any(|entry| entry.id == route.id());
+            let preserves_assurance = input.assurance != AssuranceLevel::CrossChecked
+                || matrix_free_plan
+                    .independent_crosscheck
+                    .is_some_and(installed);
+            if installed(matrix_free_plan.primary)
+                && preserves_assurance
+                && context
+                    .resources
+                    .assess(matrix_free_plan.resource_estimate.clone())
+                    .feasible
             {
                 alternatives.push(SolverResourceAlternative {
                     kind: SolverResourceAlternativeKind::MatrixFreeSelectedSpectrum,
@@ -4639,6 +5975,24 @@ fn solver_capability(
         operator_representations: string_set(representations),
         target_kinds: string_set(targets),
         generalized,
+        delivers_eigenvectors: !matches!(
+            route,
+            SolverRoute::TridiagonalSturmSelected
+                | SolverRoute::TridiagonalFullSpectrumReference
+                | SolverRoute::HpTridiagonalFullSpectrumReference
+        ),
+        maximum_eigenpairs: matches!(
+            route,
+            SolverRoute::DenseFullSpectrumReference
+                | SolverRoute::ShiftedPowerExtremeReference
+                | SolverRoute::LanczosExtremeReference
+                | SolverRoute::DenseGeneralizedWhiteningReference
+                | SolverRoute::MatrixFreeGeneralizedLobpcg
+                | SolverRoute::HpDenseReference
+                | SolverRoute::HpMatrixFreeGeneralizedRayleighRitz
+                | SolverRoute::HpDenseGeneralizedWhiteningReference
+        )
+        .then_some(1),
         maximum_assurance: AssuranceLevel::CrossChecked,
         checkpoint_supported: route == SolverRoute::BlockSubspaceExtremeReference,
     }
@@ -4651,7 +6005,7 @@ pub fn installed_solver_capability_catalog() -> CapabilityCatalog {
     let scalar_backends = vec![ScalarCapability {
         id: "f64".to_owned(),
         supported_platforms: platforms.clone(),
-        maximum_precision_bits: Some(64),
+        maximum_precision_bits: Some(f64::MANTISSA_DIGITS),
         arbitrary_precision: false,
         rigorous_real_enclosures: false,
         rigorous_complex_enclosures: false,
@@ -4669,6 +6023,18 @@ pub fn installed_solver_capability_catalog() -> CapabilityCatalog {
     ];
     let extreme = ["algebraic_extreme"];
     let solvers = vec![
+        SolverCapability {
+            id: "diagonal_rank_one_secular".into(),
+            algorithm_family: "exact_sign_secular_bisection".into(),
+            scalar_backends: string_set(&["f64"]),
+            operator_representations: string_set(&["diagonal_rank_one"]),
+            target_kinds: string_set(&["full_spectrum"]),
+            generalized: false,
+            delivers_eigenvectors: false,
+            maximum_eigenpairs: None,
+            maximum_assurance: AssuranceLevel::Computed,
+            checkpoint_supported: false,
+        },
         solver_capability(
             SolverRoute::DenseFullSpectrumReference,
             &["f64"],
@@ -4677,17 +6043,10 @@ pub fn installed_solver_capability_catalog() -> CapabilityCatalog {
             false,
         ),
         solver_capability(
-            SolverRoute::TridiagonalFullSpectrumReference,
-            &["f64"],
-            &["tridiagonal"],
-            &["algebraic_extreme", "index_range"],
-            false,
-        ),
-        solver_capability(
             SolverRoute::TridiagonalSturmSelected,
             &["f64"],
             &["tridiagonal"],
-            &["algebraic_extreme", "index_range", "interval"],
+            &["algebraic_extreme", "index_range"],
             false,
         ),
         solver_capability(
@@ -4832,16 +6191,14 @@ mod planner_tests {
             matrix_materialized: true,
             generalized: false,
         };
-        let plan = plan_symmetric_eigenproblem(&input).unwrap();
-        assert_eq!(plan.primary, SolverRoute::TridiagonalSturmSelected);
-        assert_eq!(
-            plan.independent_crosscheck,
-            Some(SolverRoute::TridiagonalFullSpectrumReference)
-        );
+        assert!(matches!(
+            plan_symmetric_eigenproblem(&input),
+            Err(SolverError::UnsupportedTarget(_))
+        ));
     }
 
     #[test]
-    fn hp_tridiagonal_selected_plan_uses_hp_sturm_with_full_qr_crosscheck() {
+    fn hp_tridiagonal_selected_plan_does_not_substitute_values_only_crosscheck() {
         let input = SolverPlannerInput {
             structure: MatrixStructure::Tridiagonal,
             dimension: 100,
@@ -4854,10 +6211,7 @@ mod planner_tests {
         };
         let plan = plan_symmetric_eigenproblem(&input).unwrap();
         assert_eq!(plan.primary, SolverRoute::HpTridiagonalSturmSelected);
-        assert_eq!(
-            plan.independent_crosscheck,
-            Some(SolverRoute::HpTridiagonalFullSpectrumReference)
-        );
+        assert_eq!(plan.independent_crosscheck, None);
         assert!(!plan.requires_factorization);
         assert!(!plan
             .notes
@@ -4928,10 +6282,10 @@ mod planner_tests {
     #[test]
     fn installed_crosscheck_routes_pass_exact_preflight() {
         let input = SolverPlannerInput {
-            structure: MatrixStructure::Tridiagonal,
+            structure: MatrixStructure::Dense,
             dimension: 100,
-            target: EigenTarget::IndexRange { first: 0, last: 2 },
-            requested_eigenpairs: 3,
+            target: EigenTarget::AlgebraicLargest,
+            requested_eigenpairs: 1,
             assurance: AssuranceLevel::CrossChecked,
             precision: PrecisionPolicy::fixed(53),
             matrix_materialized: true,
@@ -4949,6 +6303,22 @@ mod planner_tests {
             outcome.preflight.failures
         );
         assert!(outcome.independent_evidence.is_some());
+        // A native selected Sturm range has no installed independent full
+        // tridiagonal spectrum route; preflight must reject this assurance.
+        let unavailable = SolverPlannerInput {
+            structure: MatrixStructure::Tridiagonal,
+            target: EigenTarget::IndexRange { first: 0, last: 2 },
+            requested_eigenpairs: 3,
+            ..input
+        };
+        assert!(matches!(
+            plan_and_preflight_symmetric_eigenproblem(
+                &unavailable,
+                &local_context("f64"),
+                &installed_solver_capability_catalog()
+            ),
+            Err(SolverError::UnsupportedTarget(_))
+        ));
     }
 
     #[test]
@@ -5048,6 +6418,9 @@ mod planner_tests {
         let mut dense_small_input = small_input;
         dense_small_input.structure = MatrixStructure::Dense;
         dense_small_input.matrix_materialized = true;
+        // The installed dense reference returns one extreme. Multi-pair
+        // requests correctly choose the linear-workspace block route instead.
+        dense_small_input.requested_eigenpairs = 1;
         let mut dense_large_input = dense_small_input.clone();
         dense_large_input.dimension = 2_000;
         let dense_small = plan_symmetric_eigenproblem(&dense_small_input).unwrap();
@@ -5368,7 +6741,36 @@ mod planner_tests {
                 && alternative.profile == Some(ResourceProfile::ExternalCompute)
                 && alternative.estimate == outcome.plan.resource_estimate
         }));
-        assert!(outcome.resource_alternatives.iter().any(|alternative| {
+        // At N=100000, six dense f64 matrix buffers plus vectors require
+        // about 480 GB: the 128 GiB profile cannot honestly admit this plan.
+        let peak = outcome
+            .plan
+            .resource_estimate
+            .resident_memory_bytes
+            .unwrap()
+            + outcome
+                .plan
+                .resource_estimate
+                .temporary_memory_bytes
+                .unwrap();
+        let high_memory = ResourcePolicy::for_profile(ResourceProfile::HighMemoryWorkstation);
+        assert!(peak > high_memory.maximum_memory_bytes.unwrap());
+        assert!(!outcome.resource_alternatives.iter().any(|alternative| {
+            alternative.kind == SolverResourceAlternativeKind::LargerResourceProfile
+                && alternative.profile == Some(ResourceProfile::HighMemoryWorkstation)
+        }));
+        // A 40000-dimensional dense request is about 76.8 GB. It is too large
+        // for the normal profile but supplies a positive 128 GiB alternative.
+        let mut moderate = input.clone();
+        moderate.dimension = 40_000;
+        let moderate = plan_and_preflight_symmetric_eigenproblem(
+            &moderate,
+            &local_context("f64"),
+            &installed_solver_capability_catalog(),
+        )
+        .unwrap();
+        assert!(!moderate.execution_allowed());
+        assert!(moderate.resource_alternatives.iter().any(|alternative| {
             alternative.kind == SolverResourceAlternativeKind::LargerResourceProfile
                 && alternative.profile == Some(ResourceProfile::HighMemoryWorkstation)
         }));
@@ -5388,6 +6790,9 @@ pub struct HpCrossCheckTolerance {
 
 #[cfg(feature = "hp-reference")]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// Historical type name for a report-agreement diagnostic. Caller-supplied
+/// reports cannot prove independent executions or target identity; accepted
+/// assurance is Computed regardless of the input reports' asserted labels.
 pub struct CrossCheckedEigenpairHp {
     pub accepted: EigenpairReportHp,
     pub independent: EigenpairReportHp,
@@ -5399,95 +6804,188 @@ pub struct CrossCheckedEigenpairHp {
 
 #[cfg(feature = "hp-reference")]
 fn hp_parse_string(value: &str, precision_bits: u32) -> Result<rug::Float, SolverError> {
-    let parsed = rug::Float::parse(value).map_err(|error| {
-        SolverError::InvalidConfiguration(format!(
-            "failed to parse HP report value {value:?}: {error}"
-        ))
-    })?;
-    Ok(rug::Float::with_val(precision_bits, parsed))
+    if !(32..=1_000_064).contains(&precision_bits) {
+        return Err(SolverError::InvalidConfiguration(
+            "unsupported HP scalar precision".into(),
+        ));
+    }
+    let literal = xc_core::DecimalLiteral::new(value)
+        .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
+    let parsed =
+        rug::Float::parse(value).map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?;
+    let parsed = rug::Float::with_val(precision_bits, parsed);
+    if !parsed.is_finite()
+        || (parsed.is_zero()
+            && literal
+                .canonical()
+                .map_err(|e| SolverError::InvalidConfiguration(e.to_string()))?
+                .as_str()
+                != "0")
+    {
+        return Err(SolverError::InvalidConfiguration(
+            "HP scalar is outside the representable exponent range".into(),
+        ));
+    }
+    Ok(parsed)
 }
 
 #[cfg(feature = "hp-reference")]
+/// Compare the stored MPFR values decoded at each report's declared precision.
+/// Difference and one-minus-overlap are upward bounds; overlap is a lower
+/// bound. This prevents rounded boundary coincidences from passing a tolerance.
+/// This report-only API does not replay an operator, establish independence,
+/// or verify target selection. It returns agreement diagnostics with Computed
+/// assurance; editing report names cannot earn CrossChecked assurance.
 pub fn cross_check_hp_reports(
     primary: &EigenpairReportHp,
     independent: &EigenpairReportHp,
     tolerance: HpCrossCheckTolerance,
 ) -> Result<CrossCheckedEigenpairHp, SolverError> {
-    use rug::Float;
+    use rug::{float::Round, Float};
+    use xc_numerics::mpfr_interval::MpfrInterval;
+    let invalid = |message: &str| SolverError::CrossCheckDisagreement(message.into());
     if primary.eigenvector.len() != independent.eigenvector.len() || primary.eigenvector.is_empty()
     {
-        return Err(SolverError::CrossCheckDisagreement(
-            "HP eigenvectors must have the same nonzero dimension".to_owned(),
+        return Err(invalid(
+            "HP eigenvectors must have the same nonzero dimension",
         ));
+    }
+    for report in [primary, independent] {
+        if !(32..=1_000_000).contains(&report.precision_bits)
+            || report.status != ResultStatus::Converged
+        {
+            return Err(invalid(
+                "HP cross-check requires converged reports at supported precision",
+            ));
+        }
+        for value in [
+            &report.residual_norm,
+            &report.relative_residual,
+            &report.scaled_backward_error,
+            &report.diagnostics.absolute_residual,
+            &report.diagnostics.relative_residual,
+            &report.diagnostics.scaled_backward_error,
+            &report.diagnostics.orthogonality_error,
+        ] {
+            let parsed = hp_parse_string(value, report.precision_bits)?;
+            if !parsed.is_finite() || parsed < 0 {
+                return Err(invalid(
+                    "HP report diagnostics must be finite and nonnegative",
+                ));
+            }
+        }
+    }
+    if primary.algorithm.trim().is_empty()
+        || independent.algorithm.trim().is_empty()
+        || primary.algorithm == independent.algorithm
+    {
+        return Err(invalid("HP cross-check requires distinct identified routes; the caller must establish independence"));
     }
     let precision_bits = primary
         .precision_bits
         .max(independent.precision_bits)
-        .saturating_add(64);
-    let primary_value = hp_parse_string(&primary.eigenvalue, precision_bits)?;
-    let independent_value = hp_parse_string(&independent.eigenvalue, precision_bits)?;
-    let mut eigenvalue_difference = primary_value;
-    eigenvalue_difference -= independent_value;
-    eigenvalue_difference.abs_mut();
-
-    let left: Vec<Float> = primary
-        .eigenvector
-        .iter()
-        .map(|value| hp_parse_string(value, precision_bits))
-        .collect::<Result<_, _>>()?;
-    let right: Vec<Float> = independent
-        .eigenvector
-        .iter()
-        .map(|value| hp_parse_string(value, precision_bits))
-        .collect::<Result<_, _>>()?;
-    let mut dot = Float::with_val(precision_bits, 0);
-    let mut left_norm_sq = Float::with_val(precision_bits, 0);
-    let mut right_norm_sq = Float::with_val(precision_bits, 0);
-    for (left_value, right_value) in left.iter().zip(&right) {
-        let mut term = left_value.clone();
-        term *= right_value;
-        dot += term;
-        let mut square = left_value.clone();
-        square *= left_value;
-        left_norm_sq += square;
-        let mut square = right_value.clone();
-        square *= right_value;
-        right_norm_sq += square;
+        .checked_add(64)
+        .filter(|p| *p <= rug::float::prec_max())
+        .ok_or_else(|| invalid("unsupported HP cross-check guard precision"))?;
+    let parse = |value: &str, source_precision| -> Result<Float, SolverError> {
+        let parsed = hp_parse_string(value, source_precision)?;
+        if !parsed.is_finite() {
+            return Err(invalid("HP report contains a nonfinite scalar"));
+        }
+        // Report strings encode a stored Float, rather than an exact decimal.
+        Ok(Float::with_val(precision_bits, parsed))
+    };
+    let parse_tolerance = |literal: &xc_core::DecimalLiteral| -> Result<Float, SolverError> {
+        literal.validate().map_err(|e| invalid(&e.to_string()))?;
+        let _representable = hp_parse_literal(literal, precision_bits)?;
+        let parsed = Float::parse(literal.as_str()).map_err(|e| invalid(&e.to_string()))?;
+        let parsed = Float::with_val_round(precision_bits, parsed, Round::Down).0;
+        if !parsed.is_finite() || parsed < 0 {
+            return Err(invalid(
+                "HP cross-check tolerance must be finite and nonnegative",
+            ));
+        }
+        Ok(parsed)
+    };
+    let eigenvalue_tolerance = parse_tolerance(&tolerance.eigenvalue_absolute)?;
+    let overlap_tolerance = parse_tolerance(&tolerance.one_minus_overlap_squared)?;
+    let primary_value = parse(&primary.eigenvalue, primary.precision_bits)?;
+    let independent_value = parse(&independent.eigenvalue, independent.precision_bits)?;
+    let eigenvalue_difference = if primary_value >= independent_value {
+        Float::with_val_round(
+            precision_bits,
+            &primary_value - &independent_value,
+            Round::Up,
+        )
+        .0
+    } else {
+        Float::with_val_round(
+            precision_bits,
+            &independent_value - &primary_value,
+            Round::Up,
+        )
+        .0
+    };
+    if !eigenvalue_difference.is_finite() {
+        return Err(invalid("HP cross-check difference is unrepresentable"));
     }
-    if left_norm_sq.is_zero() || right_norm_sq.is_zero() {
-        return Err(SolverError::CrossCheckDisagreement(
-            "HP cross-check received a zero eigenvector".to_owned(),
-        ));
+    let scaled = |report: &EigenpairReportHp| -> Result<Vec<MpfrInterval>, SolverError> {
+        let values: Vec<_> = report
+            .eigenvector
+            .iter()
+            .map(|v| parse(v, report.precision_bits))
+            .collect::<Result<_, _>>()?;
+        let maximum = values
+            .iter()
+            .map(|v| v.clone().abs())
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap();
+        if maximum.is_zero() {
+            return Err(invalid("HP cross-check received a zero eigenvector"));
+        }
+        let divisor = MpfrInterval::point(maximum);
+        values
+            .into_iter()
+            .map(|v| {
+                MpfrInterval::point(v)
+                    .div(&divisor)
+                    .map_err(|e| invalid(&e.to_string()))
+            })
+            .collect()
+    };
+    let left = scaled(primary)?;
+    let right = scaled(independent)?;
+    let mut dot = MpfrInterval::from_i64(0, precision_bits);
+    let mut left_norm = dot.clone();
+    let mut right_norm = dot.clone();
+    for (a, b) in left.iter().zip(&right) {
+        dot = dot.add(&a.mul(b));
+        left_norm = left_norm.add(&a.square());
+        right_norm = right_norm.add(&b.square());
     }
-    dot.square_mut();
-    let mut norm_product = left_norm_sq;
-    norm_product *= right_norm_sq;
-    let mut overlap_squared = dot;
-    overlap_squared /= norm_product;
+    let overlap = dot
+        .square()
+        .div(&left_norm.mul(&right_norm))
+        .map_err(|e| invalid(&e.to_string()))?;
+    overlap.validate().map_err(|e| invalid(&e.to_string()))?;
+    let mut overlap_squared = overlap.lower().clone();
+    // The exact normalized squared overlap belongs to [0,1]. Intersecting
+    // with that mathematical domain preserves a conservative lower bound.
+    if overlap_squared < 0 {
+        overlap_squared = Float::with_val(precision_bits, 0);
+    }
     if overlap_squared > 1 {
-        // Decimal serialization and independent normalization may place the
-        // computed overlap a few ulps above one. Clamp only for reporting the
-        // sign-invariant overlap metric, never for eigenvalue acceptance.
-        overlap_squared = Float::with_val(precision_bits, 1);
+        return Err(invalid("HP overlap enclosure contradicts Cauchy-Schwarz"));
     }
-    let mut one_minus_overlap = Float::with_val(precision_bits, 1);
-    one_minus_overlap -= &overlap_squared;
-    one_minus_overlap.abs_mut();
-
-    let eigenvalue_tolerance = hp_parse_literal(&tolerance.eigenvalue_absolute, precision_bits)?;
-    let overlap_tolerance = hp_parse_literal(&tolerance.one_minus_overlap_squared, precision_bits)?;
+    let one = Float::with_val(precision_bits, 1);
+    let one_minus_overlap =
+        Float::with_val_round(precision_bits, &one - &overlap_squared, Round::Up).0;
     if eigenvalue_difference > eigenvalue_tolerance || one_minus_overlap > overlap_tolerance {
-        return Err(SolverError::CrossCheckDisagreement(format!(
-            "HP reports disagree: eigenvalue difference {}, one-minus-overlap {}",
-            eigenvalue_difference.to_string_radix(10, Some(20)),
-            one_minus_overlap.to_string_radix(10, Some(20))
-        )));
+        return Err(invalid("HP report agreement does not establish the requested eigenvalue and overlap tolerances"));
     }
-
-    // Exact-round-trip width; the bare ceiling loses one ulp on decode.
     let digits = xc_numerics::reduction::roundtrip_decimal_digits(precision_bits).max(32);
     let mut accepted = primary.clone();
-    accepted.assurance = AssuranceLevel::CrossChecked;
+    accepted.assurance = AssuranceLevel::Computed;
     Ok(CrossCheckedEigenpairHp {
         accepted,
         independent: independent.clone(),
@@ -5525,9 +7023,46 @@ mod hp_crosscheck_tests {
     }
 
     #[test]
+    fn hp_crosscheck_rejects_nonfinite_reports_and_tolerances() {
+        let tolerance = || HpCrossCheckTolerance {
+            eigenvalue_absolute: xc_core::DecimalLiteral::new("1e-30").unwrap(),
+            one_minus_overlap_squared: xc_core::DecimalLiteral::new("1e-30").unwrap(),
+        };
+        let mut good = report("1", &["1", "0"], 128);
+        good.algorithm = "independent-fixture".into();
+        for bad in [
+            report("NaN", &["1", "0"], 128),
+            report("1", &["NaN", "0"], 128),
+        ] {
+            assert!(cross_check_hp_reports(&bad, &good, tolerance()).is_err());
+        }
+        let mut excessive = tolerance();
+        excessive.eigenvalue_absolute = xc_core::DecimalLiteral::new("1e1000000000").unwrap();
+        assert!(cross_check_hp_reports(&report("1", &["1", "0"], 128), &good, excessive).is_err());
+    }
+
+    #[test]
+    fn hp_crosscheck_does_not_round_excess_error_into_tolerance() {
+        let tiny: rug::Float = rug::Float::with_val(128, -1) >> 400u32;
+        let primary = report("1", &["1", "0"], 128);
+        let mut independent = report(&tiny.to_string_radix(10, None), &["1", "0"], 128);
+        independent.algorithm = "independent-fixture".into();
+        assert!(cross_check_hp_reports(
+            &primary,
+            &independent,
+            HpCrossCheckTolerance {
+                eigenvalue_absolute: xc_core::DecimalLiteral::new("1").unwrap(),
+                one_minus_overlap_squared: xc_core::DecimalLiteral::new("1e-30").unwrap()
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
     fn hp_crosscheck_is_sign_invariant() {
         let primary = report("1e-400", &["1", "0"], 1024);
-        let independent = report("1.0000000001e-400", &["-1", "0"], 2048);
+        let mut independent = report("1.0000000001e-400", &["-1", "0"], 2048);
+        independent.algorithm = "independent-fixture".into();
         let result = cross_check_hp_reports(
             &primary,
             &independent,
@@ -5537,7 +7072,7 @@ mod hp_crosscheck_tests {
             },
         )
         .unwrap();
-        assert_eq!(result.accepted.assurance, AssuranceLevel::CrossChecked);
+        assert_eq!(result.accepted.assurance, AssuranceLevel::Computed);
     }
 }
 
@@ -5545,116 +7080,59 @@ mod hp_crosscheck_tests {
 // Diagonal-plus-rank-one secular reference solver
 // ===========================================================================
 
+/// Exact stored-binary width policy: width <= max(absolute_width, relative_width*|point|).
+/// Set absolute_width to zero to require relative accuracy without a unit floor.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RankOneSecularToleranceF64 {
+    pub absolute_width: f64,
+    pub relative_width: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RankOneSecularEnclosureF64 {
+    pub lower: f64,
+    pub upper: f64,
+    pub lower_is_pole: bool,
+    pub upper_is_pole: bool,
+    /// Upward bound on exact upper-lower, absent only if no finite binary64 bound exists.
+    pub absolute_width_upper_bound: Option<f64>,
+    /// Upward bound on exact width/|returned point|, absent at zero or outside finite range.
+    pub relative_width_upper_bound: Option<f64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RankOneSecularSpectrumF64 {
     pub eigenvalues: Vec<f64>,
+    #[serde(default)]
+    pub enclosures: Vec<RankOneSecularEnclosureF64>,
+    #[serde(default)]
+    pub tolerance_policy: Option<RankOneSecularToleranceF64>,
+    /// Finite upward-rounded bounds on |1 + alpha*sum(u_i^2/(d_i-lambda))|
+    /// for the exact stored binary inputs and each returned point.
     pub residuals: Vec<f64>,
     pub bisection_iterations: usize,
     pub algorithm: String,
     pub assumptions: Vec<String>,
 }
 
-fn rank_one_secular_value(
-    diagonal: &[f64],
-    vector: &[f64],
-    alpha: f64,
-    lambda: f64,
-) -> Result<f64, SolverError> {
-    let mut value = 1.0;
-    for (&pole, &component) in diagonal.iter().zip(vector) {
-        let denominator = pole - lambda;
-        if denominator == 0.0 {
-            return Err(SolverError::NumericalBreakdown(
-                "rank-one secular evaluation reached a diagonal pole".to_owned(),
-            ));
-        }
-        value += alpha * component * component / denominator;
-    }
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        Err(SolverError::NumericalBreakdown(
-            "rank-one secular evaluation was non-finite".to_owned(),
-        ))
-    }
-}
-
-fn adjacent_float_toward(value: f64, toward_positive: bool) -> f64 {
-    if value.is_nan()
-        || value
-            == if toward_positive {
-                f64::INFINITY
-            } else {
-                f64::NEG_INFINITY
-            }
-    {
-        return value;
-    }
-    if value == 0.0 {
-        return if toward_positive {
-            f64::from_bits(1)
-        } else {
-            -f64::from_bits(1)
-        };
-    }
-    let bits = value.to_bits();
-    let next = if (value > 0.0) == toward_positive {
-        bits + 1
-    } else {
-        bits - 1
-    };
-    f64::from_bits(next)
-}
-
-fn bisect_monotone_secular(
-    diagonal: &[f64],
-    vector: &[f64],
-    alpha: f64,
-    mut lower: f64,
-    mut upper: f64,
-    tolerance: f64,
-    maximum_iterations: usize,
-) -> Result<(f64, f64, usize), SolverError> {
-    let mut f_lower = rank_one_secular_value(diagonal, vector, alpha, lower)?;
-    let f_upper = rank_one_secular_value(diagonal, vector, alpha, upper)?;
-    if f_lower == 0.0 {
-        return Ok((lower, 0.0, 0));
-    }
-    if f_upper == 0.0 {
-        return Ok((upper, 0.0, 0));
-    }
-    if f_lower.is_sign_positive() == f_upper.is_sign_positive() {
-        return Err(SolverError::NumericalBreakdown(format!(
-            "rank-one secular bracket does not change sign: [{lower:e}, {upper:e}]"
-        )));
-    }
-    for iteration in 1..=maximum_iterations {
-        let midpoint = lower + 0.5 * (upper - lower);
-        let f_midpoint = rank_one_secular_value(diagonal, vector, alpha, midpoint)?;
-        if f_midpoint == 0.0 || (upper - lower).abs() <= tolerance * midpoint.abs().max(1.0) {
-            return Ok((midpoint, f_midpoint.abs(), iteration));
-        }
-        if f_lower.is_sign_positive() != f_midpoint.is_sign_positive() {
-            upper = midpoint;
-        } else {
-            lower = midpoint;
-            f_lower = f_midpoint;
-        }
-    }
-    let midpoint = lower + 0.5 * (upper - lower);
-    let residual = rank_one_secular_value(diagonal, vector, alpha, midpoint)?.abs();
-    Ok((midpoint, residual, maximum_iterations))
-}
+mod rank_one_secular_f64;
 
 /// Enumerate every eigenvalue of `diag(d) + alpha * u u^T` through its
 /// secular equation.
 ///
-/// This trusted f64 route requires strictly increasing diagonal entries and
+/// This reference route requires strictly increasing diagonal entries and
 /// nonzero update components. Under those assumptions the secular function is
 /// strictly monotone between poles and the rank-one interlacing count is
 /// complete. The generic result is useful as an independent route for
 /// arrowhead/rank-one formulations; applying it to CCM requires a separately
 /// reviewed derivation of the correct finite operator and metric.
+///
+/// Stored inputs are exact dyadic rationals for secular sign and outer-bound
+/// arithmetic. A returned point is an exact secular zero or lies in a root
+/// bracket whose exact width is at most `tolerance * max(1, abs(point))`.
+/// Exhausted iterations, unresolved binary64 brackets, and unrepresentable
+/// finite output/residual bounds are errors. Exact integer reference arithmetic
+/// costs more than a floating-only iteration; no dense eigensolver is used.
 pub fn diagonal_rank_one_spectrum_f64(
     diagonal: &[f64],
     vector: &[f64],
@@ -5662,6 +7140,97 @@ pub fn diagonal_rank_one_spectrum_f64(
     tolerance: f64,
     maximum_iterations: usize,
 ) -> Result<RankOneSecularSpectrumF64, SolverError> {
+    diagonal_rank_one_spectrum_with_tolerances_f64(
+        diagonal,
+        vector,
+        alpha,
+        RankOneSecularToleranceF64 {
+            absolute_width: tolerance,
+            relative_width: tolerance,
+        },
+        maximum_iterations,
+    )
+}
+
+/// Validated values-only plan for the explicitly supplied diagonal rank-one form.
+/// Execution revalidates deserialized plans and applies the retained width policy.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RankOneSecularPlanF64 {
+    diagonal: Vec<f64>,
+    vector: Vec<f64>,
+    alpha: f64,
+    tolerance: RankOneSecularToleranceF64,
+    maximum_iterations: usize,
+}
+
+impl RankOneSecularPlanF64 {
+    pub fn route_id(&self) -> &'static str {
+        "diagonal_rank_one_secular"
+    }
+    pub fn semantics_id(&self) -> &'static str {
+        "diagonal_rank_one_values_plan_f64_v1"
+    }
+    pub fn dimension(&self) -> usize {
+        self.diagonal.len()
+    }
+    pub fn tolerance(&self) -> RankOneSecularToleranceF64 {
+        self.tolerance
+    }
+    pub fn execute(&self) -> Result<RankOneSecularSpectrumF64, SolverError> {
+        diagonal_rank_one_spectrum_with_tolerances_f64(
+            &self.diagonal,
+            &self.vector,
+            self.alpha,
+            self.tolerance,
+            self.maximum_iterations,
+        )
+    }
+}
+
+/// Plan every eigenvalue of an explicit diagonal-plus-rank-one matrix.
+/// This values-only route is separate from the generic eigenpair planner;
+/// generic rank-one metadata does not establish a diagonal base operator.
+pub fn plan_diagonal_rank_one_spectrum_f64(
+    diagonal: &[f64],
+    vector: &[f64],
+    alpha: f64,
+    tolerance: RankOneSecularToleranceF64,
+    maximum_iterations: usize,
+) -> Result<RankOneSecularPlanF64, SolverError> {
+    validate_diagonal_rank_one_inputs(diagonal, vector, alpha, tolerance, maximum_iterations)?;
+    Ok(RankOneSecularPlanF64 {
+        diagonal: diagonal.to_vec(),
+        vector: vector.to_vec(),
+        alpha,
+        tolerance,
+        maximum_iterations,
+    })
+}
+
+/// Enumerate rank-one roots with an explicit absolute/relative width policy.
+/// Returned brackets use exact secular signs for the stored binary inputs;
+/// absolute_width=0 requires relative bracket accuracy even for tiny roots.
+/// The same interlacing and nonzero-component requirements as
+/// diagonal_rank_one_spectrum_f64 apply. Unresolvable widths return an error.
+pub fn diagonal_rank_one_spectrum_with_tolerances_f64(
+    diagonal: &[f64],
+    vector: &[f64],
+    alpha: f64,
+    tolerance: RankOneSecularToleranceF64,
+    maximum_iterations: usize,
+) -> Result<RankOneSecularSpectrumF64, SolverError> {
+    validate_diagonal_rank_one_inputs(diagonal, vector, alpha, tolerance, maximum_iterations)?;
+    rank_one_secular_f64::solve(diagonal, vector, alpha, tolerance, maximum_iterations)
+}
+
+fn validate_diagonal_rank_one_inputs(
+    diagonal: &[f64],
+    vector: &[f64],
+    alpha: f64,
+    tolerance: RankOneSecularToleranceF64,
+    maximum_iterations: usize,
+) -> Result<(), SolverError> {
     if diagonal.is_empty() || diagonal.len() != vector.len() {
         return Err(SolverError::InvalidConfiguration(
             "rank-one secular solver requires equal nonzero diagonal and vector lengths".to_owned(),
@@ -5673,8 +7242,11 @@ pub fn diagonal_rank_one_spectrum_f64(
         .any(|value| !value.is_finite())
         || !alpha.is_finite()
         || alpha == 0.0
-        || !tolerance.is_finite()
-        || tolerance <= 0.0
+        || !tolerance.absolute_width.is_finite()
+        || tolerance.absolute_width < 0.0
+        || !tolerance.relative_width.is_finite()
+        || tolerance.relative_width < 0.0
+        || (tolerance.absolute_width == 0.0 && tolerance.relative_width == 0.0)
         || maximum_iterations == 0
     {
         return Err(SolverError::InvalidConfiguration(
@@ -5694,63 +7266,7 @@ pub fn diagonal_rank_one_spectrum_f64(
         ));
     }
 
-    let norm_bound = diagonal.iter().map(|value| value.abs()).fold(0.0, f64::max)
-        + alpha.abs() * vector.iter().map(|value| value * value).sum::<f64>();
-    let expansion = norm_bound.max(1.0).mul_add(2.0, 1.0);
-    let mut brackets = Vec::with_capacity(diagonal.len());
-    if alpha > 0.0 {
-        for window in diagonal.windows(2) {
-            brackets.push((
-                adjacent_float_toward(window[0], true),
-                adjacent_float_toward(window[1], false),
-            ));
-        }
-        brackets.push((
-            adjacent_float_toward(*diagonal.last().unwrap(), true),
-            *diagonal.last().unwrap() + expansion,
-        ));
-    } else {
-        brackets.push((
-            diagonal[0] - expansion,
-            adjacent_float_toward(diagonal[0], false),
-        ));
-        for window in diagonal.windows(2) {
-            brackets.push((
-                adjacent_float_toward(window[0], true),
-                adjacent_float_toward(window[1], false),
-            ));
-        }
-    }
-
-    let mut eigenvalues = Vec::with_capacity(diagonal.len());
-    let mut residuals = Vec::with_capacity(diagonal.len());
-    let mut total_iterations = 0usize;
-    for (lower, upper) in brackets {
-        let (root, residual, iterations) = bisect_monotone_secular(
-            diagonal,
-            vector,
-            alpha,
-            lower,
-            upper,
-            tolerance,
-            maximum_iterations,
-        )?;
-        eigenvalues.push(root);
-        residuals.push(residual);
-        total_iterations += iterations;
-    }
-    eigenvalues.sort_by(f64::total_cmp);
-    Ok(RankOneSecularSpectrumF64 {
-        eigenvalues,
-        residuals,
-        bisection_iterations: total_iterations,
-        algorithm: "diagonal_rank_one_secular_bisection_f64".to_owned(),
-        assumptions: vec![
-            "diagonal entries are strictly increasing".to_owned(),
-            "every rank-one update component is nonzero".to_owned(),
-            "result is an f64 reference route, not a certified enclosure".to_owned(),
-        ],
-    })
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5785,5 +7301,94 @@ mod rank_one_secular_tests {
             diagonal_rank_one_spectrum_f64(&[1.0, 3.0], &[1.0, 1.0], -0.5, 1e-14, 200).unwrap();
         assert!(spectrum.eigenvalues[0] < 1.0);
         assert!(spectrum.eigenvalues[1] > 1.0 && spectrum.eigenvalues[1] < 3.0);
+    }
+}
+
+#[cfg(all(test, feature = "hp-reference"))]
+mod hp_diagnostic_contract_tests;
+
+#[cfg(test)]
+mod native_tolerance_boundary_contract {
+    use super::*;
+    #[test]
+    fn native_acceptance_threshold_cannot_round_up_to_one() {
+        let mut config = SolverConfig {
+            target: EigenTarget::AlgebraicLargest,
+            subspace: xc_core::Subspace::Full,
+            assurance: AssuranceLevel::Computed,
+            precision: xc_core::PrecisionPolicy::fixed(53),
+            stopping: xc_core::StoppingPolicy::default(),
+            reproducibility: xc_core::Reproducibility::Deterministic,
+            algorithm_preferences: vec![],
+            allow_lower_precision_seed: false,
+            allow_randomized_seed: false,
+        };
+        config.stopping.absolute_residual =
+            xc_core::DecimalLiteral::new("0.999999999999999999999999999999999999999999").unwrap();
+        config.stopping.scaled_backward_error = config.stopping.absolute_residual.clone();
+        let (absolute, backward) = stopping_thresholds_f64(&config).unwrap();
+        assert!(absolute < 1. && backward < 1.);
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_native_iteration_contract {
+    use super::*;
+    #[test]
+    fn native_rank_is_invariant_under_small_scaling() {
+        let a = 2.0f64.powi(-200);
+        let basis = orthonormalize_block(vec![vec![a, 0.0], vec![0.0, a]], 2, 2, 2).unwrap();
+        assert_eq!(basis, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+    }
+    #[test]
+    fn ritz_stability_does_not_accept_rounded_product_equality() {
+        assert!(!native_ritz_stable(5.0, 3.5, 0.3));
+    }
+}
+
+#[cfg(all(test, feature = "hp-reference"))]
+mod exhaustive_block_termination_contract {
+    use super::*;
+    use rug::Float;
+    #[test]
+    fn mixed_block_does_not_claim_either_uniform_stopping_condition() {
+        let zero = Float::with_val(128, 0);
+        let one = Float::with_val(128, 1);
+        let two = Float::with_val(128, 2);
+        assert_eq!(
+            hp_block_termination([(&zero, &two), (&two, &zero)], &one, &one),
+            TerminationReason::ResidualOrBackwardErrorTolerance
+        );
+        assert_eq!(
+            hp_block_termination([(&zero, &two)], &one, &one),
+            TerminationReason::ResidualTolerance
+        );
+        assert_eq!(
+            hp_block_termination([(&two, &zero)], &one, &one),
+            TerminationReason::BackwardErrorTolerance
+        );
+    }
+}
+
+#[cfg(all(test, feature = "hp-reference"))]
+mod exhaustive_hp_stability_contract {
+    use super::*;
+    use rug::{ops::Pow, Float, Rational};
+    #[test]
+    fn absolute_stability_cannot_round_a_larger_difference_down_to_tolerance() {
+        let one = Float::with_val(64, 1);
+        let previous = -Float::with_val(64, 2).pow(-65i32);
+        assert!(hp_ritz_change(&one, &previous, None) > one);
+    }
+    #[test]
+    fn relative_stability_is_an_upper_bound_on_the_exact_ratio() {
+        let three = Float::with_val(65, 3);
+        let two = Float::with_val(65, 2);
+        assert!(
+            hp_ritz_change(&three, &two, Some(&three))
+                .to_rational()
+                .unwrap()
+                >= Rational::from((1, 3))
+        );
     }
 }

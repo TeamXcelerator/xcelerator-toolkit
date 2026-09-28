@@ -18,9 +18,16 @@ pub struct BlockGeneralizedConfigHp {
     pub precision_bits: u32,
     pub requested_eigenpairs: usize,
     pub guard_eigenpairs: usize,
+    /// Absolute residual in operator units; acceptance is this OR the scaled
+    /// backward-error tolerance, followed by the separate stability guards.
+    /// Scaling the operator without scaling this tolerance changes acceptance.
     pub absolute_residual_tolerance: DecimalLiteral,
+    /// Dimensionless residual normalized by the computed action norms.
     pub scaled_backward_error_tolerance: DecimalLiteral,
+    /// Maximum |lambda_new-lambda_old| / max(1, |lambda_new|, |lambda_old|).
+    /// This is iterate agreement, not an eigenvalue error bound.
     pub ritz_value_stability_tolerance: DecimalLiteral,
+    /// Absolute projected gap tolerance in eigenvalue/target-distance units.
     pub boundary_cluster_tolerance: DecimalLiteral,
     pub maximum_iterations: usize,
     pub minimum_iterations: usize,
@@ -37,7 +44,7 @@ pub struct BlockPreconditionerDescriptorHp {
 
 impl BlockPreconditionerDescriptorHp {
     pub fn validate(&self, precision_bits: u32) -> Result<(), SolverError> {
-        if self.id.trim().is_empty() {
+        if !(33..=1_000_000).contains(&precision_bits) || self.id.trim().is_empty() {
             return Err(SolverError::InvalidConfiguration(
                 "HP block preconditioner id must not be empty".to_owned(),
             ));
@@ -46,12 +53,7 @@ impl BlockPreconditionerDescriptorHp {
             .approximation_error_bound
             .as_ref()
             .map(|bound| {
-                let parsed = Float::parse(bound.as_str()).map_err(|error| {
-                    SolverError::InvalidConfiguration(format!(
-                        "failed to parse HP block preconditioner bound: {error}"
-                    ))
-                })?;
-                let parsed = Float::with_val(precision_bits, parsed);
+                let parsed = super::hp_parse_literal(bound, precision_bits)?;
                 if !parsed.is_finite() || parsed < 0 {
                     return Err(SolverError::InvalidConfiguration(
                         "HP block preconditioner bound must be finite and nonnegative".to_owned(),
@@ -94,6 +96,7 @@ pub struct BlockGeneralizedEigenpairHp {
     pub residual_norm: Float,
     pub scaled_backward_error: Float,
     pub diagnostics: super::EigenpairDiagnostics<Float>,
+    pub stopping_evidence: super::HpResidualAcceptance,
 }
 
 #[derive(Clone, Debug)]
@@ -113,11 +116,17 @@ pub struct GeneralizedBoundaryClusterHp {
 }
 
 #[derive(Clone, Debug)]
+/// Convergence concerns retained Ritz residuals and stability. The projected
+/// boundary cannot exclude an unvisited eigenspace or establish multiplicity.
 pub struct BlockGeneralizedEigenReportHp {
+    /// True only after a full-space projection; false means global target
+    /// selection and completeness remain unverified, even when Converged.
+    pub global_target_ordering_established: bool,
     pub target: EigenTarget,
     pub requested_eigenpairs: usize,
     pub retained_eigenpairs: Vec<BlockGeneralizedEigenpairHp>,
     pub boundary_cluster: Option<GeneralizedBoundaryClusterHp>,
+    pub effective_boundary_cluster_tolerance: Float,
     pub maximum_metric_orthogonality_error: Float,
     pub maximum_ritz_value_stability: Float,
     pub iterations: usize,
@@ -145,9 +154,16 @@ pub struct AdaptiveBlockGeneralizedOptionsHp {
     pub target: EigenTarget,
     pub requested_eigenpairs: usize,
     pub guard_eigenpairs: usize,
+    /// Absolute residual in operator units; acceptance is this OR the scaled
+    /// backward-error tolerance, followed by the separate stability guards.
+    /// Scaling the operator without scaling this tolerance changes acceptance.
     pub absolute_residual_tolerance: DecimalLiteral,
+    /// Dimensionless residual normalized by the computed action norms.
     pub scaled_backward_error_tolerance: DecimalLiteral,
+    /// Maximum |lambda_new-lambda_old| / max(1, |lambda_new|, |lambda_old|).
+    /// This is iterate agreement, not an eigenvalue error bound.
     pub ritz_value_stability_tolerance: DecimalLiteral,
+    /// Absolute projected gap tolerance in eigenvalue/target-distance units.
     pub boundary_cluster_tolerance: DecimalLiteral,
     pub maximum_iterations: usize,
     pub minimum_iterations: usize,
@@ -165,6 +181,8 @@ pub struct BlockGeneralizedPrecisionAttemptHp {
     pub metric_applications: usize,
     pub preconditioner_applications: usize,
     pub maximum_requested_residual_norm: Option<String>,
+    #[serde(default)]
+    pub maximum_retained_residual_norm: Option<String>,
     pub maximum_metric_orthogonality_error: Option<String>,
     pub reason: String,
 }
@@ -194,20 +212,11 @@ fn zero(precision_bits: u32) -> Float {
 }
 
 fn parse_positive(
-    literal: &DecimalLiteral,
-    precision_bits: u32,
+    value: &xc_core::DecimalLiteral,
+    precision: u32,
     name: &str,
 ) -> Result<Float, SolverError> {
-    let parsed = Float::parse(literal.as_str()).map_err(|error| {
-        SolverError::InvalidConfiguration(format!("failed to parse {name}: {error}"))
-    })?;
-    let parsed = Float::with_val(precision_bits, parsed);
-    if !parsed.is_finite() || parsed <= 0 {
-        return Err(SolverError::InvalidConfiguration(format!(
-            "{name} must be finite and positive"
-        )));
-    }
-    Ok(parsed)
+    super::hp_positive_threshold(value, precision, name, rug::float::Round::Down)
 }
 
 fn dot(left: &[Float], right: &[Float], precision_bits: u32) -> Float {
@@ -220,25 +229,11 @@ fn dot(left: &[Float], right: &[Float], precision_bits: u32) -> Float {
     sum
 }
 
-fn norm(vector: &[Float], precision_bits: u32) -> Float {
-    dot(vector, vector, precision_bits).sqrt()
-}
-
 fn apply<O>(operator: &O, vector: &[Float], precision_bits: u32) -> Result<Vec<Float>, SolverError>
 where
     O: xc_operator::LinearOperator<Float> + ?Sized,
 {
-    let mut output = vec![zero(precision_bits); vector.len()];
-    operator.apply(vector, &mut output)?;
-    for value in &mut output {
-        if !value.is_finite() {
-            return Err(SolverError::NumericalBreakdown(
-                "HP block generalized operator produced a nonfinite value".to_owned(),
-            ));
-        }
-        super::reprecision_hp_value(value, precision_bits);
-    }
-    Ok(output)
+    super::hp_checked_action(operator, vector, precision_bits)
 }
 
 fn canonicalize(basis: &mut BasisVectorHp) {
@@ -269,6 +264,11 @@ fn add_b_orthonormal_vector(
     operator_applications: &mut usize,
     metric_applications: &mut usize,
 ) -> Result<bool, SolverError> {
+    // Exact zero residuals and continuation directions have rank zero; other
+    // candidates can still expand the trial space when some pairs converged.
+    if candidate.iter().all(Float::is_zero) {
+        return Ok(false);
+    }
     let mut applied_metric = apply(problem.metric, &candidate, precision_bits)?;
     *metric_applications += 1;
     let initial_norm_squared = dot(&candidate, &applied_metric, precision_bits);
@@ -320,147 +320,29 @@ fn add_b_orthonormal_vector(
     Ok(true)
 }
 
-fn maximum_off_diagonal(matrix: &[Float], dimension: usize, precision_bits: u32) -> Float {
-    let mut maximum = zero(precision_bits);
-    for row in 0..dimension {
-        for column in row + 1..dimension {
-            let magnitude = matrix[row * dimension + column].clone().abs();
-            if magnitude > maximum {
-                maximum = magnitude;
-            }
-        }
-    }
-    maximum
-}
-
+/// Shared scale-relative Jacobi decomposition. Keeping one implementation
+/// prevents projected solvers from retaining an obsolete absolute scale floor.
 pub(crate) fn symmetric_jacobi_eigensystem(
     input: &[Float],
     dimension: usize,
     precision_bits: u32,
     maximum_sweeps: usize,
 ) -> Result<(Vec<Float>, Vec<Vec<Float>>), SolverError> {
-    let mut matrix: Vec<Float> = input
-        .iter()
-        .map(|value| Float::with_val(precision_bits, value))
-        .collect();
-    let mut vectors = vec![zero(precision_bits); dimension * dimension];
-    for index in 0..dimension {
-        vectors[index * dimension + index].assign(1);
-    }
-    let mut scale = Float::with_val(precision_bits, 1);
-    for value in &matrix {
-        let magnitude = value.clone().abs();
-        if magnitude > scale {
-            scale = magnitude;
-        }
-    }
-    let mut tolerance = Float::with_val(precision_bits, 2);
-    tolerance = tolerance.pow(-((precision_bits as i32) - 16));
-    tolerance *= scale;
-    let one = Float::with_val(precision_bits, 1);
-    for _ in 0..maximum_sweeps {
-        if maximum_off_diagonal(&matrix, dimension, precision_bits) <= tolerance {
-            break;
-        }
-        for p in 0..dimension.saturating_sub(1) {
-            for q in p + 1..dimension {
-                let apq = matrix[p * dimension + q].clone();
-                if apq.clone().abs() <= tolerance {
-                    continue;
-                }
-                let app = matrix[p * dimension + p].clone();
-                let aqq = matrix[q * dimension + q].clone();
-                let mut tau = aqq.clone();
-                tau -= &app;
-                let mut denominator = apq.clone();
-                denominator *= 2u32;
-                tau /= denominator;
-                let mut root = tau.clone();
-                root *= &tau;
-                root += &one;
-                root.sqrt_mut();
-                let mut tangent_denominator = tau.clone().abs();
-                tangent_denominator += root;
-                let mut tangent = one.clone();
-                tangent /= tangent_denominator;
-                if tau.is_sign_negative() {
-                    tangent = -tangent;
-                }
-                let mut cosine = tangent.clone();
-                cosine *= &tangent;
-                cosine += &one;
-                cosine.sqrt_mut();
-                cosine.recip_mut();
-                let mut sine = tangent.clone();
-                sine *= &cosine;
-                for k in 0..dimension {
-                    if k != p && k != q {
-                        let akp = matrix[k * dimension + p].clone();
-                        let akq = matrix[k * dimension + q].clone();
-                        let mut new_kp = cosine.clone();
-                        new_kp *= &akp;
-                        let mut term = sine.clone();
-                        term *= &akq;
-                        new_kp -= term;
-                        let mut new_kq = sine.clone();
-                        new_kq *= akp;
-                        let mut term = cosine.clone();
-                        term *= akq;
-                        new_kq += term;
-                        matrix[k * dimension + p].assign(&new_kp);
-                        matrix[p * dimension + k].assign(new_kp);
-                        matrix[k * dimension + q].assign(&new_kq);
-                        matrix[q * dimension + k].assign(new_kq);
-                    }
-                    let vkp = vectors[k * dimension + p].clone();
-                    let vkq = vectors[k * dimension + q].clone();
-                    let mut new_vkp = cosine.clone();
-                    new_vkp *= &vkp;
-                    let mut term = sine.clone();
-                    term *= &vkq;
-                    new_vkp -= term;
-                    let mut new_vkq = sine.clone();
-                    new_vkq *= vkp;
-                    let mut term = cosine.clone();
-                    term *= vkq;
-                    new_vkq += term;
-                    vectors[k * dimension + p].assign(new_vkp);
-                    vectors[k * dimension + q].assign(new_vkq);
-                }
-                let mut diagonal_change = tangent;
-                diagonal_change *= &apq;
-                matrix[p * dimension + p].assign(app - &diagonal_change);
-                matrix[q * dimension + q].assign(aqq + &diagonal_change);
-                matrix[p * dimension + q].assign(0);
-                matrix[q * dimension + p].assign(0);
-            }
-        }
-    }
-    let maximum = maximum_off_diagonal(&matrix, dimension, precision_bits);
-    if maximum > tolerance {
-        return Err(SolverError::NonConvergence(format!(
-            "HP projected Jacobi eigensystem did not converge; maximum off-diagonal={maximum}"
-        )));
-    }
-    let mut ordering: Vec<usize> = (0..dimension).collect();
-    ordering.sort_by(|left, right| {
-        matrix[*left * dimension + *left]
-            .partial_cmp(&matrix[*right * dimension + *right])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let eigenvalues = ordering
-        .iter()
-        .map(|index| matrix[index * dimension + index].clone())
-        .collect();
-    let eigenvectors = ordering
-        .iter()
+    let result = xc_numerics::eigen::dense_symmetric_eigendecomposition_jacobi_hp(
+        input,
+        dimension,
+        precision_bits,
+        maximum_sweeps,
+    )
+    .map_err(|error| SolverError::NumericalBreakdown(error.to_string()))?;
+    let vectors = (0..dimension)
         .map(|column| {
             (0..dimension)
-                .map(|row| vectors[row * dimension + column].clone())
+                .map(|row| result.eigenvectors[row * dimension + column].clone())
                 .collect()
         })
         .collect();
-    Ok((eigenvalues, eigenvectors))
+    Ok((result.eigenvalues, vectors))
 }
 
 fn linear_combination(
@@ -628,7 +510,7 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
         let retained = config
             .requested_eigenpairs
             .saturating_add(config.guard_eigenpairs);
-        if config.precision_bits <= 32
+        if !(33..=1_000_000).contains(&config.precision_bits)
             || dimension == 0
             || problem.metric.dimension() != dimension
             || config.requested_eigenpairs < 2
@@ -640,7 +522,7 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
             || config.maximum_projected_sweeps == 0
         {
             return Err(SolverError::InvalidConfiguration(
-                "HP block generalized LOBPCG requires matching positive dimensions, at least two requested eigenpairs, a guard for partial selection, precision above 32 bits, and valid iteration/sweep bounds"
+                "HP block generalized LOBPCG requires matching positive dimensions, at least two requested eigenpairs, a guard for partial selection, precision in 33..=1000000 bits, and valid iteration/sweep bounds"
                     .to_owned(),
             ));
         }
@@ -659,10 +541,11 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
             config.precision_bits,
             "ritz_value_stability_tolerance",
         )?;
-        let cluster_tolerance = parse_positive(
+        let cluster_tolerance = super::hp_positive_threshold(
             &config.boundary_cluster_tolerance,
             config.precision_bits,
             "boundary_cluster_tolerance",
+            rug::float::Round::Up,
         )?;
         let preconditioner_descriptor = preconditioner.map(|value| value.descriptor());
         if let Some(descriptor) = &preconditioner_descriptor {
@@ -743,16 +626,13 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                         value
                     })
                     .collect();
-                let residual_norm = norm(&residual, config.precision_bits);
-                let operator_norm = norm(&state.applied_operator, config.precision_bits);
-                let metric_norm = norm(&state.applied_metric, config.precision_bits);
-                let mut scale = eigenvalue.clone().abs();
-                scale *= metric_norm;
-                scale += operator_norm;
-                let mut backward = residual_norm.clone();
-                if !scale.is_zero() {
-                    backward /= scale;
-                }
+                let (residual_norm, backward) = super::hp_residual_measures(
+                    &residual,
+                    &state.applied_operator,
+                    &state.applied_metric,
+                    eigenvalue,
+                    config.precision_bits,
+                )?;
                 residuals.push(residual);
                 residual_norms.push(residual_norm);
                 backward_errors.push(backward);
@@ -761,10 +641,7 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                 .as_ref()
                 .map(|previous| {
                     let mut maximum = zero(config.precision_bits);
-                    for index in 0..config.requested_eigenpairs {
-                        let mut difference = eigenvalues[index].clone();
-                        difference -= &previous[index];
-                        difference.abs_mut();
+                    for index in 0..retained {
                         let mut scale = eigenvalues[index].clone().abs();
                         let previous_abs = previous[index].clone().abs();
                         if previous_abs > scale {
@@ -773,7 +650,11 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                         if scale < 1 {
                             scale.assign(1);
                         }
-                        difference /= scale;
+                        let difference = super::hp_ritz_change(
+                            &eigenvalues[index],
+                            &previous[index],
+                            Some(&scale),
+                        );
                         if difference > maximum {
                             maximum = difference;
                         }
@@ -781,13 +662,19 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                     maximum
                 })
                 .unwrap_or_else(|| Float::with_val(config.precision_bits, Special::Infinity));
-            let residuals_converged = (0..config.requested_eigenpairs).all(|index| {
+            let residuals_converged = (0..retained).all(|index| {
                 residual_norms[index] <= absolute_tolerance
                     || backward_errors[index] <= backward_tolerance
             });
             let converged = iteration >= config.minimum_iterations
                 && residuals_converged
                 && maximum_stability <= stability_tolerance;
+            let cluster_tolerance = super::hp_effective_cluster_tolerance(
+                &cluster_tolerance,
+                eigenvalues.iter(),
+                dimension,
+                config.precision_bits,
+            );
             let boundary_cluster = if config.requested_eigenpairs < retained {
                 let requested = config.requested_eigenpairs - 1;
                 let guard = config.requested_eigenpairs;
@@ -872,7 +759,14 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                 } else if converged {
                     (
                         ResultStatus::Converged,
-                        TerminationReason::BackwardErrorTolerance,
+                        super::hp_block_termination(
+                            residual_norms
+                                .iter()
+                                .zip(&backward_errors)
+                                .take(config.requested_eigenpairs),
+                            &absolute_tolerance,
+                            &backward_tolerance,
+                        ),
                     )
                 } else {
                     (
@@ -911,12 +805,23 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                                 scaled_backward_error: scaled_backward_error.clone(),
                                 orthogonality_error,
                             };
+                            let stopping_evidence = super::hp_residual_acceptance(
+                                &state.applied_operator,
+                                &state.applied_metric,
+                                &eigenvalue,
+                                &residual_norm,
+                                &scaled_backward_error,
+                                &absolute_tolerance,
+                                &backward_tolerance,
+                                config.precision_bits,
+                            );
                             BlockGeneralizedEigenpairHp {
                                 eigenvalue,
                                 eigenvector: state.vector,
                                 residual_norm,
                                 scaled_backward_error,
                                 diagnostics,
+                                stopping_evidence,
                             }
                         },
                     )
@@ -926,10 +831,12 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                 let mut provenance = SolverProvenance::current_package("rug_mpfr");
                 provenance.precision_bits = Some(config.precision_bits);
                 return Ok(BlockGeneralizedEigenReportHp {
+                    global_target_ordering_established: maximum_trial_dimension == dimension,
                     target: config.target.clone(),
                     requested_eigenpairs: config.requested_eigenpairs,
                     retained_eigenpairs,
                     boundary_cluster,
+                    effective_boundary_cluster_tolerance: cluster_tolerance,
                     maximum_metric_orthogonality_error,
                     maximum_ritz_value_stability: maximum_stability,
                     iterations: iteration,
@@ -941,7 +848,7 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                     estimated_peak_memory_bytes: live_vectors
                         .saturating_mul(dimension as u64)
                         .saturating_mul(bytes_per_value),
-                    algorithm: "matrix_free_block_generalized_b_orthogonal_lobpcg_hp".to_owned(),
+                    algorithm: "matrix_free_block_generalized_guard_residuals_hp_v3".to_owned(),
                     preconditioner: preconditioner_descriptor.clone(),
                     status,
                     termination,
@@ -949,12 +856,8 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                     provenance,
                 });
             }
-            if residuals_converged {
-                // Preserve the converged Ritz block for one additional
-                // observation when only the explicit stability check remains.
-                previous_values = Some(eigenvalues.clone());
-                continue;
-            }
+            // Stability compares successive iterates, so converged residuals
+            // still take a real step; only a stationary block is observed again.
             previous_values = Some(eigenvalues.clone());
             let old_states = states;
             let search_vectors = if let Some(preconditioner) = preconditioner {
@@ -985,6 +888,11 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                 .chain(search_vectors)
                 .chain(previous_directions.iter().cloned())
             {
+                // An exactly zero residual belongs to an exact eigenvector and
+                // adds no direction.
+                if candidate.iter().all(Float::is_zero) {
+                    continue;
+                }
                 let _ = add_b_orthonormal_vector(
                     problem,
                     candidate,
@@ -996,6 +904,10 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
                 )?;
             }
             if trial_basis.len() <= retained {
+                if residuals_converged {
+                    states = old_states;
+                    continue;
+                }
                 return Err(SolverError::NumericalBreakdown(
                     "HP block generalized trial space failed to expand before convergence"
                         .to_owned(),
@@ -1035,6 +947,24 @@ impl MatrixFreeBlockGeneralizedLobpcgHp {
     }
 }
 
+fn maximum_requested_residual(report: &BlockGeneralizedEigenReportHp) -> Option<String> {
+    if report
+        .boundary_cluster
+        .as_ref()
+        .is_some_and(|cluster| cluster.requested_members != 0)
+        || report.retained_eigenpairs.len() < report.requested_eigenpairs
+    {
+        return None;
+    }
+    report
+        .retained_eigenpairs
+        .iter()
+        .take(report.requested_eigenpairs)
+        .map(|pair| &pair.residual_norm)
+        .max_by(|a, b| a.total_cmp(b))
+        .map(ToString::to_string)
+}
+
 fn maximum_reported_residual(report: &BlockGeneralizedEigenReportHp) -> Option<String> {
     let precision_bits = report.provenance.precision_bits?;
     let mut maximum = zero(precision_bits);
@@ -1064,7 +994,7 @@ pub fn solve_matrix_free_block_generalized_adaptive_hp(
 }
 
 /// Adaptive block generalized solve with an optional typed preconditioner.
-/// Convergence is always decided from exact operator and metric residuals;
+/// Convergence is decided from computed original operator and metric residuals;
 /// the preconditioner only supplies trial directions under its descriptor.
 pub fn solve_matrix_free_block_generalized_adaptive_with_preconditioner_hp(
     problem: &GeneralizedEigenProblem<'_, Float>,
@@ -1080,7 +1010,7 @@ pub fn solve_matrix_free_block_generalized_adaptive_with_preconditioner_hp(
         .initial_bits
         .saturating_add(options.precision.guard_bits)
         .min(options.precision.maximum_bits);
-    if precision_bits <= 32 {
+    if !(33..=1_000_000).contains(&precision_bits) {
         return Err(SolverError::InvalidConfiguration(
             "adaptive HP block generalized precision must exceed 32 bits after guard bits"
                 .to_owned(),
@@ -1113,7 +1043,7 @@ pub fn solve_matrix_free_block_generalized_adaptive_with_preconditioner_hp(
                 let converged = result.status == ResultStatus::Converged;
                 let reason = match &result.status {
                     ResultStatus::Converged => {
-                        "all residual, backward-error, Ritz-stability, and boundary checks passed"
+                        "each requested residual or backward-error check, Ritz stability, and boundary checks passed"
                             .to_owned()
                     }
                     ResultStatus::UnresolvedCluster => {
@@ -1130,7 +1060,8 @@ pub fn solve_matrix_free_block_generalized_adaptive_with_preconditioner_hp(
                     operator_applications: result.operator_applications,
                     metric_applications: result.metric_applications,
                     preconditioner_applications: result.preconditioner_applications,
-                    maximum_requested_residual_norm: maximum_reported_residual(&result),
+                    maximum_requested_residual_norm: maximum_requested_residual(&result),
+                    maximum_retained_residual_norm: maximum_reported_residual(&result),
                     maximum_metric_orthogonality_error: Some(
                         result.maximum_metric_orthogonality_error.to_string(),
                     ),
@@ -1145,18 +1076,39 @@ pub fn solve_matrix_free_block_generalized_adaptive_with_preconditioner_hp(
                 last_result = Some(Box::new(result));
             }
             Err(error @ SolverError::InvalidConfiguration(_))
-            | Err(error @ SolverError::UnsupportedTarget(_)) => return Err(error),
-            Err(error) => attempts.push(BlockGeneralizedPrecisionAttemptHp {
-                precision_bits,
-                status: ResultStatus::InsufficientPrecision,
-                iterations: 0,
-                operator_applications: 0,
-                metric_applications: 0,
-                preconditioner_applications: 0,
-                maximum_requested_residual_norm: None,
-                maximum_metric_orthogonality_error: None,
-                reason: error.to_string(),
-            }),
+            | Err(error @ SolverError::UnsupportedTarget(_))
+            | Err(error @ SolverError::Cancelled(_)) => return Err(error),
+            Err(error @ SolverError::PrecisionExhausted(_)) => {
+                attempts.push(BlockGeneralizedPrecisionAttemptHp {
+                    precision_bits,
+                    status: ResultStatus::InsufficientPrecision,
+                    iterations: 0,
+                    operator_applications: 0,
+                    metric_applications: 0,
+                    preconditioner_applications: 0,
+                    maximum_requested_residual_norm: None,
+                    maximum_retained_residual_norm: None,
+                    maximum_metric_orthogonality_error: None,
+                    reason: error.to_string(),
+                })
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                attempts.push(BlockGeneralizedPrecisionAttemptHp {
+                    precision_bits,
+                    status: ResultStatus::Failed,
+                    iterations: 0,
+                    operator_applications: 0,
+                    metric_applications: 0,
+                    preconditioner_applications: 0,
+                    maximum_requested_residual_norm: None,
+                    maximum_retained_residual_norm: None,
+                    maximum_metric_orthogonality_error: None,
+                    reason: error.to_string(),
+                });
+                return Ok(AdaptiveBlockGeneralizedResultHp::Inconclusive { last_result, attempts,
+                    reason: format!("execution failed without evidence that precision escalation remedies it: {reason}") });
+            }
         }
         let Some(next_bits) = options.precision.next_bits(precision_bits) else {
             return Ok(AdaptiveBlockGeneralizedResultHp::Inconclusive {
@@ -1229,6 +1181,37 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn exhaustive_zero_metric_direction_has_rank_zero() {
+        let operator = DenseSymmetricHp::new(
+            "identity",
+            1,
+            vec![Float::with_val(128, 1)],
+            128,
+            &Float::with_val(128, 0),
+        )
+        .unwrap();
+        let metric = DenseMetricHp(operator.clone());
+        let problem = GeneralizedEigenProblem::new(&operator, &metric).unwrap();
+        let mut basis = Vec::new();
+        let mut applications = 0;
+        let mut metric_applications = 0;
+        let result = add_b_orthonormal_vector(
+            &problem,
+            vec![Float::with_val(128, 0)],
+            &mut basis,
+            128,
+            &Float::with_val(128, 2).pow(-64i32),
+            &mut applications,
+            &mut metric_applications,
+        );
+        assert!(
+            matches!(result, Ok(false)),
+            "zero direction should be skipped: {result:?}"
+        );
+        assert!(basis.is_empty());
     }
 
     fn diagonal(precision_bits: u32, values: &[i32]) -> Vec<Float> {
@@ -1483,11 +1466,82 @@ mod tests {
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].precision_bits, 64);
         assert_eq!(attempts[1].precision_bits, 192);
-        assert_eq!(attempts[0].status, ResultStatus::InsufficientPrecision);
+        // Exact zero directions are now skipped instead of aborting the
+        // block. The low-precision attempt reaches its iteration limit and
+        // must still escalate without declaring convergence.
+        assert_eq!(attempts[0].status, ResultStatus::Approximate);
+        assert_eq!(attempts[0].iterations, options.maximum_iterations);
+        // The request cuts the exact double eigenvalue at 2. An unresolved
+        // cluster has no separate residual for an individually requested member.
+        assert!(attempts[0].maximum_requested_residual_norm.is_none());
+        assert!(attempts[0].maximum_retained_residual_norm.is_some());
+        assert!(attempts[1].maximum_requested_residual_norm.is_none());
+        assert!(attempts[1].maximum_retained_residual_norm.is_some());
         assert_eq!(attempts[1].status, ResultStatus::UnresolvedCluster);
         assert!(!attempts[0].reason.is_empty());
         let last_result = last_result.expect("last cluster report must be retained");
-        assert!(last_result.boundary_cluster.is_some());
+        let cluster = last_result
+            .boundary_cluster
+            .as_ref()
+            .expect("exact repeated boundary");
+        assert_eq!(cluster.dimension, 2);
+        assert_eq!(cluster.requested_members, 1);
+        assert_eq!(cluster.basis.len(), 2);
+        let tolerance = Float::with_val(512, Float::parse("1e-25").unwrap());
+        for vector in &cluster.basis {
+            let mut residual_sq = rug::Rational::new();
+            let mut norm_sq = rug::Rational::new();
+            for (entry, component) in [1, 2, 2, 4].iter().zip(vector) {
+                let x = component.to_rational().unwrap();
+                let residual = rug::Rational::from(*entry - 2) * &x;
+                residual_sq += rug::Rational::from(&residual * &residual);
+                norm_sq += rug::Rational::from(&x * &x);
+            }
+            assert!(Float::with_val(512, residual_sq).sqrt() < tolerance);
+            assert!(Float::with_val(512, norm_sq - 1).abs() < tolerance);
+        }
+        let mut independent_retained_max = cluster.maximum_residual_norm.clone();
+        for pair in &last_result.retained_eigenpairs {
+            if pair.residual_norm > independent_retained_max {
+                independent_retained_max = pair.residual_norm.clone();
+            }
+        }
+        let recorded = Float::with_val(
+            192,
+            Float::parse(attempts[1].maximum_retained_residual_norm.as_ref().unwrap()).unwrap(),
+        );
+        assert_eq!(recorded, independent_retained_max);
         assert_eq!(last_result.provenance.precision_bits, Some(192));
+    }
+}
+
+#[cfg(test)]
+mod tolerance_boundary_contract {
+    use super::*;
+    #[test]
+    fn acceptance_threshold_cannot_round_up_to_one() {
+        let threshold =
+            xc_core::DecimalLiteral::new("0.999999999999999999999999999999999999999999").unwrap();
+        // 1 exceeds the exact requested threshold, even though nearest
+        // rounding at 64 bits makes the two values indistinguishable.
+        assert!(parse_positive(&threshold, 64, "acceptance tolerance").unwrap() < 1);
+    }
+}
+
+#[cfg(test)]
+mod operator_precision_contract {
+    use super::*;
+    #[test]
+    fn action_cannot_silently_promote_lower_precision_results() {
+        let operator = xc_operator::DenseSymmetricHp::new(
+            "fixed 32-bit action",
+            2,
+            [1, 0, 0, 2].map(|v| Float::with_val(32, v)).to_vec(),
+            32,
+            &Float::with_val(32, 0),
+        )
+        .unwrap();
+        let vector = [Float::with_val(128, 1), Float::with_val(128, 1)];
+        assert!(apply(&operator, &vector, 128).is_err());
     }
 }

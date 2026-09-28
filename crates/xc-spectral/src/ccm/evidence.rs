@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.®)
 // All rights reserved. See LICENSE in the repository root.
 
-//! Rigorous finite-claim evidence for CCM and prolate comparisons.
+//! Finite CCM evidence: exact algebra, conditional bounds and point diagnostics.
 //!
 //! This module deliberately keeps three quantities separate:
 //!
@@ -15,136 +15,51 @@
 //! never constructed outside its theorem domain.
 
 use anyhow::{bail, Result};
+#[cfg(test)]
 use rug::float::Constant;
 use rug::{Float, Rational};
 use xc_numerics::interval::RationalInterval;
 
-/// An explicit operator-norm upper bound for the omitted archimedean tail.
-#[derive(Clone, Debug)]
-pub struct ArchimedeanTailBudget {
-    /// `L = log(c)`.
-    pub log_cutoff: Float,
-    /// `rho = 2*pi/L`.
-    pub rho: Float,
-    /// Finite frequency band `{-N, ..., N}`.
-    pub modes: usize,
-    /// Archimedean integration cutoff `T`.
-    pub cutoff_t: Float,
-    /// The strict theorem threshold `max(rho*N, 7)`.
-    pub theorem_threshold: Float,
-    /// Explicit upper bound `B_T` from Corollary 3.3(iii).
-    pub upper_bound: Float,
-}
+mod state_comparison;
+pub use state_comparison::{
+    compare_prolate_weil_states_hp, ActiveTruncationBound, ComparisonTruncationKind,
+    ProlateWeilStateComparisonHp,
+};
+mod asymptotic;
+pub use asymptotic::{
+    prolate_chi2_deficiency_asymptotic, prolate_chi2_log_deficiency_asymptotic,
+    try_prolate_chi2_deficiency_asymptotic,
+};
+mod tail_budget;
+pub use tail_budget::{
+    finite_cutoff_decision, finite_cutoff_interval_decision, try_finite_cutoff_decision,
+    ArchimedeanTailBudget, FiniteCutoffDecision,
+};
 
-impl ArchimedeanTailBudget {
-    /// Evaluate the published explicit tail bound.
-    ///
-    /// The theorem requires integer `c > 1`, `N >= 1`, and
-    /// `T > max(rho*N, 7)`.  Invalid requests fail rather than extrapolate the
-    /// formula beyond its hypotheses.
-    pub fn explicit(integer_cutoff_c: u64, modes: usize, cutoff_t: &Float) -> Result<Self> {
-        if integer_cutoff_c <= 1 {
-            bail!("archimedean tail budget requires integer cutoff c > 1");
-        }
-        if modes == 0 {
-            bail!("the explicit Corollary 3.3 budget requires N >= 1");
-        }
-        let precision = cutoff_t.prec();
-        if !cutoff_t.is_finite() || cutoff_t <= &Float::with_val(precision, 0) {
-            bail!("archimedean cutoff T must be finite and positive");
-        }
-
-        let log_cutoff = Float::with_val(precision, integer_cutoff_c).ln();
-        let pi = Float::with_val(precision, Constant::Pi);
-        let mut rho = pi.clone();
-        rho *= 2u32;
-        rho /= &log_cutoff;
-        let mut band_edge = rho.clone();
-        band_edge *= modes as u32;
-        let seven = Float::with_val(precision, 7);
-        let theorem_threshold = if band_edge > seven { band_edge } else { seven };
-        if cutoff_t <= &theorem_threshold {
-            bail!("archimedean cutoff T must be strictly greater than max(rho*N, 7)");
-        }
-
-        // B_T <= 2(2N+1)rho/pi^2 *
-        //   [log(T)/(T-rho*N) + log(T/(T-rho*N))/(rho*N)].
-        let mut denominator = cutoff_t.clone();
-        let mut rho_n = rho.clone();
-        rho_n *= modes as u32;
-        denominator -= &rho_n;
-
-        let mut first = cutoff_t.clone().ln();
-        first /= &denominator;
-        let mut ratio = cutoff_t.clone();
-        ratio /= &denominator;
-        let mut second = ratio.ln();
-        second /= &rho_n;
-        first += second;
-
-        let mut prefactor = rho.clone();
-        prefactor *= 2u32;
-        prefactor *= (2 * modes + 1) as u32;
-        let mut pi_squared = pi;
-        pi_squared.square_mut();
-        prefactor /= pi_squared;
-        let mut upper_bound = prefactor;
-        upper_bound *= first;
-
-        Ok(Self {
-            log_cutoff,
-            rho,
-            modes,
-            cutoff_t: cutoff_t.clone(),
-            theorem_threshold,
-            upper_bound,
-        })
-    }
-}
-
-/// What a finite-`T` eigenvalue and a valid tail budget prove about the
-/// corresponding cutoff-free eigenvalue.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FiniteCutoffDecision {
-    /// `lambda_j(Q_T) >= 0`, hence `lambda_j(Q_infinity) > 0`.
-    CutoffFreePositive,
-    /// `lambda_j(Q_T) < -B_T`, hence `lambda_j(Q_infinity) < 0`.
-    CutoffFreeNegative,
-    /// The finite value lies in `[-B_T, 0)` and has no cutoff-free sign.
-    InconclusiveTailBand,
-}
-
-pub fn finite_cutoff_decision(
-    finite_t_eigenvalue: &Float,
-    budget: &ArchimedeanTailBudget,
-) -> FiniteCutoffDecision {
-    let zero = Float::with_val(finite_t_eigenvalue.prec(), 0);
-    if finite_t_eigenvalue >= &zero {
-        return FiniteCutoffDecision::CutoffFreePositive;
-    }
-    let mut negative_budget = budget.upper_bound.clone();
-    negative_budget = -negative_budget;
-    if finite_t_eigenvalue < &negative_budget {
-        FiniteCutoffDecision::CutoffFreeNegative
-    } else {
-        FiniteCutoffDecision::InconclusiveTailBand
-    }
-}
-
-/// Certified finite evaluation of the positive prolate angular deficiency
-/// `1 - chi_2(lambda)` associated with `h_{4,lambda}`.
+/// Exact interval propagation of `1-sqrt(nu)` for supplied nu in `[0,1]`.
+/// Identifying nu with a particular prolate mode, and establishing its source
+/// enclosure, are external premises. This record certifies the algebra only.
+///
+/// ```compile_fail
+/// use rug::Rational;
+/// use xc_numerics::interval::RationalInterval;
+/// use xc_spectral::ccm::evidence::CertifiedProlateDeficiency;
+/// let mut value = CertifiedProlateDeficiency::from_concentration_enclosure(
+///     RationalInterval::point(Rational::from((1, 4))), 64).unwrap();
+/// value.deficiency = RationalInterval::point(Rational::from(0));
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CertifiedProlateDeficiency {
     /// Certified enclosure of `nu_2 = chi_2^2`.
-    pub concentration_eigenvalue: RationalInterval,
+    concentration_eigenvalue: RationalInterval,
     /// Certified enclosure of the positive square root `chi_2`.
-    pub angular_eigenvalue: RationalInterval,
+    angular_eigenvalue: RationalInterval,
     /// Certified enclosure of `1 - chi_2`.
-    pub deficiency: RationalInterval,
+    deficiency: RationalInterval,
     /// Whether the finite deficiency was represented exactly by the dyadic
     /// square-root grid rather than by a nonzero-width enclosure.
-    pub exact_finite: bool,
-    pub fraction_bits: u32,
+    exact_finite: bool,
+    fraction_bits: u32,
 }
 
 impl CertifiedProlateDeficiency {
@@ -172,6 +87,21 @@ impl CertifiedProlateDeficiency {
             fraction_bits,
         })
     }
+    pub fn concentration_eigenvalue(&self) -> &RationalInterval {
+        &self.concentration_eigenvalue
+    }
+    pub fn angular_eigenvalue(&self) -> &RationalInterval {
+        &self.angular_eigenvalue
+    }
+    pub fn deficiency(&self) -> &RationalInterval {
+        &self.deficiency
+    }
+    pub fn exact_finite(&self) -> bool {
+        self.exact_finite
+    }
+    pub fn fraction_bits(&self) -> u32 {
+        self.fraction_bits
+    }
 }
 
 /// End-to-end finite prolate evidence: an exact shifted-inertia certificate
@@ -186,6 +116,10 @@ pub struct CertifiedProlateDeficiencyEvidence {
 #[derive(Clone, Debug)]
 pub struct ProlateConcentrationCertificationRequest {
     pub dimension: usize,
+    /// Zero-based ASCENDING index of the supplied finite matrix.
+    /// Conventional prolate concentration modes are descending: chi_2^2 is
+    /// descending even-sector index 2 (full even mode 4), at C=2*pi*lambda^2.
+    /// Identifying a matrix index with that mode remains a separate premise.
     pub requested_index: usize,
     pub lower_bracket: Rational,
     pub upper_bracket: Rational,
@@ -197,6 +131,8 @@ pub struct ProlateConcentrationCertificationRequest {
 /// Generate the selected concentration-eigenvalue enclosure rather than
 /// accepting an unaudited interval from the caller, verify it against the
 /// exact interval matrix, and propagate it through `1 - sqrt(nu)`.
+/// Establishing that the supplied matrix and index represent the intended
+/// continuum prolate mode (including discretization error) is a separate premise.
 pub fn certify_prolate_deficiency_from_concentration_matrix(
     concentration_matrix: &[RationalInterval],
     request: ProlateConcentrationCertificationRequest,
@@ -265,7 +201,7 @@ impl ProlateWeilComparison {
             bail!("prolate asymptotic predictor requires lambda^2 > 1");
         }
         let asymptotic_predictor =
-            prolate_chi2_deficiency_asymptotic(lambda_squared, precision_bits);
+            try_prolate_chi2_deficiency_asymptotic(lambda_squared, precision_bits)?;
         let finite_difference = measured_weil_plunge.sub(&finite_prolate.deficiency);
         Ok(Self {
             finite_prolate,
@@ -276,43 +212,16 @@ impl ProlateWeilComparison {
     }
 }
 
-/// The large-`lambda` predictor
-/// `(2^14/3)*sqrt(2)*pi^5*exp(-4*pi*exp(L) + 9L/2)`, `L=log(lambda^2)`.
+/// Conditional residual/separation bound for a unit vector v, a self-adjoint
+/// operator A, a scalar mu and an identified one-dimensional target eigenspace.
+/// If ||Av-mu*v|| <= r and every unwanted eigenvalue has distance at least delta
+/// from mu, then sin(angle) <= r/delta. The spectral theorem proves this by
+/// bounding every unwanted component in the residual norm.
 ///
-/// Fuchs' constant `4*sqrt(pi)*8^4/4!*(2*pi)^(9/2)` equals `2^15*sqrt(2)*pi^5/3`
-/// and governs the concentration deficiency `1 - lambda_4`. The predictor here
-/// is for `1 - chi_2`, and `chi_2^2 = lambda_4` gives `1 - chi_2 ~
-/// (1 - lambda_4)/2`, so the retained prefactor is half of Fuchs' constant,
-/// `2^14*sqrt(2)*pi^5/3`, whose base-ten logarithm is the published
-/// `C_0 = 6.373563`. An earlier form carried `sqrt(2*pi)` in place of
-/// `sqrt(2)*pi^5` and was low by `pi^(9/2) = 172.65`.
-///
-/// This is intentionally labeled as an asymptotic predictor, never a finite
-/// certificate.
-pub fn prolate_chi2_deficiency_asymptotic(lambda_squared: u64, precision_bits: u32) -> Float {
-    let pi = Float::with_val(precision_bits, Constant::Pi);
-    let l = Float::with_val(precision_bits, lambda_squared).ln();
-    let mut exponent = pi.clone();
-    exponent *= lambda_squared;
-    exponent *= -4i32;
-    let mut nine_l_over_two = l;
-    nine_l_over_two *= 9u32;
-    nine_l_over_two /= 2u32;
-    exponent += nine_l_over_two;
-
-    let mut prefactor = Float::with_val(precision_bits, 2u32);
-    prefactor.sqrt_mut();
-    let pi_fourth = pi.clone().square().square();
-    prefactor *= &pi_fourth;
-    prefactor *= &pi;
-    prefactor *= 2u32.pow(14);
-    prefactor /= 3u32;
-    prefactor * exponent.exp()
-}
-
-/// A rigorous residual-to-gap conclusion for a normalized approximate
-/// eigenvector.  With residual `r` and certified gap `delta`, the standard
-/// simple-eigenvector bound gives `sin(angle) <= r/delta`.
+/// A gap between the target eigenvalue and its neighbors is NOT this delta.
+/// It must first be reduced by a certified |mu-lambda_target| error. Neither
+/// helper here establishes normalization, self-adjointness, target identity,
+/// residual validity or spectral exclusion; those remain explicit premises.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResidualGapConclusion {
     Reliable {
@@ -326,15 +235,19 @@ pub enum ResidualGapConclusion {
     },
 }
 
-pub fn residual_to_certified_gap(
+/// Conditional ratio using a separately certified distance from mu to the
+/// unwanted spectrum. `gap_lower` in the result means this separation, never
+/// a raw spacing between eigenvalues.
+pub fn residual_to_complement_separation(
     residual_upper: Rational,
-    gap_lower: Rational,
+    complement_separation_lower: Rational,
 ) -> Result<ResidualGapConclusion> {
+    let gap_lower = complement_separation_lower;
     if residual_upper < 0 {
         bail!("residual upper bound must be non-negative");
     }
     if gap_lower <= 0 {
-        bail!("certified spectral-gap lower bound must be positive");
+        bail!("certified distance from mu to the unwanted spectrum must be positive");
     }
     if residual_upper >= gap_lower {
         return Ok(ResidualGapConclusion::Inconclusive {
@@ -351,202 +264,31 @@ pub fn residual_to_certified_gap(
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ComparisonTruncationKind {
-    ValueSpace,
-    CoefficientSpace,
-    FormNorm,
+/// Retired ambiguous compatibility entry point. A raw eigenvalue spacing does
+/// not determine the residual separation needed by the angle theorem. Always
+/// returns an error; use the explicitly named separation or gap/error API.
+pub fn residual_to_certified_gap(
+    _residual_upper: Rational,
+    _gap_lower: Rational,
+) -> Result<ResidualGapConclusion> {
+    bail!("ambiguous gap premise: use residual_to_complement_separation or residual_to_eigenvalue_gap with a certified eigenvalue error")
 }
 
-#[derive(Clone, Debug)]
-pub struct ActiveTruncationBound {
-    pub kind: ComparisonTruncationKind,
-    pub upper_bound: Float,
-    pub source: String,
-}
-
-/// Direct finite-dimensional comparison of the reference prolate candidate and a
-/// computed Weil state. Both inputs are normalized internally, and the
-/// prolate sign is aligned to the Weil state before differences are formed.
-#[derive(Clone, Debug)]
-pub struct ProlateWeilStateComparisonHp {
-    pub value_space_overlap: Float,
-    pub value_space_residual: Float,
-    pub coefficient_overlap: Float,
-    pub coefficient_residual: Float,
-    pub prolate_rayleigh_quotient: Float,
-    pub weil_rayleigh_quotient: Float,
-    pub prolate_eigen_residual: Float,
-    pub weil_eigen_residual: Float,
-    pub form_norm_difference: Float,
-    pub truncation_bounds: Vec<ActiveTruncationBound>,
-}
-
-fn hp_dot(left: &[Float], right: &[Float], precision_bits: u32) -> Result<Float> {
-    if left.len() != right.len() || left.is_empty() {
-        bail!("HP comparison vectors must have the same nonzero dimension");
+/// Convert a target-to-complement eigenvalue gap g using a separately certified
+/// error e>=|mu-lambda_target|. Triangle inequality gives delta>=g-e. Failure
+/// to establish a positive delta returns an error; r>=delta is inconclusive.
+pub fn residual_to_eigenvalue_gap(
+    residual_upper: Rational,
+    eigenvalue_gap_lower: Rational,
+    eigenvalue_error_upper: Rational,
+) -> Result<ResidualGapConclusion> {
+    if eigenvalue_error_upper < 0 || eigenvalue_gap_lower <= eigenvalue_error_upper {
+        bail!("positive complement separation requires gap > nonnegative eigenvalue error");
     }
-    let terms = left
-        .iter()
-        .zip(right)
-        .map(|(left, right)| {
-            let mut term = Float::with_val(precision_bits, left);
-            term *= right;
-            term
-        })
-        .collect::<Vec<_>>();
-    Ok(xc_numerics::reduction::deterministic_pairwise_sum_hp(
-        &terms,
-        precision_bits,
-    ))
-}
-
-fn hp_normalize(vector: &[Float], precision_bits: u32) -> Result<Vec<Float>> {
-    let norm_squared = hp_dot(vector, vector, precision_bits)?;
-    if !norm_squared.is_finite() || norm_squared <= 0 {
-        bail!("HP comparison vectors must have finite positive norm");
-    }
-    let norm = norm_squared.sqrt();
-    Ok(vector
-        .iter()
-        .map(|value| {
-            let mut normalized = Float::with_val(precision_bits, value);
-            normalized /= &norm;
-            normalized
-        })
-        .collect())
-}
-
-fn hp_matvec(matrix: &[Float], vector: &[Float], precision_bits: u32) -> Result<Vec<Float>> {
-    let dimension = vector.len();
-    if dimension == 0 || matrix.len() != dimension * dimension {
-        bail!("HP comparison form must be a nonempty square matrix");
-    }
-    Ok((0..dimension)
-        .map(|row| {
-            let terms = (0..dimension)
-                .map(|column| {
-                    let mut term =
-                        Float::with_val(precision_bits, &matrix[row * dimension + column]);
-                    term *= &vector[column];
-                    term
-                })
-                .collect::<Vec<_>>();
-            xc_numerics::reduction::deterministic_pairwise_sum_hp(&terms, precision_bits)
-        })
-        .collect())
-}
-
-fn hp_l2_norm(vector: &[Float], precision_bits: u32) -> Result<Float> {
-    Ok(hp_dot(vector, vector, precision_bits)?.sqrt())
-}
-
-fn aligned_difference(
-    reference: &[Float],
-    candidate: &[Float],
-    precision_bits: u32,
-) -> Result<(Float, Vec<Float>)> {
-    let signed_overlap = hp_dot(reference, candidate, precision_bits)?;
-    let sign = if signed_overlap < 0 { -1i32 } else { 1i32 };
-    let difference = reference
-        .iter()
-        .zip(candidate)
-        .map(|(reference, candidate)| {
-            let mut value = Float::with_val(precision_bits, candidate);
-            value *= sign;
-            value -= reference;
-            value
-        })
-        .collect();
-    Ok((signed_overlap.abs(), difference))
-}
-
-/// Compare the two states in sampled value space, coefficient space, and the
-/// supplied positive-form norm. Exactly one active bound for each space is
-/// mandatory so a report cannot omit the truncation regime under comparison.
-pub fn compare_prolate_weil_states_hp(
-    weil_values: &[Float],
-    prolate_values: &[Float],
-    weil_coefficients: &[Float],
-    prolate_coefficients: &[Float],
-    weil_form: &[Float],
-    truncation_bounds: Vec<ActiveTruncationBound>,
-    precision_bits: u32,
-) -> Result<ProlateWeilStateComparisonHp> {
-    for kind in [
-        ComparisonTruncationKind::ValueSpace,
-        ComparisonTruncationKind::CoefficientSpace,
-        ComparisonTruncationKind::FormNorm,
-    ] {
-        let matches = truncation_bounds
-            .iter()
-            .filter(|bound| bound.kind == kind)
-            .count();
-        if matches != 1 {
-            bail!("each prolate/Weil comparison space requires exactly one truncation bound");
-        }
-    }
-    if truncation_bounds.iter().any(|bound| {
-        !bound.upper_bound.is_finite() || bound.upper_bound < 0 || bound.source.trim().is_empty()
-    }) {
-        bail!("active truncation bounds require finite nonnegative values and a source");
-    }
-
-    let weil_values = hp_normalize(weil_values, precision_bits)?;
-    let prolate_values = hp_normalize(prolate_values, precision_bits)?;
-    let (value_space_overlap, value_difference) =
-        aligned_difference(&weil_values, &prolate_values, precision_bits)?;
-    let value_space_residual = hp_l2_norm(&value_difference, precision_bits)?;
-
-    let weil_coefficients = hp_normalize(weil_coefficients, precision_bits)?;
-    let prolate_coefficients = hp_normalize(prolate_coefficients, precision_bits)?;
-    let (coefficient_overlap, coefficient_difference) =
-        aligned_difference(&weil_coefficients, &prolate_coefficients, precision_bits)?;
-    let coefficient_residual = hp_l2_norm(&coefficient_difference, precision_bits)?;
-
-    let weil_action = hp_matvec(weil_form, &weil_coefficients, precision_bits)?;
-    let prolate_action = hp_matvec(weil_form, &prolate_coefficients, precision_bits)?;
-    let weil_rayleigh_quotient = hp_dot(&weil_coefficients, &weil_action, precision_bits)?;
-    let prolate_rayleigh_quotient = hp_dot(&prolate_coefficients, &prolate_action, precision_bits)?;
-    let residual = |state: &[Float], action: &[Float], rayleigh: &Float| {
-        let values = state
-            .iter()
-            .zip(action)
-            .map(|(state, action)| {
-                let mut value = Float::with_val(precision_bits, state);
-                value *= rayleigh;
-                let mut residual = Float::with_val(precision_bits, action);
-                residual -= value;
-                residual
-            })
-            .collect::<Vec<_>>();
-        hp_l2_norm(&values, precision_bits)
-    };
-    let weil_eigen_residual = residual(&weil_coefficients, &weil_action, &weil_rayleigh_quotient)?;
-    let prolate_eigen_residual = residual(
-        &prolate_coefficients,
-        &prolate_action,
-        &prolate_rayleigh_quotient,
-    )?;
-    let difference_action = hp_matvec(weil_form, &coefficient_difference, precision_bits)?;
-    let form_norm_squared = hp_dot(&coefficient_difference, &difference_action, precision_bits)?;
-    if form_norm_squared < 0 {
-        bail!("the supplied Weil form is negative on the candidate difference");
-    }
-    let form_norm_difference = form_norm_squared.sqrt();
-
-    Ok(ProlateWeilStateComparisonHp {
-        value_space_overlap,
-        value_space_residual,
-        coefficient_overlap,
-        coefficient_residual,
-        prolate_rayleigh_quotient,
-        weil_rayleigh_quotient,
-        prolate_eigen_residual,
-        weil_eigen_residual,
-        form_norm_difference,
-        truncation_bounds,
-    })
+    residual_to_complement_separation(
+        residual_upper,
+        eigenvalue_gap_lower - eigenvalue_error_upper,
+    )
 }
 
 #[cfg(test)]
@@ -565,18 +307,18 @@ mod tests {
 
         let t = Float::with_val(precision, 100);
         let budget = ArchimedeanTailBudget::explicit(13, 4, &t).unwrap();
-        assert!(budget.upper_bound > 0);
+        assert!(budget.upper_bound() > &0);
         assert_eq!(
             finite_cutoff_decision(&Float::with_val(precision, 1), &budget),
             FiniteCutoffDecision::CutoffFreePositive
         );
-        let mut deep_negative = budget.upper_bound.clone();
+        let mut deep_negative = budget.upper_bound().clone();
         deep_negative *= -2i32;
         assert_eq!(
             finite_cutoff_decision(&deep_negative, &budget),
             FiniteCutoffDecision::CutoffFreeNegative
         );
-        let mut shallow_negative = budget.upper_bound.clone();
+        let mut shallow_negative = budget.upper_bound().clone();
         shallow_negative /= -2i32;
         assert_eq!(
             finite_cutoff_decision(&shallow_negative, &budget),
@@ -653,7 +395,7 @@ mod tests {
 
     #[test]
     fn residual_to_gap_is_fail_closed() {
-        let reliable = residual_to_certified_gap(q(1, 1000), q(1, 10)).unwrap();
+        let reliable = residual_to_complement_separation(q(1, 1000), q(1, 10)).unwrap();
         assert!(matches!(
             reliable,
             ResidualGapConclusion::Reliable {
@@ -662,7 +404,7 @@ mod tests {
             } if sin_angle_upper == q(1, 100)
         ));
         assert!(matches!(
-            residual_to_certified_gap(q(1, 5), q(1, 10)).unwrap(),
+            residual_to_complement_separation(q(1, 5), q(1, 10)).unwrap(),
             ResidualGapConclusion::Inconclusive { .. }
         ));
     }

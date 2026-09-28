@@ -2,7 +2,7 @@
 // All rights reserved. See LICENSE in the repository root.
 //
 
-//! Prolate spheroidal wave functions: CCM Lemma 7.2 falsification test.
+//! Bounded-endpoint prolate approximation and sampled prolate/Weil comparison.
 //!
 //! Implements the prolate-wave educated guess `k_λ` from Section 7 of
 //! the CCM construction. The educated guess approximates
@@ -27,18 +27,25 @@
 //! Public usage examples and assurance boundaries are documented in
 //! `docs/RESEARCH_WORKFLOWS.md`.
 //!
-//! ## Status: complete (HP version available below)
+//! ## Scope: computed discretization (HP version available below)
 //!
 //! Implemented:
-//! - Finite-difference PW_λ matrix construction
+//! - Bounded-endpoint Legendre Galerkin approximation for ordinary entry points
+//! - Explicit historical finite-difference PW_λ matrix construction
 //! - Dense symmetric eigendecomposition via nalgebra
-//! - Node-counting and parity detection to identify h_{0,λ} and h_{4,λ}
+//! - Even Legendre indices 0 and 2 select full modes 0 and 4; historical FD uses
+//!   node-counting and parity detection to identify h_{0,λ} and h_{4,λ}
 //! - Linear combination h_λ = c_4·h_{4,λ} + c_0·h_{0,λ} with ∫h_λ = 0
 //! - ℰ map evaluation on a logarithmic grid in [λ⁻¹, λ]
 //! - Comparison ‖ξ_λ − c·k_λ‖_∞, ‖ξ_λ − c·k_λ‖_2 against the Weil
 //!   eigenvector reconstructed from its V_n Fourier coefficients
 //! - High-precision (rug) version (`prolate::hp` submodule) with
-//!   truly-dynamic working precision (HP-200 through HP-5000+).
+//!   dynamic working precision subject to explicit memory and work budgets.
+
+mod comparison;
+mod grid_contract;
+mod legendre;
+mod stencil;
 
 use anyhow::Result;
 use nalgebra::{DMatrix, SymmetricEigen};
@@ -60,7 +67,7 @@ pub fn prolate_artifact_reuse_plan() -> xc_core::ArtifactReusePlan {
     ArtifactReusePlan {
         schema_version: 1,
         domain: "prolate".to_owned(),
-        semantics_version: "prolate-v0.13.0-v1".to_owned(),
+        semantics_version: "prolate-bounded-legendre-candidate-v6".to_owned(),
         artifacts: vec![
             node("basis", &[], &["lambda_squared", "basis", "truncation"]),
             node(
@@ -92,7 +99,8 @@ pub fn prolate_artifact_reuse_plan() -> xc_core::ArtifactReusePlan {
     }
 }
 
-/// Threshold for detecting zero-norm vectors in parity classification.
+/// Legacy compatibility constant; parity and node-count classification now
+/// use relative scaling and do not apply this absolute cutoff.
 pub const PARITY_ZERO_THRESHOLD: f64 = 1e-30;
 
 /// Relative tolerance for classifying a vector as even or odd.
@@ -119,9 +127,9 @@ pub const DOT_PRODUCT_ZERO_THRESHOLD: f64 = 1e-300;
 pub struct ProlateConfig {
     /// λ for the operator PW_λ. Same λ as the Weil form.
     pub lambda: f64,
-    /// Number of interior grid points for the finite-difference
-    /// discretization of PW_λ on `[-λ, λ]`. Forced to be odd so the
-    /// origin sits on a grid point and even/odd parity is exact.
+    /// Maximum number of even Legendre coefficients for the ordinary prolate
+    /// candidate. The explicit finite-Dirichlet APIs interpret this same legacy
+    /// configuration field as the number of interior grid points.
     pub n_grid: usize,
     /// Number of sample points on `[λ⁻¹, λ]` for the comparison grid.
     pub n_sample: usize,
@@ -133,8 +141,9 @@ pub struct ProlateConfig {
 impl ProlateConfig {
     /// Construct a config with default `n_sample = 256` and
     /// `precision_bits = 53` (f64). `n_grid` is rounded up to the
-    /// next odd integer so `x = 0` lands on a grid point and the
-    /// even/odd parity classification is exact.
+    /// next odd integer for compatibility with the explicit finite-Dirichlet
+    /// routes, where this places `x = 0` on the spatial grid. The ordinary
+    /// route interprets this value as a maximum Legendre coefficient count.
     // Keep remainder arithmetic for the Rust 1.85 MSRV.
     #[allow(unknown_lints, clippy::manual_is_multiple_of)]
     pub fn new(lambda: f64, n_grid: usize) -> Self {
@@ -157,6 +166,17 @@ impl ProlateConfig {
 /// Result of computing the prolate-wave educated guess k_λ.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProlateResult {
+    /// Discretization and endpoint realization used by this result.
+    #[serde(default = "legacy_fd_discretization")]
+    pub discretization: String,
+    #[serde(default)]
+    pub resolution_budget: usize,
+    #[serde(default)]
+    pub basis_dimension: usize,
+    /// Computed infinite-Legendre-operator residual divided by 1+|eigenvalue|,
+    /// maximized over h0 and h4. This is not a certified continuum error bound.
+    #[serde(default)]
+    pub relative_operator_residual: Option<f64>,
     /// k_λ sampled on `u_grid`.
     pub k_values: Vec<f64>,
     /// Sample points u_i ∈ [λ⁻¹, λ]. Logarithmically spaced so that
@@ -175,64 +195,46 @@ pub struct ProlateResult {
     pub elapsed_seconds: f64,
 }
 
+fn legacy_fd_discretization() -> String {
+    "centered_finite_difference_dirichlet_v1".into()
+}
+
 /// Build the prolate wave operator PW_λ matrix at f64 precision via
 /// 3-point finite differences on a uniform grid `[-λ, λ]` with N+2
 /// points (boundary nodes at ±λ where u=0 by Dirichlet, so the matrix
 /// is N × N for the interior nodes).
 ///
 /// The matrix is symmetric tridiagonal:
-///   - Diagonal: `(2/h²)·(λ² − x_i²) + (2πλ x_i)²`
+///   - Diagonal: `((λ²-x_{i-1/2}²)+(λ²-x_{i+1/2}²))/h² + (2πλ x_i)²`,
+///     equivalently `(2/h²)·(λ²-x_i²) - 1/2 + (2πλ x_i)²`.
 ///   - Off-diagonal: `-(1/h²)·(λ² − x_{i±1/2}²)`
 ///
 /// where `h = 2λ/(N+1)` is the grid spacing and `x_i = -λ + i·h` for
 /// `i = 1, …, N`.
 ///
 /// Returns the diagonal and the lower off-diagonal as separate `Vec<f64>`.
+pub fn try_build_pw_matrix_f64(cfg: &ProlateConfig) -> Result<(Vec<f64>, Vec<f64>)> {
+    stencil::build_f64(cfg)
+}
+
+/// Compatibility wrapper; invalid input panics. Use the checked variant.
 pub fn build_pw_matrix_f64(cfg: &ProlateConfig) -> (Vec<f64>, Vec<f64>) {
-    let n = cfg.n_grid;
-    let lambda = cfg.lambda;
-    let lambda_sq = lambda * lambda;
-    let h = 2.0 * lambda / ((n + 1) as f64);
-    let h_sq = h * h;
-    let two_pi_lambda = 2.0 * std::f64::consts::PI * lambda;
-
-    let mut diag = vec![0.0_f64; n];
-    let mut off_diag = vec![0.0_f64; n.saturating_sub(1)];
-
-    for i in 0..n {
-        // x_i = -λ + (i+1)·h, i = 0..n-1 are interior nodes 1..n.
-        let x = -lambda + (i + 1) as f64 * h;
-        let x_minus_half = x - h / 2.0;
-        let x_plus_half = x + h / 2.0;
-
-        let coef_minus = lambda_sq - x_minus_half * x_minus_half;
-        let coef_plus = lambda_sq - x_plus_half * x_plus_half;
-
-        // Diagonal: (1/h²) · (coef_plus + coef_minus) + (2πλx)²
-        diag[i] = (coef_plus + coef_minus) / h_sq + (two_pi_lambda * x).powi(2);
-
-        // Lower off-diagonal: -(1/h²) · coef_minus (at the interface to i-1)
-        if i > 0 {
-            off_diag[i - 1] = -coef_minus / h_sq;
-        }
-    }
-
-    (diag, off_diag)
+    try_build_pw_matrix_f64(cfg).expect("valid representable native prolate grid")
 }
 
 /// Construct PW_λ as a dense `DMatrix<f64>` from its tridiagonal data.
-fn build_pw_dense_f64(cfg: &ProlateConfig) -> DMatrix<f64> {
-    let (diag, off_diag) = build_pw_matrix_f64(cfg);
+fn build_pw_dense_f64(cfg: &ProlateConfig) -> Result<DMatrix<f64>> {
+    let (diag, off) = try_build_pw_matrix_f64(cfg)?;
     let n = diag.len();
-    let mut m = DMatrix::<f64>::zeros(n, n);
+    let mut matrix = DMatrix::<f64>::zeros(n, n);
     for i in 0..n {
-        m[(i, i)] = diag[i];
+        matrix[(i, i)] = diag[i];
         if i > 0 {
-            m[(i, i - 1)] = off_diag[i - 1];
-            m[(i - 1, i)] = off_diag[i - 1];
+            matrix[(i, i - 1)] = off[i - 1];
+            matrix[(i - 1, i)] = off[i - 1];
         }
     }
-    m
+    Ok(matrix)
 }
 
 /// Parity classification of an eigenvector on the symmetric grid.
@@ -246,28 +248,26 @@ enum Parity {
 /// Detect parity of `v` under the index reflection `i ↔ n-1-i` (which
 /// implements `x ↔ -x` on the symmetric grid).
 fn parity_of_f64(v: &[f64]) -> Parity {
-    let n = v.len();
-    if n == 0 {
+    if v.is_empty() || v.iter().any(|x| !x.is_finite()) {
         return Parity::Indeterminate;
     }
-    let mut even_dev = 0.0_f64;
-    let mut odd_dev = 0.0_f64;
-    let mut total = 0.0_f64;
-    for i in 0..n / 2 {
-        let a = v[i];
-        let b = v[n - 1 - i];
-        even_dev += (a - b).abs();
-        odd_dev += (a + b).abs();
-        total += a.abs() + b.abs();
-    }
-    if total < PARITY_ZERO_THRESHOLD {
+    let scale = v.iter().map(|x| x.abs()).fold(0.0f64, f64::max);
+    if scale == 0.0 {
         return Parity::Indeterminate;
     }
-    let r_even = even_dev / total;
-    let r_odd = odd_dev / total;
-    if r_even < PARITY_CLASSIFICATION_TOL {
+    let mut total = 0.0;
+    let mut even = 0.0;
+    let mut odd = 0.0;
+    for (a, b) in v.iter().zip(v.iter().rev()) {
+        let a = a / scale;
+        let b = b / scale;
+        total += a.abs();
+        even += (a - b).abs();
+        odd += (a + b).abs();
+    }
+    if even / total < PARITY_CLASSIFICATION_TOL {
         Parity::Even
-    } else if r_odd < PARITY_CLASSIFICATION_TOL {
+    } else if odd / total < PARITY_CLASSIFICATION_TOL {
         Parity::Odd
     } else {
         Parity::Indeterminate
@@ -278,57 +278,33 @@ fn parity_of_f64(v: &[f64]) -> Parity {
 /// max absolute value) are skipped to avoid spurious counts from
 /// numerical noise near boundary.
 fn count_nodes_f64(v: &[f64]) -> usize {
-    let max_abs = v.iter().fold(0.0_f64, |m, &x| m.max(x.abs()));
-    if max_abs < PARITY_ZERO_THRESHOLD {
-        return 0;
-    }
-    let threshold = max_abs * NODE_NOISE_FACTOR;
-    let mut count = 0usize;
-    let mut prev_sign = 0i32;
-    for &x in v {
-        if x.abs() < threshold {
-            continue;
-        }
-        let s = if x > 0.0 { 1 } else { -1 };
-        if prev_sign != 0 && s != prev_sign {
-            count += 1;
-        }
-        prev_sign = s;
-    }
-    count
+    grid_contract::nodes_f64(v)
 }
 
 /// Linearly interpolate a function defined on the FD grid
 /// `x_i = -λ + (i+1)h` (i = 0..n-1) at an arbitrary point `x ∈ [-λ, λ]`.
 /// Returns 0 outside the support (Dirichlet BC).
 fn interp_grid_f64(values: &[f64], lambda: f64, h: f64, x: f64) -> f64 {
-    let n = values.len();
     if x.abs() >= lambda {
         return 0.0;
     }
-    // x_i = -λ + (i+1)·h ⇒ i = (x + λ)/h − 1
-    let f_idx = (x + lambda) / h - 1.0;
-    let i_lo = f_idx.floor() as isize;
-    let i_hi = i_lo + 1;
-    if i_lo < 0 {
-        // Linear extrapolation toward the left Dirichlet boundary at x=-λ
-        // (where the function is 0). i_lo = -1 corresponds to x = -λ.
-        if i_lo == -1 && i_hi == 0 {
-            let frac = f_idx - i_lo as f64; // in [0, 1)
-            return frac * values[0];
+    // Measure from the nearer Dirichlet endpoint. Adding lambda to a point
+    // just below +lambda can round to 2*lambda and erase a nonzero value.
+    let from_right = x > 0.0;
+    let distance = if from_right { lambda - x } else { lambda + x };
+    let position = distance / h;
+    let lower = position.floor() as usize;
+    let fraction = position - lower as f64;
+    let sample = |index: usize| {
+        if index == 0 || index > values.len() {
+            0.0
+        } else if from_right {
+            values[values.len() - index]
+        } else {
+            values[index - 1]
         }
-        return 0.0;
-    }
-    if i_hi >= n as isize {
-        // Linear extrapolation toward the right Dirichlet boundary x=+λ.
-        if i_lo == n as isize - 1 {
-            let frac = f_idx - i_lo as f64;
-            return (1.0 - frac) * values[i_lo as usize];
-        }
-        return 0.0;
-    }
-    let frac = f_idx - i_lo as f64;
-    (1.0 - frac) * values[i_lo as usize] + frac * values[i_hi as usize]
+    };
+    (1.0 - fraction) * sample(lower) + fraction * sample(lower + 1)
 }
 
 /// Compute the prolate-wave educated guess k_λ.
@@ -341,18 +317,45 @@ fn interp_grid_f64(values: &[f64], lambda: f64, h: f64, x: f64) -> f64 {
 /// 4. Sample k_λ(u) = √u · Σ_{n=1}^{⌊λ/u⌋} h_λ(n·u) on a logarithmic
 ///    grid `u_i ∈ [λ⁻¹, λ]`. The grid is logarithmic to align with
 ///    the V_n Fourier basis of the Weil form.
-pub fn compute_k_lambda_f64(cfg: &ProlateConfig) -> Result<ProlateResult> {
+pub fn compute_k_lambda_finite_dirichlet_f64(cfg: &ProlateConfig) -> Result<ProlateResult> {
+    anyhow::ensure!(
+        cfg.lambda.is_finite() && cfg.lambda > 1.0 && cfg.lambda * cfg.lambda < u64::MAX as f64,
+        "prolate candidate needs lambda > 1 and a representable finite-sum cutoff"
+    );
+    anyhow::ensure!(
+        cfg.n_sample >= 2 && cfg.n_sample <= u32::MAX as usize,
+        "prolate candidate needs at least two samples"
+    );
+
     let start = std::time::Instant::now();
     let lambda = cfg.lambda;
     let n = cfg.n_grid;
     if n < 16 {
         anyhow::bail!("n_grid too small (got {}); need at least 16 to find h_4", n);
     }
+    // Admit all simultaneously retained dense storage before any allocation.
+    legendre::resource_budget(n, cfg.n_sample, (lambda * lambda).ceil() as usize, 53, true)?;
+    let m = build_pw_dense_f64(cfg)?;
     let h = 2.0 * lambda / ((n + 1) as f64);
 
-    // Build matrix and diagonalize.
-    let m = build_pw_dense_f64(cfg);
-    let eig = SymmetricEigen::new(m);
+    // Diagonalize the finite matrix, then pair each eigenvalue with its own
+    // column; the library QR can attach tiny eigenvalues to other columns.
+    let mut eig = SymmetricEigen::try_new(m.clone(), f64::EPSILON, n.saturating_mul(128))
+        .ok_or_else(|| anyhow::anyhow!("prolate eigensolver did not converge"))?;
+
+    anyhow::ensure!(
+        eig.eigenvalues
+            .iter()
+            .chain(eig.eigenvectors.iter())
+            .all(|x| x.is_finite()),
+        "prolate eigensolver returned nonfinite arithmetic"
+    );
+    let values = xc_numerics::symmetric_f64::complete_symmetric_eigensystem_f64(
+        m.as_slice(),
+        n,
+        eig.eigenvectors.as_mut_slice(),
+    )?;
+    eig.eigenvalues = nalgebra::DVector::from_vec(values);
 
     // Sort indices by ascending eigenvalue.
     let mut idx: Vec<usize> = (0..n).collect();
@@ -392,6 +395,13 @@ pub fn compute_k_lambda_f64(cfg: &ProlateConfig) -> Result<ProlateResult> {
             n_try
         )
     })?;
+    // For this irreducible symmetric tridiagonal matrix with negative
+    // off-diagonals, the ordered modes have 0 and 4 sign changes. The
+    // approximate parity/node heuristic must never silently relabel a mode.
+    anyhow::ensure!(
+        h0_idx == idx[0] && h4_idx == idx[4],
+        "prolate parity/node classification disagrees with ordered modes 0 and 4"
+    );
     let eigenvalue_0 = eig.eigenvalues[h0_idx];
     let eigenvalue_4 = eig.eigenvalues[h4_idx];
 
@@ -427,7 +437,8 @@ pub fn compute_k_lambda_f64(cfg: &ProlateConfig) -> Result<ProlateResult> {
         }
     }
 
-    // ∫h dx via midpoint rule (h · Σ v_i is the FD analog of ∫f dx).
+    // The trapezoidal integral of the piecewise-linear interpolant is
+    // exactly h * sum(v_i), since both endpoint samples are zero.
     let int_h0: f64 = h * h0.iter().sum::<f64>();
     let int_h4: f64 = h * h4.iter().sum::<f64>();
     if int_h0.abs() < INTEGRAL_ZERO_THRESHOLD {
@@ -468,7 +479,15 @@ pub fn compute_k_lambda_f64(cfg: &ProlateConfig) -> Result<ProlateResult> {
         })
         .collect();
 
+    anyhow::ensure!(
+        k_values.iter().all(|x| x.is_finite()) && c_0.is_finite(),
+        "prolate sampling produced nonfinite arithmetic"
+    );
     Ok(ProlateResult {
+        discretization: legacy_fd_discretization(),
+        resolution_budget: cfg.n_grid,
+        basis_dimension: n,
+        relative_operator_residual: None,
         k_values,
         u_grid,
         eigenvalue_0,
@@ -477,6 +496,14 @@ pub fn compute_k_lambda_f64(cfg: &ProlateConfig) -> Result<ProlateResult> {
         c_0,
         elapsed_seconds: start.elapsed().as_secs_f64(),
     })
+}
+
+/// Compute bounded-endpoint prolate modes by even Legendre Galerkin projection.
+/// `n_grid` is a maximum coefficient budget, not a spatial grid. Failure to
+/// resolve the omitted coupling returns an error. Sampling evaluates the
+/// polynomial modes directly; the Eisenstein sum retains open support.
+pub fn compute_k_lambda_f64(cfg: &ProlateConfig) -> Result<ProlateResult> {
+    legendre::compute_f64(cfg)
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -521,73 +548,7 @@ pub fn compare_xi_to_k_lambda_f64(
     u_grid: &[f64],
     k_values: &[f64],
 ) -> Result<ComparisonResult> {
-    if xi.len() != 2 * n_modes + 1 {
-        anyhow::bail!(
-            "xi has wrong length: got {}, expected 2N+1 = {}",
-            xi.len(),
-            2 * n_modes + 1
-        );
-    }
-    if u_grid.len() != k_values.len() {
-        anyhow::bail!(
-            "u_grid and k_values have different lengths: {} vs {}",
-            u_grid.len(),
-            k_values.len()
-        );
-    }
-    if u_grid.is_empty() {
-        anyhow::bail!("empty grid");
-    }
-
-    let l = (lambda * lambda).ln();
-    let inv_sqrt_l = 1.0 / l.sqrt();
-    let xi_0 = xi[n_modes];
-    let xi_pos: Vec<f64> = (1..=n_modes).map(|n| xi[n_modes + n]).collect();
-
-    let xi_values: Vec<f64> = u_grid
-        .iter()
-        .map(|&u| {
-            let phase_base = 2.0 * std::f64::consts::PI * (lambda * u).ln() / l;
-            let mut acc = xi_0;
-            for n in 1..=n_modes {
-                acc += 2.0 * xi_pos[n - 1] * (n as f64 * phase_base).cos();
-            }
-            inv_sqrt_l * acc
-        })
-        .collect();
-
-    // Optimal scalar minimizing ‖ξ − c·k‖₂² is c = ⟨ξ, k⟩/⟨k, k⟩.
-    let dot_xk: f64 = xi_values.iter().zip(k_values).map(|(x, k)| x * k).sum();
-    let dot_kk: f64 = k_values.iter().map(|k| k * k).sum();
-    if dot_kk < DOT_PRODUCT_ZERO_THRESHOLD {
-        anyhow::bail!("k_values are essentially zero on the grid");
-    }
-    let c = dot_xk / dot_kk;
-
-    // Residual and its norms.
-    let mut linf_error = 0.0_f64;
-    let mut linf_index = 0usize;
-    let mut l2_sq = 0.0_f64;
-    for (i, (&x, &k)) in xi_values.iter().zip(k_values).enumerate() {
-        let r = x - c * k;
-        l2_sq += r * r;
-        let abs_r = r.abs();
-        if abs_r > linf_error {
-            linf_error = abs_r;
-            linf_index = i;
-        }
-    }
-    let xi_linf = xi_values.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
-    let xi_l2 = xi_values.iter().map(|x| x * x).sum::<f64>().sqrt();
-
-    Ok(ComparisonResult {
-        optimal_scalar: c,
-        linf_error,
-        l2_error: l2_sq.sqrt(),
-        xi_linf,
-        xi_l2,
-        linf_index,
-    })
+    comparison::compare_f64(xi, n_modes, lambda, u_grid, k_values)
 }
 
 #[cfg(test)]
@@ -597,6 +558,10 @@ mod tests {
     #[test]
     fn f64_prolate_results_round_trip_without_loss() {
         let result = ProlateResult {
+            discretization: legacy_fd_discretization(),
+            resolution_budget: 17,
+            basis_dimension: 17,
+            relative_operator_residual: None,
             k_values: vec![0.25, 0.5],
             u_grid: vec![0.5, 2.0],
             eigenvalue_0: 3.25,
@@ -699,7 +664,7 @@ mod tests {
         // λ = 5 is large enough that the prolate operator looks like
         // a harmonic oscillator on its support.
         let cfg = ProlateConfig::new(5.0, 401);
-        let m = build_pw_dense_f64(&cfg);
+        let m = build_pw_dense_f64(&cfg).unwrap();
         let eig = SymmetricEigen::new(m);
         let mut evals: Vec<f64> = eig.eigenvalues.iter().copied().collect();
         evals.sort_by(|a, b| a.total_cmp(b));
@@ -762,8 +727,8 @@ mod tests {
 //
 // Mirrors the f64 prototype above, but operates entirely in `rug::Float`
 // arithmetic with truly-dynamic working precision (HP-200 through HP-5000+).
-// Uses the HP eigensolver in `xc_numerics::eigen` for tridiagonal QR and
-// shifted inverse iteration on the FD-discretized PW_λ matrix.
+// The ordinary route uses the bounded even Legendre block at guarded precision;
+// the explicitly named finite-Dirichlet route retains the historical FD model.
 // ===========================================================================
 
 #[cfg(feature = "hp")]
@@ -777,9 +742,7 @@ pub mod hp {
         resolve_or_compute_json_artifact, ArtifactCacheContext, ArtifactExecutionCacheRequest,
         CacheError, CacheQuality, SemanticKeyEnvelope, ToolkitVersion,
     };
-    use xc_numerics::eigen::{
-        tridiag_eigenvalues_hp, tridiag_eigenvector_for_value_hp, TridiagEigvecOptions,
-    };
+    use xc_numerics::eigen::{tridiag_eigenvalues_hp, TridiagEigvecOptions};
     use xc_numerics::quadrature::CacheMode;
 
     use super::super::ccm::LambdaSq;
@@ -806,7 +769,7 @@ pub mod hp {
         n_grid: usize,
         prec: u32,
     ) -> std::result::Result<Vec<Float>, CacheError> {
-        if artifact.schema_version != 2
+        if artifact.schema_version != 3
             || artifact.lambda != lambda.to_string()
             || artifact.lambda_precision_bits != lambda.prec()
             || artifact.grid_points != n_grid
@@ -848,24 +811,128 @@ pub mod hp {
         off_diag: &[Float],
         cache: &ArtifactCacheContext<'_>,
     ) -> std::result::Result<Vec<Float>, CacheError> {
+        prolate_spectrum_via_cache_model(lambda, n_grid, prec, diag, off_diag, cache, false)
+    }
+
+    // The finite-Dirichlet consumer selects these two ordered source values.
+    // Validate inside cache admission so corruption becomes a miss, not a sticky
+    // post-load failure. This is finite-matrix index replay, not continuum accuracy.
+    fn validate_fd_selected_spectrum(
+        d: &[Float],
+        b: &[Float],
+        values: &[Float],
+        p: u32,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            d.len() >= 5 && values.len() == d.len() && b.len() + 1 == d.len(),
+            "finite-Dirichlet spectrum shape mismatch"
+        );
+        let work = p + 64;
+        let norm = (0..d.len())
+            .map(|i| {
+                let mut row = Float::with_val(work, &d[i]).abs();
+                if i > 0 {
+                    row += Float::with_val(work, &b[i - 1]).abs();
+                }
+                if i < b.len() {
+                    row += Float::with_val(work, &b[i]).abs();
+                }
+                row
+            })
+            .max_by(Float::total_cmp)
+            .ok_or_else(|| anyhow::anyhow!("empty prolate matrix"))?;
+        let radius = (norm * (8 * d.len())) >> p;
+        for index in [0, 4] {
+            anyhow::ensure!(
+                values[index].is_finite(),
+                "nonfinite finite-Dirichlet eigenvalue"
+            );
+            let lo = Float::with_val(work, &values[index] - &radius);
+            let hi = Float::with_val(work, &values[index] + &radius);
+            anyhow::ensure!(
+                xc_numerics::eigen::tridiag_sturm_count_below_hp(d, b, &lo, work)? == index
+                    && xc_numerics::eigen::tridiag_sturm_count_below_hp(d, b, &hi, work)?
+                        == index + 1,
+                "finite-Dirichlet eigenvalue does not match its source-matrix index"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod admission_tests {
+        use super::*;
+
+        #[test]
+        fn cached_indices_use_stored_precision_not_half_precision() {
+            for p in [96u32, 128, 192, 257] {
+                for step in [1u32, 7] {
+                    let d: Vec<_> = (0..7).map(|i| Float::with_val(p, 2 + step * i)).collect();
+                    let b = vec![Float::with_val(p, 0); 6];
+                    validate_fd_selected_spectrum(&d, &b, &d, p).unwrap();
+                    super::super::legendre::hp::validate_spectrum(&d, &b, &d, p).unwrap();
+                    for index in [0, 4] {
+                        for exponent in [p / 2 + 4, p - 20] {
+                            let mut wrong = d.clone();
+                            wrong[index] += Float::with_val(p, 1) >> exponent;
+                            assert!(validate_fd_selected_spectrum(&d, &b, &wrong, p).is_err());
+                            assert!(super::super::legendre::hp::validate_spectrum(
+                                &d, &b, &wrong, p
+                            )
+                            .is_err());
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn finite_dirichlet_resource_gate_precedes_eigensolution() {
+            let p = 256;
+            let lambda = Float::with_val(p, 2);
+            let started = std::time::Instant::now();
+            let error = compute_k_lambda_finite_dirichlet(&lambda, 100001, 2, p, CacheMode::Off)
+                .unwrap_err();
+            assert!(error.to_string().contains("work budget"), "{error}");
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            // This documented setting is admissible under both memory and work policy.
+            super::super::legendre::resource_budget(512, 64, 13, 3386, false).unwrap();
+            assert!(super::super::legendre::resource_budget(100001, 2, 4, 3386, false).is_err());
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prolate_spectrum_via_cache_model(
+        lambda: &Float,
+        n_grid: usize,
+        prec: u32,
+        diag: &[Float],
+        off_diag: &[Float],
+        cache: &ArtifactCacheContext<'_>,
+        legendre: bool,
+    ) -> std::result::Result<Vec<Float>, CacheError> {
+        let model = if legendre {
+            "prolate-bounded-legendre-even-spectrum-v1"
+        } else {
+            "prolate-fd-working-precision-spectrum-v0.15.1-v2"
+        };
         let semantic_key = SemanticKeyEnvelope {
             schema_version: 1,
             artifact_kind: "prolate_eigenvalue_spectrum".to_owned(),
-            mathematical_semantics_version: "prolate-fd-exact-source-spectrum-v0.15.0-v1"
-                .to_owned(),
+            mathematical_semantics_version: model.to_owned(),
             resolved_mathematical_parameters: serde_json::json!({
                 "lambda": lambda.to_string(),
                 "lambda_precision_bits": lambda.prec(),
                 "grid_points": n_grid,
                 "precision_bits": prec,
                 "scalar_backend": "rug_mpfr",
-                "discretization": "centered_finite_difference_dirichlet_v1"
+                "discretization": if legendre { super::legendre::SPECTRUM_DISCRETIZATION } else { "centered_finite_difference_dirichlet_v1" }
             }),
             normalization: Some("ascending_eigenvalues".to_owned()),
             target: Some("prolate_wave_operator".to_owned()),
             subspace: None,
             source_data_identities: BTreeMap::new(),
-            algorithm_semantics: None,
+            algorithm_semantics: Some(xc_numerics::eigen::TRIDIAG_QR_SEMANTICS.to_owned()),
         };
         let logical_key = format!(
             "prolate/exact-lambda/{}/{n_grid}/{prec}",
@@ -900,7 +967,7 @@ pub mod hp {
                         ))
                     })?;
                 Ok(PortableProlateSpectrum {
-                    schema_version: 2,
+                    schema_version: 3,
                     lambda: lambda.to_string(),
                     lambda_precision_bits: lambda.prec(),
                     grid_points: n_grid,
@@ -908,7 +975,17 @@ pub mod hp {
                     eigenvalues: eigenvalues.iter().map(Float::to_string).collect(),
                 })
             },
-            |artifact| decode_prolate_spectrum(artifact, lambda, n_grid, prec).map(|_| ()),
+            |artifact| {
+                let values = decode_prolate_spectrum(artifact, lambda, n_grid, prec)?;
+                if legendre {
+                    super::legendre::hp::validate_spectrum(diag, off_diag, &values, prec)
+                        .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+                } else {
+                    validate_fd_selected_spectrum(diag, off_diag, &values, prec)
+                        .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+                }
+                Ok(())
+            },
         )?;
         decode_prolate_spectrum(&resolved.value, lambda, n_grid, prec)
     }
@@ -923,8 +1000,34 @@ pub mod hp {
         off_diag: &[Float],
         cache_directory: Option<&std::path::Path>,
     ) -> Result<Vec<Float>> {
+        exact_standalone_prolate_spectrum_model(
+            lambda,
+            n_grid,
+            prec,
+            diag,
+            off_diag,
+            cache_directory,
+            false,
+        )
+    }
+
+    fn exact_standalone_prolate_spectrum_model(
+        lambda: &Float,
+        n_grid: usize,
+        prec: u32,
+        diag: &[Float],
+        off_diag: &[Float],
+        cache_directory: Option<&std::path::Path>,
+        legendre: bool,
+    ) -> Result<Vec<Float>> {
+        let model = if legendre {
+            "prolate-bounded-legendre-even-spectrum-v1"
+        } else {
+            "prolate-fd-working-precision-spectrum-v0.15.1-v2"
+        };
         let identity = xc_cache::ContentDigest::sha256(&serde_json::to_vec(&(
-            "prolate-fd-exact-source-spectrum-v0.15.0-v1",
+            model,
+            xc_numerics::eigen::TRIDIAG_QR_SEMANTICS,
             lambda.to_string(),
             lambda.prec(),
             n_grid,
@@ -937,10 +1040,25 @@ pub mod hp {
                 let read = || -> Result<Vec<Float>> {
                     use std::io::Read;
                     let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+                    let limit = prolate_spectrum_json_limit(n_grid, prec.max(lambda.prec()))
+                        .ok_or_else(|| anyhow::anyhow!("prolate cache size bound overflow"))?;
+                    let entry = zip.by_name(&entry_name)?;
+                    if entry.size() > limit {
+                        anyhow::bail!("prolate cache exceeds decoded size bound");
+                    }
                     let mut bytes = Vec::new();
-                    zip.by_name(&entry_name)?.read_to_end(&mut bytes)?;
+                    entry.take(limit + 1).read_to_end(&mut bytes)?;
+                    if bytes.len() as u64 > limit {
+                        anyhow::bail!("prolate cache exceeds decoded size bound");
+                    }
                     let artifact: PortableProlateSpectrum = serde_json::from_slice(&bytes)?;
-                    Ok(decode_prolate_spectrum(&artifact, lambda, n_grid, prec)?)
+                    let values = decode_prolate_spectrum(&artifact, lambda, n_grid, prec)?;
+                    if legendre {
+                        super::legendre::hp::validate_spectrum(diag, off_diag, &values, prec)?;
+                    } else {
+                        validate_fd_selected_spectrum(diag, off_diag, &values, prec)?;
+                    }
+                    Ok(values)
                 };
                 match read() {
                     Ok(values) => return Ok(values),
@@ -950,7 +1068,7 @@ pub mod hp {
         }
         let eigenvalues = tridiag_eigenvalues_hp(diag, off_diag, prec)?;
         let artifact = PortableProlateSpectrum {
-            schema_version: 2,
+            schema_version: 3,
             lambda: lambda.to_string(),
             lambda_precision_bits: lambda.prec(),
             grid_points: n_grid,
@@ -958,6 +1076,11 @@ pub mod hp {
             eigenvalues: eigenvalues.iter().map(Float::to_string).collect(),
         };
         let values = decode_prolate_spectrum(&artifact, lambda, n_grid, prec)?;
+        if legendre {
+            super::legendre::hp::validate_spectrum(diag, off_diag, &values, prec)?;
+        } else {
+            validate_fd_selected_spectrum(diag, off_diag, &values, prec)?;
+        }
         if let Some(path) = path {
             let save = || -> Result<()> {
                 use std::io::Write;
@@ -1031,87 +1154,17 @@ pub mod hp {
     /// Lower off-diagonal: `-coef_minus / h²`.
     // Keep remainder arithmetic for the Rust 1.85 MSRV.
     #[allow(unknown_lints, clippy::manual_is_multiple_of)]
+    pub fn try_build_pw_matrix(
+        lambda: &Float,
+        n_grid: usize,
+        prec: u32,
+    ) -> Result<(Vec<Float>, Vec<Float>)> {
+        super::stencil::build_hp(lambda, n_grid, prec)
+    }
+
+    /// Compatibility wrapper; invalid input panics. Use the checked variant.
     pub fn build_pw_matrix(lambda: &Float, n_grid: usize, prec: u32) -> (Vec<Float>, Vec<Float>) {
-        // n_grid forced odd so x=0 is on the grid.
-        let n = if n_grid % 2 == 0 { n_grid + 1 } else { n_grid };
-
-        let lambda_sq = {
-            let mut t = lambda.clone();
-            t *= lambda;
-            t
-        };
-        let pi_v = Float::with_val(prec, rug::float::Constant::Pi);
-        let mut two_pi_lambda = pi_v.clone();
-        two_pi_lambda *= 2u32;
-        two_pi_lambda *= lambda;
-
-        // h = 2λ / (n+1)
-        let mut h = lambda.clone();
-        h *= 2u32;
-        let n_plus_1 = Float::with_val(prec, (n + 1) as u32);
-        h /= &n_plus_1;
-        let h_sq = {
-            let mut t = h.clone();
-            t *= &h;
-            t
-        };
-        let half_h = {
-            let mut t = h.clone();
-            t /= 2u32;
-            t
-        };
-
-        let mut diag: Vec<Float> = (0..n).map(|_| Float::with_val(prec, 0)).collect();
-        let mut off_diag: Vec<Float> = (0..n.saturating_sub(1))
-            .map(|_| Float::with_val(prec, 0))
-            .collect();
-
-        for i in 0..n {
-            // x_i = -λ + (i+1)·h  computed as: x = (i+1)·h - λ
-            let mut x = h.clone();
-            let i_plus_1 = Float::with_val(prec, (i + 1) as u32);
-            x *= &i_plus_1;
-            x -= lambda;
-
-            // x ± h/2
-            let mut x_minus_half = x.clone();
-            x_minus_half -= &half_h;
-            let mut x_plus_half = x.clone();
-            x_plus_half += &half_h;
-
-            // coef_minus = λ² - (x - h/2)²
-            let mut coef_minus = lambda_sq.clone();
-            let mut tmp = x_minus_half.clone();
-            tmp *= &x_minus_half;
-            coef_minus -= &tmp;
-
-            // coef_plus = λ² - (x + h/2)²
-            let mut coef_plus = lambda_sq.clone();
-            let mut tmp = x_plus_half.clone();
-            tmp *= &x_plus_half;
-            coef_plus -= &tmp;
-
-            // diagonal term: (coef_plus + coef_minus) / h² + (2π λ x)²
-            let mut sum = coef_plus.clone();
-            sum += &coef_minus;
-            sum /= &h_sq;
-            let mut potential = two_pi_lambda.clone();
-            potential *= &x;
-            let mut potential_sq = potential.clone();
-            potential_sq *= &potential;
-            sum += &potential_sq;
-            diag[i] = sum;
-
-            // off-diagonal term: -coef_minus / h²
-            if i > 0 {
-                let mut off = coef_minus.clone();
-                off /= &h_sq;
-                off = -off;
-                off_diag[i - 1] = off;
-            }
-        }
-
-        (diag, off_diag)
+        try_build_pw_matrix(lambda, n_grid, prec).expect("valid representable HP prolate grid")
     }
 
     /// Dense Galerkin forms for `PW_lambda` in a caller-supplied trial basis.
@@ -1129,6 +1182,131 @@ pub mod hp {
         pub gram: Vec<Float>,
     }
 
+    fn qualify_trial_basis(basis: &[Vec<Float>], p: u32) -> Result<()> {
+        // Reorthogonalize before forming Gram: otherwise rounding squares the
+        // basis condition number and can manufacture a positive null pivot.
+        let work = p
+            .checked_add(64)
+            .ok_or_else(|| anyhow::anyhow!("rank precision overflow"))?;
+        let threshold = Float::with_val(work, 1) >> (p / 2);
+        let mut orthogonal: Vec<Vec<Float>> = Vec::with_capacity(basis.len());
+        for column in basis {
+            let scale = column
+                .iter()
+                .map(|x| x.clone().abs())
+                .max_by(Float::total_cmp)
+                .unwrap();
+            anyhow::ensure!(
+                !scale.is_zero(),
+                "prolate trial basis contains a zero vector"
+            );
+            let mut v = column
+                .iter()
+                .map(|x| Float::with_val(work, x) / &scale)
+                .collect::<Vec<_>>();
+            let original = Float::with_val(work, Float::dot(v.iter().zip(&v)));
+            for _ in 0..2 {
+                for q in &orthogonal {
+                    let projection = Float::with_val(work, Float::dot(v.iter().zip(q)));
+                    for (x, y) in v.iter_mut().zip(q) {
+                        *x -= Float::with_val(work, &projection * y);
+                    }
+                }
+            }
+            let squared_norm = Float::with_val(work, Float::dot(v.iter().zip(&v)));
+            anyhow::ensure!(squared_norm.is_finite() && squared_norm > Float::with_val(work, &original * &threshold),
+                "prolate trial basis is dependent or numerically unresolved at the working precision");
+            let norm = squared_norm.sqrt();
+            for x in &mut v {
+                *x /= &norm;
+            }
+            orthogonal.push(v);
+        }
+        Ok(())
+    }
+
+    fn qualify_gram(gram: &[Float], n: usize, p: u32) -> Result<()> {
+        use rug::float::Round;
+        use xc_numerics::mpfr_interval::MpfrInterval as I;
+        anyhow::ensure!(
+            (33..=1_000_000).contains(&p) && n > 0 && n.checked_mul(n) == Some(gram.len()),
+            "invalid prolate Gram shape or precision"
+        );
+        anyhow::ensure!(
+            gram.iter().all(Float::is_finite),
+            "nonfinite prolate Gram form"
+        );
+        for i in 0..n {
+            for j in 0..i {
+                anyhow::ensure!(
+                    gram[i * n + j] == gram[j * n + i],
+                    "prolate Gram form must be exactly symmetric"
+                );
+            }
+        }
+        let scale_exp = gram.iter().filter_map(Float::get_exp).max().unwrap_or(0);
+        let work = p + 64;
+        anyhow::ensure!(
+            gram.len() as u128 * (u128::from(work).div_ceil(8) + 192) * 64 <= (8u128 << 30),
+            "prolate Gram qualification exceeds workspace budget"
+        );
+        let scaled = gram
+            .iter()
+            .map(|x| {
+                let mut value = Float::with_val(work, x);
+                value >>= scale_exp;
+                anyhow::ensure!(
+                    value.is_finite() && (x.is_zero() || !value.is_zero()),
+                    "prolate Gram scaling exceeds exponent range"
+                );
+                anyhow::ensure!(
+                    value
+                        .get_exp()
+                        .is_none_or(|e| i64::from(e).unsigned_abs() <= u64::from(work) * 4),
+                    "prolate Gram dynamic range is numerically unresolved"
+                );
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let max_diagonal = (0..n)
+            .map(|i| &scaled[i * n + i])
+            .max_by(|a, b| a.total_cmp(b))
+            .unwrap();
+        anyhow::ensure!(
+            max_diagonal > &0,
+            "prolate Gram form has no positive diagonal"
+        );
+        let shift = Float::with_val(work, max_diagonal) >> (p / 2);
+        let intervals = scaled
+            .iter()
+            .enumerate()
+            .map(|(k, x)| {
+                if k / n == k % n {
+                    I::new(
+                        Float::with_val_round(work, x - &shift, Round::Down).0,
+                        Float::with_val_round(work, x - &shift, Round::Up).0,
+                    )
+                } else {
+                    I::from_float(x, work)
+                }
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let rational = intervals
+            .iter()
+            .map(I::to_rational_interval)
+            .collect::<Vec<_>>();
+        match xc_certify::exact::interval_symmetric_ldlt_inertia_mpfr(&rational, n, work)? {
+            xc_certify::exact::IntervalInertiaResult::Conclusive {
+                positive,
+                negative: 0,
+                ..
+            } if positive == n => Ok(()),
+            _ => anyhow::bail!(
+                "prolate Gram form is dependent or insufficiently separated from singularity"
+            ),
+        }
+    }
+
     /// Build the generalized symmetric Ritz pair `(V^T PW V, V^T V)`.
     pub fn build_pw_subspace_forms(
         lambda: &Float,
@@ -1136,7 +1314,7 @@ pub mod hp {
         basis_vectors: &[Vec<Float>],
         precision_bits: u32,
     ) -> Result<ProlateSubspaceFormsHp> {
-        if precision_bits <= 32
+        if !(33..=1_000_000).contains(&precision_bits)
             || n_grid == 0
             || n_grid.is_multiple_of(2)
             || basis_vectors.is_empty()
@@ -1154,8 +1332,11 @@ pub mod hp {
         {
             anyhow::bail!("every prolate trial vector must be finite and match the grid dimension");
         }
+        if basis_vectors.len() > n_grid {
+            anyhow::bail!("prolate trial basis has more columns than the ambient dimension");
+        }
 
-        let (diagonal, off_diagonal) = build_pw_matrix(lambda, n_grid, precision_bits);
+        let (diagonal, off_diagonal) = try_build_pw_matrix(lambda, n_grid, precision_bits)?;
         let basis = basis_vectors
             .iter()
             .map(|vector| {
@@ -1165,6 +1346,7 @@ pub mod hp {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        qualify_trial_basis(&basis, precision_bits)?;
         let applied = basis
             .iter()
             .map(|vector| {
@@ -1187,8 +1369,10 @@ pub mod hp {
             })
             .collect::<Vec<_>>();
         let basis_dimension = basis.len();
-        let mut stiffness =
-            vec![Float::with_val(precision_bits, 0); basis_dimension * basis_dimension];
+        let entries = basis_dimension
+            .checked_mul(basis_dimension)
+            .ok_or_else(|| anyhow::anyhow!("prolate trial-basis shape overflows usize"))?;
+        let mut stiffness = vec![Float::with_val(precision_bits, 0); entries];
         let mut gram = stiffness.clone();
         for row in 0..basis_dimension {
             for column in 0..=row {
@@ -1218,6 +1402,10 @@ pub mod hp {
                     stiffness_terms,
                     precision_bits,
                 );
+                anyhow::ensure!(
+                    gram_value.is_finite() && stiffness_value.is_finite(),
+                    "prolate projected form is outside MPFR range"
+                );
                 let indices = [
                     row * basis_dimension + column,
                     column * basis_dimension + row,
@@ -1238,32 +1426,47 @@ pub mod hp {
     }
 
     /// Solve either algebraic generalized extreme of a nonorthogonal prolate
-    /// trial subspace. Positive definiteness of the Gram form is established
-    /// by the common MPFR Cholesky route and dependent bases fail closed.
+    /// trial subspace. Precision-scaled rank/conditioning gates reject unresolved
+    /// bases before the computed Cholesky solve. These are numerical admissibility
+    /// checks, not certificates of continuum accuracy or exact basis rank.
     pub fn solve_pw_subspace_extreme(
         forms: &ProlateSubspaceFormsHp,
         target: xc_core::EigenTarget,
     ) -> Result<xc_solver::DenseGeneralizedEigenpairReportHp> {
         use xc_core::DecimalLiteral;
+        if forms.basis_dimension > forms.ambient_dimension {
+            anyhow::bail!("prolate trial basis exceeds its ambient dimension");
+        }
+        qualify_gram(&forms.gram, forms.basis_dimension, forms.precision_bits)?;
         let problem = xc_solver::DenseGeneralizedProblemHp::new(
             &forms.stiffness,
             &forms.gram,
             forms.basis_dimension,
         )
         .map_err(anyhow::Error::new)?;
-        xc_solver::solve_dense_generalized_whitening_hp(
+        let tolerance = Float::with_val(forms.precision_bits, 1) >> (forms.precision_bits / 2);
+        let stopping_tolerance = DecimalLiteral::new(tolerance.to_string())?;
+        let mut report = xc_solver::solve_dense_generalized_whitening_hp(
             &problem,
             &xc_solver::GeneralizedExtremeConfigHp {
                 target,
                 precision_bits: forms.precision_bits,
-                absolute_residual_tolerance: DecimalLiteral::new("1e-30")?,
-                scaled_backward_error_tolerance: DecimalLiteral::new("1e-30")?,
-                ritz_value_stability_tolerance: DecimalLiteral::new("1e-30")?,
+                absolute_residual_tolerance: stopping_tolerance.clone(),
+                scaled_backward_error_tolerance: stopping_tolerance.clone(),
+                ritz_value_stability_tolerance: stopping_tolerance.clone(),
                 maximum_iterations: 100,
                 minimum_iterations: 1,
             },
         )
-        .map_err(anyhow::Error::new)
+        .map_err(anyhow::Error::new)?;
+        report
+            .algorithm
+            .push_str(";prolate_precision_scaled_ritz_stopping_v2");
+        anyhow::ensure!(
+            report.scaled_backward_error <= tolerance,
+            "prolate Ritz pair fails the precision-scaled backward-error requirement"
+        );
+        Ok(report)
     }
 
     /// Detect parity of vector `v` under index reflection `i ↔ n-1-i`.
@@ -1275,50 +1478,43 @@ pub mod hp {
         Even,
         /// `v(x) ≈ -v(-x)` to working precision.
         Odd,
-        /// Neither even nor odd (mixed-parity or below the zero
-        /// threshold).
+        /// Neither even nor odd, including zero or nonfinite input.
         Indeterminate,
     }
 
     /// Classify the parity of HP vector `v` under the index reflection
     /// `i ↔ n-1-i` (which corresponds to `x ↔ -x` on the symmetric FD
-    /// grid). Returns `HpParity::Indeterminate` when the vector's
-    /// total mass is below the zero threshold or both even/odd
+    /// grid). Returns `HpParity::Indeterminate` when the
+    /// vector is zero/nonfinite or both even/odd
     /// deviations exceed the classification tolerance.
     pub fn parity_of(v: &[Float], prec: u32) -> HpParity {
-        let n = v.len();
-        if n == 0 {
+        if !(32..=1_000_000).contains(&prec) || v.is_empty() || v.iter().any(|x| !x.is_finite()) {
             return HpParity::Indeterminate;
         }
-        // Build threshold: 1e-30 (HP literal).
-        let zero_thresh = Float::with_val(prec, Float::parse("1e-30").unwrap());
-        let class_tol = Float::with_val(prec, Float::parse("1e-3").unwrap());
-
-        let mut even_dev = Float::with_val(prec, 0);
-        let mut odd_dev = Float::with_val(prec, 0);
+        let scale = v
+            .iter()
+            .map(|x| x.clone().abs())
+            .max_by(|a, b| a.partial_cmp(b).expect("finite entries"))
+            .unwrap();
+        if scale.is_zero() {
+            return HpParity::Indeterminate;
+        }
         let mut total = Float::with_val(prec, 0);
-        for i in 0..(n / 2) {
-            let a = &v[i];
-            let b = &v[n - 1 - i];
-            let mut diff = a.clone();
-            diff -= b;
-            even_dev += diff.abs();
-            let mut sum = a.clone();
-            sum += b;
-            odd_dev += sum.abs();
+        let mut even = total.clone();
+        let mut odd = total.clone();
+        for (a, b) in v.iter().zip(v.iter().rev()) {
+            let a = Float::with_val(prec, a / &scale);
+            let b = Float::with_val(prec, b / &scale);
             total += a.clone().abs();
-            total += b.clone().abs();
+            even += Float::with_val(prec, &a - &b).abs();
+            odd += Float::with_val(prec, &a + &b).abs();
         }
-        if total < zero_thresh {
-            return HpParity::Indeterminate;
-        }
-        let mut r_even = even_dev.clone();
-        r_even /= &total;
-        let mut r_odd = odd_dev.clone();
-        r_odd /= &total;
-        if r_even < class_tol {
+        even /= &total;
+        odd /= total;
+        let tolerance = Float::with_val(prec, Float::parse("1e-3").unwrap());
+        if even < tolerance {
             HpParity::Even
-        } else if r_odd < class_tol {
+        } else if odd < tolerance {
             HpParity::Odd
         } else {
             HpParity::Indeterminate
@@ -1326,116 +1522,54 @@ pub mod hp {
     }
 
     /// Count zero crossings of HP vector `v`. Values below
-    /// `max_abs * 1e-6` are skipped (boundary noise).
+    /// `max_abs * 1e-6` are skipped (boundary noise). Invalid input panics;
+    /// use `try_count_nodes` for fallible validation.
     pub fn count_nodes(v: &[Float], prec: u32) -> usize {
-        if v.is_empty() {
-            return 0;
-        }
-        let zero_thresh = Float::with_val(prec, Float::parse("1e-30").unwrap());
-        let noise_factor = Float::with_val(prec, Float::parse("1e-6").unwrap());
+        try_count_nodes(v, prec).expect("valid finite HP node-count samples and precision")
+    }
 
-        // max_abs
-        let mut max_abs = Float::with_val(prec, 0);
-        for x in v {
-            let a = x.clone().abs();
-            if a > max_abs {
-                max_abs = a;
-            }
-        }
-        if max_abs < zero_thresh {
-            return 0;
-        }
-        let mut threshold = max_abs.clone();
-        threshold *= &noise_factor;
-
-        let mut count = 0usize;
-        let mut prev_sign = 0i32;
-        let zero = Float::with_val(prec, 0);
-        for x in v {
-            let abs_x = x.clone().abs();
-            if abs_x < threshold {
-                continue;
-            }
-            let s: i32 = if *x > zero { 1 } else { -1 };
-            if prev_sign != 0 && s != prev_sign {
-                count += 1;
-            }
-            prev_sign = s;
-        }
-        count
+    /// Count sign changes after removing samples smaller than 1e-6 of the
+    /// largest magnitude. This scale-invariant heuristic is not a Sturm index.
+    pub fn try_count_nodes(v: &[Float], prec: u32) -> Result<usize> {
+        super::grid_contract::nodes_hp(v, prec)
     }
 
     /// Linearly interpolate HP function `values` defined on the FD grid
     /// `x_i = -λ + (i+1)h` at point `x ∈ [-λ, λ]`. Returns zero outside
     /// the support (Dirichlet BC).
     ///
-    /// `h` is the grid spacing as an HP value.
+    /// `h` is the grid spacing as an HP value. Invalid input panics;
+    /// use `try_interp_grid` for fallible validation.
     pub fn interp_grid(values: &[Float], lambda: &Float, h: &Float, x: &Float, prec: u32) -> Float {
-        let n = values.len();
-        let zero = Float::with_val(prec, 0);
+        try_interp_grid(values, lambda, h, x, prec)
+            .expect("valid representable HP Dirichlet interpolation")
+    }
 
-        // If |x| >= λ, return zero.
-        let abs_x = x.clone().abs();
-        if abs_x >= *lambda {
-            return zero;
-        }
-
-        // f_idx = (x + λ) / h - 1  (HP arithmetic)
-        let mut f_idx = x.clone();
-        f_idx += lambda;
-        f_idx /= h;
-        f_idx -= 1u32;
-
-        // i_lo = floor(f_idx) — convert HP Float floor-result to i64 via
-        // the Integer trait (requires the `integer` feature on rug, which
-        // the workspace enables).
-        let f_idx_floor = f_idx.clone().floor();
-        let i_lo_f = f_idx_floor.clone();
-        // to_integer() returns Option<Integer> (None for NaN/Inf — our
-        // values are always finite).
-        let i_lo_int = i_lo_f.to_integer().expect("interp f_idx must be finite");
-        let i_lo: i64 = i_lo_int.to_i64().unwrap_or(0);
-        let i_hi = i_lo + 1;
-
-        // Compute fractional part: frac = f_idx - i_lo (still HP).
-        let mut frac = f_idx.clone();
-        frac -= &i_lo_f;
-
-        if i_lo < 0 {
-            // Linear extrapolation toward x=-λ where f=0.
-            // i_lo == -1 corresponds to x = -λ (Dirichlet boundary).
-            if i_lo == -1 && i_hi == 0 {
-                let mut result = frac.clone();
-                result *= &values[0];
-                return result;
-            }
-            return zero;
-        }
-        if i_hi >= n as i64 {
-            if i_lo == (n as i64) - 1 {
-                let mut t = Float::with_val(prec, 1);
-                t -= &frac;
-                t *= &values[i_lo as usize];
-                return t;
-            }
-            return zero;
-        }
-        // (1 - frac) · v[i_lo] + frac · v[i_hi]
-        let mut one_minus_frac = Float::with_val(prec, 1);
-        one_minus_frac -= &frac;
-        let mut result = one_minus_frac;
-        result *= &values[i_lo as usize];
-        let mut term2 = frac.clone();
-        term2 *= &values[i_hi as usize];
-        result += &term2;
-        result
+    /// Checked linear interpolation on the uniform grid with zero endpoint
+    /// values. Spacing must equal 2*lambda/(N+1) rounded at working precision.
+    /// Returns zero outside support. Invalid/nonfinite data or arithmetic fail.
+    pub fn try_interp_grid(
+        values: &[Float],
+        lambda: &Float,
+        h: &Float,
+        x: &Float,
+        prec: u32,
+    ) -> Result<Float> {
+        super::grid_contract::validate_grid(values, lambda, h, prec)?;
+        anyhow::ensure!(x.is_finite(), "interpolation point must be finite");
+        let result = super::grid_contract::interpolate(values, lambda, x, prec);
+        anyhow::ensure!(
+            result.is_finite(),
+            "interpolation result is outside MPFR range"
+        );
+        Ok(result)
     }
 
     // ===========================================================================
     // Prolate eigenvalue cache
     // ===========================================================================
     //
-    // The dominant cost in `compute_k_lambda` at HP-1000 is the full
+    // The dominant cost in the historical finite-Dirichlet route at HP-1000 is the full
     // tridiagonal QR on PW_λ — at N=8001 prec=3338 this is ~30 minutes
     // of wall-time. The output is just the eigenvalue vector (a few MB
     // serialized at HP-1000). It's deterministic in `(λ², n_grid, prec)`
@@ -1448,17 +1582,8 @@ pub mod hp {
     // fresh spectrum on a miss. Managed remote resolution uses
     // `prolate_spectrum_via_cache`.
     //
-    // Cache key is `λ²_int = round(λ²)` — only used when the round-trip
-    // is exact (i.e. λ² is an integer like 13, 100, 1000 in our publication
-    // configs). Non-integer λ² silently bypasses the cache.
-
-    /// Tolerance for structural identity checks on a loaded prolate
-    /// eigenvalue cache file. Mirror of `quadrature::hp` cache check
-    /// tolerance.
-    fn prolate_cache_tol(prec: u32) -> Float {
-        use rug::ops::Pow;
-        Float::with_val(prec, 2).pow(-((prec as i32) - 8))
-    }
+    // The historical integer key is used only for integer source lambda.
+    // Every other cutoff uses an exact-source identity; it does not bypass caching.
 
     /// Verify a loaded eigenvalue vector satisfies the prolate-spectrum
     /// structural identities:
@@ -1466,10 +1591,9 @@ pub mod hp {
     ///   1. Count = `n_grid` (after rounding to odd if the caller's
     ///      n_grid was even).
     ///   2. Ascending order: `e[k] ≤ e[k+1]` for all `k`.
-    ///   3. The smallest eigenvalue ≈ 2π·λ² (the asymptotic prediction
-    ///      for the prolate operator's ground state). At our scales the
-    ///      relative deviation is ≲ 1% — far above any cache-corruption
-    ///      noise.
+    ///   3. Every value reproduces its ordered index in the stored finite
+    ///      matrix at a precision-scaled radius; continuum asymptotics do not
+    ///      determine whether a finite-grid spectrum is valid.
     ///
     /// Returns `None` if all identities hold; `Some(reason)` otherwise.
     fn prolate_cache_structural_check(
@@ -1498,44 +1622,26 @@ pub mod hp {
             }
         }
 
-        // Ground state ≈ 2π·λ². Tolerance is loose: 5% relative,
-        // since the FD discretization itself contributes ~0.1-1%
-        // deviation from the continuum value.
-        let pi_v = Float::with_val(prec, rug::float::Constant::Pi);
-        let mut expected_e0 = pi_v.clone();
-        expected_e0 *= 2u32;
-        expected_e0 *= Float::with_val(prec, lambda_sq.value_f64);
-        let mut diff = evals[0].clone();
-        diff -= &expected_e0;
-        let abs_diff = diff.abs();
-        let mut tol_rel = expected_e0.clone().abs();
-        tol_rel *= 5u32;
-        tol_rel /= 100u32; // 5% of expected
-        if !abs_diff
-            .cmp_abs(&tol_rel)
-            .map(|o| o.is_lt())
-            .unwrap_or(false)
-        {
-            return Some(format!(
-                "ground state {} deviates from 2πλ² ≈ {} by {} (5% tol)",
-                evals[0], expected_e0, abs_diff
-            ));
+        if evals.iter().any(|value| !value.is_finite()) {
+            return Some("nonfinite prolate eigenvalue".into());
         }
-
-        // Per-element finiteness/precision sanity (cheap belt-and-
-        // suspenders against hot-tip values like NaN slipping through
-        // the JSON parser).
-        let tol = prolate_cache_tol(prec);
-        for (k, e) in evals.iter().enumerate() {
-            if e.is_nan() {
-                return Some(format!("eigenvalue {} is NaN", k));
-            }
-            if e.is_infinite() {
-                return Some(format!("eigenvalue {} is infinite", k));
-            }
-            // Suppress unused warning — tol is passed for parity with
-            // future identity checks; not currently used.
-            let _ = &tol;
+        if !(32..=1_000_000).contains(&prec)
+            || n_expected == 0
+            || !lambda_sq.value_f64.is_finite()
+            || lambda_sq.value_f64 <= 0.0
+        {
+            return Some("invalid finite prolate source dimensions or cutoff".into());
+        }
+        if let Err(error) = super::legendre::resource_budget(n_expected, 2, 0, prec, false) {
+            return Some(error.to_string());
+        }
+        let lambda = Float::with_val(prec, lambda_sq.value_f64).sqrt();
+        let (d, b) = match try_build_pw_matrix(&lambda, n_expected, prec) {
+            Ok(matrix) => matrix,
+            Err(error) => return Some(error.to_string()),
+        };
+        if let Err(error) = super::legendre::hp::validate_spectrum(&d, &b, evals, prec) {
+            return Some(error.to_string());
         }
 
         None
@@ -1583,10 +1689,34 @@ pub mod hp {
     /// Parse a prolate eigenvalue cache JSON.
     /// Expects schema_version 1 envelope format. Returns `None` on any
     /// structural mismatch or a stale `toolkit_version`.
-    fn parse_prolate_cache_json(data: &str, n_expected: usize, prec: u32) -> Option<Vec<Float>> {
+    fn parse_prolate_cache_json(
+        data: &str,
+        lambda_sq: LambdaSq,
+        n_expected: usize,
+        prec: u32,
+    ) -> Option<Vec<Float>> {
         let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
         let obj = parsed.as_object()?;
+        if !(32..=1_000_000).contains(&prec)
+            || n_expected == 0
+            || n_expected >= u32::MAX as usize
+            || obj.get("schema_version").and_then(|v| v.as_u64()) != Some(1)
+            || obj.get("lambda_sq_identity").and_then(|v| v.as_str())
+                != Some(lambda_sq.filename_str().as_str())
+            || obj.get("lambda_sq_mode").and_then(|v| v.as_str()) != Some(lambda_sq.mode_str())
+            || obj.get("n_grid").and_then(|v| v.as_u64()) != Some(n_expected as u64)
+            || obj.get("precision_bits").and_then(|v| v.as_u64()) != Some(u64::from(prec))
+        {
+            return None;
+        }
 
+        if obj.get("arithmetic_semantics").and_then(|v| v.as_str())
+            != Some("prolate-fd-working-precision-v2")
+            || obj.get("qr_arithmetic").and_then(|v| v.as_str())
+                != Some(xc_numerics::eigen::TRIDIAG_QR_SEMANTICS)
+        {
+            return None;
+        }
         let file_ver = obj.get("toolkit_version").and_then(|v| v.as_str())?;
         if prolate_version_is_older(file_ver, &prolate_effective_min_version()) {
             return None;
@@ -1603,16 +1733,35 @@ pub mod hp {
         Some(evals)
     }
 
-    /// Returns `true` if version string `a` is strictly older than `b`.
+    #[cfg(test)]
+    mod exhaustive_resumed_version_contract {
+        use super::*;
+        #[test]
+        fn exhaustive_resumed_prolate_rejects_malformed_future_versions() {
+            for version in ["999.0.bad", "999.0", "999.00.0", "999.0.0-"] {
+                assert!(
+                    prolate_version_is_older(version, "0.13.0"),
+                    "accepted {version}"
+                );
+            }
+            assert!(!prolate_version_is_older("0.15.1", "0.13.0"));
+        }
+        #[test]
+        fn exhaustive_resumed_prolate_prerelease_is_below_release_floor() {
+            assert!(prolate_version_is_older("0.13.0-alpha", "0.13.0"));
+            assert!(!prolate_version_is_older("0.13.0", "0.13.0"));
+        }
+    }
+
+    /// Reject an invalid version or one below the required producer floor.
     fn prolate_version_is_older(a: &str, b: &str) -> bool {
-        let parse = |s: &str| -> (u64, u64, u64) {
-            let mut parts = s.splitn(3, '.');
-            let major = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            let minor = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            let patch = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            (major, minor, patch)
-        };
-        parse(a) < parse(b)
+        match (
+            xc_cache::ToolkitVersion::parse(a),
+            xc_cache::ToolkitVersion::parse(b),
+        ) {
+            (Ok(actual), Ok(minimum)) => actual < minimum,
+            _ => true,
+        }
     }
 
     fn warn_prolate_cache_skip(path: &std::path::Path, reason: &str) {
@@ -1623,20 +1772,86 @@ pub mod hp {
         );
     }
 
+    // Generated point decimals use fewer than p digits plus sign/exponent.
+    // Allow generous metadata overhead while bounding hostile ZIP expansion.
+    fn prolate_spectrum_json_limit(count: usize, precision_bits: u32) -> Option<u64> {
+        (count as u64)
+            .checked_add(2)?
+            .checked_mul(u64::from(precision_bits).checked_add(128)?)?
+            .checked_add(65_536)
+            .filter(|limit| *limit < u64::MAX)
+    }
+
     fn load_prolate_eigvals_from_zip(
         zip_path: &std::path::Path,
         json_filename: &str,
+        lambda_sq: LambdaSq,
         n_expected: usize,
         prec: u32,
     ) -> Option<(Vec<Float>, String)> {
         use std::io::Read;
         let file = std::fs::File::open(zip_path).ok()?;
         let mut archive = zip::ZipArchive::new(file).ok()?;
-        let mut entry = archive.by_name(json_filename).ok()?;
+        let limit = prolate_spectrum_json_limit(n_expected, prec)?;
+        let entry = archive.by_name(json_filename).ok()?;
+        if entry.size() > limit {
+            return None;
+        }
         let mut data = String::new();
-        entry.read_to_string(&mut data).ok()?;
-        let parsed = parse_prolate_cache_json(&data, n_expected, prec)?;
+        entry.take(limit + 1).read_to_string(&mut data).ok()?;
+        if data.len() as u64 > limit {
+            return None;
+        }
+        let parsed = parse_prolate_cache_json(&data, lambda_sq, n_expected, prec)?;
         Some((parsed, data))
+    }
+
+    #[cfg(test)]
+    mod standalone_zip_size_contract {
+        use super::*;
+        #[test]
+        fn bounded_zip_read_accepts_generated_shape_and_rejects_oversized_decoded_json() {
+            use std::io::Write;
+            let root = std::env::temp_dir().join(format!(
+                "xc-prolate-size-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let lambda = LambdaSq::integer(1);
+            let name = "spectrum.json";
+            let json = serde_json::json!({ "schema_version":1, "toolkit_version":PROLATE_TOOLKIT_VERSION,
+                "arithmetic_semantics":"prolate-fd-working-precision-v2", "qr_arithmetic":xc_numerics::eigen::TRIDIAG_QR_SEMANTICS, "lambda_sq_identity":lambda.filename_str(),
+                "lambda_sq_mode":lambda.mode_str(), "n_grid":1, "precision_bits":64, "eigenvalues":["1.5"] }).to_string();
+            for oversized in [false, true] {
+                let path = root.join(if oversized { "large.zip" } else { "valid.zip" });
+                let mut data = json.clone();
+                if oversized {
+                    data.push_str(
+                        &" ".repeat(prolate_spectrum_json_limit(1, 64).unwrap() as usize),
+                    );
+                }
+                assert!(parse_prolate_cache_json(&data, lambda, 1, 64).is_some());
+                let mut writer = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+                writer
+                    .start_file(
+                        name,
+                        zip::write::SimpleFileOptions::default()
+                            .compression_method(zip::CompressionMethod::Deflated),
+                    )
+                    .unwrap();
+                writer.write_all(data.as_bytes()).unwrap();
+                writer.finish().unwrap();
+                assert_eq!(
+                    load_prolate_eigvals_from_zip(&path, name, lambda, 1, 64).is_some(),
+                    !oversized
+                );
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     /// Try to load prolate eigenvalues from cache for `(λ², n_grid, prec)`.
@@ -1686,7 +1901,7 @@ pub mod hp {
             return None;
         }
         let json_filename = prolate_cache_filename(lambda_sq, n_grid, prec);
-        match load_prolate_eigvals_from_zip(&zip_path, &json_filename, n_grid, prec) {
+        match load_prolate_eigvals_from_zip(&zip_path, &json_filename, lambda_sq, n_grid, prec) {
             Some((evals, _json_string)) => {
                 if let Some(reason) =
                     prolate_cache_structural_check(&evals, n_grid, lambda_sq, prec)
@@ -1721,8 +1936,11 @@ pub mod hp {
         let json = serde_json::json!({
             "schema_version": 1,
             "toolkit_version": PROLATE_TOOLKIT_VERSION,
+            "arithmetic_semantics": "prolate-fd-working-precision-v2",
+            "qr_arithmetic": xc_numerics::eigen::TRIDIAG_QR_SEMANTICS,
             "lambda_sq": lambda_sq.value_f64,
             "lambda_sq_mode": lambda_sq.mode_str(),
+            "lambda_sq_identity": lambda_sq.filename_str(),
             "n_grid": n_grid,
             "precision_bits": prec,
             "eigenvalues": strs,
@@ -1765,7 +1983,7 @@ pub mod hp {
                 return;
             }
         }
-        if let Err(e) = std::fs::write(&zip_path, &buf) {
+        if let Err(e) = xc_cache::atomic_replace_cache_file(&zip_path, &buf) {
             eprintln!(
                 "[prolate_cache] WARNING: could not write {}: {}",
                 zip_path.display(),
@@ -1820,6 +2038,8 @@ pub mod hp {
     /// Aggregate report from `verify_prolate_eigvals_cache_dir`.
     #[derive(Debug, Clone)]
     pub struct ProlateCacheVerifyReport {
+        /// Identity of finite-matrix cache admission and replay.
+        pub validation_semantics: &'static str,
         /// Directory that was scanned.
         pub directory: std::path::PathBuf,
         /// One status entry per file in `directory`.
@@ -1877,6 +2097,10 @@ pub mod hp {
         Some((lambda_sq, n_grid, prec))
     }
 
+    /// Finite-source ordered-index replay policy for legacy cache inspection.
+    pub const PROLATE_CACHE_VALIDATION_SEMANTICS: &str =
+        "prolate_cache_ordered_enclosure_replay_v3";
+
     /// Walk the prolate eigenvalue cache directory and structurally
     /// verify every `lambda_sq{L}_ngrid{N}_prec{P}.json[.zip]` file.
     /// Returns a per-file status report; does not mutate any files.
@@ -1887,6 +2111,7 @@ pub mod hp {
 
         if !dir.exists() {
             return Ok(ProlateCacheVerifyReport {
+                validation_semantics: PROLATE_CACHE_VALIDATION_SEMANTICS,
                 directory: dir.to_path_buf(),
                 statuses,
             });
@@ -1920,11 +2145,12 @@ pub mod hp {
 
             let parsed: Option<Vec<Float>> = if name.ends_with(".json.zip") {
                 let json_filename = prolate_cache_filename(lambda_sq, n_grid, prec);
-                load_prolate_eigvals_from_zip(&path, &json_filename, n_grid, prec).map(|(p, _)| p)
+                load_prolate_eigvals_from_zip(&path, &json_filename, lambda_sq, n_grid, prec)
+                    .map(|(p, _)| p)
             } else {
                 std::fs::read_to_string(&path)
                     .ok()
-                    .and_then(|data| parse_prolate_cache_json(&data, n_grid, prec))
+                    .and_then(|data| parse_prolate_cache_json(&data, lambda_sq, n_grid, prec))
             };
 
             let evals = match parsed {
@@ -1963,6 +2189,7 @@ pub mod hp {
         }
 
         Ok(ProlateCacheVerifyReport {
+            validation_semantics: PROLATE_CACHE_VALIDATION_SEMANTICS,
             directory: dir.to_path_buf(),
             statuses,
         })
@@ -1972,6 +2199,15 @@ pub mod hp {
     /// values in HP.
     #[derive(Debug, Clone)]
     pub struct HpProlateResult {
+        /// Bounded Legendre or explicit historical finite-Dirichlet model.
+        pub discretization: String,
+        /// Caller-supplied maximum resolution budget (`n_grid`).
+        pub resolution_budget: usize,
+        /// Retained even Legendre coefficient count, or FD interior node count.
+        pub basis_dimension: usize,
+        /// Computed omitted-coupling plus finite residual diagnostic, not a
+        /// certified continuum eigenfunction or sampling error bound.
+        pub relative_operator_residual: Option<Float>,
         /// k_λ sampled on `u_grid` (HP).
         pub k_values: Vec<Float>,
         /// Sample points u_i ∈ [λ⁻¹, λ], logarithmically spaced (HP).
@@ -1993,15 +2229,19 @@ pub mod hp {
     /// HP version of `compute_k_lambda_f64`.
     ///
     /// Pipeline:
-    ///   1. Build PW_λ tridiagonal at HP.
+    ///   1. Build the even bounded-endpoint Legendre tridiagonal at HP.
     ///   2. Compute all eigenvalues in HP via `tridiag_eigenvalues_hp`.
     ///   3. Recover lowest-lying eigenvectors via shifted inverse iteration
-    ///      and identify h_0 (smallest, even, 0 nodes) and h_4 (even, 4 nodes).
+    ///      and select even-block indices 0 and 2 (h_0 and h_4).
     ///   4. Form h_λ = h_4 - r·h_0 with r = ∫h_4 / ∫h_0 in HP.
     ///   5. Sample k_λ on a logarithmic grid in [λ⁻¹, λ] in HP.
     ///
-    /// `n_grid` is the number of FD interior points (forced odd).
-    /// `n_sample` is the number of comparison-grid points.
+    /// `n_grid` is the maximum number of even Legendre coefficients. This
+    /// legacy parameter is a resolution budget, not a spatial sampling grid.
+    /// Unresolved truncation returns an error, without a Dirichlet fallback.
+    /// `n_sample` is the number of comparison-grid points. The source cutoff is
+    /// rounded to `prec` bits; Legendre assembly, solve, and polynomial evaluation
+    /// use `prec + 64` bits, and returned samples/scalars are rounded to `prec`.
     ///
     /// `mode` selects the prolate-eigenvalue cache strategy (see
     /// [`xc_numerics::quadrature::CacheMode`]): `Off` always recomputes
@@ -2017,7 +2257,7 @@ pub mod hp {
         prec: u32,
         mode: CacheMode,
     ) -> Result<HpProlateResult> {
-        compute_k_lambda_inner(
+        compute_k_lambda_legendre_inner(
             lambda,
             n_grid,
             n_sample,
@@ -2029,20 +2269,22 @@ pub mod hp {
     /// Computes the HP prolate comparison kernel through the common cache fabric.
     ///
     /// # Mathematical semantics
-    /// Uses the centered finite-difference prolate-wave operator and constructs
+    /// Uses the bounded-endpoint even Legendre prolate-wave operator and constructs
     /// the normalized `h_0`/`h_4` comparison kernel on the requested sample grid.
     ///
     /// # Precision
-    /// Matrix construction, eigensolution, eigenvectors, and sampling use MPFR at
-    /// `prec` bits. The cached artifact contains the complete ordered spectrum.
+    /// Legendre assembly, eigensolution, eigenvectors, and sampling use MPFR at
+    /// `prec + 64` bits; returned samples and scalars are rounded to `prec`.
+    /// The cached artifact contains the complete ordered spectrum.
     ///
     /// # Failure states
     /// Invalid dimensions, eigensolver failures, corrupt or incompatible cache
     /// artifacts, required-cache misses, and missing writable overlays are errors.
     ///
     /// # Assurance and validity
-    /// Cached spectra are dimension checked, finite, and sorted before use. The
-    /// downstream eigenvectors are recomputed against the current tridiagonal.
+    /// Cached spectra are dimension checked, finite, sorted, and index-replayed
+    /// against the current tridiagonal before use. Downstream eigenvectors are
+    /// recomputed against that same tridiagonal.
     ///
     /// # Cache effects
     /// All lookup and persistence follows `cache`; this function has no direct
@@ -2059,12 +2301,91 @@ pub mod hp {
         prec: u32,
         cache: &ArtifactCacheContext<'_>,
     ) -> Result<HpProlateResult> {
+        compute_k_lambda_legendre_inner(
+            lambda,
+            n_grid,
+            n_sample,
+            prec,
+            ProlateCacheRoute::Fabric(cache),
+        )
+    }
+
+    /// Explicit compatibility route for the historical finite Dirichlet model.
+    /// This has logarithmically slow endpoint convergence for small cutoffs and
+    /// is not the ordinary bounded-endpoint prolate approximation.
+    pub fn compute_k_lambda_finite_dirichlet(
+        lambda: &Float,
+        n_grid: usize,
+        n_sample: usize,
+        prec: u32,
+        mode: CacheMode,
+    ) -> Result<HpProlateResult> {
+        compute_k_lambda_inner(
+            lambda,
+            n_grid,
+            n_sample,
+            prec,
+            ProlateCacheRoute::Standalone(mode),
+        )
+    }
+
+    /// Managed-cache counterpart of the explicit finite-Dirichlet route.
+    pub fn compute_k_lambda_finite_dirichlet_via_cache(
+        lambda: &Float,
+        n_grid: usize,
+        n_sample: usize,
+        prec: u32,
+        cache: &ArtifactCacheContext<'_>,
+    ) -> Result<HpProlateResult> {
         compute_k_lambda_inner(
             lambda,
             n_grid,
             n_sample,
             prec,
             ProlateCacheRoute::Fabric(cache),
+        )
+    }
+
+    fn compute_k_lambda_legendre_inner(
+        lambda: &Float,
+        budget: usize,
+        n_sample: usize,
+        prec: u32,
+        cache_route: ProlateCacheRoute<'_>,
+    ) -> Result<HpProlateResult> {
+        let directory = if matches!(
+            cache_route,
+            ProlateCacheRoute::Standalone(CacheMode::JsonZip)
+        ) {
+            prolate_cache_dir()
+        } else {
+            None
+        };
+        super::legendre::hp::compute(
+            lambda,
+            budget,
+            n_sample,
+            prec,
+            |d, b, p| match &cache_route {
+                ProlateCacheRoute::Fabric(cache) => Ok(prolate_spectrum_via_cache_model(
+                    lambda,
+                    d.len(),
+                    p,
+                    d,
+                    b,
+                    cache,
+                    true,
+                )?),
+                ProlateCacheRoute::Standalone(_) => exact_standalone_prolate_spectrum_model(
+                    lambda,
+                    d.len(),
+                    p,
+                    d,
+                    b,
+                    directory.as_deref(),
+                    true,
+                ),
+            },
         )
     }
 
@@ -2079,18 +2400,39 @@ pub mod hp {
         let start = std::time::Instant::now();
 
         if !lambda.is_finite()
-            || lambda <= &0
+            || lambda <= &1
             || !(32..=1_000_000).contains(&prec)
             || n_grid >= u32::MAX as usize
             || n_sample < 2
+            || n_sample > u32::MAX as usize
         {
             anyhow::bail!("prolate requires finite positive lambda, valid precision, grid < u32::MAX, and at least two samples");
         }
+        let source_lambda = lambda;
+        let working_lambda = Float::with_val(prec, lambda);
+        let lambda = &working_lambda;
+        anyhow::ensure!(
+            lambda > &1,
+            "prolate lambda must remain greater than one at working precision"
+        );
+        let cutoff = lambda.clone().square();
+        anyhow::ensure!(
+            cutoff.is_finite() && cutoff < (Float::with_val(prec, 1) << 64u32),
+            "prolate finite-sum cutoff exceeds u64 range"
+        );
         // Grid forced odd; the guard above also protects N+1 and u32 casts.
         let n = if n_grid % 2 == 0 { n_grid + 1 } else { n_grid };
         if n < 16 {
             anyhow::bail!("n_grid too small (got {}); need at least 16 to find h_4", n);
         }
+
+        let terms = cutoff
+            .clone()
+            .ceil()
+            .to_integer()
+            .and_then(|x| x.to_usize())
+            .ok_or_else(|| anyhow::anyhow!("prolate finite-sum work budget exceeded"))?;
+        super::legendre::resource_budget(n, n_sample, terms, prec, false)?;
 
         eprintln!(
             "[HP prolate] computing k_λ at λ²={}, N={}, n_sample={}, prec={} bits",
@@ -2107,7 +2449,7 @@ pub mod hp {
         // Build the tridiagonal in HP.
         eprintln!("[HP prolate] building tridiagonal PW_λ on N={} grid...", n);
         let pw_start = std::time::Instant::now();
-        let (diag, off_diag) = build_pw_matrix(lambda, n, prec);
+        let (diag, off_diag) = try_build_pw_matrix(lambda, n, prec)?;
         eprintln!(
             "[HP prolate] PW_λ built in {:.1}s",
             pw_start.elapsed().as_secs_f64()
@@ -2126,17 +2468,28 @@ pub mod hp {
         // ~5-second JSON read. Cache key derives from λ²_int — only
         // used only when λ² is exactly integer-valued. Other cutoffs use an
         // exact-source zip identity, including rounded square roots of integers.
-        let mut lambda_sq_for_key = lambda.clone();
-        lambda_sq_for_key *= lambda;
-        let cache_key = lambda_sq_int_for_key(&lambda_sq_for_key);
+        let cache_key = if source_lambda.is_integer() {
+            source_lambda.to_integer().and_then(|value| {
+                let square = value.square();
+                square
+                    .to_u64()
+                    .and_then(|value| lambda_sq_int_for_key(&Float::with_val(64, value)))
+            })
+        } else {
+            None
+        };
 
         let eigenvalues: Vec<Float> = if let ProlateCacheRoute::Fabric(cache) = &cache_route {
             // Exact source keys support every finite cutoff and enforce RequireReuse
             // even when lambda squared is not an integer.
-            prolate_spectrum_via_cache(lambda, n, prec, &diag, &off_diag, cache)?
+            prolate_spectrum_via_cache(source_lambda, n, prec, &diag, &off_diag, cache)?
         } else if let Some(lambda_sq_int) = cache_key {
             if let ProlateCacheRoute::Standalone(mode) = cache_route {
-                if let Some(cached) = load_prolate_eigvals_cache(lambda_sq_int, n, prec, mode) {
+                if let Some(cached) = load_prolate_eigvals_cache(lambda_sq_int, n, prec, mode)
+                    .filter(|values| {
+                        validate_fd_selected_spectrum(&diag, &off_diag, values, prec).is_ok()
+                    })
+                {
                     eprintln!(
                         "[HP prolate] loaded {} cached eigenvalues for λ²={}, N={}, prec={} bits",
                         cached.len(),
@@ -2173,7 +2526,7 @@ pub mod hp {
                 None
             };
             exact_standalone_prolate_spectrum(
-                lambda,
+                source_lambda,
                 n,
                 prec,
                 &diag,
@@ -2188,6 +2541,7 @@ pub mod hp {
                 n
             );
         }
+        validate_fd_selected_spectrum(&diag, &off_diag, &eigenvalues, prec)?;
 
         // Search the lowest-lying eigenfunctions for h_0 and h_4.
         // Limit search depth: prolate h_4 is the third even eigenfunction.
@@ -2198,6 +2552,8 @@ pub mod hp {
         let mut h4_idx: Option<usize> = None;
         let mut h0_vec: Option<Vec<Float>> = None;
         let mut h4_vec: Option<Vec<Float>> = None;
+        let mut h0_value = None;
+        let mut h4_value = None;
 
         for (k, lambda_k) in eigenvalues.iter().enumerate().take(n_try) {
             eprintln!(
@@ -2221,10 +2577,11 @@ pub mod hp {
             // to seconds at HP-1000 with N=8001, and the memory
             // footprint from ~26 GB to a few KB, vs the dense LU
             // alternative.
-            let v = match tridiag_eigenvector_for_value_hp(
+            let recovery = match xc_numerics::eigen::tridiag_eigenvector_for_value_detailed_hp(
                 &diag,
                 &off_diag,
                 lambda_k,
+                None,
                 prec,
                 TridiagEigvecOptions {
                     solver: xc_numerics::eigen::TridiagSolver::BandedInterleaved,
@@ -2234,6 +2591,7 @@ pub mod hp {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            let v = recovery.eigenvector;
             // Check parity.
             let parity = parity_of(&v, prec);
             let is_even = matches!(parity, HpParity::Even);
@@ -2241,17 +2599,19 @@ pub mod hp {
                 continue;
             }
             // Count nodes.
-            let nodes = count_nodes(&v, prec);
+            let nodes = try_count_nodes(&v, prec)?;
             match nodes {
                 0 if h0_idx.is_none() => {
                     eprintln!("[HP prolate] found h_0 at index {}", k);
                     h0_idx = Some(k);
                     h0_vec = Some(v);
+                    h0_value = Some(recovery.eigenvalue);
                 }
                 4 if h4_idx.is_none() => {
                     eprintln!("[HP prolate] found h_4 at index {}", k);
                     h4_idx = Some(k);
                     h4_vec = Some(v);
+                    h4_value = Some(recovery.eigenvalue);
                 }
                 _ => {}
             }
@@ -2275,10 +2635,14 @@ pub mod hp {
                 n_try
             )
         })?;
+        anyhow::ensure!(
+            h0_idx == 0 && h4_idx == 4,
+            "prolate parity/node classification disagrees with ordered modes 0 and 4"
+        );
         let mut h0_vec = h0_vec.unwrap();
         let mut h4_vec = h4_vec.unwrap();
-        let eigenvalue_0 = eigenvalues[h0_idx].clone();
-        let eigenvalue_4 = eigenvalues[h4_idx].clone();
+        let eigenvalue_0 = h0_value.expect("selected ground Rayleigh value");
+        let eigenvalue_4 = h4_value.expect("selected fourth Rayleigh value");
 
         // Inverse iteration normalizes to unit ℓ² norm. To get unit
         // continuous-L² norm, scale by 1/√h.
@@ -2306,7 +2670,8 @@ pub mod hp {
             }
         }
 
-        // ∫h via midpoint rule = h · Σ v_i.
+        // Trapezoidal integral of the piecewise-linear Dirichlet interpolant:
+        // exactly h * sum(v_i), before floating-point rounding.
         let mut sum_h0 = Float::with_val(prec, 0);
         for v in &h0_vec {
             sum_h0 += v;
@@ -2345,6 +2710,8 @@ pub mod hp {
             })
             .collect();
 
+        super::grid_contract::validate_grid(&h_lambda, lambda, &h, prec)?;
+
         // Build logarithmic u-grid in [λ⁻¹, λ].
         let n_sample = n_sample.max(2);
         let log_lambda = lambda.clone().ln();
@@ -2377,8 +2744,12 @@ pub mod hp {
                 let mut ratio = lambda.clone();
                 ratio /= u;
                 let ratio_floor = ratio.floor();
-                let n_terms_int = ratio_floor.to_integer().expect("λ/u must be finite");
-                let n_terms = n_terms_int.to_u64().unwrap_or(0);
+                let n_terms = ratio_floor
+                    .to_integer()
+                    .and_then(|value| value.to_u64())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("sampled finite-sum cutoff exceeds u64 range")
+                    })?;
 
                 let mut s = Float::with_val(prec, 0);
                 for k in 1..=n_terms {
@@ -2388,15 +2759,16 @@ pub mod hp {
                     if x >= *lambda {
                         break;
                     }
-                    s += &interp_grid(&h_lambda, lambda, &h, &x, prec);
+                    s += super::grid_contract::interpolate(&h_lambda, lambda, &x, prec);
                 }
                 // u^(1/2)
                 let sqrt_u = u.clone().sqrt();
                 let mut result = sqrt_u;
                 result *= &s;
-                result
+                anyhow::ensure!(result.is_finite(), "prolate sample is outside MPFR range");
+                Ok(result)
             })
-            .collect();
+            .collect::<Result<_>>()?;
         eprintln!(
             "[HP prolate] k_λ sampling done in {:.1}s; total compute_k_lambda elapsed {:.1}s",
             sample_start.elapsed().as_secs_f64(),
@@ -2404,6 +2776,10 @@ pub mod hp {
         );
 
         Ok(HpProlateResult {
+            discretization: "prolate-finite-dirichlet-recovered-rayleigh-v3".to_owned(),
+            resolution_budget: n_grid,
+            basis_dimension: n,
+            relative_operator_residual: None,
             k_values,
             u_grid,
             eigenvalue_0,
@@ -2448,149 +2824,7 @@ pub mod hp {
         k_values: &[Float],
         prec: u32,
     ) -> Result<HpComparisonResult> {
-        if xi.len() != 2 * n_modes + 1 {
-            anyhow::bail!(
-                "xi has wrong length: got {}, expected 2N+1 = {}",
-                xi.len(),
-                2 * n_modes + 1
-            );
-        }
-        if u_grid.len() != k_values.len() {
-            anyhow::bail!(
-                "u_grid and k_values have different lengths: {} vs {}",
-                u_grid.len(),
-                k_values.len()
-            );
-        }
-        if u_grid.is_empty() {
-            anyhow::bail!("empty grid");
-        }
-
-        let cmp_start = std::time::Instant::now();
-        eprintln!(
-            "[HP prolate] comparing ξ_λ to c·k_λ on {} grid points (N={} modes)...",
-            u_grid.len(),
-            n_modes
-        );
-
-        // L = ln(λ²) = 2 ln λ; inv_sqrt_l = 1/√L.
-        let mut lambda_sq = lambda.clone();
-        lambda_sq *= lambda;
-        let l = lambda_sq.clone().ln();
-        let l_sqrt = l.clone().sqrt();
-        let mut inv_sqrt_l = Float::with_val(prec, 1);
-        inv_sqrt_l /= &l_sqrt;
-
-        let xi_0 = xi[n_modes].clone();
-        let xi_pos: Vec<Float> = (1..=n_modes).map(|n| xi[n_modes + n].clone()).collect();
-
-        // Reconstruct ξ_λ on u_grid.
-        let pi_v = Float::with_val(prec, rug::float::Constant::Pi);
-        let mut two_pi = pi_v.clone();
-        two_pi *= 2u32;
-
-        // Reconstruct ξ_λ on u_grid. Each grid point is independent →
-        // parallel evaluation across u_grid.
-        let xi_values: Vec<Float> = u_grid
-            .par_iter()
-            .map(|u| {
-                // phase_base = 2π · ln(λ·u) / L
-                let mut lambda_u = lambda.clone();
-                lambda_u *= u;
-                let log_lu = lambda_u.ln();
-                let mut phase_base = two_pi.clone();
-                phase_base *= &log_lu;
-                phase_base /= &l;
-
-                let mut acc = xi_0.clone();
-                for n in 1..=n_modes {
-                    let mut arg = phase_base.clone();
-                    arg *= n as u32;
-                    let mut term = arg.cos();
-                    term *= 2u32;
-                    term *= &xi_pos[n - 1];
-                    acc += &term;
-                }
-                acc *= &inv_sqrt_l;
-                acc
-            })
-            .collect();
-
-        // Optimal c = ⟨ξ, k⟩ / ⟨k, k⟩. Parallel reductions.
-        let dot_xk_terms: Vec<Float> = xi_values
-            .par_iter()
-            .zip(k_values.par_iter())
-            .map(|(x, k)| {
-                let mut t = x.clone();
-                t *= k;
-                t
-            })
-            .collect();
-        let dot_xk = xc_numerics::reduction::deterministic_pairwise_sum_hp(&dot_xk_terms, prec);
-        let dot_kk_terms: Vec<Float> = k_values
-            .par_iter()
-            .map(|k| {
-                let mut t = k.clone();
-                t *= k;
-                t
-            })
-            .collect();
-        let dot_kk = xc_numerics::reduction::deterministic_pairwise_sum_hp(&dot_kk_terms, prec);
-
-        let kk_zero_thresh = Float::with_val(prec, Float::parse("1e-300").unwrap());
-        if dot_kk < kk_zero_thresh {
-            anyhow::bail!("k_values essentially zero on grid");
-        }
-        let mut c = dot_xk;
-        c /= &dot_kk;
-
-        // Residual norms.
-        let mut linf_error = Float::with_val(prec, 0);
-        let mut linf_index = 0usize;
-        let mut l2_sq = Float::with_val(prec, 0);
-        for (i, (x, k)) in xi_values.iter().zip(k_values.iter()).enumerate() {
-            // r = x - c · k
-            let mut r = c.clone();
-            r *= k;
-            r = -r;
-            r += x;
-            let r_sq = {
-                let mut t = r.clone();
-                t *= &r;
-                t
-            };
-            l2_sq += &r_sq;
-            let abs_r = r.abs();
-            if abs_r > linf_error {
-                linf_error = abs_r;
-                linf_index = i;
-            }
-        }
-        let l2_error = l2_sq.sqrt();
-
-        let mut xi_linf = Float::with_val(prec, 0);
-        let mut xi_l2_sq = Float::with_val(prec, 0);
-        for x in &xi_values {
-            let abs_x = x.clone().abs();
-            if abs_x > xi_linf {
-                xi_linf = abs_x;
-            }
-            xi_l2_sq += x.clone().square();
-        }
-        let xi_l2 = xi_l2_sq.sqrt();
-
-        eprintln!(
-            "[HP prolate] compare done in {:.1}s",
-            cmp_start.elapsed().as_secs_f64()
-        );
-        Ok(HpComparisonResult {
-            optimal_scalar: c,
-            linf_error,
-            l2_error,
-            xi_linf,
-            xi_l2,
-            linf_index,
-        })
+        super::comparison::compare_hp(xi, n_modes, lambda, u_grid, k_values, prec)
     }
 
     // -----------------------------------------------------------------------
@@ -2599,11 +2833,20 @@ pub mod hp {
 
     /// End-to-end CCM -> prolate accuracy measurement.
     ///
-    /// This is the CCM Lemma 7.2 / Step 2 quantity: how closely the prolate
+    /// This samples the additional prolate/Weil bridge, not Lemma 7.2: how closely the prolate
     /// educated guess `k_λ` approximates the true smallest-eigenvalue Weil
     /// eigenvector `ξ_λ` at mode cutoff `N`.
     #[derive(Clone, Debug)]
     pub struct CcmProlateDistanceHp {
+        pub n_grid: usize,
+        pub n_sample: usize,
+        pub precision_bits: u32,
+        /// Precision used for the finite source, samples, and comparison before rounding.
+        pub working_precision_bits: u32,
+        /// Identity of the guarded finite-source comparison policy.
+        pub algorithm_semantics: String,
+        pub prolate_discretization: String,
+        pub prolate_basis_dimension: usize,
         /// `λ²` the measurement was taken at.
         pub lambda_squared: f64,
         /// Mode cutoff `N`. The expanded `ξ_λ` has `2N+1` coefficients.
@@ -2633,6 +2876,9 @@ pub mod hp {
     ///
     /// This is a finite-`N`, finite-precision measurement. It does not on its
     /// own establish anything about the `N → ∞` limit.
+    /// The finite source and comparison use 64 guard bits above the requested
+    /// output precision; report fields are rounded once to that output precision.
+    /// Guarded computation does not certify continuum or forward accuracy.
     pub fn ccm_prolate_distance_hp(
         params: &crate::ccm::CcmParams,
         cfg: &crate::ccm::hp::HighPrecConfig,
@@ -2640,23 +2886,24 @@ pub mod hp {
         n_sample: usize,
         mode: CacheMode,
     ) -> Result<CcmProlateDistanceHp> {
-        let prec = cfg.precision_bits;
-        // Follow the documented LambdaSq promotion rule so an integer λ² stays
-        // exact instead of round-tripping through f64.
-        let lambda_sq = if params.lambda_sq.is_integer {
-            Float::with_val(prec, params.lambda_sq.value_u64)
-        } else {
-            Float::with_val(prec, params.lambda_sq.value_f64)
-        };
+        let output_precision = cfg.precision_bits;
+        let prec = output_precision
+            .checked_add(64)
+            .ok_or_else(|| anyhow::anyhow!("prolate comparison guard precision overflow"))?;
+        let mut working_cfg = cfg.clone();
+        working_cfg.precision_bits = prec;
+        let lambda_sq = crate::ccm::hp::lambda_squared_value_hp(params, prec)?;
         if lambda_sq <= 1u32 {
             anyhow::bail!(
-                "prolate comparison needs λ² > 1 so the ℰ-map interval [λ⁻¹, λ] is nondegenerate; got λ² = {}",
-                params.lambda_squared()
+                "prolate comparison requires a nondegenerate interval with lambda squared > 1"
             );
         }
         let lambda = lambda_sq.sqrt();
-
-        let gap = crate::ccm::hp::analyze_sector_gap(params, cfg, 1)?;
+        let gap = crate::ccm::hp::analyze_sector_gap(
+            params,
+            &working_cfg,
+            crate::ccm::hp::MINIMUM_SECTOR_EIGENPAIRS,
+        )?;
         let ground = gap
             .even
             .eigenpairs
@@ -2665,26 +2912,44 @@ pub mod hp {
         let expected = params.n_modes + 1;
         if ground.eigenvector.len() != expected {
             anyhow::bail!(
-                "CCM even sector eigenvector has dimension {}, expected N+1 = {expected}",
-                ground.eigenvector.len(),
+                "CCM even sector eigenvector has dimension {}, expected {expected}",
+                ground.eigenvector.len()
             );
         }
         let xi =
             crate::ccm::hp::expand_even_sector_vector(&ground.eigenvector, params.n_modes, prec);
-
         let k = compute_k_lambda(&lambda, n_grid, n_sample, prec, mode)?;
-        let comparison =
+        let mut comparison =
             compare_xi_to_k_lambda(&xi, params.n_modes, &lambda, &k.u_grid, &k.k_values, prec)?;
-
         if comparison.xi_l2 == 0u32 {
-            anyhow::bail!("ξ_λ vanishes on the prolate sample grid; relative distance undefined");
+            anyhow::bail!(
+                "Weil state vanishes on the prolate sample grid; relative distance undefined"
+            );
         }
-        let relative_l2_distance = comparison.l2_error.clone() / comparison.xi_l2.clone();
-
+        let relative_l2_distance = Float::with_val(
+            output_precision,
+            comparison.l2_error.clone() / comparison.xi_l2.clone(),
+        );
+        for value in [
+            &mut comparison.optimal_scalar,
+            &mut comparison.linf_error,
+            &mut comparison.l2_error,
+            &mut comparison.xi_linf,
+            &mut comparison.xi_l2,
+        ] {
+            value.set_prec(output_precision);
+        }
         Ok(CcmProlateDistanceHp {
+            n_grid,
+            n_sample,
+            precision_bits: output_precision,
+            working_precision_bits: prec,
+            algorithm_semantics: "ccm_prolate_guarded_source_and_comparison_v3".into(),
+            prolate_discretization: k.discretization,
+            prolate_basis_dimension: k.basis_dimension,
             lambda_squared: params.lambda_squared(),
             n_modes: params.n_modes,
-            eigenvalue: ground.eigenvalue.clone(),
+            eigenvalue: Float::with_val(output_precision, &ground.eigenvalue),
             comparison,
             relative_l2_distance,
         })
@@ -2694,6 +2959,141 @@ pub mod hp {
     mod tests {
         use super::*;
         use xc_numerics::fmt::display_hp;
+
+        #[test]
+        fn fd_cache_recomputes_sorted_wrong_spectrum() {
+            let root = std::env::temp_dir().join(format!(
+                "xc-remaining-fd-cache-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let p = 128;
+            let n = 25;
+            let lambda = Float::with_val(p, 2).sqrt();
+            let (d, b) = build_pw_matrix(&lambda, n, p);
+            let original =
+                exact_standalone_prolate_spectrum_model(&lambda, n, p, &d, &b, Some(&root), false)
+                    .unwrap();
+            assert_eq!(
+                original,
+                exact_standalone_prolate_spectrum_model(&lambda, n, p, &d, &b, Some(&root), false)
+                    .unwrap()
+            );
+            let path = std::fs::read_dir(&root)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let name = path.file_stem().unwrap().to_str().unwrap().to_owned();
+            let wrong = PortableProlateSpectrum {
+                schema_version: 3,
+                lambda: lambda.to_string(),
+                lambda_precision_bits: lambda.prec(),
+                grid_points: n,
+                precision_bits: p,
+                eigenvalues: original
+                    .iter()
+                    .map(|x| (Float::with_val(p, x) + 1i32).to_string())
+                    .collect(),
+            };
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            writer
+                .start_file(&name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut writer, &serde_json::to_vec(&wrong).unwrap()).unwrap();
+            let bytes = writer.finish().unwrap().into_inner();
+            xc_cache::atomic_replace_cache_file(&path, &bytes).unwrap();
+            assert_eq!(
+                original,
+                exact_standalone_prolate_spectrum_model(&lambda, n, p, &d, &b, Some(&root), false)
+                    .unwrap()
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn legendre_cache_rejects_sorted_wrong_spectrum() {
+            let root = std::env::temp_dir().join(format!(
+                "xc-confirmed-legendre-cache-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let p = 128;
+            let n = 24;
+            let lambda = Float::with_val(p, 2).sqrt();
+            let (d, b) = super::super::legendre::hp::block(&lambda, n, p);
+            let original = exact_standalone_prolate_spectrum_model(
+                &lambda,
+                n,
+                p,
+                &d,
+                &b[..n - 1],
+                Some(&root),
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                original,
+                exact_standalone_prolate_spectrum_model(
+                    &lambda,
+                    n,
+                    p,
+                    &d,
+                    &b[..n - 1],
+                    Some(&root),
+                    true
+                )
+                .unwrap()
+            );
+            let path = std::fs::read_dir(&root)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let name = path.file_stem().unwrap().to_str().unwrap().to_owned();
+            let wrong = PortableProlateSpectrum {
+                schema_version: 3,
+                lambda: lambda.to_string(),
+                lambda_precision_bits: lambda.prec(),
+                grid_points: n,
+                precision_bits: p,
+                eigenvalues: original
+                    .iter()
+                    .map(|x| (Float::with_val(p, x) + 1i32).to_string())
+                    .collect(),
+            };
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            writer
+                .start_file(&name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut writer, &serde_json::to_vec(&wrong).unwrap()).unwrap();
+            let bytes = writer.finish().unwrap().into_inner();
+            xc_cache::atomic_replace_cache_file(&path, &bytes).unwrap();
+            assert_eq!(
+                original,
+                exact_standalone_prolate_spectrum_model(
+                    &lambda,
+                    n,
+                    p,
+                    &d,
+                    &b[..n - 1],
+                    Some(&root),
+                    true
+                )
+                .unwrap()
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
 
         #[test]
         fn exact_standalone_cache_reuses_noninteger_sources_and_never_aliases_nearby_cutoffs() {
@@ -2714,7 +3114,7 @@ pub mod hp {
                 exact_standalone_prolate_spectrum(&lambda, n, p, &d, &e, Some(&root)).unwrap();
             // Empty solver inputs prove the second call gets its spectrum from disk.
             let warm =
-                exact_standalone_prolate_spectrum(&lambda, n, p, &[], &[], Some(&root)).unwrap();
+                exact_standalone_prolate_spectrum(&lambda, n, p, &d, &e, Some(&root)).unwrap();
             assert_eq!(cold, warm);
             assert!(exact_standalone_prolate_spectrum(&lambda, n, p, &[], &[], None).is_err());
             let near = Float::with_val(p, Float::parse("3.123456789000000000001").unwrap());
@@ -2872,6 +3272,43 @@ pub mod hp {
             let _ = std::fs::remove_dir_all(root);
         }
 
+        #[test]
+        fn legacy_cache_requires_exact_identity_precision_and_arithmetic_stamp() {
+            let lsq = LambdaSq::integer(25);
+            let valid = serde_json::json!({
+                "schema_version": 1,
+                "toolkit_version": prolate_toolkit_version_for_test(),
+                "arithmetic_semantics": "prolate-fd-working-precision-v2",
+            "qr_arithmetic": xc_numerics::eigen::TRIDIAG_QR_SEMANTICS,
+                "lambda_sq_mode": lsq.mode_str(),
+                "lambda_sq_identity": lsq.filename_str(),
+                "n_grid": 3,
+                "precision_bits": 256,
+                "eigenvalues": ["1","2","3"]
+            });
+            assert!(parse_prolate_cache_json(&valid.to_string(), lsq, 3, 256).is_some());
+            for (field, bad) in [
+                ("schema_version", serde_json::json!(2)),
+                ("lambda_sq_identity", serde_json::json!("26")),
+                ("lambda_sq_mode", serde_json::json!("fractional")),
+                ("n_grid", serde_json::json!(5)),
+                ("precision_bits", serde_json::json!(53)),
+                ("arithmetic_semantics", serde_json::json!("old")),
+            ] {
+                let mut altered = valid.clone();
+                altered[field] = bad;
+                assert!(
+                    parse_prolate_cache_json(&altered.to_string(), lsq, 3, 256).is_none(),
+                    "{field}"
+                );
+                altered.as_object_mut().unwrap().remove(field);
+                assert!(
+                    parse_prolate_cache_json(&altered.to_string(), lsq, 3, 256).is_none(),
+                    "missing {field}"
+                );
+            }
+        }
+
         fn hp(prec: u32, s: &str) -> Float {
             Float::with_val(prec, Float::parse(s).unwrap())
         }
@@ -2919,6 +3356,131 @@ pub mod hp {
                 let mut difference = Float::with_val(320, low);
                 difference -= high;
                 assert!(difference.abs() < repeat_tolerance);
+            }
+        }
+
+        #[test]
+        fn trial_subspace_stopping_matches_precision_and_independent_quadratic() {
+            use xc_core::{EigenTarget, ResultStatus};
+            for p in [40u32, 64, 100, 128] {
+                for (a, b, c) in [(2i32, 1i32, 5i32), (-3, 2, 7)] {
+                    let forms = ProlateSubspaceFormsHp {
+                        ambient_dimension: 7,
+                        basis_dimension: 2,
+                        precision_bits: p,
+                        stiffness: [a, b, b, c]
+                            .into_iter()
+                            .map(|x| Float::with_val(p, x))
+                            .collect(),
+                        gram: [1, 0, 0, 1]
+                            .into_iter()
+                            .map(|x| Float::with_val(p, x))
+                            .collect(),
+                    };
+                    // Independent characteristic polynomial of this exact 2x2 matrix.
+                    let discriminant =
+                        Float::with_val(p + 64, (a - c) * (a - c) + 4 * b * b).sqrt();
+                    for (target, sign) in [
+                        (EigenTarget::AlgebraicSmallest, -1),
+                        (EigenTarget::AlgebraicLargest, 1),
+                    ] {
+                        let expected = (Float::with_val(p + 64, a + c)
+                            + Float::with_val(p + 64, &discriminant * sign))
+                            / 2u32;
+                        let report = solve_pw_subspace_extreme(&forms, target).unwrap();
+                        assert_eq!(report.status, ResultStatus::Converged, "p={p}");
+                        assert!(report
+                            .algorithm
+                            .contains("prolate_precision_scaled_ritz_stopping_v2"));
+                        let tolerance = Float::with_val(p + 64, 1) >> (p / 2);
+                        assert!(
+                            Float::with_val(p + 64, &report.eigenvalue - expected).abs()
+                                < tolerance
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn finite_grid_cache_does_not_require_continuum_asymptotics() {
+            for (lambda, n, p) in [
+                (10u32, 17usize, 96u32),
+                (10, 33, 96),
+                (7, 19, 164),
+                (13, 23, 128),
+            ] {
+                let lambda = Float::with_val(p, lambda);
+                let (d, b) = try_build_pw_matrix(&lambda, n, p).unwrap();
+                let values = tridiag_eigenvalues_hp(&d, &b, p).unwrap();
+                let cutoff = LambdaSq::integer(
+                    lambda.to_u32_saturating().unwrap() as u64
+                        * lambda.to_u32_saturating().unwrap() as u64,
+                );
+                let rejection = prolate_cache_structural_check(&values, n, cutoff, p);
+                assert!(
+                    rejection.is_none(),
+                    "lambda={lambda}, n={n}, p={p}: {rejection:?}"
+                );
+                // Independent bisection of the exact stored matrix, rather
+                // than the QR producer, checks every ordered value.
+                let q = p + 64;
+                let tolerance = Float::with_val(q, 1) >> (p + 8);
+                let independent = xc_numerics::eigen::tridiag_selected_eigenvalues_hp(
+                    &d,
+                    &b,
+                    0,
+                    n - 1,
+                    &tolerance,
+                    (p + 160) as usize,
+                    q,
+                )
+                .unwrap();
+                let source_norm = (0..n)
+                    .map(|i| {
+                        let mut row = Float::with_val(q, &d[i]).abs();
+                        if i > 0 {
+                            row += Float::with_val(q, &b[i - 1]).abs();
+                        }
+                        if i + 1 < n {
+                            row += Float::with_val(q, &b[i]).abs();
+                        }
+                        row
+                    })
+                    .max_by(Float::total_cmp)
+                    .unwrap();
+                // Compare against the documented normwise source-precision
+                // radius, using bisection rather than QR as the value oracle.
+                let padding = (source_norm * (8 * n)) >> p;
+                for (value, bracket) in values.iter().zip(&independent.enclosures) {
+                    assert!(
+                        Float::with_val(q, value) >= Float::with_val(q, &bracket.lower - &padding)
+                    );
+                    assert!(
+                        Float::with_val(q, value) <= Float::with_val(q, &bracket.upper + &padding)
+                    );
+                }
+                let mut bad = values.clone();
+                bad[0] += Float::with_val(p, 1) >> (p / 2);
+                assert!(prolate_cache_structural_check(&bad, n, cutoff, p).is_some());
+            }
+        }
+
+        #[test]
+        fn cache_enclosures_allow_exact_and_subscale_multiplicity() {
+            let p = 192;
+            for second in [
+                Float::with_val(256, 1),
+                Float::with_val(256, 1) + (Float::with_val(256, 1) >> 190),
+            ] {
+                let d = vec![Float::with_val(256, 1), second];
+                let b = vec![Float::with_val(256, 0)];
+                let values = d.iter().map(|v| Float::with_val(p, v)).collect::<Vec<_>>();
+                // The diagonal entries are the exact, independent eigenvalues.
+                super::super::legendre::hp::validate_spectrum(&d, &b, &values, p).unwrap();
+                let mut wrong = values.clone();
+                wrong[1] += Float::with_val(p, 1) >> 160;
+                assert!(super::super::legendre::hp::validate_spectrum(&d, &b, &wrong, p).is_err());
             }
         }
 
@@ -3242,7 +3804,11 @@ pub mod hp {
             let valid_json = serde_json::json!({
                 "schema_version": 1,
                 "toolkit_version": prolate_toolkit_version_for_test(),
+            "arithmetic_semantics": "prolate-fd-working-precision-v2",
+            "qr_arithmetic": xc_numerics::eigen::TRIDIAG_QR_SEMANTICS,
                 "lambda_sq": lambda_sq.value_f64,
+                "lambda_sq_mode": lambda_sq.mode_str(),
+                "lambda_sq_identity": lambda_sq.filename_str(),
                 "n_grid": n_grid,
                 "precision_bits": prec,
                 "eigenvalues": strs,
@@ -3260,7 +3826,11 @@ pub mod hp {
             let bad_json = serde_json::json!({
                 "schema_version": 1,
                 "toolkit_version": prolate_toolkit_version_for_test(),
+            "arithmetic_semantics": "prolate-fd-working-precision-v2",
+            "qr_arithmetic": xc_numerics::eigen::TRIDIAG_QR_SEMANTICS,
                 "lambda_sq": lsq_bad.value_f64,
+                "lambda_sq_mode": lsq_bad.mode_str(),
+                "lambda_sq_identity": lsq_bad.filename_str(),
                 "n_grid": n_grid,
                 "precision_bits": prec,
                 "eigenvalues": bad_strs,

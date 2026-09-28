@@ -17,6 +17,7 @@ mod config;
 mod config_resolution;
 mod diagnostics;
 mod error;
+pub mod finite_json;
 mod hypothesis;
 mod optimization;
 mod performance;

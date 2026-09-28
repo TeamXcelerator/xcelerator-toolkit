@@ -1,0 +1,30 @@
+{
+  "scope": "Manufactured exact-rational negative control and C=10 N=6 p=256 production CCM matrix/oracle from immutable independent audit. Only required objects retained; no numerical values changed. No general source-assembly guarantee inferred.",
+  "sources": [
+    {
+      "original": "independent oracle generated outside the repository",
+      "source_sha256": "62f903b2a6c157f1f8f578975e5350f298f6878565fed2ef0a0fb00d547c9250",
+      "retained_keys": [
+        "directional"
+      ],
+      "fixture": "oracles.json",
+      "fixture_sha256": "ae7718e4393b52e9f69c5de25f2aa87f66668064c0df0ffe074a91c42efc0365"
+    },
+    {
+      "original": "independent oracle generated outside the repository",
+      "source_sha256": "0fc0e66cd1428f8e98ec5c03cbc4bfc060b1172d464532099e3225e6349aaa63",
+      "retained_keys": [
+        "center"
+      ],
+      "fixture": "ccm_matrices.json",
+      "fixture_sha256": "a692694c42ede2e60ab15875f2ab320a8d1308b1ec55b27f092c0d2189489b81"
+    },
+    {
+      "original": "independent oracle generated outside the repository",
+      "source_sha256": "5790301c60ca550333ea5b39674f20b6be1b5af7df4541619fd84500937c790a",
+      "retained_keys": null,
+      "fixture": "ccm_producer_inputs.json",
+      "fixture_sha256": "848af8910f186a9ab0ccb71a43e5e9b024127e58402688f10a3f56a02cff427f"
+    }
+  ]
+}

@@ -76,24 +76,36 @@ impl PrecisionPolicy {
         Ok(())
     }
 
+    /// First actual working precision, including guard bits within the ceiling.
+    pub fn initial_working_bits(&self) -> Result<u32, ConfigError> {
+        self.validate()?;
+        Ok(self
+            .initial_bits
+            .saturating_add(self.guard_bits)
+            .min(self.maximum_bits))
+    }
+
+    /// Next strictly greater precision, or None for a fixed/invalid/exhausted
+    /// policy. Equivalent rational growth factors have identical schedules.
     pub fn next_bits(&self, current_bits: u32) -> Option<u32> {
-        if current_bits >= self.maximum_bits {
+        self.validate().ok()?;
+        if current_bits == 0 || current_bits >= self.maximum_bits {
             return None;
         }
         let candidate = match self.escalation {
             PrecisionEscalation::Fixed => return None,
-            PrecisionEscalation::AddBits(bits) => current_bits.saturating_add(bits),
+            PrecisionEscalation::AddBits(bits) => u64::from(current_bits) + u64::from(bits),
             PrecisionEscalation::Multiply {
                 numerator,
                 denominator,
             } => {
-                current_bits
-                    .saturating_mul(numerator)
-                    .saturating_add(denominator - 1)
-                    / denominator
+                // A u32*u32 product fits u64. Cap only AFTER the exact ceiling
+                // division; saturation before division can reduce precision.
+                (u64::from(current_bits) * u64::from(numerator)).div_ceil(u64::from(denominator))
             }
         };
-        Some(candidate.min(self.maximum_bits))
+        let next = candidate.min(u64::from(self.maximum_bits)) as u32;
+        (next > current_bits).then_some(next)
     }
 }
 
@@ -174,13 +186,9 @@ pub fn run_adaptive_precision<T, E, F>(
 where
     F: FnMut(u32) -> Result<AdaptivePrecisionEvaluation<T>, E>,
 {
-    policy
-        .validate()
-        .map_err(AdaptivePrecisionRunError::InvalidPolicy)?;
     let mut precision_bits = policy
-        .initial_bits
-        .saturating_add(policy.guard_bits)
-        .min(policy.maximum_bits);
+        .initial_working_bits()
+        .map_err(AdaptivePrecisionRunError::InvalidPolicy)?;
     let mut attempts = Vec::new();
     loop {
         let evaluation = attempt(precision_bits).map_err(AdaptivePrecisionRunError::Attempt)?;

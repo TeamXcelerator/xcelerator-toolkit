@@ -18,7 +18,30 @@
       "const": 1
     },
     "semantics": {
-      "const": "ccm-retained-research-observations-v1"
+      "enum": [
+        "ccm-retained-research-observations-v1",
+        "ccm-retained-research-observations-v2",
+        "ccm-retained-research-observations-v3",
+        "ccm-retained-research-observations-v4",
+        "ccm-retained-research-observations-v5",
+        "ccm-retained-research-observations-v6",
+        "ccm-retained-research-observations-v7",
+        "ccm-retained-research-observations-v8",
+        "ccm-retained-research-observations-v9",
+        "ccm-retained-research-observations-v10",
+        "ccm-retained-research-observations-v11",
+        "ccm-retained-research-observations-v12",
+        "ccm-retained-research-observations-v13",
+        "ccm-retained-research-observations-v14",
+        "ccm-retained-research-observations-v15",
+        "ccm-retained-research-observations-v16",
+        "ccm-retained-research-observations-v17",
+        "ccm-retained-research-observations-v18",
+        "ccm-retained-research-observations-v19",
+        "ccm-retained-research-observations-v20",
+        "ccm-retained-research-observations-v21",
+        "ccm-retained-research-observations-v22"
+      ]
     },
     "kind": {
       "const": "ccm_indexed_transform_analysis"
@@ -54,13 +77,13 @@
               },
               "parameters_digest": {
                 "type": "string",
-                "pattern": "^[0-9a-f]{64}$"
+                "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
               }
             }
           },
           "content_digest": {
             "type": "string",
-            "pattern": "^[0-9a-f]{64}$"
+            "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
           },
           "required_quality": {
             "enum": [
@@ -159,7 +182,7 @@
                     "anyOf": [
                       {
                         "type": "string",
-                        "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                        "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
                       },
                       {
                         "type": "null"
@@ -176,6 +199,18 @@
         },
         "formula": {
           "type": "string"
+        },
+        "transform_arithmetic": {
+          "enum": [
+            "exact_cutoff_stored_points_directed_sinc_v1",
+            "exact_cutoff_stored_points_directed_sinc_root_convention_v2"
+          ]
+        },
+        "maximum_transform_guard_bits": {
+          "const": 4096
+        },
+        "curvature_output": {
+          "const": "outward_upper_endpoint_v1"
         }
       }
     },
@@ -219,7 +254,7 @@
         },
         "second_derivative_cauchy_schwarz_expression": {
           "type": "string",
-          "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+          "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
         },
         "rows": {
           "type": "array",
@@ -251,7 +286,7 @@
                 "anyOf": [
                   {
                     "type": "string",
-                    "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
                   },
                   {
                     "type": "null"
@@ -270,7 +305,7 @@
                 "anyOf": [
                   {
                     "type": "string",
-                    "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
                   },
                   {
                     "type": "null"
@@ -281,7 +316,7 @@
                 "anyOf": [
                   {
                     "type": "string",
-                    "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
                   },
                   {
                     "type": "null"
@@ -292,7 +327,7 @@
                 "anyOf": [
                   {
                     "type": "string",
-                    "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
                   },
                   {
                     "type": "null"
@@ -303,7 +338,7 @@
                 "anyOf": [
                   {
                     "type": "string",
-                    "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
                   },
                   {
                     "type": "null"
@@ -314,7 +349,7 @@
                 "anyOf": [
                   {
                     "type": "string",
-                    "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
                   },
                   {
                     "type": "null"
@@ -325,7 +360,7 @@
                 "anyOf": [
                   {
                     "type": "string",
-                    "pattern": "^-?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+                    "pattern": "^[+-]?(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?![\\s\\S])"
                   },
                   {
                     "type": "null"
@@ -340,5 +375,41 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "semantics": {
+            "enum": [
+              "ccm-retained-research-observations-v13",
+              "ccm-retained-research-observations-v14",
+              "ccm-retained-research-observations-v15",
+              "ccm-retained-research-observations-v16",
+              "ccm-retained-research-observations-v17",
+              "ccm-retained-research-observations-v18",
+              "ccm-retained-research-observations-v19",
+              "ccm-retained-research-observations-v20",
+              "ccm-retained-research-observations-v21",
+              "ccm-retained-research-observations-v22"
+            ]
+          }
+        },
+        "required": [
+          "semantics"
+        ]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "required": [
+              "transform_arithmetic",
+              "maximum_transform_guard_bits",
+              "curvature_output"
+            ]
+          }
+        }
+      }
+    }
+  ]
 }

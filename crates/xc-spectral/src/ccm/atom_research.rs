@@ -5,7 +5,7 @@ use super::{
     state_geometry::RetainedState,
 };
 use anyhow::{bail, Context, Result};
-use rug::{Assign, Float};
+use rug::Float;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -15,6 +15,7 @@ use std::{
     path::{Component, Path},
 };
 use xc_cache::ContentDigest;
+use xc_numerics::prefix::lossless_decimal as dec;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -276,7 +277,12 @@ pub(crate) fn weighted_report(
     let values = i
         .atoms
         .iter()
-        .map(|x| Ok((scalar(&x.coordinate, p)?, scalar(&x.weight, p)?)))
+        .map(|x| {
+            Ok(super::extended_research::atom_math::Atom {
+                coordinate: scalar(&x.coordinate, i.precision_bits)?,
+                weight: scalar(&x.weight, i.precision_bits)?,
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
     let tasks = a
         .evaluations
@@ -288,17 +294,21 @@ pub(crate) fn weighted_report(
         })
         .collect::<Vec<_>>();
     let store = super::capture_runtime::Checkpoints::new(&(
-        "signed-atom-kernels-v1",
+        "signed-atom-kernels-v3-working-precision-echo",
         &s.manifest.content_digest,
         i,
         o,
     ))?;
     let rows = super::capture_runtime::row_blocks(&store, tasks.len(), |j| {
         let (e, (family, partition), indices) = tasks[j];
-        let z = scalar(&e.coordinate, p)?;
+        let z = scalar(&e.coordinate, i.precision_bits)?;
         let mut rr = row(e.ordinal, "signed_atom_kernel");
         rr.notes.push(format!("evaluation {}; coordinate {}; family {}; partition {}; supplied ordinal, not inferred zeta identity",e.label,i.atom_coordinate.as_deref().unwrap_or("unspecified"),family,partition));
-        put(&mut rr.values, "evaluation_coordinate", &z);
+        put(
+            &mut rr.values,
+            "evaluation_coordinate",
+            &Float::with_val(p, &z),
+        );
         let exclusions = e
             .exclude
             .iter()
@@ -310,83 +320,74 @@ pub(crate) fn weighted_report(
                 .push("declared excluded atom absent; no sum emitted".into());
             return Ok(rr);
         };
-        let mut sums = [
-            Float::with_val(p, 0),
-            Float::with_val(p, 0),
-            Float::with_val(p, 0),
-        ];
-        let mut absolute = sums.clone();
-        let mut closest: Option<Float> = None;
-        let mut excluded = 0;
-        let mut used = 0;
-        let mut unsafe_denominator = false;
-        let guard = (z.clone().abs() + 1u32) >> (p.saturating_sub(32));
-        let mut dx = Float::with_val(p, 0);
-        let mut distance = dx.clone();
-        let mut inverse = dx.clone();
-        let mut term = dx.clone();
-        let mut magnitude = dx.clone();
-        for &index in indices {
-            if exclusions.contains(&index) {
-                excluded += 1;
-                continue;
-            }
-            let (x, w) = &values[index];
-            dx.assign(x);
-            dx -= &z;
-            distance.assign(&dx);
-            distance.abs_mut();
-            if closest.as_ref().is_none_or(|v| &distance < v) {
-                closest = Some(distance.clone());
-            }
-            if distance <= guard {
-                unsafe_denominator = true;
-                continue;
-            }
-            inverse.assign(1);
-            inverse /= &dx;
-            term.assign(w);
-            for j in 0..3 {
-                term *= &inverse;
-                sums[j] += &term;
-                magnitude.assign(&term);
-                magnitude.abs_mut();
-                absolute[j] += &magnitude;
-            }
-            used += 1;
-        }
+        let excluded = indices
+            .iter()
+            .filter(|index| exclusions.contains(*index))
+            .count();
+        let included = indices
+            .iter()
+            .filter(|index| !exclusions.contains(*index))
+            .map(|&index| values[index].clone())
+            .collect::<Vec<_>>();
         put(
             &mut rr.values,
             "explicitly_excluded_atoms",
             &Float::with_val(p, excluded),
         );
-        put(&mut rr.values, "used_atoms", &Float::with_val(p, used));
-        if let Some(v) = closest {
-            put(&mut rr.values, "closest_included_atom_distance", &v);
+        if let Some(limit) = o.maximum_working_bytes {
+            if super::extended_research::atom_math::scratch_bytes(&included, 1, p)? > limit {
+                rr.outcome = "unresolved_denominator".into();
+                rr.notes.push(
+                    "finite atom kernel scratch estimate exceeds explicit working-byte budget"
+                        .into(),
+                );
+                return Ok(rr);
+            }
         }
-        if unsafe_denominator {
-            rr.outcome = "unresolved_denominator".into();
-            rr.notes
-                .push("coincident or precision-limited included atom: full sums withheld".into());
-        } else {
-            for j in 0..3 {
+        match super::extended_research::atom_math::kernel(&included, &z, p) {
+            Ok(values) => {
                 put(
                     &mut rr.values,
-                    &format!("signed_kernel_{}", j + 1),
-                    &sums[j],
+                    "used_atoms",
+                    &Float::with_val(p, included.len()),
                 );
                 put(
                     &mut rr.values,
-                    &format!("absolute_kernel_{}", j + 1),
-                    &absolute[j],
+                    "arithmetic_precision_bits",
+                    &Float::with_val(p, values.arithmetic_precision),
                 );
-                if sums[j] != 0 {
+                if let Some(distance) = values.closest {
+                    put(&mut rr.values, "closest_included_atom_distance", &distance);
+                }
+                for j in 0..3 {
                     put(
                         &mut rr.values,
-                        &format!("cancellation_digits_{}", j + 1),
-                        &(Float::with_val(p, &absolute[j]) / sums[j].clone().abs()).log10(),
+                        &format!("signed_kernel_{}", j + 1),
+                        &values.signed[j],
                     );
+                    put(
+                        &mut rr.values,
+                        &format!("absolute_kernel_{}", j + 1),
+                        &values.absolute[j],
+                    );
+                    if values.signed[j] != 0 {
+                        let work = p + 64;
+                        let cancellation = Float::with_val(work, &values.absolute[j]).log10()
+                            - Float::with_val(work, &values.signed[j]).abs().log10();
+                        put(
+                            &mut rr.values,
+                            &format!("cancellation_digits_{}", j + 1),
+                            &Float::with_val(p, cancellation.max(&Float::with_val(work, 0))),
+                        );
+                    }
                 }
+            }
+            Err(error) => {
+                rr.outcome = "unresolved_denominator".into();
+                put(&mut rr.values, "used_atoms", &Float::with_val(p, 0));
+                rr.notes.push(format!(
+                    "finite atom arithmetic unresolved; full sums withheld: {error}"
+                ));
             }
         }
         Ok(rr)
@@ -404,6 +405,7 @@ fn ladder_row(
     label: &str,
     cutoff: &str,
     result: Result<ExtendedAnalysis>,
+    required_degree: Option<usize>,
     p: u32,
 ) -> Result<AnalysisRow> {
     let mut rr = row(index, label);
@@ -430,7 +432,11 @@ fn ladder_row(
                     .insert("last_model_band_root".into(), (*last).clone());
             }
             let mut margin: Option<Float> = None;
-            for row in r.rows.iter().take(r.rows.len().saturating_sub(1)) {
+            for row in r
+                .rows
+                .iter()
+                .filter(|row| required_degree.is_none_or(|degree| row.ordinal < degree))
+            {
                 if let (Some(n), Some(d)) = (
                     row.values.get("next_signed_norm_squared"),
                     row.values.get("next_absolute_norm_squared"),
@@ -518,6 +524,8 @@ pub(crate) fn band_report(
         return Ok(r);
     };
     let p = o.working_precision_bits;
+    let source_precision = i.unwrap().precision_bits;
+    let point = |x: &str| -> Result<Float> { Ok(Float::with_val(p, scalar(x, source_precision)?)) };
     put(&mut r.values, "band_degree", &Float::with_val(p, b.degree));
     put(
         &mut r.values,
@@ -528,7 +536,7 @@ pub(crate) fn band_report(
         .atoms
         .iter()
         .filter(|x| x.family == "zero")
-        .map(|x| scalar(&x.coordinate, p))
+        .map(|x| point(&x.coordinate))
         .collect::<Result<Vec<_>>>()?;
     let last = r
         .rows
@@ -567,16 +575,23 @@ pub(crate) fn band_report(
                 .and_then(|r| r.completion.as_mut())
                 .and_then(|c| c.band.as_mut())
                 .context("band cutoff model absent")?;
-            let cutoff = scalar(c, p)?;
-            model.atoms.retain(|x| {
-                x.family != "zero" || scalar(&x.coordinate, p).is_ok_and(|v| v <= cutoff)
-            });
+            let cutoff = point(c)?;
+            model
+                .atoms
+                .retain(|x| x.family != "zero" || point(&x.coordinate).is_ok_and(|v| v <= cutoff));
             model.scoring_roots.clear();
             model.coverage = format!(
                 "fixed finite zero cutoff {c}; all supplied nonzero-family atoms retained; {}",
                 b.coverage
             );
-            let rr = ladder_row(j + 1, "band_cutoff", c, band_single(s, o, Some(&input)), p)?;
+            let rr = ladder_row(
+                j + 1,
+                "band_cutoff",
+                &dec(&cutoff),
+                band_single(s, o, Some(&input)),
+                Some(b.degree),
+                p,
+            )?;
             append_ladder(&mut r, rr, p);
         }
     }
@@ -589,24 +604,25 @@ pub(crate) fn tail_report(
 ) -> Result<ExtendedAnalysis> {
     let a = policy(i);
     let p = o.working_precision_bits;
+    let source_precision = i.map_or(s.precision, |i| i.precision_bits);
     let make = |cutoff: Option<&str>| -> Result<super::convergence_capture::RunOnceInputs> {
         let input = i.context("tail recipe input absent")?;
         let recipe = a
             .and_then(|a| a.tail_recipe.as_ref())
             .context("tail recipe absent")?;
-        let cut = cutoff.map(|c| scalar(c, p)).transpose()?;
+        let cut = cutoff.map(|c| scalar(c, source_precision)).transpose()?;
         let atoms = input
             .atoms
             .iter()
             .filter(|x| {
                 x.family != "zero"
-                    || cut
-                        .as_ref()
-                        .is_none_or(|c| scalar(&x.coordinate, p).is_ok_and(|x| &x <= c))
+                    || cut.as_ref().is_none_or(|c| {
+                        scalar(&x.coordinate, source_precision).is_ok_and(|x| &x <= c)
+                    })
             })
             .cloned()
             .collect::<Vec<_>>();
-        let form = prepare_tail_form(
+        let form = prepare_tail_form_at_precision(
             input.definition_digest.clone(),
             &recipe.basis_polynomials,
             &atoms,
@@ -616,7 +632,12 @@ pub(crate) fn tail_report(
                 .as_deref()
                 .context("tail atom coverage absent")?,
             &recipe.hypotheses,
+            source_precision,
             p,
+            o.maximum_working_bytes.unwrap_or(
+                super::capture_runtime::CaptureResourcePolicy::from_environment()?
+                    .maximum_working_bytes,
+            ),
         )?;
         Ok(super::convergence_capture::RunOnceInputs {
             tail_form: Some(form),
@@ -639,6 +660,11 @@ pub(crate) fn tail_report(
         synthesized
             .as_ref()
             .or_else(|| i.and_then(|i| i.run_once.as_ref())),
+        if synthesized.is_some() {
+            p
+        } else {
+            source_precision
+        },
     )?;
     if let Some(a) = a.filter(|a| a.tail_recipe.is_some()) {
         if synthesized.is_none() {
@@ -646,8 +672,9 @@ pub(crate) fn tail_report(
         }
         for (j, c) in a.cutoffs.iter().enumerate() {
             let child = make(Some(c))
-                .and_then(|once| super::convergence_capture::tail_operator(s, o, Some(&once)));
-            let mut rr = ladder_row(j + 1, "tail_model_cutoff", c, child, p)?;
+                .and_then(|once| super::convergence_capture::tail_operator(s, o, Some(&once), p));
+            let cutoff = Float::with_val(p, scalar(c, source_precision)?);
+            let mut rr = ladder_row(j + 1, "tail_model_cutoff", &dec(&cutoff), child, None, p)?;
             rr.notes.push("same supplied basis, lattice and tail correction across cutoffs; finite cutoff stability is not an infinite-tail bound".into());
             append_ladder(&mut r, rr, p);
         }
@@ -677,6 +704,7 @@ mod tests {
             "band_cutoff",
             "not-a-number",
             Err(anyhow::anyhow!("unused")),
+            None,
             128
         )
         .is_err());
@@ -715,5 +743,53 @@ mod tests {
         std::fs::write(root.join("part.jsonl"), b"broken").unwrap();
         assert!(read_chunks::<BandAtom>(&root, &[chunk], 256 << 20).is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    use super::*;
+    #[test]
+    fn failed_required_step_is_included_but_unused_terminal_step_is_not() {
+        let mut rows = Vec::new();
+        for (j, n, d) in [(1, 1, 1), (2, -1, 7)] {
+            let mut rr = row(j, "signed_functional_stieltjes_recurrence");
+            rr.values
+                .insert("next_signed_norm_squared".into(), n.to_string());
+            rr.values
+                .insert("next_absolute_norm_squared".into(), d.to_string());
+            rows.push(rr);
+        }
+        let report = ExtendedAnalysis {
+            diagnostic: "band_reconstruction".into(),
+            outcome: "partial_unresolved".into(),
+            reason: Some("required positivity failed".into()),
+            lambda_squared: "13".into(),
+            n_modes: 1,
+            source_precision_bits: 128,
+            working_precision_bits: 128,
+            convention: "test".into(),
+            assurance: "point_diagnostics_only".into(),
+            values: Default::default(),
+            rows,
+        };
+        let failed = ladder_row(1, "band_cutoff", "3", Ok(report.clone()), Some(3), 128).unwrap();
+        assert_eq!(
+            scalar(
+                &failed.values["minimum_recurrence_relative_positivity"],
+                128
+            )
+            .unwrap(),
+            Float::with_val(128, -1) / 7
+        );
+        let terminal = ladder_row(1, "band_cutoff", "3", Ok(report), Some(2), 128).unwrap();
+        assert_eq!(
+            scalar(
+                &terminal.values["minimum_recurrence_relative_positivity"],
+                128
+            )
+            .unwrap(),
+            1
+        );
     }
 }

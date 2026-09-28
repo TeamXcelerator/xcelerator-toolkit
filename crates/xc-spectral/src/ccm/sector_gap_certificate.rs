@@ -5,7 +5,7 @@
 //! Numerical sector spectra remain the discovery guide.  The proof itself is
 //! rebuilt from the cutoff-free interval enclosure of the full CCM Weil
 //! matrix, projected into exact reflection-parity sectors, and replayed with
-//! exact-rational shifted-inertia counts.  The resulting claim is strictly
+//! directed MPFR shifted-inertia counts with recorded proof precision.  The resulting claim is strictly
 //! about one recorded finite `(c, N)` matrix; it is not a continuum or
 //! convergence theorem.
 
@@ -16,7 +16,7 @@ use xc_cache::ContentDigest;
 #[cfg(feature = "arb")]
 use xc_cache::SemanticKeyEnvelope;
 use xc_certify::exact::{
-    certify_exact_spectral_gap, certify_selected_interval_eigenvalue, interval_record, parse,
+    certify_exact_spectral_gap, certify_selected_interval_eigenvalue_mpfr, interval_record, parse,
     parse_interval, rational_record, verify_exact_spectral_gap_certificate,
     verify_portable_interval_inertia_certificate, verify_selected_interval_eigenvalue_enclosure,
 };
@@ -30,23 +30,29 @@ use xc_numerics::interval::RationalInterval;
 #[cfg(feature = "arb")]
 use super::CcmParams;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
+const SELECTED_INERTIA_SEMANTICS: &str = "directed_mpfr_selected_interval_inertia_guard_ladder_v1";
 const CLAIM_SCOPE: &str =
     "cutoff_free_finite_ccm_conditional_sector_ordering_simplicity_and_unconditional_full_inertia";
 const INTERVAL_MATRIX_SEMANTICS: &str =
     "raw_full_corrected_endpoint_aggregate_prime_tau_certified_by_interval_ldlt_then_reflection_orbits_intersected_for_conditional_parity_projection_v3";
 const PARITY_INVARIANCE_PREMISE: &str =
     "the exact closed_form_ccm_tau matrix is centrosymmetric under index reflection";
+// The portable verifier is available without Arb, so these supported recorded
+// identities remain readable independently of the assembly backend feature.
+const ASSEMBLY_SEMANTICS: &str = "ccm-cutoff-free-zero-endpoint-aggregate-primes-v0.15.0-v1";
+const INERTIA_SEMANTICS: &str = "mpfr-directed-interval-ldlt-v1";
 
 /// Cost and discovery controls for the finite sector-gap certificate.
 ///
 /// The numerical eigenvalues determine only the initial brackets.  Each
-/// accepted bracket is independently proved by exact-rational shifted
+/// accepted bracket is independently proved by directed interval shifted
 /// inertia.  Expansions are bounded so a positive guide never receives a
 /// bracket crossing zero merely because of this discovery policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CcmSectorGapCertificationOptions {
+    /// Supported relative precision: 8 through 1,000,000 bits.
     pub relative_enclosure_bits: u32,
     pub maximum_bracket_expansions: u32,
 }
@@ -62,8 +68,8 @@ impl Default for CcmSectorGapCertificationOptions {
 
 impl CcmSectorGapCertificationOptions {
     pub fn validate(&self) -> Result<()> {
-        if self.relative_enclosure_bits < 8 {
-            bail!("CCM sector-gap certification requires at least 8 relative enclosure bits");
+        if !(8..=1_000_000).contains(&self.relative_enclosure_bits) {
+            bail!("CCM sector-gap certification requires 8..=1,000,000 relative enclosure bits");
         }
         if self.maximum_bracket_expansions == 0
             || self.maximum_bracket_expansions >= self.relative_enclosure_bits
@@ -131,6 +137,7 @@ fn checked_full_dimension(n_modes: usize) -> Result<usize> {
 fn invalid_report(message: impl Into<String>) -> VerificationReport {
     VerificationReport {
         valid: false,
+        mathematical_claim_verified: false,
         checks: Vec::new(),
         warnings: Vec::new(),
         errors: vec![message.into()],
@@ -314,25 +321,34 @@ fn guided_selected_certificate(
         let lower = center.clone() - radius.clone();
         let upper = center.clone() + radius.clone();
         let width = upper.clone() - lower.clone();
-        match certify_selected_interval_eigenvalue(
-            matrix,
-            dimension,
-            requested_index,
-            lower,
-            upper,
-            width,
-            1,
-        ) {
-            SelectedEigenvalueEnclosureResult::Conclusive { certificate } => {
-                if !certificate.simple {
-                    bail!(
-                        "CCM sector-gap {name} bracket enclosed multiple eigenvalues at expansion {expansion}"
-                    );
-                }
-                return Ok(*certificate);
+        let mut previous_precision = 0;
+        for guard in [64_u32, 256, 1024] {
+            let proof_precision = guide.prec().saturating_add(guard).min(1_000_000);
+            if proof_precision == previous_precision {
+                continue;
             }
-            SelectedEigenvalueEnclosureResult::Inconclusive { boundary, reason } => {
-                failures.push(format!("expansion {expansion}, {boundary}: {reason}"));
+            previous_precision = proof_precision;
+            match certify_selected_interval_eigenvalue_mpfr(
+                matrix,
+                dimension,
+                requested_index,
+                lower.clone(),
+                upper.clone(),
+                width.clone(),
+                1,
+                proof_precision,
+            ) {
+                SelectedEigenvalueEnclosureResult::Conclusive { certificate } => {
+                    if !certificate.simple {
+                        bail!("CCM sector-gap {name} bracket enclosed multiple eigenvalues at expansion {expansion}");
+                    }
+                    return Ok(*certificate);
+                }
+                SelectedEigenvalueEnclosureResult::Inconclusive { boundary, reason } => {
+                    failures.push(format!(
+                        "expansion {expansion}, precision {proof_precision}, {boundary}: {reason}"
+                    ));
+                }
             }
         }
         radius *= 2;
@@ -362,7 +378,7 @@ fn build_certificate_from_tau(
     options: CcmSectorGapCertificationOptions,
 ) -> Result<PortableCcmSectorGapCertificate> {
     options.validate()?;
-    if n_modes == 0 || precision_bits < 64 || geometric_terms == 0 {
+    if n_modes == 0 || !(64..=1_000_000).contains(&precision_bits) || geometric_terms == 0 {
         bail!("CCM sector-gap certificate metadata is outside the supported finite model");
     }
     for digest in [
@@ -421,7 +437,7 @@ fn build_certificate_from_tau(
     // a deeply cancelled ground state, however, a tiny entrywise difference
     // between that point matrix and the cutoff-free interval midpoint can be
     // many relative orders at the eigenvalue. Use native midpoint guides for
-    // proof search; exact shifted inertia remains the verifier.
+    // proof search; directed interval shifted inertia remains the verifier.
     let even_certification_guides =
         interval_midpoint_guides(&even, n_modes + 1, 2, precision_bits)?;
     let odd_certification_guides = interval_midpoint_guides(&odd, n_modes, 1, precision_bits)?;
@@ -505,17 +521,18 @@ fn build_certificate_from_tau(
 
 /// Independently replay the exact finite-sector claims from the stored Tau
 /// intervals.  No numerical guide value participates in the proof replay.
+/// This checks the recorded matrix, conditional on its assembly provenance;
+/// use the reassembly variant to bind externally supplied records to CCM.
 pub fn verify_portable_ccm_sector_gap_certificate(
     certificate: &PortableCcmSectorGapCertificate,
 ) -> VerificationReport {
     let verify = || -> Result<Vec<String>> {
-        if certificate.schema_version != SCHEMA_VERSION
+        if !matches!(certificate.schema_version, 3 | SCHEMA_VERSION)
             || certificate.lambda_squared != certificate.integer_cutoff_c.to_string()
             || certificate.n_modes == 0
             || checked_full_dimension(certificate.n_modes).is_err()
             || certificate.integer_cutoff_c <= 1
-            || certificate.precision_bits > i32::MAX as u32 - 64
-            || certificate.precision_bits < 64
+            || !(64..=1_000_000).contains(&certificate.precision_bits)
             || certificate.geometric_terms == 0
             || certificate.scalar_backend.trim().is_empty()
             || certificate.interval_matrix_semantics != INTERVAL_MATRIX_SEMANTICS
@@ -523,6 +540,26 @@ pub fn verify_portable_ccm_sector_gap_certificate(
             || certificate.claim_scope != CLAIM_SCOPE
         {
             bail!("CCM sector-gap certificate metadata or finite claim scope is invalid");
+        }
+        for selected in [
+            &certificate.even_ground,
+            &certificate.even_first_excited,
+            &certificate.odd_ground,
+        ] {
+            if certificate.schema_version == SCHEMA_VERSION
+                && !selected
+                    .inertia_precision_bits
+                    .is_some_and(|p| (64..=1_000_000).contains(&p))
+            {
+                bail!(
+                    "CCM sector-gap schema 4 requires a recorded directed inertia proof precision"
+                );
+            }
+            if certificate.schema_version == 3 && selected.inertia_precision_bits.is_some() {
+                bail!(
+                    "CCM sector-gap historical schema 3 requires its original exact inertia replay"
+                );
+            }
         }
         CcmSectorGapCertificationOptions {
             relative_enclosure_bits: certificate.relative_enclosure_bits,
@@ -561,6 +598,18 @@ pub fn verify_portable_ccm_sector_gap_certificate(
         let expected_modes = certificate.n_modes.to_string();
         let expected_geometric_terms = certificate.geometric_terms.to_string();
         if certificate.full_matrix_inertia_certificate.dimension != full_dimension
+            || certificate
+                .full_matrix_inertia_certificate
+                .configuration
+                .get("assembly_semantics")
+                .map(String::as_str)
+                != Some(ASSEMBLY_SEMANTICS)
+            || certificate
+                .full_matrix_inertia_certificate
+                .configuration
+                .get("inertia_semantics")
+                .map(String::as_str)
+                != Some(INERTIA_SEMANTICS)
             || certificate.full_matrix_inertia_certificate.precision_bits
                 != certificate.precision_bits
             || certificate.full_matrix_inertia_certificate.scalar_backend
@@ -687,7 +736,7 @@ pub fn verify_portable_ccm_sector_gap_certificate(
             bail!("CCM finite positive-definite flag differs from full-matrix inertia replay");
         }
         checks.push(
-            "raw full cutoff-free Tau inertia replays without a centrosymmetry premise".to_owned(),
+            "recorded raw full-matrix inertia replays without a centrosymmetry premise".to_owned(),
         );
         checks.push(
             "conditional parity projection derives from the recorded reflection-orbit intersections"
@@ -702,8 +751,10 @@ pub fn verify_portable_ccm_sector_gap_certificate(
     match verify() {
         Ok(checks) => VerificationReport {
             valid: true,
+            mathematical_claim_verified: true,
             checks,
             warnings: vec![
+                "matrix-to-CCM assembly binding is not replayed; the finite CCM interpretation requires the stated assembly provenance".to_owned(),
                 format!(
                     "parity, sector ordering, and sector simplicity are conditional on this premise: {PARITY_INVARIANCE_PREMISE}; full-matrix positivity is not"
                 ),
@@ -714,6 +765,44 @@ pub fn verify_portable_ccm_sector_gap_certificate(
         },
         Err(error) => invalid_report(error.to_string()),
     }
+}
+
+/// Replay the finite-sector proof and independently bind its raw matrix and
+/// component digest to a fresh cutoff-free CCM assembly at the recorded settings.
+#[cfg(feature = "arb")]
+pub fn verify_portable_ccm_sector_gap_certificate_with_reassembly(
+    certificate: &PortableCcmSectorGapCertificate,
+) -> VerificationReport {
+    let mut report = verify_portable_ccm_sector_gap_certificate(certificate);
+    if !report.valid {
+        return report;
+    }
+    let bind = || -> Result<()> {
+        let matrix = super::cutoff_free::assemble(&super::cutoff_free::CutoffFreeConfig {
+            integer_cutoff_c: certificate.integer_cutoff_c,
+            modes: certificate.n_modes,
+            precision_bits: certificate.precision_bits,
+            geometric_terms: certificate.geometric_terms,
+        })?;
+        if matrix.scalar_backend != certificate.scalar_backend
+            || matrix.component_evidence_digest()? != certificate.component_evidence_digest
+            || matrix.tau.iter().map(interval_record).collect::<Vec<_>>()
+                != certificate.full_matrix_inertia_certificate.matrix_row_major
+        {
+            bail!("recorded sector certificate does not match the reconstructed CCM assembly");
+        }
+        Ok(())
+    };
+    if let Err(error) = bind() {
+        return invalid_report(error.to_string());
+    }
+    report
+        .warnings
+        .retain(|warning| !warning.starts_with("matrix-to-CCM assembly binding is not replayed;"));
+    report.checks.push(
+        "raw matrix, backend, and component evidence match independent CCM reassembly".to_owned(),
+    );
+    report
 }
 
 #[cfg(feature = "arb")]
@@ -741,8 +830,8 @@ pub(crate) fn resolve_sector_gap_certificate_via_cache(
     if !params.lambda_sq.is_integer || params.lambda_sq_int() <= 1 || params.n_modes == 0 {
         bail!("CCM sector-gap certification requires integer lambda_squared > 1 and N >= 1");
     }
-    if precision_bits < 64 {
-        bail!("CCM sector-gap certification requires at least 64 bits");
+    if !(64..=1_000_000).contains(&precision_bits) {
+        bail!("CCM sector-gap certification requires 64..=1,000,000 bits");
     }
     if even_manifest.key.kind != "ccm_sector_spectrum"
         || odd_manifest.key.kind != "ccm_sector_spectrum"
@@ -761,13 +850,16 @@ pub(crate) fn resolve_sector_gap_certificate_via_cache(
         schema_version: 1,
         artifact_kind: "ccm_sector_gap_certificate".to_owned(),
         mathematical_semantics_version:
-            "ccm-cutoff-free-sector-gap-certificate-v0.15.0-v3".to_owned(),
+            "ccm-cutoff-free-sector-gap-certificate-mpfr-selected-v5".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared,
             "n_modes": params.n_modes,
             "precision_bits": precision_bits,
             "geometric_terms": geometric_terms,
             "assembly_semantics": super::cutoff_free::ASSEMBLY_SEMANTICS,
+            "full_matrix_inertia_semantics": super::cutoff_free::INERTIA_SEMANTICS,
+            "selected_inertia_semantics": SELECTED_INERTIA_SEMANTICS,
+            "selected_inertia_guard_bits": [64, 256, 1024],
             "relative_enclosure_bits": options.relative_enclosure_bits,
             "maximum_bracket_expansions": options.maximum_bracket_expansions,
             "even_spectrum_content_digest": even_manifest.content_digest.0,
@@ -798,7 +890,7 @@ pub(crate) fn resolve_sector_gap_certificate_via_cache(
             ),
         ]),
         algorithm_semantics: Some(
-            "corrected_endpoint_aggregate_prime_interval_assembly_full_matrix_ldlt_then_conditional_symmetry_intersection_parity_projection_exact_shifted_inertia_v3".to_owned(),
+            "corrected_endpoint_aggregate_prime_interval_assembly_directed_mpfr_full_matrix_ldlt_then_conditional_symmetry_intersection_parity_projection_directed_selected_inertia_v5".to_owned(),
         ),
     };
     let semantic_digest = semantic_key.digest()?;
@@ -822,7 +914,7 @@ pub(crate) fn resolve_sector_gap_certificate_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Certified,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+        minimum_reader_version: ToolkitVersion::parse("0.15.1")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -926,6 +1018,13 @@ pub(crate) fn resolve_sector_gap_certificate_via_cache(
                 || artifact.precision_bits != precision_bits
                 || artifact.geometric_terms != geometric_terms
                 || artifact.scalar_backend != scalar_backend
+                || artifact.full_matrix_inertia_certificate.schema_version != 2
+                || artifact
+                    .full_matrix_inertia_certificate
+                    .configuration
+                    .get("inertia_semantics")
+                    .map(String::as_str)
+                    != Some(super::cutoff_free::INERTIA_SEMANTICS)
                 || artifact.relative_enclosure_bits != options.relative_enclosure_bits
                 || artifact.maximum_bracket_expansions != options.maximum_bracket_expansions
                 || artifact.guide_even_spectrum_content_digest != even_manifest.content_digest
@@ -976,6 +1075,11 @@ mod tests {
                 "synthetic-exact",
                 component_digest.clone(),
                 std::collections::BTreeMap::from([
+                    (
+                        "assembly_semantics".to_owned(),
+                        ASSEMBLY_SEMANTICS.to_owned(),
+                    ),
+                    ("inertia_semantics".to_owned(), INERTIA_SEMANTICS.to_owned()),
                     ("integer_cutoff_c".to_owned(), "5".to_owned()),
                     ("modes".to_owned(), "2".to_owned()),
                     ("geometric_terms".to_owned(), "32".to_owned()),
@@ -1001,6 +1105,153 @@ mod tests {
             CcmSectorGapCertificationOptions::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn directed_selected_sector_certificate_dense_exact_oracle() {
+        // Rational Householder similarity Q D Q^T, Q=I-2vv^T/(v^Tv).
+        // Its exact eigenvalues are 1,...,7 despite dense entries.
+        let n = 7;
+        let v: Vec<Rational> = (1..=n).map(Rational::from).collect();
+        let norm: Rational = v.iter().map(|x| x.clone() * x).sum();
+        let q: Vec<Rational> = (0..n * n)
+            .map(|k| {
+                let (i, j) = (k / n, k % n);
+                Rational::from(i32::from(i == j)) - Rational::from(2) * &v[i] * &v[j] / &norm
+            })
+            .collect();
+        let matrix: Vec<RationalInterval> = (0..n * n)
+            .map(|k| {
+                let (i, j) = (k / n, k % n);
+                RationalInterval::point(
+                    (0..n)
+                        .map(|r| q[i * n + r].clone() * &q[j * n + r] * Rational::from(r + 1))
+                        .sum(),
+                )
+            })
+            .collect();
+        for index in [0, 1, 5] {
+            let certificate = guided_selected_certificate(
+                &matrix,
+                n,
+                index,
+                &Float::with_val(128, index + 1),
+                "dense exact oracle",
+                CcmSectorGapCertificationOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(certificate.inertia_precision_bits, Some(192));
+            assert!(parse(&certificate.lower).unwrap() < index + 1);
+            assert!(parse(&certificate.upper).unwrap() > index + 1);
+            assert!(
+                verify_selected_interval_eigenvalue_enclosure(&certificate, &matrix)
+                    .mathematical_claim_verified
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustive_resumed_sector_gap_rejects_unbounded_radius_precision() {
+        assert!(CcmSectorGapCertificationOptions {
+            relative_enclosure_bits: u32::MAX,
+            maximum_bracket_expansions: 1,
+        }
+        .validate()
+        .is_err());
+        assert!(CcmSectorGapCertificationOptions {
+            relative_enclosure_bits: 1_000_000,
+            maximum_bracket_expansions: 1,
+        }
+        .validate()
+        .is_ok());
+        let mut certificate = synthetic_certificate();
+        certificate.precision_bits = 1_000_001;
+        assert!(!verify_portable_ccm_sector_gap_certificate(&certificate).valid);
+    }
+
+    #[test]
+    fn sector_recorded_proof_discloses_assembly_premise() {
+        let mut certificate = synthetic_certificate();
+        let report = verify_portable_ccm_sector_gap_certificate(&certificate);
+        assert!(report.valid, "{:?}", report.errors);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|x| x.contains("assembly binding is not replayed")));
+        certificate
+            .full_matrix_inertia_certificate
+            .configuration
+            .insert("assembly_semantics".into(), "foreign".into());
+        assert!(!verify_portable_ccm_sector_gap_certificate(&certificate).valid);
+        let mut certificate = synthetic_certificate();
+        certificate
+            .full_matrix_inertia_certificate
+            .configuration
+            .insert("inertia_semantics".into(), "foreign".into());
+        assert!(!verify_portable_ccm_sector_gap_certificate(&certificate).valid);
+    }
+
+    #[cfg(feature = "arb")]
+    #[test]
+    fn sector_reassembly_rejects_foreign_matrix() {
+        assert_eq!(
+            ASSEMBLY_SEMANTICS,
+            super::super::cutoff_free::ASSEMBLY_SEMANTICS
+        );
+        assert_eq!(
+            INERTIA_SEMANTICS,
+            super::super::cutoff_free::INERTIA_SEMANTICS
+        );
+        let certificate = synthetic_certificate();
+        assert!(verify_portable_ccm_sector_gap_certificate(&certificate).valid);
+        let report = verify_portable_ccm_sector_gap_certificate_with_reassembly(&certificate);
+        assert!(!report.valid);
+        assert!(report
+            .errors
+            .iter()
+            .any(|x| x.contains("reconstructed CCM assembly")));
+    }
+
+    #[test]
+    #[cfg(feature = "arb")]
+    fn exhaustive_resumed_source_error_interval_contains_exact_zero_error() {
+        use crate::ccm::{state_geometry::RetainedState, transform_enclosure::test_source_error};
+        let certificate = synthetic_certificate();
+        let ver = serde_json::json!({"major":0,"minor":15,"patch":1,"prerelease":null});
+        let manifest=serde_json::from_value(serde_json::json!({
+            "schema_version":1,"key":{"kind":"ccm_weil_eigenpair","logical_key":"synthetic finite angle","parameters_digest":digest("key")},
+            "content_digest":digest("state"),"size_bytes":0,"objects":[],"created_unix_seconds":1,
+            "producer_toolkit_version":ver,"minimum_reader_version":ver,"maximum_reader_version":null,"quality":"validated","visibility":"local","immutable":true,"dependencies":[],"tags":{},"provenance_digest":null
+        })).unwrap();
+        let state = RetainedState {
+            manifest,
+            cutoff: "5".into(),
+            modes: 2,
+            precision: 128,
+            coefficients: [0, 0, 1, 0, 0]
+                .iter()
+                .map(|v| Float::with_val(128, *v))
+                .collect(),
+            eigenvalue: "0.5".into(),
+            selection_policy: Some("synthetic even ground".into()),
+        };
+        assert!(
+            crate::ccm::transform_enclosure::test_source_error_with_reassembly(
+                &state,
+                &certificate
+            )
+            .is_err(),
+            "external manufactured matrix must not be admitted as a CCM source allowance"
+        );
+        // The vector is the exact ground eigenvector of the diagonal fixture.
+        // An inexact trial eigenvalue creates a positive residual bound, but
+        // cannot establish a positive lower bound for the actual state error.
+        let bound = test_source_error(&state, &certificate).unwrap();
+        assert!(
+            bound.contains_zero(),
+            "upper-bound estimate was mislabeled as an actual error enclosure: {bound:?}"
+        );
+        assert!(bound.upper() > &0);
     }
 
     #[test]
@@ -1109,6 +1360,12 @@ mod tests {
         let report = verify_portable_ccm_sector_gap_certificate(&certificate);
         assert!(report.valid, "{:?}", report.errors);
         assert_eq!(certificate.certified_finite_ground_parity, "even");
+        let strict = verify_portable_ccm_sector_gap_certificate_with_reassembly(&certificate);
+        assert!(strict.valid, "{:?}", strict.errors);
+        assert!(!strict
+            .warnings
+            .iter()
+            .any(|x| x.contains("assembly binding is not replayed")));
         // Independent defining-integral point references, not claimed as
         // certificates. The exact inertia brackets must contain these guides.
         for (enclosure, reference) in [

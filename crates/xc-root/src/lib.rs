@@ -7,6 +7,14 @@
 //! interval Newton, Krawczyk, and contour-count backends remain separate
 //! assurance milestones and may not be silently replaced by these routines.
 
+/// Bind this identity into artifacts produced by point root refinement.
+pub const ROOT_POINT_REFINEMENT_SEMANTICS: &str =
+    "root-point-positional-stop-local-nondecreasing-residual-growth-v3";
+/// Bind this identity into artifacts produced by pole-aware sign discovery.
+pub const ROOT_DISCOVERY_SEMANTICS: &str = "root-discovery-disjoint-bracket-distinctness-v2";
+
+mod native_stopping;
+
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -20,6 +28,8 @@ pub use xc_numerics::interval::{
 };
 
 /// Certified argument-principle count for an exact finite entire polynomial.
+/// Backend invalid/inconclusive outcomes are returned as RootError::Evaluation;
+/// its message preserves the backend reason, and no count is returned.
 #[cfg(feature = "hp")]
 pub fn certify_entire_polynomial_contour(
     coefficients_ascending: &[xc_numerics::interval::ComplexRational],
@@ -80,6 +90,8 @@ impl Display for RootError {
 
 impl Error for RootError {}
 
+/// Point callback. Bracketed refinement requires continuity throughout the
+/// supplied bracket; a sign change across an undeclared pole is not a root.
 pub trait RealFunctionF64: Send + Sync {
     fn evaluate(&self, x: f64) -> Result<f64, RootError>;
 
@@ -127,6 +139,27 @@ pub enum RootApproximationStatus {
     Failed,
 }
 
+/// The observed stopping condition, not a proof of existence or uniqueness.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootConvergenceCriterion {
+    /// Historical or externally constructed records do not identify their stop.
+    #[default]
+    Unspecified,
+    ObservedZero,
+    Residual,
+    BracketWidth,
+    ResidualAndBracketWidth,
+}
+fn convergence_criterion(zero: bool, residual: bool, width: bool) -> RootConvergenceCriterion {
+    match (zero, residual, width) {
+        (true, _, _) => RootConvergenceCriterion::ObservedZero,
+        (_, true, true) => RootConvergenceCriterion::ResidualAndBracketWidth,
+        (_, true, false) => RootConvergenceCriterion::Residual,
+        (_, false, true) => RootConvergenceCriterion::BracketWidth,
+        _ => RootConvergenceCriterion::Unspecified,
+    }
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RootApproximationF64 {
     pub midpoint: f64,
@@ -136,22 +169,48 @@ pub struct RootApproximationF64 {
     pub iterations: usize,
     pub function_evaluations: usize,
     pub derivative_evaluations: usize,
+    /// Current refiners require position convergence or an observed zero. Legacy
+    /// records retain their explicit convergence_criterion, including residual-only stops.
     pub status: RootApproximationStatus,
+    #[serde(default)]
+    pub convergence_criterion: RootConvergenceCriterion,
     pub method: String,
 }
 
 impl RootApproximationF64 {
+    /// Export the exact stored binary endpoints. Panics on an invalid bracket;
+    /// use `try_decimal_interval` for externally supplied approximation records.
     pub fn decimal_interval(&self) -> DecimalInterval {
-        DecimalInterval {
-            lower: format!("{:.17e}", self.bracket.lower),
-            upper: format!("{:.17e}", self.bracket.upper),
+        self.try_decimal_interval()
+            .expect("finite ordered root bracket required")
+    }
+
+    /// Exact decimal endpoints, allowing a singleton bracket for an exact root.
+    /// Short round-trip formatting can move an endpoint inward and is unsuitable
+    /// for exporting an enclosure. This does not certify the source bracket.
+    pub fn try_decimal_interval(&self) -> Result<DecimalInterval, RootError> {
+        if self.bracket.lower > self.bracket.upper {
+            return Err(RootError::InvalidConfiguration(
+                "root export bracket is reversed".into(),
+            ));
         }
+        let exact = |value| {
+            xc_core::DecimalLiteral::from_f64_exact(value)
+                .map(|literal| literal.to_string())
+                .map_err(|error| RootError::InvalidConfiguration(error.to_string()))
+        };
+        Ok(DecimalInterval {
+            lower: exact(self.bracket.lower)?,
+            upper: exact(self.bracket.upper)?,
+        })
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RootStoppingF64 {
     pub absolute_x_tolerance: f64,
+    /// Width threshold relative to max(1, abs(lower), abs(upper)); the unit
+    /// floor makes this an absolute threshold for brackets inside [-1, 1].
     pub relative_x_tolerance: f64,
     pub residual_tolerance: f64,
     pub maximum_iterations: usize,
@@ -193,19 +252,14 @@ impl RootStoppingF64 {
         if !midpoint.is_finite() {
             return false;
         }
-        let width = upper - lower;
         let scale = midpoint.abs().max(1.0);
-        if width.is_finite() {
-            width
-                <= self
-                    .absolute_x_tolerance
-                    .max(self.relative_x_tolerance * scale)
-        } else {
-            // Opposite large endpoints can have an unrepresentable full width.
-            // Scale both sides before subtracting or multiplying.
-            (0.5 * upper - 0.5 * lower)
-                <= (0.5 * self.absolute_x_tolerance).max((0.5 * self.relative_x_tolerance) * scale)
-        }
+        native_stopping::width_at_most_product(lower, upper, self.absolute_x_tolerance, 1.0)
+            || native_stopping::width_at_most_product(
+                lower,
+                upper,
+                self.relative_x_tolerance,
+                scale,
+            )
     }
 }
 
@@ -256,7 +310,7 @@ where
     let mut lower = bracket.lower;
     let mut upper = bracket.upper;
     let mut f_lower = checked_evaluate(function, lower, &mut evaluations)?;
-    let f_upper = checked_evaluate(function, upper, &mut evaluations)?;
+    let mut f_upper = checked_evaluate(function, upper, &mut evaluations)?;
     if f_lower == 0.0 {
         return Ok(RootApproximationF64 {
             midpoint: lower,
@@ -270,7 +324,8 @@ where
             function_evaluations: evaluations,
             derivative_evaluations: 0,
             status: RootApproximationStatus::Refined,
-            method: "bisection_f64".to_owned(),
+            convergence_criterion: RootConvergenceCriterion::ObservedZero,
+            method: "bisection_f64_position_local_guard_v3".to_owned(),
         });
     }
     if f_upper == 0.0 {
@@ -286,7 +341,8 @@ where
             function_evaluations: evaluations,
             derivative_evaluations: 0,
             status: RootApproximationStatus::Refined,
-            method: "bisection_f64".to_owned(),
+            convergence_criterion: RootConvergenceCriterion::ObservedZero,
+            method: "bisection_f64_position_local_guard_v3".to_owned(),
         });
     }
     if f_lower.is_sign_positive() == f_upper.is_sign_positive() {
@@ -295,13 +351,29 @@ where
         )));
     }
 
+    let mut local_residuals = std::collections::VecDeque::new();
     for iteration in 1..=stopping.maximum_iterations {
         check_cancellation(cancellation)?;
         let midpoint = lower.midpoint(upper);
         let f_midpoint = checked_evaluate(function, midpoint, &mut evaluations)?;
-        if f_midpoint.abs() <= stopping.residual_tolerance
-            || stopping.x_converged(lower, upper, midpoint)
-        {
+        let residual_met = f_midpoint.abs() <= stopping.residual_tolerance;
+        let width_met = stopping.x_converged(lower, upper, midpoint);
+        let local_growth = local_residuals.front().is_some_and(|&(a, b)| {
+            let left = f_lower.abs();
+            let right = f_upper.abs();
+            local_residuals.len() == 8 && left >= a && right >= b && (left > a || right > b)
+        });
+        local_residuals.push_back((f_lower.abs(), f_upper.abs()));
+        if local_residuals.len() > 8 {
+            local_residuals.pop_front();
+        }
+        if width_met && f_midpoint != 0.0 && local_growth {
+            return Err(RootError::NonConvergence(
+                "narrow bracket has a growing residual; continuity or pole exclusion is unresolved"
+                    .into(),
+            ));
+        }
+        if f_midpoint == 0.0 || width_met {
             let derivative = function
                 .derivative(midpoint)
                 .ok()
@@ -315,11 +387,17 @@ where
                 function_evaluations: evaluations,
                 derivative_evaluations: usize::from(derivative.is_some()),
                 status: RootApproximationStatus::Refined,
-                method: "bisection_f64".to_owned(),
+                convergence_criterion: convergence_criterion(
+                    f_midpoint == 0.0,
+                    residual_met,
+                    width_met,
+                ),
+                method: "bisection_f64_position_local_guard_v3".to_owned(),
             });
         }
         if f_lower.is_sign_positive() != f_midpoint.is_sign_positive() {
             upper = midpoint;
+            f_upper = f_midpoint;
         } else {
             lower = midpoint;
             f_lower = f_midpoint;
@@ -334,7 +412,12 @@ where
 /// Refines one bracketed real root with Newton steps safeguarded by bisection.
 ///
 /// # Mathematical semantics
-/// The bracket must contain a sign change. Newton steps are accepted only when
+/// The callback must be continuous on the bracket and the endpoints must have
+/// opposite signs. Every pole must be excluded by the caller. Refinement
+/// requires bracket-position accuracy or an observed zero; a small absolute
+/// residual alone is insufficient. The local residual-growth safeguard is
+/// diagnostic and does not replace the continuity/pole-exclusion premise.
+/// Newton steps are accepted only when
 /// safe; otherwise interval bisection preserves containment of a root.
 ///
 /// # Precision
@@ -390,7 +473,7 @@ pub fn safeguarded_newton_f64_controlled(
     let mut lower = bracket.lower;
     let mut upper = bracket.upper;
     let mut f_lower = checked_evaluate(function, lower, &mut function_evaluations)?;
-    let f_upper = checked_evaluate(function, upper, &mut function_evaluations)?;
+    let mut f_upper = checked_evaluate(function, upper, &mut function_evaluations)?;
     if f_lower == 0.0 || f_upper == 0.0 {
         let endpoint = if f_lower == 0.0 { lower } else { upper };
         return Ok(RootApproximationF64 {
@@ -405,7 +488,8 @@ pub fn safeguarded_newton_f64_controlled(
             function_evaluations,
             derivative_evaluations: 0,
             status: RootApproximationStatus::Refined,
-            method: "safeguarded_newton_f64".into(),
+            convergence_criterion: RootConvergenceCriterion::ObservedZero,
+            method: "safeguarded_newton_f64_position_local_guard_v3".into(),
         });
     }
     if f_lower.is_sign_positive() == f_upper.is_sign_positive() {
@@ -414,10 +498,28 @@ pub fn safeguarded_newton_f64_controlled(
         ));
     }
     let mut x = initial;
+    let mut local_residuals = std::collections::VecDeque::new();
     for iteration in 1..=stopping.maximum_iterations {
         check_cancellation(cancellation)?;
         let fx = checked_evaluate(function, x, &mut function_evaluations)?;
-        if fx.abs() <= stopping.residual_tolerance || stopping.x_converged(lower, upper, x) {
+        let residual_met = fx.abs() <= stopping.residual_tolerance;
+        let width_met = stopping.x_converged(lower, upper, x);
+        let local_growth = local_residuals.front().is_some_and(|&(a, b)| {
+            let left = f_lower.abs();
+            let right = f_upper.abs();
+            local_residuals.len() == 8 && left >= a && right >= b && (left > a || right > b)
+        });
+        local_residuals.push_back((f_lower.abs(), f_upper.abs()));
+        if local_residuals.len() > 8 {
+            local_residuals.pop_front();
+        }
+        if width_met && fx != 0.0 && local_growth {
+            return Err(RootError::NonConvergence(
+                "narrow bracket has a growing residual; continuity or pole exclusion is unresolved"
+                    .into(),
+            ));
+        }
+        if fx == 0.0 || width_met {
             let derivative = function.derivative(x).ok().filter(|v| v.is_finite());
             derivative_evaluations += usize::from(derivative.is_some());
             return Ok(RootApproximationF64 {
@@ -429,11 +531,13 @@ pub fn safeguarded_newton_f64_controlled(
                 function_evaluations,
                 derivative_evaluations,
                 status: RootApproximationStatus::Refined,
-                method: "safeguarded_newton_f64".to_owned(),
+                convergence_criterion: convergence_criterion(fx == 0.0, residual_met, width_met),
+                method: "safeguarded_newton_f64_position_local_guard_v3".to_owned(),
             });
         }
         if f_lower.is_sign_positive() != fx.is_sign_positive() {
             upper = x;
+            f_upper = fx;
         } else {
             lower = x;
             f_lower = fx;
@@ -445,7 +549,11 @@ pub fn safeguarded_newton_f64_controlled(
         } else {
             f64::NAN
         };
-        x = if candidate.is_finite() && candidate > lower && candidate < upper {
+        let center = lower.midpoint(upper);
+        x = if candidate.is_finite()
+            && candidate > lower.midpoint(center)
+            && candidate < center.midpoint(upper)
+        {
             candidate
         } else {
             lower.midpoint(upper)
@@ -476,6 +584,9 @@ impl Default for PoleAwareDiscoveryOptionsF64 {
     }
 }
 
+/// Scan non-pole windows for sampled zeros and strict sign changes. Each
+/// distinct observed zero is retained; spatial proximity alone is not duplication. This finite
+/// sampling procedure does not establish mathematical root completeness.
 pub fn discover_pole_aware_sign_changes_f64(
     function: &dyn MeromorphicFunctionF64,
     lower: f64,
@@ -542,8 +653,23 @@ pub fn discover_pole_aware_sign_changes_f64_controlled(
         };
         let margin =
             fractional_margin.max(f64::EPSILON * window[0].abs().max(window[1].abs()).max(1.0));
-        let interval_lower = window[0] + margin;
-        let interval_upper = window[1] - margin;
+        // Only declared poles need an exclusion margin. Ordinary discovery
+        // boundaries remain part of the search, including very narrow windows.
+        let is_pole = |endpoint: f64| {
+            poles
+                .binary_search_by(|pole| pole.partial_cmp(&endpoint).unwrap())
+                .is_ok()
+        };
+        let interval_lower = if is_pole(window[0]) {
+            window[0] + margin
+        } else {
+            window[0]
+        };
+        let interval_upper = if is_pole(window[1]) {
+            window[1] - margin
+        } else {
+            window[1]
+        };
         if !interval_lower.is_finite()
             || !interval_upper.is_finite()
             || interval_lower >= interval_upper
@@ -553,6 +679,24 @@ pub fn discover_pole_aware_sign_changes_f64_controlled(
         let mut evaluations = 0;
         let mut x0 = interval_lower;
         let mut f0 = checked_evaluate(function, x0, &mut evaluations)?;
+        let mut retain_root = |root: RootApproximationF64| {
+            // Adjacent sampled sign brackets are independent evidence for
+            // distinct roots, however close their refined midpoints are.
+            // Only an identical observed/refined point from an overlapping
+            // bracket is a duplicate observation.
+            if !roots.iter().any(|prior: &RootApproximationF64| {
+                prior.midpoint == root.midpoint
+                    && prior.bracket.lower <= root.bracket.upper
+                    && root.bracket.lower <= prior.bracket.upper
+            }) {
+                roots.push(root);
+            }
+        };
+        // Retain each observed zero independently. Bisection of an interval
+        // with two zero endpoints can return only one of those observations.
+        if f0 == 0.0 {
+            retain_root(observed_zero_f64(x0));
+        }
         for step in 1..=options.subdivisions_per_interval {
             check_cancellation(cancellation)?;
             let fraction = step as f64 / options.subdivisions_per_interval as f64;
@@ -568,18 +712,19 @@ pub fn discover_pole_aware_sign_changes_f64_controlled(
                 continue;
             }
             let f1 = checked_evaluate(function, x1, &mut evaluations)?;
-            if f0 == 0.0 || f1 == 0.0 || f0.is_sign_positive() != f1.is_sign_positive() {
+            if f1 == 0.0 {
+                retain_root(observed_zero_f64(x1));
+            } else if f0 != 0.0 && f0.is_sign_positive() != f1.is_sign_positive() {
                 let bracket = RootBracketF64 {
                     lower: x0,
                     upper: x1,
                 };
-                let root =
-                    bisect_f64_controlled(function, bracket, &options.stopping, cancellation)?;
-                if roots.iter().all(|prior: &RootApproximationF64| {
-                    (prior.midpoint - root.midpoint).abs() > options.duplicate_tolerance
-                }) {
-                    roots.push(root);
-                }
+                retain_root(bisect_f64_controlled(
+                    function,
+                    bracket,
+                    &options.stopping,
+                    cancellation,
+                )?);
             }
             x0 = x1;
             f0 = f1;
@@ -587,6 +732,24 @@ pub fn discover_pole_aware_sign_changes_f64_controlled(
     }
     roots.sort_by(|left, right| left.midpoint.total_cmp(&right.midpoint));
     Ok(roots)
+}
+
+fn observed_zero_f64(point: f64) -> RootApproximationF64 {
+    RootApproximationF64 {
+        midpoint: point,
+        bracket: RootBracketF64 {
+            lower: point,
+            upper: point,
+        },
+        residual: 0.0,
+        derivative_magnitude: None,
+        iterations: 0,
+        function_evaluations: 1,
+        derivative_evaluations: 0,
+        status: RootApproximationStatus::Refined,
+        convergence_criterion: RootConvergenceCriterion::ObservedZero,
+        method: "sampled_zero_f64_position_local_guard_v3".to_owned(),
+    }
 }
 
 fn check_cancellation(cancellation: &CancellationToken) -> Result<(), RootError> {
@@ -718,6 +881,10 @@ mod tests {
 // ===========================================================================
 
 #[cfg(feature = "hp")]
+/// Point callbacks must return at least the requested arithmetic precision.
+/// Bracketed refinement requires continuity and exclusion of every pole.
+/// Solvers check storage precision and finiteness, not the accuracy of an
+/// arbitrary user callback. Extra guard precision is rounded once on return.
 pub trait RealFunctionHp: Send + Sync {
     fn evaluate(&self, x: &rug::Float, precision_bits: u32) -> Result<rug::Float, RootError>;
 
@@ -779,7 +946,15 @@ pub struct RootApproximationHp {
     pub iterations: usize,
     pub function_evaluations: usize,
     pub derivative_evaluations: usize,
+    /// Accepted derivative-based interior updates. Terminal derivative diagnostics
+    /// and fallback bisection steps do not establish a Newton refinement.
+    #[serde(default)]
+    pub newton_steps: usize,
+    /// Current refiners require position convergence or an observed zero. Legacy
+    /// records retain their explicit convergence_criterion, including residual-only stops.
     pub status: RootApproximationStatus,
+    #[serde(default)]
+    pub convergence_criterion: RootConvergenceCriterion,
     pub method: String,
 }
 
@@ -788,13 +963,64 @@ fn parse_hp_decimal(
     value: &xc_core::DecimalLiteral,
     precision_bits: u32,
 ) -> Result<rug::Float, RootError> {
-    let parsed = rug::Float::parse(value.as_str()).map_err(|error| {
-        RootError::InvalidConfiguration(format!(
-            "failed to parse HP decimal {:?}: {error}",
-            value.as_str()
-        ))
-    })?;
-    Ok(rug::Float::with_val(precision_bits, parsed))
+    if !(32..=1_000_000).contains(&precision_bits) {
+        return Err(RootError::InvalidConfiguration(
+            "HP decimal precision is outside 32..=1000000".into(),
+        ));
+    }
+    value
+        .validate()
+        .map_err(|e| RootError::InvalidConfiguration(e.to_string()))?;
+    let parsed = rug::Float::parse(value.as_str())
+        .map_err(|e| RootError::InvalidConfiguration(e.to_string()))?;
+    let result = rug::Float::with_val(precision_bits, parsed);
+    let zero = xc_core::DecimalLiteral::new("0").expect("zero decimal");
+    let exact_zero = value
+        .cmp_numeric(&zero)
+        .map_err(|e| RootError::InvalidConfiguration(e.to_string()))?
+        == std::cmp::Ordering::Equal;
+    if !result.is_finite() || (result.is_zero() && !exact_zero) {
+        return Err(RootError::InvalidConfiguration(
+            "HP decimal is outside the representable exponent range".into(),
+        ));
+    }
+    Ok(result)
+}
+
+#[cfg(feature = "hp")]
+fn parse_hp_tolerance(value: &xc_core::DecimalLiteral, bits: u32) -> Result<rug::Float, RootError> {
+    let nearest = parse_hp_decimal(value, bits)?;
+    if nearest <= 0 {
+        return Err(RootError::InvalidConfiguration(
+            "HP tolerance must be strictly positive".into(),
+        ));
+    }
+    let parsed = rug::Float::parse(value.as_str())
+        .map_err(|e| RootError::InvalidConfiguration(e.to_string()))?;
+    let lower = rug::Float::with_val_round(bits, parsed, rug::float::Round::Down).0;
+    if lower <= 0 {
+        return Err(RootError::InvalidConfiguration(
+            "HP tolerance underflowed".into(),
+        ));
+    }
+    Ok(lower)
+}
+
+#[cfg(feature = "hp")]
+fn hp_bracket_midpoint(lower: &rug::Float, upper: &rug::Float) -> Result<rug::Float, RootError> {
+    let interval = xc_numerics::mpfr_interval::MpfrInterval::new(lower.clone(), upper.clone())
+        .map_err(|e| RootError::Evaluation(e.to_string()))?;
+    Ok(interval.midpoint_point().lower().clone())
+}
+
+#[cfg(feature = "hp")]
+fn hp_difference_up(left: &rug::Float, right: &rug::Float, bits: u32) -> rug::Float {
+    let (high, low) = if left >= right {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    rug::Float::with_val_round(bits, high - low, rug::float::Round::Up).0
 }
 
 #[cfg(feature = "hp")]
@@ -821,13 +1047,33 @@ fn checked_hp_evaluate(
     if !x.is_finite() {
         return Err(RootError::Evaluation("nonfinite HP root argument".into()));
     }
-    let value = function.evaluate(x, bits)?;
+    let value = checked_hp_callback_precision(function.evaluate(x, bits)?, bits)?;
     if !value.is_finite() {
         return Err(RootError::Evaluation(
             "nonfinite HP root function value".into(),
         ));
     }
     Ok(value)
+}
+
+#[cfg(feature = "hp")]
+fn checked_hp_callback_precision(value: rug::Float, bits: u32) -> Result<rug::Float, RootError> {
+    if value.prec() < bits {
+        return Err(RootError::Evaluation(format!(
+            "HP callback returned {}-bit arithmetic for a {bits}-bit request",
+            value.prec()
+        )));
+    }
+    Ok(rug::Float::with_val(bits, value))
+}
+
+#[cfg(feature = "hp")]
+fn checked_hp_derivative(
+    function: &dyn RealFunctionHp,
+    x: &rug::Float,
+    bits: u32,
+) -> Result<rug::Float, RootError> {
+    checked_hp_callback_precision(function.derivative(x, bits)?, bits)
 }
 
 #[cfg(feature = "hp")]
@@ -869,19 +1115,19 @@ pub fn bisect_hp_controlled(
             "HP bisection requires precision >= 32 and lower < upper".to_owned(),
         ));
     }
-    let x_tolerance = parse_hp_decimal(&stopping.x_tolerance, precision_bits)?;
-    let residual_tolerance = parse_hp_decimal(&stopping.residual_tolerance, precision_bits)?;
+    let x_tolerance = parse_hp_tolerance(&stopping.x_tolerance, precision_bits)?;
+    let residual_tolerance = parse_hp_tolerance(&stopping.residual_tolerance, precision_bits)?;
     let mut function_evaluations = 0usize;
     let mut lower = Float::with_val(precision_bits, lower);
     let mut upper = Float::with_val(precision_bits, upper);
-    if lower >= upper {
+    if !lower.is_finite() || !upper.is_finite() || lower >= upper {
         return Err(RootError::InvalidConfiguration(
             "HP bracket collapsed at working precision".into(),
         ));
     }
     let mut f_lower = checked_hp_evaluate(function, &lower, precision_bits)?;
     function_evaluations += 1;
-    let f_upper = checked_hp_evaluate(function, &upper, precision_bits)?;
+    let mut f_upper = checked_hp_evaluate(function, &upper, precision_bits)?;
     function_evaluations += 1;
     if f_lower == 0 {
         return Ok(RootApproximationHp {
@@ -894,8 +1140,10 @@ pub fn bisect_hp_controlled(
             iterations: 0,
             function_evaluations,
             derivative_evaluations: 0,
+            newton_steps: 0,
             status: RootApproximationStatus::Refined,
-            method: "bisection_hp".to_owned(),
+            convergence_criterion: RootConvergenceCriterion::ObservedZero,
+            method: "bisection_hp_position_local_guard_v3".to_owned(),
         });
     }
     if f_upper == 0 {
@@ -909,8 +1157,10 @@ pub fn bisect_hp_controlled(
             iterations: 0,
             function_evaluations,
             derivative_evaluations: 0,
+            newton_steps: 0,
             status: RootApproximationStatus::Refined,
-            method: "bisection_hp".to_owned(),
+            convergence_criterion: RootConvergenceCriterion::ObservedZero,
+            method: "bisection_hp_position_local_guard_v3".to_owned(),
         });
     }
     if hp_same_nonzero_sign(&f_lower, &f_upper) {
@@ -919,21 +1169,32 @@ pub fn bisect_hp_controlled(
         ));
     }
 
+    let mut local_residuals: std::collections::VecDeque<(Float, Float)> =
+        std::collections::VecDeque::new();
     for iteration in 1..=stopping.maximum_iterations {
         check_cancellation(cancellation)?;
-        let mut midpoint = lower.clone();
-        midpoint += &upper;
-        midpoint /= 2;
+        let midpoint = hp_bracket_midpoint(&lower, &upper)?;
         let f_midpoint = checked_hp_evaluate(function, &midpoint, precision_bits)?;
         function_evaluations += 1;
         let mut residual = f_midpoint.clone();
         residual.abs_mut();
-        let mut width = upper.clone();
-        width -= &lower;
-        width.abs_mut();
-        if residual <= residual_tolerance || width <= x_tolerance {
-            let derivative = function
-                .derivative(&midpoint, precision_bits)
+        let width = hp_difference_up(&upper, &lower, precision_bits);
+        let residual_met = residual <= residual_tolerance;
+        let width_met = width <= x_tolerance;
+        let local_growth = local_residuals.front().is_some_and(|(a, b)| {
+            let left = f_lower.clone().abs();
+            let right = f_upper.clone().abs();
+            local_residuals.len() == 8 && &left >= a && &right >= b && (&left > a || &right > b)
+        });
+        local_residuals.push_back((f_lower.clone().abs(), f_upper.clone().abs()));
+        if local_residuals.len() > 8 {
+            local_residuals.pop_front();
+        }
+        if width_met && !residual.is_zero() && local_growth {
+            return Err(RootError::NonConvergence("narrow HP bracket has a growing residual; continuity or pole exclusion is unresolved".into()));
+        }
+        if residual.is_zero() || width_met {
+            let derivative = checked_hp_derivative(function, &midpoint, precision_bits)
                 .ok()
                 .filter(|v| v.is_finite());
             let derivative_magnitude = derivative.as_ref().map(|value| {
@@ -951,12 +1212,19 @@ pub fn bisect_hp_controlled(
                 iterations: iteration,
                 function_evaluations,
                 derivative_evaluations: usize::from(derivative.is_some()),
+                newton_steps: 0,
                 status: RootApproximationStatus::Refined,
-                method: "bisection_hp".to_owned(),
+                convergence_criterion: convergence_criterion(
+                    residual == 0,
+                    residual_met,
+                    width_met,
+                ),
+                method: "bisection_hp_position_local_guard_v3".to_owned(),
             });
         }
         if !hp_same_nonzero_sign(&f_lower, &f_midpoint) {
             upper = midpoint;
+            f_upper = f_midpoint;
         } else {
             lower = midpoint;
             f_lower = f_midpoint;
@@ -1014,11 +1282,11 @@ pub fn safeguarded_newton_hp_controlled(
                 .to_owned(),
         ));
     }
-    let x_tolerance = parse_hp_decimal(&stopping.x_tolerance, precision_bits)?;
-    let residual_tolerance = parse_hp_decimal(&stopping.residual_tolerance, precision_bits)?;
+    let x_tolerance = parse_hp_tolerance(&stopping.x_tolerance, precision_bits)?;
+    let residual_tolerance = parse_hp_tolerance(&stopping.residual_tolerance, precision_bits)?;
     let mut lower = Float::with_val(precision_bits, lower);
     let mut upper = Float::with_val(precision_bits, upper);
-    if lower >= upper {
+    if !lower.is_finite() || !upper.is_finite() || lower >= upper {
         return Err(RootError::InvalidConfiguration(
             "HP bracket collapsed at working precision".into(),
         ));
@@ -1026,9 +1294,10 @@ pub fn safeguarded_newton_hp_controlled(
     let mut x = Float::with_val(precision_bits, initial);
     let mut function_evaluations = 0usize;
     let mut derivative_evaluations = 0usize;
+    let mut newton_steps = 0usize;
     let mut f_lower = checked_hp_evaluate(function, &lower, precision_bits)?;
     function_evaluations += 1;
-    let f_upper = checked_hp_evaluate(function, &upper, precision_bits)?;
+    let mut f_upper = checked_hp_evaluate(function, &upper, precision_bits)?;
     function_evaluations += 1;
     if f_lower.is_zero() || f_upper.is_zero() {
         let endpoint = if f_lower.is_zero() { &lower } else { &upper };
@@ -1042,8 +1311,10 @@ pub fn safeguarded_newton_hp_controlled(
             iterations: 0,
             function_evaluations,
             derivative_evaluations: 0,
+            newton_steps: 0,
             status: RootApproximationStatus::Refined,
-            method: "safeguarded_newton_hp".into(),
+            convergence_criterion: RootConvergenceCriterion::ObservedZero,
+            method: "safeguarded_newton_hp_position_local_guard_v3".into(),
         });
     }
     if hp_same_nonzero_sign(&f_lower, &f_upper) {
@@ -1052,18 +1323,31 @@ pub fn safeguarded_newton_hp_controlled(
         ));
     }
 
+    let mut local_residuals: std::collections::VecDeque<(Float, Float)> =
+        std::collections::VecDeque::new();
     for iteration in 1..=stopping.maximum_iterations {
         check_cancellation(cancellation)?;
         let fx = checked_hp_evaluate(function, &x, precision_bits)?;
         function_evaluations += 1;
         let mut residual = fx.clone();
         residual.abs_mut();
-        let mut width = upper.clone();
-        width -= &lower;
-        width.abs_mut();
-        if residual <= residual_tolerance || width <= x_tolerance {
-            let derivative = function
-                .derivative(&x, precision_bits)
+        let width = hp_difference_up(&upper, &lower, precision_bits);
+        let residual_met = residual <= residual_tolerance;
+        let width_met = width <= x_tolerance;
+        let local_growth = local_residuals.front().is_some_and(|(a, b)| {
+            let left = f_lower.clone().abs();
+            let right = f_upper.clone().abs();
+            local_residuals.len() == 8 && &left >= a && &right >= b && (&left > a || &right > b)
+        });
+        local_residuals.push_back((f_lower.clone().abs(), f_upper.clone().abs()));
+        if local_residuals.len() > 8 {
+            local_residuals.pop_front();
+        }
+        if width_met && !residual.is_zero() && local_growth {
+            return Err(RootError::NonConvergence("narrow HP bracket has a growing residual; continuity or pole exclusion is unresolved".into()));
+        }
+        if residual.is_zero() || width_met {
+            let derivative = checked_hp_derivative(function, &x, precision_bits)
                 .ok()
                 .filter(|v| v.is_finite());
             derivative_evaluations += usize::from(derivative.is_some());
@@ -1082,17 +1366,24 @@ pub fn safeguarded_newton_hp_controlled(
                 iterations: iteration,
                 function_evaluations,
                 derivative_evaluations,
+                newton_steps,
                 status: RootApproximationStatus::Refined,
-                method: "safeguarded_newton_hp".to_owned(),
+                convergence_criterion: convergence_criterion(
+                    residual == 0,
+                    residual_met,
+                    width_met,
+                ),
+                method: "safeguarded_newton_hp_position_local_guard_v3".to_owned(),
             });
         }
         if !hp_same_nonzero_sign(&f_lower, &fx) {
             upper = x.clone();
+            f_upper = fx.clone();
         } else {
             lower = x.clone();
             f_lower = fx.clone();
         }
-        let derivative = function.derivative(&x, precision_bits)?;
+        let derivative = checked_hp_derivative(function, &x, precision_bits)?;
         derivative_evaluations += 1;
         let mut candidate = x.clone();
         let valid_derivative = derivative.is_finite() && derivative != 0;
@@ -1101,10 +1392,17 @@ pub fn safeguarded_newton_hp_controlled(
             step /= derivative;
             candidate -= step;
         }
-        if !valid_derivative || !candidate.is_finite() || candidate <= lower || candidate >= upper {
-            candidate = lower.clone();
-            candidate += &upper;
-            candidate /= 2;
+        let center = hp_bracket_midpoint(&lower, &upper)?;
+        let interior_lower = hp_bracket_midpoint(&lower, &center)?;
+        let interior_upper = hp_bracket_midpoint(&center, &upper)?;
+        if !valid_derivative
+            || !candidate.is_finite()
+            || candidate <= interior_lower
+            || candidate >= interior_upper
+        {
+            candidate = hp_bracket_midpoint(&lower, &upper)?;
+        } else {
+            newton_steps += 1;
         }
         x = candidate;
     }
@@ -1120,6 +1418,7 @@ pub struct HpRootCrossCheck {
     pub bisection: RootApproximationHp,
     pub safeguarded_newton: RootApproximationHp,
     pub agreement_tolerance: String,
+    /// Round-trip encoding of an upward bound for the stored midpoint difference.
     pub observed_midpoint_difference: String,
     pub accepted: bool,
     pub independence_established: bool,
@@ -1138,7 +1437,9 @@ fn parse_hp_output(value: &str, precision_bits: u32) -> Result<rug::Float, RootE
 /// HP refinement algorithms. Bisection uses only ordered signs; safeguarded
 /// Newton separately evaluates derivatives and may fall back to its own
 /// bisection step. Neither route receives the other route's result as a seed,
-/// stopping decision, or intermediate value.
+/// stopping decision, or intermediate value. The caller must establish continuity
+/// and the intended simple-root interpretation. Agreement does not prove
+/// simplicity or uniqueness. Both routes must meet their positional stop or observe an exact stored zero.
 #[cfg(feature = "hp")]
 pub fn cross_check_simple_root_hp(
     function: &dyn RealFunctionHp,
@@ -1149,7 +1450,7 @@ pub fn cross_check_simple_root_hp(
     stopping: &RootStoppingHp,
     agreement_tolerance: &xc_core::DecimalLiteral,
 ) -> Result<HpRootCrossCheck, RootError> {
-    let tolerance = parse_hp_decimal(agreement_tolerance, precision_bits)?;
+    let tolerance = parse_hp_tolerance(agreement_tolerance, precision_bits)?;
     if tolerance <= 0 {
         return Err(RootError::InvalidConfiguration(
             "HP root cross-check agreement tolerance must be positive".to_owned(),
@@ -1160,20 +1461,26 @@ pub fn cross_check_simple_root_hp(
         safeguarded_newton_hp(function, lower, upper, initial, precision_bits, stopping)?;
     let bisection_midpoint = parse_hp_output(&bisection.midpoint, precision_bits)?;
     let newton_midpoint = parse_hp_output(&safeguarded_newton.midpoint, precision_bits)?;
-    let mut difference = bisection_midpoint;
-    difference -= newton_midpoint;
-    difference.abs_mut();
-    let independence_established = safeguarded_newton.derivative_evaluations > 0;
+    let difference = hp_difference_up(&bisection_midpoint, &newton_midpoint, precision_bits);
+    if !difference.is_finite() {
+        return Err(RootError::Evaluation(
+            "unrepresentable root comparison difference".into(),
+        ));
+    }
+    let independence_established = safeguarded_newton.newton_steps > 0;
     let accepted = difference <= tolerance && independence_established;
     Ok(HpRootCrossCheck {
         bisection,
         safeguarded_newton,
-        agreement_tolerance: hp_string(&tolerance, precision_bits),
+        agreement_tolerance: agreement_tolerance.as_str().to_owned(),
         observed_midpoint_difference: hp_string(&difference, precision_bits),
         accepted,
         independence_established,
-        independence_rationale: "HP sign-only bisection and derivative-based safeguarded Newton execute independently from the original bracket and share no decisive iterates"
-            .to_owned(),
+        independence_rationale: if independence_established {
+            "HP sign-only bisection and safeguarded Newton execute from the original bracket, share no decisive iterates, and Newton accepted at least one derivative-based interior update".to_owned()
+        } else {
+            "No accepted derivative-based Newton update occurred; terminal derivative diagnostics and fallback bisection do not establish independent refinement".to_owned()
+        },
     })
 }
 
@@ -1285,6 +1592,10 @@ pub fn refine_roots_parallel_hp(
 // ===========================================================================
 
 #[cfg(feature = "hp")]
+/// Inclusion callbacks for a single continuously differentiable real function
+/// on the entire candidate interval. Each callback must enclose all values of
+/// that function (or its derivative) on the supplied interval, at the supplied
+/// precision. An arithmetic error is not evidence for existence or exclusion.
 pub trait RealIntervalFunctionHp: Send + Sync {
     fn evaluate_interval(
         &self,
@@ -1307,8 +1618,38 @@ pub enum IntervalRootStatus {
 }
 
 #[cfg(feature = "hp")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntervalRootEndpointEncoding {
+    #[default]
+    StoredBinaryNearestV1,
+    OutwardDecimalV2,
+}
+#[cfg(feature = "hp")]
+fn legacy_interval_root_schema() -> u32 {
+    1
+}
+#[cfg(feature = "hp")]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IntervalNewtonWitness {
+    /// Exact stored binary endpoints, independent of decimal display rounding.
+    pub interval: xc_numerics::fmt::PortableHpInterval,
+    pub iteration: usize,
+    /// Includes the strict-inclusion step and every subsequent contraction.
+    pub contraction_steps: usize,
+}
+#[cfg(feature = "hp")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Schema 2 publishes outward decimal bounds and a replayable uniqueness
+/// witness. Schema 1 decimals encode stored binary endpoints, recovered with
+/// nearest rounding at `precision_bits`; their printed rationals are not bounds.
 pub struct IntervalRootCertificate {
+    #[serde(default = "legacy_interval_root_schema")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub endpoint_encoding: IntervalRootEndpointEncoding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uniqueness_witness: Option<IntervalNewtonWitness>,
     pub lower: String,
     pub upper: String,
     pub precision_bits: u32,
@@ -1333,8 +1674,33 @@ impl IntervalNewtonOptions {
                 "interval Newton maximum_iterations must be positive".to_owned(),
             ));
         }
-        let tolerance = parse_hp_decimal(&self.width_tolerance, precision_bits)?;
-        if tolerance <= 0 {
+        self.width_tolerance
+            .validate()
+            .map_err(|error| RootError::InvalidConfiguration(error.to_string()))?;
+        if !(32..=1_000_000).contains(&precision_bits) {
+            return Err(RootError::InvalidConfiguration(
+                "interval Newton precision must be in 32..=1000000".into(),
+            ));
+        }
+        let ceiling = rug::Float::with_val_round(
+            precision_bits,
+            rug::Float::parse(self.width_tolerance.as_str())
+                .map_err(|error| RootError::InvalidConfiguration(error.to_string()))?,
+            rug::float::Round::Up,
+        )
+        .0;
+        if !ceiling.is_finite() {
+            return Err(RootError::InvalidConfiguration(
+                "interval Newton tolerance exceeds the finite exponent range".into(),
+            ));
+        }
+        // Rounding the tolerance downward ensures an accepted upward-rounded
+        // width also meets the user's exact decimal tolerance.
+        let parsed = rug::Float::parse(self.width_tolerance.as_str())
+            .map_err(|error| RootError::InvalidConfiguration(error.to_string()))?;
+        let tolerance =
+            rug::Float::with_val_round(precision_bits, parsed, rug::float::Round::Down).0;
+        if !tolerance.is_finite() || tolerance <= 0 {
             return Err(RootError::InvalidConfiguration(
                 "interval Newton width tolerance must be positive".to_owned(),
             ));
@@ -1349,11 +1715,20 @@ fn interval_root_certificate(
     iterations: usize,
     status: IntervalRootStatus,
     uniqueness_witnessed: bool,
+    witness: Option<&IntervalNewtonWitness>,
     reason: impl Into<String>,
 ) -> IntervalRootCertificate {
+    let digits = xc_numerics::reduction::roundtrip_decimal_digits(interval.precision()).max(32);
     IntervalRootCertificate {
-        lower: hp_string(interval.lower(), interval.precision()),
-        upper: hp_string(interval.upper(), interval.precision()),
+        schema_version: 2,
+        endpoint_encoding: IntervalRootEndpointEncoding::OutwardDecimalV2,
+        uniqueness_witness: witness.cloned(),
+        lower: interval
+            .lower()
+            .to_string_radix_round(10, Some(digits), rug::float::Round::Down),
+        upper: interval
+            .upper()
+            .to_string_radix_round(10, Some(digits), rug::float::Round::Up),
         precision_bits: interval.precision(),
         iterations,
         status,
@@ -1368,48 +1743,104 @@ pub fn interval_newton_hp(
     initial: &xc_numerics::mpfr_interval::MpfrInterval,
     options: &IntervalNewtonOptions,
 ) -> Result<IntervalRootCertificate, RootError> {
+    initial
+        .validate()
+        .map_err(|error| RootError::InvalidConfiguration(error.to_string()))?;
     let tolerance = options.validate(initial.precision())?;
+    let check_enclosure =
+        |value: &xc_numerics::mpfr_interval::MpfrInterval| -> Result<(), RootError> {
+            value
+                .validate()
+                .map_err(|error| RootError::Evaluation(error.to_string()))?;
+            if value.precision() != initial.precision() {
+                return Err(RootError::Evaluation(
+                    "interval callback precision mismatch".into(),
+                ));
+            }
+            Ok(())
+        };
     let mut current = initial.clone();
     let mut uniqueness_witnessed = false;
+    let mut witness: Option<IntervalNewtonWitness> = None;
     for iteration in 1..=options.maximum_iterations {
         let derivative = function.derivative_interval(&current)?;
+        check_enclosure(&derivative)?;
         if derivative.contains_zero() {
             return Ok(interval_root_certificate(
                 &current,
                 iteration,
                 IntervalRootStatus::Inconclusive,
                 uniqueness_witnessed,
+                witness.as_ref(),
                 "derivative enclosure contains zero",
             ));
         }
         let midpoint = current.midpoint_point();
         let midpoint_value = function.evaluate_interval(&midpoint)?;
+        check_enclosure(&midpoint_value)?;
         let newton_image = midpoint.sub(
             &midpoint_value
                 .div(&derivative)
                 .map_err(|error| RootError::Evaluation(error.to_string()))?,
         );
+        check_enclosure(&newton_image)?;
         if newton_image.is_interior_subset_of(&current) {
             uniqueness_witnessed = true;
+            witness = Some(IntervalNewtonWitness {
+                interval: xc_numerics::fmt::PortableHpInterval::from_bounds(
+                    current.lower(),
+                    current.upper(),
+                )
+                .map_err(|e| RootError::Evaluation(e.to_string()))?,
+                iteration,
+                contraction_steps: 0,
+            });
         }
-        let Some(next) = current.intersection(&newton_image) else {
+        let Some(next) = current
+            .try_intersection(&newton_image)
+            .map_err(|error| RootError::Evaluation(error.to_string()))?
+        else {
             return Ok(interval_root_certificate(
                 &current,
                 iteration,
                 IntervalRootStatus::ExcludedNoRoot,
                 false,
+                None,
                 "interval Newton image is disjoint from the candidate interval",
             ));
         };
         current = next;
+        if let Some(witness) = &mut witness {
+            witness.contraction_steps += 1;
+        }
         if uniqueness_witnessed && current.width() <= tolerance {
-            return Ok(interval_root_certificate(
-                &current,
-                iteration,
-                IntervalRootStatus::CertifiedUnique,
-                true,
-                "interval Newton image lies strictly inside the candidate interval",
-            ));
+            let report=interval_root_certificate(&current,iteration,IntervalRootStatus::CertifiedUnique,true,witness.as_ref(),
+                "recorded strict interval Newton witness and subsequent contractions establish the published root enclosure");
+            let display_precision = current.precision().saturating_add(64).min(1_000_000);
+            let parse_bound = |text: &str,
+                               round: rug::float::Round|
+             -> Result<rug::Float, RootError> {
+                Ok(rug::Float::with_val_round(
+                    display_precision,
+                    rug::Float::parse(text).map_err(|e| RootError::Evaluation(e.to_string()))?,
+                    round,
+                )
+                .0)
+            };
+            let published_width = rug::Float::with_val_round(
+                display_precision,
+                parse_bound(&report.upper, rug::float::Round::Up)?
+                    - parse_bound(&report.lower, rug::float::Round::Down)?,
+                rug::float::Round::Up,
+            )
+            .0;
+            let exact_tolerance_floor =
+                parse_bound(options.width_tolerance.as_str(), rug::float::Round::Down)?;
+            if published_width <= exact_tolerance_floor
+                && verify_interval_root_certificate_hp(function, &report)?
+            {
+                return Ok(report);
+            }
         }
     }
     Ok(interval_root_certificate(
@@ -1417,8 +1848,113 @@ pub fn interval_newton_hp(
         options.maximum_iterations,
         IntervalRootStatus::Inconclusive,
         uniqueness_witnessed,
-        "interval Newton iteration limit reached before the width target",
+        witness.as_ref(),
+        if uniqueness_witnessed {
+            "interval Newton iteration limit reached before the width target"
+        } else {
+            "interval Newton did not establish strict self-inclusion; uniqueness remains unresolved even if the width target was met"
+        },
     ))
+}
+
+/// Independently replay a schema-2 uniqueness witness against the supplied
+/// inclusion callbacks. A legacy certificate without recorded witness evidence
+/// is not upgraded by this API. All steps are recomputed, including the final
+/// enclosure containment; no earlier strict-inclusion flag is trusted alone.
+#[cfg(feature = "hp")]
+pub fn verify_interval_root_certificate_hp(
+    function: &dyn RealIntervalFunctionHp,
+    certificate: &IntervalRootCertificate,
+) -> Result<bool, RootError> {
+    use rug::{float::Round, Float};
+    use xc_numerics::mpfr_interval::MpfrInterval as I;
+    if certificate.schema_version != 2
+        || certificate.endpoint_encoding != IntervalRootEndpointEncoding::OutwardDecimalV2
+        || certificate.status != IntervalRootStatus::CertifiedUnique
+        || !certificate.uniqueness_witnessed
+    {
+        return Ok(false);
+    }
+    let Some(witness) = &certificate.uniqueness_witness else {
+        return Ok(false);
+    };
+    if witness.iteration == 0
+        || witness.contraction_steps == 0
+        || witness.iteration.checked_add(witness.contraction_steps - 1)
+            != Some(certificate.iterations)
+        || witness.contraction_steps > 1_000_000
+        || !(32..=1_000_000).contains(&certificate.precision_bits)
+    {
+        return Ok(false);
+    }
+    let (lower, upper) = witness
+        .interval
+        .to_bounds()
+        .map_err(|e| RootError::Evaluation(e.to_string()))?;
+    if lower.prec() != certificate.precision_bits || upper.prec() != certificate.precision_bits {
+        return Ok(false);
+    }
+    let original = I::new(lower, upper).map_err(|e| RootError::Evaluation(e.to_string()))?;
+    let mut current = original.clone();
+    let check = |x: &I| -> Result<(), RootError> {
+        x.validate()
+            .map_err(|e| RootError::Evaluation(e.to_string()))?;
+        if x.precision() != certificate.precision_bits {
+            return Err(RootError::Evaluation(
+                "interval replay callback precision mismatch".into(),
+            ));
+        }
+        Ok(())
+    };
+    for step in 0..witness.contraction_steps {
+        let derivative = function.derivative_interval(&current)?;
+        check(&derivative)?;
+        if derivative.contains_zero() {
+            return Ok(false);
+        }
+        let midpoint = current.midpoint_point();
+        let value = function.evaluate_interval(&midpoint)?;
+        check(&value)?;
+        let image = midpoint.sub(
+            &value
+                .div(&derivative)
+                .map_err(|e| RootError::Evaluation(e.to_string()))?,
+        );
+        check(&image)?;
+        if step == 0 && !image.is_interior_subset_of(&current) {
+            return Ok(false);
+        }
+        let Some(next) = current
+            .try_intersection(&image)
+            .map_err(|e| RootError::Evaluation(e.to_string()))?
+        else {
+            return Ok(false);
+        };
+        current = next;
+    }
+    let parse = |text: &str, round: Round| -> Result<Float, RootError> {
+        Ok(Float::with_val_round(
+            certificate.precision_bits,
+            Float::parse(text).map_err(|e| RootError::Evaluation(e.to_string()))?,
+            round,
+        )
+        .0)
+    };
+    let published = I::new(
+        parse(&certificate.lower, Round::Down)?,
+        parse(&certificate.upper, Round::Up)?,
+    )
+    .map_err(|e| RootError::Evaluation(e.to_string()))?;
+    // Inward parsing proves containment in the exact printed decimal interval;
+    // merely comparing outward-parsed floats could accept inward decimal tampering.
+    let inner_lower = parse(&certificate.lower, Round::Up)?;
+    let inner_upper = parse(&certificate.upper, Round::Down)?;
+    if inner_lower > inner_upper {
+        return Ok(false);
+    }
+    let inward =
+        I::new(inner_lower, inner_upper).map_err(|e| RootError::Evaluation(e.to_string()))?;
+    Ok(current.is_subset_of(&inward) && published.is_subset_of(&original))
 }
 
 #[cfg(all(test, feature = "hp"))]
@@ -1576,11 +2112,24 @@ mod hp_tests {
     #[test]
     fn hp_newton_resolves_deep_tolerance_without_f64() {
         let precision = 512;
-        let stopping = RootStoppingHp {
+        let mut stopping = RootStoppingHp {
             x_tolerance: xc_core::DecimalLiteral::new("1e-100").unwrap(),
             residual_tolerance: xc_core::DecimalLiteral::new("1e-100").unwrap(),
             maximum_iterations: 300,
         };
+        assert!(matches!(
+            safeguarded_newton_hp(
+                &SqrtTwo,
+                &Float::with_val(precision, 1),
+                &Float::with_val(precision, 2),
+                &Float::with_val(precision, 1.5),
+                precision,
+                &stopping,
+            ),
+            Err(RootError::NonConvergence(_))
+        ));
+        // The original residual-only budget does not establish the required position width.
+        stopping.maximum_iterations = 400;
         let result = safeguarded_newton_hp(
             &SqrtTwo,
             &Float::with_val(precision, 1),
@@ -1590,7 +2139,21 @@ mod hp_tests {
             &stopping,
         )
         .unwrap();
-        assert!(result.residual.starts_with("0") || result.residual.contains("e-"));
+        let lower = parse_hp_output(&result.lower, precision).unwrap();
+        let upper = parse_hp_output(&result.upper, precision).unwrap();
+        let width = upper.to_rational().unwrap() - lower.to_rational().unwrap();
+        let denominator = (0..100).fold(rug::Integer::from(1), |x, _| x * 10);
+        let tolerance = rug::Rational::from((rug::Integer::from(1), denominator));
+        assert!(width <= tolerance);
+        // Independent 1024-bit analytic oracle and exact quadratic endpoint signs.
+        let reference = Float::with_val(1024, 2).sqrt();
+        assert!(
+            Float::with_val(1024, &lower) <= reference
+                && reference <= Float::with_val(1024, &upper)
+        );
+        let lo = lower.to_rational().unwrap();
+        let hi = upper.to_rational().unwrap();
+        assert!(lo.clone() * lo <= 2 && hi.clone() * hi >= 2);
     }
 
     #[test]
@@ -1613,8 +2176,14 @@ mod hp_tests {
         .unwrap();
         assert!(report.accepted, "{:?}", report);
         assert!(report.independence_established);
-        assert_eq!(report.bisection.method, "bisection_hp");
-        assert_eq!(report.safeguarded_newton.method, "safeguarded_newton_hp");
+        assert_eq!(
+            report.bisection.method,
+            "bisection_hp_position_local_guard_v3"
+        );
+        assert_eq!(
+            report.safeguarded_newton.method,
+            "safeguarded_newton_hp_position_local_guard_v3"
+        );
         assert!(report.independence_rationale.contains("share no decisive"));
     }
 

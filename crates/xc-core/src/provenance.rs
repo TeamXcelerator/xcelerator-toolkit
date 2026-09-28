@@ -150,11 +150,11 @@ impl ExecutionFingerprint {
                     "bitwise execution fingerprint requires algorithm-semantics identities",
                 ));
             }
-            if self.scalar_backend.to_ascii_lowercase().contains("mpfr")
+            if !matches!(self.scalar_backend.as_str(), "f64" | "binary64")
                 && self.native_libraries.is_empty()
             {
                 return Err(ConfigError::new(
-                    "bitwise MPFR fingerprint requires native-library versions",
+                    "bitwise fingerprint requires native-library versions unless the backend is explicitly pure Rust (f64 or binary64)",
                 ));
             }
         }
@@ -297,6 +297,11 @@ impl ReproducibleReductionArtifact {
             ));
         }
         self.policy.validate()?;
+        if self.scalar_encoding.trim().is_empty() || self.value.trim().is_empty() {
+            return Err(ConfigError::new(
+                "reproducible reduction scalar encoding and value must be nonempty",
+            ));
+        }
         if self.execution_fingerprint_digest != fingerprint.digest()?
             || self.scalar_backend != fingerprint.scalar_backend
             || self.precision_bits != fingerprint.precision.working_precision_bits
@@ -510,7 +515,11 @@ pub enum CacheReuseDisposition {
 #[serde(rename_all = "snake_case")]
 pub enum CacheValidationMode {
     None,
+    /// Trusted metadata and exact dependency identities, without payload checks.
     Fast,
+    /// The selected root payload was checked; dependency payloads were not all checked.
+    Root,
+    /// Every payload in the complete dependency closure was checked.
     Full,
 }
 
@@ -761,6 +770,7 @@ impl SolverProvenance {
             || self.thread_policy.as_ref() != Some(&fingerprint.thread_policy)
             || resolved_digest != Some(&fingerprint.effective_configuration_digest)
             || self.execution_fingerprint_digest.as_ref() != Some(&fingerprint_digest)
+            || self.deterministic != (fingerprint.reproducibility != Reproducibility::Exploratory)
             || self
                 .solver_configuration
                 .as_ref()
@@ -795,6 +805,12 @@ impl SolverProvenance {
             }
         }
         self.artifact_hashes.validate()?;
+        for access in &self.cache_accesses {
+            access.validate()?;
+        }
+        for artifact in &self.artifact_semantics {
+            artifact.validate()?;
+        }
         Ok(())
     }
 
@@ -803,13 +819,6 @@ impl SolverProvenance {
         access: CacheAccessProvenance,
     ) -> Result<(), ConfigError> {
         access.validate()?;
-        self.artifact_semantics.push(SemanticArtifactProvenance {
-            direction: ArtifactProvenanceDirection::Consumed,
-            artifact_family: access.artifact_family.clone(),
-            semantic_key_schema_version: access.semantic_key_schema_version,
-            resolved_semantic_key: access.resolved_semantic_key.clone(),
-            semantic_digest: access.semantic_digest.clone(),
-        });
         if let Some(manifest_digest) = &access.selected_manifest_digest {
             insert_artifact_hash(
                 &mut self.artifact_hashes.input_cache_manifests,
@@ -820,6 +829,13 @@ impl SolverProvenance {
                 manifest_digest.clone(),
             )?;
         }
+        self.artifact_semantics.push(SemanticArtifactProvenance {
+            direction: ArtifactProvenanceDirection::Consumed,
+            artifact_family: access.artifact_family.clone(),
+            semantic_key_schema_version: access.semantic_key_schema_version,
+            resolved_semantic_key: access.resolved_semantic_key.clone(),
+            semantic_digest: access.semantic_digest.clone(),
+        });
         self.cache_accesses.push(access);
         Ok(())
     }
@@ -922,6 +938,21 @@ impl CacheAccessProvenance {
         {
             return Err(ConfigError::new(
                 "cache validation mode requires a validation outcome",
+            ));
+        }
+        if (self.reuse_disposition == CacheReuseDisposition::Reused
+            && self.validation_outcome == CacheValidationOutcome::Failed)
+            || (self.validation_mode == CacheValidationMode::None
+                && self.validation_outcome != CacheValidationOutcome::NotRequested)
+            || (!self.validated_artifacts.is_empty()
+                && (self.validation_outcome != CacheValidationOutcome::Passed
+                    || !matches!(
+                        self.validation_mode,
+                        CacheValidationMode::Root | CacheValidationMode::Full
+                    )))
+        {
+            return Err(ConfigError::new(
+                "cache validation and reuse provenance are contradictory",
             ));
         }
         if self.validated_artifacts.iter().any(|artifact| {

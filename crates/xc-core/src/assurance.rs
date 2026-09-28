@@ -140,11 +140,22 @@ pub struct IndependenceDeclaration {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IndependenceAssessment {
+    #[serde(default = "historical_assurance_semantics")]
+    pub algorithm_semantics: String,
     pub independent: bool,
     pub intended_claim: String,
     pub reasons: Vec<String>,
     pub stability_evidence: Vec<String>,
     pub shared_decisive_intermediates: Vec<String>,
+}
+
+pub const ASSURANCE_EVALUATION_SEMANTICS: &str = "distinct-canonical-route-evidence-v2";
+
+fn historical_assurance_semantics() -> String {
+    "unversioned-route-evidence-v1".to_owned()
+}
+fn normalized_route_id(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 /// Evaluate whether two routes are independent for one declared claim.
@@ -165,25 +176,50 @@ pub fn assess_route_independence(
     if primary.route_id.trim().is_empty() || secondary.route_id.trim().is_empty() {
         reasons.push("both route identifiers must be nonempty".to_owned());
     }
-    if primary.route_id == secondary.route_id {
+    if normalized_route_id(&primary.route_id) == normalized_route_id(&secondary.route_id) {
         reasons.push("both evidence records identify the same route".to_owned());
     }
 
-    let same_algorithm = primary.algorithm_family == secondary.algorithm_family;
-    let same_formulation = primary.formulation == secondary.formulation;
+    for (role, route) in [("primary", primary), ("secondary", secondary)] {
+        for (field, value) in [
+            ("algorithm family", &route.algorithm_family),
+            ("formulation", &route.formulation),
+            ("implementation identity", &route.implementation_id),
+        ] {
+            if value.trim().is_empty() {
+                reasons.push(format!("{role} route has no {field}"));
+            }
+        }
+    }
+
+    let same_algorithm = normalized_route_id(&primary.algorithm_family)
+        == normalized_route_id(&secondary.algorithm_family);
+    let same_formulation =
+        normalized_route_id(&primary.formulation) == normalized_route_id(&secondary.formulation);
     if same_algorithm && same_formulation {
         reasons.push(
             "routes share the same decisive algorithm family and mathematical formulation"
                 .to_owned(),
         );
     }
-    if primary.implementation_id == secondary.implementation_id {
+    if normalized_route_id(&primary.implementation_id)
+        == normalized_route_id(&secondary.implementation_id)
+    {
         reasons.push("routes share the same implementation identity".to_owned());
     }
 
-    let shared_decisive_intermediates: Vec<_> = primary
+    let primary_intermediates: BTreeSet<_> = primary
         .decisive_intermediates
-        .intersection(&secondary.decisive_intermediates)
+        .iter()
+        .map(|s| normalized_route_id(s))
+        .collect();
+    let secondary_intermediates: BTreeSet<_> = secondary
+        .decisive_intermediates
+        .iter()
+        .map(|s| normalized_route_id(s))
+        .collect();
+    let shared_decisive_intermediates: Vec<_> = primary_intermediates
+        .intersection(&secondary_intermediates)
         .cloned()
         .collect();
     if !shared_decisive_intermediates.is_empty() {
@@ -210,6 +246,7 @@ pub fn assess_route_independence(
     }
 
     IndependenceAssessment {
+        algorithm_semantics: ASSURANCE_EVALUATION_SEMANTICS.to_owned(),
         independent: reasons.is_empty(),
         intended_claim: declaration.intended_claim.clone(),
         reasons,
@@ -223,14 +260,49 @@ pub struct AssuranceEvidence {
     pub computation_valid: bool,
     pub stability_checks: Vec<String>,
     pub independence: Option<IndependenceAssessment>,
+    /// Completed result comparison, separate from structural route independence.
+    #[serde(default)]
+    pub comparison: Option<RouteComparisonEvidence>,
     pub certificate_verified: bool,
     pub certificate_claim_scope: Option<String>,
-    #[serde(default)]
+    /// Required even when empty: absence is not evidence of no approximations.
     pub approximations: ApproximationLedger,
+}
+
+/// Caller attestation of an actually performed comparison. This API checks the
+/// evidence contract; it does not replay numerical results or infer agreement
+/// from independent algorithm names. Use exact relations or explicitly stated
+/// tolerances in `comparison_rule`, and identify both immutable result records.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteComparisonEvidence {
+    pub intended_claim: String,
+    pub left_result_digest: String,
+    pub right_result_digest: String,
+    pub comparison_rule: String,
+    pub agreement_accepted: bool,
+}
+
+impl RouteComparisonEvidence {
+    fn accepts(&self, independence: &IndependenceAssessment) -> bool {
+        let valid_digest = |digest: &str| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        self.agreement_accepted
+            && self.left_result_digest != self.right_result_digest
+            && self.intended_claim == independence.intended_claim
+            && !self.comparison_rule.trim().is_empty()
+            && valid_digest(&self.left_result_digest)
+            && valid_digest(&self.right_result_digest)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AssuranceEvaluation {
+    #[serde(default = "historical_assurance_semantics")]
+    pub algorithm_semantics: String,
     pub requested: AssuranceLevel,
     pub achieved: Option<AssuranceLevel>,
     pub completed_checks: Vec<String>,
@@ -255,10 +327,16 @@ pub fn evaluate_assurance(
         missing_checks.push("valid primary computation".to_owned());
     }
 
-    let independent_routes_accepted = evidence
-        .independence
-        .as_ref()
-        .is_some_and(|assessment| assessment.independent);
+    let independent_routes_accepted = evidence.independence.as_ref().is_some_and(|assessment| {
+        assessment.independent
+            && !assessment.intended_claim.trim().is_empty()
+            && assessment.reasons.is_empty()
+            && assessment.shared_decisive_intermediates.is_empty()
+            && evidence
+                .comparison
+                .as_ref()
+                .is_some_and(|comparison| comparison.accepts(assessment))
+    });
     let approximation_evidence_accepted = evidence
         .approximations
         .validate_for_assurance(AssuranceLevel::Certified)
@@ -289,7 +367,10 @@ pub fn evaluate_assurance(
     }
 
     if requested == AssuranceLevel::CrossChecked && !independent_routes_accepted {
-        missing_checks.push("accepted independent route comparison".to_owned());
+        missing_checks.push(
+            "accepted independent route comparison with result identities and comparison rule"
+                .to_owned(),
+        );
     }
     if requested == AssuranceLevel::Certified && !certificate_accepted {
         missing_checks.push("verified certificate with explicit claim scope".to_owned());
@@ -302,6 +383,7 @@ pub fn evaluate_assurance(
     }
 
     AssuranceEvaluation {
+        algorithm_semantics: ASSURANCE_EVALUATION_SEMANTICS.to_owned(),
         requested,
         achieved,
         completed_checks,
@@ -397,6 +479,7 @@ mod tests {
             &AssuranceEvidence {
                 computation_valid: false,
                 independence: Some(IndependenceAssessment {
+                    algorithm_semantics: historical_assurance_semantics(),
                     independent: true,
                     intended_claim: "eigenvalue".to_owned(),
                     reasons: Vec::new(),

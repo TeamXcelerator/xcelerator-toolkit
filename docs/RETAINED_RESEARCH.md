@@ -33,14 +33,13 @@ including removable Fourier-carrier singularities. No infinite physical tail
 is inferred. The Newton correction is -F/F' only where the numerical guards
 resolve both channels; no root-error remainder is claimed. The stored
 sqrt(L^5/80) expression is the Cauchy-Schwarz second-derivative bound for the
-unit-norm finite function, evaluated as a point expression, not an interval.
+unit-norm finite function, recorded as the outward upper endpoint of a directed interval evaluation.
 
 Every supplied ordinal remains present. Failed source rows remain missing;
 stagnated or approximate roots retain their source status. Retained-window
 ordinals are not automatically zeta ordinals. Reference-seeded acquisition and
 root-domain provenance remain explicit. Working precision defaults to the
-maximum declared state/root precision plus 64 bits, including adaptive root
-verification precision. Extra arithmetic does not recover source accuracy.
+maximum declared stored state/root precision plus 64 bits. Adaptive root verification precision is separate metadata; stored ordinates remain at their declared source precision. Extra arithmetic does not recover source accuracy.
 
 ### Projection
 
@@ -55,6 +54,20 @@ two supplied components and an explicit fixed parameter b, the artifact keeps
 B2 = a1 - b*a0 and b_effective = a1/a0 when defined. Its meaning is tied to those
 exact component definitions and this metric. It must not be equated to a
 similarly named coefficient obtained with a different measure or normalization.
+
+Current projection reports retain a midpoint estimate and outward real-decimal
+bounds for every measured field in `arithmetic_enclosures`, together with
+`arithmetic_precision_bits`. Stable normalization preserves small differences
+before fitting. A bounded interval Gram solve verifies positive pivots for the
+finite matrix or withholds the fit. An interval containing zero does not prove
+a nonzero residual; `b_effective` is withheld when its denominator interval
+contains zero. Fixed b parameters denote exact decimal values. These arithmetic
+bounds exclude reference approximation and source-construction errors.
+
+Raw basis coefficients multiply `exp(2*pi*i*j*(x/L+1/2))`; their full-support
+inner product is `L*a^T*b`. Source/reference unit normalization divides by
+`sqrt(L)*||a||_2`, while center-one normalization divides by the exact stored
+center. Basis columns retain their declared raw units.
 
 ### Energy, windows and stabilization
 
@@ -130,3 +143,59 @@ separate from the additive backfill executable.
 See [Ultra completeness](ULTRA_COMPLETENESS.md) for numerical coverage, reusable
 reference preparation, local cohort discovery, finite source-qualified enclosures,
 signed-band reconstruction and resumable diagnostic blocks.
+
+
+## Signed-transform point arithmetic
+
+Retained revision 9 binds signed_channel_arithmetic to
+exact_center_declared_points_single_round_channels_v2. External jet decimals
+denote binary points at ExternalResearchInputs.precision_bits; higher working
+precision promotes these existing points. It does not reinterpret their text.
+Working precision must be at least both the source and external input precision.
+
+For each value/derivative channel, actual A, reference window W, full reference F,
+tail T, endpoint E and fitted parts P_k retain their signs. The reported channels
+are A-W, A-W-T, F-W-T, A-W-sum(P_k), and T-E. Each composite uses one rounded
+MPFR sum of its original terms. The displayed rounded interior is not reused
+to compute the total. Nonfinite and nonzero-underflow results are rejected.
+
+The center is summed from the stored Fourier coefficients before normalization,
+with reversible common binary scaling. The normalizer is the absolute center
+divided by the coefficient norm and sqrt(log(C)), evaluated with 64 guard bits.
+An exactly zero center produces an unresolved report. This repairs cancellation
+from summing independently rounded unit coefficients; it is not an all-domain
+forward-error bound on Fourier evaluation or on division by a small center.
+
+Reports retain arithmetic_precision_bits and normalization_precision_bits.
+The cancellation_limited flag is a point-arithmetic heuristic. These reports
+do not certify source approximation, reference error, an infinite tail, ground
+selection, or convergence. The temporary local revision-9 method v1 snapshot
+is preserved with its own checkpoint/schema; current producers require v2.
+Older source-definition readability does not validate old calculation reports.
+
+
+## Arithmetic-energy enclosures
+
+Revision 10 binds energy_arithmetic=stored_points_scaled_quadratic_intervals_v1,
+a 4096-bit maximum guard increment, and midpoint estimates with outward decimal
+lower/upper fields. Operators, compact actions, trial vectors and deficits retain
+their declared input points. Raw homogeneous quadratic quotients avoid squaring
+unscaled tiny trial vectors. Signed component reductions and action closure use
+directed intervals, with explicit unresolved output when the guard cap or an
+explicit working-memory budget is insufficient. The actual arithmetic precision
+is retained. A zero trial has no Rayleigh quotient and produces partial status.
+
+Compact actions are already actions on the signed, center-oriented unit
+coefficient state; full operators instead act on the original stored vector.
+Each convention uses its own normalization formula. The scalar estimate is not
+the entire result: consult its lower/upper fields, especially around zero.
+These enclosures cover finite stored-input arithmetic only. Source construction,
+operator modeling, ground selection and convergence remain outside their scope.
+Earlier report revisions do not acquire this assurance. The shared directional
+diagnostic requires its separate mathematical review.
+
+Root-window transform reports use `exp(-i*t*x)`, matching the production secular root convention. Explicit evaluation datasets continue to use their documented `exp(+i*t*x)` convention. The derivative changes sign when converting conventions; even states alone cannot expose this distinction.
+
+Operator-energy reports use the raw retained matrix for residuals. The quadratic form equals that of its symmetric part, but this does not authorize symmetrizing the residual. `residual_normalization` distinguishes division by `abs(eigenvalue)*norm(coefficients)` from the zero-eigenvalue convention `norm(A*coefficients)/norm(coefficients)`.
+
+The historical `Published` quality token has no numerical admission rank. Retained research requires an explicitly validated source and its authenticated dependencies; publication location alone supplies no numerical assurance.

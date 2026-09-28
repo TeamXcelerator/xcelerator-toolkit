@@ -16,17 +16,28 @@ impl<'a> DenseGeneralizedProblemHp<'a> {
         metric: &'a [Float],
         dimension: usize,
     ) -> Result<Self, SolverError> {
-        let expected = dimension.saturating_mul(dimension);
-        if dimension == 0 || operator.len() != expected || metric.len() != expected {
-            return Err(SolverError::InvalidConfiguration(format!(
-                "dense HP generalized matrices must both contain {expected} entries"
-            )));
-        }
-        Ok(Self {
+        let result = Self {
             operator,
             metric,
             dimension,
-        })
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    /// Revalidate public records at every numerical entry boundary.
+    pub fn validate(&self) -> Result<(), SolverError> {
+        if self.dimension == 0
+            || self.dimension.checked_mul(self.dimension) != Some(self.operator.len())
+            || self.operator.len() != self.metric.len()
+        {
+            return Err(SolverError::InvalidConfiguration(
+                "dense HP generalized matrices require a positive checked square dimension".into(),
+            ));
+        }
+        validate_symmetric_matrix(self.operator, self.dimension, "operator")?;
+        validate_symmetric_matrix(self.metric, self.dimension, "metric")?;
+        Ok(())
     }
 }
 
@@ -40,8 +51,10 @@ pub struct DenseGeneralizedEigenpairReportHp {
     pub scaled_backward_error: Float,
     pub metric_normalization_error: Float,
     pub diagnostics: super::EigenpairDiagnostics<Float>,
+    pub stopping_evidence: super::HpResidualAcceptance,
     pub minimum_cholesky_pivot: Float,
     pub precision_bits: u32,
+    /// Completed factorizations: metric Cholesky and the retained shifted recovery factor.
     pub factorization_count: usize,
     pub estimated_peak_memory_bytes: u64,
     pub algorithm: String,
@@ -66,20 +79,11 @@ fn zero(precision_bits: u32) -> Float {
 }
 
 fn parse_positive(
-    literal: &xc_core::DecimalLiteral,
-    precision_bits: u32,
+    value: &xc_core::DecimalLiteral,
+    precision: u32,
     name: &str,
 ) -> Result<Float, SolverError> {
-    let parsed = Float::parse(literal.as_str()).map_err(|error| {
-        SolverError::InvalidConfiguration(format!("failed to parse {name}: {error}"))
-    })?;
-    let parsed = Float::with_val(precision_bits, parsed);
-    if !parsed.is_finite() || parsed <= 0 {
-        return Err(SolverError::InvalidConfiguration(format!(
-            "{name} must be finite and positive"
-        )));
-    }
-    Ok(parsed)
+    super::hp_positive_threshold(value, precision, name, rug::float::Round::Down)
 }
 
 fn dot(left: &[Float], right: &[Float], precision_bits: u32) -> Float {
@@ -90,10 +94,6 @@ fn dot(left: &[Float], right: &[Float], precision_bits: u32) -> Float {
         sum += term;
     }
     sum
-}
-
-fn norm(vector: &[Float], precision_bits: u32) -> Float {
-    dot(vector, vector, precision_bits).sqrt()
 }
 
 fn matvec(matrix: &[Float], vector: &[Float], dimension: usize, precision_bits: u32) -> Vec<Float> {
@@ -132,7 +132,7 @@ fn validate_symmetric_matrix(
     Ok(())
 }
 
-fn cholesky_lower(
+pub(super) fn cholesky_lower(
     metric: &[Float],
     dimension: usize,
     precision_bits: u32,
@@ -193,7 +193,7 @@ fn forward_solve(
     solution
 }
 
-fn backward_solve_transpose(
+pub(super) fn backward_solve_transpose(
     lower: &[Float],
     right_hand_side: &[Float],
     dimension: usize,
@@ -213,7 +213,7 @@ fn backward_solve_transpose(
     solution
 }
 
-fn whiten_operator(
+pub(super) fn whiten_operator(
     operator: &[Float],
     lower: &[Float],
     dimension: usize,
@@ -268,6 +268,7 @@ pub fn solve_dense_generalized_whitening_hp(
     problem: &DenseGeneralizedProblemHp<'_>,
     config: &GeneralizedExtremeConfigHp,
 ) -> Result<DenseGeneralizedEigenpairReportHp, SolverError> {
+    problem.validate()?;
     let target_index = match config.target {
         EigenTarget::AlgebraicSmallest => 0,
         EigenTarget::AlgebraicLargest => problem.dimension - 1,
@@ -277,14 +278,12 @@ pub fn solve_dense_generalized_whitening_hp(
             ));
         }
     };
-    if config.precision_bits <= 32 || config.maximum_iterations == 0 {
+    if !(33..=1_000_000).contains(&config.precision_bits) || config.maximum_iterations == 0 {
         return Err(SolverError::InvalidConfiguration(
-            "dense HP generalized whitening requires precision above 32 bits and a positive iteration bound"
+            "dense HP generalized whitening requires precision in 33..=1000000 bits and a positive iteration bound"
                 .to_owned(),
         ));
     }
-    validate_symmetric_matrix(problem.operator, problem.dimension, "operator")?;
-    validate_symmetric_matrix(problem.metric, problem.dimension, "metric")?;
     let absolute_tolerance = parse_positive(
         &config.absolute_residual_tolerance,
         config.precision_bits,
@@ -303,21 +302,16 @@ pub fn solve_dense_generalized_whitening_hp(
         problem.dimension,
         config.precision_bits,
     );
-    let eigenvalues = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(
+    let recovered = xc_numerics::eigen::dense_symmetric_eigenpair_at_index_hp(
         &whitened,
         problem.dimension,
-        config.precision_bits,
-    )
-    .map_err(|error| SolverError::NumericalBreakdown(error.to_string()))?;
-    let eigenvalue = eigenvalues[target_index].clone();
-    let whitened_vector = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
-        &whitened,
-        problem.dimension,
-        &eigenvalue,
+        target_index,
         config.precision_bits,
         config.maximum_iterations,
     )
-    .map_err(|error| SolverError::NumericalBreakdown(error.to_string()))?;
+    .map_err(|error| super::map_hp_recovery_error(error.downcast_ref(), error.to_string()))?;
+    let eigenvalue = recovered.eigenvalue;
+    let whitened_vector = recovered.eigenvector;
     let mut eigenvector = backward_solve_transpose(
         &lower,
         &whitened_vector,
@@ -364,16 +358,13 @@ pub fn solve_dense_generalized_whitening_hp(
             value
         })
         .collect();
-    let residual_norm = norm(&residual, config.precision_bits);
-    let operator_norm = norm(&applied_operator, config.precision_bits);
-    let metric_image_norm = norm(&applied_metric, config.precision_bits);
-    let mut scale = eigenvalue.clone().abs();
-    scale *= metric_image_norm;
-    scale += operator_norm;
-    let mut relative_residual = residual_norm.clone();
-    if !scale.is_zero() {
-        relative_residual /= &scale;
-    }
+    let (residual_norm, relative_residual) = super::hp_residual_measures(
+        &residual,
+        &applied_operator,
+        &applied_metric,
+        &eigenvalue,
+        config.precision_bits,
+    )?;
     let scaled_backward_error = relative_residual.clone();
     let mut metric_normalization_error = dot(&eigenvector, &applied_metric, config.precision_bits);
     metric_normalization_error -= 1u32;
@@ -391,7 +382,7 @@ pub fn solve_dense_generalized_whitening_hp(
     } else {
         (
             ResultStatus::Approximate,
-            TerminationReason::MaximumIterations,
+            TerminationReason::MaximumPrecision,
         )
     };
     let bytes_per_value = u64::from(config.precision_bits).div_ceil(8);
@@ -403,6 +394,16 @@ pub fn solve_dense_generalized_whitening_hp(
         scaled_backward_error: scaled_backward_error.clone(),
         orthogonality_error: metric_normalization_error.clone(),
     };
+    let stopping_evidence = super::hp_residual_acceptance(
+        &applied_operator,
+        &applied_metric,
+        &eigenvalue,
+        &residual_norm,
+        &scaled_backward_error,
+        &absolute_tolerance,
+        &backward_tolerance,
+        config.precision_bits,
+    );
     Ok(DenseGeneralizedEigenpairReportHp {
         target: config.target.clone(),
         eigenvalue,
@@ -412,6 +413,7 @@ pub fn solve_dense_generalized_whitening_hp(
         scaled_backward_error,
         metric_normalization_error,
         diagnostics,
+        stopping_evidence,
         minimum_cholesky_pivot,
         precision_bits: config.precision_bits,
         factorization_count: 2,
@@ -419,7 +421,10 @@ pub fn solve_dense_generalized_whitening_hp(
             .saturating_mul(problem.dimension as u64)
             .saturating_mul(problem.dimension as u64)
             .saturating_mul(bytes_per_value),
-        algorithm: "dense_generalized_cholesky_whitening_householder_qr_hp".to_owned(),
+        algorithm: format!(
+            "dense_generalized_cholesky_whitening_gap_bound_hp_v4:{}",
+            xc_numerics::eigen::DENSE_EIGENVECTOR_SEMANTICS
+        ),
         metric_validity_evidence: "strictly_positive_mpfr_cholesky_pivots".to_owned(),
         status,
         termination,
@@ -428,80 +433,23 @@ pub fn solve_dense_generalized_whitening_hp(
     })
 }
 
-/// Compare matrix-free and dense-whitened MPFR generalized eigenpairs using a
-/// sign-invariant metric overlap and an absolute eigenvalue tolerance.
+/// Compare stored generalized eigenvalues and normalized computed metric overlap.
+/// Differences are upward bounds and tolerances round downward. The overlap
+/// bounds arithmetic on the returned metric images; it does not bound error
+/// inside an arbitrary metric callback. The caller must establish problem and
+/// state identity, positive definiteness, and actual algorithm independence.
+/// Agreement is not a certificate of an extreme eigenstate index. This report-only
+/// comparison retains `Computed`: caller-populated algorithm names cannot prove
+/// execution independence or target identity. Its vector test requires a simple,
+/// separated state; matching values with noncollinear vectors return
+/// `UnresolvedEigenspace`, including valid bases of a repeated eigenspace.
 pub fn cross_check_generalized_hp_reports(
     problem: &GeneralizedEigenProblem<'_, Float>,
     matrix_free: &super::MatrixFreeGeneralizedEigenpairReportHp,
     dense_whitening: &DenseGeneralizedEigenpairReportHp,
     tolerance: &HpCrossCheckTolerance,
 ) -> Result<CrossCheckedGeneralizedEigenpairHp, SolverError> {
-    if matrix_free.eigenvector.len() != dense_whitening.eigenvector.len()
-        || matrix_free.eigenvector.len() != problem.operator.dimension()
-        || matrix_free.target != dense_whitening.target
-    {
-        return Err(SolverError::InvalidConfiguration(
-            "HP generalized cross-check reports do not describe the same problem and target"
-                .to_owned(),
-        ));
-    }
-    if matrix_free.status != ResultStatus::Converged
-        || dense_whitening.status != ResultStatus::Converged
-    {
-        return Err(SolverError::NonConvergence(
-            "HP generalized cross-check requires two converged routes".to_owned(),
-        ));
-    }
-    let precision_bits = matrix_free
-        .eigenvalue
-        .prec()
-        .min(dense_whitening.eigenvalue.prec());
-    let eigenvalue_tolerance = parse_positive(
-        &tolerance.eigenvalue_absolute,
-        precision_bits,
-        "eigenvalue_absolute",
-    )?;
-    let overlap_tolerance = parse_positive(
-        &tolerance.one_minus_overlap_squared,
-        precision_bits,
-        "one_minus_overlap_squared",
-    )?;
-    let mut eigenvalue_absolute_difference =
-        Float::with_val(precision_bits, &matrix_free.eigenvalue);
-    eigenvalue_absolute_difference -= &dense_whitening.eigenvalue;
-    eigenvalue_absolute_difference.abs_mut();
-    let mut metric_image = vec![zero(precision_bits); matrix_free.eigenvector.len()];
-    problem
-        .metric
-        .apply(&dense_whitening.eigenvector, &mut metric_image)?;
-    for value in &mut metric_image {
-        super::reprecision_hp_value(value, precision_bits);
-    }
-    let overlap = dot(&matrix_free.eigenvector, &metric_image, precision_bits);
-    let mut one_minus_metric_overlap_squared = overlap;
-    one_minus_metric_overlap_squared *= &one_minus_metric_overlap_squared.clone();
-    one_minus_metric_overlap_squared = -one_minus_metric_overlap_squared;
-    one_minus_metric_overlap_squared += 1u32;
-    one_minus_metric_overlap_squared.abs_mut();
-    if eigenvalue_absolute_difference > eigenvalue_tolerance
-        || one_minus_metric_overlap_squared > overlap_tolerance
-    {
-        return Err(SolverError::CrossCheckDisagreement(format!(
-            "HP generalized routes disagree: eigenvalue difference={}, one-minus-metric-overlap-squared={}",
-            eigenvalue_absolute_difference, one_minus_metric_overlap_squared
-        )));
-    }
-    let mut matrix_free = matrix_free.clone();
-    matrix_free.assurance = AssuranceLevel::CrossChecked;
-    let mut dense_whitening = dense_whitening.clone();
-    dense_whitening.assurance = AssuranceLevel::CrossChecked;
-    Ok(CrossCheckedGeneralizedEigenpairHp {
-        matrix_free,
-        dense_whitening,
-        eigenvalue_absolute_difference,
-        one_minus_metric_overlap_squared,
-        assurance: AssuranceLevel::CrossChecked,
-    })
+    super::hp_generalized_crosscheck::check(problem, matrix_free, dense_whitening, tolerance)
 }
 
 #[cfg(test)]
@@ -621,7 +569,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.status, ResultStatus::Approximate);
-        assert_eq!(report.termination, TerminationReason::MaximumIterations);
+        assert_eq!(report.termination, TerminationReason::MaximumPrecision);
+    }
+
+    #[test]
+    fn repeated_generalized_eigenvalue_requires_a_subspace_comparison() {
+        let p = 256;
+        let data = values(p, &[1, 0, 0, 1]);
+        let operator = DenseSymmetricHp::new("identity", 2, data.clone(), p, &zero(p)).unwrap();
+        let metric = DenseMetricHp(operator.clone());
+        let problem = GeneralizedEigenProblem::new(&operator, &metric).unwrap();
+        let cfg = config(EigenTarget::AlgebraicSmallest);
+        let mut left = super::super::MatrixFreeGeneralizedRayleighRitzHp
+            .solve(&problem, &cfg)
+            .unwrap();
+        // (I,I) has a two-dimensional repeated eigenspace. The directed
+        // member recovery must refuse an individually separated dense vector.
+        assert!(matches!(
+            solve_dense_generalized_whitening_hp(
+                &DenseGeneralizedProblemHp::new(&data, &data, 2).unwrap(),
+                &cfg
+            ),
+            Err(SolverError::UnresolvedEigenspace(_))
+        ));
+        // Retain the report-only comparison control with independently exact
+        // caller-provided vectors. A simple problem supplies the report shape;
+        // all state evidence is checked below against the original (I,I).
+        let simple = values(p, &[1, 0, 0, 2]);
+        let mut right = solve_dense_generalized_whitening_hp(
+            &DenseGeneralizedProblemHp::new(&simple, &data, 2).unwrap(),
+            &cfg,
+        )
+        .unwrap();
+        // Both vectors are exact, normalized, valid eigenvectors of (I,I).
+        left.eigenvector = values(p, &[1, 0]);
+        right.eigenvector = values(p, &[0, 1]);
+        assert_eq!(left.eigenvalue, 1);
+        assert_eq!(right.eigenvalue, 1);
+        for vector in [&left.eigenvector, &right.eigenvector] {
+            let mut applied = values(p, &[0, 0]);
+            operator.apply(vector, &mut applied).unwrap();
+            let mut metric_image = values(p, &[0, 0]);
+            metric.apply(vector, &mut metric_image).unwrap();
+            assert_eq!(applied, metric_image); // Exact A*x = 1*B*x.
+            let norm_sq: rug::Rational = vector
+                .iter()
+                .map(|x| {
+                    let exact = x.to_rational().unwrap();
+                    exact.clone() * exact
+                })
+                .sum();
+            assert_eq!(norm_sq, 1);
+        }
+
+        let limits = HpCrossCheckTolerance {
+            eigenvalue_absolute: DecimalLiteral::new("1e-35").unwrap(),
+            one_minus_overlap_squared: DecimalLiteral::new("1e-35").unwrap(),
+        };
+        assert!(matches!(
+            cross_check_generalized_hp_reports(&problem, &left, &right, &limits),
+            Err(SolverError::UnresolvedEigenspace(_))
+        ));
+        right.eigenvector = left.eigenvector.clone();
+        let agreement =
+            cross_check_generalized_hp_reports(&problem, &left, &right, &limits).unwrap();
+        assert_eq!(agreement.assurance, AssuranceLevel::Computed);
+        assert_eq!(agreement.matrix_free.assurance, AssuranceLevel::Computed);
     }
 
     #[test]
@@ -655,7 +668,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(checked.assurance, AssuranceLevel::CrossChecked);
+        assert_eq!(checked.assurance, AssuranceLevel::Computed);
         assert!(checked.eigenvalue_absolute_difference < Float::with_val(precision, 1e-35));
         assert!(checked.one_minus_metric_overlap_squared < Float::with_val(precision, 1e-35));
 
@@ -672,5 +685,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, SolverError::CrossCheckDisagreement(_)));
+    }
+}
+
+#[cfg(test)]
+mod tolerance_boundary_contract {
+    use super::*;
+    #[test]
+    fn acceptance_threshold_cannot_round_up_to_one() {
+        let threshold =
+            xc_core::DecimalLiteral::new("0.999999999999999999999999999999999999999999").unwrap();
+        // 1 exceeds the exact requested threshold, even though nearest
+        // rounding at 64 bits makes the two values indistinguishable.
+        assert!(parse_positive(&threshold, 64, "acceptance tolerance").unwrap() < 1);
     }
 }

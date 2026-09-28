@@ -124,3 +124,60 @@ fn capture_receipt_is_append_only_and_complete_only_with_all_evidence() {
     r.record("b", done).unwrap();
     assert!(r.is_complete());
 }
+
+#[test]
+fn respelled_exact_design_cannot_cross_protected_partition() {
+    for spelling in ["13.0", "1.3e1", "+013", "130e-1"] {
+        let mut s = spec();
+        let mut other = s.cases["dev"].clone();
+        other.partition = DatasetPartition::ProtectedValidation;
+        other.family_id = "different-family".into();
+        other
+            .design
+            .coordinates
+            .insert("c=lambda^2".into(), DecimalLiteral::new(spelling).unwrap());
+        s.cases.insert("protected".into(), other);
+        assert!(s
+            .freeze()
+            .unwrap_err()
+            .to_string()
+            .contains("same exact design"));
+    }
+}
+
+#[test]
+fn original_zero_is_not_a_finite_positive_log_observation() {
+    let fixture = spec();
+    let mut payload = ObservationPayload {
+        schema_version: 1,
+        observable: fixture.observable,
+        design: fixture.cases["dev"].design.clone(),
+        value: ObservedScalar::ExactZero,
+        resolution: ObservableResolution {
+            components: RESOLUTION_AXES
+                .iter()
+                .map(|axis| ResolutionComponent {
+                    axis: *axis,
+                    classification: ResolutionClass::Unknown,
+                    absolute: None,
+                    explanation: "not measured".into(),
+                    evidence: vec![],
+                    dependency_groups: Default::default(),
+                })
+                .collect(),
+            source_precision_bits: 256,
+            analysis_precision_bits: 256,
+            export_significant_digits: 60,
+        },
+    };
+    payload.validate().unwrap();
+    payload.observable.transform = ObservableTransform::PositiveLog {
+        base: LogBase::Decimal,
+        negative: true,
+    };
+    assert!(payload.validate().unwrap_err().to_string().contains("zero"));
+    payload.value = ObservedScalar::Finite {
+        value: DecimalLiteral::new("0").unwrap(),
+    };
+    payload.validate().unwrap();
+}

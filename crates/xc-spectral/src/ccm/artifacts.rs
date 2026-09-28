@@ -1,7 +1,12 @@
 // Copyright (c) 2026 Ronnie Andrews, Jr. (Team Xcelerator Inc.®)
 // All rights reserved. See LICENSE in the repository root.
 
-//! Granular CCM artifact identity and cache-key construction.
+//! Legacy standalone CCM identity templates, retained for compatibility.
+//!
+//! These builders do **not** construct or resolve production CCM keys. Production
+//! uses per-kind semantic envelopes and authenticated dependencies in `hp`. The
+//! historical mathematics stamp below must not be interpreted as the current
+//! numerical implementation version or used to validate results across releases.
 //!
 //! Expensive source construction is separated from root-window requests. A
 //! request for additional roots may therefore reuse the same matrix
@@ -10,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 use xc_cache::{ArtifactKey, CacheError, ContentDigest, DependencyRef};
 
+/// Historical template version; not the current production mathematics identity.
 pub const CCM_MATHEMATICS_SEMANTICS: &str = "ccm-v0.13.0-v1";
 
 pub fn ccm_artifact_reuse_plan() -> xc_core::ArtifactReusePlan {

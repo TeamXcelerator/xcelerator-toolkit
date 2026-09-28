@@ -1,0 +1,11 @@
+# Limit disk growth from ordinary Rust builds. Release/research profiles retain their settings.
+[build]
+incremental = false
+# Share the toolkit build tree with nested consumer workspaces.
+target-dir = "target"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

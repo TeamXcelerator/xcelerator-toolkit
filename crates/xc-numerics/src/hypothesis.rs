@@ -21,17 +21,21 @@ pub struct DecimalEnclosure {
     pub upper: String,
 }
 impl DecimalEnclosure {
-    fn from_interval(value: &MpfrInterval) -> Self {
+    fn from_interval(value: &MpfrInterval) -> Result<Self> {
+        value.validate()?;
         // lossless_decimal round-trips in nearest rounding. Widen endpoints
         // once before export so exact decimal consumers retain the enclosure.
         let mut lower = value.lower().clone();
         lower.next_down();
         let mut upper = value.upper().clone();
         upper.next_up();
-        Self {
+        if !lower.is_finite() || !upper.is_finite() {
+            bail!("decimal enclosure widening exceeds the finite exponent range");
+        }
+        Ok(Self {
             lower: lossless_decimal(&lower),
             upper: lossless_decimal(&upper),
-        }
+        })
     }
 }
 fn precision(p: u32) -> Result<()> {
@@ -78,7 +82,7 @@ pub fn convert_log_units(
     if from_negative != to_negative {
         x = x.neg();
     }
-    Ok(DecimalEnclosure::from_interval(&x))
+    DecimalEnclosure::from_interval(&x)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -113,7 +117,7 @@ fn resolution_range(
             radius = radius.add(&enclose_decimal(x, p)?);
         }
     }
-    summary.known_radius_upper = DecimalEnclosure::from_interval(&radius).upper;
+    summary.known_radius_upper = DecimalEnclosure::from_interval(&radius)?.upper;
     let center = match value {
         ObservedScalar::Finite { value } => Some(enclose_decimal(value, p)?),
         ObservedScalar::SignedLogMagnitude { log_magnitude, .. } => {
@@ -363,7 +367,7 @@ where
                     "observation range overlaps the acceptance boundary; resolution cannot decide"
                         .into();
             }
-            score.signed_residual = Some(DecimalEnclosure::from_interval(&residual));
+            score.signed_residual = Some(DecimalEnclosure::from_interval(&residual)?);
             Ok(())
         })();
         if scored.is_err() {
@@ -439,9 +443,7 @@ pub fn scaled_correction(
     let (range, _) = resolution_range(&payload.value, &payload.resolution, p)?;
     range
         .map(|r| {
-            Ok(DecimalEnclosure::from_interval(
-                &r.sub(&enclose_decimal(leading, p)?).div(&scale)?,
-            ))
+            DecimalEnclosure::from_interval(&r.sub(&enclose_decimal(leading, p)?).div(&scale)?)
         })
         .transpose()
 }
@@ -579,9 +581,9 @@ fn stabilization_ladder_checked(
             });
         result.push(StabilizationStep {
             from_n_modes: from, to_n_modes: to,
-            signed_change: change.as_ref().map(DecimalEnclosure::from_interval),
-            ratio_denominator: previous_change.as_ref().map(DecimalEnclosure::from_interval),
-            signed_change_ratio: ratio.as_ref().map(DecimalEnclosure::from_interval),
+            signed_change: change.as_ref().map(DecimalEnclosure::from_interval).transpose()?,
+            ratio_denominator: previous_change.as_ref().map(DecimalEnclosure::from_interval).transpose()?,
+            signed_change_ratio: ratio.as_ref().map(DecimalEnclosure::from_interval).transpose()?,
             interpretation: if schedule.is_some() {
                 "Finite coupled N/quadrature change; neither a pure truncation error nor an infinite-N remainder bound. Shared-input dependencies are enclosed conservatively; a zero-containing denominator leaves the ratio unresolved."
             } else {

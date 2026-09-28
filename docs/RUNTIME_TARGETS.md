@@ -19,6 +19,18 @@ A schema-3 specification has `schema_version`, an opaque `profile_id`, and
 - `provider_sha256`: SHA-256 of the authorized executable's exact bytes;
 - `input`: provider-defined JSON data.
 
+Encode decimal values and integers outside the signed/unsigned 64-bit range as
+strings inside `input`, including nested arrays and objects. Floating JSON
+numbers are rejected before hashing or provider launch: parsing them into the
+JSON value model would otherwise round them to binary64. Rejecting floating numbers preserves the serialization of accepted integers,
+strings, booleans and null; external target identities nevertheless changed
+with protocol 2, as described below. This
+validation does not inspect the scientific meaning of the opaque input.
+
+The native Gaussian evaluator rejects nonzero decimal coefficients or scales
+that become zero or subnormal, including during coefficient normalization.
+Use the HP evaluator for these inputs; it preserves their decimal scale.
+
 Set `XC_TARGET_PROVIDER_EXECUTABLE` to an absolute executable path. This is an
 explicit authorization to run that program; a specification cannot choose an
 executable or command. Use a trusted provider. The Toolkit checks its digest,
@@ -27,19 +39,20 @@ must write only protocol responses to stdout. Stderr is suppressed by default.
 Neither the
 input nor response values are included in protocol error messages.
 
-The protocol version is 1. Every request has a monotonically increasing unsigned
-`request_id` (starting at 1), `protocol_version: 1`, `operation`, and
-`precision_bits`. Every reply must echo all four exactly. A missing, duplicated,
+The protocol version is 2. Every request has a monotonically increasing unsigned
+`request_id` (starting at 1), a fresh 256-bit hexadecimal `request_nonce`,
+`protocol_version: 2`, `operation`, and
+`precision_bits`. Every reply must echo all five exactly. A missing, duplicated,
 out-of-order, wrong-operation, or wrong-precision reply fails the connection.
 Unversioned providers must be updated; they are not silently accepted.
 
 For example, initialization at 256 working bits sends:
 
 ```json
-{"protocol_version":1,"request_id":1,"operation":"initialize","precision_bits":256,"input":{}}
+{"protocol_version":2,"request_id":1,"request_nonce":"<64 lowercase hex digits>","operation":"initialize","precision_bits":256,"input":{}}
 ```
 
-The provider replies with the same four envelope fields and `"ready":true`.
+The provider replies with the same five envelope fields and `"ready":true`.
 An evaluation request adds `"u":"1.25"`; its matching reply adds
 `"value":"0.75"`. Decimal strings must retain the declared working precision.
 These values are interface examples only. A reply containing `error` fails.
@@ -102,3 +115,10 @@ separate evaluators; no process-global provider cache is used. With diagnostic
 logging enabled, each construction creates a separate file, and a failed launch
 may leave an empty file. Logs are not rotated automatically. Enable the setting
 for a bounded troubleshooting session and manage the private directory afterward.
+
+Protocol 2 providers must echo `request_nonce` exactly along with the other
+request fields. A response prepared before receiving its request cannot predict
+this nonce. Unsolicited frames, mismatches, and legacy protocol 1 replies terminate
+the connection. Provider migration requires reading and echoing the nonce; the
+provider executable digest and the target evaluator identity change accordingly.
+OS entropy comes from the workspace's existing pinned `getrandom` dependency.

@@ -42,6 +42,10 @@ pub struct AnalyticErrorBudget {
     pub quantity: String,
     pub terms: Vec<AnalyticErrorTerm>,
     pub total_absolute_bound: Option<DecimalLiteral>,
+    /// Certified contexts currently support `triangle inequality`: the total
+    /// must cover the exact sum of all decisive bounds for `quantity`.
+    /// Other aggregation descriptions remain available to computed contexts;
+    /// their mathematical proof is not verified by this structural API.
     pub aggregation_method: String,
 }
 
@@ -142,9 +146,46 @@ impl AnalyticProblemContext {
                 "Certified analytic context requires a total bound and rigorous decisive terms",
             ));
         }
+        if self.requested_assurance == AssuranceLevel::Certified {
+            if self.error_budget.aggregation_method.trim() != "triangle inequality" {
+                return Err(ConfigError::new(
+                    "Certified analytic contexts require the supported triangle inequality aggregation",
+                ));
+            }
+            let terms = self
+                .error_budget
+                .terms
+                .iter()
+                .filter(|term| term.decisive_for_claim);
+            let mut bounds = Vec::new();
+            for term in terms {
+                if term.affects != self.error_budget.quantity {
+                    return Err(ConfigError::new(
+                        "decisive analytic bounds must affect the error budget's quantity",
+                    ));
+                }
+                bounds.push(term.absolute_bound.as_ref().ok_or_else(|| {
+                    ConfigError::new("decisive analytic term is missing its bound")
+                })?);
+            }
+            let total = self
+                .error_budget
+                .total_absolute_bound
+                .as_ref()
+                .ok_or_else(|| {
+                    ConfigError::new("Certified analytic context is missing its total bound")
+                })?;
+            if total.cmp_sum_many(&bounds)? == std::cmp::Ordering::Less {
+                return Err(ConfigError::new(
+                    "analytic total bound is smaller than the sum of its decisive bounds",
+                ));
+            }
+        }
         Ok(())
     }
 
+    /// Deterministic digest of the stored representation. Decimal spellings and
+    /// ordered term lists are preserved; this is not algebraic canonicalization.
     pub fn canonical_sha256(&self) -> Result<String, ConfigError> {
         self.validate()?;
         let bytes = serde_json::to_vec(self).map_err(|error| {

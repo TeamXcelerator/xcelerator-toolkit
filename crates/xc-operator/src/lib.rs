@@ -6,6 +6,8 @@
 //! The core solver layer sees mathematical actions, dimensions, and bounds;
 //! it does not require every problem to materialize a dense matrix.
 
+#[cfg(feature = "hp")]
+use rug::ops::AddAssignRound;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -13,6 +15,7 @@ use std::sync::Arc;
 
 pub mod batch;
 pub mod checkpoint;
+mod rank_one_action;
 pub mod vector_storage;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -52,7 +55,7 @@ impl OperatorMetadata {
             structure,
             scalar_backend: scalar_backend.into(),
             symmetric: false,
-            exact_action: true,
+            exact_action: false,
             tags: Vec::new(),
         }
     }
@@ -82,6 +85,8 @@ impl Error for OperatorError {}
 /// Absolute error contract for one operator application.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ApplicationErrorBound<S> {
+    /// No approximation bound has been established by this implementation.
+    Unknown,
     /// The action is exact up to arithmetic in its declared scalar backend.
     Exact,
     /// The returned vector differs from the mathematical action by at most
@@ -134,11 +139,39 @@ pub trait LinearOperator<S>: Send + Sync {
     where
         S: Clone,
     {
-        ApplicationErrorBound::Exact
+        if self.metadata().exact_action {
+            ApplicationErrorBound::Exact
+        } else {
+            ApplicationErrorBound::Unknown
+        }
     }
 }
 
-pub trait SymmetricOperator<S>: LinearOperator<S> {}
+/// Counts for the exact stored symmetric operator at a queried scalar shift.
+/// They include algebraic multiplicity and must exhaust the operator dimension.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SpectralInertia {
+    pub below: usize,
+    pub equal: usize,
+    pub above: usize,
+}
+
+pub trait SymmetricOperator<S>: LinearOperator<S> {
+    /// Return rigorous spectral counts for this exact operator at `shift`.
+    /// The implementation must bind its proof to the same source and basis as
+    /// `apply`; metadata or counts from a different matrix are not evidence.
+    /// `None` means that a complete count is unavailable at this shift.
+    fn spectral_inertia_at(&self, _shift: &S) -> Result<Option<SpectralInertia>, OperatorError> {
+        Ok(None)
+    }
+
+    /// Borrow existing exact row-major symmetric storage when available.
+    /// These entries must describe the same stored operator as `apply`, before
+    /// ordinary arithmetic roundoff; approximate materializations do not qualify.
+    fn stored_symmetric_entries(&self) -> Option<&[S]> {
+        None
+    }
+}
 pub trait PositiveDefiniteMetric<S>: SymmetricOperator<S> {}
 
 /// Domain-independent description of a user-supplied finite basis.
@@ -194,6 +227,50 @@ where
     Ok(y)
 }
 
+// Nonnegative binary64 bounds. TwoSum exposes the exact addition residual;
+// increase by one ulp only when the rounded sum was below the exact sum.
+fn add_bound_f64(a: f64, b: f64) -> f64 {
+    let sum = a + b;
+    if !sum.is_finite() {
+        return f64::INFINITY;
+    }
+    let b_virtual = sum - a;
+    let residual = (a - (sum - b_virtual)) + (b - b_virtual);
+    if residual > 0.0 {
+        sum.next_up()
+    } else {
+        sum
+    }
+}
+
+fn multiply_bound_f64(a: f64, b: f64) -> f64 {
+    if a == 0.0 || b == 0.0 {
+        return 0.0;
+    }
+    if a == 1.0 {
+        return b;
+    }
+    if b == 1.0 {
+        return a;
+    }
+    // One upward ulp encloses nearest rounding, including underflow to zero.
+    (a * b).next_up()
+}
+
+fn finite_bound_f64(bound: f64) -> Option<f64> {
+    (bound.is_finite() && bound >= 0.0).then_some(bound)
+}
+
+fn validate_output_f64(output: &[f64]) -> Result<(), OperatorError> {
+    if output.iter().any(|x| !x.is_finite()) {
+        Err(OperatorError::ApplicationFailed(
+            "operator action produced a nonfinite value".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn check_dimensions(n: usize, x: &[f64], y: &[f64]) -> Result<(), OperatorError> {
     if x.len() != n {
         return Err(OperatorError::DimensionMismatch {
@@ -207,10 +284,18 @@ fn check_dimensions(n: usize, x: &[f64], y: &[f64]) -> Result<(), OperatorError>
             actual: y.len(),
         });
     }
+    if x.iter().any(|x| !x.is_finite()) {
+        return Err(OperatorError::InvalidData(
+            "operator input must be finite".into(),
+        ));
+    }
     Ok(())
 }
 
-/// Trusted row-major dense symmetric f64 reference operator.
+/// Row-major dense symmetric binary64 operator with exact symmetric storage.
+/// The tolerance parameter is retained for source compatibility and validated;
+/// it cannot turn a nonsymmetric action into a symmetric one. Symmetrize a
+/// measured matrix explicitly before construction if that is the intended map.
 #[derive(Clone, Debug)]
 pub struct DenseSymmetricF64 {
     n: usize,
@@ -231,9 +316,12 @@ impl DenseSymmetricF64 {
                 "dimension must be positive".to_owned(),
             ));
         }
-        if data.len() != n * n {
+        let expected = n
+            .checked_mul(n)
+            .ok_or_else(|| OperatorError::InvalidData("dense dimension overflow".into()))?;
+        if data.len() != expected {
             return Err(OperatorError::DimensionMismatch {
-                expected: n * n,
+                expected,
                 actual: data.len(),
             });
         }
@@ -251,7 +339,7 @@ impl DenseSymmetricF64 {
             for j in 0..i {
                 let a = data[i * n + j];
                 let b = data[j * n + i];
-                if (a - b).abs() > symmetry_tolerance {
+                if a != b {
                     return Err(OperatorError::InvalidData(format!(
                         "matrix is not symmetric at ({i}, {j}): {a} vs {b}"
                     )));
@@ -259,7 +347,11 @@ impl DenseSymmetricF64 {
             }
         }
         let norm_bound = (0..n)
-            .map(|i| (0..n).map(|j| data[i * n + j].abs()).sum::<f64>())
+            .map(|i| {
+                (0..n)
+                    .map(|j| data[i * n + j].abs())
+                    .fold(0.0, add_bound_f64)
+            })
             .fold(0.0, f64::max);
         Ok(Self {
             n,
@@ -296,18 +388,19 @@ impl LinearOperator<f64> for DenseSymmetricF64 {
                 .map(|(entry, component)| entry * component)
                 .sum();
         }
-        Ok(())
+        validate_output_f64(y)
     }
 
     fn metadata(&self) -> OperatorMetadata {
         let mut metadata =
             OperatorMetadata::new(self.name.clone(), self.n, MatrixStructure::Dense, "f64");
         metadata.symmetric = true;
+        metadata.exact_action = true;
         metadata
     }
 
     fn norm_bound(&self) -> Option<f64> {
-        Some(self.norm_bound)
+        finite_bound_f64(self.norm_bound)
     }
 }
 
@@ -349,7 +442,11 @@ impl PackedSymmetricF64 {
             lower[high * (high + 1) / 2 + low]
         };
         let norm_bound = (0..n)
-            .map(|row| (0..n).map(|column| get(row, column).abs()).sum())
+            .map(|row| {
+                (0..n)
+                    .map(|column| get(row, column).abs())
+                    .fold(0.0, add_bound_f64)
+            })
             .fold(0.0, f64::max);
         Ok(Self {
             n,
@@ -389,7 +486,7 @@ impl LinearOperator<f64> for PackedSymmetricF64 {
                 }
             }
         }
-        Ok(())
+        validate_output_f64(y)
     }
 
     fn metadata(&self) -> OperatorMetadata {
@@ -400,11 +497,12 @@ impl LinearOperator<f64> for PackedSymmetricF64 {
             "f64",
         );
         metadata.symmetric = true;
+        metadata.exact_action = true;
         metadata
     }
 
     fn norm_bound(&self) -> Option<f64> {
-        Some(self.norm_bound)
+        finite_bound_f64(self.norm_bound)
     }
 }
 
@@ -444,9 +542,9 @@ impl SymmetricBandedF64 {
         let mut row_sums = vec![0.0; n];
         for (distance, band) in bands.iter().enumerate() {
             for (row, value) in band.iter().enumerate() {
-                row_sums[row] += value.abs();
+                row_sums[row] = add_bound_f64(row_sums[row], value.abs());
                 if distance != 0 {
-                    row_sums[row + distance] += value.abs();
+                    row_sums[row + distance] = add_bound_f64(row_sums[row + distance], value.abs());
                 }
             }
         }
@@ -479,7 +577,7 @@ impl LinearOperator<f64> for SymmetricBandedF64 {
                 }
             }
         }
-        Ok(())
+        validate_output_f64(y)
     }
 
     fn metadata(&self) -> OperatorMetadata {
@@ -493,11 +591,12 @@ impl LinearOperator<f64> for SymmetricBandedF64 {
             "f64",
         );
         metadata.symmetric = true;
+        metadata.exact_action = true;
         metadata
     }
 
     fn norm_bound(&self) -> Option<f64> {
-        Some(self.norm_bound)
+        finite_bound_f64(self.norm_bound)
     }
 }
 
@@ -588,7 +687,8 @@ impl LinearOperator<f64> for MatrixFreeSymmetricF64 {
 
     fn apply(&self, x: &[f64], y: &mut [f64]) -> Result<(), OperatorError> {
         check_dimensions(self.dimension, x, y)?;
-        (self.action)(x, y)
+        (self.action)(x, y)?;
+        validate_output_f64(y)
     }
 
     fn metadata(&self) -> OperatorMetadata {
@@ -648,7 +748,7 @@ impl LinearOperator<f64> for DiagonalF64 {
         for ((yi, di), xi) in y.iter_mut().zip(&self.diagonal).zip(x) {
             *yi = di * xi;
         }
-        Ok(())
+        validate_output_f64(y)
     }
 
     fn metadata(&self) -> OperatorMetadata {
@@ -659,6 +759,7 @@ impl LinearOperator<f64> for DiagonalF64 {
             "f64",
         );
         metadata.symmetric = true;
+        metadata.exact_action = true;
         metadata
     }
 
@@ -730,7 +831,7 @@ impl LinearOperator<f64> for TridiagonalF64 {
             }
             y[i] = value;
         }
-        Ok(())
+        validate_output_f64(y)
     }
 
     fn metadata(&self) -> OperatorMetadata {
@@ -741,6 +842,7 @@ impl LinearOperator<f64> for TridiagonalF64 {
             "f64",
         );
         metadata.symmetric = true;
+        metadata.exact_action = true;
         metadata
     }
 
@@ -750,14 +852,14 @@ impl LinearOperator<f64> for TridiagonalF64 {
         for i in 0..n {
             let mut row = self.diagonal[i].abs();
             if i > 0 {
-                row += self.off_diagonal[i - 1].abs();
+                row = add_bound_f64(row, self.off_diagonal[i - 1].abs());
             }
             if i + 1 < n {
-                row += self.off_diagonal[i].abs();
+                row = add_bound_f64(row, self.off_diagonal[i].abs());
             }
             bound = bound.max(row);
         }
-        Some(bound)
+        finite_bound_f64(bound)
     }
 }
 
@@ -785,11 +887,12 @@ impl LinearOperator<f64> for ShiftedF64<'_> {
     }
 
     fn apply(&self, x: &[f64], y: &mut [f64]) -> Result<(), OperatorError> {
+        check_dimensions(self.dimension(), x, y)?;
         self.base.apply(x, y)?;
         for (yi, xi) in y.iter_mut().zip(x) {
             *yi -= self.shift * xi;
         }
-        Ok(())
+        validate_output_f64(y)
     }
 
     fn metadata(&self) -> OperatorMetadata {
@@ -800,7 +903,10 @@ impl LinearOperator<f64> for ShiftedF64<'_> {
     }
 
     fn norm_bound(&self) -> Option<f64> {
-        self.base.norm_bound().map(|b| b + self.shift.abs())
+        self.base
+            .norm_bound()
+            .and_then(finite_bound_f64)
+            .and_then(|b| finite_bound_f64(add_bound_f64(b, self.shift.abs())))
     }
 
     fn application_error_bound(&self) -> ApplicationErrorBound<f64> {
@@ -826,11 +932,12 @@ impl LinearOperator<f64> for NegatedF64<'_> {
     }
 
     fn apply(&self, x: &[f64], y: &mut [f64]) -> Result<(), OperatorError> {
+        check_dimensions(self.dimension(), x, y)?;
         self.base.apply(x, y)?;
-        for yi in y {
+        for yi in y.iter_mut() {
             *yi = -*yi;
         }
-        Ok(())
+        validate_output_f64(y)
     }
 
     fn metadata(&self) -> OperatorMetadata {
@@ -888,12 +995,10 @@ impl LinearOperator<f64> for RankOneUpdateF64<'_> {
     }
 
     fn apply(&self, x: &[f64], y: &mut [f64]) -> Result<(), OperatorError> {
+        check_dimensions(self.dimension(), x, y)?;
         self.base.apply(x, y)?;
-        let dot: f64 = self.vector.iter().zip(x).map(|(a, b)| a * b).sum();
-        for (yi, vi) in y.iter_mut().zip(&self.vector) {
-            *yi += self.alpha * vi * dot;
-        }
-        Ok(())
+        rank_one_action::add(self.alpha, &self.vector, x, y)?;
+        validate_output_f64(y)
     }
 
     fn metadata(&self) -> OperatorMetadata {
@@ -904,10 +1009,20 @@ impl LinearOperator<f64> for RankOneUpdateF64<'_> {
     }
 
     fn norm_bound(&self) -> Option<f64> {
-        let vector_norm_sq: f64 = self.vector.iter().map(|v| v * v).sum();
+        let vector_norm_sq = self
+            .vector
+            .iter()
+            .map(|v| multiply_bound_f64(v.abs(), v.abs()))
+            .fold(0.0, add_bound_f64);
         self.base
             .norm_bound()
-            .map(|bound| bound + self.alpha.abs() * vector_norm_sq)
+            .and_then(finite_bound_f64)
+            .and_then(|bound| {
+                finite_bound_f64(add_bound_f64(
+                    bound,
+                    multiply_bound_f64(self.alpha.abs(), vector_norm_sq),
+                ))
+            })
     }
 
     fn application_error_bound(&self) -> ApplicationErrorBound<f64> {
@@ -1228,16 +1343,29 @@ impl DenseSymmetricHp {
                 "dimension must be positive".to_owned(),
             ));
         }
-        if data.len() != n * n {
+        let expected = n
+            .checked_mul(n)
+            .ok_or_else(|| OperatorError::InvalidData("dense dimension overflow".into()))?;
+        if data.len() != expected {
             return Err(OperatorError::DimensionMismatch {
-                expected: n * n,
+                expected,
                 actual: data.len(),
             });
         }
-        if precision_bits < 32 || symmetry_tolerance < &Float::with_val(precision_bits, 0) {
+        if !(32..=1_000_000).contains(&precision_bits)
+            || !symmetry_tolerance.is_finite()
+            || symmetry_tolerance < &0
+        {
             return Err(OperatorError::InvalidData(
                 "HP precision must be at least 32 bits and symmetry tolerance nonnegative"
                     .to_owned(),
+            ));
+        }
+        if data.iter().any(|x| !x.is_finite())
+            || (0..n).any(|i| (0..i).any(|j| data[i * n + j] != data[j * n + i]))
+        {
+            return Err(OperatorError::InvalidData(
+                "HP entries must be finite and exactly symmetric".into(),
             ));
         }
         let data: Vec<Float> = data
@@ -1250,12 +1378,17 @@ impl DenseSymmetricHp {
                 }
             })
             .collect();
+        if data.iter().any(|x| !x.is_finite()) {
+            return Err(OperatorError::InvalidData(
+                "HP precision conversion overflowed".into(),
+            ));
+        }
         for row in 0..n {
             for column in 0..row {
                 let mut difference = data[row * n + column].clone();
                 difference -= &data[column * n + row];
                 difference.abs_mut();
-                if &difference > symmetry_tolerance {
+                if !difference.is_zero() {
                     return Err(OperatorError::InvalidData(format!(
                         "HP matrix is not symmetric at ({row}, {column})"
                     )));
@@ -1268,7 +1401,7 @@ impl DenseSymmetricHp {
             for column in 0..n {
                 let mut term = data[row * n + column].clone();
                 term.abs_mut();
-                row_sum += term;
+                row_sum.add_assign_round(term, rug::float::Round::Up);
             }
             if row_sum > norm_bound {
                 norm_bound = row_sum;
@@ -1311,6 +1444,11 @@ impl LinearOperator<rug::Float> for DenseSymmetricHp {
                 actual: y.len(),
             });
         }
+        if x.iter().any(|x| !x.is_finite()) {
+            return Err(OperatorError::InvalidData(
+                "HP operator input must be finite".into(),
+            ));
+        }
         for (row, output) in self.data.chunks_exact(self.n).zip(y.iter_mut()) {
             let mut sum = rug::Float::with_val(self.precision_bits, 0);
             for (entry, component) in row.iter().zip(x) {
@@ -1319,6 +1457,11 @@ impl LinearOperator<rug::Float> for DenseSymmetricHp {
                 sum += term;
             }
             *output = sum;
+        }
+        if y.iter().any(|x| !x.is_finite()) {
+            return Err(OperatorError::ApplicationFailed(
+                "HP operator action produced a nonfinite value".into(),
+            ));
         }
         Ok(())
     }
@@ -1331,6 +1474,7 @@ impl LinearOperator<rug::Float> for DenseSymmetricHp {
             "rug_mpfr",
         );
         metadata.symmetric = true;
+        metadata.exact_action = true;
         metadata
             .tags
             .push(format!("precision_bits={}", self.precision_bits));
@@ -1338,12 +1482,16 @@ impl LinearOperator<rug::Float> for DenseSymmetricHp {
     }
 
     fn norm_bound(&self) -> Option<rug::Float> {
-        Some(self.norm_bound.clone())
+        self.norm_bound.is_finite().then(|| self.norm_bound.clone())
     }
 }
 
 #[cfg(feature = "hp")]
-impl SymmetricOperator<rug::Float> for DenseSymmetricHp {}
+impl SymmetricOperator<rug::Float> for DenseSymmetricHp {
+    fn stored_symmetric_entries(&self) -> Option<&[rug::Float]> {
+        Some(&self.data)
+    }
+}
 
 #[cfg(feature = "hp")]
 #[derive(Clone, Debug)]
@@ -1369,9 +1517,14 @@ impl TridiagonalHp {
                 "HP tridiagonal requires off_diagonal.len() + 1 == diagonal.len()".to_owned(),
             ));
         }
-        if precision_bits < 32 {
+        if !(32..=1_000_000).contains(&precision_bits) {
             return Err(OperatorError::InvalidData(
                 "HP precision must be at least 32 bits".to_owned(),
+            ));
+        }
+        if diagonal.iter().chain(&off_diagonal).any(|x| !x.is_finite()) {
+            return Err(OperatorError::InvalidData(
+                "HP tridiagonal entries must be finite".into(),
             ));
         }
         let diagonal: Vec<Float> = diagonal
@@ -1394,6 +1547,11 @@ impl TridiagonalHp {
                 }
             })
             .collect();
+        if diagonal.iter().chain(&off_diagonal).any(|x| !x.is_finite()) {
+            return Err(OperatorError::InvalidData(
+                "HP precision conversion overflowed".into(),
+            ));
+        }
         let mut norm_bound = Float::with_val(precision_bits, 0);
         for row in 0..diagonal.len() {
             let mut row_sum = diagonal[row].clone();
@@ -1401,12 +1559,12 @@ impl TridiagonalHp {
             if row > 0 {
                 let mut term = off_diagonal[row - 1].clone();
                 term.abs_mut();
-                row_sum += term;
+                row_sum.add_assign_round(term, rug::float::Round::Up);
             }
             if row + 1 < diagonal.len() {
                 let mut term = off_diagonal[row].clone();
                 term.abs_mut();
-                row_sum += term;
+                row_sum.add_assign_round(term, rug::float::Round::Up);
             }
             if row_sum > norm_bound {
                 norm_bound = row_sum;
@@ -1455,6 +1613,11 @@ impl LinearOperator<rug::Float> for TridiagonalHp {
                 actual: y.len(),
             });
         }
+        if x.iter().any(|x| !x.is_finite()) {
+            return Err(OperatorError::InvalidData(
+                "HP operator input must be finite".into(),
+            ));
+        }
         for row in 0..n {
             let mut value = self.diagonal[row].clone();
             value *= &x[row];
@@ -1470,6 +1633,11 @@ impl LinearOperator<rug::Float> for TridiagonalHp {
             }
             y[row] = value;
         }
+        if y.iter().any(|x| !x.is_finite()) {
+            return Err(OperatorError::ApplicationFailed(
+                "HP operator action produced a nonfinite value".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -1481,6 +1649,7 @@ impl LinearOperator<rug::Float> for TridiagonalHp {
             "rug_mpfr",
         );
         metadata.symmetric = true;
+        metadata.exact_action = true;
         metadata
             .tags
             .push(format!("precision_bits={}", self.precision_bits));
@@ -1488,7 +1657,7 @@ impl LinearOperator<rug::Float> for TridiagonalHp {
     }
 
     fn norm_bound(&self) -> Option<rug::Float> {
-        Some(self.norm_bound.clone())
+        self.norm_bound.is_finite().then(|| self.norm_bound.clone())
     }
 }
 

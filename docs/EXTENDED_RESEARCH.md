@@ -204,3 +204,156 @@ The current extended diagnostic request semantics are
 old identities; their raw sources remain reusable. The data envelope remains
 schema 1, with optional additional inputs. A changed target, cohort, contour,
 resource policy or source digest produces a different child identity.
+
+
+## Directional arithmetic and root storage
+
+Revision 11 evaluates the projected resolvent using homogeneous stored-point
+formulas with directed arithmetic. Subtracting E from each diagonal entry before
+matrix application preserves common scalar-shift invariance. Full perturbation
+operators and supplied unit-state actions retain their distinct normalizations.
+Every measured scalar has outward lower/upper companions and the row records
+its arithmetic precision. Carrier, guard exhaustion and explicit row/memory
+limits withhold measurements or ratios with a qualified status.
+
+The reported root-condition threshold is a numerical proximity rule. It does
+not establish an exact root, simple minimum, displacement identity or spectral
+gap. Conditional tau-response ratios require those external mathematical
+premises. Their arithmetic bounds exclude source construction and modeling
+errors, and do not establish physical-root motion or convergence.
+
+Retained adaptive root values decode at the payload precision. Solver target,
+evaluation and verification precisions do not increase stored-point precision.
+Target bits describe requested accuracy and may be below 64. Failed root rows
+and original ordinals remain visible. Earlier results retain their historical
+meaning and do not acquire this repair's arithmetic assurance.
+
+
+## Conditional allowance arithmetic
+
+Revision 12 retains U, b, mu and H at declared input precision and uses separate
+binary scales for H and mu-U. Directed arithmetic avoids premature H^2
+underflow and returns scalar estimates with outward lower/upper companions.
+Nonpositive margins withhold allowances; explicit memory/guard/range limits
+remain visible. Arithmetic bounds do not authenticate the external block
+hypotheses, ground selection or a truncation model.
+
+For nonzero U, scale_comparison_resolved indicates whether the strict comparison
+with |U| is decided. If its value is 0, a below-scale flag of 0 means the strict
+inequality was not established; it does not assert equality or greater-than.
+The arithmetic allowances may still have narrow enclosures. U=0 omits all scale
+ratio/comparison fields. Earlier revisions do not acquire these guarantees.
+
+
+## Finite transform and resolution arithmetic
+
+Revision 13 encloses exact-decimal cutoff construction, source normalization,
+finite transforms and derivatives with directed arithmetic. Ordinates, external
+errors and radii retain their declared precision; retained-root joins use the
+root payload's precision. Equivalent spellings cannot invent spacing.
+
+Resolution scalar estimates have outward lower/upper companions. Named
+conditional root-distance allowances and the curvature expression use outward
+upper endpoints. A successful row requires a positive slope lower bound and
+an allowance upper bound below the advertised lower budget threshold. Ambiguity
+is unresolved. A prefix requires all consecutive ordinals starting at 1.
+The target error, curvature and isolation assumptions remain external; the
+finite-state curvature formula does not certify them for a different target.
+The report makes no zeta identification, infinite-tail or source-error claim.
+Point-transform callers still require their own interpretation review. Older
+cached revisions do not acquire the new arithmetic guarantees.
+
+
+## Observation and comparison arithmetic
+
+Revision 14 preserves the owning precision of external state errors, comparison
+coefficients/eigenvalues/roots, retained eigenvalues, and retained roots.
+Observation reports enclose finite-support L2 transport with exact-cutoff
+moments sqrt(L) and sqrt(L^3/12). Named error allowances are outward upper
+endpoints; named lower margins are outward lower endpoints. Supplied state-error
+and support hypotheses remain external. Missing errors leave channels unassessed.
+
+Configuration comparisons use separately scaled vectors for overlap and form
+A-EI entrywise before evaluating low/high residual squares. This preserves
+common-scale invariance and small forcing next to a large canceled shift.
+Signed energy/root/transform differences use original points and directed
+arithmetic. Canonical exact cutoff equality controls same-basis comparisons
+and duplicate-policy keys. Root comparisons retain branch/ordinal gates;
+zero vectors, unavailable precision and explicit resource limits remain visible.
+Joined-root fields participate in output estimates. All physical measurements
+have outward enclosures and record the guard precision, capped at 4096 extra bits.
+
+These calculations do not validate external source selection, source accuracy,
+root identification, historical results or convergence. Remaining callers of
+shared dot/norm/matrix helpers require their own review. Archived report revisions
+retain their original guarantees.
+
+
+## Finite-section and consistency arithmetic
+
+Revision 15 evaluates every centered projection of a retained state using its
+full-state coefficient norm. Residuals form A-EI before matrix action; retained
+and omitted masses are summed directly. Matrix, shifted-action and coefficient
+scales are separated. All prefixes retain quadratic arithmetic complexity.
+Optional comparison block norms and signed defects preserve comparison-point
+precision and nonzero common-scale invariance. A zero comparison state leaves
+the defined block norm and prefix measurements available with a qualification.
+
+Independent action consistency decodes both actions at their declared input
+precision, scales their difference before taking norms, and encloses the signed
+contraction on the original center-oriented unit source. Common normalization
+and source independence remain external premises. These two diagnostics report
+outward finite-expression intervals and the actual arithmetic precision, with
+4096 maximum guard bits and explicit resource/precision failure behavior.
+
+Operator-cluster reference columns now preserve their own input precision and
+are normalized before numerical rank selection. Its factor checkpoint identity
+changes accordingly. This repairs arbitrary column-scale dependence; it does
+not certify the remaining cluster compression, solve, feedback or rank logic.
+No primary eigenstate, infinite-limit, historical or scientific clearance is
+implied by these repairs. Archived reports retain their original guarantees.
+
+
+### Finite operator cluster arithmetic (retained observations revision 16)
+
+The operator-cluster producer decodes each source point at its declared precision.
+Reference columns are normalized before numerical rank selection. The fixed
+requested-precision threshold is enclosed during twice-reorthogonalized Gram–Schmidt;
+an ambiguous decision retries guard precision, then reports unresolved. This selects
+a numerical subspace and does not certify the full declared span or spectral selection.
+
+For its ideal orthonormal basis U, P=UU^T, Q=I-P, D=A-EI, and K=QDU, the producer
+encloses U^T A U, K^T K, K^T[QDQ+P]^-1 K, and their effective-operator difference.
+It removes E before projection and rescales D by an exact power of two before the
+complement solve. Directed interval elimination requires pivots excluding zero;
+unresolved or budget-limited inversion retains enclosed compression and coupling
+while withholding feedback. The reported residual concerns the solution midpoint
+in the scaled system; the feedback enclosure comes from interval elimination.
+Each value carries outward decimal bounds and the used precision. Guards are
+limited to 4,096 extra bits. Checkpoints bind original inputs and their precisions,
+source identities, options, selected columns, scale, guard precision, and method.
+These are finite stored-point arithmetic bounds, not source-error, continuum, or
+ground-state-selection certificates.
+
+
+### Complex finite-transform arithmetic (retained observations revision 17)
+
+Complex samples use the exact decimal cutoff and original stored coefficient
+and ordinate points. Their transform convention is `exp(-i*z*x)`, matching retained secular roots; the derivative is taken with respect to the same original coordinate `z`. Directed rectangle arithmetic encloses the entire finite
+Fourier transform and its derivative. Small-argument series keep the leading
+derivative term separate and bound the omitted tail; integer-pi carrier shifts
+are removed analytically away from a removable carrier. Binary scaling protects
+complex magnitudes and quotients from avoidable squared-norm range failures.
+Exact Fourier orthogonality fixes F(0); exact evenness fixes the imaginary-axis
+zero channels. Every measured scalar carries outward bounds and used precision.
+
+Five offsets are retained at every root ordinal and the origin. Missing ordinates
+have explicit missing rows. The 65-point closed counterclockwise contour uses
+exact affine coordinate expressions in the stored maximum ordinate. These
+samples do not certify a contour count or root. F/F(0) and F'/F are emitted only
+when their denominators and arithmetic are resolved; a failed ratio retains
+enclosed F and F' when available. Guards are limited to 4,096 extra bits, and
+working/output budgets and qualified arithmetic failures remain explicit.
+The bounds exclude source-construction and infinite-tail errors. Revisioned
+method, coordinate, point-precision and output contracts prevent reuse of the
+old unbounded complex producer's cached results as new arithmetic evidence.

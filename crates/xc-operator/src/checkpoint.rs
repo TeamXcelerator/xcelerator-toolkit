@@ -72,11 +72,24 @@ impl OperatorConstructionCheckpointF64 {
         (self.assembled_rows.len() as u64).saturating_mul(8)
     }
 
+    /// Validate descriptor/shape and replay every retained entry against the
+    /// deterministic source. Equality is bitwise binary64, including signed zero.
+    /// Cost is O(completed_rows * dimension) source evaluations.
     pub fn validate(
         &self,
         assembler: &dyn RestartableSymmetricAssemblerF64,
         block_rows: usize,
     ) -> Result<(), ConstructionError> {
+        self.validate_with_cancellation(assembler, block_rows, None)
+    }
+
+    fn validate_with_cancellation(
+        &self,
+        assembler: &dyn RestartableSymmetricAssemblerF64,
+        block_rows: usize,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), ConstructionError> {
+        validate_descriptor(assembler, block_rows, 1)?;
         if self.schema_version != OPERATOR_CONSTRUCTION_CHECKPOINT_SCHEMA_VERSION {
             return Err(ConstructionError::IncompatibleCheckpoint(
                 "schema version differs".to_owned(),
@@ -96,12 +109,30 @@ impl OperatorConstructionCheckpointF64 {
         if self.completed_rows == 0
             || self.completed_rows >= self.dimension
             || !self.completed_rows.is_multiple_of(self.block_rows)
-            || self.assembled_rows.len() != self.completed_rows.saturating_mul(self.dimension)
+            || self.completed_rows.checked_mul(self.dimension) != Some(self.assembled_rows.len())
             || self.assembled_rows.iter().any(|value| !value.is_finite())
         {
             return Err(ConstructionError::IncompatibleCheckpoint(
                 "retained row state is malformed or not resumable".to_owned(),
             ));
+        }
+        for row in 0..self.completed_rows {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(ConstructionError::Cancelled(
+                    "cancelled while replaying retained operator rows".into(),
+                ));
+            }
+            for column in 0..self.dimension {
+                let expected = assembler.entry(row, column)?;
+                if !expected.is_finite()
+                    || expected.to_bits()
+                        != self.assembled_rows[row * self.dimension + column].to_bits()
+                {
+                    return Err(ConstructionError::IncompatibleCheckpoint(format!(
+                        "retained entry ({row}, {column}) does not replay against its stated source"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -121,7 +152,9 @@ pub enum OperatorConstructionOutcomeF64 {
 }
 
 /// Assemble a deterministic number of complete row blocks.  `maximum_blocks`
-/// bounds work in this invocation; reaching it returns a resumable checkpoint.
+/// bounds newly assembled blocks; reaching it returns a resumable checkpoint.
+/// Resume first replays all retained rows (with cancellation checked per row),
+/// so this validation work is additional to the new-block budget.
 pub fn assemble_symmetric_operator_f64(
     assembler: &dyn RestartableSymmetricAssemblerF64,
     block_rows: usize,
@@ -132,9 +165,18 @@ pub fn assemble_symmetric_operator_f64(
 ) -> Result<OperatorConstructionOutcomeF64, ConstructionError> {
     validate_descriptor(assembler, block_rows, maximum_blocks)?;
     let dimension = assembler.dimension();
-    let matrix_bytes = (dimension as u64)
-        .saturating_mul(dimension as u64)
-        .saturating_mul(8);
+    let matrix_elements = dimension.checked_mul(dimension).ok_or_else(|| {
+        ConstructionError::ResourceLimit("dense matrix element count overflows usize".to_owned())
+    })?;
+    let matrix_bytes = matrix_elements
+        .checked_mul(std::mem::size_of::<f64>())
+        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| {
+            ConstructionError::ResourceLimit(
+                "dense matrix byte count exceeds allocation range".to_owned(),
+            )
+        })?;
     if resources
         .maximum_memory_bytes
         .is_some_and(|maximum| matrix_bytes > maximum)
@@ -144,11 +186,20 @@ pub fn assemble_symmetric_operator_f64(
         )));
     }
 
-    let (mut completed_rows, mut assembled_rows) = if let Some(checkpoint) = resume {
-        checkpoint.validate(assembler, block_rows)?;
-        (checkpoint.completed_rows, checkpoint.assembled_rows.clone())
+    if let Some(checkpoint) = resume {
+        checkpoint.validate_with_cancellation(assembler, block_rows, Some(cancellation))?;
+    }
+    let mut assembled_rows = Vec::new();
+    assembled_rows
+        .try_reserve_exact(matrix_elements)
+        .map_err(|error| {
+            ConstructionError::ResourceLimit(format!("could not reserve dense output: {error}"))
+        })?;
+    let mut completed_rows = if let Some(checkpoint) = resume {
+        assembled_rows.extend_from_slice(&checkpoint.assembled_rows);
+        checkpoint.completed_rows
     } else {
-        (0, Vec::with_capacity(dimension.saturating_mul(dimension)))
+        0
     };
     let mut completed_blocks = 0usize;
     while completed_rows < dimension && completed_blocks < maximum_blocks {
@@ -319,6 +370,28 @@ mod tests {
             assemble_symmetric_operator_f64(&fixture, 2, 10, Some(&checkpoint), &resources, &token)
                 .unwrap();
         assert_eq!(resumed, cold);
+    }
+
+    #[test]
+    fn retained_checkpoint_entries_must_replay_against_source() {
+        let fixture = assembler("same-stated-identity");
+        let resources = ResourcePolicy::default();
+        let token = CancellationToken::new();
+        let first =
+            assemble_symmetric_operator_f64(&fixture, 1, 1, None, &resources, &token).unwrap();
+        let OperatorConstructionOutcomeF64::Checkpointed { mut checkpoint } = first else {
+            panic!("checkpoint expected")
+        };
+        checkpoint.validate(&fixture, 1).unwrap();
+        checkpoint.assembled_rows[0] = 999.;
+        assert!(matches!(
+            checkpoint.validate(&fixture, 1),
+            Err(ConstructionError::IncompatibleCheckpoint(_))
+        ));
+        assert!(matches!(
+            assemble_symmetric_operator_f64(&fixture, 1, 10, Some(&checkpoint), &resources, &token),
+            Err(ConstructionError::IncompatibleCheckpoint(_))
+        ));
     }
 
     #[test]

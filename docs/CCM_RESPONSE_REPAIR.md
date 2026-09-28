@@ -4,9 +4,11 @@ The `ccm_response_repair` example repairs schema-2 prime-power and cutoff-flow
 root velocities from the exact original eigenpair and retained L2 tangent
 vectors. It performs no matrix assembly, eigenstate solve, bordered solve, or
 paper-claim run. Legacy v2 inputs produce the v3 root-normalization identity
-introduced in v0.15.0. Already-v4 u-flow inputs preserve v4 under exact replay.
-This root-only tool does not recompute derivative actions or tangents and cannot
-upgrade legacy u-flow calculations to the current stable-derivative v4 identity. See [numerical compatibility](NUMERICAL_COMPATIBILITY.md#root-response-normalization)
+introduced in v0.15.0. Already-corrected prime v3/v4 and u-flow v3/v4/v5
+inputs preserve their identities under byte-exact root replay. This tool does
+not recompute derivative actions, tangents, source matrices or transforms. It
+cannot promote a legacy payload to stable derivative or source-isolation
+semantics. See [numerical compatibility](NUMERICAL_COMPATIBILITY.md#source-matrix-response-isolation)
 for the defect and its scope.
 
 The repair changes only root-velocity fields. Eigenvalues, roots, eigenvector
@@ -16,7 +18,7 @@ must be retained; corrections are separate artifacts, never replacements.
 Repaired values remain computed evidence. The procedure neither certifies a
 source nor recovers accuracy absent from its retained working precision.
 
-Use the current v0.15.0 reader when reusing repaired receipts. It validates their
+Use the current v0.15.1 reader when reusing repaired receipts. It validates their
 canonical source graph rather than expecting a shard adapter to contain local
 key-based dependencies. The reader correction preserves all repaired receipt
 identities and bytes; it does not require another repair or claim run. See
@@ -63,7 +65,7 @@ dependency, configuration, finite vectors, tangent norms and retained root
 positions. Working precision is inherited from the source. Unsupported
 semantics, missing inputs and mismatches return a nonzero exit code with a
 reason; they do not trigger an automatic claim run. Schema-1 response payloads
-are not supported. Already-v3 payloads must pass byte-exact retained replay.
+are not supported. Already-corrected payloads must pass byte-exact retained replay.
 
 ## Repairing embedded capture measurements
 

@@ -591,7 +591,9 @@ fn run_with_input<const N: usize>(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .envs(environment.iter().copied());
+        .envs(environment.iter().copied())
+        .env_remove(GITHUB_TOKEN_ENV)
+        .env_remove(GH_TOKEN_ENV);
     let mut child = command.spawn().map_err(|error| {
         CacheError::Authentication(format!(
             "could not start external credential provider: {error}"

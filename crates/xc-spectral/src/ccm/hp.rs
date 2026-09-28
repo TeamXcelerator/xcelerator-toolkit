@@ -11,7 +11,7 @@
 
 use anyhow::{bail, Result};
 use rayon::prelude::*;
-use rug::{ops::Pow, Assign, Float};
+use rug::{ops::Pow, Float};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -41,9 +41,43 @@ pub mod capture_run;
 pub mod response_repair;
 
 mod complete_discovery;
+mod eigenstate_accuracy;
+#[cfg(test)]
+mod source_resolution_tests;
+mod spectrum_accuracy;
+mod stored_resolution;
+#[cfg(test)]
+mod stored_resolution_tests;
+pub use spectrum_accuracy::{CcmWeilEigenvalueBoundHp, CcmWeilSpectrumHp};
+pub use stored_resolution::{CcmStoredStateResolution, StoredEigenvalueResolution};
+#[cfg(test)]
+mod ccm_regression_tests;
+mod ground_index;
+pub use eigenstate_accuracy::CcmStoredEigenvalueAccuracy;
+#[cfg(test)]
+#[path = "hp/evenness.rs"]
+mod evenness;
+mod matrix_point_math;
+mod parity_math;
+mod prime_response_kernel;
 mod response_performance;
 #[cfg(test)]
 mod response_performance_reference;
+mod response_point_math;
+mod root_conditioning_math;
+mod root_response_math;
+pub(in crate::ccm) mod sector_gap_math;
+mod sector_resolution;
+mod sector_transform_validation;
+mod sector_vector_validation;
+mod sonin_restriction;
+mod standalone_cache;
+mod standalone_generation;
+mod state_normalization_math;
+mod state_residual_bounds;
+mod symmetry_math;
+mod u_flow_math;
+mod verified_discovery;
 use response_performance::{FreshResponseSeal, PreparedRootResponses, ResponseProgress};
 
 // Conservative crossovers from the ignored release-mode benchmark below.
@@ -285,7 +319,7 @@ impl RootWindowSemantics {
             RootArtifactMode::Independent if self.is_complete_positive() => {
                 "complete_positive_movable_point_source"
             }
-            RootArtifactMode::Independent => "unverified_computed_discovery",
+            RootArtifactMode::Independent => "complete_requested_window_point_source",
             RootArtifactMode::ReferenceSeededRefinement => "not_applicable_refinement",
         }
     }
@@ -429,6 +463,7 @@ struct PortableSectorSpectrum {
     eigenvalues: Vec<String>,
     eigenvectors: Vec<Vec<String>>,
     residual_norms: Vec<String>,
+    eigenvalue_bounds: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -445,6 +480,8 @@ struct PortableSectorGap {
     d_even: String,
     d_odd: String,
     gap_log: String,
+    gap_log_lower: String,
+    gap_log_upper: String,
     lambda_difference: String,
     difference_depth: String,
     ordering: i8,
@@ -477,25 +514,11 @@ struct ComputedCcmMatrixComponents {
     prime: Vec<Float>,
 }
 
-fn assemble_tau_components(components: &ComputedCcmMatrixComponents, prec: u32) -> Vec<Float> {
-    let dimension = components.pole.len().isqrt();
-    let performance = xc_core::performance_stage_with("ccm.tau.assemble", || {
-        ccm_performance_metadata("ccm.tau.assemble", dimension, prec)
-    });
-    let tau = components
-        .pole
-        .iter()
-        .zip(&components.archimedean)
-        .zip(&components.prime)
-        .map(|((pole, archimedean), prime)| {
-            let mut value = Float::with_val(prec, pole);
-            value -= archimedean;
-            value -= prime;
-            value
-        })
-        .collect();
-    drop(performance);
-    tau
+fn assemble_tau_components(
+    components: &ComputedCcmMatrixComponents,
+    prec: u32,
+) -> Result<Vec<Float>> {
+    matrix_point_math::total(components, prec)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -513,6 +536,8 @@ struct PortableWeilEigenpair {
         skip_serializing_if = "is_legacy_eigenstate_route"
     )]
     eigenstate_route: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stored_state_resolution: Option<CcmStoredStateResolution>,
     eigenvalue: String,
     eigenvector: Vec<String>,
     inverse_iteration: PortableInverseIterationDiagnostics,
@@ -533,6 +558,7 @@ fn is_legacy_eigenstate_route(value: &String) -> bool {
 struct PortableShiftInvertKrylovDiagnostics {
     algorithm_semantics: String,
     factorization_id: String,
+    polishing_candidate_adopted: bool,
     requested_eigenpairs: usize,
     guard_eigenpairs: usize,
     maximum_subspace_dimension: usize,
@@ -573,6 +599,7 @@ impl PortableInverseIterationDiagnostics {
                 ShiftedRefinementOutcome::NotAttempted => "not_attempted",
                 ShiftedRefinementOutcome::Accepted => "accepted",
                 ShiftedRefinementOutcome::RejectedEigenvalueJump => "rejected_eigenvalue_jump",
+                ShiftedRefinementOutcome::RejectedResidualIncrease => "rejected_residual_increase",
                 ShiftedRefinementOutcome::Singular => "singular",
             }
             .to_owned(),
@@ -593,15 +620,7 @@ impl PortableInverseIterationDiagnostics {
                 "CCM inverse-iteration diagnostics contain invalid step counts".to_owned(),
             ));
         }
-        let parse = |value: &str| {
-            Float::parse(value)
-                .map(|parsed| Float::with_val(precision_bits, parsed))
-                .map_err(|error| {
-                    CacheError::InvalidManifest(format!(
-                        "CCM inverse-iteration diagnostics contain an invalid HP scalar: {error}"
-                    ))
-                })
-        };
+        let parse = |value: &str| parse_hp_scalar(value, precision_bits);
         let final_relative_rayleigh_change = self
             .final_relative_rayleigh_change
             .as_deref()
@@ -610,23 +629,26 @@ impl PortableInverseIterationDiagnostics {
         let final_relative_residual_norm = parse(&self.final_relative_residual_norm)?;
         if final_relative_rayleigh_change
             .as_ref()
-            .is_some_and(|value| value < &Float::with_val(precision_bits, 0))
+            .is_some_and(|value| !value.is_finite() || value < &Float::with_val(precision_bits, 0))
+            || !final_relative_residual_norm.is_finite()
             || final_relative_residual_norm < 0
         {
             return Err(CacheError::InvalidManifest(
-                "CCM inverse-iteration diagnostics contain a negative metric".to_owned(),
+                "CCM inverse-iteration diagnostics contain a nonfinite or negative metric"
+                    .to_owned(),
             ));
         }
         let shifted_refinement = match self.shifted_refinement.as_str() {
             "not_attempted" => ShiftedRefinementOutcome::NotAttempted,
             "accepted" => ShiftedRefinementOutcome::Accepted,
             "rejected_eigenvalue_jump" => ShiftedRefinementOutcome::RejectedEigenvalueJump,
+            "rejected_residual_increase" => ShiftedRefinementOutcome::RejectedResidualIncrease,
             "singular" => ShiftedRefinementOutcome::Singular,
             _ => {
                 return Err(CacheError::InvalidManifest(
                     "CCM inverse-iteration diagnostics contain an unknown shifted outcome"
                         .to_owned(),
-                ))
+                ));
             }
         };
         if self.unshifted_steps == 0 || shifted_refinement == ShiftedRefinementOutcome::NotAttempted
@@ -908,6 +930,8 @@ struct PortableResponseSpectralIsolation {
     selected_algebraic_index: usize,
     neighboring_algebraic_index: usize,
     isolation_method: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    source_matrix_eigenvalue_allowance: String,
     selected_eigenvalue_lower: String,
     selected_eigenvalue_upper: String,
     neighboring_eigenvalue_lower: String,
@@ -1031,6 +1055,8 @@ struct PortableEvennessEvidence {
     evenness_deviation: String,
     natural_eigenvalue: String,
     forced_eigenvalue: String,
+    claim_scope: CcmEvennessClaimScope,
+    assembly_error_bound: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1056,6 +1082,7 @@ struct PortableRunEvidence {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     selected_root_ordinals: Vec<usize>,
     weil_min_eigenvalue: String,
+    stored_state_resolution: CcmStoredStateResolution,
     converged_roots: usize,
     stagnated_roots: usize,
     approximate_roots: usize,
@@ -1063,7 +1090,7 @@ struct PortableRunEvidence {
     inverse_iteration: PortableInverseIterationDiagnostics,
 }
 
-fn lambda_squared_cache_identity(params: &CcmParams) -> String {
+pub(crate) fn lambda_squared_cache_identity(params: &CcmParams) -> String {
     if params.lambda_sq.is_integer {
         params.lambda_sq.value_u64.to_string()
     } else {
@@ -1144,13 +1171,15 @@ pub struct ExactCcmWeilFormHp {
 
 /// Construct the localized Weil form without passing lambda-squared through
 /// binary64. Integer and fractional inputs use the same exact decimal route;
-/// MPFR performs the sole rounding at the requested working precision.
+/// The exact cutoff logarithm and subsequent declared finite point stages are
+/// correctly rounded individually; quadrature/source error requires a certificate.
 pub fn localized_weil_form_exact_hp(
     lambda_squared: ExactLambdaSquaredHp,
     n_modes: usize,
     cfg: &HighPrecConfig,
     include_primes: bool,
 ) -> Result<ExactCcmWeilFormHp> {
+    validate_source_shape(n_modes, cfg.precision_bits, cfg.quad_points)?;
     // Public fields and deserialization can bypass `new`; check the complete
     // exact identity again before numerical work or provenance is produced.
     let validated =
@@ -1166,14 +1195,10 @@ pub fn localized_weil_form_exact_hp(
         .checked_mul(dimension)
         .ok_or_else(|| anyhow::anyhow!("CCM matrix element count overflow"))?;
     xc_numerics::hp_runtime::run_hp(|| {
-        let parsed = Float::parse(lambda_squared.decimal.as_str()).map_err(|error| {
-            anyhow::anyhow!("failed to parse exact lambda-squared literal for MPFR: {error}")
-        })?;
-        let value = Float::with_val(cfg.precision_bits, parsed);
-        if !value.is_finite() || value <= 1 {
-            bail!("working precision must resolve finite lambda-squared greater than one");
-        }
-        let l = value.ln();
+        let l = crate::ccm::retained_evidence::finite_math::rounded_log_cutoff(
+            lambda_squared.decimal.as_str(),
+            cfg.precision_bits,
+        )?;
         let mut matrix = build_tau_hp_compute_exact(
             n_modes,
             lambda_squared.prime_cutoff,
@@ -1181,7 +1206,7 @@ pub fn localized_weil_form_exact_hp(
             cfg,
             include_primes,
         )?;
-        force_symmetric(&mut matrix, dimension);
+        force_symmetric(&mut matrix, dimension)?;
         let prime_content = if include_primes {
             prime_powers_up_to(lambda_squared.prime_cutoff)
                 .into_iter()
@@ -1266,8 +1291,8 @@ pub struct HighPrecConfig {
     /// MPFR working precision in bits. Total digits ≈ `precision_bits / 3.322`.
     /// Use `for_decimal_digits` to construct from a target decimal precision.
     pub precision_bits: u32,
-    /// Maximum number of inverse-iteration steps for the smallest
-    /// Weil-form eigenvector recovery.
+    /// Maximum number of inverse-iteration steps for smallest-magnitude
+    /// Weil-form eigenvector recovery. This is not a certified ground-state index.
     pub inverse_iter_steps: usize,
     /// Maximum number of solver steps per Riemann-zero seed.
     /// Applies to both Halley (default) and Newton solvers.
@@ -1297,8 +1322,11 @@ pub struct HighPrecConfig {
     /// Extra bits used for the independent stored-point correction check.
     pub root_verification_precision_bits: u32,
     /// Number of Gauss–Legendre quadrature points used in the integral
-    /// computation of α_L, β_L, γ_L. Clamped to `[MIN_QUAD_POINTS,
-    /// MAX_QUAD_POINTS]` regardless of input.
+    /// computation of α_L, β_L, γ_L. The constructor clamps its default to
+    /// `[MIN_QUAD_POINTS, MAX_QUAD_POINTS]`. Explicit positive overrides are
+    /// honored as a floor. Each mode also requires `3*mode` plus a length-aware
+    /// nearest-pole geometric order with 64 guard bits. This order policy is
+    /// heuristic and does not certify the finite-form assembly error.
     pub quad_points: usize,
     /// Number of positive CCM secular roots to discover independently and
     /// refine. Zero requests an explicit source-only run.
@@ -1318,19 +1346,23 @@ pub struct HighPrecConfig {
     /// Parity treatment for the selected CCM eigenstate. The default is the
     /// optimized reduced even-sector solve used by existing v0.13 artifacts.
     pub parity_policy: CcmParityPolicy,
-    /// Enable warm-start from a nearby-precision cached eigenvector.
+    /// Legacy standalone-only warm-start control. Public `run`, `build_source`,
+    /// and evenness APIs use managed sessions and do not consult this setting.
+    /// The managed route deliberately keeps results independent of cache history.
+    /// In the internal standalone route, enable a nearby-precision eigenvector.
     /// When `true` and a cached ξ exists for the same (λ², N) within
     /// `warm_start_tolerance_bits` of the target precision, that cached ξ
     /// is used as the starting vector for inverse iteration instead of the
     /// Gaussian initial guess. Dramatically reduces iteration count for
     /// P-sweep campaigns. Default `true`.
     pub warm_start: bool,
-    /// Precision tolerance in bits for warm-start cache lookup.
+    /// Precision tolerance for the internal standalone-only warm-start lookup.
+    /// This has no effect on public managed execution.
     /// A cached ξ at prec' is accepted as a warm start if
     /// |prec' - target_prec| ≤ warm_start_tolerance_bits.
     /// Default 500 bits (~150 decimal digits) — spans a full HP-level step.
     pub warm_start_tolerance_bits: u32,
-    /// Algorithm used for the smallest Weil eigenstate.
+    /// Algorithm used for the lowest Weil state in the requested subspace.
     ///
     /// The default is [`CcmEigenstateSolver::Auto`]. It reuses an exact
     /// current-N eigenstate when available; on a miss it computes the
@@ -1510,7 +1542,6 @@ pub const GUARD_BITS: u32 = 64;
 /// monotone convergence while terminating precision-floor oscillation.
 pub const ROOT_STAGNATION_WINDOW: usize = 128;
 
-/// Minimum quadrature points for the HP tier.
 /// Fewest eigenpairs per parity sector that [`analyze_sector_gap`] accepts.
 ///
 /// The gap is a comparison, so a sector must retain more than its ground
@@ -1519,9 +1550,11 @@ pub const ROOT_STAGNATION_WINDOW: usize = 128;
 /// rejected rather than quietly widened.
 pub const MINIMUM_SECTOR_EIGENPAIRS: usize = 2;
 
+/// Minimum base order selected by the decimal-digit convenience constructor.
 pub const MIN_QUAD_POINTS: usize = 600;
 
-/// Maximum quadrature points for the HP tier (prevents excessive runtime).
+/// Maximum base order selected by the convenience constructor. Mode-dependent
+/// quadrature may use higher orders; this is not a cap on actual rule sizes.
 pub const MAX_QUAD_POINTS: usize = 4000;
 
 /// Multiplier: quad_points = digits * QUAD_POINTS_PER_DIGIT (clamped to [MIN, MAX]).
@@ -1565,7 +1598,8 @@ impl HighPrecConfig {
             root_precision_policy: RootPrecisionPolicy::FixedGuard,
             root_maximum_extra_precision_bits: 4_096,
             root_verification_precision_bits: 64,
-            quad_points: ((digits as usize) * QUAD_POINTS_PER_DIGIT)
+            quad_points: (digits as usize)
+                .saturating_mul(QUAD_POINTS_PER_DIGIT)
                 .clamp(MIN_QUAD_POINTS, MAX_QUAD_POINTS),
             n_eigenvalues: 50,
             cache_mode: xc_numerics::quadrature::CacheMode::default(),
@@ -1613,7 +1647,17 @@ impl HighPrecConfig {
     }
 
     fn validate_root_precision_policy(&self) -> Result<()> {
+        if !(64..=1_000_000).contains(&self.precision_bits) {
+            bail!("CCM root precision must be within 64..=1000000 bits");
+        }
         if self.root_precision_policy == RootPrecisionPolicy::Adaptive {
+            if self
+                .precision_bits
+                .checked_add(self.root_maximum_extra_precision_bits)
+                .is_none_or(|ceiling| ceiling > 1_000_000)
+            {
+                bail!("adaptive CCM root precision ceiling exceeds 1000000 bits");
+            }
             if self.root_verification_precision_bits == 0 {
                 bail!("adaptive CCM root precision requires a positive verification increment");
             }
@@ -1636,6 +1680,7 @@ pub struct RootRefinementDiagnostics {
     pub iterations: usize,
     pub final_correction: Float,
     pub residual: Float,
+    /// Point-correction digit estimate; certified accuracy requires separate evidence.
     pub achieved_decimal_digits: Float,
 }
 
@@ -1692,21 +1737,31 @@ pub struct HighPrecResult {
     /// Ordinary APIs retain positive roots. An explicit advanced independent
     /// discovery request may retain a numerically ordered signed window.
     ///
-    /// Each entry is one of:
-    /// Only `Converged` entries are returned by the ordinary production APIs.
-    /// Other variants retain diagnostics for explicit low-level inspection.
+    /// Computed workflows may return finite `Converged`, `Stagnated`, and
+    /// `Approximate` values with their stopping diagnostics. Check each status;
+    /// the presence of a value does not imply convergence or certification.
+    /// Workflows requesting certified assurance require converged refinements
+    /// and separate certificate evidence.
     pub eigenvalues_pos: Vec<EigenvalueResult>,
     /// One-based index assigned to the first entry in `eigenvalues_pos`.
     /// In advanced signed mode this is the ordinal within the returned signed
     /// window; the historical field name is retained for API compatibility.
     /// Empty source-only runs retain the requested start for provenance.
     pub first_positive_root_index: usize,
-    /// Smallest eigenvalue of the Weil quadratic form (the spectral
-    /// gap quantity ε_N at this `(λ², N)`).
+    /// Lowest eigenvalue estimate of exact stored Tau in the requested
+    /// subspace (the even block under the default `EvenSector` policy).
+    /// This is not a claim of full-space ordering or unrounded-form accuracy.
+    /// [`Self::stored_eigenvalue_accuracy`] reports residual-based stored-value
+    /// accuracy; the ordinary point assembly error remains unknown.
     pub weil_min_eigenvalue: Float,
-    /// Smallest-eigenvalue eigenvector of the Weil form, ℓ²-normalized,
-    /// stored in the V_n basis order (centered index `0` at position
-    /// `n_modes`).
+    /// Persisted directed stored-state resolution. Current producers always
+    /// populate this field; None identifies a historical report without it.
+    pub stored_state_resolution: Option<CcmStoredStateResolution>,
+    /// Selected-subspace lowest-eigenvalue eigenvector in the V_n basis, rescaled by the CCM
+    /// sum convention: each component is the correctly rounded value of
+    /// `xi_i * sqrt(L) / sum(xi)`, where `L = ln(lambda_squared)`.
+    /// This is not unit Euclidean or L2 normalization. The centered mode zero
+    /// is stored at position `n_modes`.
     pub xi: Vec<Float>,
     /// Structured stopping evidence for the eigenstate solve. Reaching the
     /// unshifted limit is retained even when shifted refinement subsequently
@@ -1741,6 +1796,7 @@ pub struct PortableRootRefinementResult {
 
 impl PortableRootRefinementResult {
     fn from_runtime(result: &RootRefinement) -> Result<Self> {
+        validate_portable_root_metrics(result)?;
         Ok(Self {
             value: xc_numerics::fmt::PortableHpFloat::from_float(&result.value)?,
             iterations: result.diagnostics.iterations,
@@ -1755,7 +1811,7 @@ impl PortableRootRefinementResult {
     }
 
     fn to_runtime(&self) -> Result<RootRefinement> {
-        Ok(RootRefinement {
+        let result = RootRefinement {
             value: self.value.to_float()?,
             diagnostics: RootRefinementDiagnostics {
                 iterations: self.iterations,
@@ -1763,8 +1819,41 @@ impl PortableRootRefinementResult {
                 residual: self.residual.to_float()?,
                 achieved_decimal_digits: self.achieved_decimal_digits.to_float()?,
             },
-        })
+        };
+        validate_portable_root_metrics(&result)?;
+        Ok(result)
     }
+}
+
+fn validate_portable_root_metrics(result: &RootRefinement) -> Result<()> {
+    let metrics = &result.diagnostics;
+    if !result.value.is_finite()
+        || metrics.iterations == 0
+        || [
+            &metrics.final_correction,
+            &metrics.residual,
+            &metrics.achieved_decimal_digits,
+        ]
+        .iter()
+        .any(|value| !value.is_finite() || *value < &0)
+    {
+        bail!(
+            "portable root diagnostics require a finite point, positive iterations and finite nonnegative metrics"
+        );
+    }
+    Ok(())
+}
+
+fn validate_portable_result_header(precision_bits: u32, elapsed_seconds: f64) -> Result<()> {
+    if !(64..=1_000_000).contains(&precision_bits)
+        || !elapsed_seconds.is_finite()
+        || elapsed_seconds < 0.
+    {
+        bail!(
+            "portable CCM result requires precision 64..=1000000 and finite nonnegative elapsed time"
+        );
+    }
+    Ok(())
 }
 
 /// Portable CCM result payload for use inside [`xc_core::ResearchResult`].
@@ -1774,6 +1863,8 @@ pub struct PortableHighPrecResult {
     pub eigenvalues_pos: Vec<PortableEigenvalueResult>,
     pub first_positive_root_index: usize,
     pub weil_min_eigenvalue: xc_numerics::fmt::PortableHpFloat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_state_resolution: Option<CcmStoredStateResolution>,
     pub xi: Vec<xc_numerics::fmt::PortableHpFloat>,
     pub inverse_iteration_diagnostics: PortableInverseIterationDiagnostics,
     pub elapsed_seconds: f64,
@@ -1782,6 +1873,9 @@ pub struct PortableHighPrecResult {
 
 impl PortableHighPrecResult {
     pub fn from_runtime(result: &HighPrecResult) -> Result<Self> {
+        validate_portable_result_header(result.precision_bits, result.elapsed_seconds)?;
+        PortableInverseIterationDiagnostics::from_runtime(&result.inverse_iteration_diagnostics)
+            .to_runtime(result.precision_bits)?;
         if result.first_positive_root_index == 0
             || result
                 .first_positive_root_index
@@ -1817,6 +1911,7 @@ impl PortableHighPrecResult {
         Ok(Self {
             eigenvalues_pos,
             first_positive_root_index: result.first_positive_root_index,
+            stored_state_resolution: result.stored_state_resolution.clone(),
             weil_min_eigenvalue: xc_numerics::fmt::PortableHpFloat::from_float(
                 &result.weil_min_eigenvalue,
             )?,
@@ -1834,6 +1929,7 @@ impl PortableHighPrecResult {
     }
 
     pub fn to_runtime(&self) -> Result<HighPrecResult> {
+        validate_portable_result_header(self.precision_bits, self.elapsed_seconds)?;
         if self.first_positive_root_index == 0
             || self
                 .first_positive_root_index
@@ -1866,6 +1962,7 @@ impl PortableHighPrecResult {
         Ok(HighPrecResult {
             eigenvalues_pos,
             first_positive_root_index: self.first_positive_root_index,
+            stored_state_resolution: self.stored_state_resolution.clone(),
             weil_min_eigenvalue: self.weil_min_eigenvalue.to_float()?,
             xi: self
                 .xi
@@ -1883,6 +1980,13 @@ impl PortableHighPrecResult {
 }
 
 impl HighPrecResult {
+    /// Directed residual accuracy for the selected eigenvalue of stored Tau.
+    /// No assembly error is known here. Printed digits and MPFR working bits
+    /// must not be interpreted as accurate digits of the unrounded Weil form.
+    pub fn stored_eigenvalue_accuracy(&self) -> Result<CcmStoredEigenvalueAccuracy> {
+        eigenstate_accuracy::diagnostic(self)
+    }
+
     /// CCM secular roots in the requested window.
     ///
     /// This terminology avoids confusing these values with the distinct Tau
@@ -2019,6 +2123,10 @@ pub struct CcmSectorEigenpairHp {
     pub eigenvalue: Float,
     pub eigenvector: Vec<Float>,
     pub residual_norm: Float,
+    /// Directed indexed bounds for the exact retained parity matrix, including
+    /// Householder reduction error. No quadrature or assembly error is included.
+    pub eigenvalue_lower: Float,
+    pub eigenvalue_upper: Float,
 }
 
 #[derive(Clone, Debug)]
@@ -2034,10 +2142,14 @@ pub struct CcmSectorSpectrumHp {
 }
 
 #[derive(Clone, Debug)]
-/// Replayable comparison of the lowest even and odd parity-block states.
+/// Replayable comparison of the exact stored even and odd parity-block states.
+/// The eigenvalue and GapLog endpoints include numerical reduction uncertainty;
+/// assembly/quadrature uncertainty and continuum conclusions are not included.
 ///
-/// `gap_log` is `D_even-D_odd`; `difference_depth` is a distinct diagnostic
-/// derived from the direct eigenvalue difference.
+/// `gap_log` represents the stored-source `D_even-D_odd`. The displayed
+/// eigenvalues and depths remain point estimates, so their rounded difference
+/// need not equal this interval-supported representative. `difference_depth`
+/// is a distinct diagnostic derived from the direct point eigenvalue difference.
 pub struct CcmSectorGapHp {
     pub even: CcmSectorSpectrumHp,
     pub odd: CcmSectorSpectrumHp,
@@ -2045,11 +2157,18 @@ pub struct CcmSectorGapHp {
     pub lambda_odd: Float,
     pub d_even: Float,
     pub d_odd: Float,
+    /// Representative inside the published stored-matrix GapLog enclosure.
     pub gap_log: Float,
+    pub gap_log_lower: Float,
+    pub gap_log_upper: Float,
+    /// Difference of the retained point estimates; `ordering` uses source bounds.
     pub lambda_difference: Float,
     pub difference_depth: Float,
+    /// Sign of the source-enclosed odd-minus-even difference.
     pub ordering: i8,
+    /// Established by disjoint source bounds for the first two even values.
     pub even_simple: bool,
+    /// Difference of the first two even point estimates, not a certified margin.
     pub even_simplicity_margin: Float,
 }
 
@@ -2267,8 +2386,12 @@ impl CcmResearchCaptureOptions {
     }
 
     fn captures_root_conditioning(&self) -> bool {
-        self.sector_analysis
-            .is_some_and(|sector| sector.eigenvalue_route == CcmSectorEigenvalueRoute::CompleteQr)
+        self.sector_analysis.is_some_and(|sector| {
+            matches!(
+                sector.eigenvalue_route,
+                CcmSectorEigenvalueRoute::CompleteQr | CcmSectorEigenvalueRoute::CrossChecked
+            )
+        })
     }
 }
 
@@ -2343,13 +2466,15 @@ fn evenness_from_sector_gap(
         ),
         _ => bail!("CCM natural evenness is ambiguous at an even/odd degeneracy"),
     };
-    Ok(evenness_from_natural_state(
+    let mut result = evenness_from_natural_state(
         params,
         precision_bits,
         natural_eigenvalue,
         &natural_vector,
         gap.lambda_even.clone(),
-    ))
+    );
+    result.claim_scope = CcmEvennessClaimScope::ExactStoredParityMatrices;
+    Ok(result)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2387,6 +2512,9 @@ pub struct SelectedCcmStateHp {
     pub parity: CcmParity,
 }
 
+/// Select only among the supplied finite, nonzero-vector candidates.
+/// Parity labels, candidate completeness and eigenpair validity are caller
+/// premises; this function does not certify a global ground state.
 pub fn select_ccm_state_hp(
     target: CcmStateTarget,
     candidates: &[CcmStateCandidateHp],
@@ -2394,11 +2522,12 @@ pub fn select_ccm_state_hp(
     if candidates.is_empty()
         || candidates.iter().any(|candidate| {
             candidate.eigenvector.is_empty()
+                || candidate.eigenvector.iter().all(Float::is_zero)
                 || !candidate.eigenvalue.is_finite()
                 || candidate.eigenvector.iter().any(|value| !value.is_finite())
         })
     {
-        anyhow::bail!("CCM state selection requires finite nonempty eigenpairs");
+        anyhow::bail!("CCM state selection requires finite eigenpairs with nonzero vectors");
     }
     let (parity, criterion) = match target {
         CcmStateTarget::AlgebraicGround => (None, CcmStateCriterion::AlgebraicGround),
@@ -2479,6 +2608,12 @@ pub struct CcmFormDecompositionHp {
     pub components: Vec<CcmFormComponentValueHp>,
 }
 
+/// Evaluate each finite binary quadratic quotient with one final rounding.
+/// Signed contributions include the integer coefficient before that rounding.
+/// Reconstruction sums the reported contribution points; the residual compares
+/// that rounded sum with the reported total point. Neither is an error enclosure.
+/// Exact arithmetic has an eight-million-bit span limit and an 8 GiB numerical
+/// workspace limit; unsupported precision, range or workspace returns an error.
 pub fn evaluate_ccm_form_components_hp(
     total_matrix_row_major: &[Float],
     components: &[CcmFormComponentMatrixHp],
@@ -2486,9 +2621,12 @@ pub fn evaluate_ccm_form_components_hp(
     precision_bits: u32,
 ) -> Result<CcmFormDecompositionHp> {
     let dimension = vector.len();
-    if precision_bits < 64
+    if !(64..=1_000_000).contains(&precision_bits)
         || dimension == 0
         || total_matrix_row_major.len() != dimension.saturating_mul(dimension)
+        || total_matrix_row_major
+            .iter()
+            .any(|value| !value.is_finite())
         || vector.iter().any(|value| !value.is_finite())
     {
         anyhow::bail!("invalid CCM form-decomposition dimensions or precision");
@@ -2520,55 +2658,24 @@ pub fn evaluate_ccm_form_components_hp(
         anyhow::bail!("CCM form components require finite square matrices and nonzero signs");
     }
 
-    let rayleigh = |matrix: &[Float]| -> Result<Float> {
-        let mut applied = vec![Float::with_val(precision_bits, 0); dimension];
-        for row in 0..dimension {
-            let terms = (0..dimension)
-                .map(|column| {
-                    let mut term =
-                        Float::with_val(precision_bits, &matrix[row * dimension + column]);
-                    term *= &vector[column];
-                    term
-                })
-                .collect::<Vec<_>>();
-            applied[row] =
-                xc_numerics::reduction::deterministic_pairwise_sum_hp(&terms, precision_bits);
-        }
-        let numerator_terms = vector
-            .iter()
-            .zip(&applied)
-            .map(|(left, right)| {
-                let mut term = Float::with_val(precision_bits, left);
-                term *= right;
-                term
-            })
-            .collect::<Vec<_>>();
-        let denominator_terms = vector
-            .iter()
-            .map(|value| {
-                let mut term = Float::with_val(precision_bits, value);
-                term *= value;
-                term
-            })
-            .collect::<Vec<_>>();
-        let numerator =
-            xc_numerics::reduction::deterministic_pairwise_sum_hp(&numerator_terms, precision_bits);
-        let denominator = xc_numerics::reduction::deterministic_pairwise_sum_hp(
-            &denominator_terms,
-            precision_bits,
-        );
-        if denominator <= 0 {
-            anyhow::bail!("CCM form-decomposition vector has nonpositive norm");
-        }
-        Ok(Float::with_val(precision_bits, numerator / denominator))
-    };
-
-    let total_value = rayleigh(total_matrix_row_major)?;
+    const WORKSPACE_BYTES: u64 = 8 << 30;
+    let total_value = super::band_runtime::rayleigh(
+        total_matrix_row_major,
+        vector,
+        precision_bits,
+        1,
+        WORKSPACE_BYTES,
+    )?
+    .0;
     let mut values = Vec::with_capacity(components.len());
     for component in components {
-        let rayleigh_value = rayleigh(&component.matrix_row_major)?;
-        let mut signed_contribution = Float::with_val(precision_bits, &rayleigh_value);
-        signed_contribution *= component.signed_coefficient;
+        let (rayleigh_value, signed_contribution) = super::band_runtime::rayleigh(
+            &component.matrix_row_major,
+            vector,
+            precision_bits,
+            component.signed_coefficient,
+            WORKSPACE_BYTES,
+        )?;
         values.push(CcmFormComponentValueHp {
             kind: component.kind,
             signed_coefficient: component.signed_coefficient,
@@ -2576,16 +2683,17 @@ pub fn evaluate_ccm_form_components_hp(
             signed_contribution,
         });
     }
-    let reconstructed_total = xc_numerics::reduction::deterministic_pairwise_sum_hp(
-        &values
-            .iter()
-            .map(|value| value.signed_contribution.clone())
-            .collect::<Vec<_>>(),
-        precision_bits,
-    );
-    let mut cancellation_residual = Float::with_val(precision_bits, &total_value);
-    cancellation_residual -= &reconstructed_total;
-    cancellation_residual.abs_mut();
+    let contributions = values
+        .iter()
+        .map(|v| v.signed_contribution.clone())
+        .collect::<Vec<_>>();
+    let one = vec![Float::with_val(precision_bits, 1); values.len()];
+    let reconstructed_total =
+        super::band_runtime::inner(&one, &one, &contributions, precision_bits, WORKSPACE_BYTES)?;
+    let pair = [total_value.clone(), -reconstructed_total.clone()];
+    let cancellation_residual =
+        super::band_runtime::inner(&one[..2], &one[..2], &pair, precision_bits, WORKSPACE_BYTES)?
+            .abs();
     Ok(CcmFormDecompositionHp {
         total_value,
         reconstructed_total,
@@ -2604,28 +2712,31 @@ fn pi(prec: u32) -> Float {
     Float::with_val(prec, rug::float::Constant::Pi)
 }
 #[inline]
+#[cfg(test)]
 fn euler(prec: u32) -> Float {
     Float::with_val(prec, rug::float::Constant::Euler)
 }
 
-/// Force exact symmetry on a `dim × dim` row-major HP matrix in-place.
-///
-/// Computes `(M[i,j] + M[j,i]) / 2` for every upper-triangle pair and
-/// immediately stores the average in both positions. This removes the former
-/// O(dim²) index and MPFR-result scratch while retaining identical arithmetic.
-/// The diagonal is untouched. This is called on the τ-matrix before eigenvector
-/// computation to ensure that floating-point construction noise doesn't
-/// break the assumed symmetry of the Weil quadratic form.
-fn force_symmetric(matrix: &mut [Float], dim: usize) {
+/// Force exact symmetry on a finite square row-major HP matrix.
+/// Each pair is replaced by its correctly rounded stored-point average at
+/// the greater input precision. Unrepresentable arithmetic is an error.
+fn force_symmetric(matrix: &mut [Float], dim: usize) -> Result<()> {
+    if dim == 0
+        || dim.checked_mul(dim) != Some(matrix.len())
+        || matrix
+            .iter()
+            .any(|v| !v.is_finite() || v.prec() > 1_000_000)
+    {
+        bail!("invalid symmetry source shape, finite values or precision");
+    }
     for i in 0..dim {
         for j in (i + 1)..dim {
-            let mut sum = matrix[i * dim + j].clone();
-            sum += &matrix[j * dim + i];
-            sum /= 2u32;
-            matrix[i * dim + j] = sum.clone();
-            matrix[j * dim + i] = sum;
+            let value = symmetry_math::average(&matrix[i * dim + j], &matrix[j * dim + i])?;
+            matrix[i * dim + j] = value.clone();
+            matrix[j * dim + i] = value;
         }
     }
+    Ok(())
 }
 
 fn decode_tau_artifact(
@@ -2645,15 +2756,7 @@ fn decode_tau_artifact(
             "CCM tau payload does not match its semantic identity".to_owned(),
         ));
     }
-    let parse = |entry: &String| {
-        Float::parse(entry)
-            .map(|parsed| Float::with_val(prec, parsed))
-            .map_err(|error| {
-                CacheError::InvalidManifest(format!(
-                    "CCM tau payload contains an invalid HP scalar: {error}"
-                ))
-            })
-    };
+    let parse = |entry: &String| parse_hp_scalar(entry, prec);
     let tau = if artifact.entries.len() < hp_vector_parallel_decode_min_entries(prec) {
         artifact
             .entries
@@ -2683,6 +2786,41 @@ fn decode_tau_artifact(
 }
 
 #[cfg(feature = "arb")]
+fn tau_certification_config(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+) -> Result<super::cutoff_free::CutoffFreeConfig> {
+    if !params.lambda_sq.is_integer {
+        bail!(
+            "Tau certification currently requires exact integer lambda_squared; fractional cutoffs cannot use their integer floor"
+        );
+    }
+    // Public parameter fields can be changed after construction.
+    lambda_squared_value_hp(params, cfg.precision_bits)?;
+    Ok(super::cutoff_free::CutoffFreeConfig::new(
+        params.lambda_sq_int(),
+        params.n_modes,
+        cfg.precision_bits,
+    ))
+}
+
+#[cfg(feature = "arb")]
+fn tau_accuracy_agreement(
+    scale: &rug::Rational,
+    error: &rug::Rational,
+    p: u32,
+) -> Result<rug::Rational> {
+    if p < 64 || scale < &0 || error < &0 {
+        bail!("invalid finite-form agreement input");
+    }
+    let allowance = scale.clone() >> (p - 32);
+    if error > &allowance {
+        bail!("independent finite-form error exceeds the declared p-32 bit entrywise agreement policy");
+    }
+    Ok(allowance)
+}
+
+#[cfg(feature = "arb")]
 fn certify_tau_from_retained_computation(
     params: &CcmParams,
     cfg: &HighPrecConfig,
@@ -2690,22 +2828,24 @@ fn certify_tau_from_retained_computation(
     manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<ArtifactProductionAssessment> {
-    let certification = super::cutoff_free::CutoffFreeConfig::new(
-        params.lambda_sq_int(),
-        params.n_modes,
-        cfg.precision_bits,
-    );
+    let certification = tau_certification_config(params, cfg)?;
     let (interval_matrix, certificate) = super::cutoff_free::certify_portable(&certification)?;
     if interval_matrix.tau.len() != tau.len() {
         bail!("cutoff-free certification matrix dimension differs from retained tau matrix");
     }
     let mut error_enclosures = Vec::with_capacity(tau.len());
+    let mut maximum_error = rug::Rational::from(0);
+    let mut source_scale = rug::Rational::from(0);
     for (index, (point, enclosure)) in tau.iter().zip(&interval_matrix.tau).enumerate() {
         let exact_point = point.to_rational().ok_or_else(|| {
             anyhow::anyhow!("retained tau entry {index} cannot be represented exactly")
         })?;
         let error_lower = enclosure.lower().clone() - &exact_point;
         let error_upper = enclosure.upper().clone() - &exact_point;
+        maximum_error = maximum_error
+            .max(error_lower.clone().abs())
+            .max(error_upper.clone().abs());
+        source_scale = source_scale.max(exact_point.clone().abs());
         error_enclosures.push(serde_json::json!({
             "index": index,
             "point": {
@@ -2724,6 +2864,7 @@ fn certify_tau_from_retained_computation(
             }
         }));
     }
+    let allowed_error = tau_accuracy_agreement(&source_scale, &maximum_error, cfg.precision_bits)?;
     let replay = xc_certify::exact::verify_portable_interval_inertia_certificate(&certificate);
     if !replay.valid {
         bail!(
@@ -2745,6 +2886,13 @@ fn certify_tau_from_retained_computation(
         "certificate_id": certificate.certificate_id,
         "interval_matrix_digest": certificate.matrix_digest,
         "verified_entry_count": tau.len(),
+        "agreement_policy": "max_entry_abs_error <= max_entry_abs_stored_point * 2^-(precision_bits-32); zero_scale_requires_exact_zero_error",
+        "precision_bits": cfg.precision_bits,
+        "source_scale_exact": source_scale.to_string(),
+        "maximum_error_exact": maximum_error.to_string(),
+        "allowed_error_exact": allowed_error.to_string(),
+        "agreement_passed": true,
+        "accuracy_scope": "independently_enclosed_finite_weil_form_entrywise_error; no_continuum_limit_claim",
         "claim": "each exact retained MPFR value has the listed rigorous true-minus-point error enclosure",
         "error_enclosures": error_enclosures
     }))?;
@@ -2775,23 +2923,17 @@ fn certify_tau_from_retained_computation(
     bail!("cross-checked or certified CCM assurance requires the xc-spectral arb feature")
 }
 
+fn parse_standalone_scalar(value: &str, precision: u32) -> Option<Float> {
+    let parsed = parse_hp_scalar(value, precision).ok()?;
+    (parsed.to_string() == value).then_some(parsed)
+}
+
 fn parse_hp_scalar(value: &str, precision_bits: u32) -> std::result::Result<Float, CacheError> {
-    Float::parse(value)
-        .map(|parsed| Float::with_val(precision_bits, parsed))
-        .map_err(|error| {
-            CacheError::InvalidManifest(format!(
-                "CCM component contains an invalid HP scalar: {error}"
-            ))
-        })
-        .and_then(|parsed| {
-            if parsed.is_finite() {
-                Ok(parsed)
-            } else {
-                Err(CacheError::InvalidManifest(
-                    "CCM component contains a non-finite HP scalar".to_owned(),
-                ))
-            }
-        })
+    super::retained_evidence::scalar(value, precision_bits).map_err(|error| {
+        CacheError::InvalidManifest(format!(
+            "CCM component contains an invalid HP scalar: {error}"
+        ))
+    })
 }
 
 fn parse_hp_vector(
@@ -2926,7 +3068,8 @@ fn resolve_archimedean_integrals_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_archimedean_integrals".to_owned(),
-        mathematical_semantics_version: "ccm-archimedean-integrals-v0.13.0-v1".to_owned(),
+        mathematical_semantics_version: "ccm-archimedean-integrals-length-aware-order-v3"
+            .to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -2959,7 +3102,7 @@ fn resolve_archimedean_integrals_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -3022,7 +3165,7 @@ fn resolve_prime_component_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_prime_component".to_owned(),
-        mathematical_semantics_version: "ccm-prime-component-v0.13.0-v1".to_owned(),
+        mathematical_semantics_version: "ccm-prime-component-v0.15.2-v2".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "prime_cutoff": params.lambda_sq_int(),
@@ -3055,7 +3198,7 @@ fn resolve_prime_component_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -3073,8 +3216,10 @@ fn resolve_prime_component_via_cache(
                 params.lambda_sq_int(),
                 l,
                 precision_bits,
-            );
-            force_symmetric(&mut entries, params.matrix_size());
+            )
+            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+            force_symmetric(&mut entries, params.matrix_size())
+                .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
             Ok((
                 PortablePrimeComponent {
                     schema_version: 1,
@@ -3117,17 +3262,21 @@ fn build_tau_hp_via_cache(
     cfg: &HighPrecConfig,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<(Vec<Float>, ArtifactManifest)> {
+    validate_managed_source_length(params, cfg, l)?;
+    matrix_point_math::preflight(params.n_modes, l, cfg.precision_bits)?;
     let prec = cfg.precision_bits;
     let lambda_identity = lambda_squared_cache_identity(params);
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_tau_matrix".to_owned(),
-        mathematical_semantics_version: "ccm-weil-form-v0.13.0-v2".to_owned(),
+        mathematical_semantics_version: "ccm-weil-form-source-bound-length-aware-arch-v4"
+            .to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_identity,
             "prime_cutoff": params.lambda_sq.value_u64,
             "n_modes": params.n_modes,
             "precision_bits": prec,
+            "quadrature_points": cfg.quad_points,
             "scalar_backend": "rug_mpfr",
             "include_primes": true
         }),
@@ -3156,7 +3305,7 @@ fn build_tau_hp_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -3178,7 +3327,8 @@ fn build_tau_hp_via_cache(
             let (prime, prime_manifest) = resolve_prime_component_via_cache(params, l, cfg, cache)
                 .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
             let (pole, archimedean) =
-                assemble_pole_and_archimedean_components(params.n_modes, l, prec, &integrals);
+                assemble_pole_and_archimedean_components(params.n_modes, l, prec, &integrals)
+                    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
             let components = ComputedCcmMatrixComponents {
                 pole,
                 archimedean,
@@ -3186,7 +3336,8 @@ fn build_tau_hp_via_cache(
             };
             let dependencies =
                 canonical_dependency_refs(vec![archimedean_manifest, prime_manifest]);
-            let tau = assemble_tau_components(&components, prec);
+            let tau = assemble_tau_components(&components, prec)
+                .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
             Ok((
                 PortableTauMatrix {
                     schema_version: 2,
@@ -3235,7 +3386,9 @@ fn build_tau_hp_via_cache(
             .transpose()?
             .flatten()
             .filter(|assessment| assessment.achieved_assurance >= required_assurance);
-        if retained_assurance.is_some() {
+        // Historical fractional attestations used an integer-floor assembly.
+        // They cannot establish assurance for this exact retained cutoff.
+        if params.lambda_sq.is_integer && retained_assurance.is_some() {
             return Ok((tau, manifest));
         }
         match certify_tau_from_retained_computation(params, cfg, &tau, &manifest, cache) {
@@ -3281,8 +3434,8 @@ fn decode_weil_eigenpair(
     let prec = cfg.precision_bits;
     let parity_policy = cfg.effective_parity_policy();
     let expected_schema = match cfg.eigenstate_solver {
-        CcmEigenstateSolver::LegacyInverseIteration => 2,
-        CcmEigenstateSolver::ShiftInvertKrylov => 3,
+        CcmEigenstateSolver::LegacyInverseIteration => 4,
+        CcmEigenstateSolver::ShiftInvertKrylov => 5,
         CcmEigenstateSolver::Auto => {
             unreachable!("automatic eigenstate policy is resolved before payload decoding")
         }
@@ -3299,21 +3452,17 @@ fn decode_weil_eigenpair(
             "CCM Weil eigenpair payload does not match its semantic identity".to_owned(),
         ));
     }
-    let parse = |value: &str| {
-        Float::parse(value)
-            .map(|parsed| Float::with_val(prec, parsed))
-            .map_err(|error| {
-                CacheError::InvalidManifest(format!(
-                    "CCM Weil eigenpair contains an invalid HP scalar: {error}"
-                ))
-            })
-    };
+    let parse = |value: &str| parse_hp_scalar(value, prec);
     let eps_n = parse(&artifact.eigenvalue)?;
     let xi: Vec<Float> = artifact
         .eigenvector
         .iter()
         .map(|entry| parse(entry))
         .collect::<std::result::Result<_, _>>()?;
+    let length = log_lambda_sq_hp(params, prec)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+    validate_eigenstate_contract(&xi, &length, prec, parity_policy)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
     let diagnostics = artifact.inverse_iteration.to_runtime(prec)?;
     match cfg.eigenstate_solver {
         CcmEigenstateSolver::LegacyInverseIteration => {
@@ -3332,19 +3481,18 @@ fn decode_weil_eigenpair(
                 )
             })?;
             let parse_metric = |value: &str, name: &str| {
-                Float::parse(value)
-                    .map(|parsed| Float::with_val(prec, parsed))
-                    .map_err(|error| {
-                        CacheError::InvalidManifest(format!(
-                            "CCM Krylov {name} is not a valid HP scalar: {error}"
-                        ))
-                    })
+                parse_hp_scalar(value, prec).map_err(|error| {
+                    CacheError::InvalidManifest(format!(
+                        "CCM Krylov {name} is not a valid HP scalar: {error}"
+                    ))
+                })
             };
             let tau_residual = parse_metric(&krylov.final_relative_tau_residual, "Tau residual")?;
             let backward = parse_metric(&krylov.final_scaled_backward_error, "backward error")?;
             let stability = parse_metric(&krylov.maximum_ritz_value_stability, "Ritz stability")?;
             if krylov.algorithm_semantics
-                != "ccm_even_zero_shift_thick_restart_shift_invert_krylov_rayleigh_ritz_v1"
+                != "ccm_even_zero_shift_krylov_guarded_lu_polish_resolution_v6"
+                || diagnostics.configured_step_limit != cfg.inverse_iter_steps
                 || krylov.status != "converged"
                 || krylov.requested_eigenpairs != 1
                 || krylov.guard_eigenpairs != cfg.krylov_guard_eigenpairs
@@ -3396,48 +3544,44 @@ fn decode_weil_eigenpair(
             ));
         }
     }
+    if cfg.eigenstate_solver == CcmEigenstateSolver::ShiftInvertKrylov {
+        let residual = state_residual_bounds::evaluate(tau, &xi, &eps_n, prec)
+            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+        let floor = eigenstate_accuracy::residual_floor(tau, params.matrix_size(), prec)
+            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+        if residual.eigenvalue_error_upper > floor {
+            return Err(CacheError::InvalidManifest(
+                "CCM polished eigenstate failed its storage-floor replay".into(),
+            ));
+        }
+    }
+    ground_index::validate(tau, &xi, &eps_n, prec, parity_policy)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+    let resolution = stored_resolution::bounds(tau, &xi, &eps_n, prec, parity_policy)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?
+        .record;
+    if artifact.stored_state_resolution.as_ref() != Some(&resolution) {
+        return Err(CacheError::InvalidManifest(
+            "CCM stored-state resolution failed source replay".into(),
+        ));
+    }
     Ok((eps_n, xi, diagnostics))
 }
 
-// Replay the historical projection and final symmetry averaging entrywise.
-// This removes an O(N^2) temporary MPFR matrix without changing a single
-// projection operation or relaxing the full-Tau dependency comparison.
+// Replay each correctly rounded projection entry against the full stored Tau.
 fn even_sector_matches_tau(sector: &[Float], tau: &[Float], n: usize, p: u32) -> bool {
-    let Some(full) = n.checked_mul(2).and_then(|x| x.checked_add(1)) else {
+    let Ok(projection) = parity_math::Projection::new(tau, n, p, false) else {
         return false;
     };
-    let Some(d) = n.checked_add(1) else {
-        return false;
-    };
-    if full.checked_mul(full) != Some(tau.len()) || d.checked_mul(d) != Some(sector.len()) {
+    let d = projection.dimension();
+    if sector.len() != d * d {
         return false;
     }
-    let sqrt_two = Float::with_val(p, 2).sqrt();
-    let entry = |i: usize, j: usize| {
-        if i == 0 && j == 0 {
-            return tau[n * full + n].clone();
-        }
-        if i == 0 || j == 0 {
-            let k = i.max(j);
-            let mut v = tau[n * full + n - k].clone();
-            v += &tau[n * full + n + k];
-            v /= &sqrt_two;
-            return v;
-        }
-        let mut v = tau[(n - i) * full + n - j].clone();
-        v += &tau[(n - i) * full + n + j];
-        v += &tau[(n + i) * full + n - j];
-        v += &tau[(n + i) * full + n + j];
-        v /= 2u32;
-        v
-    };
     for i in 0..d {
         for j in i..d {
-            let mut expected = entry(i, j);
-            if i != j {
-                expected += entry(j, i);
-                expected /= 2u32;
-            }
+            let Ok(expected) = projection.entry(i, j) else {
+                return false;
+            };
             if sector[i * d + j] != expected || sector[j * d + i] != expected {
                 return false;
             }
@@ -3446,58 +3590,14 @@ fn even_sector_matches_tau(sector: &[Float], tau: &[Float], n: usize, p: u32) ->
     true
 }
 
-fn build_even_sector_matrix(tau: &[Float], n_modes: usize, prec: u32) -> Vec<Float> {
-    let full_dim = 2 * n_modes + 1;
-    let even_dim = n_modes + 1;
-    let center = n_modes;
-    let sqrt_two = Float::with_val(prec, 2).sqrt();
-    let mut sector = vec![Float::with_val(prec, 0); even_dim * even_dim];
-    sector[0] = tau[center * full_dim + center].clone();
-    for k in 1..=n_modes {
-        let minus_k = center - k;
-        let plus_k = center + k;
-        let mut row_value = tau[center * full_dim + minus_k].clone();
-        row_value += &tau[center * full_dim + plus_k];
-        row_value /= &sqrt_two;
-        sector[k] = row_value.clone();
-        sector[k * even_dim] = row_value;
-        for j in 1..=n_modes {
-            let minus_j = center - j;
-            let plus_j = center + j;
-            let mut value = tau[minus_k * full_dim + minus_j].clone();
-            value += &tau[minus_k * full_dim + plus_j];
-            value += &tau[plus_k * full_dim + minus_j];
-            value += &tau[plus_k * full_dim + plus_j];
-            value /= 2u32;
-            sector[k * even_dim + j] = value;
-        }
-    }
-    force_symmetric(&mut sector, even_dim);
-    sector
+fn build_even_sector_matrix(tau: &[Float], n_modes: usize, prec: u32) -> Result<Vec<Float>> {
+    parity_math::Projection::new(tau, n_modes, prec, false)?.matrix()
 }
 
-/// Restrict the full Weil form to the historical orthonormal odd basis
-/// `(e_k - e_-k)/sqrt(2)`, `k=1..=N`.
-///
-/// The reduced entry `Q[k,j] - Q[k,-j]` is the established sector-gap
-/// convention. It is exactly the four-term
-/// orthogonal projection when the full form is centrosymmetric.  Keeping this
-/// operation order preserves the established MPFR values.
-fn build_odd_sector_matrix(tau: &[Float], n_modes: usize, prec: u32) -> Vec<Float> {
-    let full_dim = 2 * n_modes + 1;
-    let center = n_modes;
-    let mut sector = vec![Float::with_val(prec, 0); n_modes * n_modes];
-    for k in 1..=n_modes {
-        let plus_k = center + k;
-        for j in 1..=n_modes {
-            let minus_j = center - j;
-            let plus_j = center + j;
-            let mut value = tau[plus_k * full_dim + plus_j].clone();
-            value -= &tau[plus_k * full_dim + minus_j];
-            sector[(k - 1) * n_modes + (j - 1)] = value;
-        }
-    }
-    sector
+/// Restrict the exact stored symmetric form to the orthonormal odd basis.
+/// The four-term projection also applies without exact reflection symmetry.
+fn build_odd_sector_matrix(tau: &[Float], n_modes: usize, prec: u32) -> Result<Vec<Float>> {
+    parity_math::Projection::new(tau, n_modes, prec, true)?.matrix()
 }
 
 /// Expand an odd parity-sector eigenvector into the full `2N+1` `V_n`
@@ -3511,14 +3611,37 @@ fn build_odd_sector_matrix(tau: &[Float], n_modes: usize, prec: u32) -> Vec<Floa
 ///
 /// # Panics
 ///
-/// Panics if `vector` holds fewer than `n_modes` coefficients.
+/// Panics unless `vector` has exactly `n_modes` finite coefficients.
+/// Arithmetic and every returned coefficient use `prec` bits. Panics for unsupported
+/// precision/storage or a quotient outside the representable exponent range.
 pub fn expand_odd_sector_vector(vector: &[Float], n_modes: usize, prec: u32) -> Vec<Float> {
-    debug_assert_eq!(vector.len(), n_modes);
-    let mut expanded = vec![Float::with_val(prec, 0); 2 * n_modes + 1];
-    let sqrt_two = Float::with_val(prec, 2).sqrt();
+    let required = n_modes;
+    assert_eq!(
+        vector.len(),
+        required,
+        "parity expansion requires its exact sector dimension"
+    );
+    assert!(
+        vector.iter().all(Float::is_finite),
+        "parity expansion requires finite coefficients"
+    );
+    let full = n_modes
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        .expect("full parity dimension overflow");
+
+    assert!(
+        (rug::float::prec_min()..=1_000_000).contains(&prec),
+        "unsupported parity expansion precision"
+    );
+    assert!(
+        (full as u64).saturating_mul(u64::from(prec).div_ceil(8) + 64) <= (8u64 << 30),
+        "parity expansion exceeds numerical workspace budget"
+    );
+    let mut expanded = vec![Float::with_val(prec, 0); full];
     for k in 1..=n_modes {
-        let mut value = vector[k - 1].clone();
-        value /= &sqrt_two;
+        let value = parity_math::linear(&[(&vector[k - 1], 1)], 0, true, prec)
+            .expect("parity expansion quotient is outside the representable exponent range");
         expanded[n_modes + k] = value.clone();
         expanded[n_modes - k] = -value;
     }
@@ -3526,7 +3649,8 @@ pub fn expand_odd_sector_vector(vector: &[Float], n_modes: usize, prec: u32) -> 
 }
 
 fn matrix_is_exactly_symmetric(matrix: &[Float], dimension: usize) -> bool {
-    matrix.len() == dimension * dimension
+    dimension.checked_mul(dimension) == Some(matrix.len())
+        && matrix.iter().all(Float::is_finite)
         && (0..dimension).all(|row| {
             ((row + 1)..dimension)
                 .all(|column| matrix[row * dimension + column] == matrix[column * dimension + row])
@@ -3545,14 +3669,41 @@ fn matrix_is_exactly_symmetric(matrix: &[Float], dimension: usize) -> bool {
 ///
 /// # Panics
 ///
-/// Panics if `vector` holds fewer than `n_modes + 1` coefficients.
+/// Panics unless `vector` has exactly `n_modes + 1` finite coefficients.
+/// Arithmetic and every returned coefficient use `prec` bits. Panics for unsupported
+/// precision/storage or a quotient outside the representable exponent range.
 pub fn expand_even_sector_vector(vector: &[Float], n_modes: usize, prec: u32) -> Vec<Float> {
-    let mut expanded = vec![Float::with_val(prec, 0); 2 * n_modes + 1];
-    expanded[n_modes] = vector[0].clone();
-    let sqrt_two = Float::with_val(prec, 2).sqrt();
+    let required = n_modes
+        .checked_add(1)
+        .expect("even sector dimension overflow");
+    assert_eq!(
+        vector.len(),
+        required,
+        "parity expansion requires its exact sector dimension"
+    );
+    assert!(
+        vector.iter().all(Float::is_finite),
+        "parity expansion requires finite coefficients"
+    );
+    let full = n_modes
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        .expect("full parity dimension overflow");
+
+    assert!(
+        (rug::float::prec_min()..=1_000_000).contains(&prec),
+        "unsupported parity expansion precision"
+    );
+    assert!(
+        (full as u64).saturating_mul(u64::from(prec).div_ceil(8) + 64) <= (8u64 << 30),
+        "parity expansion exceeds numerical workspace budget"
+    );
+    let mut expanded = vec![Float::with_val(prec, 0); full];
+    expanded[n_modes] = super::retained_evidence::point::output(&vector[0], prec)
+        .expect("parity center is outside the representable exponent range");
     for k in 1..=n_modes {
-        let mut value = vector[k].clone();
-        value /= &sqrt_two;
+        let value = parity_math::linear(&[(&vector[k], 1)], 0, true, prec)
+            .expect("parity expansion quotient is outside the representable exponent range");
         expanded[n_modes - k] = value.clone();
         expanded[n_modes + k] = value;
     }
@@ -3570,7 +3721,7 @@ fn resolve_even_sector_matrix_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_even_sector_matrix".to_owned(),
-        mathematical_semantics_version: "ccm-even-sector-v0.13.0-v1".to_owned(),
+        mathematical_semantics_version: "ccm-even-sector-v0.15.1-v2".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -3615,7 +3766,8 @@ fn resolve_even_sector_matrix_via_cache(
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            let sector = build_even_sector_matrix(tau, params.n_modes, cfg.precision_bits);
+            let sector = build_even_sector_matrix(tau, params.n_modes, cfg.precision_bits)
+                .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
             Ok((
                 PortableEvenSectorMatrix {
                     schema_version: 1,
@@ -3676,7 +3828,7 @@ fn resolve_odd_sector_matrix_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_odd_sector_matrix".to_owned(),
-        mathematical_semantics_version: "ccm-odd-sector-v0.13.0-v1".to_owned(),
+        mathematical_semantics_version: "ccm-odd-sector-v0.15.1-v2".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -3687,7 +3839,7 @@ fn resolve_odd_sector_matrix_via_cache(
         target: Some("odd_sector_weil_form".to_owned()),
         subspace: Some("odd".to_owned()),
         source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some("centrosymmetric_q_plus_plus_minus_q_plus_minus".to_owned()),
+        algorithm_semantics: Some(parity_math::ARITHMETIC.to_owned()),
     };
     let logical_key = format!(
         "ccm/odd-sector/{}/{}/{}",
@@ -3721,7 +3873,8 @@ fn resolve_odd_sector_matrix_via_cache(
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            let sector = build_odd_sector_matrix(tau, params.n_modes, cfg.precision_bits);
+            let sector = build_odd_sector_matrix(tau, params.n_modes, cfg.precision_bits)
+                .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
             if !matrix_is_exactly_symmetric(&sector, dimension) {
                 return Err(CacheError::InvalidManifest(
                     "CCM odd-sector projection is not exactly symmetric".to_owned(),
@@ -3756,7 +3909,8 @@ fn resolve_odd_sector_matrix_via_cache(
                 ));
             }
             let decoded = parse_hp_vector(&artifact.entries, cfg.precision_bits)?;
-            let expected = build_odd_sector_matrix(tau, params.n_modes, cfg.precision_bits);
+            let expected = build_odd_sector_matrix(tau, params.n_modes, cfg.precision_bits)
+                .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
             if decoded != expected || !matrix_is_exactly_symmetric(&decoded, dimension) {
                 return Err(CacheError::InvalidManifest(
                     "CCM odd-sector matrix is inconsistent with its full tau dependency".to_owned(),
@@ -3898,7 +4052,7 @@ fn resolve_sector_tridiagonal_via_cache(
         target: Some("symmetric_tridiagonal_reduction".to_owned()),
         subspace: Some(parity.as_str().to_owned()),
         source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some("householder-scaled-opposite-sign-v1".to_owned()),
+        algorithm_semantics: Some(xc_numerics::eigen::STABLE_HOUSEHOLDER_SEMANTICS.to_owned()),
     };
     let logical_key = format!(
         "ccm/sector-tridiagonal/{}/{}/{}/{}",
@@ -4000,103 +4154,16 @@ fn validate_sector_transform(
     transform: &SectorTransformHp,
     dimension: usize,
     precision_bits: u32,
-) -> std::result::Result<(), String> {
-    if matrix.len() != dimension * dimension || transform.basis.len() != dimension * dimension {
-        return Err("matrix or basis dimensions are inconsistent".to_owned());
-    }
-    // `HighPrecConfig::for_decimal_digits` reserves GUARD_BITS beyond the
-    // caller's requested precision. Validation must enforce the requested
-    // contract, not demand that an O(n^3) accumulated transformation retain
-    // half of those guard bits as additional answer digits.
-    let orthogonality_tolerance = Float::with_val(precision_bits, 2)
-        .pow(-((precision_bits.saturating_sub(GUARD_BITS).max(1)) as i32));
-
-    // Check every basis-vector norm and every adjacent dot product.  This is
-    // O(n^2), so cached transforms remain cheap to validate at research sizes.
-    for column in 0..dimension {
-        let mut norm = Float::with_val(precision_bits, 0);
-        let mut adjacent = Float::with_val(precision_bits, 0);
-        for row in 0..dimension {
-            let mut square = transform.basis[row * dimension + column].clone();
-            square.square_mut();
-            norm += square;
-            if column + 1 < dimension {
-                let mut product = transform.basis[row * dimension + column].clone();
-                product *= &transform.basis[row * dimension + column + 1];
-                adjacent += product;
-            }
-        }
-        norm -= 1u32;
-        let norm_error = norm.abs();
-        let adjacent_error = adjacent.abs();
-        if norm_error > orthogonality_tolerance {
-            return Err(format!(
-                "basis column {column} norm error {} exceeds requested-precision tolerance {}",
-                norm_error, orthogonality_tolerance
-            ));
-        }
-        if adjacent_error > orthogonality_tolerance {
-            return Err(format!(
-                "basis columns {column} and {} inner-product error {} exceeds requested-precision tolerance {}",
-                column + 1,
-                adjacent_error,
-                orthogonality_tolerance
-            ));
-        }
-    }
-
-    // A Q = Q T is a homogeneous identity. Use a relative infinity-scale
-    // threshold so an otherwise identical matrix expressed at a different
-    // magnitude cannot be spuriously rejected by an absolute cutoff.
-    let mut matrix_scale = Float::with_val(precision_bits, 1);
-    for row in 0..dimension {
-        let mut row_sum = Float::with_val(precision_bits, 0);
-        for column in 0..dimension {
-            row_sum += matrix[row * dimension + column].clone().abs();
-        }
-        if row_sum > matrix_scale {
-            matrix_scale = row_sum;
-        }
-    }
-    let mut similarity_tolerance = orthogonality_tolerance.clone();
-    similarity_tolerance *= matrix_scale;
-
-    // Replay A Q = Q T for boundary and central columns.  Every retained
-    // eigenvector is additionally replayed against A before acceptance.
-    let mut columns = vec![0, dimension / 2, dimension - 1];
-    columns.sort_unstable();
-    columns.dedup();
-    for column in columns {
-        for row in 0..dimension {
-            let mut left = Float::with_val(precision_bits, 0);
-            for inner in 0..dimension {
-                let mut term = matrix[row * dimension + inner].clone();
-                term *= &transform.basis[inner * dimension + column];
-                left += term;
-            }
-            let mut right = transform.basis[row * dimension + column].clone();
-            right *= &tridiagonal.diagonal[column];
-            if column > 0 {
-                let mut term = transform.basis[row * dimension + column - 1].clone();
-                term *= &tridiagonal.off_diagonal[column - 1];
-                right += term;
-            }
-            if column + 1 < dimension {
-                let mut term = transform.basis[row * dimension + column + 1].clone();
-                term *= &tridiagonal.off_diagonal[column];
-                right += term;
-            }
-            left -= right;
-            let residual = left.abs();
-            if residual > similarity_tolerance {
-                return Err(format!(
-                    "A Q = Q T residual at row {row}, column {column} is {} and exceeds scale-aware tolerance {}",
-                    residual, similarity_tolerance
-                ));
-            }
-        }
-    }
-    Ok(())
+) -> std::result::Result<Float, String> {
+    sector_transform_validation::bounds(
+        matrix,
+        &tridiagonal.diagonal,
+        &tridiagonal.off_diagonal,
+        &transform.basis,
+        dimension,
+        precision_bits,
+    )
+    .map(|bounds| bounds.eigenvalue_allowance)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4110,7 +4177,7 @@ fn resolve_sector_transform_via_cache(
     tridiagonal_manifest: &ArtifactManifest,
     precomputed: Option<&SectorTransformHp>,
     cache: &ArtifactCacheContext<'_>,
-) -> Result<(SectorTransformHp, ArtifactManifest)> {
+) -> Result<(SectorTransformHp, ArtifactManifest, Float)> {
     let dimension = match parity {
         CcmParity::Even => params.n_modes + 1,
         CcmParity::Odd => params.n_modes,
@@ -4131,7 +4198,7 @@ fn resolve_sector_transform_via_cache(
         target: Some("tridiagonal_to_dense_eigenvector_transform".to_owned()),
         subspace: Some(parity.as_str().to_owned()),
         source_data_identities: BTreeMap::new(),
-        algorithm_semantics: Some("householder-scaled-opposite-sign-v1".to_owned()),
+        algorithm_semantics: Some(xc_numerics::eigen::STABLE_HOUSEHOLDER_SEMANTICS.to_owned()),
     };
     let logical_key = format!(
         "ccm/sector-transform/{}/{}/{}/{}",
@@ -4217,18 +4284,19 @@ fn resolve_sector_transform_via_cache(
             let transform = SectorTransformHp {
                 basis: parse_hp_vector(&artifact.basis, cfg.precision_bits)?,
             };
-            if let Err(reason) = validate_sector_transform(
+            let allowance = validate_sector_transform(
                 matrix,
                 tridiagonal,
                 &transform,
                 dimension,
                 cfg.precision_bits,
-            ) {
-                return Err(CacheError::InvalidManifest(format!(
-                    "CCM sector transform failed orthogonality or A Q = Q T replay: {reason}"
-                )));
-            }
-            validated.replace(Some(transform));
+            )
+            .map_err(|reason| {
+                CacheError::InvalidManifest(format!(
+                    "CCM sector transform failed full Gram or A Q = Q T replay: {reason}"
+                ))
+            })?;
+            validated.replace(Some((transform, allowance)));
             Ok(())
         },
     )?;
@@ -4237,7 +4305,7 @@ fn resolve_sector_transform_via_cache(
         .produced_manifest
         .or(resolved.reused_manifest)
         .ok_or_else(|| anyhow::anyhow!("sector-transform execution returned no manifest"))?;
-    let transform = validated.into_inner().ok_or_else(|| {
+    let (transform, allowance) = validated.into_inner().ok_or_else(|| {
         anyhow::anyhow!("sector-transform execution retained no validated runtime value")
     })?;
     eprintln!(
@@ -4245,11 +4313,36 @@ fn resolve_sector_transform_via_cache(
         if was_produced { "computed" } else { "reused" },
         started.elapsed().as_secs_f64()
     );
-    Ok((transform, manifest))
+    Ok((transform, manifest, allowance))
 }
 
-fn selected_sector_tolerance(precision_bits: u32) -> Float {
-    Float::with_val(precision_bits, 2).pow(-((precision_bits.saturating_sub(32)) as i32))
+fn selected_sector_tolerance(tridiagonal: &SectorTridiagonalHp, p: u32) -> Result<Float> {
+    if !(64..=1_000_000).contains(&p)
+        || tridiagonal.diagonal.is_empty()
+        || tridiagonal.off_diagonal.len().checked_add(1) != Some(tridiagonal.diagonal.len())
+        || tridiagonal
+            .diagonal
+            .iter()
+            .chain(&tridiagonal.off_diagonal)
+            .any(|x| !x.is_finite() || x.prec() > p)
+    {
+        bail!("invalid selected sector tolerance inputs");
+    }
+    // Binary matrix scale gives the same relative accuracy after any exact
+    // power-of-two rescaling. Eight bits reserve rounding margin; downstream
+    // diagnostics additionally require relative, source-bound resolution.
+    let exponent = tridiagonal
+        .diagonal
+        .iter()
+        .chain(&tridiagonal.off_diagonal)
+        .filter_map(Float::get_exp)
+        .max()
+        .map_or(0, i64::from);
+    super::retained_evidence::finite_math::scale_float(
+        &(Float::with_val(p, 1) >> (p - 8)),
+        exponent - 1,
+        p,
+    )
 }
 
 fn complete_sector_eigenvalues_qr(
@@ -4268,6 +4361,26 @@ fn complete_sector_eigenvalues_qr(
     )
 }
 
+/// Public sector vectors require simple individually isolated eigenvalues.
+/// Response inversion only requires the lowest eigenvalue to be simple; its
+/// neighboring index-one enclosure may contain a repeated higher cluster.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SectorIsolationPolicy {
+    IndividualEigenvalues,
+    ResponseLowestAndNeighbor,
+}
+
+impl SectorIsolationPolicy {
+    fn accepts_counts(self, index: usize, lower: usize, upper: usize) -> bool {
+        lower == index
+            && if self == Self::ResponseLowestAndNeighbor && index == 1 {
+                upper >= 2
+            } else {
+                upper == index + 1
+            }
+    }
+}
+
 fn compute_sector_eigenvalues(
     tridiagonal: &SectorTridiagonalHp,
     dimension: usize,
@@ -4275,16 +4388,141 @@ fn compute_sector_eigenvalues(
     route: CcmSectorEigenvalueRoute,
     precision_bits: u32,
 ) -> Result<SectorEigenvaluesHp> {
-    let selected = || {
-        xc_numerics::eigen::tridiag_selected_eigenvalues_hp(
+    compute_sector_eigenvalues_with_policy(
+        tridiagonal,
+        dimension,
+        requested_eigenvalues,
+        route,
+        precision_bits,
+        SectorIsolationPolicy::IndividualEigenvalues,
+    )
+}
+
+fn compute_sector_eigenvalues_with_policy(
+    tridiagonal: &SectorTridiagonalHp,
+    dimension: usize,
+    requested_eigenvalues: usize,
+    route: CcmSectorEigenvalueRoute,
+    precision_bits: u32,
+    policy: SectorIsolationPolicy,
+) -> Result<SectorEigenvaluesHp> {
+    if policy == SectorIsolationPolicy::ResponseLowestAndNeighbor
+        && (route != CcmSectorEigenvalueRoute::Selected || requested_eigenvalues != 2)
+    {
+        bail!("response sector isolation requires the lowest two selected indices");
+    }
+    let selected = || -> Result<xc_numerics::eigen::HpSelectedTridiagonalSpectrum> {
+        let (diagonal, off, exponent) = sector_gap_math::scaled_tridiagonal(
             &tridiagonal.diagonal,
             &tridiagonal.off_diagonal,
-            0,
-            requested_eigenvalues - 1,
-            &selected_sector_tolerance(precision_bits),
-            (precision_bits as usize).saturating_mul(2),
             precision_bits,
-        )
+        )?;
+        let initial_tolerance = selected_sector_tolerance(
+            &SectorTridiagonalHp {
+                diagonal: diagonal.clone(),
+                off_diagonal: off.clone(),
+            },
+            precision_bits,
+        )?;
+        let last = requested_eigenvalues.checked_sub(1).ok_or_else(|| {
+            anyhow::anyhow!("selected sector requires a positive eigenvalue count")
+        })?;
+        let mut spectrum = xc_numerics::eigen::HpSelectedTridiagonalSpectrum {
+            precision_bits,
+            first_index: 0,
+            last_index: last,
+            sturm_evaluations: 0,
+            enclosures: Vec::with_capacity(requested_eigenvalues),
+        };
+        // Refine each index separately: a zero or near-zero root must not
+        // drive an already resolved O(1) neighbor below its representable ulp.
+        for index in 0..=last {
+            let mut tolerance = initial_tolerance.clone();
+            let mut retained = None;
+            for refinement in 0..=8 {
+                let candidate = xc_numerics::eigen::tridiag_selected_eigenvalues_hp(
+                    &diagonal,
+                    &off,
+                    index,
+                    index,
+                    &tolerance,
+                    (precision_bits as usize)
+                        .saturating_mul(2)
+                        .saturating_add(256),
+                    precision_bits,
+                );
+                let candidate = match candidate {
+                    Ok(value) => value,
+                    // A tighter numerical request can stagnate at working
+                    // precision. Preserve only an already count-validated
+                    // enclosure; downstream source/relative gates still apply.
+                    Err(error)
+                        if retained.is_some()
+                            && error
+                                .to_string()
+                                .starts_with("HP Sturm bisection stagnated at ") =>
+                    {
+                        break
+                    }
+                    Err(error) => return Err(error),
+                };
+                spectrum.sturm_evaluations += candidate.sturm_evaluations;
+                let e = candidate.enclosures.into_iter().next().ok_or_else(|| {
+                    anyhow::anyhow!("selected sector computation returned no enclosure")
+                })?;
+                if policy.accepts_counts(e.index, e.lower_count, e.upper_count) {
+                    let width = Float::with_val_round(
+                        precision_bits + 64,
+                        &e.upper - &e.lower,
+                        rug::float::Round::Up,
+                    )
+                    .0;
+                    let minimum = e.lower.clone().abs().min(&e.upper.clone().abs());
+                    let relatively_resolved =
+                        !(e.lower <= 0 && e.upper >= 0) && width <= (minimum >> 12);
+                    retained = Some(e);
+                    if relatively_resolved {
+                        break;
+                    }
+                }
+                if refinement < 8 {
+                    tolerance >>= 16;
+                    if tolerance.is_zero() {
+                        break;
+                    }
+                }
+            }
+            spectrum.enclosures.push(retained.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "CCM sector resolution limit: Sturm enclosure does not isolate index {index}"
+                )
+            })?);
+        }
+        for enclosure in &mut spectrum.enclosures {
+            enclosure.lower = super::retained_evidence::finite_math::scale_float(
+                &enclosure.lower,
+                exponent,
+                precision_bits,
+            )?;
+            enclosure.upper = super::retained_evidence::finite_math::scale_float(
+                &enclosure.upper,
+                exponent,
+                precision_bits,
+            )?;
+        }
+        for enclosure in &spectrum.enclosures {
+            if !policy.accepts_counts(
+                enclosure.index,
+                enclosure.lower_count,
+                enclosure.upper_count,
+            ) {
+                bail!(
+                    "CCM sector resolution limit: Sturm enclosure does not isolate index {}",
+                    enclosure.index
+                );
+            }
+        }
+        Ok(spectrum)
     };
     match route {
         CcmSectorEigenvalueRoute::Selected => {
@@ -4293,10 +4531,14 @@ fn compute_sector_eigenvalues(
                 .enclosures
                 .iter()
                 .map(|enclosure| {
-                    let mut midpoint = enclosure.lower.clone();
-                    midpoint += &enclosure.upper;
-                    midpoint /= 2u32;
-                    midpoint
+                    xc_numerics::mpfr_interval::MpfrInterval::new(
+                        enclosure.lower.clone(),
+                        enclosure.upper.clone(),
+                    )
+                    .expect("selected eigenvalue enclosure is finite and ordered")
+                    .midpoint_point()
+                    .lower()
+                    .clone()
                 })
                 .collect();
             Ok(SectorEigenvaluesHp {
@@ -4318,12 +4560,20 @@ fn compute_sector_eigenvalues(
                 bail!("complete QR sector spectrum has the wrong dimension");
             }
             let selected = selected()?;
+            let allowance = sector_gap_math::qr_agreement_allowance(
+                &tridiagonal.diagonal,
+                &tridiagonal.off_diagonal,
+                precision_bits,
+            )?;
             for enclosure in &selected.enclosures {
-                if values[enclosure.index] < enclosure.lower
-                    || values[enclosure.index] > enclosure.upper
-                {
+                if !sector_gap_math::qr_point_agrees(
+                    &values[enclosure.index],
+                    &enclosure.lower,
+                    &enclosure.upper,
+                    &allowance,
+                ) {
                     bail!(
-                        "QR eigenvalue {} escaped its independently selected Sturm enclosure",
+                        "CCM sector resolution limit: QR eigenvalue {} disagrees with its independently selected Sturm enclosure beyond the normwise comparison allowance",
                         enclosure.index
                     );
                 }
@@ -4372,6 +4622,7 @@ fn portable_sector_eigenvalues(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn decode_sector_eigenvalues(
     artifact: &PortableSectorEigenvalues,
@@ -4383,6 +4634,31 @@ fn decode_sector_eigenvalues(
     route: CcmSectorEigenvalueRoute,
     tridiagonal: &SectorTridiagonalHp,
 ) -> std::result::Result<SectorEigenvaluesHp, CacheError> {
+    decode_sector_eigenvalues_with_policy(
+        artifact,
+        params,
+        cfg,
+        parity,
+        dimension,
+        requested_eigenvalues,
+        route,
+        tridiagonal,
+        SectorIsolationPolicy::IndividualEigenvalues,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_sector_eigenvalues_with_policy(
+    artifact: &PortableSectorEigenvalues,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    parity: CcmParity,
+    dimension: usize,
+    requested_eigenvalues: usize,
+    route: CcmSectorEigenvalueRoute,
+    tridiagonal: &SectorTridiagonalHp,
+    policy: SectorIsolationPolicy,
+) -> std::result::Result<SectorEigenvaluesHp, CacheError> {
     let expected_value_count = if route == CcmSectorEigenvalueRoute::Selected {
         requested_eigenvalues
     } else {
@@ -4393,7 +4669,9 @@ fn decode_sector_eigenvalues(
     } else {
         requested_eigenvalues
     };
-    if artifact.schema_version != 1
+    if (policy == SectorIsolationPolicy::ResponseLowestAndNeighbor
+        && (route != CcmSectorEigenvalueRoute::Selected || requested_eigenvalues != 2))
+        || artifact.schema_version != 1
         || artifact.lambda_squared != lambda_squared_cache_identity(params)
         || artifact.n_modes != params.n_modes
         || artifact.precision_bits != cfg.precision_bits
@@ -4435,6 +4713,12 @@ fn decode_sector_eigenvalues(
             enclosure_detail
         )));
     }
+    let scaled = sector_gap_math::scaled_tridiagonal(
+        &tridiagonal.diagonal,
+        &tridiagonal.off_diagonal,
+        cfg.precision_bits,
+    )
+    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
     let mut selected_enclosures = Vec::with_capacity(expected_enclosure_count);
     for (expected_index, enclosure) in artifact.selected_enclosures.iter().enumerate() {
         let lower = parse_hp_scalar(&enclosure.lower, cfg.precision_bits)?;
@@ -4443,31 +4727,57 @@ fn decode_sector_eigenvalues(
             || !lower.is_finite()
             || !upper.is_finite()
             || lower >= upper
-            || enclosure.lower_count > expected_index
-            || enclosure.upper_count <= expected_index
+            || !policy.accepts_counts(expected_index, enclosure.lower_count, enclosure.upper_count)
+            || enclosure.upper_count > dimension
             || enclosure.iterations == 0
         {
             return Err(CacheError::InvalidManifest(
                 "CCM selected eigenvalue enclosure is invalid".to_owned(),
             ));
         }
-        let value = &values[expected_index];
-        if value < &lower || value > &upper {
+        let width =
+            Float::with_val_round(cfg.precision_bits, &upper - &lower, rug::float::Round::Up).0;
+        if !width.is_finite()
+            || width
+                > selected_sector_tolerance(tridiagonal, cfg.precision_bits)
+                    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?
+        {
             return Err(CacheError::InvalidManifest(
-                "CCM selected eigenvalue escaped its indexed enclosure".to_owned(),
+                "CCM selected eigenvalue enclosure exceeds its requested matrix-scaled width"
+                    .into(),
             ));
         }
+        let value = &values[expected_index];
+        let allowance = if route == CcmSectorEigenvalueRoute::CrossChecked {
+            sector_gap_math::qr_agreement_allowance(
+                &tridiagonal.diagonal,
+                &tridiagonal.off_diagonal,
+                cfg.precision_bits,
+            )
+            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?
+        } else {
+            Float::with_val(cfg.precision_bits, 0)
+        };
+        if !sector_gap_math::qr_point_agrees(value, &lower, &upper, &allowance) {
+            return Err(CacheError::InvalidManifest(
+                "CCM selected eigenvalue escaped its indexed enclosure and route comparison allowance".to_owned(),
+            ));
+        }
+        let scale_endpoint = |point: &Float| {
+            super::retained_evidence::finite_math::scale_float(point, -scaled.2, cfg.precision_bits)
+                .map_err(|error| CacheError::InvalidManifest(error.to_string()))
+        };
         let replay_lower = xc_numerics::eigen::tridiag_sturm_count_below_hp(
-            &tridiagonal.diagonal,
-            &tridiagonal.off_diagonal,
-            &lower,
+            &scaled.0,
+            &scaled.1,
+            &scale_endpoint(&lower)?,
             cfg.precision_bits,
         )
         .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
         let replay_upper = xc_numerics::eigen::tridiag_sturm_count_below_hp(
-            &tridiagonal.diagonal,
-            &tridiagonal.off_diagonal,
-            &upper,
+            &scaled.0,
+            &scaled.1,
+            &scale_endpoint(&upper)?,
             cfg.precision_bits,
         )
         .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
@@ -4486,39 +4796,17 @@ fn decode_sector_eigenvalues(
         });
     }
     if artifact.complete {
-        let mut eigenvalue_trace = Float::with_val(cfg.precision_bits, 0);
-        let mut eigenvalue_square_sum = Float::with_val(cfg.precision_bits, 0);
-        for value in &values {
-            eigenvalue_trace += value;
-            let mut square = value.clone();
-            square.square_mut();
-            eigenvalue_square_sum += square;
-        }
-        let mut tridiagonal_trace = Float::with_val(cfg.precision_bits, 0);
-        let mut tridiagonal_square_sum = Float::with_val(cfg.precision_bits, 0);
-        for value in &tridiagonal.diagonal {
-            tridiagonal_trace += value;
-            let mut square = value.clone();
-            square.square_mut();
-            tridiagonal_square_sum += square;
-        }
-        for value in &tridiagonal.off_diagonal {
-            let mut square = value.clone();
-            square.square_mut();
-            square *= 2u32;
-            tridiagonal_square_sum += square;
-        }
-        if !hp_invariant_close(&eigenvalue_trace, &tridiagonal_trace, cfg.precision_bits)
-            || !hp_invariant_close(
-                &eigenvalue_square_sum,
-                &tridiagonal_square_sum,
-                cfg.precision_bits,
-            )
-        {
-            return Err(CacheError::InvalidManifest(
-                "complete CCM sector eigenvalues failed trace or Frobenius replay".to_owned(),
-            ));
-        }
+        sector_gap_math::validate_complete_points(
+            &tridiagonal.diagonal,
+            &tridiagonal.off_diagonal,
+            &values,
+            cfg.precision_bits,
+        )
+        .map_err(|error| {
+            CacheError::InvalidManifest(format!(
+                "complete CCM sector spectrum failed indexed Sturm validation: {error}"
+            ))
+        })?;
     }
     Ok(SectorEigenvaluesHp {
         route,
@@ -4540,6 +4828,33 @@ fn resolve_sector_eigenvalues_via_cache(
     tridiagonal_manifest: &ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<(SectorEigenvaluesHp, ArtifactManifest)> {
+    resolve_sector_eigenvalues_with_policy_via_cache(
+        params,
+        cfg,
+        parity,
+        dimension,
+        requested_eigenvalues,
+        route,
+        tridiagonal,
+        tridiagonal_manifest,
+        cache,
+        SectorIsolationPolicy::IndividualEigenvalues,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_sector_eigenvalues_with_policy_via_cache(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    parity: CcmParity,
+    dimension: usize,
+    requested_eigenvalues: usize,
+    route: CcmSectorEigenvalueRoute,
+    tridiagonal: &SectorTridiagonalHp,
+    tridiagonal_manifest: &ArtifactManifest,
+    cache: &ArtifactCacheContext<'_>,
+    policy: SectorIsolationPolicy,
+) -> Result<(SectorEigenvaluesHp, ArtifactManifest)> {
     // A complete QR result is independent of how many eigenvectors the caller
     // will retain. Key it as the complete dimension so later requests for a
     // larger vector prefix reuse the same expensive spectrum artifact.
@@ -4551,7 +4866,14 @@ fn resolve_sector_eigenvalues_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_sector_eigenvalues".to_owned(),
-        mathematical_semantics_version: "ccm-parity-sector-eigenvalues-v0.13.0-v1".to_owned(),
+        mathematical_semantics_version: if policy
+            == SectorIsolationPolicy::ResponseLowestAndNeighbor
+        {
+            "ccm-even-response-lowest-isolation-with-neighbor-cluster-v1"
+        } else {
+            "ccm-parity-sector-eigenvalues-isolating-v4"
+        }
+        .to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -4562,7 +4884,14 @@ fn resolve_sector_eigenvalues_via_cache(
             "requested_eigenvalues": artifact_request_count,
             "tridiagonal_content_digest": tridiagonal_manifest.content_digest.0
         }),
-        normalization: Some("strict_algebraic_order".to_owned()),
+        normalization: Some(
+            if policy == SectorIsolationPolicy::ResponseLowestAndNeighbor {
+                "isolated_lowest_and_index_one_neighbor_cluster"
+            } else {
+                "strict_algebraic_order"
+            }
+            .to_owned(),
+        ),
         target: Some(if route == CcmSectorEigenvalueRoute::Selected {
             "requested_parity_sector_eigenvalue_prefix".to_owned()
         } else {
@@ -4572,13 +4901,19 @@ fn resolve_sector_eigenvalues_via_cache(
         source_data_identities: BTreeMap::new(),
         algorithm_semantics: Some(
             match route {
-                CcmSectorEigenvalueRoute::Selected => "hp_sturm_indexed_bisection",
-                CcmSectorEigenvalueRoute::CompleteQr => "implicit_wilkinson_shift_tridiagonal_qr",
+                CcmSectorEigenvalueRoute::Selected => {
+                    "hp_sturm_per_index_adaptive_bisection_binary_scaled_tolerance_v4"
+                }
+                CcmSectorEigenvalueRoute::CompleteQr => xc_numerics::eigen::TRIDIAG_QR_SEMANTICS,
                 CcmSectorEigenvalueRoute::CrossChecked => {
-                    "implicit_wilkinson_shift_tridiagonal_qr_cross_checked_by_hp_sturm"
+                    "implicit_wilkinson_shift_tridiagonal_qr_cross_checked_by_per_index_hp_sturm_v5"
                 }
             }
-            .to_owned(),
+            .to_owned()
+                + "+"
+                + xc_numerics::eigen::TRIDIAG_QR_SEMANTICS
+                + "+"
+                + sector_gap_math::QR_AGREEMENT_SEMANTICS,
         ),
     };
     let logical_key = format!(
@@ -4619,12 +4954,13 @@ fn resolve_sector_eigenvalues_via_cache(
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            let values = compute_sector_eigenvalues(
+            let values = compute_sector_eigenvalues_with_policy(
                 tridiagonal,
                 dimension,
                 artifact_request_count,
                 route,
                 cfg.precision_bits,
+                policy,
             )
             .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
             Ok((
@@ -4644,7 +4980,7 @@ fn resolve_sector_eigenvalues_via_cache(
             ))
         },
         |artifact| {
-            validated.replace(Some(decode_sector_eigenvalues(
+            validated.replace(Some(decode_sector_eigenvalues_with_policy(
                 artifact,
                 params,
                 cfg,
@@ -4653,6 +4989,7 @@ fn resolve_sector_eigenvalues_via_cache(
                 artifact_request_count,
                 route,
                 tridiagonal,
+                policy,
             )?));
             Ok(())
         },
@@ -4682,24 +5019,37 @@ fn sector_eigenpair_residual_norm(
     eigenvector: &[Float],
     precision_bits: u32,
 ) -> Result<Float> {
-    if matrix.len() != dimension * dimension || eigenvector.len() != dimension {
-        bail!("sector eigenpair dimensions do not match the matrix");
+    use super::retained_evidence::point;
+    if dimension == 0
+        || dimension.checked_mul(dimension) != Some(matrix.len())
+        || eigenvector.len() != dimension
+        || !(64..=1_000_000).contains(&precision_bits)
+        || matrix
+            .iter()
+            .chain(eigenvector)
+            .chain(std::iter::once(eigenvalue))
+            .any(|x| !x.is_finite() || x.prec() > precision_bits)
+    {
+        bail!("invalid sector eigenpair dimensions, precision, or points");
     }
-    let mut squared_norm = Float::with_val(precision_bits, 0);
+    let work = precision_bits + 64;
+    let buffers = (dimension as u64).saturating_mul(8).saturating_add(128);
+    if buffers.saturating_mul(u64::from(work).div_ceil(8) + 64) > (8u64 << 30) {
+        bail!("sector residual exceeds numerical workspace budget");
+    }
+    let mut vector = eigenvector.to_vec();
+    vector.push(Float::with_val(precision_bits, 0));
+    let mut norm = Float::with_val(work, 0);
     for row in 0..dimension {
-        let mut residual = Float::with_val(precision_bits, 0);
-        for column in 0..dimension {
-            let mut term = matrix[row * dimension + column].clone();
-            term *= &eigenvector[column];
-            residual += term;
-        }
-        let mut expected = eigenvector[row].clone();
-        expected *= eigenvalue;
-        residual -= expected;
-        residual.square_mut();
-        squared_norm += residual;
+        let mut coefficients = matrix[row * dimension..(row + 1) * dimension].to_vec();
+        coefficients.push(-eigenvalue.clone());
+        vector[dimension] = eigenvector[row].clone();
+        // Exact binary products and one guarded sum avoid separate rounded
+        // matrix-vector and lambda-vector paths. Hypot avoids residual squares
+        // outside the exponent range. This is a point diagnostic, not a bound.
+        norm.hypot_mut(&point::dot(&coefficients, &vector, work)?);
     }
-    Ok(squared_norm.sqrt())
+    point::output(&norm, precision_bits)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4720,6 +5070,14 @@ fn compute_sector_spectrum(
     {
         bail!("requested CCM sector spectrum is outside the sector dimension");
     }
+    let source_bounds = sector_resolution::bounds(
+        matrix,
+        tridiagonal,
+        transform,
+        eigenvalues,
+        requested_eigenpairs,
+        cfg.precision_bits,
+    )?;
     let eigenvector_start = Instant::now();
     // Each retained eigenvector is recovered from the same immutable matrix and
     // a distinct eigenvalue. An indexed Rayon collect runs those independent
@@ -4733,17 +5091,40 @@ fn compute_sector_spectrum(
         .cloned()
         .enumerate()
         .map(|(algebraic_index, eigenvalue)| {
-            let tridiagonal_vector = xc_numerics::eigen::tridiag_eigenvector_for_value_hp(
-                &tridiagonal.diagonal,
-                &tridiagonal.off_diagonal,
-                &eigenvalue,
-                cfg.precision_bits,
-                xc_numerics::eigen::TridiagEigvecOptions {
-                    max_steps: cfg.inverse_iter_steps,
-                    early_termination: true,
-                    solver: xc_numerics::eigen::TridiagSolver::BandedInterleaved,
-                },
-            )?;
+            // Selected values are rounded midpoints of validated enclosures,
+            // not eigenvalues known to all working-precision bits. Preserve
+            // that certified input uncertainty through the pairing check.
+            let uncertainty = if let Some(enclosure) = eigenvalues
+                .selected_enclosures
+                .iter()
+                .find(|enclosure| enclosure.index == algebraic_index)
+            {
+                let allowance = if eigenvalues.route == CcmSectorEigenvalueRoute::CrossChecked {
+                    sector_gap_math::qr_agreement_allowance(&tridiagonal.diagonal,
+                        &tridiagonal.off_diagonal, cfg.precision_bits)?
+                } else { Float::with_val(cfg.precision_bits, 0) };
+                if !sector_gap_math::qr_point_agrees(&eigenvalue, &enclosure.lower, &enclosure.upper, &allowance) {
+                    bail!("CCM sector resolution limit: sector point disagrees with its selected enclosure");
+                }
+                let interval = xc_numerics::mpfr_interval::MpfrInterval::new(enclosure.lower.clone(), enclosure.upper.clone())?;
+                let displacement = interval.sub(&xc_numerics::mpfr_interval::MpfrInterval::from_float(&eigenvalue, cfg.precision_bits)?);
+                super::retained_evidence::finite_math::abs(&displacement)?.upper().clone()
+            } else {
+                Float::with_val(cfg.precision_bits, 0)
+            };
+            let tridiagonal_vector =
+                xc_numerics::eigen::tridiag_eigenvector_for_value_with_uncertainty_hp(
+                    &tridiagonal.diagonal,
+                    &tridiagonal.off_diagonal,
+                    &eigenvalue,
+                    &uncertainty,
+                    cfg.precision_bits,
+                    xc_numerics::eigen::TridiagEigvecOptions {
+                        max_steps: cfg.inverse_iter_steps,
+                        early_termination: true,
+                        solver: xc_numerics::eigen::TridiagSolver::BandedInterleaved,
+                    },
+                )?;
             let eigenvector = (0..dimension)
                 .map(|row| {
                     let terms = (0..dimension)
@@ -4759,6 +5140,12 @@ fn compute_sector_spectrum(
                     )
                 })
                 .collect::<Vec<_>>();
+            sector_vector_validation::validate(
+                matrix,
+                &eigenvector,
+                &eigenvalue,
+                cfg.precision_bits,
+            )?;
             let residual_norm = sector_eigenpair_residual_norm(
                 matrix,
                 dimension,
@@ -4771,6 +5158,8 @@ fn compute_sector_spectrum(
                 eigenvalue,
                 eigenvector,
                 residual_norm,
+                eigenvalue_lower: source_bounds[algebraic_index].0.clone(),
+                eigenvalue_upper: source_bounds[algebraic_index].1.clone(),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -4789,7 +5178,7 @@ fn compute_sector_spectrum(
 
 fn portable_sector_spectrum(spectrum: &CcmSectorSpectrumHp) -> PortableSectorSpectrum {
     PortableSectorSpectrum {
-        schema_version: 1,
+        schema_version: 2,
         lambda_squared: String::new(),
         n_modes: 0,
         precision_bits: 0,
@@ -4806,6 +5195,16 @@ fn portable_sector_spectrum(spectrum: &CcmSectorSpectrumHp) -> PortableSectorSpe
             .eigenpairs
             .iter()
             .map(|pair| pair.eigenvector.iter().map(Float::to_string).collect())
+            .collect(),
+        eigenvalue_bounds: spectrum
+            .eigenpairs
+            .iter()
+            .map(|pair| {
+                (
+                    pair.eigenvalue_lower.to_string(),
+                    pair.eigenvalue_upper.to_string(),
+                )
+            })
             .collect(),
         residual_norms: spectrum
             .eigenpairs
@@ -4825,6 +5224,8 @@ fn decode_sector_spectrum(
     matrix: &[Float],
     dimension: usize,
     requested_eigenpairs: usize,
+    expected_eigenvalues: &[Float],
+    expected_bounds: &[(Float, Float)],
 ) -> std::result::Result<CcmSectorSpectrumHp, CacheError> {
     validate_sector_spectrum_identity(
         artifact,
@@ -4841,10 +5242,35 @@ fn decode_sector_spectrum(
             "CCM sector spectrum is not strictly ordered".to_owned(),
         ));
     }
+    if expected_eigenvalues.len() < requested_eigenpairs
+        || eigenvalues != expected_eigenvalues[..requested_eigenpairs]
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM sector spectrum does not match its indexed eigenvalue parent".to_owned(),
+        ));
+    }
+    if expected_bounds.len() < requested_eigenpairs {
+        return Err(CacheError::InvalidManifest(
+            "sector eigenvalue bounds are missing".into(),
+        ));
+    }
+    let bounds = artifact
+        .eigenvalue_bounds
+        .iter()
+        .map(|(lo, hi)| {
+            Ok((
+                parse_hp_scalar(lo, cfg.precision_bits + 64)?,
+                parse_hp_scalar(hi, cfg.precision_bits + 64)?,
+            ))
+        })
+        .collect::<std::result::Result<Vec<_>, CacheError>>()?;
+    if bounds != expected_bounds[..requested_eigenpairs] {
+        return Err(CacheError::InvalidManifest(
+            "sector eigenvalue bounds failed source replay".into(),
+        ));
+    }
     let stored_residuals = parse_hp_vector(&artifact.residual_norms, cfg.precision_bits)?;
     let mut eigenpairs = Vec::with_capacity(requested_eigenpairs);
-    let tolerance =
-        Float::with_val(cfg.precision_bits, 2).pow(-((cfg.precision_bits / 4).max(8) as i32));
     for index in 0..requested_eigenpairs {
         let eigenvector = parse_hp_vector(&artifact.eigenvectors[index], cfg.precision_bits)?;
         if eigenvector.len() != dimension {
@@ -4852,6 +5278,13 @@ fn decode_sector_spectrum(
                 "CCM sector eigenvector has the wrong dimension".to_owned(),
             ));
         }
+        sector_vector_validation::validate(
+            matrix,
+            &eigenvector,
+            &eigenvalues[index],
+            cfg.precision_bits,
+        )
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
         let residual = sector_eigenpair_residual_norm(
             matrix,
             dimension,
@@ -4860,7 +5293,7 @@ fn decode_sector_spectrum(
             cfg.precision_bits,
         )
         .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
-        if residual > tolerance || residual != stored_residuals[index] {
+        if residual != stored_residuals[index] {
             return Err(CacheError::InvalidManifest(
                 "CCM sector eigenpair failed exact residual replay".to_owned(),
             ));
@@ -4870,6 +5303,8 @@ fn decode_sector_spectrum(
             eigenvalue: eigenvalues[index].clone(),
             eigenvector,
             residual_norm: residual,
+            eigenvalue_lower: bounds[index].0.clone(),
+            eigenvalue_upper: bounds[index].1.clone(),
         });
     }
     Ok(CcmSectorSpectrumHp {
@@ -4890,7 +5325,7 @@ fn validate_sector_spectrum_identity(
     dimension: usize,
     requested_eigenpairs: usize,
 ) -> std::result::Result<(), CacheError> {
-    if artifact.schema_version != 1
+    if artifact.schema_version != 2
         || artifact.lambda_squared != lambda_squared_cache_identity(params)
         || artifact.n_modes != params.n_modes
         || artifact.precision_bits != cfg.precision_bits
@@ -4901,6 +5336,7 @@ fn validate_sector_spectrum_identity(
         || artifact.eigenvalues.len() != requested_eigenpairs
         || artifact.eigenvectors.len() != requested_eigenpairs
         || artifact.residual_norms.len() != requested_eigenpairs
+        || artifact.eigenvalue_bounds.len() != requested_eigenpairs
     {
         return Err(CacheError::InvalidManifest(
             "CCM sector spectrum does not match its semantic identity".to_owned(),
@@ -4932,7 +5368,8 @@ fn resolve_sector_spectrum_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_sector_spectrum".to_owned(),
-        mathematical_semantics_version: "ccm-parity-sector-spectrum-v0.15.0-v1".to_owned(),
+        mathematical_semantics_version: "ccm-parity-sector-spectrum-source-enclosures-v3"
+            .to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -4943,15 +5380,19 @@ fn resolve_sector_spectrum_via_cache(
             "sector_matrix_content_digest": matrix_manifest.content_digest.0,
             "sector_eigenvalues_content_digest": eigenvalues_manifest.content_digest.0,
             "sector_tridiagonal_content_digest": tridiagonal_manifest.content_digest.0,
-            "sector_transform_content_digest": transform_manifest.content_digest.0
+            "sector_transform_content_digest": transform_manifest.content_digest.0,
+            "l2_normalization_arithmetic": xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2,
+            "source_uncertainty_arithmetic": sector_resolution::ARITHMETIC,
+            "tridiagonal_eigenvector_semantics": xc_numerics::eigen::TridiagSolver::BandedInterleaved.semantics_id(),
+            "eigenvector_iteration_limit": cfg.inverse_iter_steps,
+            "eigenvector_early_termination": true
         }),
         normalization: Some("l2_unit_sector_vectors_algebraic_order".to_owned()),
         target: Some("lowest_parity_sector_eigenpairs".to_owned()),
         subspace: Some(parity.as_str().to_owned()),
         source_data_identities: BTreeMap::new(),
         algorithm_semantics: Some(
-            "indexed_eigenvalues_interleaved_pivoted_solve_stable_householder_backtransform_v2"
-                .to_owned(),
+            "indexed_parent_unit_vectors_directed_similarity_eigenvalue_enclosures_v5".to_owned(),
         ),
     };
     let logical_key = format!(
@@ -4989,6 +5430,14 @@ fn resolve_sector_spectrum_via_cache(
     // Validation decodes and replays every portable spectrum. Retain that
     // validated runtime value so the caller does not parse the same HP decimal
     // vectors and repeat every residual calculation a second time.
+    let source_bounds = sector_resolution::bounds(
+        matrix,
+        tridiagonal,
+        transform,
+        eigenvalues,
+        requested_eigenpairs,
+        cfg.precision_bits,
+    )?;
     let validated_spectrum = RefCell::new(None);
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
@@ -5028,6 +5477,8 @@ fn resolve_sector_spectrum_via_cache(
                 matrix,
                 dimension,
                 requested_eigenpairs,
+                &eigenvalues.values,
+                &source_bounds,
             )?;
             validated_spectrum.replace(Some(spectrum));
             Ok(())
@@ -5066,23 +5517,55 @@ fn compute_sector_gap(
     {
         bail!("CCM sector-gap analysis requires two ordered eigenpairs per parity sector");
     }
+    // Carry the indexed source intervals into every categorical conclusion.
+    // The eight-bit relative floor prevents a near-zero enclosure midpoint
+    // from masquerading as a resolved logarithmic depth.
+    let even_interval = sector_resolution::require_relative(&even.eigenpairs[0], precision_bits)?;
+    let odd_interval = sector_resolution::require_relative(&odd.eigenpairs[0], precision_bits)?;
+    let next_even = sector_resolution::interval(&even.eigenpairs[1], precision_bits)?;
+    let difference_interval = odd_interval.sub(&even_interval);
+    if difference_interval.lower() <= &0 && difference_interval.upper() >= &0 {
+        bail!("CCM sector resolution limit: even/odd ordering is unresolved");
+    }
+    if next_even.lower() <= even_interval.upper() {
+        bail!("CCM sector resolution limit: even ground-state simplicity is unresolved");
+    }
+    let even_abs = super::retained_evidence::finite_math::abs(&even_interval)?;
+    let odd_abs = super::retained_evidence::finite_math::abs(&odd_interval)?;
+    let gap_interval = odd_abs
+        .ln()?
+        .sub(&even_abs.ln()?)
+        .div(&xc_numerics::mpfr_interval::MpfrInterval::from_i64(10, precision_bits + 64).ln()?)?;
     let lambda_even = even.eigenpairs[0].eigenvalue.clone();
     let lambda_odd = odd.eigenpairs[0].eigenvalue.clone();
     let d_even = negative_log10_abs(&lambda_even, precision_bits)?;
     let d_odd = negative_log10_abs(&lambda_odd, precision_bits)?;
-    let mut gap_log = d_even.clone();
-    gap_log -= &d_odd;
-    let mut lambda_difference = lambda_odd.clone();
-    lambda_difference -= &lambda_even;
+    let mut gap_log =
+        sector_gap_math::log_magnitude_ratio(&lambda_odd, &lambda_even, precision_bits)?;
+    // A complete-QR point estimate need not lie inside the independently
+    // obtained source enclosure. Preserve the cancellation-resistant estimate
+    // when supported; otherwise use the source interval's midpoint. Include
+    // the final p-bit rounding in the published enclosure as well.
+    if &gap_log < gap_interval.lower() || &gap_log > gap_interval.upper() {
+        gap_log = Float::with_val(precision_bits, gap_interval.midpoint_point().lower());
+    }
+    let gap_log_lower = gap_interval.lower().clone().min(&gap_log);
+    let gap_log_upper = gap_interval.upper().clone().max(&gap_log);
+    let lambda_difference = super::retained_evidence::point::sum(
+        &[lambda_odd.clone(), -lambda_even.clone()],
+        precision_bits,
+    )?;
     let difference_depth = negative_log10_abs(&lambda_difference, precision_bits)?;
-    let ordering = match lambda_difference.cmp0() {
-        Some(std::cmp::Ordering::Greater) => 1,
-        Some(std::cmp::Ordering::Less) => -1,
-        _ => 0,
+    let ordering = if difference_interval.lower() > &0 {
+        1
+    } else {
+        -1
     };
-    let mut even_simplicity_margin = even.eigenpairs[1].eigenvalue.clone();
-    even_simplicity_margin -= &lambda_even;
-    let even_simple = even_simplicity_margin > 0;
+    let even_simplicity_margin = super::retained_evidence::point::sum(
+        &[even.eigenpairs[1].eigenvalue.clone(), -lambda_even.clone()],
+        precision_bits,
+    )?;
+    let even_simple = true; // next_even.lower() > even_interval.upper() was proved above.
     Ok(CcmSectorGapHp {
         even,
         odd,
@@ -5091,6 +5574,8 @@ fn compute_sector_gap(
         d_even,
         d_odd,
         gap_log,
+        gap_log_lower,
+        gap_log_upper,
         lambda_difference,
         difference_depth,
         ordering,
@@ -5107,7 +5592,7 @@ fn portable_sector_gap(
     odd_manifest: &ArtifactManifest,
 ) -> PortableSectorGap {
     PortableSectorGap {
-        schema_version: 1,
+        schema_version: 2,
         lambda_squared: lambda_squared_cache_identity(params),
         n_modes: params.n_modes,
         precision_bits: cfg.precision_bits,
@@ -5118,6 +5603,8 @@ fn portable_sector_gap(
         d_even: result.d_even.to_string(),
         d_odd: result.d_odd.to_string(),
         gap_log: result.gap_log.to_string(),
+        gap_log_lower: result.gap_log_lower.to_string(),
+        gap_log_upper: result.gap_log_upper.to_string(),
         lambda_difference: result.lambda_difference.to_string(),
         difference_depth: result.difference_depth.to_string(),
         ordering: result.ordering,
@@ -5138,21 +5625,22 @@ fn resolve_sector_gap_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_sector_gap".to_owned(),
-        mathematical_semantics_version: "ccm-even-odd-gap-log-v0.13.0-v1".to_owned(),
+        mathematical_semantics_version: "ccm-even-odd-gap-log-source-resolved-v3".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
             "precision_bits": cfg.precision_bits,
             "even_spectrum_content_digest": even_manifest.content_digest.0,
             "odd_spectrum_content_digest": odd_manifest.content_digest.0,
-            "definition": "log10(abs(lambda_odd)/abs(lambda_even))"
+            "definition": "log10(abs(lambda_odd)/abs(lambda_even))",
+            "source_uncertainty_arithmetic": sector_resolution::ARITHMETIC
         }),
         normalization: None,
         target: Some("finite_ccm_even_odd_sector_gap".to_owned()),
         subspace: Some("even_vs_odd".to_owned()),
         source_data_identities: BTreeMap::new(),
         algorithm_semantics: Some(
-            "mpfr_depth_difference_and_direct_eigenvalue_ordering".to_owned(),
+            "indexed_source_interval_resolved_log_ratio_ordering_and_simplicity_v3".to_owned(),
         ),
     };
     let logical_key = format!(
@@ -5229,7 +5717,7 @@ fn resolve_sector_branch_via_cache(
     };
     let (tridiagonal, tridiagonal_manifest, precomputed_transform) =
         resolve_sector_tridiagonal_via_cache(params, cfg, parity, matrix, matrix_manifest, cache)?;
-    let (transform, transform_manifest) = resolve_sector_transform_via_cache(
+    let (transform, transform_manifest, _source_allowance) = resolve_sector_transform_via_cache(
         params,
         cfg,
         parity,
@@ -5308,7 +5796,8 @@ fn analyze_sector_gap_inner(
     options: CcmSectorAnalysisOptions,
     cache: Option<&ArtifactCacheContext<'_>>,
 ) -> Result<CcmSectorGapHp> {
-    let l = log_lambda_sq_hp(params, cfg.precision_bits);
+    validate_source_shape(params.n_modes, cfg.precision_bits, cfg.quad_points)?;
+    let l = log_lambda_sq_hp(params, cfg.precision_bits)?;
     let source = if let Some(cache) = cache {
         let (tau, tau_manifest) = build_tau_hp_via_cache(params, &l, cfg, cache)?;
         RetainedCcmSource {
@@ -5402,7 +5891,7 @@ fn analyze_sector_gap_from_retained_source(
             anyhow::anyhow!("managed retained CCM source is missing its Tau manifest")
         })?;
         let mut tau = source.tau;
-        force_symmetric(&mut tau, params.matrix_size());
+        force_symmetric(&mut tau, params.matrix_size())?;
         let (even_matrix, even_matrix_manifest) =
             resolve_even_sector_matrix_via_cache(params, cfg, &tau, &tau_manifest, cache)?;
         let (odd_matrix, odd_matrix_manifest) =
@@ -5452,9 +5941,9 @@ fn analyze_sector_gap_from_retained_source(
         })
     } else {
         let mut tau = source.tau;
-        force_symmetric(&mut tau, params.matrix_size());
-        let even_matrix = build_even_sector_matrix(&tau, params.n_modes, cfg.precision_bits);
-        let odd_matrix = build_odd_sector_matrix(&tau, params.n_modes, cfg.precision_bits);
+        force_symmetric(&mut tau, params.matrix_size())?;
+        let even_matrix = build_even_sector_matrix(&tau, params.n_modes, cfg.precision_bits)?;
+        let odd_matrix = build_odd_sector_matrix(&tau, params.n_modes, cfg.precision_bits)?;
         let (even, odd) = rayon::join(
             || {
                 compute_sector_branch(
@@ -5555,16 +6044,33 @@ pub fn analyze_sector_gap_with_options_via_cache(
     xc_numerics::hp_runtime::run_hp(|| analyze_sector_gap_inner(params, cfg, options, Some(cache)))
 }
 
-fn factorization_probe_backward_error(
+fn factorization_backward_error(
     matrix: &[Float],
     factors: &xc_numerics::linalg::LuFactors,
     dimension: usize,
     precision_bits: u32,
 ) -> Option<Float> {
-    if matrix.len() != dimension * dimension
-        || factors.lu.len() != dimension * dimension
+    use super::retained_evidence::finite_math::{abs, scale_float};
+    use rug::float::Round;
+    use xc_numerics::mpfr_interval::MpfrInterval as I;
+    if dimension == 0
+        || !(64..=1_000_000).contains(&precision_bits)
+        || dimension.checked_mul(dimension) != Some(matrix.len())
+        || factors.lu.len() != matrix.len()
         || factors.perm.len() != dimension
+        || matrix
+            .iter()
+            .chain(&factors.lu)
+            .any(|x| !x.is_finite() || x.prec() > precision_bits)
     {
+        return None;
+    }
+    let work = precision_bits + 64;
+    let buffers = (matrix.len() as u64)
+        .saturating_mul(4)
+        .saturating_add((dimension as u64).saturating_mul(4))
+        .saturating_add(128);
+    if buffers.saturating_mul(u64::from(work).div_ceil(8) + 64) > (8u64 << 30) {
         return None;
     }
     let mut seen = vec![false; dimension];
@@ -5574,72 +6080,66 @@ fn factorization_probe_backward_error(
         }
         seen[index] = true;
     }
-    if matrix.iter().any(|value| !value.is_finite())
-        || factors.lu.iter().any(|value| !value.is_finite())
-    {
+    for i in 0..dimension {
+        if factors.lu[i * dimension + i].is_zero() {
+            return None;
+        }
+        // Partial pivoting has |L_ij|<=1. An invalid multiplier is not a
+        // reason to enlarge the factorization's permitted reconstruction error.
+        for j in 0..i {
+            if factors.lu[i * dimension + j].clone().abs() > 1 {
+                return None;
+            }
+        }
+    }
+    let exponent = i64::from(matrix.iter().filter_map(Float::get_exp).max()?);
+    let mut combined = Vec::with_capacity(matrix.len());
+    for (k, x) in factors.lu.iter().enumerate() {
+        let value = if k / dimension <= k % dimension {
+            scale_float(x, -exponent, work).ok()?
+        } else {
+            Float::with_val(work, x)
+        };
+        combined.push(I::point(value));
+    }
+    let mut norm_lower = Float::with_val(work, 0);
+    for row in matrix.chunks(dimension) {
+        let terms = row
+            .iter()
+            .map(|x| scale_float(&x.clone().abs(), -exponent, work))
+            .collect::<Result<Vec<_>>>()
+            .ok()?;
+        let bound = Float::with_val_round(work, Float::sum(terms.iter()), Round::Down).0;
+        norm_lower = norm_lower.max(&bound);
+    }
+    if norm_lower <= 0 || !norm_lower.is_finite() {
         return None;
     }
-    let mut worst = Float::with_val(precision_bits, 0);
-    // Three deterministic independent probes, O(d^2) each. This is a
-    // solve-backward-error screen, not a full PA=LU certificate.
-    for probe in 0..3 {
-        let rhs: Vec<Float> = (0..dimension)
-            .map(|index| match probe {
-                0 => Float::with_val(precision_bits, index + 1),
-                1 => Float::with_val(precision_bits, if index % 2 == 0 { 1 } else { -1 }),
-                _ => Float::with_val(precision_bits, 1),
-            })
-            .collect();
-        let solution = xc_numerics::linalg::lu_solve(factors, &rhs, dimension, precision_bits);
-        if solution.iter().any(|value| !value.is_finite()) {
-            return None;
-        }
-        let mut maximum_residual = Float::with_val(precision_bits, 0);
-        let mut matrix_norm = Float::with_val(precision_bits, 0);
-        for row in 0..dimension {
-            let mut value = Float::with_val(precision_bits, 0);
-            let mut row_sum = Float::with_val(precision_bits, 0);
-            for column in 0..dimension {
-                let mut term = matrix[row * dimension + column].clone();
-                row_sum += term.clone().abs();
-                term *= &solution[column];
-                value += term;
+    // Replay every entry of PA=LU with outward arithmetic. A few sample
+    // solves cannot detect factor errors on their common orthogonal complement.
+    let mut error_upper = Float::with_val(work, 0);
+    for i in 0..dimension {
+        let mut row_error = I::from_i64(0, work);
+        for j in 0..dimension {
+            let mut product = I::from_i64(0, work);
+            for k in 0..=i.min(j) {
+                let term = if k == i {
+                    combined[k * dimension + j].clone()
+                } else {
+                    combined[i * dimension + k].mul(&combined[k * dimension + j])
+                };
+                product = product.add(&term);
             }
-            if row_sum > matrix_norm {
-                matrix_norm = row_sum;
-            }
-            value -= &rhs[row];
-            let residual = value.abs();
-            if residual > maximum_residual {
-                maximum_residual = residual;
-            }
+            let expected = I::point(
+                scale_float(&matrix[factors.perm[i] * dimension + j], -exponent, work).ok()?,
+            );
+            row_error = row_error.add(&abs(&expected.sub(&product)).ok()?);
         }
-        let mut solution_norm = Float::with_val(precision_bits, 0);
-        for value in &solution {
-            let magnitude = value.clone().abs();
-            if magnitude > solution_norm {
-                solution_norm = magnitude;
-            }
-        }
-        let mut rhs_norm = Float::with_val(precision_bits, 0);
-        for value in &rhs {
-            let magnitude = value.clone().abs();
-            if magnitude > rhs_norm {
-                rhs_norm = magnitude;
-            }
-        }
-        let mut scale = matrix_norm;
-        scale *= solution_norm;
-        scale += rhs_norm;
-        if scale.is_zero() || !scale.is_finite() {
-            return None;
-        }
-        maximum_residual /= scale;
-        if maximum_residual > worst {
-            worst = maximum_residual;
-        }
+        row_error.validate().ok()?;
+        error_upper = error_upper.max(row_error.upper());
     }
-    Some(worst)
+    let result = Float::with_val_round(precision_bits, &error_upper / &norm_lower, Round::Up).0;
+    result.is_finite().then_some(result)
 }
 
 fn resolve_factorization_via_cache(
@@ -5748,10 +6248,9 @@ fn resolve_factorization_via_cache(
                 lu: parse_hp_vector(&artifact.lu, cfg.precision_bits)?,
                 perm: artifact.permutation.clone(),
             };
-            let tolerance =
-                Float::with_val(cfg.precision_bits, 2).pow(-((cfg.precision_bits / 4) as i32));
+            let tolerance = Float::with_val(cfg.precision_bits, 1) >> (cfg.precision_bits - 32);
             let backward_error =
-                factorization_probe_backward_error(matrix, &factors, dimension, cfg.precision_bits)
+                factorization_backward_error(matrix, &factors, dimension, cfg.precision_bits)
                     .ok_or_else(|| {
                         CacheError::InvalidManifest(
                     "CCM factorization has invalid dimensions, permutation, or finite values"
@@ -5762,13 +6261,11 @@ fn resolve_factorization_via_cache(
                 validated_factors.replace(Some(factors));
                 Ok(())
             } else {
-                Err(CacheError::InvalidManifest(
-                    format!(
-                        "CCM factorization failed its three-probe normwise solve-backward-error check: error={}, tolerance={}",
-                        xc_numerics::fmt::display_hp(&backward_error, 8),
-                        xc_numerics::fmt::display_hp(&tolerance, 8)
-                    ),
-                ))
+                Err(CacheError::InvalidManifest(format!(
+                    "CCM factorization failed its directed full PA=LU reconstruction check: error={}, tolerance={}",
+                    xc_numerics::fmt::display_hp(&backward_error, 8),
+                    xc_numerics::fmt::display_hp(&tolerance, 8)
+                )))
             }
         },
     )?;
@@ -5813,25 +6310,35 @@ impl LinearOperator<Float> for BorrowedDenseSymmetricHp<'_> {
                 actual: y.len(),
             });
         }
+        if self.dimension == 0
+            || self.dimension.checked_mul(self.dimension) != Some(self.entries.len())
+            || !(64..=1_000_000).contains(&self.precision_bits)
+            || self
+                .entries
+                .iter()
+                .chain(x)
+                .any(|v| !v.is_finite() || v.prec() > self.precision_bits)
+        {
+            return Err(OperatorError::InvalidData(
+                "invalid borrowed matrix points, shape, or precision".into(),
+            ));
+        }
         let apply_row = |row: &[Float]| {
-            let mut sum = Float::with_val(self.precision_bits, 0);
-            for (entry, component) in row.iter().zip(x) {
-                let mut term = Float::with_val(self.precision_bits, entry);
-                term *= component;
-                sum += term;
-            }
-            sum
+            super::retained_evidence::point::dot(row, x, self.precision_bits)
+                .map_err(|error| OperatorError::ApplicationFailed(error.to_string()))
         };
-        if self.dimension < BORROWED_DENSE_PARALLEL_MIN_DIMENSION {
-            for (row, output) in self.entries.chunks_exact(self.dimension).zip(y.iter_mut()) {
-                *output = apply_row(row);
-            }
+        let output = if self.dimension < BORROWED_DENSE_PARALLEL_MIN_DIMENSION {
+            self.entries
+                .chunks_exact(self.dimension)
+                .map(apply_row)
+                .collect::<std::result::Result<Vec<_>, _>>()?
         } else {
             self.entries
                 .par_chunks_exact(self.dimension)
-                .zip(y.par_iter_mut())
-                .for_each(|(row, output)| *output = apply_row(row));
-        }
+                .map(apply_row)
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        y.clone_from_slice(&output);
         Ok(())
     }
 
@@ -5851,7 +6358,11 @@ impl LinearOperator<Float> for BorrowedDenseSymmetricHp<'_> {
     }
 }
 
-impl SymmetricOperator<Float> for BorrowedDenseSymmetricHp<'_> {}
+impl SymmetricOperator<Float> for BorrowedDenseSymmetricHp<'_> {
+    fn stored_symmetric_entries(&self) -> Option<&[Float]> {
+        Some(self.entries)
+    }
+}
 
 struct RetainedCcmLuShiftInvert<'a> {
     factors: &'a xc_numerics::linalg::LuFactors,
@@ -5886,15 +6397,37 @@ impl xc_solver::ShiftInvertSolveHp for RetainedCcmLuShiftInvert<'_> {
                 "retained CCM LU solve has incompatible precision or dimensions".to_owned(),
             ));
         }
-        let solution = xc_numerics::linalg::lu_solve(
+        let solution = xc_numerics::linalg::try_lu_solve(
             self.factors,
             right_hand_side,
             self.dimension,
             working_precision_bits,
-        );
+        )
+        .map_err(|e| xc_solver::SolverError::NumericalBreakdown(e.to_string()))?;
         output.clone_from_slice(&solution);
         Ok(())
     }
+}
+
+// Resolving every retained guard from A^-1 can consume about p bits when
+// the selected eigenvalue is near the stored matrix's p-bit rounding scale.
+// Double precision plus 64 guard bits preserves the original p-derived
+// stopping thresholds. This bounded arithmetic policy is not a source-error
+// bound; unresolved or excessively conditioned systems still fail the gates.
+fn krylov_working_precision(dimension: usize, subspace: usize, p: u32) -> Result<u32> {
+    if dimension == 0 || subspace == 0 || subspace > dimension || !(64..=1_000_000).contains(&p) {
+        bail!("invalid CCM Krylov working precision or shape");
+    }
+    let work = p.saturating_mul(2).saturating_add(64).min(1_000_000);
+    // Include original/guarded sectors and LU, projected inverse/Jacobi,
+    // retained basis/images/restart vectors, and reconstruction scratch.
+    let n = dimension as u128;
+    let k = subspace as u128;
+    let values = 16 * n * n + 8 * n * k + 8 * k * k + 32 * n + 128;
+    if values * (u128::from(work + 64).div_ceil(8) + 160) > (8u128 << 30) {
+        bail!("CCM guarded Krylov exceeds numerical workspace budget");
+    }
+    Ok(work)
 }
 
 fn krylov_tolerance(precision_bits: u32) -> DecimalLiteral {
@@ -5906,29 +6439,6 @@ fn krylov_tolerance(precision_bits: u32) -> DecimalLiteral {
         u64::from(precision_bits.saturating_sub(24)).saturating_mul(30_103) / 100_000;
     DecimalLiteral::new(format!("1e-{}", decimal_digits.max(12)))
         .expect("generated Krylov tolerance is a valid decimal literal")
-}
-
-fn krylov_inverse_compatibility_diagnostics(
-    report: &xc_solver::ShiftInvertKrylovReportHp,
-) -> xc_numerics::linalg::InverseIterationDiagnostics {
-    use xc_numerics::linalg::ShiftedRefinementOutcome;
-    let configured_step_limit = report
-        .maximum_subspace_dimension
-        .saturating_mul(report.restarts.max(1));
-    xc_numerics::linalg::InverseIterationDiagnostics {
-        configured_step_limit,
-        unshifted_steps: report.shifted_solves.min(configured_step_limit),
-        unshifted_converged: report.status == ResultStatus::Converged,
-        final_relative_rayleigh_change: Some(report.maximum_ritz_value_stability.clone()),
-        shifted_refinement: ShiftedRefinementOutcome::Accepted,
-        final_relative_residual_norm: report
-            .retained_eigenpairs
-            .first()
-            .map(|pair| pair.scaled_backward_error.clone())
-            .unwrap_or_else(|| {
-                Float::with_val(report.factorization.factorization_precision_bits, 0)
-            }),
-    }
 }
 
 fn weil_eigenpair_via_cache(
@@ -5967,10 +6477,10 @@ pub(crate) fn resolve_canonical_even_eigenstate_via_cache(
     even_cfg.set_parity_policy(CcmParityPolicy::EvenSector);
     let precision_bits = even_cfg.precision_bits;
     let dimension = params.matrix_size();
-    let log_lambda_squared = log_lambda_sq_hp(params, precision_bits);
+    let log_lambda_squared = log_lambda_sq_hp(params, precision_bits)?;
     let (mut tau, tau_manifest) =
         build_tau_hp_via_cache(params, &log_lambda_squared, &even_cfg, cache)?;
-    force_symmetric(&mut tau, dimension);
+    force_symmetric(&mut tau, dimension)?;
     let (eigenvalue, eigenvector, diagnostics, manifest, _) = weil_eigenpair_via_cache_with_seed(
         params,
         &even_cfg,
@@ -6013,10 +6523,40 @@ pub(crate) fn resolve_canonical_even_eigenstate_via_cache(
     })
 }
 
+const MANAGED_EIGENSTATE_SOURCE_IDENTITY: &str = "validated_tau_dependency_and_exact_log_source_v2";
+
+fn validate_managed_source_length(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+) -> Result<()> {
+    validate_source_shape(params.n_modes, cfg.precision_bits, cfg.quad_points)?;
+    ground_index::preflight(
+        params.matrix_size(),
+        cfg.precision_bits,
+        cfg.effective_parity_policy(),
+    )?;
+    if !l.is_finite()
+        || l.prec() != cfg.precision_bits
+        || *l != log_lambda_sq_hp(params, cfg.precision_bits)?
+    {
+        bail!("managed CCM source length differs from its exact cutoff and precision");
+    }
+    Ok(())
+}
+
 fn weil_eigenpair_cache_identity(
     params: &CcmParams,
     cfg: &HighPrecConfig,
+    tau_manifest: &ArtifactManifest,
 ) -> Result<(SemanticKeyEnvelope, String)> {
+    tau_manifest.validate()?;
+    if tau_manifest.key.kind != "ccm_tau_matrix"
+        || !tau_manifest.immutable
+        || tau_manifest.quality.admissible_rank() < CacheQuality::Validated.admissible_rank()
+    {
+        bail!("managed eigenpair requires a validated immutable Tau dependency");
+    }
     let prec = cfg.precision_bits;
     let route = cfg.eigenstate_solver.as_str();
     let parity_policy = cfg.effective_parity_policy();
@@ -6040,25 +6580,62 @@ fn weil_eigenpair_cache_identity(
             "eigenstate_route": route,
             "krylov_subspace_dimension": cfg.krylov_subspace_dimension,
             "krylov_maximum_restarts": cfg.krylov_maximum_restarts,
-            "krylov_guard_eigenpairs": cfg.krylov_guard_eigenpairs
+            "krylov_guard_eigenpairs": cfg.krylov_guard_eigenpairs,
+            "polishing_inverse_iteration_step_limit": cfg.inverse_iter_steps,
+            "polishing_residual_policy": "directed_nonworsening_16_dim_ulp_matrix_floor_budgeted_phases_v2"
         }),
         CcmEigenstateSolver::Auto => {
             bail!("automatic CCM eigenstate selection must be resolved before key construction")
         }
     };
+    resolved_mathematical_parameters["source_identity_arithmetic"] =
+        serde_json::json!(MANAGED_EIGENSTATE_SOURCE_IDENTITY);
+    resolved_mathematical_parameters["tau_source_identity"] = serde_json::json!(DependencyRef {
+        key: tau_manifest.key.clone(),
+        content_digest: tau_manifest.content_digest.clone(),
+        required_quality: CacheQuality::Validated,
+    });
+    resolved_mathematical_parameters["l2_normalization_arithmetic"] =
+        serde_json::json!(xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2);
+    if cfg.eigenstate_solver == CcmEigenstateSolver::ShiftInvertKrylov {
+        resolved_mathematical_parameters["krylov_working_precision_bits"] =
+            serde_json::json!(krylov_working_precision(
+                params.n_modes + 1,
+                cfg.krylov_subspace_dimension.min(params.n_modes + 1),
+                prec
+            )?);
+        resolved_mathematical_parameters["krylov_precision_policy"] =
+            serde_json::json!("same_stored_sector_double_source_plus_64_capped_one_million_v1");
+        resolved_mathematical_parameters["source_boundary_count_semantics"] =
+            serde_json::json!(xc_solver::HP_KRYLOV_COUNT_SEMANTICS);
+        resolved_mathematical_parameters["boundary_cluster_resolution_policy"] =
+            serde_json::json!(stored_resolution::ARITHMETIC);
+        resolved_mathematical_parameters["borrowed_dense_action"] =
+            serde_json::json!("exact_products_guarded_sum_v2");
+    }
+    resolved_mathematical_parameters["parity_basis_arithmetic"] =
+        serde_json::json!(parity_math::ARITHMETIC);
+    resolved_mathematical_parameters["state_normalization_arithmetic"] =
+        serde_json::json!(state_normalization_math::ARITHMETIC);
+    resolved_mathematical_parameters["tau_residual_arithmetic"] =
+        serde_json::json!(standalone_cache::RESIDUAL_ARITHMETIC);
+    resolved_mathematical_parameters["ground_index_validation"] =
+        serde_json::json!(ground_index::ARITHMETIC);
+    resolved_mathematical_parameters["inverse_iteration_semantics"] =
+        serde_json::json!(xc_numerics::linalg::INVERSE_ITERATION_SEMANTICS);
     add_adaptive_parity_parameter(&mut resolved_mathematical_parameters, parity_policy);
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_weil_eigenpair".to_owned(),
         mathematical_semantics_version: match (cfg.eigenstate_solver, parity_policy) {
             (CcmEigenstateSolver::LegacyInverseIteration, CcmParityPolicy::AdaptiveEven) => {
-                "ccm-smallest-weil-eigenpair-adaptive-even-v1"
+                "ccm-smallest-weil-eigenpair-adaptive-even-resolution-v2"
             }
             (CcmEigenstateSolver::LegacyInverseIteration, _) => {
-                "ccm-smallest-weil-eigenpair-v0.13.0-v3"
+                "ccm-smallest-weil-eigenpair-stored-resolution-v4"
             }
             (CcmEigenstateSolver::ShiftInvertKrylov, _) => {
-                "ccm-smallest-weil-eigenpair-shift-invert-krylov-v1"
+                "ccm-smallest-weil-eigenpair-shift-invert-krylov-guarded-resolution-v6"
             }
             (CcmEigenstateSolver::Auto, _) => unreachable!(),
         }
@@ -6077,7 +6654,7 @@ fn weil_eigenpair_cache_identity(
                 (CcmEigenstateSolver::LegacyInverseIteration, _) =>
                     "dense_inverse_iteration_with_half_precision_basin_shifted_rescue_and_full_tau_residual_gate_v1",
                 (CcmEigenstateSolver::ShiftInvertKrylov, _) =>
-                    "ccm_even_zero_shift_thick_restart_shift_invert_krylov_rayleigh_ritz_v1",
+                    "ccm_even_zero_shift_krylov_guarded_lu_polish_resolution_v6",
                 (CcmEigenstateSolver::Auto, _) => unreachable!(),
             }
             .to_owned(),
@@ -6160,6 +6737,18 @@ fn weil_eigenpair_via_cache_with_seed(
     ArtifactManifest,
     CcmEigenstateSolver,
 )> {
+    validate_managed_source_length(params, cfg, l)?;
+    let dimension = params.matrix_size();
+    if dimension.checked_mul(dimension) != Some(tau.len())
+        || tau
+            .iter()
+            .any(|v| !v.is_finite() || v.prec() != cfg.precision_bits)
+        || !matrix_is_exactly_symmetric(tau, dimension)
+    {
+        bail!(
+            "managed eigenpair source must be a finite symmetric matrix at the declared precision"
+        );
+    }
     // A persisted eigenpair is a pure function of its semantic identity:
     // the solve always starts from the canonical initial state. Neither
     // cache contents (a discovered lower-N state) nor an explicitly offered
@@ -6192,7 +6781,8 @@ fn weil_eigenpair_via_cache_with_seed(
             );
         }
         selected.eigenstate_solver = CcmEigenstateSolver::ShiftInvertKrylov;
-        let (semantic_key, logical_key) = weil_eigenpair_cache_identity(params, &selected)?;
+        let (semantic_key, logical_key) =
+            weil_eigenpair_cache_identity(params, &selected, tau_manifest)?;
         if consult_exact_cache && accepted_identity_exists(&semantic_key, &logical_key, cache)? {
             return weil_eigenpair_via_cache_with_seed(
                 params,
@@ -6206,7 +6796,8 @@ fn weil_eigenpair_via_cache_with_seed(
             );
         }
         selected.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
-        let (semantic_key, logical_key) = weil_eigenpair_cache_identity(params, &selected)?;
+        let (semantic_key, logical_key) =
+            weil_eigenpair_cache_identity(params, &selected, tau_manifest)?;
         if consult_exact_cache && accepted_identity_exists(&semantic_key, &logical_key, cache)? {
             return weil_eigenpair_via_cache_with_seed(
                 params,
@@ -6274,7 +6865,7 @@ fn weil_eigenpair_via_cache_with_seed(
         || "canonical".to_owned(),
         |manifest| format!("from-eigenpair-{}", manifest.content_digest.0),
     );
-    let (semantic_key, logical_key) = weil_eigenpair_cache_identity(params, cfg)?;
+    let (semantic_key, logical_key) = weil_eigenpair_cache_identity(params, cfg, tau_manifest)?;
     let mut tags = BTreeMap::from([
         ("domain".to_owned(), "ccm".to_owned()),
         ("artifact".to_owned(), "weil_eigenpair".to_owned()),
@@ -6312,7 +6903,7 @@ fn weil_eigenpair_via_cache_with_seed(
     let resolved = resolve_or_compute_json_artifact_with_dependencies(
         &request,
         || {
-            let (eps_n, xi, diagnostics, factor_manifest, krylov_diagnostics) = if parity_policy
+            let (eps_n, xi, diagnostics, factor_manifests, krylov_diagnostics) = if parity_policy
                 == CcmParityPolicy::EvenSector
             {
                 let (sector, sector_manifest) =
@@ -6343,9 +6934,10 @@ fn weil_eigenpair_via_cache_with_seed(
                             expand_even_sector_vector(&output.eigenvector, params.n_modes, prec);
                         (
                             output.eigenvalue,
-                            normalize_eigenvector(&expanded, l, prec),
+                            normalize_eigenvector(&expanded, l, prec)
+                                .map_err(|e| CacheError::InvalidManifest(e.to_string()))?,
                             output.diagnostics,
-                            factor_manifest,
+                            vec![factor_manifest],
                             None,
                         )
                     }
@@ -6361,22 +6953,44 @@ fn weil_eigenpair_via_cache_with_seed(
                                     .to_owned(),
                             ));
                         }
+                        let working_precision =
+                            krylov_working_precision(dimension, maximum_subspace_dimension, prec)
+                                .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+                        // Lift the exact stored dyadic sector, without rebuilding Tau
+                        // or changing its source precision. Retain the actual guarded
+                        // LU as a separate dependency from output-precision polishing.
+                        let guarded_sector: Vec<Float> = sector
+                            .iter()
+                            .map(|entry| Float::with_val(working_precision, entry))
+                            .collect();
+                        let mut guarded_cfg = cfg.clone();
+                        guarded_cfg.precision_bits = working_precision;
+                        let (guarded_factors, guarded_factor_manifest) =
+                            resolve_factorization_via_cache(
+                                params,
+                                &guarded_cfg,
+                                &guarded_sector,
+                                &sector_manifest,
+                                "even",
+                                cache,
+                            )
+                            .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
                         let operator = BorrowedDenseSymmetricHp {
                             name: "ccm-even-sector",
                             dimension,
                             entries: &sector,
-                            precision_bits: prec,
+                            precision_bits: working_precision,
                         };
                         let shifted = RetainedCcmLuShiftInvert {
-                            factors: &factors,
+                            factors: &guarded_factors,
                             dimension,
-                            precision_bits: prec,
-                            id: format!("ccm-even-lu:{}", factor_manifest.content_digest.0),
+                            precision_bits: working_precision,
+                            id: format!("ccm-even-lu:{}", guarded_factor_manifest.content_digest.0),
                         };
                         let tolerance = krylov_tolerance(prec);
                         let solver_config = xc_solver::ShiftInvertKrylovConfigHp {
                             target: EigenTarget::SmallestMagnitude,
-                            precision_bits: prec,
+                            precision_bits: working_precision,
                             requested_eigenpairs: 1,
                             guard_eigenpairs: cfg.krylov_guard_eigenpairs,
                             maximum_subspace_dimension,
@@ -6386,7 +7000,12 @@ fn weil_eigenpair_via_cache_with_seed(
                             absolute_residual_tolerance: tolerance.clone(),
                             scaled_backward_error_tolerance: tolerance.clone(),
                             ritz_value_stability_tolerance: tolerance.clone(),
-                            boundary_cluster_tolerance: tolerance,
+                            boundary_cluster_tolerance: DecimalLiteral::new(
+                                stored_resolution::matrix_rounding_scale(&sector, dimension, prec)
+                                    .map_err(|e| CacheError::InvalidManifest(e.to_string()))?
+                                    .to_string_radix_round(10, None, rug::float::Round::Up),
+                            )
+                            .map_err(|e| CacheError::InvalidManifest(e.to_string()))?,
                         };
                         let initial_basis = continuation_seed
                             .map(|seed| vec![seed.to_vec()])
@@ -6404,20 +7023,40 @@ fn weil_eigenpair_via_cache_with_seed(
                             || report.retained_eigenpairs.is_empty()
                         {
                             return Err(CacheError::InvalidTransition(format!(
-                                "CCM shift-invert Krylov did not produce an unambiguous converged target: status={:?}, boundary_cluster={}",
+                                "CCM shift-invert Krylov did not produce an unambiguous converged target: status={:?}, boundary_cluster={}, restarts={}, stability={}, retained_residuals={:?}",
                                 report.status,
-                                report.boundary_cluster.is_some()
+                                report.boundary_cluster.is_some(),
+                                report.restarts,
+                                report.maximum_ritz_value_stability,
+                                report.retained_eigenpairs.iter().map(|pair| (
+                                    pair.eigenvalue.to_string(),
+                                    pair.residual_norm.to_string(),
+                                    pair.scaled_backward_error.to_string(),
+                                )).collect::<Vec<_>>()
                             )));
                         }
                         let pair = &report.retained_eigenpairs[0];
+                        let candidate_value = Float::with_val(prec, &pair.eigenvalue);
+                        let candidate_vector: Vec<Float> = pair
+                            .eigenvector
+                            .iter()
+                            .map(|entry| Float::with_val(prec, entry))
+                            .collect();
+                        let polished = eigenstate_accuracy::polish(
+                            &sector, &factors, &candidate_value, &candidate_vector,
+                            prec, cfg.inverse_iter_steps,
+                        ).map_err(|error| CacheError::InvalidTransition(format!(
+                            "CCM shift-invert Krylov did not produce an unambiguous converged target: polishing: {error}"
+                        )))?;
                         let expanded =
-                            expand_even_sector_vector(&pair.eigenvector, params.n_modes, prec);
-                        let diagnostics = krylov_inverse_compatibility_diagnostics(&report);
+                            expand_even_sector_vector(&polished.vector, params.n_modes, prec);
+                        let diagnostics = polished.diagnostics;
                         let portable = PortableShiftInvertKrylovDiagnostics {
                             algorithm_semantics:
-                                "ccm_even_zero_shift_thick_restart_shift_invert_krylov_rayleigh_ritz_v1"
+                                "ccm_even_zero_shift_krylov_guarded_lu_polish_resolution_v6"
                                     .to_owned(),
                             factorization_id: report.factorization.id.clone(),
+                            polishing_candidate_adopted: polished.candidate_adopted,
                             requested_eigenpairs: report.requested_eigenpairs,
                             guard_eigenpairs: cfg.krylov_guard_eigenpairs,
                             maximum_subspace_dimension: report.maximum_subspace_dimension,
@@ -6429,17 +7068,16 @@ fn weil_eigenpair_via_cache_with_seed(
                             maximum_ritz_value_stability: report
                                 .maximum_ritz_value_stability
                                 .to_string(),
-                            final_scaled_backward_error: pair
-                                .scaled_backward_error
-                                .to_string(),
+                            final_scaled_backward_error: pair.scaled_backward_error.to_string(),
                             final_relative_tau_residual: "pending_full_tau_replay".to_owned(),
                             seed_identity: seed_identity.clone(),
                         };
                         (
-                            pair.eigenvalue.clone(),
-                            normalize_eigenvector(&expanded, l, prec),
+                            polished.value,
+                            normalize_eigenvector(&expanded, l, prec)
+                                .map_err(|e| CacheError::InvalidManifest(e.to_string()))?,
                             diagnostics,
-                            factor_manifest,
+                            vec![factor_manifest, guarded_factor_manifest],
                             Some(portable),
                         )
                     }
@@ -6463,9 +7101,10 @@ fn weil_eigenpair_via_cache_with_seed(
                 .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
                 (
                     output.eigenvalue,
-                    normalize_eigenvector(&output.eigenvector, l, prec),
+                    normalize_eigenvector(&output.eigenvector, l, prec)
+                        .map_err(|e| CacheError::InvalidManifest(e.to_string()))?,
                     output.diagnostics,
-                    factor_manifest,
+                    vec![factor_manifest],
                     None,
                 )
             };
@@ -6489,7 +7128,12 @@ fn weil_eigenpair_via_cache_with_seed(
             });
             Ok((
                 PortableWeilEigenpair {
-                    schema_version: if krylov_diagnostics.is_some() { 3 } else { 2 },
+                    schema_version: if krylov_diagnostics.is_some() { 5 } else { 4 },
+                    stored_state_resolution: Some(
+                        stored_resolution::bounds(tau, &xi, &eps_n, prec, parity_policy)
+                            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?
+                            .record,
+                    ),
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
                     precision_bits: prec,
@@ -6503,7 +7147,7 @@ fn weil_eigenpair_via_cache_with_seed(
                     ),
                     shift_invert_krylov: krylov_diagnostics,
                 },
-                canonical_dependency_refs(vec![factor_manifest]),
+                canonical_dependency_refs(factor_manifests),
             ))
         },
         |artifact| {
@@ -6686,8 +7330,8 @@ fn certify_roots_from_retained_source(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_certificate_bundle".to_owned(),
-        mathematical_semantics_version: "ccm-exact-point-source-root-certificate-v0.13.0-v1"
-            .to_owned(),
+        mathematical_semantics_version:
+            "ccm-exact-point-source-root-certificate-outward-witness-replay-v3".to_owned(),
         resolved_mathematical_parameters: resolved_parameters,
         normalization: Some("sum_xi_equals_sqrt_log_lambda_squared".to_owned()),
         target: Some("independently_indexed_positive_ccm_roots".to_owned()),
@@ -6696,7 +7340,9 @@ fn certify_roots_from_retained_source(
             "ccm_secular_source".to_owned(),
             secular_manifest.content_digest.clone(),
         )]),
-        algorithm_semantics: Some("flint_exact_count_arb_isolation_interval_newton_v1".to_owned()),
+        algorithm_semantics: Some(
+            "flint_exact_count_arb_isolation_adaptive_exact_source_newton_witness_v2".to_owned(),
+        ),
     };
     let semantic_digest = semantic_key.digest()?;
     let logical_key = format!(
@@ -6719,7 +7365,7 @@ fn certify_roots_from_retained_source(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Certified,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -6778,6 +7424,26 @@ fn certify_roots_from_retained_source(
     Ok(resolved.value)
 }
 
+fn stored_root_in_decimal_interval(
+    value: &Float,
+    lower: &str,
+    upper: &str,
+    p: u32,
+) -> Result<bool> {
+    if !(64..=1_000_000).contains(&p) || value.prec() > 1_000_000 || !value.is_finite() {
+        bail!("invalid computed root point or membership precision");
+    }
+    // Certificate decimals encode stored MPFR endpoints, not exact decimal
+    // bounds. Reconstruct at the certificate precision with nearest rounding;
+    // Float comparisons then compare the two stored binary points exactly.
+    let lower = Float::with_val(p, Float::parse(lower)?);
+    let upper = Float::with_val(p, Float::parse(upper)?);
+    if !lower.is_finite() || !upper.is_finite() {
+        bail!("nonfinite certified root interval endpoint");
+    }
+    Ok(value >= &lower && value <= &upper)
+}
+
 fn reconcile_computed_roots_with_certificate(
     result: &HighPrecResult,
     certificate: &super::certified_roots::ProductionIndependentCcmRootCertificate,
@@ -6785,7 +7451,7 @@ fn reconcile_computed_roots_with_certificate(
     let first = certificate
         .first_selected_positive_index
         .ok_or_else(|| anyhow::anyhow!("CCM root certificate does not assign positive ordinals"))?;
-    for (offset, enclosure) in certificate.selected_roots().iter().enumerate() {
+    for (offset, enclosure) in certificate.try_selected_roots()?.iter().enumerate() {
         let positive_index = first
             .checked_add(offset)
             .ok_or_else(|| anyhow::anyhow!("certified CCM root ordinal overflows"))?;
@@ -6805,17 +7471,12 @@ fn reconcile_computed_roots_with_certificate(
                     "computed CCM root window has no value for certified ordinal {positive_index}"
                 )
             })?;
-        let lower = Float::with_val(
-            result.precision_bits,
-            Float::parse(&enclosure.lower)
-                .map_err(|error| anyhow::anyhow!("parse certified CCM lower endpoint: {error}"))?,
-        );
-        let upper = Float::with_val(
-            result.precision_bits,
-            Float::parse(&enclosure.upper)
-                .map_err(|error| anyhow::anyhow!("parse certified CCM upper endpoint: {error}"))?,
-        );
-        if computed < &lower || computed > &upper {
+        if !stored_root_in_decimal_interval(
+            computed,
+            &enclosure.lower,
+            &enclosure.upper,
+            enclosure.precision_bits,
+        )? {
             bail!(
                 "computed CCM root ordinal {positive_index} is outside its certified interval; independent discovery ordering or refinement does not reconcile"
             );
@@ -6888,6 +7549,15 @@ fn adaptive_root_outcome(
     seed: &Float,
     cfg: &HighPrecConfig,
 ) -> ComputedRootOutcome {
+    if let Err(error) = cfg.validate_root_precision_policy() {
+        return ComputedRootOutcome {
+            outcome: EigenvalueResult::Failed {
+                iterations: 0,
+                reason: error.to_string(),
+            },
+            adaptive_precision: None,
+        };
+    }
     let base_precision = cfg.precision_bits;
     let target_bits = base_precision.saturating_sub(GUARD_BITS).max(1);
     let verification_bits = cfg.root_verification_precision_bits.max(1);
@@ -6976,7 +7646,15 @@ fn adaptive_root_outcome(
                     target_bits,
                     verification_precision,
                 );
-                if verification_correction < tolerance {
+                if verification_correction < tolerance
+                    && root_accuracy_witness(
+                        &verification_xi,
+                        &verification_poles,
+                        &verification_value,
+                        target_bits,
+                        verification_precision,
+                    )
+                {
                     let confirmed = root_refinement(
                         xi,
                         poles,
@@ -7099,11 +7777,21 @@ fn compute_root_range_detailed(
     // pole vector once and share it across every seed's refinement instead of
     // reconstructing it per root. Pole values are identical to per-root
     // construction, so refinement arithmetic is unchanged.
-    let two_pi_over_l = {
-        let mut v = pi(cfg.precision_bits);
-        v *= 2u32;
-        v /= l;
-        v
+    let two_pi_over_l = match secular_spacing(l, cfg.precision_bits) {
+        Ok(value) => value,
+        Err(error) => {
+            return seeds
+                .iter()
+                .take(1)
+                .map(|_| ComputedRootOutcome {
+                    outcome: EigenvalueResult::Failed {
+                        iterations: 0,
+                        reason: error.to_string(),
+                    },
+                    adaptive_precision: None,
+                })
+                .collect();
+        }
     };
     let poles = secular_poles(&two_pi_over_l, params.n_modes, cfg.precision_bits);
     let solve = |(_index, seed): (usize, &Float)| match cfg.root_precision_policy {
@@ -7176,7 +7864,10 @@ fn ensure_root_window_usable(
                         result.diagnostics.iterations,
                         xc_numerics::fmt::display_hp(&result.diagnostics.final_correction, 8),
                         xc_numerics::fmt::display_hp(&result.diagnostics.residual, 8),
-                        xc_numerics::fmt::display_hp(&result.diagnostics.achieved_decimal_digits, 8)
+                        xc_numerics::fmt::display_hp(
+                            &result.diagnostics.achieved_decimal_digits,
+                            8
+                        )
                     )
                 }
                 result
@@ -7189,7 +7880,10 @@ fn ensure_root_window_usable(
                         result.diagnostics.iterations,
                         xc_numerics::fmt::display_hp(&result.diagnostics.final_correction, 8),
                         xc_numerics::fmt::display_hp(&result.diagnostics.residual, 8),
-                        xc_numerics::fmt::display_hp(&result.diagnostics.achieved_decimal_digits, 8)
+                        xc_numerics::fmt::display_hp(
+                            &result.diagnostics.achieved_decimal_digits,
+                            8
+                        )
                     )
                 }
                 result
@@ -7203,7 +7897,9 @@ fn ensure_root_window_usable(
                 )
             }
         };
-        if (domain == IndependentRootDomain::Positive && result.value <= 0)
+        validate_portable_root_metrics(result)?;
+        if !result.value.is_finite()
+            || (domain == IndependentRootDomain::Positive && result.value <= 0)
             || result.value.is_zero()
             || previous.is_some_and(|value| &result.value <= value)
         {
@@ -7329,40 +8025,60 @@ fn residual_replay_matches(
     term_count: usize,
     precision_bits: u32,
 ) -> bool {
-    let Some(replayed) = replayed else {
+    use super::retained_evidence::finite_math::scale_float;
+    use rug::float::Round;
+    let (Some(replayed), Some(replay_term_scale)) = (replayed, replay_term_scale) else {
         return false;
     };
-    if !stored.is_finite() || !replayed.is_finite() || stored < &0 || replayed < &0 {
+    let values = [stored, replayed, replay_term_scale];
+    if !(64..=1_000_000).contains(&precision_bits)
+        || term_count == 0
+        || values
+            .iter()
+            .any(|value| !value.is_finite() || **value < 0 || value.prec() > 1_000_128)
+    {
         return false;
     }
     if stored == replayed {
         return true;
     }
-    let Some(replay_term_scale) = replay_term_scale else {
+    // This is the existing diagnostic replay tolerance, not a proof of the
+    // source residual's forward error. Compare exact stored operands without
+    // first rounding away differences. Scaling keeps the comparison finite;
+    // a range failure conservatively rejects the replay.
+    let work = values
+        .iter()
+        .map(|value| value.prec())
+        .max()
+        .unwrap()
+        .max(precision_bits)
+        + 64;
+    let exponent = values
+        .iter()
+        .filter_map(|value| value.get_exp())
+        .max()
+        .unwrap_or(0);
+    let scaled = values.map(|value| scale_float(value, -i64::from(exponent), work));
+    let [Ok(stored), Ok(replayed), Ok(term_scale)] = scaled else {
         return false;
     };
-    if !replay_term_scale.is_finite() || replay_term_scale < &0 || term_count == 0 {
+    let (large, small) = if stored >= replayed {
+        (&stored, &replayed)
+    } else {
+        (&replayed, &stored)
+    };
+    let difference_upper = Float::with_val_round(work, large - small, Round::Up).0;
+    // 8*term_count*2^(-(precision_bits-4))*term_scale, with the actual
+    // count rather than a saturating u32 conversion. Downward rounding makes
+    // acceptance conservative even at the exact tolerance boundary.
+    let count = Float::with_val(work, term_count);
+    let tolerance = Float::with_val_round(work, &term_scale * count, Round::Down).0;
+    let Ok(tolerance_lower) = scale_float(&tolerance, 7 - i64::from(precision_bits), work) else {
         return false;
-    }
-    let mut difference = Float::with_val(precision_bits, stored);
-    difference -= replayed;
-    difference.abs_mut();
-    // Portable decimal round-tripping can change cancellation-dominated
-    // residuals in their low-order bits. Compare the replay to the stored
-    // residual itself, not to the unrelated Halley correction tolerance.
-    //
-    // Each term performs a pole multiply, subtraction, division, and ordered
-    // addition. Bound their aggregate roundoff by the absolute term sum,
-    // operation count, and the MPFR working unit. This remains meaningful
-    // under severe cancellation; a relative comparison to the tiny final
-    // residual does not.
-    let unit_bits = precision_bits.saturating_sub(4).max(1);
-    let mut tolerance = Float::with_val(precision_bits, 2).pow(-(unit_bits as i32));
-    tolerance *= replay_term_scale;
-    tolerance *= u32::try_from(term_count)
-        .unwrap_or(u32::MAX)
-        .saturating_mul(8);
-    difference <= tolerance
+    };
+    difference_upper.is_finite()
+        && tolerance_lower.is_finite()
+        && difference_upper <= tolerance_lower
 }
 
 fn validate_adaptive_root_evidence(
@@ -7373,6 +8089,8 @@ fn validate_adaptive_root_evidence(
     xi: &[Float],
     poles: &[Float],
 ) -> std::result::Result<(), CacheError> {
+    cfg.validate_root_precision_policy()
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
     let evidence = evidence.ok_or_else(|| {
         CacheError::InvalidManifest(
             "adaptive CCM root-range payload omits precision evidence".to_owned(),
@@ -7396,6 +8114,23 @@ fn validate_adaptive_root_evidence(
                 .to_owned(),
         ));
     }
+    let stored_correction = parse_hp_scalar(
+        &evidence.verification_correction,
+        evidence.verification_precision_bits,
+    )?;
+    if stored_correction < 0 {
+        return Err(CacheError::InvalidManifest(
+            "negative adaptive root correction".into(),
+        ));
+    }
+    if evidence.stopping_reason != "requested_target_confirmed"
+        && Float::with_val(cfg.precision_bits, &stored_correction)
+            != result.diagnostics.final_correction
+    {
+        return Err(CacheError::InvalidManifest(
+            "adaptive root correction does not replay its retained diagnostic".into(),
+        ));
+    }
     match evidence.stopping_reason.as_str() {
         "requested_target_confirmed" => {
             let expected_verification = evidence
@@ -7412,14 +8147,6 @@ fn validate_adaptive_root_evidence(
                 ));
             }
             let precision = evidence.verification_precision_bits;
-            let stored_correction = Float::with_val(
-                precision,
-                Float::parse(&evidence.verification_correction).map_err(|error| {
-                    CacheError::InvalidManifest(format!(
-                        "adaptive CCM root verification correction is invalid: {error}"
-                    ))
-                })?,
-            );
             let promoted_xi = xi
                 .iter()
                 .map(|value| Float::with_val(precision, value))
@@ -7441,7 +8168,15 @@ fn validate_adaptive_root_evidence(
                     "adaptive CCM root verification cannot replay its stored point".to_owned(),
                 )
             })?;
-            if replayed != stored_correction
+            if !root_accuracy_witness(
+                &promoted_xi,
+                &promoted_poles,
+                &promoted_value,
+                target_bits,
+                precision,
+            ) || replayed != stored_correction
+                || Float::with_val_round(cfg.precision_bits, &replayed, rug::float::Round::Up).0
+                    != result.diagnostics.final_correction
                 || replayed
                     >= root_correction_tolerance_for_target(&promoted_value, target_bits, precision)
             {
@@ -7475,7 +8210,7 @@ fn validate_adaptive_root_evidence(
         _ => {
             return Err(CacheError::InvalidManifest(
                 "adaptive CCM root precision evidence has an unknown stopping reason".to_owned(),
-            ))
+            ));
         }
     }
     Ok(())
@@ -7557,9 +8292,7 @@ fn decode_root_range(
             }),
         })
         .collect::<std::result::Result<_, _>>()?;
-    let mut two_pi_over_l = pi(cfg.precision_bits);
-    two_pi_over_l *= 2u32;
-    two_pi_over_l /= l;
+    let two_pi_over_l = secular_spacing(l, cfg.precision_bits)?;
     let poles = secular_poles(&two_pi_over_l, params.n_modes, cfg.precision_bits);
     let mut previous: Option<&Float> = None;
     for (portable, outcome) in artifact.outcomes.iter().zip(&decoded) {
@@ -7576,7 +8309,7 @@ fn decode_root_range(
             (PortableRootOutcome::Failed { .. }, EigenvalueResult::Failed { .. }) => {
                 return Err(CacheError::InvalidManifest(
                     "computed CCM root-range payload contains a failed root".to_owned(),
-                ))
+                ));
             }
             _ => unreachable!("portable and decoded root outcome variants match"),
         };
@@ -7596,6 +8329,23 @@ fn decode_root_range(
         let replayed = secular_residual_and_scale_at(xi, &poles, value, cfg.precision_bits);
         let replayed_residual = replayed.as_ref().map(|(residual, _)| residual);
         let replay_term_scale = replayed.as_ref().map(|(_, scale)| scale);
+        // Adaptive evidence replays the same directed witness below at its
+        // recorded verification precision. Requiring a second witness at the
+        // fixed guard precision would undo adaptive cancellation recovery.
+        if !adaptive_precision
+            && status == "converged"
+            && !root_accuracy_witness(
+                xi,
+                &poles,
+                value,
+                expected_target_bits,
+                cfg.precision_bits.saturating_add(GUARD_BITS),
+            )
+        {
+            return Err(CacheError::InvalidManifest(
+                "converged CCM root has no directed local root witness".into(),
+            ));
+        }
         let invalid_iterations = result.diagnostics.iterations > cfg.solver_steps;
         let invalid_status = if adaptive_precision {
             validate_adaptive_root_evidence(
@@ -7608,16 +8358,16 @@ fn decode_root_range(
             )
             .is_err()
         } else {
-            let confirmed_correction = cfg
-                .precision_bits
-                .checked_add(GUARD_BITS)
-                .and_then(|p| secular_correction_at(xi, &poles, value, p, cfg.root_solver))
-                .map(|v| Float::with_val_round(cfg.precision_bits, v, rug::float::Round::Up).0);
+            let confirmed_correction = fixed_guard_retained_correction(
+                xi,
+                &poles,
+                value,
+                cfg.precision_bits,
+                cfg.root_solver,
+            );
             portable_result.adaptive_precision.is_some()
-                || (status == "converged"
-                    && confirmed_correction.as_ref() != Some(&result.diagnostics.final_correction))
+                || confirmed_correction.as_ref() != Some(&result.diagnostics.final_correction)
                 || (status == "converged" && !correction_meets_target)
-                || (status != "converged" && correction_meets_target)
                 || (status == "approximate" && result.diagnostics.iterations != cfg.solver_steps)
         };
         let digits_mismatch = replayed_digits != result.diagnostics.achieved_decimal_digits;
@@ -7651,6 +8401,10 @@ fn decode_root_range(
             )));
         }
         previous = Some(value);
+    }
+    if artifact_mode == RootArtifactMode::Independent {
+        complete_discovery::validate_assignment(&decoded, seeds)
+            .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
     }
     Ok(decoded)
 }
@@ -7694,7 +8448,8 @@ fn root_range_semantic_key(
         "solver": cfg.root_solver.display_name().to_ascii_lowercase(),
         "solver_steps": cfg.solver_steps,
         "accuracy_guard_bits": GUARD_BITS,
-        "convergence_confirmation": "directed_interval_newton_at_stored_point_v1",
+        "convergence_confirmation": "directed_local_root_sign_witness_at_stored_point_v2",
+        "residual_arithmetic": "guarded_point_difference_quotient_exact_sum_v2",
         "secular_source_content_digest": secular_source_digest.0
     });
     if cfg.root_precision_policy == RootPrecisionPolicy::Adaptive {
@@ -7726,6 +8481,10 @@ fn root_range_semantic_key(
             serde_json::json!("double_extra_bits_from_64_bit_quantum_v1"),
         );
     }
+    if cfg.root_precision_policy == RootPrecisionPolicy::FixedGuard {
+        resolved_parameters["fixed_guard_correction_guards"] =
+            serde_json::json!(FIXED_CORRECTION_GUARDS);
+    }
     add_adaptive_parity_parameter(&mut resolved_parameters, parity_policy);
     if let Some(dataset) = reference_dataset {
         resolved_parameters
@@ -7755,13 +8514,24 @@ fn root_range_semantic_key(
         );
         parameters.insert(
             "discovery_method".into(),
-            serde_json::json!("exact_even_point_numerator_flint_arb_v1"),
+            serde_json::json!(
+                "exact_even_point_numerator_shared_spacing_exact_height_partition_v3"
+            ),
         );
         parameters.insert(
             "pole_geometry".into(),
             serde_json::json!("exact_stored_mpfr_pole_points"),
         );
     }
+    if artifact_mode == RootArtifactMode::Independent && !semantics.is_complete_positive() {
+        resolved_parameters["discovery_method"] =
+            serde_json::json!("exact_point_numerator_exact_window_v1");
+        resolved_parameters["pole_geometry"] = serde_json::json!("exact_stored_mpfr_pole_points");
+    }
+    resolved_parameters["point_refinement_semantics"] =
+        serde_json::json!(xc_root::ROOT_POINT_REFINEMENT_SEMANTICS);
+    resolved_parameters["generic_discovery_semantics"] =
+        serde_json::json!(xc_root::ROOT_DISCOVERY_SEMANTICS);
     let mut source_data_identities = reference_dataset
         .map(|dataset| {
             BTreeMap::from([(
@@ -7781,14 +8551,18 @@ fn root_range_semantic_key(
             RootArtifactMode::ReferenceSeededRefinement => "ccm_root_refinement",
         }
         .to_owned(),
-        mathematical_semantics_version: if semantics.is_complete_positive() {
-            "ccm-root-range-v0.15.1-v13"
+        mathematical_semantics_version: if artifact_mode == RootArtifactMode::Independent
+            && !semantics.is_complete_positive()
+        {
+            "ccm-root-discovery-v0.15.2-v2"
+        } else if semantics.is_complete_positive() {
+            "ccm-root-range-v0.15.2-v15"
         } else if cfg.root_precision_policy == RootPrecisionPolicy::Adaptive {
-            "ccm-root-range-v0.15.1-v12"
+            "ccm-root-range-v0.15.2-v12"
         } else if semantics.is_advanced() {
-            "ccm-root-range-v0.15.1-v11-advanced"
+            "ccm-root-range-v0.15.2-v11-advanced"
         } else {
-            "ccm-root-range-v0.15.1-v11"
+            "ccm-root-range-v0.15.2-v11"
         }
         .to_owned(),
         resolved_mathematical_parameters: resolved_parameters,
@@ -7809,7 +8583,10 @@ fn root_range_semantic_key(
                     cfg.root_solver.display_name().to_ascii_lowercase()
                 )
             } else {
-                cfg.root_solver.display_name().to_ascii_lowercase()
+                format!(
+                    "{}+confirmed_retained_correction_v2",
+                    cfg.root_solver.display_name().to_ascii_lowercase()
+                )
             },
         ),
     })
@@ -7922,7 +8699,9 @@ fn resolve_root_range_via_cache(
                     canonical != &Float::with_val(cfg.precision_bits, supplied)
                 })
             {
-                eprintln!("[CCM cache] larger seeded-window reuse declined: supplied values differ from bundled reference seeds at working precision");
+                eprintln!(
+                    "[CCM cache] larger seeded-window reuse declined: supplied values differ from bundled reference seeds at working precision"
+                );
                 // Every candidate uses the same bundled values on this window.
                 break;
             }
@@ -7987,7 +8766,7 @@ fn resolve_root_range_via_cache(
                         l,
                         RootWindowSemantics::strict_positive(candidate_seeds.len()),
                         Some(&secular_manifest.content_digest),
-                        require_converged,
+                        false,
                     )?;
                     validated_candidate.replace(Some(roots));
                     Ok(())
@@ -8008,6 +8787,9 @@ fn resolve_root_range_via_cache(
             })?;
             let start = first_root_index - 1;
             let projected = decoded[start..start + seeds.len()].to_vec();
+            if require_converged && projected.iter().any(|root| !root.is_converged()) {
+                continue;
+            }
             eprintln!(
                 "  cache root window: reused indices 1..={candidate_count} for contained request {first_root_index}..={last_root_index}"
             );
@@ -8048,13 +8830,7 @@ fn resolve_root_range_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(if semantics.is_complete_positive() {
-            "0.15.0"
-        } else if semantics.is_advanced() {
-            "0.13.3"
-        } else {
-            "0.13.0"
-        })?,
+        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -8086,6 +8862,10 @@ fn resolve_root_range_via_cache(
                 semantics.domain,
             )
             .map_err(|error| CacheError::InvalidTransition(error.to_string()))?;
+            if artifact_mode == RootArtifactMode::Independent {
+                complete_discovery::validate_assignment(&runtime_outcomes, seeds)
+                    .map_err(|error| CacheError::InvalidTransition(error.to_string()))?;
+            }
             let outcomes = computed
                 .into_iter()
                 .map(|computed| {
@@ -8222,14 +9002,36 @@ fn root_selection_digest(
 fn positive_root_indices(
     roots: &[EigenvalueResult],
     first_positive_root_index: usize,
-) -> Vec<Option<usize>> {
+) -> std::result::Result<Vec<Option<usize>>, CacheError> {
+    if roots
+        .iter()
+        .filter_map(EigenvalueResult::value)
+        .any(|value| !value.is_finite())
+    {
+        return Err(CacheError::InvalidManifest(
+            "nonfinite root cannot carry an ordinal".into(),
+        ));
+    }
     let positive_window = roots
         .iter()
         .filter_map(EigenvalueResult::value)
-        .all(|value| value > &Float::with_val(value.prec(), 0));
-    (0..roots.len())
-        .map(|offset| positive_window.then(|| first_positive_root_index.saturating_add(offset)))
-        .collect()
+        .all(|value| value > &0);
+    if !positive_window {
+        return Ok(vec![None; roots.len()]);
+    }
+    if first_positive_root_index == 0 {
+        return Err(CacheError::InvalidManifest(
+            "positive root ordinals are one-based".into(),
+        ));
+    }
+    if let Some(last) = roots.len().checked_sub(1) {
+        first_positive_root_index
+            .checked_add(last)
+            .ok_or_else(|| CacheError::InvalidManifest("positive root ordinal overflow".into()))?;
+    }
+    Ok((0..roots.len())
+        .map(|offset| Some(first_positive_root_index + offset))
+        .collect())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8243,7 +9045,27 @@ fn root_conditioning_details(
     positive_root_index: Option<usize>,
     precision_bits: u32,
 ) -> std::result::Result<PortableRootConditioningDetails, CacheError> {
-    if xi.len() != poles.len() || xi.len() != 2 * n_modes + 1 || poles.is_empty() {
+    use super::retained_evidence::point;
+    let invalid = |error: anyhow::Error| CacheError::InvalidManifest(error.to_string());
+    if !(64..=1_000_000).contains(&precision_bits)
+        || !pole_spacing.is_finite()
+        || pole_spacing <= &0
+        || xi
+            .iter()
+            .chain(poles)
+            .chain([value, pole_spacing])
+            .any(|x| !x.is_finite() || x.prec() > precision_bits)
+        || window_position == 0
+        || positive_root_index == Some(0)
+    {
+        return Err(CacheError::InvalidManifest(
+            "invalid conditioning precision, points, spacing or ordinal".into(),
+        ));
+    }
+    if xi.len() != poles.len()
+        || n_modes.checked_mul(2).and_then(|n| n.checked_add(1)) != Some(xi.len())
+        || poles.is_empty()
+    {
         return Err(CacheError::InvalidManifest(
             "CCM root conditioning requires one retained weight per secular pole".to_owned(),
         ));
@@ -8251,40 +9073,34 @@ fn root_conditioning_details(
     let n_modes_i64 = i64::try_from(n_modes).map_err(|_| {
         CacheError::InvalidManifest("CCM root conditioning mode count exceeds i64".to_owned())
     })?;
-    let mut term_magnitude_sum = Float::with_val(precision_bits, 0);
-    let mut derivative = Float::with_val(precision_bits, 0);
-    let mut nearest: Option<(i64, Float, Float)> = None;
+    let (term_magnitude_sum, derivative, reciprocal_derivative) =
+        root_conditioning_math::evaluate(xi, poles, value, precision_bits).map_err(invalid)?;
     let mut left: Option<(i64, Float, Float)> = None;
     let mut right: Option<(i64, Float, Float)> = None;
 
-    for (offset, (weight, pole)) in xi.iter().zip(poles).enumerate() {
+    for (offset, pole) in poles.iter().enumerate() {
         let offset_i64 = i64::try_from(offset).map_err(|_| {
             CacheError::InvalidManifest("CCM root conditioning pole offset exceeds i64".to_owned())
         })?;
         let pole_index = offset_i64 - n_modes_i64;
-        let mut denominator = Float::with_val(precision_bits, value);
-        denominator -= pole;
+        let expected = point::product(
+            &[pole_spacing, &fl_i(precision_bits, pole_index)],
+            precision_bits,
+        )
+        .map_err(invalid)?;
+        if *pole != expected {
+            return Err(CacheError::InvalidManifest(
+                "conditioning pole is not the declared uniform retained point".into(),
+            ));
+        }
+        let denominator =
+            point::sum(&[value.clone(), -pole.clone()], precision_bits).map_err(invalid)?;
         if denominator.is_zero() {
             return Err(CacheError::InvalidManifest(format!(
                 "CCM root conditioning root {window_position} coincides with secular pole {pole_index}"
             )));
         }
-        let mut secular_term = Float::with_val(precision_bits, weight);
-        secular_term /= &denominator;
-        term_magnitude_sum += secular_term.abs();
-        let mut denominator_squared = denominator.clone();
-        denominator_squared.square_mut();
-        let mut derivative_term = Float::with_val(precision_bits, weight);
-        derivative_term /= denominator_squared;
-        derivative -= derivative_term;
-
         let distance = denominator.abs();
-        if nearest
-            .as_ref()
-            .is_none_or(|(_, _, nearest_distance)| &distance < nearest_distance)
-        {
-            nearest = Some((pole_index, pole.clone(), distance.clone()));
-        }
         if pole < value {
             left = Some((pole_index, pole.clone(), distance));
         } else if right.is_none() {
@@ -8292,28 +9108,48 @@ fn root_conditioning_details(
         }
     }
 
-    if derivative.is_zero() {
-        return Err(CacheError::InvalidManifest(format!(
-            "CCM root conditioning root {window_position} has zero secular derivative"
-        )));
-    }
     let derivative_magnitude = derivative.clone().abs();
-    let mut reciprocal_derivative = Float::with_val(precision_bits, 1);
-    reciprocal_derivative /= &derivative;
     let condition_estimate = reciprocal_derivative.clone().abs();
-    let (nearest_pole_index, nearest_pole, nearest_pole_distance) = nearest.ok_or_else(|| {
-        CacheError::InvalidManifest("CCM root conditioning found no secular poles".to_owned())
-    })?;
-    let mut normalized_isolation_margin = nearest_pole_distance.clone();
-    normalized_isolation_margin /= pole_spacing;
-    let normalized_interval_position =
-        left.as_ref()
-            .zip(right.as_ref())
-            .map(|((_, _, left_distance), _)| {
-                let mut position = Float::with_val(precision_bits, left_distance);
-                position /= pole_spacing;
-                lossless_hp_decimal(&position)
-            });
+    let nearest = match (&left, &right) {
+        (Some(left), Some(right)) => {
+            // Compare exact stored distances through 2*z-left-right, so an
+            // outside-window rounded distance tie cannot select the wrong pole.
+            let side = point::sum(
+                &[
+                    value.clone(),
+                    value.clone(),
+                    -left.1.clone(),
+                    -right.1.clone(),
+                ],
+                precision_bits,
+            )
+            .map_err(invalid)?;
+            if side <= 0 {
+                left
+            } else {
+                right
+            }
+        }
+        (Some(left), None) => left,
+        (None, Some(right)) => right,
+        _ => {
+            return Err(CacheError::InvalidManifest(
+                "conditioning found no neighboring poles".into(),
+            ));
+        }
+    };
+    let (nearest_pole_index, nearest_pole, nearest_pole_distance) = nearest.clone();
+    let normalized_isolation_margin =
+        point::quotient(&nearest_pole_distance, pole_spacing, precision_bits).map_err(invalid)?;
+    let normalized_interval_position = left
+        .as_ref()
+        .zip(right.as_ref())
+        .map(|((_, _, distance), _)| {
+            point::quotient(distance, pole_spacing, precision_bits)
+                .map(|v| lossless_hp_decimal(&v))
+                .map_err(invalid)
+        })
+        .transpose()?;
 
     Ok(PortableRootConditioningDetails {
         window_position,
@@ -8354,11 +9190,9 @@ fn compute_root_conditioning_analysis(
     secular_manifest: &ArtifactManifest,
     selection_digest: &ContentDigest,
 ) -> std::result::Result<PortableRootConditioningAnalysis, CacheError> {
-    let mut pole_spacing = pi(cfg.precision_bits);
-    pole_spacing *= 2u32;
-    pole_spacing /= l;
+    let pole_spacing = secular_spacing(l, cfg.precision_bits)?;
     let poles = secular_poles(&pole_spacing, params.n_modes, cfg.precision_bits);
-    let positive_indices = positive_root_indices(roots, first_positive_root_index);
+    let positive_indices = positive_root_indices(roots, first_positive_root_index)?;
     let outcomes = roots
         .par_iter()
         .zip(positive_indices.par_iter())
@@ -8424,77 +9258,9 @@ fn parse_root_conditioning_scalar(
     precision_bits: u32,
     field: &str,
 ) -> std::result::Result<Float, CacheError> {
-    let parsed = Float::parse(value).map_err(|error| {
-        CacheError::InvalidManifest(format!(
-            "CCM root conditioning {field} is not a valid HP scalar: {error}"
-        ))
-    })?;
-    let value = Float::with_val(precision_bits, parsed);
-    if !value.is_finite() {
-        return Err(CacheError::InvalidManifest(format!(
-            "CCM root conditioning {field} is nonfinite"
-        )));
-    }
-    Ok(value)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_root_conditioning_side(
-    index: Option<i64>,
-    pole: Option<&str>,
-    distance: Option<&str>,
-    root: &Float,
-    pole_spacing: &Float,
-    n_modes: usize,
-    precision_bits: u32,
-    left_side: bool,
-) -> std::result::Result<Option<(i64, Float, Float)>, CacheError> {
-    let side = if left_side { "left" } else { "right" };
-    let (index, pole, distance) = match (index, pole, distance) {
-        (None, None, None) => return Ok(None),
-        (Some(index), Some(pole), Some(distance)) => (index, pole, distance),
-        _ => {
-            return Err(CacheError::InvalidManifest(format!(
-                "CCM root conditioning {side}-pole fields are only partially populated"
-            )))
-        }
-    };
-    let n_modes_i64 = i64::try_from(n_modes).map_err(|_| {
-        CacheError::InvalidManifest("CCM root conditioning mode count exceeds i64".to_owned())
-    })?;
-    if index < -n_modes_i64 || index > n_modes_i64 {
-        return Err(CacheError::InvalidManifest(format!(
-            "CCM root conditioning {side}-pole index leaves the retained source"
-        )));
-    }
-    let parsed_pole = parse_root_conditioning_scalar(pole, precision_bits, side)?;
-    let mut expected_pole = Float::with_val(precision_bits, pole_spacing);
-    expected_pole *= fl_i(precision_bits, index);
-    if parsed_pole != expected_pole
-        || (left_side && &parsed_pole >= root)
-        || (!left_side && &parsed_pole <= root)
-    {
-        return Err(CacheError::InvalidManifest(format!(
-            "CCM root conditioning {side}-pole geometry is invalid"
-        )));
-    }
-    let parsed_distance =
-        parse_root_conditioning_scalar(distance, precision_bits, &format!("{side}-pole distance"))?;
-    let expected_distance = if left_side {
-        let mut value = Float::with_val(precision_bits, root);
-        value -= &parsed_pole;
-        value
-    } else {
-        let mut value = parsed_pole.clone();
-        value -= root;
-        value
-    };
-    if parsed_distance != expected_distance || parsed_distance <= 0 {
-        return Err(CacheError::InvalidManifest(format!(
-            "CCM root conditioning {side}-pole distance is invalid"
-        )));
-    }
-    Ok(Some((index, parsed_pole, parsed_distance)))
+    parse_hp_scalar(value, precision_bits).map_err(|error| {
+        CacheError::InvalidManifest(format!("CCM root conditioning {field} is invalid: {error}"))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8509,178 +9275,20 @@ fn validate_root_conditioning_details(
     n_modes: usize,
     precision_bits: u32,
 ) -> std::result::Result<(), CacheError> {
-    if details.window_position != expected_window_position
-        || details.positive_root_index != expected_positive_root_index
-    {
-        return Err(CacheError::InvalidManifest(
-            "CCM root conditioning root position or ordinal is invalid".to_owned(),
-        ));
-    }
-    let root = parse_root_conditioning_scalar(&details.value, precision_bits, "root value")?;
-    if root != expected_root.value {
-        return Err(CacheError::InvalidManifest(
-            "CCM root conditioning value does not match its root-range parent".to_owned(),
-        ));
-    }
-    if xi.len() != poles.len() || xi.len() != 2 * n_modes + 1 {
-        return Err(CacheError::InvalidManifest(
-            "CCM root conditioning source and pole dimensions are inconsistent".to_owned(),
-        ));
-    }
-    let mut expected_term_magnitude_sum = Float::with_val(precision_bits, 0);
-    let mut expected_derivative = Float::with_val(precision_bits, 0);
-    for (weight, pole) in xi.iter().zip(poles) {
-        let mut denominator = Float::with_val(precision_bits, &root);
-        denominator -= pole;
-        if denominator.is_zero() {
-            return Err(CacheError::InvalidManifest(
-                "CCM root conditioning value coincides with a secular pole".to_owned(),
-            ));
-        }
-        let mut term = Float::with_val(precision_bits, weight);
-        term /= &denominator;
-        expected_term_magnitude_sum += term.abs();
-        let mut denominator_squared = denominator;
-        denominator_squared.square_mut();
-        let mut derivative_term = Float::with_val(precision_bits, weight);
-        derivative_term /= denominator_squared;
-        expected_derivative -= derivative_term;
-    }
-    let term_magnitude_sum = parse_root_conditioning_scalar(
-        &details.secular_term_magnitude_sum,
-        precision_bits,
-        "secular term-magnitude sum",
-    )?;
-    let derivative = parse_root_conditioning_scalar(
-        &details.secular_derivative,
-        precision_bits,
-        "secular derivative",
-    )?;
-    if term_magnitude_sum != expected_term_magnitude_sum
-        || term_magnitude_sum < 0
-        || derivative != expected_derivative
-        || derivative.is_zero()
-    {
-        return Err(CacheError::InvalidManifest(
-            "CCM root conditioning secular sum scale or derivative fails source replay".to_owned(),
-        ));
-    }
-    let derivative_magnitude = parse_root_conditioning_scalar(
-        &details.derivative_magnitude,
-        precision_bits,
-        "derivative magnitude",
-    )?;
-    if derivative_magnitude != derivative.clone().abs() {
-        return Err(CacheError::InvalidManifest(
-            "CCM root conditioning derivative magnitude is inconsistent".to_owned(),
-        ));
-    }
-    let reciprocal_derivative = parse_root_conditioning_scalar(
-        &details.reciprocal_derivative,
-        precision_bits,
-        "reciprocal derivative",
-    )?;
-    let mut expected_reciprocal = Float::with_val(precision_bits, 1);
-    expected_reciprocal /= &derivative;
-    let condition_estimate = parse_root_conditioning_scalar(
-        &details.condition_estimate,
-        precision_bits,
-        "condition estimate",
-    )?;
-    if reciprocal_derivative != expected_reciprocal
-        || condition_estimate != reciprocal_derivative.clone().abs()
-    {
-        return Err(CacheError::InvalidManifest(
-            "CCM root conditioning reciprocal derivative is inconsistent".to_owned(),
-        ));
-    }
-
-    let left = validate_root_conditioning_side(
-        details.left_pole_index,
-        details.left_pole.as_deref(),
-        details.left_pole_distance.as_deref(),
-        &root,
+    let expected = root_conditioning_details(
+        xi,
+        poles,
         pole_spacing,
         n_modes,
+        &expected_root.value,
+        expected_window_position,
+        expected_positive_root_index,
         precision_bits,
-        true,
     )?;
-    let right = validate_root_conditioning_side(
-        details.right_pole_index,
-        details.right_pole.as_deref(),
-        details.right_pole_distance.as_deref(),
-        &root,
-        pole_spacing,
-        n_modes,
-        precision_bits,
-        false,
-    )?;
-    if let (Some((left_index, _, _)), Some((right_index, _, _))) = (&left, &right) {
-        if left_index.checked_add(1) != Some(*right_index) {
-            return Err(CacheError::InvalidManifest(
-                "CCM root conditioning enclosing poles are not adjacent".to_owned(),
-            ));
-        }
-    }
-    let expected_nearest = match (&left, &right) {
-        (Some(left), Some(right)) if left.2 <= right.2 => left,
-        (Some(_), Some(right)) => right,
-        (Some(left), None) => left,
-        (None, Some(right)) => right,
-        (None, None) => {
-            return Err(CacheError::InvalidManifest(
-                "CCM root conditioning records no neighboring retained pole".to_owned(),
-            ))
-        }
-    };
-    let nearest_pole =
-        parse_root_conditioning_scalar(&details.nearest_pole, precision_bits, "nearest pole")?;
-    let nearest_distance = parse_root_conditioning_scalar(
-        &details.nearest_pole_distance,
-        precision_bits,
-        "nearest-pole distance",
-    )?;
-    if details.nearest_pole_index != expected_nearest.0
-        || nearest_pole != expected_nearest.1
-        || nearest_distance != expected_nearest.2
-    {
+    if details != &expected {
         return Err(CacheError::InvalidManifest(
-            "CCM root conditioning nearest-pole selection is inconsistent".to_owned(),
+            "conditioning payload fails complete canonical source replay".into(),
         ));
-    }
-    let normalized_margin = parse_root_conditioning_scalar(
-        &details.normalized_isolation_margin,
-        precision_bits,
-        "normalized isolation margin",
-    )?;
-    let mut expected_margin = nearest_distance;
-    expected_margin /= pole_spacing;
-    if normalized_margin != expected_margin {
-        return Err(CacheError::InvalidManifest(
-            "CCM root conditioning normalized isolation margin is inconsistent".to_owned(),
-        ));
-    }
-    match (&left, &right, &details.normalized_interval_position) {
-        (Some((_, _, left_distance)), Some(_), Some(position)) => {
-            let parsed_position = parse_root_conditioning_scalar(
-                position,
-                precision_bits,
-                "normalized interval position",
-            )?;
-            let mut expected_position = left_distance.clone();
-            expected_position /= pole_spacing;
-            if parsed_position != expected_position {
-                return Err(CacheError::InvalidManifest(
-                    "CCM root conditioning normalized interval position is inconsistent".to_owned(),
-                ));
-            }
-        }
-        (Some(_), Some(_), None) | (None, _, Some(_)) | (_, None, Some(_)) => {
-            return Err(CacheError::InvalidManifest(
-                "CCM root conditioning interval position has inconsistent pole support".to_owned(),
-            ))
-        }
-        _ => {}
     }
     Ok(())
 }
@@ -8718,9 +9326,7 @@ fn validate_root_conditioning_analysis(
             "CCM root conditioning payload does not match its semantic identity".to_owned(),
         ));
     }
-    let mut expected_spacing = pi(cfg.precision_bits);
-    expected_spacing *= 2u32;
-    expected_spacing /= l;
+    let expected_spacing = secular_spacing(l, cfg.precision_bits)?;
     let pole_spacing =
         parse_root_conditioning_scalar(&artifact.pole_spacing, cfg.precision_bits, "pole spacing")?;
     if pole_spacing != expected_spacing || pole_spacing <= 0 {
@@ -8729,7 +9335,7 @@ fn validate_root_conditioning_analysis(
         ));
     }
     let poles = secular_poles(&pole_spacing, params.n_modes, cfg.precision_bits);
-    let positive_indices = positive_root_indices(roots, first_positive_root_index);
+    let positive_indices = positive_root_indices(roots, first_positive_root_index)?;
     for (offset, ((artifact_outcome, root_outcome), positive_root_index)) in artifact
         .outcomes
         .iter()
@@ -8776,7 +9382,7 @@ fn validate_root_conditioning_analysis(
             _ => {
                 return Err(CacheError::InvalidManifest(
                     "CCM root conditioning statuses do not match the root-range parent".to_owned(),
-                ))
+                ));
             }
         }
     }
@@ -8816,7 +9422,7 @@ fn resolve_root_conditioning_analysis_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_root_conditioning_analysis".to_owned(),
-        mathematical_semantics_version: "ccm-root-conditioning-v0.14.1-v2".to_owned(),
+        mathematical_semantics_version: "ccm-root-conditioning-v0.15.2-v1".to_owned(),
         resolved_mathematical_parameters: resolved_parameters,
         normalization: Some(ROOT_CONDITIONING_NORMALIZATION.to_owned()),
         target: Some("selected_ccm_root_conditioning".to_owned()),
@@ -8832,7 +9438,7 @@ fn resolve_root_conditioning_analysis_via_cache(
             ),
         ]),
         algorithm_semantics: Some(
-            "direct_hp_secular_scale_derivative_and_uniform_pole_geometry_v2".to_owned(),
+            "directed_scaled_correct_rounding_and_complete_uniform_pole_geometry_v3".to_owned(),
         ),
     };
     let semantic_digest = semantic_key.digest()?;
@@ -8857,7 +9463,7 @@ fn resolve_root_conditioning_analysis_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -8909,16 +9515,23 @@ fn resolve_root_conditioning_analysis_via_cache(
 const PRIME_POWER_RESPONSE_NORMALIZATION: &str =
     "l2_eigenvector_response_with_sum_xi_equals_sqrt_log_lambda_squared_root_transport";
 const PRIME_POWER_RESPONSE_VELOCITY_PARAMETER: &str = "u=log(lambda_squared)";
-const PRIME_POWER_RESPONSE_DEFINITION: &str =
-    "per-active-prime-power additive contribution to dQ/du at fixed observation geometry; nonprime and pole-motion derivatives excluded; at power=lambda_squared this is the right-minus-left event jump";
+const PRIME_POWER_RESPONSE_DEFINITION: &str = "per-active-prime-power additive contribution to dQ/du at fixed observation geometry; nonprime and pole-motion derivatives excluded; at power=lambda_squared this is the right-minus-left event jump";
 const PRIME_POWER_RESPONSE_EDGE_DIRECTION: &str = "negative_all_ones_outer_product";
+fn cutoff_equals_event_power(cutoff: &str, power: u64) -> Result<bool> {
+    Ok(xc_core::DecimalLiteral::new(cutoff)?
+        .cmp_numeric(&xc_core::DecimalLiteral::new(power.to_string())?)?
+        == std::cmp::Ordering::Equal)
+}
+const PRIME_POWER_RESPONSE_MATHEMATICAL_SEMANTICS: &str =
+    "ccm-prime-power-response-exact-event-edge-v3";
 const RESPONSE_SPECTRAL_ISOLATION_METHOD: &str =
-    "even_sector_indices_0_1_disjoint_hp_sturm_enclosures";
+    "even_sector_simple_index_0_neighbor_cluster_sturm_source_allowance_directed_residual_v3";
 const RESPONSE_SPECTRAL_ISOLATION_STATUS: &str = "isolated_simple";
 
 #[derive(Clone, Debug)]
 struct ResponseSpectralPreparation {
     even_sector_matrix: Vec<Float>,
+    source_matrix_eigenvalue_allowance: Float,
     selected_enclosures: Vec<xc_numerics::eigen::HpTridiagonalEigenvalueEnclosure>,
 }
 
@@ -8927,6 +9540,7 @@ struct ManagedResponseSpectralPreparation {
     numerical: ResponseSpectralPreparation,
     even_sector_matrix_manifest: ArtifactManifest,
     even_sector_eigenvalues_manifest: ArtifactManifest,
+    even_sector_transform_manifest: ArtifactManifest,
 }
 
 fn require_response_even_sector(cfg: &HighPrecConfig) -> Result<()> {
@@ -8949,16 +9563,26 @@ fn compute_response_spectral_preparation(
         bail!("CCM response spectral isolation requires N >= 1");
     }
     let mut symmetric_tau = tau.to_vec();
-    force_symmetric(&mut symmetric_tau, params.matrix_size());
+    force_symmetric(&mut symmetric_tau, params.matrix_size())?;
     let even_sector_matrix =
-        build_even_sector_matrix(&symmetric_tau, params.n_modes, cfg.precision_bits);
+        build_even_sector_matrix(&symmetric_tau, params.n_modes, cfg.precision_bits)?;
     let even_dimension = params.n_modes + 1;
-    let (diagonal, off_diagonal, _) = xc_numerics::eigen::householder_tridiag_hp_stable(
+    let (diagonal, off_diagonal, basis) = xc_numerics::eigen::householder_tridiag_hp_stable(
         &even_sector_matrix,
         even_dimension,
         cfg.precision_bits,
     )?;
-    let eigenvalues = compute_sector_eigenvalues(
+    let source_matrix_eigenvalue_allowance = sector_transform_validation::bounds(
+        &even_sector_matrix,
+        &diagonal,
+        &off_diagonal,
+        &basis,
+        even_dimension,
+        cfg.precision_bits,
+    )
+    .map_err(anyhow::Error::msg)?
+    .eigenvalue_allowance;
+    let eigenvalues = compute_sector_eigenvalues_with_policy(
         &SectorTridiagonalHp {
             diagonal,
             off_diagonal,
@@ -8967,10 +9591,12 @@ fn compute_response_spectral_preparation(
         2,
         CcmSectorEigenvalueRoute::Selected,
         cfg.precision_bits,
+        SectorIsolationPolicy::ResponseLowestAndNeighbor,
     )?;
     Ok(ResponseSpectralPreparation {
         even_sector_matrix,
         selected_enclosures: eigenvalues.selected_enclosures,
+        source_matrix_eigenvalue_allowance,
     })
 }
 
@@ -8986,35 +9612,52 @@ fn resolve_response_spectral_preparation_via_cache(
         bail!("CCM response spectral isolation requires N >= 1");
     }
     let mut symmetric_tau = tau.to_vec();
-    force_symmetric(&mut symmetric_tau, params.matrix_size());
+    force_symmetric(&mut symmetric_tau, params.matrix_size())?;
     let (even_sector_matrix, even_sector_matrix_manifest) =
         resolve_even_sector_matrix_via_cache(params, cfg, &symmetric_tau, tau_manifest, cache)?;
-    let (tridiagonal, tridiagonal_manifest, _) = resolve_sector_tridiagonal_via_cache(
-        params,
-        cfg,
-        CcmParity::Even,
-        &even_sector_matrix,
-        &even_sector_matrix_manifest,
-        cache,
-    )?;
-    let (eigenvalues, even_sector_eigenvalues_manifest) = resolve_sector_eigenvalues_via_cache(
-        params,
-        cfg,
-        CcmParity::Even,
-        params.n_modes + 1,
-        2,
-        CcmSectorEigenvalueRoute::Selected,
-        &tridiagonal,
-        &tridiagonal_manifest,
-        cache,
-    )?;
+    let (tridiagonal, tridiagonal_manifest, precomputed_transform) =
+        resolve_sector_tridiagonal_via_cache(
+            params,
+            cfg,
+            CcmParity::Even,
+            &even_sector_matrix,
+            &even_sector_matrix_manifest,
+            cache,
+        )?;
+    let (_, even_sector_transform_manifest, source_matrix_eigenvalue_allowance) =
+        resolve_sector_transform_via_cache(
+            params,
+            cfg,
+            CcmParity::Even,
+            &even_sector_matrix,
+            &even_sector_matrix_manifest,
+            &tridiagonal,
+            &tridiagonal_manifest,
+            precomputed_transform.as_ref(),
+            cache,
+        )?;
+    let (eigenvalues, even_sector_eigenvalues_manifest) =
+        resolve_sector_eigenvalues_with_policy_via_cache(
+            params,
+            cfg,
+            CcmParity::Even,
+            params.n_modes + 1,
+            2,
+            CcmSectorEigenvalueRoute::Selected,
+            &tridiagonal,
+            &tridiagonal_manifest,
+            cache,
+            SectorIsolationPolicy::ResponseLowestAndNeighbor,
+        )?;
     Ok(ManagedResponseSpectralPreparation {
         numerical: ResponseSpectralPreparation {
             even_sector_matrix,
             selected_enclosures: eigenvalues.selected_enclosures,
+            source_matrix_eigenvalue_allowance,
         },
         even_sector_matrix_manifest,
         even_sector_eigenvalues_manifest,
+        even_sector_transform_manifest,
     })
 }
 
@@ -9022,18 +9665,45 @@ fn restrict_even_sector_vector(
     vector: &[Float],
     n_modes: usize,
     precision_bits: u32,
-) -> Vec<Float> {
-    debug_assert_eq!(vector.len(), 2 * n_modes + 1);
-    let mut restricted = Vec::with_capacity(n_modes + 1);
-    restricted.push(vector[n_modes].clone());
-    let sqrt_two = Float::with_val(precision_bits, 2).sqrt();
-    for k in 1..=n_modes {
-        let mut value = vector[n_modes - k].clone();
-        value += &vector[n_modes + k];
-        value /= &sqrt_two;
-        restricted.push(value);
+) -> Result<Vec<Float>> {
+    let full = n_modes
+        .checked_mul(2)
+        .and_then(|x| x.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("parity restriction dimension overflow"))?;
+    if !(64..=1_000_000).contains(&precision_bits)
+        || full != vector.len()
+        || full > 16385
+        || vector
+            .iter()
+            .any(|v| !v.is_finite() || v.prec() > 1_000_000)
+    {
+        bail!("invalid parity restriction source, precision or shape");
     }
-    restricted
+    let maxp = vector
+        .iter()
+        .map(Float::prec)
+        .max()
+        .unwrap()
+        .max(precision_bits);
+    if (full as u128 + 8) * (u128::from(maxp + 4096).div_ceil(8) + 96) * 4 > (8u128 << 30) {
+        bail!("parity restriction exceeds numerical workspace budget");
+    }
+    let mut restricted = Vec::with_capacity(n_modes + 1);
+    restricted.push(parity_math::linear(
+        &[(&vector[n_modes], 1)],
+        0,
+        false,
+        precision_bits,
+    )?);
+    for k in 1..=n_modes {
+        restricted.push(parity_math::linear(
+            &[(&vector[n_modes - k], 1), (&vector[n_modes + k], 1)],
+            0,
+            true,
+            precision_bits,
+        )?);
+    }
+    Ok(restricted)
 }
 
 fn response_spectral_isolation(
@@ -9043,78 +9713,118 @@ fn response_spectral_isolation(
     state_eigenvalue: &Float,
     unit_state: &[Float],
 ) -> Result<PortableResponseSpectralIsolation> {
+    use rug::float::Round;
     require_response_even_sector(cfg)?;
-    if preparation.selected_enclosures.len() != 2 {
-        bail!("CCM response spectral isolation did not retain two indexed enclosures");
+    let p = cfg.precision_bits;
+    let dimension = params.n_modes.checked_mul(2).and_then(|n| n.checked_add(1));
+    let allowance = &preparation.source_matrix_eigenvalue_allowance;
+    if !(64..=1_000_000).contains(&p)
+        || dimension != Some(unit_state.len())
+        || unit_state.iter().any(|x| !x.is_finite() || x.prec() > p)
+        || !state_eigenvalue.is_finite()
+        || state_eigenvalue.prec() > p
+        || !allowance.is_finite()
+        || allowance < &0
+        || preparation.selected_enclosures.len() != 2
+    {
+        bail!("CCM response spectral isolation has invalid finite inputs or indexed enclosures");
     }
     let selected = &preparation.selected_enclosures[0];
     let neighboring = &preparation.selected_enclosures[1];
-    if selected.index != 0 || neighboring.index != 1 {
-        bail!("CCM response spectral isolation retained the wrong algebraic indices");
+    if selected.index != 0
+        || neighboring.index != 1
+        || preparation.selected_enclosures.iter().any(|e| {
+            !e.lower.is_finite()
+                || !e.upper.is_finite()
+                || e.lower > e.upper
+                || !SectorIsolationPolicy::ResponseLowestAndNeighbor.accepts_counts(
+                    e.index,
+                    e.lower_count,
+                    e.upper_count,
+                )
+                || e.upper_count > params.n_modes + 1
+        })
+    {
+        bail!("CCM response spectral isolation retained invalid algebraic enclosures");
     }
-    let mut gap_lower_bound = neighboring.lower.clone();
-    gap_lower_bound -= &selected.upper;
-    if gap_lower_bound <= 0 {
+    // Index zero is simple. The index-one enclosure may include a repeated
+    // higher cluster: its lower endpoint still bounds the entire remainder.
+    // Keep the original T/Sturm counts attached to T. These widened intervals
+    // instead enclose the ordered eigenvalues of the stored symmetric A.
+    let allowance = Float::with_val_round(p, allowance, Round::Up).0;
+    let selected_lower = Float::with_val_round(p, &selected.lower - &allowance, Round::Down).0;
+    let selected_upper = Float::with_val_round(p, &selected.upper + &allowance, Round::Up).0;
+    let neighbor_lower = Float::with_val_round(p, &neighboring.lower - &allowance, Round::Down).0;
+    let neighbor_upper = Float::with_val_round(p, &neighboring.upper + &allowance, Round::Up).0;
+    let gap = Float::with_val_round(p, &neighbor_lower - &selected_upper, Round::Down).0;
+    if [
+        &allowance,
+        &selected_lower,
+        &selected_upper,
+        &neighbor_lower,
+        &neighbor_upper,
+        &gap,
+    ]
+    .iter()
+    .any(|x| !x.is_finite())
+        || gap <= 0
+    {
         bail!(
-            "CCM response unresolved_near_crossing: the first two even-sector eigenvalues are not separated by disjoint Sturm enclosures at {} bits",
-            cfg.precision_bits
+            "CCM response unresolved_near_crossing: source-matrix eigenvalue intervals are not finitely separated at {p} bits"
         );
     }
-    let sector_state = restrict_even_sector_vector(unit_state, params.n_modes, cfg.precision_bits);
-    let selected_state_absolute_residual = sector_eigenpair_residual_norm(
+    let sector_state = restrict_even_sector_vector(unit_state, params.n_modes, p)?;
+    let residual = state_residual_bounds::evaluate(
         &preparation.even_sector_matrix,
-        params.n_modes + 1,
-        state_eigenvalue,
         &sector_state,
-        cfg.precision_bits,
+        state_eigenvalue,
+        p,
     )?;
-    let selected_state_relative_residual = weil_eigvec_cache::relative_residual_norm(
-        &preparation.even_sector_matrix,
-        params.n_modes + 1,
-        &sector_state,
-        state_eigenvalue,
-        cfg.precision_bits,
-    )
-    .ok_or_else(|| anyhow::anyhow!("CCM response selected state has an invalid sector residual"))?;
-    if !weil_eigvec_cache::residual_within_precision_floor(
-        &selected_state_relative_residual,
-        cfg.precision_bits,
-    ) {
+    // Both quantities are upper bounds for the actual stored sector vector;
+    // its rounded normalization is not assumed to have exact norm one.
+    let absolute = Float::with_val_round(p, &residual.eigenvalue_error_upper, Round::Up).0;
+    let relative = Float::with_val_round(p, &residual.vector_scaled_residual_upper, Round::Up).0;
+    let ratio = Float::with_val_round(p, &absolute / &gap, Round::Up).0;
+    if !absolute.is_finite()
+        || !relative.is_finite()
+        || !ratio.is_finite()
+        || !weil_eigvec_cache::residual_within_precision_floor(&relative, p)
+        || ratio >= Float::with_val(p, 0.125)
+    {
         bail!(
-            "CCM response unresolved_near_crossing: the selected state does not replay as the isolated lowest even-sector eigenpair"
+            "CCM response unresolved_near_crossing: selected-state residual is not small relative to the source gap and precision floor"
         );
     }
-    let mut state_residual_to_gap = selected_state_absolute_residual.clone();
-    state_residual_to_gap /= &gap_lower_bound;
-    let isolation_limit = Float::with_val(cfg.precision_bits, 0.125);
-    if state_residual_to_gap >= isolation_limit {
+    let state_lower = Float::with_val_round(p, state_eigenvalue - &absolute, Round::Down).0;
+    let state_upper = Float::with_val_round(p, state_eigenvalue + &absolute, Round::Up).0;
+    if !state_lower.is_finite()
+        || !state_upper.is_finite()
+        || state_upper < selected_lower
+        || state_lower > selected_upper
+    {
         bail!(
-            "CCM response unresolved_near_crossing: selected-state residual is not small relative to the same-sector spectral gap"
+            "CCM response unresolved_near_crossing: selected-state residual enclosure does not intersect the indexed lowest source-matrix enclosure"
         );
     }
-    let mut state_lower = state_eigenvalue.clone();
-    state_lower -= &selected_state_absolute_residual;
-    let mut state_upper = state_eigenvalue.clone();
-    state_upper += &selected_state_absolute_residual;
-    if state_upper < selected.lower || state_lower > selected.upper {
-        bail!(
-            "CCM response unresolved_near_crossing: the selected state residual enclosure does not intersect the indexed lowest-even Sturm enclosure"
-        );
-    }
+    // Directed decimal conversion preserves literal real bounds as well as
+    // p-bit round trips. Nearest decimal formatting is not an enclosure.
+    let down = |x: &Float| x.to_string_radix_round(10, None, Round::Down);
+    let up = |x: &Float| x.to_string_radix_round(10, None, Round::Up);
     Ok(PortableResponseSpectralIsolation {
         status: RESPONSE_SPECTRAL_ISOLATION_STATUS.to_owned(),
         parity: CcmParity::Even,
         selected_algebraic_index: 0,
         neighboring_algebraic_index: 1,
         isolation_method: RESPONSE_SPECTRAL_ISOLATION_METHOD.to_owned(),
-        selected_eigenvalue_lower: lossless_hp_decimal(&selected.lower),
-        selected_eigenvalue_upper: lossless_hp_decimal(&selected.upper),
-        neighboring_eigenvalue_lower: lossless_hp_decimal(&neighboring.lower),
-        neighboring_eigenvalue_upper: lossless_hp_decimal(&neighboring.upper),
-        sturm_gap_lower_bound: lossless_hp_decimal(&gap_lower_bound),
-        selected_state_absolute_residual: lossless_hp_decimal(&selected_state_absolute_residual),
-        selected_state_relative_residual: lossless_hp_decimal(&selected_state_relative_residual),
-        selected_state_residual_to_gap_upper_bound: lossless_hp_decimal(&state_residual_to_gap),
+        source_matrix_eigenvalue_allowance: up(&allowance),
+        selected_eigenvalue_lower: down(&selected_lower),
+        selected_eigenvalue_upper: up(&selected_upper),
+        neighboring_eigenvalue_lower: down(&neighbor_lower),
+        neighboring_eigenvalue_upper: up(&neighbor_upper),
+        sturm_gap_lower_bound: down(&gap),
+        selected_state_absolute_residual: up(&absolute),
+        selected_state_relative_residual: up(&relative),
+        selected_state_residual_to_gap_upper_bound: up(&ratio),
     })
 }
 
@@ -9133,7 +9843,7 @@ fn build_even_sector_bordered_response_solver(
     unit_state: &[Float],
 ) -> Result<EvenSectorBorderedResponseSolver> {
     let sector_dimension = params.n_modes + 1;
-    let sector_state = restrict_even_sector_vector(unit_state, params.n_modes, cfg.precision_bits);
+    let sector_state = restrict_even_sector_vector(unit_state, params.n_modes, cfg.precision_bits)?;
     let bordered_dimension = sector_dimension + 1;
     let mut bordered = vec![Float::with_val(cfg.precision_bits, 0); bordered_dimension.pow(2)];
     for row in 0..sector_dimension {
@@ -9158,54 +9868,98 @@ fn build_even_sector_bordered_response_solver(
 fn solve_even_sector_bordered_response(
     solver: &EvenSectorBorderedResponseSolver,
     projected_forcing: &[Float],
-) -> (Vec<Float>, Float) {
+) -> Result<(Vec<Float>, Float)> {
     let sector_forcing =
-        restrict_even_sector_vector(projected_forcing, solver.n_modes, solver.precision_bits);
+        restrict_even_sector_vector(projected_forcing, solver.n_modes, solver.precision_bits)?;
     let mut right_hand_side = sector_forcing
         .iter()
         .map(|value| -Float::with_val(solver.precision_bits, value))
         .collect::<Vec<_>>();
     right_hand_side.push(Float::with_val(solver.precision_bits, 0));
-    let solution = xc_numerics::linalg::lu_solve(
+    let solution = xc_numerics::linalg::try_lu_solve(
         &solver.factors,
         &right_hand_side,
         solver.sector_dimension + 1,
         solver.precision_bits,
-    );
-    (
+    )?;
+    Ok((
         expand_even_sector_vector(
             &solution[..solver.sector_dimension],
             solver.n_modes,
             solver.precision_bits,
         ),
         solution[solver.sector_dimension].clone(),
-    )
+    ))
 }
 
-fn deterministic_dot_hp(left: &[Float], right: &[Float], precision_bits: u32) -> Float {
-    debug_assert_eq!(left.len(), right.len());
-    let terms = left
-        .iter()
-        .zip(right)
-        .map(|(left, right)| {
-            let mut term = Float::with_val(precision_bits, left);
-            term *= right;
-            term
-        })
-        .collect::<Vec<_>>();
-    xc_numerics::reduction::deterministic_pairwise_sum_hp(&terms, precision_bits)
+fn deterministic_dot_hp(
+    left: &[Float],
+    right: &[Float],
+    precision_bits: u32,
+) -> std::result::Result<Float, CacheError> {
+    response_point_math::dot(left, right, precision_bits)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))
 }
 
-fn deterministic_l2_norm_hp(values: &[Float], precision_bits: u32) -> Float {
-    deterministic_dot_hp(values, values, precision_bits).sqrt()
+fn deterministic_l2_norm_hp(
+    values: &[Float],
+    precision_bits: u32,
+) -> std::result::Result<Float, CacheError> {
+    response_point_math::norm(values, precision_bits)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))
+}
+
+// Extracted from the production response paths so its stored-point arithmetic
+// can be checked independently of the bordered solver.
+fn projected_response_forcing(
+    action: &[Float],
+    unit: &[Float],
+    eigenvalue_response: &Float,
+    p: u32,
+) -> std::result::Result<Vec<Float>, CacheError> {
+    response_point_math::projected_forcing(action, unit, eigenvalue_response, p)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))
+}
+
+fn response_unit_state(xi: &[Float], p: u32) -> std::result::Result<Vec<Float>, CacheError> {
+    response_point_math::unit_state(xi, p)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))
+}
+fn response_normalization_scale(
+    unit: &[Float],
+    l: &Float,
+    p: u32,
+) -> std::result::Result<Float, CacheError> {
+    response_point_math::normalization_scale(unit, l, p)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))
+}
+fn response_target_velocity(l: &Float, p: u32) -> std::result::Result<Float, CacheError> {
+    response_point_math::target_velocity(l, p)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))
+}
+
+fn response_state_sum(values: &[Float], p: u32) -> std::result::Result<Float, CacheError> {
+    response_point_math::point_sum(values, p)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))
+}
+fn response_normalization_tangent(
+    unit: &[Float],
+    response: &[Float],
+    target_velocity: &Float,
+    scale: &Float,
+    unit_sum: &Float,
+    p: u32,
+) -> std::result::Result<Float, CacheError> {
+    response_point_math::normalization_tangent(unit, response, target_velocity, scale, unit_sum, p)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))
 }
 
 fn ccm_response_roots(
     roots: &[EigenvalueResult],
     first_positive_root_index: usize,
-) -> Vec<PortableCcmResponseRoot> {
-    let positive_indices = positive_root_indices(roots, first_positive_root_index);
-    roots
+) -> std::result::Result<Vec<PortableCcmResponseRoot>, CacheError> {
+    let positive_indices = positive_root_indices(roots, first_positive_root_index)?;
+    Ok(roots
         .iter()
         .zip(positive_indices)
         .enumerate()
@@ -9229,7 +9983,7 @@ fn ccm_response_roots(
                 value,
             }
         })
-        .collect()
+        .collect())
 }
 
 struct PrimePowerVelocityAction {
@@ -9241,12 +9995,6 @@ struct PrimePowerVelocityAction {
     action: Vec<Float>,
 }
 
-struct ComputedArchimedeanIntegralVelocities {
-    alpha: Vec<Float>,
-    beta: Vec<Float>,
-    gamma: Vec<Float>,
-}
-
 struct UFlowVelocityActions {
     tau_pole: Vec<Float>,
     tau_archimedean: Vec<Float>,
@@ -9254,6 +10002,7 @@ struct UFlowVelocityActions {
     tau_total: Vec<Float>,
 }
 
+#[cfg(test)]
 fn rho_hp_velocity(x: &Float, x_velocity: &Float, precision_bits: u32) -> Float {
     let rho = rho_hp(x, precision_bits);
     let mut coth = Float::with_val(precision_bits, x).cosh();
@@ -9266,6 +10015,7 @@ fn rho_hp_velocity(x: &Float, x_velocity: &Float, precision_bits: u32) -> Float 
     logarithmic_derivative
 }
 
+#[cfg(test)]
 fn compute_archimedean_integral_velocities_l(
     n: i64,
     l: &Float,
@@ -9364,208 +10114,13 @@ fn compute_archimedean_integral_velocities_l(
     (alpha_velocity, beta_velocity, gamma_velocity)
 }
 
-fn compute_archimedean_integral_velocities(
-    n_modes: usize,
-    l: &Float,
-    cfg: &HighPrecConfig,
-) -> ComputedArchimedeanIntegralVelocities {
-    use std::collections::HashMap;
-
-    let precision_bits = cfg.precision_bits;
-    let precision_extra = (precision_bits / 2) as usize;
-    let points_for_mode = (0..=n_modes)
-        .map(|mode| cfg.quad_points.max(3 * mode + precision_extra))
-        .collect::<Vec<_>>();
-    let mut unique_points = points_for_mode.clone();
-    unique_points.sort_unstable();
-    unique_points.dedup();
-    type GlTable = (Vec<Float>, Vec<Float>);
-    let plan = xc_numerics::hp_runtime::plan_gl_precompute(&unique_points, precision_bits);
-    let tables = xc_numerics::hp_runtime::map_gl_precompute_planned(
-        &unique_points,
-        plan,
-        |points, root_schedule| {
-            (
-                points,
-                xc_numerics::quadrature::gauss_legendre_nodes_scheduled(
-                    points,
-                    precision_bits,
-                    cfg.cache_mode,
-                    root_schedule,
-                ),
-            )
-        },
-    )
-    .into_iter()
-    .collect::<HashMap<usize, GlTable>>();
-    let values = (0..=n_modes)
-        .into_par_iter()
-        .map(|mode| {
-            let (nodes, weights) = tables
-                .get(&points_for_mode[mode])
-                .expect("planned GL table is present");
-            compute_archimedean_integral_velocities_l(
-                mode as i64,
-                l,
-                precision_bits,
-                nodes,
-                weights,
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut alpha = Vec::with_capacity(values.len());
-    let mut beta = Vec::with_capacity(values.len());
-    let mut gamma = Vec::with_capacity(values.len());
-    for (alpha_value, beta_value, gamma_value) in values {
-        alpha.push(alpha_value);
-        beta.push(beta_value);
-        gamma.push(gamma_value);
-    }
-    ComputedArchimedeanIntegralVelocities { alpha, beta, gamma }
-}
-
 fn compute_u_flow_velocity_actions(
     params: &CcmParams,
     cfg: &HighPrecConfig,
     l: &Float,
     unit_state: &[Float],
 ) -> Result<UFlowVelocityActions> {
-    let precision_bits = cfg.precision_bits;
-    let n_modes = params.n_modes;
-    let dimension = params.matrix_size();
-    if unit_state.len() != dimension || l <= &Float::with_val(precision_bits, 0) {
-        bail!("CCM u-flow response received incompatible dimensions or cutoff");
-    }
-    let archimedean = compute_archimedean_integral_velocities(n_modes, l, cfg);
-    let pi_value = pi(precision_bits);
-    let mut sixteen_pi_squared = Float::with_val(precision_bits, &pi_value);
-    sixteen_pi_squared.square_mut();
-    sixteen_pi_squared *= 16u32;
-    let mut l_squared = Float::with_val(precision_bits, l);
-    l_squared.square_mut();
-    let mut sinh_quarter = Float::with_val(precision_bits, l);
-    sinh_quarter /= 4u32;
-    sinh_quarter = sinh_quarter.sinh();
-    let mut sinh_quarter_squared = Float::with_val(precision_bits, &sinh_quarter);
-    sinh_quarter_squared.square_mut();
-    let mut sinh_half = Float::with_val(precision_bits, l);
-    sinh_half /= 2u32;
-    sinh_half = sinh_half.sinh();
-
-    let rows = (0..dimension)
-        .into_par_iter()
-        .map(|row| {
-            let n = row as i64 - n_modes as i64;
-            let nf = fl_i(precision_bits, n);
-            let mut pole_terms = Vec::with_capacity(dimension);
-            let mut archimedean_terms = Vec::with_capacity(dimension);
-            for (column, state_value) in unit_state.iter().enumerate() {
-                let m = column as i64 - n_modes as i64;
-                let mf = fl_i(precision_bits, m);
-                let mut mn_term = Float::with_val(precision_bits, &sixteen_pi_squared);
-                mn_term *= &mf;
-                mn_term *= &nf;
-                let mut numerator = Float::with_val(precision_bits, &l_squared);
-                numerator -= mn_term;
-                let mut left = Float::with_val(precision_bits, &sixteen_pi_squared);
-                left *= Float::with_val(precision_bits, &mf).square();
-                left += &l_squared;
-                let mut right = Float::with_val(precision_bits, &sixteen_pi_squared);
-                right *= Float::with_val(precision_bits, &nf).square();
-                right += &l_squared;
-                let mut denominator = Float::with_val(precision_bits, &left);
-                denominator *= &right;
-                let mut denominator_velocity = Float::with_val(precision_bits, &left);
-                denominator_velocity += &right;
-                denominator_velocity *= l;
-                denominator_velocity *= 2u32;
-                let mut prefactor = Float::with_val(precision_bits, &sinh_quarter_squared);
-                prefactor *= l;
-                prefactor *= 32u32;
-                let mut prefactor_velocity = Float::with_val(precision_bits, &sinh_quarter_squared);
-                let mut hyperbolic_term = Float::with_val(precision_bits, &sinh_half);
-                hyperbolic_term *= l;
-                hyperbolic_term /= 4u32;
-                prefactor_velocity += hyperbolic_term;
-                prefactor_velocity *= 32u32;
-                let mut numerator_velocity = Float::with_val(precision_bits, l);
-                numerator_velocity *= 2u32;
-
-                let mut pole_velocity_numerator = prefactor_velocity;
-                pole_velocity_numerator *= &numerator;
-                let mut product_velocity = Float::with_val(precision_bits, &prefactor);
-                product_velocity *= numerator_velocity;
-                pole_velocity_numerator += product_velocity;
-                pole_velocity_numerator *= &denominator;
-                let mut quotient_velocity = prefactor;
-                quotient_velocity *= &numerator;
-                quotient_velocity *= denominator_velocity;
-                pole_velocity_numerator -= quotient_velocity;
-                let mut denominator_squared = denominator;
-                denominator_squared.square_mut();
-                pole_velocity_numerator /= denominator_squared;
-                pole_velocity_numerator *= state_value;
-                pole_terms.push(pole_velocity_numerator);
-
-                let archimedean_velocity = if n == m {
-                    let index = n.unsigned_abs() as usize;
-                    let mut value = Float::with_val(precision_bits, &archimedean.gamma[index]);
-                    value -= &archimedean.beta[index];
-                    value *= 2u32;
-                    value
-                } else {
-                    let mut value = signed_alpha(&archimedean.alpha, m, precision_bits);
-                    value -= signed_alpha(&archimedean.alpha, n, precision_bits);
-                    value /= fl_i(precision_bits, n - m);
-                    value
-                };
-                let mut tau_archimedean_term = -archimedean_velocity;
-                tau_archimedean_term *= state_value;
-                archimedean_terms.push(tau_archimedean_term);
-            }
-            (
-                xc_numerics::reduction::deterministic_pairwise_sum_hp(&pole_terms, precision_bits),
-                xc_numerics::reduction::deterministic_pairwise_sum_hp(
-                    &archimedean_terms,
-                    precision_bits,
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
-    let tau_pole = rows
-        .iter()
-        .map(|values| values.0.clone())
-        .collect::<Vec<_>>();
-    let tau_archimedean = rows
-        .iter()
-        .map(|values| values.1.clone())
-        .collect::<Vec<_>>();
-
-    let mut tau_prime = vec![Float::with_val(precision_bits, 0); dimension];
-    for (power, prime, _) in prime_powers_up_to(params.lambda_sq_int()) {
-        let velocity =
-            apply_prime_power_velocity(n_modes, power, prime, l, unit_state, precision_bits)?;
-        for (aggregate, value) in tau_prime.iter_mut().zip(velocity.action) {
-            *aggregate += value;
-        }
-    }
-    let tau_total = tau_pole
-        .iter()
-        .zip(&tau_archimedean)
-        .zip(&tau_prime)
-        .map(|((pole, archimedean), prime)| {
-            let mut value = Float::with_val(precision_bits, pole);
-            value += archimedean;
-            value += prime;
-            value
-        })
-        .collect::<Vec<_>>();
-    Ok(UFlowVelocityActions {
-        tau_pole,
-        tau_archimedean,
-        tau_prime,
-        tau_total,
-    })
+    u_flow_math::evaluate(params, cfg, l, unit_state)
 }
 
 /// Apply one active prime power's additive contribution to `dQ/du` to a
@@ -9580,96 +10135,7 @@ fn apply_prime_power_velocity(
     vector: &[Float],
     precision_bits: u32,
 ) -> Result<PrimePowerVelocityAction> {
-    let dimension = 2 * n_modes + 1;
-    if vector.len() != dimension || l <= &Float::with_val(precision_bits, 0) {
-        bail!("prime-power response received incompatible dimensions or cutoff");
-    }
-    let log_power = Float::with_val(precision_bits, power).ln();
-    let von_mangoldt_weight = Float::with_val(precision_bits, prime).ln();
-    let sqrt_power = Float::with_val(precision_bits, power).sqrt();
-    let mut reduced_position = Float::with_val(precision_bits, 1);
-    let mut ratio = Float::with_val(precision_bits, &log_power);
-    ratio /= l;
-    reduced_position -= ratio;
-
-    let mut velocity_coefficient = Float::with_val(precision_bits, &von_mangoldt_weight);
-    velocity_coefficient *= &log_power;
-    velocity_coefficient /= &sqrt_power;
-    let mut l_squared = Float::with_val(precision_bits, l);
-    l_squared.square_mut();
-    velocity_coefficient /= l_squared;
-    velocity_coefficient = -velocity_coefficient;
-
-    let mut edge_jump_coefficient = Float::with_val(precision_bits, &von_mangoldt_weight);
-    edge_jump_coefficient *= -2i32;
-    edge_jump_coefficient /= &sqrt_power;
-    edge_jump_coefficient /= &log_power;
-
-    let pi_value = pi(precision_bits);
-    let mut two_pi = Float::with_val(precision_bits, &pi_value);
-    two_pi *= 2u32;
-    let mut four_pi = Float::with_val(precision_bits, &pi_value);
-    four_pi *= 4u32;
-    let modes = (-(n_modes as i64)..=(n_modes as i64)).collect::<Vec<_>>();
-    let phases = modes
-        .iter()
-        .map(|mode| {
-            let mut phase = Float::with_val(precision_bits, &two_pi);
-            phase *= fl_i(precision_bits, *mode);
-            phase *= &reduced_position;
-            phase
-        })
-        .collect::<Vec<_>>();
-    let sines = phases
-        .par_iter()
-        .map(|phase| phase.clone().sin())
-        .collect::<Vec<_>>();
-    let cosines = phases.into_par_iter().map(Float::cos).collect::<Vec<_>>();
-
-    let action = modes
-        .par_iter()
-        .enumerate()
-        .map(|(row, n)| {
-            let mut terms = Vec::with_capacity(dimension);
-            for (column, m) in modes.iter().enumerate() {
-                let derivative_kernel = if n == m {
-                    let mut value = Float::with_val(precision_bits, &cosines[row]);
-                    value *= 2u32;
-                    let mut oscillatory = Float::with_val(precision_bits, &four_pi);
-                    oscillatory *= fl_i(precision_bits, *n);
-                    oscillatory *= &reduced_position;
-                    oscillatory *= &sines[row];
-                    value -= oscillatory;
-                    value
-                } else {
-                    let mut value = Float::with_val(precision_bits, &cosines[row]);
-                    value *= fl_i(precision_bits, *n);
-                    let mut other = Float::with_val(precision_bits, &cosines[column]);
-                    other *= fl_i(precision_bits, *m);
-                    value -= other;
-                    value *= 2u32;
-                    value /= fl_i(precision_bits, n - m);
-                    value
-                };
-                let mut term = derivative_kernel;
-                term *= &vector[column];
-                terms.push(term);
-            }
-            let mut value =
-                xc_numerics::reduction::deterministic_pairwise_sum_hp(&terms, precision_bits);
-            value *= &velocity_coefficient;
-            value
-        })
-        .collect::<Vec<_>>();
-
-    Ok(PrimePowerVelocityAction {
-        log_power,
-        von_mangoldt_weight,
-        reduced_position,
-        velocity_coefficient,
-        edge_jump_coefficient,
-        action,
-    })
+    prime_response_kernel::evaluate(n_modes, power, prime, l, vector, precision_bits, true)
 }
 
 // Root motion is invariant under a common, parameter-dependent normalization.
@@ -9683,38 +10149,8 @@ fn prime_power_root_velocity_response(
     root: &Float,
     precision_bits: u32,
 ) -> Result<Float> {
-    if xi.len() != xi_velocity.len() || xi.len() != poles.len() {
-        bail!("prime-power root response received incompatible source dimensions");
-    }
-    let mut numerator_terms = Vec::with_capacity(xi.len());
-    let mut derivative_terms = Vec::with_capacity(xi.len());
-    for ((weight, velocity), pole) in xi.iter().zip(xi_velocity).zip(poles) {
-        let mut denominator = Float::with_val(precision_bits, root);
-        denominator -= pole;
-        if denominator.is_zero() {
-            bail!("prime-power root response encountered a secular pole");
-        }
-        let mut numerator = Float::with_val(precision_bits, velocity);
-        numerator /= &denominator;
-        numerator_terms.push(numerator);
-        denominator.square_mut();
-        let mut derivative = Float::with_val(precision_bits, weight);
-        derivative /= denominator;
-        derivative = -derivative;
-        derivative_terms.push(derivative);
-    }
-    let numerator =
-        xc_numerics::reduction::deterministic_pairwise_sum_hp(&numerator_terms, precision_bits);
-    let derivative =
-        xc_numerics::reduction::deterministic_pairwise_sum_hp(&derivative_terms, precision_bits);
-    if derivative.is_zero() {
-        bail!("prime-power root response has a zero secular derivative");
-    }
-    let mut response = -numerator;
-    response /= derivative;
-    Ok(response)
+    root_response_math::evaluate(xi, xi_velocity, poles, None, root, precision_bits, None)
 }
-
 fn secular_root_velocity_response(
     xi: &[Float],
     xi_velocity: &[Float],
@@ -9723,73 +10159,47 @@ fn secular_root_velocity_response(
     root: &Float,
     precision_bits: u32,
 ) -> Result<Float> {
-    if xi.len() != xi_velocity.len() || xi.len() != poles.len() || xi.len() != pole_velocities.len()
-    {
-        bail!("CCM u-flow root response received incompatible source dimensions");
-    }
-    let mut source_terms = Vec::with_capacity(xi.len());
-    let mut derivative_terms = Vec::with_capacity(xi.len());
-    for (((weight, weight_velocity), pole), pole_velocity) in
-        xi.iter().zip(xi_velocity).zip(poles).zip(pole_velocities)
-    {
-        let mut denominator = Float::with_val(precision_bits, root);
-        denominator -= pole;
-        if denominator.is_zero() {
-            bail!("CCM u-flow root response encountered a secular pole");
-        }
-        let mut weight_term = Float::with_val(precision_bits, weight_velocity);
-        weight_term /= &denominator;
-        denominator.square_mut();
-        let mut pole_term = Float::with_val(precision_bits, weight);
-        pole_term *= pole_velocity;
-        pole_term /= &denominator;
-        weight_term += pole_term;
-        source_terms.push(weight_term);
-        let mut derivative = Float::with_val(precision_bits, weight);
-        derivative /= denominator;
-        derivative = -derivative;
-        derivative_terms.push(derivative);
-    }
-    let source =
-        xc_numerics::reduction::deterministic_pairwise_sum_hp(&source_terms, precision_bits);
-    let derivative =
-        xc_numerics::reduction::deterministic_pairwise_sum_hp(&derivative_terms, precision_bits);
-    if derivative.is_zero() {
-        bail!("CCM u-flow root response has a zero secular derivative");
-    }
-    let mut response = -source;
-    response /= derivative;
-    Ok(response)
+    root_response_math::evaluate(
+        xi,
+        xi_velocity,
+        poles,
+        Some(pole_velocities),
+        root,
+        precision_bits,
+        None,
+    )
+}
+
+fn secular_spacing(l: &Float, p: u32) -> std::result::Result<Float, CacheError> {
+    crate::ccm::certified_roots::boundary::rounded_spacing(l, p)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))
 }
 
 fn ccm_secular_poles_and_u_velocities(
     l: &Float,
     n_modes: usize,
-    precision_bits: u32,
-) -> (Vec<Float>, Vec<Float>) {
-    let mut spacing = pi(precision_bits);
-    spacing *= 2u32;
-    spacing /= l;
-    let mut spacing_velocity = -Float::with_val(precision_bits, &spacing);
-    spacing_velocity /= l;
-    let modes = (-(n_modes as i64)..=(n_modes as i64)).collect::<Vec<_>>();
-    let poles = modes
-        .iter()
+    p: u32,
+) -> std::result::Result<(Vec<Float>, Vec<Float>), CacheError> {
+    if n_modes > 4096 {
+        return Err(CacheError::InvalidManifest(
+            "unsupported secular pole dimension".into(),
+        ));
+    }
+    let spacing = secular_spacing(l, p)?;
+    let poles = secular_poles(&spacing, n_modes, p);
+    if poles.iter().any(|v| !v.is_finite()) {
+        return Err(CacheError::InvalidManifest(
+            "secular pole outside exponent range".into(),
+        ));
+    }
+    let velocities = (-(n_modes as i64)..=n_modes as i64)
         .map(|mode| {
-            let mut value = Float::with_val(precision_bits, &spacing);
-            value *= fl_i(precision_bits, *mode);
-            value
+            let numerator = Float::with_val(p + 64, &spacing) * -mode;
+            crate::ccm::retained_evidence::point::quotient(&numerator, l, p)
+                .map_err(|error| CacheError::InvalidManifest(error.to_string()))
         })
-        .collect::<Vec<_>>();
-    let velocities = modes
-        .iter()
-        .map(|mode| {
-            let mut value = Float::with_val(precision_bits, &spacing_velocity);
-            value *= fl_i(precision_bits, *mode);
-            value
-        })
-        .collect::<Vec<_>>();
-    (poles, velocities)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok((poles, velocities))
 }
 
 fn shifted_matrix_frobenius_norm(
@@ -9797,20 +10207,9 @@ fn shifted_matrix_frobenius_norm(
     eigenvalue: &Float,
     dimension: usize,
     precision_bits: u32,
-) -> Float {
-    let terms = tau
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let mut shifted = Float::with_val(precision_bits, value);
-            if index / dimension == index % dimension {
-                shifted -= eigenvalue;
-            }
-            shifted.square_mut();
-            shifted
-        })
-        .collect::<Vec<_>>();
-    xc_numerics::reduction::deterministic_pairwise_sum_hp(&terms, precision_bits).sqrt()
+) -> std::result::Result<Float, CacheError> {
+    response_point_math::shifted_norm(tau, eigenvalue, dimension, precision_bits)
+        .map_err(|error| CacheError::InvalidManifest(error.to_string()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9823,42 +10222,18 @@ fn bordered_response_relative_residual(
     lagrange_multiplier: &Float,
     shifted_frobenius_norm: &Float,
     precision_bits: u32,
-) -> Float {
-    let dimension = unit_state.len();
-    let mut residual = Vec::with_capacity(dimension + 1);
-    for row in 0..dimension {
-        let mut terms = Vec::with_capacity(dimension);
-        for column in 0..dimension {
-            let mut coefficient = Float::with_val(precision_bits, &tau[row * dimension + column]);
-            if row == column {
-                coefficient -= eigenvalue;
-            }
-            coefficient *= &response[column];
-            terms.push(coefficient);
-        }
-        let mut value =
-            xc_numerics::reduction::deterministic_pairwise_sum_hp(&terms, precision_bits);
-        let mut border = Float::with_val(precision_bits, &unit_state[row]);
-        border *= lagrange_multiplier;
-        value += border;
-        value += &projected_forcing[row];
-        residual.push(value);
-    }
-    residual.push(deterministic_dot_hp(unit_state, response, precision_bits));
-    let residual_norm = deterministic_l2_norm_hp(&residual, precision_bits);
-    let forcing_norm = deterministic_l2_norm_hp(projected_forcing, precision_bits);
-    let response_norm = deterministic_l2_norm_hp(response, precision_bits);
-    let mut denominator = Float::with_val(precision_bits, shifted_frobenius_norm);
-    denominator *= response_norm;
-    denominator += forcing_norm;
-    denominator += lagrange_multiplier.clone().abs();
-    if denominator.is_zero() {
-        residual_norm
-    } else {
-        let mut relative = residual_norm;
-        relative /= denominator;
-        relative
-    }
+) -> std::result::Result<Float, CacheError> {
+    response_point_math::bordered_residual(
+        tau,
+        eigenvalue,
+        unit_state,
+        projected_forcing,
+        response,
+        lagrange_multiplier,
+        shifted_frobenius_norm,
+        precision_bits,
+    )
+    .map_err(|error| CacheError::InvalidManifest(error.to_string()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9884,25 +10259,12 @@ fn compute_prime_power_response_analysis(
         bail!("prime-power response capture requires a retained state and root window");
     }
 
-    let xi_norm = deterministic_l2_norm_hp(xi, precision_bits);
-    if xi_norm.is_zero() {
-        bail!("prime-power response capture received a zero eigenstate");
-    }
-    let unit_state = xi
-        .iter()
-        .map(|value| {
-            let mut normalized = Float::with_val(precision_bits, value);
-            normalized /= &xi_norm;
-            normalized
-        })
-        .collect::<Vec<_>>();
-    let unit_state_sum =
-        xc_numerics::reduction::deterministic_pairwise_sum_hp(&unit_state, precision_bits);
+    let unit_state = response_unit_state(xi, precision_bits)?;
+    let unit_state_sum = response_state_sum(&unit_state, precision_bits)?;
     if unit_state_sum.is_zero() {
         bail!("prime-power response cannot preserve the CCM zero-sum eigenstate normalization");
     }
-    let mut ccm_scale = Float::with_val(precision_bits, l).sqrt();
-    ccm_scale /= &unit_state_sum;
+    let ccm_scale = response_normalization_scale(&unit_state, l, precision_bits)?;
     let spectral_isolation = response_spectral_isolation(
         spectral_preparation,
         params,
@@ -9918,9 +10280,9 @@ fn compute_prime_power_response_analysis(
         &unit_state,
     )?;
     let shifted_frobenius_norm =
-        shifted_matrix_frobenius_norm(tau, state_eigenvalue, dimension, precision_bits);
-    let (poles, _) = ccm_secular_poles_and_u_velocities(l, params.n_modes, precision_bits);
-    let portable_roots = ccm_response_roots(roots, first_positive_root_index);
+        shifted_matrix_frobenius_norm(tau, state_eigenvalue, dimension, precision_bits)?;
+    let (poles, _) = ccm_secular_poles_and_u_velocities(l, params.n_modes, precision_bits)?;
+    let portable_roots = ccm_response_roots(roots, first_positive_root_index)?;
     let prime_content = prime_powers_up_to(params.lambda_sq_int());
     let lambda_identity = lambda_squared_cache_identity(params);
     let prepared_roots = PreparedRootResponses::new(&unit_state, &poles, roots, precision_bits)?;
@@ -9941,31 +10303,13 @@ fn compute_prime_power_response_analysis(
                     precision_bits,
                 )?;
                 let eigenvalue_response =
-                    deterministic_dot_hp(&unit_state, &velocity.action, precision_bits);
-                let projected_forcing = velocity
-                    .action
-                    .iter()
-                    .zip(&unit_state)
-                    .map(|(action, state)| {
-                        let mut projection = Float::with_val(precision_bits, state);
-                        projection *= &eigenvalue_response;
-                        let mut value = Float::with_val(precision_bits, action);
-                        value -= projection;
-                        value
-                    })
-                    .collect::<Vec<_>>();
-                let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits);
+                    deterministic_dot_hp(&unit_state, &velocity.action, precision_bits)?;
+                let projected_forcing = projected_response_forcing(&velocity.action, &unit_state, &eigenvalue_response, precision_bits)?;
+                let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
                 let (eigenvector_response, lagrange_multiplier) =
-                    solve_even_sector_bordered_response(&bordered_solver, &projected_forcing);
-                let response_norm = deterministic_l2_norm_hp(&eigenvector_response, precision_bits);
-                let response_sum = xc_numerics::reduction::deterministic_pairwise_sum_hp(
-                    &eigenvector_response,
-                    precision_bits,
-                );
-                let mut ccm_scale_response = Float::with_val(precision_bits, &ccm_scale);
-                ccm_scale_response *= &response_sum;
-                ccm_scale_response /= &unit_state_sum;
-                ccm_scale_response = -ccm_scale_response;
+                    solve_even_sector_bordered_response(&bordered_solver, &projected_forcing)?;
+                let response_norm = deterministic_l2_norm_hp(&eigenvector_response, precision_bits)?;
+                let ccm_scale_response = response_normalization_tangent(&unit_state, &eigenvector_response, &Float::with_val(precision_bits, 0), &ccm_scale, &unit_state_sum, precision_bits)?;
                 let root_velocity_responses = prepared_roots.values(&eigenvector_response)?;
                 let relative_residual = bordered_response_relative_residual(
                     tau,
@@ -9976,7 +10320,7 @@ fn compute_prime_power_response_analysis(
                     &lagrange_multiplier,
                     &shifted_frobenius_norm,
                     precision_bits,
-                );
+                )?;
                 if !weil_eigvec_cache::residual_within_precision_floor(&relative_residual, precision_bits) {
                     bail!(
                         "prime-power response bordered solve for {power} failed its precision-scaled residual gate"
@@ -9992,7 +10336,7 @@ fn compute_prime_power_response_analysis(
                 reduced_position: lossless_hp_decimal(&velocity.reduced_position),
                 velocity_coefficient: lossless_hp_decimal(&velocity.velocity_coefficient),
                 edge_jump_coefficient: lossless_hp_decimal(&velocity.edge_jump_coefficient),
-                observation_is_event_edge: lambda_identity == power.to_string(),
+                observation_is_event_edge: cutoff_equals_event_power(&lambda_identity, power)?,
                 eigenvalue_velocity_response: lossless_hp_decimal(&eigenvalue_response),
                 projected_forcing_norm: lossless_hp_decimal(&projected_forcing_norm),
                 l2_eigenvector_velocity_response_norm: lossless_hp_decimal(&response_norm),
@@ -10062,7 +10406,7 @@ fn validate_prime_power_response_analysis(
     let precision_bits = cfg.precision_bits;
     let dimension = params.matrix_size();
     let parity_policy = cfg.effective_parity_policy();
-    let expected_roots = ccm_response_roots(roots, first_positive_root_index);
+    let expected_roots = ccm_response_roots(roots, first_positive_root_index)?;
     let expected_content = prime_powers_up_to(params.lambda_sq_int());
     if artifact.schema_version != 2
         || artifact.lambda_squared != lambda_squared_cache_identity(params)
@@ -10091,22 +10435,8 @@ fn validate_prime_power_response_analysis(
         ));
     }
 
-    let xi_norm = deterministic_l2_norm_hp(xi, precision_bits);
-    if xi_norm.is_zero() {
-        return Err(invalid(
-            "CCM prime-power response retained a zero eigenstate".to_owned(),
-        ));
-    }
-    let unit_state = xi
-        .iter()
-        .map(|value| {
-            let mut normalized = Float::with_val(precision_bits, value);
-            normalized /= &xi_norm;
-            normalized
-        })
-        .collect::<Vec<_>>();
-    let unit_state_sum =
-        xc_numerics::reduction::deterministic_pairwise_sum_hp(&unit_state, precision_bits);
+    let unit_state = response_unit_state(xi, precision_bits)?;
+    let unit_state_sum = response_state_sum(&unit_state, precision_bits)?;
     if unit_state_sum.is_zero() {
         return Err(invalid(
             "CCM prime-power response has an invalid zero-sum normalized state".to_owned(),
@@ -10125,11 +10455,10 @@ fn validate_prime_power_response_analysis(
             "CCM prime-power response has invalid spectral-isolation evidence".to_owned(),
         ));
     }
-    let mut ccm_scale = Float::with_val(precision_bits, l).sqrt();
-    ccm_scale /= &unit_state_sum;
+    let ccm_scale = response_normalization_scale(&unit_state, l, precision_bits)?;
     let shifted_frobenius_norm =
-        shifted_matrix_frobenius_norm(tau, state_eigenvalue, dimension, precision_bits);
-    let (poles, _) = ccm_secular_poles_and_u_velocities(l, params.n_modes, precision_bits);
+        shifted_matrix_frobenius_norm(tau, state_eigenvalue, dimension, precision_bits)?;
+    let (poles, _) = ccm_secular_poles_and_u_velocities(l, params.n_modes, precision_bits)?;
     let lambda_identity = lambda_squared_cache_identity(params);
 
     let prepared_roots = PreparedRootResponses::new(&unit_state, &poles, roots, precision_bits)
@@ -10149,7 +10478,9 @@ fn validate_prime_power_response_analysis(
                     if event.power != power
                         || event.prime != prime
                         || event.exponent != exponent
-                        || event.observation_is_event_edge != (lambda_identity == power.to_string())
+                        || event.observation_is_event_edge
+                            != cutoff_equals_event_power(&lambda_identity, power)
+                                .map_err(|e| invalid(e.to_string()))?
                         || event.l2_eigenvector_velocity_response.len() != dimension
                         || event.root_velocity_responses.len() != roots.len()
                     {
@@ -10167,21 +10498,15 @@ fn validate_prime_power_response_analysis(
                     )
                     .map_err(|error| invalid(error.to_string()))?;
                     let eigenvalue_response =
-                        deterministic_dot_hp(&unit_state, &velocity.action, precision_bits);
-                    let projected_forcing = velocity
-                        .action
-                        .iter()
-                        .zip(&unit_state)
-                        .map(|(action, state)| {
-                            let mut projection = Float::with_val(precision_bits, state);
-                            projection *= &eigenvalue_response;
-                            let mut value = Float::with_val(precision_bits, action);
-                            value -= projection;
-                            value
-                        })
-                        .collect::<Vec<_>>();
+                        deterministic_dot_hp(&unit_state, &velocity.action, precision_bits)?;
+                    let projected_forcing = projected_response_forcing(
+                        &velocity.action,
+                        &unit_state,
+                        &eigenvalue_response,
+                        precision_bits,
+                    )?;
                     let projected_forcing_norm =
-                        deterministic_l2_norm_hp(&projected_forcing, precision_bits);
+                        deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
                     let response =
                         parse_hp_vector(&event.l2_eigenvector_velocity_response, precision_bits)?;
                     if response.iter().any(|value| !value.is_finite()) {
@@ -10189,15 +10514,15 @@ fn validate_prime_power_response_analysis(
                 "CCM prime-power response event {power} contains a nonfinite vector value"
             )));
                     }
-                    let response_norm = deterministic_l2_norm_hp(&response, precision_bits);
-                    let response_sum = xc_numerics::reduction::deterministic_pairwise_sum_hp(
+                    let response_norm = deterministic_l2_norm_hp(&response, precision_bits)?;
+                    let ccm_scale_response = response_normalization_tangent(
+                        &unit_state,
                         &response,
+                        &Float::with_val(precision_bits, 0),
+                        &ccm_scale,
+                        &unit_state_sum,
                         precision_bits,
-                    );
-                    let mut ccm_scale_response = Float::with_val(precision_bits, &ccm_scale);
-                    ccm_scale_response *= &response_sum;
-                    ccm_scale_response /= &unit_state_sum;
-                    ccm_scale_response = -ccm_scale_response;
+                    )?;
                     let lagrange_multiplier =
                         parse_hp_scalar(&event.bordered_lagrange_multiplier, precision_bits)?;
                     let relative_residual = bordered_response_relative_residual(
@@ -10209,7 +10534,7 @@ fn validate_prime_power_response_analysis(
                         &lagrange_multiplier,
                         &shifted_frobenius_norm,
                         precision_bits,
-                    );
+                    )?;
 
                     if event.log_power != lossless_hp_decimal(&velocity.log_power)
                         || event.von_mangoldt_weight
@@ -10299,6 +10624,7 @@ fn resolve_prime_power_response_analysis_via_cache(
         "root_selection_digest": selection_digest.0,
         "even_sector_matrix_content_digest": spectral_preparation.even_sector_matrix_manifest.content_digest.0,
         "even_sector_eigenvalues_content_digest": spectral_preparation.even_sector_eigenvalues_manifest.content_digest.0,
+        "even_sector_transform_content_digest": spectral_preparation.even_sector_transform_manifest.content_digest.0,
         "spectral_isolation_method": RESPONSE_SPECTRAL_ISOLATION_METHOD,
         "velocity_parameter": PRIME_POWER_RESPONSE_VELOCITY_PARAMETER,
         "response_definition": PRIME_POWER_RESPONSE_DEFINITION,
@@ -10307,7 +10633,7 @@ fn resolve_prime_power_response_analysis_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_prime_power_response_analysis".to_owned(),
-        mathematical_semantics_version: "ccm-prime-power-response-v0.15.0-v3".to_owned(),
+        mathematical_semantics_version: PRIME_POWER_RESPONSE_MATHEMATICAL_SEMANTICS.to_owned(),
         resolved_mathematical_parameters: resolved_parameters,
         normalization: Some(PRIME_POWER_RESPONSE_NORMALIZATION.to_owned()),
         target: Some("selected_ccm_state_and_root_prime_velocity_response".to_owned()),
@@ -10337,9 +10663,13 @@ fn resolve_prime_power_response_analysis_via_cache(
                     .content_digest
                     .clone(),
             ),
+            (
+                "ccm_even_sector_transform".to_owned(),
+                spectral_preparation.even_sector_transform_manifest.content_digest.clone(),
+            ),
         ]),
         algorithm_semantics: Some(
-            "analytic_prime_velocity_action_even_sector_isolated_bordered_lu_hellmann_feynman_and_secular_implicit_response_v2"
+            "analytic_prime_velocity_action_source_bound_even_sector_bordered_lu_hellmann_feynman_and_secular_implicit_response_v3"
                 .to_owned(),
         ),
     };
@@ -10365,7 +10695,7 @@ fn resolve_prime_power_response_analysis_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -10413,12 +10743,15 @@ fn resolve_prime_power_response_analysis_via_cache(
                     spectral_preparation
                         .even_sector_eigenvalues_manifest
                         .clone(),
+                    spectral_preparation.even_sector_transform_manifest.clone(),
                 ]),
             ))
         },
         |artifact| {
             if fresh.verify_fresh(artifact)? {
-                eprintln!("[HP] response validation: exact fresh payload seal verified; production numerical gates already passed");
+                eprintln!(
+                    "[HP] response validation: exact fresh payload seal verified; production numerical gates already passed"
+                );
                 return Ok(());
             }
             validate_prime_power_response_analysis(
@@ -10443,12 +10776,11 @@ fn resolve_prime_power_response_analysis_via_cache(
     Ok(resolved.value)
 }
 
-const U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS: &str = "ccm-u-flow-response-v0.15.1-v4";
+const U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS: &str = "ccm-u-flow-response-exact-quadrants-v4";
 const U_FLOW_RESPONSE_NORMALIZATION: &str =
     "l2_eigenvector_gauge_with_sum_xi_equals_sqrt_u_and_moving_uniform_secular_poles";
 const U_FLOW_RESPONSE_VELOCITY_PARAMETER: &str = "u=log(lambda_squared)";
-const U_FLOW_RESPONSE_DERIVATIVE_CONVENTION: &str =
-    "analytic_right_continuous_active_prime_set; tau=pole-archimedean-prime; total roots include d(2*pi*n/u)/du=-2*pi*n/u^2";
+const U_FLOW_RESPONSE_DERIVATIVE_CONVENTION: &str = "analytic_right_continuous_active_prime_set; tau=pole-archimedean-prime; total roots include d(2*pi*n/u)/du=-2*pi*n/u^2";
 const U_FLOW_CHANNELS: [&str; 4] = [
     "tau_pole",
     "tau_archimedean",
@@ -10476,32 +10808,21 @@ fn compute_u_flow_response_channel(
     if action.len() != dimension {
         bail!("CCM u-flow channel {channel} has an incompatible action dimension");
     }
-    let eigenvalue_response = deterministic_dot_hp(unit_state, action, precision_bits);
-    let projected_forcing = action
-        .iter()
-        .zip(unit_state)
-        .map(|(action_value, state)| {
-            let mut projection = Float::with_val(precision_bits, state);
-            projection *= &eigenvalue_response;
-            let mut value = Float::with_val(precision_bits, action_value);
-            value -= projection;
-            value
-        })
-        .collect::<Vec<_>>();
-    let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits);
+    let eigenvalue_response = deterministic_dot_hp(unit_state, action, precision_bits)?;
+    let projected_forcing =
+        projected_response_forcing(action, unit_state, &eigenvalue_response, precision_bits)?;
+    let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
     let (eigenvector_response, lagrange_multiplier) =
-        solve_even_sector_bordered_response(bordered_solver, &projected_forcing);
-    let response_norm = deterministic_l2_norm_hp(&eigenvector_response, precision_bits);
-    let response_sum = xc_numerics::reduction::deterministic_pairwise_sum_hp(
+        solve_even_sector_bordered_response(bordered_solver, &projected_forcing)?;
+    let response_norm = deterministic_l2_norm_hp(&eigenvector_response, precision_bits)?;
+    let ccm_scale_response = response_normalization_tangent(
+        unit_state,
         &eigenvector_response,
+        normalization_target_velocity,
+        ccm_scale,
+        unit_state_sum,
         precision_bits,
-    );
-    let mut ccm_scale_response = Float::with_val(precision_bits, normalization_target_velocity);
-    ccm_scale_response /= unit_state_sum;
-    let mut gauge_term = Float::with_val(precision_bits, ccm_scale);
-    gauge_term *= response_sum;
-    gauge_term /= unit_state_sum;
-    ccm_scale_response -= gauge_term;
+    )?;
     let fixed_pole_root_velocity_responses = roots
         .iter()
         .map(|outcome| {
@@ -10529,7 +10850,7 @@ fn compute_u_flow_response_channel(
         &lagrange_multiplier,
         shifted_frobenius_norm,
         precision_bits,
-    );
+    )?;
     if !weil_eigvec_cache::residual_within_precision_floor(&relative_residual, precision_bits) {
         bail!("CCM u-flow channel {channel} failed its precision-scaled bordered residual gate");
     }
@@ -10539,7 +10860,7 @@ fn compute_u_flow_response_channel(
             tau_velocity_action_norm: lossless_hp_decimal(&deterministic_l2_norm_hp(
                 action,
                 precision_bits,
-            )),
+            )?),
             tau_velocity_action_on_state: encode_hp_vector(action),
             eigenvalue_velocity_response: lossless_hp_decimal(&eigenvalue_response),
             projected_forcing_norm: lossless_hp_decimal(&projected_forcing_norm),
@@ -10577,28 +10898,13 @@ fn compute_u_flow_response_analysis(
     if roots.is_empty() || tau.len() != dimension * dimension || xi.len() != dimension {
         bail!("CCM u-flow response capture requires a retained state and root window");
     }
-    let xi_norm = deterministic_l2_norm_hp(xi, precision_bits);
-    if xi_norm.is_zero() {
-        bail!("CCM u-flow response capture received a zero eigenstate");
-    }
-    let unit_state = xi
-        .iter()
-        .map(|value| {
-            let mut normalized = Float::with_val(precision_bits, value);
-            normalized /= &xi_norm;
-            normalized
-        })
-        .collect::<Vec<_>>();
-    let unit_state_sum =
-        xc_numerics::reduction::deterministic_pairwise_sum_hp(&unit_state, precision_bits);
+    let unit_state = response_unit_state(xi, precision_bits)?;
+    let unit_state_sum = response_state_sum(&unit_state, precision_bits)?;
     if unit_state_sum.is_zero() {
         bail!("CCM u-flow response cannot preserve the CCM zero-sum eigenstate normalization");
     }
-    let mut normalization_target = Float::with_val(precision_bits, l).sqrt();
-    let mut ccm_scale = Float::with_val(precision_bits, &normalization_target);
-    ccm_scale /= &unit_state_sum;
-    normalization_target *= 2u32;
-    let normalization_target_velocity = normalization_target.recip();
+    let ccm_scale = response_normalization_scale(&unit_state, l, precision_bits)?;
+    let normalization_target_velocity = response_target_velocity(l, precision_bits)?;
     let spectral_isolation = response_spectral_isolation(
         spectral_preparation,
         params,
@@ -10614,9 +10920,9 @@ fn compute_u_flow_response_analysis(
         &unit_state,
     )?;
     let shifted_frobenius_norm =
-        shifted_matrix_frobenius_norm(tau, state_eigenvalue, dimension, precision_bits);
+        shifted_matrix_frobenius_norm(tau, state_eigenvalue, dimension, precision_bits)?;
     let (poles, pole_velocities) =
-        ccm_secular_poles_and_u_velocities(l, params.n_modes, precision_bits);
+        ccm_secular_poles_and_u_velocities(l, params.n_modes, precision_bits)?;
     let zero_target_velocity = Float::with_val(precision_bits, 0);
     let action_slices = [
         velocity_actions.tau_pole.as_slice(),
@@ -10716,7 +11022,7 @@ fn compute_u_flow_response_analysis(
         state_eigenvalue: lossless_hp_decimal(state_eigenvalue),
         spectral_isolation,
         normalization_target_velocity: lossless_hp_decimal(&normalization_target_velocity),
-        roots: ccm_response_roots(roots, first_positive_root_index),
+        roots: ccm_response_roots(roots, first_positive_root_index)?,
         channels,
         secular_pole_motion_root_velocity_responses,
         total_moving_pole_root_velocity_responses,
@@ -10751,34 +11057,29 @@ fn validate_u_flow_response_channel(
             "CCM u-flow channel {expected_channel} has incompatible identity or shape"
         )));
     }
-    let eigenvalue_response = deterministic_dot_hp(unit_state, expected_action, precision_bits);
-    let projected_forcing = expected_action
-        .iter()
-        .zip(unit_state)
-        .map(|(action_value, state)| {
-            let mut projection = Float::with_val(precision_bits, state);
-            projection *= &eigenvalue_response;
-            let mut value = Float::with_val(precision_bits, action_value);
-            value -= projection;
-            value
-        })
-        .collect::<Vec<_>>();
-    let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits);
+    let eigenvalue_response = deterministic_dot_hp(unit_state, expected_action, precision_bits)?;
+    let projected_forcing = projected_response_forcing(
+        expected_action,
+        unit_state,
+        &eigenvalue_response,
+        precision_bits,
+    )?;
+    let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
     let response = parse_hp_vector(&artifact.l2_eigenvector_velocity_response, precision_bits)?;
     if response.iter().any(|value| !value.is_finite()) {
         return Err(invalid(format!(
             "CCM u-flow channel {expected_channel} contains a nonfinite response"
         )));
     }
-    let response_norm = deterministic_l2_norm_hp(&response, precision_bits);
-    let response_sum =
-        xc_numerics::reduction::deterministic_pairwise_sum_hp(&response, precision_bits);
-    let mut ccm_scale_response = Float::with_val(precision_bits, normalization_target_velocity);
-    ccm_scale_response /= unit_state_sum;
-    let mut gauge_term = Float::with_val(precision_bits, ccm_scale);
-    gauge_term *= response_sum;
-    gauge_term /= unit_state_sum;
-    ccm_scale_response -= gauge_term;
+    let response_norm = deterministic_l2_norm_hp(&response, precision_bits)?;
+    let ccm_scale_response = response_normalization_tangent(
+        unit_state,
+        &response,
+        normalization_target_velocity,
+        ccm_scale,
+        unit_state_sum,
+        precision_bits,
+    )?;
     let lagrange_multiplier =
         parse_hp_scalar(&artifact.bordered_lagrange_multiplier, precision_bits)?;
     let relative_residual = bordered_response_relative_residual(
@@ -10790,9 +11091,9 @@ fn validate_u_flow_response_channel(
         &lagrange_multiplier,
         shifted_frobenius_norm,
         precision_bits,
-    );
+    )?;
     if artifact.tau_velocity_action_norm
-        != lossless_hp_decimal(&deterministic_l2_norm_hp(expected_action, precision_bits))
+        != lossless_hp_decimal(&deterministic_l2_norm_hp(expected_action, precision_bits)?)
         || artifact.eigenvalue_velocity_response != lossless_hp_decimal(&eigenvalue_response)
         || artifact.projected_forcing_norm != lossless_hp_decimal(&projected_forcing_norm)
         || artifact.l2_eigenvector_velocity_response_norm != lossless_hp_decimal(&response_norm)
@@ -10872,7 +11173,7 @@ fn validate_u_flow_response_analysis(
         || artifact.velocity_parameter != U_FLOW_RESPONSE_VELOCITY_PARAMETER
         || artifact.derivative_convention != U_FLOW_RESPONSE_DERIVATIVE_CONVENTION
         || artifact.state_eigenvalue != lossless_hp_decimal(state_eigenvalue)
-        || artifact.roots != ccm_response_roots(roots, first_positive_root_index)
+        || artifact.roots != ccm_response_roots(roots, first_positive_root_index)?
         || artifact.channels.len() != U_FLOW_CHANNELS.len()
         || artifact.secular_pole_motion_root_velocity_responses.len() != roots.len()
         || artifact.total_moving_pole_root_velocity_responses.len() != roots.len()
@@ -10883,22 +11184,8 @@ fn validate_u_flow_response_analysis(
             "CCM u-flow response payload does not match its semantic identity".to_owned(),
         ));
     }
-    let xi_norm = deterministic_l2_norm_hp(xi, precision_bits);
-    if xi_norm.is_zero() {
-        return Err(invalid(
-            "CCM u-flow response retained a zero eigenstate".to_owned(),
-        ));
-    }
-    let unit_state = xi
-        .iter()
-        .map(|value| {
-            let mut normalized = Float::with_val(precision_bits, value);
-            normalized /= &xi_norm;
-            normalized
-        })
-        .collect::<Vec<_>>();
-    let unit_state_sum =
-        xc_numerics::reduction::deterministic_pairwise_sum_hp(&unit_state, precision_bits);
+    let unit_state = response_unit_state(xi, precision_bits)?;
+    let unit_state_sum = response_state_sum(&unit_state, precision_bits)?;
     if unit_state_sum.is_zero() {
         return Err(invalid(
             "CCM u-flow response has an invalid zero-sum normalized state".to_owned(),
@@ -10917,11 +11204,8 @@ fn validate_u_flow_response_analysis(
             "CCM u-flow response has invalid spectral-isolation evidence".to_owned(),
         ));
     }
-    let mut normalization_target = Float::with_val(precision_bits, l).sqrt();
-    let mut ccm_scale = Float::with_val(precision_bits, &normalization_target);
-    ccm_scale /= &unit_state_sum;
-    normalization_target *= 2u32;
-    let normalization_target_velocity = normalization_target.recip();
+    let ccm_scale = response_normalization_scale(&unit_state, l, precision_bits)?;
+    let normalization_target_velocity = response_target_velocity(l, precision_bits)?;
     if artifact.normalization_target_velocity != lossless_hp_decimal(&normalization_target_velocity)
     {
         return Err(invalid(
@@ -10929,9 +11213,9 @@ fn validate_u_flow_response_analysis(
         ));
     }
     let shifted_frobenius_norm =
-        shifted_matrix_frobenius_norm(tau, state_eigenvalue, dimension, precision_bits);
+        shifted_matrix_frobenius_norm(tau, state_eigenvalue, dimension, precision_bits)?;
     let (poles, pole_velocities) =
-        ccm_secular_poles_and_u_velocities(l, params.n_modes, precision_bits);
+        ccm_secular_poles_and_u_velocities(l, params.n_modes, precision_bits)?;
     let zero_target_velocity = Float::with_val(precision_bits, 0);
     let action_slices = [
         velocity_actions.tau_pole.as_slice(),
@@ -11041,18 +11325,7 @@ fn resolve_u_flow_response_analysis_via_cache(
         resolve_response_spectral_preparation_via_cache(params, cfg, tau, tau_manifest, cache)?;
     let selection_digest = root_selection_digest(roots)?;
     let precision_bits = cfg.precision_bits;
-    let xi_norm = deterministic_l2_norm_hp(xi, precision_bits);
-    if xi_norm.is_zero() {
-        bail!("CCM u-flow response capture received a zero eigenstate");
-    }
-    let unit_state = xi
-        .iter()
-        .map(|value| {
-            let mut normalized = Float::with_val(precision_bits, value);
-            normalized /= &xi_norm;
-            normalized
-        })
-        .collect::<Vec<_>>();
+    let unit_state = response_unit_state(xi, precision_bits)?;
     let velocity_actions = compute_u_flow_velocity_actions(params, cfg, l, &unit_state)?;
     let parity_policy = cfg.effective_parity_policy();
     let mut resolved_parameters = serde_json::json!({
@@ -11072,6 +11345,7 @@ fn resolve_u_flow_response_analysis_via_cache(
         "root_selection_digest": selection_digest.0,
         "even_sector_matrix_content_digest": spectral_preparation.even_sector_matrix_manifest.content_digest.0,
         "even_sector_eigenvalues_content_digest": spectral_preparation.even_sector_eigenvalues_manifest.content_digest.0,
+        "even_sector_transform_content_digest": spectral_preparation.even_sector_transform_manifest.content_digest.0,
         "spectral_isolation_method": RESPONSE_SPECTRAL_ISOLATION_METHOD,
         "velocity_parameter": U_FLOW_RESPONSE_VELOCITY_PARAMETER,
         "derivative_convention": U_FLOW_RESPONSE_DERIVATIVE_CONVENTION,
@@ -11116,9 +11390,13 @@ fn resolve_u_flow_response_analysis_via_cache(
                     .content_digest
                     .clone(),
             ),
+            (
+                "ccm_even_sector_transform".to_owned(),
+                spectral_preparation.even_sector_transform_manifest.content_digest.clone(),
+            ),
         ]),
         algorithm_semantics: Some(
-            "analytic_tau_component_u_derivatives_stable_gamma_even_sector_isolated_bordered_lu_and_moving_secular_poles_v3"
+            "analytic_tau_component_u_derivatives_stable_gamma_source_bound_even_sector_bordered_lu_and_moving_secular_poles_v4"
                 .to_owned(),
         ),
     };
@@ -11144,7 +11422,7 @@ fn resolve_u_flow_response_analysis_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.1")?,
+        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -11190,12 +11468,15 @@ fn resolve_u_flow_response_analysis_via_cache(
                     spectral_preparation
                         .even_sector_eigenvalues_manifest
                         .clone(),
+                    spectral_preparation.even_sector_transform_manifest.clone(),
                 ]),
             ))
         },
         |artifact| {
             if fresh.verify_fresh(artifact)? {
-                eprintln!("[HP] response validation: exact fresh payload seal verified; production numerical gates already passed");
+                eprintln!(
+                    "[HP] response validation: exact fresh payload seal verified; production numerical gates already passed"
+                );
                 return Ok(());
             }
             validate_u_flow_response_analysis(
@@ -11227,6 +11508,7 @@ fn record_run_evidence_via_cache(
     cfg: &HighPrecConfig,
     eps_n: &Float,
     inverse_iteration: &xc_numerics::linalg::InverseIterationDiagnostics,
+    stored_state_resolution: &CcmStoredStateResolution,
     roots: &[EigenvalueResult],
     first_root_index: usize,
     eigenpair_manifest: &ArtifactManifest,
@@ -11236,11 +11518,13 @@ fn record_run_evidence_via_cache(
     semantics: RootWindowSemantics,
     selected_root_ordinals: &[usize],
 ) -> Result<ArtifactManifest> {
-    if first_root_index == 0 || roots.is_empty() {
-        bail!("CCM run evidence requires a nonempty one-based root range");
+    if first_root_index == 0 || (roots.is_empty() && !semantics.allow_incomplete) {
+        bail!("CCM run evidence requires a one-based root range; empty results require allow_incomplete");
     }
+    // For an admitted empty selection, last=first-1 is an explicit empty range.
     let last_root_index = first_root_index
-        .checked_add(roots.len() - 1)
+        .checked_add(roots.len())
+        .and_then(|end| end.checked_sub(1))
         .ok_or_else(|| anyhow::anyhow!("CCM run-evidence root range overflows usize"))?;
     let counts = roots
         .iter()
@@ -11292,9 +11576,9 @@ fn record_run_evidence_via_cache(
         schema_version: 1,
         artifact_kind: "ccm_convergence_diagnostics".to_owned(),
         mathematical_semantics_version: if semantics.is_advanced() {
-            "ccm-run-evidence-v0.13.3-v4"
+            "ccm-run-evidence-stored-resolution-advanced-v5"
         } else {
-            "ccm-run-evidence-v0.13.0-v3"
+            "ccm-run-evidence-stored-resolution-v4"
         }
         .to_owned(),
         resolved_mathematical_parameters: resolved_parameters,
@@ -11361,7 +11645,8 @@ fn record_run_evidence_via_cache(
         || {
             Ok((
                 PortableRunEvidence {
-                    schema_version: 3,
+                    schema_version: 4,
+                    stored_state_resolution: stored_state_resolution.clone(),
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
                     precision_bits: cfg.precision_bits,
@@ -11394,7 +11679,8 @@ fn record_run_evidence_via_cache(
             ))
         },
         |artifact| {
-            if artifact.schema_version != 3
+            if artifact.schema_version != 4
+                || &artifact.stored_state_resolution != stored_state_resolution
                 || artifact.lambda_squared != lambda_squared_cache_identity(params)
                 || artifact.n_modes != params.n_modes
                 || artifact.precision_bits != cfg.precision_bits
@@ -11479,6 +11765,33 @@ pub fn run(params: &CcmParams, cfg: &HighPrecConfig) -> Result<HighPrecResult> {
 /// Compute the Tau/eigenstate/secular source without requesting roots.
 pub fn build_source(params: &CcmParams, cfg: &HighPrecConfig) -> Result<HighPrecResult> {
     run_with_acquisition(params, cfg, RootAcquisition::SourceOnly)
+}
+
+/// Resolve a source through read-only persistent overlays and bounded ephemeral
+/// dependencies. This performs no persistent cache writes or publication.
+/// Mode and requested assurance remain configured by the managed policy;
+/// unavailable assurance, required-reuse misses, and incompatible reference or
+/// remote persistence modes return explicit errors.
+pub fn build_source_read_only(params: &CcmParams, cfg: &HighPrecConfig) -> Result<HighPrecResult> {
+    validate_source_shape(params.n_modes, cfg.precision_bits, cfg.quad_points)?;
+    let managed = xc_cache::ManagedArtifactCacheSession::from_environment_read_only()?
+        .ok_or_else(|| anyhow::anyhow!("read-only source requires a managed ephemeral session"))?;
+    #[cfg(not(feature = "arb"))]
+    if managed.requested_assurance() != xc_core::AssuranceLevel::Computed {
+        bail!(
+            "requested {:?} assurance requires an xc-spectral build with the arb feature",
+            managed.requested_assurance()
+        );
+    }
+    let cache = managed.context();
+    xc_numerics::hp_runtime::run_hp(|| {
+        run_inner(
+            params,
+            cfg,
+            RootAcquisition::SourceOnly,
+            CcmCacheRoute::Fabric(&cache),
+        )
+    })
 }
 
 /// Independently discover and then refine a requested finite-source window.
@@ -11616,7 +11929,7 @@ fn run_with_research_capture(
                     "managed prime-power response capture is missing its retained secular-source manifest"
                 )
             })?;
-            let l = log_lambda_sq_hp(params, cfg.precision_bits);
+            let l = log_lambda_sq_hp(params, cfg.precision_bits)?;
             let analysis = resolve_prime_power_response_analysis_via_cache(
                 params,
                 cfg,
@@ -11665,7 +11978,7 @@ fn run_with_research_capture(
                     "managed u-flow response capture is missing its retained secular-source manifest"
                 )
             })?;
-            let l = log_lambda_sq_hp(params, cfg.precision_bits);
+            let l = log_lambda_sq_hp(params, cfg.precision_bits)?;
             let analysis = resolve_u_flow_response_analysis_via_cache(
                 params,
                 cfg,
@@ -11705,7 +12018,7 @@ fn run_with_research_capture(
                     "managed maximum capture is missing its retained secular-source manifest"
                 )
             })?;
-            let l = log_lambda_sq_hp(params, cfg.precision_bits);
+            let l = log_lambda_sq_hp(params, cfg.precision_bits)?;
             resolve_root_conditioning_analysis_via_cache(
                 params,
                 cfg,
@@ -11978,6 +12291,7 @@ fn run_with_acquisition(
     cfg: &HighPrecConfig,
     acquisition: RootAcquisition<'_>,
 ) -> Result<HighPrecResult> {
+    validate_source_shape(params.n_modes, cfg.precision_bits, cfg.quad_points)?;
     let managed =
         xc_cache::ManagedArtifactCacheSession::from_environment().map_err(anyhow::Error::from)?;
     if let Some(managed) = &managed {
@@ -12196,19 +12510,24 @@ fn independently_discovered_starting_points(
     options: IndependentRootDiscoveryOptions,
     precision_bits: u32,
 ) -> Result<IndependentRootDiscoveryPlan> {
-    if xi.len() != params.matrix_size() {
-        bail!("independent HP discovery requires one weight per CCM pole");
+    if !(64..=1_000_000).contains(&precision_bits)
+        || params.n_modes.checked_mul(2).and_then(|n| n.checked_add(1)) != Some(xi.len())
+        || xi.len() > 8193
+        || !l.is_finite()
+        || l <= &0
+        || l.prec() > 1_000_000
+        || xi.iter().any(|x| !x.is_finite() || x.prec() > 1_000_000)
+        || xi.iter().all(Float::is_zero)
+    {
+        bail!(
+            "independent discovery requires a finite nonzero source, positive length and supported shape/precision"
+        );
     }
     if options.complete_positive {
         return complete_discovery::plan(params, l, xi, target, options, precision_bits);
     }
-    let mut spacing = pi(precision_bits);
-    spacing *= 2u32;
-    spacing /= l;
-    let mut maximum = spacing.clone();
-    maximum *= params.n_modes;
-    let zero = Float::with_val(precision_bits, 0);
-    if options.domain == IndependentRootDomain::Signed
+    let signed = options.domain == IndependentRootDomain::Signed;
+    if signed
         && !matches!(
             target,
             ZeroTarget::FirstK { .. } | ZeroTarget::SymmetricHeightWindow { .. }
@@ -12218,202 +12537,100 @@ fn independently_discovered_starting_points(
             "signed independent discovery supports FirstK and SymmetricHeightWindow targets only"
         );
     }
-    let (scan_upper, lower_filter) = match target {
-        ZeroTarget::FirstK { count } => {
-            if *count == 0 {
-                bail!("independent CCM prefix count must be positive");
-            }
-            (maximum.clone(), zero.clone())
-        }
-        ZeroTarget::IndexRange { first, last } => {
-            if *first == 0 || first > last {
-                bail!("independent CCM root indices require 1 <= first <= last");
-            }
-            (maximum.clone(), zero.clone())
-        }
-        ZeroTarget::HeightWindow { lower, upper } => {
-            let lower = Float::with_val(precision_bits, Float::parse(lower)?);
-            let upper = Float::with_val(precision_bits, Float::parse(upper)?);
-            if lower <= 0 || lower >= upper || upper > maximum {
-                bail!("independent positive height window lies outside the finite CCM reach");
-            }
-            (upper, lower)
-        }
-        ZeroTarget::SymmetricHeightWindow { height } => {
-            let upper = Float::with_val(precision_bits, Float::parse(height)?);
-            if upper <= 0 || upper > maximum {
-                bail!("independent symmetric height window lies outside the finite CCM reach");
-            }
-            (upper, zero.clone())
-        }
+    if matches!(
+        target,
+        ZeroTarget::HeightWindow { .. } | ZeroTarget::SymmetricHeightWindow { .. }
+    ) {
+        return verified_discovery::height_plan(params, l, xi, target, options, precision_bits);
+    }
+    let (first, last) = match target {
+        ZeroTarget::FirstK { count } if *count > 0 => (1, *count),
+        ZeroTarget::IndexRange { first, last } if *first > 0 && first <= last => (*first, *last),
+        _ => bail!("independent discovery requires positive ordered root indices"),
     };
+    let requested_count = last - first + 1;
     let advanced = options != IndependentRootDiscoveryOptions::default();
-    let scan_extent = if !advanced && options.domain == IndependentRootDomain::Positive {
-        match target {
-            ZeroTarget::FirstK { count } => RootScanExtent::PositivePrefix {
-                minimum_discovered_roots: NonZeroUsize::new(*count)
-                    .expect("positive prefix count was validated above"),
-            },
-            ZeroTarget::IndexRange { last, .. } => RootScanExtent::PositivePrefix {
-                minimum_discovered_roots: NonZeroUsize::new(*last)
-                    .expect("positive range bound was validated above"),
-            },
-            ZeroTarget::HeightWindow { .. } | ZeroTarget::SymmetricHeightWindow { .. } => {
-                RootScanExtent::Complete
-            }
-        }
+    let spacing = secular_spacing(l, precision_bits)?;
+    let maximum = spacing.clone() * params.n_modes;
+    if !spacing.is_finite() || spacing <= 0 || !maximum.is_finite() {
+        bail!("discovery pole range is unrepresentable");
+    }
+    let values = if params.n_modes == 0 {
+        vec![]
     } else {
-        RootScanExtent::Complete
-    };
-    let values = if options.domain == IndependentRootDomain::Signed {
-        discover_secular_roots_hp_signed(xi, params.n_modes, &spacing, &scan_upper, precision_bits)?
-    } else {
-        discover_secular_roots_hp_with_extent(
+        discover_secular_roots_hp_range(
             xi,
             params.n_modes,
             &spacing,
-            &scan_upper,
+            &if signed {
+                -maximum.clone()
+            } else {
+                Float::with_val(precision_bits, 0)
+            },
+            &maximum,
             precision_bits,
-            scan_extent,
+            if advanced {
+                RootScanExtent::Complete
+            } else {
+                RootScanExtent::PositivePrefix {
+                    minimum_discovered_roots: NonZeroUsize::new(last)
+                        .expect("validated positive count"),
+                }
+            },
         )?
     };
-    let requested_count = match target {
-        ZeroTarget::FirstK { count } => *count,
-        ZeroTarget::IndexRange { first, last } => last - first + 1,
-        ZeroTarget::HeightWindow { .. } | ZeroTarget::SymmetricHeightWindow { .. } => values.len(),
-    };
-    // Preserve the exact v6 request-shaped artifact path for every ordinary
-    // caller. Advanced requests instead cache the complete discovered finite
-    // window and record the request/projection only in the small evidence
-    // artifact. This lets a later contained request reuse the same numerical
-    // root payload without duplicating it under a policy-shaped cache key.
+    if values.len() < last && !options.allow_incomplete {
+        bail!(
+            "independent exact discovery found only {} {} roots, but target requests {last}; enable the explicit incomplete-window policy or increase finite reach",
+            values.len(),
+            options.domain.as_str()
+        );
+    }
     if !advanced {
-        let (first_index, selected): (usize, &[Float]) = match target {
-            ZeroTarget::FirstK { count } => {
-                if values.len() < *count {
-                    bail!(
-                        "independent HP discovery found only {} positive roots, but target requests {count}; enable the explicit incomplete-window policy or increase finite reach",
-                        values.len()
-                    );
-                }
-                (1, &values[..*count])
-            }
-            ZeroTarget::IndexRange { first, last } => {
-                if values.len() < *last {
-                    bail!(
-                        "independent HP discovery found only {} positive roots, but target requires index {last}; enable the explicit incomplete-window policy or increase finite reach",
-                        values.len()
-                    );
-                }
-                (*first, &values[*first - 1..*last])
-            }
-            ZeroTarget::HeightWindow { .. } | ZeroTarget::SymmetricHeightWindow { .. } => {
-                let first_offset = values.partition_point(|value| value <= &lower_filter);
-                let selected = &values[first_offset..];
-                if selected.is_empty() {
-                    bail!("independent computed height window contains no discovered roots");
-                }
-                (first_offset + 1, selected)
-            }
-        };
-        let artifact_seeds = selected.to_vec();
+        let selected = values[first - 1..last].to_vec();
         return Ok(IndependentRootDiscoveryPlan {
-            artifact_first_root_index: first_index,
-            selected_positions: (0..artifact_seeds.len()).collect(),
-            artifact_seeds,
-            result_first_root_index: first_index,
+            artifact_first_root_index: first,
+            selected_positions: (0..selected.len()).collect(),
+            artifact_seeds: selected,
+            result_first_root_index: first,
             request_semantics: RootWindowSemantics::strict_positive(requested_count),
         });
     }
-
-    let selected_positions = match target {
-        ZeroTarget::FirstK { count } => {
-            if values.len() < *count {
-                if !options.allow_incomplete {
-                    bail!(
-                        "independent HP discovery found only {} {} roots, but target requests {count}; enable the explicit incomplete-window policy or increase finite reach",
-                        values.len(),
-                        options.domain.as_str()
-                    );
-                }
-                eprintln!(
-                    "[HP] advanced root discovery exhausted the finite {} window: requested {}, returning {}",
-                    options.domain.as_str(),
-                    count,
-                    values.len()
-                );
-            }
-            if options.domain == IndependentRootDomain::Signed {
-                let mut positions: Vec<usize> = (0..values.len()).collect();
-                positions.sort_by(|left, right| {
-                    values[*left]
-                        .clone()
-                        .abs()
-                        .partial_cmp(&values[*right].clone().abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| {
-                            values[*left]
-                                .partial_cmp(&values[*right])
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                });
-                positions.truncate((*count).min(positions.len()));
-                positions.sort_unstable();
-                positions
-            } else {
-                (0..(*count).min(values.len())).collect()
-            }
+    let selected_positions = if signed {
+        let mut positions = (0..values.len()).collect::<Vec<_>>();
+        positions.sort_by(|a, b| {
+            values[*a]
+                .clone()
+                .abs()
+                .partial_cmp(&values[*b].clone().abs())
+                .expect("finite root")
+                .then_with(|| a.cmp(b))
+        });
+        let keep = last.min(positions.len());
+        // Equal rounded magnitudes may conceal unequal exact magnitudes.
+        // Exact even weights prove the +/- symmetry; otherwise an ambiguous
+        // selection boundary must be resolved at a higher output precision.
+        if keep > 0
+            && keep < positions.len()
+            && values[positions[keep - 1]].clone().abs() == values[positions[keep]].clone().abs()
+            && xi.iter().zip(xi.iter().rev()).any(|(a, b)| a != b)
+        {
+            bail!("signed nearest-magnitude selection is unresolved at the requested precision");
         }
-        ZeroTarget::IndexRange { first, last } => {
-            if values.len() < *last {
-                if !options.allow_incomplete {
-                    bail!(
-                        "independent HP discovery found only {} positive roots, but target requires index {last}; enable the explicit incomplete-window policy or increase finite reach",
-                        values.len()
-                    );
-                }
-                if values.len() < *first {
-                    eprintln!(
-                        "[HP] advanced root discovery exhausted the finite positive window: requested indices {}..={}, returning no roots",
-                        first, last
-                    );
-                } else {
-                    eprintln!(
-                        "[HP] advanced root discovery exhausted the finite positive window: requested indices {}..={}, returning {}..={}",
-                        first,
-                        last,
-                        first,
-                        values.len()
-                    );
-                }
-            }
-            ((*first - 1).min(values.len())..(*last).min(values.len())).collect()
-        }
-        ZeroTarget::HeightWindow { .. } | ZeroTarget::SymmetricHeightWindow { .. } => {
-            let first_offset = values.partition_point(|value| value <= &lower_filter);
-            if first_offset == values.len() && !options.allow_incomplete {
-                bail!("independent computed height window contains no discovered roots");
-            }
-            (first_offset..values.len()).collect()
-        }
+        positions.truncate(keep);
+        positions.sort_unstable();
+        positions
+    } else {
+        ((first - 1).min(values.len())..last.min(values.len())).collect()
     };
     if selected_positions.is_empty() && !options.allow_incomplete {
-        bail!("independent HP discovery found no roots in the finite source window");
+        bail!("independent exact discovery found no roots in the finite source window");
     }
-    let result_first_root_index = match target {
-        ZeroTarget::IndexRange { first, .. } => *first,
-        ZeroTarget::HeightWindow { .. } if options.domain == IndependentRootDomain::Positive => {
-            selected_positions
-                .first()
-                .map_or(1, |position| position + 1)
-        }
-        _ => 1,
-    };
     Ok(IndependentRootDiscoveryPlan {
         artifact_first_root_index: 1,
         artifact_seeds: values,
         selected_positions,
-        result_first_root_index,
+        result_first_root_index: first,
         request_semantics: RootWindowSemantics::advanced(
             options.domain,
             requested_count,
@@ -12432,6 +12649,7 @@ fn secular_poles(spacing: &Float, n_modes: usize, precision_bits: u32) -> Vec<Fl
         .collect()
 }
 
+#[cfg(test)]
 fn evaluate_secular_hp(
     xi: &[Float],
     poles: &[Float],
@@ -12452,11 +12670,9 @@ fn evaluate_secular_hp(
     Ok(value)
 }
 
-/// Computed-assurance discovery using the full MPFR source. Pole-free
-/// intervals are scanned in order and sign-changing brackets are bisected to
-/// 128 bits before the configured HP point solver runs. This prevents the
-/// severe loss of source information caused by converting a deep CCM state to
-/// binary64 and makes pole crossing by the subsequent point solver unlikely.
+/// Exact numerator isolation of every distinct movable root in the open
+/// stored-point window. Correctly rounded, distinct non-pole seeds are required
+/// before the configured HP refinement; source/continuum accuracy is separate.
 #[cfg(test)]
 fn discover_secular_roots_hp(
     xi: &[Float],
@@ -12475,6 +12691,7 @@ fn discover_secular_roots_hp(
     )
 }
 
+#[cfg(test)]
 fn discover_secular_roots_hp_with_extent(
     xi: &[Float],
     n_modes: usize,
@@ -12494,26 +12711,6 @@ fn discover_secular_roots_hp_with_extent(
     )
 }
 
-fn discover_secular_roots_hp_signed(
-    xi: &[Float],
-    n_modes: usize,
-    spacing: &Float,
-    scan_height: &Float,
-    precision_bits: u32,
-) -> Result<Vec<Float>> {
-    let mut lower = Float::with_val(precision_bits, scan_height);
-    lower *= -1;
-    discover_secular_roots_hp_range(
-        xi,
-        n_modes,
-        spacing,
-        &lower,
-        scan_height,
-        precision_bits,
-        RootScanExtent::Complete,
-    )
-}
-
 fn discover_secular_roots_hp_range(
     xi: &[Float],
     n_modes: usize,
@@ -12523,59 +12720,24 @@ fn discover_secular_roots_hp_range(
     precision_bits: u32,
     extent: RootScanExtent,
 ) -> Result<Vec<Float>> {
-    if scan_lower >= scan_upper {
-        bail!("independent HP discovery requires a nonempty scan interval");
+    if !(64..=1_000_000).contains(&precision_bits)
+        || n_modes.checked_mul(2).and_then(|n| n.checked_add(1)) != Some(xi.len())
+        || xi.len() > 8193
+        || !spacing.is_finite()
+        || spacing <= &0
+        || spacing.prec() > precision_bits
+    {
+        bail!(
+            "independent HP discovery requires a supported source shape, precision and positive pole spacing"
+        );
     }
     let poles = secular_poles(spacing, n_modes, precision_bits);
-    let mut boundaries = vec![scan_lower.clone()];
-    for pole in &poles {
-        if pole > scan_lower && pole < scan_upper {
-            boundaries.push(pole.clone());
-        }
-    }
-    boundaries.push(scan_upper.clone());
-
-    let margin_fraction = Float::with_val(precision_bits, 2).pow(-64i32);
-    // Pole intervals do not share state. Scan bounded consecutive chunks so
-    // an ordinary positive prefix can stop once its requested extent exists.
-    // Indexed collection plus sequential Result resolution preserves interval
-    // order and deterministic failure precedence inside every scanned chunk.
-    const INTERVAL_CHUNK_SIZE: usize = 32;
-    let mut roots = Vec::new();
-    for chunk_start in (0..boundaries.len() - 1).step_by(INTERVAL_CHUNK_SIZE) {
-        let chunk_end = (chunk_start + INTERVAL_CHUNK_SIZE).min(boundaries.len() - 1);
-        let interval_results: Vec<Result<Vec<Float>>> = boundaries[chunk_start..=chunk_end]
-            .par_windows(2)
-            .map(|interval| {
-                discover_secular_roots_in_interval_hp(
-                    xi,
-                    &poles,
-                    interval,
-                    &margin_fraction,
-                    precision_bits,
-                )
-            })
-            .collect();
-        for interval_result in interval_results {
-            for root in interval_result? {
-                if root > *scan_lower
-                    && root < *scan_upper
-                    && roots.last().is_none_or(|previous| &root > previous)
-                {
-                    roots.push(root);
-                }
-            }
-        }
-        if let RootScanExtent::PositivePrefix {
-            minimum_discovered_roots,
-        } = extent
-        {
-            let minimum = minimum_discovered_roots.get();
-            if roots.len() >= minimum {
-                roots.truncate(minimum);
-                break;
-            }
-        }
+    let mut roots = verified_discovery::roots(&poles, xi, scan_lower, scan_upper, precision_bits)?;
+    if let RootScanExtent::PositivePrefix {
+        minimum_discovered_roots,
+    } = extent
+    {
+        roots.truncate(minimum_discovered_roots.get());
     }
     Ok(roots)
 }
@@ -12614,76 +12776,18 @@ fn discover_secular_roots_hp_sequential_reference(
     Ok(roots)
 }
 
+#[cfg(test)]
 fn discover_secular_roots_in_interval_hp(
     xi: &[Float],
     poles: &[Float],
     interval: &[Float],
-    margin_fraction: &Float,
+    _margin_fraction: &Float,
     precision_bits: u32,
 ) -> Result<Vec<Float>> {
-    const SUBDIVISIONS: usize = 16;
-    const BISECTION_STEPS: usize = 128;
-
-    let mut width = interval[1].clone();
-    width -= &interval[0];
-    if width <= 0 {
-        return Ok(Vec::new());
+    if interval.len() != 2 {
+        bail!("discovery interval requires two endpoints");
     }
-    let mut margin = width.clone();
-    margin *= margin_fraction;
-    let mut left = interval[0].clone();
-    left += &margin;
-    let mut right = interval[1].clone();
-    right -= &margin;
-    if left >= right {
-        return Ok(Vec::new());
-    }
-
-    let mut roots = Vec::new();
-    let mut previous_point = left.clone();
-    let mut previous_value = evaluate_secular_hp(xi, poles, &previous_point, precision_bits)?;
-    for subdivision in 1..=SUBDIVISIONS {
-        let mut point = right.clone();
-        point -= &left;
-        point *= subdivision;
-        point /= SUBDIVISIONS;
-        point += &left;
-        let value = evaluate_secular_hp(xi, poles, &point, precision_bits)?;
-        let changes_sign = previous_value.is_zero()
-            || value.is_zero()
-            || previous_value.is_sign_positive() != value.is_sign_positive();
-        if changes_sign {
-            let mut bracket_left = previous_point.clone();
-            let mut bracket_right = point.clone();
-            let mut left_value = previous_value.clone();
-            for _ in 0..BISECTION_STEPS {
-                let mut midpoint = bracket_left.clone();
-                midpoint += &bracket_right;
-                midpoint /= 2u32;
-                let midpoint_value = evaluate_secular_hp(xi, poles, &midpoint, precision_bits)?;
-                if midpoint_value.is_zero() {
-                    bracket_left = midpoint.clone();
-                    bracket_right = midpoint;
-                    break;
-                }
-                if left_value.is_sign_positive() != midpoint_value.is_sign_positive() {
-                    bracket_right = midpoint;
-                } else {
-                    bracket_left = midpoint;
-                    left_value = midpoint_value;
-                }
-            }
-            let mut root = bracket_left;
-            root += bracket_right;
-            root /= 2u32;
-            if roots.last().is_none_or(|previous| &root > previous) {
-                roots.push(root);
-            }
-        }
-        previous_point = point;
-        previous_value = value;
-    }
-    Ok(roots)
+    verified_discovery::roots(poles, xi, &interval[0], &interval[1], precision_bits)
 }
 
 fn run_inner(
@@ -12703,6 +12807,12 @@ fn run_inner_retaining_source(
     cache_route: CcmCacheRoute<'_>,
     continuation: Option<(&[Float], &ArtifactManifest)>,
 ) -> Result<(HighPrecResult, RetainedCcmSource)> {
+    validate_source_shape(params.n_modes, cfg.precision_bits, cfg.quad_points)?;
+    ground_index::preflight(
+        params.matrix_size(),
+        cfg.precision_bits,
+        cfg.effective_parity_policy(),
+    )?;
     if !matches!(acquisition, RootAcquisition::SourceOnly) {
         cfg.validate_root_precision_policy()?;
     }
@@ -12720,7 +12830,7 @@ fn run_inner_retaining_source(
         );
     }
 
-    let l = log_lambda_sq_hp(params, prec);
+    let l = log_lambda_sq_hp(params, prec)?;
     let tau_started = Instant::now();
     let performance_tau = xc_core::performance_stage_with("ccm.hp.tau", || {
         ccm_performance_metadata("ccm.hp.tau", dim, prec)
@@ -12739,7 +12849,7 @@ fn run_inner_retaining_source(
     drop(performance_tau);
 
     // Force exact symmetry of the τ-matrix (parallel compute, sequential write).
-    force_symmetric(&mut tau, dim);
+    force_symmetric(&mut tau, dim)?;
 
     // Smallest eigenpair (ξ, ε_N).
     //
@@ -12784,26 +12894,36 @@ fn run_inner_retaining_source(
         } else {
             let lambda_sq = params.lambda_sq;
             let n_modes_key = params.n_modes;
+            let tau_source_point_digest =
+                standalone_cache::tau_point_digest(&tau, n_modes_key, prec)
+                    .ok_or_else(|| anyhow::anyhow!("invalid standalone Tau source identity"))?;
             let mut cached_pair: Option<(
                 Float,
                 Vec<Float>,
                 xc_numerics::linalg::InverseIterationDiagnostics,
             )> = None;
-            if let Some(c) =
-                weil_eigvec_cache::load(lambda_sq, n_modes_key, prec, cfg.cache_mode, parity_policy)
-            {
+            if let Some(c) = weil_eigvec_cache::load(
+                lambda_sq,
+                n_modes_key,
+                prec,
+                &tau_source_point_digest,
+                cfg.cache_mode,
+                parity_policy,
+            ) {
                 let replayed_residual =
                     weil_eigvec_cache::relative_residual_norm(&tau, dim, &c.xi, &c.eps_n, prec);
                 if c.diagnostics.configured_step_limit == cfg.inverse_iter_steps
                     && replayed_residual
                         .as_ref()
                         .is_some_and(|value| value == &c.diagnostics.final_relative_residual_norm)
+                    && validate_eigenstate_contract(&c.xi, &l, prec, parity_policy).is_ok()
                     && weil_eigvec_cache::residual_ok(&tau, dim, &c.xi, &c.eps_n, prec)
+                    && ground_index::validate(&tau, &c.xi, &c.eps_n, prec, parity_policy).is_ok()
                 {
                     eprintln!(
-                "[HP] loaded cached Weil eigenvector for λ²={}, N={}, prec={} bits (τ-residual validated)",
-                lambda_sq.value_f64, n_modes_key, prec
-            );
+                        "[HP] loaded cached Weil eigenvector for λ²={}, N={}, prec={} bits (τ-residual validated)",
+                        lambda_sq.value_f64, n_modes_key, prec
+                    );
                     cached_pair = Some((c.eps_n, c.xi, c.diagnostics));
                 } else {
                     crate::hp_debug!(
@@ -12821,18 +12941,20 @@ fn run_inner_retaining_source(
                     // Warm-start from nearby-precision cache if enabled.
                     // Scan for a cached ξ at a nearby precision to use as the
                     // starting vector for inverse iteration instead of the Gaussian.
-                    let warm_xi: Option<Vec<Float>> =
-                        if cfg.warm_start && parity_policy != CcmParityPolicy::EvenSector {
-                            weil_eigvec_cache::find_warm_start(
-                                lambda_sq,
-                                n_modes_key,
-                                prec,
-                                cfg.warm_start_tolerance_bits,
-                                parity_policy,
-                            )
-                        } else {
-                            None
-                        };
+                    let warm_xi: Option<Vec<Float>> = if cfg.warm_start
+                        && cfg.cache_mode == xc_numerics::quadrature::CacheMode::JsonZip
+                        && parity_policy != CcmParityPolicy::EvenSector
+                    {
+                        weil_eigvec_cache::find_warm_start(
+                            lambda_sq,
+                            n_modes_key,
+                            prec,
+                            cfg.warm_start_tolerance_bits,
+                            parity_policy,
+                        )
+                    } else {
+                        None
+                    };
 
                     // Find the selected smallest eigenpair under the explicit
                     // parity policy.
@@ -12840,7 +12962,7 @@ fn run_inner_retaining_source(
                         == CcmParityPolicy::EvenSector
                     {
                         let sector =
-                            build_even_sector_matrix(&tau, params.n_modes, cfg.precision_bits);
+                            build_even_sector_matrix(&tau, params.n_modes, cfg.precision_bits)?;
                         let sector_dimension = params.n_modes + 1;
                         eprintln!(
                             "[HP] LU factoring {}×{} even-sector matrix (one-time cost)...",
@@ -12890,7 +13012,8 @@ fn run_inner_retaining_source(
                     crate::hp_debug!("[HP] LU factorization done.");
                     // Normalize: Σ ξ_j = √L.
                     let eps_n = raw_eigenvalue;
-                    let xi = normalize_eigenvector(&raw_eigenvector, &l, prec);
+                    let xi = normalize_eigenvector(&raw_eigenvector, &l, prec)?;
+                    validate_eigenstate_contract(&xi, &l, prec, parity_policy)?;
                     diagnostics.final_relative_residual_norm =
                         weil_eigvec_cache::relative_residual_norm(&tau, dim, &xi, &eps_n, prec)
                             .ok_or_else(|| {
@@ -12898,11 +13021,13 @@ fn run_inner_retaining_source(
                                     "CCM inverse iteration produced an invalid eigenvector"
                                 )
                             })?;
+                    ground_index::validate(&tau, &xi, &eps_n, prec, parity_policy)?;
                     eprintln!("[HP] Eigenvector computed. Solving spectrum...");
                     weil_eigvec_cache::save(
                         lambda_sq,
                         n_modes_key,
                         prec,
+                        &tau_source_point_digest,
                         &eps_n,
                         &xi,
                         &diagnostics,
@@ -12926,6 +13051,9 @@ fn run_inner_retaining_source(
     );
     drop(performance_eigenstate);
 
+    let stored_state_resolution =
+        stored_resolution::bounds(&tau, &xi, &eps_n, prec, parity_policy)?.record;
+    validate_eigenstate_contract(&xi, &l, prec, parity_policy)?;
     if !weil_eigvec_cache::residual_ok(&tau, dim, &xi, &eps_n, prec) {
         bail!(
             "CCM inverse iteration did not meet the working-precision tau-residual acceptance floor after {} steps",
@@ -13076,7 +13204,7 @@ fn run_inner_retaining_source(
         ensure_root_window_usable(&roots, artifact_seeds.len(), false, root_semantics.domain)?;
         (roots, None, None, false)
     };
-    if root_semantics.is_complete_positive() {
+    if artifact_mode == RootArtifactMode::Independent {
         complete_discovery::validate_assignment(&canonical_roots, &artifact_seeds)?;
     }
     let eigenvalues_pos = selected_root_positions
@@ -13117,6 +13245,7 @@ fn run_inner_retaining_source(
                 cfg,
                 &eps_n,
                 &inverse_iteration_diagnostics,
+                &stored_state_resolution,
                 &eigenvalues_pos,
                 first_root_index,
                 eigenpair_manifest
@@ -13174,6 +13303,7 @@ fn run_inner_retaining_source(
         HighPrecResult {
             eigenvalues_pos,
             first_positive_root_index: first_root_index,
+            stored_state_resolution: Some(stored_state_resolution),
             weil_min_eigenvalue: eps_n,
             xi,
             inverse_iteration_diagnostics,
@@ -13198,11 +13328,20 @@ fn run_inner_retaining_source(
 /// - `natural_eigenvalue` = smallest eigenvalue without forcing
 /// - `forced_eigenvalue` = smallest *even* eigenvalue (with forcing)
 ///
-/// At small λ, the natural eigenvector is essentially even (deviation ~10⁻¹⁵⁰).
-/// At large λ (λ²≥1000), the natural eigenvector may be odd or mixed-symmetry,
-/// with deviation O(1). This is a structural property of the construction,
-/// not a precision artifact (verified at HP-1000).
+/// For an exactly reflection-invariant stored matrix, a simple exact
+/// eigenvector has deviation zero (even) or two (odd). Intermediate deviations
+/// can reflect an unresolved parity gap or mixing inside a repeated eigenspace;
+/// they do not establish structural symmetry breaking. This API reports a
+/// computed vector diagnostic, not a resolved even/odd classification. Use
+/// [`analyze_sector_gap_with_options`] for source-interval ordering of the parity
+/// minima. Assembly accuracy remains outside this stored-matrix diagnostic.
 pub fn measure_evenness(params: &CcmParams, cfg: &HighPrecConfig) -> Result<EvennessResult> {
+    validate_source_shape(params.n_modes, cfg.precision_bits, cfg.quad_points)?;
+    ground_index::preflight(
+        params.matrix_size(),
+        cfg.precision_bits,
+        CcmParityPolicy::Natural,
+    )?;
     let managed =
         xc_cache::ManagedArtifactCacheSession::from_environment().map_err(anyhow::Error::from)?;
     if let Some(managed) = &managed {
@@ -13214,7 +13353,7 @@ pub fn measure_evenness(params: &CcmParams, cfg: &HighPrecConfig) -> Result<Even
             .map_err(anyhow::Error::from)?;
         Ok(result)
     } else {
-        let l = log_lambda_sq_hp(params, cfg.precision_bits);
+        let l = log_lambda_sq_hp(params, cfg.precision_bits)?;
         let tau = build_tau_hp(params, &l, cfg)?;
         measure_evenness_from_tau(params, cfg, tau)
     }
@@ -13252,6 +13391,8 @@ fn evenness_from_natural_state(
         evenness_deviation: deviation,
         natural_eigenvalue: natural_eval,
         forced_eigenvalue: forced_eval,
+        claim_scope: CcmEvennessClaimScope::ExactStoredTau,
+        assembly_error_bound: None,
     }
 }
 
@@ -13260,7 +13401,8 @@ fn measure_evenness_via_cache(
     cfg: &HighPrecConfig,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<EvennessResult> {
-    let l = log_lambda_sq_hp(params, cfg.precision_bits);
+    validate_source_shape(params.n_modes, cfg.precision_bits, cfg.quad_points)?;
+    let l = log_lambda_sq_hp(params, cfg.precision_bits)?;
     let (tau, tau_manifest) = build_tau_hp_via_cache(params, &l, cfg, cache)?;
     measure_evenness_from_retained_source_via_cache(params, cfg, tau, tau_manifest, cache)
 }
@@ -13272,8 +13414,9 @@ fn measure_evenness_from_retained_source_via_cache(
     tau_manifest: ArtifactManifest,
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<EvennessResult> {
-    let l = log_lambda_sq_hp(params, cfg.precision_bits);
-    force_symmetric(&mut tau, params.matrix_size());
+    validate_source_shape(params.n_modes, cfg.precision_bits, cfg.quad_points)?;
+    let l = log_lambda_sq_hp(params, cfg.precision_bits)?;
+    force_symmetric(&mut tau, params.matrix_size())?;
 
     let mut natural_cfg = cfg.clone();
     natural_cfg.set_parity_policy(CcmParityPolicy::Natural);
@@ -13294,7 +13437,7 @@ fn measure_evenness_from_retained_source_via_cache(
     let semantic_key = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: "ccm_validation_record".to_owned(),
-        mathematical_semantics_version: "ccm-evenness-evidence-v0.13.0-v1".to_owned(),
+        mathematical_semantics_version: "ccm-evenness-stored-source-scope-v2".to_owned(),
         resolved_mathematical_parameters: serde_json::json!({
             "lambda_squared": lambda_squared_cache_identity(params),
             "n_modes": params.n_modes,
@@ -13342,19 +13485,23 @@ fn measure_evenness_from_retained_source_via_cache(
         || {
             Ok((
                 PortableEvennessEvidence {
-                    schema_version: 1,
+                    schema_version: 2,
                     lambda_squared: lambda_squared_cache_identity(params),
                     n_modes: params.n_modes,
                     precision_bits: cfg.precision_bits,
                     evenness_deviation: calculated.evenness_deviation.to_string(),
                     natural_eigenvalue: calculated.natural_eigenvalue.to_string(),
                     forced_eigenvalue: calculated.forced_eigenvalue.to_string(),
+                    claim_scope: CcmEvennessClaimScope::ExactStoredTau,
+                    assembly_error_bound: None,
                 },
                 canonical_dependency_refs(vec![natural_manifest, forced_manifest]),
             ))
         },
         |artifact| {
-            if artifact.schema_version != 1
+            if artifact.schema_version != 2
+                || artifact.claim_scope != CcmEvennessClaimScope::ExactStoredTau
+                || artifact.assembly_error_bound.is_some()
                 || artifact.lambda_squared != lambda_squared_cache_identity(params)
                 || artifact.n_modes != params.n_modes
                 || artifact.precision_bits != cfg.precision_bits
@@ -13378,6 +13525,8 @@ fn measure_evenness_from_retained_source_via_cache(
                 evenness_deviation: values[0].clone(),
                 natural_eigenvalue: values[1].clone(),
                 forced_eigenvalue: values[2].clone(),
+                claim_scope: artifact.claim_scope,
+                assembly_error_bound: None,
             }));
             Ok(())
         },
@@ -13396,15 +13545,37 @@ fn measure_evenness_from_tau(
     let dim = params.matrix_size();
 
     // Force exact symmetry of the τ-matrix (parallel compute, sequential write).
-    force_symmetric(&mut tau, dim);
+    force_symmetric(&mut tau, dim)?;
 
     // Natural (unforced) smallest eigenpair.
     let (natural_eval, xi_natural) =
         xc_numerics::linalg::inverse_iteration(&tau, dim, prec, cfg.inverse_iter_steps, false)?;
+    let xi_natural = response_point_math::unit_state(&xi_natural, prec)?;
+    if !weil_eigvec_cache::residual_ok(&tau, dim, &xi_natural, &natural_eval, prec) {
+        bail!("natural evenness state failed its directed source residual gate");
+    }
+    ground_index::validate(
+        &tau,
+        &xi_natural,
+        &natural_eval,
+        prec,
+        CcmParityPolicy::Natural,
+    )?;
 
     // Forced-even smallest eigenpair.
-    let (forced_eval, _xi_forced) =
+    let (forced_eval, xi_forced) =
         xc_numerics::linalg::inverse_iteration(&tau, dim, prec, cfg.inverse_iter_steps, true)?;
+    let xi_forced = response_point_math::unit_state(&xi_forced, prec)?;
+    if !weil_eigvec_cache::residual_ok(&tau, dim, &xi_forced, &forced_eval, prec) {
+        bail!("forced-even evenness state failed its directed source residual gate");
+    }
+    ground_index::validate(
+        &tau,
+        &xi_forced,
+        &forced_eval,
+        prec,
+        CcmParityPolicy::EvenSector,
+    )?;
 
     // Evenness deviation: ‖ξ - γξ‖ / ‖ξ‖ where γ is index reflection.
     // γξ_i = ξ_{dim-1-i}. Deviation = ‖ξ - γξ‖₂ / ‖ξ‖₂.
@@ -13437,52 +13608,50 @@ fn measure_evenness_from_tau(
         evenness_deviation: deviation,
         natural_eigenvalue: natural_eval,
         forced_eigenvalue: forced_eval,
+        claim_scope: CcmEvennessClaimScope::ExactStoredTau,
+        assembly_error_bound: None,
     })
 }
 
-/// Result of the evenness measurement.
+/// Mathematical object to which an ordinary evenness measurement applies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CcmEvennessClaimScope {
+    ExactStoredTau,
+    ExactStoredParityMatrices,
+}
+
+/// Result of the evenness measurement. Ground parity of the unrounded finite
+/// form is not established without separate assembly/ordering certification.
 pub struct EvennessResult {
     /// ‖ξ - γξ‖ / ‖ξ‖. Zero means perfectly even.
     pub evenness_deviation: Float,
-    /// Smallest eigenvalue without forced-even projection.
+    /// Lowest value in the declared stored-source scope. For
+    /// ExactStoredParityMatrices this comes from a lifted parity eigenpair after
+    /// interval-separated sector ordering, not an independent natural solve.
     pub natural_eigenvalue: Float,
     /// Smallest eigenvalue with forced-even projection.
     pub forced_eigenvalue: Float,
+    pub claim_scope: CcmEvennessClaimScope,
+    /// Ordinary measurements do not enclose assembly uncertainty.
+    pub assembly_error_bound: Option<Float>,
 }
 
 // ===========================================================================
 // Matrix construction
 // ===========================================================================
 
-/// Wrapper around `build_tau_hp_compute` that consults the tau matrix
-/// disk cache before invoking the full HP construction.
-///
-/// At HP-1000 the τ-matrix construction is O(N²) HP integral
-/// evaluations + O(N³) LU-equivalent work in inverse iteration; for the
-/// representative large configurations (λ²=13/100/1000 at N=120/500/800) this is
-/// minutes-to-hours of wall-time. The output is fully determined by
-/// `(λ²_int, n_modes, prec)`, so it can be cached on disk and reused
-/// across runs.
-///
-/// Cache layout (mirrors `gl_cache` and `prolate_eigvals_cache`):
-///   <cwd>/data/tau_cache/lambda_sq{L}_nmodes{N}_prec{P}.json[.zip[.partXX]]
-///
-/// Lookup priority:
-///   1. Uncompressed `.json`
-///   2. Single zip `.json.zip`
-///   3. Multi-part split `.json.zip.part00, .part01, ...` (used when
-///      compressed payload exceeds GitHub's 100 MB hard limit; we
-///      split at 90 MB-byte boundaries and concatenate the parts on
-///      read before passing to the zip decoder).
-///
-/// Cache miss → compute fresh via `build_tau_hp_compute`, save in
-/// the most appropriate format for the resulting size.
+/// Internal legacy standalone cache adapter. Public matrix/spectrum APIs use the
+/// local managed component graph; ordinary run/build_source use managed sessions.
+/// Legacy files remain readable only along explicitly internal standalone routes.
 fn build_tau_hp(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<Vec<Float>> {
+    validate_managed_source_length(params, cfg, l)?;
     let prec = cfg.precision_bits;
     let lambda_sq = params.lambda_sq;
     let n_modes = params.n_modes;
 
-    if let Some(cached) = tau_cache::load(lambda_sq, n_modes, prec, cfg.cache_mode) {
+    if let Some(cached) = tau_cache::load(lambda_sq, n_modes, prec, cfg.quad_points, cfg.cache_mode)
+    {
         eprintln!(
             "[HP] loaded cached τ-matrix for λ²={}, N={}, prec={} bits ({}×{} = {} entries)",
             lambda_sq.value_f64,
@@ -13496,7 +13665,14 @@ fn build_tau_hp(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<V
     }
 
     let tau = build_tau_hp_compute(params, l, cfg, true)?;
-    tau_cache::save(lambda_sq, n_modes, prec, &tau, cfg.cache_mode);
+    tau_cache::save(
+        lambda_sq,
+        n_modes,
+        prec,
+        cfg.quad_points,
+        &tau,
+        cfg.cache_mode,
+    );
     Ok(tau)
 }
 
@@ -13536,7 +13712,10 @@ pub fn weil_spectrum_hp(
 /// Assemble the dense HP Weil-form matrix for independent solver and
 /// certificate routes. The returned storage is exactly symmetric row-major
 /// data at `cfg.precision_bits`; `include_primes=false` selects the
-/// archimedean-only form and bypasses the full-form cache.
+/// archimedean-only form and bypasses the full-form cache. With JsonZip, the
+/// full form uses the local managed cache and authenticated component dependency
+/// graph, with remote overlays and publication disabled. Off and JsonOnly compute
+/// without cache access. Computed reuse is not independent formula certification.
 pub fn weil_matrix_hp(
     params: &CcmParams,
     cfg: &HighPrecConfig,
@@ -13545,20 +13724,56 @@ pub fn weil_matrix_hp(
     xc_numerics::hp_runtime::run_hp(|| weil_matrix_hp_inner(params, cfg, include_primes))
 }
 
+fn direct_matrix_tau(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<Vec<Float>> {
+    if cfg.cache_mode != xc_numerics::quadrature::CacheMode::JsonZip {
+        let mut uncached = cfg.clone();
+        uncached.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        return build_tau_hp_compute(params, l, &uncached, true);
+    }
+    let mut managed = xc_cache::ManagedArtifactCacheConfig::from_environment()?
+        .ok_or_else(|| anyhow::anyhow!("managed local cache unavailable"))?;
+    managed.profile = xc_cache::ManagedRunProfile::Normal;
+    managed.requested_assurance = xc_core::AssuranceLevel::Computed;
+    managed.remote_cache_mode = xc_cache::ManagedRemoteCacheMode::None;
+    managed.publication_target = xc_core::PublicationTarget::None;
+    managed.execute_remote_mutations = false;
+    managed.replace_existing_publication = false;
+    managed.staging_root = None;
+    managed.output_validation = None;
+    managed.cache_mode = xc_cache::ArtifactExecutionCacheMode::PreferReuse;
+    let session = xc_cache::ManagedArtifactCacheSession::new(managed)?;
+    Ok(build_tau_hp_via_cache(params, l, cfg, &session.context())?.0)
+}
+
 fn weil_matrix_hp_inner(
     params: &CcmParams,
     cfg: &HighPrecConfig,
     include_primes: bool,
 ) -> Result<Vec<Float>> {
+    validate_source_shape(params.n_modes, cfg.precision_bits, cfg.quad_points)?;
     let dim = params.matrix_size();
-    let l = log_lambda_sq_hp(params, cfg.precision_bits);
+    let l = log_lambda_sq_hp(params, cfg.precision_bits)?;
     let mut tau = if include_primes {
-        build_tau_hp(params, &l, cfg)?
+        direct_matrix_tau(params, &l, cfg)?
     } else {
         build_tau_hp_compute(params, &l, cfg, false)?
     };
-    force_symmetric(&mut tau, dim);
+    force_symmetric(&mut tau, dim)?;
     Ok(tau)
+}
+
+/// Retain the full stored-matrix spectrum, including unresolved signs and
+/// storage-scale values, together with directed indexed enclosures.
+/// The legacy point-only spectrum API requires each interpretation to resolve.
+pub fn weil_spectrum_with_accuracy_hp(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    include_primes: bool,
+) -> Result<CcmWeilSpectrumHp> {
+    xc_numerics::hp_runtime::run_hp(|| {
+        let tau = weil_matrix_hp_inner(params, cfg, include_primes)?;
+        spectrum_accuracy::full_spectrum(&tau, params.matrix_size(), cfg.precision_bits)
+    })
 }
 
 fn weil_spectrum_hp_inner(
@@ -13566,10 +13781,16 @@ fn weil_spectrum_hp_inner(
     cfg: &HighPrecConfig,
     include_primes: bool,
 ) -> Result<Vec<Float>> {
-    let prec = cfg.precision_bits;
-    let dim = params.matrix_size();
     let tau = weil_matrix_hp_inner(params, cfg, include_primes)?;
-    xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&tau, dim, prec)
+    let report = spectrum_accuracy::full_spectrum(&tau, params.matrix_size(), cfg.precision_bits)?;
+    if report
+        .eigenvalue_bounds
+        .iter()
+        .any(|x| x.resolution != StoredEigenvalueResolution::Resolved)
+    {
+        bail!("CCM spectrum resolution limit: a stored eigenvalue sign or storage-scale interpretation is unresolved; increase precision or use weil_spectrum_with_accuracy_hp for the retained bounds");
+    }
+    Ok(report.eigenvalues)
 }
 
 /// Decomposition of the plunge into archimedean and prime Rayleigh
@@ -13590,6 +13811,13 @@ fn weil_spectrum_hp_inner(
 /// archimedean↔prime (Weil-positivity) cancellation that produces the
 /// CCM convergence floor.
 pub struct PlungeCancellation {
+    /// Source-bound algorithm identity for these values and their acceptance.
+    pub algorithm_semantics: String,
+    pub selected_algebraic_index: usize,
+    pub stored_eigenvalue_lower: Float,
+    pub stored_eigenvalue_upper: Float,
+    pub eigenvector_sine_angle_upper: Float,
+    pub matrix_rounding_scale_upper: Float,
     /// Plunge eigenvalue `ε_N = arch_rayleigh − prime_rayleigh`.
     pub eps_n: Float,
     /// `⟨A_arch ξ,ξ⟩/⟨ξ,ξ⟩` — archimedean Rayleigh on the full plunge ξ.
@@ -13612,41 +13840,52 @@ fn weil_plunge_cancellation_hp_inner(
     params: &CcmParams,
     cfg: &HighPrecConfig,
 ) -> Result<PlungeCancellation> {
+    validate_source_shape(params.n_modes, cfg.precision_bits, cfg.quad_points)?;
     let prec = cfg.precision_bits;
     let dim = params.matrix_size();
-    let l = log_lambda_sq_hp(params, prec);
+    let l = log_lambda_sq_hp(params, prec)?;
 
     // Full Weil form; smallest positive eigenvalue (the plunge) and its
     // eigenvector via the dense HP symmetric path.
-    let mut tau_full = build_tau_hp(params, &l, cfg)?;
-    force_symmetric(&mut tau_full, dim);
-    let eigs = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&tau_full, dim, prec)?;
-    let zero = Float::with_val(prec, 0);
-    let eps_n = eigs
-        .iter()
-        .find(|e| **e > zero)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no positive eigenvalue (Weil form indefinite?)"))?;
-    let xi = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
-        &tau_full,
-        dim,
-        &eps_n,
-        prec,
-        cfg.inverse_iter_steps,
-    )?;
+    let mut tau_full = direct_matrix_tau(params, &l, cfg)?;
+    force_symmetric(&mut tau_full, dim)?;
+    let pair = spectrum_accuracy::first_positive(&tau_full, dim, prec, cfg.inverse_iter_steps)?;
+    let xi = &pair.eigenvector;
 
     // Archimedean-only form (prime sum dropped).
     let mut tau_arch = build_tau_hp_compute(params, &l, cfg, false)?;
-    force_symmetric(&mut tau_arch, dim);
+    force_symmetric(&mut tau_arch, dim)?;
 
     // Rayleigh quotients on the SAME ξ. The split is exact by linearity:
     // arch_rayleigh − prime_rayleigh = full_rayleigh = ε_N.
-    let full_rayleigh = xc_numerics::linalg::rayleigh_quotient(&tau_full, dim, &xi, prec);
-    let arch_rayleigh = xc_numerics::linalg::rayleigh_quotient(&tau_arch, dim, &xi, prec);
+    let full_rayleigh = pair.eigenvalue.clone();
+    let arch_rayleigh = xc_numerics::linalg::rayleigh_quotient(&tau_arch, dim, xi, prec);
     let mut prime_rayleigh = Float::with_val(prec, &arch_rayleigh);
     prime_rayleigh -= &full_rayleigh;
 
     Ok(PlungeCancellation {
+        algorithm_semantics: format!(
+            "{}+{}",
+            spectrum_accuracy::PLUNGE_SEMANTICS,
+            xc_numerics::eigen::DENSE_EIGENVECTOR_SEMANTICS
+        ),
+        selected_algebraic_index: pair.index,
+        stored_eigenvalue_lower: Float::with_val_round(
+            prec + 64,
+            &pair.eigenvalue - &pair.residual_upper_bound,
+            rug::float::Round::Down,
+        )
+        .0,
+        stored_eigenvalue_upper: Float::with_val_round(
+            prec + 64,
+            &pair.eigenvalue + &pair.residual_upper_bound,
+            rug::float::Round::Up,
+        )
+        .0,
+        eigenvector_sine_angle_upper: pair.sine_angle_upper_bound,
+        matrix_rounding_scale_upper: stored_resolution::matrix_rounding_scale(
+            &tau_full, dim, prec,
+        )?,
         eps_n: full_rayleigh,
         arch_rayleigh,
         prime_rayleigh,
@@ -13655,13 +13894,12 @@ fn weil_plunge_cancellation_hp_inner(
 
 /// `sinc(t) = sin(t)/t`, with `sinc(0) = 1`, at working precision `prec`.
 fn sinc_hp(t: &Float, prec: u32) -> Float {
-    let tiny = Float::with_val(prec, Float::parse("1e-40").unwrap());
-    if t.cmp_abs(&tiny).map(|o| o.is_lt()).unwrap_or(false) {
+    if t.is_zero() {
         Float::with_val(prec, 1)
     } else {
-        let mut s = t.clone().sin();
-        s /= t;
-        s
+        // MPFR sin preserves small nonzero arguments at the requested
+        // precision; a fixed constant branch erases resolvable corrections.
+        Float::with_val(prec, t.sin_ref()) / t
     }
 }
 
@@ -13669,17 +13907,30 @@ fn sinc_hp(t: &Float, prec: u32) -> Float {
 /// `V_n` trigonometric basis as the localized Weil form, for a frequency
 /// band `(−Ω, Ω)` (`omega` = Ω).
 ///
-/// With `φ_n(x) = e^{2π i n x / L}/√L` on the log-interval `(−a, a)`
-/// (`a = ½ ln λ²`, `L = 2a`) and `ω_n = 2π n / L`, the entry is the
-/// time-then-band-limiting (Slepian concentration) operator
-/// `C[n,m] = (a/π) ∫_{−Ω}^{Ω} sinc(a(ω_n−ξ)) sinc(a(ω_m−ξ)) dξ`,
+/// With `V_n(exp(x)) = (-1)^n exp(2*pi*i*n*x/L)/sqrt(L)` on the
+/// centered log interval `(-a,a)`, where `a=L/2`, and `omega_n=2*pi*n/L`,
+/// the time-then-band-limiting (Slepian concentration) operator has entries
+/// `C[n,m] = (-1)^(n+m) (a/pi) integral_{-omega}^{omega}
+/// sinc(a*(omega_n-t)) sinc(a*(omega_m-t)) dt`,
 /// computed by HP Gauss–Legendre quadrature on the band.
+/// The band is split into panels with logarithmic half-width at most 8;
+/// quadrature order also increases with working precision. `quad_points` is
+/// a minimum total node count across those panels. More than one million
+/// total quadrature nodes is an explicit resource error.
 ///
 /// Its eigenvalues `χ ∈ (0,1)` are the band-concentration ratios: `χ ≈ 1`
 /// modes are band-concentrated (the prolate/PSWF subspace), `χ ≈ 0` modes
 /// span the Sonin-like (anti-band) subspace. The number of `χ ≈ 1` modes
 /// is the Shannon number `≈ 2aΩ/π`. Symmetric, row-major, dimension `2N+1`,
 /// in the `params.idx` ordering (so it matches `weil_spectrum_hp`).
+///
+/// This is a computed quadrature matrix. The continuum operator has spectrum
+/// in `[0,1]`, but finite quadrature and point rounding do not certify that bound
+/// or a continuum approximation error. The input band must be finite and
+/// nonnegative (zero returns the zero matrix), lambda-squared must exceed one,
+/// and precision must be 64..=1,000,000 bits. Invalid dimensions, quadrature
+/// failure, nonfinite arithmetic or the 8 GiB numerical-buffer limit return an
+/// error. The buffer limit does not bound total process memory.
 pub fn band_concentration_matrix_hp(
     params: &CcmParams,
     cfg: &HighPrecConfig,
@@ -13694,15 +13945,84 @@ fn band_concentration_matrix_hp_inner(
     omega: &Float,
 ) -> Result<Vec<Float>> {
     let prec = cfg.precision_bits;
-    let n_max = params.n_modes as i64;
-    let dim = params.matrix_size();
-    let l = log_lambda_sq_hp(params, prec);
+    let dim = params.n_modes.checked_mul(2).and_then(|n| n.checked_add(1));
+    let minimum_order = params
+        .n_modes
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(64));
+    let valid_cutoff = if params.lambda_sq.is_integer {
+        params.lambda_sq.value_u64 > 1
+    } else {
+        params.lambda_sq.value_f64.is_finite() && params.lambda_sq.value_f64 > 1.0
+    };
+    if !(64..=1_000_000).contains(&prec)
+        || dim.is_none_or(|n| n.checked_mul(n).is_none())
+        || minimum_order.is_none_or(|n| i64::try_from(n).is_err())
+        || !valid_cutoff
+        || !omega.is_finite()
+        || omega < &0
+    {
+        bail!("invalid concentration matrix dimension, precision, cutoff or bandwidth");
+    }
+    let dim = dim.unwrap();
+    let n_max = i64::try_from(params.n_modes)?;
+    let minimum_total = cfg.quad_points.max(minimum_order.unwrap());
+    let l = log_lambda_sq_hp(params, prec)?;
     let mut a = l.clone();
     a /= 2u32;
     let pi_v = pi(prec);
-    let npts = cfg.quad_points.max(8 * params.n_modes + 64);
+    if !l.is_finite() || l <= 0 {
+        bail!("concentration matrix requires a finite positive logarithmic length");
+    }
+    // sinc(s) = (1/2) integral[-1,1] exp(i*s*u) du. On one rescaled
+    // panel, the product of two sincs is a mean of exponential functions
+    // with frequency <= 2*a*h <= 16. For k=2q, Taylor's remainder is
+    // bounded by 16^k/k!. Since k! >= (k/e)^k and e < 3, k >= 96 gives
+    // remainder <= 2^-k. GL exactness through degree k-1 and positive
+    // weights give total entry truncation <= 4*a*omega/pi * 2^-k.
+    // The order below makes that <= 2^(-prec-3). This controls mathematical
+    // quadrature truncation for the stored point parameters; it is not a
+    // bound on point arithmetic or the accuracy of the input parameters.
+    let phase = Float::with_val_round(prec, &a * omega, rug::float::Round::Up).0;
+    const MAX_BAND_QUADRATURE_NODES: usize = 1_000_000;
+    if !phase.is_finite() || phase > (8 * MAX_BAND_QUADRATURE_NODES) as u32 {
+        bail!("concentration bandwidth exceeds the quadrature work budget");
+    }
+    let panels = if phase <= 8 {
+        1
+    } else {
+        let count = Float::with_val_round(prec, &phase / 8, rug::float::Round::Up).0;
+        count
+            .to_integer_round(rug::float::Round::Up)
+            .and_then(|(value, _)| value.to_usize())
+            .ok_or_else(|| {
+                anyhow::anyhow!("concentration panel count exceeds the supported range")
+            })?
+    };
+    let exponent = phase.get_exp().unwrap_or(0).max(0) as usize;
+    let accuracy_order = (prec as usize + exponent + 4).div_ceil(2).max(48);
+    let npts = minimum_total.div_ceil(panels).max(accuracy_order);
+    if panels
+        .checked_mul(npts)
+        .is_none_or(|count| count > MAX_BAND_QUADRATURE_NODES)
+    {
+        bail!("concentration matrix exceeds the quadrature work budget");
+    }
+    // Bound retained matrix, vectors and quadrature buffers before allocation.
+    // This is a numerical-buffer budget, not a process-RSS guarantee.
+    let buffers = (dim as u64)
+        .saturating_mul(dim as u64)
+        .saturating_add((dim as u64).saturating_mul(5))
+        .saturating_add((npts as u64).saturating_mul(4))
+        .saturating_add(128);
+    if buffers.saturating_mul(u64::from(prec).div_ceil(8) + 64) > 8 << 30 {
+        bail!("concentration matrix exceeds numerical workspace budget");
+    }
+    if omega.is_zero() {
+        return Ok(vec![Float::with_val(prec, 0); dim * dim]);
+    }
     let (nodes, weights) =
-        xc_numerics::quadrature::gauss_legendre_nodes(npts, prec, cfg.cache_mode);
+        xc_numerics::quadrature::try_gauss_legendre_nodes(npts, prec, cfg.cache_mode)?;
 
     // ω_n = 2π n / L, indexed by position params.idx(n) = n + N.
     let omega_n: Vec<Float> = (-n_max..=n_max)
@@ -13715,33 +14035,42 @@ fn band_concentration_matrix_hp_inner(
         })
         .collect();
 
-    // prefactor (a/π)·Ω folded into the quadrature weight.
+    let half_width = Float::with_val(prec, omega / panels);
+    // prefactor (a/pi) times panel half-width, folded into each weight.
     let mut aon = a.clone();
     aon /= &pi_v;
-    aon *= omega;
+    aon *= &half_width;
 
     let mut c = vec![Float::with_val(prec, 0); dim * dim];
-    for (q, node) in nodes.iter().enumerate() {
-        let mut xi = node.clone(); // GL node on [-1,1]
-        xi *= omega; // ξ_q = Ω·node ∈ (−Ω, Ω)
-        let svec: Vec<Float> = omega_n
-            .iter()
-            .map(|wn| {
-                let mut arg = wn.clone();
-                arg -= &xi;
-                arg *= &a;
-                sinc_hp(&arg, prec)
-            })
-            .collect();
-        let mut wq = weights[q].clone();
-        wq *= &aon;
-        for i in 0..dim {
-            let mut wi = svec[i].clone();
-            wi *= &wq;
-            for j in i..dim {
-                let mut term = wi.clone();
-                term *= &svec[j];
-                c[i * dim + j] += &term;
+    for panel in 0..panels {
+        let center = Float::with_val(prec, &half_width * (2 * panel + 1)) - omega;
+        for (q, node) in nodes.iter().enumerate() {
+            let mut xi = Float::with_val(prec, node * &half_width);
+            xi += &center;
+            let svec: Vec<Float> = omega_n
+                .iter()
+                .map(|wn| {
+                    let mut arg = wn.clone();
+                    arg -= &xi;
+                    arg *= &a;
+                    sinc_hp(&arg, prec)
+                })
+                .collect();
+            let mut wq = weights[q].clone();
+            wq *= &aon;
+            for i in 0..dim {
+                let mut wi = svec[i].clone();
+                wi *= &wq;
+                for j in i..dim {
+                    let mut term = wi.clone();
+                    term *= &svec[j];
+                    // V_n(exp(x)) = (-1)^n exp(2*pi*i*n*x/L)/sqrt(L).
+                    // Since n=i-N and m=j-N, (-1)^(n+m)=(-1)^(i+j).
+                    if (i + j) % 2 != 0 {
+                        term = -term;
+                    }
+                    c[i * dim + j] += &term;
+                }
             }
         }
     }
@@ -13751,38 +14080,36 @@ fn band_concentration_matrix_hp_inner(
             c[j * dim + i] = v;
         }
     }
+    if c.iter().any(|value| !value.is_finite()) {
+        bail!("concentration matrix arithmetic exceeded the finite exponent range");
+    }
     Ok(c)
 }
 
-/// Result of restricting the archimedean Weil form to the Sonin-like
-/// (anti-band) subspace via band-concentration deflation.
+/// Computed finite-dimensional restriction of the archimedean Weil form
+/// to the complement of the largest band-concentration modes.
 pub struct SoninRestriction {
-    /// Band-concentration eigenvalues `χ ∈ (0,1)`, ascending. The count
-    /// of `χ ≈ 1` is the Shannon number; the `χ ≈ 0` tail is the Sonin
-    /// subspace.
+    /// Computed band-concentration eigenvalues, in ascending order.
     pub chi: Vec<Float>,
-    /// Spectrum of the archimedean Weil form after deflating the top
-    /// `n_dropped` band-concentrated modes (those land near `+σ`). The
-    /// smallest entry is the archimedean Rayleigh minimum on the
-    /// band-complement (Sonin-like) subspace — positive iff archimedean
-    /// positivity holds there (source theorem 7.1).
+    /// Eigenvalues of Q^T A_arch Q, with `dim - n_dropped` entries.
+    /// Q contains the retained, orthonormal concentration modes. Empty when
+    /// every mode is dropped; an empty spectrum has no Rayleigh minimum.
+    /// These are computed estimates: their signs do not certify positivity
+    /// of the exact quadrature matrix or of the continuum Sonin space.
     pub spectrum: Vec<Float>,
-    /// Number of band-concentrated modes deflated out.
+    /// Number of largest concentration modes removed.
     pub n_dropped: usize,
 }
 
-/// Archimedean Weil-form spectrum restricted to the Sonin-like (anti-band)
-/// subspace. The full-space archimedean form is O(1)-indefinite; this
-/// deflates the top `n_drop` band-concentration eigenvectors (band
-/// `(−Ω, Ω)`, `omega = Ω`) by a positive shift `σ`, leaving the
-/// archimedean form on the band-complement. Returns the deflated spectrum;
-/// its minimum is the archimedean Rayleigh minimum on that subspace.
+/// Compute the archimedean Weil form on the retained concentration subspace.
 ///
-/// Method: build [`band_concentration_matrix_hp`], take its top `n_drop`
-/// eigenvectors `v_k` (largest `χ`), and form `A_deflated = A_arch + σ Σ_k v_k v_kᵀ`
-/// with `σ` a Gershgorin bound on `‖A_arch‖` (so deflated modes leave the
-/// spectrum bottom). `A_arch` is the prime-free Weil matrix
-/// (`build_tau_hp_compute(.., include_primes=false)`).
+/// Diagonalize C with cyclic Jacobi, retain its lowest `dim - n_drop` modes
+/// as columns of Q, and form the actual compression Q^T A_arch Q. A finite
+/// positive penalty on the removed modes is not an exact restriction and is
+/// not used. An unresolved cluster across the requested cutoff is an error.
+/// `cfg.inverse_iter_steps` supplies the Jacobi sweep budget for this route.
+/// Quadrature, floating-point, and continuum approximation errors remain
+/// separate from this computed finite-dimensional diagnostic.
 pub fn weil_spectrum_sonin_hp(
     params: &CcmParams,
     cfg: &HighPrecConfig,
@@ -13798,58 +14125,33 @@ fn weil_spectrum_sonin_hp_inner(
     omega: &Float,
     n_drop: usize,
 ) -> Result<SoninRestriction> {
+    let checked_dim = params.n_modes.checked_mul(2).and_then(|v| v.checked_add(1));
+    if checked_dim.is_none_or(|dim| dim.checked_mul(dim).is_none() || n_drop > dim)
+        || params.n_modes > (i64::MAX as usize - 64) / 8
+        || !(64..=1_000_000).contains(&cfg.precision_bits)
+        || cfg.inverse_iter_steps == 0
+        || !params.lambda_squared().is_finite()
+        || params.lambda_squared() <= 1.0
+        || !omega.is_finite()
+        || omega < &0
+    {
+        bail!("invalid Sonin parameters, dimension, precision, band, or sweep budget");
+    }
     let prec = cfg.precision_bits;
     let dim = params.matrix_size();
-    let l = log_lambda_sq_hp(params, prec);
+    let l = log_lambda_sq_hp(params, prec)?;
 
     let cmat = band_concentration_matrix_hp_inner(params, cfg, omega)?;
-    let chi = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&cmat, dim, prec)?;
-
-    let n_drop = n_drop.min(dim);
-    let mut deflate: Vec<Vec<Float>> = Vec::with_capacity(n_drop);
-    for k in 0..n_drop {
-        let chi_k = &chi[dim - 1 - k]; // largest χ first
-        let mut v = xc_numerics::eigen::dense_symmetric_eigenvector_for_value_hp(
-            &cmat,
-            dim,
-            chi_k,
-            prec,
-            cfg.inverse_iter_steps,
-        )?;
-        xc_numerics::linalg::normalize_l2(&mut v);
-        deflate.push(v);
-    }
-
     let mut a_arch = build_tau_hp_compute(params, &l, cfg, false)?;
-    force_symmetric(&mut a_arch, dim);
-
-    // σ = 10 · (Gershgorin bound on |spectrum|) + 1.
-    let mut sigma = Float::with_val(prec, 0);
-    for i in 0..dim {
-        let mut row = Float::with_val(prec, 0);
-        for j in 0..dim {
-            row += a_arch[i * dim + j].clone().abs();
-        }
-        if row > sigma {
-            sigma = row;
-        }
-    }
-    sigma *= 10u32;
-    sigma += 1u32;
-
-    for v in &deflate {
-        for i in 0..dim {
-            let mut svi = v[i].clone();
-            svi *= &sigma;
-            for j in 0..dim {
-                let mut term = svi.clone();
-                term *= &v[j];
-                a_arch[i * dim + j] += &term;
-            }
-        }
-    }
-    force_symmetric(&mut a_arch, dim);
-    let spectrum = xc_numerics::eigen::dense_symmetric_eigenvalues_hp(&a_arch, dim, prec)?;
+    force_symmetric(&mut a_arch, dim)?;
+    let (chi, spectrum) = sonin_restriction::restricted_spectrum(
+        &a_arch,
+        &cmat,
+        dim,
+        n_drop,
+        prec,
+        cfg.inverse_iter_steps,
+    )?;
 
     Ok(SoninRestriction {
         chi,
@@ -13864,6 +14166,7 @@ fn build_tau_hp_compute(
     cfg: &HighPrecConfig,
     include_primes: bool,
 ) -> Result<Vec<Float>> {
+    matrix_point_math::preflight(params.n_modes, l, cfg.precision_bits)?;
     build_tau_hp_compute_exact(
         params.n_modes,
         params.lambda_sq_int(),
@@ -13882,7 +14185,11 @@ fn build_tau_hp_compute_exact(
 ) -> Result<Vec<Float>> {
     let (components, _) =
         build_tau_components_exact_tracked(n_modes, lambda_sq_int, l, cfg, include_primes, None)?;
-    Ok(assemble_tau_components(&components, cfg.precision_bits))
+    let tau = assemble_tau_components(&components, cfg.precision_bits)?;
+    if tau.iter().any(|value| !value.is_finite()) {
+        bail!("CCM source assembly produced nonfinite matrix entries");
+    }
+    Ok(tau)
 }
 
 fn report_quadrature_precompute_summary(
@@ -13932,8 +14239,11 @@ fn compute_archimedean_integrals_tracked_with_bucket(
     bucket: usize,
 ) -> Result<(ComputedArchimedeanIntegrals, Vec<ArtifactManifest>)> {
     let prec = cfg.precision_bits;
+    validate_source_shape(n_modes, prec, cfg.quad_points)?;
+    if !l.is_finite() || l <= &0 || l.prec() < prec {
+        bail!("CCM source length must be positive and finite at the working precision");
+    }
     let base_pts = cfg.quad_points;
-    let prec_extra = (prec / 2) as usize;
     crate::hp_debug!(
         "[HP] Computing alpha_L, beta_L, gamma_L for n=0..{} (base quad={})",
         n_modes,
@@ -13941,14 +14251,8 @@ fn compute_archimedean_integrals_tracked_with_bucket(
     );
 
     use std::collections::HashMap;
-    let pts_for_n: Vec<usize> = if bucket == 1 {
-        // Preserve the original production sequence and exact GL identities.
-        (0..=n_modes)
-            .map(|n| base_pts.max(3 * n + prec_extra))
-            .collect()
-    } else {
-        super::research::quadrature_orders(n_modes, base_pts, prec, bucket)?
-    };
+    let pts_for_n =
+        super::research::quadrature_orders_for_length(n_modes, base_pts, prec, bucket, l)?;
     let unique_pts: Vec<usize> = {
         let mut values = pts_for_n.clone();
         values.sort_unstable();
@@ -13961,6 +14265,15 @@ fn compute_archimedean_integrals_tracked_with_bucket(
         unique_pts.last().copied().unwrap_or(0),
         prec
     );
+    let work_bytes = (u128::from(prec * 2 + 4096).div_ceil(8) + 96) * 16;
+    let table_bytes = unique_pts.iter().map(|&n| n as u128).sum::<u128>()
+        * 2
+        * (u128::from(prec).div_ceil(8) + 96);
+    let active = rayon::current_num_threads().min(n_modes + 1) as u128;
+    let scratch_bytes = unique_pts.iter().copied().max().unwrap_or(0) as u128 * active * work_bytes;
+    if table_bytes + scratch_bytes > (8u128 << 30) {
+        bail!("CCM quadrature tables and concurrent arithmetic exceed 8 GiB workspace");
+    }
     type GlTable = (Vec<Float>, Vec<Float>);
     let gl_plan = xc_numerics::hp_runtime::plan_gl_precompute(&unique_pts, prec);
     let mut performance_gl = xc_core::performance_stage_with("ccm.tau.gl_precompute", || {
@@ -14009,28 +14322,34 @@ fn compute_archimedean_integrals_tracked_with_bucket(
         for result in resolved {
             let (npts, table, manifest, access) = result.map_err(anyhow::Error::from)?;
             tables.insert(npts, table);
-            manifests.push(manifest);
+            if let Some(manifest) = manifest {
+                manifests.push(manifest);
+            }
             accesses.push(access);
         }
         manifests.sort_by(|left, right| left.key.logical_key.cmp(&right.key.logical_key));
         (tables, manifests, accesses)
     } else {
-        let pairs: Vec<(usize, GlTable)> = xc_numerics::hp_runtime::map_gl_precompute_planned(
+        let pairs = xc_numerics::hp_runtime::map_gl_precompute_planned(
             &unique_pts,
             gl_plan,
             |npts, root_schedule| {
-                (
+                xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
                     npts,
-                    xc_numerics::quadrature::gauss_legendre_nodes_scheduled(
-                        npts,
-                        prec,
-                        cfg.cache_mode,
-                        root_schedule,
-                    ),
+                    prec,
+                    cfg.cache_mode,
+                    root_schedule,
                 )
+                .map(|table| (npts, table))
             },
         );
-        (pairs.into_iter().collect(), Vec::new(), Vec::new())
+        (
+            pairs
+                .into_iter()
+                .collect::<std::result::Result<HashMap<usize, GlTable>, _>>()?,
+            Vec::new(),
+            Vec::new(),
+        )
     };
     let disposition = report_quadrature_precompute_summary(unique_pts.len(), &quadrature_accesses);
     performance_gl.set_cache_disposition(disposition);
@@ -14042,14 +14361,13 @@ fn compute_archimedean_integrals_tracked_with_bucket(
             ccm_performance_metadata("ccm.tau.archimedean_integrals", n_modes + 1, prec)
         });
     let indices: Vec<usize> = (0..=n_modes).collect();
-    let kappa_half = compute_kappa_half(l, prec);
     let fused: Vec<(Float, Float, Float)> = indices
         .par_iter()
         .map(|&n| {
             let (nodes, weights) = gl_cache.get(&pts_for_n[n]).unwrap();
-            compute_archimedean_integrals_l(n as i64, l, prec, nodes, weights, &kappa_half)
+            compute_archimedean_integrals_l(n as i64, l, prec, nodes, weights)
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let mut alpha = Vec::with_capacity(fused.len());
     let mut beta = Vec::with_capacity(fused.len());
     let mut gamma = Vec::with_capacity(fused.len());
@@ -14070,74 +14388,8 @@ fn assemble_pole_and_archimedean_components(
     l: &Float,
     prec: u32,
     integrals: &ComputedArchimedeanIntegrals,
-) -> (Vec<Float>, Vec<Float>) {
-    let dim = 2 * n_modes + 1;
-    let _performance =
-        xc_core::performance_stage_with("ccm.tau.pole_archimedean_components", || {
-            let mut metadata =
-                ccm_performance_metadata("ccm.tau.pole_archimedean_components", dim, prec);
-            metadata.retained_hp_entries = Some(2usize.saturating_mul(dim.saturating_mul(dim)));
-            metadata
-        });
-    let pi_v = pi(prec);
-    let mut sixteen_pi2 = pi_v.square();
-    sixteen_pi2 *= 16u32;
-    let l_sq = l.clone().square();
-    let sinh2_l_over_4 = {
-        let mut value = l.clone();
-        value /= 4u32;
-        value.sinh().square()
-    };
-    let mut pole = vec![Float::with_val(prec, 0); dim * dim];
-    let mut archimedean = vec![Float::with_val(prec, 0); dim * dim];
-    pole.par_chunks_mut(dim)
-        .zip(archimedean.par_chunks_mut(dim))
-        .enumerate()
-        .for_each(|(row, (pole_row, archimedean_row))| {
-            let n = row as i64 - n_modes as i64;
-            for column in 0..dim {
-                let m = column as i64 - n_modes as i64;
-                let nf = fl_i(prec, n);
-                let mf = fl_i(prec, m);
-                let pole_value = {
-                    let mut mn = sixteen_pi2.clone();
-                    mn *= &mf;
-                    mn *= &nf;
-                    let mut numerator = l_sq.clone();
-                    numerator -= &mn;
-                    let mut left = sixteen_pi2.clone();
-                    left *= &mf;
-                    left *= &mf;
-                    left += &l_sq;
-                    let mut right = sixteen_pi2.clone();
-                    right *= &nf;
-                    right *= &nf;
-                    right += &l_sq;
-                    left *= right;
-                    let mut value = sinh2_l_over_4.clone();
-                    value *= 32u32;
-                    value *= l;
-                    value *= numerator;
-                    value /= left;
-                    value
-                };
-                let archimedean_value = if n == m {
-                    let index = n.unsigned_abs() as usize;
-                    let mut value = integrals.gamma[index].clone();
-                    value -= &integrals.beta[index];
-                    value *= 2u32;
-                    value
-                } else {
-                    let mut value = signed_alpha(&integrals.alpha, m, prec);
-                    value -= signed_alpha(&integrals.alpha, n, prec);
-                    value /= fl_i(prec, n - m);
-                    value
-                };
-                pole_row[column] = pole_value;
-                archimedean_row[column] = archimedean_value;
-            }
-        });
-    (pole, archimedean)
+) -> Result<(Vec<Float>, Vec<Float>)> {
+    matrix_point_math::pole_arch(n_modes, l, prec, integrals)
 }
 
 #[cfg(test)]
@@ -14218,107 +14470,8 @@ fn compute_prime_component_matrix(
     prime_cutoff: u64,
     l: &Float,
     prec: u32,
-) -> Vec<Float> {
-    let dim = 2 * n_modes + 1;
-    let _performance = xc_core::performance_stage_with("ccm.tau.prime_component", || {
-        let mut metadata = ccm_performance_metadata("ccm.tau.prime_component", dim, prec);
-        metadata.retained_hp_entries = Some(dim.saturating_mul(dim));
-        metadata
-    });
-    let pi_v = pi(prec);
-    let mut two_pi = pi_v.clone();
-    two_pi *= 2u32;
-    let mode_values = (-(n_modes as i64)..=(n_modes as i64))
-        .map(|mode| fl_i(prec, mode))
-        .collect::<Vec<_>>();
-    let mode_frequencies = mode_values
-        .iter()
-        .map(|mode| {
-            let mut frequency = two_pi.clone();
-            frequency *= mode;
-            frequency /= l;
-            frequency
-        })
-        .collect::<Vec<_>>();
-    let difference_denominators = (-(2 * n_modes as i64)..=(2 * n_modes as i64))
-        .map(|difference| {
-            let mut denominator = pi_v.clone();
-            denominator *= fl_i(prec, difference);
-            denominator
-        })
-        .collect::<Vec<_>>();
-    struct PrimeKernelTable {
-        log_prime: Float,
-        sqrt_power: Float,
-        diagonal_factor: Float,
-        sines: Vec<Float>,
-        cosines: Vec<Float>,
-    }
-    let prime_data: Vec<PrimeKernelTable> = prime_powers_up_to(prime_cutoff)
-        .into_iter()
-        .map(|(power, prime, _)| {
-            let log_power = Float::with_val(prec, power).ln();
-            let log_prime = Float::with_val(prec, prime).ln();
-            let sqrt_power = Float::with_val(prec, power).sqrt();
-            let mut diagonal_factor = Float::with_val(prec, 1);
-            let mut ratio = log_power.clone();
-            ratio /= l;
-            diagonal_factor -= ratio;
-            diagonal_factor *= 2u32;
-            let phases = mode_frequencies
-                .iter()
-                .map(|frequency| {
-                    let mut phase = frequency.clone();
-                    phase *= &log_power;
-                    phase
-                })
-                .collect::<Vec<_>>();
-            let sines = phases.iter().map(|phase| phase.clone().sin()).collect();
-            let cosines = phases.into_iter().map(Float::cos).collect();
-            PrimeKernelTable {
-                log_prime,
-                sqrt_power,
-                diagonal_factor,
-                sines,
-                cosines,
-            }
-        })
-        .collect();
-    let mut matrix = vec![Float::with_val(prec, 0); dim * dim];
-    matrix
-        .par_chunks_mut(dim)
-        .enumerate()
-        .for_each(|(row, matrix_row)| {
-            let n = row as i64 - n_modes as i64;
-            let n_index = (n + n_modes as i64) as usize;
-            // One scratch allocation per row, not per prime-power/cell.
-            // Operation ordering is unchanged: this route must remain
-            // bit-identical to compute_prime_component_matrix_reference.
-            let mut sum = Float::with_val(prec, 0);
-            let mut kernel = Float::with_val(prec, 0);
-            let mut term = Float::with_val(prec, 0);
-            for (column, matrix_cell) in matrix_row.iter_mut().enumerate() {
-                let m = column as i64 - n_modes as i64;
-                let m_index = (m + n_modes as i64) as usize;
-                sum.assign(0);
-                for data in &prime_data {
-                    if n == m {
-                        kernel.assign(&data.diagonal_factor);
-                        kernel *= &data.cosines[n_index];
-                    } else {
-                        kernel.assign(&data.sines[m_index]);
-                        kernel -= &data.sines[n_index];
-                        kernel /= &difference_denominators[(n - m + 2 * n_modes as i64) as usize];
-                    }
-                    term.assign(&kernel);
-                    term *= &data.log_prime;
-                    term /= &data.sqrt_power;
-                    sum += &term;
-                }
-                matrix_cell.assign(&sum);
-            }
-        });
-    matrix
+) -> Result<Vec<Float>> {
+    matrix_point_math::prime_matrix(n_modes, prime_cutoff, l, prec)
 }
 
 // Frozen allocating implementation retained only as an exact-equivalence
@@ -14406,288 +14559,27 @@ fn build_tau_components_exact_tracked(
     include_primes: bool,
     fabric_cache: Option<&ArtifactCacheContext<'_>>,
 ) -> Result<(ComputedCcmMatrixComponents, Vec<ArtifactManifest>)> {
-    let prec = cfg.precision_bits;
-    let n_max = n_modes;
-    let dim = 2 * n_modes + 1;
-
-    let pi_v = pi(prec);
-    let mut two_pi = pi_v.clone();
-    two_pi *= 2u32;
-    let mut sixteen_pi2 = pi_v.clone().square();
-    sixteen_pi2 *= 16u32;
-    let l_sq = l.clone().square();
-    let sinh2_l_over_4 = {
-        let mut v = l.clone();
-        v /= 4u32;
-        v.sinh().square()
-    };
-
-    let base_pts = cfg.quad_points;
-    let prec_extra = (cfg.precision_bits / 2) as usize;
-    crate::hp_debug!(
-        "[HP] Computing α_L, β_L, γ_L for n=0..{} (base quad={})",
-        n_max,
-        base_pts
-    );
-
-    use std::collections::HashMap;
-    let pts_for_n: Vec<usize> = (0..=n_max)
-        .map(|n| base_pts.max(3 * n + prec_extra))
-        .collect();
-    let unique_pts: Vec<usize> = {
-        let mut v = pts_for_n.clone();
-        v.sort_unstable();
-        v.dedup();
-        v
-    };
-    eprintln!(
-        "[HP] Precomputing {} unique GL node tables (npts up to {}, prec={} bits)...",
-        unique_pts.len(),
-        unique_pts.last().copied().unwrap_or(0),
-        prec
-    );
-    // The owning thread resolves exactly one parallel level for this batch.
-    // Root parallelism is opt-in for underfilled native-Linux batches; the
-    // default remains table-parallel/root-serial. WSL remains excluded from
-    // supported root-parallel qualification because concurrent GMP allocation
-    // has caused non-deterministic glibc aborts even with plain OS threads.
-    type GlTable = (Vec<Float>, Vec<Float>);
-    let gl_plan = xc_numerics::hp_runtime::plan_gl_precompute(&unique_pts, prec);
-    let mut performance_gl = xc_core::performance_stage_with("ccm.tau.gl_precompute", || {
-        gl_batch_performance_metadata(&unique_pts, prec, gl_plan)
-    });
-    let (gl_cache, quadrature_manifests, quadrature_accesses): (
-        HashMap<usize, GlTable>,
-        Vec<ArtifactManifest>,
-        Vec<xc_core::CacheAccessProvenance>,
-    ) = if let Some(cache) = fabric_cache {
-        let resolved = xc_numerics::hp_runtime::map_gl_precompute_planned(
-            &unique_pts,
-            gl_plan,
-            |npts, root_schedule| {
-                let request = ArtifactCacheContext {
-                    resolver: cache.resolver,
-                    reference_resolver: cache.reference_resolver,
-                    acceptance: cache.acceptance,
-                    ordered_overlays: cache.ordered_overlays.clone(),
-                    mode: cache.mode,
-                    write_on_miss: cache.write_on_miss,
-                    write_visibility: cache.write_visibility,
-                    requested_assurance: cache.requested_assurance,
-                    certification_failure_policy: cache.certification_failure_policy,
-                    production_sink: cache.production_sink,
-                };
-                xc_numerics::quadrature::gauss_legendre_nodes_via_cache_scheduled(
-                    npts,
-                    prec,
-                    request,
-                    root_schedule,
-                )
-                .map(|rule| {
-                    (
-                        npts,
-                        (rule.nodes, rule.weights),
-                        rule.artifact_manifest,
-                        rule.cache_access,
-                    )
-                })
-            },
-        );
-        let mut tables = HashMap::new();
-        let mut manifests = Vec::new();
-        let mut accesses = Vec::new();
-        for result in resolved {
-            let (npts, table, manifest, access) = result.map_err(anyhow::Error::from)?;
-            tables.insert(npts, table);
-            manifests.push(manifest);
-            accesses.push(access);
-        }
-        manifests.sort_by(|left, right| left.key.logical_key.cmp(&right.key.logical_key));
-        (tables, manifests, accesses)
+    let dim = validate_source_shape(n_modes, cfg.precision_bits, cfg.quad_points)?;
+    let (integrals, manifests) =
+        compute_archimedean_integrals_tracked(n_modes, l, cfg, fabric_cache)?;
+    let (pole, archimedean) =
+        assemble_pole_and_archimedean_components(n_modes, l, cfg.precision_bits, &integrals)?;
+    let prime = if include_primes {
+        compute_prime_component_matrix(n_modes, lambda_sq_int, l, cfg.precision_bits)?
     } else {
-        let gl_pairs: Vec<(usize, GlTable)> = xc_numerics::hp_runtime::map_gl_precompute_planned(
-            &unique_pts,
-            gl_plan,
-            |npts, root_schedule| {
-                (
-                    npts,
-                    xc_numerics::quadrature::gauss_legendre_nodes_scheduled(
-                        npts,
-                        prec,
-                        cfg.cache_mode,
-                        root_schedule,
-                    ),
-                )
-            },
-        );
-        (gl_pairs.into_iter().collect(), Vec::new(), Vec::new())
+        vec![Float::with_val(cfg.precision_bits, 0); dim * dim]
     };
-    let disposition = report_quadrature_precompute_summary(unique_pts.len(), &quadrature_accesses);
-    performance_gl.set_cache_disposition(disposition);
-    drop(performance_gl);
-    eprintln!("[HP] Computing alpha_L, beta_L, gamma_L integrals...");
-    let performance_integrals =
-        xc_core::performance_stage_with("ccm.tau.archimedean_integrals", || {
-            ccm_performance_metadata("ccm.tau.archimedean_integrals", n_max + 1, prec)
-        });
-    let indices: Vec<usize> = (0..=n_max).collect();
-    let kappa_half = compute_kappa_half(l, prec);
-    let fused_integrals: Vec<(Float, Float, Float)> = indices
-        .par_iter()
-        .map(|&n| {
-            let pts = pts_for_n[n];
-            let (nodes, weights) = gl_cache.get(&pts).unwrap();
-            compute_archimedean_integrals_l(n as i64, l, prec, nodes, weights, &kappa_half)
-        })
-        .collect();
-    let mut alpha_l = Vec::with_capacity(fused_integrals.len());
-    let mut beta_l = Vec::with_capacity(fused_integrals.len());
-    let mut gamma_l = Vec::with_capacity(fused_integrals.len());
-    for (alpha_value, beta_value, gamma_value) in fused_integrals {
-        alpha_l.push(alpha_value);
-        beta_l.push(beta_value);
-        gamma_l.push(gamma_value);
-    }
-    drop(performance_integrals);
-    eprintln!(
-        "[HP] Integrals done. Assembling {}×{} τ-matrix...",
-        dim, dim
-    );
-
-    let _performance_components =
-        xc_core::performance_stage_with("ccm.tau.fused_components", || {
-            let mut metadata = ccm_performance_metadata("ccm.tau.fused_components", dim, prec);
-            metadata.retained_hp_entries = Some(3usize.saturating_mul(dim.saturating_mul(dim)));
-            metadata
-        });
-
-    let prime_powers = prime_powers_up_to(lambda_sq_int);
-    // Pure HP path: compute log_p in HP from the exposed prime, do not
-    // recover j from log ratios. j is provided directly by the sieve.
-    let pp_data: Vec<(Float, Float, Float)> = prime_powers
-        .iter()
-        .map(|&(k, _p, _j)| {
-            let log_k = Float::with_val(prec, k).ln();
-            let log_p = Float::with_val(prec, _p).ln();
-            let sqrt_k = Float::with_val(prec, k).sqrt();
-            (log_k, log_p, sqrt_k)
-        })
-        .collect();
-
-    let mut pole = vec![Float::with_val(prec, 0); dim * dim];
-    let mut archimedean = vec![Float::with_val(prec, 0); dim * dim];
-    let mut prime = vec![Float::with_val(prec, 0); dim * dim];
-    pole.par_chunks_mut(dim)
-        .zip(archimedean.par_chunks_mut(dim))
-        .zip(prime.par_chunks_mut(dim))
-        .enumerate()
-        .for_each(|(row, ((pole_row, archimedean_row), prime_row))| {
-            let n = row as i64 - n_max as i64;
-            for column in 0..dim {
-                let m = column as i64 - n_max as i64;
-                let nf = fl_i(prec, n);
-                let mf = fl_i(prec, m);
-
-                let w02 = {
-                    let mut mn = sixteen_pi2.clone();
-                    mn *= &mf;
-                    mn *= &nf;
-                    let mut num = l_sq.clone();
-                    num -= &mn;
-                    let mut a = sixteen_pi2.clone();
-                    a *= &mf;
-                    a *= &mf;
-                    a += &l_sq;
-                    let mut b = sixteen_pi2.clone();
-                    b *= &nf;
-                    b *= &nf;
-                    b += &l_sq;
-                    let mut den = a;
-                    den *= &b;
-                    let mut v = sinh2_l_over_4.clone();
-                    v *= 32u32;
-                    v *= l;
-                    v *= &num;
-                    v /= &den;
-                    v
-                };
-
-                let wr = if n == m {
-                    let k = n.unsigned_abs() as usize;
-                    let mut v = gamma_l[k].clone();
-                    v -= &beta_l[k];
-                    v *= 2u32;
-                    v
-                } else {
-                    let an = signed_alpha(&alpha_l, n, prec);
-                    let am = signed_alpha(&alpha_l, m, prec);
-                    let mut v = am;
-                    v -= &an;
-                    v /= fl_i(prec, n - m);
-                    v
-                };
-
-                let two_pi_n_over_l = {
-                    let mut v = two_pi.clone();
-                    v *= &nf;
-                    v /= l;
-                    v
-                };
-                let two_pi_m_over_l = {
-                    let mut v = two_pi.clone();
-                    v *= &mf;
-                    v /= l;
-                    v
-                };
-                let mut wp = Float::with_val(prec, 0);
-                if include_primes {
-                    for (log_k, log_p, sqrt_k) in &pp_data {
-                        let q = if n == m {
-                            let mut ph = two_pi_n_over_l.clone();
-                            ph *= log_k;
-                            let c = ph.cos();
-                            let mut t = log_k.clone();
-                            t /= l;
-                            let mut f = Float::with_val(prec, 1);
-                            f -= &t;
-                            f *= 2u32;
-                            f *= &c;
-                            f
-                        } else {
-                            let mut sm = two_pi_m_over_l.clone();
-                            sm *= log_k;
-                            let sm_s = sm.sin();
-                            let mut sn = two_pi_n_over_l.clone();
-                            sn *= log_k;
-                            let sn_s = sn.sin();
-                            let mut d = sm_s;
-                            d -= &sn_s;
-                            let mut dn = pi_v.clone();
-                            dn *= fl_i(prec, n - m);
-                            d /= &dn;
-                            d
-                        };
-                        let mut term = q;
-                        term *= log_p;
-                        term /= sqrt_k;
-                        wp += &term;
-                    }
-                }
-                pole_row[column] = w02;
-                archimedean_row[column] = wr;
-                prime_row[column] = wp;
-            }
-        });
     Ok((
         ComputedCcmMatrixComponents {
             pole,
             archimedean,
             prime,
         },
-        quadrature_manifests,
+        manifests,
     ))
 }
 
+#[cfg(test)]
 fn signed_alpha(table: &[Float], n: i64, prec: u32) -> Float {
     let k = n.unsigned_abs() as usize;
     if k >= table.len() {
@@ -14702,6 +14594,7 @@ fn signed_alpha(table: &[Float], n: i64, prec: u32) -> Float {
     }
 }
 
+#[cfg(test)]
 fn compute_kappa_half(l: &Float, prec: u32) -> Float {
     let mut half_l = Float::with_val(prec, l);
     half_l /= 2u32;
@@ -14715,6 +14608,60 @@ fn compute_kappa_half(l: &Float, prec: u32) -> Float {
     kappa_half
 }
 
+// The residual is homogeneous and cannot establish either of these contracts.
+// Check the actual stored points, independently of their metadata stamps.
+fn validate_eigenstate_contract(
+    xi: &[Float],
+    l: &Float,
+    p: u32,
+    parity: CcmParityPolicy,
+) -> Result<()> {
+    if !(64..=1_000_000).contains(&p)
+        || xi.is_empty()
+        || xi.len().is_multiple_of(2)
+        || xi.iter().any(|x| !x.is_finite())
+        || !l.is_finite()
+        || l <= &0
+    {
+        bail!("CCM eigenstate has an invalid dimension, precision, length, or coefficient");
+    }
+    if parity == CcmParityPolicy::EvenSector && xi.iter().zip(xi.iter().rev()).any(|(a, b)| a != b)
+    {
+        bail!("CCM eigenstate does not have its declared exact even parity");
+    }
+    let work = p + 64;
+    let mut sum = xc_numerics::reduction::deterministic_pairwise_sum_hp_owned(
+        xi.iter().map(|x| Float::with_val(work, x)).collect(),
+        work,
+    );
+    let target = Float::with_val(work, l).sqrt();
+    if !sum.is_finite() || sum <= 0 || !target.is_finite() || target <= 0 {
+        bail!("CCM eigenstate normalization is zero, negative, or unrepresentable");
+    }
+    // Summation and coefficient rounding are absolute errors proportional to
+    // sum |xi|, not to |sum xi|. A fixed relative test rejects legitimate
+    // cancellation. The existing 32-bit arithmetic reserve covers the bounded
+    // source dimension and its sum/scale rounding; unresolved scale still fails.
+    let magnitude = xc_numerics::reduction::deterministic_pairwise_sum_hp_owned(
+        xi.iter().map(|x| Float::with_val(work, x).abs()).collect(),
+        work,
+    );
+    let mut tolerance = Float::with_val(work, &magnitude + &target);
+    tolerance *= Float::with_val(work, 2).pow(-((p - 32) as i32));
+    let scale_limit = Float::with_val(work, &target / 4);
+    sum -= &target;
+    if !tolerance.is_finite()
+        || tolerance >= scale_limit
+        || !sum.is_finite()
+        || sum.abs() >= tolerance
+    {
+        bail!(
+            "CCM eigenstate normalization is incompatible with coefficient roundoff or is unresolved"
+        );
+    }
+    Ok(())
+}
+
 /// Evaluate alpha, beta, and gamma in one ordered quadrature pass. Each
 /// accumulator follows the same operation order as the standalone test
 /// evaluator. Gamma uses a cancellation-free trigonometric/expm1 difference.
@@ -14724,57 +14671,8 @@ fn compute_archimedean_integrals_l(
     prec: u32,
     nodes: &[Float],
     weights: &[Float],
-    kappa_half: &Float,
-) -> (Float, Float, Float) {
-    let pi_value = pi(prec);
-    let mut frequency = pi_value.clone();
-    frequency *= 2u32;
-    frequency *= fl_i(prec, n);
-    frequency /= l;
-    let mut half_l = l.clone();
-    half_l /= 2u32;
-    let mut alpha = Float::with_val(prec, 0);
-    let mut beta = Float::with_val(prec, 0);
-    let mut gamma = Float::with_val(prec, 0);
-    for (node, weight) in nodes.iter().zip(weights) {
-        let mut x = node.clone();
-        x += 1u32;
-        x *= &half_l;
-        let rho = rho_hp(&x, prec);
-        let mut phase = frequency.clone();
-        phase *= &x;
-        // Keep separate sin/cos routes for the alpha and beta integrands.
-        let sine = phase.clone().sin();
-        let cosine = phase.clone().cos();
-
-        if n != 0 {
-            let mut alpha_value = sine;
-            alpha_value *= &rho;
-            let mut alpha_term = weight.clone();
-            alpha_term *= &alpha_value;
-            alpha += &alpha_term;
-        }
-
-        let mut beta_value = x.clone();
-        beta_value *= &cosine;
-        beta_value *= &rho;
-        let mut beta_term = weight.clone();
-        beta_term *= &beta_value;
-        beta += &beta_term;
-
-        let mut gamma_value = gamma_difference_hp(&phase, &x, prec);
-        gamma_value *= &rho;
-        let mut gamma_term = weight.clone();
-        gamma_term *= &gamma_value;
-        gamma += &gamma_term;
-    }
-    alpha *= &half_l;
-    alpha /= &pi_value;
-    beta *= &half_l;
-    beta /= l;
-    gamma *= &half_l;
-    gamma += kappa_half;
-    (alpha, beta, gamma)
+) -> Result<(Float, Float, Float)> {
+    matrix_point_math::integrals(n, l, prec, nodes, weights)
 }
 
 #[cfg(test)]
@@ -14840,6 +14738,7 @@ fn compute_gamma_l(n: i64, l: &Float, prec: u32, nodes: &[Float], weights: &[Flo
     v
 }
 
+#[cfg(test)]
 fn rho_hp(x: &Float, prec: u32) -> Float {
     let mut half_x = Float::with_val(prec, x);
     half_x /= 2u32;
@@ -14851,6 +14750,7 @@ fn rho_hp(x: &Float, prec: u32) -> Float {
 }
 
 // cos(phase) - exp(-x/2), with neither subtraction of values near one.
+#[cfg(test)]
 fn gamma_difference_hp(phase: &Float, x: &Float, prec: u32) -> Float {
     let mut half_phase = Float::with_val(prec, phase);
     half_phase /= 2u32;
@@ -14884,40 +14784,89 @@ where
     acc
 }
 
-fn normalize_eigenvector(xi: &[Float], l: &Float, prec: u32) -> Vec<Float> {
-    let mut sum = Float::with_val(prec, 0);
-    for v in xi {
-        sum += v;
-    }
-    let mut target = l.clone().sqrt();
-    target /= &sum;
-    xi.iter()
-        .map(|v| {
-            let mut x = v.clone();
-            x *= &target;
-            x
-        })
-        .collect()
+fn normalize_eigenvector(xi: &[Float], l: &Float, prec: u32) -> Result<Vec<Float>> {
+    state_normalization_math::evaluate(xi, l, prec)
 }
 
-/// Basis half-period `L = ln(λ²) = 2 ln λ` at full working precision.
+/// Validate the shared CCM assembly precision, shape, and quadrature domain.
+fn validate_source_shape(n_modes: usize, precision_bits: u32, quad_points: usize) -> Result<usize> {
+    if !(64..=1_000_000).contains(&precision_bits) || quad_points == 0 {
+        bail!("CCM source requires precision 64..=1000000 and positive quadrature order");
+    }
+    let dimension = n_modes
+        .checked_mul(2)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("CCM matrix dimension overflow"))?;
+    let bytes = dimension
+        .checked_mul(dimension)
+        .and_then(|n| n.checked_mul(std::mem::size_of::<Float>()));
+    if bytes.is_none_or(|n| n > isize::MAX as usize) || n_modes > (i64::MAX as usize - 64) / 8 {
+        bail!("CCM source matrix storage or signed mode arithmetic is not representable");
+    }
+    let byte_budget =
+        dimension as u128 * dimension as u128 * (u128::from(precision_bits).div_ceil(8) + 96) * 4;
+    if n_modes > 4096 || quad_points > 1_000_000 || byte_budget > (8u128 << 30) {
+        bail!("CCM source exceeds the supported dimension, quadrature or 8 GiB workspace budget");
+    }
+    let order = n_modes
+        .checked_mul(3)
+        .and_then(|n| n.checked_add((precision_bits / 2) as usize))
+        .map(|n| n.max(quad_points));
+    if order
+        .and_then(|n| n.checked_mul(4))
+        .and_then(|n| n.checked_add(2))
+        .and_then(|n| i64::try_from(n).ok())
+        .is_none()
+    {
+        bail!("CCM quadrature order is not representable");
+    }
+    Ok(dimension)
+}
+
+/// Promote the same exact cutoff identity used by CCM assembly. Extra guard
+/// precision changes rounding, never the underlying input decimal.
+pub(crate) fn lambda_squared_value_hp(params: &CcmParams, prec: u32) -> Result<Float> {
+    if !(64..=1_000_064).contains(&prec) {
+        bail!("CCM cutoff promotion requires 64..=1000064 bits including guard precision");
+    }
+    if !params.lambda_sq.value_f64.is_finite()
+        || (params.lambda_sq.is_integer
+            && params.lambda_sq.value_f64 != params.lambda_sq.value_u64 as f64)
+    {
+        bail!("CCM lambda-squared representation is inconsistent or nonfinite");
+    }
+    let literal = xc_core::DecimalLiteral::new(lambda_squared_cache_identity(params))?;
+    ExactLambdaSquaredHp::new(literal.clone(), params.lambda_sq.value_u64)?;
+    let value = if params.lambda_sq.is_integer {
+        Float::with_val(prec, params.lambda_sq.value_u64)
+    } else {
+        Float::with_val(prec, Float::parse(literal.as_str())?)
+    };
+    if !value.is_finite() || value <= 1 {
+        bail!("working precision must resolve finite lambda-squared greater than one");
+    }
+    Ok(value)
+}
+
 ///
 /// Compute `L = ln(λ²)` at full HP precision.
 ///
 /// Integer mode: uses `value_u64` for exact HP promotion —
 /// full working-precision result, no f64 representation error.
 ///
-/// Fractional mode: formats `value_f64` to 17 significant figures
-/// and parses into HP. Gives L accurate to ~17 digits (the f64
-/// input limit).
-fn log_lambda_sq_hp(params: &CcmParams, prec: u32) -> Float {
-    if params.lambda_sq.is_integer {
-        Float::with_val(prec, params.lambda_sq.value_u64).ln()
-    } else {
-        let lsq_str = format!("{:.17e}", params.lambda_sq.value_f64);
-        let lsq_hp = Float::with_val(prec, Float::parse(&lsq_str).unwrap());
-        lsq_hp.ln()
-    }
+/// Fractional mode: uses 17 digits after the leading scientific-notation digit
+/// (18 significant digits) as the exact decimal cutoff. Its logarithm is rounded
+/// at the requested precision; accuracy relative to the original binary64 input
+/// depends on logarithm conditioning, especially for cutoffs near one.
+fn log_lambda_sq_hp(params: &CcmParams, prec: u32) -> Result<Float> {
+    validate_source_shape(params.n_modes, prec, 1)?;
+    // Preserve all validation of the source representation; round the exact
+    // declared decimal logarithm directly rather than logging a rounded cutoff.
+    lambda_squared_value_hp(params, prec)?;
+    crate::ccm::retained_evidence::finite_math::rounded_log_cutoff(
+        &lambda_squared_cache_identity(params),
+        prec,
+    )
 }
 
 // ===========================================================================
@@ -14943,14 +14892,14 @@ fn solve_r_zero(
 ) -> EigenvalueResult {
     let target_bits = prec.saturating_sub(GUARD_BITS).max(1);
     let outcome = solve_r_zero_with_target(xi, poles, seed, prec, target_bits, n_steps, method);
-    let EigenvalueResult::Converged(result) = outcome else {
-        return outcome;
+    let was_approximate = matches!(outcome, EigenvalueResult::Approximate(_));
+    let result = match outcome {
+        EigenvalueResult::Converged(result)
+        | EigenvalueResult::Stagnated(result)
+        | EigenvalueResult::Approximate(result) => result,
+        failed @ EigenvalueResult::Failed { .. } => return failed,
     };
-    let correction = prec
-        .checked_add(GUARD_BITS)
-        .and_then(|verification_precision| {
-            secular_correction_at(xi, poles, &result.value, verification_precision, method)
-        });
+    let correction = fixed_guard_retained_correction(xi, poles, &result.value, prec, method);
     let Some(correction) = correction else {
         return EigenvalueResult::Failed {
             iterations: result.diagnostics.iterations,
@@ -14960,8 +14909,9 @@ fn solve_r_zero(
         };
     };
     let correction = Float::with_val_round(prec, correction, rug::float::Round::Up).0;
-    let accepted =
-        correction < root_correction_tolerance_for_target(&result.value, target_bits, prec);
+    let accepted = correction
+        < root_correction_tolerance_for_target(&result.value, target_bits, prec)
+        && root_accuracy_witness(xi, poles, &result.value, target_bits, prec + GUARD_BITS);
     match root_refinement(
         xi,
         poles,
@@ -14972,6 +14922,7 @@ fn solve_r_zero(
         prec,
     ) {
         Some(result) if accepted => EigenvalueResult::Converged(result),
+        Some(result) if was_approximate => EigenvalueResult::Approximate(result),
         Some(result) => EigenvalueResult::Stagnated(result),
         None => EigenvalueResult::Failed {
             iterations: result.diagnostics.iterations,
@@ -15009,25 +14960,62 @@ fn secular_residual_and_scale_at(
     z: &Float,
     prec: u32,
 ) -> Option<(Float, Float)> {
-    let mut residual = Float::with_val(prec, 0);
-    let mut term_scale = Float::with_val(prec, 0);
+    use super::retained_evidence::point;
+    if !(64..=1_000_128).contains(&prec)
+        || xi.is_empty()
+        || xi.len() != poles.len()
+        || xi
+            .iter()
+            .chain(poles)
+            .chain(std::iter::once(z))
+            .any(|x| !x.is_finite() || x.prec() > prec)
+    {
+        return None;
+    }
+    if (xi.len() as u64)
+        .saturating_mul(6)
+        .saturating_add(64)
+        .saturating_mul(u64::from(prec).div_ceil(8) + 64)
+        > (8u64 << 30)
+    {
+        return None;
+    }
+    let mut terms = Vec::with_capacity(xi.len());
     for (weight, pole) in xi.iter().zip(poles) {
-        let mut denominator = z.clone();
-        denominator -= pole;
+        let denominator = point::sum(&[z.clone(), -pole.clone()], prec).ok()?;
         if denominator.is_zero() {
             return None;
         }
-        let mut term = weight.clone();
-        term /= denominator;
-        term_scale += Float::with_val(prec, &term).abs();
-        residual += term;
+        terms.push(point::quotient(weight, &denominator, prec).ok()?);
     }
-    Some((residual.abs(), term_scale))
+    let residual = point::sum(&terms, prec).ok()?.abs();
+    let magnitudes = terms.into_iter().map(Float::abs).collect::<Vec<_>>();
+    Some((residual, point::sum(&magnitudes, prec).ok()?))
 }
 
 /// Enclose the magnitude of the Newton correction at an unchanged stored
 /// point with directed interval arithmetic. This confirms the requested point
 /// correction; it does not by itself certify existence or uniqueness of a root.
+const FIXED_CORRECTION_GUARDS: [u32; 7] = [64, 128, 256, 512, 1024, 2048, 4096];
+
+// Escalation here measures an unchanged retained point; it never changes the
+// fixed-guard iteration or its p+64 convergence sign-witness requirement.
+fn fixed_guard_retained_correction(
+    xi: &[Float],
+    poles: &[Float],
+    z: &Float,
+    p: u32,
+    method: RootSolver,
+) -> Option<Float> {
+    for guard in FIXED_CORRECTION_GUARDS {
+        let work = p.checked_add(guard)?;
+        if let Some(correction) = secular_correction_at(xi, poles, z, work, method) {
+            return Some(Float::with_val_round(p, correction, rug::float::Round::Up).0);
+        }
+    }
+    None
+}
+
 fn secular_correction_at(
     xi: &[Float],
     poles: &[Float],
@@ -15107,10 +15095,85 @@ fn achieved_decimal_digits_for_target(
     }
 }
 
-/// Relative correction threshold corresponding to the caller's requested
-/// accuracy. `for_decimal_digits` reserves `GUARD_BITS` beyond that contract;
-/// those working bits absorb secular-sum cancellation and are not themselves
-/// demanded from the final root.
+/// A directed sign change on a pole-free interval proves a real root lies
+/// strictly within the requested relative/absolute error of the stored point.
+/// This establishes local existence and accuracy, not a global ordinal or
+/// continuum claim. The point Newton quotient alone does not prove existence.
+fn root_accuracy_witness(
+    xi: &[Float],
+    poles: &[Float],
+    value: &Float,
+    target_bits: u32,
+    p: u32,
+) -> bool {
+    use rug::float::Round;
+    use xc_numerics::mpfr_interval::MpfrInterval as I;
+    if !(64..=1_000_128).contains(&p)
+        || target_bits == 0
+        || target_bits >= p
+        || xi.is_empty()
+        || xi.len() != poles.len()
+        || xi.iter().all(Float::is_zero)
+        || xi
+            .iter()
+            .chain(poles)
+            .chain(std::iter::once(value))
+            .any(|x| !x.is_finite() || x.prec() > p)
+    {
+        return false;
+    }
+    let evaluate = |z: &Float| -> Option<I> {
+        let mut result = I::from_i64(0, p);
+        for (weight, pole) in xi.iter().zip(poles) {
+            if weight.is_zero() {
+                continue;
+            }
+            let denominator = I::from_float(z, p).ok()?.sub(&I::from_float(pole, p).ok()?);
+            result = result.add(&I::from_float(weight, p).ok()?.div(&denominator).ok()?);
+        }
+        result.validate().ok()?;
+        Some(result)
+    };
+    if evaluate(value).is_some_and(|center| center.lower() == &0 && center.upper() == &0) {
+        return true;
+    }
+    let tolerance = root_correction_tolerance_for_target(value, target_bits, p);
+    let mut radius = Float::with_val(p, &tolerance) / 2u32;
+    for (weight, pole) in xi.iter().zip(poles) {
+        if weight.is_zero() {
+            continue;
+        }
+        let distance = Float::with_val_round(p, value - pole, Round::Zero).0.abs();
+        radius = radius.min(&(distance / 2u32));
+    }
+    let lower = Float::with_val_round(p, value - &radius, Round::Down).0;
+    let upper = Float::with_val_round(p, value + &radius, Round::Up).0;
+    if !tolerance.is_finite()
+        || tolerance <= 0
+        || !lower.is_finite()
+        || !upper.is_finite()
+        || lower >= *value
+        || upper <= *value
+        || Float::with_val_round(p, value - &lower, Round::Up).0 >= tolerance
+        || Float::with_val_round(p, &upper - value, Round::Up).0 >= tolerance
+        || xi
+            .iter()
+            .zip(poles)
+            .any(|(w, pole)| !w.is_zero() && pole >= &lower && pole <= &upper)
+    {
+        return false;
+    }
+    let (Some(left), Some(right)) = (evaluate(&lower), evaluate(&upper)) else {
+        return false;
+    };
+    (left.upper() < &0 && right.lower() > &0)
+        || (left.lower() > &0 && right.upper() < &0)
+        || (left.lower() == &0 && left.upper() == &0)
+        || (right.lower() == &0 && right.upper() == &0)
+}
+
+/// Relative correction threshold for the requested accuracy; working guard
+/// bits absorb cancellation and are not demanded from the final root.
 fn root_correction_tolerance(value: &Float, prec: u32) -> Float {
     root_correction_tolerance_for_target(value, prec.saturating_sub(GUARD_BITS).max(1), prec)
 }
@@ -15134,9 +15197,19 @@ fn root_refinement(
     target_bits: u32,
     prec: u32,
 ) -> Option<RootRefinement> {
+    if iterations == 0
+        || !value.is_finite()
+        || !final_correction.is_finite()
+        || final_correction < 0
+    {
+        return None;
+    }
     let residual = secular_residual_at(xi, poles, &value, prec)?;
     let achieved_decimal_digits =
         achieved_decimal_digits_for_target(&value, &final_correction, target_bits, prec);
+    if !achieved_decimal_digits.is_finite() || achieved_decimal_digits < 0 {
+        return None;
+    }
     Some(RootRefinement {
         value,
         diagnostics: RootRefinementDiagnostics {
@@ -15220,6 +15293,7 @@ fn newton_xi_hat_zero_with_target(
             .cmp_abs(&tolerance)
             .map(|o| o.is_lt())
             .unwrap_or(false)
+            && root_accuracy_witness(xi, poles, &z, target_bits, prec.saturating_add(GUARD_BITS))
         {
             return match root_refinement(xi, poles, z, iteration, abs_dz, target_bits, prec) {
                 Some(result) => EigenvalueResult::Converged(result),
@@ -15353,6 +15427,7 @@ fn halley_xi_hat_zero_with_target(
             .cmp_abs(&tolerance)
             .map(|o| o.is_lt())
             .unwrap_or(false)
+            && root_accuracy_witness(xi, poles, &z, target_bits, prec.saturating_add(GUARD_BITS))
         {
             return match root_refinement(xi, poles, z, iteration, abs_dz, target_bits, prec) {
                 Some(result) => EigenvalueResult::Converged(result),
@@ -15400,20 +15475,11 @@ fn halley_xi_hat_zero_with_target(
 mod tau_cache {
     //! Disk cache for the HP τ-matrix produced by `build_tau_hp_compute`.
     //!
-    //! Cache layout under `<cwd>/data/tau_cache/`:
-    //!   - `lambda_sq{L}_nmodes{N}_prec{P}.json` (uncompressed, fast path)
-    //!   - `lambda_sq{L}_nmodes{N}_prec{P}.json.zip` (single-zip when
-    //!     compressed payload ≤ 90 MB)
-    //!   - `lambda_sq{L}_nmodes{N}_prec{P}.json.zip.part00, .part01, ...`
-    //!     (byte-split when compressed payload > 90 MB; we split at
-    //!     90 MB-byte boundaries, comfortably under GitHub's 100 MB
-    //!     hard file size limit)
-    //!
-    //! Read priority: uncompressed → single zip → multi-part zip →
-    //! compute fresh. Multi-part read concatenates the part bytes in
-    //! lexicographic order and decompresses the result as one zip.
-    //! Write logic picks single vs multi-part based on the compressed
-    //! payload size.
+    //! New saves publish `.json.zip.manifest.json` atomically after writing
+    //! all hash-checked parts under `.json.zip.chunks/`. Readers use one complete
+    //! generation. Prior generations remain available to concurrent readers.
+    //! Legacy single ZIP and numeric split ZIP inputs remain readable when
+    //! no committed generation exists. No uncompressed payload is written.
     //!
     //! Structural validation on cache hit: matrix length matches
     //! `(2N+1)²`, no NaN/Inf entries, and symmetry `τ[i,j] = τ[j,i]`
@@ -15422,13 +15488,12 @@ mod tau_cache {
     //! compute fresh. Bad files are preserved on disk.
 
     use rug::{ops::Pow, Float};
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     use super::super::LambdaSq;
 
     /// Per-part byte cap for split files. 90 MB stays comfortably
-    /// under GitHub's 100 MB hard file limit and well under the
-    /// 50 MB soft warning, leaving headroom for git's pack overhead.
+    /// under the historical 100 MB per-file limit.
     const PART_BYTE_LIMIT: usize = 90 * 1024 * 1024;
 
     /// Toolkit version string embedded in every tau cache file written
@@ -15474,10 +15539,6 @@ mod tau_cache {
         )
     }
 
-    fn json_path(lambda_sq: LambdaSq, n_modes: usize, prec: u32) -> Option<std::path::PathBuf> {
-        cache_dir().map(|d| d.join(cache_filename(lambda_sq, n_modes, prec)))
-    }
-
     fn zip_path(lambda_sq: LambdaSq, n_modes: usize, prec: u32) -> Option<std::path::PathBuf> {
         cache_dir().map(|d| {
             let f = cache_filename(lambda_sq, n_modes, prec);
@@ -15485,8 +15546,8 @@ mod tau_cache {
         })
     }
 
-    /// Glob the .partXX files for a given config in lexicographic
-    /// order. Returns `None` if no parts exist.
+    /// Find numeric .partXX files for a given config. The decoder validates
+    /// and orders their indices before concatenation. No parts means `None`.
     fn part_paths(
         lambda_sq: LambdaSq,
         n_modes: usize,
@@ -15501,7 +15562,10 @@ mod tau_cache {
                 let entry = entry.ok()?;
                 let name = entry.file_name();
                 let s = name.to_str()?;
-                if s.starts_with(&prefix) {
+                if s.strip_prefix(&prefix).is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit())
+                }) && entry.path().is_file()
+                {
                     Some(entry.path())
                 } else {
                     None
@@ -15516,14 +15580,33 @@ mod tau_cache {
     }
 
     /// Parse the cache JSON for the tau matrix.
-    /// Expects schema_version 1 envelope format. Returns `None` on any
+    /// Expects schema_version 2 with an explicit quadrature order. Returns `None` on any
     /// structural mismatch or a stale `toolkit_version`.
-    fn parse_json(data: &str, n_modes: usize, prec: u32) -> Option<Vec<Float>> {
-        let dim = 2 * n_modes + 1;
-        let n_expected = dim * dim;
+    struct CachedTau {
+        matrix: Vec<Float>,
+        quadrature_points: usize,
+    }
+
+    fn parse_json(data: &str, lambda_sq: LambdaSq, n_modes: usize, prec: u32) -> Option<CachedTau> {
+        let (n_expected, limit) = super::standalone_cache::shape(n_modes, prec, true)?;
+        if data.len() as u64 > limit {
+            return None;
+        }
         let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
         let obj = parsed.as_object()?;
+        if !super::standalone_cache::identity_matches(obj, lambda_sq, n_modes, prec, 3) {
+            return None;
+        }
 
+        if obj
+            .get("assembly_arithmetic")
+            .and_then(serde_json::Value::as_str)
+            != Some("directed_component_point_stages_length_aware_arch_v3")
+        {
+            return None;
+        }
+        let quadrature_points = usize::try_from(obj.get("quadrature_points")?.as_u64()?).ok()?;
+        super::validate_source_shape(n_modes, prec, quadrature_points).ok()?;
         let file_ver = obj.get("toolkit_version").and_then(|v| v.as_str())?;
         if version_is_older(file_ver, &effective_min_version()) {
             return None;
@@ -15535,28 +15618,35 @@ mod tau_cache {
         }
         let mut out = Vec::with_capacity(n_expected);
         for s in arr {
-            out.push(Float::with_val(prec, Float::parse(s.as_str()?).ok()?));
+            out.push(super::parse_standalone_scalar(s.as_str()?, prec)?);
         }
-        Some(out)
+        Some(CachedTau {
+            matrix: out,
+            quadrature_points,
+        })
     }
 
     /// Returns `true` if version string `a` is strictly older than `b`.
     fn version_is_older(a: &str, b: &str) -> bool {
-        let parse = |s: &str| -> (u64, u64, u64) {
-            let mut parts = s.splitn(3, '.');
-            let major = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            let minor = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            let patch = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            (major, minor, patch)
-        };
-        parse(a) < parse(b)
+        match (
+            xc_cache::ToolkitVersion::parse(a),
+            xc_cache::ToolkitVersion::parse(b),
+        ) {
+            (Ok(a), Ok(b)) => a < b,
+            _ => true,
+        }
     }
 
     /// Verify the loaded matrix satisfies the structural identities:
     /// length matches `(2N+1)²`, no NaN/Inf entries, and symmetry
     /// `τ[i,j] = τ[j,i]` to working precision.
     pub(super) fn structural_check(tau: &[Float], n_modes: usize, prec: u32) -> Option<String> {
-        let dim = 2 * n_modes + 1;
+        let Some(dim) = n_modes.checked_mul(2).and_then(|n| n.checked_add(1)) else {
+            return Some("Tau dimension overflow".into());
+        };
+        if !(64..=1_000_000).contains(&prec) || dim.checked_mul(dim) != Some(tau.len()) {
+            return Some("unsupported Tau precision or matrix shape".into());
+        }
         if tau.len() != dim * dim {
             return Some(format!(
                 "matrix length {} != expected {}², = {}",
@@ -15572,6 +15662,13 @@ mod tau_cache {
             if v.is_infinite() {
                 return Some(format!("entry {} is infinite", k));
             }
+        }
+        if tau
+            .iter()
+            .enumerate()
+            .any(|(k, value)| value != &tau[tau.len() - 1 - k])
+        {
+            return Some("Tau is not exactly centrosymmetric under mode reflection".into());
         }
         // Symmetry check: τ[i,j] = τ[j,i] for i < j.
         let tol = cache_tol(prec);
@@ -15607,13 +15704,23 @@ mod tau_cache {
         json_filename: &str,
         n_modes: usize,
         prec: u32,
-    ) -> Option<(Vec<Float>, String)> {
+    ) -> Option<(CachedTau, String)> {
+        let (_, limit) = super::standalone_cache::shape(n_modes, prec, true)?;
+        if zip_bytes.len() as u64 > limit + (1 << 20) {
+            return None;
+        }
+        let (lambda_sq, filename_modes, filename_precision, _) = parse_filename(json_filename)?;
+        if filename_modes != n_modes || filename_precision != prec {
+            return None;
+        }
         let cursor = std::io::Cursor::new(zip_bytes);
         let mut archive = zip::ZipArchive::new(cursor).ok()?;
-        let mut entry = archive.by_name(json_filename).ok()?;
-        let mut data = String::new();
-        entry.read_to_string(&mut data).ok()?;
-        let parsed = parse_json(&data, n_modes, prec)?;
+        let entry = archive.by_name(json_filename).ok()?;
+        if entry.size() > limit {
+            return None;
+        }
+        let data = super::standalone_cache::text(entry, limit)?;
+        let parsed = parse_json(&data, lambda_sq, n_modes, prec)?;
         Some((parsed, data))
     }
 
@@ -15624,11 +15731,35 @@ mod tau_cache {
         json_filename: &str,
         n_modes: usize,
         prec: u32,
-    ) -> Option<(Vec<Float>, String)> {
-        let mut concatenated: Vec<u8> = Vec::new();
-        for p in parts {
-            let mut bytes = Vec::new();
-            std::fs::File::open(p).ok()?.read_to_end(&mut bytes).ok()?;
+    ) -> Option<(CachedTau, String)> {
+        let (_, limit) = super::standalone_cache::shape(n_modes, prec, true)?;
+        let limit = limit + (1 << 20);
+        if parts.is_empty() || parts.len() as u64 > limit {
+            return None;
+        }
+        let prefix = format!("{json_filename}.zip.part");
+        let mut ordered = parts
+            .iter()
+            .map(|path| {
+                let suffix = path.file_name()?.to_str()?.strip_prefix(&prefix)?;
+                if suffix.is_empty() || !suffix.bytes().all(|c| c.is_ascii_digit()) {
+                    return None;
+                }
+                Some((suffix.parse::<usize>().ok()?, path))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        ordered.sort_by_key(|(index, _)| *index);
+        if ordered
+            .iter()
+            .enumerate()
+            .any(|(expected, (actual, _))| expected != *actual)
+        {
+            return None;
+        }
+        let mut concatenated = Vec::new();
+        for (_, path) in ordered {
+            let remaining = limit.checked_sub(concatenated.len() as u64)?;
+            let bytes = super::standalone_cache::bytes(path, remaining)?;
             concatenated.extend_from_slice(&bytes);
         }
         read_single_zip(&concatenated, json_filename, n_modes, prec)
@@ -15638,6 +15769,7 @@ mod tau_cache {
         lambda_sq: LambdaSq,
         n_modes: usize,
         prec: u32,
+        quadrature_points: usize,
         mode: xc_numerics::quadrature::CacheMode,
     ) -> Option<Vec<Float>> {
         use xc_numerics::quadrature::CacheMode;
@@ -15655,7 +15787,7 @@ mod tau_cache {
 
         // Local zip — single first, then
         // multi-part. Decompressed in memory; no .json written.
-        if let Some(tau) = try_load_local_zip(lambda_sq, n_modes, prec) {
+        if let Some(tau) = try_load_local_zip(lambda_sq, n_modes, prec, quadrature_points) {
             return Some(tau);
         }
 
@@ -15666,24 +15798,49 @@ mod tau_cache {
     /// multi-part parts. Decompresses in memory; does NOT write a
     /// decompressed `.json`. Returns `None` if no local zip/parts exist
     /// or they fail validation.
-    fn try_load_local_zip(lambda_sq: LambdaSq, n_modes: usize, prec: u32) -> Option<Vec<Float>> {
+    fn try_load_local_zip(
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
+        quadrature_points: usize,
+    ) -> Option<Vec<Float>> {
         let json_filename = cache_filename(lambda_sq, n_modes, prec);
+        let (_, limit) = super::standalone_cache::shape(n_modes, prec, true)?;
+
+        let generation_path = zip_path(lambda_sq, n_modes, prec)?;
+        match super::standalone_generation::read(&generation_path, limit + (1 << 20)) {
+            Ok(Some(bytes)) => {
+                let (tau, _) = read_single_zip(&bytes, &json_filename, n_modes, prec)?;
+                return (tau.quadrature_points == quadrature_points
+                    && structural_check(&tau.matrix, n_modes, prec).is_none())
+                .then_some(tau.matrix);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn_skip(&generation_path, &error.to_string());
+                return None;
+            }
+        }
 
         // Single zip first.
         if let Some(zp) = zip_path(lambda_sq, n_modes, prec) {
             if zp.exists() {
-                match std::fs::read(&zp) {
-                    Ok(bytes) => match read_single_zip(&bytes, &json_filename, n_modes, prec) {
+                match super::standalone_cache::bytes(&zp, limit + (1 << 20)) {
+                    Some(bytes) => match read_single_zip(&bytes, &json_filename, n_modes, prec) {
                         Some((tau, _data)) => {
-                            if let Some(reason) = structural_check(&tau, n_modes, prec) {
+                            if tau.quadrature_points != quadrature_points {
+                                warn_skip(&zp, "quadrature request mismatch");
+                            } else if let Some(reason) =
+                                structural_check(&tau.matrix, n_modes, prec)
+                            {
                                 warn_skip(&zp, &reason);
                             } else {
-                                return Some(tau);
+                                return Some(tau.matrix);
                             }
                         }
                         None => warn_skip(&zp, "zip parse / shape failed"),
                     },
-                    Err(e) => warn_skip(&zp, &format!("read failed: {}", e)),
+                    None => warn_skip(&zp, "read failed or exceeded cache payload limit"),
                 }
             }
         }
@@ -15693,10 +15850,12 @@ mod tau_cache {
             let first_part_path = parts.first().cloned().unwrap_or_default();
             match read_split_zip_parts(&parts, &json_filename, n_modes, prec) {
                 Some((tau, _data)) => {
-                    if let Some(reason) = structural_check(&tau, n_modes, prec) {
+                    if tau.quadrature_points != quadrature_points {
+                        warn_skip(&first_part_path, "quadrature request mismatch");
+                    } else if let Some(reason) = structural_check(&tau.matrix, n_modes, prec) {
                         warn_skip(&first_part_path, &format!("{} (split parts)", reason));
                     } else {
-                        return Some(tau);
+                        return Some(tau.matrix);
                     }
                 }
                 None => warn_skip(
@@ -15711,19 +15870,34 @@ mod tau_cache {
 
     /// Test-only accessor for the current schema parser.
     #[cfg(test)]
-    pub(super) fn parse_json_for_test(data: &str, n_modes: usize, prec: u32) -> Option<Vec<Float>> {
-        parse_json(data, n_modes, prec)
+    pub(super) fn parse_json_for_test(
+        data: &str,
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
+    ) -> Option<Vec<Float>> {
+        parse_json(data, lambda_sq, n_modes, prec).map(|cached| cached.matrix)
     }
 
     /// Serialize `tau` to the versioned JSON envelope and return the
     /// resulting bytes.
-    fn serialize_to_json(tau: &[Float], lambda_sq: LambdaSq, n_modes: usize, prec: u32) -> Vec<u8> {
+    fn serialize_to_json(
+        tau: &[Float],
+        lambda_sq: LambdaSq,
+        n_modes: usize,
+        prec: u32,
+        quadrature_points: usize,
+    ) -> Vec<u8> {
         let strs: Vec<String> = tau.iter().map(|f| f.to_string()).collect();
         let payload = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 3,
+            "assembly_arithmetic":"directed_component_point_stages_length_aware_arch_v3",
+            "quadrature_points": quadrature_points,
             "toolkit_version": TOOLKIT_VERSION,
             "lambda_sq": lambda_sq.value_f64,
             "lambda_sq_mode": lambda_sq.mode_str(),
+            "lambda_sq_key":lambda_sq.filename_str(),
+            "prime_cutoff":lambda_sq.value_u64,
             "n_modes": n_modes,
             "precision_bits": prec,
             "matrix": strs,
@@ -15766,31 +15940,11 @@ mod tau_cache {
         buf
     }
 
-    /// Remove any pre-existing single-zip / multi-part-zip / .json
-    /// files for this config so we don't leave stale partner files
-    /// from a previous run that wrote a different shape.
-    fn cleanup_previous(lambda_sq: LambdaSq, n_modes: usize, prec: u32) {
-        if let Some(p) = json_path(lambda_sq, n_modes, prec) {
-            if p.exists() {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-        if let Some(p) = zip_path(lambda_sq, n_modes, prec) {
-            if p.exists() {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-        if let Some(parts) = part_paths(lambda_sq, n_modes, prec) {
-            for p in parts {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-    }
-
     pub(super) fn save(
         lambda_sq: LambdaSq,
         n_modes: usize,
         prec: u32,
+        quadrature_points: usize,
         tau: &[Float],
         mode: xc_numerics::quadrature::CacheMode,
     ) {
@@ -15802,13 +15956,32 @@ mod tau_cache {
             return;
         }
 
+        let Some((count, limit)) = super::standalone_cache::shape(n_modes, prec, true) else {
+            return;
+        };
+        if tau.len() != count
+            || tau.iter().any(|x| x.prec() != prec || !x.is_finite())
+            || structural_check(tau, n_modes, prec).is_some()
+        {
+            return;
+        }
         // Serialize to JSON in memory.
-        let json_bytes = serialize_to_json(tau, lambda_sq, n_modes, prec);
+        let json_bytes = serialize_to_json(tau, lambda_sq, n_modes, prec, quadrature_points);
         if json_bytes.is_empty() {
             return;
         }
 
-        cleanup_previous(lambda_sq, n_modes, prec);
+        if json_bytes.len() as u64 > limit
+            || parse_json(
+                std::str::from_utf8(&json_bytes).unwrap_or(""),
+                lambda_sq,
+                n_modes,
+                prec,
+            )
+            .is_none()
+        {
+            return;
+        }
 
         // Write ONLY the compressed copy. Readers decompress from the zip
         // on demand — no uncompressed .json is persisted. Decide single-zip
@@ -15828,46 +16001,15 @@ mod tau_cache {
             return;
         }
 
-        if zip_bytes.len() <= PART_BYTE_LIMIT {
-            // Single-zip path: under the per-part cap, write one file.
-            if let Some(zp) = zip_path(lambda_sq, n_modes, prec) {
-                if let Err(e) = std::fs::write(&zp, &zip_bytes) {
-                    crate::hp_debug!(
-                        "[tau_cache] WARNING: could not write {}: {}",
-                        zp.display(),
-                        e
-                    );
-                }
+        if zip_bytes.len() as u64 > limit + (1 << 20) {
+            return;
+        }
+        if let Some(path) = zip_path(lambda_sq, n_modes, prec) {
+            if let Err(error) =
+                super::standalone_generation::write(&path, &zip_bytes, PART_BYTE_LIMIT)
+            {
+                crate::hp_debug!("[tau_cache] generation not committed: {}", error);
             }
-        } else {
-            // Multi-part split path: byte-split at PART_BYTE_LIMIT.
-            // The toolkit reads parts back by lexicographic
-            // concatenation, so naming uses zero-padded indices to
-            // keep the order correct.
-            let n_parts = zip_bytes.len().div_ceil(PART_BYTE_LIMIT);
-            let dir = match cache_dir() {
-                Some(d) => d,
-                None => return,
-            };
-            for i in 0..n_parts {
-                let start = i * PART_BYTE_LIMIT;
-                let end = ((i + 1) * PART_BYTE_LIMIT).min(zip_bytes.len());
-                let part_path = dir.join(format!("{}.zip.part{:02}", entry_name, i));
-                if let Err(e) = std::fs::write(&part_path, &zip_bytes[start..end]) {
-                    crate::hp_debug!(
-                        "[tau_cache] WARNING: could not write {}: {}",
-                        part_path.display(),
-                        e
-                    );
-                    return;
-                }
-            }
-            crate::hp_debug!(
-                "[tau_cache] wrote {} parts of ≤{} MB each (compressed total {} MB) for λ²={}, N={}, prec={}",
-                n_parts, PART_BYTE_LIMIT / (1024 * 1024),
-                zip_bytes.len() / (1024 * 1024),
-                lambda_sq.value_f64, n_modes, prec
-            );
         }
     }
 
@@ -15964,7 +16106,9 @@ mod tau_cache {
     /// parts and inspect the assembled set instead).
     pub(super) fn parse_filename(name: &str) -> Option<(LambdaSq, usize, u32, FileKind)> {
         // Three possible suffixes, in priority order.
-        let (stem, kind) = if let Some(s) = strip_part_suffix(name) {
+        let (stem, kind) = if let Some(s) = name.strip_suffix(".json.zip.manifest.json") {
+            (s, FileKind::Generation)
+        } else if let Some(s) = strip_part_suffix(name) {
             (s, FileKind::Part)
         } else if let Some(s) = name.strip_suffix(".json.zip") {
             (s, FileKind::Zip)
@@ -15998,6 +16142,7 @@ mod tau_cache {
     }
 
     pub(super) enum FileKind {
+        Generation,
         Json,
         Zip,
         Part,
@@ -16022,8 +16167,10 @@ mod tau_cache {
         // Multi-part archives (kind=Part) are deduplicated: we verify
         // the whole set once per config rather than per-file.
         // Key is (filename_str, n_modes, prec) for uniqueness; value is LambdaSq.
-        let mut configs_with_parts: std::collections::BTreeMap<(String, usize, u32), LambdaSq> =
-            std::collections::BTreeMap::new();
+        let mut configs_with_parts: std::collections::BTreeMap<
+            (String, usize, u32),
+            (LambdaSq, Vec<std::path::PathBuf>),
+        > = std::collections::BTreeMap::new();
         let mut singletons: Vec<(std::path::PathBuf, LambdaSq, usize, u32, FileKind)> = Vec::new();
 
         for entry in std::fs::read_dir(dir)? {
@@ -16038,11 +16185,15 @@ mod tau_cache {
             };
             match parse_filename(&name) {
                 Some((lsq, n_modes, prec, kind)) => match kind {
-                    FileKind::Json | FileKind::Zip => {
+                    FileKind::Json | FileKind::Zip | FileKind::Generation => {
                         singletons.push((path, lsq, n_modes, prec, kind));
                     }
                     FileKind::Part => {
-                        configs_with_parts.insert((lsq.filename_str(), n_modes, prec), lsq);
+                        configs_with_parts
+                            .entry((lsq.filename_str(), n_modes, prec))
+                            .or_insert_with(|| (lsq, Vec::new()))
+                            .1
+                            .push(path);
                     }
                 },
                 None => {
@@ -16059,18 +16210,32 @@ mod tau_cache {
 
         // Verify singletons.
         for (path, lsq, n_modes, prec, kind) in singletons {
-            let parsed: Option<Vec<Float>> = match kind {
-                FileKind::Json => std::fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|d| parse_json(&d, n_modes, prec)),
-                FileKind::Zip => std::fs::read(&path).ok().and_then(|bytes| {
-                    let entry_name = cache_filename(lsq, n_modes, prec);
-                    read_single_zip(&bytes, &entry_name, n_modes, prec).map(|(t, _)| t)
-                }),
+            let parsed: Option<CachedTau> = match kind {
+                FileKind::Json => super::standalone_cache::shape(n_modes, prec, true)
+                    .and_then(|(_, limit)| {
+                        super::standalone_cache::text(std::fs::File::open(&path).ok()?, limit)
+                    })
+                    .and_then(|d| parse_json(&d, lsq, n_modes, prec)),
+                FileKind::Zip => super::standalone_cache::shape(n_modes, prec, true)
+                    .and_then(|(_, limit)| super::standalone_cache::bytes(&path, limit + (1 << 20)))
+                    .and_then(|bytes| {
+                        let entry_name = cache_filename(lsq, n_modes, prec);
+                        read_single_zip(&bytes, &entry_name, n_modes, prec).map(|(t, _)| t)
+                    }),
+                FileKind::Generation => super::standalone_cache::shape(n_modes, prec, true)
+                    .and_then(|(_, limit)| {
+                        let zip_path =
+                            dir.join(format!("{}.zip", cache_filename(lsq, n_modes, prec)));
+                        let bytes =
+                            super::standalone_generation::read(&zip_path, limit + (1 << 20))
+                                .ok()??;
+                        read_single_zip(&bytes, &cache_filename(lsq, n_modes, prec), n_modes, prec)
+                            .map(|(tau, _)| tau)
+                    }),
                 FileKind::Part => unreachable!(),
             };
             match parsed {
-                Some(tau) => match structural_check(&tau, n_modes, prec) {
+                Some(tau) => match structural_check(&tau.matrix, n_modes, prec) {
                     None => statuses.push(TauCacheFileStatus::Ok {
                         path,
                         lambda_sq: lsq,
@@ -16096,15 +16261,14 @@ mod tau_cache {
         }
 
         // Verify split-archive sets (one entry per config, not per part).
-        for ((_key, n_modes, prec), lsq) in configs_with_parts {
-            let parts = match part_paths(lsq, n_modes, prec) {
-                Some(p) => p,
-                None => continue,
-            };
+        for ((_key, n_modes, prec), (lsq, mut parts)) in configs_with_parts {
+            // Use the paths actually observed in the requested directory.
+            // A missing or unreadable part must remain a reported failure.
+            parts.sort();
             let representative = parts[0].clone();
             let entry_name = cache_filename(lsq, n_modes, prec);
             match read_split_zip_parts(&parts, &entry_name, n_modes, prec) {
-                Some((tau, _data)) => match structural_check(&tau, n_modes, prec) {
+                Some((tau, _data)) => match structural_check(&tau.matrix, n_modes, prec) {
                     None => statuses.push(TauCacheFileStatus::Ok {
                         path: representative,
                         lambda_sq: lsq,
@@ -16137,6 +16301,70 @@ mod tau_cache {
             statuses,
         })
     }
+    #[cfg(test)]
+    mod exhaustive_discovery_cache {
+        use super::*;
+        #[test]
+        fn exhaustive_discovery_cache_verifies_requested_directory() {
+            let dir = crate::fresh_test_dir("audit_tau_requested_directory");
+            let path = dir.join(format!(
+                "{}.zip.part00",
+                cache_filename(LambdaSq::integer(987654321), 1, 128)
+            ));
+            std::fs::write(&path, b"broken ZIP").unwrap();
+            let report = verify_tau_cache_dir(&dir).unwrap();
+            assert_eq!(report.statuses.len(), 1);
+            assert_eq!(report.failure_count(), 1);
+            assert!(
+                matches!(&report.statuses[0],TauCacheFileStatus::LoadFailed {path:p,..} if p==&path)
+            );
+        }
+        fn zip_fixture() -> (String, Vec<u8>) {
+            let lsq = LambdaSq::integer(987654322);
+            let name = cache_filename(lsq, 1, 128);
+            let tau = [2, 0, 0, 0, 1, 0, 0, 0, 2].map(|x| Float::with_val(128, x));
+            let bytes = compress_to_zip(&serialize_to_json(&tau, lsq, 1, 128, 64), &name);
+            assert!(bytes.len() > 101);
+            (name, bytes)
+        }
+        #[test]
+        fn exhaustive_discovery_cache_numeric_order_beyond_two_digit_parts() {
+            let dir = crate::fresh_test_dir("audit_tau_numeric_parts");
+            let (name, bytes) = zip_fixture();
+            for i in 0..100 {
+                std::fs::write(dir.join(format!("{name}.zip.part{i:02}")), &bytes[i..i + 1])
+                    .unwrap();
+            }
+            std::fs::write(dir.join(format!("{name}.zip.part100")), &bytes[100..]).unwrap();
+            let report = verify_tau_cache_dir(&dir).unwrap();
+            assert_eq!(report.ok_count(), 1, "{:?}", report.statuses);
+            assert_eq!(report.statuses.len(), 1);
+        }
+        #[test]
+        fn exhaustive_discovery_cache_missing_part_index_is_rejected() {
+            let dir = crate::fresh_test_dir("audit_tau_missing_part");
+            let (name, bytes) = zip_fixture();
+            let paths = [
+                dir.join(format!("{name}.zip.part00")),
+                dir.join(format!("{name}.zip.part02")),
+            ];
+            std::fs::write(&paths[0], &bytes[..100]).unwrap();
+            std::fs::write(&paths[1], &bytes[100..]).unwrap();
+            assert!(read_split_zip_parts(&paths, &name, 1, 128).is_none());
+        }
+        #[test]
+        fn exhaustive_discovery_cache_duplicate_part_index_is_rejected() {
+            let dir = crate::fresh_test_dir("audit_tau_duplicate_part");
+            let (name, bytes) = zip_fixture();
+            let paths = [
+                dir.join(format!("{name}.zip.part0")),
+                dir.join(format!("{name}.zip.part00")),
+            ];
+            std::fs::write(&paths[0], &bytes[..100]).unwrap();
+            std::fs::write(&paths[1], &bytes[100..]).unwrap();
+            assert!(read_split_zip_parts(&paths, &name, 1, 128).is_none());
+        }
+    }
 }
 
 #[cfg(feature = "hp")]
@@ -16164,8 +16392,7 @@ mod weil_eigvec_cache {
     //! HP-1000/N=800), so there is no byte-split `.partXX` tier — single
     //! zip only, exactly like the GL-node cache.
     //!
-    //! Schema mirrors [`super::HighPrecResult::save_xi_json`]
-    //! (`schema_version: 1`): a JSON object carrying ξ as decimal strings
+    //! The source-bound cache schema (`schema_version: 3` with arithmetic stamps): a JSON object carrying ξ as decimal strings
     //! plus `weil_min_eigenvalue` (ε_N) and the `(λ², N, prec)` metadata.
     //!
     //! Validation on load is two-tier:
@@ -16177,7 +16404,7 @@ mod weil_eigvec_cache {
     //!      *after* the τ build.
 
     use rug::{ops::Pow, Float};
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     use xc_numerics::quadrature::CacheMode;
 
@@ -16205,17 +16432,56 @@ mod weil_eigvec_cache {
     }
 
     /// Current schema version for the weil eigvec JSON envelope.
-    const SCHEMA_VERSION: u32 = 2;
+    const SCHEMA_VERSION: u32 = 3;
 
     /// A ξ entry loaded from the cache: the eigenvector plus its
     /// eigenvalue ε_N, both at the requested working precision.
     pub(super) struct CachedXi {
+        pub tau_source_point_digest: xc_cache::ContentDigest,
         pub eps_n: Float,
         pub xi: Vec<Float>,
         pub diagnostics: xc_numerics::linalg::InverseIterationDiagnostics,
     }
 
+    #[cfg(test)]
+    thread_local! {
+        static TEST_CACHE_ROOT: std::cell::RefCell<Option<std::path::PathBuf>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    /// An absolute, thread-local test root avoids redirecting unrelated cache
+    /// writers through the process-wide current directory. The guard cannot be
+    /// moved to another thread, so Drop always restores the correct slot.
+    #[cfg(test)]
+    pub(super) struct TestCacheRootGuard {
+        previous: Option<std::path::PathBuf>,
+        _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+    #[cfg(test)]
+    impl TestCacheRootGuard {
+        pub(super) fn enter(root: &std::path::Path) -> Self {
+            assert!(root.is_absolute());
+            let previous = TEST_CACHE_ROOT.with(|slot| slot.replace(Some(root.to_path_buf())));
+            Self {
+                previous,
+                _same_thread: std::marker::PhantomData,
+            }
+        }
+    }
+    #[cfg(test)]
+    impl Drop for TestCacheRootGuard {
+        fn drop(&mut self) {
+            let _ = TEST_CACHE_ROOT.with(|slot| slot.replace(self.previous.take()));
+        }
+    }
+
     fn cache_dir() -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        let cwd = TEST_CACHE_ROOT
+            .with(|slot| slot.borrow().clone())
+            .or_else(|| std::env::current_dir().ok())?;
+        #[cfg(not(test))]
         let cwd = std::env::current_dir().ok()?;
         let dir = cwd.join("data").join("weil_eigvec_cache");
         std::fs::create_dir_all(&dir).ok()?;
@@ -16241,6 +16507,7 @@ mod weil_eigvec_cache {
         tolerance_bits: u32,
         parity_policy: CcmParityPolicy,
     ) -> Option<Vec<Float>> {
+        super::standalone_cache::shape(n_modes, target_prec, false)?;
         let dir = cache_dir()?;
         let variant = cache_variant(parity_policy);
         let prefix = format!(
@@ -16257,7 +16524,10 @@ mod weil_eigvec_cache {
         let entries = std::fs::read_dir(&dir).ok()?;
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let name_str = name.to_string_lossy();
+            let name_string = name.to_string_lossy();
+            let name_str = name_string
+                .strip_suffix(".manifest.json")
+                .unwrap_or(&name_string);
             if !name_str.starts_with(&prefix) || !name_str.ends_with(&suffix) {
                 continue;
             }
@@ -16278,27 +16548,15 @@ mod weil_eigvec_cache {
         let nearby_prec = best_prec?;
 
         // Load the nearby cache entry (at its original precision)
-        let cached = load(
-            lambda_sq,
-            n_modes,
-            nearby_prec,
-            CacheMode::JsonZip,
-            parity_policy,
-        )?;
+        let cached = try_load_local_zip(lambda_sq, n_modes, nearby_prec, parity_policy)?;
 
-        // Promote ξ to target precision by re-parsing each entry.
-        // This is exact: we're just increasing the mantissa bits, no rounding.
-        let xi_promoted: Vec<Float> = cached
+        // Preserve the original binary point when increasing precision. Reducing
+        // precision performs one explicit MPFR rounding, never decimal re-parsing.
+        let xi_promoted = cached
             .xi
             .iter()
-            .map(|v| {
-                let s = v.to_string();
-                Float::with_val(
-                    target_prec,
-                    Float::parse(&s).unwrap_or_else(|_| Float::parse("0").unwrap()),
-                )
-            })
-            .collect();
+            .map(|v| super::super::retained_evidence::point::output(v, target_prec).ok())
+            .collect::<Option<Vec<_>>>()?;
 
         crate::hp_debug!(
             "[HP] warm-start from nearby cache prec={} (target={}, diff={} bits)",
@@ -16339,15 +16597,6 @@ mod weil_eigvec_cache {
         }
     }
 
-    fn json_path(
-        lambda_sq: LambdaSq,
-        n_modes: usize,
-        prec: u32,
-        parity_policy: CcmParityPolicy,
-    ) -> Option<std::path::PathBuf> {
-        cache_dir().map(|d| d.join(cache_filename(lambda_sq, n_modes, prec, parity_policy)))
-    }
-
     fn zip_path(
         lambda_sq: LambdaSq,
         n_modes: usize,
@@ -16361,7 +16610,7 @@ mod weil_eigvec_cache {
     }
 
     /// Parse the cache JSON object into `(eps_n, xi)`.
-    /// Expects schema_version 1 envelope format. Returns `None` on any
+    /// Expects the current schema-v3 envelope and normalization stamp. Returns `None` on any
     /// structural mismatch or a stale `toolkit_version`.
     pub(super) fn parse_json(
         data: &str,
@@ -16369,42 +16618,74 @@ mod weil_eigvec_cache {
         n_modes: usize,
         prec: u32,
     ) -> Option<CachedXi> {
+        let (dimension, limit) = super::standalone_cache::shape(n_modes, prec, false)?;
+        if data.len() as u64 > limit {
+            return None;
+        }
         let v: serde_json::Value = serde_json::from_str(data).ok()?;
         let obj = v.as_object()?;
 
-        if obj.get("schema_version").and_then(|x| x.as_u64())? as u32 != SCHEMA_VERSION {
+        if !super::standalone_cache::identity_matches(
+            obj,
+            lambda_sq,
+            n_modes,
+            prec,
+            u64::from(SCHEMA_VERSION),
+        ) || obj
+            .get("tau_residual_arithmetic")
+            .and_then(serde_json::Value::as_str)
+            != Some(super::standalone_cache::RESIDUAL_ARITHMETIC)
+        {
             return None;
         }
 
+        if obj
+            .get("parity_basis_arithmetic")
+            .and_then(serde_json::Value::as_str)
+            != Some(super::parity_math::ARITHMETIC)
+        {
+            return None;
+        }
+
+        if obj
+            .get("state_normalization_arithmetic")
+            .and_then(serde_json::Value::as_str)
+            != Some(super::state_normalization_math::ARITHMETIC)
+        {
+            return None;
+        }
+
+        if obj
+            .get("l2_normalization_arithmetic")
+            .and_then(|x| x.as_str())
+            != Some(xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2)
+        {
+            return None;
+        }
         let file_ver = obj.get("toolkit_version").and_then(|x| x.as_str())?;
         if version_is_older(file_ver, &effective_min_version()) {
             return None;
         }
 
-        if obj.get("n_modes").and_then(|x| x.as_u64())? as usize != n_modes {
-            return None;
-        }
-        if obj.get("precision_bits").and_then(|x| x.as_u64())? as u32 != prec {
-            return None;
-        }
-        let l_meta = obj.get("lambda_sq").and_then(|x| x.as_f64())?;
-        if (l_meta - lambda_sq.value_f64).abs() > 0.5 {
+        let tau_source_point_digest =
+            xc_cache::ContentDigest(obj.get("tau_source_point_digest")?.as_str()?.to_owned());
+        if !tau_source_point_digest.validate() {
             return None;
         }
 
         let eps_str = obj.get("weil_min_eigenvalue").and_then(|x| x.as_str())?;
-        let eps_n = Float::with_val(prec, Float::parse(eps_str).ok()?);
+        let eps_n = super::parse_standalone_scalar(eps_str, prec)?;
         if eps_n.is_nan() || eps_n.is_infinite() {
             return None;
         }
 
         let arr = obj.get("xi").and_then(|x| x.as_array())?;
-        if arr.len() != 2 * n_modes + 1 {
+        if arr.len() != dimension {
             return None;
         }
         let mut xi = Vec::with_capacity(arr.len());
         for s in arr {
-            let f = Float::with_val(prec, Float::parse(s.as_str()?).ok()?);
+            let f = super::parse_standalone_scalar(s.as_str()?, prec)?;
             if f.is_nan() || f.is_infinite() {
                 return None;
             }
@@ -16414,6 +16695,7 @@ mod weil_eigvec_cache {
             serde_json::from_value(obj.get("inverse_iteration")?.clone()).ok()?;
         let diagnostics = portable.to_runtime(prec).ok()?;
         Some(CachedXi {
+            tau_source_point_digest,
             eps_n,
             xi,
             diagnostics,
@@ -16422,21 +16704,19 @@ mod weil_eigvec_cache {
 
     /// Returns `true` if version string `a` is strictly older than `b`.
     fn version_is_older(a: &str, b: &str) -> bool {
-        let parse = |s: &str| -> (u64, u64, u64) {
-            let mut parts = s.splitn(3, '.');
-            let major = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            let minor = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            let patch = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-            (major, minor, patch)
-        };
-        parse(a) < parse(b)
+        match (
+            xc_cache::ToolkitVersion::parse(a),
+            xc_cache::ToolkitVersion::parse(b),
+        ) {
+            (Ok(a), Ok(b)) => a < b,
+            _ => true,
+        }
     }
 
-    /// Eigen-residual check: is `(xi, eps_n)` a genuine eigenpair of the
-    /// in-hand τ matrix? Returns `true` when `‖τξ − ε_N·ξ‖_∞ / ‖ξ‖_∞`
-    /// sits below the working-precision floor. This is the strong
-    /// integrity test that catches a structurally-valid-but-wrong ξ
-    /// (e.g. a different eigenvector, or one from a subtly different τ).
+    /// Directed upper bound on ||Tau*xi-eps*xi||_infinity/||xi||_infinity
+    /// for the exact stored finite symmetric source. Matrix and vector scales
+    /// are normalized independently before products. This is in eigenvalue
+    /// units and does not identify which eigenvalue an eigenpair represents.
     pub(super) fn relative_residual_norm(
         tau: &[Float],
         dim: usize,
@@ -16444,70 +16724,20 @@ mod weil_eigvec_cache {
         eps_n: &Float,
         prec: u32,
     ) -> Option<Float> {
-        if xi.len() != dim
-            || tau.len() != dim * dim
-            || !eps_n.is_finite()
-            || xi.iter().chain(tau).any(|value| !value.is_finite())
-        {
+        if xi.len() != dim || dim.checked_mul(dim) != Some(tau.len()) {
             return None;
         }
-
-        // ‖ξ‖_∞ for the relative bound. A zero vector can never be a
-        // valid eigenvector.
-        let mut xi_linf = Float::with_val(prec, 0);
-        for v in xi {
-            let a = v.clone().abs();
-            if a > xi_linf {
-                xi_linf = a;
-            }
-        }
-        if xi_linf.is_zero() {
-            return None;
-        }
-
-        // max_i | (τξ)_i − ε_N ξ_i |, rows computed in parallel then a
-        // deterministic max-fold. The inner row sum is sequential (it is
-        // the same fixed index order every run).
-        use rayon::prelude::*;
-        let residuals: Vec<Float> = (0..dim)
-            .into_par_iter()
-            .map(|i| {
-                let mut row = Float::with_val(prec, 0);
-                for j in 0..dim {
-                    let mut t = tau[i * dim + j].clone();
-                    t *= &xi[j];
-                    row += &t;
-                }
-                let mut e = eps_n.clone();
-                e *= &xi[i];
-                row -= &e;
-                row.abs()
-            })
-            .collect();
-        let mut resid_inf = Float::with_val(prec, 0);
-        for residual in residuals {
-            // NaN comparisons are false. Never let a nonfinite row disappear
-            // into the maximum's initial zero, including finite-input overflow.
-            if !residual.is_finite() {
-                return None;
-            }
-            if residual > resid_inf {
-                resid_inf = residual;
-            }
-        }
-
-        // Relative residual vs floor. Use a generous floor: the eigenpair
-        // is accurate to ~working precision, but the residual accumulates
-        // O(N) HP roundings in the matrix-vector product. 2^-(prec-32)
-        // leaves 32 bits (~10 digits) of headroom — far below the O(1)
-        // residual a wrong ξ would produce, yet safely above the genuine
-        // floor.
-        let mut rel = resid_inf;
-        rel /= &xi_linf;
-        rel.is_finite().then_some(rel)
+        let bound = super::state_residual_bounds::evaluate(tau, xi, eps_n, prec)
+            .ok()?
+            .vector_scaled_residual_upper;
+        let result = Float::with_val_round(prec, &bound, rug::float::Round::Up).0;
+        (result.is_finite() && (bound.is_zero() || !result.is_zero())).then_some(result)
     }
 
     pub(super) fn residual_within_precision_floor(residual: &Float, prec: u32) -> bool {
+        if !(64..=1_000_000).contains(&prec) || !residual.is_finite() || residual < &0 {
+            return false;
+        }
         let floor = Float::with_val(prec, 2).pow(-((prec as i32) - 32));
         residual
             .cmp_abs(&floor)
@@ -16552,18 +16782,31 @@ mod weil_eigvec_cache {
     /// JSON (so the caller can write the decompressed copy without
     /// re-serializing).
     fn read_single_zip(
-        zip_path: &std::path::Path,
+        zip_bytes: &[u8],
         lambda_sq: LambdaSq,
         n_modes: usize,
         prec: u32,
         parity_policy: CcmParityPolicy,
     ) -> Option<(CachedXi, String)> {
-        let file = std::fs::File::open(zip_path).ok()?;
-        let mut archive = zip::ZipArchive::new(file).ok()?;
+        let (_, limit) = super::standalone_cache::shape(n_modes, prec, false)?;
+        if zip_bytes.len() as u64 > limit + (1 << 20) {
+            return None;
+        }
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).ok()?;
         let entry_name = cache_filename(lambda_sq, n_modes, prec, parity_policy);
-        let mut entry = archive.by_name(&entry_name).ok()?;
-        let mut data = String::new();
-        entry.read_to_string(&mut data).ok()?;
+        let entry = archive.by_name(&entry_name).ok()?;
+        if entry.size() > limit {
+            return None;
+        }
+        let data = super::standalone_cache::text(entry, limit)?;
+        let metadata: serde_json::Value = serde_json::from_str(&data).ok()?;
+        if metadata
+            .get("parity_policy")
+            .and_then(serde_json::Value::as_str)
+            != Some(parity_policy.cache_label())
+        {
+            return None;
+        }
         let parsed = parse_json(&data, lambda_sq, n_modes, prec)?;
         Some((parsed, data))
     }
@@ -16572,10 +16815,11 @@ mod weil_eigvec_cache {
         lambda_sq: LambdaSq,
         n_modes: usize,
         prec: u32,
+        source_digest: &xc_cache::ContentDigest,
         mode: CacheMode,
         parity_policy: CcmParityPolicy,
     ) -> Option<CachedXi> {
-        if mode == CacheMode::Off {
+        if !source_digest.validate() || mode == CacheMode::Off {
             return None;
         }
 
@@ -16588,7 +16832,7 @@ mod weil_eigvec_cache {
 
         // Local single zip — in memory.
         if let Some(c) = try_load_local_zip(lambda_sq, n_modes, prec, parity_policy) {
-            return Some(c);
+            return (c.tau_source_point_digest == *source_digest).then_some(c);
         }
 
         None
@@ -16603,10 +16847,16 @@ mod weil_eigvec_cache {
         parity_policy: CcmParityPolicy,
     ) -> Option<CachedXi> {
         let zp = zip_path(lambda_sq, n_modes, prec, parity_policy)?;
-        if !zp.exists() {
-            return None;
-        }
-        match read_single_zip(&zp, lambda_sq, n_modes, prec, parity_policy) {
+        let (_, limit) = super::standalone_cache::shape(n_modes, prec, false)?;
+        let bytes = match super::standalone_generation::read(&zp, limit + (1 << 20)) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => super::standalone_cache::bytes(&zp, limit + (1 << 20))?,
+            Err(error) => {
+                warn_skip(&zp, &error.to_string());
+                return None;
+            }
+        };
+        match read_single_zip(&bytes, lambda_sq, n_modes, prec, parity_policy) {
             Some((parsed, _json_string)) => Some(parsed),
             None => {
                 warn_skip(&zp, "zip open / decompress / shape parse failed");
@@ -16615,21 +16865,32 @@ mod weil_eigvec_cache {
         }
     }
 
-    /// Serialize `(eps_n, xi)` to the versioned schema-v1 JSON object.
+    /// Serialize `(eps_n, xi)` to the stamped schema-v3 JSON object.
+    #[allow(clippy::too_many_arguments)]
     fn serialize_to_json(
         lambda_sq: LambdaSq,
         n_modes: usize,
         prec: u32,
+        source_digest: &xc_cache::ContentDigest,
         eps_n: &Float,
         xi: &[Float],
+        parity_policy: CcmParityPolicy,
         diagnostics: &xc_numerics::linalg::InverseIterationDiagnostics,
     ) -> Vec<u8> {
         let xi_strings: Vec<String> = xi.iter().map(|f| f.to_string()).collect();
         let payload = serde_json::json!({
+            "parity_policy":parity_policy.cache_label(),
+            "tau_residual_arithmetic":super::standalone_cache::RESIDUAL_ARITHMETIC,
             "schema_version": SCHEMA_VERSION,
+            "tau_source_point_digest": source_digest,
+            "parity_basis_arithmetic": super::parity_math::ARITHMETIC,
+            "state_normalization_arithmetic": super::state_normalization_math::ARITHMETIC,
+            "l2_normalization_arithmetic": xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2,
             "toolkit_version": TOOLKIT_VERSION,
             "lambda_sq": lambda_sq.value_f64,
             "lambda_sq_mode": lambda_sq.mode_str(),
+            "lambda_sq_key":lambda_sq.filename_str(),
+            "prime_cutoff":lambda_sq.value_u64,
             "n_modes": n_modes,
             "precision_bits": prec,
             "weil_min_eigenvalue": eps_n.to_string(),
@@ -16662,29 +16923,12 @@ mod weil_eigvec_cache {
         buf
     }
 
-    fn cleanup_previous(
-        lambda_sq: LambdaSq,
-        n_modes: usize,
-        prec: u32,
-        parity_policy: CcmParityPolicy,
-    ) {
-        if let Some(p) = json_path(lambda_sq, n_modes, prec, parity_policy) {
-            if p.exists() {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-        if let Some(p) = zip_path(lambda_sq, n_modes, prec, parity_policy) {
-            if p.exists() {
-                let _ = std::fs::remove_file(&p);
-            }
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn save(
         lambda_sq: LambdaSq,
         n_modes: usize,
         prec: u32,
+        source_digest: &xc_cache::ContentDigest,
         eps_n: &Float,
         xi: &[Float],
         diagnostics: &xc_numerics::linalg::InverseIterationDiagnostics,
@@ -16692,16 +16936,45 @@ mod weil_eigvec_cache {
         parity_policy: CcmParityPolicy,
     ) {
         // Off and JsonOnly write nothing: the cache is zip-only.
-        if matches!(mode, CacheMode::Off | CacheMode::JsonOnly) {
+        if !source_digest.validate() || matches!(mode, CacheMode::Off | CacheMode::JsonOnly) {
             return;
         }
 
-        let json_bytes = serialize_to_json(lambda_sq, n_modes, prec, eps_n, xi, diagnostics);
+        let Some((count, limit)) = super::standalone_cache::shape(n_modes, prec, false) else {
+            return;
+        };
+        if xi.len() != count
+            || xi.iter().any(|x| !x.is_finite() || x.prec() != prec)
+            || !eps_n.is_finite()
+            || eps_n.prec() != prec
+        {
+            return;
+        }
+        let json_bytes = serialize_to_json(
+            lambda_sq,
+            n_modes,
+            prec,
+            source_digest,
+            eps_n,
+            xi,
+            parity_policy,
+            diagnostics,
+        );
         if json_bytes.is_empty() {
             return;
         }
 
-        cleanup_previous(lambda_sq, n_modes, prec, parity_policy);
+        if json_bytes.len() as u64 > limit
+            || parse_json(
+                std::str::from_utf8(&json_bytes).unwrap_or(""),
+                lambda_sq,
+                n_modes,
+                prec,
+            )
+            .is_none()
+        {
+            return;
+        }
 
         // Write ONLY the compressed copy. Readers decompress from the zip
         // on demand — no uncompressed .json is persisted. ξ is small, so
@@ -16720,8 +16993,11 @@ mod weil_eigvec_cache {
             );
             return;
         }
+        if zip_bytes.len() as u64 > limit + (1 << 20) {
+            return;
+        }
         if let Some(zp) = zip_path(lambda_sq, n_modes, prec, parity_policy) {
-            if let Err(e) = std::fs::write(&zp, &zip_bytes) {
+            if let Err(e) = super::standalone_generation::write(&zp, &zip_bytes, 90 * 1024 * 1024) {
                 crate::hp_debug!(
                     "[weil_eigvec_cache] WARNING: could not write {}: {}",
                     zp.display(),
@@ -16852,17 +17128,18 @@ pub fn assemble_research_matrix_hp(
     options: &super::research::ResearchAssemblyOptions,
 ) -> Result<super::research::ResearchMatrixHp> {
     use super::research::{
-        aggregate_prime_component_hp, quadrature_orders, PrimeAssemblyRoute,
+        aggregate_prime_component_hp, quadrature_orders_for_length, PrimeAssemblyRoute,
         ResearchAssemblyIdentity, ResearchMatrixHp, RESEARCH_ASSEMBLY_SEMANTICS,
     };
     let dimension = options.validate(cutoff, n_modes)?;
     let precision_bits = cfg.precision_bits;
     let length = cutoff.log_length(precision_bits)?;
-    let orders = quadrature_orders(
+    let orders = quadrature_orders_for_length(
         n_modes,
         cfg.quad_points,
         precision_bits,
         options.quadrature_order_bucket,
+        &length,
     )?;
     let (integrals, _) = compute_archimedean_integrals_tracked_with_bucket(
         n_modes,
@@ -16872,10 +17149,10 @@ pub fn assemble_research_matrix_hp(
         options.quadrature_order_bucket,
     )?;
     let (pole, archimedean) =
-        assemble_pole_and_archimedean_components(n_modes, &length, precision_bits, &integrals);
+        assemble_pole_and_archimedean_components(n_modes, &length, precision_bits, &integrals)?;
     let prime = match options.prime_route {
         PrimeAssemblyRoute::CanonicalCellSum => {
-            compute_prime_component_matrix(n_modes, cutoff.prime_cutoff(), &length, precision_bits)
+            compute_prime_component_matrix(n_modes, cutoff.prime_cutoff(), &length, precision_bits)?
         }
         PrimeAssemblyRoute::AggregateGenerators => {
             aggregate_prime_component_hp(cutoff, n_modes, precision_bits, options)?
@@ -16888,8 +17165,8 @@ pub fn assemble_research_matrix_hp(
             prime,
         },
         precision_bits,
-    );
-    force_symmetric(&mut entries, dimension);
+    )?;
+    force_symmetric(&mut entries, dimension)?;
     Ok(ResearchMatrixHp {
         identity: ResearchAssemblyIdentity {
             semantics: RESEARCH_ASSEMBLY_SEMANTICS.to_owned(),
@@ -17040,17 +17317,21 @@ mod tests {
     #[test]
     #[ignore = "diagnostic; requires extracted payload files via env vars"]
     fn replay_stored_root_residuals_against_stored_eigenpair() {
-        let (Ok(ep_path), Ok(rp_path)) = (
-            std::env::var("XC_REPLAY_EIGENPAIR"),
-            std::env::var("XC_REPLAY_ROOTS"),
-        ) else {
-            eprintln!("payload paths not provided; nothing to replay");
-            return;
-        };
+        let ep_path = std::env::var("XC_REPLAY_EIGENPAIR")
+            .expect("set XC_REPLAY_EIGENPAIR to the retained eigenpair payload");
+        let rp_path = std::env::var("XC_REPLAY_ROOTS")
+            .expect("set XC_REPLAY_ROOTS to the matching retained root payload");
         let ep: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(ep_path).unwrap()).unwrap();
         let rp: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(rp_path).unwrap()).unwrap();
+        for field in ["lambda_squared", "n_modes", "precision_bits"] {
+            assert_eq!(
+                ep[field], rp[field],
+                "retained payload configuration differs: {field}"
+            );
+        }
+        assert!(!rp["outcomes"].as_array().unwrap().is_empty());
         let prec = ep["precision_bits"].as_u64().unwrap() as u32;
         let n_modes = ep["n_modes"].as_u64().unwrap() as usize;
         let lambda_sq: u64 = ep["lambda_squared"]
@@ -17068,12 +17349,12 @@ mod tests {
             .map(|s| parse(s.as_str().unwrap()))
             .collect();
         let params = CcmParams::from_lambda_sq_integer(lambda_sq, n_modes);
-        let l = log_lambda_sq_hp(&params, prec);
+        let l = log_lambda_sq_hp(&params, prec).unwrap();
         let mut two_pi_over_l = pi(prec);
         two_pi_over_l *= 2u32;
         two_pi_over_l /= &l;
         let poles = secular_poles(&two_pi_over_l, n_modes, prec);
-        let xi_norm = normalize_eigenvector(&xi_raw, &l, prec);
+        let xi_norm = normalize_eigenvector(&xi_raw, &l, prec).unwrap();
         let fmt = |v: &Float| v.to_string_radix(10, Some(24));
 
         for (i, outcome) in rp["outcomes"].as_array().unwrap().iter().enumerate() {
@@ -17248,16 +17529,16 @@ mod tests {
                 let x = (0..dimension)
                     .map(|index| Float::with_val(precision_bits, index + 2))
                     .collect::<Vec<_>>();
+                // Independent exact rational oracle for the stored dyadic inputs.
+                // The action now rounds the complete exact dot product once.
                 let serial = entries
                     .chunks_exact(dimension)
                     .map(|row| {
-                        let mut sum = Float::with_val(precision_bits, 0);
+                        let mut sum = rug::Rational::new();
                         for (entry, component) in row.iter().zip(&x) {
-                            let mut term = Float::with_val(precision_bits, entry);
-                            term *= component;
-                            sum += term;
+                            sum += entry.to_rational().unwrap() * component.to_rational().unwrap();
                         }
-                        sum
+                        Float::with_val(precision_bits, sum)
                     })
                     .collect::<Vec<_>>();
                 let operator = BorrowedDenseSymmetricHp {
@@ -17404,6 +17685,7 @@ mod tests {
     #[test]
     fn legacy_eigenstate_payload_keeps_its_established_json_shape() {
         let artifact = PortableWeilEigenpair {
+            stored_state_resolution: None,
             schema_version: 2,
             lambda_squared: "13".to_owned(),
             n_modes: 1,
@@ -17486,36 +17768,45 @@ mod tests {
 
     #[test]
     fn legacy_and_krylov_eigenstate_cache_identities_are_disjoint() {
+        let tau_manifest = conditioning_test_manifest("ccm_tau_matrix", "key-source");
         let params = CcmParams::from_lambda_sq_integer(13, 120);
         let mut legacy = HighPrecConfig::for_decimal_digits(1_000);
         legacy.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
         let (legacy_semantic, legacy_logical) =
-            weil_eigenpair_cache_identity(&params, &legacy).unwrap();
+            weil_eigenpair_cache_identity(&params, &legacy, &tau_manifest).unwrap();
         assert_eq!(
             legacy_logical,
             format!("ccm/weil-eigenpair/13/120/{}/even", legacy.precision_bits)
         );
         assert_eq!(
             legacy_semantic.mathematical_semantics_version,
-            "ccm-smallest-weil-eigenpair-v0.13.0-v3"
+            "ccm-smallest-weil-eigenpair-stored-resolution-v4"
         );
         assert_eq!(
             legacy_semantic.resolved_mathematical_parameters,
             serde_json::json!({
+                "source_identity_arithmetic": MANAGED_EIGENSTATE_SOURCE_IDENTITY,
+                "tau_source_identity": DependencyRef { key: tau_manifest.key.clone(), content_digest: tau_manifest.content_digest.clone(), required_quality: CacheQuality::Validated },
                 "lambda_squared": "13",
                 "n_modes": 120,
                 "precision_bits": legacy.precision_bits,
                 "scalar_backend": "rug_mpfr",
                 "force_even": true,
                 "normalization": "sum_xi_equals_sqrt_log_lambda_squared",
-                "inverse_iteration_step_limit": 2_000
+                "inverse_iteration_step_limit": 2_000,
+                "inverse_iteration_semantics": xc_numerics::linalg::INVERSE_ITERATION_SEMANTICS,
+                "tau_residual_arithmetic": standalone_cache::RESIDUAL_ARITHMETIC,
+                "ground_index_validation": ground_index::ARITHMETIC,
+                "parity_basis_arithmetic": super::parity_math::ARITHMETIC,
+            "state_normalization_arithmetic": super::state_normalization_math::ARITHMETIC,
+            "l2_normalization_arithmetic": xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2
             })
         );
 
         let mut krylov = legacy.clone();
         krylov.eigenstate_solver = CcmEigenstateSolver::ShiftInvertKrylov;
         let (krylov_semantic, krylov_logical) =
-            weil_eigenpair_cache_identity(&params, &krylov).unwrap();
+            weil_eigenpair_cache_identity(&params, &krylov, &tau_manifest).unwrap();
         assert_eq!(
             krylov_logical,
             format!(
@@ -17532,7 +17823,7 @@ mod tests {
         let mut natural = legacy.clone();
         natural.set_parity_policy(CcmParityPolicy::Natural);
         let (natural_semantic, natural_logical) =
-            weil_eigenpair_cache_identity(&params, &natural).unwrap();
+            weil_eigenpair_cache_identity(&params, &natural, &tau_manifest).unwrap();
         assert_eq!(
             natural_logical,
             format!(
@@ -17544,7 +17835,7 @@ mod tests {
         let mut adaptive = legacy.clone();
         adaptive.set_parity_policy(CcmParityPolicy::AdaptiveEven);
         let (adaptive_semantic, adaptive_logical) =
-            weil_eigenpair_cache_identity(&params, &adaptive).unwrap();
+            weil_eigenpair_cache_identity(&params, &adaptive, &tau_manifest).unwrap();
         assert_eq!(
             adaptive_logical,
             format!(
@@ -17560,7 +17851,7 @@ mod tests {
         );
         assert_eq!(
             adaptive_semantic.mathematical_semantics_version,
-            "ccm-smallest-weil-eigenpair-adaptive-even-v1"
+            "ccm-smallest-weil-eigenpair-adaptive-even-resolution-v2"
         );
         assert_ne!(
             legacy_semantic.digest().unwrap(),
@@ -17574,6 +17865,23 @@ mod tests {
             natural_semantic.digest().unwrap(),
             adaptive_semantic.digest().unwrap()
         );
+        for current in [
+            &legacy_semantic,
+            &krylov_semantic,
+            &natural_semantic,
+            &adaptive_semantic,
+        ] {
+            assert_eq!(
+                current.resolved_mathematical_parameters["l2_normalization_arithmetic"],
+                xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2
+            );
+            let mut old = current.clone();
+            old.resolved_mathematical_parameters
+                .as_object_mut()
+                .unwrap()
+                .remove("l2_normalization_arithmetic");
+            assert_ne!(old.digest().unwrap(), current.digest().unwrap());
+        }
     }
 
     /// The persisted eigenpair must be a pure function of its semantic
@@ -17638,8 +17946,8 @@ mod tests {
         cfg.krylov_maximum_restarts = 16;
         let params_low = CcmParams::from_lambda_sq_integer(5, 2);
         let params = CcmParams::from_lambda_sq_integer(5, 3);
-        let l_low = log_lambda_sq_hp(&params_low, cfg.precision_bits);
-        let l = log_lambda_sq_hp(&params, cfg.precision_bits);
+        let l_low = log_lambda_sq_hp(&params_low, cfg.precision_bits).unwrap();
+        let l = log_lambda_sq_hp(&params, cfg.precision_bits).unwrap();
 
         // Cache A holds a compatible lower-N state before the target solve.
         let resolver_a = resolver_at(&base.join("a"));
@@ -17723,7 +18031,7 @@ mod tests {
         assert_eq!(manifest_a.content_digest, manifest_refresh.content_digest);
 
         // The retained payload records the canonical start, never a seed.
-        let (semantic, logical) = weil_eigenpair_cache_identity(&params, &cfg).unwrap();
+        let (semantic, logical) = weil_eigenpair_cache_identity(&params, &cfg, &tau_a.1).unwrap();
         let key = ArtifactKey {
             kind: semantic.artifact_kind.clone(),
             logical_key: logical,
@@ -17780,7 +18088,7 @@ mod tests {
         assert_eq!(independent.artifact_kind, "ccm_root_discovery_window");
         assert_eq!(
             independent.mathematical_semantics_version,
-            "ccm-root-range-v0.15.1-v11"
+            "ccm-root-discovery-v0.15.2-v2"
         );
         assert!(independent
             .resolved_mathematical_parameters
@@ -17818,7 +18126,7 @@ mod tests {
         assert_eq!(signed.target.as_deref(), Some("signed_ccm_spectral_roots"));
         assert_eq!(
             signed.mathematical_semantics_version,
-            "ccm-root-range-v0.15.1-v11-advanced"
+            "ccm-root-discovery-v0.15.2-v2"
         );
         assert_ne!(independent.digest().unwrap(), signed.digest().unwrap());
         let same_signed_window_for_another_request = root_range_semantic_key(
@@ -17895,7 +18203,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             adaptive_key.mathematical_semantics_version,
-            "ccm-root-range-v0.15.1-v12"
+            "ccm-root-discovery-v0.15.2-v2"
         );
         assert_eq!(
             adaptive_key
@@ -17925,7 +18233,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             fixed_key.mathematical_semantics_version,
-            "ccm-root-range-v0.15.1-v11"
+            "ccm-root-discovery-v0.15.2-v2"
         );
         assert!(fixed_key
             .resolved_mathematical_parameters
@@ -17994,8 +18302,7 @@ mod tests {
         );
         let matrix = vec![one.clone(), one.clone(), one, one_plus_delta];
         let factors = xc_numerics::linalg::lu_factor(&matrix, 2).unwrap();
-        let backward_error =
-            factorization_probe_backward_error(&matrix, &factors, 2, precision).unwrap();
+        let backward_error = factorization_backward_error(&matrix, &factors, 2, precision).unwrap();
         let tolerance = Float::with_val(precision, 2).pow(-((precision / 4) as i32));
         assert!(
             backward_error < tolerance,
@@ -18009,8 +18316,7 @@ mod tests {
             perm: vec![0, 0],
         };
         assert!(
-            factorization_probe_backward_error(&matrix, &invalid_permutation, 2, precision)
-                .is_none()
+            factorization_backward_error(&matrix, &invalid_permutation, 2, precision).is_none()
         );
     }
 
@@ -18202,8 +18508,8 @@ mod tests {
         let point = Float::with_val(precision, Float::parse("0.625").unwrap());
 
         let mut old_value = Float::with_val(precision, 0);
-        let mut old_residual = Float::with_val(precision, 0);
-        let mut old_scale = Float::with_val(precision, 0);
+        let mut exact_term_sum = rug::Rational::new();
+        let mut exact_magnitude_sum = rug::Rational::new();
         let mut old_first_derivative = Float::with_val(precision, 0);
         let mut old_second_derivative = Float::with_val(precision, 0);
         for (index, mode) in (-(n_modes as i64)..=(n_modes as i64)).enumerate() {
@@ -18214,8 +18520,16 @@ mod tests {
             let mut term = xi[index].clone();
             term /= &denominator;
             old_value += &term;
-            old_residual += &term;
-            old_scale += Float::with_val(precision, &term).abs();
+            // Quotients are point-rounded; their aggregate is now summed exactly
+            // before its single output rounding. Use GMP rational arithmetic.
+            let exact_denominator =
+                point.to_rational().unwrap() - poles[index].to_rational().unwrap();
+            let rational_term = xi[index].to_rational().unwrap() / exact_denominator;
+            let stored_term = Float::with_val(precision, rational_term)
+                .to_rational()
+                .unwrap();
+            exact_term_sum += &stored_term;
+            exact_magnitude_sum += stored_term.abs();
             let mut denominator_squared = denominator.clone();
             denominator_squared.square_mut();
             let mut first = xi[index].clone();
@@ -18234,7 +18548,10 @@ mod tests {
         );
         assert_eq!(
             secular_residual_and_scale_at(&xi, &poles, &point, precision).unwrap(),
-            (old_residual.abs(), old_scale)
+            (
+                Float::with_val(precision, exact_term_sum).abs(),
+                Float::with_val(precision, exact_magnitude_sum)
+            )
         );
 
         let mut retained_first = Float::with_val(precision, 0);
@@ -18433,7 +18750,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             format!(
-                "independent HP discovery found only {} positive roots, but target requests 20; enable the explicit incomplete-window policy or increase finite reach",
+                "independent exact discovery found only {} positive roots, but target requests 20; enable the explicit incomplete-window policy or increase finite reach",
                 complete.len()
             )
         );
@@ -18633,12 +18950,17 @@ mod tests {
         let l = Float::with_val(cfg.precision_bits, 13).ln();
         let xi = vec![Float::with_val(cfg.precision_bits, 1); params.matrix_size()];
         let value = Float::with_val(cfg.precision_bits, 1);
-        let correction = Float::with_val(cfg.precision_bits, Float::parse("1e-50").unwrap());
+        let spacing = secular_spacing(&l, cfg.precision_bits).unwrap();
+        let poles = secular_poles(&spacing, params.n_modes, cfg.precision_bits);
+        let correction = fixed_guard_retained_correction(
+            &xi,
+            &poles,
+            &value,
+            cfg.precision_bits,
+            cfg.root_solver,
+        )
+        .unwrap();
         assert!(correction >= root_correction_tolerance(&value, cfg.precision_bits));
-        let mut two_pi_over_l = pi(cfg.precision_bits);
-        two_pi_over_l *= 2u32;
-        two_pi_over_l /= &l;
-        let poles = secular_poles(&two_pi_over_l, params.n_modes, cfg.precision_bits);
         let result = RootRefinement {
             value: value.clone(),
             diagnostics: RootRefinementDiagnostics {
@@ -18664,7 +18986,7 @@ mod tests {
             discovery_mode: RootArtifactMode::Independent.as_str().to_owned(),
             reference_seeds_used: false,
             reference_dataset: None,
-            completeness: "unverified_computed_discovery".to_owned(),
+            completeness: "complete_requested_window_point_source".to_owned(),
             starting_points: vec![value.to_string()],
             outcomes: vec![PortableRootOutcome::Stagnated(
                 PortableRootRefinement::from_runtime(&result),
@@ -18746,7 +19068,7 @@ mod tests {
             )),
         }]);
         let policy = CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.15.0").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -18766,7 +19088,7 @@ mod tests {
                 xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
             production_sink: None,
         };
-        let l = log_lambda_sq_hp(params, cfg.precision_bits);
+        let l = log_lambda_sq_hp(params, cfg.precision_bits).unwrap();
         let plan = independently_discovered_starting_points(
             params,
             &l,
@@ -18834,7 +19156,7 @@ mod tests {
             .map(|v| Float::with_val(cfg.precision_bits, v))
             .collect::<Vec<_>>();
         check_complete_root_cache(&params, &cfg, &xi, 2);
-        let l = log_lambda_sq_hp(&params, cfg.precision_bits);
+        let l = log_lambda_sq_hp(&params, cfg.precision_bits).unwrap();
         let full = independently_discovered_starting_points(
             &params,
             &l,
@@ -18870,7 +19192,7 @@ mod tests {
         assert_ne!(old.digest().unwrap(), new.digest().unwrap());
         assert_eq!(
             new.mathematical_semantics_version,
-            "ccm-root-range-v0.15.1-v13"
+            "ccm-root-range-v0.15.2-v15"
         );
         let zero = vec![Float::with_val(cfg.precision_bits, 0); 5];
         let mut only_central = zero;
@@ -18950,7 +19272,7 @@ mod tests {
             )),
         }]);
         let policy = CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.14.1").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -18974,7 +19296,7 @@ mod tests {
         let mut fixed = HighPrecConfig::for_decimal_digits(40);
         fixed.precision_bits = 192;
         fixed.root_precision_policy = RootPrecisionPolicy::FixedGuard;
-        let l = log_lambda_sq_hp(&params, fixed.precision_bits);
+        let l = log_lambda_sq_hp(&params, fixed.precision_bits).unwrap();
         let xi = vec![Float::with_val(fixed.precision_bits, 1); params.matrix_size()];
         let seed = Float::with_val(fixed.precision_bits, 1);
         let secular_manifest = conditioning_test_manifest("ccm_secular_source", "adaptive-source");
@@ -19066,11 +19388,16 @@ mod tests {
             reused_manifest.content_digest,
             adaptive_manifest.content_digest
         );
+        let mut old_reader = policy.clone();
+        old_reader.current_toolkit_version = ToolkitVersion::parse("0.15.1").unwrap();
+        assert!(resolver
+            .resolve(&adaptive_manifest.key, &old_reader)
+            .is_err());
         let _ = std::fs::remove_dir_all(cache_root);
     }
 
     #[test]
-    fn fused_archimedean_integrals_are_bit_identical_to_separate_evaluators() {
+    fn directed_archimedean_integrals_match_independent_high_precision_evaluators() {
         let precision = 256;
         let l = Float::with_val(precision, 13).ln();
         let nodes = ["-0.91", "-0.43", "0", "0.37", "0.88"]
@@ -19081,36 +19408,78 @@ mod tests {
             .iter()
             .map(|value| Float::with_val(precision, Float::parse(value).unwrap()))
             .collect::<Vec<_>>();
-        let kappa_half = compute_kappa_half(&l, precision);
+        let reference_l = Float::with_val(2048, &l);
+        let reference_nodes = nodes
+            .iter()
+            .map(|v| Float::with_val(2048, v))
+            .collect::<Vec<_>>();
+        let reference_weights = weights
+            .iter()
+            .map(|v| Float::with_val(2048, v))
+            .collect::<Vec<_>>();
         for mode in 0..=6 {
             let fused =
-                compute_archimedean_integrals_l(mode, &l, precision, &nodes, &weights, &kappa_half);
+                compute_archimedean_integrals_l(mode, &l, precision, &nodes, &weights).unwrap();
             assert_eq!(
                 fused.0,
-                compute_alpha_l(mode, &l, precision, &nodes, &weights),
+                Float::with_val(
+                    precision,
+                    compute_alpha_l(
+                        mode,
+                        &reference_l,
+                        2048,
+                        &reference_nodes,
+                        &reference_weights
+                    )
+                ),
                 "alpha changed at mode {mode}"
             );
             assert_eq!(
                 fused.1,
-                compute_beta_l(mode, &l, precision, &nodes, &weights),
+                Float::with_val(
+                    precision,
+                    compute_beta_l(
+                        mode,
+                        &reference_l,
+                        2048,
+                        &reference_nodes,
+                        &reference_weights
+                    )
+                ),
                 "beta changed at mode {mode}"
             );
             assert_eq!(
                 fused.2,
-                compute_gamma_l(mode, &l, precision, &nodes, &weights),
+                Float::with_val(
+                    precision,
+                    compute_gamma_l(
+                        mode,
+                        &reference_l,
+                        2048,
+                        &reference_nodes,
+                        &reference_weights
+                    )
+                ),
                 "gamma changed at mode {mode}"
             );
         }
     }
 
     #[test]
-    fn precomputed_prime_kernels_are_bit_identical_to_reference() {
+    fn directed_prime_kernels_match_high_precision_reference() {
         for precision in [128, 257] {
             let l = Float::with_val(precision, 13).ln();
             for n_modes in 0..=4 {
-                let optimized = compute_prime_component_matrix(n_modes, 19, &l, precision);
-                let reference =
-                    compute_prime_component_matrix_reference(n_modes, 19, &l, precision);
+                let optimized = compute_prime_component_matrix(n_modes, 19, &l, precision).unwrap();
+                let reference = compute_prime_component_matrix_reference(
+                    n_modes,
+                    19,
+                    &Float::with_val(2048, &l),
+                    2048,
+                )
+                .iter()
+                .map(|v| Float::with_val(precision, v))
+                .collect::<Vec<_>>();
                 assert_eq!(
                     optimized.len(),
                     reference.len(),
@@ -19157,12 +19526,46 @@ mod tests {
                 };
                 let one = one_worker.install(|| {
                     assemble_pole_and_archimedean_components(n_modes, &l, precision, &integrals)
+                        .unwrap()
                 });
                 let four = four_workers.install(|| {
                     assemble_pole_and_archimedean_components(n_modes, &l, precision, &integrals)
+                        .unwrap()
                 });
+                let reference_integrals = ComputedArchimedeanIntegrals {
+                    alpha: integrals
+                        .alpha
+                        .iter()
+                        .map(|v| Float::with_val(2048, v))
+                        .collect(),
+                    beta: integrals
+                        .beta
+                        .iter()
+                        .map(|v| Float::with_val(2048, v))
+                        .collect(),
+                    gamma: integrals
+                        .gamma
+                        .iter()
+                        .map(|v| Float::with_val(2048, v))
+                        .collect(),
+                };
                 let expected = assemble_pole_and_archimedean_components_reference(
-                    n_modes, &l, precision, &integrals,
+                    n_modes,
+                    &Float::with_val(2048, &l),
+                    2048,
+                    &reference_integrals,
+                );
+                let expected = (
+                    expected
+                        .0
+                        .iter()
+                        .map(|v| Float::with_val(precision, v))
+                        .collect::<Vec<_>>(),
+                    expected
+                        .1
+                        .iter()
+                        .map(|v| Float::with_val(precision, v))
+                        .collect::<Vec<_>>(),
                 );
                 assert_eq!(
                     one, expected,
@@ -19208,8 +19611,8 @@ mod tests {
         let (integrals, _) =
             compute_archimedean_integrals_tracked(n_modes, &l, &cfg, None).unwrap();
         let (pole, archimedean) =
-            assemble_pole_and_archimedean_components(n_modes, &l, precision, &integrals);
-        let prime = compute_prime_component_matrix(n_modes, lambda_sq, &l, precision);
+            assemble_pole_and_archimedean_components(n_modes, &l, precision, &integrals).unwrap();
+        let prime = compute_prime_component_matrix(n_modes, lambda_sq, &l, precision).unwrap();
 
         assert_eq!(fused_one.pole, pole);
         assert_eq!(fused_one.archimedean, archimedean);
@@ -19261,6 +19664,7 @@ mod tests {
         let result = match route.as_str() {
             "direct" => {
                 assemble_pole_and_archimedean_components(n_modes, &l, precision, &integrals)
+                    .unwrap()
             }
             "reference" => assemble_pole_and_archimedean_components_reference(
                 n_modes, &l, precision, &integrals,
@@ -19296,7 +19700,7 @@ mod tests {
             )),
         }]);
         let policy = CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -19318,7 +19722,7 @@ mod tests {
         };
         let params = CcmParams::from_lambda_sq_integer(5, 2);
         let cfg = HighPrecConfig::for_decimal_digits(40);
-        let l = log_lambda_sq_hp(&params, cfg.precision_bits);
+        let l = log_lambda_sq_hp(&params, cfg.precision_bits).unwrap();
         let first = build_tau_hp_via_cache(&params, &l, &cfg, &context).unwrap();
         let second = build_tau_hp_via_cache(&params, &l, &cfg, &context).unwrap();
         assert_eq!(first, second);
@@ -19359,8 +19763,10 @@ mod tests {
         assert_eq!(auto_next.xi.len(), 7);
         let mut resolved_auto_cfg = cfg.clone();
         resolved_auto_cfg.eigenstate_solver = CcmEigenstateSolver::ShiftInvertKrylov;
+        let auto_next_tau = build_tau_hp_via_cache(&auto_next_params, &l, &cfg, &context).unwrap();
         let (auto_next_semantic, auto_next_logical) =
-            weil_eigenpair_cache_identity(&auto_next_params, &resolved_auto_cfg).unwrap();
+            weil_eigenpair_cache_identity(&auto_next_params, &resolved_auto_cfg, &auto_next_tau.1)
+                .unwrap();
         let auto_next_key = ArtifactKey {
             kind: auto_next_semantic.artifact_kind.clone(),
             logical_key: auto_next_logical,
@@ -19528,7 +19934,7 @@ mod tests {
                 tau[column * dim + row] = value;
             }
         }
-        let sector = build_even_sector_matrix(&tau, n_modes, precision_bits);
+        let sector = build_even_sector_matrix(&tau, n_modes, precision_bits).unwrap();
         let y = vec![
             Float::with_val(precision_bits, 1),
             Float::with_val(precision_bits, 2),
@@ -19558,7 +19964,7 @@ mod tests {
             &ResearchAssemblyOptions::default(),
         )
         .unwrap();
-        let even = build_even_sector_matrix(&matrix.entries, modes, 256);
+        let even = build_even_sector_matrix(&matrix.entries, modes, 256).unwrap();
         let original = even.clone();
         let reports = [256, 512].map(|p| {
             xc_numerics::prefix::analyze_prefixes_with_policy(
@@ -19666,7 +20072,7 @@ mod tests {
             }
         }
 
-        let sector = build_odd_sector_matrix(&tau, n_modes, precision_bits);
+        let sector = build_odd_sector_matrix(&tau, n_modes, precision_bits).unwrap();
         for k in 1..=n_modes {
             for j in 1..=n_modes {
                 let mut historical = tau[(n_modes + k) * dim + (n_modes + j)].clone();
@@ -19949,6 +20355,8 @@ mod tests {
         let pair = |index: usize, value: &str| CcmSectorEigenpairHp {
             algebraic_index: index,
             eigenvalue: Float::with_val(precision_bits, Float::parse(value).unwrap()),
+            eigenvalue_lower: Float::with_val(precision_bits, Float::parse(value).unwrap()),
+            eigenvalue_upper: Float::with_val(precision_bits, Float::parse(value).unwrap()),
             eigenvector: vec![Float::with_val(precision_bits, 1)],
             residual_norm: Float::with_val(precision_bits, 0),
         };
@@ -20000,7 +20408,7 @@ mod tests {
             )),
         }]);
         let policy = CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -20029,7 +20437,7 @@ mod tests {
         };
         let params = CcmParams::from_lambda_sq_integer(5, 2);
         let cfg = HighPrecConfig::for_decimal_digits(40);
-        let l = log_lambda_sq_hp(&params, cfg.precision_bits);
+        let l = log_lambda_sq_hp(&params, cfg.precision_bits).unwrap();
         let first = build_tau_hp_via_cache(&params, &l, &cfg, &context).unwrap();
         let reused = build_tau_hp_via_cache(&params, &l, &cfg, &context).unwrap();
         assert_eq!(first, reused);
@@ -20103,7 +20511,7 @@ mod tests {
         let params = CcmParams::from_lambda_sq_integer(13, 1);
         let mut cfg = HighPrecConfig::for_decimal_digits(40);
         cfg.precision_bits = precision_bits;
-        let l = log_lambda_sq_hp(&params, precision_bits);
+        let l = log_lambda_sq_hp(&params, precision_bits).unwrap();
         let mut spacing = pi(precision_bits);
         spacing *= 2u32;
         spacing /= &l;
@@ -20214,7 +20622,14 @@ mod tests {
         ];
         let velocity =
             apply_prime_power_velocity(n_modes, 13, 13, &l, &vector, precision_bits).unwrap();
-        assert!(velocity.reduced_position.is_zero());
+        // Stored L is a dyadic approximation of log(13), so exact constant
+        // arithmetic retains its tiny offset from the activation boundary.
+        let reduced =
+            Float::with_val(1024, 1) - Float::with_val(1024, 13).ln() / Float::with_val(1024, &l);
+        assert_eq!(
+            velocity.reduced_position,
+            Float::with_val(precision_bits, reduced)
+        );
         let vector_sum =
             xc_numerics::reduction::deterministic_pairwise_sum_hp(&vector, precision_bits);
         for value in velocity.action {
@@ -20235,7 +20650,7 @@ mod tests {
         let params = CcmParams::from_lambda_sq_integer(cutoff, n);
         let mut cfg = HighPrecConfig::for_decimal_digits(40);
         cfg.precision_bits = bits;
-        let l = log_lambda_sq_hp(&params, bits);
+        let l = log_lambda_sq_hp(&params, bits).unwrap();
         let dimension = params.matrix_size();
         let mut tau = vec![Float::with_val(bits, 0); dimension * dimension];
         for index in 0..dimension {
@@ -20408,7 +20823,7 @@ mod tests {
         let params = CcmParams::from_lambda_sq_integer(13, 1);
         let mut cfg = HighPrecConfig::for_decimal_digits(40);
         cfg.precision_bits = precision_bits;
-        let l = log_lambda_sq_hp(&params, precision_bits);
+        let l = log_lambda_sq_hp(&params, precision_bits).unwrap();
         let tau = vec![
             Float::with_val(precision_bits, 2),
             Float::with_val(precision_bits, 0),
@@ -20536,6 +20951,7 @@ mod tests {
             }
         };
         let preparation = ResponseSpectralPreparation {
+            source_matrix_eigenvalue_allowance: Float::with_val(precision_bits, 0),
             even_sector_matrix: vec![
                 Float::with_val(precision_bits, 1),
                 Float::with_val(precision_bits, 0),
@@ -20588,7 +21004,7 @@ mod tests {
         .unwrap();
         let preparation =
             compute_response_spectral_preparation(&params, &cfg, &retained.tau).unwrap();
-        let xi_norm = deterministic_l2_norm_hp(&source.xi, cfg.precision_bits);
+        let xi_norm = deterministic_l2_norm_hp(&source.xi, cfg.precision_bits).unwrap();
         let unit_state = source
             .xi
             .iter()
@@ -20669,8 +21085,8 @@ mod tests {
                 value
             })
             .collect::<Vec<_>>();
-        let mut relative = deterministic_l2_norm_hp(&difference, precision_bits);
-        let mut scale = deterministic_l2_norm_hp(right, precision_bits);
+        let mut relative = deterministic_l2_norm_hp(&difference, precision_bits).unwrap();
+        let mut scale = deterministic_l2_norm_hp(right, precision_bits).unwrap();
         if scale < 1 {
             scale = Float::with_val(precision_bits, 1);
         }
@@ -20691,13 +21107,13 @@ mod tests {
         let params = CcmParams::from_lambda_sq_integer(13, 1);
         let mut cfg = HighPrecConfig::for_decimal_digits(40);
         cfg.precision_bits = precision_bits;
-        let l = log_lambda_sq_hp(&params, precision_bits);
+        let l = log_lambda_sq_hp(&params, precision_bits).unwrap();
         let raw_state = vec![
             Float::with_val(precision_bits, 1),
             Float::with_val(precision_bits, 2),
             Float::with_val(precision_bits, 3),
         ];
-        let norm = deterministic_l2_norm_hp(&raw_state, precision_bits);
+        let norm = deterministic_l2_norm_hp(&raw_state, precision_bits).unwrap();
         let state = raw_state
             .iter()
             .map(|value| {
@@ -20737,7 +21153,8 @@ mod tests {
     fn secular_pole_motion_response_matches_closed_form() {
         let precision_bits = 192;
         let l = Float::with_val(precision_bits, 13).ln();
-        let (poles, pole_velocities) = ccm_secular_poles_and_u_velocities(&l, 1, precision_bits);
+        let (poles, pole_velocities) =
+            ccm_secular_poles_and_u_velocities(&l, 1, precision_bits).unwrap();
         let xi = vec![
             Float::with_val(precision_bits, 1),
             Float::with_val(precision_bits, 0),
@@ -20824,7 +21241,7 @@ mod tests {
             Float::with_val(reference_bits, 1),
             Float::with_val(reference_bits, 1),
         ];
-        let norm = deterministic_l2_norm_hp(&weights, reference_bits);
+        let norm = deterministic_l2_norm_hp(&weights, reference_bits).unwrap();
         let unit_reference = weights
             .iter()
             .map(|weight| {
@@ -20875,8 +21292,19 @@ mod tests {
             &unit_state,
         )
         .unwrap();
-        let shifted_norm = shifted_matrix_frobenius_norm(&tau, &eigenvalue, 5, bits);
-        let sum = xc_numerics::reduction::deterministic_pairwise_sum_hp(&unit_state, bits);
+        let shifted_norm = shifted_matrix_frobenius_norm(&tau, &eigenvalue, 5, bits).unwrap();
+        // Supply the exact stored-source sum rounded once. The former pairwise
+        // fixture input loses cancellation bits and now fails source binding.
+        let exact_sum = unit_state
+            .iter()
+            .fold(rug::Rational::from(0), |sum, value| {
+                sum + value.to_rational().unwrap()
+            });
+        let sum = Float::with_val(bits, exact_sum);
+        assert_ne!(
+            sum,
+            xc_numerics::reduction::deterministic_pairwise_sum_hp(&unit_state, bits)
+        );
         let scale = Float::with_val(bits, &sum).recip();
         let zero = Float::with_val(bits, 0);
         let poles = (-2..=2)
@@ -20985,7 +21413,7 @@ mod tests {
         let params = CcmParams::from_lambda_sq_integer(13, 1);
         let mut cfg = HighPrecConfig::for_decimal_digits(40);
         cfg.precision_bits = precision_bits;
-        let l = log_lambda_sq_hp(&params, precision_bits);
+        let l = log_lambda_sq_hp(&params, precision_bits).unwrap();
         let tau = vec![
             Float::with_val(precision_bits, 2),
             Float::with_val(precision_bits, 0),
@@ -21005,7 +21433,7 @@ mod tests {
         ];
         let spectral_preparation =
             compute_response_spectral_preparation(&params, &cfg, &tau).unwrap();
-        let xi_norm = deterministic_l2_norm_hp(&xi, precision_bits);
+        let xi_norm = deterministic_l2_norm_hp(&xi, precision_bits).unwrap();
         let unit_state = xi
             .iter()
             .map(|value| {
@@ -21149,7 +21577,7 @@ mod tests {
         let params = CcmParams::from_lambda_sq_integer(13, 1);
         let mut cfg = HighPrecConfig::for_decimal_digits(40);
         cfg.precision_bits = precision_bits;
-        let l = log_lambda_sq_hp(&params, precision_bits);
+        let l = log_lambda_sq_hp(&params, precision_bits).unwrap();
         let tau = vec![
             Float::with_val(precision_bits, 2),
             Float::with_val(precision_bits, 0),
@@ -21263,11 +21691,11 @@ mod tests {
             serde_json::from_str(&manifests[0].tags[xc_cache::SEMANTIC_KEY_MANIFEST_TAG]).unwrap();
         assert_eq!(
             semantic.mathematical_semantics_version,
-            "ccm-u-flow-response-v0.15.1-v4"
+            "ccm-u-flow-response-exact-quadrants-v4"
         );
         assert_eq!(
             manifests[0].minimum_reader_version,
-            ToolkitVersion::parse("0.15.1").unwrap()
+            ToolkitVersion::parse("0.15.2").unwrap()
         );
         let mut legacy = semantic.clone();
         legacy.mathematical_semantics_version = "ccm-u-flow-response-v0.15.0-v3".into();
@@ -21311,6 +21739,101 @@ mod tests {
         .unwrap();
         assert_eq!(u_flow_created, u_flow_reused);
         assert_eq!(u_flow_created, u_flow_refreshed);
+        // The source transform is an explicit dependency of both response
+        // kinds, and is required even when a response payload is already warm.
+        for (kind, prefix, version) in [
+            (
+                "ccm_prime_power_response_analysis",
+                "ccm/prime-power-response/",
+                PRIME_POWER_RESPONSE_MATHEMATICAL_SEMANTICS,
+            ),
+            (
+                "ccm_u_flow_response_analysis",
+                "ccm/u-flow-response/",
+                U_FLOW_RESPONSE_MATHEMATICAL_SEMANTICS,
+            ),
+        ] {
+            let keys = store.matching_keys(kind, prefix, 10).unwrap();
+            assert_eq!(keys.len(), 1);
+            let rows = store.candidates(&keys[0]).unwrap();
+            assert!(!rows.is_empty());
+            for row in &rows {
+                let key: SemanticKeyEnvelope =
+                    serde_json::from_str(&row.tags[xc_cache::SEMANTIC_KEY_MANIFEST_TAG]).unwrap();
+                assert_eq!(key.mathematical_semantics_version, version);
+                let digest = &key.source_data_identities["ccm_even_sector_transform"];
+                assert_eq!(
+                    key.resolved_mathematical_parameters["even_sector_transform_content_digest"],
+                    digest.0
+                );
+                assert!(row
+                    .dependencies
+                    .iter()
+                    .any(|d| d.key.kind == "ccm_sector_transform" && &d.content_digest == digest));
+            }
+        }
+
+        struct HiddenTransform(xc_cache::FilesystemCacheStore);
+        impl xc_cache::CacheStore for HiddenTransform {
+            fn name(&self) -> &str {
+                "workstation"
+            }
+            fn writable(&self) -> bool {
+                false
+            }
+            fn visibility(&self) -> CacheVisibility {
+                CacheVisibility::Local
+            }
+            fn put(
+                &self,
+                _: &xc_cache::ArtifactDraft,
+                _: &[u8],
+            ) -> std::result::Result<ArtifactManifest, CacheError> {
+                Err(CacheError::InvalidManifest("read-only test layer".into()))
+            }
+            fn candidates(
+                &self,
+                key: &xc_cache::ArtifactKey,
+            ) -> std::result::Result<Vec<ArtifactManifest>, CacheError> {
+                if key.kind == "ccm_sector_transform" {
+                    Ok(vec![])
+                } else {
+                    self.0.candidates(key)
+                }
+            }
+            fn read_payload_to(
+                &self,
+                m: &ArtifactManifest,
+                w: &mut dyn std::io::Write,
+            ) -> std::result::Result<(), CacheError> {
+                self.0.read_payload_to(m, w)
+            }
+        }
+        let missing_transform = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(HiddenTransform(FilesystemCacheStore::new(
+                "workstation",
+                cache_root.join("cache"),
+                false,
+                CacheVisibility::Local,
+            ))),
+        }]);
+        let missing_context = ArtifactCacheContext {
+            resolver: Some(&missing_transform),
+            ..context(ArtifactExecutionCacheMode::RequireReuse, false)
+        };
+        assert!(
+            resolve_response_spectral_preparation_via_cache(
+                &params,
+                &cfg,
+                &tau,
+                &tau_manifest,
+                &missing_context,
+            )
+            .is_err(),
+            "warm response preparation must not bypass a missing transform"
+        );
+
         response_repair::check_fresh_response_repair(
             prime_created,
             u_flow_created,
@@ -21342,7 +21865,7 @@ mod tests {
             )),
         }]);
         let policy = CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.14.1").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -21366,7 +21889,7 @@ mod tests {
         let params = CcmParams::from_lambda_sq_integer(13, 1);
         let mut cfg = HighPrecConfig::for_decimal_digits(40);
         cfg.precision_bits = precision_bits;
-        let l = log_lambda_sq_hp(&params, precision_bits);
+        let l = log_lambda_sq_hp(&params, precision_bits).unwrap();
         let mut spacing = pi(precision_bits);
         spacing *= 2u32;
         spacing /= &l;
@@ -21455,7 +21978,7 @@ mod tests {
             )),
         }]);
         let policy = CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -21604,6 +22127,7 @@ mod tests {
             },
         };
         let runtime = HighPrecResult {
+            stored_state_resolution: None,
             eigenvalues_pos: vec![
                 EigenvalueResult::Converged(refinement(
                     precision_bits,
@@ -21710,9 +22234,13 @@ mod tests {
         }
         let mut cfg = HighPrecConfig::for_decimal_digits(20);
         cfg.precision_bits = 64;
-        let unresolved =
+        let near_one =
             ExactLambdaSquaredHp::new(decimal("1.0000000000000000000000000000000000000001"), 1)
                 .unwrap();
+        assert!(localized_weil_form_exact_hp(near_one, 0, &cfg, true).is_ok());
+        // Resolving this cutoff needs more than the 4096 guard-bit budget.
+        let text = format!("1.{}1", "0".repeat(1999));
+        let unresolved = ExactLambdaSquaredHp::new(decimal(&text), 1).unwrap();
         assert!(localized_weil_form_exact_hp(unresolved, 0, &cfg, true).is_err());
         let bypassed = ExactLambdaSquaredHp {
             decimal: decimal("13.5"),
@@ -22248,12 +22776,10 @@ mod tests {
         );
     }
 
-    /// Sonin restriction deflates exactly `n_drop` band-concentrated modes:
-    /// they cluster near the shift σ (≈ max eigenvalue), well separated
-    /// from the rest, and the result shape is consistent.
+    /// A genuine restriction has dim-n_drop values, with no shifted modes.
     #[test]
     #[ignore = "HP matrix compute — GMP arena exhaustion in long debug test runs on WSL2; run with: RAYON_NUM_THREADS=2 cargo test --features hp -- --include-ignored --test-threads=1"]
-    fn weil_sonin_deflates_band_modes() {
+    fn weil_sonin_restricts_band_modes() {
         let params = CcmParams::from_lambda_sq_integer(5, 8);
         let mut cfg = HighPrecConfig::for_decimal_digits(30);
         cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
@@ -22263,24 +22789,13 @@ mod tests {
         let n_drop = 5usize;
         let res = weil_spectrum_sonin_hp(&params, &cfg, &omega, n_drop).unwrap();
         assert_eq!(res.chi.len(), dim);
-        assert_eq!(res.spectrum.len(), dim);
+        assert_eq!(res.spectrum.len(), dim - n_drop);
         assert_eq!(res.n_dropped, n_drop);
         for w in res.chi.windows(2) {
             assert!(w[0].to_f64() <= w[1].to_f64() + 1e-12, "χ not ascending");
         }
-        // The n_drop deflated modes cluster near σ (the max); everything
-        // else sits below σ/2 — so exactly n_drop eigenvalues exceed σ/2.
-        let s: Vec<f64> = res.spectrum.iter().map(|x| x.to_f64()).collect();
-        let max_v = *s.last().unwrap();
-        assert!(
-            max_v > 10.0,
-            "deflation shift σ should be large, got {max_v}"
-        );
-        let big = s.iter().filter(|&&e| e > max_v / 2.0).count();
-        assert_eq!(
-            big, n_drop,
-            "expected {n_drop} deflated modes near σ, got {big}"
-        );
+        assert!(res.spectrum.iter().all(|x| x.is_finite()));
+        assert!(res.spectrum.windows(2).all(|w| w[0] <= w[1]));
     }
 
     /// HighPrecConfig::for_decimal_digits at 500 digits.
@@ -22538,7 +23053,7 @@ mod tests {
         let prec = 512;
         // λ²=2.5 — fractional. ln(2.5) = 0.916290731874155...
         let params = CcmParams::from_lambda_sq_fractional(2.5, 10);
-        let l = log_lambda_sq_hp(&params, prec);
+        let l = log_lambda_sq_hp(&params, prec).unwrap();
         // Reference: ln(2.5) computed at HP from exact rational 5/2.
         let ref_val = {
             let five = Float::with_val(prec, 5);
@@ -22764,7 +23279,7 @@ mod tests {
         let mut sym = vec![Float::with_val(prec, 0); dim * dim];
         for i in 0..dim {
             for j in i..dim {
-                let val = Float::with_val(prec, (i + j + 1) as f64);
+                let val = Float::with_val(prec, i.abs_diff(j) + 1);
                 sym[i * dim + j] = val.clone();
                 sym[j * dim + i] = val;
             }
@@ -22819,7 +23334,13 @@ mod tests {
         })
         .to_string();
         assert!(
-            super::tau_cache::parse_json_for_test(&payload, n_modes, prec).is_none(),
+            super::tau_cache::parse_json_for_test(
+                &payload,
+                super::super::LambdaSq::integer(13),
+                n_modes,
+                prec
+            )
+            .is_none(),
             "tau parser should reject a stale toolkit_version=0.0.1"
         );
     }
@@ -22857,7 +23378,7 @@ mod tests {
         let mut sym = vec![Float::with_val(prec, 0); dim * dim];
         for i in 0..dim {
             for j in i..dim {
-                let val = Float::with_val(prec, (i + j + 1) as f64);
+                let val = Float::with_val(prec, i.abs_diff(j) + 1);
                 sym[i * dim + j] = val.clone();
                 sym[j * dim + i] = val;
             }
@@ -22866,9 +23387,11 @@ mod tests {
         let valid_path = temp_dir.join(&valid_name);
         let strs: Vec<String> = sym.iter().map(|f| f.to_string()).collect();
         let valid_json = serde_json::json!({
-            "schema_version": 1,
+            "schema_version":3,"assembly_arithmetic":"directed_component_point_stages_length_aware_arch_v3","quadrature_points":64,
             "toolkit_version": super::tau_cache::toolkit_version_for_test(),
             "lambda_sq": lambda_sq.value_f64,
+            "lambda_sq_mode":lambda_sq.mode_str(),"lambda_sq_key":lambda_sq.filename_str(),"prime_cutoff":lambda_sq.value_u64,
+            "tau_residual_arithmetic":standalone_cache::RESIDUAL_ARITHMETIC,
             "n_modes": n_modes,
             "precision_bits": prec,
             "matrix": strs,
@@ -22885,9 +23408,10 @@ mod tests {
         let bad_path = temp_dir.join(&bad_name);
         let bad_strs: Vec<String> = asym.iter().map(|f| f.to_string()).collect();
         let bad_json = serde_json::json!({
-            "schema_version": 1,
+            "schema_version":3,"assembly_arithmetic":"directed_component_point_stages_length_aware_arch_v3","quadrature_points":64,
             "toolkit_version": super::tau_cache::toolkit_version_for_test(),
             "lambda_sq": lsq_bad.value_f64,
+            "lambda_sq_mode":lsq_bad.mode_str(),"lambda_sq_key":lsq_bad.filename_str(),"prime_cutoff":lsq_bad.value_u64,
             "n_modes": n_modes,
             "precision_bits": prec,
             "matrix": bad_strs,
@@ -22985,7 +23509,7 @@ mod tests {
         let mut m = vec![Float::with_val(prec, 0); dim * dim];
         for i in 0..dim {
             for j in i..dim {
-                let val = Float::with_val(prec, (i + j + 1) as f64);
+                let val = Float::with_val(prec, i.abs_diff(j) + 1);
                 m[i * dim + j] = val.clone();
                 m[j * dim + i] = val;
             }
@@ -22993,9 +23517,11 @@ mod tests {
         m[0 * dim + 1] = Float::with_val(prec, 99); // τ[1,0] unchanged → asymmetric
         let strs: Vec<String> = m.iter().map(|f| f.to_string()).collect();
         let json = serde_json::json!({
-            "schema_version": 1,
+            "schema_version":3,"assembly_arithmetic":"directed_component_point_stages_length_aware_arch_v3","quadrature_points":64,
             "toolkit_version": super::tau_cache::toolkit_version_for_test(),
             "lambda_sq": lambda_sq.value_f64,
+            "lambda_sq_mode":lambda_sq.mode_str(),"lambda_sq_key":lambda_sq.filename_str(),"prime_cutoff":lambda_sq.value_u64,
+            "tau_residual_arithmetic":standalone_cache::RESIDUAL_ARITHMETIC,
             "n_modes": n_modes,
             "precision_bits": prec,
             "matrix": strs,
@@ -23017,11 +23543,11 @@ mod tests {
         // load must skip the asymmetric matrix (None). JsonOnly is a
         // read no-op; JsonZip reads the zip, runs structural_check, rejects.
         assert!(
-            load(lambda_sq, n_modes, prec, CacheMode::JsonOnly).is_none(),
+            load(lambda_sq, n_modes, prec, 64, CacheMode::JsonOnly).is_none(),
             "JsonOnly is a read no-op under the zip-only contract"
         );
         assert!(
-            load(lambda_sq, n_modes, prec, CacheMode::JsonZip).is_none(),
+            load(lambda_sq, n_modes, prec, 64, CacheMode::JsonZip).is_none(),
             "structurally-invalid (asymmetric) τ matrix in the zip must be skipped"
         );
 
@@ -23064,7 +23590,7 @@ mod tests {
         std::fs::write(&zip_path, b"not a zip file at all -- random bytes").unwrap();
 
         assert!(
-            load(lambda_sq, n_modes, prec, CacheMode::JsonZip).is_none(),
+            load(lambda_sq, n_modes, prec, 64, CacheMode::JsonZip).is_none(),
             "corrupt τ .json.zip must be skipped, not loaded"
         );
 
@@ -23081,6 +23607,121 @@ mod tests {
     // weil_eigvec_cache tests
     // -----------------------------------------------------------------
 
+    fn invalid_cache_replacement_tau(kind: usize) {
+        let dir = crate::fresh_test_dir("invalid-tau-generation");
+        let _guard = CwdGuard::enter(&dir);
+        let lambda = crate::ccm::LambdaSq::integer(13);
+        let p = 128;
+        let mode = xc_numerics::quadrature::CacheMode::JsonZip;
+        let source = [2, 0, 0, 0, 1, 0, 0, 0, 2].map(|x| Float::with_val(p, x));
+        tau_cache::save(lambda, 1, p, 64, &source, mode);
+        assert_eq!(tau_cache::load(lambda, 1, p, 64, mode).unwrap(), source);
+        let mut invalid = source.to_vec();
+        match kind {
+            0 => {
+                invalid.pop();
+            }
+            1 => invalid[4] = Float::with_val(p, rug::float::Special::Nan),
+            _ => {
+                invalid[4] = Float::with_val(p + 16, 3);
+                invalid[4].next_up();
+            }
+        }
+        tau_cache::save(lambda, 1, p, 64, &invalid, mode);
+        assert_eq!(
+            tau_cache::load(lambda, 1, p, 64, mode),
+            Some(source.to_vec()),
+            "invalid replacement destroyed valid Tau cache"
+        );
+    }
+    fn invalid_cache_replacement_xi(kind: usize) {
+        let dir = crate::fresh_test_dir("invalid-xi-generation");
+        let _guard = CwdGuard::enter(&dir);
+        let lambda = crate::ccm::LambdaSq::integer(13);
+        let p = 128;
+        let mode = xc_numerics::quadrature::CacheMode::JsonZip;
+        let parity = CcmParityPolicy::EvenSector;
+        let digest = xc_cache::ContentDigest("a".repeat(64));
+        let source = [1, 2, 1].map(|x| Float::with_val(p, x));
+        let eps = Float::with_val(p, 1);
+        let diagnostics = xc_numerics::linalg::InverseIterationDiagnostics {
+            configured_step_limit: 1,
+            unshifted_steps: 1,
+            unshifted_converged: true,
+            final_relative_rayleigh_change: Some(Float::with_val(p, 0)),
+            shifted_refinement: xc_numerics::linalg::ShiftedRefinementOutcome::Accepted,
+            final_relative_residual_norm: Float::with_val(p, 0),
+        };
+        weil_eigvec_cache::save(
+            lambda,
+            1,
+            p,
+            &digest,
+            &eps,
+            &source,
+            &diagnostics,
+            mode,
+            parity,
+        );
+        assert_eq!(
+            weil_eigvec_cache::load(lambda, 1, p, &digest, mode, parity)
+                .unwrap()
+                .xi,
+            source
+        );
+        let mut invalid = source.to_vec();
+        match kind {
+            0 => {
+                invalid.pop();
+            }
+            1 => invalid[1] = Float::with_val(p, rug::float::Special::Nan),
+            _ => {
+                invalid[1] = Float::with_val(p + 16, 3);
+                invalid[1].next_up();
+            }
+        }
+        weil_eigvec_cache::save(
+            lambda,
+            1,
+            p,
+            &digest,
+            &eps,
+            &invalid,
+            &diagnostics,
+            mode,
+            parity,
+        );
+        assert_eq!(
+            weil_eigvec_cache::load(lambda, 1, p, &digest, mode, parity).map(|x| x.xi),
+            Some(source.to_vec()),
+            "invalid replacement destroyed valid Xi cache"
+        );
+    }
+    #[test]
+    fn exhaustive_cache_generation_tau_invalid_shape() {
+        invalid_cache_replacement_tau(0);
+    }
+    #[test]
+    fn exhaustive_cache_generation_tau_nonfinite() {
+        invalid_cache_replacement_tau(1);
+    }
+    #[test]
+    fn exhaustive_cache_generation_tau_precision() {
+        invalid_cache_replacement_tau(2);
+    }
+    #[test]
+    fn exhaustive_cache_generation_xi_invalid_shape() {
+        invalid_cache_replacement_xi(0);
+    }
+    #[test]
+    fn exhaustive_cache_generation_xi_nonfinite() {
+        invalid_cache_replacement_xi(1);
+    }
+    #[test]
+    fn exhaustive_cache_generation_xi_precision() {
+        invalid_cache_replacement_xi(2);
+    }
+
     /// A fresh temp dir + cwd guard so cache reads/writes land in a
     /// throwaway location and never touch the real `data/` tree.
     /// Scratch lives under `target/test-tmp/` (removed by `cargo clean`),
@@ -23089,8 +23730,458 @@ mod tests {
         crate::fresh_test_dir(&format!("weil_eigvec_{}", tag))
     }
 
-    /// `parse_json` accepts a well-formed entry and rejects metadata
-    /// mismatches, wrong xi length, and non-finite values.
+    #[test]
+    fn exhaustive_standalone_source_identity_tau_requires_quadrature() {
+        let mut value = exhaustive_standalone_tau_fixture();
+        value.as_object_mut().unwrap().remove("quadrature_points");
+        assert!(tau_cache::parse_json_for_test(
+            &value.to_string(),
+            crate::ccm::LambdaSq::integer(13),
+            1,
+            128
+        )
+        .is_none());
+    }
+    #[test]
+    fn exhaustive_standalone_source_identity_xi_requires_source() {
+        let mut value = exhaustive_standalone_xi_fixture();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("tau_source_point_digest");
+        assert!(weil_eigvec_cache::parse_json(
+            &value.to_string(),
+            crate::ccm::LambdaSq::integer(13),
+            1,
+            128
+        )
+        .is_none());
+    }
+    #[test]
+    fn exhaustive_standalone_source_identity_changed_quadrature_recomputes() {
+        let temp = crate::fresh_test_dir("standalone-source-quadrature");
+        let guard = CwdGuard::enter(&temp);
+        let params = CcmParams::from_lambda_sq_integer(13, 1);
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = 128;
+        cfg.quad_points = 16;
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::JsonZip;
+        let l = log_lambda_sq_hp(&params, 128).unwrap();
+        let low = build_tau_hp(&params, &l, &cfg).unwrap();
+        cfg.quad_points = 256;
+        let fresh = build_tau_hp_compute(&params, &l, &cfg, true).unwrap();
+        assert_ne!(
+            low, fresh,
+            "fixture must expose distinct stored matrix points"
+        );
+        let requested = build_tau_hp(&params, &l, &cfg).unwrap();
+        assert_eq!(
+            requested, fresh,
+            "standalone cache reused another quadrature computation"
+        );
+        drop(guard);
+        // Best-effort cleanup: the assertions above are the test. Concurrent tests
+        // may briefly hold entries in the shared working directory.
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn exhaustive_standalone_source_identity_header_boundaries() {
+        let lambda = crate::ccm::LambdaSq::integer(13);
+        let tau = exhaustive_standalone_tau_fixture();
+        assert!(tau_cache::parse_json_for_test(&tau.to_string(), lambda, 1, 128).is_some());
+        for q in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(true),
+            serde_json::json!("64"),
+            serde_json::json!(u64::MAX),
+        ] {
+            let mut value = tau.clone();
+            value["quadrature_points"] = q;
+            assert!(tau_cache::parse_json_for_test(&value.to_string(), lambda, 1, 128).is_none());
+        }
+        let mut legacy = tau;
+        legacy["schema_version"] = serde_json::json!(1);
+        assert!(tau_cache::parse_json_for_test(&legacy.to_string(), lambda, 1, 128).is_none());
+        let xi = exhaustive_standalone_xi_fixture();
+        assert!(weil_eigvec_cache::parse_json(&xi.to_string(), lambda, 1, 128).is_some());
+        for digest in [
+            serde_json::Value::Null,
+            serde_json::json!(1),
+            serde_json::json!(""),
+            serde_json::json!("a".repeat(63)),
+            serde_json::json!("a".repeat(65)),
+            serde_json::json!("A".repeat(64)),
+            serde_json::json!("g".repeat(64)),
+        ] {
+            let mut value = xi.clone();
+            value["tau_source_point_digest"] = digest;
+            assert!(weil_eigvec_cache::parse_json(&value.to_string(), lambda, 1, 128).is_none());
+        }
+        let mut legacy = xi;
+        legacy["schema_version"] = serde_json::json!(2);
+        assert!(weil_eigvec_cache::parse_json(&legacy.to_string(), lambda, 1, 128).is_none());
+    }
+    #[test]
+    fn exhaustive_standalone_source_identity_zip_and_parts_bind_quadrature() {
+        use std::io::Write;
+        use xc_numerics::quadrature::CacheMode;
+        let temp = crate::fresh_test_dir("standalone-source-parts");
+        let guard = CwdGuard::enter(&temp);
+        let lambda = crate::ccm::LambdaSq::integer(13);
+        let dir = temp.join("data/tau_cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = tau_cache::cache_filename(lambda, 1, 128);
+        let path = dir.join(format!("{name}.zip"));
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file(&name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(exhaustive_standalone_tau_fixture().to_string().as_bytes())
+            .unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(tau_cache::load(lambda, 1, 128, 64, CacheMode::JsonZip).is_some());
+        assert!(tau_cache::load(lambda, 1, 128, 256, CacheMode::JsonZip).is_none());
+        std::fs::remove_file(&path).unwrap();
+        let split = bytes.len() / 2;
+        std::fs::write(dir.join(format!("{name}.zip.part00")), &bytes[..split]).unwrap();
+        std::fs::write(dir.join(format!("{name}.zip.part01")), &bytes[split..]).unwrap();
+        assert!(tau_cache::load(lambda, 1, 128, 64, CacheMode::JsonZip).is_some());
+        assert!(tau_cache::load(lambda, 1, 128, 256, CacheMode::JsonZip).is_none());
+        assert!(tau_cache::load(lambda, 1, 128, 64, CacheMode::Off).is_none());
+        assert!(tau_cache::load(lambda, 1, 128, 64, CacheMode::JsonOnly).is_none());
+        drop(guard);
+        // Best-effort cleanup: the assertions above are the test. Concurrent tests
+        // may briefly hold entries in the shared working directory.
+        let _ = std::fs::remove_dir_all(temp);
+    }
+    #[test]
+    fn exhaustive_standalone_source_identity_xi_binds_actual_source() {
+        use xc_numerics::quadrature::CacheMode;
+        let temp = crate::fresh_test_dir("standalone-source-xi");
+        let guard = weil_eigvec_cache::TestCacheRootGuard::enter(&temp);
+        let lambda = crate::ccm::LambdaSq::integer(13);
+        let tau = [2, 0, 0, 0, 1, 0, 0, 0, 2].map(|x| Float::with_val(128, x));
+        let source = standalone_cache::tau_point_digest(&tau, 1, 128).unwrap();
+        let mut changed = tau.clone();
+        changed[0] = Float::with_val(128, 3);
+        let other = standalone_cache::tau_point_digest(&changed, 1, 128).unwrap();
+        // Both matrices share this exact ground eigenpair: residual replay alone
+        // cannot establish which matrix produced a retained state.
+        let c = weil_eigvec_cache::parse_json(
+            &exhaustive_standalone_xi_fixture().to_string(),
+            lambda,
+            1,
+            128,
+        )
+        .unwrap();
+        for matrix in [&tau, &changed] {
+            assert!(weil_eigvec_cache::residual_ok(
+                matrix, 3, &c.xi, &c.eps_n, 128
+            ));
+        }
+        weil_eigvec_cache::save(
+            lambda,
+            1,
+            128,
+            &source,
+            &c.eps_n,
+            &c.xi,
+            &c.diagnostics,
+            CacheMode::JsonZip,
+            CcmParityPolicy::EvenSector,
+        );
+        assert!(weil_eigvec_cache::load(
+            lambda,
+            1,
+            128,
+            &source,
+            CacheMode::JsonZip,
+            CcmParityPolicy::EvenSector
+        )
+        .is_some());
+        assert!(weil_eigvec_cache::load(
+            lambda,
+            1,
+            128,
+            &other,
+            CacheMode::JsonZip,
+            CcmParityPolicy::EvenSector
+        )
+        .is_none());
+        assert!(weil_eigvec_cache::load(
+            lambda,
+            1,
+            128,
+            &source,
+            CacheMode::Off,
+            CcmParityPolicy::EvenSector
+        )
+        .is_none());
+        assert!(weil_eigvec_cache::load(
+            lambda,
+            1,
+            128,
+            &source,
+            CacheMode::JsonOnly,
+            CcmParityPolicy::EvenSector
+        )
+        .is_none());
+        drop(guard);
+        std::fs::remove_dir_all(&temp).unwrap();
+        assert!(
+            !temp.exists(),
+            "isolated Xi cache test must remove its scratch root"
+        );
+    }
+
+    /// Well-formed standalone Tau cache used by identity regressions.
+    fn exhaustive_standalone_tau_fixture() -> serde_json::Value {
+        serde_json::json!({"schema_version":3,"assembly_arithmetic":"directed_component_point_stages_length_aware_arch_v3","quadrature_points":64,"toolkit_version":env!("CARGO_PKG_VERSION"),
+            "lambda_sq":13,"lambda_sq_mode":"integer","lambda_sq_key":"13","prime_cutoff":13,
+            "n_modes":1,"precision_bits":128,"matrix":([1,0,0,0,1,0,0,0,1].map(|v| Float::with_val(128,v).to_string()))})
+    }
+    fn exhaustive_standalone_xi_fixture() -> serde_json::Value {
+        serde_json::json!({"schema_version":3,"tau_source_point_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","toolkit_version":env!("CARGO_PKG_VERSION"),
+            "lambda_sq":13,"lambda_sq_mode":"integer","lambda_sq_key":"13","prime_cutoff":13,
+            "parity_policy":"even_sector","n_modes":1,"precision_bits":128,
+            "parity_basis_arithmetic": super::parity_math::ARITHMETIC,
+            "state_normalization_arithmetic": super::state_normalization_math::ARITHMETIC,
+            "l2_normalization_arithmetic":xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2,
+            "tau_residual_arithmetic":"directed_scaled_stored_infinity_norm_v2",
+            "weil_min_eigenvalue":Float::with_val(128,1).to_string(),"xi":([0,1,0].map(|v| Float::with_val(128,v).to_string())),
+            "inverse_iteration":{"configured_step_limit":1,"unshifted_steps":1,
+              "unshifted_converged":true,"final_relative_rayleigh_change":"0",
+              "shifted_refinement":"accepted","final_relative_residual_norm":"0"}})
+    }
+    #[test]
+    fn exhaustive_standalone_tau_modes() {
+        let mut v = exhaustive_standalone_tau_fixture();
+        v["n_modes"] = 2.into();
+        assert!(tau_cache::parse_json_for_test(
+            &v.to_string(),
+            super::super::LambdaSq::integer(13),
+            1,
+            128
+        )
+        .is_none());
+    }
+    #[test]
+    fn exhaustive_standalone_tau_precision() {
+        let mut v = exhaustive_standalone_tau_fixture();
+        v["precision_bits"] = 64.into();
+        assert!(tau_cache::parse_json_for_test(
+            &v.to_string(),
+            super::super::LambdaSq::integer(13),
+            1,
+            128
+        )
+        .is_none());
+    }
+    #[test]
+    fn exhaustive_standalone_tau_schema() {
+        let mut v = exhaustive_standalone_tau_fixture();
+        v["schema_version"] = 999.into();
+        assert!(tau_cache::parse_json_for_test(
+            &v.to_string(),
+            super::super::LambdaSq::integer(13),
+            1,
+            128
+        )
+        .is_none());
+    }
+    #[test]
+    fn exhaustive_standalone_tau_version() {
+        let mut v = exhaustive_standalone_tau_fixture();
+        v["toolkit_version"] = "9.bad.version".into();
+        assert!(tau_cache::parse_json_for_test(
+            &v.to_string(),
+            super::super::LambdaSq::integer(13),
+            1,
+            128
+        )
+        .is_none());
+    }
+    #[test]
+    fn exhaustive_standalone_tau_shape() {
+        assert!(std::panic::catch_unwind(|| tau_cache::parse_json_for_test(
+            "{}",
+            super::super::LambdaSq::integer(13),
+            usize::MAX,
+            128
+        ))
+        .is_ok_and(|x| x.is_none()));
+    }
+    #[test]
+    fn exhaustive_standalone_tau_cutoff() {
+        let dir = crate::fresh_test_dir("audit-tau-cutoff");
+        let mut v = exhaustive_standalone_tau_fixture();
+        v["lambda_sq"] = 14.into();
+        let name = tau_cache::cache_filename(super::super::LambdaSq::integer(13), 1, 128);
+        std::fs::write(dir.join(name), v.to_string()).unwrap();
+        let report = tau_cache::verify_tau_cache_dir(&dir).unwrap();
+        assert_eq!(report.ok_count(), 0);
+    }
+    #[test]
+    fn exhaustive_standalone_xi_cutoff() {
+        let mut v = exhaustive_standalone_xi_fixture();
+        v["lambda_sq"] = 13.25.into();
+        assert!(weil_eigvec_cache::parse_json(
+            &v.to_string(),
+            super::super::LambdaSq::integer(13),
+            1,
+            128
+        )
+        .is_none());
+    }
+    #[test]
+    fn exhaustive_standalone_xi_mode() {
+        let mut v = exhaustive_standalone_xi_fixture();
+        v["lambda_sq_mode"] = "fractional".into();
+        assert!(weil_eigvec_cache::parse_json(
+            &v.to_string(),
+            super::super::LambdaSq::integer(13),
+            1,
+            128
+        )
+        .is_none());
+    }
+    #[test]
+    fn exhaustive_standalone_xi_schema_wrap() {
+        let mut v = exhaustive_standalone_xi_fixture();
+        v["schema_version"] = serde_json::json!((1u64 << 32) + 2);
+        assert!(weil_eigvec_cache::parse_json(
+            &v.to_string(),
+            super::super::LambdaSq::integer(13),
+            1,
+            128
+        )
+        .is_none());
+    }
+    #[test]
+    fn exhaustive_standalone_xi_precision_wrap() {
+        let mut v = exhaustive_standalone_xi_fixture();
+        v["precision_bits"] = serde_json::json!((1u64 << 32) + 128);
+        assert!(weil_eigvec_cache::parse_json(
+            &v.to_string(),
+            super::super::LambdaSq::integer(13),
+            1,
+            128
+        )
+        .is_none());
+    }
+    #[test]
+    fn exhaustive_standalone_xi_version() {
+        let mut v = exhaustive_standalone_xi_fixture();
+        v["toolkit_version"] = "9.bad.version".into();
+        assert!(weil_eigvec_cache::parse_json(
+            &v.to_string(),
+            super::super::LambdaSq::integer(13),
+            1,
+            128
+        )
+        .is_none());
+    }
+    #[test]
+    fn exhaustive_standalone_warm_promotion() {
+        let dir = crate::fresh_test_dir("audit-warm-promotion");
+        let _guard = CwdGuard::enter(&dir);
+        let p = 64;
+        let one = Float::with_val(p, 1);
+        let third = Float::with_val(p, &one / 3);
+        let lambda = super::super::LambdaSq::integer(13);
+        let diagnostic = xc_numerics::linalg::InverseIterationDiagnostics {
+            configured_step_limit: 1,
+            unshifted_steps: 1,
+            unshifted_converged: true,
+            final_relative_rayleigh_change: Some(Float::with_val(p, 0)),
+            shifted_refinement: xc_numerics::linalg::ShiftedRefinementOutcome::Accepted,
+            final_relative_residual_norm: Float::with_val(p, 0),
+        };
+        weil_eigvec_cache::save(
+            lambda,
+            1,
+            p,
+            &xc_cache::ContentDigest("a".repeat(64)),
+            &one,
+            &[third.clone(), one.clone(), third.clone()],
+            &diagnostic,
+            xc_numerics::quadrature::CacheMode::JsonZip,
+            CcmParityPolicy::EvenSector,
+        );
+        let actual =
+            weil_eigvec_cache::find_warm_start(lambda, 1, 256, 256, CcmParityPolicy::EvenSector)
+                .unwrap();
+        assert_eq!(actual[0], Float::with_val(256, third));
+    }
+    #[test]
+    fn exhaustive_standalone_residual_underflow() {
+        let p = 128;
+        let tiny = Float::with_val(p, 1) >> 700_000_000u32;
+        let actual = weil_eigvec_cache::relative_residual_norm(
+            std::slice::from_ref(&tiny),
+            1,
+            std::slice::from_ref(&tiny),
+            &Float::with_val(p, 0),
+            p,
+        )
+        .unwrap();
+        assert!(
+            actual >= tiny,
+            "nonzero source residual was rounded to zero before normalization"
+        );
+    }
+    #[test]
+    fn exhaustive_standalone_residual_bounds_match_exact_rational_oracles() {
+        use rug::Rational;
+        for p in [64, 128, 256] {
+            for n in 1..=4usize {
+                let a = (0..n * n)
+                    .map(|i| Float::with_val(p, (i / n + i % n + 1) as i32 - 3) / 7u32)
+                    .collect::<Vec<_>>();
+                let v = (0..n)
+                    .map(|i| Float::with_val(p, i + 1) / 3u32)
+                    .collect::<Vec<_>>();
+                let lambda = Float::with_val(p, 2) / 11u32;
+                let exact_v = v
+                    .iter()
+                    .map(|x| x.to_rational().unwrap())
+                    .collect::<Vec<_>>();
+                let norm = exact_v.iter().cloned().map(Rational::abs).max().unwrap();
+                let exact = (0..n)
+                    .map(|i| {
+                        let row = (0..n)
+                            .map(|j| a[i * n + j].to_rational().unwrap() * &exact_v[j])
+                            .sum::<Rational>();
+                        (row - lambda.to_rational().unwrap() * &exact_v[i]).abs()
+                    })
+                    .max()
+                    .unwrap()
+                    / norm;
+                for ae in [-700_000_000i32, 0, 700_000_000] {
+                    for ve in [-700_000_000i32, 0, 700_000_000] {
+                        let a = a.iter().map(|x| x.clone() << ae).collect::<Vec<_>>();
+                        let v = v.iter().map(|x| x.clone() << ve).collect::<Vec<_>>();
+                        let bound = weil_eigvec_cache::relative_residual_norm(
+                            &a,
+                            n,
+                            &v,
+                            &(lambda.clone() << ae),
+                            p,
+                        )
+                        .unwrap();
+                        assert_eq!(bound.prec(), p);
+                        assert!((bound >> ae).to_rational().unwrap() >= exact);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn weil_eigvec_parse_json_validates() {
         use super::super::LambdaSq;
@@ -23105,12 +24196,17 @@ mod tests {
             .collect();
         let xi_strs: Vec<String> = xi.iter().map(|f| f.to_string()).collect();
         let good = serde_json::json!({
-            "schema_version": 2,
+            "schema_version":3,"tau_source_point_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "parity_basis_arithmetic": super::parity_math::ARITHMETIC,
+            "state_normalization_arithmetic": super::state_normalization_math::ARITHMETIC,
+            "l2_normalization_arithmetic": xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2,
             "toolkit_version": super::weil_eigvec_cache::toolkit_version_for_test(),
             "lambda_sq": lambda_sq.value_f64,
+            "lambda_sq_mode":lambda_sq.mode_str(),"lambda_sq_key":lambda_sq.filename_str(),"prime_cutoff":lambda_sq.value_u64,
+            "tau_residual_arithmetic":standalone_cache::RESIDUAL_ARITHMETIC,
             "n_modes": n_modes,
             "precision_bits": prec,
-            "weil_min_eigenvalue": "1.5e-40",
+            "weil_min_eigenvalue": Float::with_val(prec, Float::parse("1.5e-40").unwrap()).to_string(),
             "xi": xi_strs,
             "inverse_iteration": {
                 "configured_step_limit": 2000,
@@ -23125,6 +24221,27 @@ mod tests {
         let parsed =
             parse_json(&good, lambda_sq, n_modes, prec).expect("well-formed entry should parse");
         assert_eq!(parsed.xi.len(), dim);
+
+        let mut unstamped: serde_json::Value = serde_json::from_str(&good).unwrap();
+        unstamped
+            .as_object_mut()
+            .unwrap()
+            .remove("l2_normalization_arithmetic");
+        assert!(parse_json(&unstamped.to_string(), lambda_sq, n_modes, prec).is_none());
+        unstamped["l2_normalization_arithmetic"] = serde_json::json!("old-normalization");
+        assert!(parse_json(&unstamped.to_string(), lambda_sq, n_modes, prec).is_none());
+
+        for name in ["state_normalization_arithmetic", "parity_basis_arithmetic"] {
+            for stamp in [None, Some("old-normalization")] {
+                let mut stale: serde_json::Value = serde_json::from_str(&good).unwrap();
+                if let Some(stamp) = stamp {
+                    stale[name] = serde_json::json!(stamp);
+                } else {
+                    stale.as_object_mut().unwrap().remove(name);
+                }
+                assert!(parse_json(&stale.to_string(), lambda_sq, n_modes, prec).is_none());
+            }
+        }
 
         // Wrong n_modes metadata → reject.
         assert!(
@@ -23152,8 +24269,13 @@ mod tests {
         let mut short_strs = xi_strs.clone();
         short_strs.pop();
         let short = serde_json::json!({
-            "schema_version": 2, "toolkit_version": super::weil_eigvec_cache::toolkit_version_for_test(),
-            "lambda_sq": lambda_sq.value_f64, "n_modes": n_modes,
+            "schema_version":3,"tau_source_point_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "parity_basis_arithmetic": super::parity_math::ARITHMETIC,
+            "state_normalization_arithmetic": super::state_normalization_math::ARITHMETIC,
+            "l2_normalization_arithmetic": xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2, "toolkit_version": super::weil_eigvec_cache::toolkit_version_for_test(),
+            "lambda_sq": lambda_sq.value_f64,
+            "lambda_sq_mode":lambda_sq.mode_str(),"lambda_sq_key":lambda_sq.filename_str(),"prime_cutoff":lambda_sq.value_u64,
+            "tau_residual_arithmetic":standalone_cache::RESIDUAL_ARITHMETIC, "n_modes": n_modes,
             "precision_bits": prec, "weil_min_eigenvalue": "1.5e-40", "xi": short_strs,
             "inverse_iteration": {
                 "configured_step_limit": 2000,
@@ -23185,6 +24307,8 @@ mod tests {
             "schema_version": 1,
             "toolkit_version": "0.0.1",
             "lambda_sq": lambda_sq.value_f64,
+            "lambda_sq_mode":lambda_sq.mode_str(),"lambda_sq_key":lambda_sq.filename_str(),"prime_cutoff":lambda_sq.value_u64,
+            "tau_residual_arithmetic":standalone_cache::RESIDUAL_ARITHMETIC,
             "n_modes": n_modes,
             "precision_bits": prec,
             "weil_min_eigenvalue": "1.23e-10",
@@ -23275,6 +24399,7 @@ mod tests {
             lambda_sq,
             n_modes,
             prec,
+            &xc_cache::ContentDigest("a".repeat(64)),
             &eps,
             &xi,
             &diagnostics,
@@ -23286,6 +24411,7 @@ mod tests {
                 lambda_sq,
                 n_modes,
                 prec,
+                &xc_cache::ContentDigest("a".repeat(64)),
                 CacheMode::Off,
                 CcmParityPolicy::EvenSector,
             )
@@ -23297,6 +24423,7 @@ mod tests {
                 lambda_sq,
                 n_modes,
                 prec,
+                &xc_cache::ContentDigest("a".repeat(64)),
                 CacheMode::JsonZip,
                 CcmParityPolicy::EvenSector,
             )
@@ -23310,6 +24437,7 @@ mod tests {
             lambda_sq,
             n_modes,
             prec,
+            &xc_cache::ContentDigest("a".repeat(64)),
             &eps,
             &xi,
             &diagnostics,
@@ -23335,6 +24463,7 @@ mod tests {
             lambda_sq,
             n_modes,
             prec,
+            &xc_cache::ContentDigest("a".repeat(64)),
             CacheMode::JsonZip,
             CcmParityPolicy::EvenSector,
         )
@@ -23360,6 +24489,7 @@ mod tests {
                 lambda_sq,
                 n_modes,
                 prec,
+                &xc_cache::ContentDigest("a".repeat(64)),
                 CacheMode::JsonOnly,
                 CcmParityPolicy::EvenSector,
             )
@@ -23398,6 +24528,8 @@ mod tests {
             "schema_version": 1,
             "toolkit_version": super::weil_eigvec_cache::toolkit_version_for_test(),
             "lambda_sq": lambda_sq.value_f64,
+            "lambda_sq_mode":lambda_sq.mode_str(),"lambda_sq_key":lambda_sq.filename_str(),"prime_cutoff":lambda_sq.value_u64,
+            "tau_residual_arithmetic":standalone_cache::RESIDUAL_ARITHMETIC,
             "n_modes": n_modes,
             "precision_bits": prec,
             "weil_min_eigenvalue": "1.0e-20",
@@ -23423,6 +24555,7 @@ mod tests {
                 lambda_sq,
                 n_modes,
                 prec,
+                &xc_cache::ContentDigest("a".repeat(64)),
                 CacheMode::JsonOnly,
                 CcmParityPolicy::EvenSector,
             )
@@ -23434,6 +24567,7 @@ mod tests {
                 lambda_sq,
                 n_modes,
                 prec,
+                &xc_cache::ContentDigest("a".repeat(64)),
                 CacheMode::JsonZip,
                 CcmParityPolicy::EvenSector,
             )
@@ -23484,6 +24618,7 @@ mod tests {
                 lambda_sq,
                 n_modes,
                 prec,
+                &xc_cache::ContentDigest("a".repeat(64)),
                 CacheMode::JsonZip,
                 CcmParityPolicy::EvenSector,
             )
@@ -23623,7 +24758,9 @@ mod audit_research_tests {
                         v
                     })
                     .collect::<Vec<_>>();
-                let mut sector = build_even_sector_matrix(&tau, n, p);
+                let mut tau = tau;
+                force_symmetric(&mut tau, d).unwrap();
+                let mut sector = build_even_sector_matrix(&tau, n, p).unwrap();
                 assert!(even_sector_matches_tau(&sector, &tau, n, p));
                 sector[0] += 1;
                 assert!(!even_sector_matches_tau(&sector, &tau, n, p));
@@ -23642,7 +24779,8 @@ mod audit_research_tests {
                 let cutoff = ExactCutoff::parse(&c.to_string()).unwrap();
                 let length = cutoff.log_length(precision_bits).unwrap();
                 let options = ResearchAssemblyOptions::default();
-                let expected = compute_prime_component_matrix(6, c, &length, precision_bits);
+                let expected =
+                    compute_prime_component_matrix(6, c, &length, precision_bits).unwrap();
                 let actual =
                     aggregate_prime_component_hp(&cutoff, 6, precision_bits, &options).unwrap();
                 let tolerance =
@@ -23681,14 +24819,22 @@ mod audit_research_tests {
     }
 
     #[test]
-    fn canonical_prime_scratch_reuse_is_bit_identical_to_v0143() {
+    fn directed_prime_matches_independent_v0143_high_precision_formula() {
         for p in [128, 256, 1024] {
             for c in [5, 13, 100] {
                 let length = Float::with_val(p, c).ln();
                 assert_eq!(
-                    compute_prime_component_matrix(8, c, &length, p),
-                    compute_prime_component_matrix_v0143_reference(8, c, &length, p),
-                    "default prime bytes changed at c={c}, p={p}"
+                    compute_prime_component_matrix(8, c, &length, p).unwrap(),
+                    compute_prime_component_matrix_v0143_reference(
+                        8,
+                        c,
+                        &Float::with_val(4096, &length),
+                        4096
+                    )
+                    .iter()
+                    .map(|v| Float::with_val(p, v))
+                    .collect::<Vec<_>>(),
+                    "prime high-precision formula disagrees at c={c}, p={p}"
                 );
             }
         }
@@ -23745,10 +24891,9 @@ mod audit_research_tests {
                 let previous = compute_prime_component_matrix_v0143_reference(n, 500, &length, p);
                 baseline.push(start.elapsed().as_nanos());
                 let start = std::time::Instant::now();
-                let reference = compute_prime_component_matrix(n, 500, &length, p);
+                let reference = compute_prime_component_matrix(n, 500, &length, p).unwrap();
                 canonical.push(start.elapsed().as_nanos());
                 canonical_identity &= previous == reference;
-                assert!(canonical_identity);
                 let start = std::time::Instant::now();
                 let candidate = aggregate_prime_component_hp(&cutoff, n, p, &options).unwrap();
                 aggregate.push(start.elapsed().as_nanos());
@@ -23827,16 +24972,3698 @@ mod eigenpair_nonfinite_audit_regressions {
     }
 
     #[test]
-    fn eigenpair_residual_rejects_nonfinite_arithmetic() {
+    fn eigenpair_residual_recovers_finite_cancellation_before_overflow() {
         let p = 128;
         let big = Float::with_val(p, Float::parse("1e200000000").unwrap());
-        assert!(big.is_finite());
         let tau = vec![big.clone(); 4];
-        let xi = vec![big.clone(), -big];
-        assert!(
-            weil_eigvec_cache::relative_residual_norm(&tau, 2, &xi, &Float::with_val(p, 0), p,)
-                .is_none(),
-            "overflow cancellation was silently treated as zero residual"
+        // The exact stored matrix annihilates [b,-b]. Directed intervals
+        // return a finite conservative bound without overflowing individual
+        // products; dependency loss need not produce a zero-width bound.
+        let xi = vec![big.clone(), -big.clone()];
+        let zero = Float::with_val(p, 0);
+        let bound = weil_eigvec_cache::relative_residual_norm(&tau, 2, &xi, &zero, p).unwrap();
+        assert!(bound.is_finite() && bound >= 0);
+        assert!(Float::with_val(p, &bound / &big) <= (Float::with_val(p, 1) >> (p - 32)));
+        let xi = vec![big.clone(), -Float::with_val(p, &big / 2)];
+        let bound = weil_eigvec_cache::relative_residual_norm(&tau, 2, &xi, &zero, p).unwrap();
+        assert!(bound >= Float::with_val(p, &big / 2) && bound.is_finite());
+    }
+}
+
+#[cfg(test)]
+mod concentration_precision_tests {
+    use super::*;
+    #[test]
+    fn sinc_matches_independent_alternating_series_at_requested_precision() {
+        let mut checks = 0;
+        for q in [64, 128, 256] {
+            for p in [64, 128, 256, 512, 1024] {
+                for exponent in [1, 4, 64, 128, 140, 256, 512, 2000] {
+                    for sign in [-1, 1] {
+                        let x = Float::with_val(q, sign) >> exponent;
+                        let work = p.max(q) + 256;
+                        let squared = Float::with_val(work, &x * &x);
+                        let mut term = Float::with_val(work, 1);
+                        let mut expected = term.clone();
+                        for k in 1u32..1000 {
+                            term *= -squared.clone();
+                            term /= 2 * k;
+                            term /= 2 * k + 1;
+                            expected += &term;
+                            if term.clone().abs() < (Float::with_val(work, 1) >> (work - 16)) {
+                                break;
+                            }
+                        }
+                        let actual = sinc_hp(&x, p);
+                        assert_eq!(actual.prec(), p);
+                        assert!(
+                            (Float::with_val(work, &actual) - expected).abs()
+                                <= (Float::with_val(work, 1) >> (p - 2))
+                        );
+                        checks += 1;
+                    }
+                }
+                assert_eq!(sinc_hp(&Float::with_val(q, 0), p), 1);
+            }
+        }
+        assert_eq!(checks, 240);
+    }
+}
+
+#[cfg(test)]
+mod source_isolation_tests {
+    use super::*;
+    use rug::{Integer, Rational};
+
+    fn exact_decimal(text: &str) -> Rational {
+        let (mantissa, exponent) = text
+            .split_once('e')
+            .map_or((text, 0), |(m, e)| (m, e.parse::<i32>().unwrap()));
+        let fractional = mantissa.split_once('.').map_or(0, |(_, d)| d.len() as i32);
+        let integer = Integer::from_str_radix(&mantissa.replace('.', ""), 10).unwrap();
+        let power = exponent - fractional;
+        if power >= 0 {
+            Rational::from(integer * Integer::from(10).pow(power as u32))
+        } else {
+            Rational::from((integer, Integer::from(10).pow((-power) as u32)))
+        }
+    }
+
+    #[test]
+    fn source_isolation_rejects_equal_invariant_wrong_transform() {
+        let p = 128;
+        let d = [0, 9, 11, 22].map(|v| Float::with_val(p, v)).to_vec();
+        let actual = [0, 7, 14, 21];
+        let a = (0..16)
+            .map(|j| Float::with_val(p, if j / 4 == j % 4 { actual[j / 4] } else { 0 }))
+            .collect::<Vec<_>>();
+        let t = SectorTridiagonalHp {
+            diagonal: d,
+            off_diagonal: vec![Float::with_val(p, 0); 3],
+        };
+        let q = SectorTransformHp {
+            basis: (0..16)
+                .map(|j| Float::with_val(p, i32::from(j / 4 == j % 4)))
+                .collect(),
+        };
+        assert!(sector_tridiagonal_invariants_match(&a, &t, 4, p));
+        assert!(validate_sector_transform(&a, &t, &q, 4, p).is_err());
+    }
+
+    #[test]
+    fn source_isolation_encloses_actual_gap_and_directed_residuals_as_literal_decimals() {
+        for p in [64, 128, 256] {
+            let params = CcmParams::from_lambda_sq_integer(9, 1);
+            let mut cfg = HighPrecConfig::for_decimal_digits(20);
+            cfg.precision_bits = p;
+            let zero = Float::with_val(p, 0);
+            let one = Float::with_val(p, 1);
+            let perturbation = Float::with_val(p, 1) >> (p - 48);
+            let a = vec![zero.clone(), zero.clone(), zero.clone(), one.clone()];
+            let t = SectorTridiagonalHp {
+                diagonal: vec![zero.clone(), Float::with_val(p, &one + &perturbation)],
+                off_diagonal: vec![zero.clone()],
+            };
+            let q = SectorTransformHp {
+                basis: vec![one.clone(), zero.clone(), zero.clone(), one.clone()],
+            };
+            let allowance = validate_sector_transform(&a, &t, &q, 2, p).unwrap();
+            let values =
+                compute_sector_eigenvalues(&t, 2, 2, CcmSectorEigenvalueRoute::Selected, p)
+                    .unwrap();
+            let prep = ResponseSpectralPreparation {
+                even_sector_matrix: a,
+                source_matrix_eigenvalue_allowance: allowance,
+                selected_enclosures: values.selected_enclosures,
+            };
+            // The center component is deliberately not unit normalized.
+            let v = vec![zero.clone(), Float::with_val(p, 7), zero.clone()];
+            for lambda in [zero.clone(), Float::with_val(p, 1) >> (p - 16)] {
+                let report =
+                    response_spectral_isolation(&prep, &params, &cfg, &lambda, &v).unwrap();
+                let lo = exact_decimal(&report.selected_eigenvalue_lower);
+                let hi = exact_decimal(&report.selected_eigenvalue_upper);
+                let nlo = exact_decimal(&report.neighboring_eigenvalue_lower);
+                let nhi = exact_decimal(&report.neighboring_eigenvalue_upper);
+                assert!(lo <= 0 && hi >= 0 && nlo <= 1 && nhi >= 1);
+                let gap = exact_decimal(&report.sturm_gap_lower_bound);
+                assert!(gap > 0 && gap <= 1);
+                let residual = exact_decimal(&report.selected_state_absolute_residual);
+                assert!(residual >= lambda.to_rational().unwrap());
+                assert!(
+                    exact_decimal(&report.selected_state_relative_residual)
+                        >= lambda.to_rational().unwrap()
+                );
+                assert!(
+                    exact_decimal(&report.selected_state_residual_to_gap_upper_bound)
+                        >= lambda.to_rational().unwrap()
+                );
+                assert!(
+                    exact_decimal(&report.source_matrix_eigenvalue_allowance)
+                        >= perturbation.to_rational().unwrap()
+                );
+                assert_eq!(report.isolation_method, RESPONSE_SPECTRAL_ISOLATION_METHOD);
+            }
+            let mut unresolved = prep;
+            unresolved.source_matrix_eigenvalue_allowance = one;
+            assert!(response_spectral_isolation(&unresolved, &params, &cfg, &zero, &v).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod state_contract;
+
+#[cfg(test)]
+mod renewed_boundary_contract {
+    use super::*;
+    #[test]
+    fn root_velocity_cannot_become_zero_from_an_infinite_derivative() {
+        let p = 160;
+        let h = Float::with_val(p, 1) << (rug::float::exp_min() / 2 - 100);
+        let xi = [Float::with_val(p, 1), Float::with_val(p, 1)];
+        let velocity = [Float::with_val(p, 1), Float::with_val(p, -1)];
+        let poles = [-h.clone(), h.clone()];
+        let root = Float::with_val(p, 0);
+        // R=1/(r+h)+1/(r-h) has root r=0. With residue velocities
+        // [1,-1], exact implicit differentiation gives r'=h, not zero.
+        // Its unscaled derivative -2/h^2 is outside the MPFR range.
+        assert_eq!(
+            prime_power_root_velocity_response(&xi, &velocity, &poles, &root, p).unwrap(),
+            h
         );
+        let zeros = [root.clone(), root.clone()];
+        assert_eq!(
+            secular_root_velocity_response(&xi, &velocity, &poles, &zeros, &root, p).unwrap(),
+            h
+        );
+    }
+    #[test]
+    fn root_velocity_matches_implicit_differentiation_and_uniform_translation() {
+        let p = 160;
+        let h = Float::with_val(p, 1) >> 100u32;
+        let xi = [Float::with_val(p, 1), Float::with_val(p, 1)];
+        let velocity = [Float::with_val(p, 1), Float::with_val(p, -1)];
+        let poles = [-h.clone(), h.clone()];
+        let root = Float::with_val(p, 0);
+        assert_eq!(
+            prime_power_root_velocity_response(&xi, &velocity, &poles, &root, p).unwrap(),
+            h
+        );
+        let zeros = [root.clone(), root.clone()];
+        let translation = [Float::with_val(p, 3), Float::with_val(p, 3)];
+        assert_eq!(
+            secular_root_velocity_response(&xi, &zeros, &poles, &translation, &root, p).unwrap(),
+            3
+        );
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_resumed_hp_admission {
+    use super::*;
+    fn metrics() -> PortableInverseIterationDiagnostics {
+        PortableInverseIterationDiagnostics {
+            configured_step_limit: 2,
+            unshifted_steps: 2,
+            unshifted_converged: true,
+            final_relative_rayleigh_change: Some("0".into()),
+            shifted_refinement: "accepted".into(),
+            final_relative_residual_norm: "0".into(),
+        }
+    }
+    fn portable() -> PortableHighPrecResult {
+        let point =
+            |n| xc_numerics::fmt::PortableHpFloat::from_float(&Float::with_val(128, n)).unwrap();
+        PortableHighPrecResult {
+            stored_state_resolution: None,
+            eigenvalues_pos: vec![],
+            first_positive_root_index: 1,
+            weil_min_eigenvalue: point(1),
+            xi: vec![point(0), point(1), point(0)],
+            inverse_iteration_diagnostics: metrics(),
+            elapsed_seconds: 1.,
+            precision_bits: 128,
+        }
+    }
+    #[test]
+    fn exhaustive_resumed_hp_admission_scalar_nonzero_range() {
+        for text in ["1e-400000000", "-1e-400000000"] {
+            assert!(
+                parse_hp_scalar(text, 128).is_err(),
+                "nonzero input became zero: {text}"
+            );
+        }
+        for text in ["0", "-0", "1e-1000"] {
+            assert!(parse_hp_scalar(text, 128).is_ok());
+        }
+    }
+    #[test]
+    fn exhaustive_resumed_hp_admission_invalid_precision_does_not_panic() {
+        let result = std::panic::catch_unwind(|| parse_hp_scalar("1", 0));
+        assert!(
+            result.is_ok_and(|v| v.is_err()),
+            "invalid precision reached MPFR allocation"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_hp_admission_metric_range() {
+        for correction in [false, true] {
+            let mut v = metrics();
+            if correction {
+                v.final_relative_rayleigh_change = Some("1e-400000000".into());
+            } else {
+                v.final_relative_residual_norm = "1e-400000000".into();
+            }
+            assert!(
+                v.to_runtime(128).is_err(),
+                "nonzero stopping evidence became exact zero"
+            );
+        }
+    }
+    #[test]
+    fn exhaustive_resumed_hp_admission_public_header() {
+        let good = portable();
+        assert!(good.to_runtime().is_ok());
+        for time in [-1., f64::NAN, f64::INFINITY] {
+            let mut value = good.clone();
+            value.elapsed_seconds = time;
+            assert!(
+                value.to_runtime().is_err(),
+                "invalid persisted duration admitted"
+            );
+            let mut runtime = good.to_runtime().unwrap();
+            runtime.elapsed_seconds = time;
+            assert!(
+                PortableHighPrecResult::from_runtime(&runtime).is_err(),
+                "invalid duration persisted"
+            );
+        }
+        let mut bad = good.clone();
+        bad.precision_bits = 0;
+        assert!(std::panic::catch_unwind(|| bad.to_runtime()).is_ok_and(|v| v.is_err()));
+    }
+    #[test]
+    fn exhaustive_resumed_hp_admission_public_root_metrics() {
+        let point =
+            |n| xc_numerics::fmt::PortableHpFloat::from_float(&Float::with_val(128, n)).unwrap();
+        let good = PortableRootRefinementResult {
+            value: point(1),
+            iterations: 1,
+            final_correction: point(0),
+            residual: point(0),
+            achieved_decimal_digits: point(20),
+        };
+        assert!(good.to_runtime().is_ok());
+        for field in 0..4 {
+            let mut bad = good.clone();
+            match field {
+                0 => bad.iterations = 0,
+                1 => bad.final_correction = point(-1),
+                2 => bad.residual = point(-1),
+                _ => bad.achieved_decimal_digits = point(-1),
+            }
+            assert!(
+                bad.to_runtime().is_err(),
+                "invalid root evidence admitted: {field}"
+            );
+            let mut runtime = good.to_runtime().unwrap();
+            match field {
+                0 => runtime.diagnostics.iterations = 0,
+                1 => runtime.diagnostics.final_correction = Float::with_val(128, -1),
+                2 => runtime.diagnostics.residual = Float::with_val(128, -1),
+                _ => runtime.diagnostics.achieved_decimal_digits = Float::with_val(128, -1),
+            }
+            assert!(PortableRootRefinementResult::from_runtime(&runtime).is_err());
+        }
+    }
+
+    #[test]
+    fn exhaustive_resumed_hp_admission_tau_payload_range() {
+        let params = CcmParams::from_lambda_sq_integer(13, 1);
+        let mut a = PortableTauMatrix {
+            schema_version: 2,
+            lambda_squared: "13".into(),
+            n_modes: 1,
+            precision_bits: 128,
+            entries: vec!["0".into(); 9],
+        };
+        for j in [0, 4, 8] {
+            a.entries[j] = "1".into();
+        }
+        assert!(decode_tau_artifact(&a, &params, 128).is_ok());
+        for j in [1, 3, 5, 7] {
+            a.entries[j] = "1e-400000000".into();
+        }
+        assert!(
+            decode_tau_artifact(&a, &params, 128).is_err(),
+            "nonzero matrix entries became zero"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_hp_admission_eigenpair_payload_range() {
+        let params = CcmParams::from_lambda_sq_integer(13, 1);
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = 128;
+        cfg.inverse_iter_steps = 2;
+        cfg.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
+        let tau = (0..9)
+            .map(|k| {
+                Float::with_val(
+                    128,
+                    if k == 4 {
+                        1
+                    } else if k == 0 || k == 8 {
+                        2
+                    } else {
+                        0
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let center = log_lambda_sq_hp(&params, 128).unwrap().sqrt().to_string();
+        let mut a = PortableWeilEigenpair {
+            stored_state_resolution: None,
+            schema_version: 4,
+            lambda_squared: "13".into(),
+            n_modes: 1,
+            precision_bits: 128,
+            force_even: true,
+            parity_policy: None,
+            eigenstate_route: legacy_eigenstate_route_name(),
+            eigenvalue: "1".into(),
+            eigenvector: vec!["0".into(), center, "0".into()],
+            inverse_iteration: metrics(),
+            shift_invert_krylov: None,
+        };
+        a.stored_state_resolution = Some(
+            stored_resolution::bounds(
+                &tau,
+                &parse_hp_vector(&a.eigenvector, 128).unwrap(),
+                &Float::with_val(128, 1),
+                128,
+                CcmParityPolicy::EvenSector,
+            )
+            .unwrap()
+            .record,
+        );
+        assert!(decode_weil_eigenpair(&a, &params, &cfg, &tau).is_ok());
+        a.eigenvector[0] = "1e-400000000".into();
+        a.eigenvector[2] = "1e-400000000".into();
+        assert!(
+            decode_weil_eigenpair(&a, &params, &cfg, &tau).is_err(),
+            "nonzero state components became zero"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_hp_admission_conditioning_range() {
+        assert!(parse_root_conditioning_scalar("1e-400000000", 128, "derivative").is_err());
+    }
+}
+
+#[cfg(all(test, feature = "arb"))]
+mod exhaustive_resumed_certification_cutoff {
+    use super::*;
+    #[test]
+    fn exhaustive_resumed_certification_cutoff_matches_exact_input() {
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = 128;
+        let integer = CcmParams::from_lambda_sq_integer(13, 1);
+        assert_eq!(
+            tau_certification_config(&integer, &cfg)
+                .unwrap()
+                .integer_cutoff_c,
+            13
+        );
+        for value in [13.5, 2.5, 1.5] {
+            let params = CcmParams::from_lambda_sq_fractional(value, 1);
+            assert!(
+                tau_certification_config(&params, &cfg).is_err(),
+                "mapped fractional cutoff {value} to an integer-only proof configuration"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_resumed_sector_integrity {
+    use super::*;
+    fn sector(parity: CcmParity, value: &Float) -> CcmSectorSpectrumHp {
+        CcmSectorSpectrumHp {
+            parity,
+            dimension: 2,
+            eigenvalue_route: CcmSectorEigenvalueRoute::CompleteQr,
+            complete_eigenvalues: None,
+            eigenpairs: [value.clone(), value.clone() * 2u32]
+                .into_iter()
+                .enumerate()
+                .map(|(algebraic_index, eigenvalue)| CcmSectorEigenpairHp {
+                    algebraic_index,
+                    eigenvalue_lower: eigenvalue.clone(),
+                    eigenvalue_upper: eigenvalue.clone(),
+                    eigenvalue,
+                    eigenvector: vec![],
+                    residual_norm: Float::with_val(value.prec(), 0),
+                })
+                .collect(),
+        }
+    }
+    #[test]
+    fn exhaustive_resumed_sector_integrity_small_nonzero_log_gap() {
+        let p = 128;
+        for exponent in [-10000i32, 10000] {
+            let even = Float::with_val(p, 1) << exponent;
+            let mut odd = even.clone();
+            odd.next_up();
+            let expected = (Float::with_val(3 * p, &odd) / Float::with_val(3 * p, &even)).log10();
+            let gap = compute_sector_gap(
+                sector(CcmParity::Even, &even),
+                sector(CcmParity::Odd, &odd),
+                p,
+            )
+            .unwrap();
+            let error = (Float::with_val(3 * p, &gap.gap_log) - &expected).abs();
+            assert!(
+                error < expected.abs() >> (p - 8),
+                "near-equal sector magnitudes lost the nonzero logarithmic gap at exponent {exponent}"
+            );
+        }
+    }
+    #[test]
+    fn exhaustive_resumed_sector_integrity_complete_tail_replays_beyond_moments() {
+        let p = 128;
+        let params = CcmParams::from_lambda_sq_integer(13, 4);
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = p;
+        let tri = SectorTridiagonalHp {
+            diagonal: (0..5).map(|v| Float::with_val(p, v)).collect(),
+            off_diagonal: vec![Float::with_val(p, 0); 4],
+        };
+        let computed =
+            compute_sector_eigenvalues(&tri, 5, 5, CcmSectorEigenvalueRoute::CompleteQr, p)
+                .unwrap();
+        let mut payload =
+            portable_sector_eigenvalues(&computed, &params, &cfg, CcmParity::Even, 5, 5);
+        assert!(decode_sector_eigenvalues(
+            &payload,
+            &params,
+            &cfg,
+            CcmParity::Even,
+            5,
+            5,
+            CcmSectorEigenvalueRoute::CompleteQr,
+            &tri
+        )
+        .is_ok());
+        // First two remain 0,1. Replace 2,3,4 by 13/7,24/7,26/7:
+        // both sum=9 and sum of squares=29 remain unchanged exactly.
+        for (slot, numerator) in payload.eigenvalues[2..].iter_mut().zip([13, 24, 26]) {
+            *slot = (Float::with_val(p, numerator) / 7u32).to_string();
+        }
+        assert!(
+            decode_sector_eigenvalues(
+                &payload,
+                &params,
+                &cfg,
+                CcmParity::Even,
+                5,
+                5,
+                CcmSectorEigenvalueRoute::CompleteQr,
+                &tri
+            )
+            .is_err(),
+            "wrong complete-spectrum tail passed two moment checks"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_sector_integrity_selected_width_contract() {
+        let p = 128;
+        let params = CcmParams::from_lambda_sq_integer(13, 2);
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = p;
+        let tri = SectorTridiagonalHp {
+            diagonal: (1..=3).map(|v| Float::with_val(p, v)).collect(),
+            off_diagonal: vec![Float::with_val(p, 0); 2],
+        };
+        let computed =
+            compute_sector_eigenvalues(&tri, 3, 2, CcmSectorEigenvalueRoute::Selected, p).unwrap();
+        let mut payload =
+            portable_sector_eigenvalues(&computed, &params, &cfg, CcmParity::Even, 3, 2);
+        assert!(decode_sector_eigenvalues(
+            &payload,
+            &params,
+            &cfg,
+            CcmParity::Even,
+            3,
+            2,
+            CcmSectorEigenvalueRoute::Selected,
+            &tri
+        )
+        .is_ok());
+        let first = &mut payload.selected_enclosures[0];
+        first.lower = "0".into();
+        first.upper = "4".into();
+        first.lower_count = 0;
+        first.upper_count = 3;
+        assert!(
+            decode_sector_eigenvalues(
+                &payload,
+                &params,
+                &cfg,
+                CcmParity::Even,
+                3,
+                2,
+                CcmSectorEigenvalueRoute::Selected,
+                &tri
+            )
+            .is_err(),
+            "unbounded eigenvalue enclosure violated requested matrix-scaled width"
+        );
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_resumed_sector_vector {
+    use super::*;
+    fn fixture(
+        scale: i32,
+    ) -> (
+        CcmParams,
+        HighPrecConfig,
+        Vec<Float>,
+        Vec<Float>,
+        PortableSectorSpectrum,
+    ) {
+        let p = 128;
+        let params = CcmParams::from_lambda_sq_integer(13, 2);
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = p;
+        let diagonal = (1..=3)
+            .map(|v| Float::with_val(p, v) << scale)
+            .collect::<Vec<_>>();
+        let matrix = (0..9)
+            .map(|k| {
+                if k / 3 == k % 3 {
+                    diagonal[k / 3].clone()
+                } else {
+                    Float::with_val(p, 0)
+                }
+            })
+            .collect();
+        let payload = PortableSectorSpectrum {
+            schema_version: 2,
+            lambda_squared: "13".into(),
+            n_modes: 2,
+            precision_bits: p,
+            parity: CcmParity::Even,
+            eigenvalue_route: CcmSectorEigenvalueRoute::CompleteQr,
+            dimension: 3,
+            requested_eigenpairs: 2,
+            eigenvalues: diagonal[..2].iter().map(Float::to_string).collect(),
+            eigenvectors: vec![
+                vec!["1".into(), "0".into(), "0".into()],
+                vec!["0".into(), "1".into(), "0".into()],
+            ],
+            residual_norms: vec!["0".into(); 2],
+            eigenvalue_bounds: diagonal[..2]
+                .iter()
+                .map(|x| {
+                    let x = Float::with_val(p + 64, x).to_string();
+                    (x.clone(), x)
+                })
+                .collect(),
+        };
+        (params, cfg, matrix, diagonal, payload)
+    }
+    fn decode(
+        a: &PortableSectorSpectrum,
+        params: &CcmParams,
+        cfg: &HighPrecConfig,
+        matrix: &[Float],
+        expected: &[Float],
+    ) -> std::result::Result<CcmSectorSpectrumHp, CacheError> {
+        decode_sector_spectrum(
+            a,
+            params,
+            cfg,
+            CcmParity::Even,
+            CcmSectorEigenvalueRoute::CompleteQr,
+            matrix,
+            3,
+            2,
+            expected,
+            &expected
+                .iter()
+                .map(|x| (x.clone(), x.clone()))
+                .collect::<Vec<_>>(),
+        )
+    }
+    #[test]
+    fn exhaustive_resumed_sector_vector_zero_is_not_an_eigenvector() {
+        let (params, cfg, matrix, expected, mut a) = fixture(0);
+        assert!(decode(&a, &params, &cfg, &matrix, &expected).is_ok());
+        a.eigenvectors = vec![vec!["0".into(); 3]; 2];
+        assert!(
+            decode(&a, &params, &cfg, &matrix, &expected).is_err(),
+            "zero vectors passed exact residual replay"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_sector_vector_replays_unit_normalization() {
+        let (params, cfg, matrix, expected, mut a) = fixture(0);
+        a.eigenvectors[0][0] = "2".into();
+        a.eigenvectors[1][1] = "3".into();
+        assert!(
+            decode(&a, &params, &cfg, &matrix, &expected).is_err(),
+            "nonunit vectors passed a unit-vector artifact contract"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_sector_vector_binds_indexed_eigenvalue_parent() {
+        let (params, cfg, matrix, expected, mut a) = fixture(0);
+        a.eigenvalues = vec!["2".into(), "3".into()];
+        a.eigenvectors = vec![
+            vec!["0".into(), "1".into(), "0".into()],
+            vec!["0".into(), "0".into(), "1".into()],
+        ];
+        assert!(
+            decode(&a, &params, &cfg, &matrix, &expected).is_err(),
+            "higher algebraic eigenpairs were relabeled as the lowest prefix"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_sector_vector_checks_small_matrix_scale() {
+        let (params, cfg, matrix, expected, mut a) = fixture(-700_000_000);
+        assert!(decode(&a, &params, &cfg, &matrix, &expected).is_ok());
+        a.eigenvectors.swap(0, 1);
+        assert!(
+            decode(&a, &params, &cfg, &matrix, &expected).is_err(),
+            "wrong vectors passed after residual squares underflowed"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_sector_vector_residual_norm_preserves_extreme_scale() {
+        let p = 128;
+        for exponent in [-700_000_000i32, 700_000_000] {
+            let expected = Float::with_val(p, 1) << exponent;
+            let actual = sector_eigenpair_residual_norm(
+                std::slice::from_ref(&expected),
+                1,
+                &Float::with_val(p, 0),
+                &[Float::with_val(p, 1)],
+                p,
+            )
+            .unwrap();
+            assert_eq!(
+                actual, expected,
+                "finite residual magnitude was lost at exponent {exponent}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_resumed_sector_relative_selection {
+    use super::*;
+    #[test]
+    fn exhaustive_resumed_sector_selected_intervals_and_vectors_are_scale_invariant() {
+        let p = 128;
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = p;
+        let mut baseline: Option<Vec<Float>> = None;
+        for exponent in [0i32, -700_000_000, 700_000_000] {
+            let matrix = [2, 1, 1, 3].map(|v| Float::with_val(p, v) << exponent);
+            let spectrum = compute_sector_branch(
+                &matrix,
+                2,
+                CcmParity::Odd,
+                2,
+                CcmSectorEigenvalueRoute::Selected,
+                &cfg,
+            )
+            .unwrap();
+            let points = spectrum
+                .eigenpairs
+                .iter()
+                .map(|pair| pair.eigenvalue.clone() >> exponent)
+                .collect::<Vec<_>>();
+            if let Some(expected) = &baseline {
+                assert_eq!(&points, expected);
+            } else {
+                baseline = Some(points);
+            }
+            for pair in spectrum.eigenpairs {
+                sector_vector_validation::validate(&matrix, &pair.eigenvector, &pair.eigenvalue, p)
+                    .unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_resumed_lu_factor {
+    use super::*;
+    #[test]
+    fn exhaustive_resumed_lu_factor_replays_beyond_three_probes() {
+        let p = 128;
+        let a = (0..16)
+            .map(|k| Float::with_val(p, if k / 4 == k % 4 { 1 } else { 0 }))
+            .collect::<Vec<_>>();
+        let mut lu = a.clone();
+        // B=I+e0*(-1,1,1,-1)/2 fixes all three legacy probe vectors,
+        // but B is not I. It is already upper triangular with valid pivots.
+        for (j, value) in [0.5, 0.5, 0.5, -0.5].iter().enumerate() {
+            lu[j] = Float::with_val(p, value);
+        }
+        let factors = xc_numerics::linalg::LuFactors {
+            lu,
+            perm: vec![0, 1, 2, 3],
+        };
+        let error = factorization_backward_error(&a, &factors, 4, p).unwrap();
+        assert!(
+            error > Float::with_val(p, 0.1),
+            "incorrect LU factors passed all sampled right-hand sides with reported error {error}"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_lu_factor_shape_overflow_returns_failure() {
+        let factors = xc_numerics::linalg::LuFactors {
+            lu: vec![],
+            perm: vec![],
+        };
+        let outcome = std::panic::catch_unwind(|| {
+            factorization_backward_error(&[], &factors, usize::MAX, 128)
+        });
+        assert!(
+            outcome.is_ok(),
+            "LU shape validation panicked before rejecting an impossible dimension"
+        );
+        assert!(outcome.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_resumed_lu_directed {
+    use super::*;
+    #[test]
+    fn exhaustive_resumed_lu_directed_reconstruction_covers_pivots_and_extreme_scales() {
+        for p in [64, 128, 256] {
+            for exponent in [-700_000_000i32, 0, 700_000_000] {
+                let n = 4;
+                let perm = vec![2, 0, 3, 1];
+                let lower = [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.5, 1.0, 0.0, 0.0],
+                    [-0.25, 0.5, 1.0, 0.0],
+                    [0.125, -0.25, 0.5, 1.0],
+                ];
+                let upper = [
+                    [2.0, 0.5, -0.25, 0.125],
+                    [0.0, -3.0, 0.5, 0.25],
+                    [0.0, 0.0, 4.0, -0.5],
+                    [0.0, 0.0, 0.0, 5.0],
+                ];
+                let mut a = vec![Float::with_val(p, 0); n * n];
+                let mut lu = a.clone();
+                for i in 0..n {
+                    for j in 0..n {
+                        // All products/sums are small dyadics, exact at every p.
+                        let value = (0..n).map(|k| lower[i][k] * upper[k][j]).sum::<f64>();
+                        a[perm[i] * n + j] = Float::with_val(p, value) << exponent;
+                        lu[i * n + j] = if i > j {
+                            Float::with_val(p, lower[i][j])
+                        } else {
+                            Float::with_val(p, upper[i][j]) << exponent
+                        };
+                    }
+                }
+                let factors = xc_numerics::linalg::LuFactors { lu, perm };
+                assert_eq!(factorization_backward_error(&a, &factors, n, p).unwrap(), 0);
+                a[0] += Float::with_val(p, 1) << exponent;
+                assert!(
+                    factorization_backward_error(&a, &factors, n, p).unwrap()
+                        > Float::with_val(p, 0.01)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_resumed_root_confirmation {
+    use super::*;
+    #[test]
+    fn exhaustive_resumed_root_newton_cannot_converge_to_a_pole_without_a_root() {
+        let p = 128;
+        let xi = vec![Float::with_val(p, 1)];
+        let poles = vec![Float::with_val(p, 0)];
+        let seed = Float::with_val(p, 1) >> 100u32;
+        let result = solve_r_zero(&xi, &poles, &seed, p, 8, RootSolver::Newton);
+        assert!(
+            !matches!(result, EigenvalueResult::Converged(_)),
+            "1/z has no finite zero, but near-pole Newton correction was labeled converged: {result:?}"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_root_membership_uses_original_stored_endpoint_precision() {
+        let value = Float::with_val(64, 1);
+        let lower = Float::with_val(128, 1) + (Float::with_val(128, 1) >> 100u32);
+        let upper = Float::with_val(128, 2);
+        assert!(
+            !stored_root_in_decimal_interval(&value, &lower.to_string(), &upper.to_string(), 128)
+                .unwrap(),
+            "the lower-precision point lies strictly below the original stored lower endpoint"
+        );
+    }
+    fn adaptive_fixture() -> (
+        HighPrecConfig,
+        RootRefinement,
+        Vec<Float>,
+        Vec<Float>,
+        PortableAdaptiveRootPrecision,
+    ) {
+        let p = 128;
+        let mut cfg = HighPrecConfig::for_decimal_digits(20).with_adaptive_root_precision();
+        cfg.precision_bits = p;
+        let xi = [0, 1, 1].map(|v| Float::with_val(p, v)).to_vec();
+        let poles = [-2, 0, 2].map(|v| Float::with_val(p, v)).to_vec();
+        let root = root_refinement(
+            &xi,
+            &poles,
+            Float::with_val(p, 1),
+            1,
+            Float::with_val(p, 0),
+            p - GUARD_BITS,
+            p,
+        )
+        .unwrap();
+        let evidence = PortableAdaptiveRootPrecision {
+            source_accuracy_scope: "exact_stored_point_source".into(),
+            target_precision_bits: p - GUARD_BITS,
+            evaluation_precision_bits: p,
+            verification_precision_bits: p + cfg.root_verification_precision_bits,
+            precision_escalations: 0,
+            verification_correction: "0".into(),
+            stopping_reason: "requested_target_confirmed".into(),
+        };
+        (cfg, root, xi, poles, evidence)
+    }
+    #[test]
+    fn exhaustive_resumed_root_adaptive_correction_may_not_underflow_into_replay() {
+        let (cfg, root, xi, poles, mut e) = adaptive_fixture();
+        assert!(
+            validate_adaptive_root_evidence(Some(&e), &root, "converged", &cfg, &xi, &poles)
+                .is_ok()
+        );
+        e.verification_correction = "1e-400000000".into();
+        assert!(
+            validate_adaptive_root_evidence(Some(&e), &root, "converged", &cfg, &xi, &poles)
+                .is_err(),
+            "nonzero evidence silently became exact zero"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_root_confirmed_correction_is_bound_to_verification() {
+        let (cfg, mut root, xi, poles, e) = adaptive_fixture();
+        // This is an exact root with a verified zero correction. Changing only
+        // the displayed correction must not produce accepted scientific data.
+        root.diagnostics.final_correction = Float::with_val(cfg.precision_bits, 1) >> 70u32;
+        assert!(
+            validate_adaptive_root_evidence(Some(&e), &root, "converged", &cfg, &xi, &poles)
+                .is_err()
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_root_iteration_evidence_correction_is_validated() {
+        let (cfg, mut root, xi, poles, mut e) = adaptive_fixture();
+        root.diagnostics.iterations = cfg.solver_steps;
+        e.stopping_reason = "iteration_limit".into();
+        e.verification_precision_bits = e.evaluation_precision_bits;
+        e.verification_correction = "NaN".into();
+        assert!(
+            validate_adaptive_root_evidence(Some(&e), &root, "approximate", &cfg, &xi, &poles)
+                .is_err(),
+            "iteration-limit correction was never parsed"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_root_adaptive_precision_rejects_unbounded_ceiling() {
+        let (mut cfg, _, _, _, _) = adaptive_fixture();
+        cfg.root_maximum_extra_precision_bits = u32::MAX;
+        assert!(
+            cfg.validate_root_precision_policy().is_err(),
+            "unbounded adaptive precision was admitted"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_root_window_rejects_nonfinite_numeric_outcomes() {
+        let (_, mut root, _, _, _) = adaptive_fixture();
+        root.value = Float::with_val(128, f64::NAN);
+        assert!(
+            ensure_root_window_usable(
+                &[EigenvalueResult::Converged(root)],
+                1,
+                true,
+                IndependentRootDomain::Positive
+            )
+            .is_err(),
+            "NaN passed ordered positive root-window validation"
+        );
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_resumed_root_witness_oracle {
+    use super::*;
+    #[test]
+    fn exhaustive_resumed_root_witness_agrees_with_exact_rational_root_and_scales() {
+        // R(z)=1/z+1/(z-2s) has its unique movable zero exactly at s.
+        for p in [128, 256, 512] {
+            let target = p - 64;
+            for exponent in [-700_000_000i32, 0, 700_000_000] {
+                let root = Float::with_val(p, 1) << exponent;
+                let xi = [0, 1, 1].map(|v| Float::with_val(p, v));
+                let poles = [-2, 0, 2].map(|v| Float::with_val(p, v) << exponent);
+                assert!(root_accuracy_witness(&xi, &poles, &root, target, p + 64));
+                let near = Float::with_val(
+                    p,
+                    &root + Float::with_val(p, &root) / 8u32 / (Float::with_val(p, 1) << target),
+                );
+                assert!(root_accuracy_witness(&xi, &poles, &near, target, p + 64));
+                if exponent >= 0 {
+                    let far =
+                        Float::with_val(p, &root + (Float::with_val(p, &root) >> target) * 4u32);
+                    assert!(!root_accuracy_witness(&xi, &poles, &far, target, p + 64));
+                }
+            }
+        }
+    }
+    #[test]
+    fn adaptive_root_cache_replays_witness_at_recorded_precision() {
+        let p = 192;
+        let params = CcmParams::from_lambda_sq_integer(13, 1);
+        let mut cfg = HighPrecConfig::for_decimal_digits(40).with_adaptive_root_precision();
+        cfg.precision_bits = p;
+        let l = log_lambda_sq_hp(&params, p).unwrap();
+        let spacing = secular_spacing(&l, p).unwrap();
+        let poles = secular_poles(&spacing, 1, p);
+        // R(z)=1/(z+a)-2(1+e)/z+1/(z-a), e=2^-160.
+        // Its positive movable root is exactly a*sqrt(2^160+1).
+        // Cancellation needs more than the fixed 64 guard bits to prove it.
+        let epsilon = Float::with_val(p, 1) >> 160u32;
+        let xi = vec![
+            Float::with_val(p, 1),
+            -Float::with_val(p, 1 + epsilon) * 2u32,
+            Float::with_val(p, 1),
+        ];
+        let seed = Float::with_val(p, &spacing) << 80u32;
+        let computed = adaptive_root_outcome(&xi, &poles, &seed, &cfg);
+        let EigenvalueResult::Converged(result) = computed.outcome else {
+            panic!(
+                "adaptive cancellation recovery failed: {:?}",
+                computed.outcome
+            );
+        };
+        let evidence = computed.adaptive_precision.unwrap();
+        assert!(evidence.verification_precision_bits > p + GUARD_BITS);
+        assert!(!root_accuracy_witness(
+            &xi,
+            &poles,
+            &result.value,
+            p - GUARD_BITS,
+            p + GUARD_BITS
+        ));
+        let exact_square = (rug::Integer::from(1) << 160u32) + 1;
+        let reference =
+            Float::with_val(1024, exact_square).sqrt() * Float::with_val(1024, &spacing);
+        assert!(
+            Float::with_val(1024, &result.value - &reference).abs()
+                < root_correction_tolerance(&result.value, p)
+        );
+        let source = ContentDigest::sha256(b"adaptive cancellation fixture");
+        let semantics = RootWindowSemantics::strict_positive(1);
+        let mut artifact = PortableRootRange {
+            schema_version: 5,
+            lambda_squared: lambda_squared_cache_identity(&params),
+            n_modes: 1,
+            precision_bits: p,
+            force_even: cfg.effective_parity_policy().legacy_force_even(),
+            parity_policy: cfg.effective_parity_policy().portable_marker(),
+            first_root_index: 1,
+            root_domain: IndependentRootDomain::Positive,
+            discovery_mode: RootArtifactMode::Independent.as_str().into(),
+            reference_seeds_used: false,
+            reference_dataset: None,
+            completeness: semantics.completeness(RootArtifactMode::Independent).into(),
+            starting_points: vec![seed.to_string()],
+            outcomes: vec![PortableRootOutcome::Converged(
+                PortableRootRefinement::from_runtime_adaptive(&result, evidence),
+            )],
+            solver: cfg.root_solver.display_name().to_ascii_lowercase(),
+            solver_steps: cfg.solver_steps,
+            accuracy_guard_bits: GUARD_BITS,
+            root_precision_policy: Some(RootPrecisionPolicy::Adaptive),
+            target_precision_bits: Some(p - GUARD_BITS),
+            maximum_extra_precision_bits: Some(cfg.root_maximum_extra_precision_bits),
+            verification_precision_bits: Some(cfg.root_verification_precision_bits),
+            secular_source_content_digest: Some(source.clone()),
+        };
+        let decode = |artifact: &PortableRootRange| {
+            decode_root_range(
+                artifact,
+                &params,
+                &cfg,
+                1,
+                std::slice::from_ref(&seed),
+                RootArtifactMode::Independent,
+                None,
+                &xi,
+                &l,
+                semantics,
+                Some(&source),
+                true,
+            )
+        };
+        assert!(decode(&artifact).is_ok());
+        let PortableRootOutcome::Converged(root) = &mut artifact.outcomes[0] else {
+            unreachable!()
+        };
+        root.adaptive_precision
+            .as_mut()
+            .unwrap()
+            .verification_precision_bits = p + GUARD_BITS;
+        assert!(
+            decode(&artifact).is_err(),
+            "tampered verification precision was accepted"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_root_decimal_membership_preserves_a_higher_precision_point() {
+        let value = Float::with_val(512, 1) + (Float::with_val(512, 1) >> 200u32);
+        assert!(!stored_root_in_decimal_interval(
+            &value,
+            "1",
+            "1.000000000000000000000000000000000000000000000000000000000000000000001",
+            64
+        )
+        .unwrap());
+        assert!(stored_root_in_decimal_interval(&Float::with_val(64, 1), "1", "1", 64).unwrap());
+        assert!(stored_root_in_decimal_interval(&Float::with_val(64, 1), "NaN", "2", 64).is_err());
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_resumed_runtime_contracts {
+    use super::*;
+    #[test]
+    fn exhaustive_resumed_runtime_tau_requires_reflection_symmetry() {
+        let p = 128;
+        let params = CcmParams::from_lambda_sq_integer(13, 1);
+        let tau = PortableTauMatrix {
+            schema_version: 2,
+            lambda_squared: "13".into(),
+            n_modes: 1,
+            precision_bits: p,
+            entries: ["1", "0", "0", "0", "0", "0", "0", "0", "3"]
+                .map(str::to_owned)
+                .to_vec(),
+        };
+        assert!(
+            decode_tau_artifact(&tau, &params, p).is_err(),
+            "noncentrosymmetric Tau passed admission although odd reduction would report3 instead of the projected2"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_runtime_tau_impossible_shape_fails_without_panic() {
+        let result = std::panic::catch_unwind(|| tau_cache::structural_check(&[], usize::MAX, 128));
+        assert!(result.is_ok(), "Tau shape arithmetic overflowed");
+        assert!(result.unwrap().is_some());
+    }
+    #[test]
+    fn exhaustive_resumed_runtime_odd_expansion_rejects_partial_underflow() {
+        let p = 128;
+        let tiny = Float::with_val(p, 1) << (rug::float::exp_min() - 1);
+        assert!(
+            std::panic::catch_unwind(|| expand_odd_sector_vector(&[tiny], 1, p)).is_err(),
+            "odd expansion silently rounded a nonrepresentable quotient up to the minimum normal"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_runtime_even_expansion_rejects_partial_underflow() {
+        let p = 128;
+        let tiny = Float::with_val(p, 1) << (rug::float::exp_min() - 1);
+        assert!(
+            std::panic::catch_unwind(|| expand_even_sector_vector(
+                &[Float::with_val(p, 0), tiny],
+                1,
+                p
+            ))
+            .is_err(),
+            "even expansion silently rounded a nonrepresentable quotient up to the minimum normal"
+        );
+    }
+    fn root_fixture() -> (Vec<Float>, Vec<Float>, RootRefinement) {
+        let p = 128;
+        let xi = [3, 0, 1].map(|v| Float::with_val(p, v)).to_vec();
+        let poles = [-1, 0, 1].map(|v| Float::with_val(p, v)).to_vec();
+        let root = root_refinement(
+            &xi,
+            &poles,
+            Float::with_val(p, 0.5),
+            1,
+            Float::with_val(p, 0),
+            64,
+            p,
+        )
+        .unwrap();
+        (xi, poles, root)
+    }
+    #[test]
+    fn exhaustive_resumed_runtime_conditioning_replays_neighbor_presence_and_ties() {
+        let (xi, poles, root) = root_fixture();
+        let p = 128;
+        let spacing = Float::with_val(p, 1);
+        let mut details =
+            root_conditioning_details(&xi, &poles, &spacing, 1, &root.value, 1, Some(1), p)
+                .unwrap();
+        assert!(validate_root_conditioning_details(
+            &details,
+            &root,
+            1,
+            Some(1),
+            &spacing,
+            &xi,
+            &poles,
+            1,
+            p
+        )
+        .is_ok());
+        details.left_pole_index = None;
+        details.left_pole = None;
+        details.left_pole_distance = None;
+        details.normalized_interval_position = None;
+        details.nearest_pole_index = details.right_pole_index.unwrap();
+        details.nearest_pole = details.right_pole.clone().unwrap();
+        details.nearest_pole_distance = details.right_pole_distance.clone().unwrap();
+        assert!(
+            validate_root_conditioning_details(
+                &details,
+                &root,
+                1,
+                Some(1),
+                &spacing,
+                &xi,
+                &poles,
+                1,
+                p
+            )
+            .is_err(),
+            "omitting the left neighbor allowed the wrong nearest-pole tie result"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_runtime_refinement_rejects_nonfinite_diagnostics() {
+        let (xi, poles, root) = root_fixture();
+        assert!(
+            root_refinement(
+                &xi,
+                &poles,
+                root.value,
+                1,
+                Float::with_val(128, f64::NAN),
+                64,
+                128
+            )
+            .is_none(),
+            "runtime refinement accepted a NaN correction"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_runtime_window_rejects_nonfinite_diagnostics() {
+        let (_, _, mut root) = root_fixture();
+        root.diagnostics.residual = Float::with_val(128, f64::NAN);
+        assert!(
+            ensure_root_window_usable(
+                &[EigenvalueResult::Converged(root)],
+                1,
+                true,
+                IndependentRootDomain::Positive
+            )
+            .is_err(),
+            "runtime window admitted a NaN residual"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_runtime_residual_does_not_silently_underflow() {
+        let p = 128;
+        let tiny = Float::with_val(p, 1) << (rug::float::exp_min() - 1);
+        assert!(
+            secular_residual_and_scale_at(
+                &[tiny],
+                &[Float::with_val(p, 0)],
+                &Float::with_val(p, 2),
+                p
+            )
+            .is_none(),
+            "nonzero secular residual silently became zero"
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_runtime_matrix_symmetry_rejects_nonfinite_and_overflow() {
+        assert!(
+            !matrix_is_exactly_symmetric(&[Float::with_val(128, f64::NAN)], 1),
+            "NaN diagonal was declared symmetric"
+        );
+        let result = std::panic::catch_unwind(|| matrix_is_exactly_symmetric(&[], usize::MAX));
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+    #[test]
+    fn exhaustive_resumed_runtime_borrowed_action_rejects_nonfinite_output() {
+        let p = 128;
+        let huge = Float::with_val(p, 1) << (rug::float::exp_max() - 1);
+        let entries = [huge];
+        let operator = BorrowedDenseSymmetricHp {
+            name: "audit-overflow",
+            dimension: 1,
+            entries: &entries,
+            precision_bits: p,
+        };
+        let mut y = [Float::with_val(p, 0)];
+        assert!(
+            operator.apply(&[Float::with_val(p, 2)], &mut y).is_err(),
+            "borrowed matrix action returned Ok with infinite output"
+        );
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_resumed_conditioning_arithmetic {
+    use super::*;
+    fn fixture(exponent: i32) -> (Vec<Float>, Vec<Float>, Float, Float) {
+        let p = 128;
+        let scale = Float::with_val(p, 1) << exponent;
+        let xi = (1..=3).map(|n| Float::with_val(p, n) * &scale).collect();
+        let poles = [-1, 0, 1]
+            .iter()
+            .map(|n| Float::with_val(p, *n) * &scale)
+            .collect();
+        let root = Float::with_val(p, &scale / 2);
+        (xi, poles, scale, root)
+    }
+    fn exact_scaled_oracle(exponent: i32) {
+        let p = 128;
+        let (xi, poles, spacing, root) = fixture(exponent);
+        let result =
+            root_conditioning_details(&xi, &poles, &spacing, 1, &root, 1, Some(1), p).unwrap();
+        let parse = |s: &str| parse_hp_scalar(s, p).unwrap();
+        assert_eq!(
+            parse(&result.secular_term_magnitude_sum),
+            Float::with_val(p, rug::Rational::from((32, 3)))
+        );
+        assert_eq!(
+            parse(&result.secular_derivative),
+            Float::with_val(p, rug::Rational::from((-184, 9))) >> exponent
+        );
+        assert_eq!(
+            parse(&result.reciprocal_derivative),
+            Float::with_val(p, rug::Rational::from((-9, 184))) << exponent
+        );
+        assert_eq!(
+            parse(&result.normalized_isolation_margin),
+            Float::with_val(p, 0.5)
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_conditioning_large_scale() {
+        exact_scaled_oracle(700_000_000);
+    }
+    #[test]
+    fn exhaustive_resumed_conditioning_small_scale() {
+        exact_scaled_oracle(-700_000_000);
+    }
+    #[test]
+    fn exhaustive_resumed_conditioning_nan_weight() {
+        let (mut xi, poles, spacing, root) = fixture(0);
+        xi[0] = Float::with_val(128, rug::float::Special::Nan);
+        assert!(
+            root_conditioning_details(&xi, &poles, &spacing, 1, &root, 1, Some(1), 128).is_err()
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_conditioning_zero_spacing() {
+        let (xi, poles, _, root) = fixture(0);
+        assert!(root_conditioning_details(
+            &xi,
+            &poles,
+            &Float::with_val(128, 0),
+            1,
+            &root,
+            1,
+            Some(1),
+            128
+        )
+        .is_err());
+    }
+    #[test]
+    fn exhaustive_resumed_conditioning_uniform_pole_identity() {
+        let (xi, mut poles, spacing, root) = fixture(0);
+        poles[2] *= 2;
+        assert!(
+            root_conditioning_details(&xi, &poles, &spacing, 1, &root, 1, Some(1), 128).is_err()
+        );
+    }
+    #[test]
+    fn exhaustive_resumed_conditioning_invalid_precision_without_panic() {
+        let (xi, poles, spacing, root) = fixture(0);
+        let result = std::panic::catch_unwind(|| {
+            root_conditioning_details(&xi, &poles, &spacing, 1, &root, 1, Some(1), 0)
+        });
+        assert!(result.is_ok_and(|v| v.is_err()));
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_ground_index {
+    use super::*;
+    fn fixture(
+        parity: CcmParityPolicy,
+        outer: i32,
+        center: i32,
+    ) -> (CcmParams, HighPrecConfig, Vec<Float>, PortableWeilEigenpair) {
+        let params = CcmParams::from_lambda_sq_integer(13, 1);
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = 128;
+        cfg.inverse_iter_steps = 2;
+        cfg.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
+        cfg.set_parity_policy(parity);
+        let mut tau = vec![Float::with_val(128, 0); 9];
+        tau[0] = Float::with_val(128, outer);
+        tau[4] = Float::with_val(128, center);
+        tau[8] = Float::with_val(128, outer);
+        let xi = vec![
+            Float::with_val(128, 0),
+            log_lambda_sq_hp(&params, 128).unwrap().sqrt(),
+            Float::with_val(128, 0),
+        ];
+        let eps = Float::with_val(128, center);
+        let diagnostics = xc_numerics::linalg::InverseIterationDiagnostics {
+            configured_step_limit: 2,
+            unshifted_steps: 1,
+            unshifted_converged: true,
+            final_relative_rayleigh_change: Some(Float::with_val(128, 0)),
+            shifted_refinement: xc_numerics::linalg::ShiftedRefinementOutcome::Accepted,
+            final_relative_residual_norm: weil_eigvec_cache::relative_residual_norm(
+                &tau, 3, &xi, &eps, 128,
+            )
+            .unwrap(),
+        };
+        let artifact = PortableWeilEigenpair {
+            stored_state_resolution: Some(
+                stored_resolution::bounds(&tau, &xi, &eps, 128, parity)
+                    .unwrap()
+                    .record,
+            ),
+            schema_version: 4,
+            lambda_squared: "13".into(),
+            n_modes: 1,
+            precision_bits: 128,
+            force_even: parity.legacy_force_even(),
+            parity_policy: parity.portable_marker(),
+            eigenstate_route: legacy_eigenstate_route_name(),
+            eigenvalue: eps.to_string(),
+            eigenvector: xi.iter().map(Float::to_string).collect(),
+            inverse_iteration: PortableInverseIterationDiagnostics::from_runtime(&diagnostics),
+            shift_invert_krylov: None,
+        };
+        (params, cfg, tau, artifact)
+    }
+    #[test]
+    fn exhaustive_ground_index_even_rejects_higher_exact_eigenpair() {
+        let (p, c, a, v) = fixture(CcmParityPolicy::EvenSector, 1, 2);
+        assert!(decode_weil_eigenpair(&v, &p, &c, &a).is_err());
+    }
+    #[test]
+    fn exhaustive_ground_index_natural_rejects_higher_exact_eigenpair() {
+        let (p, c, a, v) = fixture(CcmParityPolicy::Natural, 1, 2);
+        assert!(decode_weil_eigenpair(&v, &p, &c, &a).is_err());
+    }
+    #[test]
+    fn exhaustive_ground_index_adaptive_rejects_higher_exact_eigenpair() {
+        let (p, c, a, v) = fixture(CcmParityPolicy::AdaptiveEven, 1, 2);
+        assert!(decode_weil_eigenpair(&v, &p, &c, &a).is_err());
+    }
+    #[test]
+    fn exhaustive_ground_index_cluster_does_not_claim_individual_state() {
+        let (p, c, a, v) = fixture(CcmParityPolicy::EvenSector, 1, 1);
+        assert!(decode_weil_eigenpair(&v, &p, &c, &a).is_err());
+    }
+    #[test]
+    fn exhaustive_ground_index_distinct_ground_positive_control() {
+        for parity in [
+            CcmParityPolicy::EvenSector,
+            CcmParityPolicy::Natural,
+            CcmParityPolicy::AdaptiveEven,
+        ] {
+            let (p, c, a, v) = fixture(parity, 2, 1);
+            assert!(decode_weil_eigenpair(&v, &p, &c, &a).is_ok());
+        }
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_discovery_cache {
+    use super::*;
+    #[test]
+    fn exhaustive_discovery_cache_signed_window_retains_both_halves() {
+        let p = 192;
+        let params = CcmParams::from_lambda_sq_integer(13, 2);
+        let l = Float::with_val(p, pi(p) * 2u32);
+        let xi = vec![Float::with_val(p, 1); 5];
+        let plan = independently_discovered_starting_points(
+            &params,
+            &l,
+            &xi,
+            &ZeroTarget::SymmetricHeightWindow {
+                height: "1.9".into(),
+            },
+            IndependentRootDiscoveryOptions::advanced(true, false),
+            p,
+        )
+        .unwrap();
+        assert_eq!(plan.artifact_seeds.len(), 4);
+        assert_eq!(plan.selected_positions, vec![0, 1, 2, 3]);
+        // For P(t)=t(t^2-1)(t^2-4), the roots are those of P'(t)=5t^4-15t^2+4.
+        let radical = Float::with_val(512, 145).sqrt();
+        let lo = Float::with_val(512, (Float::with_val(512, 15) - &radical) / 10u32).sqrt();
+        let hi = Float::with_val(512, (Float::with_val(512, 15) + &radical) / 10u32).sqrt();
+        for (actual, expected) in plan
+            .artifact_seeds
+            .iter()
+            .zip([-hi.clone(), -lo.clone(), lo, hi])
+        {
+            assert!(
+                Float::with_val(512, actual - &expected).abs() < Float::with_val(512, 1) >> 100u32
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_state_normalization {
+    use super::*;
+    #[test]
+    fn exhaustive_state_normalization_overflowing_sum() {
+        let p = 128;
+        let big = Float::with_val(p, 1) << (rug::float::exp_max() - 1);
+        let xi = [big.clone(), big];
+        let normalized = normalize_eigenvector(&xi, &Float::with_val(p, 1), p).unwrap();
+        assert_eq!(normalized, vec![Float::with_val(p, 0.5); 2]);
+    }
+    #[test]
+    fn exhaustive_state_normalization_canceling_sum() {
+        let p = 128;
+        let big = Float::with_val(p, 1) << 200i32;
+        let xi = [big.clone(), Float::with_val(p, 1), -big];
+        let normalized = normalize_eigenvector(&xi, &Float::with_val(p, 1), p).unwrap();
+        assert_eq!(normalized, xi);
+    }
+    #[test]
+    fn exhaustive_state_normalization_tiny_input() {
+        let p = 128;
+        let tiny = Float::with_val(p, 1) << (rug::float::exp_min() - 1);
+        let xi = [tiny];
+        let normalized = normalize_eigenvector(&xi, &Float::with_val(p, 1), p).unwrap();
+        assert_eq!(normalized, vec![Float::with_val(p, 1)]);
+    }
+    #[test]
+    fn exhaustive_state_normalization_exact_rational_rounding() {
+        use rug::Rational;
+        for p in [64, 128, 256] {
+            for case in 1..=64i32 {
+                let values = [case - 20, case + 3, 2 - case];
+                let sum: i32 = values.iter().sum();
+                if sum == 0 {
+                    continue;
+                }
+                let xi = values.map(|v| Float::with_val(p, v));
+                let expected = values.map(|v| Float::with_val(p, Rational::from((2 * v, sum))));
+                assert_eq!(
+                    normalize_eigenvector(&xi, &Float::with_val(p, 4), p).unwrap(),
+                    expected,
+                    "case={case}, p={p}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn exhaustive_state_normalization_rejects_invalid_domains() {
+        let p = 128;
+        let one = Float::with_val(p, 1);
+        for values in [
+            vec![],
+            vec![Float::with_val(p, 0)],
+            vec![one.clone(), -one.clone()],
+            vec![Float::with_val(p, rug::float::Special::Nan)],
+            vec![Float::with_val(p, rug::float::Special::Infinity)],
+            vec![Float::with_val(p + 1, 1)],
+        ] {
+            assert!(normalize_eigenvector(&values, &one, p).is_err());
+        }
+        for l in [
+            Float::with_val(p, 0),
+            Float::with_val(p, -1),
+            Float::with_val(p, rug::float::Special::Nan),
+            Float::with_val(p, rug::float::Special::Infinity),
+            Float::with_val(p + 1, 1),
+        ] {
+            assert!(normalize_eigenvector(std::slice::from_ref(&one), &l, p).is_err());
+        }
+        for p in [0, 63, 1_000_001, u32::MAX] {
+            assert!(normalize_eigenvector(std::slice::from_ref(&one), &one, p).is_err());
+        }
+        assert!(normalize_eigenvector(&vec![one.clone(); 16386], &one, 128).is_err());
+        assert!(normalize_eigenvector(&vec![one.clone(); 16385], &one, 1_000_000).is_err());
+        let big = Float::with_val(128, 1) << (rug::float::exp_max() - 1);
+        let tiny = Float::with_val(128, 1) << (rug::float::exp_min() - 1);
+        assert!(normalize_eigenvector(&[big.clone(), tiny.clone()], &one, 128).is_err());
+        // Exact normalization would need an unrepresentable component.
+        assert!(normalize_eigenvector(
+            &[big.clone(), one.clone(), -big],
+            &Float::with_val(128, 4),
+            128
+        )
+        .is_err());
+        assert_eq!(
+            normalize_eigenvector(&[one.clone(), Float::with_val(128, 0)], &one, 128).unwrap(),
+            [one, Float::with_val(128, 0)]
+        );
+    }
+    #[test]
+    fn exhaustive_state_normalization_scaled_algebraic_oracle() {
+        use rug::{float::Round, Rational};
+        let mut checked = 0;
+        for p in [64, 128, 256] {
+            for case in 1..=32i32 {
+                let values = [case - 20, case + 3, 2 - case];
+                let sum: i32 = values.iter().sum();
+                if sum == 0 {
+                    continue;
+                }
+                // Independent algebraic identity |xi_i sqrt(2)/sum| =
+                // sqrt(2 xi_i^2 / sum^2); exact rational radicands.
+                let expected = values.map(|v| {
+                    let radicand = Rational::from((2 * v * v, sum * sum));
+                    let mut lo = Float::with_val_round(p + 1024, &radicand, Round::Down).0;
+                    let mut hi = Float::with_val_round(p + 1024, &radicand, Round::Up).0;
+                    lo.sqrt_round(Round::Down);
+                    hi.sqrt_round(Round::Up);
+                    let mut expected = Float::with_val(p, &lo);
+                    assert_eq!(expected, Float::with_val(p, &hi));
+                    if v * sum < 0 {
+                        expected = -expected;
+                    }
+                    expected
+                });
+                for e in [-700_000_000, 0, 700_000_000] {
+                    let xi = values.map(|v| Float::with_val(p, v) << e);
+                    for le in [-700_000_000, 0, 700_000_000] {
+                        let l = Float::with_val(p, 2) << le;
+                        let out = normalize_eigenvector(&xi, &l, p).unwrap();
+                        for (v, exact) in out.iter().zip(&expected) {
+                            assert_eq!(
+                                *v,
+                                exact.clone() << (le / 2),
+                                "case={case}, p={p}, e={e}, le={le}"
+                            );
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 837);
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_symmetry_range {
+    use super::*;
+    #[test]
+    fn exhaustive_symmetry_range_average_does_not_overflow() {
+        let p = 128;
+        let big = Float::with_val(p, 1) << (rug::float::exp_max() - 1);
+        let mut matrix = vec![
+            Float::with_val(p, 0),
+            big.clone(),
+            big.clone(),
+            Float::with_val(p, 0),
+        ];
+        force_symmetric(&mut matrix, 2).unwrap();
+        assert_eq!(matrix[1], big);
+        assert_eq!(matrix[2], big);
+    }
+    #[test]
+    fn exhaustive_symmetry_range_preserves_maximum_input_precision() {
+        let low = Float::with_val(64, 1);
+        let mut high = Float::with_val(128, 1);
+        high += Float::with_val(128, 1) >> 100u32;
+        let mut expected = Float::with_val(128, 1);
+        expected += Float::with_val(128, 1) >> 101u32;
+        let mut matrix = vec![low.clone(), low, high.clone(), high];
+        force_symmetric(&mut matrix, 2).unwrap();
+        assert_eq!(matrix[1], expected);
+        assert_eq!(matrix[2], expected);
+    }
+    #[test]
+    fn exhaustive_symmetry_range_exact_rational_oracles() {
+        use rug::Rational;
+        let mut checked = 0;
+        for p in [64, 128, 256] {
+            for k in 0..64i32 {
+                let a = 3 * k - 100;
+                let b = 50 - k;
+                let expected = Float::with_val(p, Rational::from((a + b, 16)));
+                for e in [-700_000_000, 0, 700_000_000] {
+                    let a = Float::with_val(p, Rational::from((a, 8))) << e;
+                    let b = Float::with_val(p, Rational::from((b, 8))) << e;
+                    let mut matrix = vec![Float::with_val(p, 7), a, b, Float::with_val(p, 9)];
+                    force_symmetric(&mut matrix, 2).unwrap();
+                    assert_eq!(matrix[1], expected.clone() << e);
+                    assert_eq!(matrix[2], matrix[1]);
+                    assert_eq!(matrix[0], 7);
+                    assert_eq!(matrix[3], 9);
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 576);
+    }
+    #[test]
+    fn exhaustive_symmetry_range_rejects_invalid_and_unrepresentable_inputs() {
+        let p = 128;
+        let zero = Float::with_val(p, 0);
+        for (mut matrix, dimension) in [
+            (vec![], 0),
+            (vec![], usize::MAX),
+            (vec![zero.clone(); 3], 2),
+            (vec![Float::with_val(p, rug::float::Special::Nan)], 1),
+            (vec![Float::with_val(p, rug::float::Special::Infinity)], 1),
+            (vec![Float::with_val(1_000_001, 1)], 1),
+        ] {
+            assert!(force_symmetric(&mut matrix, dimension).is_err());
+        }
+        let minimum = Float::with_val(p, 1) << (rug::float::exp_min() - 1);
+        let mut matrix = vec![zero.clone(), minimum.clone(), zero.clone(), zero.clone()];
+        assert!(force_symmetric(&mut matrix, 2).is_err());
+        let mut matrix = vec![zero.clone(), minimum.clone(), minimum.clone(), zero.clone()];
+        force_symmetric(&mut matrix, 2).unwrap();
+        assert_eq!(matrix[1], minimum);
+        let mut matrix = vec![zero.clone(), minimum.clone(), -minimum, zero];
+        force_symmetric(&mut matrix, 2).unwrap();
+        assert_eq!(matrix[1], 0);
+        assert_eq!(matrix[2], 0);
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_parity_arithmetic {
+    use super::*;
+    fn divided_by_sqrt_two(value: i32, p: u32) -> Float {
+        use rug::{float::Round, Rational};
+        let square = Rational::from((value * value, 2));
+        let mut lo = Float::with_val_round(p + 1024, &square, Round::Down).0;
+        let mut hi = Float::with_val_round(p + 1024, &square, Round::Up).0;
+        lo.sqrt_round(Round::Down);
+        hi.sqrt_round(Round::Up);
+        let out = Float::with_val(p, lo);
+        assert_eq!(out, Float::with_val(p, hi));
+        if value < 0 {
+            -out
+        } else {
+            out
+        }
+    }
+    #[test]
+    fn exhaustive_parity_arithmetic_even_cancellation() {
+        let p = 128;
+        let big = Float::with_val(p, 1) << 200i32;
+        let mut tau = vec![Float::with_val(p, 0); 9];
+        tau[0] = big.clone();
+        tau[2] = Float::with_val(p, 1);
+        tau[6] = Float::with_val(p, 1);
+        tau[8] = -big;
+        let even = build_even_sector_matrix(&tau, 1, p).unwrap();
+        assert_eq!(even[3], 1);
+    }
+    #[test]
+    fn exhaustive_parity_arithmetic_even_overflow() {
+        let p = 128;
+        let e = rug::float::exp_max() - 1;
+        let big = Float::with_val(p, 1) << e;
+        let mut tau = vec![Float::with_val(p, 0); 9];
+        for k in [1, 3, 5, 7] {
+            tau[k] = big.clone();
+        }
+        let even = build_even_sector_matrix(&tau, 1, p).unwrap();
+        assert_eq!(even[1], divided_by_sqrt_two(2, p) << e);
+    }
+    #[test]
+    fn exhaustive_parity_arithmetic_even_radical_rounding() {
+        for p in [64, 128, 256] {
+            for v in 1..32 {
+                let mut tau = vec![Float::with_val(p, 0); 9];
+                tau[1] = Float::with_val(p, v);
+                tau[3] = Float::with_val(p, v);
+                let even = build_even_sector_matrix(&tau, 1, p).unwrap();
+                assert_eq!(even[1], divided_by_sqrt_two(v, p), "p={p}, v={v}");
+            }
+        }
+    }
+    #[test]
+    fn exhaustive_parity_arithmetic_odd_full_projection() {
+        let p = 128;
+        let mut tau = vec![Float::with_val(p, 0); 9];
+        tau[0] = Float::with_val(p, 1);
+        tau[8] = Float::with_val(p, 3);
+        let odd = build_odd_sector_matrix(&tau, 1, p).unwrap();
+        assert_eq!(odd[0], 2);
+    }
+    #[test]
+    fn exhaustive_parity_arithmetic_expansion_radical_rounding() {
+        for p in [64, 128, 256] {
+            for v in 1..32 {
+                let value = Float::with_val(p, v);
+                let expected = divided_by_sqrt_two(v, p);
+                let even = expand_even_sector_vector(&[Float::with_val(p, 0), value.clone()], 1, p);
+                let odd = expand_odd_sector_vector(&[value], 1, p);
+                assert_eq!(even[2], expected, "even p={p}, v={v}");
+                assert_eq!(odd[2], expected, "odd p={p}, v={v}");
+            }
+        }
+    }
+    #[test]
+    fn exhaustive_parity_restriction_radical_rounding() {
+        let p = 64;
+        let values = [
+            Float::with_val(p, 1),
+            Float::with_val(p, 0),
+            Float::with_val(p, 0),
+        ];
+        let reduced = restrict_even_sector_vector(&values, 1, p).unwrap();
+        assert_eq!(reduced[1], divided_by_sqrt_two(1, p));
+    }
+    #[test]
+    fn exhaustive_parity_restriction_finite_overflow() {
+        let p = 128;
+        let e = rug::float::exp_max() - 1;
+        let big = Float::with_val(p, 1) << e;
+        let reduced =
+            restrict_even_sector_vector(&[big.clone(), Float::with_val(p, 0), big], 1, p).unwrap();
+        assert_eq!(reduced[1], divided_by_sqrt_two(2, p) << e);
+    }
+    fn algebraic_reference(value: rug::Rational, sqrt_divisor: bool, p: u32) -> Float {
+        use rug::float::Round;
+        if !sqrt_divisor {
+            return Float::with_val(p, value);
+        }
+        let negative = value < 0;
+        let mut square = value.square();
+        square /= 2;
+        let mut lo = Float::with_val_round(p + 1024, &square, Round::Down).0;
+        let mut hi = Float::with_val_round(p + 1024, &square, Round::Up).0;
+        lo.sqrt_round(Round::Down);
+        hi.sqrt_round(Round::Up);
+        let out = Float::with_val(p, lo);
+        assert_eq!(out, Float::with_val(p, hi));
+        if negative {
+            -out
+        } else {
+            out
+        }
+    }
+    #[test]
+    fn exhaustive_parity_arithmetic_dense_algebraic_oracle() {
+        use rug::Rational;
+        let mut checked = 0;
+        for p in [64, 128, 256] {
+            for n in 0..=3usize {
+                let full = 2 * n + 1;
+                for seed in 0..4i32 {
+                    let mut source = vec![Rational::new(); full * full];
+                    for i in 0..full {
+                        for j in i..full {
+                            let c = (i as i32 * 13 + j as i32 * 19 + seed * 11) % 127 - 63;
+                            source[i * full + j] = Rational::from((c, 8));
+                            source[j * full + i] = Rational::from((c, 8));
+                        }
+                    }
+                    for e in [-700_000_000, 0, 700_000_000] {
+                        let tau = source
+                            .iter()
+                            .map(|v| Float::with_val(p, v) << e)
+                            .collect::<Vec<_>>();
+                        for odd in [false, true] {
+                            let d = n + usize::from(!odd);
+                            let out = if odd {
+                                build_odd_sector_matrix(&tau, n, p)
+                            } else {
+                                build_even_sector_matrix(&tau, n, p)
+                            }
+                            .unwrap();
+                            assert_eq!(out.len(), d * d);
+                            // Dense basis bilinear form over exact rational source
+                            // entries, reducing paired sqrt factors algebraically.
+                            let coefficient = |column: usize, row: usize| -> i32 {
+                                if !odd && column == 0 {
+                                    return i32::from(row == n);
+                                }
+                                let k = column + usize::from(odd);
+                                if row == n + k {
+                                    1
+                                } else if row == n - k {
+                                    if odd {
+                                        -1
+                                    } else {
+                                        1
+                                    }
+                                } else {
+                                    0
+                                }
+                            };
+                            for i in 0..d {
+                                for j in 0..d {
+                                    let mut value = Rational::new();
+                                    for row in 0..full {
+                                        for col in 0..full {
+                                            value += source[row * full + col].clone()
+                                                * (coefficient(i, row) * coefficient(j, col));
+                                        }
+                                    }
+                                    let roots =
+                                        usize::from(odd || i > 0) + usize::from(odd || j > 0);
+                                    if roots == 2 {
+                                        value /= 2;
+                                    }
+                                    let expected = algebraic_reference(value, roots == 1, p) << e;
+                                    assert_eq!(
+                                        out[i * d + j],
+                                        expected,
+                                        "n={n}, seed={seed}, p={p}, e={e}, odd={odd}, i={i}, j={j}"
+                                    );
+                                }
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 288);
+    }
+    #[test]
+    fn exhaustive_parity_arithmetic_domain_and_source_precision() {
+        let p = 128;
+        let one = Float::with_val(p, 1);
+        for (tau, n, p) in [
+            (vec![], usize::MAX, p),
+            (vec![], 1, p),
+            (vec![one.clone()], 0, 0),
+            (vec![Float::with_val(p, rug::float::Special::Nan)], 0, p),
+            (vec![Float::with_val(1_000_001, 1)], 0, p),
+        ] {
+            assert!(build_even_sector_matrix(&tau, n, p).is_err());
+            assert!(build_odd_sector_matrix(&tau, n, p).is_err());
+            assert!(restrict_even_sector_vector(&tau, n, p).is_err());
+        }
+        let mut asymmetric = vec![Float::with_val(p, 0); 9];
+        asymmetric[1] = one.clone();
+        assert!(build_even_sector_matrix(&asymmetric, 1, p).is_err());
+        assert!(build_odd_sector_matrix(&asymmetric, 1, p).is_err());
+        assert!(restrict_even_sector_vector(&vec![one; 16387], 8193, p).is_err());
+        let mut source = Float::with_val(256, 1);
+        source += Float::with_val(256, 1) >> 130u32;
+        let exact = source.to_rational().unwrap();
+        let expected = algebraic_reference(exact, true, 64);
+        let expanded = expand_even_sector_vector(&[Float::with_val(256, 0), source.clone()], 1, 64);
+        assert_eq!(expanded[2], expected);
+        let restricted = restrict_even_sector_vector(
+            &[source, Float::with_val(256, 0), Float::with_val(256, 0)],
+            1,
+            64,
+        )
+        .unwrap();
+        assert_eq!(restricted[1], expected);
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_managed_source_identity {
+    use super::*;
+    use xc_cache::{ArtifactExecutionCacheMode, CacheVisibility, CertificationFailurePolicy};
+    fn with_context<T>(f: impl FnOnce(&ArtifactCacheContext<'_>) -> T) -> T {
+        use xc_cache::{CacheLayer, CachePolicy, CacheResolver, FilesystemCacheStore};
+        let base = std::env::temp_dir().join(format!(
+            "xc-audit-managed-source-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "audit-source",
+                &base,
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let context = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["audit-source".into()],
+            mode: ArtifactExecutionCacheMode::Refresh,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let out = f(&context);
+        std::fs::remove_dir_all(base).unwrap();
+        out
+    }
+    fn fixture(
+        outer: i32,
+        label: &str,
+    ) -> (CcmParams, HighPrecConfig, Vec<Float>, ArtifactManifest) {
+        let params = CcmParams::from_lambda_sq_integer(13, 1);
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = 128;
+        cfg.quad_points = 64;
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        cfg.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
+        let mut tau = vec![Float::with_val(128, 0); 9];
+        tau[0] = Float::with_val(128, outer);
+        tau[4] = Float::with_val(128, 1);
+        tau[8] = Float::with_val(128, outer);
+        let bytes = serde_json::to_vec(&PortableTauMatrix {
+            schema_version: 2,
+            lambda_squared: "13".into(),
+            n_modes: 1,
+            precision_bits: 128,
+            entries: encode_hp_vector(&tau),
+        })
+        .unwrap();
+        let digest = ContentDigest::sha256(&bytes);
+        let manifest = ArtifactManifest {
+            schema_version: 1,
+            key: ArtifactKey::new(
+                "ccm_tau_matrix",
+                format!("ccm/test/source/{label}"),
+                label.as_bytes(),
+            )
+            .unwrap(),
+            content_digest: digest.clone(),
+            size_bytes: bytes.len() as u64,
+            objects: vec![xc_cache::CacheObjectRef {
+                content_digest: digest,
+                size_bytes: bytes.len() as u64,
+            }],
+            created_unix_seconds: 0,
+            producer_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            maximum_reader_version: None,
+            quality: CacheQuality::Validated,
+            visibility: CacheVisibility::Local,
+            immutable: true,
+            dependencies: vec![],
+            tags: BTreeMap::new(),
+            provenance_digest: None,
+        };
+        manifest.validate().unwrap();
+        (params, cfg, tau, manifest)
+    }
+    #[test]
+    fn exhaustive_managed_source_identity_tau_quadrature() {
+        let (params, mut cfg, _, _) = fixture(2, "quad");
+        let l = log_lambda_sq_hp(&params, cfg.precision_bits).unwrap();
+        let a = with_context(|cache| build_tau_hp_via_cache(&params, &l, &cfg, cache).unwrap());
+        cfg.quad_points = 256;
+        let b = with_context(|cache| build_tau_hp_via_cache(&params, &l, &cfg, cache).unwrap());
+        assert_ne!(
+            a.1.key, b.1.key,
+            "different quadrature requests share a Tau key"
+        );
+    }
+    fn eigen_manifest(outer: i32, label: &str) -> ArtifactManifest {
+        let (params, cfg, tau, source) = fixture(outer, label);
+        let l = log_lambda_sq_hp(&params, cfg.precision_bits).unwrap();
+        with_context(|cache| {
+            weil_eigenpair_via_cache_with_seed(&params, &cfg, &l, &tau, &source, cache, None, None)
+                .unwrap()
+                .3
+        })
+    }
+
+    #[test]
+    fn exhaustive_managed_source_identity_eigenpair_matrix() {
+        let a = eigen_manifest(2, "a");
+        let b = eigen_manifest(3, "b");
+        assert_ne!(
+            a.key, b.key,
+            "different actual matrix parents share an eigenpair key"
+        );
+    }
+    #[test]
+    fn exhaustive_managed_source_identity_eigenpair_parent_key() {
+        let a = eigen_manifest(2, "a");
+        let b = eigen_manifest(2, "other-parent-identity");
+        assert_ne!(
+            a.key, b.key,
+            "different matrix dependency identities share an eigenpair key"
+        );
+    }
+    #[test]
+    fn exhaustive_managed_source_identity_rejects_mismatched_length_and_matrix() {
+        let (params, cfg, tau, source) = fixture(2, "boundary");
+        let l = log_lambda_sq_hp(&params, cfg.precision_bits).unwrap();
+        with_context(|cache| {
+            assert!(
+                build_tau_hp_via_cache(&params, &Float::with_val(128, 1), &cfg, cache).is_err()
+            );
+            assert!(weil_eigenpair_via_cache_with_seed(
+                &params,
+                &cfg,
+                &Float::with_val(128, 1),
+                &tau,
+                &source,
+                cache,
+                None,
+                None
+            )
+            .is_err());
+            for mode in 0..6 {
+                let mut changed = cfg.clone();
+                let mut matrix = tau.clone();
+                match mode {
+                    0 => changed.precision_bits = 0,
+                    1 => changed.quad_points = 0,
+                    2 => {
+                        matrix.pop();
+                    }
+                    3 => matrix[0] = Float::with_val(128, rug::float::Special::Nan),
+                    4 => matrix[0] = Float::with_val(256, 2),
+                    _ => matrix[1] = Float::with_val(128, 1),
+                }
+                assert!(
+                    weil_eigenpair_via_cache_with_seed(
+                        &params, &changed, &l, &matrix, &source, cache, None, None
+                    )
+                    .is_err(),
+                    "mode={mode}"
+                );
+            }
+        });
+    }
+    #[test]
+    fn exhaustive_managed_source_identity_checks_parent_and_ignores_nonmathematical_metadata() {
+        let (params, cfg, _, source) = fixture(2, "parent");
+        let key = weil_eigenpair_cache_identity(&params, &cfg, &source)
+            .unwrap()
+            .0
+            .digest()
+            .unwrap();
+        let mut metadata = source.clone();
+        metadata.created_unix_seconds += 1;
+        metadata
+            .tags
+            .insert("audit-note".into(), "same mathematical parent".into());
+        assert_eq!(
+            key,
+            weil_eigenpair_cache_identity(&params, &cfg, &metadata)
+                .unwrap()
+                .0
+                .digest()
+                .unwrap()
+        );
+        for mode in 0..3 {
+            let mut bad = source.clone();
+            match mode {
+                0 => bad.key.kind = "ccm_prime_component".into(),
+                1 => bad.immutable = false,
+                _ => bad.content_digest.0 = "invalid".into(),
+            }
+            assert!(weil_eigenpair_cache_identity(&params, &cfg, &bad).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_root_identity_replay {
+    use super::*;
+    fn root(value: Float) -> EigenvalueResult {
+        let p = value.prec();
+        EigenvalueResult::Converged(RootRefinement {
+            value,
+            diagnostics: RootRefinementDiagnostics {
+                iterations: 1,
+                final_correction: Float::with_val(p, 0),
+                residual: Float::with_val(p, 0),
+                achieved_decimal_digits: Float::with_val(p, 10),
+            },
+        })
+    }
+    #[test]
+    fn exhaustive_root_identity_replay_ordinal_overflow() {
+        let roots = [root(Float::with_val(128, 1)), root(Float::with_val(128, 2))];
+        assert!(positive_root_indices(&roots, usize::MAX).is_err());
+        assert!(ccm_response_roots(&roots, usize::MAX).is_err());
+    }
+    #[test]
+    fn exhaustive_root_identity_replay_zero_ordinal() {
+        let roots = [root(Float::with_val(128, 1))];
+        assert!(positive_root_indices(&roots, 0).is_err());
+        assert!(ccm_response_roots(&roots, 0).is_err());
+    }
+    #[test]
+    fn exhaustive_root_identity_replay_precision_before_equality() {
+        let one = Float::with_val(64, 1);
+        assert!(!residual_replay_matches(&one, Some(&one), Some(&one), 1, 0));
+    }
+    #[test]
+    fn exhaustive_root_identity_replay_does_not_round_away_a_mismatch() {
+        let one = Float::with_val(256, 1);
+        let tiny = Float::with_val(256, 1) >> 200;
+        let stored = Float::with_val(256, &one + tiny);
+        let zero = Float::with_val(256, 0);
+        assert!(!residual_replay_matches(
+            &stored,
+            Some(&one),
+            Some(&zero),
+            1,
+            64
+        ));
+    }
+    #[test]
+    fn exhaustive_root_identity_replay_low_precision_overflow_is_rejected() {
+        let huge = Float::with_val(64, 1) << (rug::float::exp_max() - 1);
+        let zero = Float::with_val(64, 0);
+        assert!(!residual_replay_matches(
+            &huge,
+            Some(&zero),
+            Some(&huge),
+            1,
+            1
+        ));
+    }
+    #[test]
+    fn exhaustive_root_identity_replay_ordinals_preserve_failed_slots_and_signed_windows() {
+        let values = [
+            root(Float::with_val(128, 1)),
+            EigenvalueResult::Failed {
+                iterations: 1,
+                reason: "unresolved".into(),
+            },
+            root(Float::with_val(128, 3)),
+        ];
+        assert_eq!(
+            positive_root_indices(&values, 7).unwrap(),
+            vec![Some(7), Some(8), Some(9)]
+        );
+        let portable = ccm_response_roots(&values, 7).unwrap();
+        assert_eq!(portable[1].positive_root_index, Some(8));
+        assert_eq!(portable[1].status, "failed");
+        let signed = [
+            root(Float::with_val(128, -1)),
+            root(Float::with_val(128, 1)),
+        ];
+        assert_eq!(
+            positive_root_indices(&signed, usize::MAX).unwrap(),
+            vec![None, None]
+        );
+        assert_eq!(
+            positive_root_indices(&values[..1], usize::MAX).unwrap(),
+            vec![Some(usize::MAX)]
+        );
+        for value in [
+            rug::float::Special::Nan,
+            rug::float::Special::Infinity,
+            rug::float::Special::NegInfinity,
+        ] {
+            assert!(positive_root_indices(&[root(Float::with_val(128, value))], 1).is_err());
+        }
+        assert!(positive_root_indices(&[], 1).unwrap().is_empty());
+    }
+    #[test]
+    fn exhaustive_root_identity_replay_exact_rational_tolerance_oracle() {
+        use rug::Rational;
+        let mut checked = 0;
+        for p in [64, 128, 256] {
+            for count in [1usize, 3, 16385, u32::MAX as usize] {
+                for scale_num in [1, 7, 129] {
+                    for multiplier in [0, 1, 2, 3, 4] {
+                        let work = p + 64;
+                        let term_scale = Float::with_val(work, Rational::from((scale_num, 7)));
+                        let exact_tolerance = term_scale.to_rational().unwrap()
+                            * Rational::from(count)
+                            * Rational::from(128)
+                            / (rug::Integer::from(1) << p);
+                        let point = Rational::from(1)
+                            + exact_tolerance.clone() * Rational::from((multiplier, 2));
+                        let stored = Float::with_val(work, point);
+                        let replayed = Float::with_val(work, 1);
+                        let exact_difference = (stored.to_rational().unwrap() - 1i32).abs();
+                        assert_eq!(
+                            residual_replay_matches(
+                                &stored,
+                                Some(&replayed),
+                                Some(&term_scale),
+                                count,
+                                p
+                            ),
+                            exact_difference <= exact_tolerance,
+                            "p={p}, count={count}, scale={scale_num}, multiplier={multiplier}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 180);
+    }
+    #[test]
+    fn exhaustive_root_identity_replay_range_domain_and_actual_count() {
+        let zero = Float::with_val(128, 0);
+        let one = Float::with_val(128, 1);
+        for p in [0, 1, 63, 1_000_001, u32::MAX] {
+            assert!(!residual_replay_matches(&one, Some(&one), Some(&one), 1, p));
+        }
+        assert!(!residual_replay_matches(
+            &one,
+            Some(&one),
+            Some(&one),
+            0,
+            128
+        ));
+        assert!(!residual_replay_matches(&one, Some(&one), None, 1, 128));
+        assert!(!residual_replay_matches(&one, None, Some(&one), 1, 128));
+        assert!(residual_replay_matches(
+            &zero,
+            Some(&zero),
+            Some(&zero),
+            1,
+            128
+        ));
+        for value in [
+            Float::with_val(128, -1),
+            Float::with_val(128, rug::float::Special::Nan),
+            Float::with_val(128, rug::float::Special::Infinity),
+        ] {
+            assert!(!residual_replay_matches(
+                &value,
+                Some(&one),
+                Some(&one),
+                1,
+                128
+            ));
+            assert!(!residual_replay_matches(
+                &one,
+                Some(&value),
+                Some(&one),
+                1,
+                128
+            ));
+            assert!(!residual_replay_matches(
+                &one,
+                Some(&one),
+                Some(&value),
+                1,
+                128
+            ));
+        }
+        for exponent in [-1_000_000_000i32, 1_000_000_000i32] {
+            let source = Float::with_val(128, 1) << exponent;
+            let mut neighbor = source.clone();
+            neighbor.next_up();
+            assert!(residual_replay_matches(
+                &source,
+                Some(&neighbor),
+                Some(&source),
+                3,
+                128
+            ));
+            assert!(!residual_replay_matches(
+                &source,
+                Some(&zero),
+                Some(&source),
+                3,
+                128
+            ));
+        }
+        let count = u32::MAX as usize;
+        let scale = Float::with_val(128, 1);
+        let difference = Float::with_val(128, count) >> 58;
+        assert!(residual_replay_matches(
+            &difference,
+            Some(&zero),
+            Some(&scale),
+            count,
+            64
+        ));
+    }
+    #[test]
+    fn exhaustive_root_identity_replay_quadrature_clamps_before_platform_overflow() {
+        for digits in [0, 1, 100, 1_000_000, u32::MAX] {
+            let cfg = HighPrecConfig::for_decimal_digits(digits);
+            let expected = (u64::from(digits) * QUAD_POINTS_PER_DIGIT as u64)
+                .clamp(MIN_QUAD_POINTS as u64, MAX_QUAD_POINTS as u64);
+            assert_eq!(cfg.quad_points as u64, expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_response_norm {
+    use super::*;
+    #[test]
+    fn exhaustive_response_norm_large_finite_vector() {
+        let x = Float::with_val(128, 1) << 700_000_000u32;
+        assert_eq!(
+            deterministic_l2_norm_hp(std::slice::from_ref(&x), 128).unwrap(),
+            x
+        );
+    }
+    #[test]
+    fn exhaustive_response_norm_tiny_finite_vector() {
+        let x = Float::with_val(128, 1) >> 700_000_000u32;
+        assert_eq!(
+            deterministic_l2_norm_hp(std::slice::from_ref(&x), 128).unwrap(),
+            x
+        );
+    }
+    #[test]
+    fn exhaustive_response_norm_cancelling_dot_never_forms_infinities() {
+        let x = Float::with_val(128, 1) << 700_000_000u32;
+        let left = [x.clone(), -x.clone()];
+        let right = [x.clone(), x];
+        assert_eq!(deterministic_dot_hp(&left, &right, 128).unwrap(), 0);
+    }
+    #[test]
+    fn exhaustive_response_norm_dot_preserves_higher_precision_sources() {
+        let delta = Float::with_val(256, 1) >> 200u32;
+        let left = [Float::with_val(256, 1) + &delta, Float::with_val(256, -1)];
+        let right = [Float::with_val(256, 1), Float::with_val(256, 1)];
+        assert_eq!(deterministic_dot_hp(&left, &right, 64).unwrap(), delta);
+    }
+    #[test]
+    fn exhaustive_response_norm_shifted_matrix_preserves_tiny_feedback() {
+        let p = 128;
+        let huge = Float::with_val(p, 1) << 700_000_000u32;
+        let tiny = Float::with_val(p, 1) >> 700_000_000u32;
+        let matrix = [
+            huge.clone(),
+            Float::with_val(p, &tiny * 3u32),
+            Float::with_val(p, &tiny * 4u32),
+            huge.clone(),
+        ];
+        assert_eq!(
+            shifted_matrix_frobenius_norm(&matrix, &huge, 2, p).unwrap(),
+            Float::with_val(p, tiny * 5u32)
+        );
+    }
+    #[test]
+    fn exhaustive_response_norm_rejects_shape_mismatch_without_debug_panic() {
+        let left = [Float::with_val(128, 1)];
+        let right = [];
+        let result = std::panic::catch_unwind(|| deterministic_dot_hp(&left, &right, 128));
+        assert!(
+            result.is_ok_and(|value| value.is_err()),
+            "invalid dot shape must be a propagated error"
+        );
+    }
+    #[test]
+    fn exhaustive_response_norm_exact_stored_algebraic_rounding() {
+        use rug::{float::Round, Rational};
+        for p in [64, 128, 256] {
+            for i in 1..=8 {
+                for j in 1..=8 {
+                    let values = [
+                        Float::with_val(p, Rational::from((i, 3))),
+                        Float::with_val(p, Rational::from((j, 7))),
+                    ];
+                    let sum = values.iter().fold(Rational::from(0), |acc, x| {
+                        let q = x.to_rational().unwrap();
+                        acc + Rational::from(&q * &q)
+                    });
+                    let mut lo = Float::with_val_round(1024, &sum, Round::Down).0;
+                    let mut hi = Float::with_val_round(1024, &sum, Round::Up).0;
+                    lo.sqrt_round(Round::Down);
+                    hi.sqrt_round(Round::Up);
+                    let expected = Float::with_val(p, lo);
+                    assert_eq!(expected, Float::with_val(p, hi));
+                    assert_eq!(
+                        deterministic_l2_norm_hp(&values, p).unwrap(),
+                        expected,
+                        "p={p},i={i},j={j}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_bordered_residual {
+    use super::*;
+    #[test]
+    fn exhaustive_bordered_residual_denominator_overflow_must_not_report_zero() {
+        let p = 128;
+        let z = Float::with_val(p, 0);
+        let one = Float::with_val(p, 1);
+        let huge = one.clone() << 700_000_000u32;
+        let tau = [huge.clone(), z.clone(), z.clone(), z.clone()];
+        let unit = [one, z.clone()];
+        let response = [z.clone(), huge.clone()];
+        let forcing = [huge.clone(), z.clone()];
+        let actual =
+            bordered_response_relative_residual(&tau, &z, &unit, &forcing, &response, &z, &huge, p)
+                .unwrap();
+        let expected = Float::with_val(p, 1) >> 700_000_000u32;
+        let mut upper = expected.clone();
+        upper.next_up();
+        assert!(
+            actual >= expected && actual <= upper,
+            "nonzero relative residual rounded to {actual}"
+        );
+    }
+    #[test]
+    fn exhaustive_bordered_residual_tiny_products_keep_unit_relative_error() {
+        let p = 128;
+        let z = Float::with_val(p, 0);
+        let one = Float::with_val(p, 1);
+        let tiny = one.clone() >> 700_000_000u32;
+        let tau = [z.clone(), z.clone(), z.clone(), tiny.clone()];
+        let unit = [one, z.clone()];
+        let response = [z.clone(), tiny.clone()];
+        let forcing = [z.clone(), z.clone()];
+        assert_eq!(
+            bordered_response_relative_residual(&tau, &z, &unit, &forcing, &response, &z, &tiny, p)
+                .unwrap(),
+            1
+        );
+    }
+    #[test]
+    fn exhaustive_bordered_residual_preserves_source_precision() {
+        let z = Float::with_val(256, 0);
+        let one = Float::with_val(256, 1);
+        let delta = one.clone() >> 200u32;
+        let tau = [
+            one.clone(),
+            z.clone(),
+            z.clone(),
+            Float::with_val(256, &one + &delta),
+        ];
+        let unit = [one.clone(), z.clone()];
+        let response = [z.clone(), one.clone()];
+        let forcing = [z.clone(), z.clone()];
+        assert_eq!(
+            bordered_response_relative_residual(
+                &tau, &one, &unit, &forcing, &response, &z, &delta, 64
+            )
+            .unwrap(),
+            1
+        );
+    }
+    #[test]
+    fn exhaustive_bordered_residual_rejects_shape_before_indexing() {
+        let z = Float::with_val(128, 0);
+        let unit = [Float::with_val(128, 1)];
+        let outcome = std::panic::catch_unwind(|| {
+            bordered_response_relative_residual(
+                &[],
+                &z,
+                &unit,
+                std::slice::from_ref(&z),
+                std::slice::from_ref(&z),
+                &z,
+                &z,
+                128,
+            )
+        });
+        assert!(
+            outcome.is_ok_and(|x| x.is_err()),
+            "invalid dimensions must return an error"
+        );
+    }
+    #[test]
+    fn exhaustive_bordered_residual_rejects_unbound_denominator_norm() {
+        let z = Float::with_val(128, 0);
+        let one = Float::with_val(128, 1);
+        let tau = [z.clone(), z.clone(), z.clone(), one.clone()];
+        let unit = [one.clone(), z.clone()];
+        let response = [z.clone(), one.clone()];
+        let forcing = [z.clone(), z.clone()];
+        let false_norm = one << 500u32;
+        assert!(bordered_response_relative_residual(
+            &tau,
+            &z,
+            &unit,
+            &forcing,
+            &response,
+            &z,
+            &false_norm,
+            128
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_response_projection {
+    use super::*;
+    #[test]
+    fn exhaustive_response_projection_cancellation_preserves_product_low_bits() {
+        let p = 64;
+        let one = Float::with_val(p, 1);
+        let delta = one.clone() >> 63u32;
+        let unit = Float::with_val(p, &one + &delta);
+        let eigenvalue = Float::with_val(p, &one - &delta);
+        assert_eq!(
+            projected_response_forcing(&[one], &[unit], &eigenvalue, p).unwrap(),
+            vec![Float::with_val(p, &delta * &delta)]
+        );
+    }
+    #[test]
+    fn exhaustive_response_projection_preserves_higher_precision_input() {
+        let one = Float::with_val(256, 1);
+        let delta = one.clone() >> 200u32;
+        let unit = Float::with_val(256, &one + &delta);
+        assert_eq!(
+            projected_response_forcing(std::slice::from_ref(&one), &[unit], &one, 64).unwrap(),
+            vec![-delta]
+        );
+    }
+    #[test]
+    fn exhaustive_response_projection_intermediate_overflow_can_cancel() {
+        let p = 128;
+        let e = rug::float::exp_max();
+        let unit = Float::with_val(p, 1) << 600_000_000;
+        let eigenvalue = Float::with_val(p, 1) << (e - 600_000_000);
+        let action = Float::with_val(p, 0.75) << e;
+        let expected = Float::with_val(p, -0.25) << e;
+        assert_eq!(
+            projected_response_forcing(&[action], &[unit], &eigenvalue, p).unwrap(),
+            vec![expected]
+        );
+    }
+    #[test]
+    fn exhaustive_response_projection_rejects_mismatched_lengths() {
+        let one = Float::with_val(128, 1);
+        assert!(projected_response_forcing(std::slice::from_ref(&one), &[], &one, 128).is_err());
+    }
+    #[test]
+    fn exhaustive_response_projection_rejects_nonfinite_sources() {
+        let one = Float::with_val(128, 1);
+        let nan = Float::with_val(128, rug::float::Special::Nan);
+        assert!(projected_response_forcing(std::slice::from_ref(&one), &[nan], &one, 128).is_err());
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_response_gauge {
+    use super::*;
+    #[test]
+    fn exhaustive_response_gauge_unit_sum_preserves_cancellation() {
+        let p = 64;
+        let delta = Float::with_val(p, 1) >> 200u32;
+        let values = [Float::with_val(p, 1), delta.clone(), Float::with_val(p, -1)];
+        assert_eq!(response_state_sum(&values, p).unwrap(), delta);
+    }
+    #[test]
+    fn exhaustive_response_gauge_avoids_intermediate_product_overflow() {
+        let p = 128;
+        let zero = Float::with_val(p, 0);
+        let huge = Float::with_val(p, 1) << 700_000_000u32;
+        assert_eq!(
+            response_normalization_tangent(
+                std::slice::from_ref(&huge),
+                std::slice::from_ref(&huge),
+                &zero,
+                &huge,
+                &huge,
+                p
+            )
+            .unwrap(),
+            -huge
+        );
+    }
+    #[test]
+    fn exhaustive_response_gauge_preserves_underflowed_product_after_division() {
+        let p = 128;
+        let zero = Float::with_val(p, 0);
+        let tiny = Float::with_val(p, 1) >> 700_000_000u32;
+        assert_eq!(
+            response_normalization_tangent(
+                std::slice::from_ref(&tiny),
+                std::slice::from_ref(&tiny),
+                &zero,
+                &tiny,
+                &tiny,
+                p
+            )
+            .unwrap(),
+            -tiny
+        );
+    }
+    #[test]
+    fn exhaustive_response_gauge_cancels_before_overflowing_divisions() {
+        let p = 128;
+        let huge = Float::with_val(p, 1) << 700_000_000u32;
+        let tiny = Float::with_val(p, 1) >> 700_000_000u32;
+        let one = Float::with_val(p, 1);
+        assert_eq!(
+            response_normalization_tangent(
+                std::slice::from_ref(&tiny),
+                &[one],
+                &huge,
+                &huge,
+                &tiny,
+                p
+            )
+            .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn exhaustive_response_gauge_response_sum_retains_small_nonzero() {
+        let p = 64;
+        let zero = Float::with_val(p, 0);
+        let one = Float::with_val(p, 1);
+        let delta = one.clone() >> 200u32;
+        let unit = [one.clone(), zero.clone(), zero.clone()];
+        let response = [one.clone(), delta.clone(), -one.clone()];
+        assert_eq!(
+            response_normalization_tangent(&unit, &response, &zero, &one, &one, p).unwrap(),
+            -delta
+        );
+    }
+    #[test]
+    fn exhaustive_response_gauge_binds_actual_unit_sum() {
+        let p = 128;
+        let zero = Float::with_val(p, 0);
+        let one = Float::with_val(p, 1);
+        let wrong = Float::with_val(p, 2);
+        assert!(response_normalization_tangent(
+            std::slice::from_ref(&one),
+            std::slice::from_ref(&one),
+            &zero,
+            &one,
+            &wrong,
+            p
+        )
+        .is_err());
+    }
+    #[test]
+    fn exhaustive_response_gauge_zero_sum_is_an_error() {
+        let p = 128;
+        let zero = Float::with_val(p, 0);
+        let one = Float::with_val(p, 1);
+        assert!(response_normalization_tangent(
+            std::slice::from_ref(&zero),
+            std::slice::from_ref(&one),
+            &zero,
+            &one,
+            &zero,
+            p
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_response_inputs {
+    use super::*;
+    use rug::{float::Round, Rational};
+    // Independent exact rational radicand, then directed square root bounds.
+    fn algebraic_sqrt(q: Rational, p: u32) -> Float {
+        let mut lo = Float::with_val_round(4096, &q, Round::Down).0;
+        let mut hi = Float::with_val_round(4096, &q, Round::Up).0;
+        lo.sqrt_round(Round::Down);
+        hi.sqrt_round(Round::Up);
+        let lo = Float::with_val(p, lo);
+        let hi = Float::with_val(p, hi);
+        assert_eq!(lo, hi);
+        lo
+    }
+
+    #[test]
+    fn response_inputs_exact_algebraic_oracles() {
+        for p in [64, 128, 256] {
+            for i in -9..=9 {
+                for j in -5..=5 {
+                    let f = |n, d| Float::with_val(320, Rational::from((n, d)));
+                    let values = [f(i, 7), f(j, 11), f(1, 13)];
+                    let l = f(1 + i * i + j * j, 23);
+                    let exact = values
+                        .iter()
+                        .map(|v| v.to_rational().unwrap())
+                        .collect::<Vec<_>>();
+                    let squares = exact.iter().map(|v| v.clone() * v).collect::<Vec<_>>();
+                    let norm2 = squares.iter().fold(Rational::from(0), |a, v| a + v);
+                    let expected = squares
+                        .into_iter()
+                        .zip(&exact)
+                        .map(|(sq, x)| {
+                            let value = algebraic_sqrt(sq / &norm2, p);
+                            if x < &0 {
+                                -value
+                            } else {
+                                value
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        response_unit_state(&values, p).unwrap(),
+                        expected,
+                        "unit p={p},i={i},j={j}"
+                    );
+                    let sum = exact.iter().fold(Rational::from(0), |a, v| a + v);
+                    assert_ne!(sum, 0);
+                    let mut expected =
+                        algebraic_sqrt(l.to_rational().unwrap() / (sum.clone() * &sum), p);
+                    if sum < 0 {
+                        expected = -expected;
+                    }
+                    assert_eq!(
+                        response_normalization_scale(&values, &l, p).unwrap(),
+                        expected,
+                        "scale p={p},i={i},j={j}"
+                    );
+                    assert_eq!(
+                        response_target_velocity(&l, p).unwrap(),
+                        algebraic_sqrt(Rational::from(1) / (l.to_rational().unwrap() * 4), p),
+                        "velocity p={p},i={i},j={j}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn response_inputs_extreme_binary_scaling_and_zero_components() {
+        let p = 128;
+        let expected = [
+            Float::with_val(p, Rational::from((3, 5))),
+            Float::with_val(p, Rational::from((-4, 5))),
+            Float::with_val(p, 0),
+        ];
+        for exponent in [-700_000_000i32, 0, 700_000_000] {
+            let scale = Float::with_val(p, 1) << exponent;
+            let values = [
+                Float::with_val(p, 3) * &scale,
+                Float::with_val(p, -4) * &scale,
+                Float::with_val(p, 0),
+            ];
+            assert_eq!(response_unit_state(&values, p).unwrap(), expected);
+            let l = Float::with_val(p, 1) << exponent;
+            let expected_velocity = Float::with_val(p, 0.5) << (-exponent / 2);
+            assert_eq!(response_target_velocity(&l, p).unwrap(), expected_velocity);
+            assert_eq!(
+                response_normalization_scale(&values, &l, p).unwrap(),
+                -Float::with_val(p, 1) << (-exponent / 2)
+            );
+        }
+        let minimum = Float::with_val(p, 1) << (rug::float::exp_min() - 1);
+        assert_eq!(
+            response_unit_state(std::slice::from_ref(&minimum), p).unwrap(),
+            vec![Float::with_val(p, 1)]
+        );
+        let huge = Float::with_val(p, 0.75) << rug::float::exp_max();
+        assert!(response_unit_state(&[minimum, huge], p).is_err());
+    }
+    #[test]
+    fn response_inputs_reject_invalid_domain_shape_precision_and_range() {
+        use rug::float::Special;
+        let p = 128;
+        let one = Float::with_val(p, 1);
+        let zero = Float::with_val(p, 0);
+        for bad in [
+            Float::with_val(p, Special::Nan),
+            Float::with_val(p, Special::Infinity),
+            Float::with_val(1_000_129, 1),
+        ] {
+            assert!(response_unit_state(std::slice::from_ref(&bad), p).is_err());
+            assert!(response_normalization_scale(std::slice::from_ref(&one), &bad, p).is_err());
+            assert!(response_normalization_scale(std::slice::from_ref(&bad), &one, p).is_err());
+            assert!(response_target_velocity(&bad, p).is_err());
+        }
+        for p in [0, 63, 1_000_001, u32::MAX] {
+            assert!(response_unit_state(std::slice::from_ref(&one), p).is_err());
+            assert!(response_normalization_scale(std::slice::from_ref(&one), &one, p).is_err());
+            assert!(response_target_velocity(&one, p).is_err());
+        }
+        assert!(response_unit_state(&[], p).is_err());
+        assert!(response_unit_state(std::slice::from_ref(&zero), p).is_err());
+        assert!(response_unit_state(&vec![one.clone(); 16386], p).is_err());
+        assert!(response_normalization_scale(&[], &one, p).is_err());
+        assert!(response_normalization_scale(&vec![one.clone(); 16386], &one, p).is_err());
+        assert!(
+            response_normalization_scale(std::slice::from_ref(&one), &-one.clone(), p).is_err()
+        );
+        assert!(response_target_velocity(&-one.clone(), p).is_err());
+        let tiny = one.clone() >> 700_000_000u32;
+        let huge = one.clone() << 1_000_000_000u32;
+        assert!(response_normalization_scale(&[tiny], &huge, p).is_err());
+    }
+    #[test]
+    fn exhaustive_response_inputs_unit_single_rounding() {
+        let p = 64;
+        let values = [Float::with_val(p, 1), Float::with_val(p, 1)];
+        assert_eq!(
+            response_unit_state(&values, p).unwrap(),
+            vec![algebraic_sqrt(Rational::from((1, 2)), p); 2]
+        );
+    }
+    #[test]
+    fn exhaustive_response_inputs_unit_avoids_unrepresentable_norm() {
+        let p = 128;
+        let huge = Float::with_val(p, 0.75) << rug::float::exp_max();
+        assert_eq!(
+            response_unit_state(&[huge.clone(), huge], p).unwrap(),
+            vec![algebraic_sqrt(Rational::from((1, 2)), p); 2]
+        );
+    }
+    #[test]
+    fn exhaustive_response_inputs_unit_preserves_source_precision() {
+        let p = 64;
+        for i in 1..40 {
+            let x = Float::with_val(256, Rational::from((i, 7)));
+            let y = Float::with_val(256, Rational::from((i + 1, 11)));
+            let xq = x.to_rational().unwrap();
+            let yq = y.to_rational().unwrap();
+            let xx = xq.clone() * xq;
+            let yy = yq.clone() * yq;
+            let total = xx.clone() + yy.clone();
+            assert_eq!(
+                response_unit_state(&[x, y], p).unwrap(),
+                vec![
+                    algebraic_sqrt(xx / &total, p),
+                    algebraic_sqrt(yy / total, p)
+                ],
+                "i={i}"
+            );
+        }
+    }
+    #[test]
+    fn exhaustive_response_inputs_scale_uses_exact_state_sum() {
+        let p = 64;
+        let one = Float::with_val(p, 1);
+        let delta = one.clone() >> 64u32;
+        let sum = one.to_rational().unwrap() + delta.to_rational().unwrap();
+        assert_eq!(
+            response_normalization_scale(&[one.clone(), delta], &one, p).unwrap(),
+            Float::with_val(p, Rational::from(1) / sum)
+        );
+    }
+    #[test]
+    fn exhaustive_response_inputs_scale_single_rounding() {
+        let p = 64;
+        for i in 1..40 {
+            let l = Float::with_val(256, Rational::from((i, 7)));
+            let unit = [Float::with_val(p, 3)];
+            assert_eq!(
+                response_normalization_scale(&unit, &l, p).unwrap(),
+                algebraic_sqrt(l.to_rational().unwrap() / 9, p),
+                "i={i}"
+            );
+        }
+    }
+    #[test]
+    fn exhaustive_response_inputs_velocity_single_rounding() {
+        let p = 64;
+        for i in 1..40 {
+            let l = Float::with_val(256, Rational::from((i, 7)));
+            assert_eq!(
+                response_target_velocity(&l, p).unwrap(),
+                algebraic_sqrt(Rational::from(1) / (l.to_rational().unwrap() * 4), p),
+                "i={i}"
+            );
+        }
+    }
+    #[test]
+    fn exhaustive_response_inputs_reject_invalid_cutoff_and_sum() {
+        let p = 128;
+        let one = Float::with_val(p, 1);
+        let zero = Float::with_val(p, 0);
+        assert!(response_normalization_scale(std::slice::from_ref(&one), &zero, p).is_err());
+        assert!(response_target_velocity(&zero, p).is_err());
+        assert!(response_normalization_scale(&[one.clone(), -one.clone()], &one, p).is_err());
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_discovery_count {
+    use super::*;
+    use rug::Rational;
+    fn residues(a: Rational, b: Rational, p: u32) -> Vec<Float> {
+        [-1, 0, 1]
+            .into_iter()
+            .map(|pole| {
+                let derivative = if pole == 0 { -1 } else { 2 };
+                Float::with_val(
+                    p,
+                    (Rational::from(pole) - &a) * (Rational::from(pole) - &b) / derivative,
+                )
+            })
+            .collect()
+    }
+    fn roots(weights: &[Float], p: u32) -> Result<Vec<Float>> {
+        discover_secular_roots_hp(
+            weights,
+            1,
+            &Float::with_val(p, 1),
+            &Float::with_val(p, 1),
+            p,
+        )
+    }
+
+    #[test]
+    fn exact_discovery_matches_216_factored_sources_across_scales_and_precisions() {
+        for p in [64, 128, 256] {
+            for exponent in [-1000, 0, 1000] {
+                let spacing = Float::with_val(p, 1) << exponent;
+                for i in 0..12 {
+                    for sign in [-1, 1] {
+                        let a = Rational::from((sign * (3 * i + 1), 128));
+                        let b = Rational::from((3 * i + 2, 128));
+                        let weights = residues(a.clone(), b.clone(), p);
+                        let expected = vec![
+                            Float::with_val(p, a) * &spacing,
+                            Float::with_val(p, b) * &spacing,
+                        ];
+                        let roots = discover_secular_roots_hp_range(
+                            &weights,
+                            1,
+                            &spacing,
+                            &-spacing.clone(),
+                            &spacing,
+                            p,
+                            RootScanExtent::Complete,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            roots, expected,
+                            "p={p},exponent={exponent},i={i},sign={sign}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn exact_discovery_open_endpoints_and_inactive_poles_are_explicit() {
+        let p = 128;
+        let poles = [-1, 0, 1].map(|x| Float::with_val(p, x));
+        let weights = residues(Rational::from((1, 2)), Rational::from((3, 4)), p);
+        assert_eq!(
+            verified_discovery::roots(
+                &poles,
+                &weights,
+                &Float::with_val(p, 0.5),
+                &Float::with_val(p, 1),
+                p
+            )
+            .unwrap(),
+            vec![Float::with_val(p, 0.75)]
+        );
+        assert!(verified_discovery::roots(
+            &poles,
+            &weights,
+            &Float::with_val(p, 0.5),
+            &Float::with_val(p, 0.75),
+            p
+        )
+        .unwrap()
+        .is_empty());
+        assert!(verified_discovery::roots(
+            &poles,
+            &[
+                Float::with_val(p, 1),
+                Float::with_val(p, 0),
+                Float::with_val(p, 1)
+            ],
+            &Float::with_val(p, -1),
+            &Float::with_val(p, 1),
+            p
+        )
+        .is_err());
+        assert!(roots(
+            &[
+                Float::with_val(p, 1),
+                Float::with_val(p, 0),
+                Float::with_val(p, 0)
+            ],
+            p
+        )
+        .unwrap()
+        .is_empty());
+    }
+    #[test]
+    fn exact_discovery_rounding_does_not_merge_roots_or_move_them_to_poles() {
+        let high = 320;
+        let p = 64;
+        let delta = Rational::from((1, rug::Integer::from(1) << 100));
+        for (a, b) in [
+            (
+                Rational::from((1, 2)) + &delta,
+                Rational::from((1, 2)) + delta.clone() * 2,
+            ),
+            (Rational::from(1) + &delta, Rational::from((3, 2))),
+        ] {
+            let weights = residues(a, b, high);
+            assert!(discover_secular_roots_hp_range(
+                &weights,
+                1,
+                &Float::with_val(p, 1),
+                &Float::with_val(p, 0),
+                &Float::with_val(p, 2),
+                p,
+                RootScanExtent::Complete
+            )
+            .is_err());
+        }
+    }
+    #[test]
+    fn exact_discovery_rejects_invalid_window_source_and_resource_inputs() {
+        let p = 128;
+        let poles = [-1, 0, 1].map(|x| Float::with_val(p, x));
+        let weights = vec![Float::with_val(p, 1); 3];
+        let zero = Float::with_val(p, 0);
+        let one = Float::with_val(p, 1);
+        assert!(verified_discovery::roots(&poles, &weights, &one, &zero, p).is_err());
+        assert!(verified_discovery::roots(
+            &poles,
+            &weights,
+            &zero,
+            &Float::with_val(p, rug::float::Special::Nan),
+            p
+        )
+        .is_err());
+        assert!(verified_discovery::roots(
+            &[one.clone(), one.clone(), one.clone()],
+            &weights,
+            &zero,
+            &one,
+            p
+        )
+        .is_err());
+        assert!(roots(&vec![zero; 3], p).is_err());
+        assert!(roots(
+            &[
+                Float::with_val(p, 1) << 100_000_000u32,
+                one.clone(),
+                one.clone()
+            ],
+            p
+        )
+        .is_err());
+        for bad in [0, 63, 1_000_001, u32::MAX] {
+            assert!(
+                verified_discovery::roots(&poles, &weights, &Float::with_val(p, 0), &one, bad)
+                    .is_err()
+            );
+        }
+    }
+    #[test]
+    fn exhaustive_discovery_count_two_roots_inside_one_grid_cell() {
+        let p = 256;
+        let a = Rational::from((65, 128));
+        let b = Rational::from((66, 128));
+        assert_eq!(
+            roots(&residues(a.clone(), b.clone(), p), p).unwrap(),
+            vec![Float::with_val(p, a), Float::with_val(p, b)]
+        );
+    }
+    #[test]
+    fn exhaustive_discovery_count_roots_inside_discarded_pole_margin() {
+        let p = 256;
+        let a = Rational::from((1, rug::Integer::from(1) << 100));
+        let b = Rational::from((3, 4));
+        assert_eq!(
+            roots(&residues(a.clone(), b.clone(), p), p).unwrap(),
+            vec![Float::with_val(p, a), Float::with_val(p, b)]
+        );
+    }
+    #[test]
+    fn exhaustive_discovery_count_sampled_zero_does_not_create_ghost_root() {
+        let p = 256;
+        let a = Rational::from((1, 2));
+        let b = Rational::from((3, 4));
+        assert_eq!(
+            roots(&residues(a.clone(), b.clone(), p), p).unwrap(),
+            vec![Float::with_val(p, a), Float::with_val(p, b)]
+        );
+    }
+    #[test]
+    fn exhaustive_discovery_count_repeated_root_is_not_silently_missing() {
+        let p = 256;
+        let a = Rational::from((65, 128));
+        assert!(roots(&residues(a.clone(), a, p), p).is_err());
+    }
+    #[test]
+    fn exhaustive_discovery_count_rejects_mismatched_weight_shape() {
+        let p = 128;
+        assert!(roots(&[Float::with_val(p, 1)], p).is_err());
+    }
+    #[test]
+    fn exhaustive_discovery_count_rejects_nonfinite_weights() {
+        let p = 128;
+        assert!(roots(
+            &[
+                Float::with_val(p, 1),
+                Float::with_val(p, rug::float::Special::Nan),
+                Float::with_val(p, 1)
+            ],
+            p
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_discovery_boundary {
+    use super::*;
+    fn plan(target: ZeroTarget, signed: bool) -> Result<IndependentRootDiscoveryPlan> {
+        let p = 64;
+        let params = CcmParams::from_lambda_sq_integer(13, 1);
+        let l = pi(p) * 2;
+        independently_discovered_starting_points(
+            &params,
+            &l,
+            &[3, 2, 3].map(|x| Float::with_val(p, x)),
+            &target,
+            if signed {
+                IndependentRootDiscoveryOptions::advanced(true, false)
+            } else {
+                IndependentRootDiscoveryOptions::default()
+            },
+            p,
+        )
+    }
+    #[test]
+    fn exact_window_excludes_lower_and_checks_empty_and_invalid_domains() {
+        assert!(plan(
+            ZeroTarget::HeightWindow {
+                lower: "0.5".into(),
+                upper: "0.75".into()
+            },
+            false
+        )
+        .is_err());
+        for (lower, upper) in [("0", "0.5"), ("0.6", "0.5"), ("0.1", "1.01"), ("NaN", "1")] {
+            assert!(plan(
+                ZeroTarget::HeightWindow {
+                    lower: lower.into(),
+                    upper: upper.into()
+                },
+                false
+            )
+            .is_err());
+        }
+        let p = 64;
+        let l = pi(p) * 2;
+        let params = CcmParams::from_lambda_sq_integer(13, 0);
+        let found = independently_discovered_starting_points(
+            &params,
+            &l,
+            &[Float::with_val(p, 1)],
+            &ZeroTarget::FirstK { count: 1 },
+            IndependentRootDiscoveryOptions::advanced(false, true),
+            p,
+        )
+        .unwrap();
+        assert!(found.artifact_seeds.is_empty() && found.selected_positions.is_empty());
+        assert!(independently_discovered_starting_points(
+            &params,
+            &l,
+            &[Float::with_val(p, 1)],
+            &ZeroTarget::FirstK { count: 1 },
+            IndependentRootDiscoveryOptions::default(),
+            p
+        )
+        .is_err());
+    }
+    #[test]
+    fn signed_selection_rejects_unresolved_asymmetric_absolute_tie() {
+        use rug::Rational;
+        let p = 64;
+        let high = 320;
+        let params = CcmParams::from_lambda_sq_integer(13, 1);
+        let l = pi(p) * 2;
+        let a = Rational::from((-1, 2));
+        let b = Rational::from((1, 2)) + Rational::from((1, rug::Integer::from(1) << 100));
+        let weights = [-1, 0, 1].map(|pole| {
+            let q = Rational::from(pole);
+            let d = if pole == 0 { -1 } else { 2 };
+            Float::with_val(high, (q.clone() - &a) * (q - &b) / d)
+        });
+        let result = independently_discovered_starting_points(
+            &params,
+            &l,
+            &weights,
+            &ZeroTarget::FirstK { count: 1 },
+            IndependentRootDiscoveryOptions::advanced(true, false),
+            p,
+        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("nearest-magnitude"));
+        let symmetric = plan(ZeroTarget::FirstK { count: 1 }, true).unwrap();
+        assert_eq!(symmetric.selected_positions, vec![0]);
+    }
+    fn root(value: Float) -> EigenvalueResult {
+        let p = value.prec();
+        EigenvalueResult::Converged(RootRefinement {
+            value,
+            diagnostics: RootRefinementDiagnostics {
+                iterations: 1,
+                final_correction: Float::with_val(p, 0),
+                residual: Float::with_val(p, 0),
+                achieved_decimal_digits: Float::with_val(p, 10),
+            },
+        })
+    }
+    #[test]
+    fn exhaustive_discovery_boundary_positive_upper_endpoint_is_included() {
+        let found = plan(
+            ZeroTarget::HeightWindow {
+                lower: "0.4".into(),
+                upper: "0.5".into(),
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(found.artifact_seeds, vec![Float::with_val(64, 0.5)]);
+    }
+    #[test]
+    fn exhaustive_discovery_boundary_exact_decimal_window_does_not_collapse() {
+        let found = plan(
+            ZeroTarget::HeightWindow {
+                lower: "0.499999999999999999999999999999".into(),
+                upper: "0.500000000000000000000000000001".into(),
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(found.artifact_seeds, vec![Float::with_val(64, 0.5)]);
+    }
+    #[test]
+    fn exhaustive_discovery_boundary_signed_height_includes_both_endpoints() {
+        let found = plan(
+            ZeroTarget::SymmetricHeightWindow {
+                height: "0.5".into(),
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            found.artifact_seeds,
+            vec![Float::with_val(64, -0.5), Float::with_val(64, 0.5)]
+        );
+    }
+    #[test]
+    fn exhaustive_discovery_boundary_assignment_rejects_nonfinite_value() {
+        assert!(complete_discovery::validate_assignment(
+            &[root(Float::with_val(128, rug::float::Special::Nan))],
+            &[Float::with_val(128, 1)]
+        )
+        .is_err());
+    }
+    #[test]
+    fn exhaustive_discovery_boundary_assignment_rejects_unordered_seeds() {
+        assert!(complete_discovery::validate_assignment(
+            &[root(Float::with_val(128, 3)), root(Float::with_val(128, 1))],
+            &[Float::with_val(128, 3), Float::with_val(128, 1)]
+        )
+        .is_err());
+    }
+    #[test]
+    fn exhaustive_discovery_boundary_assignment_preserves_exact_distance_order() {
+        let values = [
+            EigenvalueResult::Failed {
+                iterations: 0,
+                reason: "fixture".into(),
+            },
+            root(Float::with_val(128, 1) << 10000u32),
+        ];
+        assert!(complete_discovery::validate_assignment(
+            &values,
+            &[Float::with_val(128, -1), Float::with_val(128, 1)]
+        )
+        .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_prime_action {
+    use super::*;
+    #[test]
+    fn exhaustive_prime_action_rejects_nonfinite_length() {
+        assert!(apply_prime_power_velocity(
+            0,
+            2,
+            2,
+            &Float::with_val(128, rug::float::Special::Nan),
+            &[Float::with_val(128, 1)],
+            128
+        )
+        .is_err());
+    }
+    #[test]
+    fn exhaustive_prime_action_rejects_nonfinite_vector() {
+        assert!(apply_prime_power_velocity(
+            0,
+            2,
+            2,
+            &Float::with_val(128, 3),
+            &[Float::with_val(128, rug::float::Special::Nan)],
+            128
+        )
+        .is_err());
+    }
+    #[test]
+    fn exhaustive_prime_action_dimension_overflow_is_explicit() {
+        assert!(std::panic::catch_unwind(|| apply_prime_power_velocity(
+            usize::MAX,
+            2,
+            2,
+            &Float::with_val(128, 3),
+            &[],
+            128
+        ))
+        .is_ok_and(|r| r.is_err()));
+    }
+    #[test]
+    fn exhaustive_prime_action_underflowed_coefficient_is_not_zero() {
+        assert!(apply_prime_power_velocity(
+            0,
+            2,
+            2,
+            &(Float::with_val(128, 1) << 600_000_000u32),
+            &[Float::with_val(128, 1)],
+            128
+        )
+        .is_err());
+    }
+    #[test]
+    fn exhaustive_prime_action_cancellation_keeps_central_component() {
+        let p = 128;
+        let a = Float::with_val(p, 1) << 400u32;
+        let result = apply_prime_power_velocity(
+            1,
+            2,
+            2,
+            &Float::with_val(p, 3),
+            &[a.clone(), Float::with_val(p, 1), -a],
+            p,
+        )
+        .unwrap();
+        assert!(!result.action[1].is_zero());
+    }
+    #[test]
+    fn exhaustive_prime_action_scalar_matches_independent_high_precision_formula() {
+        for p in [64, 128, 256] {
+            for prime in [2u64, 3, 5, 7] {
+                for length in [3, 5, 7] {
+                    let reference = -Float::with_val(1024, prime).ln().square() * 2u32
+                        / Float::with_val(1024, prime).sqrt()
+                        / Float::with_val(1024, length).square();
+                    let actual = apply_prime_power_velocity(
+                        0,
+                        prime,
+                        prime,
+                        &Float::with_val(p, length),
+                        &[Float::with_val(p, 1)],
+                        p,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        actual.action[0],
+                        Float::with_val(p, reference),
+                        "p={p},prime={prime},L={length}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_uflow_kernel {
+    use super::*;
+    fn config(p: u32) -> HighPrecConfig {
+        let mut c = HighPrecConfig::for_decimal_digits(20);
+        c.precision_bits = p;
+        c.quad_points = 64;
+        c
+    }
+    fn pole_zero(l: &Float, p: u32) -> Float {
+        let w = 2048;
+        let x = Float::with_val(w, l);
+        let s = (Float::with_val(w, &x) / 4u32).sinh();
+        Float::with_val(
+            p,
+            ((Float::with_val(w, &x) / 2u32).sinh() * &x / 4u32 - s.square()) * 32u32 / x.square(),
+        )
+    }
+    #[test]
+    fn exhaustive_uflow_rejects_nan_length() {
+        let c = config(64);
+        let p = CcmParams::from_lambda_sq_integer(2, 0);
+        assert!(compute_u_flow_velocity_actions(
+            &p,
+            &c,
+            &Float::with_val(64, rug::float::Special::Nan),
+            &[Float::with_val(64, 1)]
+        )
+        .is_err());
+    }
+    #[test]
+    fn exhaustive_uflow_rejects_nan_vector() {
+        let c = config(64);
+        let p = CcmParams::from_lambda_sq_integer(2, 0);
+        assert!(compute_u_flow_velocity_actions(
+            &p,
+            &c,
+            &Float::with_val(64, 3),
+            &[Float::with_val(64, rug::float::Special::Nan)]
+        )
+        .is_err());
+    }
+    #[test]
+    fn exhaustive_uflow_dimension_overflow_is_error() {
+        let c = config(64);
+        let p = CcmParams::from_lambda_sq_integer(2, usize::MAX);
+        assert!(compute_u_flow_velocity_actions(&p, &c, &Float::with_val(64, 3), &[]).is_err());
+    }
+    #[test]
+    fn exhaustive_uflow_pole_scalar_is_correctly_rounded() {
+        for p in [64, 128, 256] {
+            for length in [1, 3, 7] {
+                let c = config(p);
+                let params = CcmParams::from_lambda_sq_integer(2, 0);
+                let l = Float::with_val(p, length);
+                let v = compute_u_flow_velocity_actions(&params, &c, &l, &[Float::with_val(p, 1)])
+                    .unwrap();
+                assert_eq!(v.tau_pole[0], pole_zero(&l, p));
+            }
+        }
+    }
+    #[test]
+    fn exhaustive_uflow_pole_action_preserves_cancellation() {
+        let p = 128;
+        let c = config(p);
+        let params = CcmParams::from_lambda_sq_integer(2, 1);
+        let l = Float::with_val(p, 3);
+        let a = Float::with_val(p, 1) << 400u32;
+        let v = compute_u_flow_velocity_actions(
+            &params,
+            &c,
+            &l,
+            &[a.clone(), Float::with_val(p, 1), -a],
+        )
+        .unwrap();
+        assert_eq!(v.tau_pole[1], pole_zero(&l, p));
+    }
+}
+
+#[cfg(test)]
+mod exhaustive_matrix_point {
+    use super::*;
+    #[test]
+    fn exhaustive_matrix_point_total_preserves_cancelled_unit() {
+        let p = 128;
+        let huge = Float::with_val(p, 1) << 400u32;
+        let c = ComputedCcmMatrixComponents {
+            pole: vec![huge.clone()],
+            archimedean: vec![Float::with_val(p, 1)],
+            prime: vec![huge],
+        };
+        assert_eq!(
+            assemble_tau_components(&c, p).unwrap(),
+            vec![Float::with_val(p, -1)]
+        );
+    }
+    #[test]
+    fn exhaustive_matrix_point_prime_scalar_rounds_once() {
+        for p in [64, 128, 256] {
+            let l = Float::with_val(p, 3);
+            let got = compute_prime_component_matrix(0, 3, &l, p).unwrap();
+            let want =
+                compute_prime_component_matrix_reference(0, 3, &Float::with_val(2048, &l), 2048);
+            assert_eq!(got[0], Float::with_val(p, &want[0]));
+        }
+    }
+    #[test]
+    fn exhaustive_matrix_point_pole_scalar_rounds_once() {
+        for p in [64, 128, 256] {
+            let l = Float::with_val(p, 3);
+            let z = vec![Float::with_val(p, 0)];
+            let a = ComputedArchimedeanIntegrals {
+                alpha: z.clone(),
+                beta: z.clone(),
+                gamma: z,
+            };
+            let got = assemble_pole_and_archimedean_components(0, &l, p, &a).unwrap();
+            let want = (Float::with_val(2048, &l) / 4u32).sinh().square() * 32u32
+                / Float::with_val(2048, &l);
+            assert_eq!(got.0[0], Float::with_val(p, want));
+        }
+    }
+    #[test]
+    fn exhaustive_matrix_point_center_quadrature_sine_is_exact_zero() {
+        let p = 128;
+        let l = Float::with_val(p, 3);
+        let a = compute_archimedean_integrals_l(
+            1,
+            &l,
+            p,
+            &[Float::with_val(p, 0)],
+            &[Float::with_val(p, 2)],
+        )
+        .unwrap();
+        assert!(a.0.is_zero());
+    }
+    #[test]
+    fn exhaustive_matrix_point_quadrature_scalar_rounds_once() {
+        for p in [64, 128, 256] {
+            let l = Float::with_val(p, 3);
+            let nodes = [Float::with_val(p, 0)];
+            let weights = [Float::with_val(p, 2)];
+            let a = compute_archimedean_integrals_l(0, &l, p, &nodes, &weights).unwrap();
+            let l = Float::with_val(2048, l);
+            let want = compute_gamma_l(
+                0,
+                &l,
+                2048,
+                &nodes
+                    .iter()
+                    .map(|v| Float::with_val(2048, v))
+                    .collect::<Vec<_>>(),
+                &weights
+                    .iter()
+                    .map(|v| Float::with_val(2048, v))
+                    .collect::<Vec<_>>(),
+            );
+            assert_eq!(a.2, Float::with_val(p, want));
+        }
+    }
+}
+#[cfg(test)]
+mod exhaustive_length_stage {
+    use super::*;
+    #[test]
+    fn exhaustive_length_stage_fractional_log_rounds_exact_decimal_once() {
+        for p in [64, 128, 256] {
+            for c in [1.000001, 1.1, 2.3, 13.1] {
+                let params = CcmParams::from_lambda_sq_fractional(c, 0);
+                let text = lambda_squared_cache_identity(&params);
+                let reference = Float::with_val(2048, Float::parse(&text).unwrap()).ln();
+                assert_eq!(
+                    log_lambda_sq_hp(&params, p).unwrap(),
+                    Float::with_val(p, reference),
+                    "p={p}, C={text}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn exhaustive_length_stage_exact_cutoff_near_one_remains_supported() {
+        let text = format!("1.{}1", "0".repeat(79));
+        let exact =
+            ExactLambdaSquaredHp::new(xc_core::DecimalLiteral::new(text).unwrap(), 1).unwrap();
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = 128;
+        cfg.quad_points = 8;
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let result = localized_weil_form_exact_hp(exact, 0, &cfg, false);
+        assert!(
+            result.is_ok(),
+            "valid exact cutoff lost before logarithm: {:?}",
+            result.err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod archimedean_length_order_tests {
+    use super::*;
+
+    #[test]
+    fn large_cutoff_archimedean_order_matches_independent_tanh_sinh_oracle() {
+        // Defining integrals evaluated by mpmath tanh-sinh at 210 and 250
+        // decimal digits; the oracle shares neither GL nodes nor order policy.
+        let oracle: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/archimedean_tanh_sinh_oracle.json"
+        ))
+        .unwrap();
+        for cutoff in [13u64, 1_000_000, 4_000_000, 10_000_000] {
+            for p in [256u32, 512] {
+                let mut cfg = HighPrecConfig::for_decimal_digits(20);
+                cfg.precision_bits = p;
+                cfg.quad_points = 1;
+                cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+                let l = Float::with_val(p, cutoff).ln();
+                let (integrals, _) =
+                    compute_archimedean_integrals_tracked(2, &l, &cfg, None).unwrap();
+                let (pole, arch) =
+                    assemble_pole_and_archimedean_components(2, &l, p, &integrals).unwrap();
+                let expected = oracle[cutoff.to_string()]["entries"].as_array().unwrap();
+                for (i, value) in expected.iter().enumerate() {
+                    let want = Float::with_val(768, Float::parse(value.as_str().unwrap()).unwrap());
+                    let mut got = Float::with_val(768, &pole[i]);
+                    got -= &arch[i];
+                    let error = Float::with_val(768, &got - &want).abs();
+                    let scale = Float::with_val(768, &want)
+                        .abs()
+                        .max(&Float::with_val(768, 1));
+                    let allowance = scale * (Float::with_val(768, 1) >> (p - 7));
+                    assert!(error <= allowance, "cutoff={cutoff} p={p} entry={i}");
+                }
+            }
+        }
     }
 }

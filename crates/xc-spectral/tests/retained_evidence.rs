@@ -402,7 +402,8 @@ fn root_windows_bind_sources_keep_failures_and_adaptive_precision() {
     ];
     let r = RetainedRoots::from_payload(&rm, &rb, &sec, &sb, &s, &approved).unwrap();
     let options = TransformOptions::for_roots(&s, &r);
-    assert_eq!(options.working_precision_bits, 448);
+    // Adaptive evaluation precision does not change the stored 128-bit root.
+    assert_eq!(options.working_precision_bits, 192);
     let report = capture_root_window(&r, &context()).unwrap().value.data;
     assert_eq!(
         report.points.iter().map(|r| r.ordinal).collect::<Vec<_>>(),
