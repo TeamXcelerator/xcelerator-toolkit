@@ -119,6 +119,30 @@ xc_numerics::hp_runtime::run_hp_with_policy(&policy, || {
 })?;
 ```
 
+### Settings not described elsewhere
+
+The managed cache reads its process configuration once per
+`ManagedArtifactCacheConfig::from_environment` call. These settings complete
+the variables documented above and in [cache schema](CACHE_SCHEMA.md):
+
+| Variable | Values (default first) | Effect |
+|---|---|---|
+| `XC_RUN_PROFILE` | `normal`, `author` | `normal` runs never publish: a publication target, `XC_PUBLISH_EXECUTE`, `XC_PUBLISH_REPLACE` or a refresh cache mode is rejected. `author` permits publication and stages under `<cache root>/publication` unless a staging root is set. |
+| `XC_ASSURANCE` | `computed`, `cross_checked` (or `cross-checked`), `certified` | Requested assurance for the run's artifacts. Above `computed`, roots must converge and staged artifacts must reach the level before publication. |
+| `XC_CERTIFICATION_FAILURE_POLICY` | `retain_computed_fail_run`, `retain_computed_skip_publication` | When staged artifacts miss the requested assurance, computed artifacts are always retained; the first value then fails the run with an inventory of ineligible artifacts, the second skips publication and continues. |
+| `XC_CACHE_REPOSITORY_OWNER` | `TeamXcelerator` | GitHub owner of the registry and shard repositories used for remote reads and publication. |
+| `XC_CACHE_ROOT` | per-user cache: `%LOCALAPPDATA%\Xcelerator\cache` on Windows, `$XDG_CACHE_HOME/xcelerator` or `~/.cache/xcelerator` elsewhere | Local cache root. The managed cache and the standalone Gauss-Legendre, tau, Weil-eigenvector and prolate caches (`gl_cache`, `tau_cache`, `weil_eigvec_cache`, `prolate_eigvals_cache`) live under it. The working directory is never used. |
+| `XC_TYPED_CACHE_ROOT` | unset | Older name for `XC_CACHE_ROOT`, used only when `XC_CACHE_ROOT` is unset. |
+| `XC_PUBLICATION_QUEUE` | unset | Older name for `XC_PUBLISH_STAGING_ROOT`, used only when that is unset. |
+| `XC_PUBLICATION_INSTANCE_LABEL` | `HOSTNAME`, then `COMPUTERNAME`, then `unlabelled-instance` | Label of this machine in private publication leases, so concurrent authors can identify lease holders. |
+
+Three values are fixed when the toolkit is compiled, not read at run time.
+`XC_SOURCE_REVISION` (the Git commit, required for author publication; set it
+explicitly when building outside a Git checkout) and `XC_SOURCE_TREE_DIGEST`
+(a digest of the toolkit source) bind published provenance to the exact code.
+`XC_CHECKPOINT_BUILD_ID` keys local research checkpoints to the build, so a
+rebuilt toolkit never resumes another build's checkpoints.
+
 ## Target-distance measurement
 
 Version 0.14.1 includes the measurement layer for runtime target-distance work:
@@ -131,7 +155,7 @@ Version 0.14.1 includes the measurement layer for runtime target-distance work:
   (left/right Riemann, midpoint, trapezoid) on grids uniform in `u` or `ln u`,
   at binary64 and HP. `xc_spectral::distance::WeightedIntegrationRule` selects
   between that family and Gauss--Legendre for every weighted norm and distance,
-  so a collaborator's rule can be reproduced exactly rather than approximated.
+  so an externally specified rule can be reproduced exactly rather than approximated.
   Neither family is privileged: Gauss--Legendre converges spectrally on smooth
   integrands but loses that advantage at the derivative kinks introduced by
   absolute residuals at interior sign changes.
@@ -185,9 +209,10 @@ step reuses an eigenfunction value only when the refined MPFR abscissa is
 binary-identical. The original Q pass is not reused because resolution replay
 uses retained coefficients. Midpoint grids remain independent.
 
-The four runtime-target-derived kinds -- `ccm_target_distance`,
-`ccm_distance_resolution_evidence`, `ccm_target_residual_analysis`, and
-`ccm_deviation_decomposition` -- are private-only. Managed publication routes
+The five runtime-target-derived kinds -- `ccm_target_distance`,
+`ccm_distance_resolution_evidence`, `ccm_target_residual_analysis`,
+`ccm_deviation_decomposition`, and `ccm_target_comparison_analysis` -- are
+private-only. Managed publication routes
 them to the private leg: under `Both` they are withheld from the public
 destination while public-eligible kinds publish to both, and an explicit
 `Public`-only request fails when nothing staged is public-eligible. Public
@@ -295,4 +320,4 @@ cargo run -p xc-spectral --example target_distance
 
 prints the opaque target-definition digest, a normalized runtime-target table,
 the weighted target norm, and the same distance under several quadrature
-schemes for line-by-line comparison with an authorized private implementation.
+schemes for line-by-line comparison with an independent implementation.

@@ -50,19 +50,13 @@ impl CacheStore for ReceiptStore {
 }
 
 struct Fixture {
-    directory: PathBuf,
+    _directory: crate::test_support::TestDir,
     record: CaptureArtifact,
     root: ArtifactManifest,
     source: ArtifactManifest,
     source_identity: PayloadDependencyIdentity,
     payload: Vec<u8>,
 }
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.directory).unwrap();
-    }
-}
-
 fn policy() -> CachePolicy {
     CachePolicy {
         current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
@@ -109,7 +103,6 @@ fn rewrite_canonical(
 impl Fixture {
     fn new(aliases: bool) -> Self {
         let directory = crate::test_support::temporary_root("bootstrap-receipt-adapter");
-        fs::create_dir_all(&directory).unwrap();
         let adapter =
             GitHubBootstrapCacheStore::public("fixture-owner", directory.join("remote")).unwrap();
         let mut source_artifact = super::tests::resolved_fixture(&directory, "source", vec![]);
@@ -201,7 +194,7 @@ impl Fixture {
         assert!(root.dependencies.is_empty());
         assert!(!record.source_dependencies.is_empty());
         Self {
-            directory,
+            _directory: directory,
             record,
             root,
             source,

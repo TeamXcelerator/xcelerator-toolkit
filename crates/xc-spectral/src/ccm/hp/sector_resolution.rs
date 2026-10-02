@@ -29,6 +29,22 @@ pub(super) fn bounds(
     )
     .map_err(anyhow::Error::msg)?
     .eigenvalue_allowance;
+    bounds_with_allowance(&allowance, tridiagonal, eigenvalues, count, p)
+}
+
+/// [`bounds`] for a transform whose similarity allowance was already admitted:
+/// proved where it was produced or explicitly verified, or recorded by that
+/// proof and admitted by the retained-transform reuse checks. The allowance
+/// is exactly the value [`bounds`] would prove for that transform, so the
+/// enclosures are identical; only the repeated O(n^3) proof is skipped.
+pub(super) fn bounds_with_allowance(
+    allowance: &Float,
+    tridiagonal: &SectorTridiagonalHp,
+    eigenvalues: &SectorEigenvaluesHp,
+    count: usize,
+    p: u32,
+) -> Result<Vec<(Float, Float)>> {
+    let n = tridiagonal.diagonal.len();
     let selected;
     let enclosures = if eigenvalues.selected_enclosures.len() >= count {
         &eigenvalues.selected_enclosures
@@ -46,8 +62,8 @@ pub(super) fn bounds(
         if e.index != index || e.lower_count != index || e.upper_count != index + 1 {
             bail!("CCM sector resolution limit: Sturm enclosure does not isolate algebraic index {index}");
         }
-        let lower = Float::with_val_round(p + 64, &e.lower - &allowance, Round::Down).0;
-        let upper = Float::with_val_round(p + 64, &e.upper + &allowance, Round::Up).0;
+        let lower = Float::with_val_round(p + 64, &e.lower - allowance, Round::Down).0;
+        let upper = Float::with_val_round(p + 64, &e.upper + allowance, Round::Up).0;
         I::new(lower.clone(), upper.clone())?;
         Ok((lower, upper))
     }).collect()

@@ -174,7 +174,7 @@ impl Drop for PerformanceStageGuard {
             self.started.elapsed(),
             self.top_level,
         ) {
-            eprintln!(
+            crate::progress_message!(
                 "performance report: failed to record stage {} at {}: {error}",
                 self.stage,
                 report_path.display()
@@ -276,7 +276,7 @@ where
             .as_ref()
             .is_some_and(|active| active.report_path != path)
         {
-            eprintln!(
+            crate::progress_message!(
                 "performance report: ignored concurrent report path {} while {} is active",
                 path.display(),
                 recorder
@@ -409,19 +409,13 @@ fn reset_recorder_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestDir;
     use std::sync::Mutex;
 
     static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
-    fn report_path(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "xc-performance-{label}-{}-{}.performance.json",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
+    fn report_path(dir: &TestDir) -> PathBuf {
+        dir.join("report.performance.json")
     }
 
     fn read_report(path: &Path) -> PerformanceRunReport {
@@ -433,7 +427,8 @@ mod tests {
         let _environment = ENVIRONMENT_LOCK.lock().unwrap();
         reset_recorder_for_test();
         std::env::remove_var(PERFORMANCE_REPORT_ENV);
-        let path = report_path("disabled");
+        let dir = TestDir::new("perf-disabled");
+        let path = report_path(&dir);
         {
             let _stage =
                 performance_top_level_stage("test.disabled", PerformanceStageMetadata::default());
@@ -460,7 +455,8 @@ mod tests {
     fn nested_top_level_stages_snapshot_only_after_the_outer_stage_closes() {
         let _environment = ENVIRONMENT_LOCK.lock().unwrap();
         reset_recorder_for_test();
-        let path = report_path("nested");
+        let dir = TestDir::new("perf-nested");
+        let path = report_path(&dir);
         let outer = performance_top_level_stage_at_path(
             &path,
             "test.outer",
@@ -487,14 +483,14 @@ mod tests {
             .any(|record| record.stage == "test.outer"));
 
         reset_recorder_for_test();
-        let _ = fs::remove_file(path);
     }
 
     #[test]
     fn error_drop_persists_and_later_stages_accumulate() {
         let _environment = ENVIRONMENT_LOCK.lock().unwrap();
         reset_recorder_for_test();
-        let path = report_path("cumulative");
+        let dir = TestDir::new("perf-cumulative");
+        let path = report_path(&dir);
         std::env::set_var(PERFORMANCE_REPORT_ENV, &path);
 
         let fail = || -> Result<(), &'static str> {
@@ -533,6 +529,5 @@ mod tests {
 
         std::env::remove_var(PERFORMANCE_REPORT_ENV);
         reset_recorder_for_test();
-        let _ = fs::remove_file(path);
     }
 }

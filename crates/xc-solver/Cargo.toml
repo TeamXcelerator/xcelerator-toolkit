@@ -16,7 +16,10 @@ hp-reference = ["dep:rug", "xc-numerics/hp", "xc-operator/hp"]
 [dependencies]
 num-bigint = "0.4.8"
 nalgebra = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 rug = { workspace = true, optional = true }
 xc-core = { workspace = true }
 xc-operator = { workspace = true }

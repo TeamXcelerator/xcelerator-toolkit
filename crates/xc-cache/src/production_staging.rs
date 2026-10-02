@@ -1438,6 +1438,7 @@ const CCM_EVIDENCE_KINDS: &[&str] = &[
     "ccm_consistency_analysis",
     "ccm_configuration_comparison",
     "ccm_band_reconstruction",
+    "ccm_finite_diagnostic_analysis",
     "ccm_transform_enclosure",
     "research_capture_receipt",
     "research_hypothesis_evaluation",
@@ -1460,6 +1461,9 @@ const CCM_EVIDENCE_KINDS: &[&str] = &[
     "ccm_cross_check_record",
     "ccm_validation_record",
     "ccm_certificate_bundle",
+    "ccm_root_certification_report",
+    "ccm_assembly_error_analysis",
+    "ccm_checkpoint_spectra",
 ];
 /// Eigenfunction profiles and target-distance measurements. These are
 /// derived measurement products: they are reproducible from a retained
@@ -1475,6 +1479,7 @@ const CCM_DISTANCE_KINDS: &[&str] = &[
     "ccm_eigenfunction_profile",
     "ccm_target_distance",
     "ccm_target_residual_analysis",
+    "ccm_target_comparison_analysis",
 ];
 
 /// Artifact kinds whose values depend on a private runtime target definition.
@@ -1485,6 +1490,7 @@ const CCM_DISTANCE_KINDS: &[&str] = &[
 /// and an explicit public-only request fails when nothing staged is
 /// public-eligible.
 const PRIVATE_ONLY_ARTIFACT_KINDS: &[&str] = &[
+    "ccm_finite_diagnostic_analysis",
     "ccm_band_reconstruction",
     "ccm_configuration_comparison",
     "ccm_external_research_source",
@@ -1505,6 +1511,7 @@ const PRIVATE_ONLY_ARTIFACT_KINDS: &[&str] = &[
     "ccm_distance_resolution_evidence",
     "ccm_target_distance",
     "ccm_target_residual_analysis",
+    "ccm_target_comparison_analysis",
 ];
 
 pub fn artifact_kind_is_private_only(kind: &str) -> bool {
@@ -2179,6 +2186,7 @@ mod tests {
             "ccm_distance_resolution_evidence",
             "ccm_target_residual_analysis",
             "ccm_deviation_decomposition",
+            "ccm_target_comparison_analysis",
         ] {
             assert!(artifact_kind_is_private_only(kind));
         }
@@ -2225,8 +2233,8 @@ mod tests {
                     size_bytes: payload.len() as u64,
                 }],
                 created_unix_seconds: 1,
-                producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-                minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+                minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
                 maximum_reader_version: None,
                 quality: CacheQuality::Validated,
                 visibility: CacheVisibility::Local,
@@ -2243,12 +2251,9 @@ mod tests {
 
     #[test]
     fn typed_record_stages_as_deterministic_bounded_canonical_draft() {
-        let first_root =
-            std::env::temp_dir().join(format!("xc-production-stage-first-{}", std::process::id()));
-        let second_root =
-            std::env::temp_dir().join(format!("xc-production-stage-second-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&first_root);
-        let _ = fs::remove_dir_all(&second_root);
+        let scratch = crate::test_support::TestDir::new("production-stage");
+        let first_root = scratch.join("first-root");
+        let second_root = scratch.join("second-root");
         let record = record();
         let first = stage_produced_artifact(
             &record,
@@ -2284,11 +2289,8 @@ mod tests {
 
     #[test]
     fn staging_adopts_verified_encoded_payload_without_changing_bytes() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-production-stage-encoded-adoption-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-stage-encoded");
+        let root = scratch.join("root");
         let record = record();
         let reference = stage_produced_artifact(
             &record,
@@ -2375,11 +2377,8 @@ mod tests {
 
     #[test]
     fn unprofiled_local_zip_is_reencoded_instead_of_adopted() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-production-stage-unprofiled-reencode-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-stage-unprofi");
+        let root = scratch.join("root");
         let record = record();
         let unprofiled = VerifiedEncodedPayload {
             // A rejected descriptor must not even be opened: the typed
@@ -2509,11 +2508,8 @@ mod tests {
 
     #[test]
     fn same_payload_from_distinct_source_manifests_gets_distinct_draft_roots() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-production-stage-source-manifest-identity-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-stage-source");
+        let root = scratch.join("root");
         let first_record = record();
         let first = stage_produced_artifact(
             &first_record,
@@ -2524,7 +2520,7 @@ mod tests {
         )
         .unwrap();
         let mut second_record = first_record;
-        second_record.manifest.producer_toolkit_version = ToolkitVersion::parse("0.14.2").unwrap();
+        second_record.manifest.producer_toolkit_version = ToolkitVersion::parse("0.17.2").unwrap();
         let second = stage_produced_artifact(
             &second_record,
             &root,
@@ -2556,11 +2552,8 @@ mod tests {
 
     #[test]
     fn staged_dependency_lookup_enforces_quality_and_source_collisions_are_stable() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-production-stage-quality-source-index-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-stage-quality");
+        let root = scratch.join("root");
         let source = record();
         let first = stage_produced_artifact(
             &source,
@@ -2606,7 +2599,7 @@ mod tests {
         // source-key recording intentionally deduplicates non-remote records.
         let mut alternate_source = source.clone();
         alternate_source.manifest.producer_toolkit_version =
-            ToolkitVersion::parse("0.14.2").unwrap();
+            ToolkitVersion::parse("0.17.2").unwrap();
         alternate_source.manifest.validate().unwrap();
         let alternate_draft = stage_produced_artifact(
             &alternate_source,
@@ -2673,7 +2666,7 @@ mod tests {
         );
 
         let mut second = first.clone();
-        second.manifest.producer_toolkit_version = ToolkitVersion::parse("0.14.2").unwrap();
+        second.manifest.producer_toolkit_version = ToolkitVersion::parse("0.17.2").unwrap();
         second.manifest.validate().unwrap();
         let mut inventory = DraftInventory::default();
         inventory.push(first.clone()).unwrap();
@@ -2716,11 +2709,8 @@ mod tests {
 
     #[test]
     fn wrong_sized_retained_part_falls_back_to_the_verified_package() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-production-stage-wrong-size-part-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-stage-wrong-s");
+        let root = scratch.join("root");
         let record = record();
         let reference = stage_produced_artifact(
             &record,
@@ -2816,11 +2806,8 @@ mod tests {
 
     #[test]
     fn metadata_only_record_stages_identically_to_the_payload_record() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-production-stage-metadata-only-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-stage-metadat");
+        let root = scratch.join("root");
         let record = record();
 
         // The payload-carrying path is the reference.
@@ -2933,9 +2920,8 @@ mod tests {
 
     #[test]
     fn managed_inventory_rejects_public_target_derived_artifacts() {
-        let root =
-            std::env::temp_dir().join(format!("xc-production-private-only-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-private-only");
+        let root = scratch.join("root");
         let mut restricted = record();
         restricted.operation = "ccm.target_distance.resolve_or_compute".to_owned();
         restricted.logical_key = "ccm/target-distance/fixture".to_owned();
@@ -2945,8 +2931,8 @@ mod tests {
         restricted.manifest.key.kind = restricted.semantic_key.artifact_kind.clone();
         restricted.manifest.key.logical_key = restricted.logical_key.clone();
         restricted.manifest.key.parameters_digest = restricted.semantic_key.digest().unwrap();
-        restricted.manifest.producer_toolkit_version = ToolkitVersion::parse("0.14.1").unwrap();
-        restricted.manifest.minimum_reader_version = ToolkitVersion::parse("0.14.1").unwrap();
+        restricted.manifest.producer_toolkit_version = ToolkitVersion::parse("0.17.1").unwrap();
+        restricted.manifest.minimum_reader_version = ToolkitVersion::parse("0.16.0").unwrap();
         let draft = stage_produced_artifact(
             &restricted,
             &root,
@@ -3012,11 +2998,8 @@ mod tests {
     /// proceeds.
     #[test]
     fn managed_inventory_routes_mixed_drafts_across_destinations() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-production-mixed-routing-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-mixed-routing");
+        let root = scratch.join("root");
         let mut restricted = record();
         restricted.operation = "ccm.target_distance.resolve_or_compute".to_owned();
         restricted.logical_key = "ccm/target-distance/fixture".to_owned();
@@ -3026,8 +3009,8 @@ mod tests {
         restricted.manifest.key.kind = restricted.semantic_key.artifact_kind.clone();
         restricted.manifest.key.logical_key = restricted.logical_key.clone();
         restricted.manifest.key.parameters_digest = restricted.semantic_key.digest().unwrap();
-        restricted.manifest.producer_toolkit_version = ToolkitVersion::parse("0.14.1").unwrap();
-        restricted.manifest.minimum_reader_version = ToolkitVersion::parse("0.14.1").unwrap();
+        restricted.manifest.producer_toolkit_version = ToolkitVersion::parse("0.17.1").unwrap();
+        restricted.manifest.minimum_reader_version = ToolkitVersion::parse("0.16.0").unwrap();
         let restricted_draft = stage_produced_artifact(
             &restricted,
             &root,
@@ -3044,8 +3027,8 @@ mod tests {
         eligible.manifest.key.kind = eligible.semantic_key.artifact_kind.clone();
         eligible.manifest.key.logical_key = eligible.logical_key.clone();
         eligible.manifest.key.parameters_digest = eligible.semantic_key.digest().unwrap();
-        eligible.manifest.producer_toolkit_version = ToolkitVersion::parse("0.14.1").unwrap();
-        eligible.manifest.minimum_reader_version = ToolkitVersion::parse("0.14.0").unwrap();
+        eligible.manifest.producer_toolkit_version = ToolkitVersion::parse("0.17.1").unwrap();
+        eligible.manifest.minimum_reader_version = ToolkitVersion::parse("0.16.0").unwrap();
         let eligible_draft = stage_produced_artifact(
             &eligible,
             &root,
@@ -3085,16 +3068,9 @@ mod tests {
 
     #[test]
     fn remotely_reused_record_preserves_its_canonical_dependency_identity() {
-        let source_root = std::env::temp_dir().join(format!(
-            "xc-production-remote-source-{}",
-            std::process::id()
-        ));
-        let replay_root = std::env::temp_dir().join(format!(
-            "xc-production-remote-replay-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&source_root);
-        let _ = fs::remove_dir_all(&replay_root);
+        let scratch = crate::test_support::TestDir::new("production-remote");
+        let source_root = scratch.join("source-root");
+        let replay_root = scratch.join("replay-root");
         let base_record = record();
         let mut source = stage_produced_artifact(
             &base_record,
@@ -3164,11 +3140,8 @@ mod tests {
 
     #[test]
     fn historical_and_active_manifests_with_same_semantic_and_item_coexist() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-production-same-item-distinct-closure-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-same-item-dis");
+        let root = scratch.join("root");
         let base = record();
         let historical = stage_produced_artifact(
             &base,
@@ -3304,11 +3277,8 @@ mod tests {
 
     #[test]
     fn identity_first_dedup_persists_real_key_for_fresh_child() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-production-identity-first-key-promotion-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-identity-firs");
+        let root = scratch.join("root");
         let source_root = root.join("source");
         let staging_root = root.join("staging");
 
@@ -3418,11 +3388,8 @@ mod tests {
 
     #[test]
     fn interrupted_canonical_draft_is_rebuilt_from_validated_record() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-production-interrupted-stage-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-interrupted-s");
+        let root = scratch.join("root");
         let record = record();
         let reference_root = root.with_extension("reference");
         let _ = fs::remove_dir_all(&reference_root);
@@ -3463,11 +3430,8 @@ mod tests {
 
     #[test]
     fn reopened_draft_rejects_deserialized_path_substitution() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-production-reopened-path-binding-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-reopened-path");
+        let root = scratch.join("root");
         let staged = stage_produced_artifact(
             &record(),
             &root,
@@ -3499,11 +3463,8 @@ mod tests {
 
     #[test]
     fn reopened_v0141_two_level_draft_layout_remains_resumable() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-production-reopened-v0141-layout-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-reopened-v014");
+        let root = scratch.join("root");
         let staged = stage_produced_artifact(
             &record(),
             &root,
@@ -3562,9 +3523,8 @@ mod tests {
 
     #[test]
     fn canonical_staging_binds_exact_dependency_draft() {
-        let root =
-            std::env::temp_dir().join(format!("xc-production-dependencies-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("production-dependencies");
+        let root = scratch.join("root");
 
         let mut dependency = record();
         dependency.semantic_key.artifact_kind = "gauss_legendre_rule".to_owned();
@@ -3630,11 +3590,8 @@ mod tests {
 
     #[test]
     fn integrated_sink_stages_dependency_chain_in_process() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-integrated-production-sink-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("integrated-production-si");
+        let root = scratch.join("root");
         let sink = CanonicalStagingProductionSink::new(
             &root,
             TransportPolicy::default(),

@@ -4,8 +4,8 @@
 //! Gauss-Legendre quadrature at f64 and high precision.
 //!
 //! The HP nodes/weights are computed via Newton iteration on Legendre
-//! polynomials and cached to disk under `$XC_CACHE_ROOT/gl_cache/`, or
-//! `<cwd>/data/gl_cache/` when that variable is unset, so they're reused
+//! polynomials and cached to disk under `$XC_CACHE_ROOT/gl_cache/`, or under
+//! the per-user cache root when that variable is unset, so they're reused
 //! across runs at the same `(n_pts, precision_bits)`.
 //!
 //! The standalone HP API reads a local deterministic `.json.zip`, directly
@@ -22,7 +22,8 @@
 //! explicitly; pass `CacheMode::default()` for standard local behavior.
 //!
 //! New computes write only the compressed representation. Every reused HP rule
-//! passes the full O(n^2) Legendre/node/weight check. Legacy standalone files
+//! passes the full O(n^2) Legendre/node/weight check, once per process for each
+//! exact managed-cache payload. Legacy standalone files
 //! establish numerical compatibility, not bit-for-bit producer authenticity:
 //! accepted values may differ from a fresh rule within the explicit validation
 //! tolerances. Managed identities bind generation semantics, but are not by
@@ -218,7 +219,7 @@ fn legendre_p_deriv_f64(n: usize, x: f64) -> (f64, f64) {
 
 #[cfg(feature = "hp")]
 mod hp {
-    use rug::{ops::Pow, Float};
+    use rug::{ops::Pow, Assign, Float};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
     use xc_cache::{
@@ -280,12 +281,65 @@ mod hp {
     }
 
     fn full_cache_check(nodes: &[Float], weights: &[Float], prec: u32) -> Option<String> {
-        match check_gauss_legendre_rule_hp(nodes, weights, prec, nodes.len()) {
+        full_cache_check_scheduled(
+            nodes,
+            weights,
+            prec,
+            crate::hp_runtime::GlRootSchedule::serial(),
+        )
+    }
+
+    /// [`full_cache_check`] under a fresh rule's root schedule. The outcome and
+    /// every reported value are those of the serial check.
+    fn full_cache_check_scheduled(
+        nodes: &[Float],
+        weights: &[Float],
+        prec: u32,
+        schedule: crate::hp_runtime::GlRootSchedule,
+    ) -> Option<String> {
+        match check_gauss_legendre_rule_indices_scheduled_hp(
+            nodes,
+            weights,
+            prec,
+            nodes.len(),
+            0..nodes.len(),
+            schedule,
+        ) {
             Ok(check) if check.checks_passed => None,
             Ok(_) => Some("Gauss-Legendre root or derivative-weight identity mismatch".into()),
             Err(error) => Some(error.to_string()),
         }
     }
+
+    /// Constant many polynomial probes plus all structural/moment checks. The
+    /// three recurrences each cost O(n); this is admission, not a full rule proof.
+    pub(super) fn cache_sanity_check(
+        nodes: &[Float],
+        weights: &[Float],
+        prec: u32,
+    ) -> Option<String> {
+        let n = nodes.len();
+        if n == 0 {
+            return Some("empty Gauss-Legendre rule".into());
+        }
+        // The structural check already proves mirror symmetry, so probes use
+        // an end node, an interior quarter node and the central node.
+        let mut probes = vec![0, n / 4, n / 2];
+        probes.dedup();
+        match check_gauss_legendre_rule_indices_hp(nodes, weights, prec, n, probes) {
+            Ok(check) if check.checks_passed => None,
+            Ok(_) => Some("Gauss-Legendre sampled root or derivative-weight mismatch".into()),
+            Err(error) => Some(error.to_string()),
+        }
+    }
+
+    /// Rules that already passed linear cache sanity checks in this process, keyed by
+    /// their exact payload. The check is a pure function of these bytes, so a
+    /// later lookup of the same rule returns the checked values instead of
+    /// repeating it. Bounded to a few rules.
+    static VALIDATED_TABLES: std::sync::Mutex<Vec<(PortableGlTable, GlTable)>> =
+        std::sync::Mutex::new(Vec::new());
+    const VALIDATED_TABLE_LIMIT: usize = 8;
 
     fn decode_portable_table(
         table: &PortableGlTable,
@@ -303,6 +357,14 @@ mod hp {
                 "quadrature payload identity or dimensions do not match its semantic key"
                     .to_owned(),
             ));
+        }
+        if let Some((_, checked)) = VALIDATED_TABLES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|(validated, _)| validated == table)
+        {
+            return Ok(checked.clone());
         }
         let parse = |value: &str| {
             Float::parse(value)
@@ -323,11 +385,18 @@ mod hp {
             .iter()
             .map(|value| parse(value))
             .collect::<Result<_, _>>()?;
-        if let Some(reason) = full_cache_check(&nodes, &weights, prec) {
+        if let Some(reason) = cache_sanity_check(&nodes, &weights, prec) {
             return Err(CacheError::InvalidManifest(format!(
                 "quadrature payload failed structural validation: {reason}"
             )));
         }
+        let mut validated = VALIDATED_TABLES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if validated.len() >= VALIDATED_TABLE_LIMIT {
+            validated.remove(0);
+        }
+        validated.push((table.clone(), (nodes.clone(), weights.clone())));
         Ok((nodes, weights))
     }
 
@@ -348,9 +417,10 @@ mod hp {
     /// never silently falls through to a fresh computation.
     ///
     /// # Assurance and validity
-    /// Reused and fresh rules must pass structural moments and every Legendre
-    /// root/derivative-weight identity before return. Validation costs O(n^2)
-    /// point arithmetic and does not establish an interval certificate.
+    /// Fresh rules pass every Legendre root/weight identity. Reuse checks shape,
+    /// finite ordered nodes, positive symmetric weights, low moments and three
+    /// deterministic root/weight probes in O(n) arithmetic. These sanity checks
+    /// do not certify every root; use `check_gauss_legendre_rule_hp` for full replay.
     ///
     /// # Cache effects
     /// Behavior is entirely controlled by `cache`. `PreferReuse` may write only when
@@ -433,7 +503,7 @@ mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "quadrature".to_owned()),
@@ -449,7 +519,20 @@ mod hp {
                     xc_core::performance_stage_with("quadrature.gl.construct", || {
                         gl_performance_metadata_scheduled(n, precision_bits, root_schedule)
                     });
+                let started = std::time::Instant::now();
+                xc_core::progress_message!(
+                    "[HP] Gauss-Legendre rule n={n}, {precision_bits} bits: computing {} roots",
+                    if root_schedule.parallel_min_task_len().is_some() {
+                        "parallel"
+                    } else {
+                        "serial"
+                    }
+                );
                 let table = gauss_legendre_compute_scheduled(n, precision_bits, root_schedule)?;
+                xc_core::progress_message!(
+                    "[HP] Gauss-Legendre rule n={n}, {precision_bits} bits: computed in {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
                 drop(performance_construct);
                 let performance_encode =
                     xc_core::performance_stage_with("quadrature.gl.portable_encode", || {
@@ -825,13 +908,10 @@ mod hp {
     }
 
     /// Cache directory: `$XC_CACHE_ROOT/gl_cache` when that is set, else
-    /// `<cwd>/data/gl_cache`. Created on demand so fresh checkouts work
-    /// without manual setup.
-    ///
-    /// Honouring `XC_CACHE_ROOT` matters because the fallback is relative to
-    /// the *working directory*: a run started from inside a checkout drops
-    /// binary cache files into that checkout, where they are neither the
-    /// operator's chosen cache volume nor necessarily ignored by git.
+    /// `gl_cache` under the per-user cache root shared with the managed
+    /// cache ([`xc_core::default_cache_root`]). Created on demand. The
+    /// working directory is never used, so runs started inside a checkout
+    /// do not write into it.
     fn gl_cache_dir() -> Option<std::path::PathBuf> {
         #[cfg(test)]
         if let Some(root) = TEST_CACHE_ROOT.with(|current| current.borrow().clone()) {
@@ -839,11 +919,7 @@ mod hp {
             std::fs::create_dir_all(&dir).ok()?;
             return Some(dir);
         }
-        let root = match std::env::var_os("XC_CACHE_ROOT") {
-            Some(root) if !root.is_empty() => std::path::PathBuf::from(root),
-            _ => std::env::current_dir().ok()?.join("data"),
-        };
-        let dir = root.join("gl_cache");
+        let dir = xc_core::configured_cache_root().join("gl_cache");
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
     }
@@ -872,8 +948,8 @@ mod hp {
         Some(table)
     }
 
-    // Untrusted decoded values for the verifier's error classification. A
-    // production result must pass full_cache_check before it can be returned.
+    // Untrusted decoded values for the verifier's error classification.
+    // Runtime results pass cache_sanity_check; explicit audits use full_cache_check.
     fn parse_gl_envelope_unchecked(data: &str, n: usize, prec: u32) -> Option<GlTable> {
         validate_gl_domain(n, prec).ok()?;
         let parsed: serde_json::Value = serde_json::from_str(data).ok()?;
@@ -927,7 +1003,7 @@ mod hp {
     /// so reviewers can identify and remediate corrupt fixtures
     /// without silently triggering a multi-minute Newton recompute.
     fn warn_cache_skip(path: &std::path::Path, reason: &str) {
-        eprintln!(
+        xc_core::progress_message!(
             "[gl_cache] WARNING: skipping {} ({}); recomputing",
             path.display(),
             reason
@@ -964,7 +1040,7 @@ mod hp {
         if !zip_path.exists() {
             return None;
         }
-        match load_from_zip(&zip_path, n, prec) {
+        match load_from_zip(&zip_path, n, prec, false) {
             Ok((table, _)) => Some(table),
             Err(error) => {
                 warn_cache_skip(&zip_path, &error.reason());
@@ -1001,12 +1077,13 @@ mod hp {
             }
         }
     }
-    // Runtime and verifier use exactly the same container, version, envelope,
-    // and full numerical acceptance path.
+    // Runtime and verifier share container, version and envelope admission.
+    // Only the explicit verifier requests full numerical replay.
     fn load_from_zip(
         zip_path: &std::path::Path,
         n: usize,
         prec: u32,
+        full_replay: bool,
     ) -> Result<(GlTable, String), GlCacheReadError> {
         let data = read_gl_zip_payload(zip_path, n, prec).ok_or_else(|| {
             GlCacheReadError::Load(
@@ -1033,7 +1110,11 @@ mod hp {
                 "GL envelope identity, shape, domain, or decimal parse failed".to_owned(),
             )
         })?;
-        if let Some(reason) = full_cache_check(&table.0, &table.1, prec) {
+        if let Some(reason) = if full_replay {
+            full_cache_check(&table.0, &table.1, prec)
+        } else {
+            cache_sanity_check(&table.0, &table.1, prec)
+        } {
             return Err(GlCacheReadError::Numerical(reason));
         }
         Ok((table, data))
@@ -1133,7 +1214,7 @@ mod hp {
                 }
             }
             if let Err(error) = xc_cache::atomic_replace_cache_file(&zip_path, &buf) {
-                eprintln!("quadrature cache write failed: {error}");
+                xc_core::progress_message!("quadrature cache write failed: {error}");
             }
         }
     }
@@ -1192,7 +1273,8 @@ mod hp {
         }
         combined.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         let result: GlTable = combined.into_iter().unzip();
-        if let Some(reason) = full_cache_check(&result.0, &result.1, prec) {
+        if let Some(reason) = full_cache_check_scheduled(&result.0, &result.1, prec, root_schedule)
+        {
             return Err(CacheError::InvalidManifest(format!(
                 "fresh GL rule failed validation: {reason}"
             )));
@@ -1240,6 +1322,121 @@ mod hp {
     }
 
     #[cfg(test)]
+    #[test]
+    fn validated_rules_are_remembered_and_altered_rules_still_rejected() {
+        let (n, prec) = (12, 192);
+        let rule = portable_table(
+            n,
+            prec,
+            gauss_legendre_compute_scheduled(n, prec, crate::hp_runtime::GlRootSchedule::serial())
+                .unwrap(),
+        );
+        let first = decode_portable_table(&rule, n, prec).unwrap();
+        assert!(VALIDATED_TABLES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(table, _)| table == &rule));
+        let second = decode_portable_table(&rule, n, prec).unwrap();
+        assert_eq!(first, second);
+        let mut altered = rule.clone();
+        altered.nodes.swap(0, 1);
+        assert!(decode_portable_table(&altered, n, prec).is_err());
+        let mut altered = rule;
+        altered.weights[0] = "0".into();
+        assert!(decode_portable_table(&altered, n, prec).is_err());
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn native_integer_recurrence_equals_float_integer_recurrence() {
+        let same = |left: &(Float, Float), right: &(Float, Float)| {
+            for (a, b) in [(&left.0, &right.0), (&left.1, &right.1)] {
+                assert_eq!(a.prec(), b.prec());
+                assert_eq!(a.to_string_radix(16, None), b.to_string_radix(16, None));
+                assert_eq!(a.is_sign_negative(), b.is_sign_negative());
+            }
+        };
+        for prec in [16, 53, 192, 793] {
+            for n in [0, 1, 2, 3, 7, 64, 255, 1000] {
+                for x_prec in [prec, prec + 64] {
+                    let mut points = vec![
+                        Float::with_val(x_prec, 0),
+                        -Float::with_val(x_prec, 0),
+                        Float::with_val(x_prec, 1),
+                        Float::with_val(x_prec, -1),
+                    ];
+                    for k in 1..=9 {
+                        let mut x = Float::with_val(x_prec, rug::float::Constant::Pi);
+                        x *= k;
+                        x /= 31;
+                        points.push(x.clone().cos());
+                        points.push(-x.sin());
+                    }
+                    for x in &points {
+                        same(
+                            &legendre_p_and_deriv(n, x, prec),
+                            &legendre_p_and_deriv_float_integers(n, x, prec),
+                        );
+                    }
+                }
+            }
+        }
+        // Integers above 2^16 are inexact at 16 bits and keep the reference route.
+        let x = Float::with_val(16, 0.25);
+        same(
+            &legendre_p_and_deriv(40_000, &x, 16),
+            &legendre_p_and_deriv_float_integers(40_000, &x, 16),
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn scheduled_rule_check_equals_serial_check_at_any_worker_count() {
+        use crate::hp_runtime::GlRootSchedule;
+        let render = |check: &anyhow::Result<GaussLegendreRuleCheckHp>| match check {
+            Ok(check) => format!(
+                "{} {} {} {} {} {}",
+                check.checks_passed,
+                check.maximum_legendre_residual,
+                check.maximum_relative_weight_defect,
+                check.maximum_node_correction,
+                check.maximum_weight_error,
+                check.tolerance
+            ),
+            Err(error) => format!("error: {error}"),
+        };
+        for (n, prec) in [(1, 64), (24, 192), (97, 320)] {
+            let (nodes, weights) = gauss_legendre_compute(n, prec);
+            let mut perturbed = weights.clone();
+            perturbed[n / 2] *= 1.0 + 1e-6;
+            perturbed[n - 1 - n / 2] = perturbed[n / 2].clone();
+            for weights in [&weights, &perturbed] {
+                let serial = render(&check_gauss_legendre_rule_hp(&nodes, weights, prec, n));
+                for workers in [1, 2, 7] {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(workers)
+                        .build()
+                        .unwrap();
+                    for _ in 0..3 {
+                        let parallel = pool.install(|| {
+                            check_gauss_legendre_rule_indices_scheduled_hp(
+                                &nodes,
+                                weights,
+                                prec,
+                                n,
+                                0..n,
+                                GlRootSchedule::parallel_for_test(1),
+                            )
+                        });
+                        assert_eq!(render(&parallel), serial);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn gauss_legendre_compute_allocating_reference(
         n: usize,
         prec: u32,
@@ -1256,7 +1453,7 @@ mod hp {
             let mut x = phi.cos();
             let eps_threshold = Float::with_val(prec, 2).pow(-((prec as i32) - 8));
             for _ in 0..50 {
-                let (pn, pn_prime) = legendre_p_and_deriv(n, &x, prec);
+                let (pn, pn_prime) = legendre_p_and_deriv_float_integers(n, &x, prec);
                 let mut dx = pn;
                 dx /= &pn_prime;
                 x -= &dx;
@@ -1268,7 +1465,7 @@ mod hp {
                     break;
                 }
             }
-            let (_pn, pn_prime) = legendre_p_and_deriv(n, &x, prec);
+            let (_pn, pn_prime) = legendre_p_and_deriv_float_integers(n, &x, prec);
             let one_minus_x2 = {
                 let mut value = one.clone();
                 value -= x.clone().square();
@@ -1288,7 +1485,48 @@ mod hp {
         (nodes, weights)
     }
 
+    /// `P_n(x)` and `P_n'(x)` by the three-term recurrence. Every value equals
+    /// [`legendre_p_and_deriv_float_integers`]: when the recurrence integers
+    /// are exact at `prec` bits, multiplying or dividing by such an integer
+    /// rounds the same exact quotient or product once, so the native-integer
+    /// MPFR operations give the same correctly rounded results. Temporaries
+    /// reuse three buffers at the precision of `x`, which is where the
+    /// reference rounds them (its first `P_0 * 1` is exact at any precision).
     fn legendre_p_and_deriv(n: usize, x: &Float, prec: u32) -> (Float, Float) {
+        let largest_integer = n.checked_mul(2).and_then(|n| n.checked_add(1));
+        let exact_integers = largest_integer
+            .and_then(|value| u32::try_from(value).ok())
+            .is_some_and(|value| u32::BITS - value.leading_zeros() <= prec);
+        if n < 2 || !exact_integers {
+            return legendre_p_and_deriv_float_integers(n, x, prec);
+        }
+        let working = x.prec();
+        let mut p0 = Float::with_val(working, 1);
+        let mut p1 = x.clone();
+        let mut next = Float::new(working);
+        let mut scaled_previous = Float::new(working);
+        for k in 1..n as u32 {
+            next.assign(x * &p1);
+            next *= 2 * k + 1;
+            scaled_previous.assign(&p0 * k);
+            next -= &scaled_previous;
+            next /= k + 1;
+            std::mem::swap(&mut p0, &mut p1);
+            std::mem::swap(&mut p1, &mut next);
+        }
+        let mut numer = Float::with_val(working, x * &p1);
+        numer -= &p0;
+        numer *= n as u32;
+        let mut denom = x.clone().square();
+        denom -= 1u32;
+        let mut deriv = numer;
+        deriv /= &denom;
+        (p1, deriv)
+    }
+
+    /// The recurrence with every integer rounded to a `prec`-bit float. It
+    /// remains the route for integers that `prec` bits cannot hold exactly.
+    fn legendre_p_and_deriv_float_integers(n: usize, x: &Float, prec: u32) -> (Float, Float) {
         let one = Float::with_val(prec, 1);
         if n == 0 {
             return (one, Float::with_val(prec, 0));
@@ -1323,7 +1561,7 @@ mod hp {
         (p1, deriv)
     }
 
-    /// Computed full-rule diagnostics, also required at cache/read boundaries.
+    /// Computed full-rule diagnostics for generation and explicit verification.
     #[derive(Clone, Debug)]
     pub struct GaussLegendreRuleCheckHp {
         pub order: usize,
@@ -1352,6 +1590,77 @@ mod hp {
         prec: u32,
         maximum_order: usize,
     ) -> anyhow::Result<GaussLegendreRuleCheckHp> {
+        check_gauss_legendre_rule_indices_hp(nodes, weights, prec, maximum_order, 0..nodes.len())
+    }
+
+    fn check_gauss_legendre_rule_indices_hp(
+        nodes: &[Float],
+        weights: &[Float],
+        prec: u32,
+        maximum_order: usize,
+        indices: impl IntoIterator<Item = usize>,
+    ) -> anyhow::Result<GaussLegendreRuleCheckHp> {
+        check_gauss_legendre_rule_indices_scheduled_hp(
+            nodes,
+            weights,
+            prec,
+            maximum_order,
+            indices,
+            crate::hp_runtime::GlRootSchedule::serial(),
+        )
+    }
+
+    /// One node's recurrence values for the rule check, rounded exactly as
+    /// the serial check rounds them.
+    struct RuleProbe {
+        legendre_residual: Float,
+        relative_weight_defect: Float,
+        node_correction: Float,
+        weight_error: Float,
+    }
+
+    fn rule_probe(n: usize, source_x: &Float, source_w: &Float, guard: u32) -> RuleProbeResult {
+        let x = Float::with_val(guard, source_x);
+        let (pn, dpn) = legendre_p_and_deriv(n, &x, guard);
+        if !pn.is_finite() || !dpn.is_finite() || dpn.is_zero() {
+            return Err("nonfinite GL recurrence");
+        }
+        // A per-node scale: |P_n'| ranges from about sqrt(n) inside the
+        // interval to n^2/2 at its ends, so |P_n| alone is not comparable.
+        let legendre_residual = pn.clone().abs();
+        let node_correction = Float::with_val(guard, &pn / &dpn).abs();
+        let mut formula = Float::with_val(guard, 1);
+        formula -= x.clone().square();
+        formula *= dpn.square();
+        let mut relative_defect = Float::with_val(guard, &formula * source_w);
+        relative_defect /= 2;
+        relative_defect -= 1;
+        let relative_weight_defect = relative_defect.abs();
+        let formula = Float::with_val(guard, 2) / formula;
+        let weight_error = Float::with_val(guard, source_w - &formula).abs();
+        Ok(RuleProbe {
+            legendre_residual,
+            relative_weight_defect,
+            node_correction,
+            weight_error,
+        })
+    }
+
+    type RuleProbeResult = Result<RuleProbe, &'static str>;
+
+    /// The rule check with an optional root-parallel schedule. Each probe is
+    /// a pure function of its node and weight, so parallel probes compute the
+    /// same values; the maxima and the first failure are then taken serially
+    /// in index order, exactly as in the serial check. Parallel probes run
+    /// only when every worker shares the caller's MPFR exponent range.
+    fn check_gauss_legendre_rule_indices_scheduled_hp(
+        nodes: &[Float],
+        weights: &[Float],
+        prec: u32,
+        maximum_order: usize,
+        indices: impl IntoIterator<Item = usize>,
+        schedule: crate::hp_runtime::GlRootSchedule,
+    ) -> anyhow::Result<GaussLegendreRuleCheckHp> {
         if !(16..=1_000_000).contains(&prec)
             || nodes.len() > maximum_order
             || nodes.is_empty()
@@ -1367,37 +1676,44 @@ mod hp {
         let n = nodes.len();
         validate_gl_domain(n, prec)?;
         let guard = prec + 64;
+        let indices: Vec<usize> = indices.into_iter().collect();
+        let parallel_min_len = schedule
+            .parallel_min_task_len()
+            .filter(|_| crate::mpfr_interval::ensure_uniform_exponent_range().is_ok());
+        let parallel_probes = parallel_min_len.map(|min_len| {
+            use rayon::prelude::*;
+            indices
+                .par_iter()
+                .with_min_len(min_len)
+                .map(|&index| rule_probe(n, &nodes[index], &weights[index], guard))
+                .collect::<Vec<_>>()
+        });
+        let mut parallel_probes = parallel_probes.map(Vec::into_iter);
         let mut root_max = Float::with_val(guard, 0);
         let mut relative_weight_max = Float::with_val(guard, 0);
         let mut correction_max = Float::with_val(guard, 0);
         let mut weight_max = Float::with_val(guard, 0);
-        for (source_x, source_w) in nodes.iter().zip(weights) {
-            let x = Float::with_val(guard, source_x);
-            let (pn, dpn) = legendre_p_and_deriv(n, &x, guard);
-            if !pn.is_finite() || !dpn.is_finite() || dpn.is_zero() {
-                anyhow::bail!("nonfinite GL recurrence");
-            }
-            // A per-node scale: |P_n'| ranges from about sqrt(n) inside the
-            // interval to n^2/2 at its ends, so |P_n| alone is not comparable.
-            root_max = root_max.max(&pn.clone().abs());
-            let correction = Float::with_val(guard, &pn / &dpn).abs();
-            let mut formula = Float::with_val(guard, 1);
-            formula -= x.clone().square();
-            formula *= dpn.square();
-            let mut relative_defect = Float::with_val(guard, &formula * source_w);
-            relative_defect /= 2;
-            relative_defect -= 1;
-            relative_weight_max = relative_weight_max.max(&relative_defect.abs());
-            let formula = Float::with_val(guard, 2) / formula;
-            let error = Float::with_val(guard, source_w - &formula).abs();
-            if !correction.is_finite() || !error.is_finite() {
+        for index in indices {
+            #[cfg(test)]
+            RULE_PROBES.with(|count| count.set(count.get() + 1));
+            let probe = match parallel_probes.as_mut() {
+                Some(probes) => probes.next().expect("one probe per index"),
+                None => rule_probe(n, &nodes[index], &weights[index], guard),
+            };
+            let probe = match probe {
+                Ok(probe) => probe,
+                Err(reason) => anyhow::bail!(reason),
+            };
+            root_max = root_max.max(&probe.legendre_residual);
+            relative_weight_max = relative_weight_max.max(&probe.relative_weight_defect);
+            if !probe.node_correction.is_finite() || !probe.weight_error.is_finite() {
                 anyhow::bail!("nonfinite GL weight check");
             }
-            if correction > correction_max {
-                correction_max = correction;
+            if probe.node_correction > correction_max {
+                correction_max = probe.node_correction;
             }
-            if error > weight_max {
-                weight_max = error;
+            if probe.weight_error > weight_max {
+                weight_max = probe.weight_error;
             }
         }
         // Correctly rounded tables measure below 2 * 2^-prec on both counts.
@@ -1414,12 +1730,17 @@ mod hp {
         })
     }
 
+    #[cfg(test)]
+    std::thread_local! {
+        pub(super) static RULE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     // ===========================================================================
     // Public cache-verification API
     // ===========================================================================
 
     pub const GL_CACHE_ADMISSION_SEMANTICS: &str =
-        "gl-zip-runtime-aligned-version-envelope-full-rule-admission-v2";
+        "gl-zip-version-envelope-linear-sanity-explicit-full-replay-v3";
 
     /// Per-file outcome from `verify_gl_cache_dir`.
     #[derive(Debug, Clone)]
@@ -1588,7 +1909,7 @@ mod hp {
                 });
                 continue;
             }
-            statuses.push(match load_from_zip(&path, n, prec) {
+            statuses.push(match load_from_zip(&path, n, prec, true) {
                 Ok(_) => CacheFileStatus::Ok { path, n, prec },
                 Err(GlCacheReadError::Stale { found, minimum }) => CacheFileStatus::Stale {
                     path,
@@ -1674,11 +1995,7 @@ mod tests {
         };
         use xc_core::{CacheLookupOutcome, CacheReuseDisposition};
 
-        let root = std::env::temp_dir().join(format!(
-            "xc-numerics-quadrature-fabric-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = xc_core::test_support::TestDir::new("quad-fabric");
         let reference_root = root.join("reference");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
@@ -1690,7 +2007,7 @@ mod tests {
             )),
         }]);
         let policy = CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -1771,7 +2088,6 @@ mod tests {
         .unwrap();
         assert!(report.output_preserving);
         assert_eq!(report.totals.matched, 1);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1950,7 +2266,7 @@ mod hp_cache_tests {
 
     #[test]
     fn allocation_reduction_preserves_exact_gl_payload_values() {
-        for (order, precision) in [(1, 128), (8, 192), (33, 257)] {
+        for (order, precision) in [(1, 128), (8, 192), (33, 257), (120, 793)] {
             let reference = hp::gauss_legendre_compute_allocating_reference(order, precision);
             let actual = hp::gauss_legendre_compute(order, precision);
             assert_eq!(
@@ -1978,32 +2294,12 @@ mod hp_cache_tests {
         }
     }
 
-    /// Make a fresh, unique throwaway directory under the workspace
-    /// `target/test-tmp/` dir (not the OS temp dir). Keeping test scratch
-    /// inside `target/` means it is contained in the repo's build area
-    /// and removed by `cargo clean`, rather than scattering directories
-    /// in `/tmp` or `%TEMP%`. The path is resolved from
-    /// `CARGO_MANIFEST_DIR` at compile time, so it is correct regardless
-    /// of the process's runtime cwd. A tag plus a process-id +
-    /// nanosecond suffix avoids clashes when tests run in parallel or
-    /// are re-run rapidly.
-    fn fresh_temp_dir(tag: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let pid = std::process::id();
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("test-tmp")
-            .join(format!(
-                "xc_numerics_gl_cache_test_{}_{}_{}",
-                tag, pid, nanos
-            ));
-        std::fs::create_dir_all(&dir).expect("create test tmp dir");
-        dir
+    /// Make a fresh, unique throwaway directory outside the checkout. The
+    /// returned guard deletes the directory when dropped, including on
+    /// panic, so callers must keep it alive for the whole test and declare
+    /// it before any `CacheRootGuard` that points into it.
+    fn fresh_temp_dir(tag: &str) -> xc_core::test_support::TestDir {
+        xc_core::test_support::TestDir::new(tag)
     }
 
     #[test]
@@ -2031,6 +2327,41 @@ mod hp_cache_tests {
         bad.swap(0, 1);
         assert!(hp::cache_structural_check(&bad, &weights, p).is_some());
         assert!(hp::cache_structural_check(&[], &[], p).is_some());
+    }
+
+    #[test]
+    fn cache_sanity_uses_three_probes_and_explicit_replay_checks_all_roots() {
+        for (n, p) in [(8, 64), (32, 256), (128, 128)] {
+            let (nodes, weights) = hp::gauss_legendre_nodes(n, p, hp::CacheMode::Off);
+            hp::RULE_PROBES.with(|count| count.set(0));
+            assert!(hp::cache_sanity_check(&nodes, &weights, p).is_none());
+            assert_eq!(hp::RULE_PROBES.with(|count| count.get()), 3);
+            hp::RULE_PROBES.with(|count| count.set(0));
+            assert!(
+                hp::check_gauss_legendre_rule_hp(&nodes, &weights, p, n)
+                    .unwrap()
+                    .checks_passed
+            );
+            assert_eq!(hp::RULE_PROBES.with(|count| count.get()), n);
+            let mut bad = weights.clone();
+            bad[n / 2] = Float::with_val(p, -1);
+            assert!(hp::cache_sanity_check(&nodes, &bad, p).is_some());
+            assert!(hp::cache_sanity_check(&nodes, &weights[..n - 1], p).is_some());
+        }
+        // Sanity is deliberately not proof of every root. Exact transport
+        // digests protect retained bytes; the explicit audit can find errors
+        // constructed to pass the sparse probes and low moments.
+        let (n, p) = (128, 128);
+        let (mut nodes, weights) = hp::gauss_legendre_nodes(n, p, hp::CacheMode::Off);
+        let change = Float::with_val(p, 512) >> p;
+        nodes[45] -= &change;
+        nodes[n - 1 - 45] += &change;
+        assert!(hp::cache_sanity_check(&nodes, &weights, p).is_none());
+        assert!(
+            !hp::check_gauss_legendre_rule_hp(&nodes, &weights, p, n)
+                .unwrap()
+                .checks_passed
+        );
     }
 
     #[test]
@@ -2245,7 +2576,7 @@ mod hp_cache_tests {
         // Zip-only: fresh compute writes the .json.zip, never the .json.
         assert!(
             zip_path.exists(),
-            "fresh compute should write the .json.zip to <cwd>/data/gl_cache/..."
+            "fresh compute should write the .json.zip to gl_cache/ under the redirected cache root"
         );
         assert!(
             !json_path.exists(),
@@ -2437,8 +2768,8 @@ mod hp_cache_tests {
 
     /// Sanity check that the legitimate computed GL nodes integrate a
     /// known polynomial correctly. This is a sanity wrapper around
-    /// `gauss_legendre_compute` (no cache involved if the test runs
-    /// in a fresh temp cwd).
+    /// `gauss_legendre_compute` (no cache involved because the cache
+    /// root is redirected to a fresh scratch directory).
     #[test]
     fn fresh_compute_integrates_x_squared() {
         let temp = fresh_temp_dir("integrate_x2");

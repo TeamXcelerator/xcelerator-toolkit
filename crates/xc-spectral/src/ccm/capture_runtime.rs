@@ -12,7 +12,14 @@ use std::{
 };
 use xc_cache::ContentDigest;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Largest serialized research input a capture admits: prepared external
+/// inputs, finite-diagnostic and energy requests, and retained trial
+/// components. A fixed constant, so admission never changes an identity; the
+/// declared working budget separately decides whether the work may run, and
+/// work over that budget is reported as unavailable instead of truncated.
+pub const RESEARCH_INPUT_MAXIMUM_BYTES: u64 = 4 << 30;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureResourcePolicy {
     pub maximum_working_bytes: u64,
@@ -68,20 +75,24 @@ pub(crate) struct Stage {
 impl Stage {
     pub(crate) fn new(label: impl Into<String>) -> Self {
         let label = label.into();
-        eprintln!("research stage {label}: started");
+        xc_core::progress_message!("research stage {label}: started");
         let (stop, rx) = mpsc::channel();
         let name = label.clone();
+        // Heartbeats join any message capture of the stage's own thread.
+        let capture = xc_core::current_message_capture();
         let thread = std::thread::spawn(move || {
-            let start = Instant::now();
-            while rx
-                .recv_timeout(std::time::Duration::from_secs(30))
-                .is_err_and(|e| e == mpsc::RecvTimeoutError::Timeout)
-            {
-                eprintln!(
-                    "research stage {name}: active, {:.1}s elapsed",
-                    start.elapsed().as_secs_f64()
-                );
-            }
+            xc_core::with_message_capture(capture, || {
+                let start = Instant::now();
+                while rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .is_err_and(|e| e == mpsc::RecvTimeoutError::Timeout)
+                {
+                    xc_core::progress_message!(
+                        "research stage {name}: active, {:.1}s elapsed",
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+            })
         });
         Self {
             stop,
@@ -97,7 +108,7 @@ impl Drop for Stage {
         if let Some(h) = self.thread.take() {
             let _ = h.join();
         }
-        eprintln!(
+        xc_core::progress_message!(
             "research stage {}: ended after {:.3}s",
             self.label,
             self.start.elapsed().as_secs_f64()
@@ -239,12 +250,12 @@ impl Checkpoints {
         match result {
             Ok(value) => {
                 if self.verbose {
-                    eprintln!("research checkpoint {display_label}: reused");
+                    xc_core::progress_message!("research checkpoint {display_label}: reused");
                 }
                 Ok(Some(value))
             }
             Err(e) => {
-                eprintln!(
+                xc_core::progress_message!(
                     "research checkpoint {display_label}: rejected ({e}); recomputing diagnostic stage"
                 );
                 Ok(None)
@@ -373,7 +384,9 @@ where
                 .map(&compute)
                 .collect::<Result<Vec<_>>>()?;
             if let Err(e) = store.save(&key, &rows) {
-                eprintln!("research checkpoint unavailable: {e}; numerical result retained");
+                xc_core::progress_message!(
+                    "research checkpoint unavailable: {e}; numerical result retained"
+                );
             }
             rows
         };
@@ -382,12 +395,387 @@ where
     Ok(result)
 }
 
+type LookAheadJob<T> = Box<dyn FnOnce() -> T + Send>;
+type LookAheadOutcome<T> = std::thread::Result<(T, Vec<String>)>;
+
+enum LookAheadSlot<T> {
+    Queued(LookAheadJob<T>),
+    Running,
+    Done(LookAheadOutcome<T>),
+    /// Taken, released to its owner, or never runnable here.
+    Closed,
+}
+
+struct LookAheadState<K, T> {
+    slots: Vec<(String, K, LookAheadSlot<T>)>,
+    stopped: bool,
+}
+
+struct LookAheadShared<K, T> {
+    state: std::sync::Mutex<LookAheadState<K, T>>,
+    changed: std::sync::Condvar,
+}
+
+impl<K, T> LookAheadShared<K, T> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LookAheadState<K, T>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LOOKAHEAD_RESULTS_TAKEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Pure computations started ahead of their turn on one background thread,
+/// in the order given. A job must be a deterministic function of the inputs
+/// recorded in its key, read no cache and write no file. Its owner claims the
+/// result where the serial code would compute it, after checking that the
+/// key equals the inputs it would use there; on any mismatch, or for a job
+/// that has not started, the owner computes inline as before. Everything
+/// observable stays with the owner: cache access, staging and errors happen
+/// at the serial position, and the job's progress messages are held and
+/// delivered there in order. A job's panic resumes on the owner's thread when
+/// it claims that job.
+///
+/// Jobs run in the configuration of their owner: on the global Rayon pool,
+/// or, for an owner inside another pool, on a private pool with the same
+/// number of workers (waiting on the lane never occupies a worker the lane
+/// needs); an active full-parallel HP policy is installed for them; and a job
+/// runs only where the MPFR exponent range equals the owner's. The lane does
+/// not start under a safe-capped policy. Arb/FLINT keep per-thread constant
+/// caches, so jobs must not reach Arb.
+pub(crate) struct LookAhead<K, T> {
+    shared: std::sync::Arc<LookAheadShared<K, T>>,
+    range: (i32, i32),
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl<K: Send + 'static, T: Send + 'static> LookAhead<K, T> {
+    pub(crate) fn start(jobs: Vec<(String, K, LookAheadJob<T>)>) -> Option<Self> {
+        if jobs.is_empty() {
+            return None;
+        }
+        let policy = xc_numerics::hp_runtime::active_policy();
+        if policy
+            .as_ref()
+            .is_some_and(|p| p.mode != xc_numerics::hp_runtime::HpRuntimeMode::FullParallel)
+        {
+            return None;
+        }
+        let pool = match rayon::current_thread_index() {
+            Some(_) => Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(rayon::current_num_threads())
+                    .thread_name(|i| format!("xc-capture-lookahead-{i}"))
+                    .build()
+                    .ok()?,
+            ),
+            None => None,
+        };
+        let range = (rug::float::exp_min(), rug::float::exp_max());
+        let shared = std::sync::Arc::new(LookAheadShared {
+            state: std::sync::Mutex::new(LookAheadState {
+                slots: jobs
+                    .into_iter()
+                    .map(|(id, key, job)| (id, key, LookAheadSlot::Queued(job)))
+                    .collect(),
+                stopped: false,
+            }),
+            changed: std::sync::Condvar::new(),
+        });
+        let worker = std::sync::Arc::clone(&shared);
+        let thread = std::thread::Builder::new()
+            .name("xc-capture-lookahead".into())
+            .stack_size(64 << 20)
+            .spawn(move || {
+                // One job with held messages, under the owner's policy and
+                // exponent range; `None` releases it to the owner.
+                let execute = |job: LookAheadJob<T>, capture: &xc_core::MessageCapture| {
+                    xc_core::with_message_capture(Some(capture.clone()), || {
+                        if (rug::float::exp_min(), rug::float::exp_max()) != range {
+                            return None;
+                        }
+                        match &policy {
+                            Some(policy) => {
+                                xc_numerics::hp_runtime::run_hp_with_policy(policy, job).ok()
+                            }
+                            None => Some(job()),
+                        }
+                    })
+                };
+                loop {
+                    let job = {
+                        let mut state = worker.lock();
+                        let runnable = !state.stopped;
+                        let next = state
+                            .slots
+                            .iter_mut()
+                            .find(|(_, _, slot)| matches!(slot, LookAheadSlot::Queued(_)));
+                        match next {
+                            Some((_, _, slot)) if runnable => {
+                                match std::mem::replace(slot, LookAheadSlot::Running) {
+                                    LookAheadSlot::Queued(job) => job,
+                                    _ => unreachable!("selected a queued job"),
+                                }
+                            }
+                            _ => {
+                                for (_, _, slot) in &mut state.slots {
+                                    if matches!(slot, LookAheadSlot::Queued(_)) {
+                                        *slot = LookAheadSlot::Closed;
+                                    }
+                                }
+                                worker.changed.notify_all();
+                                return;
+                            }
+                        }
+                    };
+                    let capture = xc_core::MessageCapture::default();
+                    let outcome =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &pool {
+                            Some(pool) => pool.install(|| execute(job, &capture)),
+                            None => execute(job, &capture),
+                        }));
+                    let mut state = worker.lock();
+                    if let Some((_, _, slot)) = state
+                        .slots
+                        .iter_mut()
+                        .find(|(_, _, slot)| matches!(slot, LookAheadSlot::Running))
+                    {
+                        *slot = match outcome {
+                            Ok(Some(value)) => LookAheadSlot::Done(Ok((value, capture.take()))),
+                            Ok(None) => LookAheadSlot::Closed,
+                            Err(panic) => LookAheadSlot::Done(Err(panic)),
+                        };
+                    }
+                    worker.changed.notify_all();
+                }
+            })
+            .ok()?;
+        Some(Self {
+            shared,
+            range,
+            thread: Some(thread),
+        })
+    }
+
+    /// Take the result of `id` when `matches` accepts the inputs it was
+    /// computed from, waiting while it runs; deliver its held messages here.
+    /// `None` means compute inline. A job not yet started is withdrawn.
+    pub(crate) fn claim(&self, id: &str, matches: impl FnOnce(&K) -> bool) -> Option<T>
+    where
+        K: Clone,
+    {
+        let usable = (rug::float::exp_min(), rug::float::exp_max()) == self.range;
+        // Compare inputs outside the lock; a key never changes.
+        let key = self
+            .shared
+            .lock()
+            .slots
+            .iter()
+            .find(|(name, _, _)| name == id)
+            .map(|(_, key, _)| key.clone())?;
+        let accepted = usable && matches(&key);
+        let mut state = self.shared.lock();
+        let outcome = loop {
+            let (_, _, slot) = state.slots.iter_mut().find(|(name, _, _)| name == id)?;
+            if !accepted {
+                if matches!(slot, LookAheadSlot::Queued(_)) {
+                    *slot = LookAheadSlot::Closed;
+                }
+                return None;
+            }
+            match std::mem::replace(slot, LookAheadSlot::Closed) {
+                LookAheadSlot::Running => {
+                    *slot = LookAheadSlot::Running;
+                    state = self
+                        .shared
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                LookAheadSlot::Done(outcome) => break outcome,
+                LookAheadSlot::Queued(_) | LookAheadSlot::Closed => return None,
+            }
+        };
+        drop(state);
+        match outcome {
+            Ok((value, messages)) => {
+                for message in messages {
+                    xc_core::emit_message(message);
+                }
+                #[cfg(test)]
+                LOOKAHEAD_RESULTS_TAKEN.with(|taken| taken.set(taken.get() + 1));
+                Some(value)
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<K, T> LookAhead<K, T> {
+    /// Wait until no job is queued or running (tests only).
+    pub(crate) fn wait_idle(&self) {
+        let mut state = self.shared.lock();
+        while state
+            .slots
+            .iter()
+            .any(|(_, _, slot)| matches!(slot, LookAheadSlot::Queued(_) | LookAheadSlot::Running))
+        {
+            state = self
+                .shared
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+impl<K, T> Drop for LookAhead<K, T> {
+    fn drop(&mut self) {
+        self.shared.lock().stopped = true;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Results taken from look-ahead lanes on this thread (tests only).
+#[cfg(test)]
+pub(crate) fn lookahead_results_taken() -> usize {
+    LOOKAHEAD_RESULTS_TAKEN.with(std::cell::Cell::get)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    type Jobs<T> = Vec<(String, u32, LookAheadJob<T>)>;
+
+    // A job that reports its start, then waits for the test to release it.
+    fn gated<T: Send + 'static>(
+        value: impl FnOnce() -> T + Send + 'static,
+    ) -> (LookAheadJob<T>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (started, on_start) = mpsc::channel();
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let job: LookAheadJob<T> = Box::new(move || {
+            started.send(()).unwrap();
+            gate.lock().unwrap().recv().unwrap();
+            value()
+        });
+        (job, on_start, release)
+    }
+
+    #[test]
+    fn lookahead_delivers_results_and_messages_at_the_claim_in_order() {
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (first, started, release) = gated(|| {
+            xc_core::progress_message!("first job message");
+            let _stage = Stage::new("lookahead test stage");
+            10
+        });
+        let counted = |value| -> LookAheadJob<u32> {
+            let ran = Arc::clone(&ran);
+            Box::new(move || {
+                ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                value
+            })
+        };
+        let jobs: Jobs<u32> = vec![
+            ("a".into(), 1, first),
+            ("b".into(), 2, counted(20)),
+            ("c".into(), 3, counted(30)),
+        ];
+        let lane = LookAhead::start(jobs).unwrap();
+        started.recv().unwrap();
+        // Not started: withdrawn and computed inline by the owner.
+        assert_eq!(lane.claim("c", |key| *key == 3), None);
+        // Inputs differ from the recorded key: withdrawn as well.
+        assert_eq!(lane.claim("b", |key| *key == 99), None);
+        assert_eq!(lane.claim("unknown", |_| true), None);
+        // The owner waits for a running job, which is released meanwhile.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            release.send(()).unwrap();
+        });
+        let capture = xc_core::MessageCapture::default();
+        let taken = lookahead_results_taken();
+        let first = xc_core::with_message_capture(Some(capture.clone()), || {
+            lane.claim("a", |key| *key == 1)
+        });
+        releaser.join().unwrap();
+        assert_eq!(first, Some(10));
+        assert_eq!(lookahead_results_taken(), taken + 1);
+        let messages = capture.take();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert_eq!(messages[0], "first job message");
+        assert_eq!(messages[1], "research stage lookahead test stage: started");
+        assert!(messages[2].starts_with("research stage lookahead test stage: ended after "));
+        // A taken result is gone, and withdrawn jobs never ran.
+        assert_eq!(lane.claim("a", |_| true), None);
+        drop(lane);
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn lookahead_panics_resume_at_the_claim_and_jobs_keep_the_owner_configuration() {
+        let (job, started, release) = gated(|| -> u32 { panic!("look-ahead job failure") });
+        let lane = LookAhead::start(vec![("p".to_owned(), 0, job)]).unwrap();
+        started.recv().unwrap();
+        release.send(()).unwrap();
+        let panic =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.claim("p", |_| true)))
+                .unwrap_err();
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"look-ahead job failure")
+        );
+        // Started run to completion and claimed: (workers, policy, held message).
+        let observe = || {
+            let (job, started, release) = gated(|| {
+                xc_core::progress_message!("from the job");
+                (
+                    rayon::current_num_threads(),
+                    xc_numerics::hp_runtime::active_policy(),
+                )
+            });
+            let lane = LookAhead::start(vec![("o".to_owned(), 0, job)])?;
+            started.recv().unwrap();
+            release.send(()).unwrap();
+            let capture = xc_core::MessageCapture::default();
+            let observed =
+                xc_core::with_message_capture(Some(capture.clone()), || lane.claim("o", |_| true));
+            assert_eq!(capture.take(), ["from the job"]);
+            observed
+        };
+        for threads in [1, 3] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            assert_eq!(pool.install(observe), Some((threads, None)));
+        }
+        let full = xc_numerics::hp_runtime::HpRuntimePolicy::default();
+        let observed = xc_numerics::hp_runtime::run_hp_with_policy(&full, observe).unwrap();
+        assert_eq!(observed.map(|(_, policy)| policy), Some(Some(full)));
+        let safe =
+            xc_numerics::hp_runtime::HpRuntimePolicy::safe_capped(2, 8 << 20, "test").unwrap();
+        xc_numerics::hp_runtime::run_hp_with_policy(&safe, || {
+            let jobs: Jobs<u32> = vec![("x".into(), 0, Box::new(|| 1))];
+            assert!(LookAhead::start(jobs).is_none());
+        })
+        .unwrap();
+    }
+
     #[test]
     fn checkpoints_reject_legacy_content_only_identity() {
-        let root = std::env::temp_dir().join(format!("xc-build-bound-{}", std::process::id()));
+        let root_dir = xc_core::test_support::TestDir::new("build-bound");
+        let root = root_dir.to_path_buf();
         let key = ("legacy", "same inputs");
         let legacy = Checkpoints {
             directory: Some(root.clone()),
@@ -404,14 +792,8 @@ mod tests {
     }
     #[test]
     fn checkpoint_reuse_binds_sources_and_rejects_corruption_and_resource_excess() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-checkpoint-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root_dir = xc_core::test_support::TestDir::new("checkpoint-test");
+        let root = root_dir.to_path_buf();
         let store = Checkpoints {
             directory: Some(root.clone()),
             identity: ContentDigest::sha256(b"source A and policy"),

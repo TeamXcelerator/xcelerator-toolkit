@@ -1179,8 +1179,8 @@ mod tests {
     use std::collections::BTreeMap;
     use xc_core::AssuranceLevel;
 
-    fn temporary_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("xc-cache-bundle-{name}-{}", std::process::id()))
+    fn temporary_root(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("bundle-{name}"))
     }
 
     fn fixture(
@@ -1264,8 +1264,8 @@ mod tests {
             canonical_payload,
             transport_digests: vec![transport_digest],
             resolved_mathematical_configuration_digest: ContentDigest::sha256(b"config"),
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             requested_assurance: AssuranceLevel::Computed,
             claim_scope: "offline fixture".to_owned(),
@@ -1288,8 +1288,6 @@ mod tests {
     #[test]
     fn bundle_exports_verifies_and_materializes_without_network() {
         let root = temporary_root("round-trip");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let dependency_source = fixture(&root, "dependency", None);
         let dependency = PayloadDependencyIdentity {
             artifact_family: dependency_source.artifact.identity.artifact_family.clone(),
@@ -1328,7 +1326,7 @@ mod tests {
             minimum_precision_bits: None,
             required_configuration_digest: None,
             required_provenance_evidence_digests: BTreeSet::new(),
-            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             accepted_publication_policy_digests: [ContentDigest::sha256(b"policy")]
                 .into_iter()
                 .collect(),
@@ -1489,7 +1487,7 @@ mod tests {
             &policy,
             &CacheBundleConsumptionPolicy {
                 schema_version: 1,
-                reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
                 minimum_assurance: ArtifactAssuranceState::Computed,
                 allow_deprecated: false,
             },
@@ -1506,8 +1504,6 @@ mod tests {
     #[test]
     fn bundle_rejects_missing_dependency_before_visibility() {
         let root = temporary_root("missing-dependency");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let dependency = PayloadDependencyIdentity {
             artifact_family: "fixture".to_owned(),
             semantic_digest: ContentDigest::sha256(b"missing-semantic"),
@@ -1535,8 +1531,6 @@ mod tests {
     #[test]
     fn bundle_verification_detects_corrupt_exported_part() {
         let root = temporary_root("corrupt");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let source = fixture(&root, "root", None);
         let identity = source.artifact.identity.clone();
         let first_part = source.artifact.encoding.ordered_parts[0].clone();
@@ -1571,8 +1565,6 @@ mod tests {
     }
     fn exhaustive_local_policy_case(field: &str) {
         let root = temporary_root(&format!("exhaustive-{field}"));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let source = fixture(&root, "root", None);
         let semantic_key = source.artifact.manifest.semantic_key.clone();
         let bundle = root.join("export.bundle");
@@ -1597,7 +1589,7 @@ mod tests {
             minimum_precision_bits: None,
             required_configuration_digest: None,
             required_provenance_evidence_digests: BTreeSet::new(),
-            current_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse("0.18.1").unwrap(),
             accepted_publication_policy_digests: [ContentDigest::sha256(b"policy")]
                 .into_iter()
                 .collect(),
@@ -1667,8 +1659,6 @@ mod tests {
     #[test]
     fn exhaustive_repeated_part_occurrences_share_one_bundle_file() {
         let root = temporary_root("exhaustive-repeated-part");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let mut source = fixture(&root, "root", None);
         let first = source.artifact.encoding.ordered_parts[0].clone();
         let mut second = first.clone();

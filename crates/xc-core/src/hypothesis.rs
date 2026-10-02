@@ -4,7 +4,7 @@
 //! Interpretation, frozen predictions and resolution contracts for retained evidence.
 //! Definitions and model coefficients are supplied by callers, never built into
 //! the numerical library. A frozen digest proves identity, not prior blindness.
-use crate::config_resolution::{canonical_json, sha256_hex};
+use crate::config_resolution::{canonical_json, canonical_json_sha256, sha256_hex};
 use crate::{ArtifactRef, ConfigDigest, ConfigError, DecimalLiteral, EvidenceRef};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,6 +36,46 @@ pub fn research_digest<T: Serialize>(value: &T) -> Result<ConfigDigest, ConfigEr
     crate::validate_secret_free(&value, "research specification")?;
     let text = canonical_json(&value).map_err(|e| ConfigError::new(e.to_string()))?;
     Ok(ConfigDigest(sha256_hex(text.as_bytes())))
+}
+/// [`research_digest`] of a value already in JSON form: the same digest,
+/// without copying the value or holding its canonical text.
+pub fn research_digest_value(value: &serde_json::Value) -> Result<ConfigDigest, ConfigError> {
+    crate::validate_secret_free_value(value, "research specification")?;
+    let digest = canonical_json_sha256(value).map_err(|e| ConfigError::new(e.to_string()))?;
+    Ok(ConfigDigest(digest))
+}
+/// [`research_digest`] computed while serializing: the same digest and the
+/// same secret screen, without building the value's JSON tree or holding its
+/// canonical text. For values too large to copy (certificates, matrices).
+///
+/// Precondition: the value must serialize repeatably, including its keys,
+/// values, variants and traversal order, and must have unique object keys.
+/// Digest equivalence is guaranteed only within that domain. Derived
+/// serialization alone does not ensure it when a field has a stateful custom
+/// serializer or the data changes concurrently. The writer rejects duplicate
+/// keys (which `research_digest` resolves by keeping the last value) and some
+/// detected shape changes; it does not verify repeatability or guarantee
+/// rejection of every violation. When a value both contains a secret and fails
+/// to serialize, the error reported may be the other one of the two.
+pub fn research_digest_streamed<T: Serialize + ?Sized>(
+    value: &T,
+) -> Result<ConfigDigest, ConfigError> {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    let mut sink = crate::finite_json::CanonicalSink {
+        write: &mut |text| hasher.update(text.as_bytes()),
+        context: "research specification",
+        omit: &[],
+    };
+    crate::finite_json::write_canonical(value, &mut "$".to_string(), &mut sink)
+        .map_err(|e| ConfigError::new(e.to_string()))?;
+    Ok(ConfigDigest(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    ))
 }
 fn nonnegative(value: &DecimalLiteral) -> Result<(), ConfigError> {
     if value.cmp_numeric(&DecimalLiteral::new("0")?)?.is_lt() {

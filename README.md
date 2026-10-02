@@ -7,13 +7,17 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-## Retained research with v0.15.2
+## Retained research with v0.16.0
 
 Xcelerator Toolkit supplies high-precision numerical libraries and reusable,
 source-bound research data. Applications can retain a primary calculation once
 and use Ultra capture to preserve every applicable implemented diagnostic.
-Thirty new artifact kinds cover state geometry, transforms, root responses,
-energy and tail models, reference comparisons, signed bands and finite enclosures.
+Version 0.16.0 starts a clean artifact fabric: artifacts produced by earlier
+releases are recomputed, never reused. Ultra adds rigorous error bars against
+the exact finite CCM form for eigenvalues, gaps and roots, rigorous low-spectrum
+enclosures along the mode ladder, and root certification that certifies every
+certifiable root while keeping every computed one. Capture receipts reference
+retained artifacts instead of copying them.
 
 Capture records missing inputs, failed calculations and unresolved numerical
 rows explicitly. A completed capture is separate from numerical acceptance.
@@ -25,7 +29,6 @@ convergence or RH.
 - [Ultra coverage, external inputs and recovery](docs/ULTRA_COMPLETENESS.md)
 - [Add diagnostics to existing results](docs/RESEARCH_BACKFILL.md)
 - [Release changes and compatibility](docs/RELEASE_NOTES.md)
-- [Local validation record](docs/VALIDATION.md)
 
 Large authenticated atom tables, fixed cutoff studies, signed per-ordinal atom
 sums and searchable scalar exports are described in the
@@ -34,8 +37,7 @@ sums and searchable scalar exports are described in the
 ## Getting started
 
 The minimum supported Rust version is 1.98. Development uses the stable
-channel selected by `rust-toolchain.toml`; v0.15.2 was qualified locally with Rust
-1.98.0 on x86-64 Windows/MSVC and Ubuntu/WSL. Record the exact compiler version
+channel selected by `rust-toolchain.toml`. Record the exact compiler version
 for reproducible experiments.
 
 ```bash
@@ -172,7 +174,7 @@ minimum reader version.
 
 ## Validation
 
-Release checks run locally; the repository does not require a hosted GitHub Actions workflow. The core public checks use standard Cargo commands:
+Release checks run locally; no hosted workflow is required. The core public checks use standard Cargo commands:
 
 ```bash
 cargo fmt --all -- --check
@@ -210,7 +212,7 @@ If you use Xcelerator Toolkit in research, please cite the exact version or Git 
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.15.0},
+  version = {0.16.0},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }

@@ -18,8 +18,8 @@ fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
                 size_bytes: bytes.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -393,4 +393,207 @@ fn missing_zero_singular_and_resource_cases_remain_qualified() {
     assert_eq!(r.outcome, "partial_unresolved");
     assert!(r.reason.unwrap().contains("budget"));
     assert!(r.rows[0].values.contains_key("coupling_gram_lower"));
+}
+
+#[test]
+fn budget_stop_before_any_measurement_is_not_retained() {
+    // 2^1000 times the 3x3 complete-graph Laplacian; source and reference
+    // (1,1,1), energy 0, requested 192 bits. The first guard fits 70000 bytes
+    // of vector scratch and returns no measurement; the second does not fit.
+    let p = 192;
+    let h = rug::Integer::from(1) << 1000u32;
+    let (d, o) = ((h.clone() * 2u32).to_string(), (-h).to_string());
+    let a = vec![
+        d.clone(),
+        o.clone(),
+        o.clone(),
+        o.clone(),
+        d.clone(),
+        o.clone(),
+        o.clone(),
+        o,
+        d,
+    ];
+    let (s, sm, m) = state("9", &vec!["1".into(); 3], "0", Some(&a));
+    let mut i = input(&sm, "9", 1);
+    i.run_once = Some(RunOnceInputs {
+        reference_vectors: vec![vec!["1".into(); 3]],
+        ..Default::default()
+    });
+    let dir = xc_core::test_support::TestDir::new("cluster-budget-stop");
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(ZipJsonFilesystemCacheStore::new(
+            "local",
+            dir.to_path_buf(),
+            true,
+            CacheVisibility::Local,
+        )),
+    }]);
+    let policy = CachePolicy {
+        current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        minimum_quality: CacheQuality::Validated,
+        accepted_schema_versions: vec![1],
+        allow_deprecated: false,
+        allow_quarantined: false,
+        allowed_visibilities: vec![CacheVisibility::Local],
+    };
+    let cache = ArtifactCacheContext {
+        resolver: Some(&resolver),
+        acceptance: Some(&policy),
+        mode: ArtifactExecutionCacheMode::PreferReuse,
+        write_on_miss: true,
+        ordered_overlays: vec!["local".into()],
+        ..context()
+    };
+    let low = ExtensionOptions {
+        working_precision_bits: p,
+        maximum_working_bytes: Some(70_000),
+        ..ExtensionOptions::for_source(&s)
+    };
+    let high = ExtensionOptions {
+        maximum_working_bytes: Some(10_000_000),
+        ..low.clone()
+    };
+    let capture = |o: &ExtensionOptions| {
+        capture_extended(
+            "operator_cluster",
+            &s,
+            m.as_ref(),
+            None,
+            Some(&i),
+            o,
+            &[],
+            &cache,
+        )
+        .unwrap()
+    };
+    let limited = capture(&low);
+    assert_eq!(limited.value.data.outcome, "unresolved");
+    assert!(limited
+        .value
+        .data
+        .reason
+        .as_ref()
+        .unwrap()
+        .contains("working-byte budget"));
+    assert!(limited.produced_manifest.is_none() && limited.reused_manifest.is_none());
+    let resolved = capture(&high);
+    assert!(resolved.reused_manifest.is_none());
+    assert!(resolved.produced_manifest.is_some());
+    assert_eq!(resolved.value.data.outcome, "point_measurement");
+    let warm = capture(&high);
+    assert_eq!(
+        warm.reused_manifest.as_ref().map(|m| &m.content_digest),
+        resolved
+            .produced_manifest
+            .as_ref()
+            .map(|m| &m.content_digest)
+    );
+    assert_eq!(
+        serde_json::to_value(&warm.value.data).unwrap(),
+        serde_json::to_value(&resolved.value.data).unwrap()
+    );
+}
+
+#[test]
+fn workspace_limited_partial_report_is_not_retained() {
+    // Same fixture; at 150000 bytes the vector scratch of the +1024 guard fits
+    // but the complement factorization workspace (about 191000 bytes) does not.
+    let p = 192;
+    let h = rug::Integer::from(1) << 1000u32;
+    let (d, o) = ((h.clone() * 2u32).to_string(), (-h).to_string());
+    let a = vec![
+        d.clone(),
+        o.clone(),
+        o.clone(),
+        o.clone(),
+        d.clone(),
+        o.clone(),
+        o.clone(),
+        o,
+        d,
+    ];
+    let (s, sm, m) = state("9", &vec!["1".into(); 3], "0", Some(&a));
+    let mut i = input(&sm, "9", 1);
+    i.run_once = Some(RunOnceInputs {
+        reference_vectors: vec![vec!["1".into(); 3]],
+        ..Default::default()
+    });
+    let dir = xc_core::test_support::TestDir::new("cluster-workspace-stop");
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(ZipJsonFilesystemCacheStore::new(
+            "local",
+            dir.to_path_buf(),
+            true,
+            CacheVisibility::Local,
+        )),
+    }]);
+    let policy = CachePolicy {
+        current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        minimum_quality: CacheQuality::Validated,
+        accepted_schema_versions: vec![1],
+        allow_deprecated: false,
+        allow_quarantined: false,
+        allowed_visibilities: vec![CacheVisibility::Local],
+    };
+    let cache = ArtifactCacheContext {
+        resolver: Some(&resolver),
+        acceptance: Some(&policy),
+        mode: ArtifactExecutionCacheMode::PreferReuse,
+        write_on_miss: true,
+        ordered_overlays: vec!["local".into()],
+        ..context()
+    };
+    let low = ExtensionOptions {
+        working_precision_bits: p,
+        maximum_working_bytes: Some(150_000),
+        ..ExtensionOptions::for_source(&s)
+    };
+    let high = ExtensionOptions {
+        maximum_working_bytes: Some(10_000_000),
+        ..low.clone()
+    };
+    let capture = |o: &ExtensionOptions| {
+        capture_extended(
+            "operator_cluster",
+            &s,
+            m.as_ref(),
+            None,
+            Some(&i),
+            o,
+            &[],
+            &cache,
+        )
+        .unwrap()
+    };
+    let limited = capture(&low);
+    assert_eq!(limited.value.data.outcome, "partial_unresolved");
+    assert!(limited
+        .value
+        .data
+        .reason
+        .as_ref()
+        .unwrap()
+        .contains("working-byte budget"));
+    assert!(limited.value.data.rows[0]
+        .values
+        .contains_key("coupling_gram_lower"));
+    assert!(limited.produced_manifest.is_none() && limited.reused_manifest.is_none());
+    let resolved = capture(&high);
+    assert!(resolved.reused_manifest.is_none() && resolved.produced_manifest.is_some());
+    assert_eq!(resolved.value.data.outcome, "point_measurement");
+    let warm = capture(&high);
+    assert_eq!(
+        warm.reused_manifest.as_ref().map(|m| &m.content_digest),
+        resolved
+            .produced_manifest
+            .as_ref()
+            .map(|m| &m.content_digest)
+    );
+    assert_eq!(
+        serde_json::to_value(&warm.value.data).unwrap(),
+        serde_json::to_value(&resolved.value.data).unwrap()
+    );
 }

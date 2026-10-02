@@ -989,8 +989,8 @@ mod tests {
             manifest_digest: ContentDigest::sha256(&[seed, b"manifest"].concat()),
             achieved_assurance: ArtifactAssuranceState::Computed,
             disposition: ArtifactDisposition::Active,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             transport_digests: vec![ContentDigest::sha256(&[seed, b"transport"].concat())],
             publication_transaction_id: ContentDigest::sha256(&[seed, b"transaction"].concat()).0,
         }
@@ -1069,8 +1069,8 @@ mod tests {
             ),
             achieved_assurance: ArtifactAssuranceState::Computed,
             disposition: ArtifactDisposition::Active,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.2").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.2").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
         };
         let index = CcmEigenpairContinuationIndex::rebuild(
             &query,
@@ -1082,7 +1082,7 @@ mod tests {
         )
         .unwrap();
         let keys = index
-            .query(&query, &ToolkitVersion::parse("0.13.2").unwrap(), 8)
+            .query(&query, &ToolkitVersion::parse("0.16.2").unwrap(), 8)
             .unwrap();
         assert_eq!(keys.len(), 2);
         assert!(keys[0].logical_key.contains("/20/"));
@@ -1124,8 +1124,8 @@ mod tests {
             ContentDigest::sha256(b"manifest"),
             ArtifactAssuranceState::Computed,
             ArtifactDisposition::Active,
-            ToolkitVersion::parse("0.13.2").unwrap(),
-            ToolkitVersion::parse("0.13.0").unwrap(),
+            ToolkitVersion::parse("0.16.2").unwrap(),
+            ToolkitVersion::parse("0.16.0").unwrap(),
         )
         .unwrap()
         .unwrap();

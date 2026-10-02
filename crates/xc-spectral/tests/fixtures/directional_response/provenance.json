@@ -1,5 +1,5 @@
 {
-  "scope": "Manufactured exact-rational negative control and C=10 N=6 p=256 production CCM matrix/oracle from immutable independent audit. Only required objects retained; no numerical values changed. No general source-assembly guarantee inferred.",
+  "scope": "Manufactured exact-rational negative control and C=10 N=6 p=256 production CCM matrix with an independently generated oracle. Only required objects retained; no numerical values changed. No general source-assembly guarantee inferred.",
   "sources": [
     {
       "original": "independent oracle generated outside the repository",

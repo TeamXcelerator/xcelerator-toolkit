@@ -272,7 +272,7 @@ impl Drop for OutputValidationClaim {
                 .unwrap_or(false);
             if has_active_run {
                 if let Err(error) = finish_output_validation_run(false) {
-                    eprintln!(
+                    xc_core::progress_message!(
                         "output validation: failed to persist aborted claim during cleanup: {error}"
                     );
                 }
@@ -541,7 +541,7 @@ fn persist_output_validation_report(
     let bytes = serde_json::to_vec_pretty(&report)?;
     crate::atomic_replace(&path, &bytes)?;
     crate::atomic_replace(&report_root.join("latest.json"), &bytes)?;
-    eprintln!(
+    xc_core::progress_message!(
         "output validation: status={:?}, compared={}, matched={}, mismatched={}, absent={}, first_divergences={}, report={}",
         report.run_status,
         report.totals.compared,
@@ -828,8 +828,8 @@ mod tests {
             size_bytes: payload.len() as u64,
             objects: Vec::new(),
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.3").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.3").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -840,17 +840,19 @@ mod tests {
         }
     }
 
-    fn config(name: &str) -> OutputValidationRunConfig {
-        let root = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
-        OutputValidationRunConfig {
+    fn config(name: &str) -> (crate::test_support::TestDir, OutputValidationRunConfig) {
+        let scratch = crate::test_support::TestDir::new(name);
+        let root = scratch.join("root");
+        let config = OutputValidationRunConfig {
             validation_root: root.clone(),
             report_root: root.join("reports"),
-            toolkit_version: ToolkitVersion::parse("0.13.3").unwrap(),
+            toolkit_version: ToolkitVersion::parse("0.16.3").unwrap(),
             reference_mode: "fixture".to_owned(),
             ordered_reference_overlays: vec!["reference".to_owned()],
             production_cache_installed: false,
             remote_publication_enabled: false,
-        }
+        };
+        (scratch, config)
     }
 
     fn record(
@@ -886,8 +888,7 @@ mod tests {
     #[test]
     fn claim_scope_aggregates_sequential_session_checkpoints() {
         let _guard = output_validation_test_lock().lock().unwrap();
-        let passing = config("output-validation-multi-session");
-        let _ = fs::remove_dir_all(&passing.validation_root);
+        let (_passing_dir, passing) = config("output-validation-multi-session");
         let claim = OutputValidationClaim::begin(true).unwrap();
 
         begin_output_validation_run(passing.clone()).unwrap();
@@ -943,8 +944,7 @@ mod tests {
         assert!(completed.output_preserving);
         let _ = fs::remove_dir_all(passing.validation_root);
 
-        let failing = config("output-validation-multi-session-mismatch");
-        let _ = fs::remove_dir_all(&failing.validation_root);
+        let (_failing_dir, failing) = config("output-validation-multi-session-mismatch");
         let claim = OutputValidationClaim::begin(true).unwrap();
         begin_output_validation_run(failing.clone()).unwrap();
         let mismatch_semantic = semantic("mismatch", 3);
@@ -980,8 +980,7 @@ mod tests {
         assert_eq!(failed.totals.mismatched, 1);
         assert_eq!(failed.totals.matched, 1);
 
-        let aborted = config("output-validation-aborted-claim");
-        let _ = fs::remove_dir_all(&aborted.validation_root);
+        let (_aborted_dir, aborted) = config("output-validation-aborted-claim");
         let claim = OutputValidationClaim::begin(true).unwrap();
         begin_output_validation_run(aborted.clone()).unwrap();
         let partial_semantic = semantic("partial", 5);
@@ -1010,8 +1009,7 @@ mod tests {
     #[test]
     fn dependency_classification_and_nondeterminism_are_reported() {
         let _guard = output_validation_test_lock().lock().unwrap();
-        let run_config = config("output-validation-classification");
-        let _ = fs::remove_dir_all(&run_config.validation_root);
+        let (_run_config_dir, run_config) = config("output-validation-classification");
         begin_output_validation_run(run_config.clone()).unwrap();
 
         let leaf_semantic = semantic("leaf", 10);
@@ -1120,8 +1118,7 @@ mod tests {
         assert_eq!(report.totals.compared, 4);
         assert_eq!(report.totals.matched, 1);
 
-        let nondeterminism = config("output-validation-nondeterminism");
-        let _ = fs::remove_dir_all(&nondeterminism.validation_root);
+        let (_nondeterminism_dir, nondeterminism) = config("output-validation-nondeterminism");
         begin_output_validation_run(nondeterminism.clone()).unwrap();
         let semantic = semantic("nondeterministic", 20);
         let first = manifest(&semantic, "nondeterministic/20", b"first", Vec::new());
@@ -1171,7 +1168,7 @@ mod tests {
         let _guard = output_validation_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let cfg = config("audit-reference-changed");
+        let (_cfg_dir, cfg) = config("audit-reference-changed");
         begin_output_validation_run(cfg.clone()).unwrap();
         let key = semantic("same", 17);
         let computed = manifest(&key, "same", b"same", vec![]);
@@ -1190,7 +1187,7 @@ mod tests {
         let _guard = output_validation_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let cfg = config("audit-reference-invalid");
+        let (_cfg_dir, cfg) = config("audit-reference-invalid");
         begin_output_validation_run(cfg).unwrap();
         let key = semantic("same", 18);
         let computed = manifest(&key, "same", b"same", vec![]);

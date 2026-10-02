@@ -40,8 +40,8 @@ pub(super) fn evaluate(
         if (weights.len() as u64)
             .saturating_mul(12)
             .saturating_add(128)
-            .saturating_mul(u64::from(work).div_ceil(8) + 64)
-            > (8u64 << 30)
+            .saturating_mul(u64::from(work).div_ceil(8) + 64) as u128
+            > super::source_working_budget()?
         {
             bail!("conditioning exceeds numerical workspace budget");
         }

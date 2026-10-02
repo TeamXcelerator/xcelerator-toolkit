@@ -115,7 +115,7 @@ pub struct GitHubBootstrapCacheStore {
 impl Drop for GitHubBootstrapCacheStore {
     fn drop(&mut self) {
         if let Err(error) = self.cleanup_session() {
-            eprintln!("cache reader session cleanup failed: {error}");
+            xc_core::progress_message!("cache reader session cleanup failed: {error}");
         }
     }
 }
@@ -1306,7 +1306,7 @@ impl CacheStore for GitHubBootstrapCacheStore {
         }
         drop(performance);
         if prepared_bytes >= 64 * 1024 * 1024 {
-            eprintln!(
+            xc_core::progress_message!(
                 "  cache prefetch: {} artifacts, {:.1} MB, {} immutable paths across {} repositories in {:.3}s (workers={})",
                 artifact_count,
                 prepared_bytes as f64 / 1_000_000.0,
@@ -1518,7 +1518,7 @@ impl CacheStore for GitHubBootstrapCacheStore {
             }
         }
         if resolved.encoding.package_size_bytes >= 64 * 1024 * 1024 {
-            eprintln!(
+            xc_core::progress_message!(
                 "  cache transport: {} {:.1} MB, {} parts ({} downloaded, {} reused), fetch {:.3}s, reconstruct {:.3}s, verify/decode {:.3}s, total {:.3}s",
                 resolved.family,
                 resolved.encoding.package_size_bytes as f64 / 1_000_000.0,
@@ -1684,25 +1684,8 @@ mod tests {
             "a smaller cached query suppressed a valid continuation state"
         );
     }
-    fn fresh_fixture_root(label: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        loop {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let root = std::env::temp_dir().join(format!(
-                "{label}-{}-{stamp}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            match fs::create_dir(&root) {
-                Ok(()) => return root,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => panic!("create fresh fixture directory: {error}"),
-            }
-        }
+    fn fresh_fixture_root(label: &str) -> crate::test_support::TestDir {
+        crate::test_support::temporary_root(label)
     }
 
     #[test]
@@ -2295,7 +2278,6 @@ mod tests {
     #[test]
     fn reader_sessions_are_owned_and_unchecked_metadata_stays_staged() {
         let root = crate::test_support::temporary_root("fresh-reader-session-lifetime");
-        fs::create_dir_all(&root).unwrap();
         let first = GitHubBootstrapCacheStore::public("fixture-owner", root.join("store")).unwrap();
         let second =
             GitHubBootstrapCacheStore::public("fixture-owner", root.join("store")).unwrap();
@@ -2396,8 +2378,8 @@ mod tests {
             payload_digest: payload_digest.clone(),
             transport_digests: vec![transport_digest.clone()],
             resolved_mathematical_configuration_digest: ContentDigest::sha256(b"config"),
-            producer_toolkit_version: ToolkitVersion::parse("0.14.1").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.14.1").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.17.1").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             requested_assurance: xc_core::AssuranceLevel::Computed,
             claim_scope: "same-bytes fixture".to_owned(),
@@ -2411,8 +2393,8 @@ mod tests {
             manifest_digest: manifest_digest.clone(),
             achieved_assurance: ArtifactAssuranceState::Computed,
             disposition: ArtifactDisposition::Active,
-            producer_toolkit_version: ToolkitVersion::parse("0.14.1").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.14.1").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.17.1").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             transport_digests: vec![transport_digest.clone()],
             publication_transaction_id: transaction_id.clone(),
         };
@@ -2559,11 +2541,8 @@ mod tests {
 
     #[test]
     fn same_byte_artifacts_with_different_closures_keep_their_own_transports() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-bootstrap-same-bytes-identity-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("bootstrap-same-bytes-ide");
+        let root = scratch.join("root");
         fs::create_dir_all(&root).unwrap();
         let store = GitHubBootstrapCacheStore::public("fixture-owner", root.join("store")).unwrap();
 
@@ -2706,11 +2685,8 @@ mod tests {
 
     #[test]
     fn dependency_prefetch_skips_locally_available_packages_and_parts() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-bootstrap-local-prefetch-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("bootstrap-local-prefetch");
+        let root = scratch.join("root");
         let package_bytes = b"abcdef";
         let encoding = TransportEncodingRecord {
             schema_version: 1,
@@ -2788,7 +2764,7 @@ mod tests {
             &semantic_digest.0[..2],
             manifest_digest.0
         );
-        let version = ToolkitVersion::parse("0.13.0").unwrap();
+        let version = ToolkitVersion::parse("0.16.0").unwrap();
         let batch = RepositoryPublicationBatch::new(
             PublicationDestination::Private,
             "ccm-matrices",
@@ -2914,7 +2890,8 @@ mod tests {
     #[test]
     #[ignore = "read-only live GitHub consumer acceptance"]
     fn claim_1a_artifacts_resolve_from_the_public_bootstrap_fabric() {
-        let root = std::env::temp_dir().join("xc-public-consumer-acceptance");
+        let scratch = crate::test_support::TestDir::new("public-consumer-acceptan");
+        let root = scratch.join("root");
         let store = GitHubBootstrapCacheStore::public("TeamXcelerator", root).unwrap();
         assert_claim_1a_resolves(&store, CacheVisibility::Public);
     }
@@ -2922,7 +2899,8 @@ mod tests {
     #[test]
     #[ignore = "authenticated read-only live GitHub acceptance"]
     fn claim_1a_artifacts_resolve_from_the_private_bootstrap_fabric() {
-        let root = std::env::temp_dir().join("xc-private-consumer-acceptance");
+        let scratch = crate::test_support::TestDir::new("private-consumer-accepta");
+        let root = scratch.join("root");
         let store = GitHubBootstrapCacheStore::private("TeamXcelerator", root).unwrap();
         assert_claim_1a_resolves(&store, CacheVisibility::Private);
     }
@@ -2930,8 +2908,8 @@ mod tests {
     #[test]
     #[ignore = "authenticated V1-corpus staging acceptance against the private shard"]
     fn claim_1a_v1_artifact_stages_for_republication() {
-        let root = std::env::temp_dir().join("xc-private-v1-republication-acceptance");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("private-v1-republication");
+        let root = scratch.join("root");
         let store =
             GitHubBootstrapCacheStore::private("TeamXcelerator", root.join("remote")).unwrap();
         let key = ArtifactKey {
@@ -2994,7 +2972,8 @@ mod tests {
     #[test]
     #[ignore = "authenticated revoked historical-identity rejection against the private shard"]
     fn revoked_claim_1a_matrix_is_rejected_by_exact_historical_identity() {
-        let root = std::env::temp_dir().join("xc-private-historical-identity-acceptance");
+        let scratch = crate::test_support::TestDir::new("private-historical-ident");
+        let root = scratch.join("root");
         let store = GitHubBootstrapCacheStore::private("TeamXcelerator", root).unwrap();
         let identity = PayloadDependencyIdentity {
             artifact_family: "ccm-matrices".to_owned(),

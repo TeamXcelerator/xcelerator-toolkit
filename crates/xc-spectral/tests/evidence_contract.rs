@@ -316,3 +316,128 @@ fn interval_form_admission_matches_known_exact_congruence_signatures() {
             < (Float::with_val(768, 1) >> 54)
     );
 }
+
+#[test]
+fn indexed_fuchs_predictors_match_independent_full_mode_references() {
+    // Independent 100-decimal-digit evaluation of the classical expression.
+    // These are asymptotic depths, not empirical Weil eigenvalue fixtures.
+    let cases = [
+        (
+            6,
+            5,
+            "33.26139554775990672026469973586886988069324507551809889",
+        ),
+        (
+            6,
+            9,
+            "79.70626468333282498243374145431830152434698701656941434",
+        ),
+        (
+            8,
+            5,
+            "26.23323419744849238079551850286267406760703679893102522",
+        ),
+        (
+            8,
+            50,
+            "572.1479385531618869899184001283560974584881660331055027",
+        ),
+    ];
+    for (n, c, depth) in cases {
+        let mode = EvenProlateMode::new(n).unwrap();
+        let expected = -f(256, depth);
+        for p in [64, 128] {
+            let got = prolate_log_deficiency_asymptotic(mode, c, p).unwrap();
+            let error = (Float::with_val(256, got) - &expected).abs();
+            assert!(error < expected.clone().abs() * (Float::with_val(256, 1) >> (p - 4)));
+            let value = try_prolate_deficiency_asymptotic(mode, c, p).unwrap();
+            let exact = expected.clone().exp();
+            let relative = (Float::with_val(256, value) / exact - 1u32).abs();
+            assert!(relative < (Float::with_val(256, 1) >> (p - 4)));
+        }
+    }
+    // Preserve exact compatibility, including the logarithmic extreme-cutoff route.
+    let mode = EvenProlateMode::new(4).unwrap();
+    for p in [64, 128, 256] {
+        for c in [1, 5, 50, 1000, u64::MAX] {
+            assert_eq!(
+                prolate_log_deficiency_asymptotic(mode, c, p).unwrap(),
+                prolate_chi2_log_deficiency_asymptotic(c, p).unwrap()
+            );
+            match try_prolate_chi2_deficiency_asymptotic(c, p) {
+                Ok(old) => assert_eq!(old, try_prolate_deficiency_asymptotic(mode, c, p).unwrap()),
+                Err(_) => assert!(try_prolate_deficiency_asymptotic(mode, c, p).is_err()),
+            }
+        }
+    }
+}
+
+#[test]
+fn indexed_fuchs_recurrence_and_invalid_domains() {
+    use rug::float::Constant;
+    let p = 192;
+    let c = 50;
+    for n in (0..=20).step_by(2) {
+        let lo = try_prolate_deficiency_asymptotic(EvenProlateMode::new(n).unwrap(), c, p).unwrap();
+        let hi =
+            try_prolate_deficiency_asymptotic(EvenProlateMode::new(n + 2).unwrap(), c, p).unwrap();
+        // delta_(n+2)/delta_n = 256*pi^2*c^2/((n+1)*(n+2)).
+        let pi = Float::with_val(p, Constant::Pi);
+        let expected = Float::with_val(p, &pi * &pi) * 256u32 * c * c / ((n + 1) * (n + 2));
+        let error = (hi / lo / expected - 1u32).abs();
+        assert!(error < (Float::with_val(p, 1) >> 175));
+    }
+    let mode = EvenProlateMode::new(6).unwrap();
+    for bad in [0, 63, 1_000_001] {
+        assert!(prolate_log_deficiency_asymptotic(mode, 9, bad).is_err());
+        assert!(try_prolate_deficiency_asymptotic(mode, 9, bad).is_err());
+    }
+    assert!(prolate_log_deficiency_asymptotic(mode, 0, p).is_err());
+    assert!(try_prolate_deficiency_asymptotic(mode, u64::MAX, p).is_err());
+    assert!(EvenProlateMode::new(3).is_err());
+    // Large full index uses widened integer arithmetic and logarithms, not n!.
+    let large = EvenProlateMode::new(u32::MAX - 1).unwrap();
+    assert!(prolate_log_deficiency_asymptotic(large, 9, 64)
+        .unwrap()
+        .is_finite());
+    assert!(try_prolate_deficiency_asymptotic(large, 9, 64).is_err());
+}
+
+#[test]
+fn indexed_comparison_preserves_negative_phase_and_signed_weil_energy() {
+    use xc_spectral::ccm::hp::CcmParity;
+    let mode = EvenProlateMode::new(6).unwrap();
+    assert_eq!(mode.full_index(), 6);
+    assert_eq!(mode.descending_even_index(), 3);
+    assert_eq!(mode.ascending_even_concentration_index(6).unwrap(), 2);
+    assert!(mode.ascending_even_concentration_index(3).is_err());
+    assert!(mode.ascending_even_concentration_index(0).is_err());
+    let finite = CertifiedProlateDeficiency::from_concentration_enclosure(
+        I::point(Rational::from((1, 4))),
+        64,
+    )
+    .unwrap();
+    assert_eq!(finite.singular_value(), &I::point(Rational::from((1, 2))));
+    assert_eq!(
+        finite.signed_fourier_eigenvalue(mode),
+        I::point(Rational::from((-1, 2)))
+    );
+    // The deficit stays 1/2, not 1 - (-1/2) = 3/2.
+    assert_eq!(finite.deficiency(), &I::point(Rational::from((1, 2))));
+    let indices = ProlateWeilComparisonIndices {
+        prolate_mode: mode,
+        weil_parity: CcmParity::Odd,
+        weil_spectral_index: 0,
+    };
+    let negative = I::point(Rational::from((-1, 4)));
+    let result =
+        IndexedProlateWeilComparison::new(indices, 9, finite.clone(), negative.clone(), 128)
+            .unwrap();
+    assert_eq!(result.indices, indices);
+    assert_eq!(result.comparison.measured_weil_plunge, negative);
+    assert_eq!(
+        result.comparison.finite_difference,
+        I::point(Rational::from((-3, 4)))
+    );
+    assert!(IndexedProlateWeilComparison::new(indices, 1, finite, negative, 128).is_err());
+}

@@ -10,7 +10,7 @@ The high-precision CCM API uses the managed cache without consumer setup. A full
 
 Parity-sector research is an explicit operation because dense low-spectrum recovery is unnecessary overhead for an ordinary reproduction. Calling `xc_spectral::ccm::hp::analyze_sector_gap` derives and caches both parity matrices from the same exact Tau dependency, retains the requested lowest even and odd eigenpairs as `ccm_sector_spectrum` artifacts, and retains the derived `ccm_sector_gap` evidence. The odd basis matches the historical `(e_k-e_-k)/sqrt(2)` convention. The result reports GapLog, the direct eigenvalue difference and ordering, and an even-sector simplicity margin as separate values.
 
-`xc_spectral::ccm::hp::run` is reference-free by default. It discovers a positive prefix from the finite secular source and then performs HP refinement; it does not accept a zero table. `run_independent` accepts prefix, one-based index-range, and height-window targets. Computed assurance uses pole-aware MPFR discovery directly on the full-precision secular source to obtain starting points and therefore makes no rigorous completeness claim. Certified production discovery uses exact cumulative finite-source counts, FLINT/Arb complete root isolation, and interval Newton through `certify_production_independent_ccm_roots`. `build_source` explicitly requests a source-only computation.
+`xc_spectral::ccm::hp::run` is reference-free by default. It discovers a positive prefix from the finite secular source and then performs HP refinement; it does not accept a zero table. `run_independent` accepts prefix, one-based index-range, and height-window targets. Computed assurance uses pole-aware MPFR discovery directly on the full-precision secular source to obtain starting points and therefore makes no rigorous completeness claim. Certified production discovery uses exact cumulative finite-source counts, FLINT/Arb complete root isolation, and interval Newton through `certify_production_independent_ccm_roots`; when the exact secular numerator exceeds its rational workspace budget, the counts and isolation come from a directed pole-gap census instead (see [capture levels](CAPTURE_LEVELS.md#root-certification-inside-ultra)). `build_source` explicitly requests a source-only computation.
 
 Halley's method is the ordinary HP refinement route; Newton remains an explicit comparison option and is never an automatic fallback. Root refinement and CCM inverse iteration each default to a 2,000-iteration ceiling. A root is converged only after meeting the requested-accuracy correction target. `RootPrecisionPolicy::FixedGuard` remains the default and preserves the historical v6/v7 identity and arithmetic exactly. Call `HighPrecConfig::with_adaptive_root_precision()` to opt into v9. Adaptive refinement begins with the established 64 MPFR guard bits and widens only the secular-root arithmetic when cancellation prevents a higher-precision replay of the exact stored point from confirming that target. The default resource ceiling is 4,096 extra root bits and the independent check uses a 64-bit wider precision; neither ceiling nor a precision-floor heuristic can substitute for the requested target. An unchanged MPFR point, a two-cycle, or 128 consecutive iterations without a smaller correction triggers another precision tier under the adaptive policy and remains stagnation at the ceiling. Slow monotone improvement may use the full iteration budget. Computed runs retain finite, ordered precision-limited or iteration-limited values with their correction, residual, iteration count, achieved digits, evaluation/verification precision, escalation count, and stopping reason; they are never relabeled as converged. A failed root with no value remains fatal, and cross-checked or certified assurance requires every root to converge. A v9 miss never uses a v6/v7 root as a warm start: this keeps path-dependent iteration evidence and payload bytes canonical across reuse, refresh, and verification. Inverse iteration separately records its configured limit, unshifted steps, convergence flag, final Rayleigh change, shifted-refinement outcome, and replayed relative Tau residual. Reaching the unshifted limit remains visible in ordinary output and run evidence even when shifted refinement successfully rescues the eigenstate. The CCM eigenstate must pass its Tau residual check before root refinement begins.
 
@@ -42,7 +42,7 @@ The example constructs a finite-dimensional positive-definiteness certificate, r
 
 ## Exact Maynard–Tao lower bound
 
-This route needs the `hp` feature and therefore a supported GNU/Linux toolchain with GMP/MPFR, such as the project's existing HP WSL environment:
+This route needs the `hp` feature and therefore a supported GNU/Linux toolchain with GMP/MPFR, such as Ubuntu or WSL2 Ubuntu:
 
 ```bash
 cargo run -p xc-variational --example mk_constant --features hp --locked
@@ -58,14 +58,12 @@ The exploratory eigensolver in `mk_symmetric` proposes coefficients, but the rep
 
 ## Target-distance measurement
 
-The CCM target-distance program measures
+The CCM target distance is
 `d(N, lambda) = integral_1^lambda |f(u) - target(u)| u^(-alpha) du`, where `f` is
 the even CCM ground-state eigenfunction normalized to `f(1) = 1` and the
 normalized target profile is supplied privately at runtime. Set
 `XC_TARGET_SPEC_FILE` to the JSON specification path before target-dependent
-work. The public toolkit retains only the specification's SHA-256 digest. The program's objective
-takes the limits in a fixed order: stabilize in `N` at fixed `lambda` first,
-then study the stabilized distance as `lambda` grows.
+work. The public toolkit retains only the specification's SHA-256 digest.
 
 `xc_spectral::distance::hp::ccm_distance_to_target_hp` performs one such
 measurement end to end. The eigenvector resolves through the ordinary
@@ -85,20 +83,6 @@ not interchangeable with a separately approximated sector-spectrum midpoint:
 near the precision floor that midpoint can have the wrong sign while still
 lying inside its absolute Sturm tolerance. Legacy unbound distance identities
 are therefore not reused by the corrected route.
-
-The measurement path is validated against an independent implementation. At
-`N = 150`, 500 decimal digits, matrix quadrature `Q = 600`, Gauss-Legendre
-`Q = 600`, and `alpha = 1/2`, `ccm_distance_to_target_hp` reproduces every
-digit of the values reported independently for `c = 5, 13, 17`:
-
-```text
-c = 5    0.0269735313324961574...
-c = 13   0.00988258128277552575...
-c = 17   0.00750657880432477674...
-```
-
-Only the eigenfunction is an approximation here; the agreement is to the full
-precision the comparison values were quoted at.
 
 Report every distance together with its recorded convention: integration
 rule, grid variable, resolution, `alpha`, and precision. Both the uniform-grid
@@ -290,7 +274,7 @@ either `u` or `log(u)`; midpoint grids are evaluated independently.
 
 ## Library-level normal use
 
-Every production workspace crate has a compiled normal-use target recorded in `EXAMPLE_INVENTORY.json`. The smaller library examples can be run independently:
+Every production workspace crate has a compiled normal-use example. The smaller library examples can be run independently:
 
 ```powershell
 cargo run -p xc-numerics --example quadrature --locked

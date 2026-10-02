@@ -1,5 +1,5 @@
 # Development builds use the stable channel. The minimum compiler version is
-# declared in Cargo.toml; qualification versions are recorded in docs/VALIDATION.md.
+# declared in Cargo.toml.
 # For reproducible experiments, record rustc -Vv and set RUSTUP_TOOLCHAIN to
 # the exact installed version used for the run.
 [toolchain]

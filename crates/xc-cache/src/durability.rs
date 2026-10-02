@@ -637,10 +637,8 @@ mod tests {
 
     #[test]
     fn eligible_exact_local_file_is_deleted_after_revalidation() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-prune-{}",
-            ContentDigest::sha256(format!("{:?}", std::thread::current().id()).as_bytes())
-        ));
+        let scratch = crate::test_support::TestDir::new("prune");
+        let root = scratch.join("root");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("artifact.zip");
         std::fs::write(&path, b"staged artifact").unwrap();
@@ -672,7 +670,8 @@ mod tests {
 
     #[test]
     fn changed_local_file_is_never_deleted() {
-        let root = std::env::temp_dir().join("xc-prune-changed-file");
+        let scratch = crate::test_support::TestDir::new("prune-changed-file");
+        let root = scratch.join("root");
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("artifact.zip");
         std::fs::write(&path, b"different bytes").unwrap();

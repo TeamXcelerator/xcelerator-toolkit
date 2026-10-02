@@ -78,7 +78,6 @@ impl RestartableSymmetricAssemblerF64 for ExactDiagonal {
 }
 #[test]
 fn checkpoint_validation_replays_source_and_rejects_retained_row_corruption() {
-    // The historical witness is retained in the checkpoint commit and audit logs.
     let a = ExactDiagonal {
         digest: ConfigDigest("a".repeat(64)),
     };

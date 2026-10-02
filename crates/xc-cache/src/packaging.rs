@@ -1059,19 +1059,10 @@ mod tests {
     use super::*;
     use crate::PayloadDependencyIdentity;
     use std::io::Cursor;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use xc_core::CancellationReason;
 
-    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    fn test_root(name: &str) -> PathBuf {
-        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "xc-cache-packaging-{name}-{}-{sequence}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        root
+    fn test_root(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("packaging-{name}"))
     }
 
     fn fixture(root: &Path) -> (CanonicalPayloadEnvelope, Vec<PayloadFileSource>) {
@@ -1471,7 +1462,8 @@ mod tests {
     }
     #[test]
     fn exhaustive_failed_seek_cannot_bypass_the_disk_limit() {
-        let root = std::env::temp_dir().join(format!("xc-seek-audit-{}", std::process::id()));
+        let scratch = crate::test_support::TestDir::new("seek-audit");
+        let root = scratch.join("root");
         fs::create_dir_all(&root).unwrap();
         let path = root.join("controlled");
         let file = File::create(&path).unwrap();

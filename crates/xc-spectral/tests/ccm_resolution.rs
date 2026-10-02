@@ -60,21 +60,26 @@ mod hp {
     };
 
     #[test]
-    fn selected_and_cross_checked_gaps_fail_when_source_uncertainty_dominates() {
+    fn selected_and_cross_checked_gaps_are_unresolved_when_source_uncertainty_dominates() {
         let cfg = HighPrecConfig::for_decimal_digits(30);
         for (modes, options) in [
             (30, CcmSectorAnalysisOptions::selected(2)),
             (39, CcmSectorAnalysisOptions::cross_checked(2)),
         ] {
-            let outcome = analyze_sector_gap_with_options(
+            // Either the spectra are retained without the unresolved gap, or
+            // an unresolved eigenspace already stops the spectra; never a gap.
+            match analyze_sector_gap_with_options(
                 &CcmParams::from_lambda_sq_integer(13, modes),
                 &cfg,
                 options,
-            );
-            assert!(
-                outcome.is_err(),
-                "an unresolved logarithmic gap must not be retained"
-            );
+            ) {
+                Ok(outcome) => assert!(
+                    outcome.gap_log.is_none() && !outcome.unresolved.is_empty(),
+                    "an unresolved logarithmic gap must not be retained: {:?}",
+                    outcome.unresolved
+                ),
+                Err(error) => assert!(error.to_string().contains("unresolved"), "{error:#}"),
+            }
         }
         let cfg = HighPrecConfig::for_decimal_digits(100);
         let resolved = analyze_sector_gap_with_options(
@@ -83,10 +88,12 @@ mod hp {
             CcmSectorAnalysisOptions::cross_checked(2),
         )
         .unwrap();
-        assert!(resolved.lambda_even > 0 && resolved.ordering == 1 && resolved.even_simple);
-        assert!(resolved.gap_log_lower <= resolved.gap_log);
-        assert!(resolved.gap_log <= resolved.gap_log_upper);
-        assert!(resolved.gap_log.to_f64() > 2.69 && resolved.gap_log.to_f64() < 2.70);
+        assert!(resolved.lambda_even > 0 && resolved.ordering == Some(1) && resolved.even_simple);
+        assert!(resolved.unresolved.is_empty());
+        let gap_log = resolved.gap_log.as_ref().unwrap();
+        assert!(resolved.gap_log_lower.as_ref().unwrap() <= gap_log);
+        assert!(gap_log <= resolved.gap_log_upper.as_ref().unwrap());
+        assert!(gap_log.to_f64() > 2.69 && gap_log.to_f64() < 2.70);
     }
 
     #[test]

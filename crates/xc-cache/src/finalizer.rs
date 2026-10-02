@@ -1614,17 +1614,16 @@ mod tests {
         (remote, journal, session)
     }
 
-    fn checkpoint_store(name: &str) -> PublicationJournalStore {
-        let root =
-            std::env::temp_dir().join(format!("xc-cache-finalizer-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        PublicationJournalStore::new(root)
+    fn checkpoint_store(name: &str) -> (crate::test_support::TestDir, PublicationJournalStore) {
+        let scratch = crate::test_support::TestDir::new(&format!("finalizer-{name}"));
+        let store = PublicationJournalStore::new(scratch.join("root"));
+        (scratch, store)
     }
 
     #[test]
     fn finalization_commits_metadata_then_index_ledger_and_receipt() {
         let (remote, mut journal, session) = fixture();
-        let checkpoints = checkpoint_store("complete");
+        let (_checkpoint_dir, checkpoints) = checkpoint_store("complete");
         let mut metadata = vec![
             remote.stage("transport/record.json", b"transport".to_vec()),
             remote.stage("manifests/manifest.json", b"manifest".to_vec()),
@@ -1750,7 +1749,7 @@ mod tests {
     #[test]
     fn concurrent_discoverability_update_requires_a_fresh_plan() {
         let (remote, mut journal, session) = fixture();
-        let checkpoints = checkpoint_store("conflict");
+        let (_checkpoint_dir, checkpoints) = checkpoint_store("conflict");
         let mut metadata = vec![remote.stage("transport/record.json", b"transport".to_vec())];
         metadata[0].sequence = 0;
         journal
@@ -1819,7 +1818,7 @@ mod tests {
     #[test]
     fn finalization_refuses_remote_access_without_fresh_write_permission() {
         let (remote, mut journal, _session) = fixture();
-        let checkpoints = checkpoint_store("permission");
+        let (_checkpoint_dir, checkpoints) = checkpoint_store("permission");
         let mut metadata = vec![remote.stage("transport/record.json", b"transport".to_vec())];
         metadata[0].sequence = 0;
         journal
@@ -1850,7 +1849,7 @@ mod tests {
     #[test]
     fn finalization_revalidates_capacity_before_mutation() {
         let (remote, mut journal, session) = fixture();
-        let checkpoints = checkpoint_store("capacity");
+        let (_checkpoint_dir, checkpoints) = checkpoint_store("capacity");
         let mut full_ledger = ledger("head-0");
         full_ledger.first_seen_immutable_payload_bytes =
             full_ledger.hard_capacity_bytes.saturating_sub(1);
@@ -1936,7 +1935,7 @@ mod tests {
     #[test]
     fn exhaustive_finalizer_permission_refresh_preserves_planned_receipt() {
         let (remote, mut journal, session) = fixture();
-        let checkpoints = checkpoint_store("exhaustive-permission-refresh");
+        let (checkpoint_dir, checkpoints) = checkpoint_store("exhaustive-permission-refresh");
         let destination = PublicationDestination::Private;
         journal
             .targets
@@ -1997,7 +1996,7 @@ mod tests {
             &CancellationToken::new(),
             &fresh,
             &PublicationFinalizationPolicy::default(),
-            &std::env::temp_dir(),
+            &checkpoint_dir.join("staging"),
             &xc_core::ResourcePolicy::default(),
             &mut journal,
             destination,

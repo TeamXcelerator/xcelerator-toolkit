@@ -74,7 +74,13 @@ impl BandVectors {
                     .as_nanos()
             ));
             std::fs::create_dir(&path)?;
-            (Checkpoints::local(identity, path.clone())?, Some(path))
+            match Checkpoints::local(identity, path.clone()) {
+                Ok(local) => (local, Some(path)),
+                Err(error) => {
+                    let _ = std::fs::remove_dir_all(&path);
+                    return Err(error);
+                }
+            }
         };
         Ok(Self {
             store,

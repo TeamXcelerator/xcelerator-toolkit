@@ -101,7 +101,7 @@ def main():
  missing=[p.name for p in (ROOT/'docs').glob('*.md') if p.resolve() not in seen]
  require(not missing, ('unreachable documentation',missing))
  result['documentation_reachable']=len(list((ROOT/'docs').glob('*.md')))
- for script in ['test_ccm_artifact_impact.py','test_research_tools.py','test_release_assets.py']:
+ for script in ['test_research_tools.py','test_release_assets.py']:
   run([sys.executable,ROOT/'tools'/script])
  result['inventory_and_research_tools']='passed'
  from jsonschema import Draft202012Validator

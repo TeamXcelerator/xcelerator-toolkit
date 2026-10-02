@@ -18,8 +18,8 @@ fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
                 size_bytes: bytes.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -509,15 +509,8 @@ fn cluster_checkpoints_bind_declared_column_precision() {
         .unwrap();
         return;
     }
-    let root = std::env::temp_dir().join(format!(
-        "xc-cluster-point-identity-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&root).unwrap();
+    let root_dir = xc_core::test_support::TestDir::new("cluster-point-identity");
+    let root = root_dir.to_path_buf();
     let warm = root.join("warm");
     let cold = root.join("cold");
     let execute = |bits: &str, dir: &std::path::Path, name: &str| {

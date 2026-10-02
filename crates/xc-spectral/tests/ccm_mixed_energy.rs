@@ -1,4 +1,4 @@
-//! Fresh full-toolkit audit: both public component representations are valid;
+//! Both public component representations are valid;
 //! explicit operators take precedence in computation and report validation.
 #![cfg(feature = "hp")]
 
@@ -21,8 +21,8 @@ fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
                 size_bytes: bytes.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -71,8 +71,8 @@ fn validated_mixed_component_input_must_not_reject_its_fresh_report() {
     let mut input: ExternalResearchInputs = serde_json::from_value(json!({
         "schema_version":1,"source_eigenpair":state_manifest.content_digest,
         "lambda_squared":"9","n_modes":1,"precision_bits":128,
-        "convention_id":"fresh audit exact diagonal source",
-        "definition_digest":ContentDigest::sha256(b"fresh mixed component source"),
+        "convention_id":"exact diagonal source",
+        "definition_digest":ContentDigest::sha256(b"mixed component source"),
         "approximation_scope":"synthetic finite stored points only",
         "components":[{"label":"explicit_tau","source_digest":ContentDigest::sha256(b"explicit tau"),
             "diagonal":["4","3","4"],"dense":[],"rank_one":[]}]

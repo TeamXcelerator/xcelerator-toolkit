@@ -84,14 +84,8 @@ fn finite_stored_arithmetic_matches_exact_integer_reference_for_every_chunking()
 
 #[test]
 fn corrupted_file_values_cannot_escape_the_arithmetic_boundary() {
-    let path = std::env::temp_dir().join(format!(
-        "xc-stored-finite-{}-{}.bin",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = xc_core::test_support::TestDir::new("stored-finite");
+    let path = dir.join("nan.bin");
     // Raw retained bytes can contain nonfinite values even though write_chunk
     // checks its own inputs. Arithmetic must validate the decoded source.
     std::fs::write(&path, f64::NAN.to_le_bytes()).unwrap();
@@ -102,6 +96,4 @@ fn corrupted_file_values_cannot_escape_the_arithmetic_boundary() {
         .unwrap()
         .apply_stored(&input, &output, 1)
         .is_err());
-    drop(input);
-    std::fs::remove_file(path).unwrap();
 }

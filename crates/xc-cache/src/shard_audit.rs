@@ -1534,8 +1534,8 @@ mod tests {
             payload_digest: payload_digest.clone(),
             transport_digests: vec![transport_digest.clone()],
             resolved_mathematical_configuration_digest: ContentDigest::sha256(b"config"),
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             requested_assurance: AssuranceLevel::Computed,
             claim_scope: "audit fixture".to_owned(),
@@ -1552,8 +1552,8 @@ mod tests {
                 manifest_digest: manifest_digest.clone(),
                 achieved_assurance: ArtifactAssuranceState::Computed,
                 disposition: ArtifactDisposition::Active,
-                producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-                minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+                minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
                 transport_digests: vec![transport_digest.clone()],
                 publication_transaction_id: transaction_id.clone(),
             }],
@@ -1916,7 +1916,7 @@ mod tests {
             .unwrap()
             .clone();
         let mut index: ShardIndexPartition = serde_json::from_slice(&remote.paths[&path]).unwrap();
-        index.entries[0].minimum_reader_version = ToolkitVersion::parse("0.13.1").unwrap();
+        index.entries[0].minimum_reader_version = ToolkitVersion::parse("0.17.0").unwrap();
         insert_document(&mut remote.paths, &path, &index);
         let report = audit_remote_shard(
             &remote,

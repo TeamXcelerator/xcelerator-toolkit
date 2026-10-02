@@ -75,8 +75,22 @@ pub(super) fn bounds(
     p: u32,
     parity: CcmParityPolicy,
 ) -> Result<AdmissionBounds> {
+    let residual = state_residual_bounds::evaluate(a, v, lambda, p)?;
+    bounds_with_residual(a, v, lambda, p, parity, &residual)
+}
+
+/// `bounds` from `state_residual_bounds::evaluate(a, v, lambda, p)`, already
+/// evaluated successfully by the caller for exactly these inputs.
+pub(super) fn bounds_with_residual(
+    a: &[Float],
+    v: &[Float],
+    lambda: &Float,
+    p: u32,
+    parity: CcmParityPolicy,
+    residual: &state_residual_bounds::ResidualBounds,
+) -> Result<AdmissionBounds> {
     let work = p + 64;
-    let residual = state_residual_bounds::evaluate(a, v, lambda, p)?.eigenvalue_error_upper;
+    let residual = residual.eigenvalue_error_upper.clone();
     let floor = matrix_rounding_scale(a, v.len(), p)?;
     let local = if lambda.is_zero() {
         a.iter()

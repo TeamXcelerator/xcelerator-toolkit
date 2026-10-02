@@ -360,9 +360,9 @@ mod tests {
             canonical_payload: payload,
             transport_digests: vec![ContentDigest::sha256(b"transport")],
             resolved_mathematical_configuration_digest: ContentDigest::sha256(b"configuration"),
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            maximum_reader_version: Some(ToolkitVersion::parse("0.13.9").unwrap()),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            maximum_reader_version: Some(ToolkitVersion::parse("0.16.9").unwrap()),
             requested_assurance: AssuranceLevel::Computed,
             claim_scope: "fixture theorem".to_owned(),
             assumptions: Vec::new(),
@@ -402,7 +402,7 @@ mod tests {
                 observed_scalar_backend: "mpfr",
                 observed_precision_bits: Some(256),
                 observed_dimensions: &[2, 2],
-                reader_version: &ToolkitVersion::parse("0.13.0").unwrap(),
+                reader_version: &ToolkitVersion::parse("0.16.0").unwrap(),
                 manifest: &manifest,
             })
             .unwrap();
@@ -423,7 +423,7 @@ mod tests {
                 observed_scalar_backend: "mpfr",
                 observed_precision_bits: Some(256),
                 observed_dimensions: &[2, 2],
-                reader_version: &ToolkitVersion::parse("0.13.0").unwrap(),
+                reader_version: &ToolkitVersion::parse("0.16.0").unwrap(),
                 manifest: &manifest,
             })
             .unwrap();
@@ -442,7 +442,7 @@ mod tests {
                 observed_scalar_backend: "binary64",
                 observed_precision_bits: Some(53),
                 observed_dimensions: &[4],
-                reader_version: &ToolkitVersion::parse("0.14.0").unwrap(),
+                reader_version: &ToolkitVersion::parse("0.17.0").unwrap(),
                 manifest: &manifest,
             })
             .unwrap();
@@ -455,7 +455,7 @@ mod tests {
         assert!(report.facets.iter().any(|facet| {
             facet.facet == ArtifactValidationFacet::Compatibility
                 && !facet.passed
-                && facet.reason.contains("0.14.0")
+                && facet.reason.contains("0.17.0")
         }));
     }
 

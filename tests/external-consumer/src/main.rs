@@ -171,5 +171,8 @@ fn current_ultra_requests_retained_research_without_changing_primary_algorithm()
             .unwrap()
             .capture_reference_projection
     );
-    assert_eq!(plan.semantics, "ccm-measurement-capture-plan-v6");
+    assert_eq!(plan.semantics, "ccm-measurement-capture-plan-v7");
+    let receipt = plan.receipt().unwrap();
+    assert!(receipt.outcomes().contains_key("assembly_error"));
+    assert!(receipt.outcomes().contains_key("checkpoint_spectra"));
 }

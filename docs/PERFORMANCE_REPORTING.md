@@ -8,7 +8,7 @@ before-and-after performance studies. It is disabled unless `XC_PERF_REPORT`
 names an output file.
 
 ```bash
-XC_PERF_REPORT="$PWD/performance-reports/claim1a.performance.json" \
+XC_PERF_REPORT="$PWD/performance-reports/run.performance.json" \
   cargo run --release --features hp -- <ordinary claim arguments>
 ```
 
@@ -20,6 +20,15 @@ completed before the error. Records
 include invocation counts, total/minimum/maximum elapsed nanoseconds, problem
 shape, precision, Rayon worker count, HP runtime mode, cache disposition, and
 Gauss-Legendre batch scheduling where applicable.
+
+Production finite-source root certification is the top-level stage
+`ccm.roots.production_certificate`. Its children separate exact numerator
+construction (`ccm.roots.exact_numerator`), the shared FLINT/Arb isolation of
+the pole span (`ccm.roots.flint_span_isolation`), direct window counts used
+when a root ball touches a window boundary (`ccm.roots.flint_count`), window
+root isolation (`ccm.roots.flint_isolation`) and interval-Newton proofs
+(`ccm.roots.interval_newton`). Certification also prints its count-search and
+window-certification timings to standard error.
 
 For matrix-construction stages, `retained_hp_entries` records the number of
 high-precision entries retained in destination matrices. It is a deterministic
@@ -91,3 +100,13 @@ for computation and numerical replay. These operational messages are independent
 of the optional timing sidecar and do not change artifact bytes. See
 [response capture and validation](CCM_RESPONSE_PERFORMANCE.md) for bounded parallel
 execution, fresh-data validation, benchmarks and the remaining acquisition cost.
+
+## Progress messages
+
+The libraries report phase timings and progress (for example `[HP] phase
+timing: ...` lines) through one process-wide message facility. With no sink
+installed, each message is written to stderr exactly as before, so research
+logs are unchanged. An application can call `xc_core::set_message_sink` to
+silence messages (`NoopProgress`), capture them (`CollectingProgress`), or
+forward them to its own logger; each message arrives as
+`ProgressEvent::Message` with level `"info"`. Messages never enter artifacts.

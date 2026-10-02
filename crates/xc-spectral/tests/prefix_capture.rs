@@ -13,7 +13,8 @@ mod published_sources;
 #[test]
 fn published_prefix_and_reduction_reuse_authenticate_canonical_parents() {
     use xc_cache::*;
-    let root = std::env::temp_dir().join(format!("published-prefix-{}", std::process::id()));
+    let root_dir = xc_core::test_support::TestDir::new("published-prefix");
+    let root = root_dir.to_path_buf();
     let producer = FilesystemCacheStore::new(
         "producer",
         root.join("producer"),
@@ -123,8 +124,8 @@ fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
             size_bytes: bytes.len() as u64,
         }],
         created_unix_seconds: 1,
-        producer_toolkit_version: ToolkitVersion::parse("0.14.3").unwrap(),
-        minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+        producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
         maximum_reader_version: None,
         quality: CacheQuality::Validated,
         visibility: CacheVisibility::Local,
@@ -291,18 +292,18 @@ fn ten_complete_packets_are_byte_identical() {
     }
 }
 #[test]
-fn new_kind_is_private_only_without_raising_ordinary_compatibility_floors() {
+fn prefix_and_tau_kinds_share_the_clean_slate_floor() {
     assert_eq!(
         xc_cache::artifact_compatibility_policy("ccm-evidence", PREFIX_ARTIFACT_KIND)
             .unwrap()
             .minimum_producer_version,
-        ToolkitVersion::parse("0.15.0").unwrap()
+        ToolkitVersion::parse(xc_cache::CLEAN_SLATE).unwrap()
     );
     assert_eq!(
         xc_cache::artifact_compatibility_policy("ccm-matrices", "ccm_tau_matrix")
             .unwrap()
             .minimum_producer_version,
-        ToolkitVersion::parse("0.13.0").unwrap()
+        ToolkitVersion::parse(xc_cache::CLEAN_SLATE).unwrap()
     );
 }
 #[test]
@@ -311,8 +312,8 @@ fn derived_cache_reuses_diagnostics_and_rejects_missing_requested_variant() {
         ArtifactCacheContext, ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver,
         FilesystemCacheStore,
     };
-    let root = std::env::temp_dir().join(format!("ccm-prefix-child-cache-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root_dir = xc_core::test_support::TestDir::new("ccm-prefix-child-cache");
+    let root = root_dir.to_path_buf();
     let resolver = CacheResolver::new(vec![CacheLayer {
         precedence: 0,
         store: Box::new(FilesystemCacheStore::new(
@@ -653,9 +654,15 @@ fn capture_runner_accounts_for_missing_sources_and_continues_primary_diagnostics
         })
         .unwrap();
     result.value.receipt.validate_against(&expected).unwrap();
-    assert_eq!(calls, expected.outcomes().len() - 2);
+    // The ladder, its checkpoint and the checkpoint spectra use retained
+    // sources inside the plan; every other diagnostic reaches the callback.
+    assert_eq!(calls, expected.outcomes().len() - 3);
     assert!(matches!(
         result.value.receipt.outcomes()["prefix_ladder"],
+        xc_core::DiagnosticOutcome::Missing { .. }
+    ));
+    assert!(matches!(
+        result.value.receipt.outcomes()["checkpoint_spectra"],
         xc_core::DiagnosticOutcome::Missing { .. }
     ));
     assert!(matches!(

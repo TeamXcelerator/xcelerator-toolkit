@@ -242,8 +242,8 @@ pub(super) fn evaluate(
         * rayon::current_num_threads().min(n + 1) as u128
         * (u128::from(base + 4096).div_ceil(8) + 96)
         * 16;
-    if bytes + scratch > 8u128 << 30 {
-        bail!("u-flow exceeds the 8 GiB workspace budget");
+    if bytes + scratch > super::source_working_budget()? {
+        bail!("u-flow exceeds the declared workspace budget");
     }
     let plan = xc_numerics::hp_runtime::plan_gl_precompute(&unique, p);
     let tables =

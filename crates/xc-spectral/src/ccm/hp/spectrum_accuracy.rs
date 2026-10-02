@@ -32,6 +32,20 @@ pub struct CcmWeilSpectrumHp {
 }
 
 pub(super) fn full_spectrum(a: &[Float], n: usize, p: u32) -> Result<CcmWeilSpectrumHp> {
+    lowest_spectrum(a, n, p, n)
+}
+
+/// Directed enclosures of the `count` algebraically smallest eigenvalues of an
+/// exact stored symmetric matrix, including Householder source allowance.
+pub(super) fn lowest_spectrum(
+    a: &[Float],
+    n: usize,
+    p: u32,
+    count: usize,
+) -> Result<CcmWeilSpectrumHp> {
+    if count == 0 || count > n {
+        bail!("requested eigenvalue count must lie in 1..=dimension");
+    }
     let floor = stored_resolution::matrix_rounding_scale(a, n, p)?;
     let work = p.saturating_add(64).min(1_000_000);
     let (d, e, q) = xc_numerics::eigen::householder_tridiag_hp_stable(a, n, work)?;
@@ -50,7 +64,7 @@ pub(super) fn full_spectrum(a: &[Float], n: usize, p: u32) -> Result<CcmWeilSpec
         &sd,
         &se,
         0,
-        n - 1,
+        count - 1,
         &tolerance,
         (work as usize).saturating_mul(2).saturating_add(256),
         work,
@@ -110,11 +124,12 @@ pub(super) fn first_positive(
     let floor = stored_resolution::matrix_rounding_scale(a, n, p)?;
     let mut negative_floor = floor.clone();
     negative_floor = -negative_floor;
+    let budget = u64::try_from(super::source_working_budget()?).unwrap_or(u64::MAX);
     let mut selected = None;
     for guard in [64u32, 256, 1024] {
         let work = p.saturating_add(guard).min(1_000_000);
         let count_below = |shift: &Float| {
-            xc_numerics::symmetric_inertia::point_matrix_inertia_at(a, n, shift, work, 8u64 << 30)
+            xc_numerics::symmetric_inertia::point_matrix_inertia_at(a, n, shift, work, budget)
         };
         let at_zero = count_below(&Float::with_val(work, 0))?;
         let at_negative_floor = count_below(&Float::with_val(work, &negative_floor))?;

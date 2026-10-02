@@ -391,48 +391,66 @@ fn collect_leaf_paths(value: &Value) -> BTreeSet<String> {
 /// numbers retain serde_json's pinned formatter semantics; this is a representation
 /// identity, not a normalization of mathematically equivalent inputs.
 pub(crate) fn canonical_json(value: &Value) -> Result<String, ConfigResolutionError> {
-    fn write(value: &Value, output: &mut String) -> Result<(), ConfigResolutionError> {
-        match value {
-            Value::Null => output.push_str("null"),
-            Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
-            Value::Number(value) => output.push_str(&value.to_string()),
-            Value::String(value) => output.push_str(
-                &serde_json::to_string(value)
-                    .map_err(|error| ConfigResolutionError::Serialization(error.to_string()))?,
-            ),
-            Value::Array(values) => {
-                output.push('[');
-                for (index, value) in values.iter().enumerate() {
-                    if index > 0 {
-                        output.push(',');
-                    }
-                    write(value, output)?;
-                }
-                output.push(']');
-            }
-            Value::Object(values) => {
-                output.push('{');
-                let mut keys: Vec<_> = values.keys().collect();
-                keys.sort();
-                for (index, key) in keys.into_iter().enumerate() {
-                    if index > 0 {
-                        output.push(',');
-                    }
-                    output.push_str(&serde_json::to_string(key).map_err(|error| {
-                        ConfigResolutionError::Serialization(error.to_string())
-                    })?);
-                    output.push(':');
-                    write(&values[key], output)?;
-                }
-                output.push('}');
-            }
-        }
-        Ok(())
-    }
-
     let mut output = String::new();
-    write(value, &mut output)?;
+    write_canonical_json(value, &mut |text| output.push_str(text))?;
     Ok(output)
+}
+
+/// SHA-256 (lowercase hex) of [`canonical_json`]'s text, streamed: the same
+/// bytes are hashed without holding the whole text.
+pub(crate) fn canonical_json_sha256(value: &Value) -> Result<String, ConfigResolutionError> {
+    let mut hasher = Sha256::new();
+    write_canonical_json(value, &mut |text| hasher.update(text.as_bytes()))?;
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    Ok(output)
+}
+
+fn write_canonical_json(
+    value: &Value,
+    output: &mut dyn FnMut(&str),
+) -> Result<(), ConfigResolutionError> {
+    match value {
+        Value::Null => output("null"),
+        Value::Bool(value) => output(if *value { "true" } else { "false" }),
+        Value::Number(value) => output(&value.to_string()),
+        Value::String(value) => output(
+            &serde_json::to_string(value)
+                .map_err(|error| ConfigResolutionError::Serialization(error.to_string()))?,
+        ),
+        Value::Array(values) => {
+            output("[");
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output(",");
+                }
+                write_canonical_json(value, output)?;
+            }
+            output("]");
+        }
+        Value::Object(values) => {
+            output("{");
+            let mut keys: Vec<_> = values.keys().collect();
+            keys.sort();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    output(",");
+                }
+                output(
+                    &serde_json::to_string(key)
+                        .map_err(|error| ConfigResolutionError::Serialization(error.to_string()))?,
+                );
+                output(":");
+                write_canonical_json(&values[key], output)?;
+            }
+            output("}");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {

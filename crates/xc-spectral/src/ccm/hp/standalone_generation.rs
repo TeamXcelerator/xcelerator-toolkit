@@ -248,12 +248,15 @@ pub(super) fn write(zip_path: &Path, bytes: &[u8], part_limit: usize) -> io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn path(label: &str) -> PathBuf {
-        crate::fresh_test_dir(label).join("source.json.zip")
+    /// The scratch directory guard must outlive every use of the path.
+    fn path(label: &str) -> (xc_core::test_support::TestDir, PathBuf) {
+        let dir = crate::fresh_test_dir(label);
+        let path = dir.join("source.json.zip");
+        (dir, path)
     }
     #[test]
     fn generation_failed_replacement_keeps_previous_complete_payload() {
-        let path = path("generation-failed");
+        let (_dir, path) = path("generation-failed");
         let old = b"previous valid compressed payload";
         write(&path, old, 7).unwrap();
         for fail in [Stage::Part(0), Stage::Part(2), Stage::BeforeCommit] {
@@ -275,7 +278,7 @@ mod tests {
     }
     #[test]
     fn generation_rejects_corrupt_missing_oversize_and_unsafe_parts() {
-        let path = path("generation-corrupt");
+        let (_dir, path) = path("generation-corrupt");
         write(&path, b"abcdefghijkl", 4).unwrap();
         let manifest_path = sibling(&path, ".manifest.json").unwrap();
         let original = fs::read(&manifest_path).unwrap();
@@ -305,7 +308,7 @@ mod tests {
     }
     #[test]
     fn generation_concurrent_readers_observe_whole_committed_generations() {
-        let path = path("generation-concurrent");
+        let (_dir, path) = path("generation-concurrent");
         let a = vec![b'a'; 1001];
         let b = vec![b'b'; 2011];
         write(&path, &a, 97).unwrap();
@@ -333,7 +336,7 @@ mod tests {
     }
     #[test]
     fn generation_absent_and_uncommitted_parts_do_not_publish() {
-        let path = path("generation-uncommitted");
+        let (_dir, path) = path("generation-uncommitted");
         assert_eq!(read(&path, 100).unwrap(), None);
         assert!(
             write_with_hook(&path, b"not committed", 3, |_| Err(io::Error::other(

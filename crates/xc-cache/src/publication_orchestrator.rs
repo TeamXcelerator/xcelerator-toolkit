@@ -344,7 +344,6 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use xc_core::{AssuranceLevel, PublicationTarget};
 
@@ -358,7 +357,7 @@ mod tests {
         command.status().is_ok_and(|status| status.success())
     }
 
-    fn temporary_root() -> PathBuf {
+    fn temporary_root() -> crate::test_support::TestDir {
         crate::test_support::temporary_root("publication-orchestrator")
     }
 
@@ -368,7 +367,6 @@ mod tests {
             return;
         }
         let root = temporary_root();
-        let _ = fs::remove_dir_all(&root);
         let remote_path = root.join("remote.git");
         let seed = root.join("seed");
         let transport_root = root.join("transport");
@@ -435,8 +433,8 @@ mod tests {
             payload_digest: payload_digest.clone(),
             transport_digests: vec![transport_digest],
             resolved_mathematical_configuration_digest: ContentDigest::sha256(b"configuration"),
-            producer_toolkit_version: crate::ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: crate::ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: crate::ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: crate::ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             requested_assurance: AssuranceLevel::Computed,
             claim_scope: "orchestrator fixture".to_owned(),
@@ -456,8 +454,8 @@ mod tests {
                 actor: "fixture-validator".to_owned(),
                 policy_digest: ContentDigest::sha256(b"policy"),
                 execution_fingerprint_digest: ContentDigest::sha256(b"fingerprint"),
-                producer_toolkit_version: crate::ToolkitVersion::parse("0.13.0").unwrap(),
-                dependency_versions: BTreeMap::from([("xc-cache".to_owned(), "0.13.0".to_owned())]),
+                producer_toolkit_version: crate::ToolkitVersion::parse("0.16.0").unwrap(),
+                dependency_versions: BTreeMap::from([("xc-cache".to_owned(), "0.16.0".to_owned())]),
                 source_revision: "toolkit-revision".to_owned(),
                 event_unix_seconds: 1,
                 location: None,

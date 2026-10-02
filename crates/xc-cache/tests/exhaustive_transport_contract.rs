@@ -35,14 +35,8 @@ fn repeated_content_chunks_preserve_the_encoded_stream() {
     assert_eq!(reconstructed, bytes);
     assert_eq!(stored.len(), 1);
     assert_eq!(record.schema_version, 2);
-    let root = std::env::temp_dir().join(format!(
-        "xc-repeated-reconstruct-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("repeated-reconstruct");
+    let root = scratch.join("root");
     std::fs::create_dir(&root).unwrap();
     for (path, data) in &stored {
         let path = root.join(path);

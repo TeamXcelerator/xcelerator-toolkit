@@ -177,7 +177,8 @@ fn validate_reply(
 ) -> Result<()> {
     anyhow::ensure!(
         reply["protocol_version"].as_u64() == Some(2),
-        "target provider protocol version mismatch"
+        "target provider protocol version mismatch: the Toolkit speaks protocol 2 (with request_nonce), the provider replied with {}",
+        reply.get("protocol_version").map_or_else(|| "no protocol_version".to_owned(), |v| v.to_string())
     );
     anyhow::ensure!(
         reply["request_nonce"].as_str() == Some(nonce),
@@ -280,8 +281,75 @@ fn diagnostic_stderr() -> Result<Stdio> {
     anyhow::bail!("target provider diagnostic log name budget exhausted")
 }
 
+/// Replies of providers the operator declared pure, shared by every evaluator
+/// in this process. Bounded by entries and by a logical byte budget (the
+/// lengths of the retained key and value strings, not their allocations); an
+/// evicted or absent entry is asked again.
+const PURE_REPLY_MEMO_ENTRIES: usize = 1 << 20;
+const PURE_REPLY_MEMO_BYTES: usize = 512 << 20;
+
+static PURE_REPLIES: std::sync::OnceLock<Mutex<PureReplies>> = std::sync::OnceLock::new();
+
+#[derive(Default)]
+struct PureReplies {
+    values: std::collections::HashMap<String, String>,
+    order: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+impl PureReplies {
+    /// Remember a reply within `entries` and `bytes`, evicting the oldest
+    /// first. An entry larger than the whole byte budget is not remembered,
+    /// and nothing is evicted for it.
+    fn remember(&mut self, key: String, value: &str, entries: usize, bytes: usize) {
+        let size = 2 * key.len() + value.len();
+        if size > bytes || self.values.contains_key(&key) {
+            return;
+        }
+        while self.order.len() >= entries || self.bytes + size > bytes {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.values.remove(&oldest) {
+                self.bytes -= 2 * oldest.len() + evicted.len();
+            }
+        }
+        self.order.push_back(key.clone());
+        self.values.insert(key, value.to_owned());
+        self.bytes += size;
+    }
+}
+
+/// Memo-key prefix for one pure provider, target input and precision: a
+/// fixed-size digest, so no key carries the (possibly megabyte) input.
+fn pure_reply_identity(spec: &ExternalProfileSpec, bits: u32) -> Result<String> {
+    let identity =
+        xc_cache::ContentDigest::sha256_json(&(&spec.provider_sha256, &spec.input, bits))?;
+    Ok(format!("{}\0", identity.0))
+}
+
+/// Whether the operator declared the authorized provider pure: the same
+/// target input, precision and point always yield the same reply. Only then
+/// may replies be reused within the process.
+pub(crate) fn provider_declared_pure() -> Result<bool> {
+    match std::env::var("XC_TARGET_PROVIDER_PURE") {
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) if value.is_empty() || value == "0" => Ok(false),
+        Ok(_) => anyhow::bail!("XC_TARGET_PROVIDER_PURE must be 0 or 1"),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[derive(Clone, Debug)]
-struct Provider(Arc<Mutex<Connection>>);
+struct Provider {
+    connection: Arc<Mutex<Connection>>,
+    /// Digest of the exact provider, target input and precision of these
+    /// replies when the provider is declared pure; `None` asks the provider
+    /// every time. A digest, not the input itself: at high precision the input
+    /// is megabytes and prefixes every memo key.
+    pure_identity: Option<String>,
+}
 impl Provider {
     fn start(spec: &ExternalProfileSpec, bits: u32) -> Result<Self> {
         spec.validate()?;
@@ -357,35 +425,61 @@ impl Provider {
                 }
             }
         });
-        let provider = Self(Arc::new(Mutex::new(Connection {
-            child,
-            requests,
-            writes,
-            replies,
-            timeout: Duration::from_secs(timeout),
-            failed: false,
-            next_request_id: 1,
-            precision_bits: bits,
-            _executable_file: executable_file,
-        })));
+        let pure_identity = provider_declared_pure()?
+            .then(|| pure_reply_identity(spec, bits))
+            .transpose()?;
+        let provider = Self {
+            connection: Arc::new(Mutex::new(Connection {
+                child,
+                requests,
+                writes,
+                replies,
+                timeout: Duration::from_secs(timeout),
+                failed: false,
+                next_request_id: 1,
+                precision_bits: bits,
+                _executable_file: executable_file,
+            })),
+            pure_identity,
+        };
         provider
-            .0
+            .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("target provider lock failed"))?
             .exchange(&serde_json::json!({"operation":"initialize","input":spec.input}))?;
         Ok(provider)
     }
     fn value(&self, u: &str) -> Result<String> {
+        let key = self
+            .pure_identity
+            .as_ref()
+            .map(|identity| format!("{identity}{u}"));
+        if let Some(key) = &key {
+            if let Some(value) = PURE_REPLIES
+                .get()
+                .and_then(|memo| memo.lock().ok()?.values.get(key).cloned())
+            {
+                return Ok(value);
+            }
+        }
         let reply = self
-            .0
+            .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("target provider lock failed"))?
             .exchange(&serde_json::json!({"operation":"evaluate","u":u}))?;
-        reply
+        let value = reply
             .get("value")
             .and_then(|v| v.as_str())
             .map(str::to_owned)
-            .context("external target provider omitted its value")
+            .context("external target provider omitted its value")?;
+        // Only successful replies are remembered; a failing point is asked again.
+        if let Some(key) = key {
+            let memo = PURE_REPLIES.get_or_init(|| Mutex::new(PureReplies::default()));
+            if let Ok(mut memo) = memo.lock() {
+                memo.remember(key, &value, PURE_REPLY_MEMO_ENTRIES, PURE_REPLY_MEMO_BYTES);
+            }
+        }
+        Ok(value)
     }
 }
 fn parse_scalar_f64(text: &str) -> Result<f64> {
@@ -507,6 +601,62 @@ mod tests {
     use super::*;
     fn reply(id: u64) -> serde_json::Value {
         serde_json::json!({"protocol_version":2,"request_nonce":"test-nonce","request_id":id,"operation":"evaluate","precision_bits":256,"value":"0.5"})
+    }
+    #[test]
+    fn pure_reply_keys_carry_a_digest_not_the_target_input() {
+        let spec = |coefficient: &str| ExternalProfileSpec {
+            lambda_squared: "100".into(),
+            evaluation_precision_bits: 4096,
+            provider_sha256: "ab".repeat(32),
+            input: serde_json::json!({"even_legendre_coefficients": vec![coefficient; 4000]}),
+        };
+        let large = spec(&"1".repeat(1000));
+        let identity = pure_reply_identity(&large, 3706).unwrap();
+        // 64 hex digits and a separator, however large the input.
+        assert_eq!(identity.len(), 65);
+        assert_ne!(identity, pure_reply_identity(&large, 3707).unwrap());
+        assert_ne!(identity, pure_reply_identity(&spec("2"), 3706).unwrap());
+        assert_eq!(identity, pure_reply_identity(&large, 3706).unwrap());
+    }
+    #[test]
+    fn pure_reply_memo_stays_within_its_entry_and_byte_budgets() {
+        let mut memo = PureReplies::default();
+        let consistent = |memo: &PureReplies| {
+            assert_eq!(memo.order.len(), memo.values.len());
+            let bytes: usize = memo
+                .values
+                .iter()
+                .map(|(key, value)| 2 * key.len() + value.len())
+                .sum();
+            assert_eq!(memo.bytes, bytes);
+        };
+        // 2*4 + 2 = 10 bytes per entry; budget 25 bytes, 3 entries.
+        for key in ["key1", "key2"] {
+            memo.remember(key.into(), "vv", 3, 25);
+        }
+        consistent(&memo);
+        assert_eq!(memo.order, ["key1", "key2"]);
+        memo.remember("key3".into(), "vv", 3, 25);
+        consistent(&memo);
+        assert_eq!(
+            memo.order,
+            ["key2", "key3"],
+            "byte budget evicts the oldest"
+        );
+        assert!(memo.bytes <= 25);
+        // An entry larger than the whole budget is not kept and evicts nothing.
+        memo.remember("huge".into(), &"v".repeat(30), 3, 25);
+        consistent(&memo);
+        assert_eq!(memo.order, ["key2", "key3"]);
+        // A repeated key keeps its first reply.
+        memo.remember("key3".into(), "ww", 3, 25);
+        assert_eq!(memo.values["key3"], "vv");
+        // The entry limit evicts the oldest as well.
+        for key in ["a", "b", "c"] {
+            memo.remember(key.into(), "", 3, 1000);
+        }
+        consistent(&memo);
+        assert_eq!(memo.order, ["a", "b", "c"]);
     }
     #[test]
     fn duplicate_or_uncorrelated_reply_is_rejected() {

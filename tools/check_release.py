@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Run offline local release checks and retain exit status, counts, and log hashes."""
-import argparse, hashlib, json, os, re, subprocess, time, sys
+import argparse, atexit, hashlib, json, os, re, shutil, subprocess, tempfile, time, sys
 from pathlib import Path
 if not __debug__:
  raise SystemExit("release qualification requires Python without -O or PYTHONOPTIMIZE")
@@ -28,7 +28,26 @@ checks = [
  ("rustdoc", ["cargo", "doc", "--workspace", "--no-deps", *feature, "--locked", "--offline"]),
  ("doctests", ["cargo", "test", "--workspace", "--doc", *feature, "--locked", "--offline"]),
 ]
-env = dict(os.environ, RUSTDOCFLAGS="-D warnings", XC_CACHE_REMOTE="none", XC_PUBLISH_EXECUTE="false")
+# Tests compute into a throwaway cache root so a release check never fills the
+# operator's per-user cache; it is removed when the checks finish.
+cache_root = Path(tempfile.mkdtemp(prefix="xc-release-cache-"))
+atexit.register(shutil.rmtree, cache_root, True)
+env = dict(os.environ, RUSTDOCFLAGS="-D warnings", XC_CACHE_REMOTE="none", XC_PUBLISH_EXECUTE="false", XC_CACHE_ROOT=str(cache_root))
+
+def checkout_files():
+ """Untracked and ignored paths, excluding Cargo build output (a target/ beside a Cargo.toml)."""
+ out = subprocess.run(["git", "status", "--porcelain", "--ignored", "--untracked-files=all"], cwd=root, capture_output=True, text=True, check=True).stdout
+ def build_output(path):
+  head, sep, _ = ("/" + path).partition("/target/")
+  return bool(sep) and (root / head.lstrip("/") / "Cargo.toml").is_file()
+ return {line[3:] for line in out.splitlines() if line[:2] in ("??", "!!") and not build_output(line[3:])}
+
+# Test scratch belongs in xc_core::test_support::TestDir, which lives outside
+# the checkout and removes itself; nothing may write scratch into the tree.
+in_tree_scratch = [str(f.relative_to(root)) for f in root.glob("crates/**/*.rs") if '"test-tmp"' in f.read_text(encoding="utf-8")]
+if in_tree_scratch:
+ raise SystemExit("in-checkout test scratch paths: " + ", ".join(in_tree_scratch))
+before = checkout_files()
 records = []
 for name, command in checks:
  print(f"START {name}", flush=True)
@@ -46,6 +65,14 @@ for name, command in checks:
  if result.returncode:
   print(data[-8000:].decode("utf8", errors="replace"), flush=True)
   raise SystemExit(result.returncode)
+
+output = a.output.resolve()
+own_output = output.relative_to(root).as_posix() + "/" if output.is_relative_to(root) else None
+left_behind = sorted(f for f in checkout_files() - before if not (own_output and f.startswith(own_output)))
+if (root / "target" / "test-tmp").exists():
+ left_behind.append("target/test-tmp/")
+if left_behind:
+ raise SystemExit("release checks left files in the checkout: " + ", ".join(left_behind[:20]))
 
 if a.complete:
     assets = [sys.executable, str(root / "tools/qualify_research_assets.py"), "--require-committed-source", "--output", str(a.output.resolve() / "assets")]

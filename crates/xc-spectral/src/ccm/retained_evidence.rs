@@ -68,10 +68,12 @@ pub(super) fn scalar(s: &str, p: u32) -> Result<Float> {
     if s.len() > 1_048_576 {
         bail!("research scalar exceeds the one MiB input budget");
     }
-    let decimal = xc_core::DecimalLiteral::new(s)?;
+    // Validate in place: a matrix decode parses millions of these, and the
+    // canonical spelling is needed only to tell a true zero from underflow.
+    xc_core::DecimalLiteral::validate_str(s)?;
     let v = Float::with_val(p, Float::parse(s)?);
     if !v.is_finite()
-        || (v.is_zero() && decimal.canonical()?.as_str() != "0")
+        || (v.is_zero() && xc_core::DecimalLiteral::new(s)?.canonical()?.as_str() != "0")
         // MPFR's smallest exponent has no subnormal significands. A nonzero
         // nearest result can conceal severe relative loss below that floor.
         || (v.get_exp() == Some(rug::float::exp_min())
@@ -95,6 +97,24 @@ fn dep(m: &ArtifactManifest) -> DependencyRef {
         content_digest: m.content_digest.clone(),
         required_quality: CacheQuality::Validated,
     }
+}
+fn sorted_dependencies(mut dependencies: Vec<DependencyRef>) -> Vec<DependencyRef> {
+    dependencies.sort_by(|a, b| {
+        (
+            &a.key.kind,
+            &a.key.logical_key,
+            &a.key.parameters_digest,
+            &a.content_digest,
+        )
+            .cmp(&(
+                &b.key.kind,
+                &b.key.logical_key,
+                &b.key.parameters_digest,
+                &b.content_digest,
+            ))
+    });
+    dependencies.dedup();
+    dependencies
 }
 fn admits(m: &ArtifactManifest, b: &[u8], allowed: &[ContentDigest], kind: &str) -> Result<()> {
     m.validate()?;
@@ -142,7 +162,9 @@ where
             bail!("inadmissible research parent quality");
         }
     }
-    let scope = if kind == "ccm_transform_enclosure" {
+    let scope = if kind == "ccm_finite_diagnostic_analysis" {
+        "finite_supplied_enclosures; explicit_source_scope; no_continuum_claim"
+    } else if kind == "ccm_transform_enclosure" {
         "finite_retained_function_enclosures; source_scope_explicit; no_infinite_limit_claim"
     } else {
         SCOPE
@@ -155,27 +177,16 @@ where
     {
         bail!("research observation requires independently public-admissible inputs");
     }
-    let mut dependencies = sources.iter().map(dep).collect::<Vec<_>>();
-    dependencies.sort_by(|a, b| {
-        (
-            &a.key.kind,
-            &a.key.logical_key,
-            &a.key.parameters_digest,
-            &a.content_digest,
-        )
-            .cmp(&(
-                &b.key.kind,
-                &b.key.logical_key,
-                &b.key.parameters_digest,
-                &b.content_digest,
-            ))
-    });
-    dependencies.dedup();
+    // The manifest keeps each parent's resolvable store key; the identity and
+    // the retained record bind only its label-free identity.
+    let dependencies = sorted_dependencies(sources.iter().map(dep).collect());
+    let identities =
+        sorted_dependencies(sources.iter().map(research_identity_dependency).collect());
     let semantic = SemanticKeyEnvelope {
         schema_version: 1,
         artifact_kind: kind.into(),
         mathematical_semantics_version: SEMANTICS.into(),
-        resolved_mathematical_parameters: json!({"request":request,"source_dependencies":dependencies,"source_parents_are_public":public}),
+        resolved_mathematical_parameters: json!({"request":request,"source_dependencies":identities,"source_parents_are_public":public}),
         normalization: None,
         target: Some(kind.into()),
         subspace: None,
@@ -197,7 +208,7 @@ where
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.1")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([("assurance".into(), "computed_not_certified".into())]),
         provenance_digest: None,
@@ -213,7 +224,7 @@ where
                     semantics: SEMANTICS.into(),
                     kind: kind.into(),
                     scope: scope.into(),
-                    source_dependencies: dependencies.clone(),
+                    source_dependencies: identities.clone(),
                     request: request.clone(),
                     data,
                 },
@@ -225,7 +236,7 @@ where
                 || r.semantics != SEMANTICS
                 || r.kind != kind
                 || r.scope != scope
-                || r.source_dependencies != dependencies
+                || r.source_dependencies != identities
                 || r.request != request
             {
                 return Err(CacheError::InvalidManifest(
@@ -563,7 +574,10 @@ impl RetainedRoots {
             || ((r["schema_version"].as_u64() == Some(6)
                 || r.get("secular_source_content_digest").is_some())
                 && r["secular_source_content_digest"].as_str() != Some(&secular.content_digest.0))
-            || sec["schema_version"].as_u64() != Some(1)
+            || !matches!(sec["schema_version"].as_u64(), Some(1 | 2))
+            || (sec["schema_version"].as_u64() == Some(2)
+                && sec["eigenpair_semantic_digest"].as_str()
+                    != Some(&state.manifest.key.parameters_digest.0))
             || sec["normalization"].as_str() != Some("sum_xi_equals_sqrt_log_lambda_squared")
             || r["force_even"] != sec["force_even"]
             || r["parity_policy"] != sec["parity_policy"]
@@ -1130,6 +1144,17 @@ impl<'a> RetainedMatrix<'a> {
             precision,
             entries: std::borrow::Cow::Borrowed(entries),
         })
+    }
+    /// The same matrix holding its own copy of the entries, for work that
+    /// outlives the borrowed source.
+    pub(crate) fn to_owned_entries(&self) -> RetainedMatrix<'static> {
+        RetainedMatrix {
+            manifest: self.manifest.clone(),
+            cutoff: self.cutoff.clone(),
+            modes: self.modes,
+            precision: self.precision,
+            entries: std::borrow::Cow::Owned(self.entries.to_vec()),
+        }
     }
     pub(crate) fn match_state(&self, s: &RetainedState) -> Result<()> {
         if !equal_cutoff(&self.cutoff, &s.cutoff)?
@@ -1712,8 +1737,8 @@ mod exhaustive_resumed_validation_contract {
                 size_bytes: bytes.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.14.3").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -1934,7 +1959,7 @@ mod exhaustive_runtime_matrix {
     fn manifest() -> ArtifactManifest {
         let bytes = b"admitted runtime matrix boundary";
         let digest = ContentDigest::sha256(bytes);
-        serde_json::from_value(json!({"schema_version":1,"key":ArtifactKey::new("ccm_tau_matrix","runtime-boundary",bytes).unwrap(),"content_digest":digest,"size_bytes":bytes.len(),"objects":[{"content_digest":digest,"size_bytes":bytes.len()}],"created_unix_seconds":1,"producer_toolkit_version":ToolkitVersion::parse("0.15.2").unwrap(),"minimum_reader_version":ToolkitVersion::parse("0.15.2").unwrap(),"maximum_reader_version":null,"quality":"validated","visibility":"private","immutable":true,"dependencies":[],"tags":{},"provenance_digest":null})).unwrap()
+        serde_json::from_value(json!({"schema_version":1,"key":ArtifactKey::new("ccm_tau_matrix","runtime-boundary",bytes).unwrap(),"content_digest":digest,"size_bytes":bytes.len(),"objects":[{"content_digest":digest,"size_bytes":bytes.len()}],"created_unix_seconds":1,"producer_toolkit_version":ToolkitVersion::parse("0.16.0").unwrap(),"minimum_reader_version":ToolkitVersion::parse("0.16.0").unwrap(),"maximum_reader_version":null,"quality":"validated","visibility":"private","immutable":true,"dependencies":[],"tags":{},"provenance_digest":null})).unwrap()
     }
     #[test]
     fn exhaustive_runtime_matrix_shape_overflow_returns_error() {
@@ -2017,3 +2042,118 @@ mod exhaustive_remaining_dot {
 #[cfg(test)]
 #[path = "retained_evidence/retained_regression_tests.rs"]
 mod retained_regression_tests;
+
+#[cfg(test)]
+mod cross_store_identity {
+    use super::*;
+    use std::cell::Cell;
+
+    fn parent(logical_key: &str, visibility: &str, dependencies: Value) -> ArtifactManifest {
+        let bytes = b"retained parent payload";
+        let digest = ContentDigest::sha256(bytes);
+        let mut key = ArtifactKey::new(
+            "ccm_prime_component",
+            "ccm/prime-component/13/120/3386",
+            b"p",
+        )
+        .unwrap();
+        key.logical_key = logical_key.into();
+        serde_json::from_value(json!({"schema_version":1,"key":key,"content_digest":digest,
+            "size_bytes":bytes.len(),"objects":[{"content_digest":digest,"size_bytes":bytes.len()}],
+            "created_unix_seconds":1,"producer_toolkit_version":ToolkitVersion::parse("0.16.0").unwrap(),
+            "minimum_reader_version":ToolkitVersion::parse("0.16.0").unwrap(),"maximum_reader_version":null,
+            "quality":"validated","visibility":visibility,"immutable":true,"dependencies":dependencies,
+            "tags":{},"provenance_digest":null}))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_parent_read_by_identity_from_a_remote_keeps_the_research_identity() {
+        let directory = xc_core::test_support::TestDir::new("research-cross-store-identity");
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "workstation",
+                directory.to_path_buf(),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let cache = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["workstation".to_owned()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        // The same parent bytes as the computing workstation stores them, and
+        // as another workstation resolves them from a remote shard by identity.
+        let local = parent(
+            "ccm/prime-component/13/120/3386",
+            "local",
+            json!([{"key":ArtifactKey::new("ccm_tau_matrix","ccm/tau/13/120/3386",b"t").unwrap(),
+                "content_digest":ContentDigest::sha256(b"t"),"required_quality":"validated"}]),
+        );
+        let remote = parent(
+            &format!("closure/{}", &local.key.parameters_digest.0[..16]),
+            "private",
+            json!([]),
+        );
+        assert_eq!(
+            research_identity_dependency(&local),
+            research_identity_dependency(&remote)
+        );
+        let computed = Cell::new(0);
+        let run = |source: &ArtifactManifest| {
+            managed(
+                "ccm_operator_energy_analysis",
+                json!({"test":"cross-store"}),
+                std::slice::from_ref(source),
+                &cache,
+                || {
+                    computed.set(computed.get() + 1);
+                    Ok(json!({"value":"1"}))
+                },
+                |_: &Value| Ok(()),
+            )
+            .unwrap()
+        };
+        let first = run(&local);
+        let second = run(&remote);
+        assert_eq!(
+            computed.get(),
+            1,
+            "the remote form recomputed the research artifact"
+        );
+        assert_eq!(first.value.data, second.value.data);
+        assert_eq!(
+            first.value.source_dependencies,
+            second.value.source_dependencies
+        );
+        assert_eq!(
+            first.value.source_dependencies[0].key.logical_key,
+            format!("identity/{}", local.key.parameters_digest.0)
+        );
+        // A different parent content is still a different identity.
+        let mut other = remote.clone();
+        other.content_digest = ContentDigest::sha256(b"other parent payload");
+        other.objects[0].content_digest = other.content_digest.clone();
+        assert_ne!(
+            research_identity_dependency(&other),
+            research_identity_dependency(&local)
+        );
+    }
+}

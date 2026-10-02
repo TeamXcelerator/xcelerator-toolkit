@@ -1,5 +1,246 @@
 //! Reuse directed root geometry while preserving correctly rounded responses.
 use super::*;
+
+// Cached response records are computed observations. Routine admission checks
+// their exact source joins and numerical shape; it does not manufacture a new
+// independent cross-check or rerun derivative quadrature/bordered solves.
+fn number(value: &str, p: u32, nonnegative: bool) -> std::result::Result<Float, CacheError> {
+    let value = parse_hp_scalar(value, p)?;
+    if nonnegative && value < 0 {
+        return Err(CacheError::InvalidManifest(
+            "negative response norm or bound".into(),
+        ));
+    }
+    Ok(value)
+}
+
+fn root_values(
+    values: &[Option<String>],
+    roots: &[EigenvalueResult],
+    p: u32,
+) -> std::result::Result<(), CacheError> {
+    if values.len() != roots.len() {
+        return Err(CacheError::InvalidManifest(
+            "response root count mismatch".into(),
+        ));
+    }
+    for (value, root) in values.iter().zip(roots) {
+        if value.is_some() != root.value().is_some() {
+            return Err(CacheError::InvalidManifest(
+                "response root availability mismatch".into(),
+            ));
+        }
+        if let Some(value) = value {
+            number(value, p, false)?;
+        }
+    }
+    Ok(())
+}
+
+fn response_vector(
+    values: &[String],
+    norm: &str,
+    dimension: usize,
+    p: u32,
+) -> std::result::Result<(), CacheError> {
+    if values.len() != dimension {
+        return Err(CacheError::InvalidManifest(
+            "response vector dimension mismatch".into(),
+        ));
+    }
+    let vector = parse_hp_vector(values, p)?;
+    number(norm, p, true)?;
+    if lossless_hp_decimal(&deterministic_l2_norm_hp(&vector, p)?) != norm {
+        return Err(CacheError::InvalidManifest(
+            "response vector norm mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn sanity_prime(
+    a: &PortablePrimePowerResponseAnalysis,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    state: &Float,
+    xi: &[Float],
+    roots: &[EigenvalueResult],
+    first: usize,
+    tau: &ArtifactManifest,
+    eigenpair: &ArtifactManifest,
+    root_range: &ArtifactManifest,
+    secular: &ArtifactManifest,
+    selection: &ContentDigest,
+    spectral: &ResponseSpectralPreparation,
+) -> std::result::Result<(), CacheError> {
+    let p = cfg.precision_bits;
+    let dimension = params.matrix_size();
+    let content = prime_powers_up_to(params.lambda_sq_int());
+    if a.schema_version != 2
+        || a.lambda_squared != lambda_squared_cache_identity(params)
+        || a.prime_cutoff != params.lambda_sq_int()
+        || a.n_modes != params.n_modes
+        || a.dimension != dimension
+        || a.precision_bits != p
+        || !payload_parity_matches(a.force_even, a.parity_policy, cfg.effective_parity_policy())
+        || a.tau_content_digest != tau.content_digest.0
+        || a.eigenpair_content_digest != eigenpair.content_digest.0
+        || a.root_range_content_digest != root_range.content_digest.0
+        || a.secular_source_content_digest != secular.content_digest.0
+        || a.root_selection_digest != selection.0
+        || a.normalization != PRIME_POWER_RESPONSE_NORMALIZATION
+        || a.velocity_parameter != PRIME_POWER_RESPONSE_VELOCITY_PARAMETER
+        || a.response_definition != PRIME_POWER_RESPONSE_DEFINITION
+        || a.edge_jump_direction != PRIME_POWER_RESPONSE_EDGE_DIRECTION
+        || a.state_eigenvalue != lossless_hp_decimal(state)
+        || a.roots != ccm_response_roots(roots, first)?
+        || a.events.len() != content.len()
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM response identity mismatch".into(),
+        ));
+    }
+    let unit = response_unit_state(xi, p)?;
+    if a.spectral_isolation
+        != response_spectral_isolation(spectral, params, cfg, state, &unit)
+            .map_err(|e| CacheError::InvalidManifest(e.to_string()))?
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM response source isolation mismatch".into(),
+        ));
+    }
+    for (event, (power, prime, exponent)) in a.events.iter().zip(content) {
+        if (event.power, event.prime, event.exponent) != (power, prime, exponent)
+            || event.observation_is_event_edge
+                != cutoff_equals_event_power(&a.lambda_squared, power)
+                    .map_err(|e| CacheError::InvalidManifest(e.to_string()))?
+        {
+            return Err(CacheError::InvalidManifest(
+                "CCM response event identity mismatch".into(),
+            ));
+        }
+        for value in [
+            &event.log_power,
+            &event.von_mangoldt_weight,
+            &event.reduced_position,
+            &event.velocity_coefficient,
+            &event.edge_jump_coefficient,
+            &event.eigenvalue_velocity_response,
+            &event.ccm_normalization_scale_velocity_response,
+            &event.bordered_lagrange_multiplier,
+        ] {
+            number(value, p, false)?;
+        }
+        number(&event.projected_forcing_norm, p, true)?;
+        let residual = number(&event.bordered_solve_relative_residual, p, true)?;
+        if !weil_eigvec_cache::residual_within_precision_floor(&residual, p) {
+            return Err(CacheError::InvalidManifest(
+                "CCM response retained residual exceeds tolerance".into(),
+            ));
+        }
+        response_vector(
+            &event.l2_eigenvector_velocity_response,
+            &event.l2_eigenvector_velocity_response_norm,
+            dimension,
+            p,
+        )?;
+        root_values(&event.root_velocity_responses, roots, p)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn sanity_u_flow(
+    a: &PortableUFlowResponseAnalysis,
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    state: &Float,
+    xi: &[Float],
+    roots: &[EigenvalueResult],
+    first: usize,
+    tau: &ArtifactManifest,
+    eigenpair: &ArtifactManifest,
+    root_range: &ArtifactManifest,
+    secular: &ArtifactManifest,
+    selection: &ContentDigest,
+    spectral: &ResponseSpectralPreparation,
+) -> std::result::Result<(), CacheError> {
+    let p = cfg.precision_bits;
+    let dimension = params.matrix_size();
+    if a.schema_version != 2
+        || a.lambda_squared != lambda_squared_cache_identity(params)
+        || a.prime_cutoff != params.lambda_sq_int()
+        || a.active_prime_power_count != prime_powers_up_to(params.lambda_sq_int()).len()
+        || a.n_modes != params.n_modes
+        || a.dimension != dimension
+        || a.precision_bits != p
+        || !payload_parity_matches(a.force_even, a.parity_policy, cfg.effective_parity_policy())
+        || a.tau_content_digest != tau.content_digest.0
+        || a.eigenpair_content_digest != eigenpair.content_digest.0
+        || a.root_range_content_digest != root_range.content_digest.0
+        || a.secular_source_content_digest != secular.content_digest.0
+        || a.root_selection_digest != selection.0
+        || a.normalization != U_FLOW_RESPONSE_NORMALIZATION
+        || a.velocity_parameter != U_FLOW_RESPONSE_VELOCITY_PARAMETER
+        || a.derivative_convention != U_FLOW_RESPONSE_DERIVATIVE_CONVENTION
+        || a.state_eigenvalue != lossless_hp_decimal(state)
+        || a.roots != ccm_response_roots(roots, first)?
+        || a.channels.len() != U_FLOW_CHANNELS.len()
+        || a.normalization_target_velocity != lossless_hp_decimal(&response_target_velocity(l, p)?)
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM u-flow response identity mismatch".into(),
+        ));
+    }
+    let unit = response_unit_state(xi, p)?;
+    if a.spectral_isolation
+        != response_spectral_isolation(spectral, params, cfg, state, &unit)
+            .map_err(|e| CacheError::InvalidManifest(e.to_string()))?
+    {
+        return Err(CacheError::InvalidManifest(
+            "CCM u-flow source isolation mismatch".into(),
+        ));
+    }
+    for (channel, expected) in a.channels.iter().zip(U_FLOW_CHANNELS) {
+        if channel.channel != expected {
+            return Err(CacheError::InvalidManifest(
+                "CCM u-flow channel identity mismatch".into(),
+            ));
+        }
+        for value in [
+            &channel.eigenvalue_velocity_response,
+            &channel.ccm_normalization_scale_velocity_response,
+            &channel.bordered_lagrange_multiplier,
+        ] {
+            number(value, p, false)?;
+        }
+        number(&channel.projected_forcing_norm, p, true)?;
+        let residual = number(&channel.bordered_solve_relative_residual, p, true)?;
+        if !weil_eigvec_cache::residual_within_precision_floor(&residual, p) {
+            return Err(CacheError::InvalidManifest(
+                "CCM u-flow retained residual exceeds tolerance".into(),
+            ));
+        }
+        response_vector(
+            &channel.tau_velocity_action_on_state,
+            &channel.tau_velocity_action_norm,
+            dimension,
+            p,
+        )?;
+        response_vector(
+            &channel.l2_eigenvector_velocity_response,
+            &channel.l2_eigenvector_velocity_response_norm,
+            dimension,
+            p,
+        )?;
+        root_values(&channel.fixed_pole_root_velocity_responses, roots, p)?;
+    }
+    root_values(&a.secular_pole_motion_root_velocity_responses, roots, p)?;
+    root_values(&a.total_moving_pole_root_velocity_responses, roots, p)?;
+    Ok(())
+}
 const GEOMETRY_BUDGET_BYTES: u128 = 512 * 1024 * 1024;
 const ROOT_BATCH_SIZE: usize = 16;
 struct PreparedRoot<'a> {
@@ -39,7 +280,9 @@ impl<'a> PreparedRootResponses<'a> {
         let storage =
             roots.len() as u128 * (point_bytes * 4 + 128) + if retain { bytes } else { 0 };
         let workers = roots.len().min(rayon::current_num_threads()) as u128;
-        if storage + workers * poles.len() as u128 * point_bytes * 24 > (8u128 << 30) {
+        if storage + workers * poles.len() as u128 * point_bytes * 24
+            > super::source_working_budget()?
+        {
             bail!("prepared root responses exceed combined workspace budget");
         }
         let prepared = roots
@@ -122,7 +365,7 @@ impl ResponseProgress {
     pub(super) fn new(phase: &'static str, total: usize, roots: usize) -> Self {
         let started = Instant::now();
         if total >= 64 {
-            eprintln!(
+            xc_core::progress_message!(
                 "[HP] prime-power response {phase}: 0/{total} events; {roots} roots/event; {} workers",
                 rayon::current_num_threads()
             );
@@ -138,7 +381,7 @@ impl ResponseProgress {
         let mut state = self.state.lock().expect("response progress mutex poisoned");
         state.1 += 1;
         if self.total >= 64 && (state.1 == self.total || state.0.elapsed().as_secs() >= 30) {
-            eprintln!(
+            xc_core::progress_message!(
                 "[HP] prime-power response {}: {}/{} events; elapsed {:.1}s",
                 self.phase,
                 state.1,

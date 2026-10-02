@@ -26,13 +26,18 @@ pub fn validate_secret_free<T: Serialize>(record: &T, context: &str) -> Result<(
     inspect_value(&value, "$", context)
 }
 
+/// [`validate_secret_free`] for a value already in JSON form, inspected in
+/// place instead of converted (copied) first.
+pub fn validate_secret_free_value(value: &Value, context: &str) -> Result<(), ConfigError> {
+    inspect_value(value, "$", context)
+}
+
 fn inspect_value(value: &Value, path: &str, context: &str) -> Result<(), ConfigError> {
     match value {
         Value::Object(fields) => {
             for (key, child) in fields {
                 let child_path = format!("{path}.{key}");
-                let normalized = key.to_ascii_lowercase().replace(['-', ' '], "_");
-                if SENSITIVE_KEYS.contains(&normalized.as_str()) {
+                if sensitive_key(key) {
                     return Err(ConfigError::new(format!(
                         "{context} contains a credential-bearing field at {child_path}"
                     )));
@@ -55,7 +60,13 @@ fn inspect_value(value: &Value, path: &str, context: &str) -> Result<(), ConfigE
     Ok(())
 }
 
-fn secret_marker(text: &str) -> Option<&'static str> {
+/// Whether an object key names a credential-bearing field.
+pub(crate) fn sensitive_key(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase().replace(['-', ' '], "_");
+    SENSITIVE_KEYS.contains(&normalized.as_str())
+}
+
+pub(crate) fn secret_marker(text: &str) -> Option<&'static str> {
     let trimmed = text.trim();
     let lower = trimmed.to_ascii_lowercase();
     if lower.contains("-----begin private key-----") // SECRET_AUDIT_PATTERN

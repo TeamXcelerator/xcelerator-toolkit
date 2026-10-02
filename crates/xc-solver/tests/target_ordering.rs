@@ -1,4 +1,4 @@
-//! Fresh 2026-09-28 adversarial target-selection checks. Independent oracle:
+//! Adversarial target-selection checks. Independent oracle:
 //! the diagonal spectrum is exact; the projector's largest eigenvalue is at
 //! least its (2,2) entry by the Rayleigh variational principle.
 use xc_core::{

@@ -2,6 +2,7 @@ use super::{
     check_solver_cancellation, hp_generalized_block::symmetric_jacobi_eigensystem,
     ShiftInvertFactorizationDescriptorHp, ShiftInvertSolveHp, SolverError,
 };
+use rayon::prelude::*;
 use rug::{ops::Pow, Assign, Float};
 use serde::{Deserialize, Serialize};
 use xc_core::{
@@ -123,14 +124,42 @@ fn parse_positive(
     super::hp_positive_threshold(value, precision, name, rug::float::Round::Down)
 }
 
+/// Vectors at least this long form their products and element updates in
+/// parallel. Each product or update is the same single correctly rounded
+/// operation either way, and sums are always added serially in index order,
+/// so the result is bit-identical at every thread count.
+const PARALLEL_LENGTH: usize = 32;
+
 fn dot(left: &[Float], right: &[Float], precision: u32) -> Float {
-    let mut sum = zero(precision);
-    for (left, right) in left.iter().zip(right) {
+    let product = |(left, right): (&Float, &Float)| {
         let mut product = Float::with_val(precision, left);
         product *= right;
+        product
+    };
+    let products: Vec<Float> = if left.len().min(right.len()) >= PARALLEL_LENGTH {
+        left.par_iter().zip(right.par_iter()).map(product).collect()
+    } else {
+        left.iter().zip(right).map(product).collect()
+    };
+    let mut sum = zero(precision);
+    for product in products {
         sum += product;
     }
     sum
+}
+
+/// Apply `update` to every element, in parallel for long vectors.
+fn for_each_element(values: &mut [Float], update: impl Fn(usize, &mut Float) + Sync + Send) {
+    if values.len() >= PARALLEL_LENGTH {
+        values
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, value)| update(index, value));
+    } else {
+        for (index, value) in values.iter_mut().enumerate() {
+            update(index, value);
+        }
+    }
 }
 
 fn norm(vector: &[Float], precision: u32) -> Float {
@@ -148,18 +177,20 @@ fn add_orthonormal(candidate: &[Float], basis: &mut Vec<Vec<Float>>, precision: 
     if !original_norm.is_finite() || original_norm.is_zero() {
         return false;
     }
-    for value in &mut candidate {
+    for_each_element(&mut candidate, |_, value| {
         *value = Float::with_val(precision, &*value);
         *value /= &original_norm;
-    }
+    });
     for _ in 0..2 {
         for vector in basis.iter() {
             let projection = dot(vector, &candidate, precision);
-            for (value, basis_value) in candidate.iter_mut().zip(vector) {
-                let mut correction = basis_value.clone();
-                correction *= &projection;
-                *value -= correction;
-            }
+            for_each_element(&mut candidate, |index, value| {
+                if let Some(basis_value) = vector.get(index) {
+                    let mut correction = basis_value.clone();
+                    correction *= &projection;
+                    *value -= correction;
+                }
+            });
         }
     }
     let length = norm(&candidate, precision);
@@ -167,9 +198,7 @@ fn add_orthonormal(candidate: &[Float], basis: &mut Vec<Vec<Float>>, precision: 
     if !length.is_finite() || length <= threshold {
         return false;
     }
-    for value in &mut candidate {
-        *value /= &length;
-    }
+    for_each_element(&mut candidate, |_, value| *value /= &length);
     basis.push(candidate);
     true
 }
@@ -240,10 +269,112 @@ fn orthogonality_errors(states: &[RitzState], precision: u32) -> (Vec<Float>, Fl
     (errors, maximum)
 }
 
+/// Source-bound count taken before any Krylov work, around the target shift
+/// `s`, over the open window `(s - r, s + r)` with `r` a quarter of the
+/// configured boundary-cluster tolerance.
+#[derive(Clone, Debug)]
+pub enum KrylovClusterPreflightHp {
+    /// More eigenvalues than requested lie in the window, so no Krylov run
+    /// with this configuration can be accepted (see
+    /// [`ShiftInvertKrylovSolverHp::cluster_preflight`]).
+    Precluded { radius: Float, count: usize },
+    /// At most the requested number lie in the window; Krylov may succeed.
+    Admitted { radius: Float, count: usize },
+    /// The source count is unavailable at the window's endpoints.
+    Unavailable { radius: Float },
+}
+
+impl KrylovClusterPreflightHp {
+    pub fn precludes_acceptance(&self) -> bool {
+        matches!(self, Self::Precluded { .. })
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ShiftInvertKrylovSolverHp;
 
 impl ShiftInvertKrylovSolverHp {
+    /// Decide, from source-bound counts alone, whether a solve with `config`
+    /// is certain to end without an accepted (`Converged`) report.
+    ///
+    /// A report is `Converged` only with `Verified` boundary-count evidence
+    /// for exactly the requested number. That evidence requires the Ritz
+    /// target distances `dl <= dr` on either side of the boundary to differ
+    /// by more than the effective cluster tolerance, which is at least the
+    /// configured tolerance `t`; it then counts eigenvalues of this operator
+    /// in `(s - m, s + m)` with `m = (dl + dr) / 2 > t / 2`, up to roundings
+    /// of relative size `2^(1-p)`. That window contains `(s - t/4, s + t/4)`.
+    /// If this preflight counts more than the requested number there, the
+    /// solve's own count exceeds the request too, so its evidence is a count
+    /// mismatch or a cluster or unavailable, and the report is never
+    /// accepted. Both counts are exact counts of the same operator, so
+    /// `Precluded` is a certainty, not an estimate. `Admitted` and
+    /// `Unavailable` promise nothing about convergence.
+    pub fn cluster_preflight(
+        &self,
+        operator: &dyn SymmetricOperator<Float>,
+        config: &ShiftInvertKrylovConfigHp,
+    ) -> Result<KrylovClusterPreflightHp, SolverError> {
+        let p = config.precision_bits;
+        if !(33..=1_000_000).contains(&p) || config.requested_eigenpairs == 0 {
+            return Err(SolverError::InvalidConfiguration(
+                "Krylov cluster preflight requires a positive request and adequate precision"
+                    .into(),
+            ));
+        }
+        let shift = match &config.target {
+            EigenTarget::SmallestMagnitude => zero(p),
+            EigenTarget::ClosestTo { shift } => parse_finite(shift, p, "target shift")?,
+            _ => {
+                return Err(SolverError::UnsupportedTarget(
+                    "shift-invert Krylov supports SmallestMagnitude and ClosestTo only".to_owned(),
+                ))
+            }
+        };
+        // Rounded down, so the window never exceeds a quarter of the
+        // tolerance the solve parses (rounded up).
+        let mut radius = parse_positive(
+            &config.boundary_cluster_tolerance,
+            p,
+            "boundary cluster tolerance",
+        )?;
+        radius >>= 2;
+        // The solve rounds s - m and s + m to nearest; with a nonzero shift
+        // each rounding moves an endpoint by up to |s| 2^-p, which must stay
+        // well inside the margin m - r > r.
+        let mut rounding = shift.clone().abs();
+        rounding >>= p.saturating_sub(3);
+        if radius <= rounding {
+            return Ok(KrylovClusterPreflightHp::Unavailable { radius });
+        }
+        // Directed endpoints keep the counted window inside (s - r, s + r).
+        let lower = Float::with_val_round(p, &shift - &radius, rug::float::Round::Up).0;
+        let upper = Float::with_val_round(p, &shift + &radius, rug::float::Round::Down).0;
+        if lower >= upper {
+            return Ok(KrylovClusterPreflightHp::Unavailable { radius });
+        }
+        let (Some(below_lower), Some(below_upper)) = (
+            super::hp_boundary_count::inertia(operator, &lower, p)?,
+            super::hp_boundary_count::inertia(operator, &upper, p)?,
+        ) else {
+            return Ok(KrylovClusterPreflightHp::Unavailable { radius });
+        };
+        if below_lower.equal != 0 || below_upper.equal != 0 {
+            return Ok(KrylovClusterPreflightHp::Unavailable { radius });
+        }
+        let count = below_upper
+            .below
+            .checked_sub(below_lower.below)
+            .ok_or_else(|| {
+                SolverError::NumericalBreakdown("source inertia counts are not monotone".into())
+            })?;
+        Ok(if count > config.requested_eigenpairs {
+            KrylovClusterPreflightHp::Precluded { radius, count }
+        } else {
+            KrylovClusterPreflightHp::Admitted { radius, count }
+        })
+    }
+
     pub fn solve(
         &self,
         operator: &dyn SymmetricOperator<Float>,
@@ -283,6 +414,11 @@ impl ShiftInvertKrylovSolverHp {
         cancellation: &CancellationToken,
     ) -> Result<ShiftInvertKrylovReportHp, SolverError> {
         check_solver_cancellation(cancellation)?;
+        // Solves, products and updates below run on Rayon workers; MPFR
+        // exponent bounds are thread-local, so every worker must share the
+        // caller's before any parallel arithmetic.
+        xc_numerics::mpfr_interval::ensure_uniform_exponent_range()
+            .map_err(|error| SolverError::InvalidConfiguration(error.to_string()))?;
         let dimension = operator.dimension();
         let descriptor = shifted_solver.descriptor();
         descriptor.validate(config.precision_bits)?;
@@ -474,10 +610,21 @@ impl ShiftInvertKrylovSolverHp {
                 ));
             }
 
+            // The images are independent solves with one retained factorization.
+            // Run them concurrently, then consume them in basis order so the
+            // first error and every stored value match the serial loop.
+            let images = basis
+                .par_iter()
+                .map(|vector| {
+                    let mut image = vec![zero(config.precision_bits); dimension];
+                    shifted_solver
+                        .solve_shifted(vector, &mut image, config.precision_bits)
+                        .map(|()| image)
+                })
+                .collect::<Vec<_>>();
             let mut inverse_images = Vec::with_capacity(basis.len());
-            for vector in &basis {
-                let mut image = vec![zero(config.precision_bits); dimension];
-                shifted_solver.solve_shifted(vector, &mut image, config.precision_bits)?;
+            for image in images {
+                let image = image?;
                 shifted_solves += 1;
                 if image
                     .iter()
@@ -490,15 +637,22 @@ impl ShiftInvertKrylovSolverHp {
             let subspace_dimension = basis.len();
             let mut projected =
                 vec![zero(config.precision_bits); subspace_dimension * subspace_dimension];
-            for row in 0..subspace_dimension {
-                for column in 0..=row {
+            let entries = (0..subspace_dimension)
+                .flat_map(|row| (0..=row).map(move |column| (row, column)))
+                .collect::<Vec<_>>();
+            let values = entries
+                .par_iter()
+                .map(|&(row, column)| {
                     let mut value =
                         dot(&basis[row], &inverse_images[column], config.precision_bits);
                     value += dot(&basis[column], &inverse_images[row], config.precision_bits);
                     value /= 2u32;
-                    projected[row * subspace_dimension + column] = value.clone();
-                    projected[column * subspace_dimension + row] = value;
-                }
+                    value
+                })
+                .collect::<Vec<_>>();
+            for (&(row, column), value) in entries.iter().zip(values) {
+                projected[row * subspace_dimension + column] = value.clone();
+                projected[column * subspace_dimension + row] = value;
             }
             let (values, vectors) = symmetric_jacobi_eigensystem(
                 &projected,
@@ -521,14 +675,16 @@ impl ShiftInvertKrylovSolverHp {
             let mut states = Vec::with_capacity(retained);
             for index in selected {
                 let coefficients = &vectors[index];
+                // Each component accumulates its basis columns in column order,
+                // exactly as the column-major loop did.
                 let mut vector = vec![zero(config.precision_bits); dimension];
-                for column in 0..subspace_dimension {
-                    for row in 0..dimension {
+                for_each_element(&mut vector, |row, component| {
+                    for column in 0..subspace_dimension {
                         let mut contribution = basis[column][row].clone();
                         contribution *= &coefficients[column];
-                        vector[row] += contribution;
+                        *component += contribution;
                     }
-                }
+                });
                 let applied_vector = apply(operator, &vector, config.precision_bits)?;
                 operator_applications += 1;
                 let norm_squared = dot(&vector, &vector, config.precision_bits);
@@ -900,6 +1056,94 @@ mod tests {
             .unwrap();
         assert_eq!(report.status, ResultStatus::Converged);
         assert_eq!(report.retained_eigenpairs[0].eigenvalue, 1);
+    }
+
+    fn diagonal_from(precision: u32, values: &[&str]) -> Vec<Float> {
+        let n = values.len();
+        let mut matrix = vec![zero(precision); n * n];
+        for (index, value) in values.iter().enumerate() {
+            matrix[index * n + index] = Float::with_val(precision, Float::parse(value).unwrap());
+        }
+        matrix
+    }
+
+    fn preflight_and_solve(values: &[&str]) -> (KrylovClusterPreflightHp, ResultStatus) {
+        let precision = 192;
+        let matrix = diagonal_from(precision, values);
+        let operator = DenseSymmetricHp::new(
+            "preflight",
+            values.len(),
+            matrix.clone(),
+            precision,
+            &zero(precision),
+        )
+        .unwrap();
+        let factorization = DenseShiftInvertFactorizationHp::factor(
+            "zero-shift",
+            values.len(),
+            &matrix,
+            DecimalLiteral::new("0").unwrap(),
+            precision,
+        )
+        .unwrap();
+        let preflight = ShiftInvertKrylovSolverHp
+            .cluster_preflight(&operator, &config())
+            .unwrap();
+        let report = ShiftInvertKrylovSolverHp
+            .solve(&operator, &factorization, &config())
+            .unwrap();
+        (preflight, report.status)
+    }
+
+    #[test]
+    fn preflight_precludes_a_target_cluster_that_krylov_cannot_accept() {
+        // Two eigenvalues lie within a quarter of the 1e-20 cluster tolerance.
+        let (preflight, status) =
+            preflight_and_solve(&["1e-30", "-2e-30", "1", "4", "9", "12", "15", "20"]);
+        assert!(
+            matches!(
+                preflight,
+                KrylovClusterPreflightHp::Precluded { count: 2, .. }
+            ),
+            "{preflight:?}"
+        );
+        assert_ne!(status, ResultStatus::Converged);
+    }
+
+    #[test]
+    fn preflight_admits_a_separated_target_that_krylov_accepts() {
+        for values in [
+            ["-8", "-3", "1", "4", "9", "12", "15", "20"],
+            ["1e-30", "-3", "1", "4", "9", "12", "15", "20"],
+        ] {
+            let (preflight, status) = preflight_and_solve(&values);
+            assert!(!preflight.precludes_acceptance(), "{preflight:?}");
+            assert_eq!(status, ResultStatus::Converged);
+        }
+    }
+
+    #[test]
+    fn preflight_window_is_a_quarter_of_the_rounded_down_tolerance() {
+        let precision = 192;
+        // 3e-21 is outside a quarter of 1e-20 (2.5e-21); 2e-21 is inside.
+        for (second, precluded) in [("3e-21", false), ("2e-21", true)] {
+            let (preflight, _) =
+                preflight_and_solve(&["1e-30", second, "1", "4", "9", "12", "15", "20"]);
+            assert_eq!(preflight.precludes_acceptance(), precluded, "{preflight:?}");
+            let radius = match preflight {
+                KrylovClusterPreflightHp::Precluded { radius, .. }
+                | KrylovClusterPreflightHp::Admitted { radius, .. }
+                | KrylovClusterPreflightHp::Unavailable { radius } => radius,
+            };
+            let mut expected = Float::with_val_round(
+                precision,
+                Float::parse("1e-20").unwrap(),
+                rug::float::Round::Down,
+            )
+            .0;
+            expected >>= 2;
+            assert_eq!(radius, expected);
+        }
     }
 }
 

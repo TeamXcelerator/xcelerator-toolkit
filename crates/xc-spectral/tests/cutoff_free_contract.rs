@@ -140,7 +140,7 @@ fn high_precision_inertia_has_bounded_dyadic_pivots_and_portable_replay() {
     // this 9x9 case as successive Schur denominators grew uncontrollably.
     let matrix = assemble(&CutoffFreeConfig::new(100, 4, 9000)).unwrap();
     let certificate = matrix.portable_inertia_certificate().unwrap();
-    assert_eq!(certificate.schema_version, 2);
+    assert_eq!(certificate.schema_version, 4);
     assert_eq!(
         (
             certificate.positive,

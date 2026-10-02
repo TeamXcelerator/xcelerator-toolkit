@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use xc_cache::*;
 #[test]
 fn impossible_declared_payload_size_returns_error_instead_of_panicking() {
-    let v = ToolkitVersion::parse("0.15.1").unwrap();
+    let v = ToolkitVersion::parse("0.18.1").unwrap();
     let manifest = ArtifactManifest {
         schema_version: 1,
         key: ArtifactKey::new("test", "test", b"test").unwrap(),
@@ -23,9 +23,10 @@ fn impossible_declared_payload_size_returns_error_instead_of_panicking() {
         tags: BTreeMap::new(),
         provenance_digest: None,
     };
+    let scratch = xc_core::test_support::TestDir::new("unused-capacity");
     let store = FilesystemCacheStore::new(
         "capacity",
-        std::env::temp_dir().join("xc-unused-exhaustive-capacity"),
+        scratch.join("unused"),
         false,
         CacheVisibility::Local,
     );

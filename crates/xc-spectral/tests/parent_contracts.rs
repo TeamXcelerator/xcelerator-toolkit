@@ -46,21 +46,8 @@ fn off_axis_hp_small_component_matches_exact_rational_identity() {
 fn external_provider_honest_replies_pass_and_prefetched_replies_fail() {
     use std::{fs, process::Command};
     use xc_spectral::target::{TargetEvaluatorF64, TargetProfileSpec};
-    let mut random = [0_u8; 8];
-    getrandom::fill(&mut random).unwrap();
-    let root = std::env::temp_dir().join(format!(
-        "xc-protocol-regression-{}-{}",
-        std::process::id(),
-        u64::from_ne_bytes(random)
-    ));
-    fs::create_dir(&root).unwrap();
-    struct Cleanup(std::path::PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-    let _cleanup = Cleanup(root.clone());
+    let root_dir = xc_core::test_support::TestDir::new("protocol-regression");
+    let root = root_dir.to_path_buf();
     let source = root.join("provider.rs");
     fs::write(&source, r#"
 use std::io::{self,BufRead,Write};

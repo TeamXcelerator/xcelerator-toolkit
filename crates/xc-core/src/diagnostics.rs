@@ -131,18 +131,12 @@ impl FailureDiagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::test_support::TestDir;
 
     #[test]
     fn failure_diagnostic_persists_context_and_refuses_overwrite() {
-        let path = std::env::temp_dir().join(format!(
-            "xc-failure-{}-{}.json",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = TestDir::new("failure-diagnostic");
+        let path = dir.join("failure.json");
         let mut diagnostic = FailureDiagnostic::new(
             "certificate_verification",
             "verify finite CCM inertia",
@@ -168,7 +162,6 @@ mod tests {
             diagnostic.write_new(&path).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
-        std::fs::remove_file(path).unwrap();
     }
 }
 

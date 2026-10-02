@@ -670,7 +670,8 @@ mod tests {
             "example-org/restricted-registry",
             RepositoryPermission::Admin,
         );
-        let staging = std::env::temp_dir().join(format!("xc-rollover-{}", plan.digest().unwrap()));
+        let scratch = crate::test_support::TestDir::new("rollover");
+        let staging = scratch.join("staging");
         let outcome = execute_topology_rollover(
             &remote,
             &session,

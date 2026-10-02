@@ -18,8 +18,8 @@ fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
                 size_bytes: bytes.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -289,6 +289,42 @@ fn finite_reference_samples_and_jets_match_independent_defining_integrals() {
         }
     }
 }
+#[test]
+fn finite_reference_jets_are_identical_at_any_thread_count() {
+    let all = oracle();
+    for case in all["references"].as_array().unwrap() {
+        let c = case["cutoff"].as_str().unwrap();
+        let co: Vec<String> = case["coefficients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().into())
+            .collect();
+        let (s, m) = state(c, &["1".into()], 192);
+        let mut points: Vec<_> = case["jets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| Some(v["t"].as_str().unwrap().into()))
+            .collect();
+        // An absent root value is skipped in place.
+        points.insert(1, None);
+        let roots = roots(&s, &m, c, 0, 192, 192, &points);
+        let prep = preparation(c, 192, &co);
+        let prepared = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| serde_json::to_vec(&prep.prepare(&s, Some(&roots)).unwrap()).unwrap())
+        };
+        let serial = prepared(1);
+        for threads in [2, 4, 8] {
+            assert_eq!(prepared(threads), serial);
+        }
+    }
+}
+
 #[test]
 fn reference_and_root_aliases_keep_their_original_points() {
     let alias = "1.0000000000000000000000000000000000000001";

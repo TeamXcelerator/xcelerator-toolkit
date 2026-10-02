@@ -765,24 +765,12 @@ mod tests {
 
     #[test]
     fn write_new_is_atomic_and_refuses_overwrite() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-publication-export-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        if root.exists() {
-            fs::remove_dir_all(&root).unwrap();
-        }
-        fs::create_dir(&root).unwrap();
+        let root = crate::test_support::TestDir::new("publication-export");
         let destination = root.join("bundle");
         let bundle = table().export_bundle().unwrap();
         bundle.write_new(&destination).unwrap();
         assert_eq!(fs::read(destination.join("table.csv")).unwrap(), bundle.csv);
         assert!(bundle.write_new(&destination).is_err());
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

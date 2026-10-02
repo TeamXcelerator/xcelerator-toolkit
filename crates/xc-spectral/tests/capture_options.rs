@@ -11,14 +11,8 @@ use xc_spectral::ccm::{
 
 #[test]
 fn changing_sector_capture_request_must_not_silently_reuse_the_old_request() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-fresh-capture-options-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root_dir = xc_core::test_support::TestDir::new("fresh-capture-options");
+    let root = root_dir.to_path_buf();
     let resolver = CacheResolver::new(vec![CacheLayer {
         precedence: 0,
         store: Box::new(ZipJsonFilesystemCacheStore::new(
@@ -83,6 +77,72 @@ fn changing_sector_capture_request_must_not_silently_reuse_the_old_request() {
     );
     // Recomputing the requested route or rejecting a changed request is safe.
     // An Ok result carrying the original count and selected-only route is not.
+    // A real retained run invokes every new Ultra producer and persists all
+    // outcomes, including qualified absence, without another primary solve.
+    let plan = xc_spectral::ccm::capture::CcmCapturePlan::ultra(2, 17).unwrap();
+    let ids = xc_spectral::ccm::capture::FINITE_DIAGNOSTICS;
+    let source = run
+        .primary_sources()
+        .into_iter()
+        .find(|m| m.key.kind == "ccm_weil_eigenpair")
+        .unwrap();
+    let mut target = vec!["0"; 33];
+    target[16] = "2";
+    let input = serde_json::from_value(serde_json::json!({"schema_version":1,
+        "source_eigenpair":source.content_digest,"lambda_squared":"13","n_modes":16,
+        "precision_bits":cfg.precision_bits,"convention_id":"synthetic finite target",
+        "definition_digest":ContentDigest::sha256(b"finite capture target"),"approximation_scope":"finite coefficients",
+        "target":{"definition_digest":ContentDigest::sha256(b"target"),"evaluation_policy":"finite synthetic",
+            "approximation_scope":"finite coefficient test","intervals":8,"values":vec!["2";9],"basis_values":[],
+            "fixed_second_component":null,"raw_normalizer":"2","trial_coefficients":target}})).unwrap();
+    run.set_extended_research_inputs(input).unwrap();
+    let requested = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+    let result = capture_and_persist(
+        &plan,
+        requested.clone(),
+        |id| run.capture_diagnostic_outcome(id, &options, &cache),
+        &cache,
+    )
+    .unwrap();
+    assert!(result.produced_manifest.is_some());
+    assert_eq!(result.value.measurements.len(), ids.len());
+    for id in ids {
+        assert!(plan.receipt().unwrap().outcomes().contains_key(*id));
+        let measurement = &result.value.measurements[*id];
+        assert!(measurement.value_reference.is_some(), "{id}");
+        let value = measurement_value(measurement, &resolver, &policy).unwrap();
+        assert_eq!(value["data"]["diagnostic"], *id);
+        if *id == "normalization_error_bound" {
+            assert_eq!(value["data"]["outcome"], "computed");
+            assert!(value["data"]["result"]["squared_difference"].is_string());
+        }
+        if *id == "trial_vector_energy" {
+            assert_eq!(
+                value["data"]["result"]["trial_series"]["provenance"]["target_center_normalizer"],
+                "2"
+            );
+        }
+        assert!(value["source_dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["key"]["kind"] == "ccm_weil_eigenpair"));
+    }
+    // A supplied target gives constrained_l1_fit its automatic reference
+    // amplitude baseline, a certified finite enclosure.
+    assert_eq!(
+        result.value.coverage()["constrained_l1_fit"].outcome,
+        "certified_finite_enclosure"
+    );
+    let replay = capture_and_persist(
+        &plan,
+        requested,
+        |id| run.capture_diagnostic_outcome(id, &options, &cache),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(result.value, replay.value);
+    assert!(replay.reused_manifest.is_some());
     std::fs::remove_dir_all(&root).unwrap();
     if let Ok(changed) = changed {
         let spectra = changed

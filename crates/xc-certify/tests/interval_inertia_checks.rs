@@ -2,7 +2,8 @@
 #![cfg(feature = "hp")]
 use rug::Rational;
 use xc_certify::exact::{
-    interval_symmetric_ldlt_inertia, interval_symmetric_ldlt_inertia_mpfr, IntervalInertiaResult,
+    interval_symmetric_ldlt_inertia, interval_symmetric_ldlt_inertia_mpfr,
+    interval_symmetric_ldlt_inertia_mpfr_stable, IntervalInertiaResult,
 };
 use xc_numerics::interval::RationalInterval;
 
@@ -47,6 +48,8 @@ fn interval_inertia_matches_exact_quadratic_signs_on_independent_family_members(
                         interval_symmetric_ldlt_inertia(&intervals, 2).unwrap(),
                         interval_symmetric_ldlt_inertia_mpfr(&intervals, 2, 32).unwrap(),
                         interval_symmetric_ldlt_inertia_mpfr(&intervals, 2, 127).unwrap(),
+                        interval_symmetric_ldlt_inertia_mpfr_stable(&intervals, 2, 32).unwrap(),
+                        interval_symmetric_ldlt_inertia_mpfr_stable(&intervals, 2, 127).unwrap(),
                     ];
                     for report in reports {
                         if let IntervalInertiaResult::Conclusive {

@@ -314,22 +314,56 @@ pub struct PortableIntervalInertiaCertificate {
 
 impl PortableIntervalInertiaCertificate {
     pub fn computed_matrix_digest(&self) -> Result<ContentDigest, CertificateError> {
-        let bytes =
-            serde_json::to_vec(&(self.dimension, &self.matrix_row_major)).map_err(|error| {
-                CertificateError::Invalid(format!("failed to serialize interval matrix: {error}"))
-            })?;
-        Ok(ContentDigest(sha256_hex(&bytes)))
+        ContentDigest::sha256_json(&(self.dimension, &self.matrix_row_major)).map_err(|error| {
+            CertificateError::Invalid(format!("failed to serialize interval matrix: {error}"))
+        })
     }
 
+    /// Digest of the certificate serialized with a zero identifier. A borrowed
+    /// view with the same fields in the same order serializes to the same
+    /// bytes, so the matrix is neither cloned nor buffered.
     pub fn computed_certificate_id(&self) -> Result<ContentDigest, CertificateError> {
-        let mut canonical = self.clone();
-        canonical.certificate_id = ContentDigest("00".repeat(32));
-        let bytes = serde_json::to_vec(&canonical).map_err(|error| {
+        #[derive(Serialize)]
+        struct Canonical<'a> {
+            schema_version: u32,
+            certificate_id: &'a ContentDigest,
+            toolkit_version: &'a ToolkitVersion,
+            configuration: &'a BTreeMap<String, String>,
+            dimension: usize,
+            precision_bits: u32,
+            scalar_backend: &'a str,
+            matrix_digest: &'a ContentDigest,
+            assembly_evidence_digest: &'a ContentDigest,
+            matrix_row_major: &'a [ExactRationalIntervalRecord],
+            positive: usize,
+            negative: usize,
+            zero_or_unresolved: usize,
+            pivot_enclosures: &'a [ExactRationalIntervalRecord],
+            notes: &'a [String],
+        }
+        let zero = ContentDigest("00".repeat(32));
+        ContentDigest::sha256_json(&Canonical {
+            schema_version: self.schema_version,
+            certificate_id: &zero,
+            toolkit_version: &self.toolkit_version,
+            configuration: &self.configuration,
+            dimension: self.dimension,
+            precision_bits: self.precision_bits,
+            scalar_backend: &self.scalar_backend,
+            matrix_digest: &self.matrix_digest,
+            assembly_evidence_digest: &self.assembly_evidence_digest,
+            matrix_row_major: &self.matrix_row_major,
+            positive: self.positive,
+            negative: self.negative,
+            zero_or_unresolved: self.zero_or_unresolved,
+            pivot_enclosures: &self.pivot_enclosures,
+            notes: &self.notes,
+        })
+        .map_err(|error| {
             CertificateError::Invalid(format!(
                 "failed to serialize portable inertia certificate: {error}"
             ))
-        })?;
-        Ok(ContentDigest(sha256_hex(&bytes)))
+        })
     }
 
     pub fn refresh_certificate_id(&mut self) -> Result<(), CertificateError> {
@@ -338,7 +372,7 @@ impl PortableIntervalInertiaCertificate {
     }
 
     pub fn validate_structure(&self) -> Result<(), CertificateError> {
-        if !matches!(self.schema_version, 1..=3)
+        if !matches!(self.schema_version, 1..=4)
             || self.dimension == 0
             || self.matrix_row_major.len() != self.dimension.saturating_mul(self.dimension)
         {
@@ -347,7 +381,7 @@ impl PortableIntervalInertiaCertificate {
             ));
         }
         if self.precision_bits < 32
-            || (self.schema_version == 2 && self.precision_bits > 1_000_000)
+            || (matches!(self.schema_version, 2 | 4) && self.precision_bits > 1_000_000)
             || self.scalar_backend.trim().is_empty()
             || self.configuration.is_empty()
         {
@@ -922,6 +956,33 @@ pub mod exact {
         )
     }
 
+    /// Build a schema-4 proof with outward MPFR Schur updates at the declared
+    /// precision, eliminating the largest rigorously separated diagonal pivot
+    /// (`interval_symmetric_ldlt_inertia_mpfr_stable`). Replay repeats the same
+    /// deterministic pivot choices. Schema 2 remains for replay of existing
+    /// certificates; its first-signed order can leave a positive definite
+    /// matrix unresolved once Schur widths grow past later pivots.
+    pub fn build_portable_interval_inertia_certificate_mpfr_stable(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        precision_bits: u32,
+        scalar_backend: impl Into<String>,
+        assembly_evidence_digest: ContentDigest,
+        configuration: std::collections::BTreeMap<String, String>,
+        notes: Vec<String>,
+    ) -> Result<PortableIntervalInertiaCertificate, CertificateError> {
+        build_portable_interval_inertia_with_schema(
+            matrix,
+            dimension,
+            precision_bits,
+            scalar_backend,
+            assembly_evidence_digest,
+            configuration,
+            notes,
+            4,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_portable_interval_inertia_with_schema(
         matrix: &[RationalInterval],
@@ -942,6 +1003,7 @@ pub mod exact {
             1 => interval_symmetric_ldlt_inertia_impl(matrix, dimension, false)?,
             3 => interval_symmetric_ldlt_inertia(matrix, dimension)?,
             2 => interval_symmetric_ldlt_inertia_mpfr(matrix, dimension, precision_bits)?,
+            4 => interval_symmetric_ldlt_inertia_mpfr_stable(matrix, dimension, precision_bits)?,
             _ => {
                 return Err(CertificateError::Invalid(
                     "unsupported inertia schema".into(),
@@ -1005,6 +1067,11 @@ pub mod exact {
             )?,
             3 => interval_symmetric_ldlt_inertia(&matrix, certificate.dimension)?,
             2 => interval_symmetric_ldlt_inertia_mpfr(
+                &matrix,
+                certificate.dimension,
+                certificate.precision_bits,
+            )?,
+            4 => interval_symmetric_ldlt_inertia_mpfr_stable(
                 &matrix,
                 certificate.dimension,
                 certificate.precision_bits,
@@ -1239,6 +1306,23 @@ pub mod exact {
         super::interval_inertia::inertia(matrix, dimension, precision_bits).map_err(|error| {
             CertificateError::VerificationFailed(format!("MPFR interval inertia: {error}"))
         })
+    }
+
+    /// Directed interval inertia choosing the largest rigorously separated
+    /// diagonal pivot. The historical MPFR route above remains unchanged for
+    /// replay of existing portable certificates.
+    pub fn interval_symmetric_ldlt_inertia_mpfr_stable(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        precision_bits: u32,
+    ) -> Result<IntervalInertiaResult, CertificateError> {
+        super::interval_inertia::inertia_stable(matrix, dimension, precision_bits).map_err(
+            |error| {
+                CertificateError::VerificationFailed(format!(
+                    "MPFR stable interval inertia: {error}"
+                ))
+            },
+        )
     }
 
     /// Rigorous interval LDL^T inertia with deterministic symmetric 1x1

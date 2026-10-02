@@ -38,14 +38,14 @@ pub(super) fn prepare(
     let target = crate::target::hp::TargetEvaluator::from_spec(spec, p)?;
     let cutoff = scalar(&state.cutoff, p)?;
     target.validate_lambda(&cutoff.clone().sqrt())?;
-    let l = cutoff.ln();
+    let l = cutoff.clone().ln();
     let definition = ContentDigest(spec.digest()?);
+    let workers = sample_workers(spec, intervals + 1)?;
+    let values = sample_values(&target, spec, p, &cutoff, &l, intervals, workers)?;
     let mut samples = Vec::with_capacity(intervals + 1);
     let mut fine = vec![Float::with_val(p, 0); state.modes + 1];
     let mut coarse = fine.clone();
-    for j in 0..=intervals {
-        let x = Float::with_val(p, &l) * j / (2 * intervals);
-        let value = target.try_value(&x.exp())?;
+    for (j, value) in values.into_iter().enumerate() {
         let angle = Float::with_val(p, Constant::Pi) * (Float::with_val(p, j) / intervals + 1u32);
         let cosine = angle.cos();
         let mut previous = Float::with_val(p, 1);
@@ -121,14 +121,174 @@ pub(super) fn prepare(
     });
     input.validate()?;
     if let Err(e) = store.save("reference", &(&reference, &input)) {
-        eprintln!("target research checkpoint unavailable: {e}");
+        xc_core::progress_message!("target research checkpoint unavailable: {e}");
     }
     Ok((reference, input))
+}
+
+/// Largest default number of concurrent provider processes.
+const MAXIMUM_DEFAULT_SAMPLE_WORKERS: usize = 64;
+
+/// Provider processes used for sampling. A provider is evaluated concurrently
+/// only when declared pure (`XC_TARGET_PROVIDER_PURE=1`): each value is then
+/// the same function of its point in every process. The default is the Rayon
+/// worker count, capped at 64; `XC_TARGET_PROVIDER_WORKERS` sets it
+/// explicitly (1..=256).
+pub(crate) fn sample_workers(
+    spec: &crate::target::TargetProfileSpec,
+    points: usize,
+) -> Result<usize> {
+    if spec.external_profile.is_none() || !crate::target::provider_declared_pure()? {
+        return Ok(1);
+    }
+    let workers = match std::env::var("XC_TARGET_PROVIDER_WORKERS") {
+        Ok(value) => {
+            let workers = value
+                .parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("XC_TARGET_PROVIDER_WORKERS must be an integer"))?;
+            ensure!(
+                (1..=256).contains(&workers),
+                "XC_TARGET_PROVIDER_WORKERS must be between 1 and 256"
+            );
+            workers
+        }
+        Err(std::env::VarError::NotPresent) => {
+            rayon::current_num_threads().clamp(1, MAXIMUM_DEFAULT_SAMPLE_WORKERS)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(workers.min(points))
+}
+
+/// Target values at `x_j = j*log(cutoff)/(2*intervals)`, `j=0..=intervals`,
+/// in index order (see [`target_values_at`]).
+fn sample_values(
+    target: &crate::target::hp::TargetEvaluator,
+    spec: &crate::target::TargetProfileSpec,
+    p: u32,
+    cutoff: &Float,
+    l: &Float,
+    intervals: usize,
+    workers: usize,
+) -> Result<Vec<Float>> {
+    let points = (0..=intervals)
+        .map(|j| (Float::with_val(p, l) * j / (2 * intervals)).exp())
+        .collect::<Vec<_>>();
+    target_values_at(target, spec, p, &cutoff.clone().sqrt(), &points, workers)
+}
+
+/// Target values at `points`, in order. With several workers, each evaluates
+/// one contiguous range of points through its own provider process. The
+/// values, and the sums a caller forms from them in point order, are identical
+/// to sequential evaluation; an error is reported for the lowest failing point,
+/// as sequentially.
+pub(crate) fn target_values_at(
+    target: &crate::target::hp::TargetEvaluator,
+    spec: &crate::target::TargetProfileSpec,
+    p: u32,
+    lambda: &Float,
+    points: &[Float],
+    workers: usize,
+) -> Result<Vec<Float>> {
+    if workers <= 1 || points.len() <= 1 {
+        return points.iter().map(|u| target.try_value(u)).collect();
+    }
+    let chunk = points.len().div_ceil(workers);
+    let parts = std::thread::scope(|scope| {
+        let handles = points
+            .chunks(chunk)
+            .map(|part| {
+                scope.spawn(move || -> Result<Vec<Float>> {
+                    let worker = crate::target::hp::TargetEvaluator::from_spec(spec, p)?;
+                    worker.validate_lambda(lambda)?;
+                    part.iter().map(|u| worker.try_value(u)).collect()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("target sampling worker panicked")))
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut values = Vec::with_capacity(points.len());
+    for part in parts {
+        values.extend(part?);
+    }
+    Ok(values)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_pure_provider_sampling_equals_sequential_sampling() {
+        use std::{fs, process::Command};
+        let root_dir = xc_core::test_support::TestDir::new("parallel-target-samples");
+        let root = root_dir.to_path_buf();
+        let source = root.join("provider.rs");
+        // Replies with the requested point itself: distinct, deterministic values.
+        fs::write(&source, r#"
+use std::io::{self,BufRead,Write};
+fn field<'a>(line:&'a str,name:&str)->Option<&'a str>{
+ let marker=format!("\"{}\":",name);
+ Some(line.split_once(&marker)?.1.split([',','}']).next().unwrap())
+}
+fn main(){
+ for line in io::stdin().lock().lines(){
+  let line=line.unwrap();
+  let id=field(&line,"request_id").unwrap();let nonce=field(&line,"request_nonce").unwrap();
+  let operation=field(&line,"operation").unwrap();let bits=field(&line,"precision_bits").unwrap();
+  let value=field(&line,"u").unwrap_or("\"1\"");
+  println!("{{\"protocol_version\":2,\"request_id\":{id},\"request_nonce\":{nonce},\"operation\":{operation},\"precision_bits\":{bits},\"ready\":true,\"value\":{value}}}");
+  io::stdout().flush().unwrap();
+ }
+}
+"#).unwrap();
+        let executable = root.join("provider");
+        let output = Command::new("rustc")
+            .arg("--edition=2021")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let digest = ContentDigest::sha256(&fs::read(&executable).unwrap()).0;
+        let previous = std::env::var_os("XC_TARGET_PROVIDER_EXECUTABLE");
+        std::env::set_var("XC_TARGET_PROVIDER_EXECUTABLE", &executable);
+        let spec = crate::target::TargetProfileSpec::from_json(
+            &serde_json::to_vec(&serde_json::json!({
+                "schema_version":3,"profile_id":"parallel-samples","external_profile":{
+                    "lambda_squared":"13","evaluation_precision_bits":320,"provider_sha256":digest,"input":{}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let p = 256;
+        let cutoff = Float::with_val(p, 13);
+        let l = cutoff.clone().ln();
+        let target = crate::target::hp::TargetEvaluator::from_spec(&spec, p).unwrap();
+        let sequential = sample_values(&target, &spec, p, &cutoff, &l, 64, 1);
+        let concurrent = sample_values(&target, &spec, p, &cutoff, &l, 64, 7);
+        match previous {
+            Some(value) => std::env::set_var("XC_TARGET_PROVIDER_EXECUTABLE", value),
+            None => std::env::remove_var("XC_TARGET_PROVIDER_EXECUTABLE"),
+        }
+        let (sequential, concurrent) = (sequential.unwrap(), concurrent.unwrap());
+        assert_eq!(sequential.len(), 65);
+        assert_eq!(sequential, concurrent);
+        assert!(sequential.windows(2).all(|pair| pair[0] < pair[1]));
+    }
     #[test]
     fn supplied_target_preparation_preserves_identity_and_does_not_invent_tail_inputs() {
         use crate::target::{GaussianPolynomialSeriesSpec, ScalarScaleSpec, TargetProfileSpec};
@@ -152,8 +312,8 @@ mod tests {
             "schema_version":1,"key":xc_cache::ArtifactKey::new("ccm_weil_eigenpair","test",b"test").unwrap(),
             "content_digest":digest,"size_bytes":12,
             "objects":[{"content_digest":digest,"size_bytes":12}],"created_unix_seconds":1,
-            "producer_toolkit_version":xc_cache::ToolkitVersion::parse("0.15.1").unwrap(),
-            "minimum_reader_version":xc_cache::ToolkitVersion::parse("0.15.1").unwrap(),
+            "producer_toolkit_version":xc_cache::ToolkitVersion::parse("0.16.0").unwrap(),
+            "minimum_reader_version":xc_cache::ToolkitVersion::parse("0.16.0").unwrap(),
             "maximum_reader_version":null,"quality":"validated","visibility":"private",
             "immutable":true,"dependencies":[],"tags":{},"provenance_digest":null
         })).unwrap();

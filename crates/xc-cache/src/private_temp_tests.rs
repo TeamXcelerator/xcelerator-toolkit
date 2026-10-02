@@ -4,7 +4,6 @@ use std::sync::{Arc, Barrier};
 #[test]
 fn private_staging_keeps_two_open_writers_isolated() {
     let root = crate::test_support::temporary_root("private-two-open-writers");
-    fs::create_dir_all(&root).unwrap();
     let (first_path, mut first) = create_private_sibling_file(&root, "tmp").unwrap();
     let (second_path, mut second) = create_private_sibling_file(&root, "tmp").unwrap();
     assert_ne!(first_path, second_path);
@@ -27,7 +26,6 @@ fn private_staging_keeps_two_open_writers_isolated() {
 #[test]
 fn concurrent_atomic_writes_keep_each_canonical_payload() {
     let root = crate::test_support::temporary_root("private-concurrent-atomic-writes");
-    fs::create_dir_all(&root).unwrap();
     let barrier = Arc::new(Barrier::new(8));
     std::thread::scope(|scope| {
         for worker in 0..8u8 {
@@ -57,7 +55,6 @@ fn concurrent_atomic_writes_keep_each_canonical_payload() {
 #[test]
 fn concurrent_atomic_replacements_use_private_staging() {
     let root = crate::test_support::temporary_root("private-concurrent-atomic-replaces");
-    fs::create_dir_all(&root).unwrap();
     let barrier = Arc::new(Barrier::new(8));
     std::thread::scope(|scope| {
         for worker in 0..8u8 {
@@ -86,7 +83,6 @@ fn concurrent_atomic_replacements_use_private_staging() {
 #[test]
 fn invalid_staging_parent_preserves_existing_bytes() {
     let root = crate::test_support::temporary_root("private-invalid-staging-parent");
-    fs::create_dir_all(&root).unwrap();
     let blocker = root.join("file");
     fs::write(&blocker, b"sentinel").unwrap();
     assert!(create_private_sibling_file(&blocker, "tmp").is_err());
@@ -100,7 +96,6 @@ fn invalid_staging_parent_preserves_existing_bytes() {
 #[test]
 fn concurrent_encoded_adoption_reserves_distinct_owned_links() {
     let root = crate::test_support::temporary_root("private-concurrent-adoption");
-    fs::create_dir_all(&root).unwrap();
     let source = root.join("source");
     fs::write(&source, b"verified bytes").unwrap();
     let barrier = Arc::new(Barrier::new(16));
@@ -135,7 +130,6 @@ fn concurrent_encoded_adoption_reserves_distinct_owned_links() {
 #[test]
 fn failed_encoded_staging_does_not_remove_other_owned_files() {
     let root = crate::test_support::temporary_root("private-failed-adoption");
-    fs::create_dir_all(&root).unwrap();
     let source = root.join("source");
     fs::write(&source, b"sentinel").unwrap();
     let owned = stage_encoded_object(&source, &root).unwrap();

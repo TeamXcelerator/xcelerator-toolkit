@@ -13,13 +13,21 @@ use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const GITHUB_API_ORIGIN: &str = "https://api.github.com";
 const GITHUB_CREDENTIAL_HOST: &str = "github.com";
 const GITHUB_TOKEN_ENV: &str = "GITHUB_TOKEN";
 const GH_TOKEN_ENV: &str = "GH_TOKEN";
 const PROVIDER_ID: &str = "git-credential+github-api-curl-v1";
+/// Retries after the first API attempt; a retry starts only while
+/// [`GITHUB_API_RETRY_WINDOW`] has not elapsed since the first attempt began.
+const GITHUB_API_RETRIES: u32 = 4;
+const GITHUB_API_RETRY_WINDOW: Duration = Duration::from_secs(120);
+/// Marks curl's status trailer after the response body (`--write-out`).
+const GITHUB_API_STATUS_MARKER: &str = "\nxc-github-api-status:";
+/// GitHub's minimum wait after a rate-limit response that states no time.
+const GITHUB_RATE_LIMIT_MINIMUM_WAIT: Duration = Duration::from_secs(60);
 pub const AUTHORITY_PROBE_MAX_AGE_SECONDS: u64 = 300;
 pub const STALE_AUTHORITY_PROBE_MESSAGE: &str =
     "GitHub permission probe is stale and must be repeated before mutation";
@@ -238,6 +246,8 @@ impl AuthenticatedGitHubSession {
 pub struct GitHubCredentialApiProbe {
     git_executable: OsString,
     curl_executable: OsString,
+    /// First backoff delay between API attempts; doubles per retry.
+    retry_delay: Duration,
 }
 
 impl Default for GitHubCredentialApiProbe {
@@ -245,6 +255,7 @@ impl Default for GitHubCredentialApiProbe {
         Self {
             git_executable: OsString::from("git"),
             curl_executable: OsString::from(if cfg!(windows) { "curl.exe" } else { "curl" }),
+            retry_delay: Duration::from_secs(1),
         }
     }
 }
@@ -382,6 +393,11 @@ impl GitHubCredentialApiProbe {
         parse_git_credential(&output.stdout)
     }
 
+    /// A read-only GitHub API GET. Each attempt is a separate curl process with
+    /// its own captured output, so only the final response is decoded.
+    /// Transport failures, HTTP 408, 429, 500, 502, 503 and 504, and 403 rate
+    /// limits are retried with exponential backoff (or the server's stated
+    /// wait); other HTTP errors fail at once.
     fn github_get(&self, path: &str, secret: &str) -> Result<Value, CacheError> {
         if !path.starts_with('/') || path.contains(['\r', '\n']) {
             return Err(CacheError::InvalidManifest(
@@ -397,6 +413,38 @@ impl GitHubCredentialApiProbe {
                 "credential provider returned an unsupported secret format".to_owned(),
             ));
         }
+        let started = Instant::now();
+        let mut delay = self.retry_delay;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let failure = match self.github_get_once(path, secret)? {
+                ApiAttempt::Response(value) => return Ok(value),
+                ApiAttempt::Retry { reason, wait } => {
+                    let wait = wait.unwrap_or(delay);
+                    if attempts <= GITHUB_API_RETRIES
+                        && started.elapsed() + wait <= GITHUB_API_RETRY_WINDOW
+                    {
+                        std::thread::sleep(wait);
+                        delay = delay.saturating_mul(2);
+                        continue;
+                    }
+                    reason
+                }
+                ApiAttempt::Fail(reason) => reason,
+            };
+            let tries = if attempts == 1 {
+                "1 attempt".to_owned()
+            } else {
+                format!("{attempts} attempts")
+            };
+            return Err(CacheError::Authentication(format!(
+                "GitHub API authentication or permission probe failed for {path} ({failure}; {tries})"
+            )));
+        }
+    }
+
+    fn github_get_once(&self, path: &str, secret: &str) -> Result<ApiAttempt, CacheError> {
         let config = format!(
             concat!(
                 "url = \"{GITHUB_API_ORIGIN}{path}\"\n",
@@ -404,7 +452,7 @@ impl GitHubCredentialApiProbe {
                 "header = \"Accept: application/vnd.github+json\"\n",
                 "header = \"Authorization: Bearer {secret}\"\n",
                 "header = \"X-GitHub-Api-Version: 2022-11-28\"\n",
-                "silent\nshow-error\nfail-with-body\n"
+                "silent\nshow-error\n"
             ),
             GITHUB_API_ORIGIN = GITHUB_API_ORIGIN,
             path = path,
@@ -422,22 +470,119 @@ impl GitHubCredentialApiProbe {
                 OsString::from("30"),
                 OsString::from("--max-filesize"),
                 OsString::from("1048576"),
+                OsString::from("--write-out"),
+                OsString::from(format!(
+                    "{GITHUB_API_STATUS_MARKER}%{{http_code}} %header{{retry-after}}|%header{{x-ratelimit-remaining}}|%header{{x-ratelimit-reset}}\n"
+                )),
                 OsString::from("--config"),
                 OsString::from("-"),
             ],
             config.as_bytes(),
             &[],
         )?;
-        if !output.status.success() {
-            return Err(CacheError::Authentication(format!(
-                "GitHub API authentication or permission probe failed for {path}"
-            )));
+        Ok(classify_api_attempt(
+            output.status.code(),
+            &output.stdout,
+            path,
+            SystemTime::now(),
+        ))
+    }
+}
+
+/// One GitHub API attempt's outcome.
+#[derive(Debug)]
+enum ApiAttempt {
+    Response(Value),
+    /// A transient failure; `wait` is the server's stated delay, if any.
+    Retry {
+        reason: String,
+        wait: Option<Duration>,
+    },
+    Fail(String),
+}
+
+fn classify_api_attempt(
+    exit: Option<i32>,
+    stdout: &[u8],
+    path: &str,
+    now: SystemTime,
+) -> ApiAttempt {
+    match exit {
+        Some(0) => {}
+        // Resolve, connect, timeout, TLS, empty reply, send and receive
+        // failures, partial transfers and HTTP/2 stream errors.
+        Some(code @ (5 | 6 | 7 | 16 | 18 | 28 | 35 | 52 | 55 | 56 | 92)) => {
+            return ApiAttempt::Retry {
+                reason: format!("curl exit {code}"),
+                wait: None,
+            };
         }
-        serde_json::from_slice(&output.stdout).map_err(|_| {
-            CacheError::Authentication(format!(
-                "GitHub API returned an invalid permission response for {path}"
-            ))
-        })
+        Some(code) => return ApiAttempt::Fail(format!("curl exit {code}")),
+        None => return ApiAttempt::Fail("curl terminated without exit code".to_owned()),
+    }
+    let marker = GITHUB_API_STATUS_MARKER.as_bytes();
+    let Some(split) = stdout
+        .windows(marker.len())
+        .rposition(|window| window == marker)
+    else {
+        return ApiAttempt::Fail("curl reported no HTTP status".to_owned());
+    };
+    let (body, trailer) = (&stdout[..split], &stdout[split + marker.len()..]);
+    let trailer = String::from_utf8_lossy(trailer);
+    let (status, headers) = trailer
+        .trim_end()
+        .split_once(' ')
+        .unwrap_or((trailer.trim_end(), ""));
+    let mut headers = headers.split('|').map(str::trim);
+    let (retry_after, remaining, reset) = (
+        headers.next().and_then(|v| v.parse::<u64>().ok()),
+        headers.next().unwrap_or(""),
+        headers.next().and_then(|v| v.parse::<u64>().ok()),
+    );
+    let Ok(status) = status.parse::<u16>() else {
+        return ApiAttempt::Fail("curl reported no HTTP status".to_owned());
+    };
+    match status {
+        200..=299 => match serde_json::from_slice(body) {
+            Ok(value) => ApiAttempt::Response(value),
+            Err(_) => ApiAttempt::Fail(format!("invalid JSON response for {path}")),
+        },
+        408 | 500 | 502 | 503 | 504 => ApiAttempt::Retry {
+            reason: format!("HTTP {status}"),
+            wait: retry_after.map(Duration::from_secs),
+        },
+        // GitHub signals primary and secondary rate limits with 429, or with
+        // 403 and these headers or a rate-limit message; any other 403 is a
+        // denial. Its rules: honor Retry-After; with no requests remaining,
+        // wait for the reset; otherwise wait at least a minute.
+        429 | 403
+            if status == 429
+                || retry_after.is_some()
+                || remaining == "0"
+                || String::from_utf8_lossy(body)
+                    .to_ascii_lowercase()
+                    .contains("rate limit") =>
+        {
+            let reset = reset.filter(|_| remaining == "0");
+            let (wait, until) = match (retry_after, reset) {
+                (Some(seconds), _) => (Duration::from_secs(seconds), String::new()),
+                (None, Some(reset)) => {
+                    let now = now
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |elapsed| elapsed.as_secs());
+                    (
+                        Duration::from_secs(reset.saturating_sub(now)),
+                        format!(" until {reset}"),
+                    )
+                }
+                (None, None) => (GITHUB_RATE_LIMIT_MINIMUM_WAIT, String::new()),
+            };
+            ApiAttempt::Retry {
+                reason: format!("HTTP {status} rate limited{until}"),
+                wait: Some(wait),
+            }
+        }
+        _ => ApiAttempt::Fail(format!("HTTP {status}")),
     }
 }
 
@@ -707,5 +852,265 @@ mod tests {
         assert!(session
             .requires_refresh(AUTHORITY_PROBE_MAX_AGE_SECONDS)
             .unwrap());
+    }
+
+    /// curl's per-attempt output: the body, then the status trailer.
+    fn response(
+        body: &str,
+        status: &str,
+        retry_after: &str,
+        remaining: &str,
+        reset: &str,
+    ) -> String {
+        format!("{body}{GITHUB_API_STATUS_MARKER}{status} {retry_after}|{remaining}|{reset}\n")
+    }
+
+    #[test]
+    fn api_attempts_classify_status_rate_limits_and_transport_failures() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let ok = response(r#"{"login":"owner"}"#, "200", "", "4999", "2000");
+        assert!(matches!(
+            classify_api_attempt(Some(0), ok.as_bytes(), "/user", now),
+            ApiAttempt::Response(value) if value["login"] == "owner"
+        ));
+        for status in ["408", "500", "502", "503", "504"] {
+            let failed = response(r#"{"message":"temporary"}"#, status, "", "", "");
+            assert!(matches!(
+                classify_api_attempt(Some(0), failed.as_bytes(), "/user", now),
+                ApiAttempt::Retry { wait: None, .. }
+            ));
+        }
+        let limited = response(r#"{"message":"rate"}"#, "403", "", "0", "1030");
+        assert!(matches!(
+            classify_api_attempt(Some(0), limited.as_bytes(), "/user", now),
+            ApiAttempt::Retry { wait: Some(wait), .. } if wait == Duration::from_secs(30)
+        ));
+        let secondary = response(r#"{"message":"slow down"}"#, "403", "7", "12", "");
+        assert!(matches!(
+            classify_api_attempt(Some(0), secondary.as_bytes(), "/user", now),
+            ApiAttempt::Retry { wait: Some(wait), .. } if wait == Duration::from_secs(7)
+        ));
+        // 429 and marked 403s follow GitHub's rate-limit waits.
+        for status in ["429", "403"] {
+            let until_reset = response(r#"{"message":"limit"}"#, status, "", "0", "1030");
+            assert!(matches!(
+                classify_api_attempt(Some(0), until_reset.as_bytes(), "/user", now),
+                ApiAttempt::Retry { wait: Some(wait), reason }
+                    if wait == Duration::from_secs(30) && reason == format!("HTTP {status} rate limited until 1030")
+            ));
+            let stated = response(r#"{"message":"limit"}"#, status, "7", "0", "1030");
+            assert!(matches!(
+                classify_api_attempt(Some(0), stated.as_bytes(), "/user", now),
+                ApiAttempt::Retry { wait: Some(wait), .. } if wait == Duration::from_secs(7)
+            ));
+        }
+        for (status, message) in [
+            ("429", "too many"),
+            ("403", "You have exceeded a secondary rate limit"),
+        ] {
+            let untimed = response(
+                &format!(r#"{{"message":"{message}"}}"#),
+                status,
+                "",
+                "12",
+                "1030",
+            );
+            assert!(matches!(
+                classify_api_attempt(Some(0), untimed.as_bytes(), "/user", now),
+                ApiAttempt::Retry { wait: Some(wait), .. } if wait == GITHUB_RATE_LIMIT_MINIMUM_WAIT
+            ));
+        }
+        for status in ["401", "403", "404"] {
+            let denied = response(r#"{"message":"no"}"#, status, "", "4999", "2000");
+            assert!(matches!(
+                classify_api_attempt(Some(0), denied.as_bytes(), "/user", now),
+                ApiAttempt::Fail(reason) if reason == format!("HTTP {status}")
+            ));
+        }
+        for code in [6, 7, 28, 35, 56] {
+            assert!(matches!(
+                classify_api_attempt(Some(code), br#"{"log"#, "/user", now),
+                ApiAttempt::Retry { .. }
+            ));
+        }
+        assert!(matches!(
+            classify_api_attempt(Some(63), b"", "/user", now),
+            ApiAttempt::Fail(reason) if reason == "curl exit 63"
+        ));
+        assert!(matches!(
+            classify_api_attempt(Some(0), b"no trailer", "/user", now),
+            ApiAttempt::Fail(_)
+        ));
+    }
+
+    /// A fake curl that serves the next scripted response per process, as
+    /// real curl output arrives per attempt.
+    #[cfg(unix)]
+    fn scripted_curl(
+        label: &str,
+        attempts: &[(String, i32)],
+    ) -> (crate::test_support::TestDir, GitHubCredentialApiProbe) {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = crate::test_support::TestDir::new(label);
+        for (index, (output, exit)) in attempts.iter().enumerate() {
+            std::fs::write(scratch.join(format!("out.{}", index + 1)), output).unwrap();
+            std::fs::write(
+                scratch.join(format!("exit.{}", index + 1)),
+                exit.to_string(),
+            )
+            .unwrap();
+        }
+        let curl = scratch.join("curl");
+        std::fs::write(
+            &curl,
+            concat!(
+                "#!/bin/sh\n[ -n \"$XC_FAKE_CURL_READY\" ] && exit 0\n",
+                "cat > /dev/null\nd=$(dirname \"$0\")\n",
+                "n=$(( $(cat \"$d/count\" 2>/dev/null || echo 0) + 1 ))\necho $n > \"$d/count\"\n",
+                "printf '%s\\n' \"$@\" > \"$d/args.$n\"\n",
+                "cat \"$d/out.$n\"\nexit $(cat \"$d/exit.$n\")\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A test thread forking while this script was open for writing can
+        // briefly hold it open (ETXTBSY); wait until it executes.
+        for attempt in 0.. {
+            match Command::new(&curl).env("XC_FAKE_CURL_READY", "1").status() {
+                Err(error) if error.raw_os_error() == Some(26) && attempt < 500 => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => {
+                    assert!(result.unwrap().success());
+                    break;
+                }
+            }
+        }
+        let probe = GitHubCredentialApiProbe {
+            retry_delay: Duration::ZERO,
+            ..GitHubCredentialApiProbe::default().with_curl_executable(curl)
+        };
+        (scratch, probe)
+    }
+
+    #[cfg(unix)]
+    fn attempts(scratch: &crate::test_support::TestDir) -> String {
+        std::fs::read_to_string(scratch.join("count"))
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_probe_decodes_only_the_final_response_after_transient_failures() {
+        let ok = (
+            response(r#"{"login":"owner"}"#, "200", "", "4999", "2000"),
+            0,
+        );
+        for (label, first) in [
+            (
+                "probe-503-body",
+                (response(r#"{"message":"temporary"}"#, "503", "", "", ""), 0),
+            ),
+            (
+                "probe-429-body",
+                (response(r#"{"message":"slow"}"#, "429", "0", "", ""), 0),
+            ),
+            ("probe-partial-timeout", (r#"{"login":"par"#.to_owned(), 28)),
+            (
+                "probe-rate-limited",
+                (response(r#"{"message":"rate"}"#, "403", "0", "0", ""), 0),
+            ),
+        ] {
+            let (scratch, probe) = scripted_curl(label, &[first, ok.clone()]);
+            let value = probe.github_get("/user", "secret").unwrap();
+            assert_eq!(value["login"], "owner", "{label}");
+            assert_eq!(attempts(&scratch), "2", "{label}");
+            let arguments = std::fs::read_to_string(scratch.join("args.2")).unwrap();
+            assert!(!arguments.contains("secret") && !arguments.contains("--retry"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_probe_fails_denials_at_once_and_bounds_transient_retries() {
+        let denied = (
+            response(r#"{"message":"Not Found"}"#, "404", "", "4999", "2000"),
+            0,
+        );
+        let (scratch, probe) = scripted_curl("probe-denied", &[denied]);
+        let error = probe.github_get("/user", "secret").unwrap_err().to_string();
+        assert!(
+            error.ends_with("probe failed for /user (HTTP 404; 1 attempt)"),
+            "{error}"
+        );
+        assert_eq!(attempts(&scratch), "1");
+
+        let busy = (response(r#"{"message":"busy"}"#, "503", "", "", ""), 0);
+        let (scratch, probe) = scripted_curl("probe-busy", &vec![busy; 6]);
+        let error = probe.github_get("/user", "secret").unwrap_err().to_string();
+        assert!(error.ends_with("(HTTP 503; 5 attempts)"), "{error}");
+        assert!(!error.contains("secret"));
+        assert_eq!(attempts(&scratch), "5");
+
+        // A rate limit that resets beyond the retry window fails now, with
+        // one request, for 403 and 429 alike.
+        let reset = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let ok = (
+            response(r#"{"login":"owner"}"#, "200", "", "4999", "2000"),
+            0,
+        );
+        for status in ["403", "429"] {
+            let limited = (
+                response(r#"{"message":"rate"}"#, status, "", "0", &reset.to_string()),
+                0,
+            );
+            let (scratch, probe) = scripted_curl(
+                &format!("probe-rate-reset-{status}"),
+                &[limited, ok.clone()],
+            );
+            let error = probe.github_get("/user", "secret").unwrap_err().to_string();
+            assert!(
+                error.contains(&format!(
+                    "HTTP {status} rate limited until {reset}; 1 attempt"
+                )),
+                "{error}"
+            );
+            assert_eq!(attempts(&scratch), "1");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_probe_waits_for_a_429_reset_within_the_retry_window() {
+        let ok = (
+            response(r#"{"login":"owner"}"#, "200", "", "4999", "2000"),
+            0,
+        );
+        let reset = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 2;
+        let limited = (
+            response(r#"{"message":"rate"}"#, "429", "", "0", &reset.to_string()),
+            0,
+        );
+        let (scratch, probe) = scripted_curl("probe-429-in-window", &[limited, ok]);
+        let started = Instant::now();
+        let value = probe.github_get("/user", "secret").unwrap();
+        assert_eq!(value["login"], "owner");
+        assert_eq!(attempts(&scratch), "2");
+        // The retry waited for the reset, not the zero test backoff.
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

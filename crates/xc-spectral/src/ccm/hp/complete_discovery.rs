@@ -60,9 +60,11 @@ pub(super) fn plan(
         if !options.allow_incomplete {
             bail!("{reason}");
         }
-        eprintln!("[HP] incomplete root window: {reason}; preserving available evidence");
+        xc_core::progress_message!(
+            "[HP] incomplete root window: {reason}; preserving available evidence"
+        );
     }
-    eprintln!(
+    xc_core::progress_message!(
         "[HP] complete positive movable-root discovery: {} roots isolated from the retained point source",
         values.len()
     );
@@ -345,7 +347,7 @@ mod tests {
         let params = CcmParams::from_lambda_sq_integer(2, 1);
         let length = log_lambda_sq_hp(&params, precision).unwrap();
         let weights = [1, -4, 1].map(|x| Float::with_val(precision, x));
-        // Independent rational witness in fresh_ccm_spacing_audit.rs proves
+        // Independent rational witness in ccm_spacing_witnesses.rs proves
         // sqrt(2)*shared_spacing < upper < sqrt(2)*historical_staged_spacing.
         let target = ZeroTarget::HeightWindow {
             lower: "1".into(),

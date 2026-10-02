@@ -90,7 +90,7 @@ pub(super) fn evaluate(
     let bytes = vector.len() as u128
         * (u128::from(base * 2 + 4096).div_ceil(8) + 192)
         * ((workers as u128 + 1) * 32);
-    if bytes > 8u128 << 30 {
+    if bytes > super::source_working_budget()? {
         bail!("prime-response action exceeds workspace budget");
     }
     let exponent = vector

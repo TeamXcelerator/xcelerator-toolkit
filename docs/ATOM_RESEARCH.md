@@ -1,4 +1,4 @@
-ï»¿# Large atom tables, finite cutoff studies, and research queries
+# Large atom tables, finite cutoff studies, and research queries
 
 Ultra requests the weighted-tail, band-reconstruction and tail-model diagnostics.
 Their optional atom policy adds the measurements below when the corresponding
@@ -84,7 +84,8 @@ its normalization, one-sided/two-sided factor, completeness or RH premises.
 
 ## Recurrence resources and restart
 
-`XC_RESEARCH_WORKING_BYTES` bounds estimated resident numerical work. Band basis
+`XC_RESEARCH_WORKING_BYTES` bounds estimated resident numerical work. It is not
+part of artifact identity, and a result limited by it is not retained. Band basis
 vectors are saved in independently sealed 4,096-entry blocks, with a bounded
 memory cache. `XC_RESEARCH_BASIS_BYTES` defaults to 8 GiB and limits estimated
 basis disk use. `XC_RESEARCH_CHECKPOINT_BYTES` remains a per-checkpoint limit.

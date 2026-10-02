@@ -337,6 +337,13 @@ where
     }
 }
 
+/// The explicit policy active on this thread, if any. Work handed to another
+/// thread passes it to [`run_hp_with_policy`] there, because the active policy
+/// does not propagate to threads created by the callback.
+pub fn active_policy() -> Option<HpRuntimePolicy> {
+    ACTIVE_POLICY.with(|active| active.borrow().clone())
+}
+
 /// Active explicit HP runtime mode for process performance diagnostics.
 pub fn active_runtime_mode_label() -> &'static str {
     ACTIVE_POLICY.with(
@@ -362,7 +369,6 @@ pub fn safe_mode() -> bool {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn explicit_safe_policy_changes_scheduling_not_mathematics() {
@@ -383,6 +389,18 @@ mod tests {
         .unwrap();
         assert_eq!(safe, full);
         assert_eq!(safe, vec![25, 4, 81, 1, 49]);
+    }
+
+    #[test]
+    fn active_policy_is_reported_on_its_own_thread_only() {
+        assert_eq!(active_policy(), None);
+        let policy = HpRuntimePolicy::default();
+        run_hp_with_policy(&policy, || {
+            assert_eq!(active_policy(), Some(policy.clone()));
+            assert_eq!(std::thread::spawn(active_policy).join().unwrap(), None);
+        })
+        .unwrap();
+        assert_eq!(active_policy(), None);
     }
 
     #[test]
@@ -488,14 +506,8 @@ mod tests {
 
     #[test]
     fn process_performance_report_includes_safe_thread_and_rayon_workers() {
-        let report_path = std::env::temp_dir().join(format!(
-            "xc-safe-performance-{}-{}.performance.json",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = xc_core::test_support::TestDir::new("safe-performance");
+        let report_path = dir.join("safe.performance.json");
         let policy =
             HpRuntimePolicy::safe_capped(2, 8 * 1024 * 1024, "test-platform-hp-instability")
                 .unwrap();
@@ -537,7 +549,5 @@ mod tests {
                 "missing {expected} from process report"
             );
         }
-
-        let _ = fs::remove_file(report_path);
     }
 }

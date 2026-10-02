@@ -121,7 +121,7 @@ Completed groups require evidence; a recorded outcome cannot be overwritten
 by another attempt. Pending or missing target-dependent work keeps the receipt
 incomplete. Importers validate against the expected plan to detect omissions.
 The receipt does not launch work, authorize a budget or request certification.
-Paper applications still need to adopt this API explicitly.
+Applications must adopt this API explicitly.
 
 ## Local command workflow
 
@@ -251,12 +251,12 @@ When either residual exceeds the requested tolerance, the command retains the
 failed report and exits unsuccessfully. Missing/invalid sources or an exceeded
 budget return an error without starting the decomposition.
 
-Qualification includes opposite leading signs near tridiagonal cancellation,
+Tests cover opposite leading signs near tridiagonal cancellation,
 independent cyclic-Jacobi spectra, original-matrix eigenvector residuals using
 the corrected interleaved-pivot solve, power-of-two scaling through exponents
 +/-4000, exact output repetition with one/two/four Rayon workers, no-Q identity,
-and retained-source/serialization/precision/budget checks. See
-[release validation](VALIDATION.md) for actual run counts and scope. No whole-CCM performance factor is inferred.
+and retained-source/serialization/precision/budget checks. No whole-CCM
+performance factor is inferred.
 
 ## Managed retained reduction
 
@@ -340,9 +340,9 @@ definition identity advances to gaussian-series-log-range-checked-v3, including
 Gaussian auxiliary series on external targets. External-only protocol identities
 are unchanged. No historical payload is relabeled or numerically cleared.
 
-Seven public-API regressions cover the repaired boundaries and cache identities.
-Independent 640-bit mpmath calculations check 648 HP and 216 binary64 evaluations;
-18 additional log-domain reference cases span the MPFR underflow boundary.
+Public-API regressions cover the repaired boundaries and cache identities.
+Independent fixtures cover these boundaries in HP and binary64, including
+log-domain reference cases across the MPFR underflow boundary.
 These are computed point values and tail estimates, not full interval
 certificates or uniform accuracy guarantees for arbitrary cancellation.
 Historical impact remains unvalidated.
@@ -391,9 +391,9 @@ exact-rational inertia, selected-index decisions and portable proof bytes are
 unchanged; existing valid cache and certificate identities remain applicable.
 
 Independent rational orthogonal spectral fixtures cover threshold contacts,
-interval perturbations, selected indices and clusters: 1494 conclusive counts,
-1008 unresolved boundaries and 396 portable selected proofs. All 2898 valid
-results match the prior implementation, including pivot records. Invalid
+interval perturbations, selected indices and clusters, including conclusive
+counts, unresolved boundaries and portable selected proofs. Valid results match
+the prior implementation, including pivot records. Invalid
 domains, selection controls and proof mutations also reject. This does not
 remove the exact-rational path's scaling limitation or establish historical
 correctness outside the tested and derived scope.
@@ -422,11 +422,9 @@ Filesystem atomic writes and replacements reserve private sibling files with
 exclusive creation and a checked process-local counter. Existing names are
 skipped, with a bounded 128-collision retry; writing/sync failures clean up only
 the owned staging name. Equal timestamps can no longer make two writers share
-a staging handle and change an already published file. The controlled before
-case reproduced that race; its repaired counterpart preserves both writers
-and a preexisting sentinel. Logical payload bytes and cache identities do not
-change. Destination replacement/index merging and historical incidence remain
-separate obligations.
+a staging handle and change an already published file. Logical payload bytes
+and cache identities do not change. Destination replacement/index merging is
+outside the scope of this change.
 
 The same ownership rule now covers encoded-object adoption and corrupt-part
 quarantine. Adoption keeps exclusive hard-link staging and uses exclusive

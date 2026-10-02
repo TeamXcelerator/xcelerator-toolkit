@@ -28,7 +28,8 @@ pub use state_comparison::{
 mod asymptotic;
 pub use asymptotic::{
     prolate_chi2_deficiency_asymptotic, prolate_chi2_log_deficiency_asymptotic,
-    try_prolate_chi2_deficiency_asymptotic,
+    prolate_log_deficiency_asymptotic, try_prolate_chi2_deficiency_asymptotic,
+    try_prolate_deficiency_asymptotic, EvenProlateMode,
 };
 mod tail_budget;
 pub use tail_budget::{
@@ -50,11 +51,11 @@ pub use tail_budget::{
 /// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CertifiedProlateDeficiency {
-    /// Certified enclosure of `nu_2 = chi_2^2`.
+    /// Certified enclosure of a concentration value `nu = |chi_n|^2`.
     concentration_eigenvalue: RationalInterval,
-    /// Certified enclosure of the positive square root `chi_2`.
+    /// Certified enclosure of the positive singular value `|chi_n|`.
     angular_eigenvalue: RationalInterval,
-    /// Certified enclosure of `1 - chi_2`.
+    /// Certified enclosure of the singular-value deficit `1 - |chi_n|`.
     deficiency: RationalInterval,
     /// Whether the finite deficiency was represented exactly by the dyadic
     /// square-root grid rather than by a nonzero-width enclosure.
@@ -63,7 +64,7 @@ pub struct CertifiedProlateDeficiency {
 }
 
 impl CertifiedProlateDeficiency {
-    /// Propagate a certified enclosure of `nu_2` through the positive square
+    /// Propagate a certified enclosure of `nu` through the positive square
     /// root using exact rational, outward-rounded arithmetic.
     pub fn from_concentration_enclosure(
         concentration_eigenvalue: RationalInterval,
@@ -90,8 +91,24 @@ impl CertifiedProlateDeficiency {
     pub fn concentration_eigenvalue(&self) -> &RationalInterval {
         &self.concentration_eigenvalue
     }
+    /// Positive singular value; the historical name does not encode a
+    /// signed Fourier phase. Use `signed_fourier_eigenvalue` for that phase.
     pub fn angular_eigenvalue(&self) -> &RationalInterval {
         &self.angular_eigenvalue
+    }
+    #[doc(hidden)]
+    pub fn singular_value(&self) -> &RationalInterval {
+        &self.angular_eigenvalue
+    }
+    /// Apply the caller-declared full-mode Fourier phase. Identifying the
+    /// supplied concentration enclosure with this mode is an external premise.
+    #[doc(hidden)]
+    pub fn signed_fourier_eigenvalue(&self, mode: EvenProlateMode) -> RationalInterval {
+        if mode.fourier_sign() > 0 {
+            self.angular_eigenvalue.clone()
+        } else {
+            self.angular_eigenvalue.neg()
+        }
     }
     pub fn deficiency(&self) -> &RationalInterval {
         &self.deficiency
@@ -208,6 +225,59 @@ impl ProlateWeilComparison {
             asymptotic_predictor,
             measured_weil_plunge,
             finite_difference,
+        })
+    }
+}
+
+/// Explicit indices for a proposed comparison. No correspondence between a
+/// Weil branch and a prolate mode is inferred or certified by this record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[doc(hidden)]
+pub struct ProlateWeilComparisonIndices {
+    pub prolate_mode: EvenProlateMode,
+    pub weil_parity: super::hp::CcmParity,
+    /// Zero-based algebraic index WITHIN `weil_parity`, not the full matrix.
+    pub weil_spectral_index: usize,
+}
+
+/// Mode-labelled extension of the legacy n=4 comparison. The caller must bind
+/// the concentration interval and measured Weil interval to these declared
+/// source indices. Neither interval's source/continuum validity follows from
+/// this algebraic comparison. The measured interval keeps its original sign.
+#[derive(Clone, Debug)]
+#[doc(hidden)]
+pub struct IndexedProlateWeilComparison {
+    pub indices: ProlateWeilComparisonIndices,
+    pub lambda_squared: u64,
+    pub comparison: ProlateWeilComparison,
+}
+
+impl IndexedProlateWeilComparison {
+    pub fn new(
+        indices: ProlateWeilComparisonIndices,
+        lambda_squared: u64,
+        finite_prolate: CertifiedProlateDeficiency,
+        measured_weil_plunge: RationalInterval,
+        precision_bits: u32,
+    ) -> Result<Self> {
+        if lambda_squared <= 1 {
+            bail!("prolate comparison requires lambda^2 > 1");
+        }
+        let asymptotic_predictor = try_prolate_deficiency_asymptotic(
+            indices.prolate_mode,
+            lambda_squared,
+            precision_bits,
+        )?;
+        let finite_difference = measured_weil_plunge.sub(finite_prolate.deficiency());
+        Ok(Self {
+            indices,
+            lambda_squared,
+            comparison: ProlateWeilComparison {
+                finite_prolate,
+                asymptotic_predictor,
+                measured_weil_plunge,
+                finite_difference,
+            },
         })
     }
 }

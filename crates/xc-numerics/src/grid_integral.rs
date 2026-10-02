@@ -5,9 +5,9 @@
 //!
 //! Deterministic Riemann-family rules on an equally spaced grid, in the
 //! integration variable itself or in its logarithm. These exist alongside
-//! Gauss--Legendre (see [`crate::quadrature`]) because collaborative
-//! cross-checks must be able to reproduce a partner's quadrature convention
-//! exactly, not merely converge to the same limit:
+//! Gauss--Legendre (see [`crate::quadrature`]) because cross-checks may need
+//! to reproduce another implementation's quadrature convention exactly, not
+//! merely converge to the same limit:
 //!
 //! For sufficiently smooth transformed integrands:
 //!

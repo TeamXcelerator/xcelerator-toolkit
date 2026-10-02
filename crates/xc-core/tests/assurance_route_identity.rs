@@ -1,4 +1,4 @@
-//! Fresh contract regression: independent route identities do not establish agreement.
+//! Contract regression: independent route identities do not establish agreement.
 use std::collections::BTreeSet;
 use xc_core::{
     assess_route_independence, evaluate_assurance, AssuranceEvidence, AssuranceLevel,

@@ -3,7 +3,7 @@
 The `ccm_response_repair` example repairs schema-2 prime-power and cutoff-flow
 root velocities from the exact original eigenpair and retained L2 tangent
 vectors. It performs no matrix assembly, eigenstate solve, bordered solve, or
-paper-claim run. Legacy v2 inputs produce the v3 root-normalization identity
+primary claim computation. Legacy v2 inputs produce the v3 root-normalization identity
 introduced in v0.15.0. Already-corrected prime v3/v4 and u-flow v3/v4/v5
 inputs preserve their identities under byte-exact root replay. This tool does
 not recompute derivative actions, tangents, source matrices or transforms. It
@@ -124,5 +124,5 @@ publish a private source publicly; public response repairs require a separate
 
 New response identities become available to requests with the same retained
 parents and configuration. This does not migrate unrelated historical sector
-identities, change paper results, or refresh existing application-side reports.
+identities, change previously reported results, or refresh existing application-side reports.
 Retain repair records alongside any analysis that used the original values.

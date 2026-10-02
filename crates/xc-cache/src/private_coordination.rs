@@ -3,11 +3,18 @@
 //! The coordination branch is deliberately independent of the cache branch.
 //! Every cache batch renews the lease in the same atomic Git push, so a stale
 //! publisher cannot advance `main` after another publisher takes over.
+//!
+//! The branch exists only while a publication holds or has abandoned a lease.
+//! A clean release deletes it with a compare-and-swap on the holder's exact
+//! head, and the next publisher recreates it atomically. Fencing rests on those
+//! exact commit identities: a stale publisher's expected head never matches a
+//! recreated branch. A crashed publisher's branch is taken over after expiry and
+//! removed by that publisher's release.
 
 use crate::{
     AtomicCompareAndSwapResult, AtomicRemoteCommitRequest, CacheError, CompareAndSwapResult,
-    ContentDigest, CreateRefResult, RemoteCommitRequest, RemoteGitStore, RemoteRefCreationRequest,
-    RemoteShardReader, TransportPart,
+    ContentDigest, CreateRefResult, DeleteRefResult, RemoteCommitRequest, RemoteGitStore,
+    RemoteRefCreationRequest, RemoteShardReader, TransportPart,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::path::Path;
@@ -382,7 +389,7 @@ pub fn acquire_private_publication_lease(
                     parts,
                 })? {
                     CreateRefResult::Created { commit_id } => {
-                        eprintln!(
+                        xc_core::progress_message!(
                             "private publication lock acquired: generation=1 repository={repository}"
                         );
                         return Ok(PrivatePublicationLease {
@@ -399,21 +406,42 @@ pub fn acquire_private_publication_lease(
             }
             Err(error) => return Err(error),
             Ok(coordination_head) => {
-                let mut state: PrivatePublicationCoordinationState = read_json(
+                // A releasing holder may delete the branch at any moment; a read
+                // that fails because the branch moved or vanished is retried.
+                let moved = |error: CacheError| -> Result<(), CacheError> {
+                    match remote.read_ref(repository, PRIVATE_COORDINATION_BRANCH) {
+                        Err(CacheError::NotFound(_)) => Ok(()),
+                        Ok(current) if current != coordination_head => Ok(()),
+                        _ => Err(error),
+                    }
+                };
+                let mut state: PrivatePublicationCoordinationState = match read_json(
                     remote,
                     repository,
                     &coordination_head,
                     PRIVATE_COORDINATION_STATE_PATH,
                     cancellation,
-                )?;
+                ) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        moved(error)?;
+                        continue;
+                    }
+                };
                 state.validate()?;
-                let existing: Option<PrivatePublicationLock> = read_optional_json(
+                let existing: Option<PrivatePublicationLock> = match read_optional_json(
                     remote,
                     repository,
                     &coordination_head,
                     PRIVATE_PUBLICATION_LOCK_PATH,
                     cancellation,
-                )?;
+                ) {
+                    Ok(existing) => existing,
+                    Err(error) => {
+                        moved(error)?;
+                        continue;
+                    }
+                };
                 if let Some(existing) = &existing {
                     existing.validate()?;
                     if existing.fencing_generation != state.fencing_generation {
@@ -448,7 +476,7 @@ pub fn acquire_private_publication_lease(
                     let request = RemoteCommitRequest {
                         repository: repository.to_owned(),
                         branch: PRIVATE_COORDINATION_BRANCH.to_owned(),
-                        expected_head: coordination_head,
+                        expected_head: coordination_head.clone(),
                         message: format!(
                             "acquire private publication lease generation {}",
                             state.fencing_generation
@@ -456,9 +484,16 @@ pub fn acquire_private_publication_lease(
                         parts,
                         delete_paths: Vec::new(),
                     };
-                    match remote.compare_and_swap_commit(&request)? {
+                    let result = match remote.compare_and_swap_commit(&request) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            moved(error)?;
+                            continue;
+                        }
+                    };
+                    match result {
                         CompareAndSwapResult::Committed { commit_id } => {
-                            eprintln!(
+                            xc_core::progress_message!(
                                 "private publication lock acquired: generation={} repository={repository}",
                                 state.fencing_generation
                             );
@@ -482,7 +517,7 @@ pub fn acquire_private_publication_lease(
                 }
                 if now.saturating_sub(last_status) >= 60 {
                     let existing = existing.expect("unavailable lock exists");
-                    eprintln!(
+                    xc_core::progress_message!(
                         "private publication lock held: principal={} run={} generation={} lease_remaining={}s; waiting",
                         existing.github_principal,
                         existing.owner_run_id.chars().take(12).collect::<String>(),
@@ -641,6 +676,43 @@ pub fn release_private_publication_lease(
     staging_root: &Path,
     completed: bool,
 ) -> Result<(), CacheError> {
+    match remote.delete_ref_if_head(
+        &lease.repository,
+        &lease.coordination_branch,
+        &lease.coordination_head,
+    ) {
+        Ok(DeleteRefResult::Deleted) => {
+            xc_core::progress_message!(
+                "private publication lock released: generation={} repository={}; coordination branch removed",
+                lease.lock.fencing_generation,
+                lease.repository
+            );
+            return Ok(());
+        }
+        Ok(DeleteRefResult::RefConflict { current_head }) => {
+            return Err(CacheError::InvalidTransition(format!(
+                "refused to release a superseded private publication lease at {current_head}"
+            )))
+        }
+        Ok(DeleteRefResult::Absent) => {
+            return Err(CacheError::InvalidTransition(
+                "refused to release a private publication lease whose coordination branch no longer exists"
+                    .to_owned(),
+            ))
+        }
+        Err(CacheError::ReadOnlyLayer(_)) => {}
+        Err(error) => return Err(error),
+    }
+    release_by_commit(remote, lease, staging_root, completed)
+}
+
+// Transports without compare-and-swap deletion record the released state.
+fn release_by_commit(
+    remote: &dyn RemoteGitStore,
+    lease: &PrivatePublicationLease,
+    staging_root: &Path,
+    completed: bool,
+) -> Result<(), CacheError> {
     let now = now_unix_seconds()?;
     let mut state = lease.state.clone();
     if completed {
@@ -662,9 +734,10 @@ pub fn release_private_publication_lease(
     };
     match remote.compare_and_swap_commit(&request)? {
         CompareAndSwapResult::Committed { .. } => {
-            eprintln!(
+            xc_core::progress_message!(
                 "private publication lock released: generation={} repository={}",
-                lease.lock.fencing_generation, lease.repository
+                lease.lock.fencing_generation,
+                lease.repository
             );
             Ok(())
         }
@@ -700,7 +773,7 @@ mod tests {
             owner_run_id: "run".to_owned(),
             publication_transaction_id: "transaction".to_owned(),
             github_principal: "principal".to_owned(),
-            toolkit_version: "0.13.0".to_owned(),
+            toolkit_version: "0.16.0".to_owned(),
             instance_fingerprint: ContentDigest::sha256(b"instance"),
             process_id: 1,
             fencing_generation: 3,
@@ -721,7 +794,7 @@ mod tests {
             owner_run_id: "run".into(),
             publication_transaction_id: "transaction".into(),
             github_principal: "principal".into(),
-            toolkit_version: "0.15.1".into(),
+            toolkit_version: "0.18.1".into(),
             instance_fingerprint: ContentDigest::sha256(b"instance"),
             process_id: 1,
             fencing_generation: 3,
@@ -772,12 +845,11 @@ mod tests {
     }
 
     #[test]
-    fn private_lease_lifecycle_fences_cache_batches_and_increments_generation() {
+    fn private_lease_lifecycle_fences_cache_batches_and_removes_released_branches() {
         if !test_git(None, &["--version"]) {
             return;
         }
         let root = temporary_root("private-publication-lease-lifecycle");
-        let _ = fs::remove_dir_all(&root);
         let remote_path = root.join("remote.git");
         let seed = root.join("seed");
         let staging = root.join("staging");
@@ -863,14 +935,21 @@ mod tests {
         store
             .verify_committed_part(&repository, &committed, &payload)
             .unwrap();
+        let stale = PrivatePublicationLease {
+            repository: lease.repository.clone(),
+            main_branch: lease.main_branch.clone(),
+            coordination_branch: lease.coordination_branch.clone(),
+            coordination_head: lease.coordination_head.clone(),
+            state: lease.state.clone(),
+            lock: lease.lock.clone(),
+        };
         release_private_publication_lease(&store, &lease, &staging, true).unwrap();
-        let released_head = store
-            .read_ref(&repository, PRIVATE_COORDINATION_BRANCH)
-            .unwrap();
-        assert!(store
-            .immutable_path_digest(&repository, &released_head, PRIVATE_PUBLICATION_LOCK_PATH)
-            .unwrap()
-            .is_none());
+        // A clean release leaves no coordination branch behind.
+        assert!(matches!(
+            store.read_ref(&repository, PRIVATE_COORDINATION_BRANCH),
+            Err(CacheError::NotFound(_))
+        ));
+        assert!(release_private_publication_lease(&store, &stale, &staging, true).is_err());
 
         let second_owner = PrivatePublicationLeaseOwner {
             owner_run_id: "owner-run-b".to_owned(),
@@ -889,8 +968,30 @@ mod tests {
             &policy,
         )
         .unwrap();
-        assert_eq!(second.lock.fencing_generation, 2);
+        // The branch is recreated; fencing rests on exact commit identities.
+        assert_eq!(second.lock.fencing_generation, 1);
+        assert_ne!(second.coordination_head, stale.coordination_head);
+        let mut stale_batch = stale;
+        assert!(commit_private_batch_atomically(
+            &store,
+            &mut stale_batch,
+            RemoteCommitRequest {
+                repository: repository.clone(),
+                branch: "main".to_owned(),
+                expected_head: store.read_ref(&repository, "main").unwrap(),
+                message: "stale publisher must not advance main".to_owned(),
+                parts: vec![payload.clone()],
+                delete_paths: Vec::new(),
+            },
+            &staging,
+            &policy,
+        )
+        .is_err());
         release_private_publication_lease(&store, &second, &staging, false).unwrap();
+        assert!(matches!(
+            store.read_ref(&repository, PRIVATE_COORDINATION_BRANCH),
+            Err(CacheError::NotFound(_))
+        ));
         let _ = fs::remove_dir_all(root);
     }
     fn audit_boundary_lock() -> PrivatePublicationLock {
@@ -899,7 +1000,7 @@ mod tests {
             owner_run_id: "run".into(),
             publication_transaction_id: "transaction".into(),
             github_principal: "principal".into(),
-            toolkit_version: "0.15.1".into(),
+            toolkit_version: "0.18.1".into(),
             instance_fingerprint: ContentDigest::sha256(b"instance"),
             process_id: 1,
             fencing_generation: 1,

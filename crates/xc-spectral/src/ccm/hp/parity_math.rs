@@ -83,7 +83,7 @@ impl<'a> Projection<'a> {
         }
         let maximum_precision = tau.iter().map(Float::prec).max().unwrap().max(p);
         if tau.len() as u128 * (u128::from(maximum_precision + 4096).div_ceil(8) + 96) * 2
-            > (8u128 << 30)
+            > super::source_working_budget()?
         {
             bail!("parity projection exceeds numerical workspace budget");
         }

@@ -123,7 +123,9 @@ fn write(
 }
 pub(crate) fn emit(record: &ResearchRecord<ExtendedAnalysis>, manifest: Option<&ArtifactManifest>) {
     if let Err(e) = write(record, manifest) {
-        eprintln!("research summary unavailable: {e}; canonical artifact retained");
+        xc_core::progress_message!(
+            "research summary unavailable: {e}; canonical artifact retained"
+        );
     }
 }
 #[cfg(test)]

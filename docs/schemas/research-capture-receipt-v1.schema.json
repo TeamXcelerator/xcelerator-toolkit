@@ -152,11 +152,148 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "value",
           "source_dependencies"
         ],
         "properties": {
           "value": {},
+          "value_reference": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "artifacts",
+              "array",
+              "value_digest",
+              "coverage"
+            ],
+            "properties": {
+              "artifacts": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "key",
+                    "content_digest",
+                    "required_quality"
+                  ],
+                  "properties": {
+                    "key": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "kind",
+                        "logical_key",
+                        "parameters_digest"
+                      ],
+                      "properties": {
+                        "kind": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "logical_key": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "parameters_digest": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+                        }
+                      }
+                    },
+                    "content_digest": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+                    },
+                    "required_quality": {
+                      "const": "validated"
+                    }
+                  }
+                },
+                "minItems": 1
+              },
+              "array": {
+                "type": "boolean"
+              },
+              "value_digest": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+              },
+              "coverage": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "outcome",
+                  "retained_rows",
+                  "expected_rows",
+                  "resolved_rows",
+                  "qualified_rows",
+                  "unresolved_rows",
+                  "row_outcomes",
+                  "reason",
+                  "recovery"
+                ],
+                "properties": {
+                  "outcome": {
+                    "type": "string"
+                  },
+                  "retained_rows": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "expected_rows": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "resolved_rows": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "qualified_rows": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "unresolved_rows": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "row_outcomes": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  },
+                  "reason": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "recovery": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          },
           "source_dependencies": {
             "type": "array",
             "items": {

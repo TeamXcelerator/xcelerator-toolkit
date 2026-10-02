@@ -540,7 +540,7 @@ pub fn analyze_state_geometry_via_cache(
         schema_version: 1,
         artifact_kind: ARTIFACT_KIND.into(),
         mathematical_semantics_version: SEMANTICS.into(),
-        resolved_mathematical_parameters: serde_json::json!({"source_dependencies":dependencies,"options":options,"source_parents_are_public":public}),
+        resolved_mathematical_parameters: serde_json::json!({"source_dependencies":[xc_cache::research_identity_dependency(&source.manifest)],"options":options,"source_parents_are_public":public}),
         normalization: Some(CONVENTION.into()),
         target: Some("actual_retained_state_geometry".into()),
         subspace: None,
@@ -563,7 +563,7 @@ pub fn analyze_state_geometry_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.1")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".into(), "ccm".into()),

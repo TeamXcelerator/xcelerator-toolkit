@@ -20,8 +20,8 @@ fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
             size_bytes: bytes.len() as u64,
         }],
         created_unix_seconds: 1,
-        producer_toolkit_version: ToolkitVersion::parse("0.14.3").unwrap(),
-        minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+        producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
         maximum_reader_version: None,
         quality: CacheQuality::Validated,
         visibility: CacheVisibility::Local,
@@ -51,6 +51,56 @@ fn options() -> PrefixAnalysisOptions {
 }
 fn read_matrix(m: &ArtifactManifest, b: &[u8]) -> RetainedEvenMatrix {
     RetainedEvenMatrix::from_payload(m, b, std::slice::from_ref(&m.content_digest)).unwrap()
+}
+
+static VERIFICATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn verification_workflow(
+    root: &std::path::Path,
+    index: usize,
+) -> xc_cache::ManagedArtifactCacheSession {
+    use xc_cache::*;
+    let validation_root = root.join(format!("verify-{index}"));
+    let reference_root = root.join(format!("mutation-{index}"));
+    ManagedArtifactCacheSession::with_layers_for_test(
+        ManagedArtifactCacheConfig {
+            profile: ManagedRunProfile::Normal,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            cache_root: reference_root.clone(),
+            staging_root: None,
+            publication_target: xc_core::PublicationTarget::None,
+            repository_owner: "local-fixture".into(),
+            remote_cache_mode: ManagedRemoteCacheMode::None,
+            cache_mode: ArtifactExecutionCacheMode::VerifyAgainstReference,
+            replace_existing_publication: false,
+            execute_remote_mutations: false,
+            output_validation: Some(OutputValidationConfig {
+                validation_root: validation_root.clone(),
+                report_root: validation_root.join("reports"),
+                reference_mode: ManagedRemoteCacheMode::Public,
+            }),
+        },
+        vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "validation",
+                validation_root,
+                true,
+                CacheVisibility::Local,
+            )),
+        }],
+        vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "reference",
+                reference_root,
+                false,
+                CacheVisibility::Local,
+            )),
+        }],
+    )
+    .unwrap()
 }
 
 #[test]
@@ -126,16 +176,11 @@ fn retained_prefix_export_rejects_scale_hidden_residuals_and_normalizes_extreme_
 }
 
 #[test]
-fn prefix_cache_replays_every_numerical_row_and_export_field() {
+fn prefix_explicit_verification_replays_every_numerical_row_and_export_field() {
+    let _guard = VERIFICATION_LOCK.lock().unwrap();
     use xc_cache::*;
-    let root = std::env::temp_dir().join(format!(
-        "xc-prefix-numerical-replay-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root_dir = xc_core::test_support::TestDir::new("prefix-numerical-replay");
+    let root = root_dir.join(format!("xc-prefix-numerical-replay-{}", std::process::id()));
     assert!(!root.exists());
     let resolver = CacheResolver::new(vec![CacheLayer {
         precedence: 0,
@@ -176,7 +221,7 @@ fn prefix_cache_replays_every_numerical_row_and_export_field() {
     assert_eq!(semantic.mathematical_semantics_version, PREFIX_SEMANTICS);
     assert_eq!(
         manifest.minimum_reader_version,
-        ToolkitVersion::parse("0.15.1").unwrap()
+        ToolkitVersion::parse(xc_cache::CLEAN_SLATE).unwrap()
     );
     context.mode = ArtifactExecutionCacheMode::RequireReuse;
     context.write_on_miss = false;
@@ -244,24 +289,15 @@ fn prefix_cache_replays_every_numerical_row_and_export_field() {
                 &serde_json::to_vec(&bad).unwrap(),
             )
             .unwrap();
-        let altered = CacheResolver::new(vec![CacheLayer {
-            precedence: 0,
-            store: Box::new(store),
-        }]);
-        let altered_context = ArtifactCacheContext {
-            resolver: Some(&altered),
-            reference_resolver: None,
-            acceptance: Some(&policy),
-            ordered_overlays: vec!["test".into()],
-            mode: ArtifactExecutionCacheMode::RequireReuse,
-            write_on_miss: false,
-            write_visibility: CacheVisibility::Local,
-            requested_assurance: xc_core::AssuranceLevel::Computed,
-            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
-            production_sink: None,
-        };
-        let result = analyze_retained_prefixes_via_cache(&source, &settings, &[], &altered_context);
-        assert!(result.is_err(), "accepted changed field {pointer}");
+        let workflow = verification_workflow(&root, index);
+        let result =
+            analyze_retained_prefixes_via_cache(&source, &settings, &[], &workflow.context());
+        assert_eq!(
+            result.unwrap().access.validation_outcome,
+            xc_core::CacheValidationOutcome::Failed,
+            "accepted changed field {pointer}"
+        );
+        assert!(workflow.finalize_publication_inventory().is_err());
     }
     assert!(root.starts_with(std::env::temp_dir()));
     assert!(root
@@ -274,15 +310,13 @@ fn prefix_cache_replays_every_numerical_row_and_export_field() {
 }
 
 #[test]
-fn retained_reduction_cache_replays_spectrum_norms_and_residuals() {
+fn retained_reduction_explicit_verification_replays_spectrum_norms_and_residuals() {
+    let _guard = VERIFICATION_LOCK.lock().unwrap();
     use xc_cache::*;
-    let root = std::env::temp_dir().join(format!(
-        "xc-reduction-numerical-replay-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+    let root_dir = xc_core::test_support::TestDir::new("reduction-numerical-repl");
+    let root = root_dir.join(format!(
+        "xc-reduction-numerical-replay-{}",
+        std::process::id()
     ));
     assert!(!root.exists());
     let resolver = CacheResolver::new(vec![CacheLayer {
@@ -326,7 +360,7 @@ fn retained_reduction_cache_replays_spectrum_norms_and_residuals() {
     );
     assert_eq!(
         manifest.minimum_reader_version,
-        ToolkitVersion::parse("0.15.1").unwrap()
+        ToolkitVersion::parse(xc_cache::CLEAN_SLATE).unwrap()
     );
     context.mode = ArtifactExecutionCacheMode::RequireReuse;
     context.write_on_miss = false;
@@ -386,24 +420,15 @@ fn retained_reduction_cache_replays_spectrum_norms_and_residuals() {
                 &serde_json::to_vec(&bad).unwrap(),
             )
             .unwrap();
-        let altered = CacheResolver::new(vec![CacheLayer {
-            precedence: 0,
-            store: Box::new(store),
-        }]);
-        let altered_context = ArtifactCacheContext {
-            resolver: Some(&altered),
-            reference_resolver: None,
-            acceptance: Some(&policy),
-            ordered_overlays: vec!["test".into()],
-            mode: ArtifactExecutionCacheMode::RequireReuse,
-            write_on_miss: false,
-            write_visibility: CacheVisibility::Local,
-            requested_assurance: xc_core::AssuranceLevel::Computed,
-            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
-            production_sink: None,
-        };
-        let result = check_retained_reduction_via_cache(&source, 256, 2, "1e-60", &altered_context);
-        assert!(result.is_err(), "accepted changed field {pointer}");
+        let workflow = verification_workflow(&root, index);
+        let result =
+            check_retained_reduction_via_cache(&source, 256, 2, "1e-60", &workflow.context());
+        assert_eq!(
+            result.unwrap().access.validation_outcome,
+            xc_core::CacheValidationOutcome::Failed,
+            "accepted changed field {pointer}"
+        );
+        assert!(workflow.finalize_publication_inventory().is_err());
     }
     assert!(root.starts_with(std::env::temp_dir()));
     assert!(root

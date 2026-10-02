@@ -580,6 +580,19 @@ fn destination_manifest_dominates(
             .all(|dependency| existing_dependencies.contains(dependency))
 }
 
+/// Whether a live destination index entry can prove that `draft` is already
+/// published: active, at least as assured, and from a compatible producer.
+fn destination_entry_may_prove(
+    entry: &crate::ShardIndexEntry,
+    draft: &CanonicalProductionDraft,
+    manifest: &crate::CanonicalArtifactManifest,
+) -> bool {
+    entry.achieved_assurance >= draft.achieved_assurance
+        && entry.disposition == ArtifactDisposition::Active
+        && entry.producer_toolkit_version >= manifest.producer_toolkit_version
+        && entry.minimum_reader_version == manifest.minimum_reader_version
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select_missing_destination_drafts<'a>(
     remote: &dyn crate::RemoteGitStore,
@@ -597,6 +610,26 @@ fn select_missing_destination_drafts<'a>(
         .map(|draft| draft.manifest.semantic_digest.0[..2].to_owned())
         .collect::<BTreeSet<_>>();
     let reader = crate::RemoteShardReader::new(remote, 16 * 1024 * 1024)?;
+    // One negotiation for every partition instead of one per prefix; absent
+    // partitions are skipped. Best effort: each partition is still read and
+    // validated below, so a failed prefetch costs only time.
+    let partition_paths = prefixes
+        .iter()
+        .map(|prefix| crate::RemotePathPrefetch {
+            repository_path: format!("indexes/{family}/{prefix}.json"),
+            maximum_bytes: 16 * 1024 * 1024,
+        })
+        .collect::<Vec<_>>();
+    for batch in partition_paths.chunks(256) {
+        if let Err(error) =
+            remote.prefetch_present_committed_paths(repository, revision, batch, cancellation)
+        {
+            xc_core::progress_message!(
+                "publication family {family}: batched destination index prefetch skipped: {error}"
+            );
+            break;
+        }
+    }
     for prefix in prefixes {
         let path = format!("indexes/{family}/{prefix}.json");
         match reader.read_json::<crate::ShardIndexPartition>(
@@ -619,6 +652,56 @@ fn select_missing_destination_drafts<'a>(
         }
     }
 
+    // Fetch every manifest and batch record the decisions below may read in
+    // two negotiations instead of one per document; a document that does not
+    // exist (for example a batch record) is skipped. Best effort: the loop
+    // still reads, hashes and validates each document itself, so a failed
+    // prefetch costs only time and never changes a decision.
+    let mut manifest_paths = BTreeSet::new();
+    let mut batch_paths = BTreeSet::new();
+    for draft in drafts {
+        let Ok(manifest) = target_manifest(draft, destination) else {
+            continue;
+        };
+        let Some(partition) = partitions.get(&manifest.semantic_digest.0[..2]) else {
+            continue;
+        };
+        for entry in partition
+            .lookup(&manifest.semantic_digest)
+            .filter(|entry| destination_entry_may_prove(entry, draft, &manifest))
+        {
+            manifest_paths.insert(format!(
+                "manifests/{}/{}.json",
+                &entry.semantic_digest.0[..2],
+                entry.manifest_digest
+            ));
+            batch_paths.insert(format!(
+                "transactions/batches/{}/{}.json",
+                entry.publication_transaction_id,
+                visibility_name(destination)
+            ));
+        }
+    }
+    for paths in [manifest_paths, batch_paths] {
+        if paths.is_empty() {
+            continue;
+        }
+        let paths = paths
+            .into_iter()
+            .map(|repository_path| crate::RemotePathPrefetch {
+                repository_path,
+                maximum_bytes: 16 * 1024 * 1024,
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) =
+            remote.prefetch_present_committed_paths(repository, revision, &paths, cancellation)
+        {
+            xc_core::progress_message!(
+                "publication family {family}: batched destination metadata prefetch skipped: {error}"
+            );
+        }
+    }
+
     let mut pending = Vec::with_capacity(drafts.len());
     let mut already_present = 0usize;
     let mut batches = BTreeMap::<String, Option<crate::RepositoryPublicationBatch>>::new();
@@ -637,12 +720,10 @@ fn select_missing_destination_drafts<'a>(
         }
         let mut existing_candidates = Vec::new();
         if let Some(partition) = partitions.get(prefix) {
-            for entry in partition.lookup(&manifest.semantic_digest).filter(|entry| {
-                entry.achieved_assurance >= draft.achieved_assurance
-                    && entry.disposition == ArtifactDisposition::Active
-                    && entry.producer_toolkit_version >= manifest.producer_toolkit_version
-                    && entry.minimum_reader_version == manifest.minimum_reader_version
-            }) {
+            for entry in partition
+                .lookup(&manifest.semantic_digest)
+                .filter(|entry| destination_entry_may_prove(entry, draft, &manifest))
+            {
                 let path = format!(
                     "manifests/{}/{}.json",
                     &entry.semantic_digest.0[..2],
@@ -960,7 +1041,7 @@ impl<'a> RemoteSessionCleanup<'a> {
             (Ok(_), Err(error)) => Err(error),
             (Err(error), Ok(())) => Err(error),
             (Err(error), Err(cleanup_error)) => {
-                eprintln!(
+                xc_core::progress_message!(
                     "family publication failed and its Git transport cleanup also failed: \
                      {cleanup_error}"
                 );
@@ -974,7 +1055,7 @@ impl Drop for RemoteSessionCleanup<'_> {
     fn drop(&mut self) {
         if !self.finished {
             if let Err(error) = self.remote.cleanup_session(self.repository) {
-                eprintln!(
+                xc_core::progress_message!(
                     "family publication Git transport cleanup failed for {}: {error}",
                     self.repository
                 );
@@ -1088,7 +1169,7 @@ fn execute_family_batch_publication(
             &cancellation,
         )?;
         if selection.already_present > 0 {
-            eprintln!(
+            xc_core::progress_message!(
                 "publication destination {} family {}: {} already present, {} pending",
                 visibility_name(destination),
                 first.family,
@@ -1170,7 +1251,7 @@ fn execute_family_batch_publication(
     )?;
     let prepared_files = prepared_candidate_files(&prepared_candidates);
     remote.prepare_staged_parts(&repository_url, &prepared_files)?;
-    eprintln!(
+    xc_core::progress_message!(
         "publication family {}: prepared {} candidate(s) and {} immutable file(s) before lock in {:.3}s",
         first.family,
         prepared_candidates.len(),
@@ -1220,7 +1301,7 @@ fn execute_family_batch_publication(
         // sidecars before planning the first repository batch; subsequent runs
         // simply reuse the verified sidecars.
         let locked_preparation_started = std::time::Instant::now();
-        eprintln!(
+        xc_core::progress_message!(
             "publication family {}: checking destination metadata",
             first.family
         );
@@ -1251,7 +1332,7 @@ fn execute_family_batch_publication(
                 &cancellation,
             )?;
             if selection.already_present > 0 {
-                eprintln!(
+                xc_core::progress_message!(
                     "publication destination {} family {}: {} became present before mutation, {} pending",
                     visibility_name(destination),
                     first.family,
@@ -1588,7 +1669,7 @@ fn execute_family_batch_publication(
             .saturating_sub(1024 * 1024);
         let batches = crate::plan_publication_batches(&ordered_parts, &batch_policy)?;
         let total_batches = batches.len();
-        eprintln!(
+        xc_core::progress_message!(
             "publication family {}: metadata ready in {:.3}s; {} batch(es), {} staged bytes",
             first.family,
             locked_preparation_started.elapsed().as_secs_f64(),
@@ -1605,7 +1686,7 @@ fn execute_family_batch_publication(
             let batch_started = std::time::Instant::now();
             let batch_number = batch_plan.sequence + 1;
             let mut reused_bytes = 0u64;
-            eprintln!(
+            xc_core::progress_message!(
                 "publication family {}: batch {}/{} checking {} file(s)",
                 first.family,
                 batch_number,
@@ -1635,7 +1716,7 @@ fn execute_family_batch_publication(
                 }
                 commit_parts.push(part);
             }
-            eprintln!(
+            xc_core::progress_message!(
                 "publication family {}: batch {}/{} checked in {:.3}s; {} existing bytes reused, {} new or updated bytes",
                 first.family,
                 batch_number,
@@ -1709,7 +1790,7 @@ fn execute_family_batch_publication(
                 }
             }
             remote.publication_event("batch_committed",batch_started.elapsed(),serde_json::json!({"batch":batch_number,"remaining_batches":total_batches-batch_number as usize}));
-            eprintln!(
+            xc_core::progress_message!(
                 "publication family {}: batch {}/{} committed in {:.3}s",
                 first.family,
                 batch_number,
@@ -1733,7 +1814,7 @@ fn execute_family_batch_publication(
         (Ok(_), Some(Err(error))) => Err(error),
         (Err(error), None | Some(Ok(()))) => Err(error),
         (Err(error), Some(Err(release_error))) => {
-            eprintln!(
+            xc_core::progress_message!(
                 "private publication failed and its lease release also failed: {release_error}"
             );
             Err(error)
@@ -1898,7 +1979,10 @@ fn ensure_managed_shard_sidecars(
             repository: repository.to_owned(),
             branch: branch.to_owned(),
             expected_head: head.clone(),
-            message: "initialize Xcelerator v0.13.0 shard capacity ledger".to_owned(),
+            message: format!(
+                "initialize Xcelerator shard capacity ledger (Toolkit {})",
+                env!("CARGO_PKG_VERSION")
+            ),
             parts,
             delete_paths: Vec::new(),
         };
@@ -2057,7 +2141,7 @@ fn target_manifest(
     Ok(manifest)
 }
 
-fn destination_neutral_manifest(
+pub(crate) fn destination_neutral_manifest(
     draft: &CanonicalProductionDraft,
 ) -> Result<crate::CanonicalArtifactManifest, CacheError> {
     let mut manifest = draft.manifest.clone();
@@ -2447,6 +2531,25 @@ fn exact_destination_dependency_exists_in_shard(
         let authorized_repository = &shard.authorized_repository;
         let mut identities = BTreeSet::new();
         let mut total_batch_bytes = 0u64;
+        // Best effort, as for the destination metadata: each record below is
+        // still read, hashed and validated, so a failed prefetch costs time only.
+        let batch_paths = listing
+            .paths
+            .iter()
+            .filter(|path| path.ends_with(&suffix))
+            .map(|path| crate::RemotePathPrefetch {
+                repository_path: path.clone(),
+                maximum_bytes: 16 * 1024 * 1024,
+            })
+            .collect::<Vec<_>>();
+        for batch in batch_paths.chunks(256) {
+            if remote
+                .prefetch_committed_paths(&repository_endpoint, &revision, batch, &cancellation)
+                .is_err()
+            {
+                break;
+            }
+        }
         for path in listing.paths.iter().filter(|path| path.ends_with(&suffix)) {
             let document = reader.read_json::<crate::RepositoryPublicationBatch>(
                 &repository_endpoint,
@@ -3064,6 +3167,353 @@ pub fn execute_prepared_managed_artifact_publication(
     })
 }
 
+type PublicationGroup = (
+    PublicationTarget,
+    Vec<CanonicalProductionDraft>,
+    BTreeSet<ExactDependencyIdentity>,
+);
+
+/// Exact parent identities that a draft takes from another draft of the same
+/// destination run, in any family, and that `exists` proves already present
+/// at the destination.
+fn in_run_parents_present(
+    drafts: &[CanonicalProductionDraft],
+    mut exists: impl FnMut(&crate::PayloadDependencyIdentity) -> Result<bool, CacheError>,
+) -> Result<BTreeSet<ExactDependencyIdentity>, CacheError> {
+    let produced = drafts
+        .iter()
+        .map(|draft| {
+            Ok((
+                draft.manifest.artifact_family.clone(),
+                draft.manifest.semantic_digest.clone(),
+                draft.manifest.digest()?,
+                draft.manifest.payload_digest.clone(),
+            ))
+        })
+        .collect::<Result<BTreeSet<_>, CacheError>>()?;
+    let mut checked = BTreeSet::new();
+    let mut present = BTreeSet::new();
+    for draft in drafts {
+        for dependency in &draft.manifest.canonical_payload.dependencies {
+            let identity = (
+                dependency.artifact_family.clone(),
+                dependency.semantic_digest.clone(),
+                dependency.manifest_digest.clone(),
+                dependency.payload_digest.clone(),
+            );
+            if !produced.contains(&identity) || !checked.insert(identity.clone()) {
+                continue;
+            }
+            if exists(dependency)? {
+                present.insert(identity);
+            }
+        }
+    }
+    Ok(present)
+}
+
+/// Members of `group` whose exact identities are now present at every
+/// destination of the group. A family transaction can commit some batches
+/// before it fails, so its drafts are rechecked before their dependents are
+/// skipped. Fresh refs are read; nothing is cached from the preflight.
+fn publication_group_members_present(
+    group: &PublicationGroup,
+    members: &[usize],
+    owner: &str,
+    journal_root: &Path,
+    resources: &xc_core::ResourcePolicy,
+) -> Result<Vec<usize>, CacheError> {
+    let (target, drafts, _) = group;
+    let mut present = members.to_vec();
+    for destination in destinations(*target)? {
+        let remote = crate::GitCliRemoteStore::new(
+            journal_root
+                .join("git-transport")
+                .join("dependency-recheck")
+                .join(visibility_name(destination)),
+            journal_root
+                .join("dependency-recheck-staging")
+                .join(visibility_name(destination)),
+            // The recheck only reads refs, like the dependency preflight.
+            "Xcelerator dependency preflight",
+            "preflight@invalid",
+        )?
+        .with_resource_policy(resources.clone());
+        let mut topologies = BTreeMap::new();
+        let mut revisions = BTreeMap::new();
+        let mut inventories = BTreeMap::new();
+        let mut checked = Vec::new();
+        let result = (|| {
+            for &member in &present {
+                let manifest = target_manifest(&drafts[member], destination)?;
+                let dependency = crate::PayloadDependencyIdentity {
+                    artifact_family: manifest.artifact_family.clone(),
+                    semantic_digest: manifest.semantic_digest.clone(),
+                    manifest_digest: manifest.digest()?,
+                    payload_digest: manifest.payload_digest.clone(),
+                };
+                if !topologies.contains_key(&dependency.artifact_family) {
+                    let topology = crate::bootstrap_topology::read_bootstrap_family_topology(
+                        &remote,
+                        owner,
+                        visibility(destination),
+                        &dependency.artifact_family,
+                        &xc_core::CancellationToken::for_policy(resources),
+                    )?;
+                    topologies.insert(dependency.artifact_family.clone(), topology);
+                }
+                if exact_destination_dependency_exists(
+                    &remote,
+                    destination,
+                    &dependency,
+                    &topologies[&dependency.artifact_family],
+                    &mut revisions,
+                    &mut inventories,
+                    resources,
+                )? {
+                    checked.push(member);
+                }
+            }
+            Ok::<(), CacheError>(())
+        })();
+        let cleanup = remote.cleanup_all_sessions();
+        result?;
+        cleanup?;
+        present = checked;
+    }
+    Ok(present)
+}
+
+/// A draft, as (group index, draft index within the group).
+type PublicationDraftRef = (usize, usize);
+
+/// Dependency waves for every draft of every publication group.
+struct PublicationWaves {
+    /// `waves[group][draft]`: the wave in which the draft publishes.
+    waves: Vec<Vec<usize>>,
+    /// `parents[group][draft]`: in-run producers of the draft's exact parents
+    /// that are not already present at the destination.
+    parents: Vec<Vec<Vec<PublicationDraftRef>>>,
+}
+
+/// Which members of one group publish in one wave.
+struct PublicationWaveGate {
+    runs: Vec<usize>,
+    /// The first unpublished parent, in plan order, and the members skipped.
+    blocked_by: Option<(PublicationDraftRef, Vec<usize>)>,
+}
+
+/// Plan publication waves. Each draft's prerequisites are the in-run drafts
+/// that produce its exact parents, unless `available` shows that parent
+/// already present at the destination. A prerequisite in another family
+/// group (a separate transaction) must publish in an earlier wave; one in the
+/// same group may share the wave, since the family batch commits it with or
+/// before the child. Drafts of one family with the same semantic key keep the
+/// family batch order across waves, so the live index entry is chosen as if
+/// they were published together, except where `closure_member_may_follow`
+/// shows the order cannot matter. Artifact dependencies are acyclic (the
+/// destination remapping rejects cycles), so families may depend on each
+/// other in both directions and still publish; only an ordering constraint
+/// that contradicts the dependencies, which no finite wave assignment meets,
+/// is rejected before any remote mutation.
+fn publication_waves(
+    groups: &[PublicationGroup],
+    available: &BTreeMap<PublicationDestination, BTreeSet<ExactDependencyIdentity>>,
+) -> Result<PublicationWaves, CacheError> {
+    let no_parents_present = BTreeSet::new();
+    let mut producers = BTreeMap::<
+        (PublicationDestination, ExactDependencyIdentity),
+        Vec<PublicationDraftRef>,
+    >::new();
+    for (group, (target, drafts, _)) in groups.iter().enumerate() {
+        for destination in destinations(*target)? {
+            for (index, draft) in drafts.iter().enumerate() {
+                let manifest = target_manifest(draft, destination)?;
+                producers
+                    .entry((
+                        destination,
+                        (
+                            manifest.artifact_family.clone(),
+                            manifest.semantic_digest.clone(),
+                            manifest.digest()?,
+                            manifest.payload_digest.clone(),
+                        ),
+                    ))
+                    .or_default()
+                    .push((group, index));
+            }
+        }
+    }
+    let mut parents = Vec::with_capacity(groups.len());
+    let mut predecessors = Vec::with_capacity(groups.len());
+    for (group, (target, drafts, _)) in groups.iter().enumerate() {
+        let group_destinations = destinations(*target)?;
+        let mut group_parents = Vec::with_capacity(drafts.len());
+        for (index, draft) in drafts.iter().enumerate() {
+            let mut draft_parents = BTreeSet::new();
+            for &destination in &group_destinations {
+                let present = available.get(&destination).unwrap_or(&no_parents_present);
+                for identity in publication_dependency_identities([draft]) {
+                    if present.contains(&identity) {
+                        continue;
+                    }
+                    if let Some(found) = producers.get(&(destination, identity)) {
+                        draft_parents
+                            .extend(found.iter().copied().filter(|&p| p != (group, index)));
+                    }
+                }
+            }
+            group_parents.push(draft_parents.into_iter().collect::<Vec<_>>());
+        }
+        parents.push(group_parents);
+        let mut order = drafts.iter().collect::<Vec<_>>();
+        order_family_publication_drafts(&mut order);
+        let position = |draft: &CanonicalProductionDraft| {
+            drafts
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, draft))
+                .expect("ordered draft belongs to its group")
+        };
+        let mut group_predecessors = vec![Vec::new(); drafts.len()];
+        for (earlier_position, earlier) in order.iter().enumerate() {
+            for later in &order[earlier_position + 1..] {
+                if earlier.manifest.semantic_digest == later.manifest.semantic_digest
+                    && !closure_member_may_follow(earlier, later)
+                {
+                    group_predecessors[position(later)].push(position(earlier));
+                }
+            }
+        }
+        predecessors.push(group_predecessors);
+    }
+    let total = groups
+        .iter()
+        .map(|(_, drafts, _)| drafts.len())
+        .sum::<usize>();
+    let mut waves = groups
+        .iter()
+        .map(|(_, drafts, _)| vec![0usize; drafts.len()])
+        .collect::<Vec<_>>();
+    loop {
+        let mut changed = false;
+        for group in 0..groups.len() {
+            for index in 0..waves[group].len() {
+                let mut wave = waves[group][index];
+                for &(parent_group, parent) in &parents[group][index] {
+                    let step = usize::from(parent_group != group);
+                    wave = wave.max(waves[parent_group][parent] + step);
+                }
+                for &previous in &predecessors[group][index] {
+                    wave = wave.max(waves[group][previous]);
+                }
+                if wave != waves[group][index] {
+                    if wave >= total.max(1) {
+                        return Err(CacheError::InvalidManifest(format!(
+                            "publication of {} artifact {} cannot be ordered after its exact parents",
+                            groups[group].1[index].family,
+                            groups[group].1[index].manifest.semantic_digest.0
+                        )));
+                    }
+                    waves[group][index] = wave;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(PublicationWaves { waves, parents })
+}
+
+/// Whether a historical closure member `earlier`, which the family batch order
+/// places before `later` (same family and semantic key), may instead publish
+/// after it without changing the final live index entry. It may when `later`
+/// has a strictly newer producer. Once `later` is published, the live entry
+/// is never older than `later` (advancing is monotonic in producer version),
+/// so `earlier`, being a closure member, then never advances. And in batch
+/// order, whatever `earlier` set is replaced when `later`, or the first newer
+/// draft after `earlier`, advances, so the final entry is the same.
+fn closure_member_may_follow(
+    earlier: &CanonicalProductionDraft,
+    later: &CanonicalProductionDraft,
+) -> bool {
+    earlier.source_operation == "cache.dependency.closure"
+        && later.manifest.producer_toolkit_version > earlier.manifest.producer_toolkit_version
+}
+
+impl PublicationWaves {
+    fn wave_count(&self) -> usize {
+        self.waves
+            .iter()
+            .flatten()
+            .map(|wave| wave + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Members of `group` in `wave` that may publish, given which earlier
+    /// drafts published. A member runs only if every prerequisite in an
+    /// earlier wave published and every same-wave prerequisite also runs.
+    fn gate(
+        &self,
+        group: usize,
+        wave: usize,
+        published: &[Vec<Option<bool>>],
+    ) -> PublicationWaveGate {
+        let members = (0..self.waves[group].len())
+            .filter(|&index| self.waves[group][index] == wave)
+            .collect::<Vec<_>>();
+        let mut blocked = BTreeMap::<usize, PublicationDraftRef>::new();
+        loop {
+            let mut changed = false;
+            for &member in &members {
+                if blocked.contains_key(&member) {
+                    continue;
+                }
+                let failed = self.parents[group][member].iter().copied().find(|&(g, p)| {
+                    if self.waves[g][p] < wave {
+                        published[g][p] != Some(true)
+                    } else {
+                        // Same wave implies the same group.
+                        blocked.contains_key(&p)
+                    }
+                });
+                if let Some(parent) = failed {
+                    blocked.insert(member, parent);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let runs = members
+            .iter()
+            .copied()
+            .filter(|member| !blocked.contains_key(member))
+            .collect::<Vec<_>>();
+        let blocked_by = blocked
+            .values()
+            .copied()
+            .filter(|&(g, p)| self.waves[g][p] < wave)
+            .min()
+            .map(|parent| (parent, blocked.keys().copied().collect()));
+        PublicationWaveGate { runs, blocked_by }
+    }
+}
+
+fn publication_group_label(group: &PublicationGroup) -> String {
+    group
+        .1
+        .first()
+        .map_or_else(|| "empty".to_owned(), |draft| draft.family.clone())
+}
+
+/// Destination family groups published concurrently. Each group writes only
+/// its own repository; four bounds Git transport and GitHub API concurrency.
+const MANAGED_PUBLICATION_FAMILY_WORKERS: usize = 4;
+
 #[allow(
     unreachable_code,
     unused_variables,
@@ -3324,7 +3774,7 @@ fn execute_managed_family_drafts_on_github(
                         }
                         sessions.insert(destination, refreshed);
                     }
-                    eprintln!(
+                    xc_core::progress_message!(
                         "publication authorization refreshed for family {} after a long-running artifact step",
                         draft.family
                     );
@@ -3338,7 +3788,7 @@ fn execute_managed_family_drafts_on_github(
         }
     }
     if remotely_completed > 0 {
-        eprintln!(
+        xc_core::progress_message!(
             "publication family {}: reused {remotely_completed} completed remote transaction(s)",
             first_draft.family
         );
@@ -3423,7 +3873,7 @@ impl ManagedTransportWorkspace {
         if root.exists() {
             let stale_bytes = transport_tree_size_bytes(&root)?;
             fs::remove_dir_all(&root)?;
-            eprintln!(
+            xc_core::progress_message!(
                 "publication transport recovery: removed {stale_bytes} stale temporary bytes"
             );
         }
@@ -3442,7 +3892,9 @@ impl ManagedTransportWorkspace {
         self.finished = true;
         FileExt::unlock(&self.lock)?;
         if bytes > 0 {
-            eprintln!("publication transport cleanup: removed {bytes} temporary bytes");
+            xc_core::progress_message!(
+                "publication transport cleanup: removed {bytes} temporary bytes"
+            );
         }
         Ok(())
     }
@@ -3453,7 +3905,7 @@ impl Drop for ManagedTransportWorkspace {
         if !self.finished {
             if let Err(error) = fs::remove_dir_all(&self.root) {
                 if self.root.exists() {
-                    eprintln!(
+                    xc_core::progress_message!(
                         "publication transport emergency cleanup failed for {}: {error}",
                         self.root.display()
                     );
@@ -3511,12 +3963,180 @@ pub fn execute_managed_drafts_on_github(
         (Ok(_), Err(error)) => Err(error),
         (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup_error)) => {
-            eprintln!(
+            xc_core::progress_message!(
                 "publication failed and final Git transport cleanup also failed: {cleanup_error}"
             );
             Err(error)
         }
     }
+}
+
+/// The exact destination existence checks of one publication preflight, with
+/// their memoized answers, shard revisions and historical batch inventories.
+struct DestinationDependencyCheck<'a> {
+    remote: &'a dyn crate::RemoteGitStore,
+    owner: &'a str,
+    destination: PublicationDestination,
+    topologies: &'a mut BTreeMap<
+        (PublicationDestination, String),
+        crate::bootstrap_topology::BootstrapFamilyTopology,
+    >,
+    revisions: BTreeMap<String, String>,
+    historical: HistoricalDependencyInventories,
+    results: BTreeMap<ExactDependencyIdentity, bool>,
+    resources: &'a xc_core::ResourcePolicy,
+}
+
+impl DestinationDependencyCheck<'_> {
+    fn topology_key(
+        &mut self,
+        family: &str,
+    ) -> Result<(PublicationDestination, String), CacheError> {
+        let key = (self.destination, family.to_owned());
+        if !self.topologies.contains_key(&key) {
+            let topology = crate::bootstrap_topology::read_bootstrap_family_topology(
+                self.remote,
+                self.owner,
+                visibility(self.destination),
+                family,
+                &xc_core::CancellationToken::for_policy(self.resources),
+            )?;
+            self.topologies.insert(key.clone(), topology);
+        }
+        Ok(key)
+    }
+
+    fn exists(
+        &mut self,
+        dependency: &crate::PayloadDependencyIdentity,
+    ) -> Result<bool, CacheError> {
+        let identity = (
+            dependency.artifact_family.clone(),
+            dependency.semantic_digest.clone(),
+            dependency.manifest_digest.clone(),
+            dependency.payload_digest.clone(),
+        );
+        if let Some(exists) = self.results.get(&identity) {
+            return Ok(*exists);
+        }
+        let key = self.topology_key(&dependency.artifact_family)?;
+        let exists = exact_destination_dependency_exists(
+            self.remote,
+            self.destination,
+            dependency,
+            &self.topologies[&key],
+            &mut self.revisions,
+            &mut self.historical,
+            self.resources,
+        )?;
+        self.results.insert(identity, exists);
+        Ok(exists)
+    }
+
+    /// Hydrate, in one batched fetch per readable shard, the manifest and
+    /// index partition that each check of `identities` reads first, so the
+    /// checks read locally instead of fetching one document at a time. Best
+    /// effort and never an error: every check still reads, hashes and
+    /// validates each document at the same revision, so a skipped or failed
+    /// prefetch costs only time, and every answer and error is unchanged.
+    fn prefetch(&mut self, identities: &BTreeSet<ExactDependencyIdentity>) {
+        let mut paths = BTreeMap::<String, BTreeSet<String>>::new();
+        for identity in identities {
+            if self.results.contains_key(identity) {
+                continue;
+            }
+            let (family, semantic, manifest, _) = identity;
+            // A topology that cannot be read here fails its check unchanged.
+            let Ok(key) = self.topology_key(family) else {
+                continue;
+            };
+            for shard in &self.topologies[&key].readable_shards {
+                let shard_paths = paths.entry(shard.repository_url.clone()).or_default();
+                shard_paths.insert(format!("manifests/{}/{manifest}.json", &semantic.0[..2]));
+                shard_paths.insert(format!("indexes/{family}/{}.json", &semantic.0[..2]));
+            }
+        }
+        let cancellation = xc_core::CancellationToken::for_policy(self.resources);
+        for (repository, paths) in paths {
+            // The checks read this same revision (they reuse the map).
+            let revision = match self.revisions.get(&repository) {
+                Some(revision) => revision.clone(),
+                None => match self.remote.read_ref(&repository, "main") {
+                    Ok(revision) => {
+                        self.revisions.insert(repository.clone(), revision.clone());
+                        revision
+                    }
+                    Err(_) => continue,
+                },
+            };
+            let paths = paths
+                .into_iter()
+                .map(|repository_path| crate::RemotePathPrefetch {
+                    repository_path,
+                    maximum_bytes: 16 * 1024 * 1024,
+                })
+                .collect::<Vec<_>>();
+            for batch in paths.chunks(256) {
+                if self
+                    .remote
+                    .prefetch_present_committed_paths(&repository, &revision, batch, &cancellation)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The exact external parents that `remap_destination_drafts_with_existing`
+/// asks about: dependencies that no draft in the set, nor its
+/// destination-neutral alias, provides.
+fn remap_queried_dependencies(
+    drafts: &[CanonicalProductionDraft],
+) -> BTreeSet<ExactDependencyIdentity> {
+    let mut provided = BTreeSet::new();
+    for draft in drafts {
+        let mut manifests = vec![draft.manifest.clone()];
+        if let Ok(neutral) = destination_neutral_manifest(draft) {
+            manifests.push(neutral);
+        }
+        for manifest in manifests {
+            if let Ok(digest) = manifest.digest() {
+                provided.insert((
+                    manifest.artifact_family.clone(),
+                    manifest.semantic_digest.clone(),
+                    digest,
+                    manifest.payload_digest.clone(),
+                ));
+            }
+        }
+    }
+    publication_dependency_identities(drafts)
+        .into_iter()
+        .filter(|identity| !provided.contains(identity))
+        .collect()
+}
+
+/// The in-run parents that `in_run_parents_present` asks about.
+fn in_run_queried_dependencies(
+    drafts: &[CanonicalProductionDraft],
+) -> Result<BTreeSet<ExactDependencyIdentity>, CacheError> {
+    let produced = drafts
+        .iter()
+        .map(|draft| {
+            Ok((
+                draft.manifest.artifact_family.clone(),
+                draft.manifest.semantic_digest.clone(),
+                draft.manifest.digest()?,
+                draft.manifest.payload_digest.clone(),
+            ))
+        })
+        .collect::<Result<BTreeSet<_>, CacheError>>()?;
+    Ok(publication_dependency_identities(drafts)
+        .into_iter()
+        .filter(|identity| produced.contains(identity))
+        .collect())
 }
 
 fn execute_managed_drafts_on_github_inner(
@@ -3529,10 +4149,14 @@ fn execute_managed_drafts_on_github_inner(
 ) -> Result<ManagedRunPublicationReport, CacheError> {
     let requested_destinations = destinations(target)?;
     let mut groups = Vec::new();
+    let mut available_parents =
+        BTreeMap::<PublicationDestination, BTreeSet<ExactDependencyIdentity>>::new();
     let mut family_topologies = BTreeMap::<
         (PublicationDestination, String),
         crate::bootstrap_topology::BootstrapFamilyTopology,
     >::new();
+    let probe = crate::GitHubCredentialApiProbe::default();
+    let mut principals = BTreeSet::new();
     for destination in requested_destinations.iter().copied() {
         // Mirror the inventory's routing: private-only kinds ride the private
         // leg and are withheld from the public one, so a mixed draft set
@@ -3583,58 +4207,54 @@ fn execute_managed_drafts_on_github_inner(
                 family,
                 &xc_core::CancellationToken::for_policy(resources),
             )?;
+            // Fail the complete multi-family run before the dependency
+            // preflight (minutes of destination reads on a large run) and
+            // before the first remote mutation if any destination repository
+            // is absent from the PAT or lacks write access. Per-family probes
+            // are repeated immediately before mutation so their evidence
+            // remains fresh during long publication runs.
+            let session =
+                probe.probe_repository(&topology.current_writable.authorized_repository)?;
+            principals.insert(session.evidence().principal.clone());
             family_topologies.insert((destination, family.to_owned()), topology);
         }
-        let mut dependency_revisions = BTreeMap::new();
-        let mut historical_dependency_inventories = BTreeMap::new();
-        let mut dependency_results =
-            BTreeMap::<(String, ContentDigest, ContentDigest, ContentDigest), bool>::new();
+        let mut check = DestinationDependencyCheck {
+            remote: &dependency_remote,
+            owner,
+            destination,
+            topologies: &mut family_topologies,
+            revisions: BTreeMap::new(),
+            historical: BTreeMap::new(),
+            results: BTreeMap::new(),
+            resources,
+        };
+        // A parent that this run publishes, but whose exact identity is already
+        // present at the destination, cannot be lost by a failed transaction,
+        // so it orders and gates nothing, whichever family it belongs to.
+        check.prefetch(&remap_queried_dependencies(drafts));
         let remapped_result =
             remap_destination_drafts_with_existing(drafts, destination, |dependency| {
-                let identity = (
-                    dependency.artifact_family.clone(),
-                    dependency.semantic_digest.clone(),
-                    dependency.manifest_digest.clone(),
-                    dependency.payload_digest.clone(),
-                );
-                if let Some(exists) = dependency_results.get(&identity) {
-                    return Ok(*exists);
-                }
-                let topology_key = (destination, dependency.artifact_family.clone());
-                if !family_topologies.contains_key(&topology_key) {
-                    let topology = crate::bootstrap_topology::read_bootstrap_family_topology(
-                        &dependency_remote,
-                        owner,
-                        visibility(destination),
-                        &dependency.artifact_family,
-                        &xc_core::CancellationToken::for_policy(resources),
-                    )?;
-                    family_topologies.insert(topology_key.clone(), topology);
-                }
-                let exists = exact_destination_dependency_exists(
-                    &dependency_remote,
-                    destination,
-                    dependency,
-                    &family_topologies[&topology_key],
-                    &mut dependency_revisions,
-                    &mut historical_dependency_inventories,
-                    resources,
-                )?;
-                dependency_results.insert(identity, exists);
-                Ok(exists)
+                check.exists(dependency)
+            })
+            .and_then(|remapped| {
+                check.prefetch(&in_run_queried_dependencies(&remapped)?);
+                let present =
+                    in_run_parents_present(&remapped, |dependency| check.exists(dependency))?;
+                Ok((remapped, present))
             });
         let cleanup_result = dependency_remote.cleanup_all_sessions();
-        let remapped = match (remapped_result, cleanup_result) {
-            (Ok(remapped), Ok(())) => remapped,
+        let (remapped, present_parents) = match (remapped_result, cleanup_result) {
+            (Ok(result), Ok(())) => result,
             (Ok(_), Err(error)) => return Err(error),
             (Err(error), Ok(())) => return Err(error),
             (Err(error), Err(cleanup_error)) => {
-                eprintln!(
+                xc_core::progress_message!(
                     "dependency preflight failed and its Git transport cleanup also failed: {cleanup_error}"
                 );
                 return Err(error);
             }
         };
+        available_parents.insert(destination, present_parents);
         // Retain the complete destination graph before splitting by family.
         // Family-local inspection misses matrix parents named by state drafts.
         let required_dependencies = publication_dependency_identities(&remapped);
@@ -3654,34 +4274,6 @@ fn execute_managed_drafts_on_github_inner(
         }));
     }
 
-    // Fail the complete multi-family run before the first remote mutation if
-    // any destination repository is absent from the PAT or lacks write access.
-    // Per-family probes are repeated immediately before mutation so their
-    // evidence remains fresh during long publication runs.
-    let probe = crate::GitHubCredentialApiProbe::default();
-    let mut principals = BTreeSet::new();
-    for (group_target, family_drafts, _) in &groups {
-        let family = family_drafts
-            .first()
-            .map(|draft| draft.family.as_str())
-            .ok_or_else(|| {
-                CacheError::InvalidTransition(
-                    "managed publication received an empty artifact family".to_owned(),
-                )
-            })?;
-        for destination in destinations(*group_target)? {
-            let topology = family_topologies
-                .get(&(destination, family.to_owned()))
-                .ok_or_else(|| {
-                    CacheError::NoWritableShard(format!(
-                        "managed preflight has no topology for {family:?}"
-                    ))
-                })?;
-            let authorized_repository = &topology.current_writable.authorized_repository;
-            let session = probe.probe_repository(authorized_repository)?;
-            principals.insert(session.evidence().principal.clone());
-        }
-    }
     if principals.len() != 1 {
         return Err(CacheError::Authentication(
             "managed multi-family publication resolved different GitHub principals".to_owned(),
@@ -3689,45 +4281,176 @@ fn execute_managed_drafts_on_github_inner(
     }
 
     let started = std::time::Instant::now();
-    let reports = groups
+    let run_group = |(group_target, family_drafts, required_dependencies): &PublicationGroup,
+                     members: &[usize]| {
+        let family = family_drafts
+            .first()
+            .map(|draft| draft.family.as_str())
+            .unwrap_or("empty");
+        let family_started = std::time::Instant::now();
+        let family_draft_refs = members
+            .iter()
+            .map(|&member| &family_drafts[member])
+            .collect::<Vec<_>>();
+        let targets = destinations(*group_target)?
+            .into_iter()
+            .map(|destination| {
+                let topology = family_topologies
+                    .get(&(destination, family.to_owned()))
+                    .ok_or_else(|| {
+                        CacheError::NoWritableShard(format!(
+                            "managed publication has no topology for {family:?}"
+                        ))
+                    })?;
+                Ok((destination, topology.current_writable.clone()))
+            })
+            .collect::<Result<BTreeMap<_, _>, CacheError>>()?;
+        let report = execute_managed_family_drafts_on_github(
+            &family_draft_refs,
+            *group_target,
+            owner,
+            journal_root,
+            resources,
+            replace_existing_semantic,
+            &targets,
+            required_dependencies,
+        )?;
+        xc_core::progress_message!(
+            "publication family {family}: evaluated {} staged candidate(s) in {:.3}s",
+            family_draft_refs.len(),
+            family_started.elapsed().as_secs_f64()
+        );
+        Ok(report)
+    };
+    // Drafts publish in dependency waves (see publication_waves): a draft
+    // follows every exact parent that is published in this run and not already
+    // present at the destination, a parent in another family by a whole wave.
+    // A family may therefore publish in several waves. Within a wave each
+    // family group writes only its own repository, so groups run concurrently.
+    // A draft runs only if each such parent published; otherwise it is skipped
+    // with an error naming that parent, while its unaffected siblings still
+    // publish. A failed transaction's drafts that later drafts depend on are
+    // rechecked at the destination, since it may have committed some batches
+    // first. Which drafts publish therefore depends only on transaction
+    // outcomes, destination contents and the planned graph, never on
+    // completion order. Reports and the first error are taken wave by wave:
+    // a wave's skip errors in group order, then its transaction results in
+    // group order.
+    let plan = publication_waves(&groups, &available_parents)?;
+    let wave_count = plan.wave_count();
+    if wave_count > 1 {
+        xc_core::progress_message!(
+            "publication plan: {} destination family group(s) in {wave_count} dependency wave(s)",
+            groups.len()
+        );
+    }
+    let mut published = groups
         .iter()
-        .map(|(group_target, family_drafts, required_dependencies)| {
-            let family = family_drafts
-                .first()
-                .map(|draft| draft.family.as_str())
-                .unwrap_or("empty");
-            let family_started = std::time::Instant::now();
-            let family_draft_refs = family_drafts.iter().collect::<Vec<_>>();
-            let targets = destinations(*group_target)?
-                .into_iter()
-                .map(|destination| {
-                    let topology = family_topologies
-                        .get(&(destination, family.to_owned()))
-                        .ok_or_else(|| {
-                            CacheError::NoWritableShard(format!(
-                                "managed publication has no topology for {family:?}"
-                            ))
-                        })?;
-                    Ok((destination, topology.current_writable.clone()))
+        .map(|(_, drafts, _)| vec![None::<bool>; drafts.len()])
+        .collect::<Vec<_>>();
+    let prerequisites = plan
+        .parents
+        .iter()
+        .flatten()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut results = Vec::<Result<ManagedRunPublicationReport, CacheError>>::new();
+    for wave in 0..wave_count {
+        let mut runnable = Vec::new();
+        for group in 0..groups.len() {
+            let gate = plan.gate(group, wave, &published);
+            if let Some(((parent_group, parent), skipped)) = &gate.blocked_by {
+                for &member in skipped {
+                    published[group][member] = Some(false);
+                }
+                results.push(Err(CacheError::InvalidTransition(format!(
+                    "publication group {} skipped {} artifact(s): parent {}/{} did not publish",
+                    publication_group_label(&groups[group]),
+                    skipped.len(),
+                    groups[*parent_group].1[*parent].family,
+                    groups[*parent_group].1[*parent].manifest.semantic_digest.0
+                ))));
+            }
+            if !gate.runs.is_empty() {
+                runnable.push((group, gate.runs));
+            }
+        }
+        let workers = runnable.len().clamp(1, MANAGED_PUBLICATION_FAMILY_WORKERS);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let slots = runnable
+            .iter()
+            .map(|_| std::sync::Mutex::new(None))
+            .collect::<Vec<_>>();
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let position = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some((group, members)) = runnable.get(position) else {
+                        break;
+                    };
+                    let result: Result<ManagedRunPublicationReport, CacheError> =
+                        run_group(&groups[*group], members);
+                    *slots[position]
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(result);
+                });
+            }
+        });
+        for ((group, members), slot) in runnable.iter().zip(slots) {
+            let result = slot
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(|| {
+                    Err(CacheError::InvalidTransition(
+                        "managed publication group did not run".to_owned(),
+                    ))
+                });
+            for &member in members {
+                published[*group][member] = Some(result.is_ok());
+            }
+            results.push(result);
+        }
+        for (group, members) in &runnable {
+            let recheck = members
+                .iter()
+                .copied()
+                .filter(|&member| {
+                    published[*group][member] == Some(false)
+                        && prerequisites.contains(&(*group, member))
                 })
-                .collect::<Result<BTreeMap<_, _>, CacheError>>()?;
-            let report = execute_managed_family_drafts_on_github(
-                &family_draft_refs,
-                *group_target,
+                .collect::<Vec<_>>();
+            if recheck.is_empty() {
+                continue;
+            }
+            match publication_group_members_present(
+                &groups[*group],
+                &recheck,
                 owner,
                 journal_root,
                 resources,
-                replace_existing_semantic,
-                &targets,
-                required_dependencies,
-            )?;
-            eprintln!(
-                "publication family {family}: evaluated {} staged candidate(s) in {:.3}s",
-                family_drafts.len(),
-                family_started.elapsed().as_secs_f64()
-            );
-            Ok(report)
-        })
+            ) {
+                Ok(present) => {
+                    for member in present {
+                        published[*group][member] = Some(true);
+                    }
+                }
+                Err(error) => xc_core::progress_message!(
+                    "publication group {}: could not recheck the drafts of its failed transaction; their dependents are skipped: {error}",
+                    publication_group_label(&groups[*group])
+                ),
+            }
+        }
+    }
+    let failed = results.iter().filter(|result| result.is_err()).count();
+    if failed > 0 {
+        xc_core::progress_message!(
+            "publication execution: {failed} of {} scheduled publication units failed or skipped artifacts after a parent failure; the others completed their own transactions",
+            results.len()
+        );
+    }
+    let reports = results
+        .into_iter()
         .collect::<Result<Vec<_>, CacheError>>()?;
 
     let transactions = reports
@@ -3737,7 +4460,7 @@ fn execute_managed_drafts_on_github_inner(
     let current_tree_paths_removed = reports.iter().fold(0usize, |total, report| {
         total.saturating_add(report.current_tree_paths_removed)
     });
-    eprintln!(
+    xc_core::progress_message!(
         "publication execution: evaluated {} destination candidate(s), created {} transaction(s) across {} destination shard groups in {:.3}s",
         drafts.len().saturating_mul(requested_destinations.len()),
         transactions.len(),
@@ -3757,6 +4480,578 @@ mod tests {
     mod alias_tests {
         use super::*;
         include!("managed_publication_alias_tests.rs");
+    }
+
+    fn publication_wave_fixture() -> (crate::test_support::TestDir, Vec<PublicationGroup>) {
+        // A1 -> B1 -> A2: artifacts are acyclic while families A and B depend
+        // on each other in both directions. C1 is unrelated to all of them.
+        let root = crate::test_support::temporary_root("managed-publication-waves");
+        let a1 = fixture_draft_family(fixture_draft_with_n(&root, 2), "ccm-matrices");
+        let b1 = fixture_draft_family(
+            fixture_draft_with_dependency(fixture_draft_with_n(&root, 3), &a1),
+            "ccm-evidence",
+        );
+        let a2 = fixture_draft_family(
+            fixture_draft_with_dependency(fixture_draft_with_n(&root, 4), &b1),
+            "ccm-matrices",
+        );
+        let c1 = fixture_draft_family(fixture_draft_with_n(&root, 5), "ccm-matrices");
+        let remapped =
+            remap_destination_drafts(&[a1, b1, a2, c1], PublicationDestination::Private).unwrap();
+        let mut by_family = BTreeMap::<String, Vec<CanonicalProductionDraft>>::new();
+        for draft in remapped {
+            by_family
+                .entry(draft.family.clone())
+                .or_default()
+                .push(draft);
+        }
+        let groups = by_family
+            .into_values()
+            .map(|drafts| (PublicationTarget::Private, drafts, BTreeSet::new()))
+            .collect();
+        (root, groups)
+    }
+
+    fn wave_of(plan: &PublicationWaves, groups: &[PublicationGroup], n_modes: u64) -> usize {
+        for (group, (_, drafts, _)) in groups.iter().enumerate() {
+            for (index, draft) in drafts.iter().enumerate() {
+                if draft.manifest.semantic_key.resolved_mathematical_parameters
+                    == serde_json::json!({"n_modes": n_modes})
+                {
+                    return plan.waves[group][index];
+                }
+            }
+        }
+        panic!("no fixture draft with n_modes {n_modes}");
+    }
+
+    fn draft_ref(groups: &[PublicationGroup], n_modes: u64) -> PublicationDraftRef {
+        for (group, (_, drafts, _)) in groups.iter().enumerate() {
+            for (index, draft) in drafts.iter().enumerate() {
+                if draft.manifest.semantic_key.resolved_mathematical_parameters
+                    == serde_json::json!({"n_modes": n_modes})
+                {
+                    return (group, index);
+                }
+            }
+        }
+        panic!("no fixture draft with n_modes {n_modes}");
+    }
+
+    #[test]
+    fn publication_waves_order_parents_across_mutually_dependent_families() {
+        let (root, groups) = publication_wave_fixture();
+        let plan = publication_waves(&groups, &BTreeMap::new()).unwrap();
+        assert_eq!(wave_of(&plan, &groups, 2), 0);
+        assert_eq!(wave_of(&plan, &groups, 3), 1);
+        assert_eq!(wave_of(&plan, &groups, 4), 2);
+        assert_eq!(wave_of(&plan, &groups, 5), 0);
+        assert_eq!(plan.wave_count(), 3);
+        // The plan is a function of the drafts alone.
+        for _ in 0..10 {
+            assert_eq!(
+                publication_waves(&groups, &BTreeMap::new()).unwrap().waves,
+                plan.waves
+            );
+        }
+        assert_eq!(
+            publication_waves(&[], &BTreeMap::new())
+                .unwrap()
+                .wave_count(),
+            0
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn publication_gate_skips_only_drafts_whose_exact_parent_failed() {
+        let (root, groups) = publication_wave_fixture();
+        let plan = publication_waves(&groups, &BTreeMap::new()).unwrap();
+        let (a1, b1, a2, c1) = (
+            draft_ref(&groups, 2),
+            draft_ref(&groups, 3),
+            draft_ref(&groups, 4),
+            draft_ref(&groups, 5),
+        );
+        let mut published = groups
+            .iter()
+            .map(|(_, drafts, _)| vec![None; drafts.len()])
+            .collect::<Vec<_>>();
+        // Wave 0 runs A1 and the unrelated C1 together in family A.
+        let gate = plan.gate(a1.0, 0, &published);
+        let mut expected = vec![a1.1, c1.1];
+        expected.sort();
+        assert_eq!(gate.runs, expected);
+        assert!(gate.blocked_by.is_none());
+        // Family A's wave-0 transaction fails: B1 is skipped, naming A1.
+        published[a1.0][a1.1] = Some(false);
+        published[c1.0][c1.1] = Some(false);
+        let gate = plan.gate(b1.0, 1, &published);
+        assert!(gate.runs.is_empty());
+        assert_eq!(gate.blocked_by, Some((a1, vec![b1.1])));
+        // Had it succeeded, B1 and then A2 would run.
+        published[a1.0][a1.1] = Some(true);
+        assert_eq!(plan.gate(b1.0, 1, &published).runs, vec![b1.1]);
+        published[b1.0][b1.1] = Some(true);
+        assert_eq!(plan.gate(a2.0, 2, &published).runs, vec![a2.1]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_already_present_parent_neither_orders_nor_gates_its_child() {
+        let (root, groups) = publication_wave_fixture();
+        let (a1, b1) = (draft_ref(&groups, 2), draft_ref(&groups, 3));
+        let a1_manifest = &groups[a1.0].1[a1.1].manifest;
+        let present = BTreeMap::from([(
+            PublicationDestination::Private,
+            BTreeSet::from([(
+                a1_manifest.artifact_family.clone(),
+                a1_manifest.semantic_digest.clone(),
+                a1_manifest.digest().unwrap(),
+                a1_manifest.payload_digest.clone(),
+            )]),
+        )]);
+        let plan = publication_waves(&groups, &present).unwrap();
+        assert_eq!(wave_of(&plan, &groups, 3), 0);
+        assert_eq!(wave_of(&plan, &groups, 4), 1);
+        // A1 is also staged with an unrelated draft whose family transaction
+        // fails; B1 still publishes because its exact parent is present.
+        let published = groups
+            .iter()
+            .map(|(_, drafts, _)| vec![Some(false); drafts.len()])
+            .collect::<Vec<_>>();
+        let gate = plan.gate(b1.0, 0, &published);
+        assert_eq!(gate.runs, vec![b1.1]);
+        assert!(gate.blocked_by.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn fixture_draft_with_parents(
+        mut draft: CanonicalProductionDraft,
+        parents: &[&CanonicalProductionDraft],
+    ) -> CanonicalProductionDraft {
+        let dependencies = &mut draft.manifest.canonical_payload.dependencies;
+        for parent in parents {
+            dependencies.push(crate::PayloadDependencyIdentity {
+                artifact_family: parent.manifest.artifact_family.clone(),
+                semantic_digest: parent.manifest.semantic_digest.clone(),
+                manifest_digest: parent.manifest.digest().unwrap(),
+                payload_digest: parent.manifest.payload_digest.clone(),
+            });
+        }
+        dependencies.sort_by(|left, right| {
+            (
+                &left.artifact_family,
+                &left.semantic_digest,
+                &left.manifest_digest,
+                &left.payload_digest,
+            )
+                .cmp(&(
+                    &right.artifact_family,
+                    &right.semantic_digest,
+                    &right.manifest_digest,
+                    &right.payload_digest,
+                ))
+        });
+        draft.manifest.payload_digest = draft.manifest.canonical_payload.digest().unwrap();
+        draft.encoding.canonical_payload_digest = draft.manifest.payload_digest.clone();
+        draft.manifest.transport_digests = vec![draft.encoding.digest().unwrap()];
+        draft
+    }
+
+    fn group_by_family(drafts: Vec<CanonicalProductionDraft>) -> Vec<PublicationGroup> {
+        let mut by_family = BTreeMap::<String, Vec<CanonicalProductionDraft>>::new();
+        for draft in drafts {
+            by_family
+                .entry(draft.family.clone())
+                .or_default()
+                .push(draft);
+        }
+        by_family
+            .into_values()
+            .map(|drafts| (PublicationTarget::Private, drafts, BTreeSet::new()))
+            .collect()
+    }
+
+    fn exact_identity(draft: &CanonicalProductionDraft) -> ExactDependencyIdentity {
+        (
+            draft.manifest.artifact_family.clone(),
+            draft.manifest.semantic_digest.clone(),
+            draft.manifest.digest().unwrap(),
+            draft.manifest.payload_digest.clone(),
+        )
+    }
+
+    #[test]
+    fn in_run_parents_present_asks_about_parents_in_every_family() {
+        let (root, groups) = publication_wave_fixture();
+        let drafts = groups
+            .iter()
+            .flat_map(|(_, drafts, _)| drafts.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut asked = Vec::new();
+        let present = in_run_parents_present(&drafts, |dependency| {
+            asked.push(dependency.semantic_digest.clone());
+            Ok(dependency.artifact_family == "ccm-matrices")
+        })
+        .unwrap();
+        // B1's parent A1 and A2's parent B1; each in-run parent is asked once.
+        assert_eq!(asked.len(), 2);
+        assert_eq!(present.len(), 1);
+        assert!(present.iter().all(|identity| identity.0 == "ccm-matrices"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_already_present_same_family_parent_does_not_gate_a_later_wave() {
+        // Family A holds present parent P, unrelated X and child C; C also
+        // depends on Q in family B, which puts C in a later wave than P.
+        let root = crate::test_support::temporary_root("managed-publication-same-family");
+        let p = fixture_draft_family(fixture_draft_with_n(&root, 2), "ccm-matrices");
+        let x = fixture_draft_family(fixture_draft_with_n(&root, 5), "ccm-matrices");
+        let q = fixture_draft_family(fixture_draft_with_n(&root, 6), "ccm-evidence");
+        let c = fixture_draft_family(
+            fixture_draft_with_parents(fixture_draft_with_n(&root, 7), &[&p, &q]),
+            "ccm-matrices",
+        );
+        let remapped =
+            remap_destination_drafts(&[p, x, q, c], PublicationDestination::Private).unwrap();
+        let mut asked = BTreeSet::new();
+        let p_ref_identity = |drafts: &[CanonicalProductionDraft]| {
+            exact_identity(
+                drafts
+                    .iter()
+                    .find(|draft| {
+                        draft.manifest.semantic_key.resolved_mathematical_parameters
+                            == serde_json::json!({"n_modes": 2})
+                    })
+                    .unwrap(),
+            )
+        };
+        let p_identity = p_ref_identity(&remapped);
+        let present = in_run_parents_present(&remapped, |dependency| {
+            let identity = (
+                dependency.artifact_family.clone(),
+                dependency.semantic_digest.clone(),
+                dependency.manifest_digest.clone(),
+                dependency.payload_digest.clone(),
+            );
+            asked.insert(identity.clone());
+            Ok(identity == p_identity)
+        })
+        .unwrap();
+        // The same-family parent P is asked about, as is Q.
+        assert!(asked.contains(&p_identity));
+        assert_eq!(asked.len(), 2);
+        assert_eq!(present, BTreeSet::from([p_identity]));
+        let groups = group_by_family(remapped);
+        let plan = publication_waves(
+            &groups,
+            &BTreeMap::from([(PublicationDestination::Private, present)]),
+        )
+        .unwrap();
+        let (c_ref, q_ref) = (draft_ref(&groups, 7), draft_ref(&groups, 6));
+        assert_eq!(plan.waves[c_ref.0][c_ref.1], 1);
+        // Q publishes; family A's wave-0 transaction fails on X (P with it).
+        let mut published = groups
+            .iter()
+            .map(|(_, drafts, _)| vec![Some(false); drafts.len()])
+            .collect::<Vec<_>>();
+        published[q_ref.0][q_ref.1] = Some(true);
+        let gate = plan.gate(c_ref.0, 1, &published);
+        assert_eq!(gate.runs, vec![c_ref.1]);
+        assert!(gate.blocked_by.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The index entry a draft writes when it advances the live index.
+    fn live_entry(draft: &CanonicalProductionDraft) -> crate::ShardIndexEntry {
+        crate::ShardIndexEntry {
+            semantic_digest: draft.manifest.semantic_digest.clone(),
+            canonical_payload_digest: draft.manifest.payload_digest.clone(),
+            manifest_digest: draft.manifest.digest().unwrap(),
+            achieved_assurance: draft.achieved_assurance,
+            disposition: ArtifactDisposition::Active,
+            producer_toolkit_version: draft.manifest.producer_toolkit_version.clone(),
+            minimum_reader_version: draft.manifest.minimum_reader_version.clone(),
+            transport_digests: vec![draft.encoding.digest().unwrap()],
+            publication_transaction_id: ContentDigest::sha256(b"batch").0,
+        }
+    }
+
+    /// Final live entry, by manifest digest, after applying each draft (with
+    /// its precomputed entry and whether it is required as an exact parent)
+    /// in order to a partition that starts with `initial`, as the family
+    /// batch commit does; `None` when the sequence is rejected as a downgrade.
+    fn live_after(
+        steps: &[(&CanonicalProductionDraft, &crate::ShardIndexEntry, bool)],
+        initial: Option<&ToolkitVersion>,
+        replace_existing_semantic: bool,
+    ) -> Option<Option<ContentDigest>> {
+        let first = steps[0].0;
+        let mut entries = initial
+            .map(|version| {
+                vec![crate::ShardIndexEntry {
+                    semantic_digest: first.manifest.semantic_digest.clone(),
+                    canonical_payload_digest: ContentDigest::sha256(b"initial-payload"),
+                    manifest_digest: ContentDigest::sha256(b"initial-manifest"),
+                    achieved_assurance: ArtifactAssuranceState::Certified,
+                    disposition: ArtifactDisposition::Active,
+                    producer_toolkit_version: version.clone(),
+                    minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
+                    transport_digests: vec![ContentDigest::sha256(b"initial-transport")],
+                    publication_transaction_id: ContentDigest::sha256(b"initial-batch").0,
+                }]
+            })
+            .unwrap_or_default();
+        for &(draft, entry, required) in steps {
+            let partition = crate::ShardIndexPartition::rebuild(
+                draft.manifest.artifact_family.clone(),
+                draft.manifest.semantic_digest.0[..2].to_owned(),
+                entries.clone(),
+            )
+            .unwrap();
+            match family_draft_advances_live_index(
+                &partition,
+                draft,
+                &draft.manifest,
+                required && !replace_existing_semantic,
+            ) {
+                Ok(true) => entries = vec![entry.clone()],
+                Ok(false) => {}
+                Err(_) => return None,
+            }
+        }
+        Some(entries.first().map(|entry| entry.manifest_digest.clone()))
+    }
+
+    #[test]
+    fn a_historical_closure_member_may_follow_its_newer_live_draft() {
+        // A-newer -> B -> A-historical: the closure member shares A-newer's
+        // semantic key but must publish two waves after it.
+        let root = crate::test_support::temporary_root("managed-publication-closure-order");
+        let mut a_newer = fixture_draft_family(fixture_draft_with_n(&root, 2), "ccm-matrices");
+        a_newer.source_operation = "ccm.tau.resolve_or_compute".to_owned();
+        a_newer.manifest.producer_toolkit_version = ToolkitVersion::parse("0.16.4").unwrap();
+        let b = fixture_draft_family(
+            fixture_draft_with_dependency(fixture_draft_with_n(&root, 3), &a_newer),
+            "ccm-evidence",
+        );
+        let mut a_historical = fixture_draft_family(
+            fixture_draft_with_dependency(fixture_draft_with_n(&root, 2), &b),
+            "ccm-matrices",
+        );
+        a_historical.source_operation = "cache.dependency.closure".to_owned();
+        let remapped =
+            remap_destination_drafts(&[a_newer, b, a_historical], PublicationDestination::Private)
+                .unwrap();
+        let required = publication_dependency_identities(&remapped);
+        let groups = group_by_family(remapped);
+        let plan = publication_waves(&groups, &BTreeMap::new()).unwrap();
+        let wave = |operation: &str| {
+            groups
+                .iter()
+                .enumerate()
+                .flat_map(|(group, (_, drafts, _))| {
+                    drafts
+                        .iter()
+                        .enumerate()
+                        .map(move |(index, draft)| (group, index, draft))
+                })
+                .find(|(_, _, draft)| draft.source_operation == operation)
+                .map(|(group, index, _)| plan.waves[group][index])
+                .unwrap()
+        };
+        assert_eq!(wave("ccm.tau.resolve_or_compute"), 0);
+        assert_eq!(wave("cache.dependency.closure"), 2);
+
+        // The final live entry matches one family batch in its sorted order.
+        let family = &groups
+            .iter()
+            .find(|(_, drafts, _)| drafts[0].family == "ccm-matrices")
+            .unwrap()
+            .1;
+        let mut batch_order = family.iter().collect::<Vec<_>>();
+        order_family_publication_drafts(&mut batch_order);
+        let mut wave_order = batch_order.clone();
+        wave_order.sort_by_key(|draft| draft.source_operation == "cache.dependency.closure");
+        assert_ne!(batch_order, wave_order);
+        let entries = family.iter().map(live_entry).collect::<Vec<_>>();
+        let step = |draft: &&CanonicalProductionDraft| {
+            let index = family
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, *draft))
+                .unwrap();
+            publication_requires_exact_identity(&draft.manifest, &required)
+                .map(|required| (index, required))
+                .unwrap()
+        };
+        let wave_steps = wave_order
+            .iter()
+            .map(|draft| {
+                let (index, required) = step(draft);
+                (*draft, &entries[index], required)
+            })
+            .collect::<Vec<_>>();
+        let batch_steps = batch_order
+            .iter()
+            .map(|draft| {
+                let (index, required) = step(draft);
+                (*draft, &entries[index], required)
+            })
+            .collect::<Vec<_>>();
+        for initial in [
+            None,
+            Some("0.15.0"),
+            Some("0.16.0"),
+            Some("0.16.4"),
+            Some("0.17.0"),
+        ] {
+            let initial = initial.map(|version| ToolkitVersion::parse(version).unwrap());
+            for replace in [false, true] {
+                assert_eq!(
+                    live_after(&wave_steps, initial.as_ref(), replace),
+                    live_after(&batch_steps, initial.as_ref(), replace),
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_order_the_planner_permits_keeps_the_batch_live_entry() {
+        // Exhaustive over three drafts sharing one semantic key: closure or
+        // ordinary, three producer versions (equal versions included), any
+        // subset required as an exact parent, initial live entries below,
+        // equal to and above both, and both replacement modes.
+        let root = crate::test_support::temporary_root("managed-publication-live-orders");
+        let base = fixture_draft(&root);
+        let versions = ["0.16.0", "0.16.4", "0.16.8"];
+        let variant = |index: usize, kind: usize| {
+            let mut draft = base.clone();
+            draft.source_operation = if kind.is_multiple_of(2) {
+                "cache.dependency.closure".to_owned()
+            } else {
+                "ccm.tau.resolve_or_compute".to_owned()
+            };
+            draft.manifest.producer_toolkit_version =
+                ToolkitVersion::parse(versions[kind / 2]).unwrap();
+            // A distinct external parent gives each draft its own identity.
+            draft
+                .manifest
+                .canonical_payload
+                .dependencies
+                .push(crate::PayloadDependencyIdentity {
+                    artifact_family: "ccm-components".to_owned(),
+                    semantic_digest: ContentDigest::sha256(format!("parent-{index}").as_bytes()),
+                    manifest_digest: ContentDigest::sha256(b"parent-manifest"),
+                    payload_digest: ContentDigest::sha256(b"parent-payload"),
+                });
+            draft.manifest.payload_digest = draft.manifest.canonical_payload.digest().unwrap();
+            draft.encoding.canonical_payload_digest = draft.manifest.payload_digest.clone();
+            draft.manifest.transport_digests = vec![draft.encoding.digest().unwrap()];
+            draft
+        };
+        let permutations: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let initials = [
+            None,
+            Some("0.15.0"),
+            Some("0.16.0"),
+            Some("0.16.4"),
+            Some("0.16.8"),
+            Some("0.17.0"),
+        ]
+        .map(|version| version.map(|version| ToolkitVersion::parse(version).unwrap()));
+        let mut relaxed_orders = 0usize;
+        for kinds in 0..6 * 6 * 6 {
+            let drafts = [
+                variant(0, kinds % 6),
+                variant(1, kinds / 6 % 6),
+                variant(2, kinds / 36),
+            ];
+            let mut batch = drafts.iter().collect::<Vec<_>>();
+            order_family_publication_drafts(&mut batch);
+            // Each permitted non-batch order, as positions in `batch`: a pair
+            // may be reversed only where the relaxation allows it.
+            let orders = permutations
+                .iter()
+                .filter(|permutation| {
+                    **permutation != [0, 1, 2]
+                        && (0..3).all(|i| {
+                            (i + 1..3).all(|j| {
+                                permutation.iter().position(|&k| k == i)
+                                    < permutation.iter().position(|&k| k == j)
+                                    || closure_member_may_follow(batch[i], batch[j])
+                            })
+                        })
+                })
+                .collect::<Vec<_>>();
+            if orders.is_empty() {
+                continue;
+            }
+            relaxed_orders += orders.len();
+            let entries = batch
+                .iter()
+                .map(|draft| live_entry(draft))
+                .collect::<Vec<_>>();
+            for required_mask in 0..8 {
+                let steps = |order: &[usize; 3]| {
+                    order
+                        .iter()
+                        .map(|&i| (batch[i], &entries[i], required_mask & (1 << i) != 0))
+                        .collect::<Vec<_>>()
+                };
+                let batch_steps = steps(&[0, 1, 2]);
+                for initial in &initials {
+                    for replace in [false, true] {
+                        let expected = live_after(&batch_steps, initial.as_ref(), replace);
+                        for order in &orders {
+                            assert_eq!(
+                                live_after(&steps(order), initial.as_ref(), replace),
+                                expected,
+                                "kinds {kinds}, order {order:?}, required {required_mask}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(relaxed_orders > 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_ordinary_older_draft_cannot_follow_its_newer_replacement() {
+        // The same chain with an ordinary older draft would be a downgrade
+        // after the newer one, so the plan is rejected before any mutation.
+        let root = crate::test_support::temporary_root("managed-publication-downgrade-order");
+        let mut a_newer = fixture_draft_family(fixture_draft_with_n(&root, 2), "ccm-matrices");
+        a_newer.manifest.producer_toolkit_version = ToolkitVersion::parse("0.16.4").unwrap();
+        let b = fixture_draft_family(
+            fixture_draft_with_dependency(fixture_draft_with_n(&root, 3), &a_newer),
+            "ccm-evidence",
+        );
+        let a_older = fixture_draft_family(
+            fixture_draft_with_dependency(fixture_draft_with_n(&root, 2), &b),
+            "ccm-matrices",
+        );
+        let remapped =
+            remap_destination_drafts(&[a_newer, b, a_older], PublicationDestination::Private)
+                .unwrap();
+        let error = publication_waves(&group_by_family(remapped), &BTreeMap::new())
+            .err()
+            .expect("contradictory order is rejected");
+        assert!(error
+            .to_string()
+            .contains("cannot be ordered after its exact parents"));
+        let _ = fs::remove_dir_all(root);
     }
 
     /// Publishing code must resolve its commit identity through
@@ -3802,11 +5097,8 @@ mod tests {
 
     #[test]
     fn managed_transport_workspace_removes_stale_and_completed_sessions() {
-        let root = std::env::temp_dir().join(format!(
-            "xcelerator-managed-transport-cleanup-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-transport-cleanu");
+        let root = scratch.join("root");
         let transport_root = root.join("git-transport");
         fs::create_dir_all(&transport_root).unwrap();
         fs::write(transport_root.join("stale.pack"), b"interrupted transport").unwrap();
@@ -3829,11 +5121,8 @@ mod tests {
 
     #[test]
     fn managed_transport_workspace_rejects_overlapping_local_publishers() {
-        let root = std::env::temp_dir().join(format!(
-            "xcelerator-managed-transport-lock-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-transport-lock");
+        let root = scratch.join("root");
 
         let first = ManagedTransportWorkspace::acquire(&root).unwrap();
         let error = match ManagedTransportWorkspace::acquire(&root) {
@@ -3885,11 +5174,8 @@ mod tests {
 
     #[test]
     fn family_candidate_preflight_uses_the_refreshed_active_session() {
-        let root = std::env::temp_dir().join(format!(
-            "xcelerator-managed-active-session-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-active-session");
+        let root = scratch.join("root");
         let source = root.join("source");
         let prepared = root.join("prepared");
         let draft = fixture_draft(&source);
@@ -4130,11 +5416,8 @@ mod tests {
 
     #[test]
     fn bootstrap_topology_routes_writes_to_successor_and_keeps_predecessor_readable() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-bootstrap-rollover-routing-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("bootstrap-rollover-routi");
+        let root = scratch.join("root");
         let remote = FilesystemMemoryRemote::new(root.clone());
         let registry_repository =
             "https://github.com/example-org/xcelerator-cache-private-registry.git";
@@ -4312,8 +5595,8 @@ mod tests {
             payload_digest,
             transport_digests: vec![encoding.digest().unwrap()],
             resolved_mathematical_configuration_digest: ContentDigest::sha256(b"config"),
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             requested_assurance: AssuranceLevel::Certified,
             claim_scope: "managed integration fixture".to_owned(),
@@ -4340,16 +5623,13 @@ mod tests {
 
     #[test]
     fn family_batch_leaves_active_replacement_last_for_shared_semantic_identity() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-managed-publication-order-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-publication-orde");
+        let root = scratch.join("root");
         let mut historical = fixture_draft(&root.join("historical"));
         historical.source_operation = "cache.dependency.closure".to_owned();
         let mut active = historical.clone();
         active.source_operation = "ccm.tau.resolve_or_compute".to_owned();
-        active.manifest.producer_toolkit_version = ToolkitVersion::parse("0.14.1").unwrap();
+        active.manifest.producer_toolkit_version = ToolkitVersion::parse("0.17.1").unwrap();
         active
             .manifest
             .canonical_payload
@@ -4368,18 +5648,15 @@ mod tests {
         assert_eq!(drafts[1].source_operation, "ccm.tau.resolve_or_compute");
         assert_eq!(
             drafts[1].manifest.producer_toolkit_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
+            ToolkitVersion::parse("0.17.1").unwrap()
         );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn historical_closure_member_does_not_downgrade_live_index() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-managed-publication-live-index-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-publication-live");
+        let root = scratch.join("root");
         let mut historical = fixture_draft(&root);
         historical.source_operation = "cache.dependency.closure".to_owned();
         let manifest = historical.manifest.clone();
@@ -4389,8 +5666,8 @@ mod tests {
             manifest_digest: ContentDigest::sha256(b"live-manifest"),
             achieved_assurance: ArtifactAssuranceState::Certified,
             disposition: ArtifactDisposition::Active,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.4").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.4").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             transport_digests: vec![ContentDigest::sha256(b"live-transport")],
             publication_transaction_id: ContentDigest::sha256(b"live-batch").0,
         };
@@ -4428,14 +5705,13 @@ mod tests {
     #[test]
     fn destination_selection_accepts_historical_closure_beside_newer_live_entry() {
         let root = crate::test_support::temporary_root("managed-historical-beside-live");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let mut historical = fixture_draft(&staging);
         historical.source_operation = "cache.dependency.closure".to_owned();
         let mut live = historical.clone();
         live.source_operation = "ccm.tau.resolve_or_compute".to_owned();
-        live.manifest.producer_toolkit_version = ToolkitVersion::parse("0.13.4").unwrap();
+        live.manifest.producer_toolkit_version = ToolkitVersion::parse("0.16.4").unwrap();
         live.manifest
             .canonical_payload
             .dependencies
@@ -4518,8 +5794,6 @@ mod tests {
     #[test]
     fn destination_remapping_rewrites_the_complete_dependency_closure() {
         let root = crate::test_support::temporary_root("managed-destination-dependency-remap");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
 
         let mut leaf = fixture_draft_family(fixture_draft_with_n(&root, 2), "ccm-components");
         leaf.manifest
@@ -4598,8 +5872,6 @@ mod tests {
     #[test]
     fn destination_remapping_rejects_an_incomplete_dependency_closure() {
         let root = crate::test_support::temporary_root("managed-destination-incomplete-closure");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let dependency = fixture_draft_with_n(&root, 2);
         let root_draft = fixture_draft_with_dependency(fixture_draft_with_n(&root, 3), &dependency);
 
@@ -4614,8 +5886,6 @@ mod tests {
     #[test]
     fn destination_remapping_accepts_an_exact_indexed_destination_dependency() {
         let root = crate::test_support::temporary_root("managed-destination-external-dependency");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let dependency = fixture_draft_family(fixture_draft_with_n(&root, 2), "weil-states");
         let root_draft = fixture_draft_family(
             fixture_draft_with_dependency(fixture_draft_with_n(&root, 3), &dependency),
@@ -4649,8 +5919,6 @@ mod tests {
     #[test]
     fn destination_remapping_resolves_a_neutral_alias_to_its_staged_private_manifest() {
         let root = crate::test_support::temporary_root("managed-destination-neutral-alias");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let mut dependency = fixture_draft_family(fixture_draft_with_n(&root, 2), "weil-states");
         dependency
             .manifest
@@ -4702,7 +5970,6 @@ mod tests {
     #[test]
     fn exact_destination_dependency_requires_canonical_manifest_and_active_index() {
         let root = crate::test_support::temporary_root("managed-exact-destination-dependency");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let draft = fixture_draft_with_n(&staging, 2);
@@ -4775,10 +6042,224 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Records the batched hydration requests a preflight makes, and
+    /// otherwise delegates to the in-memory remote.
+    struct PrefetchRecorder {
+        inner: FilesystemMemoryRemote,
+        prefetches: Mutex<Vec<(String, String, Vec<String>)>>,
+    }
+
+    impl RemoteGitStore for PrefetchRecorder {
+        fn read_ref(&self, repository: &str, branch: &str) -> Result<String, CacheError> {
+            self.inner.read_ref(repository, branch)
+        }
+        fn immutable_path_digest(
+            &self,
+            repository: &str,
+            revision: &str,
+            path: &str,
+        ) -> Result<Option<ContentDigest>, CacheError> {
+            self.inner.immutable_path_digest(repository, revision, path)
+        }
+        fn read_committed_path(
+            &self,
+            repository: &str,
+            revision: &str,
+            path: &str,
+            maximum_bytes: u64,
+            cancellation: &CancellationToken,
+            writer: &mut dyn Write,
+        ) -> Result<RemoteReadReport, CacheError> {
+            self.inner.read_committed_path(
+                repository,
+                revision,
+                path,
+                maximum_bytes,
+                cancellation,
+                writer,
+            )
+        }
+        fn prefetch_present_committed_paths(
+            &self,
+            repository: &str,
+            revision: &str,
+            paths: &[crate::RemotePathPrefetch],
+            _cancellation: &CancellationToken,
+        ) -> Result<(), CacheError> {
+            self.prefetches.lock().unwrap().push((
+                repository.to_owned(),
+                revision.to_owned(),
+                paths
+                    .iter()
+                    .map(|path| path.repository_path.clone())
+                    .collect(),
+            ));
+            Ok(())
+        }
+        fn compare_and_swap_commit(
+            &self,
+            request: &RemoteCommitRequest,
+        ) -> Result<CompareAndSwapResult, CacheError> {
+            self.inner.compare_and_swap_commit(request)
+        }
+        fn list_committed_paths(
+            &self,
+            repository: &str,
+            revision: &str,
+            prefix: &str,
+            maximum_paths: u64,
+            maximum_total_path_bytes: u64,
+            cancellation: &CancellationToken,
+        ) -> Result<RemotePathListReport, CacheError> {
+            self.inner.list_committed_paths(
+                repository,
+                revision,
+                prefix,
+                maximum_paths,
+                maximum_total_path_bytes,
+                cancellation,
+            )
+        }
+        fn verify_committed_part(
+            &self,
+            repository: &str,
+            revision: &str,
+            part: &TransportPart,
+        ) -> Result<(), CacheError> {
+            self.inner.verify_committed_part(repository, revision, part)
+        }
+    }
+
+    #[test]
+    fn preflight_hydrates_each_shard_once_and_answers_exactly_as_unbatched_checks() {
+        let root = crate::test_support::temporary_root("managed-batched-destination-dependency");
+        let staging = root.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let draft = fixture_draft_with_n(&staging, 2);
+        let manifest = target_manifest(&draft, PublicationDestination::Private).unwrap();
+        let present = crate::PayloadDependencyIdentity {
+            artifact_family: manifest.artifact_family.clone(),
+            semantic_digest: manifest.semantic_digest.clone(),
+            manifest_digest: manifest.digest().unwrap(),
+            payload_digest: manifest.payload_digest.clone(),
+        };
+        let mut missing = present.clone();
+        missing.manifest_digest = ContentDigest::sha256(b"not-published");
+        let historical = legacy_bootstrap_shard(
+            "example-org",
+            &present.artifact_family,
+            PublicationDestination::Private,
+        );
+        let current = crate::bootstrap_topology::BootstrapShard {
+            authorized_repository: "example-org/xcelerator-cache-private-ccm-matrices-0002"
+                .to_owned(),
+            repository_url:
+                "https://github.com/example-org/xcelerator-cache-private-ccm-matrices-0002.git"
+                    .to_owned(),
+            shard_id: "private-ccm-matrices-0002".to_owned(),
+            sequence: 2,
+            writable: true,
+        };
+        let remote = PrefetchRecorder {
+            inner: FilesystemMemoryRemote::new(staging),
+            prefetches: Mutex::new(Vec::new()),
+        };
+        remote.inner.insert_repository(
+            historical.repository_url.clone(),
+            "existing-head".to_owned(),
+            published_destination_tree(&[&draft], PublicationDestination::Private),
+        );
+        remote.inner.insert_repository(
+            current.repository_url.clone(),
+            "empty-successor".to_owned(),
+            BTreeMap::new(),
+        );
+        let topology = crate::bootstrap_topology::BootstrapFamilyTopology {
+            family: present.artifact_family.clone(),
+            visibility: CacheVisibility::Private,
+            current_writable: current.clone(),
+            readable_shards: vec![current.clone(), historical.clone()],
+        };
+        let identity = |dependency: &crate::PayloadDependencyIdentity| {
+            (
+                dependency.artifact_family.clone(),
+                dependency.semantic_digest.clone(),
+                dependency.manifest_digest.clone(),
+                dependency.payload_digest.clone(),
+            )
+        };
+        let resources = ResourcePolicy::default();
+        let mut topologies = BTreeMap::from([(
+            (
+                PublicationDestination::Private,
+                present.artifact_family.clone(),
+            ),
+            topology.clone(),
+        )]);
+        let mut check = DestinationDependencyCheck {
+            remote: &remote,
+            owner: "example-org",
+            destination: PublicationDestination::Private,
+            topologies: &mut topologies,
+            revisions: BTreeMap::new(),
+            historical: BTreeMap::new(),
+            results: BTreeMap::new(),
+            resources: &resources,
+        };
+        check.prefetch(&BTreeSet::from([identity(&present), identity(&missing)]));
+
+        // One request per readable shard, at the revision the checks then use,
+        // naming every manifest and index partition they read first.
+        let prefix = &present.semantic_digest.0[..2];
+        let expected_paths = BTreeSet::from([
+            format!("indexes/{}/{prefix}.json", present.artifact_family),
+            format!("manifests/{prefix}/{}.json", missing.manifest_digest),
+            format!("manifests/{prefix}/{}.json", present.manifest_digest),
+        ]);
+        let prefetches = remote.prefetches.lock().unwrap().clone();
+        assert_eq!(prefetches.len(), 2);
+        for (repository, head) in [
+            (&current.repository_url, "empty-successor"),
+            (&historical.repository_url, "existing-head"),
+        ] {
+            let (_, revision, paths) = prefetches
+                .iter()
+                .find(|(prefetched, _, _)| prefetched == repository)
+                .unwrap();
+            assert_eq!(revision, head);
+            assert_eq!(check.revisions[repository], head);
+            assert_eq!(
+                paths.iter().cloned().collect::<BTreeSet<_>>(),
+                expected_paths
+            );
+        }
+
+        // The answers are those of the unbatched checks.
+        for dependency in [&present, &missing] {
+            let unbatched = exact_destination_dependency_exists(
+                &remote.inner,
+                PublicationDestination::Private,
+                dependency,
+                &topology,
+                &mut BTreeMap::new(),
+                &mut BTreeMap::new(),
+                &resources,
+            )
+            .unwrap();
+            assert_eq!(check.exists(dependency).unwrap(), unbatched);
+        }
+        assert!(check.exists(&present).unwrap());
+        assert!(!check.exists(&missing).unwrap());
+
+        // Answered identities are not requested again.
+        check.prefetch(&BTreeSet::from([identity(&present), identity(&missing)]));
+        assert_eq!(remote.prefetches.lock().unwrap().len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn exact_destination_dependency_accepts_superseded_manifest_with_batch_proof() {
         let root = crate::test_support::temporary_root("managed-historical-destination-dependency");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
 
@@ -4793,7 +6274,7 @@ mod tests {
         };
 
         let mut live = historical.clone();
-        live.manifest.producer_toolkit_version = ToolkitVersion::parse("0.13.4").unwrap();
+        live.manifest.producer_toolkit_version = ToolkitVersion::parse("0.16.4").unwrap();
         let live_manifest = target_manifest(&live, PublicationDestination::Private).unwrap();
         assert_eq!(live_manifest.semantic_digest, dependency.semantic_digest);
         assert_eq!(live_manifest.payload_digest, dependency.payload_digest);
@@ -5034,7 +6515,6 @@ mod tests {
     #[test]
     fn destination_selection_excludes_exact_active_index_entries() {
         let root = crate::test_support::temporary_root("managed-destination-filter");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let existing = fixture_draft_with_n(&staging, 2);
@@ -5072,8 +6552,6 @@ mod tests {
         closure_alias: bool,
     ) {
         let root = crate::test_support::temporary_root("managed-observed-parent");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let parent = fixture_draft_with_n(&root, 2);
         assert_ne!(parent.source_operation, "cache.dependency.closure");
         let child = fixture_draft_family(
@@ -5084,7 +6562,7 @@ mod tests {
         let mut existing_parent = fixture_draft_with_dependency(parent.clone(), &extra);
         if newer_live_parent {
             existing_parent.manifest.producer_toolkit_version =
-                ToolkitVersion::parse("0.13.4").unwrap();
+                ToolkitVersion::parse("0.16.4").unwrap();
         }
         let existing = remap_destination_drafts(&[extra, existing_parent], destination).unwrap();
         let mut drafts = vec![parent.clone(), child];
@@ -5111,7 +6589,7 @@ mod tests {
         let repository = "https://github.com/example-org/test-ccm-matrices-0001.git";
         let head = "before-publication";
         let tree = published_destination_tree(&existing.iter().collect::<Vec<_>>(), destination);
-        let remote = FilesystemMemoryRemote::new(root.clone());
+        let remote = FilesystemMemoryRemote::new(root.to_path_buf());
         remote.insert_repository(repository.to_owned(), head.to_owned(), tree.clone());
         let selection = select_missing_destination_drafts(
             &remote,
@@ -5202,8 +6680,6 @@ mod tests {
     #[test]
     fn destination_manifest_with_stronger_dependencies_dominates_a_stripped_wrapper() {
         let root = crate::test_support::temporary_root("managed-destination-dependency-dominance");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let draft = fixture_draft_with_n(&root, 2);
         let staged = target_manifest(&draft, PublicationDestination::Private).unwrap();
         let mut existing = staged.clone();
@@ -5225,7 +6701,6 @@ mod tests {
     #[test]
     fn destination_selection_republishes_an_unproven_index_entry() {
         let root = crate::test_support::temporary_root("managed-destination-unproven");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let draft = fixture_draft_with_n(&staging, 2);
@@ -5277,7 +6752,6 @@ mod tests {
     #[test]
     fn destination_selection_makes_an_all_existing_family_a_no_op() {
         let root = crate::test_support::temporary_root("managed-destination-noop");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let first = fixture_draft_with_n(&staging, 2);
@@ -5415,7 +6889,6 @@ mod tests {
     #[test]
     fn missing_live_sidecars_are_initialized_without_replacing_bootstrap_content() {
         let root = crate::test_support::temporary_root("managed-bootstrap");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let remote = FilesystemMemoryRemote::new(staging.clone());
@@ -5485,7 +6958,6 @@ mod tests {
     #[test]
     fn managed_adapter_completes_dual_target_resumable_publication() {
         let root = crate::test_support::temporary_root("managed-publication");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let draft = fixture_draft(&staging);
@@ -5705,8 +7177,6 @@ mod tests {
     #[ignore = "explicit read-only live GitHub acceptance preflight"]
     fn live_managed_routes_and_owner_permissions_are_read_only() {
         let root = crate::test_support::temporary_root("managed-live-preflight");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let probe = crate::GitHubCredentialApiProbe::default();
         let cancellation = CancellationToken::new();
         let mut principals = BTreeSet::new();

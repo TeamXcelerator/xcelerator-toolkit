@@ -5,6 +5,7 @@ use super::{
     state_geometry::RetainedState,
 };
 use anyhow::{bail, Result};
+use rayon::prelude::*;
 use rug::Float;
 use serde::{Deserialize, Serialize};
 use xc_cache::ContentDigest;
@@ -442,42 +443,60 @@ impl ReferencePreparation {
                 let l = finite_math::rounded_log_cutoff(&state.cutoff, p)?;
                 // This is the transform of the explicitly finite reference, whose
                 // exterior is zero by definition, not an omitted infinite target tail.
-                for point in &roots.dataset.points {
-                    let Some(t) = &point.value else { continue };
-                    let t_value = Float::with_val(p, scalar(t, roots.dataset.precision_bits)?);
-                    let mut reference_state = state.clone();
-                    reference_state.coefficients = normalized.clone();
-                    reference_state.modes = normalized.len() / 2;
-                    let (value, derivative, _, _) = transform_terms(&reference_state, &t_value, p)?;
-                    let norm = normalized
-                        .iter()
-                        .fold(Float::with_val(p, 0), |n, x| n.hypot(x));
-                    let scale = norm * l.clone().sqrt();
-                    if !scale.is_finite() || scale <= 0 {
-                        bail!("finite reference transform scale exceeds supported exponent range");
+                let mut reference_state = state.clone();
+                reference_state.coefficients = normalized.clone();
+                reference_state.modes = normalized.len() / 2;
+                // Roots are independent: their jets are formed on workers and
+                // appended, with the first error, in root order as before.
+                xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
+                let jets = roots
+                    .dataset
+                    .points
+                    .par_iter()
+                    .map(|point| -> Result<Option<ReferenceJet>> {
+                        let Some(t) = &point.value else {
+                            return Ok(None);
+                        };
+                        let t_value = Float::with_val(p, scalar(t, roots.dataset.precision_bits)?);
+                        let (value, derivative, _, _) =
+                            transform_terms(&reference_state, &t_value, p)?;
+                        let norm = normalized
+                            .iter()
+                            .fold(Float::with_val(p, 0), |n, x| n.hypot(x));
+                        let scale = norm * l.clone().sqrt();
+                        if !scale.is_finite() || scale <= 0 {
+                            bail!(
+                                "finite reference transform scale exceeds supported exponent range"
+                            );
+                        }
+                        let jet = Jet {
+                            value: dec(&(value * &scale)),
+                            derivative: dec(&(derivative * &scale)),
+                        };
+                        Ok(Some(ReferenceJet {
+                            matched_root_ordinal: None,
+                            ordinal: point.ordinal,
+                            t: dec(&t_value),
+                            reference_window: jet.clone(),
+                            reference_full: jet,
+                            exterior_tail: Jet {
+                                value: "0".into(),
+                                derivative: "0".into(),
+                            },
+                            endpoint_tail_part: None,
+                            fitted_interior_parts: vec![],
+                            error_normalization: None,
+                            source_value_error: None,
+                            tail_value_error: None,
+                            source_derivative_error: None,
+                            root_separation_radius: None,
+                        }))
+                    })
+                    .collect::<Vec<_>>();
+                for jet in jets {
+                    if let Some(jet) = jet? {
+                        input.reference_jets.push(jet);
                     }
-                    let jet = Jet {
-                        value: dec(&(value * &scale)),
-                        derivative: dec(&(derivative * &scale)),
-                    };
-                    input.reference_jets.push(ReferenceJet {
-                        matched_root_ordinal: None,
-                        ordinal: point.ordinal,
-                        t: dec(&t_value),
-                        reference_window: jet.clone(),
-                        reference_full: jet,
-                        exterior_tail: Jet {
-                            value: "0".into(),
-                            derivative: "0".into(),
-                        },
-                        endpoint_tail_part: None,
-                        fitted_interior_parts: vec![],
-                        error_normalization: None,
-                        source_value_error: None,
-                        tail_value_error: None,
-                        source_derivative_error: None,
-                        root_separation_radius: None,
-                    });
                 }
             }
             input.run_once.as_mut().unwrap().producer_notes.push("automatically prepared finite-reference samples and transform jets; exterior zero belongs only to the declared compact finite reference".into());
@@ -497,6 +516,7 @@ fn preflight(
     roots: Option<&RetainedRoots>,
     o: &ExtensionOptions,
     i: Option<&ExternalResearchInputs>,
+    run_certificate: bool,
 ) -> Result<ExtendedAnalysis> {
     let mut r = report("capture_preflight", s, o);
     let c = completion(i);
@@ -549,7 +569,7 @@ fn preflight(
         ),
         (
             "source_assembly_certificate",
-            c.is_some_and(|c| c.sector_certificate.is_some()),
+            run_certificate || c.is_some_and(|c| c.sector_certificate.is_some()),
         ),
         (
             "tail_bilinear_model",
@@ -594,10 +614,9 @@ fn comparisons(
     use xc_numerics::mpfr_interval::MpfrInterval as I;
     let mut r = report("configuration_comparison", s, o);
     let Some(completion) = completion(i).filter(|c| !c.comparisons.is_empty()) else {
-        return Ok(missing(
-            r,
-            "comparison snapshots or a verified retained-source cohort required",
-        ));
+        r.outcome = "awaiting_cohort".into();
+        r.reason = Some("comparison follows independently acquired compatible configurations; retain this run now and assess the cohort afterward".into());
+        return Ok(r);
     };
     let p = o.working_precision_bits;
     let mut multiplicities = std::collections::BTreeMap::new();
@@ -925,7 +944,7 @@ pub(crate) fn band_single(
             beta = coeffs(&saved.beta, p)?;
             r.rows = saved.rows;
             begin = saved.next;
-            eprintln!("band recurrence resumed at degree {begin}/{d}");
+            xc_core::progress_message!("band recurrence resumed at degree {begin}/{d}");
         } else {
             vectors.clear_memory();
         }
@@ -1030,7 +1049,7 @@ pub(crate) fn band_single(
             .store
             .save("jacobi-roots", &values.iter().map(dec).collect::<Vec<_>>())
         {
-            eprintln!("band checkpoint unavailable: {e}");
+            xc_core::progress_message!("band checkpoint unavailable: {e}");
         }
         values
     };
@@ -1302,6 +1321,8 @@ fn polynomial_band(
     ))
 }
 #[allow(clippy::too_many_arguments)]
+/// `run_certificate` is the run's own sector-gap certificate, used by
+/// preflight and the transform enclosure when the input embeds none.
 pub(crate) fn analyze(
     id: &str,
     s: &RetainedState,
@@ -1309,9 +1330,10 @@ pub(crate) fn analyze(
     roots: Option<&RetainedRoots>,
     o: &ExtensionOptions,
     i: Option<&ExternalResearchInputs>,
+    run_certificate: Option<&super::sector_gap_certificate::PortableCcmSectorGapCertificate>,
 ) -> Result<ExtendedAnalysis> {
     match id {
-        "capture_preflight" => preflight(s, m, roots, o, i),
+        "capture_preflight" => preflight(s, m, roots, o, i, run_certificate.is_some()),
         "consistency" => consistency_math::analyze(s, o, i),
         "configuration_comparison" => comparisons(s, m, roots, o, i),
         "band_reconstruction" => super::atom_research::band_report(s, o, i),
@@ -1320,6 +1342,9 @@ pub(crate) fn analyze(
             roots,
             o,
             completion(i),
+            completion(i)
+                .and_then(|c| c.sector_certificate.as_ref())
+                .or(run_certificate),
             i.map_or(s.precision, |i| i.precision_bits),
         ),
         _ => bail!("unknown completion diagnostic"),

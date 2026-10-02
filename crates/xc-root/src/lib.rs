@@ -1969,7 +1969,7 @@ mod hp_tests {
     /// dominated replay validation then failed on every cache reuse.
     #[test]
     fn hp_string_round_trips_exactly_at_claim_precision() {
-        let prec = 3386_u32; // HP-1000: the precision of the paper's claims
+        let prec = 3386_u32; // HP-1000 tier
         let old_width = ((f64::from(prec)) * std::f64::consts::LOG10_2).ceil() as usize;
 
         let mut old_width_failures = 0_usize;

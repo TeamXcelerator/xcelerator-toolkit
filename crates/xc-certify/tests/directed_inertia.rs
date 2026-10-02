@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use xc_cache::ContentDigest;
 use xc_certify::exact::{
     build_portable_interval_inertia_certificate, build_portable_interval_inertia_certificate_mpfr,
-    interval_record, interval_symmetric_ldlt_inertia_mpfr,
+    build_portable_interval_inertia_certificate_mpfr_stable, interval_record,
+    interval_symmetric_ldlt_inertia_mpfr, interval_symmetric_ldlt_inertia_mpfr_stable,
     verify_portable_interval_inertia_certificate, IntervalInertiaResult,
 };
 use xc_certify::PortableIntervalInertiaCertificate;
@@ -197,5 +198,106 @@ fn directed_inertia_rejects_invalid_dimensions_precision_and_symmetry() {
         (matrix(&[1, 1, 0, 1]), 2),
     ] {
         assert!(interval_symmetric_ldlt_inertia_mpfr(&entries, n, 128).is_err());
+    }
+}
+
+#[test]
+fn stable_pivots_resolve_exact_congruence_without_tiny_first_pivot_growth() {
+    // Congruence eliminating the two unit diagonals leaves t-2 < 0, so
+    // the exact inertia is (2 positive, 1 negative) for every listed t.
+    // Eliminating t first instead creates two huge, almost equal Schur
+    // entries and loses the last sign through interval dependency.
+    for (exponent, precisions) in [
+        (300, vec![64, 128, 256]),
+        (2000, vec![64, 128, 256]),
+        (5000, vec![64, 128, 256]),
+        (6000, vec![3450, 3642, 4410]),
+    ] {
+        let mut entries = matrix(&[0, 1, 1, 1, 1, 0, 1, 0, 1]);
+        entries[0] = RationalInterval::point(Rational::from(1) >> exponent);
+        for p in precisions {
+            assert!(matches!(
+                interval_symmetric_ldlt_inertia_mpfr(&entries, 3, p).unwrap(),
+                IntervalInertiaResult::Inconclusive { .. }
+            ));
+            let result = interval_symmetric_ldlt_inertia_mpfr_stable(&entries, 3, p).unwrap();
+            assert!(
+                matches!(
+                    result,
+                    IntervalInertiaResult::Conclusive {
+                        positive: 2,
+                        negative: 1,
+                        ..
+                    }
+                ),
+                "{result:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn stable_portable_certificate_resolves_and_replays_where_schema_two_does_not() {
+    let mut entries = matrix(&[0, 1, 1, 1, 1, 0, 1, 0, 1]);
+    entries[0] = RationalInterval::point(Rational::from(1) >> 300);
+    let historical = proof(&entries, 3, 128);
+    assert_eq!(historical.schema_version, 2);
+    assert!(historical.zero_or_unresolved > 0);
+    let stable = build_portable_interval_inertia_certificate_mpfr_stable(
+        &entries,
+        3,
+        128,
+        "independent-test-fixture",
+        ContentDigest::sha256(b"fixture"),
+        BTreeMap::from([("fixture".into(), "independent".into())]),
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(stable.schema_version, 4);
+    assert_eq!(
+        (stable.positive, stable.negative, stable.zero_or_unresolved),
+        (2, 1, 0)
+    );
+    let decoded: PortableIntervalInertiaCertificate =
+        serde_json::from_slice(&serde_json::to_vec(&stable).unwrap()).unwrap();
+    assert!(verify_portable_interval_inertia_certificate(&decoded).mathematical_claim_verified);
+    // Replay uses the recorded schema's route: relabelled as schema 2 the same
+    // pivots no longer replay.
+    let mut relabelled = decoded.clone();
+    relabelled.schema_version = 2;
+    relabelled.refresh_certificate_id().unwrap();
+    assert!(!verify_portable_interval_inertia_certificate(&relabelled).valid);
+    let mut forged = decoded;
+    forged.positive = 3;
+    forged.negative = 0;
+    forged.refresh_certificate_id().unwrap();
+    assert!(!verify_portable_interval_inertia_certificate(&forged).valid);
+}
+
+#[test]
+fn streamed_certificate_digests_equal_the_buffered_definitions() {
+    let mut entries = matrix(&[0, 1, 1, 1, 1, 0, 1, 0, 1]);
+    entries[0] = RationalInterval::point(Rational::from(1) >> 300);
+    for certificate in [
+        proof(&entries, 3, 128),
+        proof(&matrix(&[2, 1, 1, 3]), 2, 64),
+    ] {
+        let mut canonical = certificate.clone();
+        canonical.certificate_id = ContentDigest("00".repeat(32));
+        assert_eq!(
+            certificate.computed_certificate_id().unwrap(),
+            ContentDigest::sha256(&serde_json::to_vec(&canonical).unwrap())
+        );
+        assert_eq!(
+            certificate.computed_matrix_digest().unwrap(),
+            ContentDigest::sha256(
+                &serde_json::to_vec(&(certificate.dimension, &certificate.matrix_row_major))
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            certificate.certificate_id,
+            certificate.computed_certificate_id().unwrap()
+        );
     }
 }

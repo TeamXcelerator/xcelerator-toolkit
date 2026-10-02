@@ -19,7 +19,7 @@ fn state() -> RetainedState {
         }],
         created_unix_seconds: 0,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
-        minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+        minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
         maximum_reader_version: None,
         quality: CacheQuality::Validated,
         visibility: CacheVisibility::Local,

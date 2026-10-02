@@ -26,15 +26,15 @@ fn version_parser_rejects_malformed_numeric_and_prerelease_fields() {
 #[test]
 fn compatibility_maximum_cannot_be_removed_by_manifest() {
     let mut policy = xc_cache::artifact_family_compatibility_policy("fixture").unwrap();
-    policy.maximum_reader_version = Some(ToolkitVersion::parse("0.13.9").unwrap());
-    let v = ToolkitVersion::parse("0.13.0").unwrap();
+    policy.maximum_reader_version = Some(ToolkitVersion::parse("0.16.9").unwrap());
+    let v = ToolkitVersion::parse("0.16.0").unwrap();
     assert!(policy.validate_manifest_versions(1, &v, &v, None).is_err());
 }
 #[test]
 fn compatibility_rejects_reversed_manifest_reader_window() {
     let policy = xc_cache::artifact_family_compatibility_policy("fixture").unwrap();
-    let v = ToolkitVersion::parse("0.13.0").unwrap();
-    let high = ToolkitVersion::parse("0.14.0").unwrap();
+    let v = ToolkitVersion::parse("0.16.0").unwrap();
+    let high = ToolkitVersion::parse("0.17.0").unwrap();
     assert!(policy
         .validate_manifest_versions(1, &v, &high, Some(&v))
         .is_err());
@@ -42,7 +42,7 @@ fn compatibility_rejects_reversed_manifest_reader_window() {
 #[test]
 fn compatibility_revalidates_directly_constructed_versions() {
     let policy = xc_cache::artifact_family_compatibility_policy("fixture").unwrap();
-    let mut v = ToolkitVersion::parse("0.14.0").unwrap();
+    let mut v = ToolkitVersion::parse("0.17.0").unwrap();
     v.prerelease = Some("bad..version".into());
     assert!(policy.validate_manifest_versions(1, &v, &v, None).is_err());
 }
