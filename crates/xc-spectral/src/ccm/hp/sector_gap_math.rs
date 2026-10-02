@@ -179,8 +179,8 @@ pub(super) fn scaled_tridiagonal(
     }
     if (diagonal.len() as u64)
         .saturating_mul(4)
-        .saturating_mul(u64::from(p).div_ceil(8) + 64)
-        > (8u64 << 30)
+        .saturating_mul(u64::from(p).div_ceil(8) + 64) as u128
+        > super::source_working_budget()?
     {
         bail!("tridiagonal scaling exceeds numerical workspace budget");
     }

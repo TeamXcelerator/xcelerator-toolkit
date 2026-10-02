@@ -177,7 +177,8 @@ fn validate_reply(
 ) -> Result<()> {
     anyhow::ensure!(
         reply["protocol_version"].as_u64() == Some(2),
-        "target provider protocol version mismatch"
+        "target provider protocol version mismatch: the Toolkit speaks protocol 2 (with request_nonce), the provider replied with {}",
+        reply.get("protocol_version").map_or_else(|| "no protocol_version".to_owned(), |v| v.to_string())
     );
     anyhow::ensure!(
         reply["request_nonce"].as_str() == Some(nonce),
@@ -280,8 +281,38 @@ fn diagnostic_stderr() -> Result<Stdio> {
     anyhow::bail!("target provider diagnostic log name budget exhausted")
 }
 
+/// Replies of providers the operator declared pure, shared by every evaluator
+/// in this process. Bounded; an evicted or absent entry is asked again.
+const PURE_REPLY_MEMO_ENTRIES: usize = 1 << 20;
+
+static PURE_REPLIES: std::sync::OnceLock<Mutex<PureReplies>> = std::sync::OnceLock::new();
+
+#[derive(Default)]
+struct PureReplies {
+    values: std::collections::HashMap<String, String>,
+    order: std::collections::VecDeque<String>,
+}
+
+/// Whether the operator declared the authorized provider pure: the same
+/// target input, precision and point always yield the same reply. Only then
+/// may replies be reused within the process.
+fn provider_declared_pure() -> Result<bool> {
+    match std::env::var("XC_TARGET_PROVIDER_PURE") {
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) if value.is_empty() || value == "0" => Ok(false),
+        Ok(_) => anyhow::bail!("XC_TARGET_PROVIDER_PURE must be 0 or 1"),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[derive(Clone, Debug)]
-struct Provider(Arc<Mutex<Connection>>);
+struct Provider {
+    connection: Arc<Mutex<Connection>>,
+    /// Exact provider, target input and precision of these replies when the
+    /// provider is declared pure; `None` asks the provider every time.
+    pure_identity: Option<String>,
+}
 impl Provider {
     fn start(spec: &ExternalProfileSpec, bits: u32) -> Result<Self> {
         spec.validate()?;
@@ -357,35 +388,75 @@ impl Provider {
                 }
             }
         });
-        let provider = Self(Arc::new(Mutex::new(Connection {
-            child,
-            requests,
-            writes,
-            replies,
-            timeout: Duration::from_secs(timeout),
-            failed: false,
-            next_request_id: 1,
-            precision_bits: bits,
-            _executable_file: executable_file,
-        })));
+        let pure_identity = provider_declared_pure()?
+            .then(|| -> Result<String> {
+                Ok(format!(
+                    "{}\0{}\0{bits}\0",
+                    spec.provider_sha256,
+                    serde_json::to_string(&spec.input)?
+                ))
+            })
+            .transpose()?;
+        let provider = Self {
+            connection: Arc::new(Mutex::new(Connection {
+                child,
+                requests,
+                writes,
+                replies,
+                timeout: Duration::from_secs(timeout),
+                failed: false,
+                next_request_id: 1,
+                precision_bits: bits,
+                _executable_file: executable_file,
+            })),
+            pure_identity,
+        };
         provider
-            .0
+            .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("target provider lock failed"))?
             .exchange(&serde_json::json!({"operation":"initialize","input":spec.input}))?;
         Ok(provider)
     }
     fn value(&self, u: &str) -> Result<String> {
+        let key = self
+            .pure_identity
+            .as_ref()
+            .map(|identity| format!("{identity}{u}"));
+        if let Some(key) = &key {
+            if let Some(value) = PURE_REPLIES
+                .get()
+                .and_then(|memo| memo.lock().ok()?.values.get(key).cloned())
+            {
+                return Ok(value);
+            }
+        }
         let reply = self
-            .0
+            .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("target provider lock failed"))?
             .exchange(&serde_json::json!({"operation":"evaluate","u":u}))?;
-        reply
+        let value = reply
             .get("value")
             .and_then(|v| v.as_str())
             .map(str::to_owned)
-            .context("external target provider omitted its value")
+            .context("external target provider omitted its value")?;
+        // Only successful replies are remembered; a failing point is asked again.
+        if let Some(key) = key {
+            let memo = PURE_REPLIES.get_or_init(|| Mutex::new(PureReplies::default()));
+            if let Ok(mut memo) = memo.lock() {
+                if !memo.values.contains_key(&key) {
+                    if memo.order.len() >= PURE_REPLY_MEMO_ENTRIES {
+                        if let Some(oldest) = memo.order.pop_front() {
+                            memo.values.remove(&oldest);
+                        }
+                    }
+                    memo.order.push_back(key.clone());
+                    memo.values.insert(key, value.clone());
+                }
+            }
+        }
+        Ok(value)
     }
 }
 fn parse_scalar_f64(text: &str) -> Result<f64> {

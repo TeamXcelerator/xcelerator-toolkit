@@ -118,9 +118,11 @@ Exact binary scaling before norms and residual squaring prevents hidden
 underflow; eigenpair checks enclose the exact stored `lambda*v` product.
 Decoded norm-one checks and serialized error bounds round outward.
 Unsupported exponent spans are unresolved. Default/extended prefix identities
-are v8/v9, with minimum reader 0.15.1. Warm cache reuse requires an exact full
-report replay, including all moments and exports, at O(D^3) arithmetic cost.
-This uses retained inputs without rebuilding Tau matrices or eigenstates.
+are v8/v9, with minimum reader 0.15.1. Ordinary cache reuse checks bindings,
+shapes, finite values and statuses, and replays every exported backward error
+exactly from the retained matrix at O(D^2) cost; explicit verification replays
+the full report, including all moments and exports, at O(D^3). Neither rebuilds
+Tau matrices or eigenstates.
 The export gate uses backward errors. It does not guarantee
 relative forward accuracy of a deeply cancelled eigenvalue or identify a branch
 inside an unresolved cluster. The explicit retained source identity, vector
@@ -162,7 +164,7 @@ Canonical shard sources use the alternative `shard_manifest` form with explicit
 local read limits. Optional `nesting_matrices` add source-bound exact block
 comparisons to the report. See the [local shard guide](PREFIX_CONVERGENCE.md#read-a-canonical-local-shard-without-rebuilding-its-matrix).
 
-## Qualification and provenance
+## Testing and provenance
 
 The recurrences are derived from the block inverse identity. Implementation
 and tests use AI assistance and the existing exact-rational and MPFR toolkit
@@ -172,8 +174,7 @@ incorporated. Fixtures use synthetic matrices and public configurations.
 Tests compare against independently implemented exact rational Gauss-Jordan
 inversion, include Hilbert and near-degenerate fixtures, malformed input,
 unresolved pivots, serialization cancellation, retained-source tampering,
-missing sources, private routing, and derived-only cache reuse. See the release
-[validation guide](VALIDATION.md) for commands, outcomes and coverage limits.
+missing sources, private routing, and derived-only cache reuse.
 Synthetic tests do not establish accuracy for an application's complete dataset.
 
 The extended policy also computes `tr(A^-3)` through a retained normalized Gram
@@ -189,11 +190,13 @@ run in separate phases while preserving the legacy arithmetic and report bytes.
 The prior retained-reduction reader checked shape, finite values, ordering,
 and self-reported residuals. A synthetic cache for diag(2,3) could return
 fabricated eigenvalues -999,-998 and a zero source norm with a passing verdict.
-The current reader recomputes the complete report from the retained matrix
-and requires exact equality, including Q-based diagnostics and the spectrum.
-Warm reuse therefore costs O(d^3). Fresh ordinary results use a process-local
-content seal; explicit verification modes replay. Canonical parent bindings
-remain required, and the original matrix is never reconstructed or replaced.
+Ordinary reuse binds the report to its retained matrix with O(d^2)
+invariants (replayed source and tridiagonal norms, trace and norm agreement
+within the recorded residual bounds, and spectrum trace and square-sum checks);
+the fabricated report above fails them. Explicit verification modes recompute
+the complete report at O(d^3) and require exact equality. Fresh ordinary results
+use a process-local content seal. Canonical parent bindings remain required,
+and the original matrix is never reconstructed or replaced.
 
 The new child identity is `ccm-retained-reduction-v0.15.1-v3`, with minimum
 reader 0.15.1. The Householder calculation and payload's computed diagnostic

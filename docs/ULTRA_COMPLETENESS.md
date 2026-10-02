@@ -148,7 +148,7 @@ The live extended producers accept these explicit environment policies:
 
 | Variable | Default | Meaning |
 |---|---:|---|
-| `XC_RESEARCH_WORKING_BYTES` | 8589934592 | Estimated working memory cap |
+| `XC_RESEARCH_WORKING_BYTES` | 8589934592 | Estimated working memory cap for primary source admission and every numerical stage's workspace check. Not part of artifact identity: a diagnostic limited by it is returned but not retained, so a later run with a larger cap computes it; complete results are reused whatever cap produced them. |
 | `XC_RESEARCH_OUTPUT_BYTES` | 8589934592 | Estimated output cap |
 | `XC_RESEARCH_CHECKPOINT_BYTES` | 8589934592 | Per-checkpoint serialized byte cap |
 | `XC_RESEARCH_ROOT_BLOCK_ROWS` | 128 | Root rows per checkpoint, 1 through 4096 |
@@ -162,8 +162,8 @@ Backfill tasks can set their `ExtensionOptions` directly. These estimates limit
 new diagnostic kernels; they are not an OS memory quota or a replacement for
 older capture groups' existing policies. Long stages report start/end time and
 30-second heartbeats. Independent root blocks run in parallel with stable output
-ordering. Complement solves share one factorization. Root blocks, complement
-factors/solutions, band eigensolutions, certificate replay and resolved contour
+ordering. Complement solves share one verified preconditioner. Root blocks, complement
+solutions, band eigensolutions, certificate replay and resolved contour
 segments have content-bound local checkpoints. The band recurrence also retains per-degree state and chunked basis vectors for
 restart; its resident basis cache and disk estimate are bounded. See
 [large atom inputs and recurrence recovery](ATOM_RESEARCH.md).

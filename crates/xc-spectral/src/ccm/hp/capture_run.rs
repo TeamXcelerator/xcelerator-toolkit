@@ -28,6 +28,42 @@ pub struct RetainedCcmRun {
     sector_record: Option<CapturedDiagnostic>,
     sector_error: Option<String>,
     sector_options: Option<CcmSectorAnalysisOptions>,
+    sector_certificate: Option<
+        xc_cache::ArtifactExecutionCacheResult<
+            crate::ccm::sector_gap_certificate::PortableCcmSectorGapCertificate,
+        >,
+    >,
+    sector_certificate_error: Option<String>,
+    sector_certificate_options:
+        Option<crate::ccm::sector_gap_certificate::CcmSectorGapCertificationOptions>,
+    /// Diagnostics computed ahead of their turn; see `start_lookahead`.
+    lookahead: Option<crate::ccm::convergence_capture::lookahead::Lane>,
+    lookahead_enabled: bool,
+    lookahead_started: bool,
+    lookahead_reached: std::collections::BTreeSet<String>,
+    /// Diagnostics the caller declared it will request; only these may be
+    /// computed ahead. `None` computes nothing ahead.
+    lookahead_requests: Option<std::collections::BTreeSet<String>>,
+}
+
+/// Look-ahead diagnostics to compute: declared requests not yet reached, in
+/// the receipt's (sorted) order. Nothing without a declaration.
+fn lookahead_ids<'a>(
+    requests: Option<&std::collections::BTreeSet<String>>,
+    reached: &std::collections::BTreeSet<String>,
+) -> Vec<&'a str> {
+    use crate::ccm::convergence_capture::lookahead;
+    let Some(requests) = requests else {
+        return Vec::new();
+    };
+    let mut ids = lookahead::FINITE
+        .iter()
+        .chain(lookahead::EXTENDED)
+        .copied()
+        .filter(|id| requests.contains(*id) && !reached.contains(*id))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
 }
 
 // Observe only the requested logical payloads. Keep the configured publication
@@ -240,9 +276,14 @@ fn recorded(mut records: Vec<ProducedArtifactRecord>) -> Result<CapturedDiagnost
         .iter()
         .map(|r| serde_json::from_slice::<serde_json::Value>(&r.payload))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(CapturedDiagnostic::new(
+    // The measurement is exactly these retained payloads, so the receipt
+    // references them instead of embedding a second copy.
+    let manifests = records.into_iter().map(|r| r.manifest).collect::<Vec<_>>();
+    Ok(CapturedDiagnostic::by_reference(
         &values,
-        records.into_iter().map(|r| r.manifest).collect(),
+        manifests.clone(),
+        true,
+        manifests,
     )?)
 }
 
@@ -333,12 +374,13 @@ impl RetainedCcmRun {
                 assembly_policy:
                     "ccm-weil-form-v0.15.1-v3; requested quadrature; corrected symmetric Tau".into(),
                 quadrature_policy: format!(
-                    "frequency-aware HP GL; configured quad_points={}",
-                    cfg.quad_points
+                    "archimedean HP GL policy={:?}; active order parameter={}",
+                    cfg.research_quadrature_policy,
+                    cfg.quadrature_identity_points()
                 ),
             };
             if let Err(e) = crate::ccm::research_cohort::register(&registration) {
-                eprintln!("research cohort registration unavailable: {e}");
+                xc_core::progress_message!("research cohort registration unavailable: {e}");
             }
         }
         Ok(Self {
@@ -362,6 +404,14 @@ impl RetainedCcmRun {
             sector_record: None,
             sector_error: None,
             sector_options: None,
+            sector_certificate: None,
+            sector_certificate_error: None,
+            sector_certificate_options: None,
+            lookahead: None,
+            lookahead_enabled: true,
+            lookahead_started: false,
+            lookahead_reached: std::collections::BTreeSet::new(),
+            lookahead_requests: None,
         })
     }
     /// Explicit additional references; the legacy runtime target file is never imported.
@@ -416,6 +466,23 @@ impl RetainedCcmRun {
             crate::ccm::extended_research::ExternalResearchInputs::from_file(path)?,
         )
     }
+    /// Allow the requested diagnostics listed in `convergence_capture::lookahead`
+    /// to be computed ahead of their turn (the default; see
+    /// [`Self::set_lookahead_requests`]). Results, artifacts and their order
+    /// are the same either way; this changes only when the numerical work runs.
+    #[doc(hidden)]
+    pub fn set_capture_lookahead(&mut self, enabled: bool) {
+        self.lookahead_enabled = enabled;
+        if !enabled {
+            self.lookahead = None;
+        }
+    }
+    /// Declare the diagnostics this run will request. Only declared
+    /// diagnostics are computed ahead, so no work runs for a diagnostic the
+    /// caller never requests; without a declaration nothing runs ahead.
+    pub fn set_lookahead_requests(&mut self, ids: impl IntoIterator<Item = String>) {
+        self.lookahead_requests = Some(ids.into_iter().collect());
+    }
     /// Outcome-aware adapter. Missing external data remains Missing in a receipt;
     /// numerical nonacceptance stays in the retained measurement.
     pub fn capture_diagnostic_outcome(
@@ -424,10 +491,28 @@ impl RetainedCcmRun {
         options: &CcmResearchCaptureOptions,
         cache: &ArtifactCacheContext<'_>,
     ) -> std::result::Result<CapturedDiagnostic, xc_cache::CaptureFailure> {
+        if id == "target_comparison" && !crate::target::runtime_target_configured() {
+            return Err(xc_cache::CaptureFailure::Missing {
+                reason: "no runtime target is configured".into(),
+            });
+        }
         let result = self
             .capture_diagnostic(id, options, cache)
             .map_err(xc_cache::CaptureFailure::failed)?;
-        if result.value["data"]["outcome"] == "missing_input" {
+        if result.value["kind"] == "ccm_finite_diagnostic_analysis"
+            && result.value_reference.is_none()
+            && result.value["data"]["outcome"] == "blocked"
+        {
+            return Err(xc_cache::CaptureFailure::Blocked {
+                reason: result.value["data"]["reason"]
+                    .as_str()
+                    .unwrap_or("diagnostic resource limit")
+                    .into(),
+            });
+        }
+        if result.value["kind"] != "ccm_finite_diagnostic_analysis"
+            && result.value["data"]["outcome"] == "missing_input"
+        {
             return Err(xc_cache::CaptureFailure::Missing {
                 reason: result.value["data"]["reason"]
                     .as_str()
@@ -514,6 +599,13 @@ impl RetainedCcmRun {
             }
         }
         let mut derived = input.run_once.take().unwrap_or_default();
+        let actual_orders = self.cfg.resolved_archimedean_orders(
+            self.params.n_modes,
+            &log_lambda_sq_hp(&self.params, self.cfg.precision_bits)?,
+        )?;
+        derived.producer_notes.push(format!("operator quadrature: policy={:?}; actual per-mode orders retained in ccm_archimedean_integrals; order_table_digest={}; minimum={}; maximum={}",
+            self.cfg.research_quadrature_policy,ContentDigest::sha256(&serde_json::to_vec(&actual_orders)?).0,
+            actual_orders.iter().min().unwrap(),actual_orders.iter().max().unwrap()));
         if self.extended_input_error.is_some() {
             derived.producer_notes.push("supplied external input rejected; source-only automatic diagnostics preserved; reference-dependent diagnostics remain failed".into());
         }
@@ -932,6 +1024,55 @@ impl RetainedCcmRun {
         }
     }
 
+    /// Resolve the run's sector-gap certificate once. The certificate capture
+    /// and the research diagnostics that replay it share this single result.
+    /// Like sector analysis, its sector and certification options are fixed by
+    /// the first request; a different request requires a new retained run.
+    fn ensure_sector_certificate(
+        &mut self,
+        options: &CcmResearchCaptureOptions,
+        cache: &ArtifactCacheContext<'_>,
+    ) -> Result<()> {
+        let certification = options
+            .sector_gap_certification
+            .ok_or_else(|| anyhow::anyhow!("sector certification not requested"))?;
+        if self
+            .sector_certificate_options
+            .is_some_and(|prior| prior != certification)
+        {
+            bail!(
+                "sector-gap certification options changed after capture; create a new retained run"
+            );
+        }
+        // Also rejects a changed sector request before any memoized result is used.
+        self.sectors(options, cache)?;
+        self.sector_certificate_options = Some(certification);
+        if self.sector_certificate.is_some() {
+            return Ok(());
+        }
+        if let Some(error) = &self.sector_certificate_error {
+            bail!("sector-gap certificate unavailable: {error}");
+        }
+        let sectors = self.sectors.as_ref().expect("resolved sectors");
+        let resolved = certify_sector_gap_from_resolution(
+            &self.params,
+            &self.cfg,
+            certification,
+            sectors,
+            Some(cache),
+        );
+        match resolved {
+            Ok(resolved) => {
+                self.sector_certificate = Some(resolved);
+                Ok(())
+            }
+            Err(error) => {
+                self.sector_certificate_error = Some(format!("{error:#}"));
+                Err(error)
+            }
+        }
+    }
+
     /// Attempt one primary diagnostic. Callers convert errors to explicit
     /// receipt outcomes and continue other independent requests. Measurements
     /// include exact authenticated artifact manifests, on fresh and warm runs.
@@ -946,6 +1087,461 @@ impl RetainedCcmRun {
     ) -> Result<CapturedDiagnostic> {
         xc_numerics::hp_runtime::run_hp(|| self.capture_inner(id, options, cache))
     }
+    /// Prepare configured source-bound inputs without capturing or publishing a diagnostic.
+    /// The caller may extend the returned data, then set it back through the checked setter.
+    #[doc(hidden)]
+    pub fn prepare_extended_research_inputs(
+        &mut self,
+    ) -> Result<Option<crate::ccm::extended_research::ExternalResearchInputs>> {
+        self.ensure_extended_input_sources()?;
+        if let Some(error) = &self.extended_input_error {
+            bail!("external research preparation: {error}");
+        }
+        Ok(self.extended_inputs.clone())
+    }
+
+    #[doc(hidden)]
+    pub fn extended_research_sources(&self) -> &[ArtifactManifest] {
+        &self.run_once_sources
+    }
+
+    /// Prepare signed finite components from this matrix's retained primitives.
+    /// No primitive computation or eigenstate solve is permitted on a miss.
+    #[doc(hidden)]
+    pub fn retained_trial_components(
+        &mut self,
+        bound_precision_bits: u32,
+        maximum_bytes: u64,
+        cache: &ArtifactCacheContext<'_>,
+    ) -> Result<
+        Option<
+            crate::ccm::convergence_capture::finite_capture::energy_extensions::ComponentRequest,
+        >,
+    > {
+        use crate::ccm::convergence_capture::finite_capture::energy_extensions::{
+            ComponentData, ComponentRequest, SignedComponent,
+        };
+        use rug::float::Round;
+        use xc_solver::trial_energy::ExactBounds;
+        anyhow::ensure!(
+            (64..=4096).contains(&bound_precision_bits),
+            "component enclosure precision outside budget"
+        );
+        let d = self.params.matrix_size();
+        let entries = (d as u64).saturating_mul(d as u64 + 1) / 2;
+        // Absolute dyadic enclosure grid 2^-bits; two endpoints per entry.
+        // Positive exponent allowance is checked
+        // before conversion below. Admission precedes dense primitive decoding.
+        let estimate = entries.saturating_mul(3).saturating_mul(
+            (4 * u64::from(bound_precision_bits) + 128)
+                .saturating_mul(31)
+                .div_ceil(100)
+                + 100,
+        );
+        let policy = crate::ccm::capture_runtime::CaptureResourcePolicy::from_environment()?;
+        let working = estimate.saturating_add(
+            (d as u64)
+                .saturating_mul(d as u64)
+                .saturating_mul(4)
+                .saturating_mul(u64::from(self.cfg.precision_bits).div_ceil(8) + 64),
+        );
+        if estimate > maximum_bytes.min(crate::ccm::capture_runtime::RESEARCH_INPUT_MAXIMUM_BYTES)
+            || working > policy.maximum_working_bytes
+        {
+            return Ok(None);
+        }
+        let tau = self
+            .source
+            .tau_manifest
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("retained matrix identity absent"))?
+            .clone();
+        let parents = xc_cache::resolve_manifest_sources(&tau, &self.run_once_sources, cache)?;
+        // Estimated admission, including raw retained payloads, temporary
+        // decoded strings, and guarded assembly buffers; not a measured peak.
+        let payload_bytes = parents
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.key.kind.as_str(),
+                    "ccm_archimedean_integrals" | "ccm_prime_component"
+                )
+            })
+            .fold(0u64, |total, m| total.saturating_add(m.size_bytes));
+        if working
+            .saturating_mul(2)
+            .saturating_add(payload_bytes.saturating_mul(4))
+            > policy.maximum_working_bytes
+        {
+            return Ok(None);
+        }
+        let resolver = cache
+            .resolver
+            .ok_or_else(|| anyhow::anyhow!("retained component resolver absent"))?;
+        let acceptance = cache
+            .acceptance
+            .ok_or_else(|| anyhow::anyhow!("retained component acceptance policy absent"))?;
+        let mut resolved = Vec::new();
+        for kind in ["ccm_archimedean_integrals", "ccm_prime_component"] {
+            let parent = parents
+                .iter()
+                .find(|m| m.key.kind == kind)
+                .ok_or_else(|| anyhow::anyhow!("retained component parent absent: {kind}"))?;
+            let record = resolver.resolve_exact(
+                &parent.key,
+                &parent.content_digest,
+                CacheQuality::Validated,
+                acceptance,
+            )?;
+            anyhow::ensure!(
+                xc_cache::manifest_depends_on(&tau, &record.manifest)?,
+                "component ancestry mismatch"
+            );
+            resolved.push(record);
+        }
+        let p = self.cfg.precision_bits;
+        let integrals = decode_archimedean_integrals(
+            &serde_json::from_slice(&resolved[0].payload)?,
+            &self.params,
+            p,
+        )?;
+        let prime = decode_prime_component(
+            &serde_json::from_slice(&resolved[1].payload)?,
+            &self.params,
+            p,
+        )?;
+        let l = log_lambda_sq_hp(&self.params, p)?;
+        let (pole, arch) =
+            assemble_pole_and_archimedean_components(self.params.n_modes, &l, p, &integrals)?;
+        let mut components = Vec::new();
+        for (label, sign, data) in [
+            ("stored_pole", "1", pole),
+            ("stored_archimedean", "-1", arch),
+            ("stored_prime", "-1", prime),
+        ] {
+            anyhow::ensure!(
+                data.iter()
+                    .all(|x| x.is_finite() && x.get_exp().is_none_or(|e| e <= 64)),
+                "component exponent exceeds serialized admission estimate"
+            );
+            let mut values = Vec::with_capacity(d * (d + 1) / 2);
+            for i in 0..d {
+                for j in i..d {
+                    let scaled = Float::with_val(p, &data[i * d + j]) << bound_precision_bits;
+                    let denominator = rug::Integer::from(1) << bound_precision_bits;
+                    let lo = scaled
+                        .to_integer_round(Round::Down)
+                        .ok_or_else(|| anyhow::anyhow!("component underflow"))?
+                        .0;
+                    let hi = scaled
+                        .to_integer_round(Round::Up)
+                        .ok_or_else(|| anyhow::anyhow!("component overflow"))?
+                        .0;
+                    values.push(ExactBounds {
+                        lower: rug::Rational::from((lo, denominator.clone())).to_string(),
+                        upper: rug::Rational::from((hi, denominator)).to_string(),
+                    });
+                }
+            }
+            components.push(SignedComponent::from_data(ComponentData {
+                label: label.into(),
+                signed_weight: sign.into(),
+                diagonal: vec![],
+                upper_triangle: values,
+                rank_one: vec![],
+            })?);
+        }
+        let request = ComponentRequest {
+            matrix_digest: tau.content_digest,
+            basis_id: "centered_full_V_fourier".into(),
+            components,
+            assembly_operator_norm_error: None,
+        };
+        anyhow::ensure!(
+            serde_json::to_vec(&request)?.len() as u64
+                <= maximum_bytes.min(crate::ccm::capture_runtime::RESEARCH_INPUT_MAXIMUM_BYTES),
+            "component serialization exceeded admitted size"
+        );
+        for record in resolved {
+            if !self
+                .run_once_sources
+                .iter()
+                .any(|m| m.content_digest == record.manifest.content_digest)
+            {
+                self.run_once_sources.push(record.manifest);
+            }
+        }
+        Ok(Some(request))
+    }
+
+    #[doc(hidden)]
+    pub fn prepare_retained_trial_components(
+        &mut self,
+        bound_precision_bits: u32,
+        maximum_bytes: u64,
+        cache: &ArtifactCacheContext<'_>,
+    ) -> Result<bool> {
+        let mut input = self.prepare_extended_research_inputs()?.ok_or_else(|| {
+            anyhow::anyhow!("component preparation requires retained research inputs")
+        })?;
+        if input
+            .finite_diagnostics
+            .as_ref()
+            .is_some_and(|i| i.component_energy.is_some())
+        {
+            return Ok(true);
+        }
+        let Some(request) =
+            self.retained_trial_components(bound_precision_bits, maximum_bytes, cache)?
+        else {
+            return Ok(false);
+        };
+        let parents = self.run_once_sources.clone();
+        let extra = input.finite_diagnostics.get_or_insert_with(|| {
+            crate::ccm::convergence_capture::finite_capture::Inputs {
+                scope: "retained signed component enclosures; stored primitive and matrix scope"
+                    .into(),
+                ..Default::default()
+            }
+        });
+        extra.component_energy = Some(request);
+        self.set_extended_research_inputs(input)?;
+        // Only this component field changed. Preserve its authenticated parents
+        // across the general setter's invalidation of derived input state.
+        self.run_once_sources = parents;
+        Ok(true)
+    }
+
+    fn ensure_extended_input_sources(&mut self) -> Result<()> {
+        use crate::ccm::extended_research::ExternalResearchInputs;
+        use crate::ccm::state_geometry::RetainedState;
+        if !self.extended_inputs_loaded {
+            self.extended_inputs_loaded = true;
+            if let Some(path) = std::env::var_os("XC_RESEARCH_INPUTS_FILE") {
+                match ExternalResearchInputs::from_file(std::path::Path::new(&path)) {
+                    Ok(input) => self.extended_inputs = Some(input),
+                    Err(e) => self.extended_input_error = Some(e.to_string()),
+                }
+            }
+            if self.extended_inputs.is_none()
+                && self.extended_input_error.is_none()
+                && std::env::var_os("XC_RESEARCH_REFERENCE_FILE").is_none()
+                && std::env::var("XC_RESEARCH_PREPARE_TARGET_REFERENCE").is_ok_and(|v| v == "1")
+            {
+                let prepared = (|| -> Result<_> {
+                    let record = self
+                        .eigenpair
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("retained primary state unavailable"))?;
+                    let state = RetainedState::from_payload(
+                        &record.manifest,
+                        &record.payload,
+                        std::slice::from_ref(&record.manifest.content_digest),
+                    )?;
+                    let spec = crate::target::TargetProfileSpec::from_environment()?;
+                    crate::ccm::research_target::prepare(
+                        &state,
+                        &spec,
+                        (16 * state.modes).clamp(256, 131072),
+                    )
+                })();
+                match prepared {
+                    Ok((reference, input)) => {
+                        self.prepared_reference = Some(
+                            crate::ccm::research_completion::ReferencePreparation {
+                                schema_version: 1,
+                                finite_reference: Some(reference.clone()),
+                                sampled_reference: input.target.clone(),
+                                lambda_squared: input.lambda_squared.clone(),
+                                precision_bits: input.precision_bits,
+                                definition_digest: input.definition_digest.clone(),
+                                approximation_scope: format!(
+                                    "{}; signed jets refer to this explicitly finite Fourier projection, extended by zero outside the run window",
+                                    input.approximation_scope
+                                ),
+                                weighted_atoms: vec![],
+                                atom_coordinate: None,
+                                atom_coverage: None,
+                                tail_form: None,
+                                tail_recipe: None,
+                                completion: None,
+                            },
+                        );
+                        if self.research_inputs.is_none() {
+                            self.research_inputs = Some(reference);
+                        }
+                        self.extended_inputs = Some(input);
+                    }
+                    Err(e) => {
+                        self.extended_input_error =
+                            Some(format!("runtime target research preparation: {e}"))
+                    }
+                }
+            }
+        }
+        if self.prepared_reference.is_none() {
+            if let Some(path) = std::env::var_os("XC_RESEARCH_REFERENCE_FILE") {
+                match crate::ccm::research_completion::ReferencePreparation::from_file(
+                    std::path::Path::new(&path),
+                ) {
+                    Ok(reference) => {
+                        if let Some(finite) = &reference.finite_reference {
+                            self.research_inputs = Some(finite.clone());
+                        }
+                        self.prepared_reference = Some(reference);
+                    }
+                    Err(e) => {
+                        self.extended_input_error = Some(format!("reference preparation: {e}"))
+                    }
+                }
+            }
+        }
+        if let Some(reference) = &self.prepared_reference {
+            if self.extended_inputs.is_none() {
+                if let Some(record) = &self.eigenpair {
+                    let state = crate::ccm::state_geometry::RetainedState::from_payload(
+                        &record.manifest,
+                        &record.payload,
+                        std::slice::from_ref(&record.manifest.content_digest),
+                    )?;
+                    match reference.prepare(&state, None) {
+                        Ok(i) => self.extended_inputs = Some(i),
+                        Err(e) => {
+                            self.extended_input_error = Some(format!("reference preparation: {e}"))
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Start the look-ahead diagnostics not yet requested on one background
+    /// thread, once per run. It starts after a capture was computed rather
+    /// than reused (the run is cold) and once the run's inputs are settled:
+    /// run-once preparation done and any reference jets added. This is
+    /// scheduling only. Each result is used where its serial computation
+    /// runs, and only if the inputs it was computed from equal the inputs
+    /// there; otherwise that diagnostic is computed inline, as before. The
+    /// look-ahead copy of Tau and a second concurrent workspace must fit
+    /// within half the declared working budget.
+    fn start_lookahead(&mut self, state: &crate::ccm::state_geometry::RetainedState) {
+        use crate::ccm::convergence_capture::{finite_capture::ExecutionContext, lookahead};
+        if !self.lookahead_enabled
+            || self.lookahead_started
+            || !self.run_once_prepared
+            || (self.prepared_reference.is_some() && !self.prepared_reference_jets)
+        {
+            return;
+        }
+        let ids = lookahead_ids(self.lookahead_requests.as_ref(), &self.lookahead_reached);
+        if ids.is_empty() {
+            return;
+        }
+        self.lookahead_started = true;
+        let jobs = (|| -> Result<_> {
+            let policy = crate::ccm::capture_runtime::CaptureResourcePolicy::from_environment()?;
+            let entry_bytes = self
+                .source
+                .tau
+                .iter()
+                .map(|x| 32 + u64::from(x.prec()).div_ceil(64) * 8)
+                .sum::<u64>();
+            // Tau entries (owned copy and workspace) and one copy of the
+            // external input, which the jobs share when both roles use it.
+            let input_bytes = self
+                .extended_inputs
+                .as_ref()
+                .map(|input| serde_json::to_vec(input).map(|bytes| bytes.len() as u64))
+                .transpose()?
+                .unwrap_or(0);
+            if entry_bytes
+                .saturating_mul(6)
+                .saturating_add(input_bytes.saturating_mul(2))
+                > policy.maximum_working_bytes
+            {
+                bail!("look-ahead exceeds the declared working budget");
+            }
+            let manifest = self
+                .source
+                .tau_manifest
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("retained Tau manifest missing"))?;
+            let matrix = crate::ccm::retained_evidence::RetainedMatrix::from_admitted_runtime(
+                manifest.clone(),
+                state.cutoff.clone(),
+                state.modes,
+                state.precision,
+                &self.source.tau,
+            )?;
+            // Exactly the arguments the capture paths pass: finite
+            // diagnostics omit a failed input; the listed retained
+            // convergence diagnostics are complete, take no roots and use
+            // the effective options of their capture.
+            let finite_input = if self.extended_input_error.is_some() {
+                None
+            } else {
+                self.extended_inputs.as_ref()
+            };
+            let execution = ExecutionContext {
+                policy: policy.clone(),
+                certificate_error: self.sector_certificate_error.clone(),
+                input_preparation_error: self.extended_input_error.clone(),
+            };
+            let options = crate::ccm::extended_research::effective_options(
+                &self.extension_options("finite_section_transfer", true, state, None)?,
+                &policy,
+            );
+            lookahead::jobs(
+                &ids,
+                state,
+                &matrix,
+                finite_input,
+                &execution,
+                self.extended_inputs.as_ref(),
+                &options,
+            )
+        })();
+        if let Ok(jobs) = jobs {
+            self.lookahead = crate::ccm::capture_runtime::LookAhead::start(jobs);
+        }
+    }
+
+    /// Options of an extended capture of `id` (after the `_full` suffix is
+    /// removed) before the capture applies its working budget.
+    fn extension_options(
+        &self,
+        id: &str,
+        complete: bool,
+        state: &crate::ccm::state_geometry::RetainedState,
+        roots: Option<&crate::ccm::retained_evidence::RetainedRoots>,
+    ) -> Result<crate::ccm::extended_research::ExtensionOptions> {
+        let mut options = self
+            .extended_options
+            .clone()
+            .unwrap_or_else(|| crate::ccm::extended_research::ExtensionOptions::for_source(state));
+        if self.extended_options.is_none() {
+            options.working_precision_bits = options
+                .working_precision_bits
+                .max(
+                    self.extended_inputs
+                        .as_ref()
+                        .map_or(0, |i| i.precision_bits.saturating_add(64)),
+                )
+                .max(roots.map_or(0, |r| r.dataset.precision_bits.saturating_add(64)));
+        }
+        if complete {
+            if self.extended_options.is_none() {
+                let policy =
+                    crate::ccm::capture_runtime::CaptureResourcePolicy::from_environment()?;
+                options.maximum_estimated_output_bytes = policy.maximum_output_bytes;
+                options.maximum_working_bytes = Some(policy.maximum_working_bytes);
+            }
+            if matches!(id, "directional_response" | "root_transport") {
+                options.maximum_directional_rows = roots.map_or(0, |r| r.dataset.points.len());
+            }
+        }
+        Ok(options)
+    }
     fn capture_inner(
         &mut self,
         id: &str,
@@ -954,122 +1550,39 @@ impl RetainedCcmRun {
     ) -> Result<CapturedDiagnostic> {
         if id == "u_flow_response" {
             if let Some(saved) = &self.uflow_capture {
-                return Ok(CapturedDiagnostic::new(
-                    &saved.value,
-                    saved.sources.clone(),
-                )?);
+                return Ok(saved.clone());
             }
         }
         let complete = id.ends_with("_full")
             || crate::ccm::convergence_capture::DIAGNOSTICS.contains(&id)
             || crate::ccm::research_completion::DIAGNOSTICS.contains(&id);
         let id = id.strip_suffix("_full").unwrap_or(id);
-        if crate::ccm::extended_research::DIAGNOSTICS.contains(&id)
+        if crate::ccm::capture::FINITE_DIAGNOSTICS.contains(&id)
+            || crate::ccm::extended_research::DIAGNOSTICS.contains(&id)
             || crate::ccm::convergence_capture::DIAGNOSTICS.contains(&id)
             || crate::ccm::research_completion::DIAGNOSTICS.contains(&id)
         {
             use crate::ccm::extended_research::*;
             use crate::ccm::retained_evidence::{RetainedMatrix, RetainedRoots};
             use crate::ccm::state_geometry::RetainedState;
-            if !self.extended_inputs_loaded {
-                self.extended_inputs_loaded = true;
-                if let Some(path) = std::env::var_os("XC_RESEARCH_INPUTS_FILE") {
-                    match ExternalResearchInputs::from_file(std::path::Path::new(&path)) {
-                        Ok(input) => self.extended_inputs = Some(input),
-                        Err(e) => self.extended_input_error = Some(e.to_string()),
-                    }
-                }
-                if self.extended_inputs.is_none()
-                    && self.extended_input_error.is_none()
-                    && std::env::var_os("XC_RESEARCH_REFERENCE_FILE").is_none()
-                    && std::env::var("XC_RESEARCH_PREPARE_TARGET_REFERENCE").is_ok_and(|v| v == "1")
-                {
-                    let prepared = (|| -> Result<_> {
-                        let record = self
-                            .eigenpair
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("retained primary state unavailable"))?;
-                        let state = RetainedState::from_payload(
-                            &record.manifest,
-                            &record.payload,
-                            std::slice::from_ref(&record.manifest.content_digest),
-                        )?;
-                        let spec = crate::target::TargetProfileSpec::from_environment()?;
-                        crate::ccm::research_target::prepare(
-                            &state,
-                            &spec,
-                            (16 * state.modes).clamp(256, 131072),
-                        )
-                    })();
-                    match prepared {
-                        Ok((reference, input)) => {
-                            self.prepared_reference = Some(
-                                crate::ccm::research_completion::ReferencePreparation {
-                                    schema_version: 1,
-                                    finite_reference: Some(reference.clone()),
-                                    sampled_reference: input.target.clone(),
-                                    lambda_squared: input.lambda_squared.clone(),
-                                    precision_bits: input.precision_bits,
-                                    definition_digest: input.definition_digest.clone(),
-                                    approximation_scope: format!(
-                                        "{}; signed jets refer to this explicitly finite Fourier projection, extended by zero outside the run window",
-                                        input.approximation_scope
-                                    ),
-                                    weighted_atoms: vec![],
-                                    atom_coordinate: None,
-                                    atom_coverage: None,
-                                    tail_form: None,
-                                    tail_recipe: None,
-                                    completion: None,
-                                },
-                            );
-                            if self.research_inputs.is_none() {
-                                self.research_inputs = Some(reference);
-                            }
-                            self.extended_inputs = Some(input);
-                        }
-                        Err(e) => {
-                            self.extended_input_error =
-                                Some(format!("runtime target research preparation: {e}"))
-                        }
-                    }
+            // Requested here: never computed ahead from now on.
+            self.lookahead_reached.insert(id.to_owned());
+            let mut certificate_error = self.sector_certificate_error.clone();
+            // The run's own certificate, when requested, supplies the source
+            // assembly certificate these two diagnostics replay.
+            if matches!(
+                id,
+                "capture_preflight" | "transform_enclosure" | "finite_root_budget"
+            ) && options.sector_gap_certification.is_some()
+            {
+                if let Err(error) = self.ensure_sector_certificate(options, cache) {
+                    certificate_error = Some(format!("{error:#}"));
+                    xc_core::progress_message!(
+                        "  sector-gap certificate unavailable to {id}: {error:#}"
+                    );
                 }
             }
-            if self.prepared_reference.is_none() {
-                if let Some(path) = std::env::var_os("XC_RESEARCH_REFERENCE_FILE") {
-                    match crate::ccm::research_completion::ReferencePreparation::from_file(
-                        std::path::Path::new(&path),
-                    ) {
-                        Ok(reference) => {
-                            if let Some(finite) = &reference.finite_reference {
-                                self.research_inputs = Some(finite.clone());
-                            }
-                            self.prepared_reference = Some(reference);
-                        }
-                        Err(e) => {
-                            self.extended_input_error = Some(format!("reference preparation: {e}"))
-                        }
-                    }
-                }
-            }
-            if let Some(reference) = &self.prepared_reference {
-                if self.extended_inputs.is_none() {
-                    if let Some(record) = &self.eigenpair {
-                        let state = crate::ccm::state_geometry::RetainedState::from_payload(
-                            &record.manifest,
-                            &record.payload,
-                            std::slice::from_ref(&record.manifest.content_digest),
-                        )?;
-                        match reference.prepare(&state, None) {
-                            Ok(i) => self.extended_inputs = Some(i),
-                            Err(e) => {
-                                self.extended_input_error =
-                                    Some(format!("reference preparation: {e}"))
-                            }
-                        }
-                    }
-                }
-            }
+            self.ensure_extended_input_sources()?;
             if complete {
                 self.prepare_run_once_inputs(options, cache)?;
             }
@@ -1077,6 +1590,14 @@ impl RetainedCcmRun {
             if !matches!(
                 id,
                 "compactness"
+                    | "finite_root_budget"
+                    | "trial_vector_energy"
+                    | "trial_vector_parity"
+                    | "indexed_prolate_comparison"
+                    | "directional_error_bound"
+                    | "finite_tail_bound"
+                    | "spectral_cluster_bound"
+                    | "dimension_precision_budget"
                     | "arithmetic_energy"
                     | "spectral_cluster"
                     | "directional_response"
@@ -1106,7 +1627,12 @@ impl RetainedCcmRun {
             )?;
             let matrix = if matches!(
                 id,
-                "arithmetic_energy"
+                "trial_vector_energy"
+                    | "trial_vector_parity"
+                    | "directional_error_bound"
+                    | "finite_tail_bound"
+                    | "spectral_cluster_bound"
+                    | "arithmetic_energy"
                     | "directional_response"
                     | "root_transport"
                     | "operator_cluster"
@@ -1132,7 +1658,10 @@ impl RetainedCcmRun {
             };
             let roots = if matches!(
                 id,
-                "directional_response"
+                "finite_root_budget"
+                    | "directional_error_bound"
+                    | "dimension_precision_budget"
+                    | "directional_response"
                     | "resolution_budget"
                     | "complex_transform"
                     | "root_transport"
@@ -1192,51 +1721,100 @@ impl RetainedCcmRun {
                     }
                 }
             }
-            let mut options = self
-                .extended_options
-                .clone()
-                .unwrap_or_else(|| ExtensionOptions::for_source(&state));
-            if self.extended_options.is_none() {
-                options.working_precision_bits = options
-                    .working_precision_bits
-                    .max(
-                        self.extended_inputs
-                            .as_ref()
-                            .map_or(0, |i| i.precision_bits.saturating_add(64)),
-                    )
-                    .max(
-                        roots
-                            .as_ref()
-                            .map_or(0, |r| r.dataset.precision_bits.saturating_add(64)),
-                    );
-            }
-            if complete {
-                if self.extended_options.is_none() {
-                    let policy =
-                        crate::ccm::capture_runtime::CaptureResourcePolicy::from_environment()?;
-                    options.maximum_estimated_output_bytes = policy.maximum_output_bytes;
-                    options.maximum_working_bytes = Some(policy.maximum_working_bytes);
-                }
-                if matches!(id, "directional_response" | "root_transport") {
-                    options.maximum_directional_rows =
-                        roots.as_ref().map_or(0, |r| r.dataset.points.len());
-                }
-            }
-            let input = if id == "compactness" {
+            let options = self.extension_options(id, complete, &state, roots.as_ref())?;
+            let input = if id == "compactness"
+                || (crate::ccm::capture::FINITE_DIAGNOSTICS.contains(&id)
+                    && self.extended_input_error.is_some())
+            {
                 None
             } else {
                 self.extended_inputs.as_ref()
             };
-            return Ok(CapturedDiagnostic::from_cached(capture_extended(
-                id,
-                &state,
-                matrix.as_ref(),
-                roots.as_ref(),
-                input,
-                &options,
-                &self.run_once_sources,
-                cache,
-            )?)?);
+            let certificate = self
+                .sector_certificate
+                .as_ref()
+                .filter(|_| certificate_error.is_none())
+                .filter(|_| {
+                    matches!(
+                        id,
+                        "capture_preflight" | "transform_enclosure" | "finite_root_budget"
+                    )
+                })
+                .and_then(|resolved| {
+                    resolved
+                        .produced_manifest
+                        .as_ref()
+                        .or(resolved.reused_manifest.as_ref())
+                        .map(|manifest| (&resolved.value, manifest))
+                });
+            use crate::ccm::convergence_capture::lookahead;
+            let (captured, produced) = if crate::ccm::capture::FINITE_DIAGNOSTICS.contains(&id) {
+                use crate::ccm::convergence_capture::finite_capture::{
+                    capture_with_prepared, ExecutionContext, Prepared,
+                };
+                let execution = ExecutionContext {
+                    policy: crate::ccm::capture_runtime::CaptureResourcePolicy::from_environment()?,
+                    certificate_error,
+                    input_preparation_error: self.extended_input_error.clone(),
+                };
+                let (state_ref, matrix_ref, roots_ref) = (&state, matrix.as_ref(), roots.as_ref());
+                let execution_ref = &execution;
+                let prepared = self.lookahead.as_ref().map(|lane| -> Prepared<'_> {
+                    Box::new(move || {
+                        lookahead::claim_finite(
+                            lane,
+                            id,
+                            state_ref,
+                            matrix_ref,
+                            roots_ref.is_some(),
+                            input,
+                            certificate.is_some(),
+                            execution_ref,
+                        )
+                    })
+                });
+                let result = capture_with_prepared(
+                    id,
+                    &state,
+                    matrix.as_ref(),
+                    roots.as_ref(),
+                    input,
+                    certificate,
+                    &self.run_once_sources,
+                    cache,
+                    &execution,
+                    prepared,
+                )?;
+                let produced = result.produced_manifest.is_some();
+                (CapturedDiagnostic::from_cached(result)?, produced)
+            } else {
+                let (state_ref, matrix_ref) = (&state, matrix.as_ref());
+                let prepared = self.lookahead.as_ref().map(|lane| -> ExtendedPrepared<'_> {
+                    Box::new(move |options, plain| {
+                        lookahead::claim_extended(
+                            lane, id, state_ref, matrix_ref, input, options, plain,
+                        )
+                    })
+                });
+                let result = capture_extended_prepared(
+                    id,
+                    &state,
+                    matrix.as_ref(),
+                    roots.as_ref(),
+                    input,
+                    certificate,
+                    &options,
+                    &self.run_once_sources,
+                    cache,
+                    prepared,
+                )?;
+                let produced = result.produced_manifest.is_some();
+                (CapturedDiagnostic::from_cached(result)?, produced)
+            };
+            if produced {
+                self.start_lookahead(&state);
+            }
+            return Ok(captured);
         }
         if matches!(
             id,
@@ -1339,6 +1917,57 @@ impl RetainedCcmRun {
                 )?,
             )?);
         }
+        if id == "checkpoint_spectra" {
+            let (matrix, _) = self.retained_even_sources(cache)?;
+            let ladder = crate::ccm::capture::checkpoint_spectrum_ladder(matrix.dimension());
+            let result = super::checkpoint_low_spectra_via_cache(&matrix, &ladder, 3, cache)?;
+            return Ok(CapturedDiagnostic::from_cached(result)?);
+        }
+        if id == "target_comparison" {
+            // Hard private-only: derived from the private runtime target.
+            let _stage = crate::ccm::capture_runtime::Stage::new(format!("{id} compute"));
+            let (matrix, _) = self.retained_even_sources(cache)?;
+            return Ok(CapturedDiagnostic::from_cached(
+                crate::distance::hp::capture_target_comparison_via_cache(
+                    &self.params,
+                    &self.cfg,
+                    &matrix,
+                    cache,
+                )?,
+            )?);
+        }
+        if id == "assembly_error" {
+            #[cfg(not(feature = "arb"))]
+            bail!("assembly error analysis requires the xc-spectral arb feature");
+            #[cfg(feature = "arb")]
+            {
+                // Sector enclosures add exact-form eigenvalue bounds; a sector
+                // limitation only omits those bounds from this measurement.
+                if options.sector_analysis.is_some() {
+                    let _ = self.sectors(options, cache);
+                }
+                let tau_manifest = self.source.tau_manifest.clone().ok_or_else(|| {
+                    anyhow::anyhow!("retained Tau manifest unavailable for assembly error analysis")
+                })?;
+                let eigenpair = self.source.eigenpair_manifest.clone();
+                let sectors = self.sectors.as_ref().and_then(|resolution| {
+                    resolution
+                        .gap_manifest
+                        .as_ref()
+                        .map(|manifest| (&resolution.gap, manifest))
+                });
+                let result = super::assembly_error::resolve_assembly_error_via_cache(
+                    &self.params,
+                    &self.cfg,
+                    &self.source.tau,
+                    &tau_manifest,
+                    eigenpair.as_ref().map(|manifest| (&self.primary, manifest)),
+                    sectors,
+                    cache,
+                )?;
+                return Ok(CapturedDiagnostic::from_cached(result)?);
+            }
+        }
         if id == "state_geometry" {
             use crate::ccm::state_geometry::{
                 analyze_state_geometry_via_cache, GeometryOptions, RetainedState,
@@ -1358,10 +1987,37 @@ impl RetainedCcmRun {
             )?;
             return Ok(CapturedDiagnostic::from_cached(result)?);
         }
-        if matches!(
-            id,
-            "evenness" | "sector_analysis" | "sector_gap_certificate"
-        ) {
+        if id == "sector_gap_certificate" {
+            // Recorded by reference to the certificate artifact, like the root
+            // certificate, so the receipt does not carry a second copy.
+            self.ensure_sector_certificate(options, cache)?;
+            let resolved = self
+                .sector_certificate
+                .as_ref()
+                .expect("resolved certificate");
+            return Ok(
+                match resolved
+                    .produced_manifest
+                    .as_ref()
+                    .or(resolved.reused_manifest.as_ref())
+                {
+                    Some(manifest) => CapturedDiagnostic::by_reference(
+                        &resolved.value,
+                        vec![manifest.clone()],
+                        false,
+                        vec![manifest.clone()],
+                    )?,
+                    None => CapturedDiagnostic::new(
+                        &resolved.value,
+                        self.sector_record
+                            .as_ref()
+                            .map(|record| record.sources.clone())
+                            .unwrap_or_default(),
+                    )?,
+                },
+            );
+        }
+        if matches!(id, "evenness" | "sector_analysis") {
             self.sectors(options, cache)?;
             let sectors = self.sectors.as_ref().expect("resolved sectors");
             let record = self.sector_record.as_ref().expect("recorded sectors");
@@ -1370,22 +2026,6 @@ impl RetainedCcmRun {
                     evenness_from_sector_gap(&self.params, self.cfg.precision_bits, &sectors.gap)?;
                 return Ok(CapturedDiagnostic::new(
                     &serde_json::json!({"method":"resolved_stored_parity_sector_lift_v2", "claim_scope":value.claim_scope, "assembly_error_bound":null, "evenness_deviation":value.evenness_deviation.to_string(), "natural_eigenvalue":value.natural_eigenvalue.to_string(), "forced_eigenvalue":value.forced_eigenvalue.to_string()}),
-                    record.sources.clone(),
-                )?);
-            }
-            if id == "sector_gap_certificate" {
-                let certification = options
-                    .sector_gap_certification
-                    .ok_or_else(|| anyhow::anyhow!("sector certification not requested"))?;
-                let certificate = certify_sector_gap_from_resolution(
-                    &self.params,
-                    &self.cfg,
-                    certification,
-                    sectors,
-                    Some(cache),
-                )?;
-                return Ok(CapturedDiagnostic::new(
-                    &certificate,
                     record.sources.clone(),
                 )?);
             }
@@ -1403,7 +2043,7 @@ impl RetainedCcmRun {
             "distance_resolution" => "ccm_distance_resolution_evidence",
             "target_residual_analysis" => "ccm_target_residual_analysis",
             "deviation_decomposition" => "ccm_deviation_decomposition",
-            "root_certificate" => "ccm_root_certificate",
+            "root_certificate" => "ccm_root_certification_report",
             _ => bail!("unknown retained-run diagnostic {id:?}"),
         };
         let sink = RecordingSink::new(cache, std::slice::from_ref(&kind));
@@ -1478,19 +2118,29 @@ impl RetainedCcmRun {
                 .root_certification
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("root certification not requested"))?;
-            let certificate = certify_roots_from_retained_source(
+            // Every requested root receives a row: certified enclosures where
+            // certifiable, computed values with reasons everywhere else.
+            let (report, manifest) = super::resolve_root_certification_report_via_cache(
                 p,
                 cfg,
+                primary,
                 &primary.xi,
-                source.secular_manifest.as_ref(),
+                Some(&required(&source.root_manifest)?),
+                Some(&required(&source.secular_manifest)?),
                 certification,
                 Some(&observed),
             )?;
-            reconcile_computed_roots_with_certificate(primary, &certificate)?;
-            return Ok(CapturedDiagnostic::new(
-                &certificate,
-                vec![required(&source.secular_manifest)?],
-            )?);
+            let mut sources = vec![
+                required(&source.root_manifest)?,
+                required(&source.secular_manifest)?,
+            ];
+            return Ok(match manifest {
+                Some(manifest) => {
+                    sources.push(manifest.clone());
+                    CapturedDiagnostic::by_reference(&report, vec![manifest], false, sources)?
+                }
+                None => CapturedDiagnostic::new(&report, sources)?,
+            });
         } else if id == "distance_profile" {
             let distance = options
                 .distance_capture
@@ -1500,6 +2150,7 @@ impl RetainedCcmRun {
                 .rules
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("profile capture requires a grid convention"))?;
+            let _stage = crate::ccm::capture_runtime::Stage::new(format!("{id} compute"));
             crate::distance::hp::capture_ccm_profile_via_cache(
                 p,
                 cfg,
@@ -1513,6 +2164,7 @@ impl RetainedCcmRun {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("distance capture not requested"))?;
             let alpha = Float::with_val(cfg.precision_bits, Float::parse(&distance.alpha)?);
+            let _stage = crate::ccm::capture_runtime::Stage::new(format!("{id} compute"));
             let captured = crate::distance::hp::capture_ccm_distance_with_derived_via_cache(
                 p,
                 cfg,
@@ -1545,10 +2197,7 @@ impl RetainedCcmRun {
             )?;
         }
         if id == "u_flow_response" {
-            self.uflow_capture = Some(CapturedDiagnostic::new(
-                &result.value,
-                result.sources.clone(),
-            )?);
+            self.uflow_capture = Some(result.clone());
         }
         Ok(result)
     }
@@ -1572,19 +2221,288 @@ mod tests {
         retained_run_round_trip(false, true);
     }
 
+    #[test]
+    fn retained_roots_replay_adopted_published_validation_chain() {
+        use xc_cache::*;
+        let directory = xc_core::test_support::TestDir::new("retained-published-roots");
+        let author = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "local",
+                directory.join("author"),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let sink = CanonicalStagingProductionSink::new(
+            directory.join("staging"),
+            TransportPolicy::default(),
+            xc_core::ResourcePolicy::default(),
+            xc_core::CancellationToken::new(),
+        )
+        .unwrap();
+        let context = ArtifactCacheContext {
+            resolver: Some(&author),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["local".into()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: Some(&sink),
+        };
+        let params = CcmParams::from_lambda_sq_integer(13, 16);
+        let mut cfg = HighPrecConfig::for_decimal_digits(40).with_adaptive_root_precision();
+        cfg.n_eigenvalues = 1;
+        let dataset = xc_zeta::zeros::bundled_dataset_identity().unwrap();
+        let seeds = vec![Float::with_val(
+            cfg.precision_bits,
+            Float::parse(&xc_zeta::zeros::bundled_first_n_strings(1).unwrap()[0]).unwrap(),
+        )];
+        let mut cold =
+            RetainedCcmRun::seeded(&params, &cfg, 1, &seeds, &dataset, &context).unwrap();
+        let options = super::super::super::capture::CcmCapturePlan::ultra(2, 17)
+            .unwrap()
+            .primary_options()
+            .unwrap();
+        let expected = cold
+            .capture_diagnostic("root_band", &options, &context)
+            .unwrap();
+        let adopted_store = FilesystemCacheStore::new(
+            "adopted",
+            directory.join("adopted"),
+            true,
+            CacheVisibility::Local,
+        );
+        for draft in sink.drafts().unwrap() {
+            let record = author
+                .resolve_exact(
+                    &draft.source_artifact_key,
+                    &draft.source_content_digest,
+                    CacheQuality::Validated,
+                    &policy,
+                )
+                .unwrap();
+            let mut tags = record.manifest.tags.clone();
+            tags.insert(
+                SEMANTIC_KEY_MANIFEST_TAG.into(),
+                serde_json::to_string(&draft.manifest.semantic_key).unwrap(),
+            );
+            tags.insert(
+                REMOTE_CANONICAL_MANIFEST_TAG.into(),
+                serde_json::to_string(&draft.manifest).unwrap(),
+            );
+            // Match the shard adapter's authenticated canonical metadata,
+            // including its intentionally empty local dependency list.
+            adopted_store
+                .put(
+                    &ArtifactDraft {
+                        schema_version: 1,
+                        key: record.manifest.key,
+                        producer_toolkit_version: record.manifest.producer_toolkit_version,
+                        minimum_reader_version: record.manifest.minimum_reader_version,
+                        maximum_reader_version: record.manifest.maximum_reader_version,
+                        quality: record.manifest.quality,
+                        visibility: CacheVisibility::Local,
+                        immutable: true,
+                        dependencies: vec![],
+                        tags,
+                        provenance_digest: Some(draft.manifest.digest().unwrap()),
+                    },
+                    &record.payload,
+                )
+                .unwrap();
+        }
+        let adopted = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(adopted_store),
+        }]);
+        let context = ArtifactCacheContext {
+            resolver: Some(&adopted),
+            ordered_overlays: vec!["adopted".into()],
+            mode: ArtifactExecutionCacheMode::RequireReuse,
+            write_on_miss: false,
+            production_sink: None,
+            ..context
+        };
+        let mut warm =
+            RetainedCcmRun::seeded(&params, &cfg, 1, &seeds, &dataset, &context).unwrap();
+        assert_eq!(
+            cold.primary().eigenvalues_pos[0].value(),
+            warm.primary().eigenvalues_pos[0].value()
+        );
+        for manifest in [&warm.source.root_manifest, &warm.source.secular_manifest] {
+            let manifest = manifest.as_ref().unwrap();
+            assert!(manifest.dependencies.is_empty());
+            assert!(retained_canonical_manifest(manifest).unwrap().is_some());
+        }
+        let actual = warm
+            .capture_diagnostic("root_band", &options, &context)
+            .unwrap();
+        assert_eq!(actual.value, expected.value);
+    }
+
+    #[cfg(feature = "arb")]
+    #[test]
+    fn sector_certificate_is_fixed_by_the_first_request_and_bound_to_its_manifest() {
+        use crate::ccm::sector_gap_certificate::CcmSectorGapCertificationOptions;
+        use xc_cache::{
+            ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
+            ZipJsonFilesystemCacheStore as FilesystemCacheStore,
+        };
+        let root_dir = xc_core::test_support::TestDir::new("ccm-retained-certificate");
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "local",
+                root_dir.to_path_buf(),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let cache = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["local".into()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy:
+                xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let params = CcmParams::from_lambda_sq_integer(13, 16);
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.n_eigenvalues = 1;
+        let dataset = xc_zeta::zeros::bundled_dataset_identity().unwrap();
+        let seeds = vec![Float::with_val(
+            cfg.precision_bits,
+            Float::parse(&xc_zeta::zeros::bundled_first_n_strings(1).unwrap()[0]).unwrap(),
+        )];
+        let mut run = RetainedCcmRun::seeded(&params, &cfg, 1, &seeds, &dataset, &cache).unwrap();
+        let mut options = super::super::super::capture::CcmCapturePlan::ultra(2, 17)
+            .unwrap()
+            .primary_options()
+            .unwrap();
+        options.sector_gap_certification = Some(CcmSectorGapCertificationOptions::default());
+        let first = run
+            .capture_diagnostic("sector_gap_certificate", &options, &cache)
+            .unwrap();
+        assert!(first.value_reference.is_some(), "recorded by reference");
+        let again = run
+            .capture_diagnostic("sector_gap_certificate", &options, &cache)
+            .unwrap();
+        assert_eq!(first.value, again.value);
+
+        let mut finer = options.clone();
+        finer.sector_gap_certification = Some(CcmSectorGapCertificationOptions {
+            relative_enclosure_bits: 24,
+            ..CcmSectorGapCertificationOptions::default()
+        });
+        let Err(error) = run.capture_diagnostic("sector_gap_certificate", &finer, &cache) else {
+            panic!("a changed request must not reuse the certificate");
+        };
+        assert!(
+            format!("{error:#}").contains("certification options changed"),
+            "{error:#}"
+        );
+        let mut wider = options.clone();
+        wider.sector_analysis = options
+            .sector_analysis
+            .map(|sector| CcmSectorAnalysisOptions {
+                requested_eigenpairs: sector.requested_eigenpairs + 1,
+                ..sector
+            });
+        let Err(error) = run.capture_diagnostic("sector_gap_certificate", &wider, &cache) else {
+            panic!("a changed request must not reuse the certificate");
+        };
+        assert!(
+            format!("{error:#}").contains("sector analysis options changed"),
+            "{error:#}"
+        );
+
+        let resolved = run.sector_certificate.as_ref().unwrap();
+        let manifest = resolved
+            .produced_manifest
+            .as_ref()
+            .or(resolved.reused_manifest.as_ref())
+            .unwrap();
+        assert!(xc_cache::json_payload_matches_manifest(manifest, &resolved.value).unwrap());
+        let mut altered = resolved.value.clone();
+        altered.certifies_finite_ground_state_simple =
+            !altered.certifies_finite_ground_state_simple;
+        assert!(!xc_cache::json_payload_matches_manifest(manifest, &altered).unwrap());
+
+        // Source-only acquisition survives an unrelated optional-input failure,
+        // while retaining both that failure and the actual certificate error.
+        run.extended_inputs_loaded = true;
+        run.extended_input_error = Some("synthetic optional preparation failure".into());
+        run.sector_certificate = None;
+        run.sector_certificate_error = Some("synthetic inertia did not separate".into());
+        let plan = crate::ccm::capture::CcmCapturePlan::ultra(2, 17).unwrap();
+        let ids = [
+            "finite_root_budget",
+            "trial_vector_energy",
+            "trial_vector_parity",
+            "indexed_prolate_comparison",
+        ];
+        let result = xc_cache::capture_and_persist(
+            &plan,
+            ids.iter().map(|s| s.to_string()).collect(),
+            |id| run.capture_diagnostic_outcome(id, &options, &cache),
+            &cache,
+        )
+        .unwrap();
+        for id in ids {
+            let value =
+                xc_cache::measurement_value(&result.value.measurements[id], &resolver, &policy)
+                    .unwrap();
+            if id == "finite_root_budget" {
+                assert_eq!(value["data"]["outcome"], "blocked");
+                assert!(value["data"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("synthetic inertia did not separate"));
+            } else {
+                assert_eq!(value["data"]["outcome"], "computed");
+                assert_eq!(
+                    value["data"]["input_preparation_error"],
+                    "synthetic optional preparation failure"
+                );
+            }
+        }
+        assert!(run
+            .capture_diagnostic("constrained_l1_fit", &options, &cache)
+            .is_err());
+    }
+
     fn retained_run_round_trip(with_staging: bool, wider_window: bool) {
         use xc_cache::{
             ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
             ZipJsonFilesystemCacheStore as FilesystemCacheStore,
         };
-        let root = std::env::temp_dir().join(format!(
-            "ccm-retained-run-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root_dir = xc_core::test_support::TestDir::new("ccm-retained-run");
+        let root = root_dir.to_path_buf();
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -1699,6 +2617,70 @@ mod tests {
         if with_staging {
             // Fresh state/matrix notifications must survive encoded production too.
             assert_eq!(run.retained_even_sources(&cache).unwrap().1.len(), 1);
+            options.root_certification = Some(
+                CcmRootCertificationOptions::for_decimal_digits(
+                    crate::ccm::certified_roots::IndependentCcmRootTarget::Prefix { count: 3 },
+                    20,
+                )
+                .unwrap(),
+            );
+            let mut ids = vec![
+                "checkpoint_spectra",
+                "root_certificate",
+                "target_comparison",
+            ];
+            if cfg!(feature = "arb") {
+                ids.push("assembly_error");
+            }
+            for id in ids {
+                let cold = run
+                    .capture_diagnostic(id, &options, &cache)
+                    .unwrap_or_else(|error| panic!("cold {id}: {error:#}"));
+                let warm = run
+                    .capture_diagnostic(id, &options, &cache)
+                    .unwrap_or_else(|error| panic!("warm {id}: {error:#}"));
+                assert_eq!(cold.value, warm.value, "{id}");
+                assert!(
+                    cold.value_reference.is_some() || id == "root_certificate",
+                    "{id}"
+                );
+                match id {
+                    "root_certificate" => {
+                        let rows = cold.value["rows"].as_array().unwrap();
+                        assert_eq!(rows.len(), 3);
+                        assert_eq!(rows[0]["computed_status"], "converged");
+                        assert!(rows
+                            .iter()
+                            .all(|row| row["outcome"] != "not_computed_not_certified"
+                                || row["reason"].is_string()));
+                    }
+                    "target_comparison" => {
+                        assert_eq!(cold.value["outcome"], "computed", "{}", cold.value);
+                        assert_eq!(cold.value["levels"].as_array().unwrap().len(), 2);
+                        let residual: f64 = cold.value["basis_consistency_residual"]
+                            .as_str()
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        assert!(residual < 1e-30, "{residual}");
+                        assert!(
+                            cold.value["levels"][1]["projection"]["rayleigh_quotient"].is_string()
+                        );
+                        assert!(!xc_cache::artifact_kind_admitted_to_destination(
+                            crate::distance::hp::TARGET_COMPARISON_KIND,
+                            xc_cache::PublicationDestination::Public
+                        ));
+                    }
+                    "assembly_error" => {
+                        assert_eq!(cold.value["outcome"], "certified_finite_enclosure");
+                        assert!(!cold.value["exact_form_bounds"]
+                            .as_array()
+                            .unwrap()
+                            .is_empty());
+                    }
+                    _ => assert!(!cold.value["rows"].as_array().unwrap().is_empty()),
+                }
+            }
             for id in [
                 "capture_preflight",
                 "consistency",
@@ -1745,6 +2727,66 @@ mod tests {
                     "{id}"
                 );
             }
+            assert!(run
+                .retained_trial_components(128, 1, &cache)
+                .unwrap()
+                .is_none());
+            let retained_components = run
+                .retained_trial_components(128, 48 * 1024 * 1024, &cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained_components.components.len(), 3);
+            assert_eq!(retained_components.components[2].data.signed_weight, "-1");
+            assert!(run
+                .prepare_retained_trial_components(128, 48 * 1024 * 1024, &cache)
+                .unwrap());
+            for kind in ["ccm_archimedean_integrals", "ccm_prime_component"] {
+                assert!(run
+                    .extended_research_sources()
+                    .iter()
+                    .any(|m| m.key.kind == kind));
+            }
+            {
+                use crate::ccm::convergence_capture::finite_capture as f;
+                let live = run
+                    .capture_diagnostic("trial_vector_energy", &options, &cache)
+                    .unwrap();
+                let replay =
+                    f::RetainedFiniteSources::from_manifests(&run.primary_sources(), true, &cache)
+                        .unwrap()
+                        .capture(
+                            "trial_vector_energy",
+                            run.extended_inputs.as_ref(),
+                            &run.run_once_sources,
+                            &cache,
+                        )
+                        .unwrap();
+                assert_eq!(live.value, serde_json::to_value(replay.value).unwrap());
+                assert!(replay.reused_manifest.is_some());
+                let components = &live.value["data"]["result"]["component_energy"];
+                assert_eq!(components["components"].as_array().unwrap().len(), 3);
+                assert_ne!(components["operator_closure"]["status"], "refuted");
+                let mut ancestry = Vec::new();
+                for manifest in &live.sources {
+                    ancestry.extend(
+                        xc_cache::resolve_manifest_sources(manifest, &run.run_once_sources, &cache)
+                            .unwrap(),
+                    );
+                }
+                let first_level = ancestry.clone();
+                for manifest in &first_level {
+                    ancestry.extend(
+                        xc_cache::resolve_manifest_sources(manifest, &run.run_once_sources, &cache)
+                            .unwrap(),
+                    );
+                }
+                for kind in ["ccm_archimedean_integrals", "ccm_prime_component"] {
+                    assert!(
+                        ancestry.iter().any(|m| m.key.kind == kind),
+                        "retained component parent {kind}"
+                    );
+                }
+            }
             let inputs = run.extended_inputs.as_ref().unwrap();
             let auto = inputs.run_once.as_ref().unwrap();
             assert_eq!(auto.component_actions.len(), 3, "{:?}", auto.producer_notes);
@@ -1755,6 +2797,252 @@ mod tests {
             );
             assert_eq!(inputs.cluster.len(), 4, "{:?}", auto.producer_notes);
             assert!(run.uflow_capture.is_some());
+            // All new automatic measurements share the existing Ultra groups.
+            // Acquire first, then bind a synthetic private provider and prove
+            // that retained-only replay produces the identical artifacts.
+            {
+                use crate::ccm::convergence_capture::finite_capture as f;
+                use crate::ccm::extended_research::SampledReference;
+                let mut supplied = inputs.clone();
+                let mut coefficients = vec!["0".to_owned(); params.matrix_size()];
+                coefficients[params.n_modes] = "1".into();
+                supplied.target = Some(SampledReference {
+                    definition_digest: ContentDigest::sha256(b"synthetic constant target"),
+                    evaluation_policy: "stored synthetic constant".into(),
+                    approximation_scope: "finite profile only".into(),
+                    intervals: 8,
+                    values: vec!["1".into(); 9],
+                    basis_values: vec![],
+                    fixed_second_component: None,
+                    raw_normalizer: "1".into(),
+                    trial_coefficients: Some(coefficients.clone()),
+                });
+                let baseline = f::ComplexVector {
+                    label: "synthetic trial".into(),
+                    real: coefficients
+                        .iter()
+                        .map(xc_solver::trial_energy::ExactBounds::point)
+                        .collect(),
+                    imaginary: vec![
+                        xc_solver::trial_energy::ExactBounds::point("0");
+                        params.matrix_size()
+                    ],
+                };
+                supplied.finite_diagnostics = Some(f::Inputs {
+                    scope: "synthetic captured complex input".into(),
+                    complex_trials: Some(f::ComplexTrialSeries {
+                        basis_id: "centered_full_V_fourier".into(),
+                        matrix_digest: run
+                            .source
+                            .tau_manifest
+                            .as_ref()
+                            .unwrap()
+                            .content_digest
+                            .clone(),
+                        scope: "synthetic finite trial".into(),
+                        baseline,
+                        corrections: vec![],
+                        functional: None,
+                        provenance: BTreeMap::new(),
+                    }),
+                    ..Default::default()
+                });
+                {
+                    use f::energy_extensions as e;
+                    use xc_solver::trial_energy::ExactBounds;
+                    let extra = supplied.finite_diagnostics.as_mut().unwrap();
+                    let matrix_digest = run
+                        .source
+                        .tau_manifest
+                        .as_ref()
+                        .unwrap()
+                        .content_digest
+                        .clone();
+                    let n = params.matrix_size();
+                    let mut upper_triangle = vec![];
+                    for i in 0..n {
+                        for j in i..n {
+                            let value: rug::Rational =
+                                (run.source.tau[i * n + j].to_rational().unwrap()
+                                    + run.source.tau[j * n + i].to_rational().unwrap())
+                                    / 2;
+                            upper_triangle.push(ExactBounds::point(value.to_string()));
+                        }
+                    }
+                    extra.component_energy = Some(e::ComponentRequest {
+                        matrix_digest,
+                        basis_id: "centered_full_V_fourier".into(),
+                        components: vec![e::SignedComponent::from_data(e::ComponentData {
+                            label: "stored form".into(),
+                            signed_weight: "1".into(),
+                            diagonal: vec![],
+                            upper_triangle,
+                            rank_one: vec![],
+                        })
+                        .unwrap()],
+                        assembly_operator_norm_error: None,
+                    });
+                    let zero = e::DeclaredBound {
+                        upper: "0".into(),
+                        provenance: "exact synthetic polynomial".into(),
+                        scope: "specified polynomial".into(),
+                    };
+                    extra.projection_energy = Some(e::ProjectionRequest {
+                        definition_digest: ContentDigest::sha256(b"synthetic projection"),
+                        operator_id: "separate synthetic interval form".into(),
+                        period: "2".into(),
+                        basis_id: "orthonormal_periodic_fourier".into(),
+                        domain: "interval_h1".into(),
+                        coefficients: extra.complex_trials.as_ref().unwrap().baseline.clone(),
+                        retained_modes: 0,
+                        remainder: e::FourierRemainder::Unknown,
+                        source_l2_error: zero.clone(),
+                        source_h1_error: zero,
+                        continuity: None,
+                        trial_absolute_energy: None,
+                        precision_bits: 128,
+                    });
+                    let triangle = e::LogProfile {
+                        label: "synthetic compact tent".into(),
+                        knots: vec![
+                            e::Knot {
+                                coordinate: "-1/4".into(),
+                                value: "0".into(),
+                            },
+                            e::Knot {
+                                coordinate: "0".into(),
+                                value: "1".into(),
+                            },
+                            e::Knot {
+                                coordinate: "1/4".into(),
+                                value: "0".into(),
+                            },
+                        ],
+                    };
+                    extra.continuous_energy = Some(e::ContinuousRequest {
+                        definition_digest: ContentDigest::sha256(b"synthetic continuous form"),
+                        profile_a: triangle.clone(),
+                        profile_b: triangle.clone(),
+                        profile_sum: triangle,
+                        scope: e::ProfileScope::UnresolvedSource,
+                        summands: vec![],
+                        integration_windows: vec![],
+                        unrepresented_sum_l2: None,
+                        overlap: None,
+                        translation_shifts: vec![],
+                        integration_cells: 16,
+                        maximum_prime_power: 8,
+                        precision_bits: 128,
+                    });
+                }
+                run.set_extended_research_inputs(supplied).unwrap();
+                for id in [
+                    "trial_vector_energy",
+                    "trial_vector_parity",
+                    "normalization_error_bound",
+                    "continuous_l1_bound",
+                    "finite_tail_bound",
+                ] {
+                    let live = run
+                        .capture_diagnostic(id, &options, &cache)
+                        .unwrap_or_else(|e| panic!("live {id}: {e:#}"));
+                    let replay = f::RetainedFiniteSources::from_manifests(
+                        &run.primary_sources(),
+                        true,
+                        &cache,
+                    )
+                    .unwrap()
+                    .capture(
+                        id,
+                        run.extended_inputs.as_ref(),
+                        &run.run_once_sources,
+                        &cache,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        live.value,
+                        serde_json::to_value(replay.value).unwrap(),
+                        "retained-only {id}"
+                    );
+                    assert!(replay.reused_manifest.is_some(), "warm replay {id}");
+                    let data = &live.value["data"]["result"];
+                    match id {
+                        "trial_vector_energy" => {
+                            assert_eq!(
+                                data["component_energy"]["operator_closure"]["status"],
+                                "exact_stored_equality"
+                            );
+                            assert_eq!(
+                                data["continuous_energy"]["source_global_status"],
+                                "unresolved"
+                            );
+                            assert!(data["functional_energy"]["rows"].is_array());
+                        }
+                        "finite_tail_bound" => {
+                            assert_eq!(data["projection_energy"]["status"], "unresolved")
+                        }
+                        "continuous_l1_bound" => assert!(data["paired_profiles"]["pairs"]
+                            .as_array()
+                            .is_some_and(|p| p.len() == 6)),
+                        "normalization_error_bound" => assert!(data["paired_normalization"]
+                            ["functional_operator_norm_bound"]
+                            .is_object()),
+                        _ => assert!(data["functional_energy"]["rows"].is_array()),
+                    }
+                }
+                let retained =
+                    f::RetainedFiniteSources::from_manifests(&run.primary_sources(), true, &cache)
+                        .unwrap();
+                let observation = retained
+                    .refinement_observation(
+                        f::RefinementConfiguration {
+                            observable: f::RefinementObservable::Eigenvalue,
+                            domain: f::ComparisonDomain::CoefficientSpace,
+                            lambda_squared: "13".into(),
+                            branch: f::SpectralBranch::EvenGround,
+                            external_index: 0,
+                            index_origin: f::IndexOrigin::Zero,
+                            n_modes: params.n_modes,
+                            precision_bits: cfg.precision_bits,
+                            operator_quadrature_orders: cfg
+                                .resolved_archimedean_orders(
+                                    params.n_modes,
+                                    &log_lambda_sq_hp(&params, cfg.precision_bits).unwrap(),
+                                )
+                                .unwrap(),
+                            projection_quadrature_order: 32,
+                            representation_order: params.n_modes,
+                            guard_bits: 64,
+                            certificate_precision_bits: cfg.precision_bits,
+                            basis_id: "centered_full_V_fourier".into(),
+                            metric_id: "identity-coefficient-metric-v1".into(),
+                            operator_recipe: ContentDigest::sha256(
+                                b"synthetic qualification recipe",
+                            ),
+                            target_definition: None,
+                            normalizer_id: "unit coefficient norm".into(),
+                            trial_recipe: None,
+                        },
+                        f::ObservationValidity::Accepted,
+                    )
+                    .unwrap();
+                let mut cohort = f::RefinementCohort {
+                    axis: f::RefinementAxis::Dimension,
+                    scope: "one retained point; branch label is not a certificate".into(),
+                    relative_tolerance: "0.01".into(),
+                    observations: vec![observation],
+                };
+                let report =
+                    f::capture_retained_refinement_cohort(&cohort, &[&retained], &cache).unwrap();
+                assert_eq!(report.value.data["operationally_stabilized"], false);
+                assert_eq!(report.value.source_dependencies.len(), 2);
+                assert!(report.value.data["source_authentication"].is_string());
+                cohort.observations[0].value = "0".into();
+                assert!(
+                    f::capture_retained_refinement_cohort(&cohort, &[&retained], &cache).is_err()
+                );
+            }
+            let inputs = run.extended_inputs.as_ref().unwrap();
             let mut foreign = inputs.clone();
             foreign.source_eigenpair = ContentDigest::sha256(b"foreign state");
             assert!(run.set_extended_research_inputs(foreign.clone()).is_err());
@@ -1839,5 +3127,334 @@ mod tests {
             .is_ok());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // Every file below `root` as (relative path, content). Only creation
+    // times may differ between runs: they are removed, with every manifest
+    // digest (which covers its creation time) and the file and staging-draft
+    // names derived from those digests.
+    fn cache_snapshot(root: &std::path::Path) -> Vec<(String, String)> {
+        fn untimed(text: &str) -> String {
+            let mut out = String::new();
+            let mut rest = text;
+            while let Some(at) = rest.find("manifests/") {
+                let (head, tail) = rest.split_at(at + "manifests/".len());
+                out.push_str(head);
+                let name = tail.split(['"', '\\']).next().unwrap_or_default();
+                let timed = name.strip_suffix(".json").and_then(|n| n.split_once('-'));
+                if timed.is_some_and(|(time, digest)| {
+                    time.bytes().all(|b| b.is_ascii_digit()) && digest.len() == 64
+                }) {
+                    out.push_str("<manifest>.json");
+                    rest = &tail[name.len()..];
+                } else {
+                    rest = tail;
+                }
+            }
+            out.push_str(rest);
+            out
+        }
+        fn strip(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    // A staged path names its run directory and source manifest.
+                    map.retain(|key, _| {
+                        !matches!(key.as_str(), "created_unix_seconds" | "staged_parts_root")
+                            && !key.ends_with("manifest_digest")
+                    });
+                    map.values_mut().for_each(strip);
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                let bytes = std::fs::read(&path).unwrap();
+                let content = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(mut value) => {
+                        strip(&mut value);
+                        untimed(&value.to_string())
+                    }
+                    Err(_) => ContentDigest::sha256(&bytes).0,
+                };
+                let mut name = path.strip_prefix(root).unwrap().display().to_string();
+                if name.starts_with("publication/drafts/") {
+                    // drafts/<semantic>/<payload>/<source manifest digest>/...
+                    let mut parts = name.split('/').map(str::to_owned).collect::<Vec<_>>();
+                    if parts.len() > 4 {
+                        parts[4] = "<source-manifest>".into();
+                    }
+                    name = parts.join("/");
+                }
+                files.push((untimed(&name), content));
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// One cold capture through the receipt collector, as an application
+    /// drives it: the persisted record, every measurement value and outcome,
+    /// and all cache and publication-staging files. Also returns how many
+    /// results came from the look-ahead lane. `wait` lets the lane finish after
+    /// each capture, so every look-ahead result is taken; otherwise claims
+    /// race the lane.
+    fn lookahead_sequence(
+        lookahead: bool,
+        wait: bool,
+        failing_trials: bool,
+    ) -> (Vec<(String, String)>, usize) {
+        use xc_cache::{
+            ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
+            ZipJsonFilesystemCacheStore as FilesystemCacheStore,
+        };
+        let root_dir = xc_core::test_support::TestDir::new("ccm-lookahead");
+        let root = root_dir.to_path_buf();
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "local",
+                root.join("cache"),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let staging = xc_cache::CanonicalStagingProductionSink::new(
+            root.join("publication"),
+            xc_cache::TransportPolicy::default(),
+            xc_core::ResourcePolicy::default(),
+            xc_core::CancellationToken::new(),
+        )
+        .unwrap();
+        let cache = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["local".into()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy:
+                xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: Some(&staging),
+        };
+        let params = CcmParams::from_lambda_sq_integer(13, 16);
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.n_eigenvalues = 1;
+        let dataset = xc_zeta::zeros::bundled_dataset_identity().unwrap();
+        let strings = xc_zeta::zeros::bundled_first_n_strings(1).unwrap();
+        let seeds = vec![Float::with_val(
+            cfg.precision_bits,
+            Float::parse(&strings[0]).unwrap(),
+        )];
+        let mut run = RetainedCcmRun::seeded(&params, &cfg, 1, &seeds, &dataset, &cache).unwrap();
+        run.set_capture_lookahead(lookahead);
+        run.set_lookahead_requests(
+            crate::ccm::convergence_capture::lookahead::FINITE
+                .iter()
+                .chain(crate::ccm::convergence_capture::lookahead::EXTENDED)
+                .map(|id| id.to_string()),
+        );
+        // Explicit inputs stand in for run-once preparation: its cohort
+        // discovery reads registrations that concurrently running tests add
+        // to the shared cache root, which would make two runs differ.
+        use crate::ccm::convergence_capture::finite_capture as f;
+        let record = run.eigenpair.as_ref().unwrap();
+        let state = crate::ccm::state_geometry::RetainedState::from_payload(
+            &record.manifest,
+            &record.payload,
+            std::slice::from_ref(&record.manifest.content_digest),
+        )
+        .unwrap();
+        let mut input: crate::ccm::extended_research::ExternalResearchInputs =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "source_eigenpair": record.manifest.content_digest,
+                "lambda_squared": state.cutoff,
+                "n_modes": state.modes,
+                "precision_bits": state.precision,
+                "convention_id": "synthetic_lookahead_inputs",
+                "definition_digest": ContentDigest::sha256(b"synthetic look-ahead inputs"),
+                "approximation_scope": "synthetic"
+            }))
+            .unwrap();
+        if failing_trials {
+            // Injected failure inside the look-ahead computation: a trial
+            // vector of the wrong length passes input validation and fails
+            // only when the trial-vector diagnostics compute.
+            input.finite_diagnostics = Some(f::Inputs {
+                scope: "synthetic trial of the wrong length".into(),
+                trials: Some(f::TrialSeries {
+                    basis_id: "centered_full_V_fourier".into(),
+                    scope: "synthetic".into(),
+                    baseline: f::Vector {
+                        label: "short".into(),
+                        coefficients: vec![xc_solver::trial_energy::ExactBounds::point("1")],
+                    },
+                    corrections: vec![],
+                    provenance: BTreeMap::new(),
+                }),
+                ..Default::default()
+            });
+        }
+        run.set_extended_research_inputs(input).unwrap();
+        run.run_once_prepared = true;
+        let plan = crate::ccm::capture::CcmCapturePlan::ultra(2, 17).unwrap();
+        let options = plan.primary_options().unwrap();
+        let ids = [
+            "constrained_l1_fit",
+            "continuous_l1_bound",
+            "finite_section_transfer",
+            "finite_tail_bound",
+            "normalization_error_bound",
+            "operator_cluster",
+            "spectral_cluster_bound",
+            "trial_vector_energy",
+            "trial_vector_parity",
+        ];
+        let taken = crate::ccm::capture_runtime::lookahead_results_taken();
+        let record = xc_cache::capture_and_persist(
+            &plan,
+            ids.iter().map(|id| id.to_string()).collect(),
+            |id| {
+                let outcome = run.capture_diagnostic_outcome(id, &options, &cache);
+                if wait {
+                    if let Some(lane) = &run.lookahead {
+                        lane.wait_idle();
+                    }
+                }
+                outcome
+            },
+            &cache,
+        )
+        .unwrap();
+        let taken = crate::ccm::capture_runtime::lookahead_results_taken() - taken;
+        assert_eq!(run.lookahead.is_some(), lookahead);
+        drop(run);
+        let mut outputs = vec![(
+            "record".to_owned(),
+            serde_json::to_string(&record.value).unwrap(),
+        )];
+        for (id, measurement) in &record.value.measurements {
+            let value = xc_cache::measurement_value(measurement, &resolver, &policy).unwrap();
+            outputs.push((id.clone(), value.to_string()));
+        }
+        for (id, outcome) in record.value.receipt.outcomes() {
+            outputs.push((
+                format!("outcome {id}"),
+                serde_json::to_string(outcome).unwrap(),
+            ));
+        }
+        outputs.extend(cache_snapshot(&root));
+        (outputs, taken)
+    }
+
+    #[test]
+    fn lookahead_runs_only_declared_requests_and_never_checkpointing_diagnostics() {
+        use std::collections::BTreeSet;
+        let reached = BTreeSet::new();
+        assert!(lookahead_ids(None, &reached).is_empty());
+        let only_energy = BTreeSet::from(["arithmetic_energy_full".to_owned()]);
+        assert!(lookahead_ids(Some(&only_energy), &reached).is_empty());
+        let with_cluster = BTreeSet::from([
+            "operator_cluster".to_owned(),
+            "trial_vector_energy".to_owned(),
+        ]);
+        assert_eq!(
+            lookahead_ids(Some(&with_cluster), &reached),
+            vec!["trial_vector_energy"]
+        );
+        let done = BTreeSet::from(["trial_vector_energy".to_owned()]);
+        assert!(lookahead_ids(Some(&with_cluster), &done).is_empty());
+    }
+
+    #[test]
+    fn lookahead_capture_matches_serial_capture_byte_for_byte() {
+        use crate::ccm::convergence_capture::lookahead;
+        let lanes = lookahead::FINITE.len() + lookahead::EXTENDED.len();
+        for failing_trials in [false, true] {
+            let (serial, taken) = lookahead_sequence(false, false, failing_trials);
+            assert_eq!(taken, 0);
+            let outcome = |id: &str| {
+                serial
+                    .iter()
+                    .find(|(name, _)| name == &format!("outcome {id}"))
+                    .unwrap()
+                    .1
+                    .clone()
+            };
+            for id in ["trial_vector_energy", "trial_vector_parity"] {
+                let outcome = outcome(id);
+                assert_eq!(
+                    outcome.contains("trial coefficients do not match retained full matrix"),
+                    failing_trials,
+                    "{id}: {outcome}"
+                );
+            }
+            // A failed diagnostic does not stop later ones.
+            assert!(outcome("spectral_cluster_bound").contains("completed"));
+            let compare = |label: &str, (outputs, taken): (Vec<(String, String)>, usize)| {
+                assert_eq!(outputs.len(), serial.len(), "{label}");
+                for (actual, expected) in outputs.iter().zip(&serial) {
+                    assert_eq!(actual.0, expected.0, "{label}");
+                    if actual.1 != expected.1 {
+                        let at = actual
+                            .1
+                            .bytes()
+                            .zip(expected.1.bytes())
+                            .position(|(a, b)| a != b)
+                            .unwrap_or(actual.1.len().min(expected.1.len()));
+                        let window = |text: &str| {
+                            text.get(at.saturating_sub(200)..(at + 200).min(text.len()))
+                                .unwrap_or_default()
+                                .to_owned()
+                        };
+                        panic!(
+                            "{label}: {} differs at byte {at}:\n{}\n{}",
+                            actual.0,
+                            window(&actual.1),
+                            window(&expected.1)
+                        );
+                    }
+                }
+                taken
+            };
+            // An application thread on the global pool, as in production.
+            let taken = compare("global", lookahead_sequence(true, true, failing_trials));
+            assert_eq!(taken, lanes);
+            for threads in [1, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                for wait in [true, false] {
+                    let label = format!("{threads} threads, wait {wait}");
+                    let taken = compare(
+                        &label,
+                        pool.install(|| lookahead_sequence(true, wait, failing_trials)),
+                    );
+                    if wait {
+                        assert_eq!(taken, lanes, "{label}");
+                    }
+                }
+            }
+        }
     }
 }

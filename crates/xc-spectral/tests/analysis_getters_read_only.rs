@@ -35,20 +35,14 @@ fn inventory(root: &Path, result: &mut BTreeMap<PathBuf, (u64, Option<SystemTime
 
 #[test]
 fn analysis_getters_leave_persistent_cache_unchanged() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-analysis-getters-read-only-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
+    let root_dir = xc_core::test_support::TestDir::new("analysis-getters-cache");
+    let root = root_dir.to_path_buf();
     // Safe: this binary contains only this test, so no other thread reads the
     // environment concurrently.
     std::env::set_var("XC_CACHE_ROOT", &root);
     // A manufactured public target, stored outside the inventoried cache root.
-    let spec = std::env::temp_dir().join(format!(
-        "xc-analysis-getters-target-{}.json",
-        std::process::id()
-    ));
+    let spec_dir = xc_core::test_support::TestDir::new("analysis-getters-target");
+    let spec = spec_dir.join("target.json");
     std::fs::write(
         &spec,
         serde_json::to_vec(&serde_json::json!({

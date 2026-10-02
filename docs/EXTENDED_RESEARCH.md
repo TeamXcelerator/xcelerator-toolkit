@@ -153,8 +153,8 @@ identities are retained. No target formula is inferred.
 Root transport reuses the full directional artifact through the managed cache.
 The finite-section scan computes every symmetric Fourier prefix of the one
 retained matrix in quadratic work; it does not solve a new eigenproblem at each
-prefix. Cluster feedback shares one complement factorization across its columns.
-It estimates workspace before allocating the dense factorization. Ultra's new
+prefix. Cluster feedback shares one verified complement solve across its columns.
+It estimates workspace before allocating the dense preconditioner. Ultra's new
 producers default to 8 GiB each for estimated output and complement workspace;
 explicit ExtensionOptions can override these budgets. If workspace is insufficient,
 the compressed operator and coupling survive with a qualified partial outcome.
@@ -260,7 +260,7 @@ is unresolved. A prefix requires all consecutive ordinals starting at 1.
 The target error, curvature and isolation assumptions remain external; the
 finite-state curvature formula does not certify them for a different target.
 The report makes no zeta identification, infinite-tail or source-error claim.
-Point-transform callers still require their own interpretation review. Older
+Point-transform callers are outside the scope of these guarantees. Older
 cached revisions do not acquire the new arithmetic guarantees.
 
 
@@ -284,8 +284,8 @@ Joined-root fields participate in output estimates. All physical measurements
 have outward enclosures and record the guard precision, capped at 4096 extra bits.
 
 These calculations do not validate external source selection, source accuracy,
-root identification, historical results or convergence. Remaining callers of
-shared dot/norm/matrix helpers require their own review. Archived report revisions
+root identification, historical results or convergence. Other callers of shared
+dot/norm/matrix helpers are outside their scope. Archived report revisions
 retain their original guarantees.
 
 
@@ -325,10 +325,18 @@ a numerical subspace and does not certify the full declared span or spectral sel
 For its ideal orthonormal basis U, P=UU^T, Q=I-P, D=A-EI, and K=QDU, the producer
 encloses U^T A U, K^T K, K^T[QDQ+P]^-1 K, and their effective-operator difference.
 It removes E before projection and rescales D by an exact power of two before the
-complement solve. Directed interval elimination requires pivots excluding zero;
-unresolved or budget-limited inversion retains enclosed compression and coupling
-while withholding feedback. The reported residual concerns the solution midpoint
-in the scaled system; the feedback enclosure comes from interval elimination.
+complement solve. The solve is a midpoint-preconditioned verified solve: an
+approximate inverse R of the interval matrix midpoint (Gauss-Jordan elimination
+with partial pivoting at the working precision) preconditions a directed proof
+that ||I - R H||_inf < 1. That bound establishes nonsingularity of every enclosed
+matrix and encloses each solution in x + z + C[-e, e], where z encloses
+R(b - H x), C encloses I - R H and e = ||z||_inf / (1 - ||C||_inf). Unlike
+directed interval elimination, its width does not compound across elimination
+steps, so large complements resolve; a system whose bound is not proven below one
+reports unresolved before any elimination of the interval matrix. Unresolved or
+budget-limited solves retain enclosed compression and coupling while withholding
+feedback. The reported residual concerns the solution midpoint in the scaled
+system; the feedback enclosure comes from the verified solve.
 Each value carries outward decimal bounds and the used precision. Guards are
 limited to 4,096 extra bits. Checkpoints bind original inputs and their precisions,
 source identities, options, selected columns, scale, guard precision, and method.

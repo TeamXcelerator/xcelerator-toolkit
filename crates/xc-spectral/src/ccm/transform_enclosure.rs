@@ -29,6 +29,7 @@ mod certified {
     };
     use super::*;
     use anyhow::bail;
+    use rayon::prelude::*;
     use rug::{float::Round, Float};
     use xc_numerics::mpfr_interval::MpfrInterval as I;
     fn decimal(s: &str, p: u32) -> Result<I> {
@@ -90,6 +91,122 @@ mod certified {
         }
         assert_eq!(checked, 18);
     }
+    #[test]
+    fn retained_contour_endpoints_match_fresh_evaluation_at_any_thread_count() {
+        // Each run binds a distinct state identity, so contour checkpoints from
+        // another run can never stand in for an evaluation.
+        let nonce = format!(
+            "{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        );
+        let state = |run: usize| {
+            let version = serde_json::json!({"major":0,"minor":16,"patch":0,"prerelease":null});
+            let digest =
+                xc_cache::ContentDigest::sha256(format!("contour {nonce} {run}").as_bytes());
+            let manifest = serde_json::from_value(serde_json::json!({
+                "schema_version":1,"key":{"kind":"ccm_weil_eigenpair","logical_key":"contour endpoint fixture","parameters_digest":xc_cache::ContentDigest::sha256(b"key")},
+                "content_digest":digest,"size_bytes":0,"objects":[],"created_unix_seconds":1,
+                "producer_toolkit_version":version,"minimum_reader_version":version,"maximum_reader_version":null,"quality":"validated","visibility":"local","immutable":true,"dependencies":[],"tags":{},"provenance_digest":null
+            }))
+            .unwrap();
+            RetainedState {
+                manifest,
+                cutoff: "13".into(),
+                modes: 2,
+                precision: 128,
+                coefficients: [-3, 5, 16, 5, -3]
+                    .iter()
+                    .map(|v| Float::with_val(128, *v) / 17u32)
+                    .collect(),
+                eigenvalue: "0.5".into(),
+                selection_policy: None,
+            }
+        };
+        let run = |run: usize, reuse: bool, threads: usize| {
+            let s = state(run);
+            let o = ExtensionOptions::for_source(&s);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    // The traversal runs on the calling thread, which owns the switch.
+                    ENDPOINT_REUSE.with(|state| state.set((reuse, 0)));
+                    let analysis = analyze(&s, None, &o, None, s.precision).unwrap();
+                    (
+                        serde_json::to_string(&analysis).unwrap(),
+                        ENDPOINT_REUSE.with(|state| state.get().1),
+                    )
+                })
+        };
+        let (fresh, _) = run(0, false, 1);
+        let mut index = 0;
+        for threads in [1, 4] {
+            for _ in 0..2 {
+                index += 1;
+                let (reused, count) = run(index, true, threads);
+                assert_eq!(reused, fresh);
+                assert!(count > 0, "contour fixture shares no endpoints");
+            }
+        }
+    }
+    #[test]
+    fn parallel_state_residual_matches_serial_reference_at_any_thread_count() {
+        use rug::Rational;
+        let (n, p) = (9, 256);
+        let record = |k: usize| {
+            let lower = Rational::from((((k * 7919) % 1013) as i64 - 506, 1 + (k % 7) as u64));
+            let upper = lower.clone() + Rational::from((1, 1u64 << (k % 50)));
+            xc_certify::exact::interval_record(
+                &xc_numerics::interval::RationalInterval::new(lower, upper).unwrap(),
+            )
+        };
+        let mut tau = (0..n * n).map(record).collect::<Vec<_>>();
+        let v = (0..n)
+            .map(|k| I::from_rational(&Rational::from((k as i64 - 4, 3u64)), p))
+            .collect::<Vec<_>>();
+        let e = I::from_rational(&Rational::from((5, 7u64)), p);
+        // Serial residual as it was before row parallelism.
+        let reference = |tau: &[xc_certify::ExactRationalIntervalRecord]| -> Result<I> {
+            let mut residual = I::from_i64(0, p);
+            for row in 0..n {
+                let mut action = I::from_i64(0, p);
+                for (col, v) in v.iter().enumerate() {
+                    let a = xc_certify::exact::parse_interval(&tau[row * n + col])?;
+                    let a = I::new(
+                        I::from_rational(a.lower(), p).lower().clone(),
+                        I::from_rational(a.upper(), p).upper().clone(),
+                    )?;
+                    action = action.add(&a.mul(v));
+                }
+                residual = residual.add(&action.sub(&e.mul(&v[row])).square());
+            }
+            Ok(residual)
+        };
+        for broken in [None, Some(40), Some(3)] {
+            if let Some(index) = broken {
+                tau[index].lower.denominator = "0".into();
+            }
+            let expected = reference(&tau);
+            for threads in [1, 2, 4, 8] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                for _ in 0..2 {
+                    let actual = pool.install(|| squared_residual(&tau, &v, &e, p));
+                    match (&actual, &expected) {
+                        (Ok(a), Ok(b)) => {
+                            assert_eq!((a.lower(), a.upper()), (b.lower(), b.upper()))
+                        }
+                        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+                        _ => panic!("parallel and serial residuals disagree on failure"),
+                    }
+                }
+            }
+        }
+    }
     fn widen(x: &I, error: &I) -> Result<I> {
         Ok(x.add(&I::new(-error.upper().clone(), error.upper().clone())?))
     }
@@ -120,7 +237,7 @@ mod certified {
         // External certificates must bind their matrix to the named CCM
         // assembly; a self-consistent proof for another matrix is insufficient.
         let _stage = Stage::new("exact source certificate replay and reassembly");
-        let check = super::super::sector_gap_certificate::verify_portable_ccm_sector_gap_certificate_with_reassembly(c);
+        let check = super::super::sector_gap_certificate::verify_retained_sector_gap(c, true);
         if !check.valid {
             bail!("source certificate verification failed: {:?}", check.errors);
         }
@@ -140,7 +257,6 @@ mod certified {
             bail!("source certificate does not isolate this finite even ground");
         }
         let p = o.working_precision_bits;
-        let n = s.coefficients.len();
         let v = s
             .coefficients
             .iter()
@@ -167,19 +283,7 @@ mod certified {
         if !gap.is_strictly_positive() {
             bail!("source energy is not below the certified complementary spectrum");
         }
-        let mut residual = I::from_i64(0, p);
-        for row in 0..n {
-            let mut action = I::from_i64(0, p);
-            for (col, v) in v.iter().enumerate() {
-                let a = xc_certify::exact::parse_interval(&c.cutoff_free_tau[row * n + col])?;
-                let a = I::new(
-                    I::from_rational(a.lower(), p).lower().clone(),
-                    I::from_rational(a.upper(), p).upper().clone(),
-                )?;
-                action = action.add(&a.mul(v));
-            }
-            residual = residual.add(&action.sub(&e.mul(&v[row])).square());
-        }
+        let residual = squared_residual(&c.cutoff_free_tau, &v, &e, p)?;
         let angle = residual.sqrt()?.div(&gap)?;
         if angle.upper() >= &1 {
             bail!("source residual does not resolve a finite ground angle");
@@ -189,7 +293,66 @@ mod certified {
         let upper_bound = I::from_i64(2, p).sqrt()?.mul(&angle);
         Ok(I::new(Float::with_val(p, 0), upper_bound.upper().clone())?)
     }
+    /// `||T v - e v||^2` for the exact interval records of `T` (row-major).
+    /// Row actions are formed on workers, each in column order; the residual
+    /// is folded serially in row order and the first failure in row-major
+    /// order is reported.
+    fn squared_residual(
+        tau: &[xc_certify::ExactRationalIntervalRecord],
+        v: &[I],
+        e: &I,
+        p: u32,
+    ) -> Result<I> {
+        let n = v.len();
+        xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
+        let actions = (0..n)
+            .into_par_iter()
+            .map(|row| -> Result<I> {
+                let mut action = I::from_i64(0, p);
+                for (col, v) in v.iter().enumerate() {
+                    let a = xc_certify::exact::parse_interval(&tau[row * n + col])?;
+                    let a = I::new(
+                        I::from_rational(a.lower(), p).lower().clone(),
+                        I::from_rational(a.upper(), p).upper().clone(),
+                    )?;
+                    action = action.add(&a.mul(v));
+                }
+                Ok(action)
+            })
+            .collect::<Vec<_>>();
+        let mut residual = I::from_i64(0, p);
+        for (row, action) in actions.into_iter().enumerate() {
+            residual = residual.add(&action?.sub(&e.mul(&v[row])).square());
+        }
+        Ok(residual)
+    }
     type SegmentEnclosure = (I, I, I, I, I);
+    /// Endpoint evaluations by exact decimal coordinates, with the point.
+    type EndpointValues =
+        std::collections::HashMap<(String, String), ((Float, Float), (I, I, I, I))>;
+    #[cfg(not(test))]
+    fn endpoint_reuse() -> bool {
+        true
+    }
+    #[cfg(test)]
+    std::thread_local! {
+        /// Whether retained endpoints are reused, and how many reuses occurred.
+        static ENDPOINT_REUSE: std::cell::Cell<(bool, usize)> = const { std::cell::Cell::new((true, 0)) };
+    }
+    #[cfg(test)]
+    fn endpoint_reuse() -> bool {
+        ENDPOINT_REUSE.with(|state| {
+            let (enabled, count) = state.get();
+            state.set((enabled, count + usize::from(enabled)));
+            enabled
+        })
+    }
+    fn same_point(a: &(Float, Float), b: &(Float, Float)) -> bool {
+        a.0.prec() == b.0.prec()
+            && a.1.prec() == b.1.prec()
+            && a.0.as_ord() == b.0.as_ord()
+            && a.1.as_ord() == b.1.as_ord()
+    }
     #[derive(Clone)]
     struct Segment {
         a: (Float, Float),
@@ -330,6 +493,27 @@ mod certified {
             o,
             input,
         ))?;
+        // Adjacent and child segments share endpoints. `evaluate` is a pure
+        // function of the exact point at this precision, and every Arb call in
+        // this traversal uses that precision on this thread, so a retained
+        // endpoint value equals a fresh evaluation.
+        let endpoints = std::cell::RefCell::new(EndpointValues::new());
+        let endpoint = |x: &(Float, Float)| -> Result<(I, I, I, I)> {
+            let key = (
+                xc_numerics::prefix::lossless_decimal(&x.0),
+                xc_numerics::prefix::lossless_decimal(&x.1),
+            );
+            if let Some((point, value)) = endpoints.borrow().get(&key) {
+                if same_point(point, x) && endpoint_reuse() {
+                    return Ok(value.clone());
+                }
+            }
+            let value = evaluate(&I::point(x.0.clone()), &I::point(x.1.clone()))?;
+            endpoints
+                .borrow_mut()
+                .insert(key, (x.clone(), value.clone()));
+            Ok(value)
+        };
         let _stage = Stage::new("adaptive certified contour");
         while let Some(seg) = pending.pop() {
             let mut rr = row(out.rows.len() + 1, "contour_segment");
@@ -350,8 +534,8 @@ mod certified {
                 if re.contains_zero() && im.contains_zero() {
                     return Ok(None);
                 }
-                let a = evaluate(&I::point(seg.a.0.clone()), &I::point(seg.a.1.clone()))?;
-                let b = evaluate(&I::point(seg.b.0.clone()), &I::point(seg.b.1.clone()))?;
+                let a = endpoint(&seg.a)?;
+                let b = endpoint(&seg.b)?;
                 let ratio = cdiv(&(b.0, b.1), &(a.0, a.1))?;
                 let turn = arb_bridge::argument(&ratio.0, &ratio.1)?;
                 if turn.lower() <= &(-pi.lower().clone()) || turn.upper() >= pi.lower() {
@@ -387,7 +571,7 @@ mod certified {
                     angle = angle.add(&turn);
                     rr.notes.push("Arb encloses the entire segment image in a convex rectangle excluding zero; endpoint argument increment is unambiguous".into());
                     if let Err(e) = store.save(&key, &rr) {
-                        eprintln!("contour checkpoint unavailable: {e}");
+                        xc_core::progress_message!("contour checkpoint unavailable: {e}");
                     }
                 }
                 _ => {
@@ -496,6 +680,20 @@ mod certified {
 #[cfg(feature = "arb")]
 pub(crate) use certified::analyze;
 
+#[cfg(feature = "arb")]
+pub(crate) fn verified_state_error(
+    s: &RetainedState,
+    c: &super::sector_gap_certificate::PortableCcmSectorGapCertificate,
+    precision: u32,
+) -> Result<xc_numerics::mpfr_interval::MpfrInterval> {
+    if precision < s.precision || precision < c.precision_bits || precision > 1_000_000 {
+        anyhow::bail!("source-bound transfer requires nondecreasing supported precision");
+    }
+    let mut options = ExtensionOptions::for_source(s);
+    options.working_precision_bits = precision;
+    certified::state_error(s, &options, c)
+}
+
 #[cfg(all(test, feature = "arb"))]
 pub(crate) fn test_source_error_with_reassembly(
     s: &RetainedState,
@@ -511,7 +709,7 @@ pub(crate) fn test_source_error(
 ) -> Result<xc_numerics::mpfr_interval::MpfrInterval> {
     // Exact manufactured-matrix controls exercise the residual/gap inequality
     // independently of CCM assembly. This helper exists only in unit tests.
-    let check = super::sector_gap_certificate::verify_portable_ccm_sector_gap_certificate(c);
+    let check = super::sector_gap_certificate::verify_retained_sector_gap(c, false);
     if !check.valid {
         anyhow::bail!(
             "recorded test matrix verification failed: {:?}",

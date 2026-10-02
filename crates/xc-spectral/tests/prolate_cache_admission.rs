@@ -149,17 +149,21 @@ fn rel(a: &Float, b: &Float) -> String {
 
 #[test]
 fn corrupted_spectra_become_recoverable_misses_and_return_fresh_pairs() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-r2-repair-prolate-cache-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).unwrap();
+    let root_dir = xc_core::test_support::TestDir::new("r2-repair-prolate-cache");
+    let root = root_dir.to_path_buf();
     let original_cwd = std::env::current_dir().unwrap();
+    // Restore the cwd before `root_dir` is removed, including on panic:
+    // Windows cannot delete the current directory.
+    struct RestoreCwd(std::path::PathBuf);
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+    let _restore_cwd = RestoreCwd(original_cwd.clone());
     std::env::set_current_dir(&root).unwrap();
+    // The only test in this binary, so setting the process environment is safe.
+    std::env::set_var("XC_CACHE_ROOT", root.join("data"));
     let dir = root.join("data").join("prolate_eigvals_cache");
 
     // ---------------- ordinary bounded Legendre route ----------------

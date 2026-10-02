@@ -2755,6 +2755,26 @@ impl CacheResolver {
         )))
     }
 
+    /// Read the verified payload of one exact artifact identity.
+    pub fn read_exact_payload(
+        &self,
+        key: &ArtifactKey,
+        content_digest: &ContentDigest,
+        policy: &CachePolicy,
+    ) -> Result<Vec<u8>, CacheError> {
+        for layer in &self.layers {
+            for manifest in layer.store.candidates(key)? {
+                if &manifest.content_digest == content_digest && policy.accepts(&manifest) {
+                    return layer.store.read_payload(&manifest);
+                }
+            }
+        }
+        Err(CacheError::NotFound(format!(
+            "{} / {} with digest {}",
+            key.kind, key.logical_key, content_digest
+        )))
+    }
+
     pub fn resolve_exact_manifest(
         &self,
         key: &ArtifactKey,
@@ -3504,8 +3524,8 @@ mod tests {
         ArtifactDraft {
             schema_version: 1,
             key,
-            producer_toolkit_version: version("0.13.0"),
-            minimum_reader_version: version("0.13.0"),
+            producer_toolkit_version: version("0.16.0"),
+            minimum_reader_version: version("0.16.0"),
             maximum_reader_version: None,
             quality,
             visibility,
@@ -3521,16 +3541,13 @@ mod tests {
     #[test]
     fn plain_local_entries_obey_kind_floor_and_producer_priority() {
         let root = temporary_root("plain-local-kind-floor");
-        let store = FilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let store = FilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         let key = ArtifactKey::new("ccm_discretization_distance", "fixture", b"{}").unwrap();
-        let older = store
-            .put(
-                &draft(key.clone(), CacheQuality::Certified, CacheVisibility::Local),
-                b"old",
-            )
-            .unwrap();
+        let mut older = draft(key.clone(), CacheQuality::Certified, CacheVisibility::Local);
+        older.producer_toolkit_version = version("0.15.2");
+        let older = store.put(&older, b"old").unwrap();
         let policy = CachePolicy {
-            current_toolkit_version: version("0.15.2"),
+            current_toolkit_version: version("0.18.2"),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -3539,7 +3556,7 @@ mod tests {
         };
         assert!(!policy.assess(&older).accepted);
         let mut newer = draft(key.clone(), CacheQuality::Validated, CacheVisibility::Local);
-        newer.producer_toolkit_version = version("0.15.2");
+        newer.producer_toolkit_version = version("0.18.2");
         let newer = store.put(&newer, b"new").unwrap();
         assert!(policy.assess(&newer).accepted);
         assert_eq!(
@@ -3570,8 +3587,7 @@ mod tests {
     #[test]
     fn chunked_payload_round_trips_and_reuses_objects() {
         let root = temporary_root("xc-cache-chunks");
-        let _ = fs::remove_dir_all(&root);
-        let store = FilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let store = FilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         let key_a = ArtifactKey::new("tau", "a", br#"{"n":120}"#).unwrap();
         let key_b = ArtifactKey::new("tau", "b", br#"{"n":121}"#).unwrap();
         let manifest_a = store
@@ -3597,8 +3613,7 @@ mod tests {
     #[test]
     fn filesystem_store_discovers_bounded_logical_key_prefixes() {
         let root = temporary_root("xc-cache-prefix-discovery");
-        let _ = fs::remove_dir_all(&root);
-        let store = FilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let store = FilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         for n_modes in [10, 20, 30] {
             let logical_key =
                 format!("ccm/weil-eigenpair/13/{n_modes}/256/even/shift_invert_krylov");
@@ -3628,8 +3643,8 @@ mod tests {
     #[test]
     fn zip_store_memoizes_exact_identity_queries_without_scanning_unrelated_manifests() {
         let root = temporary_root("xc-cache-zip-identity-inventory");
-        let _ = fs::remove_dir_all(&root);
-        let store = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let store =
+            ZipJsonFilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         let payload = br#"{"fixture":true}"#;
         let semantic_key = SemanticKeyEnvelope {
             schema_version: 1,
@@ -3668,8 +3683,8 @@ mod tests {
             payload_digest: payload_digest.clone(),
             transport_digests: vec![ContentDigest::sha256(b"transport")],
             resolved_mathematical_configuration_digest: ContentDigest::sha256(b"configuration"),
-            producer_toolkit_version: version("0.14.1"),
-            minimum_reader_version: version("0.14.1"),
+            producer_toolkit_version: version("0.17.1"),
+            minimum_reader_version: version("0.16.0"),
             maximum_reader_version: None,
             requested_assurance: xc_core::AssuranceLevel::Computed,
             claim_scope: "identity inventory fixture".to_owned(),
@@ -3722,7 +3737,7 @@ mod tests {
             .unwrap();
         assert_ne!(tampered.content_digest, honest.content_digest);
         let acceptance = CachePolicy {
-            current_toolkit_version: version("0.15.1"),
+            current_toolkit_version: version("0.18.1"),
             minimum_quality: CacheQuality::Staged,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -3757,7 +3772,7 @@ mod tests {
         assert_eq!(found[0].content_digest, honest.content_digest);
 
         let reopened =
-            ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+            ZipJsonFilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         assert_eq!(reopened.identity_candidates(&identity).unwrap().len(), 1);
         let _ = fs::remove_dir_all(root);
     }
@@ -3767,7 +3782,6 @@ mod tests {
         // Staging publishes a workstation ZIP object directly, so the store
         // encoder and the deterministic packager must never diverge.
         let root = temporary_root("xc-cache-encoder-agreement");
-        let _ = fs::remove_dir_all(&root);
         let payload = br#"{"entries":["1.0","0.0","0.0","1.0"],"note":"encoder agreement"}"#;
         let envelope = CanonicalPayloadEnvelope {
             schema_version: 1,
@@ -3824,8 +3838,8 @@ mod tests {
     #[test]
     fn zip_store_persists_encoder_provenance_and_legacy_objects_are_decode_only() {
         let root = temporary_root("xc-cache-encoder-provenance");
-        let _ = fs::remove_dir_all(&root);
-        let store = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let store =
+            ZipJsonFilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         let key = ArtifactKey::new("ccm_tau_matrix", "ccm/fixture/profile", b"profile").unwrap();
         let payload = br#"{"profile":"bound"}"#;
         let manifest = store
@@ -3879,9 +3893,8 @@ mod tests {
     #[test]
     fn verified_object_adoption_hashes_the_source_before_exposing_it() {
         let root = temporary_root("xc-cache-verified-object-source-hash");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let store = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let store =
+            ZipJsonFilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         let source = root.join("offered.zip");
         fs::write(&source, b"bytes that do not match the offered digest").unwrap();
         let offered_digest = ContentDigest::sha256(b"different bytes");
@@ -3940,8 +3953,8 @@ mod tests {
     #[test]
     fn resolve_exact_selects_the_exact_digest_not_the_newest_candidate() {
         let root = temporary_root("xc-cache-resolve-exact");
-        let _ = fs::remove_dir_all(&root);
-        let store = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let store =
+            ZipJsonFilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         let key = ArtifactKey::new("ccm_tau_matrix", "ccm/fixture/exact", b"exact").unwrap();
         let older = store
             .put(
@@ -3961,7 +3974,7 @@ mod tests {
             store: Box::new(store),
         }]);
         let policy = CachePolicy {
-            current_toolkit_version: version("0.13.0"),
+            current_toolkit_version: version("0.16.0"),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -4022,7 +4035,6 @@ mod tests {
     #[test]
     fn identity_inventory_persists_and_sees_writes_from_another_store_instance() {
         let root = temporary_root("xc-cache-identity-inventory-cross-instance");
-        let _ = fs::remove_dir_all(&root);
         let payload = br#"{"fixture":"cross-instance"}"#;
         let semantic_key = SemanticKeyEnvelope {
             schema_version: 1,
@@ -4061,8 +4073,8 @@ mod tests {
             payload_digest: payload_digest.clone(),
             transport_digests: vec![ContentDigest::sha256(b"transport")],
             resolved_mathematical_configuration_digest: ContentDigest::sha256(b"configuration"),
-            producer_toolkit_version: version("0.14.1"),
-            minimum_reader_version: version("0.14.1"),
+            producer_toolkit_version: version("0.17.1"),
+            minimum_reader_version: version("0.16.0"),
             maximum_reader_version: None,
             requested_assurance: xc_core::AssuranceLevel::Computed,
             claim_scope: "identity inventory fixture".to_owned(),
@@ -4092,12 +4104,14 @@ mod tests {
         // Instance A memoizes a miss. Instance B (another process in
         // practice) writes the artifact. A's next query must see it without
         // a restart because the inventory file changed under its memo.
-        let reader = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let reader =
+            ZipJsonFilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         assert!(reader.identity_candidates(&identity).unwrap().is_empty());
-        let writer = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let writer =
+            ZipJsonFilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         let manifest = writer.put(&artifact, payload).unwrap();
         let mut second_canonical = canonical.clone();
-        second_canonical.producer_toolkit_version = version("0.14.2");
+        second_canonical.producer_toolkit_version = version("0.17.2");
         let second_identity = PayloadDependencyIdentity {
             artifact_family: second_canonical.artifact_family.clone(),
             semantic_digest: semantic_digest.clone(),
@@ -4121,7 +4135,8 @@ mod tests {
         // A cache written before the inventory existed (or by an older
         // writer) is repaired by one bounded scan of the semantic digest.
         fs::remove_dir_all(root.join("identities")).unwrap();
-        let legacy = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let legacy =
+            ZipJsonFilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         let found = legacy.identity_candidates(&identity).unwrap();
         assert_eq!(found.len(), 1);
         assert!(
@@ -4142,7 +4157,7 @@ mod tests {
         // retained manifest under that digest.
         fs::remove_dir_all(root.join("identities")).unwrap();
         let read_only =
-            ZipJsonFilesystemCacheStore::new("local", &root, false, CacheVisibility::Local);
+            ZipJsonFilesystemCacheStore::new("local", root.path(), false, CacheVisibility::Local);
         assert_eq!(read_only.identity_candidates(&identity).unwrap().len(), 1);
         assert_eq!(
             read_only
@@ -4175,7 +4190,7 @@ mod tests {
         )
         .unwrap();
         let unsafe_reader =
-            ZipJsonFilesystemCacheStore::new("local", &root, false, CacheVisibility::Local);
+            ZipJsonFilesystemCacheStore::new("local", root.path(), false, CacheVisibility::Local);
         assert!(matches!(
             unsafe_reader.identity_candidates(&identity),
             Err(CacheError::InvalidManifest(_))
@@ -4187,11 +4202,15 @@ mod tests {
         name: &str,
         budget: Arc<InMemoryZipBudget>,
         single_pass_object_limit: u64,
-    ) -> (ZipJsonFilesystemCacheStore, ArtifactManifest, PathBuf) {
+    ) -> (
+        ZipJsonFilesystemCacheStore,
+        ArtifactManifest,
+        crate::test_support::TestDir,
+    ) {
         let root = temporary_root(name);
-        let _ = fs::remove_dir_all(&root);
-        let store = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local)
-            .with_in_memory_zip_limits(budget, single_pass_object_limit);
+        let store =
+            ZipJsonFilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local)
+                .with_in_memory_zip_limits(budget, single_pass_object_limit);
         let key = ArtifactKey::new("ccm_tau_matrix", "ccm/fixture/zip-memory", b"zip").unwrap();
         let manifest = store
             .put(
@@ -4285,9 +4304,10 @@ mod tests {
     #[test]
     fn aggregate_allowance_is_shared_across_store_instances() {
         // Default construction shares the one process-wide allowance.
+        let default_root = temporary_root("xc-cache-zip-global-budget");
         let default_store = ZipJsonFilesystemCacheStore::new(
             "local",
-            temporary_root("xc-cache-zip-global-budget"),
+            default_root.path(),
             false,
             CacheVisibility::Local,
         );
@@ -4302,7 +4322,7 @@ mod tests {
         let (first, manifest, root) =
             zip_store_with_object("xc-cache-zip-shared-budget", budget.clone(), 4096);
         let second =
-            ZipJsonFilesystemCacheStore::new("local", &root, false, CacheVisibility::Local)
+            ZipJsonFilesystemCacheStore::new("local", root.path(), false, CacheVisibility::Local)
                 .with_in_memory_zip_limits(budget.clone(), 4096);
         assert!(Arc::ptr_eq(
             &first.in_memory_zip_budget,
@@ -4373,8 +4393,7 @@ mod tests {
     #[test]
     fn filesystem_store_maintains_a_direct_continuation_inventory() {
         let root = temporary_root("xc-cache-continuation-inventory");
-        let _ = fs::remove_dir_all(&root);
-        let store = FilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let store = FilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         for n_modes in [10, 20] {
             let logical_key =
                 format!("ccm/weil-eigenpair/13/{n_modes}/729/even/shift_invert_krylov");
@@ -4423,8 +4442,7 @@ mod tests {
     #[test]
     fn reader_storage_streams_fixed_size_chunks() {
         let root = temporary_root("xc-cache-reader");
-        let _ = fs::remove_dir_all(&root);
-        let store = FilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let store = FilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         let key = ArtifactKey::new("matrix", "large", br#"{"n":8}"#).unwrap();
         let payload = b"abcdefghij";
         let mut reader = &payload[..];
@@ -4443,8 +4461,8 @@ mod tests {
     #[test]
     fn zip_json_store_reads_entry_without_extracting_logical_payload() {
         let root = temporary_root("xc-cache-zip-json");
-        let _ = fs::remove_dir_all(&root);
-        let store = ZipJsonFilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let store =
+            ZipJsonFilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         let key = ArtifactKey::new("matrix", "zip", br#"{"n":8}"#).unwrap();
         let payload = br#"{"entries":["1.0","0.0","0.0","1.0"]}"#;
         let manifest = store
@@ -4467,7 +4485,6 @@ mod tests {
     #[test]
     fn zip_json_store_adopts_a_verified_archive_without_recompression() {
         let root = temporary_root("xc-cache-zip-json-adopt");
-        let _ = fs::remove_dir_all(&root);
         let source = ZipJsonFilesystemCacheStore::new(
             "source",
             root.join("source"),
@@ -4510,8 +4527,7 @@ mod tests {
     #[test]
     fn multiple_versions_of_one_logical_key_are_indexed() {
         let root = temporary_root("xc-cache-index-update");
-        let _ = fs::remove_dir_all(&root);
-        let store = FilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let store = FilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         let key = ArtifactKey::new("tau", "same", br#"{"n":120}"#).unwrap();
         store
             .put(
@@ -4534,7 +4550,6 @@ mod tests {
     #[test]
     fn filesystem_overlay_respects_quality_and_precedence() {
         let root = temporary_root("xc-cache-overlay");
-        let _ = fs::remove_dir_all(&root);
         let local =
             FilesystemCacheStore::new("local", root.join("local"), true, CacheVisibility::Local);
         let public =
@@ -4567,7 +4582,7 @@ mod tests {
             },
         ]);
         let policy = CachePolicy {
-            current_toolkit_version: version("0.13.0"),
+            current_toolkit_version: version("0.16.0"),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -4583,8 +4598,7 @@ mod tests {
     #[test]
     fn dependency_closure_requires_exact_compatible_artifact() {
         let root = temporary_root("xc-cache-dependencies");
-        let _ = fs::remove_dir_all(&root);
-        let store = FilesystemCacheStore::new("local", &root, true, CacheVisibility::Local);
+        let store = FilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
         let dependency_key = ArtifactKey::new("gl", "n=64", br#"{"n":64}"#).unwrap();
         let dependency_manifest = store
             .put(
@@ -4613,7 +4627,7 @@ mod tests {
             store: Box::new(store),
         }]);
         let policy = CachePolicy {
-            current_toolkit_version: version("0.13.0"),
+            current_toolkit_version: version("0.16.0"),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -5013,7 +5027,7 @@ mod cache_acceptance_tests {
             }],
             created_unix_seconds: 0,
             producer_toolkit_version: ToolkitVersion::parse(version).unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.10.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality,
             visibility: CacheVisibility::Private,
@@ -5027,14 +5041,14 @@ mod cache_acceptance_tests {
     #[test]
     fn assessment_rejects_insufficient_quality_with_reason() {
         let policy = CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             minimum_quality: CacheQuality::Certified,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
             allow_quarantined: false,
             allowed_visibilities: vec![CacheVisibility::Private],
         };
-        let decision = policy.assess(&manifest_for_version("0.13.0", CacheQuality::Validated));
+        let decision = policy.assess(&manifest_for_version("0.16.0", CacheQuality::Validated));
         assert!(!decision.accepted);
         assert!(decision
             .reasons

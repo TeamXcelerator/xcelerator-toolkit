@@ -203,16 +203,7 @@ mod tests {
     /// Create a temp file with 3 zeros and verify loading works.
     #[test]
     fn load_zeros_from_file() {
-        // Scratch under target/test-tmp (removed by cargo clean), not
-        // the OS temp dir. Resolved from CARGO_MANIFEST_DIR so it is
-        // correct regardless of the process's runtime cwd.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("test-tmp")
-            .join(format!("xc_zeta_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = xc_core::test_support::TestDir::new("zeta-zeros");
         let path = dir.join("test_zeros.json");
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, r#"["14.134725141734693790457251983562470270784257", "21.022039638771554992628479593896902777334340", "25.010857580145688763213790992562821818659549"]"#).unwrap();
@@ -229,8 +220,6 @@ mod tests {
         // Requesting more than available should error.
         let err = first_n_f64(&path, 10);
         assert!(err.is_err());
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -251,13 +240,7 @@ mod tests {
     #[test]
     fn first_n_hp_loads_at_working_precision() {
         use rug::{ops::Pow, Float};
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("test-tmp")
-            .join(format!("xc_zeta_hp_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = xc_core::test_support::TestDir::new("zeta-zeros-hp");
         let path = dir.join("test_zeros_hp.json");
         let mut f = std::fs::File::create(&path).unwrap();
         // Write one zero with full 43-digit precision.
@@ -285,8 +268,6 @@ mod tests {
         // Requesting more than available should error.
         let err = first_n_hp(&path, 5, prec);
         assert!(err.is_err());
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `first_n_strings` on a non-existent file should return an error.

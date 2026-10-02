@@ -3,9 +3,59 @@ use rug::Float;
 use xc_core::EigenTarget;
 use xc_operator::{SpectralInertia, SymmetricOperator};
 
-pub const HP_KRYLOV_COUNT_SEMANTICS: &str = "hp_krylov_source_bound_boundary_inertia_v4";
+pub const HP_KRYLOV_COUNT_SEMANTICS: &str = "hp_krylov_source_bound_budgeted_boundary_inertia_v5";
 const DENSE_COUNT_MAXIMUM_BYTES: u64 = 64 * 1024 * 1024;
-const DENSE_COUNT_MAXIMUM_DIMENSION: usize = 256;
+
+#[cfg(test)]
+mod validation_capacity_repair {
+    use super::*;
+    use xc_operator::DenseSymmetricHp;
+    struct Limited(DenseSymmetricHp);
+    impl xc_operator::LinearOperator<Float> for Limited {
+        fn dimension(&self) -> usize {
+            self.0.dimension()
+        }
+        fn apply(&self, x: &[Float], y: &mut [Float]) -> Result<(), xc_operator::OperatorError> {
+            self.0.apply(x, y)
+        }
+        fn metadata(&self) -> xc_operator::OperatorMetadata {
+            self.0.metadata()
+        }
+    }
+    impl SymmetricOperator<Float> for Limited {
+        fn spectral_inertia_working_bytes(&self) -> Option<u64> {
+            Some(1)
+        }
+        fn stored_symmetric_entries(&self) -> Option<&[Float]> {
+            self.0.stored_symmetric_entries()
+        }
+    }
+    #[test]
+    fn generic_count_uses_allocated_bytes_instead_of_dimension_256() {
+        let p = 128;
+        let n = 257;
+        let mut matrix = vec![Float::with_val(p, 0); n * n];
+        for i in 0..n {
+            matrix[i * n + i] = Float::with_val(p, i + 1);
+        }
+        let operator =
+            DenseSymmetricHp::new("count-capacity", n, matrix, p, &Float::with_val(p, 0)).unwrap();
+        let count = inertia(&operator, &Float::with_val(p, 100.5), p)
+            .unwrap()
+            .unwrap();
+        assert_eq!((count.below, count.equal, count.above), (100, 0, 157));
+        // The same dimension at a precision whose workspace exceeds the
+        // default 64 MiB is refused before building an interval matrix.
+        assert!(inertia(&operator, &Float::with_val(p, 100.5), 5000)
+            .unwrap()
+            .is_none());
+        // A provider returning None cannot silently be retried with the larger
+        // default allowance when the source declared a smaller explicit cap.
+        assert!(inertia(&Limited(operator), &Float::with_val(p, 100.5), p)
+            .unwrap()
+            .is_none());
+    }
+}
 
 /// Source-bound completeness evidence for the requested side of a Ritz boundary.
 #[derive(Clone, Debug)]
@@ -58,9 +108,9 @@ fn inertia(
     let Some(matrix) = operator.stored_symmetric_entries() else {
         return Ok(None);
     };
-    if operator.dimension() > DENSE_COUNT_MAXIMUM_DIMENSION {
-        return Ok(None);
-    }
+    // Admission is based on dimension AND precision through the byte budget,
+    // not an unrelated dimension-only ceiling. Custom source-bound inertia
+    // providers above may use the caller's larger explicit budget.
     let source_precision = matrix
         .iter()
         .map(Float::prec)
@@ -80,7 +130,9 @@ fn inertia(
         operator.dimension(),
         shift,
         working,
-        DENSE_COUNT_MAXIMUM_BYTES,
+        operator
+            .spectral_inertia_working_bytes()
+            .unwrap_or(DENSE_COUNT_MAXIMUM_BYTES),
     ) {
         Ok(MpfrInertiaResult::Conclusive {
             positive, negative, ..

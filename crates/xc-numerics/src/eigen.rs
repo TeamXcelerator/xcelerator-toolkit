@@ -248,7 +248,7 @@ pub fn tridiag_eigenvalues_hp_with_options(
             if iter_count == TRIDIAG_QR_SLOW_SWEEP_WARNING + 1
                 && max_iter > TRIDIAG_QR_SLOW_SWEEP_WARNING
             {
-                eprintln!(
+                xc_core::progress_message!(
                     "[HP] tridiagonal QR slow convergence at eigenvalue l={l}: continuing beyond {TRIDIAG_QR_SLOW_SWEEP_WARNING} sweeps (hard limit={max_iter})"
                 );
             }
@@ -565,6 +565,8 @@ pub fn tridiag_selected_eigenvalues_hp(
             "selected HP tridiagonal range must satisfy first <= last < dimension"
         ));
     }
+    crate::mpfr_interval::ensure_uniform_exponent_range()
+        .map_err(|error| anyhow!(error.to_string()))?;
     if !absolute_tolerance.is_finite() || absolute_tolerance <= &hp_zero(prec) {
         return Err(anyhow!(
             "selected HP tridiagonal tolerance must be finite and positive"
@@ -609,6 +611,8 @@ pub fn tridiag_selected_eigenvalues_hp(
             let mut lower_count = global_lower_count;
             let mut upper_count = global_upper_count;
             let mut iterations = 0usize;
+            let mut verified: Option<(Float, Float)> = None;
+            let mut guided = false;
             loop {
                 let (width, _) = Float::with_val_round(prec, &upper - &lower, rug::float::Round::Up);
                 if width <= *absolute_tolerance {
@@ -616,6 +620,18 @@ pub fn tridiag_selected_eigenvalues_hp(
                 }
                 if iterations == maximum_iterations {
                     return Err(SelectedEigenvalueIterationLimit { index, maximum_iterations }.into());
+                }
+                if !guided && lower_count == index && upper_count == index + 1 {
+                    guided = true;
+                    verified = isolated_eigenvalue_guide(
+                        diag,
+                        off_diag,
+                        index,
+                        &lower,
+                        &upper,
+                        absolute_tolerance,
+                        prec,
+                    );
                 }
                 // Half-sum avoids overflow when both finite endpoints are large.
                 let mut midpoint = lower.clone() / 2u32;
@@ -628,8 +644,14 @@ pub fn tridiag_selected_eigenvalues_hp(
                         "HP Sturm bisection stagnated at {prec} bits for eigenvalue {index}; precision escalation is required"
                     ));
                 }
-                let midpoint_count =
-                    tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &midpoint, prec)?;
+                // Inside the isolated bracket, a midpoint at or below a
+                // verified `a` counts exactly `index`; at or above `b`,
+                // exactly `index + 1`. Only midpoints in (a, b) are counted.
+                let midpoint_count = match &verified {
+                    Some((a, _)) if midpoint <= *a => index,
+                    Some((_, b)) if midpoint >= *b => index + 1,
+                    _ => tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &midpoint, prec)?,
+                };
                 if midpoint_count <= index {
                     lower = midpoint;
                     lower_count = midpoint_count;
@@ -673,6 +695,119 @@ pub fn tridiag_selected_eigenvalues_hp(
         sturm_evaluations,
         enclosures,
     })
+}
+
+/// Verified points `a < b` around the isolated eigenvalue `index`, with exact
+/// directed counts `count(a) == index` and `count(b) == index + 1`. A
+/// safeguarded point Newton iteration on `det(T - xI)` only places them; the
+/// directed counts decide. Bisection then replays midpoints outside `(a, b)`
+/// without counting, so its path, enclosure, counts and iteration total are
+/// those of the plain bisection. `None` leaves plain bisection unchanged.
+fn isolated_eigenvalue_guide(
+    diag: &[Float],
+    off_diag: &[Float],
+    index: usize,
+    lower: &Float,
+    upper: &Float,
+    tolerance: &Float,
+    prec: u32,
+) -> Option<(Float, Float)> {
+    // Resolve the guide well below the final bisection width.
+    let magnitude = [lower, upper]
+        .into_iter()
+        .filter_map(Float::get_exp)
+        .max()
+        .unwrap_or(0);
+    let depth = i64::from(magnitude) - i64::from(tolerance.get_exp()?);
+    let work = u32::try_from(depth.max(i64::from(prec)).saturating_add(96))
+        .ok()?
+        .min(1_000_000);
+    let spacing = Float::with_val(work, tolerance) >> 16;
+    let mut low = Float::with_val(work, lower);
+    let mut high = Float::with_val(work, upper);
+    let mut x = Float::with_val(work, &low + &high) / 2u32;
+    let mut converged = false;
+    for _ in 0..256 {
+        // Ratio recurrence q_i = (d_i - x) - e_{i-1}^2 / q_{i-1}: negatives
+        // count eigenvalues below x, and sum(q_i'/q_i) = f'/f for f = det.
+        let mut negatives = 0usize;
+        let mut ratio = Float::with_val(work, 0);
+        let mut q = Float::with_val(work, 0);
+        let mut dq = Float::with_val(work, 0);
+        let mut singular = false;
+        for i in 0..diag.len() {
+            let mut next = Float::with_val(work, &diag[i] - &x);
+            let mut next_dq = Float::with_val(work, -1);
+            if i > 0 {
+                let coupling = Float::with_val(work, off_diag[i - 1].square_ref());
+                if !coupling.is_zero() {
+                    let mut term = Float::with_val(work, &coupling / &q);
+                    next -= &term;
+                    term /= &q;
+                    term *= &dq;
+                    next_dq += term;
+                }
+            }
+            if next.is_zero() || !next.is_finite() || !next_dq.is_finite() {
+                singular = true;
+                break;
+            }
+            if next < 0 {
+                negatives += 1;
+            }
+            ratio += Float::with_val(work, &next_dq / &next);
+            q = next;
+            dq = next_dq;
+        }
+        if singular {
+            x = Float::with_val(work, &low + &high) / 2u32;
+            continue;
+        }
+        if negatives <= index {
+            low.assign(&x);
+        } else {
+            high.assign(&x);
+        }
+        let candidate = if ratio.is_zero() || !ratio.is_finite() {
+            None
+        } else {
+            Some(Float::with_val(
+                work,
+                &x - Float::with_val(work, ratio.recip_ref()),
+            ))
+        };
+        match candidate {
+            Some(next) if next > low && next < high => {
+                let step = Float::with_val(work, &next - &x).abs();
+                x = next;
+                if step <= spacing {
+                    converged = true;
+                    break;
+                }
+            }
+            _ => {
+                x = Float::with_val(work, &low + &high) / 2u32;
+                if Float::with_val(work, &high - &low) <= spacing {
+                    converged = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !converged {
+        return None;
+    }
+    for shift in [16u32, 4] {
+        let offset = Float::with_val(work, tolerance) >> shift;
+        let a = Float::with_val(work, &x - &offset);
+        let b = Float::with_val(work, &x + &offset);
+        let below = tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &a, prec).ok()?;
+        let above = tridiag_sturm_count_below_hp_unchecked(diag, off_diag, &b, prec).ok()?;
+        if below == index && above == index + 1 {
+            return Some((a, b));
+        }
+    }
+    None
 }
 
 // Bound ||T||_2 by ||T||_infinity for symmetric T. The search bracket's
@@ -1819,6 +1954,126 @@ mod tests {
             assert!(enclosure.lower_count <= enclosure.index);
             assert!(enclosure.upper_count > enclosure.index);
         }
+    }
+
+    /// The bisection before the verified-guide replay, kept as the reference.
+    fn plain_bisection_reference(
+        diag: &[Float],
+        off_diag: &[Float],
+        index: usize,
+        tolerance: &Float,
+        maximum_iterations: usize,
+        prec: u32,
+    ) -> HpTridiagonalEigenvalueEnclosure {
+        let (mut lower, mut upper) = tridiag_gershgorin_bounds_hp(diag, off_diag, prec);
+        let mut lower_count = 0;
+        let mut upper_count = diag.len();
+        let mut iterations = 0;
+        loop {
+            let (width, _) = Float::with_val_round(prec, &upper - &lower, rug::float::Round::Up);
+            if width <= *tolerance {
+                break;
+            }
+            assert!(iterations < maximum_iterations);
+            let mut midpoint = lower.clone() / 2u32;
+            midpoint += upper.clone() / 2u32;
+            let count = tridiag_sturm_count_below_hp(diag, off_diag, &midpoint, prec).unwrap();
+            if count <= index {
+                lower = midpoint;
+                lower_count = count;
+            } else {
+                upper = midpoint;
+                upper_count = count;
+            }
+            iterations += 1;
+        }
+        HpTridiagonalEigenvalueEnclosure {
+            index,
+            lower,
+            upper,
+            lower_count,
+            upper_count,
+            iterations,
+        }
+    }
+
+    #[test]
+    fn guided_sturm_bisection_replays_the_plain_bisection_exactly() {
+        let prec = 320;
+        let laplacian = (vec![hp(prec, "2"); 12], vec![hp(prec, "-1"); 11]);
+        // A deeply cancelled ground value: shift by a computed eigenvalue.
+        let mut shifted = (
+            (0..14)
+                .map(|i| Float::with_val(prec, (i * 7 % 11) as u32) / 3u32)
+                .collect::<Vec<_>>(),
+            (0..13)
+                .map(|i| Float::with_val(prec, (i * 5 % 9 + 1) as u32) / 4u32)
+                .collect::<Vec<_>>(),
+        );
+        let ground = tridiag_eigenvalues_hp(&shifted.0, &shifted.1, prec).unwrap()[0].clone();
+        for value in &mut shifted.0 {
+            *value -= &ground;
+        }
+        // Repeated values never isolate; the guide must stay unused there.
+        let repeated = (
+            vec![hp(prec, "1"), hp(prec, "1"), hp(prec, "3"), hp(prec, "1")],
+            vec![hp(prec, "0"), hp(prec, "0.5"), hp(prec, "0")],
+        );
+        for (diag, off_diag) in [&laplacian, &shifted, &repeated] {
+            for bits in [40i32, 150, 300] {
+                let tolerance = Float::with_val(prec, 2).pow(-bits);
+                for index in 0..diag.len() {
+                    let actual = tridiag_selected_eigenvalues_hp(
+                        diag,
+                        off_diag,
+                        index,
+                        index,
+                        &tolerance,
+                        2 * prec as usize,
+                        prec,
+                    )
+                    .unwrap();
+                    let expected = plain_bisection_reference(
+                        diag,
+                        off_diag,
+                        index,
+                        &tolerance,
+                        2 * prec as usize,
+                        prec,
+                    );
+                    assert_eq!(actual.enclosures, vec![expected.clone()], "index {index}");
+                    assert_eq!(actual.sturm_evaluations, 2 + expected.iterations);
+                }
+            }
+        }
+        // The guide engages on isolated values and verifies its points.
+        let (lower, upper) = tridiag_gershgorin_bounds_hp(&laplacian.0, &laplacian.1, prec);
+        let tolerance = Float::with_val(prec, 2).pow(-300);
+        let mut lo = lower;
+        let mut hi = upper;
+        while tridiag_sturm_count_below_hp(&laplacian.0, &laplacian.1, &hi, prec).unwrap() > 1 {
+            let mid = Float::with_val(prec, &lo + &hi) / 2u32;
+            if tridiag_sturm_count_below_hp(&laplacian.0, &laplacian.1, &mid, prec).unwrap() > 0 {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let (a, b) =
+            isolated_eigenvalue_guide(&laplacian.0, &laplacian.1, 0, &lo, &hi, &tolerance, prec)
+                .expect("isolated Laplacian ground value is guided");
+        assert!(a < b && Float::with_val(prec, &b - &a) < tolerance);
+        let ground_shifted = tridiag_selected_eigenvalues_hp(
+            &shifted.0,
+            &shifted.1,
+            0,
+            0,
+            &tolerance,
+            2 * prec as usize,
+            prec,
+        )
+        .unwrap();
+        assert!(ground_shifted.enclosures[0].lower.clone().abs() < 1e-60);
     }
 
     #[test]

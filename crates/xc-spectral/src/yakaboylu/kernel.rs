@@ -46,6 +46,22 @@ pub(super) fn entry_f64(sr: f64, si: f64, tr: f64, ti: f64, epsilon: f64) -> Res
     );
     let numerator = e * e;
     ensure!(numerator > 0.0, "matrix element is outside binary64 range");
+    let di = -2.0 * r * i;
+    let difference = (e - r.abs()) * (e + r.abs());
+    if i.abs() < e && di != 0.0 && !(i * i).is_normal() && difference.abs() < di.abs() {
+        // i^2 underflows while e^2 - r^2 does not dominate Im(D), so i^2 still
+        // decides the real part: form rho = Re(D)/Im(D) =
+        // (e^2 - r^2)/Im(D) + i/(-2r) without squaring i.
+        let rho = difference / di + i / (-2.0 * r);
+        let base = (numerator / di) / rho.mul_add(rho, 1.0);
+        let real = base * rho;
+        let imaginary = -base;
+        ensure!(
+            real.is_finite() && imaginary.is_finite() && imaginary != 0.0,
+            "matrix element is outside binary64 range"
+        );
+        return Ok((real, imaginary));
+    }
     // Subtract the closest competing squares before adding the small square.
     // In particular |i|=|r| must preserve e^2, however small it is.
     let dr = if i.abs() >= e {
@@ -194,6 +210,44 @@ pub(super) fn entry_hp(
     ensure!(!numerator.is_zero(), "matrix element is outside MPFR range");
     let abs_r = r.clone().abs();
     let abs_i = i.clone().abs();
+    let mut ratio_di = Float::with_val(work, &r * &i);
+    ratio_di *= -2i32;
+    let mut difference = Float::with_val(work, &e - &abs_r);
+    difference *= Float::with_val(work, &e + &abs_r);
+    // i^2 can leave the exponent range (MPFR then rounds it to zero or to the
+    // least positive value) exactly when 2*exp(i) <= emin; decide by exponent,
+    // not by inspecting the rounded square.
+    let square_underflows = i
+        .get_exp()
+        .is_some_and(|exponent| i64::from(exponent) * 2 <= i64::from(rug::float::exp_min()) + 2);
+    if abs_i < e
+        && !ratio_di.is_zero()
+        && square_underflows
+        && difference.clone().abs() < ratio_di.clone().abs()
+    {
+        // As in the binary64 path: i^2 underflows the exponent range while
+        // e^2 - r^2 does not dominate Im(D), so form rho = Re(D)/Im(D) =
+        // (e^2 - r^2)/Im(D) + i/(-2r) without squaring i.
+        let di = ratio_di;
+        let mut rho = Float::with_val(work, &difference / &di);
+        let mut tail = Float::with_val(work, &i / &r);
+        tail /= -2i32;
+        rho += tail;
+        let mut damping = rho.clone().square();
+        damping += 1u32;
+        let mut base = Float::with_val(work, &numerator / &di);
+        base /= &damping;
+        let real = Float::with_val(p, &base * &rho);
+        let imaginary = Float::with_val(p, -base);
+        ensure!(
+            real.is_finite()
+                && imaginary.is_finite()
+                && !imaginary.is_zero()
+                && !(!rho.is_zero() && real.is_zero()),
+            "matrix element is outside MPFR range"
+        );
+        return Ok((real, imaginary));
+    }
     let (large, small) = if abs_i >= e {
         (&abs_i, &e)
     } else {

@@ -28,10 +28,36 @@ use xc_root::{
     RealIntervalFunctionHp, RootError,
 };
 
+fn root_stage_metadata(
+    operation: &str,
+    source: &CertifiedSecularFunction,
+) -> xc_core::PerformanceStageMetadata {
+    let mut metadata = xc_core::PerformanceStageMetadata::matrix(
+        source.poles.len(),
+        source.precision_bits(),
+        rayon::current_num_threads(),
+    );
+    metadata.operation = Some(operation.to_owned());
+    metadata
+}
+
+type ExactNumerator = (Vec<Rational>, Vec<Rational>);
+
 #[derive(Clone, Debug)]
 pub struct CertifiedSecularFunction {
     poles: Vec<MpfrInterval>,
     weights: Vec<MpfrInterval>,
+    /// Exact poles and numerator coefficients, derived once from the
+    /// immutable stored poles and residues and shared by every count.
+    exact_numerator: std::sync::OnceLock<ExactNumerator>,
+    /// Exact endpoints of every real-root ball strictly inside the stored
+    /// pole span, from one FLINT/Arb isolation. `None` records an isolation
+    /// that could not classify the span; window counts then use FLINT directly.
+    #[cfg(feature = "arb")]
+    span_real_roots: std::sync::OnceLock<Option<Vec<(Rational, Rational)>>>,
+    /// Memoized pole-gap census results, one per adjacent pole pair.
+    #[cfg(feature = "arb")]
+    gap_census: Vec<std::sync::OnceLock<std::result::Result<GapCensus, String>>>,
 }
 
 impl CertifiedSecularFunction {
@@ -47,17 +73,36 @@ impl CertifiedSecularFunction {
         precision_bits: u32,
     ) -> Result<Self> {
         boundary::shape(modes, weights.len(), precision_bits)?;
-        if integer_cutoff_c <= 1
-            || modes.checked_mul(2).and_then(|n| n.checked_add(1)) != Some(weights.len())
+        if integer_cutoff_c <= 1 {
+            bail!("CCM secular source requires c > 1 and exactly 2N+1 weights");
+        }
+        Self::from_ccm_cutoff_state(
+            &integer_cutoff_c.to_string(),
+            modes,
+            weights,
+            precision_bits,
+        )
+    }
+
+    /// Same shared point stages for an exact decimal cutoff, which may be
+    /// fractional: L=RN(p)(ln(cutoff)) is the logarithm used by CCM assembly
+    /// and refinement for that declared decimal.
+    pub fn from_ccm_cutoff_state(
+        cutoff: &str,
+        modes: usize,
+        weights: &[Float],
+        precision_bits: u32,
+    ) -> Result<Self> {
+        boundary::shape(modes, weights.len(), precision_bits)?;
+        cutoff_floor(cutoff)?;
+        if modes.checked_mul(2).and_then(|n| n.checked_add(1)) != Some(weights.len())
             || i64::try_from(modes).is_err()
             || !(32..=1_000_000).contains(&precision_bits)
         {
             bail!("CCM secular source requires c > 1 and exactly 2N+1 weights");
         }
-        let log_c = super::retained_evidence::finite_math::rounded_log_cutoff(
-            &integer_cutoff_c.to_string(),
-            precision_bits,
-        )?;
+        let log_c =
+            super::retained_evidence::finite_math::rounded_log_cutoff(cutoff, precision_bits)?;
         let spacing = boundary::rounded_spacing(&log_c, precision_bits)?;
         let poles = (-(modes as i64)..=(modes as i64))
             .map(|index| {
@@ -89,6 +134,47 @@ impl CertifiedSecularFunction {
         Self::from_intervals(poles, weights)
     }
 
+    /// Interval data for perturbation enclosures: residue intervals may
+    /// contain zero. Such a source supports evaluation and interval Newton but
+    /// must not be used for residue-sign root counting.
+    #[cfg(feature = "arb")]
+    pub(crate) fn from_interval_data(
+        poles: Vec<MpfrInterval>,
+        weights: Vec<MpfrInterval>,
+    ) -> Result<Self> {
+        if poles.is_empty() || poles.len() != weights.len() {
+            bail!("finite secular source needs equal nonempty pole and weight arrays");
+        }
+        for value in poles.iter().chain(&weights) {
+            value.validate()?;
+        }
+        let precision = poles[0].precision();
+        boundary::source_budget(poles.len(), precision)?;
+        if poles
+            .iter()
+            .chain(&weights)
+            .any(|value| value.precision() != precision)
+            || poles
+                .windows(2)
+                .any(|pair| pair[0].upper() >= pair[1].lower())
+        {
+            bail!(
+                "finite secular interval data must share precision and have ordered disjoint poles"
+            );
+        }
+        Ok(Self {
+            weights,
+            exact_numerator: std::sync::OnceLock::new(),
+            #[cfg(feature = "arb")]
+            span_real_roots: std::sync::OnceLock::new(),
+            #[cfg(feature = "arb")]
+            gap_census: (1..poles.len())
+                .map(|_| std::sync::OnceLock::new())
+                .collect(),
+            poles,
+        })
+    }
+
     pub fn from_intervals(poles: Vec<MpfrInterval>, weights: Vec<MpfrInterval>) -> Result<Self> {
         if poles.is_empty() || poles.len() != weights.len() {
             bail!("finite secular source needs equal nonempty pole and weight arrays");
@@ -113,7 +199,17 @@ impl CertifiedSecularFunction {
         if weights.iter().any(MpfrInterval::contains_zero) {
             bail!("finite secular residue intervals must exclude zero");
         }
-        Ok(Self { poles, weights })
+        Ok(Self {
+            weights,
+            exact_numerator: std::sync::OnceLock::new(),
+            #[cfg(feature = "arb")]
+            span_real_roots: std::sync::OnceLock::new(),
+            #[cfg(feature = "arb")]
+            gap_census: (1..poles.len())
+                .map(|_| std::sync::OnceLock::new())
+                .collect(),
+            poles,
+        })
     }
 
     pub fn poles(&self) -> &[MpfrInterval] {
@@ -305,7 +401,18 @@ impl CertifiedSecularFunction {
         })
     }
 
-    fn exact_numerator_data(&self) -> Result<(Vec<Rational>, Vec<Rational>)> {
+    fn exact_numerator_data(&self) -> Result<&ExactNumerator> {
+        if let Some(data) = self.exact_numerator.get() {
+            return Ok(data);
+        }
+        let data = self.compute_exact_numerator_data()?;
+        Ok(self.exact_numerator.get_or_init(|| data))
+    }
+
+    fn compute_exact_numerator_data(&self) -> Result<ExactNumerator> {
+        let _stage = xc_core::performance_stage_with("ccm.roots.exact_numerator", || {
+            root_stage_metadata("ccm.roots.exact_numerator", self)
+        });
         boundary::rational_budget(
             self.poles
                 .iter()
@@ -372,7 +479,7 @@ impl CertifiedSecularFunction {
     /// and residues.
     pub fn normalized_finite_entire_function(&self) -> Result<FiniteEntireFunction> {
         let (_, numerator) = self.exact_numerator_data()?;
-        FiniteEntireFunction::from_real_coefficients_monic(numerator)
+        FiniteEntireFunction::from_real_coefficients_monic(numerator.clone())
     }
 
     pub fn exact_numerator_count_between_poles(
@@ -385,7 +492,7 @@ impl CertifiedSecularFunction {
         }
         let (poles, numerator) = self.exact_numerator_data()?;
         let count = exact_sturm_root_count(
-            &numerator,
+            numerator,
             poles[first_pole].clone(),
             poles[last_pole].clone(),
         )?;
@@ -419,7 +526,7 @@ impl CertifiedSecularFunction {
         let denominator = Integer::from(1) << isolation_bits;
         let target_width = Rational::from((Integer::from(1), denominator));
         let candidates = exact_sturm_isolate_roots(
-            &numerator,
+            numerator,
             poles[first_pole].clone(),
             poles[last_pole].clone(),
             target_width,
@@ -485,8 +592,15 @@ impl CertifiedSecularFunction {
             bail!("FLINT numerator count requires lower < upper");
         }
         let (_, numerator) = self.exact_numerator_data()?;
-        let (count, square_free) =
-            crate::ccm::arb_bridge::rational_polynomial_root_count(&numerator, lower, upper)?;
+        let (count, square_free) = match self.span_window_count(lower, upper)? {
+            Some(count) => (count, true),
+            None => {
+                let _stage = xc_core::performance_stage_with("ccm.roots.flint_count", || {
+                    root_stage_metadata("ccm.roots.flint_count", self)
+                });
+                crate::ccm::arb_bridge::rational_polynomial_root_count(numerator, lower, upper)?
+            }
+        };
         Ok(SecularCountCertificate {
             pole_count: self
                 .poles
@@ -504,6 +618,53 @@ impl CertifiedSecularFunction {
                 .to_owned(),
             square_free,
         })
+    }
+
+    /// Count a window from the shared span isolation. Each retained ball holds
+    /// exactly one real root of the square-free numerator, and the isolation
+    /// already proved every other root nonreal or outside the span. A window
+    /// inside the span therefore contains exactly the balls strictly inside
+    /// it. A ball touching a window boundary, or a window outside the span,
+    /// returns `None` so the caller runs the direct FLINT window count.
+    #[cfg(feature = "arb")]
+    fn span_window_count(&self, lower: &Rational, upper: &Rational) -> Result<Option<usize>> {
+        let (poles, numerator) = self.exact_numerator_data()?;
+        let (Some(first), Some(last)) = (poles.first(), poles.last()) else {
+            return Ok(None);
+        };
+        if lower < first || upper > last || first >= last {
+            return Ok(None);
+        }
+        let roots = self.span_real_roots.get_or_init(|| {
+            let _stage = xc_core::performance_stage_with("ccm.roots.flint_span_isolation", || {
+                root_stage_metadata("ccm.roots.flint_span_isolation", self)
+            });
+            let (balls, square_free) =
+                crate::ccm::arb_bridge::rational_polynomial_real_roots(numerator, first, last, 128)
+                    .ok()?;
+            if !square_free {
+                return None;
+            }
+            balls
+                .iter()
+                .map(|ball| Some((ball.lower().to_rational()?, ball.upper().to_rational()?)))
+                .collect()
+        });
+        let Some(roots) = roots else {
+            return Ok(None);
+        };
+        let mut count = 0;
+        for (ball_lower, ball_upper) in roots {
+            if ball_upper < lower || ball_lower > upper {
+                continue;
+            }
+            if ball_lower > lower && ball_upper < upper {
+                count += 1;
+                continue;
+            }
+            return Ok(None);
+        }
+        Ok(Some(count))
     }
 
     /// Reference-free production isolation through exact FLINT/Arb root balls.
@@ -543,50 +704,21 @@ impl CertifiedSecularFunction {
         Ok(window)
     }
 
-    /// Isolate and certify every real root in an arbitrary exact rational
-    /// window. Completeness comes from the exact numerator count, while each
-    /// retained root receives an interval-Newton existence/uniqueness proof.
+    /// Interval-Newton existence and uniqueness for every window candidate,
+    /// escalating proof precision until each enclosure lies strictly inside
+    /// the open window.
     #[cfg(feature = "arb")]
-    pub fn certify_flint_numerator_rational_window(
+    fn newton_window_roots(
         &self,
+        candidates: Vec<MpfrInterval>,
         lower_bound: &Rational,
         upper_bound: &Rational,
-        isolation_bits: u32,
+        target_width: &Float,
         options: &IntervalNewtonOptions,
-    ) -> Result<SecularWindowCertificate> {
-        boundary::isolation(isolation_bits, self.precision_bits())?;
-        options
-            .validate(self.precision_bits())
-            .map_err(anyhow::Error::from)?;
-        let (_, numerator) = self.exact_numerator_data()?;
-        if lower_bound >= upper_bound {
-            bail!("FLINT numerator window requires lower < upper");
-        }
-        let (mut candidates, square_free) = crate::ccm::arb_bridge::rational_polynomial_real_roots(
-            &numerator,
-            lower_bound,
-            upper_bound,
-            self.precision_bits(),
-        )?;
-        if !square_free {
-            bail!("FLINT numerator isolation requires a square-free polynomial");
-        }
-        let target_width = Float::with_val(self.precision_bits(), 2).pow(-(isolation_bits as i32));
-        for candidate in &candidates {
-            let width = candidate.width();
-            if !width.is_finite() || width > target_width {
-                bail!("Arb root enclosure did not meet the requested absolute width");
-            }
-        }
-        candidates.sort_by(|left, right| {
-            left.lower()
-                .partial_cmp(right.lower())
-                .expect("certified Arb root endpoints are finite")
+    ) -> Result<Vec<IntervalRootCertificate>> {
+        let newton_stage = xc_core::performance_stage_with("ccm.roots.interval_newton", || {
+            root_stage_metadata("ccm.roots.interval_newton", self)
         });
-        let count = self.exact_flint_numerator_count_in_window(lower_bound, upper_bound)?;
-        if count.certified_root_count != candidates.len() || count.square_free != square_free {
-            bail!("FLINT root isolation disagrees with a repeated exact count from the same FLINT/Arb engine");
-        }
         let roots = candidates.into_iter().map(|candidate| {
             let mut failure = String::new();
             let mut previous_precision = 0;
@@ -595,8 +727,8 @@ impl CertifiedSecularFunction {
                 if work == previous_precision { continue; }
                 previous_precision = work;
                 let promoted = self.with_precision(work)?;
-                let lower = Float::with_val_round(work, candidate.lower() - &target_width, Round::Down).0;
-                let upper = Float::with_val_round(work, candidate.upper() + &target_width, Round::Up).0;
+                let lower = Float::with_val_round(work, candidate.lower() - target_width, Round::Down).0;
+                let upper = Float::with_val_round(work, candidate.upper() + target_width, Round::Up).0;
                 let mut refined_options = options.clone();
                 if guard > 0 {
                     let fine_width = Float::with_val(work, 1) >> work.saturating_sub(16);
@@ -617,6 +749,61 @@ impl CertifiedSecularFunction {
             }
             bail!("finite secular window boundary remains unresolved within the proof precision budget: {failure}")
         }).collect::<Result<Vec<_>>>()?;
+        drop(newton_stage);
+        Ok(roots)
+    }
+
+    /// Isolate and certify every real root in an arbitrary exact rational
+    /// window. Completeness comes from the exact numerator count, while each
+    /// retained root receives an interval-Newton existence/uniqueness proof.
+    #[cfg(feature = "arb")]
+    pub fn certify_flint_numerator_rational_window(
+        &self,
+        lower_bound: &Rational,
+        upper_bound: &Rational,
+        isolation_bits: u32,
+        options: &IntervalNewtonOptions,
+    ) -> Result<SecularWindowCertificate> {
+        boundary::isolation(isolation_bits, self.precision_bits())?;
+        options
+            .validate(self.precision_bits())
+            .map_err(anyhow::Error::from)?;
+        let (_, numerator) = self.exact_numerator_data()?;
+        if lower_bound >= upper_bound {
+            bail!("FLINT numerator window requires lower < upper");
+        }
+        let (mut candidates, square_free) = {
+            let _stage = xc_core::performance_stage_with("ccm.roots.flint_isolation", || {
+                root_stage_metadata("ccm.roots.flint_isolation", self)
+            });
+            crate::ccm::arb_bridge::rational_polynomial_real_roots(
+                numerator,
+                lower_bound,
+                upper_bound,
+                self.precision_bits(),
+            )?
+        };
+        if !square_free {
+            bail!("FLINT numerator isolation requires a square-free polynomial");
+        }
+        let target_width = Float::with_val(self.precision_bits(), 2).pow(-(isolation_bits as i32));
+        for candidate in &candidates {
+            let width = candidate.width();
+            if !width.is_finite() || width > target_width {
+                bail!("Arb root enclosure did not meet the requested absolute width");
+            }
+        }
+        candidates.sort_by(|left, right| {
+            left.lower()
+                .partial_cmp(right.lower())
+                .expect("certified Arb root endpoints are finite")
+        });
+        let count = self.exact_flint_numerator_count_in_window(lower_bound, upper_bound)?;
+        if count.certified_root_count != candidates.len() || count.square_free != square_free {
+            bail!("FLINT root isolation disagrees with a repeated exact count from the same FLINT/Arb engine");
+        }
+        let roots =
+            self.newton_window_roots(candidates, lower_bound, upper_bound, &target_width, options)?;
         let reconciliation = reconcile_complete_window(&roots, &count)?;
         if !reconciliation.complete {
             bail!(
@@ -630,6 +817,615 @@ impl CertifiedSecularFunction {
             reconciliation,
         })
     }
+}
+
+/// Count method recorded by the pole-gap census route.
+pub const POLE_GAP_COUNT_METHOD: &str =
+    "directed pole-gap subdivision with Taylor-model exclusion and derivative monotonicity";
+/// Discovery and count methods recorded by each independent certificate route.
+const FLINT_DISCOVERY_METHOD: &str =
+    "exact_cumulative_finite_source_counts_then_flint_arb_isolation_and_interval_newton";
+const FLINT_COUNT_METHOD: &str =
+    "flint_arb_complete_complex_root_isolation_with_real_window_classification";
+const POLE_GAP_DISCOVERY_METHOD: &str =
+    "exact_cumulative_pole_gap_census_counts_then_interval_newton";
+const POLE_GAP_CERTIFICATE_COUNT_METHOD: &str =
+    "directed_pole_gap_subdivision_with_taylor_model_exclusion_and_derivative_monotonicity";
+/// Guard bits tried, in order, for a gap whose subdivision stalls.
+#[cfg(feature = "arb")]
+const POLE_GAP_GUARDS: [u32; 5] = [0, 64, 256, 1024, 4096];
+/// Taylor-model order of the per-piece G and G' enclosures.
+#[cfg(feature = "arb")]
+const POLE_GAP_TAYLOR_ORDER: usize = 8;
+/// Safety bound on interval evaluations per gap and precision.
+#[cfg(feature = "arb")]
+const POLE_GAP_EVALUATION_LIMIT: usize = 100_000;
+
+/// Census of one gap: the precision at which it resolved and its brackets.
+#[cfg(feature = "arb")]
+type GapCensus = (u32, Vec<(Float, Float)>);
+/// A census bracket inside a window: its gap, census precision and endpoints.
+#[cfg(feature = "arb")]
+type WindowBracket = (usize, u32, (Float, Float));
+
+/// How an independent certificate counts roots. The exact FLINT route needs
+/// the exact secular numerator; the pole-gap census never forms it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CountRoute {
+    ExactFlint,
+    PoleGap,
+}
+
+impl CountRoute {
+    /// The exact route whenever its rational workspace budget admits the source.
+    #[cfg(feature = "arb")]
+    fn for_source(source: &CertifiedSecularFunction) -> Self {
+        if boundary::rational_budget(
+            source
+                .poles
+                .iter()
+                .chain(&source.weights)
+                .flat_map(|x| [x.lower(), x.upper()]),
+            source.poles.len(),
+        )
+        .is_ok()
+        {
+            Self::ExactFlint
+        } else {
+            Self::PoleGap
+        }
+    }
+    fn methods(self) -> (&'static str, &'static str) {
+        match self {
+            Self::ExactFlint => (FLINT_DISCOVERY_METHOD, FLINT_COUNT_METHOD),
+            Self::PoleGap => (POLE_GAP_DISCOVERY_METHOD, POLE_GAP_CERTIFICATE_COUNT_METHOD),
+        }
+    }
+    fn from_methods(discovery: &str, count: &str) -> Result<Self> {
+        [Self::ExactFlint, Self::PoleGap]
+            .into_iter()
+            .find(|route| route.methods() == (discovery, count))
+            .ok_or_else(|| anyhow::anyhow!("unknown independent CCM certificate route"))
+    }
+}
+
+/// Outcome of one gap's subdivision at one precision.
+#[cfg(feature = "arb")]
+enum GapSubdivision {
+    Resolved(Vec<(Float, Float)>),
+    /// No progress is possible at this precision; the reason names where.
+    Stalled(String),
+}
+
+/// Pole-gap census. Between adjacent poles p_g < p_{g+1} with spacing h,
+/// G(z) = (z - p_g)(p_{g+1} - z) R(z) is smooth on the closed gap, has the
+/// same roots as R inside it, and equals w_g h and -w_{g+1} h at the poles.
+/// A piece of the gap is resolved when an enclosure of G excludes zero (no
+/// root) or one of G' excludes zero (G is monotone there and has exactly one
+/// simple root when its endpoint signs differ, none otherwise); any other
+/// piece is halved. Enclosures are order-8 Taylor models around each piece's
+/// midpoint: point coefficients keep the cancellation among residue terms that
+/// natural interval sums lose, and only the remainder, scaled by the radius to
+/// the eighth power, uses natural bounds. A gap whose pieces can no longer be
+/// halved at the working precision is retried with more guard bits; one that
+/// still stalls is reported unresolved. No polynomial or reference value is used.
+#[cfg(feature = "arb")]
+impl CertifiedSecularFunction {
+    fn point_poles(&self) -> Result<Vec<Rational>> {
+        if self
+            .poles
+            .iter()
+            .chain(&self.weights)
+            .any(|value| value.lower() != value.upper())
+        {
+            bail!("pole-gap census requires point poles and residues");
+        }
+        self.poles
+            .iter()
+            .map(|pole| {
+                pole.lower()
+                    .to_rational()
+                    .context("convert finite MPFR pole to an exact rational")
+            })
+            .collect()
+    }
+
+    /// Natural enclosures of G, G' and G'' over `x` inside the closed gap
+    /// after pole `gap`. With A = x - p_g, B = p_{g+1} - x and
+    /// S = sum_{k != g, g+1} w_k / (x - p_k):
+    /// G = w_g B - w_{g+1} A + A B S,
+    /// G' = -w_g - w_{g+1} + (B - A) S + A B S',
+    /// G'' = -2 S + 2 (B - A) S' + A B S''.
+    fn gap_function(&self, gap: usize, x: &MpfrInterval) -> Result<[MpfrInterval; 3]> {
+        let p = x.precision();
+        let left = x.sub(&self.poles[gap]);
+        let right = self.poles[gap + 1].sub(x);
+        let mut s0 = MpfrInterval::from_i64(0, p);
+        let mut s1 = MpfrInterval::from_i64(0, p);
+        let mut s2 = MpfrInterval::from_i64(0, p);
+        for (index, (pole, weight)) in self.poles.iter().zip(&self.weights).enumerate() {
+            if index == gap || index == gap + 1 {
+                continue;
+            }
+            let reciprocal = MpfrInterval::from_i64(1, p).div(&x.sub(pole))?;
+            let term = weight.mul(&reciprocal);
+            s0 = s0.add(&term);
+            let term = term.mul(&reciprocal);
+            s1 = s1.sub(&term);
+            s2 = s2.add(&term.mul(&reciprocal));
+        }
+        let s2 = s2.add(&s2);
+        let product = left.mul(&right);
+        let spread = right.sub(&left);
+        let value = self.weights[gap]
+            .mul(&right)
+            .sub(&self.weights[gap + 1].mul(&left))
+            .add(&product.mul(&s0));
+        let first = MpfrInterval::from_i64(0, p)
+            .sub(&self.weights[gap])
+            .sub(&self.weights[gap + 1])
+            .add(&spread.mul(&s0))
+            .add(&product.mul(&s1));
+        let second = MpfrInterval::from_i64(0, p)
+            .sub(&s0.add(&s0))
+            .add(&spread.mul(&s1).add(&spread.mul(&s1)))
+            .add(&product.mul(&s2));
+        for value in [&value, &first, &second] {
+            value.validate()?;
+        }
+        Ok([value, first, second])
+    }
+
+    /// Taylor-model enclosures of G and G' over the piece [lower, upper].
+    /// Around the midpoint m, with t = x - m and |t| <= r,
+    /// G(m + t) = sum_{j<K} c_j t^j + G^(K)(xi)/K! t^K. The coefficients come
+    /// from point evaluations at m, which keep the cancellation among the
+    /// residue terms; only the remainder uses natural interval bounds, and it
+    /// is scaled by r^K. With A = x - p_g, B = p_{g+1} - x and
+    /// S = sum_{k != g, g+1} w_k / (x - p_k), whose Taylor coefficients are
+    /// s_j = (-1)^j sum w_k / (m - p_k)^(j+1), G = w_g B - w_{g+1} A + A B S
+    /// and A B = a0 + a1 t - t^2, so c_j = a0 s_j + a1 s_{j-1} - s_{j-2} plus
+    /// the linear terms in c_0 and c_1.
+    fn gap_enclosures(
+        &self,
+        gap: usize,
+        lower: &Float,
+        upper: &Float,
+    ) -> Result<(MpfrInterval, MpfrInterval)> {
+        use rug::ops::{AddAssignRound, MulAssignRound};
+        const K: usize = POLE_GAP_TAYLOR_ORDER;
+        let p = lower.prec().max(upper.prec());
+        let piece = MpfrInterval::new(lower.clone(), upper.clone())?;
+        let middle = piece.midpoint_point();
+        let radius = {
+            let below = Float::with_val_round(p, middle.upper() - lower, Round::Up).0;
+            let above = Float::with_val_round(p, upper - middle.lower(), Round::Up).0;
+            below.max(&above)
+        };
+        // Point Taylor coefficients of S at m, and natural bounds of
+        // S^(j)/j! over the piece for the remainder orders.
+        let mut s = vec![MpfrInterval::from_i64(0, p); K];
+        let mut remainder = vec![MpfrInterval::from_i64(0, p); 3];
+        for (index, (pole, weight)) in self.poles.iter().zip(&self.weights).enumerate() {
+            if index == gap || index == gap + 1 {
+                continue;
+            }
+            let inverse = MpfrInterval::from_i64(1, p).div(&middle.sub(pole))?;
+            let mut power = weight.mul(&inverse);
+            for (j, coefficient) in s.iter_mut().enumerate() {
+                let term = if j.is_multiple_of(2) {
+                    power.clone()
+                } else {
+                    MpfrInterval::from_i64(0, p).sub(&power)
+                };
+                *coefficient = coefficient.add(&term);
+                power = power.mul(&inverse);
+            }
+            let inverse = MpfrInterval::from_i64(1, p).div(&piece.sub(pole))?;
+            let mut power = weight.mul(&inverse);
+            for _ in 0..K - 2 {
+                power = power.mul(&inverse);
+            }
+            // power = w_k / (X - p_k)^(K-1), the order K-2 bound.
+            for (offset, bound) in remainder.iter_mut().enumerate() {
+                let order = K - 2 + offset;
+                let term = if order.is_multiple_of(2) {
+                    power.clone()
+                } else {
+                    MpfrInterval::from_i64(0, p).sub(&power)
+                };
+                *bound = bound.add(&term);
+                power = power.mul(&inverse);
+            }
+        }
+        let a = middle.sub(&self.poles[gap]);
+        let b = self.poles[gap + 1].sub(&middle);
+        let a0 = a.mul(&b);
+        let a1 = b.sub(&a);
+        let mut c = (0..K)
+            .map(|j| {
+                let mut value = a0.mul(&s[j]);
+                if j >= 1 {
+                    value = value.add(&a1.mul(&s[j - 1]));
+                }
+                if j >= 2 {
+                    value = value.sub(&s[j - 2]);
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        c[0] = c[0]
+            .add(&self.weights[gap].mul(&b))
+            .sub(&self.weights[gap + 1].mul(&a));
+        c[1] = c[1].sub(&self.weights[gap]).sub(&self.weights[gap + 1]);
+        // G^(K)(X)/K! = AB(X) S^(K)/K! + (B - A)(X) S^(K-1)/(K-1)! - S^(K-2)/(K-2)!.
+        let piece_a = piece.sub(&self.poles[gap]);
+        let piece_b = self.poles[gap + 1].sub(&piece);
+        let top = piece_a
+            .mul(&piece_b)
+            .mul(&remainder[2])
+            .add(&piece_b.sub(&piece_a).mul(&remainder[1]))
+            .sub(&remainder[0]);
+        top.validate()?;
+        let magnitude = |x: &MpfrInterval| -> Float {
+            let low = x.lower().clone().abs();
+            let high = x.upper().clone().abs();
+            low.max(&high)
+        };
+        let scaled = |mut value: Float, power: usize| -> Float {
+            for _ in 0..power {
+                value.mul_assign_round(&radius, Round::Up);
+            }
+            value
+        };
+        // G: c_0 +- (sum_{j>=1} |c_j| r^j + M r^K).
+        let mut spread = scaled(magnitude(&top), K);
+        for (j, coefficient) in c.iter().enumerate().skip(1) {
+            spread.add_assign_round(scaled(magnitude(coefficient), j), Round::Up);
+        }
+        // G': c_1 +- (sum_{j>=2} j |c_j| r^(j-1) + K M r^(K-1)).
+        let mut slope_spread = scaled(magnitude(&top), K - 1);
+        slope_spread.mul_assign_round(K as u32, Round::Up);
+        for (j, coefficient) in c.iter().enumerate().skip(2) {
+            let mut term = scaled(magnitude(coefficient), j - 1);
+            term.mul_assign_round(j as u32, Round::Up);
+            slope_spread.add_assign_round(term, Round::Up);
+        }
+        let widen = |center: &MpfrInterval, spread: &Float| -> Result<MpfrInterval> {
+            let low = Float::with_val_round(p, center.lower() - spread, Round::Down).0;
+            let high = Float::with_val_round(p, center.upper() + spread, Round::Up).0;
+            let value = MpfrInterval::new(low, high)?;
+            value.validate()?;
+            Ok(value)
+        };
+        Ok((widen(&c[0], &spread)?, widen(&c[1], &slope_spread)?))
+    }
+
+    /// Proven sign of G at a point of the closed gap, or `None` if unresolved.
+    fn gap_sign(&self, gap: usize, point: &Float) -> Result<Option<std::cmp::Ordering>> {
+        let [value, _, _] = self.gap_function(gap, &MpfrInterval::point(point.clone()))?;
+        Ok(if value.is_strictly_positive() {
+            Some(std::cmp::Ordering::Greater)
+        } else if value.upper() < &0 {
+            Some(std::cmp::Ordering::Less)
+        } else {
+            None
+        })
+    }
+
+    fn midpoint(lower: &Float, upper: &Float) -> Option<Float> {
+        let precision = lower.prec().max(upper.prec());
+        let middle = Float::with_val(precision, lower + upper) / 2u32;
+        (middle > *lower && middle < *upper).then_some(middle)
+    }
+
+    /// Split point of [lower, upper] with a proven G sign when one exists: the
+    /// midpoint, else the first of a fixed sequence of nearby fractions. A
+    /// root exactly at the midpoint has no sign at any precision; moving the
+    /// split leaves it inside a piece instead of on a piece boundary. Returns
+    /// the midpoint with no sign when none resolves, and `None` when the
+    /// piece cannot be split at this precision.
+    fn split_point(
+        &self,
+        gap: usize,
+        lower: &Float,
+        upper: &Float,
+    ) -> Result<Option<(Float, Option<std::cmp::Ordering>)>> {
+        let Some(middle) = Self::midpoint(lower, upper) else {
+            return Ok(None);
+        };
+        if let Some(sign) = self.gap_sign(gap, &middle)? {
+            return Ok(Some((middle, Some(sign))));
+        }
+        let precision = lower.prec().max(upper.prec());
+        let width = Float::with_val(precision, upper - lower);
+        for (numerator, denominator) in [(3u32, 8u32), (5, 8), (5, 16), (11, 16), (7, 16), (9, 16)]
+        {
+            let mut point = Float::with_val(precision, &width * numerator);
+            point /= denominator;
+            point += lower;
+            if point > *lower && point < *upper {
+                if let Some(sign) = self.gap_sign(gap, &point)? {
+                    return Ok(Some((point, Some(sign))));
+                }
+            }
+        }
+        Ok(Some((middle, None)))
+    }
+
+    /// One subdivision of the gap after pole `gap` at this source's precision.
+    fn subdivide_gap(&self, gap: usize) -> Result<GapSubdivision> {
+        let mut pending = vec![(
+            self.poles[gap].lower().clone(),
+            self.poles[gap + 1].lower().clone(),
+        )];
+        let mut brackets = Vec::new();
+        let mut evaluations = 0usize;
+        while let Some((lower, upper)) = pending.pop() {
+            evaluations += 1;
+            if evaluations > POLE_GAP_EVALUATION_LIMIT {
+                return Ok(GapSubdivision::Stalled(format!(
+                    "{POLE_GAP_EVALUATION_LIMIT} enclosures did not resolve the gap"
+                )));
+            }
+            let (value, derivative) = self.gap_enclosures(gap, &lower, &upper)?;
+            if !value.contains_zero() {
+                continue;
+            }
+            if !derivative.contains_zero() {
+                if let (Some(left), Some(right)) =
+                    (self.gap_sign(gap, &lower)?, self.gap_sign(gap, &upper)?)
+                {
+                    if left != right {
+                        brackets.push((lower, upper));
+                    }
+                    continue;
+                }
+            }
+            let Some((middle, _)) = self.split_point(gap, &lower, &upper)? else {
+                // No further progress at this precision: a nearly double root
+                // or a value within arithmetic error of zero near this point.
+                return Ok(GapSubdivision::Stalled(format!(
+                    "G stays within arithmetic error of zero near {}",
+                    lower.to_string_radix(10, Some(24))
+                )));
+            };
+            pending.push((middle.clone(), upper));
+            pending.push((lower, middle));
+        }
+        Ok(GapSubdivision::Resolved(brackets))
+    }
+
+    /// The source at `precision` bits (unchanged when already there).
+    fn at_precision(&self, precision: u32) -> Result<std::borrow::Cow<'_, Self>> {
+        Ok(if precision == self.precision_bits() {
+            std::borrow::Cow::Borrowed(self)
+        } else {
+            std::borrow::Cow::Owned(self.with_precision(precision)?)
+        })
+    }
+
+    /// Census of one gap through the fixed guard ladder.
+    fn census_gap(&self, gap: usize) -> Result<GapCensus> {
+        if gap + 1 >= self.poles.len() {
+            bail!("pole-gap census needs an adjacent pole pair");
+        }
+        self.point_poles()?;
+        let mut stalled = String::new();
+        let mut previous = 0;
+        for guard in POLE_GAP_GUARDS {
+            let precision = self.precision_bits().saturating_add(guard).min(1_000_000);
+            if precision == previous {
+                continue;
+            }
+            previous = precision;
+            match self.at_precision(precision)?.subdivide_gap(gap)? {
+                GapSubdivision::Resolved(brackets) => return Ok((precision, brackets)),
+                GapSubdivision::Stalled(reason) => stalled = format!("{precision} bits: {reason}"),
+            }
+        }
+        bail!("pole gap {gap} is unresolved through the guard ladder ({stalled})")
+    }
+
+    /// Memoized census of one gap; failures are memoized with their reason.
+    fn gap_census(&self, gap: usize) -> Result<&GapCensus> {
+        let cell = self
+            .gap_census
+            .get(gap)
+            .context("pole gap is outside the finite source")?;
+        cell.get_or_init(|| self.census_gap(gap).map_err(|error| format!("{error:#}")))
+            .as_ref()
+            .map_err(|reason| anyhow::anyhow!("{reason}"))
+    }
+
+    /// Census gaps in parallel; each result is memoized independently, so the
+    /// outcome does not depend on scheduling.
+    fn prefetch_gap_census(&self, gaps: std::ops::Range<usize>) -> Result<()> {
+        use rayon::prelude::*;
+        xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
+        gaps.into_par_iter().for_each(|gap| {
+            let _ = self.gap_census(gap);
+        });
+        Ok(())
+    }
+
+    /// Halve a census bracket by its proven G signs until it lies strictly on
+    /// one side of `bound`; a root inseparable from `bound` is an error.
+    fn separate_bracket(
+        &self,
+        gap: usize,
+        mut bracket: (Float, Float),
+        bound: &Rational,
+    ) -> Result<(Float, Float)> {
+        let left = self
+            .gap_sign(gap, &bracket.0)?
+            .context("census bracket lost its endpoint sign")?;
+        loop {
+            let lower = bracket.0.to_rational().context("finite bracket endpoint")?;
+            let upper = bracket.1.to_rational().context("finite bracket endpoint")?;
+            if upper < *bound || lower > *bound {
+                return Ok(bracket);
+            }
+            let (middle, sign) = self
+                .split_point(gap, &bracket.0, &bracket.1)?
+                .context("root is not separable from a window bound at the working precision")?;
+            match sign {
+                Some(sign) if sign == left => bracket.0 = middle,
+                Some(_) => bracket.1 = middle,
+                None => {
+                    bail!("root is not separable from a window bound at the working precision")
+                }
+            }
+        }
+    }
+
+    /// Census brackets of every root strictly inside (lower, upper), ordered,
+    /// with their gap and census precision.
+    fn census_window(&self, lower: &Rational, upper: &Rational) -> Result<Vec<WindowBracket>> {
+        let poles = self.point_poles()?;
+        let gaps = (0..poles.len() - 1)
+            .filter(|&gap| poles[gap] < *upper && poles[gap + 1] > *lower)
+            .collect::<Vec<_>>();
+        if let (Some(first), Some(last)) = (gaps.first(), gaps.last()) {
+            self.prefetch_gap_census(*first..*last + 1)?;
+        }
+        let mut roots = Vec::new();
+        for gap in gaps {
+            let (precision, brackets) = self.gap_census(gap)?;
+            let source = self.at_precision(*precision)?;
+            for bracket in brackets {
+                let mut bracket = bracket.clone();
+                if poles[gap] < *lower {
+                    bracket = source.separate_bracket(gap, bracket, lower)?;
+                }
+                if poles[gap + 1] > *upper {
+                    bracket = source.separate_bracket(gap, bracket, upper)?;
+                }
+                let (a, b) = (
+                    bracket.0.to_rational().context("finite bracket endpoint")?,
+                    bracket.1.to_rational().context("finite bracket endpoint")?,
+                );
+                if a >= *lower && b <= *upper {
+                    roots.push((gap, *precision, bracket));
+                }
+            }
+        }
+        Ok(roots)
+    }
+
+    /// Narrow a census bracket by proven G signs to width at most `width`.
+    fn narrow_bracket(
+        &self,
+        gap: usize,
+        bracket: &(Float, Float),
+        width: &Float,
+    ) -> Result<MpfrInterval> {
+        let (mut lower, mut upper) = bracket.clone();
+        let left = self
+            .gap_sign(gap, &lower)?
+            .context("census bracket lost its endpoint sign")?;
+        while Float::with_val_round(self.precision_bits(), &upper - &lower, Round::Up).0 > *width {
+            let Some((middle, sign)) = self.split_point(gap, &lower, &upper)? else {
+                break;
+            };
+            match sign {
+                Some(sign) if sign == left => lower = middle,
+                Some(_) => upper = middle,
+                None => return Ok(MpfrInterval::point(middle)),
+            }
+        }
+        Ok(MpfrInterval::new(lower, upper)?)
+    }
+
+    /// Certify every root strictly inside (lower, upper) from the census:
+    /// complete by the census count, each root by interval Newton.
+    fn certify_pole_gap_window(
+        &self,
+        lower_bound: &Rational,
+        upper_bound: &Rational,
+        isolation_bits: u32,
+        options: &IntervalNewtonOptions,
+    ) -> Result<SecularWindowCertificate> {
+        boundary::isolation(isolation_bits, self.precision_bits())?;
+        options
+            .validate(self.precision_bits())
+            .map_err(anyhow::Error::from)?;
+        if lower_bound >= upper_bound {
+            bail!("pole-gap window requires lower < upper");
+        }
+        let poles = self.point_poles()?;
+        let target_width = Float::with_val(self.precision_bits(), 2).pow(-(isolation_bits as i32));
+        let census = self.census_window(lower_bound, upper_bound)?;
+        let candidates = census
+            .iter()
+            .map(|(gap, precision, bracket)| {
+                self.at_precision(*precision)?
+                    .narrow_bracket(*gap, bracket, &target_width)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let count = SecularCountCertificate {
+            pole_count: poles
+                .iter()
+                .filter(|pole| *pole >= lower_bound && *pole <= upper_bound)
+                .count(),
+            open_intervals_counted: census
+                .iter()
+                .map(|(gap, _, _)| gap)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            certified_root_count: census.len(),
+            residue_sign: "not_required".to_owned(),
+            method: POLE_GAP_COUNT_METHOD.to_owned(),
+            square_free: true,
+        };
+        let roots =
+            self.newton_window_roots(candidates, lower_bound, upper_bound, &target_width, options)?;
+        let reconciliation = reconcile_complete_window(&roots, &count)?;
+        if !reconciliation.complete {
+            bail!(
+                "pole-gap census window failed interval-Newton reconciliation: {}",
+                reconciliation.reason
+            );
+        }
+        Ok(SecularWindowCertificate {
+            roots,
+            count,
+            reconciliation,
+        })
+    }
+}
+
+/// Cumulative pole-gap counts from the zero pole: `counts[k]` roots strictly
+/// between poles `zero` and `zero + k`, extended until `needed` roots or the
+/// last pole. A census failure stops the scan and is returned with the counts.
+/// Each parallel batch covers at most twice the roots still needed, so work
+/// beyond the requested ordinals stays bounded; results never depend on it.
+#[cfg(feature = "arb")]
+fn pole_gap_prefix(
+    source: &CertifiedSecularFunction,
+    zero: usize,
+    maximum: usize,
+    needed: usize,
+) -> (Vec<usize>, Option<anyhow::Error>) {
+    let mut counts = vec![0];
+    let threads = rayon::current_num_threads().max(1);
+    let mut gap = zero;
+    while gap < maximum && *counts.last().expect("nonempty") < needed {
+        let remaining = needed - *counts.last().expect("nonempty");
+        let chunk = remaining.saturating_mul(2).clamp(1, threads);
+        let end = (gap + chunk).min(maximum);
+        if let Err(error) = source.prefetch_gap_census(gap..end) {
+            return (counts, Some(error));
+        }
+        while gap < end && *counts.last().expect("nonempty") < needed {
+            match source.gap_census(gap) {
+                Ok((_, brackets)) => counts.push(counts.last().expect("nonempty") + brackets.len()),
+                Err(error) => return (counts, Some(error)),
+            }
+            gap += 1;
+        }
+    }
+    (counts, None)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -905,6 +1701,11 @@ pub enum FiniteSourceCertificationScope {
 pub struct ProductionIndependentCcmRootCertificate {
     pub schema_version: u32,
     pub integer_cutoff_c: u64,
+    /// Exact declared decimal lambda-squared when it is not an integer; the
+    /// integer field then holds its floor, the prime cutoff. Absent for
+    /// integer cutoffs, whose certificates are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lambda_squared_decimal: Option<String>,
     pub modes: usize,
     pub precision_bits: u32,
     pub isolation_bits: u32,
@@ -931,6 +1732,13 @@ pub struct ProductionIndependentCcmRootCertificate {
 }
 
 impl ProductionIndependentCcmRootCertificate {
+    /// Exact cutoff text that determines the certified pole geometry.
+    pub fn cutoff_text(&self) -> String {
+        self.lambda_squared_decimal
+            .clone()
+            .unwrap_or_else(|| self.integer_cutoff_c.to_string())
+    }
+
     /// Return the selected range without panicking on malformed public fields.
     /// This checks slice bounds; use the certificate validators for source truth.
     pub fn try_selected_roots(&self) -> Result<&[IntervalRootCertificate]> {
@@ -990,8 +1798,12 @@ pub fn validate_production_independent_ccm_root_certificate_structure(
         certificate.source_weights.len(),
         certificate.precision_bits,
     )?;
+    let cutoff_valid = match &certificate.lambda_squared_decimal {
+        Some(decimal) => cutoff_floor(decimal).ok() == Some(certificate.integer_cutoff_c),
+        None => certificate.integer_cutoff_c > 1,
+    };
     if certificate.schema_version != 2
-        || certificate.integer_cutoff_c <= 1
+        || !cutoff_valid
         || certificate.modes == 0
         || certificate.precision_bits <= 64
         || certificate.isolation_bits < 16
@@ -1002,10 +1814,8 @@ pub fn validate_production_independent_ccm_root_certificate_structure(
         || certificate.source_weights_digest != weights_digest(&certificate.source_weights)?
         || certificate.source_certification_scope
             != FiniteSourceCertificationScope::ExactStoredPointSource
-        || certificate.discovery_method
-            != "exact_cumulative_finite_source_counts_then_flint_arb_isolation_and_interval_newton"
-        || certificate.count_method
-            != "flint_arb_complete_complex_root_isolation_with_real_window_classification"
+        || CountRoute::from_methods(&certificate.discovery_method, &certificate.count_method)
+            .is_err()
         || certificate.selected_root_count == 0
         || !certificate.window.reconciliation.complete
         || certificate.window.count.certified_root_count != certificate.window.roots.len()
@@ -1102,8 +1912,8 @@ pub fn validate_production_independent_ccm_root_certificate_structure(
         .iter()
         .map(|x| parse_endpoint(x, certificate.precision_bits))
         .collect::<Result<Vec<_>>>()?;
-    let source = CertifiedSecularFunction::from_integer_ccm_state(
-        certificate.integer_cutoff_c,
+    let source = CertifiedSecularFunction::from_ccm_cutoff_state(
+        &certificate.cutoff_text(),
         certificate.modes,
         &weights,
         certificate.precision_bits,
@@ -1424,6 +2234,13 @@ pub fn certify_production_first_positive_ccm_roots(
     {
         bail!("production first-positive CCM request is invalid");
     }
+    let _stage =
+        xc_core::performance_top_level_stage_with("ccm.roots.production_certificate", || {
+            let mut metadata =
+                xc_core::PerformanceStageMetadata::matrix(weights.len(), precision_bits, 1);
+            metadata.operation = Some("ccm.roots.production_certificate".to_owned());
+            metadata
+        });
     let source = CertifiedSecularFunction::from_integer_ccm_state(
         integer_cutoff_c,
         modes,
@@ -1432,10 +2249,16 @@ pub fn certify_production_first_positive_ccm_roots(
     )?;
     let first_pole = modes;
     let maximum_pole = 2 * modes;
+    xc_core::progress_message!(
+        "[HP] root certification: locating the first {requested_roots} positive roots among {modes} positive poles"
+    );
+    let search_started = std::time::Instant::now();
+    let mut exact_counts = 0usize;
     let mut low = first_pole;
     let mut high = (first_pole + requested_roots).min(maximum_pole);
     let step = (requested_roots / 5).max(4);
     loop {
+        exact_counts += 1;
         let count = source.exact_flint_numerator_count_between_poles(first_pole, high)?;
         if count.certified_root_count >= requested_roots {
             break;
@@ -1448,6 +2271,7 @@ pub fn certify_production_first_positive_ccm_roots(
     }
     while high - low > 1 {
         let middle = low + (high - low) / 2;
+        exact_counts += 1;
         let count = source.exact_flint_numerator_count_between_poles(first_pole, middle)?;
         if count.certified_root_count >= requested_roots {
             high = middle;
@@ -1456,6 +2280,11 @@ pub fn certify_production_first_positive_ccm_roots(
         }
     }
     let last_pole = high;
+    xc_core::progress_message!(
+        "[HP] phase timing: root count search={:.3}s ({exact_counts} exact counts; boundary pole {last_pole})",
+        search_started.elapsed().as_secs_f64()
+    );
+    let window_started = std::time::Instant::now();
     let preceding_window_count = if last_pole == first_pole + 1 {
         SecularCountCertificate {
             pole_count: 1,
@@ -1493,6 +2322,11 @@ pub fn certify_production_first_positive_ccm_roots(
     {
         bail!("production CCM isolated window disagrees with its exact prefix count");
     }
+    xc_core::progress_message!(
+        "[HP] phase timing: root window certification={:.3}s ({} interval-Newton proofs)",
+        window_started.elapsed().as_secs_f64(),
+        window.roots.len()
+    );
     let source_weights = weights
         .iter()
         .map(|weight| serialize_float(&Float::with_val(precision_bits, weight), precision_bits))
@@ -1651,7 +2485,241 @@ pub fn certify_production_independent_ccm_roots(
         weights,
         precision_bits,
     )?;
-    let (poles, _) = source.exact_numerator_data()?;
+    certify_independent_with_source(
+        &source,
+        weights,
+        &integer_cutoff_c.to_string(),
+        modes,
+        target,
+        precision_bits,
+        isolation_bits,
+        interval_newton,
+        CountRoute::for_source(&source),
+    )
+}
+
+/// Certify an independently indexed root target for an exact decimal cutoff,
+/// which may be fractional. The pole geometry is the one CCM refinement uses
+/// for that declared decimal; integer text gives the integer certificate.
+#[cfg(feature = "arb")]
+#[allow(clippy::too_many_arguments)]
+pub fn certify_production_independent_ccm_roots_at_cutoff(
+    weights: &[Float],
+    cutoff: &str,
+    modes: usize,
+    target: &IndependentCcmRootTarget,
+    precision_bits: u32,
+    isolation_bits: u32,
+    interval_newton: &IntervalNewtonOptions,
+) -> Result<ProductionIndependentCcmRootCertificate> {
+    let source = independent_source(weights, cutoff, modes, precision_bits, isolation_bits)?;
+    certify_independent_with_source(
+        &source,
+        weights,
+        cutoff,
+        modes,
+        target,
+        precision_bits,
+        isolation_bits,
+        interval_newton,
+        CountRoute::for_source(&source),
+    )
+}
+
+/// Integer floor of an exact decimal cutoff greater than one: the prime cutoff.
+fn cutoff_floor(cutoff: &str) -> Result<u64> {
+    let value = boundary::decimal(cutoff)?;
+    if value <= 1 {
+        bail!("CCM cutoff must be an exact decimal greater than one");
+    }
+    rug::Integer::from(value.floor_ref())
+        .to_u64()
+        .context("CCM cutoff floor exceeds the supported range")
+}
+
+/// Root-by-root outcome of certifying an ordinal range: certified pieces plus
+/// the reason each remaining ordinal could not be certified. Numerical
+/// limitations never discard the pieces that did certify.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialIndependentCcmRootCertification {
+    pub first_index: usize,
+    pub last_index: usize,
+    /// Exact count of positive roots inside the positive pole range, when
+    /// that count resolved. Ordinals beyond it are outside certification reach.
+    pub available_positive_roots: Option<usize>,
+    /// Whole-source limitation that prevented any certification, if any.
+    pub source_limitation: Option<String>,
+    /// Disjoint independently replayable certificates, ordered by ordinal.
+    pub certificates: Vec<ProductionIndependentCcmRootCertificate>,
+    /// Ordinal -> reason for every requested ordinal without a certificate.
+    pub uncertified: std::collections::BTreeMap<usize, String>,
+}
+
+/// Certify every certifiable ordinal in `first..=last`. The whole range is
+/// tried first, so a fully certifiable request yields the same single
+/// certificate as `certify_production_independent_ccm_roots_at_cutoff`.
+/// On failure the range is bisected; an ordinal that fails alone, or lies
+/// beyond the exact positive root count, is recorded with its reason.
+#[cfg(feature = "arb")]
+#[allow(clippy::too_many_arguments)]
+pub fn certify_production_independent_ccm_roots_partially(
+    weights: &[Float],
+    cutoff: &str,
+    modes: usize,
+    first: usize,
+    last: usize,
+    whole_range_target: &IndependentCcmRootTarget,
+    precision_bits: u32,
+    isolation_bits: u32,
+    interval_newton: &IntervalNewtonOptions,
+) -> Result<PartialIndependentCcmRootCertification> {
+    if first == 0 || first > last {
+        bail!("partial CCM certification requires 1 <= first <= last");
+    }
+    let mut result = PartialIndependentCcmRootCertification {
+        first_index: first,
+        last_index: last,
+        available_positive_roots: None,
+        source_limitation: None,
+        certificates: Vec::new(),
+        uncertified: std::collections::BTreeMap::new(),
+    };
+    let limited = |result: &mut PartialIndependentCcmRootCertification, reason: String| {
+        for ordinal in first..=last {
+            result.uncertified.insert(ordinal, reason.clone());
+        }
+        result.source_limitation = Some(reason);
+    };
+    let source = match independent_source(weights, cutoff, modes, precision_bits, isolation_bits) {
+        Ok(source) => source,
+        Err(error) => {
+            limited(&mut result, format!("finite secular source: {error:#}"));
+            return Ok(result);
+        }
+    };
+    let route = CountRoute::for_source(&source);
+    let (available, beyond) = match route {
+        CountRoute::ExactFlint => {
+            match cumulative_positive_count(&source, modes, 2 * modes) {
+                Ok(count) => {
+                    result.available_positive_roots = Some(count);
+                    (
+                    count,
+                    format!("ordinal beyond the {count} positive roots inside the positive pole range"),
+                )
+                }
+                Err(error) => {
+                    limited(&mut result, format!("exact positive root count: {error:#}"));
+                    return Ok(result);
+                }
+            }
+        }
+        // The census counts only as far as the requested ordinals; the total
+        // is recorded only when every positive gap was counted.
+        CountRoute::PoleGap => {
+            let (counts, stopped) = pole_gap_prefix(&source, modes, 2 * modes, last);
+            let reached = *counts.last().expect("nonempty census counts");
+            let reason = match stopped {
+                Some(error) => {
+                    format!("pole-gap census stopped after {reached} positive roots: {error:#}")
+                }
+                None => {
+                    if reached < last {
+                        result.available_positive_roots = Some(reached);
+                    }
+                    format!("ordinal beyond the {reached} positive roots inside the positive pole range")
+                }
+            };
+            (reached, reason)
+        }
+    };
+    for ordinal in first.max(available + 1)..=last {
+        result.uncertified.insert(ordinal, beyond.clone());
+    }
+    if first > available {
+        return Ok(result);
+    }
+    let reachable_last = last.min(available);
+    let whole = (reachable_last == last).then_some(whole_range_target);
+    let attempt = |low: usize, high: usize, target: Option<&IndependentCcmRootTarget>| {
+        let range = IndependentCcmRootTarget::IndexRange {
+            first: low,
+            last: high,
+        };
+        certify_independent_with_source(
+            &source,
+            weights,
+            cutoff,
+            modes,
+            target.unwrap_or(&range),
+            precision_bits,
+            isolation_bits,
+            interval_newton,
+            route,
+        )
+    };
+    // Full bisection: a failure is isolated down to single ordinals, so every
+    // certifiable ordinal is certified even when a neighbor is not. A
+    // systematic failure therefore costs about 2n attempts; that is the price
+    // of never discarding a certifiable root.
+    let mut pending = vec![(first, reachable_last, whole)];
+    while let Some((low, high, target)) = pending.pop() {
+        match attempt(low, high, target) {
+            Ok(certificate) => result.certificates.push(certificate),
+            Err(error) if low == high => {
+                result.uncertified.insert(low, format!("{error:#}"));
+            }
+            Err(_) => {
+                let middle = low + (high - low) / 2;
+                pending.push((middle + 1, high, None));
+                pending.push((low, middle, None));
+            }
+        }
+    }
+    result
+        .certificates
+        .sort_by_key(|certificate| certificate.first_selected_positive_index);
+    Ok(result)
+}
+
+#[cfg(feature = "arb")]
+fn independent_source(
+    weights: &[Float],
+    cutoff: &str,
+    modes: usize,
+    precision_bits: u32,
+    isolation_bits: u32,
+) -> Result<CertifiedSecularFunction> {
+    boundary::shape(modes, weights.len(), precision_bits)?;
+    if modes == 0
+        || weights.len() != 2 * modes + 1
+        || precision_bits <= 64
+        || isolation_bits < 16
+        || isolation_bits >= precision_bits
+    {
+        bail!("production independent CCM request is invalid");
+    }
+    CertifiedSecularFunction::from_ccm_cutoff_state(cutoff, modes, weights, precision_bits)
+}
+
+#[cfg(feature = "arb")]
+#[allow(clippy::too_many_arguments)]
+fn certify_independent_with_source(
+    source: &CertifiedSecularFunction,
+    weights: &[Float],
+    cutoff: &str,
+    modes: usize,
+    target: &IndependentCcmRootTarget,
+    precision_bits: u32,
+    isolation_bits: u32,
+    interval_newton: &IntervalNewtonOptions,
+    route: CountRoute,
+) -> Result<ProductionIndependentCcmRootCertificate> {
+    let poles = match route {
+        CountRoute::ExactFlint => source.exact_numerator_data()?.0.clone(),
+        CountRoute::PoleGap => source.point_poles()?,
+    };
     let zero_pole = modes;
     let maximum_pole = 2 * modes;
 
@@ -1665,14 +2733,16 @@ pub fn certify_production_independent_ccm_roots(
                     first: 1,
                     last: *count,
                 };
-                let certificate = certify_production_independent_ccm_roots(
+                let certificate = certify_independent_with_source(
+                    source,
                     weights,
-                    integer_cutoff_c,
+                    cutoff,
                     modes,
                     &requested,
                     precision_bits,
                     isolation_bits,
                     interval_newton,
+                    route,
                 )?;
                 return Ok(ProductionIndependentCcmRootCertificate {
                     target: target.clone(),
@@ -1683,39 +2753,75 @@ pub fn certify_production_independent_ccm_roots(
                 if *first == 0 || first > last {
                     bail!("independent CCM positive indices require 1 <= first <= last");
                 }
-                let available = cumulative_positive_count(&source, zero_pole, maximum_pole)?;
-                if *last > available {
-                    bail!(
-                        "finite CCM source has only {available} positive roots inside its positive pole range; requested index {last}"
-                    );
-                }
+                let (first_boundary, last_boundary, before) = match route {
+                    CountRoute::ExactFlint => {
+                        let available = cumulative_positive_count(source, zero_pole, maximum_pole)?;
+                        if *last > available {
+                            bail!(
+                                "finite CCM source has only {available} positive roots inside its positive pole range; requested index {last}"
+                            );
+                        }
 
-                // Largest pole boundary with a cumulative count below `first`.
-                let mut low = zero_pole;
-                let mut high = maximum_pole;
-                while high - low > 1 {
-                    let middle = low + (high - low) / 2;
-                    if cumulative_positive_count(&source, zero_pole, middle)? < *first {
-                        low = middle;
-                    } else {
-                        high = middle;
-                    }
-                }
-                let first_boundary = low;
-                let before = cumulative_positive_count(&source, zero_pole, first_boundary)?;
+                        // Largest pole boundary with a cumulative count below `first`.
+                        let mut low = zero_pole;
+                        let mut high = maximum_pole;
+                        while high - low > 1 {
+                            let middle = low + (high - low) / 2;
+                            if cumulative_positive_count(source, zero_pole, middle)? < *first {
+                                low = middle;
+                            } else {
+                                high = middle;
+                            }
+                        }
+                        let first_boundary = low;
+                        let before = cumulative_positive_count(source, zero_pole, first_boundary)?;
 
-                // Smallest pole boundary whose cumulative count reaches `last`.
-                let mut low = first_boundary;
-                let mut high = maximum_pole;
-                while high - low > 1 {
-                    let middle = low + (high - low) / 2;
-                    if cumulative_positive_count(&source, zero_pole, middle)? >= *last {
-                        high = middle;
-                    } else {
-                        low = middle;
+                        // Smallest pole boundary whose cumulative count reaches `last`.
+                        let mut low = first_boundary;
+                        let mut high = maximum_pole;
+                        while high - low > 1 {
+                            let middle = low + (high - low) / 2;
+                            if cumulative_positive_count(source, zero_pole, middle)? >= *last {
+                                high = middle;
+                            } else {
+                                low = middle;
+                            }
+                        }
+                        let last_boundary = high;
+                        (first_boundary, last_boundary, before)
                     }
-                }
-                let last_boundary = high;
+                    CountRoute::PoleGap => {
+                        // counts[k]: roots strictly between poles zero and zero + k.
+                        let (counts, stopped) =
+                            pole_gap_prefix(source, zero_pole, maximum_pole, *last);
+                        let reached = *counts.last().expect("nonempty census counts");
+                        if reached < *last {
+                            match stopped {
+                                Some(error) => {
+                                    return Err(error.context(format!(
+                                        "pole-gap census stopped after {reached} positive roots; requested index {last}"
+                                    )))
+                                }
+                                None => bail!(
+                                    "finite CCM source has only {reached} positive roots inside its positive pole range; requested index {last}"
+                                ),
+                            }
+                        }
+                        let first_offset = counts
+                            .iter()
+                            .rposition(|&count| count < *first)
+                            .expect("counts start at zero");
+                        let last_offset = counts
+                            .iter()
+                            .position(|&count| count >= *last)
+                            .expect("requested count reached");
+                        (
+                            zero_pole + first_offset,
+                            zero_pole + last_offset,
+                            counts[first_offset],
+                        )
+                    }
+                };
                 (
                     poles[first_boundary].clone(),
                     poles[last_boundary].clone(),
@@ -1733,12 +2839,18 @@ pub fn certify_production_independent_ccm_roots(
                         "positive CCM height window requires 0 < lower < upper <= largest positive pole"
                     );
                 }
-                let before = source
-                    .exact_flint_numerator_count_in_window(&poles[zero_pole], &lower)?
-                    .certified_root_count;
-                let selected = source
-                    .exact_flint_numerator_count_in_window(&lower, &upper)?
-                    .certified_root_count;
+                let count_in = |a: &Rational, b: &Rational| -> Result<usize> {
+                    Ok(match route {
+                        CountRoute::ExactFlint => {
+                            source
+                                .exact_flint_numerator_count_in_window(a, b)?
+                                .certified_root_count
+                        }
+                        CountRoute::PoleGap => source.census_window(a, b)?.len(),
+                    })
+                };
+                let before = count_in(&poles[zero_pole], &lower)?;
+                let selected = count_in(&lower, &upper)?;
                 if selected == 0 {
                     bail!("independent CCM height window contains no finite-source roots");
                 }
@@ -1746,12 +2858,21 @@ pub fn certify_production_independent_ccm_roots(
             }
         };
 
-    let window = source.certify_flint_numerator_rational_window(
-        &lower_bound,
-        &upper_bound,
-        isolation_bits,
-        interval_newton,
-    )?;
+    let window = match route {
+        CountRoute::ExactFlint => source.certify_flint_numerator_rational_window(
+            &lower_bound,
+            &upper_bound,
+            isolation_bits,
+            interval_newton,
+        )?,
+        CountRoute::PoleGap => source.certify_pole_gap_window(
+            &lower_bound,
+            &upper_bound,
+            isolation_bits,
+            interval_newton,
+        )?,
+    };
+    let (discovery_method, count_method) = route.methods();
     if selected_offset
         .checked_add(selected_count)
         .is_none_or(|end| end > window.roots.len())
@@ -1763,9 +2884,13 @@ pub fn certify_production_independent_ccm_roots(
         .iter()
         .map(|weight| serialize_float(&Float::with_val(precision_bits, weight), precision_bits))
         .collect::<Vec<_>>();
+    let integer_cutoff_c = cutoff_floor(cutoff)?;
+    let lambda_squared_decimal =
+        (cutoff != integer_cutoff_c.to_string()).then(|| cutoff.to_owned());
     Ok(ProductionIndependentCcmRootCertificate {
         schema_version: 2,
         integer_cutoff_c,
+        lambda_squared_decimal,
         modes,
         precision_bits,
         isolation_bits,
@@ -1783,12 +2908,8 @@ pub fn certify_production_independent_ccm_roots(
         source_weights,
         window,
         reference_seeds_used: false,
-        discovery_method:
-            "exact_cumulative_finite_source_counts_then_flint_arb_isolation_and_interval_newton"
-                .to_owned(),
-        count_method:
-            "flint_arb_complete_complex_root_isolation_with_real_window_classification"
-                .to_owned(),
+        discovery_method: discovery_method.to_owned(),
+        count_method: count_method.to_owned(),
         finite_model_statement: "certified independently indexed roots of one finite production CCM secular source; external zeta-zero data did not seed, bound, count, or alter discovery"
             .to_owned(),
     })
@@ -1811,27 +2932,33 @@ pub fn verify_production_independent_ccm_root_certificate(
         || certificate.source_weights_digest != weights_digest(&certificate.source_weights)?
         || certificate.source_certification_scope
             != FiniteSourceCertificationScope::ExactStoredPointSource
-        || certificate.discovery_method
-            != "exact_cumulative_finite_source_counts_then_flint_arb_isolation_and_interval_newton"
-        || certificate.count_method
-            != "flint_arb_complete_complex_root_isolation_with_real_window_classification"
         || certificate.selected_root_count == 0
     {
         bail!("production independent CCM certificate identity is invalid");
     }
+    let route = CountRoute::from_methods(&certificate.discovery_method, &certificate.count_method)?;
     let weights = certificate
         .source_weights
         .iter()
         .map(|weight| parse_endpoint(weight, certificate.precision_bits))
         .collect::<Result<Vec<_>>>()?;
-    let mut replay = certify_production_independent_ccm_roots(
+    let source = independent_source(
         &weights,
-        certificate.integer_cutoff_c,
+        &certificate.cutoff_text(),
+        certificate.modes,
+        certificate.precision_bits,
+        certificate.isolation_bits,
+    )?;
+    let mut replay = certify_independent_with_source(
+        &source,
+        &weights,
+        &certificate.cutoff_text(),
         certificate.modes,
         &certificate.target,
         certificate.precision_bits,
         certificate.isolation_bits,
         &certificate.interval_newton,
+        route,
     )?;
     replay.window.roots.clone_from(&certificate.window.roots);
     // Schema 2 always retained a following span; numerical replay is unchanged.
@@ -2604,6 +3731,202 @@ mod tests {
 
     #[cfg(feature = "arb")]
     #[test]
+    fn pole_gap_census_route_matches_the_exact_route_and_replays() {
+        let precision = 192;
+        let modes = 10;
+        let params = crate::ccm::CcmParams::from_lambda_sq_integer(13, modes);
+        let mut config = crate::ccm::hp::HighPrecConfig::for_decimal_digits(40);
+        config.precision_bits = precision;
+        config.quad_points = crate::ccm::hp::MIN_QUAD_POINTS;
+        config.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let result = crate::ccm::hp::build_source(&params, &config).unwrap();
+        let options = IntervalNewtonOptions {
+            width_tolerance: DecimalLiteral::new("1e-30").unwrap(),
+            maximum_iterations: 30,
+        };
+        let source = independent_source(&result.xi, "13", modes, precision, 64).unwrap();
+        // Every positive gap: the census count equals the exact numerator count.
+        for gap in modes..2 * modes {
+            assert_eq!(
+                source.gap_census(gap).unwrap().1.len(),
+                source
+                    .exact_flint_numerator_count_between_poles(gap, gap + 1)
+                    .unwrap()
+                    .certified_root_count,
+                "gap {gap}"
+            );
+        }
+        let certify = |target: &IndependentCcmRootTarget, route| {
+            certify_independent_with_source(
+                &source, &result.xi, "13", modes, target, precision, 64, &options, route,
+            )
+        };
+        for target in [
+            // This source has two positive roots, in gaps 15 and 18.
+            IndependentCcmRootTarget::Prefix { count: 2 },
+            IndependentCcmRootTarget::IndexRange { first: 2, last: 2 },
+            IndependentCcmRootTarget::PositiveHeightWindow {
+                lower: "5".into(),
+                upper: "22".into(),
+            },
+        ] {
+            let exact = certify(&target, CountRoute::ExactFlint).unwrap();
+            let census = certify(&target, CountRoute::PoleGap).unwrap();
+            let ordinals = |c: &ProductionIndependentCcmRootCertificate| {
+                (
+                    c.lower_bound.clone(),
+                    c.upper_bound.clone(),
+                    c.positive_roots_before_window,
+                    c.selected_root_offset,
+                    c.selected_root_count,
+                    c.first_selected_positive_index,
+                    c.last_selected_positive_index,
+                    c.window.count.certified_root_count,
+                )
+            };
+            assert_eq!(ordinals(&census), ordinals(&exact), "{target:?}");
+            for (a, b) in census.window.roots.iter().zip(&exact.window.roots) {
+                let (a_lower, a_upper) = exact_root_bounds(a).unwrap();
+                let (b_lower, b_upper) = exact_root_bounds(b).unwrap();
+                assert!(a_lower <= b_upper && b_lower <= a_upper, "{target:?}");
+            }
+            assert_eq!(census.count_method, POLE_GAP_CERTIFICATE_COUNT_METHOD);
+            assert_eq!(census.window.count.method, POLE_GAP_COUNT_METHOD);
+            validate_production_independent_ccm_root_certificate_structure(&census).unwrap();
+            verify_production_independent_ccm_root_certificate(&census).unwrap();
+            let mut tampered = census.clone();
+            tampered.window.count.certified_root_count += 1;
+            assert!(verify_production_independent_ccm_root_certificate(&tampered).is_err());
+            let mut relabeled = census.clone();
+            relabeled.count_method = "unknown".into();
+            assert!(
+                validate_production_independent_ccm_root_certificate_structure(&relabeled).is_err()
+            );
+        }
+        // A synthetic mixed-sign source with two roots in one gap and none in
+        // another; the census is identical at any thread count.
+        let p = 128;
+        let point = |x: i64| Float::with_val(p, x);
+        let synthetic = || {
+            CertifiedSecularFunction::from_point_data(
+                &[point(-2), point(-1), point(0), point(1), point(2)],
+                &[point(1), point(-3), point(1), point(1), point(-2)],
+                p,
+            )
+            .unwrap()
+        };
+        let exact = synthetic();
+        let census = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let source = synthetic();
+                    source.prefetch_gap_census(0..4).unwrap();
+                    (0..4)
+                        .map(|gap| source.gap_census(gap).unwrap().clone())
+                        .collect::<Vec<_>>()
+                })
+        };
+        let serial = census(1);
+        for (gap, brackets) in serial.iter().enumerate() {
+            assert_eq!(
+                brackets.1.len(),
+                exact
+                    .exact_flint_numerator_count_between_poles(gap, gap + 1)
+                    .unwrap()
+                    .certified_root_count,
+                "synthetic gap {gap}"
+            );
+        }
+        assert!(serial.iter().any(|b| b.1.len() == 2) || serial.iter().any(|b| b.1.is_empty()));
+        for _ in 0..10 {
+            assert_eq!(census(4), serial);
+        }
+    }
+
+    /// A simple root exactly at the first split point (1/2) must not stall the
+    /// census: R = 21/2/(z+1) - 3/z + 1/2/(z-1) has numerator 8z^2 - 10z + 3,
+    /// so the gap (0, 1) holds the simple roots 1/2 and 3/4.
+    #[cfg(feature = "arb")]
+    #[test]
+    fn pole_gap_census_counts_a_root_on_a_split_point() {
+        let p = 128;
+        let source = CertifiedSecularFunction::from_point_data(
+            &[
+                Float::with_val(p, -1),
+                Float::with_val(p, 0),
+                Float::with_val(p, 1),
+            ],
+            &[
+                Float::with_val(p, 10.5),
+                Float::with_val(p, -3),
+                Float::with_val(p, 0.5),
+            ],
+            p,
+        )
+        .unwrap();
+        let (precision, brackets) = source.gap_census(1).unwrap();
+        assert_eq!(*precision, p);
+        assert_eq!(brackets.len(), 2);
+        assert_eq!(
+            brackets.len(),
+            source
+                .exact_flint_numerator_count_between_poles(1, 2)
+                .unwrap()
+                .certified_root_count
+        );
+        let half = Rational::from((1, 2));
+        let three_quarters = Rational::from((3, 4));
+        for (bracket, root) in brackets.iter().zip([&half, &three_quarters]) {
+            assert!(bracket.0.to_rational().unwrap() <= *root);
+            assert!(bracket.1.to_rational().unwrap() >= *root);
+        }
+    }
+
+    /// Larger-scale agreement of the two count routes; run with --ignored.
+    #[cfg(feature = "arb")]
+    #[test]
+    #[ignore = "larger source; run explicitly"]
+    fn pole_gap_census_matches_the_exact_route_at_sixty_modes() {
+        let precision = 320;
+        let modes = 60;
+        let params = crate::ccm::CcmParams::from_lambda_sq_integer(13, modes);
+        let mut config = crate::ccm::hp::HighPrecConfig::for_decimal_digits(80);
+        config.precision_bits = precision;
+        config.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let result = crate::ccm::hp::build_source(&params, &config).unwrap();
+        let options = IntervalNewtonOptions {
+            width_tolerance: DecimalLiteral::new("1e-60").unwrap(),
+            maximum_iterations: 60,
+        };
+        let source = independent_source(&result.xi, "13", modes, precision, 96).unwrap();
+        let target = IndependentCcmRootTarget::Prefix { count: 10 };
+        let certify = |route| {
+            certify_independent_with_source(
+                &source, &result.xi, "13", modes, &target, precision, 96, &options, route,
+            )
+            .unwrap()
+        };
+        let exact = certify(CountRoute::ExactFlint);
+        let census = certify(CountRoute::PoleGap);
+        assert_eq!(
+            census.positive_roots_before_window,
+            exact.positive_roots_before_window
+        );
+        assert_eq!(census.upper_bound, exact.upper_bound);
+        assert_eq!(census.window.roots.len(), exact.window.roots.len());
+        for (a, b) in census.window.roots.iter().zip(&exact.window.roots) {
+            let (a_lower, a_upper) = exact_root_bounds(a).unwrap();
+            let (b_lower, b_upper) = exact_root_bounds(b).unwrap();
+            assert!(a_lower <= b_upper && b_lower <= a_upper);
+        }
+        verify_production_independent_ccm_root_certificate(&census).unwrap();
+    }
+
+    #[cfg(feature = "arb")]
+    #[test]
     fn production_mixed_sign_prefix_replays_before_reference_comparison() {
         let precision = 192;
         let modes = 10;
@@ -3156,5 +4479,59 @@ mod exhaustive_certificate_pole_stage {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "arb"))]
+mod span_count_equivalence_tests {
+    use super::*;
+
+    #[test]
+    fn span_window_counts_equal_direct_flint_window_counts() {
+        let precision = 192;
+        let modes = 12;
+        // Mixed-sign residues place zero, one, or several roots between poles.
+        let weights = (0..2 * modes + 1)
+            .map(|j| {
+                let value = ((j * 7 + 3) % 11) as i32 - 5;
+                Float::with_val(precision, if value == 0 { 3 } else { value }) / 7u32
+            })
+            .collect::<Vec<_>>();
+        let source =
+            CertifiedSecularFunction::from_integer_ccm_state(13, modes, &weights, precision)
+                .unwrap();
+        let (poles, numerator) = source.exact_numerator_data().unwrap();
+        let mut compared = 0;
+        for first in 0..poles.len() {
+            for last in first + 1..poles.len() {
+                let direct = crate::ccm::arb_bridge::rational_polynomial_root_count(
+                    numerator,
+                    &poles[first],
+                    &poles[last],
+                )
+                .unwrap();
+                let shared = source
+                    .exact_flint_numerator_count_between_poles(first, last)
+                    .unwrap();
+                assert_eq!(shared.certified_root_count, direct.0, "{first}..{last}");
+                assert_eq!(shared.square_free, direct.1);
+                compared += 1;
+            }
+        }
+        // Windows strictly between poles exercise the arbitrary-window entry.
+        let midpoint = |k: usize| (poles[k].clone() + &poles[k + 1]) / 2u32;
+        for first in 0..poles.len() - 2 {
+            let (lower, upper) = (midpoint(first), midpoint(first + 1));
+            let direct =
+                crate::ccm::arb_bridge::rational_polynomial_root_count(numerator, &lower, &upper)
+                    .unwrap();
+            let shared = source
+                .exact_flint_numerator_count_in_window(&lower, &upper)
+                .unwrap();
+            assert_eq!(shared.certified_root_count, direct.0);
+            compared += 1;
+        }
+        assert!(source.span_real_roots.get().is_some_and(Option::is_some));
+        assert_eq!(compared, 300 + 23);
     }
 }

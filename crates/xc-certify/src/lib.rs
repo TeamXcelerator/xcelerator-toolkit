@@ -1241,6 +1241,23 @@ pub mod exact {
         })
     }
 
+    /// Directed interval inertia choosing the largest rigorously separated
+    /// diagonal pivot. The historical MPFR route above remains unchanged for
+    /// replay of existing portable certificates.
+    pub fn interval_symmetric_ldlt_inertia_mpfr_stable(
+        matrix: &[RationalInterval],
+        dimension: usize,
+        precision_bits: u32,
+    ) -> Result<IntervalInertiaResult, CertificateError> {
+        super::interval_inertia::inertia_stable(matrix, dimension, precision_bits).map_err(
+            |error| {
+                CertificateError::VerificationFailed(format!(
+                    "MPFR stable interval inertia: {error}"
+                ))
+            },
+        )
+    }
+
     /// Rigorous interval LDL^T inertia with deterministic symmetric 1x1
     /// pivoting and exact-rational admission limits. At input/pivot boundaries,
     /// each retained rational endpoint is limited to 262144 numerator-plus-

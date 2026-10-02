@@ -38,6 +38,8 @@ The canonical payload envelope records scalar backend, optional exact precision 
 
 One central compatibility policy supplies the minimum producer version, reader range, and accepted manifest schemas for every artifact family/kind pair. Floors are independently adjustable by kind: a defect in tau construction can invalidate `ccm_tau_matrix` and its dependent closure without invalidating unaffected quadrature or prolate artifacts. Raising a producer floor makes older entries inadmissible cache hits, so normal execution treats them as misses and recomputes them. The same policy is shared by managed remote resolution and every direct numerical cache reader.
 
+Toolkit 0.16.0 restarted the artifact repositories from a clean slate and sets the producer and reader floor of every managed family and kind to 0.16.0 (`CLEAN_SLATE`). Artifacts produced by earlier releases are misses and are recomputed, and readers released before 0.16.0 refuse 0.16.0 artifacts instead of misreading their changed formats. Each new manifest records at least its kind's reader floor. Floors named in the version-specific sections below are historical.
+
 Publication is producer-version monotonic for each semantic identity. Before payload upload, the publisher reads the current shard index and rejects an incoming producer older than any active discoverable producer. The atomic discoverability phase repeats the check against the latest repository head, closing the concurrent-publication race. Newer producers may publish alongside immutable older history; consumers order compatible candidates by producer version first and assurance second. Revoked or quarantined entries do not block a replacement.
 
 Certificates, validation reports, and publication-ready exports are separate ordinary artifacts. A canonical `ArtifactLinkSet` attaches any number of their exact semantic, manifest, and payload identities to a numerical subject without embedding report bytes in its payload or changing the subject identity. Link roles and identities are uniquely ordered and digest-bound.
@@ -118,7 +120,7 @@ Ordinary corrections use separate two-hex-digit supersession partitions under `s
 
 ## Deterministic encoding and hard size rules
 
-Logical payloads are streamed through a deterministic ZIP/ZIP64 encoder and byte-split without holding the full archive in memory. Encoding metadata fixes entry order, normalized paths, timestamps, permissions, compression method and level, ZIP implementation version, ZIP64 behavior, and split size. The unchanged single-entry workstation/publication encoder retains profile V1 and remains byte-for-byte identical across its in-memory and file-backed routes. The corrected file-backed writer uses profile V2 only when an envelope contains multiple items and requires ZIP64 local-header metadata on every V2 entry. Each workstation manifest persists the exact byte-affecting encoder profile. Staging adopts encoded bytes only when that provenance is present and supported; unprofiled legacy objects remain readable logical cache hits but are re-encoded as V1 for publication. For a retained single-entry object, V1 and the superseded interim V2 label may be interchanged only when the resulting transport digest is already authorized by the retained manifest.
+Logical payloads are streamed through a deterministic ZIP/ZIP64 encoder and byte-split without holding the full archive in memory. Encoding metadata fixes entry order, normalized paths, timestamps, permissions, compression method and level, ZIP implementation version, ZIP64 behavior, and split size. The unchanged single-entry workstation/publication encoder retains profile V1 and remains byte-for-byte identical across its in-memory and file-backed routes. The corrected file-backed writer uses profile V2 only when an envelope contains multiple items and requires ZIP64 local-header metadata on every V2 entry. Each workstation manifest persists the exact byte-affecting encoder profile. Staging adopts encoded bytes only when that provenance is present and supported; unprofiled legacy objects remain readable logical cache hits but are re-encoded as V1 for publication. For a retained single-entry object, V1 and the superseded pre-release V2 label may be interchanged only when the resulting transport digest is already authorized by the retained manifest.
 
 Project hard rules are:
 
@@ -192,13 +194,13 @@ Transaction IDs and batch digests make retry idempotent. Existing identical obje
 
 ### Private-shard publication coordination
 
-Every writable private shard owns an orphan `xcelerator-coordination` branch. It contains only `coordination/state.json` and, while a publisher holds the shard, `coordination/publication-lock.json`; it does not share history with or add lock commits to `main`. The first private publisher initializes this branch automatically with an atomic create-if-absent operation.
+A writable private shard has an orphan `xcelerator-coordination` branch only while a publication holds it, or after a publication was interrupted. The branch contains only `coordination/state.json` and, while a publisher holds the shard, `coordination/publication-lock.json`; it does not share history with or add lock commits to `main`. A publisher that finds no branch creates it with an atomic create-if-absent operation.
 
-One lease covers one physical private repository. Different private shards therefore publish concurrently, while configurations targeting the same shard wait with bounded exponential backoff and visible owner, generation, and remaining-lease status. The lock records a non-secret run identity, authenticated principal, toolkit version, hashed instance identity, process ID, observed cache head, acquisition/heartbeat/expiry times, and a monotonically increasing fencing generation. It never records credentials, local paths, or raw machine account names.
+One lease covers one physical private repository. Different private shards therefore publish concurrently, while configurations targeting the same shard wait with bounded exponential backoff and visible owner, generation, and remaining-lease status. The lock records a non-secret run identity, authenticated principal, toolkit version, hashed instance identity, process ID, observed cache head, acquisition/heartbeat/expiry times, and a fencing generation that increases with every takeover while the branch exists. It never records credentials, local paths, or raw machine account names.
 
 Acquisition, renewal, takeover, and release are compare-and-swap state transitions on the coordination branch. A crashed publisher's lease becomes eligible for takeover only after its expiry and clock-skew grace period. Every private repository batch uses one atomic two-ref push: `main` advances to the batch commit and `xcelerator-coordination` advances to the renewed lease commit. If either expected head changed, Git accepts neither update. A stale publisher therefore cannot advance the cache or ledger after another server takes over.
 
-The capacity ledger is committed with every cache batch and represents exactly the new immutable and metadata bytes reachable at that boundary. Identical existing paths are omitted from retries, a different payload at an immutable object path fails closed, and live metadata is ordered after payload objects so an interrupted transfer cannot expose an index entry whose objects are absent. Release removes the active lock document but preserves the generation and last completed transaction in the coordination state. Private coordination needs no additional repository, PAT, workflow, or consumer configuration.
+The capacity ledger is committed with every cache batch and represents exactly the new immutable and metadata bytes reachable at that boundary. Identical existing paths are omitted from retries, a different payload at an immutable object path fails closed, and live metadata is ordered after payload objects so an interrupted transfer cannot expose an index entry whose objects are absent. A clean release deletes the coordination branch with a compare-and-swap on the holder's exact head, so no branch remains between publications and no manual cleanup is needed. Fencing does not depend on the generation surviving: every renewal, batch and release names exact commit identities, which a recreated branch never matches, so a stale publisher still cannot advance `main`. A crashed publisher's branch remains until a later publisher takes it over after expiry and releases it. Transports without compare-and-swap ref deletion instead commit the released state, removing the lock document. Private coordination needs no additional repository, PAT, workflow, or consumer configuration.
 
 ## Capacity, rollover, and rebuild
 
@@ -268,6 +270,7 @@ The concrete CCM execution graph and shard placement are:
 | `ccm_target_distance` | `ccm-distance` | Private-only weighted distance to a runtime-supplied target; schema v2 binds the opaque definition digest |
 | `ccm_distance_resolution_evidence` | `ccm-distance` | Private-only tail and same-rule refinement evidence for runtime target distance |
 | `ccm_target_residual_analysis` | `ccm-distance` | Private-only signed and crossing diagnostics for a runtime target residual |
+| `ccm_target_comparison_analysis` | `ccm-distance` | Private-only runtime target diagnostics |
 | `ccm_deviation_decomposition` | `ccm-distance` | Private-only opt-in projection onto a runtime-supplied auxiliary profile, with residuals under both readings of the distance weight; schema v3 binds the opaque definition digest |
 | `ccm_eigenfunction_profile` | `ccm-distance` | Target-independent sampled CCM eigenfunction and normalized coefficients; public-eligible |
 | `ccm_discretization_distance` | `ccm-distance` | Target-independent distance between two discretizations; public-eligible |
@@ -392,8 +395,21 @@ new sector, prolate and distance semantic keys and warm numerical-validation sco
 The `ccm-evidence` family includes private-only `research_capture_receipt` and
 `research_hypothesis_evaluation` kinds. Both have producer/reader floor 0.15.0
 and source-bound, content-addressed record identities. Receipts bind every
-requested outcome and embedded measurement; evaluations embed selected
-observation bytes and replay their frozen score. Exact source dependencies are
+requested outcome and measurement; evaluations embed selected observation
+bytes and replay their frozen score.
+
+From v0.16.0 a measurement whose value is exactly the payload of retained
+artifacts is recorded by reference: `value_reference` names those artifacts
+(one, or an ordered array), binds the value with a digest and keeps its
+numerical coverage summary. The data is stored once in its own shard, and
+`measurement_value` reconstructs and verifies it. Wrapped or derived
+measurements remain embedded.
+
+v0.16.0 adds `ccm_root_certification_report` (per-root certified and
+computed-but-not-certified outcomes with embedded replayable certificates),
+`ccm_assembly_error_analysis` (stored-minus-exact finite-form bounds and
+exact-form eigenvalue enclosures) and `ccm_checkpoint_spectra` (leading-block
+low-spectrum enclosures) to the `ccm-evidence` family, each with floor 0.16.0. Exact source dependencies are
 retained for publication closure. Neither record upgrades source assurance.
 
 Both registries carry identical portable shape schemas. Public catalogs exclude
@@ -414,14 +430,13 @@ the family document's legacy `current_writable_shard`; it need not equal the
 active pointer when preserving access for older single-shard readers. Update
 the corresponding public and private topology documents consistently.
 
-An offline inventory needs every listed predecessor and rollover shard in each
-dependency visibility. `ccm_artifact_impact.py --registry` reports absent
-registered repositories; unresolved manifest digests remain an explicit
-coverage gap even when every repository is present. An inventory of main does
-not include unpublished workstation drafts. The `xcelerator-coordination`
-branch stores publication synchronization state, not artifact manifests; it
-can help investigate incomplete publication but cannot fill a dependency gap
-by itself. Do not pass a coordination-only snapshot as an artifact shard.
+A complete dependency closure needs every listed predecessor and rollover shard
+in each dependency visibility; unresolved manifest digests remain an explicit
+coverage gap even when every repository is present. The main branch does not
+include unpublished local drafts. The `xcelerator-coordination` branch, present only during or after an
+interrupted publication, stores publication synchronization state, not artifact manifests; it can help
+investigate incomplete publication but cannot fill a dependency gap by itself
+and is not an artifact shard.
 
 ## Retained state geometry
 
@@ -466,7 +481,7 @@ A journaled discoverability replan may atomically replace its uncommitted local
 index, ledger, and receipt projections after a ref conflict. Recorded plans and
 immutable artifact metadata still reject conflicting staged bytes.
 
-### Remaining-feedback accuracy and reuse contracts
+### Accuracy and reuse contracts
 
 The Tau producer identity is `ccm-weil-form-source-bound-assurance-v3`. Optional higher assurance requires an independently enclosed finite-form error no larger than `max(abs(stored entries))*2^-(p-32)`. The report records the exact scale, error, allowance, and policy; zero scale requires zero error. This threshold is an acceptance policy, not a promise that ordinary quadrature achieves it. Ordinary Computed matrices still have no assembly error certificate.
 

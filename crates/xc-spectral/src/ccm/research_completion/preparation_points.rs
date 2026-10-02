@@ -279,6 +279,7 @@ impl Promotion {
     ) -> Result<()> {
         let crate::ccm::extended_research::ExternalResearchInputs {
             run_once,
+            finite_diagnostics: _,
             schema_version: _,
             source_eigenpair: _,
             lambda_squared: _,

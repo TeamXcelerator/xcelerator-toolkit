@@ -146,6 +146,7 @@ mod tests {
                 "ccm_distance_resolution_evidence",
                 "ccm_reference_projection_analysis",
                 "ccm_signed_transform_analysis",
+                "ccm_target_comparison_analysis",
                 "ccm_target_distance",
                 "ccm_target_residual_analysis",
                 "ccm_weighted_reference_projection"

@@ -38,7 +38,7 @@ impl QuarantineCleanup {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    eprintln!(
+                    xc_core::progress_message!(
                         "  cache transport warning: could not remove quarantine scratch {}: {error}",
                         path.display()
                     );
@@ -310,7 +310,7 @@ impl<'a> RemoteShardReader<'a> {
                             Err(CacheError::DigestMismatch { .. }) => {
                                 let quarantine = quarantine_existing_file(&destination)?;
                                 quarantined_files.track(quarantine);
-                                eprintln!(
+                                xc_core::progress_message!(
                                     "  cache transport: retained part {} has the wrong size and was quarantined; fetching it again",
                                     part.repository_path
                                 );
@@ -753,17 +753,13 @@ mod tests {
         }
     }
 
-    fn temporary_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "xc-cache-remote-reader-{name}-{}",
-            std::process::id()
-        ))
+    fn temporary_root(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("remote-reader-{name}"))
     }
 
     #[test]
     fn quarantine_cleanup_is_best_effort_after_success() {
         let root = temporary_root("quarantine-cleanup-best-effort");
-        let _ = fs::remove_dir_all(&root);
         let blocked = root.join("held-as-directory");
         fs::create_dir_all(&blocked).unwrap();
         let mut cleanup = QuarantineCleanup::default();
@@ -864,7 +860,6 @@ mod tests {
             delay_millis: 0,
         };
         let root = temporary_root("resume");
-        let _ = fs::remove_dir_all(&root);
         let reader = RemoteShardReader::new(&remote, 1024).unwrap();
         let first = reader
             .fetch_transport_parts(
@@ -956,7 +951,6 @@ mod tests {
             delay_millis: 25,
         };
         let root = temporary_root("parallel-parts");
-        let _ = fs::remove_dir_all(&root);
         let reader = RemoteShardReader::new(&remote, 1024).unwrap();
         let report = reader
             .fetch_transport_parts(
@@ -1005,7 +999,6 @@ mod tests {
             delay_millis: 0,
         };
         let root = temporary_root("broken-symlink");
-        let _ = fs::remove_dir_all(&root);
         let destination = resolve_part_path(&root, &part.repository_path).unwrap();
         fs::create_dir_all(destination.parent().unwrap()).unwrap();
         symlink(root.join("absent-target"), &destination).unwrap();
@@ -1055,7 +1048,6 @@ mod tests {
             delay_millis: 0,
         };
         let root = temporary_root("exhaustive-repeats");
-        let _ = fs::remove_dir_all(&root);
         let reader = RemoteShardReader::new(&remote, 1024).unwrap();
         let report = reader
             .fetch_transport_parts(
@@ -1095,7 +1087,6 @@ mod quarantine_ownership_tests {
     #[test]
     fn quarantine_reservations_keep_existing_files_and_failed_moves_isolated() {
         let root = crate::test_support::temporary_root("quarantine-owned-reservations");
-        fs::create_dir_all(&root).unwrap();
         let a = root.join("A");
         let b = root.join("B");
         fs::write(&a, b"bad A").unwrap();

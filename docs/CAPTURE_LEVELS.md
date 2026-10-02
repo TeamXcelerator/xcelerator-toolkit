@@ -28,15 +28,15 @@ not require decoding unrelated dependency payloads.
 
 ## Default coverage
 
-The table describes the shared v0.15.1 plan, not a similarly named option in an
-application that implements its own capture policy.
+The table describes the shared v0.16.0 plan (capture-plan v7), not a similarly
+named option in an application that implements its own capture policy.
 
 | Level | Additional measurements requested by the shared plan |
 |---|---|
 | Claim / Research | No supplemental groups beyond the application's primary computation |
 | Gap | Evenness and selected sector analysis with two eigenpairs |
 | Maximum | Evenness, full sector eigenvalue spectra with a bounded number of selected vectors, root conditioning, profile, target distance, resolution and target residual analysis |
-| Ultra | Maximum plus deviation decomposition, prime-power response, u-flow response, retained prefix analysis, state geometry, indexed transforms, total operator energy, root-window summaries, and the twenty extended diagnostic groups, reference projection, and numerical coverage summaries |
+| Ultra | Maximum plus deviation decomposition, prime-power response, u-flow response, retained prefix analysis, state geometry, indexed transforms, total operator energy, root-window summaries, and the twenty extended diagnostic groups, reference projection, numerical coverage summaries, assembly error with exact-form eigenvalue enclosures, and checkpoint low-spectrum enclosures |
 
 See [extended diagnostics](EXTENDED_RESEARCH.md) for the additional groups and
 external input file. Old v1/v2/v3/v4/v5 plans retain their request sets.
@@ -160,13 +160,85 @@ preexisting `--ultra` flag must be checked against this contract. Rebuild from
 the updated lockfile and verify an example run's receipt and artifact identities
 before scheduling a larger campaign.
 
+### Exact-form error bars and checkpoint spectra (v7)
+
+`assembly_error` encloses the exact finite CCM Weil form at the declared
+cutoff, integer or fractional, with the cutoff-free FLINT/Arb closed form and
+compares it entrywise with the stored Tau matrix. It reports rigorous norms of
+the difference for the full matrix, the even and odd sectors (including the
+parity transform's own rounding) and the pole, archimedean and prime
+components, a per-mode error profile and the surviving digits. By Weyl's
+inequality every retained stored eigenvalue enclosure widens by the sector
+bound; the measurement lists these exact-form enclosures for the selected
+eigenvalue, each retained sector eigenvalue, the even gap and the lowest
+odd-minus-even separation, with the budget (stored or assembly) that limits each.
+
+When the retained state and a second even eigenvalue enclosure are available,
+`assembly_error` also encloses the exact finite-form roots. The state residual
+and the assembly bound give a Davis-Kahan angle bound to the exact ground state;
+the resulting weight intervals and exact poles define an interval secular
+function, and interval Newton from each computed root encloses the root of every
+secular function in that box, including the exact form's. Each root reports its
+exact-form enclosure and resolved digits, or the reason it is unresolved.
+
+`checkpoint_spectra` encloses the three lowest eigenvalues, the gap and the gap
+ratio of leading even-sector blocks along a halving ladder of dimensions from
+the source down to 8. The even-sector matrix nests exactly in N, so each row is
+the corresponding smaller configuration. These are directed enclosures for the
+stored matrix; widen eigenvalues by `assembly_error.even_sector.spectral_upper`
+(gaps by twice it) for exact-form enclosures.
+
+### Root certification inside Ultra
+
+Requesting root certification adds one `root_certificate` measurement and never
+removes data. Every requested ordinal receives a row:
+
+| Row outcome | Meaning |
+|---|---|
+| `certified_finite_enclosure` | Interval enclosure of the root of the exact stored secular source, with the computed value's agreement (`inside`, `outside`, `no_computed_value`) |
+| `computed_not_certified` | Computed value and solver status retained; the row states why it was not certified |
+| `not_computed_not_certified` | Neither a computed value nor a certificate |
+
+The whole range is certified first; on failure it is bisected so every
+certifiable ordinal is still certified. Ordinals beyond the exact positive root
+count of the pole range are reported as such. A stagnated computed root that
+falls outside its certified enclosure is flagged, and the ordinal whose
+enclosure it lies in is named. Integer and fractional cutoffs are supported.
+Numerical coverage counts certified rows as resolved and computed-but-not-certified
+rows as qualified. The embedded certificates replay independently.
+
+Counts come from the exact secular numerator and FLINT/Arb isolation when its
+rational workspace fits the budget. Larger sources use a directed pole-gap
+census instead: between adjacent poles, G(z) = (z - p_g)(p_{g+1} - z) R(z) is
+smooth on the closed gap, has the same interior roots and takes the residue
+signs at the poles. Enclosures of G or G' that exclude zero prove no root or a
+monotone piece with exactly one simple root, and other pieces are halved. The
+enclosures are order-8 Taylor models around each piece's midpoint: point
+coefficients keep the cancellation among the residue terms that natural
+interval sums lose, and only the remainder, scaled by the radius to the eighth
+power, uses natural bounds. A gap that cannot be
+halved further at the working precision is retried with 64, 256, 1024 and 4096
+guard bits, and is otherwise reported unresolved with its reason. A piece is
+split where G has a proven sign (the midpoint or the first of a fixed sequence
+of nearby fractions), so a root exactly at a midpoint does not stall it. The
+census counts gaps only as far as the requested ordinals (a parallel batch may
+evaluate a few more, never more than twice the roots still needed), so the
+total positive count is recorded only when every gap was counted. Interval
+Newton certifies each root in either route, and each certificate records and
+replays its own route.
+
+Sector-gap certification is additive in the same way. When it cannot complete,
+for example because the guide spectra are precision-limited at the requested
+configuration, the capture keeps the computed sector gap and every other
+measurement and records the reason (`sector_gap_certification_limitation`).
+
 ## Additional explicit work
 
 | Facility | How it is requested in v0.15.1 |
 |---|---|
 | Retained reduction similarity/orthogonality report | Supply `RetainedReductionRequest` to `execute_with_receipt_and_reduction` to execute and record it; the standalone `check_retained_reduction_via_cache` API also remains available |
-| Full Gauss--Legendre rule verification | Every ordinary HP cache read performs the full O(n^2) check; `check_gauss_legendre_rule_hp` also exposes it with an explicit order budget |
-| Root and sector certificates | Request the corresponding certification APIs explicitly |
+| Full Gauss--Legendre rule verification | Fresh rules pass the full O(n^2) root/weight check. Ordinary cache reads perform O(n) admission (shape, ordering, symmetry, low moments and three root/weight probes); `check_gauss_legendre_rule_hp` and `verify_gl_cache_dir` perform the full check with an explicit order budget |
+| Root and sector certificates | Request the corresponding certification options explicitly; root certification records per-root outcomes as described above |
 | Additional prefix checkpoints and overlap eigenstates | Set checkpoints and supply their retained sources explicitly |
 | Frozen hypothesis scoring and replication packets | `evaluate_hypothesis_packet` retains selected bytes; `persist_hypothesis_evaluation` replay-checks and caches the packet with exact source dependencies |
 | Performance records | Enable `XC_PERF_REPORT` and retain the report with run metadata |

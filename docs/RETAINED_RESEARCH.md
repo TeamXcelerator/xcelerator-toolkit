@@ -169,8 +169,8 @@ forward-error bound on Fourier evaluation or on division by a small center.
 Reports retain arithmetic_precision_bits and normalization_precision_bits.
 The cancellation_limited flag is a point-arithmetic heuristic. These reports
 do not certify source approximation, reference error, an infinite tail, ground
-selection, or convergence. The temporary local revision-9 method v1 snapshot
-is preserved with its own checkpoint/schema; current producers require v2.
+selection, or convergence. Revision-9 method v1 reports remain readable;
+current producers require v2.
 Older source-definition readability does not validate old calculation reports.
 
 
@@ -192,7 +192,7 @@ the entire result: consult its lower/upper fields, especially around zero.
 These enclosures cover finite stored-input arithmetic only. Source construction,
 operator modeling, ground selection and convergence remain outside their scope.
 Earlier report revisions do not acquire this assurance. The shared directional
-diagnostic requires its separate mathematical review.
+diagnostic is outside the scope of these enclosures.
 
 Root-window transform reports use `exp(-i*t*x)`, matching the production secular root convention. Explicit evaluation datasets continue to use their documented `exp(+i*t*x)` convention. The derivative changes sign when converting conventions; even states alone cannot expose this distinction.
 

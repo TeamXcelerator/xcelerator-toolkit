@@ -8,7 +8,24 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 pub use xc_core::PrefixDiagnosticPolicy;
 
-pub const CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v6";
+pub const CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v8";
+pub const EXACT_FORM_CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v7";
+#[doc(hidden)]
+pub const FINITE_DIAGNOSTICS: &[&str] = &[
+    "constrained_l1_fit",
+    "trial_vector_energy",
+    "trial_vector_parity",
+    "finite_root_budget",
+    "directional_error_bound",
+    "finite_tail_bound",
+    "dimension_precision_budget",
+    "normalization_error_bound",
+    "continuous_l1_bound",
+    "spectral_cluster_bound",
+    "indexed_prolate_comparison",
+];
+/// Complete Ultra plans before exact-form error and checkpoint spectra.
+pub const COMPLETE_CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v6";
 pub const RUN_ONCE_CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v5";
 pub const EXTENDED_CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v4";
 pub const RETAINED_CAPTURE_PLAN_SEMANTICS: &str = "ccm-measurement-capture-plan-v3";
@@ -58,6 +75,21 @@ pub struct CcmCapturePlan {
     pub prefix_export_policy: Option<PrefixExportPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_diagnostics: Option<PrefixDiagnosticPolicy>,
+    /// Rigorous stored-minus-exact finite-form error with exact-form
+    /// eigenvalue enclosures (v7 Ultra).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capture_assembly_error: bool,
+    #[doc(hidden)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capture_finite_diagnostics: bool,
+    /// Even-sector leading-block dimensions receiving directed low-spectrum
+    /// and gap enclosures (v7 Ultra: a halving ladder of the source dimension).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capture_checkpoint_spectra: Vec<usize>,
+    /// Private comparison of the retained even state with the runtime target
+    /// on both halves of the log grid (v7 Ultra; hard private-only).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capture_target_comparison: bool,
     pub requires_even_sector: bool,
     pub certification_requested: bool,
     pub changes_numerical_algorithm: bool,
@@ -80,7 +112,30 @@ pub struct RetainedReductionRequest {
     pub relative_tolerance: String,
 }
 
+/// Halving ladder of even-sector dimensions from the source down to 8.
+pub(crate) fn checkpoint_spectrum_ladder(source_even_dimension: usize) -> Vec<usize> {
+    let mut ladder = Vec::new();
+    let mut k = source_even_dimension;
+    while k >= 8 {
+        ladder.push(k);
+        k /= 2;
+    }
+    if ladder.is_empty() && source_even_dimension >= 2 {
+        ladder.push(source_even_dimension);
+    }
+    ladder.reverse();
+    ladder
+}
+
 impl CcmCapturePlan {
+    fn complete_semantics(&self) -> bool {
+        [
+            CAPTURE_PLAN_SEMANTICS,
+            EXACT_FORM_CAPTURE_PLAN_SEMANTICS,
+            COMPLETE_CAPTURE_PLAN_SEMANTICS,
+        ]
+        .contains(&self.semantics.as_str())
+    }
     fn resolved_value(&self) -> Result<serde_json::Value> {
         let mut canonical = self.clone();
         if let Some(policy) = &mut canonical.prefix_export_policy {
@@ -135,6 +190,14 @@ impl CcmCapturePlan {
             prefix_working_precision_bits: None,
             prefix_export_policy: None,
             prefix_diagnostics: ultra.then(PrefixDiagnosticPolicy::full),
+            capture_assembly_error: ultra,
+            capture_finite_diagnostics: ultra,
+            capture_checkpoint_spectra: if ultra {
+                checkpoint_spectrum_ladder(source_even_dimension)
+            } else {
+                vec![]
+            },
+            capture_target_comparison: ultra,
             requires_even_sector: ultra,
             certification_requested: false,
             changes_numerical_algorithm: false,
@@ -201,6 +264,8 @@ impl CcmCapturePlan {
             || self.schema_version != 1
             || ![
                 CAPTURE_PLAN_SEMANTICS,
+                EXACT_FORM_CAPTURE_PLAN_SEMANTICS,
+                COMPLETE_CAPTURE_PLAN_SEMANTICS,
                 RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
                 EXTENDED_CAPTURE_PLAN_SEMANTICS,
                 RETAINED_CAPTURE_PLAN_SEMANTICS,
@@ -210,10 +275,36 @@ impl CcmCapturePlan {
             .contains(&self.semantics.as_str())
             || (self.semantics == LEGACY_CAPTURE_PLAN_SEMANTICS && self.capture_state_geometry)
             || (self.capture_reference_projection
-                && self.semantics != CAPTURE_PLAN_SEMANTICS
+                && !self.complete_semantics()
                 && !self.capture_retained_research)
+            || (self.capture_finite_diagnostics
+                != (self.semantics == CAPTURE_PLAN_SEMANTICS && ultra))
+            || ([CAPTURE_PLAN_SEMANTICS, EXACT_FORM_CAPTURE_PLAN_SEMANTICS]
+                .contains(&self.semantics.as_str())
+                && ultra
+                && (!self.capture_assembly_error
+                    || !self.capture_target_comparison
+                    || (self.capture_checkpoint_spectra.is_empty()
+                        && self.source_even_dimension >= 2)))
+            || (![CAPTURE_PLAN_SEMANTICS, EXACT_FORM_CAPTURE_PLAN_SEMANTICS]
+                .contains(&self.semantics.as_str())
+                && (self.capture_assembly_error
+                    || self.capture_target_comparison
+                    || !self.capture_checkpoint_spectra.is_empty()))
+            || (self.capture_target_comparison && !self.requires_even_sector)
+            || (!self.capture_checkpoint_spectra.is_empty() && !self.requires_even_sector)
+            || self
+                .capture_checkpoint_spectra
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self
+                .capture_checkpoint_spectra
+                .iter()
+                .any(|&k| k < 2 || k > self.source_even_dimension)
             || (![
                 CAPTURE_PLAN_SEMANTICS,
+                EXACT_FORM_CAPTURE_PLAN_SEMANTICS,
+                COMPLETE_CAPTURE_PLAN_SEMANTICS,
                 RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
                 EXTENDED_CAPTURE_PLAN_SEMANTICS,
                 RETAINED_CAPTURE_PLAN_SEMANTICS,
@@ -222,6 +313,8 @@ impl CcmCapturePlan {
                 && self.capture_retained_research)
             || ([
                 CAPTURE_PLAN_SEMANTICS,
+                EXACT_FORM_CAPTURE_PLAN_SEMANTICS,
+                COMPLETE_CAPTURE_PLAN_SEMANTICS,
                 RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
                 EXTENDED_CAPTURE_PLAN_SEMANTICS,
                 RETAINED_CAPTURE_PLAN_SEMANTICS,
@@ -230,6 +323,8 @@ impl CcmCapturePlan {
                 && self.capture_retained_research != ultra)
             || ([
                 CAPTURE_PLAN_SEMANTICS,
+                EXACT_FORM_CAPTURE_PLAN_SEMANTICS,
+                COMPLETE_CAPTURE_PLAN_SEMANTICS,
                 RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
                 EXTENDED_CAPTURE_PLAN_SEMANTICS,
                 RETAINED_CAPTURE_PLAN_SEMANTICS,
@@ -238,6 +333,8 @@ impl CcmCapturePlan {
                 && self.capture_state_geometry != ultra)
             || (![
                 CAPTURE_PLAN_SEMANTICS,
+                EXACT_FORM_CAPTURE_PLAN_SEMANTICS,
+                COMPLETE_CAPTURE_PLAN_SEMANTICS,
                 RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
                 EXTENDED_CAPTURE_PLAN_SEMANTICS,
             ]
@@ -245,16 +342,28 @@ impl CcmCapturePlan {
                 && self.capture_extended_research)
             || ([
                 CAPTURE_PLAN_SEMANTICS,
+                EXACT_FORM_CAPTURE_PLAN_SEMANTICS,
+                COMPLETE_CAPTURE_PLAN_SEMANTICS,
                 RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
                 EXTENDED_CAPTURE_PLAN_SEMANTICS,
             ]
             .contains(&self.semantics.as_str())
                 && self.capture_extended_research != ultra)
-            || (![CAPTURE_PLAN_SEMANTICS, RUN_ONCE_CAPTURE_PLAN_SEMANTICS]
-                .contains(&self.semantics.as_str())
+            || (![
+                CAPTURE_PLAN_SEMANTICS,
+                EXACT_FORM_CAPTURE_PLAN_SEMANTICS,
+                COMPLETE_CAPTURE_PLAN_SEMANTICS,
+                RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
+            ]
+            .contains(&self.semantics.as_str())
                 && self.capture_complete_research)
-            || ([CAPTURE_PLAN_SEMANTICS, RUN_ONCE_CAPTURE_PLAN_SEMANTICS]
-                .contains(&self.semantics.as_str())
+            || ([
+                CAPTURE_PLAN_SEMANTICS,
+                EXACT_FORM_CAPTURE_PLAN_SEMANTICS,
+                COMPLETE_CAPTURE_PLAN_SEMANTICS,
+                RUN_ONCE_CAPTURE_PLAN_SEMANTICS,
+            ]
+            .contains(&self.semantics.as_str())
                 && self.capture_complete_research != ultra)
             || self.certification_requested
             || self.changes_numerical_algorithm
@@ -377,7 +486,7 @@ impl CcmCapturePlan {
                 .map(str::to_owned),
             );
         }
-        if self.semantics == CAPTURE_PLAN_SEMANTICS && self.capture_complete_research {
+        if self.complete_semantics() && self.capture_complete_research {
             requested.insert(0, "capture_preflight".into());
             requested.extend(
                 [
@@ -391,6 +500,18 @@ impl CcmCapturePlan {
         }
         if self.capture_reference_projection {
             requested.push("reference_projection".into());
+        }
+        if self.capture_finite_diagnostics {
+            requested.extend(FINITE_DIAGNOSTICS.iter().map(|s| (*s).to_owned()));
+        }
+        if self.capture_assembly_error {
+            requested.push("assembly_error".into());
+        }
+        if !self.capture_checkpoint_spectra.is_empty() {
+            requested.push("checkpoint_spectra".into());
+        }
+        if self.capture_target_comparison {
+            requested.push("target_comparison".into());
         }
         if self.capture_state_geometry {
             requested.push("state_geometry".into());
@@ -580,6 +701,21 @@ impl CcmCapturePlan {
                     return CapturedDiagnostic::new(&result.value, sources)
                         .map_err(CaptureFailure::failed);
                 }
+                if id == "checkpoint_spectra" {
+                    let Some((matrix, _)) = retained else {
+                        return Err(CaptureFailure::Missing {
+                            reason: "retained even matrix unavailable".into(),
+                        });
+                    };
+                    let result = super::hp::checkpoint_low_spectra_via_cache(
+                        matrix,
+                        &self.capture_checkpoint_spectra,
+                        3,
+                        cache,
+                    )
+                    .map_err(CaptureFailure::failed)?;
+                    return CapturedDiagnostic::from_cached(result).map_err(CaptureFailure::failed);
+                }
                 if id == "prefix_ladder" {
                     let Some((matrix, eigenpairs)) = retained else {
                         return Err(CaptureFailure::Missing {
@@ -746,10 +882,31 @@ impl CcmCapturePlan {
 mod tests {
     use super::*;
     #[test]
+    fn v7_ultra_requests_exact_form_error_and_checkpoint_spectra() {
+        let plan = CcmCapturePlan::ultra(8, 241).unwrap();
+        assert_eq!(plan.semantics, CAPTURE_PLAN_SEMANTICS);
+        assert!(plan.capture_assembly_error);
+        assert_eq!(plan.capture_checkpoint_spectra, vec![15, 30, 60, 120, 241]);
+        let receipt = plan.receipt().unwrap();
+        assert!(receipt.outcomes().contains_key("assembly_error"));
+        assert!(receipt.outcomes().contains_key("checkpoint_spectra"));
+        assert!(plan.capture_target_comparison);
+        assert!(receipt.outcomes().contains_key("target_comparison"));
+        let maximum = CcmCapturePlan::resolve(CcmCaptureLevel::Maximum, 8, 241).unwrap();
+        assert!(!maximum.capture_assembly_error && maximum.capture_checkpoint_spectra.is_empty());
+        let mut invalid = plan.clone();
+        invalid.capture_checkpoint_spectra = vec![30, 15];
+        assert!(invalid.validate().is_err());
+    }
+    #[test]
     fn v5_roundtrip_keeps_its_work_set_while_v6_adds_completion() {
         let current = CcmCapturePlan::ultra(8, 33).unwrap();
         let mut old = current.clone();
         old.semantics = RUN_ONCE_CAPTURE_PLAN_SEMANTICS.into();
+        old.capture_assembly_error = false;
+        old.capture_finite_diagnostics = false;
+        old.capture_target_comparison = false;
+        old.capture_checkpoint_spectra.clear();
         old.capture_reference_projection = false;
         let bytes = serde_json::to_vec(&old).unwrap();
         let restored: CcmCapturePlan = serde_json::from_slice(&bytes).unwrap();
@@ -777,6 +934,34 @@ mod tests {
         }
     }
     #[test]
+    fn v7_is_immutable_and_v8_binds_the_new_work_set() {
+        let current = CcmCapturePlan::ultra(2, 17).unwrap();
+        let mut old = current.clone();
+        old.semantics = EXACT_FORM_CAPTURE_PLAN_SEMANTICS.into();
+        old.capture_finite_diagnostics = false;
+        let bytes = serde_json::to_vec(&old).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("capture_finite_diagnostics"));
+        let restored: CcmCapturePlan = serde_json::from_slice(&bytes).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
+        let old_ids = restored.receipt().unwrap();
+        let new_ids = current.receipt().unwrap();
+        assert_eq!(
+            new_ids.outcomes().len(),
+            old_ids.outcomes().len() + FINITE_DIAGNOSTICS.len()
+        );
+        for id in FINITE_DIAGNOSTICS {
+            assert!(new_ids.outcomes().contains_key(*id));
+            assert!(!old_ids.outcomes().contains_key(*id));
+        }
+        assert_ne!(
+            current.resolved_value().unwrap(),
+            restored.resolved_value().unwrap()
+        );
+        old.capture_finite_diagnostics = true;
+        assert!(old.validate().is_err());
+    }
+    #[test]
     fn v4_recipe_roundtrips_without_new_work_and_v5_requests_all_roots() {
         let plan = CcmCapturePlan::ultra(8, 1001).unwrap();
         let receipt = plan.receipt().unwrap();
@@ -797,6 +982,18 @@ mod tests {
         old["semantics"] = EXTENDED_CAPTURE_PLAN_SEMANTICS.into();
         old.as_object_mut()
             .unwrap()
+            .remove("capture_finite_diagnostics");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_assembly_error");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_target_comparison");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_checkpoint_spectra");
+        old.as_object_mut()
+            .unwrap()
             .remove("capture_complete_research");
         let restored: CcmCapturePlan = serde_json::from_value(old.clone()).unwrap();
         restored.validate().unwrap();
@@ -809,6 +1006,18 @@ mod tests {
     fn v3_ultra_keeps_its_original_diagnostic_set() {
         let mut old = serde_json::to_value(CcmCapturePlan::ultra(8, 33).unwrap()).unwrap();
         old["semantics"] = RETAINED_CAPTURE_PLAN_SEMANTICS.into();
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_finite_diagnostics");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_assembly_error");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_target_comparison");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_checkpoint_spectra");
         old.as_object_mut()
             .unwrap()
             .remove("capture_complete_research");
@@ -835,6 +1044,18 @@ mod tests {
             .contains_key("state_geometry"));
         let mut old = serde_json::to_value(&new).unwrap();
         old["semantics"] = LEGACY_CAPTURE_PLAN_SEMANTICS.into();
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_finite_diagnostics");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_assembly_error");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_target_comparison");
+        old.as_object_mut()
+            .unwrap()
+            .remove("capture_checkpoint_spectra");
         old.as_object_mut()
             .unwrap()
             .remove("capture_reference_projection");

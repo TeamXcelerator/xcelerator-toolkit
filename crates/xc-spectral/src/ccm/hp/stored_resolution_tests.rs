@@ -335,14 +335,10 @@ fn explicit_krylov_admits_resolved_original_n20_and_n10_control() {
             }
         }
     }
-    let dir = Owned(std::env::temp_dir().join(format!(
-            "xc-r2-krylov-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )));
+    // `Owned` checks that the fixture created and can remove its cache; the
+    // enclosing scratch guard, declared first, is removed after it.
+    let scratch = xc_core::test_support::TestDir::new("r2-krylov");
+    let dir = Owned(scratch.join("cache"));
     let resolver = CacheResolver::new(vec![CacheLayer {
         precedence: 0,
         store: Box::new(FilesystemCacheStore::new(
@@ -404,14 +400,8 @@ fn explicit_krylov_admits_resolved_original_n20_and_n10_control() {
 
 #[test]
 fn read_only_source_preserves_explicit_solver_routes_without_creating_cache() {
-    let root = std::env::temp_dir().join(format!(
-        "r2-read-only-ccm-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("r2-read-only-ccm");
+    let root = scratch.join("cache");
     assert!(!root.exists());
     for solver in [
         CcmEigenstateSolver::LegacyInverseIteration,
@@ -513,6 +503,7 @@ fn guarded_krylov_matches_exact_hadamard_spectrum_at_unchanged_tolerances() {
                 dimension: 4,
                 entries: &matrix,
                 precision_bits: working,
+                inertia_maximum_bytes: 64 << 20,
             };
             let shifted = RetainedCcmLuShiftInvert {
                 factors: &factors,
@@ -597,4 +588,257 @@ fn current_root_keys_are_captured_from_real_producer() {
             "fixed": fixed_key, "adaptive": adaptive_key,
         })
     );
+}
+
+#[test]
+fn secular_source_rebinds_validation_identity_with_unchanged_state_bytes() {
+    use crate::ccm::retained_evidence::{capture_root_window, RetainedRoots};
+    use crate::ccm::state_geometry::RetainedState;
+    use xc_cache::{
+        ArtifactDraft, ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver,
+        CacheStore, CacheVisibility, FilesystemCacheStore,
+    };
+    let directory = xc_core::test_support::TestDir::new("secular-validation-identity");
+    let store = FilesystemCacheStore::new(
+        "local",
+        directory.to_path_buf(),
+        true,
+        CacheVisibility::Local,
+    );
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(FilesystemCacheStore::new(
+            "local",
+            directory.to_path_buf(),
+            true,
+            CacheVisibility::Local,
+        )),
+    }]);
+    let policy = CachePolicy {
+        current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        minimum_quality: CacheQuality::Validated,
+        accepted_schema_versions: vec![1],
+        allow_deprecated: false,
+        allow_quarantined: false,
+        allowed_visibilities: vec![CacheVisibility::Local],
+    };
+    let cache = ArtifactCacheContext {
+        resolver: Some(&resolver),
+        reference_resolver: None,
+        acceptance: Some(&policy),
+        ordered_overlays: vec!["local".into()],
+        mode: ArtifactExecutionCacheMode::PreferReuse,
+        write_on_miss: true,
+        write_visibility: CacheVisibility::Local,
+        requested_assurance: xc_core::AssuranceLevel::Computed,
+        certification_failure_policy: xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+        production_sink: None,
+    };
+    let params = CcmParams::from_lambda_sq_integer(13, 2);
+    let cfg = HighPrecConfig::for_decimal_digits(40).with_adaptive_root_precision();
+    let xi = ["2.5", "-20", "36", "-20", "2.5"];
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 3, "lambda_squared": "13", "n_modes": 2,
+        "precision_bits": cfg.precision_bits, "force_even": true,
+        "eigenvalue": "1", "eigenvector": xi,
+    }))
+    .unwrap();
+    let draft = |key, dependencies, tags| ArtifactDraft {
+        schema_version: 1,
+        key,
+        producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        maximum_reader_version: None,
+        quality: CacheQuality::Validated,
+        visibility: CacheVisibility::Local,
+        immutable: true,
+        dependencies,
+        tags,
+        provenance_digest: None,
+    };
+    let old = store
+        .put(
+            &draft(
+                ArtifactKey::new("ccm_weil_eigenpair", "same-stored-state", b"validation-v2")
+                    .unwrap(),
+                vec![],
+                BTreeMap::new(),
+            ),
+            &payload,
+        )
+        .unwrap();
+    let current = store
+        .put(
+            &draft(
+                ArtifactKey::new("ccm_weil_eigenpair", "same-stored-state", b"validation-v3")
+                    .unwrap(),
+                vec![],
+                BTreeMap::new(),
+            ),
+            &payload,
+        )
+        .unwrap();
+    assert_eq!(old.content_digest, current.content_digest);
+    let old_source = resolve_secular_source_via_cache(&params, &cfg, &old, &cache).unwrap();
+    let current_source = resolve_secular_source_via_cache(&params, &cfg, &current, &cache).unwrap();
+    assert_ne!(
+        old_source.key.parameters_digest,
+        current_source.key.parameters_digest
+    );
+    assert_ne!(old_source.content_digest, current_source.content_digest);
+
+    let l = log_lambda_sq_hp(&params, cfg.precision_bits).unwrap();
+    let coefficients = xi
+        .iter()
+        .map(|s| Float::with_val(cfg.precision_bits, Float::parse(s).unwrap()))
+        .collect::<Vec<_>>();
+    // This exact rational point source has positive roots 3a and 4a,
+    // where a=2*pi/log(13). No known zeta zeros are inputs to this fixture.
+    let seed = Float::with_val(
+        cfg.precision_bits,
+        Float::with_val(cfg.precision_bits, rug::float::Constant::Pi) * 6,
+    ) / &l;
+    let roots_for = |source: &ArtifactManifest, context: &ArtifactCacheContext<'_>| {
+        resolve_root_range_via_cache(
+            &params,
+            &cfg,
+            CcmEigenstateSolver::Auto,
+            &l,
+            &coefficients,
+            1,
+            std::slice::from_ref(&seed),
+            source,
+            context,
+            RootArtifactMode::Independent,
+            None,
+            RootWindowSemantics::strict_positive(1),
+        )
+        .unwrap()
+    };
+    let (old_roots, old_root_manifest, _) = roots_for(&old_source, &cache);
+    let (current_roots, current_root_manifest, _) = roots_for(&current_source, &cache);
+    assert!(current_roots.iter().all(EigenvalueResult::is_converged));
+    assert_eq!(old_roots[0].value(), current_roots[0].value());
+    assert_ne!(
+        old_root_manifest.key.parameters_digest,
+        current_root_manifest.key.parameters_digest
+    );
+
+    let warm = ArtifactCacheContext {
+        resolver: Some(&resolver),
+        reference_resolver: None,
+        acceptance: Some(&policy),
+        ordered_overlays: vec!["local".into()],
+        mode: ArtifactExecutionCacheMode::RequireReuse,
+        write_on_miss: false,
+        write_visibility: CacheVisibility::Local,
+        requested_assurance: xc_core::AssuranceLevel::Computed,
+        certification_failure_policy: xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+        production_sink: None,
+    };
+    let warm_source = resolve_secular_source_via_cache(&params, &cfg, &current, &warm).unwrap();
+    assert_eq!(warm_source.key, current_source.key);
+    let (_, warm_root, _) = roots_for(&warm_source, &warm);
+    assert_eq!(warm_root.key, current_root_manifest.key);
+    let state = RetainedState::from_payload(
+        &current,
+        &payload,
+        std::slice::from_ref(&current.content_digest),
+    )
+    .unwrap();
+    let source_bytes = resolver
+        .resolve_exact(
+            &warm_source.key,
+            &warm_source.content_digest,
+            CacheQuality::Validated,
+            &policy,
+        )
+        .unwrap()
+        .payload;
+    let root_bytes = resolver
+        .resolve_exact(
+            &warm_root.key,
+            &warm_root.content_digest,
+            CacheQuality::Validated,
+            &policy,
+        )
+        .unwrap()
+        .payload;
+    let retained = RetainedRoots::from_payload(
+        &warm_root,
+        &root_bytes,
+        &warm_source,
+        &source_bytes,
+        &state,
+        &[
+            warm_root.content_digest.clone(),
+            warm_source.content_digest.clone(),
+        ],
+    )
+    .unwrap();
+    let cold_capture = capture_root_window(&retained, &cache).unwrap();
+    let warm_capture = capture_root_window(&retained, &warm).unwrap();
+    assert_eq!(
+        serde_json::to_value(cold_capture.value).unwrap(),
+        serde_json::to_value(warm_capture.value).unwrap()
+    );
+    let old_source_bytes = resolver
+        .resolve_exact(
+            &old_source.key,
+            &old_source.content_digest,
+            CacheQuality::Validated,
+            &policy,
+        )
+        .unwrap()
+        .payload;
+    let old_root_bytes = resolver
+        .resolve_exact(
+            &old_root_manifest.key,
+            &old_root_manifest.content_digest,
+            CacheQuality::Validated,
+            &policy,
+        )
+        .unwrap()
+        .payload;
+    assert!(RetainedRoots::from_payload(
+        &old_root_manifest,
+        &old_root_bytes,
+        &old_source,
+        &old_source_bytes,
+        &state,
+        &[
+            old_root_manifest.content_digest.clone(),
+            old_source.content_digest.clone()
+        ]
+    )
+    .is_err());
+
+    let corrupt_dir = xc_core::test_support::TestDir::new("secular-wrong-validation");
+    let corrupt_store = FilesystemCacheStore::new(
+        "corrupt",
+        corrupt_dir.to_path_buf(),
+        true,
+        CacheVisibility::Local,
+    );
+    let mut changed: serde_json::Value = serde_json::from_slice(&source_bytes).unwrap();
+    changed["eigenpair_semantic_digest"] = serde_json::json!(old.key.parameters_digest.0);
+    corrupt_store
+        .put(
+            &draft(
+                current_source.key.clone(),
+                current_source.dependencies.clone(),
+                current_source.tags.clone(),
+            ),
+            &serde_json::to_vec(&changed).unwrap(),
+        )
+        .unwrap();
+    let corrupt_resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(corrupt_store),
+    }]);
+    let corrupt_cache = ArtifactCacheContext {
+        resolver: Some(&corrupt_resolver),
+        ..warm
+    };
+    assert!(resolve_secular_source_via_cache(&params, &cfg, &current, &corrupt_cache).is_err());
 }

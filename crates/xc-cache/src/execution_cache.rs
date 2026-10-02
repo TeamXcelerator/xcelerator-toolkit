@@ -415,24 +415,7 @@ impl ManagedArtifactCacheConfig {
 }
 
 fn default_managed_cache_root() -> std::ffi::OsString {
-    if let Some(root) = std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(root).join("xcelerator").into_os_string();
-    }
-    if cfg!(windows) {
-        if let Some(root) = std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
-            return PathBuf::from(root)
-                .join("Xcelerator")
-                .join("cache")
-                .into_os_string();
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(home)
-            .join(".cache")
-            .join("xcelerator")
-            .into_os_string();
-    }
-    PathBuf::from(".xcelerator-cache").into_os_string()
+    xc_core::default_cache_root().into_os_string()
 }
 
 fn default_validation_cache_root(cache_root: &Path) -> PathBuf {
@@ -1216,7 +1199,7 @@ impl ManagedArtifactCacheSession {
                 )));
             }
             self.mark_staged_drafts_completed(&pending_drafts)?;
-            eprintln!(
+            xc_core::progress_message!(
                 "{}",
                 format_publication_completion(
                     self.requested_assurance,
@@ -2115,6 +2098,17 @@ pub struct ArtifactExecutionCacheRequest<'a> {
     pub production_sink: Option<&'a dyn ArtifactProductionSink>,
 }
 
+/// True when `value` encodes, with the managed JSON artifact codec, to exactly
+/// the payload that `manifest` records. Callers that accept a decoded artifact
+/// together with its manifest use this to bind the two before relying on the
+/// manifest for identity.
+pub fn json_payload_matches_manifest<T: Serialize>(
+    manifest: &ArtifactManifest,
+    value: &T,
+) -> Result<bool, CacheError> {
+    Ok(ContentDigest::sha256(&crate::finite_json::to_vec(value)?) == manifest.content_digest)
+}
+
 /// Result plus the exact cache/provenance decision made during execution.
 pub struct ArtifactExecutionCacheResult<T> {
     pub value: T,
@@ -2263,6 +2257,18 @@ fn emit_dependency_closure(
                 dependency.key.kind, dependency.key.logical_key
             )));
         }
+        // The walk set also holds completion markers. A dependency whose
+        // payload route already completed in this walk, and which the sink
+        // reports as recorded, would only be read, hashed and recorded again
+        // as the identical no-op record (a DAG diamond such as two LUs over
+        // one sector over one Tau).
+        let completed = format!("{COMPLETED_DEPENDENCY_WALK_MARKER}{identity}");
+        if visiting.contains(&completed)
+            && sink.contains_artifact(&dependency.key, &dependency.content_digest)?
+        {
+            visiting.remove(&identity);
+            continue;
+        }
         if let Some(staged) = sink.retained_canonical_manifest_for_artifact(
             &dependency.key,
             &dependency.content_digest,
@@ -2359,9 +2365,14 @@ fn emit_dependency_closure(
             )?;
         }
         visiting.remove(&identity);
+        visiting.insert(completed);
     }
     Ok(())
 }
+
+/// Prefix of a dependency-walk completion marker. Walk identities begin with
+/// an artifact kind, which never contains a newline.
+const COMPLETED_DEPENDENCY_WALK_MARKER: &str = "\ncompleted\n";
 
 /// Verify that a retained canonical manifest really describes the adapter
 /// manifest it rides on, before anything trusts its contents.
@@ -2703,6 +2714,294 @@ where
     )
 }
 
+/// Identity of every input other than the payload bytes that a domain
+/// validator reads, for [`resolve_or_compute_json_artifact_memoized`].
+///
+/// A retained runtime value is reused only for byte-identical payloads
+/// validated under one of the contexts named here. Callers must name every
+/// configuration value, flag and runtime operand the validator closes over;
+/// an omission could let a value validated for one input satisfy another.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedValueMemoContext {
+    /// Validator identity applied to a reused payload in this call.
+    pub reuse: String,
+    /// Validator identity applied to a payload produced in this call.
+    pub produced: String,
+    /// Further validator identities whose gates include every gate of
+    /// `reuse`; their retained values also satisfy a reuse in this call.
+    pub stronger: Vec<String>,
+}
+
+impl ValidatedValueMemoContext {
+    /// One validator applied identically to reused and produced payloads.
+    pub fn exact(context: impl Into<String>) -> Self {
+        let context = context.into();
+        Self {
+            reuse: context.clone(),
+            produced: context,
+            stronger: Vec::new(),
+        }
+    }
+}
+
+/// Logical payload bytes whose validated runtime values one process retains.
+/// Eviction only causes a later use to decode and validate again.
+const VALIDATED_VALUE_MEMO_MAXIMUM_PAYLOAD_BYTES: u64 = 4 << 30;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ValidatedValueMemoKey {
+    payload_type: std::any::TypeId,
+    value_type: std::any::TypeId,
+    artifact: ArtifactKey,
+    payload_digest: ContentDigest,
+    context: String,
+}
+
+struct ValidatedValueMemoEntry {
+    value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    payload_bytes: u64,
+    sequence: u64,
+}
+
+#[derive(Default)]
+struct ValidatedValueMemo {
+    entries: std::collections::HashMap<ValidatedValueMemoKey, ValidatedValueMemoEntry>,
+    recency: BTreeMap<u64, ValidatedValueMemoKey>,
+    retained_payload_bytes: u64,
+    next_sequence: u64,
+}
+
+static VALIDATED_VALUE_MEMO: OnceLock<Mutex<ValidatedValueMemo>> = OnceLock::new();
+
+thread_local! {
+    static VALIDATED_VALUE_MEMO_THREAD_STATISTICS: std::cell::Cell<ValidatedValueMemoStatistics> =
+        const { std::cell::Cell::new(ValidatedValueMemoStatistics { hits: 0, insertions: 0 }) };
+}
+
+/// Validated-value memo activity on the calling thread. Diagnostic only.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ValidatedValueMemoStatistics {
+    pub hits: u64,
+    pub insertions: u64,
+}
+
+#[doc(hidden)]
+pub fn validated_value_memo_thread_statistics() -> ValidatedValueMemoStatistics {
+    VALIDATED_VALUE_MEMO_THREAD_STATISTICS.with(std::cell::Cell::get)
+}
+
+fn record_validated_value_memo_event(hit: bool) {
+    VALIDATED_VALUE_MEMO_THREAD_STATISTICS.with(|statistics| {
+        let mut current = statistics.get();
+        if hit {
+            current.hits += 1;
+        } else {
+            current.insertions += 1;
+        }
+        statistics.set(current);
+    });
+}
+
+/// Memo binding for one execution: the decoded payload type, the runtime
+/// value type and the validator contexts. Built only by the memoized entry
+/// point, where both types are known to be `'static`.
+struct ValidatedValueMemoBinding<'a> {
+    payload_type: std::any::TypeId,
+    context: &'a ValidatedValueMemoContext,
+}
+
+impl ValidatedValueMemoBinding<'_> {
+    fn key(
+        &self,
+        value_type: std::any::TypeId,
+        artifact: &ArtifactKey,
+        payload_digest: &ContentDigest,
+        context: &str,
+    ) -> ValidatedValueMemoKey {
+        ValidatedValueMemoKey {
+            payload_type: self.payload_type,
+            value_type,
+            artifact: artifact.clone(),
+            payload_digest: payload_digest.clone(),
+            context: context.to_owned(),
+        }
+    }
+
+    /// Return a value previously validated from exactly these payload bytes
+    /// under this call's reuse context or a stronger one.
+    fn lookup<R: Clone + Send + Sync + 'static>(
+        &self,
+        artifact: &ArtifactKey,
+        payload_digest: &ContentDigest,
+    ) -> Option<R> {
+        let memo = VALIDATED_VALUE_MEMO.get()?;
+        let retained = {
+            let mut memo = memo.lock().ok()?;
+            let memo = &mut *memo;
+            let found = std::iter::once(&self.context.reuse)
+                .chain(&self.context.stronger)
+                .map(|context| {
+                    self.key(
+                        std::any::TypeId::of::<R>(),
+                        artifact,
+                        payload_digest,
+                        context,
+                    )
+                })
+                .find(|key| memo.entries.contains_key(key))?;
+            let sequence = memo.next_sequence;
+            memo.next_sequence += 1;
+            let entry = memo.entries.get_mut(&found)?;
+            memo.recency.remove(&entry.sequence);
+            entry.sequence = sequence;
+            memo.recency.insert(sequence, found);
+            entry.value.clone()
+        };
+        let value = retained.downcast::<R>().ok()?.as_ref().clone();
+        record_validated_value_memo_event(true);
+        Some(value)
+    }
+
+    /// Retain a value that the domain validator accepted for exactly these
+    /// payload bytes under `context`.
+    fn insert<R: Clone + Send + Sync + 'static>(
+        &self,
+        artifact: &ArtifactKey,
+        payload_digest: &ContentDigest,
+        payload_bytes: u64,
+        context: &str,
+        value: &R,
+    ) {
+        if payload_bytes > VALIDATED_VALUE_MEMO_MAXIMUM_PAYLOAD_BYTES {
+            return;
+        }
+        let key = self.key(
+            std::any::TypeId::of::<R>(),
+            artifact,
+            payload_digest,
+            context,
+        );
+        let memo = VALIDATED_VALUE_MEMO.get_or_init(|| Mutex::new(ValidatedValueMemo::default()));
+        let Ok(mut memo) = memo.lock() else {
+            return;
+        };
+        let memo = &mut *memo;
+        if memo.entries.contains_key(&key) {
+            return;
+        }
+        while memo.retained_payload_bytes + payload_bytes
+            > VALIDATED_VALUE_MEMO_MAXIMUM_PAYLOAD_BYTES
+        {
+            let Some((_, oldest)) = memo.recency.pop_first() else {
+                break;
+            };
+            if let Some(evicted) = memo.entries.remove(&oldest) {
+                memo.retained_payload_bytes -= evicted.payload_bytes;
+            }
+        }
+        let sequence = memo.next_sequence;
+        memo.next_sequence += 1;
+        memo.recency.insert(sequence, key.clone());
+        memo.entries.insert(
+            key,
+            ValidatedValueMemoEntry {
+                value: std::sync::Arc::new(value.clone()),
+                payload_bytes,
+                sequence,
+            },
+        );
+        memo.retained_payload_bytes += payload_bytes;
+        record_validated_value_memo_event(false);
+    }
+}
+
+/// Decode a reused payload into the stable representation that the domain
+/// validator checks and the caller receives.
+fn decode_reused_json_payload<T>(payload: &[u8]) -> Result<T, CacheError>
+where
+    T: Serialize + DeserializeOwned,
+{
+    let value: T = serde_json::from_slice(payload).map_err(|error| {
+        CacheError::InvalidManifest(format!(
+            "cached typed payload failed JSON decoding: {error}"
+        ))
+    })?;
+    // Reject custom decoders that manufacture nonfinite values;
+    // old whitespace/field order remains admissible JSON.
+    let encoded = crate::finite_json::to_vec(&value)?;
+    // Always decode the re-encoding again: this generic path accepts any
+    // `Serialize + DeserializeOwned` codec, and only a second decode shows that
+    // the representation is stable for that codec.
+    let decoded: T = serde_json::from_slice(&encoded)?;
+    if crate::finite_json::to_vec(&decoded)? != encoded {
+        return Err(CacheError::InvalidManifest(
+            "cached typed payload changes on JSON round trip".to_owned(),
+        ));
+    }
+    Ok(decoded)
+}
+
+/// A runtime value returned by the shared execution core: decoded and
+/// validated in this call, or retained from an earlier validation of the
+/// same payload bytes in this process.
+enum ValidatedExecutionValue<T, R> {
+    Decoded(T, R),
+    Retained(R),
+}
+
+/// Memoized form of [`resolve_or_compute_json_artifact_with_dependencies`]
+/// for large payloads whose decoding and validation dominate a reuse.
+///
+/// `validate` returns the runtime value derived from the validated payload.
+/// After it succeeds, that value is retained in a bounded process-local memo
+/// keyed by the artifact key, the SHA-256 of the exact logical payload bytes
+/// computed in this process, both value types and the validator context. A
+/// later reuse of byte-identical payload bytes under a matching context
+/// returns the retained value instead of decoding and validating again.
+/// Failures are never retained and nothing is persisted.
+///
+/// Manifest selection, the verified payload read, access provenance, remote
+/// adoption, production-sink staging and cache reporting run on every call
+/// exactly as in the unmemoized form. A memo hit and a miss return equal
+/// values; scheduling can change only which of the two occurs.
+pub fn resolve_or_compute_json_artifact_memoized<T, R, Compute, Validate>(
+    request: &ArtifactExecutionCacheRequest<'_>,
+    context: &ValidatedValueMemoContext,
+    compute: Compute,
+    validate: Validate,
+) -> Result<ArtifactExecutionCacheResult<R>, CacheError>
+where
+    T: Serialize + DeserializeOwned + 'static,
+    R: Clone + Send + Sync + 'static,
+    Compute: FnOnce() -> Result<(T, Vec<crate::DependencyRef>), CacheError>,
+    Validate: Fn(&T) -> Result<R, CacheError>,
+{
+    let binding = ValidatedValueMemoBinding {
+        payload_type: std::any::TypeId::of::<T>(),
+        context,
+    };
+    let result = resolve_or_compute_json_artifact_core(
+        request,
+        Some(&binding),
+        || {
+            compute().map(|(value, dependencies)| {
+                (value, dependencies, ArtifactProductionAssessment::default())
+            })
+        },
+        validate,
+    )?;
+    Ok(ArtifactExecutionCacheResult {
+        value: match result.value {
+            ValidatedExecutionValue::Decoded(_, value)
+            | ValidatedExecutionValue::Retained(value) => value,
+        },
+        access: result.access,
+        reused_manifest: result.reused_manifest,
+        produced_manifest: result.produced_manifest,
+    })
+}
+
 /// Assurance-aware production boundary. Certification or independent
 /// cross-checking is performed from the retained computation state and bound
 /// to the exact produced artifact before the production sink can package it.
@@ -2717,6 +3016,34 @@ where
         FnOnce()
             -> Result<(T, Vec<crate::DependencyRef>, ArtifactProductionAssessment), CacheError>,
     Validate: Fn(&T) -> Result<(), CacheError>,
+{
+    let result = resolve_or_compute_json_artifact_core(request, None, compute, validate)?;
+    let ValidatedExecutionValue::Decoded(value, ()) = result.value else {
+        return Err(CacheError::InvalidTransition(
+            "unmemoized execution returned a retained value".to_owned(),
+        ));
+    };
+    Ok(ArtifactExecutionCacheResult {
+        value,
+        access: result.access,
+        reused_manifest: result.reused_manifest,
+        produced_manifest: result.produced_manifest,
+    })
+}
+
+fn resolve_or_compute_json_artifact_core<T, R, Compute, Validate>(
+    request: &ArtifactExecutionCacheRequest<'_>,
+    memo: Option<&ValidatedValueMemoBinding<'_>>,
+    compute: Compute,
+    validate: Validate,
+) -> Result<ArtifactExecutionCacheResult<ValidatedExecutionValue<T, R>>, CacheError>
+where
+    T: Serialize + DeserializeOwned,
+    R: Clone + Send + Sync + 'static,
+    Compute:
+        FnOnce()
+            -> Result<(T, Vec<crate::DependencyRef>, ArtifactProductionAssessment), CacheError>,
+    Validate: Fn(&T) -> Result<R, CacheError>,
 {
     validate_request(request)?;
     let performance_metadata = || xc_core::PerformanceStageMetadata {
@@ -2746,22 +3073,33 @@ where
                             metadata
                         },
                     );
-                    let value: T = serde_json::from_slice(&resolved.payload).map_err(|error| {
-                        CacheError::InvalidManifest(format!(
-                            "cached typed payload failed JSON decoding: {error}"
-                        ))
-                    })?;
-                    validate(&value)?;
-                    // Reject custom decoders that manufacture nonfinite values;
-                    // old whitespace/field order remains admissible JSON.
-                    let encoded = crate::finite_json::to_vec(&value)?;
-                    let decoded: T = serde_json::from_slice(&encoded)?;
-                    validate(&decoded)?;
-                    if crate::finite_json::to_vec(&decoded)? != encoded {
-                        return Err(CacheError::InvalidManifest(
-                            "cached typed payload changes on JSON round trip".to_owned(),
-                        ));
-                    }
+                    // The memo is keyed by the digest of the exact bytes in
+                    // hand, computed here, never by a store's or manifest's
+                    // claim about them.
+                    let memo_payload_digest =
+                        memo.map(|_| ContentDigest::sha256(&resolved.payload));
+                    let retained = memo
+                        .zip(memo_payload_digest.as_ref())
+                        .and_then(|(memo, digest)| memo.lookup::<R>(&key, digest));
+                    let value = if let Some(retained) = retained {
+                        ValidatedExecutionValue::Retained(retained)
+                    } else {
+                        let decoded: T = decode_reused_json_payload(&resolved.payload)?;
+                        // Validate exactly the stable representation returned to the
+                        // caller. Running the domain validator on both sides of this
+                        // round trip repeated numerical replay without adding a gate.
+                        let validated = validate(&decoded)?;
+                        if let (Some(memo), Some(digest)) = (memo, memo_payload_digest.as_ref()) {
+                            memo.insert(
+                                &key,
+                                digest,
+                                resolved.payload.len() as u64,
+                                &memo.context.reuse,
+                                &validated,
+                            );
+                        }
+                        ValidatedExecutionValue::Decoded(decoded, validated)
+                    };
                     drop(performance_decode);
                     let access = access_record(
                         request,
@@ -2914,7 +3252,6 @@ where
             ));
         }
     }
-    validate(&value)?;
     let performance_encode = xc_core::performance_stage_with("cache.artifact.encode", || {
         let mut metadata = performance_metadata();
         metadata.cache_disposition = Some("computed".to_owned());
@@ -2922,13 +3259,26 @@ where
     });
     let payload = crate::finite_json::to_vec(&value)?;
     // Return the same validated representation on cold and warm execution.
-    let value = serde_json::from_slice(&payload)?;
-    validate(&value)?;
+    let value: T = serde_json::from_slice(&payload)?;
     if crate::finite_json::to_vec(&value)? != payload {
         return Err(CacheError::InvalidManifest(
             "typed payload changes on JSON round trip".to_owned(),
         ));
     }
+    let validated = validate(&value)?;
+    // `payload` re-encodes to itself, so a later reuse of these bytes decodes
+    // exactly `value`; it differs only by the validator context it runs under.
+    // Only a written artifact can be reused later in this process.
+    if let Some(memo) = memo.filter(|_| request.write_on_miss) {
+        memo.insert(
+            &key,
+            &ContentDigest::sha256(&payload),
+            payload.len() as u64,
+            &memo.context.produced,
+            &validated,
+        );
+    }
+    let value = ValidatedExecutionValue::Decoded(value, validated);
     drop(performance_encode);
     let computed_dependencies = dependencies.clone();
     let produced_manifest = if request.write_on_miss {
@@ -2944,11 +3294,21 @@ where
             String::from_utf8(crate::protocol::canonical_json_bytes(request.semantic_key)?)
                 .map_err(|error| CacheError::Serialization(error.to_string()))?,
         );
+        // A managed kind is never written below its policy reader floor, so
+        // readers released before a format change refuse the artifact.
+        let mut minimum_reader_version = request.minimum_reader_version.clone();
+        if let Some(family) =
+            crate::production_staging::family_for_artifact_kind(&request.semantic_key.artifact_kind)
+        {
+            let policy =
+                crate::artifact_compatibility_policy(family, &request.semantic_key.artifact_kind)?;
+            minimum_reader_version = minimum_reader_version.max(policy.minimum_reader_version);
+        }
         let draft = ArtifactDraft {
             schema_version: request.semantic_key.schema_version,
             key,
             producer_toolkit_version: request.producer_toolkit_version.clone(),
-            minimum_reader_version: request.minimum_reader_version.clone(),
+            minimum_reader_version,
             maximum_reader_version: request.maximum_reader_version.clone(),
             quality: request.produced_quality,
             visibility: request.write_visibility,
@@ -3152,7 +3512,7 @@ fn report_managed_cache_decision(
         .iter()
         .any(|overlay| overlay.starts_with("github-"))
     {
-        eprintln!(
+        xc_core::progress_message!(
             "  cache artifact: {} ({outcome}, source={source})",
             request.semantic_key.artifact_kind
         );
@@ -3262,7 +3622,8 @@ mod tests {
 
     #[test]
     fn validation_cache_root_cannot_overlap_the_production_cache() {
-        let production = root("production-cache-root");
+        let scratch = crate::test_support::TestDir::new("production-cache-root");
+        let production = scratch.join("production");
         assert!(validate_separate_cache_roots(&production, &production).is_err());
         assert!(
             validate_separate_cache_roots(&production, &production.join("validation")).is_err()
@@ -3283,8 +3644,8 @@ mod tests {
     fn validation_cache_root_rejects_a_symlink_alias_of_production() {
         use std::os::unix::fs::symlink;
 
-        let root = root("validation-cache-symlink-alias");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("validation-cache-symlink");
+        let root = scratch.join("root");
         let production = root.join("production");
         let alias = root.join("validation-alias");
         fs::create_dir_all(&production).unwrap();
@@ -3349,8 +3710,8 @@ mod tests {
             }
         }
 
-        let root = root("cumulative-publication-report");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("cumulative-publication-r");
+        let root = scratch.join("root");
         let first = phase(&["transaction-a", "transaction-b"], 2);
         let second = phase(&["transaction-c"], 3);
 
@@ -3420,10 +3781,6 @@ mod tests {
         }
     }
 
-    fn root(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
-    }
-
     fn semantic_key() -> SemanticKeyEnvelope {
         SemanticKeyEnvelope {
             schema_version: 1,
@@ -3440,7 +3797,7 @@ mod tests {
 
     fn policy() -> CachePolicy {
         CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -3467,8 +3824,8 @@ mod tests {
             write_on_miss: mode.writes_computed_artifacts(),
             write_visibility: CacheVisibility::Local,
             produced_quality: CacheQuality::Validated,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             tags: BTreeMap::new(),
             provenance_digest: None,
@@ -3500,7 +3857,8 @@ mod tests {
 
     #[test]
     fn read_only_session_policies_and_no_persistent_side_effects() {
-        let root = root("r2-read-only-policy").join("never-created");
+        let scratch = crate::test_support::TestDir::new("r2-read-only-policy");
+        let root = scratch.join("root").join("never-created");
         assert!(!root.exists());
         for mode in [
             ArtifactExecutionCacheMode::Disabled,
@@ -3583,7 +3941,7 @@ mod tests {
             write_visibility: context.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: crate::current_toolkit_version().unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             tags: BTreeMap::new(),
             provenance_digest: None,
@@ -3630,9 +3988,374 @@ mod tests {
     }
 
     #[test]
+    fn stable_returned_payload_is_domain_validated_once_per_resolution() {
+        let scratch = crate::test_support::TestDir::new("exec-cache-one-validation");
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "workstation",
+                scratch.join("root"),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let key = semantic_key();
+        let policy = policy();
+        let calls = AtomicUsize::new(0);
+        for expected_calls in [1, 2] {
+            let resolved = resolve_or_compute_json_artifact(
+                &request(
+                    &key,
+                    &resolver,
+                    &policy,
+                    ArtifactExecutionCacheMode::PreferReuse,
+                ),
+                || Ok(vec![1u32, 2, 3]),
+                |value| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(value, &[1, 2, 3]);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(resolved.value, [1, 2, 3]);
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+            assert_eq!(resolved.reused_manifest.is_some(), expected_calls == 2);
+        }
+        // Invalid decoded values are still refused on a hit, with no compute fallback.
+        assert!(resolve_or_compute_json_artifact::<Vec<u32>, _, _>(
+            &request(
+                &key,
+                &resolver,
+                &policy,
+                ArtifactExecutionCacheMode::RequireReuse
+            ),
+            || panic!("invalid hit must not recompute"),
+            |_| Err(CacheError::InvalidManifest("domain rejection".into())),
+        )
+        .is_err());
+    }
+
+    /// The released reuse decoder, kept as an independent reference.
+    fn reference_decode_reused_json_payload<T>(payload: &[u8]) -> Result<T, CacheError>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        let value: T = serde_json::from_slice(payload).map_err(|error| {
+            CacheError::InvalidManifest(format!(
+                "cached typed payload failed JSON decoding: {error}"
+            ))
+        })?;
+        let encoded = crate::finite_json::to_vec(&value)?;
+        let decoded: T = serde_json::from_slice(&encoded)?;
+        if crate::finite_json::to_vec(&decoded)? != encoded {
+            return Err(CacheError::InvalidManifest(
+                "cached typed payload changes on JSON round trip".to_owned(),
+            ));
+        }
+        Ok(decoded)
+    }
+
+    #[test]
+    fn reuse_decode_rejects_a_codec_that_changes_on_its_second_decode() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DECODES: AtomicUsize = AtomicUsize::new(0);
+        #[derive(Debug, Serialize)]
+        struct Drifting {
+            v: u64,
+        }
+        impl<'de> Deserialize<'de> for Drifting {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                #[derive(Deserialize)]
+                struct Raw {
+                    v: u64,
+                }
+                let raw = Raw::deserialize(d)?;
+                // Canonical bytes on the first decode, a different value after.
+                let decodes = DECODES.fetch_add(1, Ordering::SeqCst) as u64;
+                Ok(Self { v: raw.v + decodes })
+            }
+        }
+        DECODES.store(0, Ordering::SeqCst);
+        let error = decode_reused_json_payload::<Drifting>(br#"{"v":1}"#).unwrap_err();
+        assert!(error.to_string().contains("changes on JSON round trip"));
+    }
+
+    #[test]
+    fn canonical_reuse_decode_matches_the_full_round_trip() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Fixture {
+            name: String,
+            values: Vec<f64>,
+            nested: BTreeMap<String, Option<i64>>,
+        }
+        let canonical = crate::finite_json::to_vec(&Fixture {
+            name: "tau".to_owned(),
+            values: vec![-0.0, 0.1, 1e-300, f64::MAX],
+            nested: BTreeMap::from([("a".to_owned(), None), ("b".to_owned(), Some(-7))]),
+        })
+        .unwrap();
+        let payloads: Vec<Vec<u8>> = vec![
+            canonical.clone(),
+            String::from_utf8(canonical.clone())
+                .unwrap()
+                .replace(',', " ,\n ")
+                .into_bytes(),
+            br#"{"values":[1.0,2.50,3e2],"name":"x","nested":{}}"#.to_vec(),
+            br#"{"name":"x","values":[1e400],"nested":{}}"#.to_vec(),
+            br#"{"name":"x","values":[1.0],"nested":{},"extra":1}"#.to_vec(),
+            br#"{"name":"x","values":"#.to_vec(),
+            b"null".to_vec(),
+        ];
+        for payload in payloads {
+            let reference = reference_decode_reused_json_payload::<Fixture>(&payload);
+            let current = decode_reused_json_payload::<Fixture>(&payload);
+            match (reference, current) {
+                (Ok(reference), Ok(current)) => {
+                    assert_eq!(reference, current);
+                    assert_eq!(
+                        crate::finite_json::to_vec(&reference).unwrap(),
+                        crate::finite_json::to_vec(&current).unwrap()
+                    );
+                    for (left, right) in reference.values.iter().zip(&current.values) {
+                        assert_eq!(left.to_bits(), right.to_bits());
+                    }
+                }
+                (Err(reference), Err(current)) => {
+                    assert_eq!(reference.to_string(), current.to_string());
+                }
+                (reference, current) => {
+                    panic!("decoders disagree: {reference:?} versus {current:?}")
+                }
+            }
+        }
+    }
+
+    fn memo_fixture_resolver(root: &Path) -> CacheResolver {
+        CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(crate::ZipJsonFilesystemCacheStore::new(
+                "workstation",
+                root,
+                true,
+                CacheVisibility::Local,
+            )),
+        }])
+    }
+
+    /// Memoized resolution of the shared fixture artifact; `calls` counts
+    /// domain validations.
+    fn memoized_fixture(
+        resolver: &CacheResolver,
+        context: &ValidatedValueMemoContext,
+        mode: ArtifactExecutionCacheMode,
+        calls: &AtomicUsize,
+    ) -> Result<ArtifactExecutionCacheResult<Vec<u64>>, CacheError> {
+        let key = semantic_key();
+        let policy = policy();
+        resolve_or_compute_json_artifact_memoized(
+            &request(&key, resolver, &policy, mode),
+            context,
+            || Ok((vec![1u32, 2, 3], Vec::new())),
+            |value: &Vec<u32>| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(value.iter().map(|entry| u64::from(*entry) * 10).collect())
+            },
+        )
+    }
+
+    #[test]
+    fn memoized_reuse_validates_each_payload_once_per_validator_context() {
+        let scratch = crate::test_support::TestDir::new("exec-cache-validated-memo");
+        let resolver = memo_fixture_resolver(&scratch.join("root"));
+        // Contexts are unique to this test: the memo is process-wide.
+        let context = ValidatedValueMemoContext::exact("memo-test-a");
+        let calls = AtomicUsize::new(0);
+        let before = validated_value_memo_thread_statistics();
+        let cold = memoized_fixture(
+            &resolver,
+            &context,
+            ArtifactExecutionCacheMode::PreferReuse,
+            &calls,
+        )
+        .unwrap();
+        assert!(cold.produced_manifest.is_some());
+        assert_eq!(cold.value, [10, 20, 30]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Every warm use selects the manifest, reads and verifies the payload
+        // and records provenance exactly as the unmemoized path does.
+        let key = semantic_key();
+        let policy = policy();
+        let plain = resolve_or_compute_json_artifact(
+            &request(
+                &key,
+                &resolver,
+                &policy,
+                ArtifactExecutionCacheMode::RequireReuse,
+            ),
+            || -> Result<Vec<u32>, CacheError> { panic!("hit must not recompute") },
+            |_| Ok(()),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            let warm = memoized_fixture(
+                &resolver,
+                &context,
+                ArtifactExecutionCacheMode::RequireReuse,
+                &calls,
+            )
+            .unwrap();
+            assert_eq!(warm.value, cold.value);
+            assert_eq!(warm.access, plain.access);
+            assert_eq!(warm.reused_manifest, plain.reused_manifest);
+            assert_eq!(warm.reused_manifest, cold.produced_manifest);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let after = validated_value_memo_thread_statistics();
+        assert_eq!(after.insertions - before.insertions, 1);
+        assert_eq!(after.hits - before.hits, 3);
+        // A value validated under one context never satisfies another.
+        let other = ValidatedValueMemoContext::exact("memo-test-a-other-operand");
+        let warm = memoized_fixture(
+            &resolver,
+            &other,
+            ArtifactExecutionCacheMode::RequireReuse,
+            &calls,
+        )
+        .unwrap();
+        assert_eq!(warm.value, cold.value);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // A stronger validation satisfies a weaker reuse, never the reverse.
+        let weak = ValidatedValueMemoContext {
+            reuse: "memo-test-a-weak".to_owned(),
+            produced: "memo-test-a-strong".to_owned(),
+            stronger: vec!["memo-test-a-strong".to_owned()],
+        };
+        let strong = ValidatedValueMemoContext::exact("memo-test-a-strong");
+        memoized_fixture(
+            &resolver,
+            &weak,
+            ArtifactExecutionCacheMode::RequireReuse,
+            &calls,
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        memoized_fixture(
+            &resolver,
+            &strong,
+            ArtifactExecutionCacheMode::RequireReuse,
+            &calls,
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let weak_again = ValidatedValueMemoContext {
+            reuse: "memo-test-a-weak-2".to_owned(),
+            produced: "memo-test-a-strong".to_owned(),
+            stronger: vec!["memo-test-a-strong".to_owned()],
+        };
+        memoized_fixture(
+            &resolver,
+            &weak_again,
+            ArtifactExecutionCacheMode::RequireReuse,
+            &calls,
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        // A rejected payload is never retained.
+        let rejecting = ValidatedValueMemoContext::exact("memo-test-a-rejecting");
+        for _ in 0..2 {
+            assert!(
+                resolve_or_compute_json_artifact_memoized::<Vec<u32>, u64, _, _>(
+                    &request(
+                        &key,
+                        &resolver,
+                        &policy,
+                        ArtifactExecutionCacheMode::RequireReuse,
+                    ),
+                    &rejecting,
+                    || panic!("invalid hit must not recompute"),
+                    |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Err(CacheError::InvalidManifest("domain rejection".into()))
+                    },
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn memoized_value_never_outlives_its_verified_payload() {
+        let scratch = crate::test_support::TestDir::new("exec-cache-validated-memo-fault");
+        let root = scratch.join("root");
+        let resolver = memo_fixture_resolver(&root);
+        let context = ValidatedValueMemoContext::exact("memo-test-b");
+        let calls = AtomicUsize::new(0);
+        let cold = memoized_fixture(
+            &resolver,
+            &context,
+            ArtifactExecutionCacheMode::PreferReuse,
+            &calls,
+        )
+        .unwrap();
+        let warm = memoized_fixture(
+            &resolver,
+            &context,
+            ArtifactExecutionCacheMode::RequireReuse,
+            &calls,
+        )
+        .unwrap();
+        assert_eq!(warm.value, cold.value);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let mut corrupted = 0;
+        for entry in walk_files(&root.join("objects")) {
+            let mut bytes = fs::read(&entry).unwrap();
+            let middle = bytes.len() / 2;
+            bytes[middle] ^= 0x5a;
+            fs::write(&entry, bytes).unwrap();
+            corrupted += 1;
+        }
+        assert!(corrupted > 0);
+        // The retained value is never returned for bytes that no longer
+        // verify: the payload is read and checked on every use, in this
+        // process and in a fresh one (a context with no retained value).
+        for context in [
+            context,
+            ValidatedValueMemoContext::exact("memo-test-b-fresh"),
+        ] {
+            assert!(memoized_fixture(
+                &resolver,
+                &context,
+                ArtifactExecutionCacheMode::RequireReuse,
+                &calls,
+            )
+            .is_err());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn walk_files(root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    #[test]
     fn one_contract_computes_writes_reuses_and_records_provenance() {
-        let root = root("execution-cache-roundtrip");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-roundtrip");
+        let root = scratch.join("root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -3702,8 +4425,8 @@ mod tests {
 
     #[test]
     fn refresh_bypasses_an_existing_hit_and_publishes_the_fresh_value_locally() {
-        let root = root("execution-cache-refresh");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-refresh");
+        let root = scratch.join("root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -3750,8 +4473,8 @@ mod tests {
 
     #[test]
     fn require_reuse_miss_never_computes() {
-        let root = root("execution-cache-required-miss");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-required-miss");
+        let root = scratch.join("root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -3779,8 +4502,8 @@ mod tests {
 
     #[test]
     fn produced_dependencies_are_committed_and_reused_exactly() {
-        let root = root("execution-cache-dependencies");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-dependencies");
+        let root = scratch.join("root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -3912,9 +4635,127 @@ mod tests {
     }
 
     #[test]
+    fn payload_closure_walk_reads_each_diamond_dependency_once() {
+        let scratch = crate::test_support::TestDir::new("exec-cache-diamond-walk");
+        let root = scratch.join("root");
+        let policy = policy();
+        let payload_reads = std::sync::Arc::new(AtomicUsize::new(0));
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(PayloadReadCountingStore {
+                inner: crate::ZipJsonFilesystemCacheStore::new(
+                    "workstation",
+                    root.join("cache"),
+                    true,
+                    CacheVisibility::Local,
+                ),
+                payload_reads: payload_reads.clone(),
+            }),
+        }]);
+        let fixture_key = |role: &str| SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "ccm_fixture".to_owned(),
+            mathematical_semantics_version: "ccm-diamond-fixture-v1".to_owned(),
+            resolved_mathematical_parameters: json!({"role": role}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        let produce = |role: &str, logical_key: &str, parents: &[&ArtifactManifest]| {
+            let key = fixture_key(role);
+            let mut author = request(
+                &key,
+                &resolver,
+                &policy,
+                ArtifactExecutionCacheMode::PreferReuse,
+            );
+            author.logical_key = logical_key;
+            let dependencies = parents
+                .iter()
+                .map(|parent| DependencyRef {
+                    key: parent.key.clone(),
+                    content_digest: parent.content_digest.clone(),
+                    required_quality: CacheQuality::Validated,
+                })
+                .collect::<Vec<_>>();
+            resolve_or_compute_json_artifact_with_dependencies(
+                &author,
+                || Ok((vec![role.to_owned()], dependencies)),
+                |_| Ok(()),
+            )
+            .unwrap()
+            .produced_manifest
+            .unwrap()
+        };
+        // Two parents share one grandparent, as two LUs share one sector.
+        let tau = produce("tau", "ccm/diamond/tau", &[]);
+        let left = produce("left", "ccm/diamond/left", &[&tau]);
+        let right = produce("right", "ccm/diamond/right", &[&tau]);
+        let child = produce("child", "ccm/diamond/child", &[&left, &right]);
+        let child_key = fixture_key("child");
+        let reuse_child = |sink: &dyn ArtifactProductionSink| {
+            let mut reuse = request(
+                &child_key,
+                &resolver,
+                &policy,
+                ArtifactExecutionCacheMode::RequireReuse,
+            );
+            reuse.logical_key = "ccm/diamond/child";
+            reuse.production_sink = Some(sink);
+            let reads = payload_reads.load(Ordering::Relaxed);
+            let reused = resolve_or_compute_json_artifact_with_dependencies(
+                &reuse,
+                || -> Result<(Vec<String>, Vec<DependencyRef>), CacheError> {
+                    panic!("required reuse must not compute")
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(reused.reused_manifest.as_ref(), Some(&child));
+            payload_reads.load(Ordering::Relaxed) - reads
+        };
+        // A sink that reports nothing as recorded keeps the full walk: the
+        // shared grandparent is read and recorded once per path.
+        let reference = RecordingSink(Mutex::new(Vec::new()));
+        assert_eq!(reuse_child(&reference), 5);
+        let reference_records = reference.0.into_inner().unwrap();
+        assert_eq!(reference_records.len(), 5);
+        let mut distinct: Vec<ProducedArtifactRecord> = Vec::new();
+        for record in reference_records {
+            if !distinct.contains(&record) {
+                distinct.push(record);
+            }
+        }
+        assert_eq!(distinct.len(), 4);
+        // The ephemeral sink records metadata only; its walk reads the shared
+        // grandparent once and retains exactly the same distinct records.
+        let ephemeral = crate::EphemeralCacheStore::new(1 << 20).unwrap();
+        assert_eq!(reuse_child(&ephemeral), 4);
+        let expected = crate::EphemeralCacheStore::new(1 << 20).unwrap();
+        for record in distinct {
+            expected.record(record).unwrap();
+        }
+        assert_eq!(
+            ephemeral.accounted_bytes().unwrap(),
+            expected.accounted_bytes().unwrap()
+        );
+        for manifest in [&tau, &left, &right, &child] {
+            assert!(ephemeral
+                .contains_artifact(&manifest.key, &manifest.content_digest)
+                .unwrap());
+        }
+        // A repeated walk records nothing new.
+        let accounted = ephemeral.accounted_bytes().unwrap();
+        assert_eq!(reuse_child(&ephemeral), 4);
+        assert_eq!(ephemeral.accounted_bytes().unwrap(), accounted);
+    }
+
+    #[test]
     fn closure_dependencies_from_a_zip_store_are_staged_without_reading_payloads() {
-        let root = root("execution-cache-metadata-only-closure");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-metadata-only");
+        let root = scratch.join("root");
         let policy = policy();
         let payload_reads = std::sync::Arc::new(AtomicUsize::new(0));
         let counting = PayloadReadCountingStore {
@@ -4069,6 +4910,7 @@ mod tests {
     /// adapter does -- empty key-based dependency lists, canonical manifest
     /// and semantic key retained as tags.
     struct AdoptedPairFixture {
+        _scratch: crate::test_support::TestDir,
         root: std::path::PathBuf,
         consumer_resolver: CacheResolver,
         parent: ArtifactManifest,
@@ -4086,8 +4928,8 @@ mod tests {
         parent_kind: &str,
         grandparent_kind: &str,
     ) -> AdoptedPairFixture {
-        let root = root(name);
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new(name);
+        let root = scratch.join("root");
         let policy = policy();
 
         let author_resolver = CacheResolver::new(vec![CacheLayer {
@@ -4228,6 +5070,7 @@ mod tests {
         let adopted_parent = adopt(&parent_canonical, &parent, &parent_payload);
 
         AdoptedPairFixture {
+            _scratch: scratch,
             root,
             consumer_resolver: CacheResolver::new(vec![CacheLayer {
                 precedence: 0,
@@ -4691,8 +5534,8 @@ mod tests {
 
     #[test]
     fn fresh_publication_staging_reconstructs_cached_dependency_closure() {
-        let root = root("execution-cache-fresh-staging-closure");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-fresh-staging");
+        let root = scratch.join("root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -4802,8 +5645,8 @@ mod tests {
 
     #[test]
     fn production_sink_records_fresh_and_reused_artifacts() {
-        let root = root("execution-cache-production-sink");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-production-si");
+        let root = scratch.join("root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -4874,8 +5717,8 @@ mod tests {
 
     #[test]
     fn certified_assessment_is_bound_before_packaging() {
-        let first_root = root("execution-cache-certified-assessment");
-        let _ = fs::remove_dir_all(&first_root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-certified-ass");
+        let first_root = scratch.join("first-root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -4919,8 +5762,8 @@ mod tests {
         assert_eq!(records[0].assurance_evidence_digests, vec![certificate]);
         drop(records);
 
-        let missing_root = root("execution-cache-certified-missing-evidence");
-        let _ = fs::remove_dir_all(&missing_root);
+        let missing_scratch = crate::test_support::TestDir::new("exec-cache-certified-mis");
+        let missing_root = missing_scratch.join("missing-root");
         let missing_resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -4960,8 +5803,8 @@ mod tests {
 
     #[test]
     fn directory_production_sink_queues_identity_bound_payload_once() {
-        let root = root("execution-cache-directory-sink");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-directory-sin");
+        let root = scratch.join("root");
         let sink = DirectoryArtifactProductionSink::new(&root).unwrap();
         let semantic_key = semantic_key();
         let payload = serde_json::to_vec(&vec!["node-a", "node-b"]).unwrap();
@@ -4985,8 +5828,8 @@ mod tests {
                     size_bytes: payload.len() as u64,
                 }],
                 created_unix_seconds: 1,
-                producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-                minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+                minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
                 maximum_reader_version: None,
                 quality: CacheQuality::Validated,
                 visibility: CacheVisibility::Local,
@@ -5022,8 +5865,8 @@ mod tests {
 
     #[test]
     fn successful_same_process_publication_filter_retains_restart_staging() {
-        let root = root("managed-completed-publication-filter");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-completed-public");
+        let root = scratch.join("root");
         let session = ManagedArtifactCacheSession::new(ManagedArtifactCacheConfig {
             profile: ManagedRunProfile::Author,
             requested_assurance: xc_core::AssuranceLevel::Computed,
@@ -5053,8 +5896,8 @@ mod tests {
             write_on_miss: cache.write_on_miss,
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             tags: BTreeMap::new(),
             provenance_digest: None,
@@ -5084,8 +5927,8 @@ mod tests {
 
     #[test]
     fn executed_publication_rejects_vacuous_success_without_observed_artifacts() {
-        let root = root("managed-publication-vacuous-success");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-publication-vacu");
+        let root = scratch.join("root");
         let session = ManagedArtifactCacheSession::new(ManagedArtifactCacheConfig {
             profile: ManagedRunProfile::Author,
             requested_assurance: xc_core::AssuranceLevel::Computed,
@@ -5110,8 +5953,8 @@ mod tests {
 
     #[test]
     fn managed_require_reuse_stages_workstation_hit_for_publication() {
-        let root = root("managed-require-reuse-publication");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-require-reuse-pu");
+        let root = scratch.join("root");
         let config = |cache_mode, staging: &str| ManagedArtifactCacheConfig {
             profile: ManagedRunProfile::Author,
             requested_assurance: xc_core::AssuranceLevel::Computed,
@@ -5218,8 +6061,8 @@ mod tests {
                 write_on_miss: cache.write_on_miss,
                 write_visibility: cache.write_visibility,
                 produced_quality: CacheQuality::Validated,
-                producer_toolkit_version: ToolkitVersion::parse("0.13.0")?,
-                minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+                producer_toolkit_version: ToolkitVersion::parse("0.16.0")?,
+                minimum_reader_version: ToolkitVersion::parse("0.16.0")?,
                 maximum_reader_version: None,
                 tags: BTreeMap::new(),
                 provenance_digest: None,
@@ -5243,13 +6086,13 @@ mod tests {
                 false,
             ),
         ] {
-            let root = root(match policy {
+            let scratch = crate::test_support::TestDir::new(match policy {
                 CertificationFailurePolicy::RetainComputedFailRun => "managed-fail-run",
                 CertificationFailurePolicy::RetainComputedSkipPublication => {
                     "managed-skip-publication"
                 }
             });
-            let _ = fs::remove_dir_all(&root);
+            let root = scratch.join("root");
             let staging_root = root.join("staging");
             let session = ManagedArtifactCacheSession::new(ManagedArtifactCacheConfig {
                 profile: ManagedRunProfile::Author,
@@ -5296,7 +6139,8 @@ mod tests {
 
     #[test]
     fn managed_layer_plans_isolate_validation_from_production_cache() {
-        let root = root("managed-layer-plan-isolation");
+        let scratch = crate::test_support::TestDir::new("managed-layer-plan-isola");
+        let root = scratch.join("root");
         let validation = OutputValidationConfig {
             validation_root: root.join("validation"),
             report_root: root.join("reports"),
@@ -5352,8 +6196,8 @@ mod tests {
     #[ignore = "credentialed read-only GitHub validation-layer preflight"]
     fn managed_verify_production_constructor_preflights_private_reference_layers() {
         let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
-        let root = root("managed-verify-live-private-preflight");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-verify-live-priv");
+        let root = scratch.join("root");
         let mut config = managed_verify_config(&root, "validation");
         config.repository_owner = "TeamXcelerator".to_owned();
         config.output_validation.as_mut().unwrap().reference_mode = ManagedRemoteCacheMode::Private;
@@ -5371,8 +6215,8 @@ mod tests {
     #[test]
     fn managed_verify_session_isolates_layers_and_classifies_fixed_key_cascade() {
         let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
-        let root = root("managed-verify-fixed-key-cascade");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-verify-fixed-key");
+        let root = scratch.join("root");
         let reference_root = root.join("reference");
         let computed_root = root.join("computed");
         let reference_writer = CacheResolver::new(vec![CacheLayer {
@@ -5550,8 +6394,8 @@ mod tests {
     #[test]
     fn reference_absent_rekeyed_parent_is_classified_as_inherited() {
         let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
-        let root = root("managed-verify-rekey-cascade");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-verify-rekey-cas");
+        let root = scratch.join("root");
         let reference_root = root.join("reference");
         let computed_root = root.join("computed");
         let reference_writer = CacheResolver::new(vec![CacheLayer {
@@ -5680,8 +6524,8 @@ mod tests {
     #[test]
     fn verify_mode_writes_real_artifacts_compares_and_rejects_empty_runs() {
         let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
-        let root = root("execution-cache-output-validation");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-output-valida");
+        let root = scratch.join("root");
         let reference_root = root.join("reference");
         let reference_writer = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
@@ -5715,7 +6559,7 @@ mod tests {
             crate::begin_output_validation_run(crate::OutputValidationRunConfig {
                 validation_root: validation_root.clone(),
                 report_root: report_root.clone(),
-                toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
                 reference_mode: "local_fixture".to_owned(),
                 ordered_reference_overlays: vec!["reference".to_owned()],
                 production_cache_installed: false,
@@ -5753,8 +6597,8 @@ mod tests {
                 write_on_miss: true,
                 write_visibility: CacheVisibility::Local,
                 produced_quality: CacheQuality::Validated,
-                producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-                minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+                minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
                 maximum_reader_version: None,
                 tags: BTreeMap::new(),
                 provenance_digest: None,
@@ -5821,7 +6665,7 @@ mod tests {
         crate::begin_output_validation_run(crate::OutputValidationRunConfig {
             validation_root: empty_root.clone(),
             report_root: empty_root.join("reports"),
-            toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             reference_mode: "local_fixture".to_owned(),
             ordered_reference_overlays: vec!["reference".to_owned()],
             production_cache_installed: false,
@@ -5840,12 +6684,12 @@ mod tests {
     #[test]
     fn verify_mode_never_reports_operational_reference_errors_as_absence() {
         let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
-        let root = root("execution-cache-output-validation-operational-error");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-output-valida");
+        let root = scratch.join("root");
         crate::begin_output_validation_run(crate::OutputValidationRunConfig {
             validation_root: root.clone(),
             report_root: root.join("reports"),
-            toolkit_version: ToolkitVersion::parse("0.13.3").unwrap(),
+            toolkit_version: ToolkitVersion::parse("0.16.3").unwrap(),
             reference_mode: "faulting_fixture".to_owned(),
             ordered_reference_overlays: vec!["faulting-reference".to_owned()],
             production_cache_installed: false,
@@ -5882,8 +6726,8 @@ mod tests {
             write_on_miss: true,
             write_visibility: CacheVisibility::Local,
             produced_quality: CacheQuality::Validated,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.3").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.3").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             tags: BTreeMap::new(),
             provenance_digest: None,
@@ -5938,8 +6782,8 @@ mod exhaustive_resumed_queue_contract {
                 size_bytes: payload.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.18.1").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -5959,9 +6803,8 @@ mod exhaustive_resumed_queue_contract {
         }
     }
 
-    fn queued_fixture(label: &str) -> (PathBuf, QueuedProducedArtifactRecord) {
+    fn queued_fixture(label: &str) -> (crate::test_support::TestDir, QueuedProducedArtifactRecord) {
         let root = crate::test_support::temporary_root(label);
-        fs::create_dir_all(&root).unwrap();
         let record = record();
         fs::write(
             root.join("payload.json.zip"),

@@ -59,6 +59,8 @@ pub use hp_shift_invert_krylov::*;
 #[derive(Clone, Debug)]
 pub enum SolverError {
     InvalidConfiguration(String),
+    #[doc(hidden)]
+    PremiseNotVerified(String),
     UnsupportedTarget(String),
     Operator(OperatorError),
     NumericalBreakdown(String),
@@ -79,6 +81,7 @@ impl Display for SolverError {
             Self::InvalidConfiguration(message) => {
                 write!(f, "invalid solver configuration: {message}")
             }
+            Self::PremiseNotVerified(message) => write!(f, "premise not verified: {message}"),
             Self::UnsupportedTarget(message) => write!(f, "unsupported target: {message}"),
             Self::Operator(error) => Display::fmt(error, f),
             Self::NumericalBreakdown(message) => write!(f, "numerical breakdown: {message}"),
@@ -3157,16 +3160,8 @@ where
 
 #[cfg(feature = "hp-reference")]
 fn hp_norm(values: &[rug::Float], precision_bits: u32) -> rug::Float {
-    let mut sum = hp_zero(precision_bits);
-    for value in values {
-        let mut square = value.clone();
-        square *= value;
-        sum += square;
-    }
-    if sum.is_finite() && !sum.is_zero() {
-        sum.sqrt_mut();
-        return sum;
-    }
+    // Scale every component by the largest before squaring, so an individually
+    // underflowing square is never dropped beside a larger one.
     if values.iter().any(|v| !v.is_finite()) {
         return rug::Float::with_val(precision_bits, rug::float::Special::Nan);
     }
@@ -3176,9 +3171,9 @@ fn hp_norm(values: &[rug::Float], precision_bits: u32) -> rug::Float {
         .max_by(|a, b| a.partial_cmp(b).unwrap())
         .unwrap_or_else(|| hp_zero(precision_bits));
     if maximum.is_zero() {
-        return maximum;
+        return rug::Float::with_val(precision_bits, maximum);
     }
-    sum = hp_zero(precision_bits);
+    let mut sum = hp_zero(precision_bits);
     for value in values {
         let mut scaled = rug::Float::with_val(precision_bits, value / &maximum);
         scaled.square_mut();
@@ -3186,6 +3181,42 @@ fn hp_norm(values: &[rug::Float], precision_bits: u32) -> rug::Float {
     }
     sum.sqrt_mut();
     sum *= maximum;
+    sum
+}
+
+/// Euclidean norm of `values` with every operation rounded in `round`, each
+/// magnitude scaled by the largest before squaring: an upper (`Up`) or lower
+/// (`Down`) bound of the norm of the given components.
+#[cfg(feature = "hp-reference")]
+fn hp_directed_norm(
+    values: &[rug::Float],
+    precision_bits: u32,
+    round: rug::float::Round,
+) -> rug::Float {
+    use rug::ops::{AddAssignRound, MulAssignRound};
+    use rug::Float;
+    if values.iter().any(|v| !v.is_finite()) {
+        return Float::with_val(precision_bits, rug::float::Special::Nan);
+    }
+    let Some(scale) = values
+        .iter()
+        .map(|v| v.clone().abs())
+        .max_by(|left, right| left.total_cmp(right))
+    else {
+        return hp_zero(precision_bits);
+    };
+    if scale.is_zero() {
+        return hp_zero(precision_bits);
+    }
+    let mut sum = hp_zero(precision_bits);
+    for value in values {
+        let magnitude = value.clone().abs();
+        let mut ratio = Float::with_val_round(precision_bits, &magnitude / &scale, round).0;
+        ratio.square_round(round);
+        sum.add_assign_round(&ratio, round);
+    }
+    sum.sqrt_round(round);
+    sum.mul_assign_round(&scale, round);
     sum
 }
 
@@ -3252,8 +3283,9 @@ fn hp_effective_cluster_tolerance<'a>(
     }
 }
 
-/// Computed Euclidean residual and relative residual for stored images.
-/// This is point arithmetic, not a bound on operator application error.
+/// Euclidean residual and relative residual for stored images: an upper bound
+/// of the norm of the stored residual components over a lower bound of the
+/// stored images' scale. It does not bound operator application error.
 #[cfg(feature = "hp-reference")]
 fn hp_residual_measures(
     residual: &[rug::Float],
@@ -3274,9 +3306,11 @@ fn hp_residual_measures(
     {
         return Err(invalid());
     }
-    let residual_norm = hp_norm(residual, precision_bits);
-    let left_norm = hp_norm(left_image, precision_bits);
-    let right_norm = hp_norm(right_image, precision_bits);
+    // An upper bound of the residual norm over a lower bound of its scale, so
+    // the rounding of these norms can only make acceptance stricter.
+    let residual_norm = hp_directed_norm(residual, precision_bits, rug::float::Round::Up);
+    let left_norm = hp_directed_norm(left_image, precision_bits, rug::float::Round::Down);
+    let right_norm = hp_directed_norm(right_image, precision_bits, rug::float::Round::Down);
     for (values, norm) in [
         (residual, &residual_norm),
         (left_image, &left_norm),
@@ -3289,15 +3323,32 @@ fn hp_residual_measures(
     if right_norm.is_zero() {
         return Err(invalid());
     }
-    let mut scale = eigenvalue.clone().abs();
-    scale *= right_norm;
-    scale += left_norm;
-    if !scale.is_finite() || (scale.is_zero() && !residual_norm.is_zero()) {
+    use rug::float::Round;
+    use rug::ops::{AddAssignRound, MulAssignRound};
+    // The scale is used as a lower bound; its upward rounding detects overflow,
+    // which directed downward rounding would otherwise clamp to a finite value.
+    let directed_scale = |round: Round| {
+        let mut scale = rug::Float::with_val(precision_bits, eigenvalue.abs_ref());
+        scale.mul_assign_round(&right_norm, round);
+        scale.add_assign_round(&left_norm, round);
+        scale
+    };
+    let scale = directed_scale(Round::Down);
+    if !directed_scale(Round::Up).is_finite() || (scale.is_zero() && !residual_norm.is_zero()) {
         return Err(invalid());
     }
     let mut relative = residual_norm.clone();
     if !scale.is_zero() {
-        relative /= scale;
+        // A ratio that underflows is refused, not reported as the least
+        // positive value; otherwise the upward rounding is reported.
+        if rug::Float::with_val_round(precision_bits, &residual_norm / &scale, Round::Down)
+            .0
+            .is_zero()
+            && !residual_norm.is_zero()
+        {
+            return Err(invalid());
+        }
+        relative = rug::Float::with_val_round(precision_bits, &residual_norm / &scale, Round::Up).0;
     }
     if !relative.is_finite() || (relative.is_zero() && !residual_norm.is_zero()) {
         return Err(invalid());
@@ -3350,24 +3401,95 @@ fn hp_block_termination<'a>(
 }
 
 #[cfg(feature = "hp-reference")]
-fn hp_matvec(
-    matrix: &[rug::Float],
-    dimension: usize,
-    vector: &[rug::Float],
+/// Exact product of stored values. Mantissas are multiplied at a precision
+/// holding every operand bit and the exponents are added separately, so no
+/// intermediate product can leave the exponent range; a product whose exact
+/// value is outside the range is an error, never a rounded or zero term.
+pub(crate) fn exact_product(factors: &[&rug::Float]) -> Result<rug::Float, SolverError> {
+    let out_of_range = || {
+        SolverError::NumericalBreakdown(
+            "HP residual product is outside the MPFR exponent range".into(),
+        )
+    };
+    let precision = factors.iter().map(|factor| factor.prec()).sum::<u32>();
+    let mut mantissa = rug::Float::with_val(precision, 1);
+    let mut exponent = 0i64;
+    for factor in factors {
+        if factor.is_zero() {
+            return Ok(rug::Float::with_val(precision, 0));
+        }
+        let Some(factor_exponent) = factor.get_exp() else {
+            return Err(out_of_range());
+        };
+        let mut normalized = (*factor).clone();
+        normalized >>= factor_exponent;
+        mantissa *= &normalized;
+        exponent += i64::from(factor_exponent);
+    }
+    let Some(mantissa_exponent) = mantissa.get_exp() else {
+        return Err(out_of_range());
+    };
+    let expected = exponent + i64::from(mantissa_exponent);
+    let shift = i32::try_from(exponent).map_err(|_| out_of_range())?;
+    mantissa <<= shift;
+    if mantissa.get_exp().map(i64::from) != Some(expected) {
+        return Err(out_of_range());
+    }
+    Ok(mantissa)
+}
+
+#[cfg(feature = "hp-reference")]
+/// Downward and upward roundings to `precision_bits` of the exact sum of
+/// `terms`: an enclosure of that sum.
+pub(crate) fn signed_bounds<'a, I: Iterator<Item = &'a rug::Float>>(
+    terms: impl Fn() -> I,
     precision_bits: u32,
-) -> Vec<rug::Float> {
-    (0..dimension)
-        .map(|row| {
-            let mut sum = hp_zero(precision_bits);
-            for column in 0..dimension {
-                let mut term =
-                    rug::Float::with_val(precision_bits, &matrix[row * dimension + column]);
-                term *= &vector[column];
-                sum += term;
-            }
-            sum
-        })
-        .collect()
+) -> (rug::Float, rug::Float) {
+    (
+        rug::Float::with_val_round(
+            precision_bits,
+            rug::Float::sum(terms()),
+            rug::float::Round::Down,
+        )
+        .0,
+        rug::Float::with_val_round(
+            precision_bits,
+            rug::Float::sum(terms()),
+            rug::float::Round::Up,
+        )
+        .0,
+    )
+}
+
+#[cfg(feature = "hp-reference")]
+/// Lower and upper bounds of the magnitude of the exact sum of `terms`, from
+/// its downward and upward roundings to `precision_bits`.
+pub(crate) fn magnitude_bounds<'a, I: Iterator<Item = &'a rug::Float>>(
+    terms: impl Fn() -> I,
+    precision_bits: u32,
+) -> (rug::Float, rug::Float) {
+    let (down, up) = signed_bounds(terms, precision_bits);
+    if down.is_sign_positive() && !down.is_zero() {
+        (down, up)
+    } else if up.is_sign_negative() && !up.is_zero() {
+        (
+            rug::Float::with_val(precision_bits, -up),
+            rug::Float::with_val(precision_bits, -down),
+        )
+    } else {
+        let upper = rug::Float::with_val(precision_bits, down.abs_ref())
+            .max(&rug::Float::with_val(precision_bits, up.abs_ref()));
+        (rug::Float::with_val(precision_bits, 0), upper)
+    }
+}
+
+#[cfg(feature = "hp-reference")]
+/// Sum of `terms` with a single rounding to `precision_bits`.
+pub(crate) fn rounded_once_sum<'a>(
+    terms: impl Iterator<Item = &'a rug::Float>,
+    precision_bits: u32,
+) -> rug::Float {
+    rug::Float::with_val(precision_bits, rug::Float::sum(terms))
 }
 
 #[cfg(feature = "hp-reference")]
@@ -3494,97 +3616,114 @@ pub fn solve_dense_reference_hp_controlled(
     let eigenvector = recovered.eigenvector;
     check_solver_cancellation(cancellation)?;
 
-    let applied = hp_matvec(
-        problem.matrix,
-        problem.dimension,
-        &eigenvector,
-        precision_bits,
-    );
-    let residual: Vec<Float> = applied
+    // Verify the returned pair against the stored matrix. Every product is
+    // exact and each component is enclosed by directed rounding of its exact
+    // sum, so contributions smaller than the working precision survive.
+    // Acceptance uses an upper bound of the residual norm over lower bounds of
+    // its denominators; all reported bounds are rounded up.
+    use rug::float::Round;
+    use rug::ops::{AddAssignRound, MulAssignRound};
+    let dimension = problem.dimension;
+    let verification_bits = problem
+        .matrix
         .iter()
-        .zip(&eigenvector)
-        .map(|(value, component)| {
-            let mut term = eigenvalue.clone();
-            term *= component;
-            let mut difference = value.clone();
-            difference -= term;
-            difference
-        })
-        .collect();
-    let residual_norm = hp_norm(&residual, precision_bits);
-    let applied_norm = hp_norm(&applied, precision_bits);
-    let vector_norm = hp_norm(&eigenvector, precision_bits);
+        .map(Float::prec)
+        .max()
+        .unwrap_or(precision_bits)
+        .max(precision_bits)
+        .saturating_add(64);
+    let negative_eigenvalue = Float::with_val(eigenvalue.prec(), -&eigenvalue);
+    let mut residual_upper = Vec::with_capacity(dimension);
+    let mut applied_lower = Vec::with_capacity(dimension);
+    for row in 0..dimension {
+        check_solver_cancellation(cancellation)?;
+        let mut terms = (0..dimension)
+            .map(|column| {
+                exact_product(&[
+                    &problem.matrix[row * dimension + column],
+                    &eigenvector[column],
+                ])
+            })
+            .collect::<Result<Vec<Float>, _>>()?;
+        applied_lower.push(magnitude_bounds(|| terms.iter(), verification_bits).0);
+        terms.push(exact_product(&[&negative_eigenvalue, &eigenvector[row]])?);
+        residual_upper.push(magnitude_bounds(|| terms.iter(), verification_bits).1);
+    }
+    let residual_norm = hp_directed_norm(&residual_upper, verification_bits, Round::Up);
+    let applied_norm = hp_directed_norm(&applied_lower, verification_bits, Round::Down);
+    let vector_norm = hp_directed_norm(&eigenvector, verification_bits, Round::Down);
     if [&residual_norm, &applied_norm, &vector_norm, &eigenvalue]
         .iter()
         .any(|v| !v.is_finite())
         || vector_norm.is_zero()
-        || (residual_norm.is_zero() && residual.iter().any(|v| !v.is_zero()))
     {
         return Err(SolverError::NumericalBreakdown(
             "invalid HP eigenpair diagnostic norm".into(),
         ));
     }
-    let mut eigenvalue_abs = eigenvalue.clone();
-    eigenvalue_abs.abs_mut();
-
+    let eigenvalue_abs = Float::with_val(verification_bits, eigenvalue.abs_ref());
     let mut denominator = eigenvalue_abs.clone();
-    denominator *= &vector_norm;
-    denominator += &applied_norm;
-    if !denominator.is_finite() {
-        return Err(SolverError::NumericalBreakdown(
-            "HP relative diagnostic denominator overflow".into(),
-        ));
-    }
-    let relative_residual = if denominator.is_zero() {
-        residual_norm.clone()
-    } else {
-        let mut value = residual_norm.clone();
-        value /= &denominator;
-        value
-    };
-
-    let mut infinity_bound = hp_zero(precision_bits);
-    for row in 0..problem.dimension {
+    denominator.mul_assign_round(&vector_norm, Round::Down);
+    denominator.add_assign_round(&applied_norm, Round::Down);
+    let mut infinity_bound = hp_zero(verification_bits);
+    for row in 0..dimension {
         check_solver_cancellation(cancellation)?;
-        let mut row_sum = hp_zero(precision_bits);
-        for column in 0..problem.dimension {
-            row_sum += problem.matrix[row * problem.dimension + column]
-                .clone()
-                .abs();
-        }
+        let row_sum = Float::with_val_round(
+            verification_bits,
+            Float::sum(
+                problem.matrix[row * dimension..(row + 1) * dimension]
+                    .iter()
+                    .map(|entry| entry.clone().abs())
+                    .collect::<Vec<_>>()
+                    .iter(),
+            ),
+            Round::Down,
+        )
+        .0;
         if row_sum > infinity_bound {
             infinity_bound = row_sum;
         }
     }
     let mut backward_denominator = infinity_bound;
-    backward_denominator *= &vector_norm;
+    backward_denominator.mul_assign_round(&vector_norm, Round::Down);
     let mut eigen_term = eigenvalue_abs;
-    eigen_term *= &vector_norm;
-    backward_denominator += eigen_term;
-    if !backward_denominator.is_finite() {
-        return Err(SolverError::NumericalBreakdown(
-            "HP backward diagnostic denominator overflow".into(),
-        ));
-    }
-    let scaled_backward_error = if backward_denominator.is_zero() {
-        residual_norm.clone()
-    } else {
-        let mut value = residual_norm.clone();
-        value /= backward_denominator;
-        value
+    eigen_term.mul_assign_round(&vector_norm, Round::Down);
+    backward_denominator.add_assign_round(&eigen_term, Round::Down);
+    let upper_ratio = |denominator: &Float| {
+        if denominator.is_zero() {
+            residual_norm.clone()
+        } else {
+            Float::with_val_round(verification_bits, &residual_norm / denominator, Round::Up).0
+        }
     };
+    let relative_residual = upper_ratio(&denominator);
+    let scaled_backward_error = upper_ratio(&backward_denominator);
     if [&relative_residual, &scaled_backward_error]
         .iter()
-        .any(|v| !v.is_finite() || (v.is_zero() && !residual_norm.is_zero()))
+        .any(|v| !v.is_finite())
     {
         return Err(SolverError::NumericalBreakdown(
             "HP diagnostic ratio is not representable".into(),
         ));
     }
-    let mut orthogonality_error = vector_norm.clone();
-    orthogonality_error *= &vector_norm;
-    orthogonality_error -= 1u32;
-    orthogonality_error.abs_mut();
+    let minus_one = Float::with_val(2, -1);
+    let squares = eigenvector
+        .iter()
+        .map(|component| exact_product(&[component, component]))
+        .collect::<Result<Vec<Float>, _>>()?;
+    // Upper bound of |v^T v - 1|: the larger magnitude of the directed
+    // enclosure of the exact sum.
+    let orthogonality_error = magnitude_bounds(
+        || squares.iter().chain(std::iter::once(&minus_one)),
+        verification_bits,
+    )
+    .1;
+    // Report and decide at the working precision, rounded up.
+    let report_up = |value: &Float| Float::with_val_round(precision_bits, value, Round::Up).0;
+    let residual_norm = report_up(&residual_norm);
+    let relative_residual = report_up(&relative_residual);
+    let scaled_backward_error = report_up(&scaled_backward_error);
+    let orthogonality_error = report_up(&orthogonality_error);
 
     let residual_tolerance = hp_parse_literal_round(
         &config.stopping.absolute_residual,
@@ -3670,6 +3809,82 @@ mod hp_reference_tests {
             algorithm_preferences: Vec::new(),
             allow_lower_precision_seed: false,
             allow_randomized_seed: false,
+        }
+    }
+
+    #[test]
+    fn hp_reference_adapter_verifies_the_returned_pair_against_the_stored_matrix() {
+        // A = M + delta*E (E_02 = E_20 = 1) with M the 4-cycle matrix: at 64
+        // working bits the rounded image A*v drops delta, but the exact
+        // residual of the returned pair is nonzero and far above 1e-200.
+        for exponent in [-40, -100, -200, -400] {
+            let precision = 64;
+            let mut matrix: Vec<Float> = [3, -1, 0, -1, -1, 3, -1, 0, 0, -1, 3, -1, -1, 0, -1, 3]
+                .iter()
+                .map(|entry| Float::with_val(precision, *entry))
+                .collect();
+            matrix[2] = Float::with_val(precision, Float::i_exp(1, exponent));
+            matrix[8] = matrix[2].clone();
+            let problem = DenseSymmetricProblemHp::new(&matrix, 4).unwrap();
+            let mut config = config(EigenTarget::AlgebraicSmallest);
+            config.precision = PrecisionPolicy::fixed(precision);
+            config.stopping.absolute_residual = DecimalLiteral::new("1e-200").unwrap();
+            config.stopping.scaled_backward_error = DecimalLiteral::new("1e-200").unwrap();
+            let report = solve_dense_reference_hp(&problem, &config).unwrap();
+            let residual = Float::with_val(precision, Float::parse(&report.residual_norm).unwrap());
+            assert!(!residual.is_zero(), "delta = 2^{exponent}");
+            assert_ne!(
+                report.status,
+                ResultStatus::Converged,
+                "delta = 2^{exponent}"
+            );
+        }
+    }
+
+    #[test]
+    fn hp_reference_orthogonality_error_is_an_upper_bound() {
+        // A = [[d^2, -d, -t], [-d, 1, 0], [-t, 0, 1]] at 64 bits returns
+        // v = (1, d, t), whose exact |v^T v - 1| = d^2 + t^2 must be covered.
+        for (d_exponent, t_exponent) in [(-40, -200), (-50, -300), (-80, -400), (-100, -300)] {
+            let precision = 64;
+            let d = Float::with_val(precision, Float::i_exp(1, d_exponent));
+            let t = Float::with_val(precision, Float::i_exp(1, t_exponent));
+            let zero = Float::with_val(precision, 0);
+            let one = Float::with_val(precision, 1);
+            let matrix = vec![
+                Float::with_val(precision, &d * &d),
+                Float::with_val(precision, -&d),
+                Float::with_val(precision, -&t),
+                Float::with_val(precision, -&d),
+                one.clone(),
+                zero.clone(),
+                Float::with_val(precision, -&t),
+                zero,
+                one,
+            ];
+            let problem = DenseSymmetricProblemHp::new(&matrix, 3).unwrap();
+            let mut config = config(EigenTarget::AlgebraicSmallest);
+            config.precision = PrecisionPolicy::fixed(precision);
+            let report = solve_dense_reference_hp(&problem, &config).unwrap();
+            let exact = report
+                .eigenvector
+                .iter()
+                .map(|value| {
+                    Float::with_val(precision, Float::parse(value).unwrap())
+                        .to_rational()
+                        .unwrap()
+                })
+                .fold(rug::Rational::from(-1), |sum, component| {
+                    sum + component.clone() * component
+                })
+                .abs();
+            let reported = Float::with_val(
+                precision,
+                Float::parse(&report.diagnostics.orthogonality_error).unwrap(),
+            )
+            .to_rational()
+            .unwrap();
+            assert!(reported >= exact, "d = 2^{d_exponent}, t = 2^{t_exponent}");
         }
     }
 
@@ -7390,5 +7605,3612 @@ mod exhaustive_hp_stability_contract {
                 .unwrap()
                 >= Rational::from((1, 3))
         );
+    }
+}
+
+/// Constrained real, finite-grid weighted L1 fitting and exact verification.
+/// Requires `hp-reference` for GMP rational arithmetic; no floating conversion
+/// is used by the reference solver or verifier. Bounds concern the exact stored
+/// inputs, not input uncertainty, quadrature error, or a continuum optimum.
+#[cfg(feature = "hp-reference")]
+#[doc(hidden)]
+pub mod weighted_l1 {
+    use super::SolverError;
+    use rug::{ops::Pow, Integer, Rational};
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+    use xc_core::{CancellationToken, DecimalLiteral};
+
+    pub const SEMANTICS: &str = "constrained-real-weighted-l1-exact-inputs-v1";
+    pub const SCOPE: &str = "exact_stored_finite_grid_excludes_input_and_quadrature_error";
+
+    /// Minimize `sum_j weights[j]*|target[j] - basis[j]*a|` subject to
+    /// constraints*a=rhs. Coefficients a are free signed reals. Scalar strings
+    /// are exact finite decimals or signed-integer/positive-integer rationals.
+    /// Identities describe caller-supplied sources, not authenticated provenance.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct WeightedL1Problem {
+        pub schema_version: u32,
+        pub basis_id: String,
+        pub target_id: String,
+        pub normalization_id: String,
+        pub quadrature_id: String,
+        pub basis: Vec<Vec<String>>,
+        pub target: Vec<String>,
+        pub weights: Vec<String>,
+        pub constraints: Vec<Vec<String>>,
+        pub rhs: Vec<String>,
+    }
+
+    /// Explicit bounded-work reference policy. Rational bit limits apply to
+    /// each numerator/denominator and intermediate accumulator. Cancellation
+    /// (including a token deadline) is checked during parsing and pivot work.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct WeightedL1Options {
+        pub absolute_optimality_gap: String,
+        /// Acceptance uses gap <= absolute + relative*objective_upper.
+        pub relative_optimality_gap: String,
+        pub maximum_pivots: usize,
+        pub maximum_tableau_cells: usize,
+        pub maximum_rational_bits: u32,
+    }
+
+    impl Default for WeightedL1Options {
+        fn default() -> Self {
+            Self {
+                absolute_optimality_gap: "0".into(),
+                relative_optimality_gap: "0".into(),
+                maximum_pivots: 10_000,
+                maximum_tableau_cells: 131_072,
+                maximum_rational_bits: 32_768,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct WeightedL1Witness {
+        pub coefficients: Vec<String>,
+        /// |z_j| <= w_j; B^T*z=C^T*nu. Lower bound y^T*z-d^T*nu.
+        pub dual_z: Vec<String>,
+        pub dual_nu: Vec<String>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum WeightedL1Status {
+        ExactFiniteOptimum,
+        GapWithinTolerance,
+        GapAboveTolerance,
+    }
+
+    /// Exact scalar bounds are reduced rational strings. `accepted` concerns
+    /// ONLY the requested finite optimization gap, not uniqueness or continuum
+    /// accuracy. A feasible candidate can have a valid but unaccepted bound.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct WeightedL1Verification {
+        pub objective_lower: String,
+        pub objective_upper: String,
+        pub optimality_gap: String,
+        pub status: WeightedL1Status,
+        pub accepted: bool,
+    }
+
+    /// Portable result. Replay recomputes input/request identities, primal
+    /// feasibility, dual feasibility, bounds, status, and tolerance acceptance.
+    /// Backend and pivot count are informational, not certified performance.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct WeightedL1Fit {
+        pub schema_version: u32,
+        pub semantics: String,
+        pub scope: String,
+        pub problem_sha256: String,
+        pub request_sha256: String,
+        pub backend: String,
+        pub pivots: usize,
+        pub witness: WeightedL1Witness,
+        pub verification: WeightedL1Verification,
+    }
+
+    /// Backends propose witnesses; only independent verification determines
+    /// accuracy. External backends must enforce their own resource/cancellation
+    /// policy and declare any floating candidate arithmetic in their name.
+    pub trait WeightedL1Backend {
+        fn name(&self) -> &str;
+        fn propose(
+            &self,
+            problem: &WeightedL1Problem,
+            options: &WeightedL1Options,
+            cancellation: &CancellationToken,
+        ) -> Result<(WeightedL1Witness, usize), SolverError>;
+    }
+
+    /// Dense two-phase rational simplex with Bland's deterministic pivot rule.
+    /// A small-problem reference, not a large sparse LP performance promise.
+    pub struct ExactWeightedL1Solver;
+
+    fn invalid(message: &str) -> SolverError {
+        SolverError::InvalidConfiguration(format!("weighted L1: {message}"))
+    }
+    fn exhausted(message: &str) -> SolverError {
+        SolverError::IterationBudgetExhausted(format!("weighted L1: {message}"))
+    }
+    fn check_cancel(token: &CancellationToken) -> Result<(), SolverError> {
+        if token.is_cancelled() {
+            Err(SolverError::Cancelled("weighted L1 work cancelled".into()))
+        } else {
+            Ok(())
+        }
+    }
+    fn guard(value: &Rational, options: &WeightedL1Options) -> Result<(), SolverError> {
+        if value.numer().significant_bits() > options.maximum_rational_bits
+            || value.denom().significant_bits() > options.maximum_rational_bits
+        {
+            return Err(exhausted("rational bit-growth limit reached"));
+        }
+        Ok(())
+    }
+
+    fn scalar(text: &str, options: &WeightedL1Options) -> Result<Rational, SolverError> {
+        // Bound text/exponent BEFORE constructing a GMP integer or a power.
+        if text.is_empty() || text.len() > 131_072 || text.bytes().any(|b| b.is_ascii_whitespace())
+        {
+            return Err(invalid("empty, oversized, or whitespace-containing scalar"));
+        }
+        let integer = |s: &str, signed: bool| -> Result<Integer, SolverError> {
+            let digits = if signed {
+                s.strip_prefix('-')
+                    .or_else(|| s.strip_prefix('+'))
+                    .unwrap_or(s)
+            } else {
+                s
+            };
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid("invalid exact integer"));
+            }
+            Integer::from_str_radix(s, 10).map_err(|_| invalid("invalid exact integer"))
+        };
+        let value = if let Some((n, d)) = text.split_once('/') {
+            let denominator = integer(d, false)?;
+            if denominator <= 0 {
+                return Err(invalid("positive denominator required"));
+            }
+            Rational::from((integer(n, true)?, denominator))
+        } else {
+            let canonical = DecimalLiteral::new(text)
+                .and_then(|v| v.canonical())
+                .map_err(|_| invalid("finite decimal or rational scalar required"))?;
+            let (mantissa, exponent) = canonical
+                .as_str()
+                .split_once('e')
+                .unwrap_or((canonical.as_str(), "0"));
+            let exponent: i32 = exponent
+                .parse()
+                .map_err(|_| invalid("decimal exponent outside supported range"))?;
+            if exponent.unsigned_abs() > 16_384 {
+                return Err(invalid("decimal exponent limit"));
+            }
+            let scale = Integer::from(10).pow(exponent.unsigned_abs());
+            let mantissa = integer(mantissa, true)?;
+            if exponent >= 0 {
+                Rational::from(mantissa * scale)
+            } else {
+                Rational::from((mantissa, scale))
+            }
+        };
+        guard(&value, options)?;
+        Ok(value)
+    }
+
+    fn validate_options(options: &WeightedL1Options) -> Result<(Rational, Rational), SolverError> {
+        if options.maximum_pivots > 1_000_000
+            || options.maximum_tableau_cells == 0
+            || options.maximum_tableau_cells > 1_048_576
+            || !(64..=65_536).contains(&options.maximum_rational_bits)
+        {
+            return Err(invalid("unsupported work limits"));
+        }
+        let absolute = scalar(&options.absolute_optimality_gap, options)?;
+        let relative = scalar(&options.relative_optimality_gap, options)?;
+        if absolute < 0 || relative < 0 {
+            return Err(invalid("negative optimality tolerance"));
+        }
+        Ok((absolute, relative))
+    }
+
+    struct Parsed {
+        b: Vec<Vec<Rational>>,
+        y: Vec<Rational>,
+        w: Vec<Rational>,
+        c: Vec<Vec<Rational>>,
+        d: Vec<Rational>,
+    }
+
+    fn parse(
+        problem: &WeightedL1Problem,
+        options: &WeightedL1Options,
+        token: &CancellationToken,
+    ) -> Result<Parsed, SolverError> {
+        check_cancel(token)?;
+        validate_options(options)?;
+        let m = problem.basis.len();
+        let n = problem.basis.first().map_or(0, Vec::len);
+        let k = problem.constraints.len();
+        if problem.schema_version != 1
+            || m == 0
+            || m > 2048
+            || n == 0
+            || n > 128
+            || k > 128
+            || m * n > 65_536
+            || problem.basis.iter().any(|row| row.len() != n)
+            || problem.target.len() != m
+            || problem.weights.len() != m
+            || problem.rhs.len() != k
+            || problem.constraints.iter().any(|row| row.len() != n)
+        {
+            return Err(invalid("schema, shape, or dimension limit"));
+        }
+        for id in [
+            &problem.basis_id,
+            &problem.target_id,
+            &problem.normalization_id,
+            &problem.quadrature_id,
+        ] {
+            if id.trim().is_empty() || id.len() > 4096 {
+                return Err(invalid("nonempty bounded source identities required"));
+            }
+        }
+        let mut texts = problem
+            .basis
+            .iter()
+            .flatten()
+            .chain(&problem.target)
+            .chain(&problem.weights)
+            .chain(problem.constraints.iter().flatten())
+            .chain(&problem.rhs);
+        let total_bytes = texts
+            .try_fold(0usize, |a, x| a.checked_add(x.len()))
+            .ok_or_else(|| invalid("input size overflow"))?;
+        if total_bytes > 8_388_608 {
+            return Err(invalid("input scalar byte limit"));
+        }
+        let vector = |values: &[String]| -> Result<Vec<Rational>, SolverError> {
+            values
+                .iter()
+                .map(|v| {
+                    check_cancel(token)?;
+                    scalar(v, options)
+                })
+                .collect()
+        };
+        let data = Parsed {
+            b: problem
+                .basis
+                .iter()
+                .map(|row| vector(row))
+                .collect::<Result<_, _>>()?,
+            y: vector(&problem.target)?,
+            w: vector(&problem.weights)?,
+            c: problem
+                .constraints
+                .iter()
+                .map(|row| vector(row))
+                .collect::<Result<_, _>>()?,
+            d: vector(&problem.rhs)?,
+        };
+        if data.w.iter().any(|w| w <= &0) {
+            return Err(invalid("strictly positive weights required"));
+        }
+        Ok(data)
+    }
+
+    fn add_product(
+        sum: &mut Rational,
+        a: &Rational,
+        b: &Rational,
+        options: &WeightedL1Options,
+    ) -> Result<(), SolverError> {
+        let product = Rational::from(a * b);
+        guard(&product, options)?;
+        *sum += product;
+        guard(sum, options)
+    }
+
+    fn dot(
+        a: &[Rational],
+        b: &[Rational],
+        options: &WeightedL1Options,
+        token: &CancellationToken,
+    ) -> Result<Rational, SolverError> {
+        let mut sum = Rational::from(0);
+        for (x, y) in a.iter().zip(b) {
+            check_cancel(token)?;
+            add_product(&mut sum, x, y, options)?;
+        }
+        Ok(sum)
+    }
+
+    /// Independent exact witness checker. No simplex tableau, backend success
+    /// flag, reported objective, or floating computation enters this calculation.
+    pub fn verify_weighted_l1_witness(
+        problem: &WeightedL1Problem,
+        options: &WeightedL1Options,
+        witness: &WeightedL1Witness,
+        cancellation: &CancellationToken,
+    ) -> Result<WeightedL1Verification, SolverError> {
+        let data = parse(problem, options, cancellation)?;
+        let m = data.b.len();
+        let n = data.b[0].len();
+        let k = data.c.len();
+        if witness.coefficients.len() != n
+            || witness.dual_z.len() != m
+            || witness.dual_nu.len() != k
+        {
+            return Err(invalid("witness shape mismatch"));
+        }
+        let read = |values: &[String]| -> Result<Vec<Rational>, SolverError> {
+            values
+                .iter()
+                .map(|v| {
+                    check_cancel(cancellation)?;
+                    scalar(v, options)
+                })
+                .collect()
+        };
+        let a = read(&witness.coefficients)?;
+        let z = read(&witness.dual_z)?;
+        let nu = read(&witness.dual_nu)?;
+        for (row, rhs) in data.c.iter().zip(&data.d) {
+            if dot(row, &a, options, cancellation)? != *rhs {
+                return Err(invalid("primal equality is not exact"));
+            }
+        }
+        if z.iter().zip(&data.w).any(|(v, w)| v.clone().abs() > *w) {
+            return Err(invalid("dual weight bound violated"));
+        }
+        for j in 0..n {
+            check_cancel(cancellation)?;
+            let mut left = Rational::from(0);
+            let mut right = Rational::from(0);
+            for (row, zj) in data.b.iter().zip(&z) {
+                add_product(&mut left, &row[j], zj, options)?;
+            }
+            for (row, nuj) in data.c.iter().zip(&nu) {
+                add_product(&mut right, &row[j], nuj, options)?;
+            }
+            if left != right {
+                return Err(invalid("dual stationarity is not exact"));
+            }
+        }
+        let mut upper = Rational::from(0);
+        for ((row, y), w) in data.b.iter().zip(&data.y).zip(&data.w) {
+            let residual = (y - dot(row, &a, options, cancellation)?).abs();
+            guard(&residual, options)?;
+            add_product(&mut upper, w, &residual, options)?;
+        }
+        let mut lower =
+            dot(&data.y, &z, options, cancellation)? - dot(&data.d, &nu, options, cancellation)?;
+        guard(&lower, options)?;
+        // Nonnegativity is also an exact lower bound on this objective.
+        if lower < 0 {
+            lower = Rational::from(0);
+        }
+        let gap = Rational::from(&upper - &lower);
+        guard(&gap, options)?;
+        if gap < 0 {
+            return Err(SolverError::NumericalBreakdown(
+                "weighted L1 weak duality violated".into(),
+            ));
+        }
+        let (mut threshold, relative) = validate_options(options)?;
+        add_product(&mut threshold, &relative, &upper, options)?;
+        let status = if gap == 0 {
+            WeightedL1Status::ExactFiniteOptimum
+        } else if gap <= threshold {
+            WeightedL1Status::GapWithinTolerance
+        } else {
+            WeightedL1Status::GapAboveTolerance
+        };
+        Ok(WeightedL1Verification {
+            objective_lower: lower.to_string(),
+            objective_upper: upper.to_string(),
+            optimality_gap: gap.to_string(),
+            accepted: status != WeightedL1Status::GapAboveTolerance,
+            status,
+        })
+    }
+
+    fn hash<T: Serialize>(value: &T) -> Result<String, SolverError> {
+        let bytes =
+            serde_json::to_vec(value).map_err(|_| invalid("identity serialization failed"))?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+
+    /// Wrap an externally proposed witness in a replayable Toolkit record.
+    /// An above-tolerance bound remains visible with accepted=false.
+    pub fn attest_weighted_l1_candidate(
+        problem: &WeightedL1Problem,
+        options: &WeightedL1Options,
+        witness: WeightedL1Witness,
+        backend: &str,
+        pivots: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<WeightedL1Fit, SolverError> {
+        if backend.trim().is_empty() || backend.len() > 4096 {
+            return Err(invalid("backend identity required"));
+        }
+        let verification = verify_weighted_l1_witness(problem, options, &witness, cancellation)?;
+        Ok(WeightedL1Fit {
+            schema_version: 1,
+            semantics: SEMANTICS.into(),
+            scope: SCOPE.into(),
+            problem_sha256: hash(&(SEMANTICS, problem))?,
+            request_sha256: hash(&(SEMANTICS, problem, options))?,
+            backend: backend.into(),
+            pivots,
+            witness,
+            verification,
+        })
+    }
+
+    pub fn verify_weighted_l1_fit(
+        problem: &WeightedL1Problem,
+        options: &WeightedL1Options,
+        fit: &WeightedL1Fit,
+        cancellation: &CancellationToken,
+    ) -> Result<WeightedL1Verification, SolverError> {
+        // Validate sizes before serializing potentially large caller inputs.
+        parse(problem, options, cancellation)?;
+        if fit.schema_version != 1
+            || fit.semantics != SEMANTICS
+            || fit.scope != SCOPE
+            || fit.problem_sha256 != hash(&(SEMANTICS, problem))?
+            || fit.request_sha256 != hash(&(SEMANTICS, problem, options))?
+            || fit.backend.trim().is_empty()
+            || fit.backend.len() > 4096
+        {
+            return Err(invalid("result source, request, or semantics mismatch"));
+        }
+        let result = verify_weighted_l1_witness(problem, options, &fit.witness, cancellation)?;
+        if result != fit.verification {
+            return Err(invalid("reported bounds or acceptance mismatch"));
+        }
+        Ok(result)
+    }
+
+    pub fn fit_weighted_l1_with_backend(
+        problem: &WeightedL1Problem,
+        options: &WeightedL1Options,
+        backend: &dyn WeightedL1Backend,
+        cancellation: &CancellationToken,
+    ) -> Result<WeightedL1Fit, SolverError> {
+        parse(problem, options, cancellation)?;
+        let (witness, pivots) = backend.propose(problem, options, cancellation)?;
+        check_cancel(cancellation)?;
+        attest_weighted_l1_candidate(
+            problem,
+            options,
+            witness,
+            backend.name(),
+            pivots,
+            cancellation,
+        )
+    }
+
+    /// Solve with the exact rational reference and independently replay its
+    /// zero-gap witness before returning. Work-limit/cancellation errors return
+    /// no accepted result. Use `fit_weighted_l1_with_backend` for other routes.
+    ///
+    /// ```
+    /// use xc_core::CancellationToken;
+    /// use xc_solver::weighted_l1::*;
+    /// let problem = WeightedL1Problem {
+    ///     schema_version: 1,
+    ///     basis_id: "constant".into(), target_id: "three-points".into(),
+    ///     normalization_id: "unconstrained".into(), quadrature_id: "weights-1-3-1".into(),
+    ///     basis: vec![vec!["1".into()]; 3],
+    ///     target: vec!["0".into(), "1".into(), "100".into()],
+    ///     weights: vec!["1".into(), "3".into(), "1".into()],
+    ///     constraints: vec![], rhs: vec![],
+    /// };
+    /// let options = WeightedL1Options::default();
+    /// let token = CancellationToken::new();
+    /// let fit = fit_weighted_l1(&problem, &options, &token).unwrap();
+    /// assert_eq!(fit.witness.coefficients, vec!["1"]);
+    /// assert_eq!(fit.verification.objective_upper, "100");
+    /// assert!(verify_weighted_l1_fit(&problem, &options, &fit, &token).unwrap().accepted);
+    /// ```
+    pub fn fit_weighted_l1(
+        problem: &WeightedL1Problem,
+        options: &WeightedL1Options,
+        cancellation: &CancellationToken,
+    ) -> Result<WeightedL1Fit, SolverError> {
+        let result =
+            fit_weighted_l1_with_backend(problem, options, &ExactWeightedL1Solver, cancellation)?;
+        if result.verification.status != WeightedL1Status::ExactFiniteOptimum {
+            return Err(SolverError::NumericalBreakdown(
+                "exact L1 reference failed independent optimality check".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    struct Tableau<'a> {
+        rows: Vec<Vec<Rational>>, // last column is RHS
+        basis: Vec<usize>,
+        pivots: usize,
+        options: &'a WeightedL1Options,
+        token: &'a CancellationToken,
+    }
+
+    impl Tableau<'_> {
+        fn pivot(&mut self, row: usize, column: usize) -> Result<(), SolverError> {
+            check_cancel(self.token)?;
+            if self.pivots >= self.options.maximum_pivots {
+                return Err(exhausted("simplex pivot budget reached"));
+            }
+            let pivot = self.rows[row][column].clone();
+            if pivot == 0 {
+                return Err(SolverError::NumericalBreakdown(
+                    "zero exact L1 pivot".into(),
+                ));
+            }
+            for x in &mut self.rows[row] {
+                check_cancel(self.token)?;
+                *x /= &pivot;
+                guard(x, self.options)?;
+            }
+            let normalized = self.rows[row].clone();
+            for (i, other) in self.rows.iter_mut().enumerate() {
+                check_cancel(self.token)?;
+                if i == row {
+                    continue;
+                }
+                let factor = other[column].clone();
+                if factor == 0 {
+                    continue;
+                }
+                for (x, y) in other.iter_mut().zip(&normalized) {
+                    check_cancel(self.token)?;
+                    let product = Rational::from(&factor * y);
+                    guard(&product, self.options)?;
+                    *x -= product;
+                    guard(x, self.options)?;
+                }
+                if other.last().is_some_and(|v| v < &0) {
+                    return Err(SolverError::NumericalBreakdown(
+                        "exact L1 pivot lost primal feasibility".into(),
+                    ));
+                }
+            }
+            self.basis[row] = column;
+            self.pivots += 1;
+            Ok(())
+        }
+
+        fn simplex(
+            &mut self,
+            costs: &[Rational],
+            allowed_columns: usize,
+        ) -> Result<(), SolverError> {
+            loop {
+                check_cancel(self.token)?;
+                let mut entering = None;
+                for (column, cost) in costs.iter().enumerate().take(allowed_columns) {
+                    check_cancel(self.token)?;
+                    if self.basis.contains(&column) {
+                        continue;
+                    }
+                    let mut reduced = cost.clone();
+                    for (row, &basic) in self.rows.iter().zip(&self.basis) {
+                        let term = Rational::from(&costs[basic] * &row[column]);
+                        guard(&term, self.options)?;
+                        reduced -= term;
+                        guard(&reduced, self.options)?;
+                    }
+                    if reduced < 0 {
+                        entering = Some(column);
+                        break;
+                    }
+                }
+                let Some(column) = entering else {
+                    return Ok(());
+                };
+                // Bland: least variable index enters; least BASIC variable
+                // index leaves among exactly equal minimum-ratio choices.
+                let mut leaving: Option<(usize, Rational)> = None;
+                for (i, row) in self.rows.iter().enumerate() {
+                    check_cancel(self.token)?;
+                    if row[column] <= 0 {
+                        continue;
+                    }
+                    let ratio = Rational::from(row.last().unwrap() / &row[column]);
+                    guard(&ratio, self.options)?;
+                    if leaving.as_ref().is_none_or(|(j, old)| {
+                        ratio < *old || (ratio == *old && self.basis[i] < self.basis[*j])
+                    }) {
+                        leaving = Some((i, ratio));
+                    }
+                }
+                let Some((row, _)) = leaving else {
+                    return Err(SolverError::NumericalBreakdown(
+                        "unexpected unbounded L1 phase".into(),
+                    ));
+                };
+                self.pivot(row, column)?;
+            }
+        }
+    }
+
+    impl WeightedL1Backend for ExactWeightedL1Solver {
+        fn name(&self) -> &str {
+            "gmp-rational-two-phase-simplex-bland-v1"
+        }
+        fn propose(
+            &self,
+            problem: &WeightedL1Problem,
+            options: &WeightedL1Options,
+            token: &CancellationToken,
+        ) -> Result<(WeightedL1Witness, usize), SolverError> {
+            let data = parse(problem, options, token)?;
+            let m = data.b.len();
+            let n = data.b[0].len();
+            let k = data.c.len();
+            let equations = m + k;
+            // B(a+ - a-) + r+ - r- = y; C(a+ - a-) = d.
+            let ordinary = 2 * n + 2 * m;
+            let columns = ordinary + equations;
+            let cells = equations
+                .checked_mul(columns + 1)
+                .ok_or_else(|| invalid("tableau size overflow"))?;
+            if cells > options.maximum_tableau_cells {
+                return Err(exhausted("dense tableau cell limit"));
+            }
+            let mut rows = vec![vec![Rational::from(0); columns + 1]; equations];
+            let mut signs = vec![1i32; equations];
+            for (i, row) in rows.iter_mut().enumerate() {
+                check_cancel(token)?;
+                let (coefficients, rhs) = if i < m {
+                    (&data.b[i], &data.y[i])
+                } else {
+                    (&data.c[i - m], &data.d[i - m])
+                };
+                signs[i] = if rhs < &0 { -1 } else { 1 };
+                for (j, value) in coefficients.iter().enumerate() {
+                    row[j] = value.clone() * signs[i];
+                    row[n + j] = -row[j].clone();
+                }
+                if i < m {
+                    row[2 * n + i] = Rational::from(signs[i]);
+                    row[2 * n + m + i] = Rational::from(-signs[i]);
+                }
+                row[ordinary + i] = Rational::from(1);
+                row[columns] = rhs.clone() * signs[i];
+            }
+            let mut tableau = Tableau {
+                rows,
+                basis: (ordinary..columns).collect(),
+                pivots: 0,
+                options,
+                token,
+            };
+            let phase_one: Vec<_> = (0..columns)
+                .map(|j| Rational::from(i32::from(j >= ordinary)))
+                .collect();
+            tableau.simplex(&phase_one, columns)?;
+            for (row, &basic) in tableau.rows.iter().zip(&tableau.basis) {
+                if basic >= ordinary && row[columns] != 0 {
+                    return Err(invalid("inconsistent exact equality constraints"));
+                }
+            }
+            // Pivot zero artificial basics out, or remove a redundant equation.
+            // Keep artificial COLUMNS: they retain the original-row transform
+            // needed to recover the dual multipliers, including RHS signs.
+            let mut i = 0;
+            while i < tableau.rows.len() {
+                check_cancel(token)?;
+                if tableau.basis[i] < ordinary {
+                    i += 1;
+                    continue;
+                }
+                if let Some(column) = (0..ordinary).find(|&j| tableau.rows[i][j] != 0) {
+                    tableau.pivot(i, column)?;
+                    i += 1;
+                } else {
+                    tableau.rows.remove(i);
+                    tableau.basis.remove(i);
+                }
+            }
+            let mut costs = vec![Rational::from(0); columns];
+            for (i, w) in data.w.iter().enumerate() {
+                costs[2 * n + i] = w.clone();
+                costs[2 * n + m + i] = w.clone();
+            }
+            tableau.simplex(&costs, ordinary)?;
+            let mut solution = vec![Rational::from(0); ordinary];
+            for (row, &basic) in tableau.rows.iter().zip(&tableau.basis) {
+                solution[basic] = row[columns].clone();
+            }
+            let mut multipliers = vec![Rational::from(0); equations];
+            for (j, value) in multipliers.iter_mut().enumerate() {
+                check_cancel(token)?;
+                for (row, &basic) in tableau.rows.iter().zip(&tableau.basis) {
+                    add_product(value, &costs[basic], &row[ordinary + j], options)?;
+                }
+                *value *= signs[j];
+            }
+            let witness = WeightedL1Witness {
+                coefficients: (0..n)
+                    .map(|j| Rational::from(&solution[j] - &solution[n + j]).to_string())
+                    .collect(),
+                dual_z: multipliers[..m].iter().map(ToString::to_string).collect(),
+                dual_nu: multipliers[m..]
+                    .iter()
+                    .map(|v| (-v.clone()).to_string())
+                    .collect(),
+            };
+            // The public wrapper independently checks optimality before returning.
+            Ok((witness, tableau.pivots))
+        }
+    }
+}
+
+/// Finite real symmetric trial forms. Input intervals are caller assertions;
+/// arithmetic enclosures do not certify their source or continuum validity.
+#[cfg(feature = "hp-reference")]
+#[doc(hidden)]
+pub mod trial_energy {
+    use super::SolverError;
+    use rug::{ops::Pow, Integer, Rational};
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+    use xc_core::{CancellationToken, DecimalLiteral};
+    use xc_numerics::interval::RationalInterval as I;
+
+    pub const SEMANTICS: &str = "real-symmetric-trial-energy-rational-intervals-v1";
+    pub const SCOPE: &str =
+        "finite_declared_input_enclosures_no_source_authentication_or_continuum_claim";
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ExactBounds {
+        pub lower: String,
+        pub upper: String,
+    }
+    impl ExactBounds {
+        pub fn point(value: impl Into<String>) -> Self {
+            let value = value.into();
+            Self {
+                lower: value.clone(),
+                upper: value,
+            }
+        }
+    }
+
+    /// Row-major symmetric form, not an operator-coordinate matrix G^-1 A.
+    /// Both triangles must contain identical intervals. A metric uses this
+    /// same representation and must pass a positive-definiteness check.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TrialForm {
+        pub source_id: String,
+        pub basis_id: String,
+        pub normalization_id: String,
+        pub dimension: usize,
+        pub entries: Vec<ExactBounds>,
+    }
+
+    /// A proposed vector or additive correction in the declared coordinates.
+    /// No eigenvalue, convergence flag, or eigenstate classification is needed.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TrialVector {
+        pub label: String,
+        pub source_id: String,
+        pub operator_id: String,
+        pub metric_id: String,
+        pub basis_id: String,
+        pub normalization_id: String,
+        pub coefficients: Vec<ExactBounds>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TrialEnergyProblem {
+        pub schema_version: u32,
+        pub operator: TrialForm,
+        pub metric: TrialForm,
+        pub baseline: TrialVector,
+        pub corrections: Vec<TrialVector>,
+    }
+
+    /// Structural work limits, not an exact resident-memory reservation.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TrialEnergyOptions {
+        pub maximum_dimension: usize,
+        pub maximum_parts: usize,
+        pub maximum_input_bytes: usize,
+        pub maximum_interval_operations: u64,
+        pub maximum_rational_bits: u32,
+    }
+    impl Default for TrialEnergyOptions {
+        fn default() -> Self {
+            Self {
+                maximum_dimension: 256,
+                maximum_parts: 8,
+                maximum_input_bytes: 67_108_864,
+                maximum_interval_operations: 20_000_000,
+                maximum_rational_bits: 32_768,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CancellationStatus {
+        Resolved,
+        ExactZeroTotal,
+        TotalContainsZero,
+        AllTermsZero,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct CancellationMeasure {
+        /// Sum of absolute values in the explicitly stated decomposition.
+        pub absolute_term_sum: ExactBounds,
+        /// Enclosure of sum(abs(terms))/abs(total), only away from zero.
+        /// This is an amplification factor, not a certified lost-digit count.
+        pub amplification: Option<ExactBounds>,
+        pub status: CancellationStatus,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct FormContribution {
+        /// Part zero is the baseline; parts 1.. are corrections in input order.
+        pub left: usize,
+        pub right: usize,
+        /// Q(part) on the diagonal; twice the bilinear pairing off diagonal.
+        pub value: ExactBounds,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct FormDecomposition {
+        pub contributions: Vec<FormContribution>,
+        pub expansion_sum: ExactBounds,
+        pub direct_total: ExactBounds,
+        /// Intersection of two valid evaluations of the same quadratic form.
+        pub total: ExactBounds,
+        /// Interval consistency check; dependence can make this nonzero-width.
+        pub closure_residual: ExactBounds,
+        /// Change from baseline, using the correction terms and direct values.
+        pub change_from_baseline: ExactBounds,
+        pub correction_cancellation: CancellationMeasure,
+        /// Terms A_ii*x_i^2 and 2*A_ij*x_i*x_j, i<j, for the combined vector.
+        pub coefficient_cancellation: CancellationMeasure,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TrialMeasurement {
+        pub energy: ExactBounds,
+        pub squared_norm: ExactBounds,
+        pub rayleigh_quotient: ExactBounds,
+        /// Exact rational midpoint and half-width of the Rayleigh enclosure.
+        /// Conditional on supplied input enclosures; no extra error is inferred.
+        pub rayleigh_midpoint: String,
+        pub rayleigh_absolute_error_bound: String,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TrialEnergyReport {
+        pub schema_version: u32,
+        pub semantics: String,
+        pub scope: String,
+        pub problem_sha256: String,
+        pub request_sha256: String,
+        pub metric_check: String,
+        pub part_labels: Vec<String>,
+        pub energy: FormDecomposition,
+        pub norm: FormDecomposition,
+        pub baseline: TrialMeasurement,
+        pub corrected: TrialMeasurement,
+        pub rayleigh_change: ExactBounds,
+        /// Every energy term divided by the same corrected squared norm.
+        /// The baseline contribution here is generally not its own Rayleigh
+        /// quotient, since that uses the baseline's squared norm instead.
+        pub common_norm_energy_contributions: Vec<FormContribution>,
+        pub common_norm_expansion_sum: ExactBounds,
+        pub common_norm_closure_residual: ExactBounds,
+        pub interval_operations: u64,
+    }
+
+    fn invalid(s: &str) -> SolverError {
+        SolverError::InvalidConfiguration(format!("trial energy: {s}"))
+    }
+    fn limit(s: &str) -> SolverError {
+        SolverError::IterationBudgetExhausted(format!("trial energy: {s}"))
+    }
+    pub(super) fn bounds(x: &I) -> ExactBounds {
+        ExactBounds {
+            lower: x.lower().to_string(),
+            upper: x.upper().to_string(),
+        }
+    }
+    pub(super) fn zero() -> I {
+        I::point(Rational::from(0))
+    }
+    fn two() -> I {
+        I::point(Rational::from(2))
+    }
+    pub(super) fn magnitude(x: &I) -> I {
+        if x.contains_zero() {
+            I::new(
+                Rational::from(0),
+                x.lower().clone().abs().max(x.upper().clone().abs()),
+            )
+            .unwrap()
+        } else if x.is_strictly_negative() {
+            x.neg()
+        } else {
+            x.clone()
+        }
+    }
+    pub(super) fn hash<T: Serialize>(x: &T) -> Result<String, SolverError> {
+        let bytes = serde_json::to_vec(x).map_err(|_| invalid("identity serialization"))?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+    pub(super) struct Work<'a> {
+        pub(super) options: &'a TrialEnergyOptions,
+        pub(super) token: &'a CancellationToken,
+        pub(super) operations: u64,
+    }
+    impl Work<'_> {
+        pub(super) fn cancel(&self) -> Result<(), SolverError> {
+            if self.token.is_cancelled() {
+                Err(SolverError::Cancelled("trial energy cancelled".into()))
+            } else {
+                Ok(())
+            }
+        }
+        pub(super) fn tick(&mut self) -> Result<(), SolverError> {
+            self.cancel()?;
+            if self.operations >= self.options.maximum_interval_operations {
+                return Err(limit("interval operation limit"));
+            }
+            self.operations += 1;
+            Ok(())
+        }
+        fn rational(&self, x: &Rational) -> Result<(), SolverError> {
+            if x.numer().significant_bits() > self.options.maximum_rational_bits
+                || x.denom().significant_bits() > self.options.maximum_rational_bits
+            {
+                return Err(limit("rational bit-growth limit"));
+            }
+            Ok(())
+        }
+        pub(super) fn checked(&self, x: I) -> Result<I, SolverError> {
+            self.rational(x.lower())?;
+            self.rational(x.upper())?;
+            Ok(x)
+        }
+        pub(super) fn add(&mut self, x: &I, y: &I) -> Result<I, SolverError> {
+            self.tick()?;
+            self.checked(x.add(y))
+        }
+        pub(super) fn sub(&mut self, x: &I, y: &I) -> Result<I, SolverError> {
+            self.tick()?;
+            self.checked(x.sub(y))
+        }
+        pub(super) fn mul(&mut self, x: &I, y: &I) -> Result<I, SolverError> {
+            self.tick()?;
+            self.checked(x.mul(y))
+        }
+        pub(super) fn square(&mut self, x: &I) -> Result<I, SolverError> {
+            self.tick()?;
+            self.checked(x.square())
+        }
+        pub(super) fn div(&mut self, x: &I, y: &I) -> Result<I, SolverError> {
+            self.tick()?;
+            self.checked(x.div(y).map_err(|_| invalid("denominator contains zero"))?)
+        }
+        pub(super) fn scalar(&self, text: &str) -> Result<Rational, SolverError> {
+            self.cancel()?;
+            if text.is_empty()
+                || text.len() > 131_072
+                || text.bytes().any(|b| b.is_ascii_whitespace())
+            {
+                return Err(invalid("empty, oversized, or whitespace-containing scalar"));
+            }
+            let integer = |s: &str, signed: bool| -> Result<Integer, SolverError> {
+                let digits = if signed {
+                    s.strip_prefix('-')
+                        .or_else(|| s.strip_prefix('+'))
+                        .unwrap_or(s)
+                } else {
+                    s
+                };
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(invalid("invalid exact integer"));
+                }
+                Integer::from_str_radix(s, 10).map_err(|_| invalid("invalid exact integer"))
+            };
+            let x = if let Some((a, b)) = text.split_once('/') {
+                let denominator = integer(b, false)?;
+                if denominator <= 0 {
+                    return Err(invalid("positive denominator required"));
+                }
+                Rational::from((integer(a, true)?, denominator))
+            } else {
+                let canonical = DecimalLiteral::new(text)
+                    .and_then(|v| v.canonical())
+                    .map_err(|_| invalid("finite decimal or rational required"))?;
+                let (m, e) = canonical
+                    .as_str()
+                    .split_once('e')
+                    .unwrap_or((canonical.as_str(), "0"));
+                let e: i32 = e.parse().map_err(|_| invalid("decimal exponent limit"))?;
+                if e.unsigned_abs() > 16_384 {
+                    return Err(invalid("decimal exponent limit"));
+                }
+                let scale = Integer::from(10).pow(e.unsigned_abs());
+                if e >= 0 {
+                    Rational::from(integer(m, true)? * scale)
+                } else {
+                    Rational::from((integer(m, true)?, scale))
+                }
+            };
+            self.rational(&x)?;
+            Ok(x)
+        }
+        pub(super) fn read(&self, x: &ExactBounds) -> Result<I, SolverError> {
+            I::new(self.scalar(&x.lower)?, self.scalar(&x.upper)?)
+                .map_err(|_| invalid("reversed interval endpoints"))
+        }
+    }
+
+    fn validate(
+        problem: &TrialEnergyProblem,
+        options: &TrialEnergyOptions,
+    ) -> Result<(), SolverError> {
+        if options.maximum_dimension == 0
+            || options.maximum_dimension > 512
+            || options.maximum_parts == 0
+            || options.maximum_parts > 16
+            || options.maximum_input_bytes == 0
+            || options.maximum_input_bytes > 134_217_728
+            || options.maximum_interval_operations > 1_000_000_000
+            || !(64..=65_536).contains(&options.maximum_rational_bits)
+        {
+            return Err(invalid("unsupported work limits"));
+        }
+        let n = problem.operator.dimension;
+        if problem.schema_version != 1
+            || n == 0
+            || n > options.maximum_dimension
+            || problem.metric.dimension != n
+            || problem.corrections.len() >= options.maximum_parts
+        {
+            return Err(invalid("schema, dimension or part limit"));
+        }
+        let id = |s: &str| -> Result<(), SolverError> {
+            if s.trim().is_empty() || s.len() > 4096 {
+                Err(invalid("nonempty bounded identity required"))
+            } else {
+                Ok(())
+            }
+        };
+        let a = &problem.operator;
+        let g = &problem.metric;
+        for form in [a, g] {
+            id(&form.source_id)?;
+            id(&form.basis_id)?;
+            id(&form.normalization_id)?;
+            if form.entries.len() != n * n {
+                return Err(invalid("matrix shape"));
+            }
+        }
+        if a.basis_id != g.basis_id || a.normalization_id != g.normalization_id {
+            return Err(invalid("operator/metric coordinate mismatch"));
+        }
+        let mut labels = std::collections::BTreeSet::new();
+        for v in std::iter::once(&problem.baseline).chain(&problem.corrections) {
+            id(&v.label)?;
+            id(&v.source_id)?;
+            if !labels.insert(&v.label)
+                || v.coefficients.len() != n
+                || v.operator_id != a.source_id
+                || v.metric_id != g.source_id
+                || v.basis_id != a.basis_id
+                || v.normalization_id != a.normalization_id
+            {
+                return Err(invalid(
+                    "vector label, shape, matrix, metric or coordinate mismatch",
+                ));
+            }
+        }
+        let scalar_bytes = a
+            .entries
+            .iter()
+            .chain(&g.entries)
+            .chain(
+                std::iter::once(&problem.baseline)
+                    .chain(&problem.corrections)
+                    .flat_map(|v| &v.coefficients),
+            )
+            .try_fold(0usize, |sum, v| {
+                sum.checked_add(v.lower.len())?.checked_add(v.upper.len())
+            })
+            .ok_or_else(|| invalid("input byte overflow"))?;
+        if scalar_bytes > options.maximum_input_bytes {
+            return Err(limit("input scalar byte limit"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn read_form(form: &TrialForm, work: &Work<'_>) -> Result<Vec<I>, SolverError> {
+        let values: Vec<_> = form
+            .entries
+            .iter()
+            .map(|v| work.read(v))
+            .collect::<Result<_, _>>()?;
+        for i in 0..form.dimension {
+            for j in 0..i {
+                if values[i * form.dimension + j] != values[j * form.dimension + i] {
+                    return Err(invalid("form intervals are not exactly symmetric"));
+                }
+            }
+        }
+        Ok(values)
+    }
+
+    // Interval LDL without pivoting: positive pivots prove SPD for every
+    // symmetric metric in the input box. An unresolved pivot refuses a claim.
+    pub(super) fn metric_check(g: &[I], n: usize, w: &mut Work<'_>) -> Result<String, SolverError> {
+        let diagonal = (0..n).all(|i| (0..n).all(|j| i == j || g[i * n + j] == zero()));
+        if diagonal {
+            if (0..n).any(|i| !g[i * n + i].is_strictly_positive()) {
+                return Err(invalid("metric positive definiteness unresolved"));
+            }
+            return Ok("positive_diagonal_interval_metric".into());
+        }
+        let mut l = vec![zero(); n * n];
+        let mut d = vec![zero(); n];
+        for i in 0..n {
+            w.cancel()?;
+            let mut pivot = g[i * n + i].clone();
+            for k in 0..i {
+                let square = w.square(&l[i * n + k])?;
+                let term = w.mul(&square, &d[k])?;
+                pivot = w.sub(&pivot, &term)?;
+            }
+            if !pivot.is_strictly_positive() {
+                return Err(invalid("metric positive definiteness unresolved"));
+            }
+            d[i] = pivot;
+            for j in i + 1..n {
+                let mut value = g[j * n + i].clone();
+                for k in 0..i {
+                    let product = w.mul(&l[j * n + k], &l[i * n + k])?;
+                    let term = w.mul(&product, &d[k])?;
+                    value = w.sub(&value, &term)?;
+                }
+                l[j * n + i] = w.div(&value, &d[i])?;
+            }
+        }
+        Ok("positive_interval_ldl_metric".into())
+    }
+
+    fn pairing(
+        a: &[I],
+        x: &[I],
+        y: &[I],
+        same: bool,
+        w: &mut Work<'_>,
+    ) -> Result<(I, I), SolverError> {
+        let n = x.len();
+        let mut value = zero();
+        let mut absolute = zero();
+        for i in 0..n {
+            for j in i..n {
+                w.cancel()?;
+                if a[i * n + j] == zero() {
+                    continue;
+                }
+                let product = if same {
+                    if i == j {
+                        w.square(&x[i])?
+                    } else {
+                        let p = w.mul(&x[i], &x[j])?;
+                        w.mul(&two(), &p)?
+                    }
+                } else if i == j {
+                    w.mul(&x[i], &y[i])?
+                } else {
+                    let p = w.mul(&x[i], &y[j])?;
+                    let q = w.mul(&x[j], &y[i])?;
+                    w.add(&p, &q)?
+                };
+                let term = w.mul(&a[i * n + j], &product)?;
+                value = w.add(&value, &term)?;
+                absolute = w.add(&absolute, &magnitude(&term))?;
+            }
+        }
+        Ok((value, absolute))
+    }
+    fn intersection(x: &I, y: &I) -> Result<I, SolverError> {
+        x.intersection(y).ok_or_else(|| {
+            SolverError::NumericalBreakdown("trial form evaluations do not overlap".into())
+        })
+    }
+    fn cancellation(
+        sum: &I,
+        total: &I,
+        w: &mut Work<'_>,
+    ) -> Result<CancellationMeasure, SolverError> {
+        let (status, ratio) = if sum == &zero() {
+            (CancellationStatus::AllTermsZero, None)
+        } else if total == &zero() {
+            (CancellationStatus::ExactZeroTotal, None)
+        } else if total.contains_zero() {
+            (CancellationStatus::TotalContainsZero, None)
+        } else {
+            let ratio = w.div(sum, &magnitude(total))?;
+            if ratio.upper() < &1 {
+                return Err(SolverError::NumericalBreakdown(
+                    "invalid cancellation ratio".into(),
+                ));
+            }
+            let ratio = I::new(
+                ratio.lower().clone().max(Rational::from(1)),
+                ratio.upper().clone(),
+            )
+            .unwrap();
+            (CancellationStatus::Resolved, Some(bounds(&ratio)))
+        };
+        Ok(CancellationMeasure {
+            absolute_term_sum: bounds(sum),
+            amplification: ratio,
+            status,
+        })
+    }
+    struct Evaluated {
+        report: FormDecomposition,
+        baseline: I,
+        total: I,
+    }
+    fn decompose(
+        a: &[I],
+        parts: &[Vec<I>],
+        combined: &[I],
+        w: &mut Work<'_>,
+    ) -> Result<Evaluated, SolverError> {
+        let count = parts.len();
+        let mut pairings = vec![zero(); count * count];
+        for i in 0..count {
+            for j in i..count {
+                pairings[i * count + j] = pairing(a, &parts[i], &parts[j], i == j, w)?.0;
+            }
+        }
+        let (direct, coefficient_absolute) = pairing(a, combined, combined, true, w)?;
+        decompose_pairings(&pairings, count, direct, coefficient_absolute, w)
+    }
+    fn decompose_pairings(
+        pairings: &[I],
+        count: usize,
+        direct: I,
+        coefficient_absolute: I,
+        w: &mut Work<'_>,
+    ) -> Result<Evaluated, SolverError> {
+        let mut contributions = Vec::new();
+        let mut expansion = zero();
+        let mut change = zero();
+        let mut absolute = zero();
+        let mut baseline = zero();
+        for i in 0..count {
+            for j in i..count {
+                let mut value = pairings[i * count + j].clone();
+                if i != j {
+                    value = w.mul(&two(), &value)?;
+                }
+                if i == 0 && j == 0 {
+                    baseline = value.clone();
+                } else {
+                    change = w.add(&change, &value)?;
+                }
+                expansion = w.add(&expansion, &value)?;
+                absolute = w.add(&absolute, &magnitude(&value))?;
+                contributions.push(FormContribution {
+                    left: i,
+                    right: j,
+                    value: bounds(&value),
+                });
+            }
+        }
+        let total = intersection(&direct, &expansion)?;
+        let closure = w.sub(&direct, &expansion)?;
+        let difference = w.sub(&total, &baseline)?;
+        let change = intersection(&change, &difference)?;
+        let correction_cancellation = cancellation(&absolute, &total, w)?;
+        let coefficient_cancellation = cancellation(&coefficient_absolute, &total, w)?;
+        let report = FormDecomposition {
+            contributions,
+            expansion_sum: bounds(&expansion),
+            direct_total: bounds(&direct),
+            total: bounds(&total),
+            closure_residual: bounds(&closure),
+            change_from_baseline: bounds(&change),
+            correction_cancellation,
+            coefficient_cancellation,
+        };
+        Ok(Evaluated {
+            report,
+            baseline,
+            total,
+        })
+    }
+    fn measurement(
+        energy: &I,
+        norm: &I,
+        w: &mut Work<'_>,
+    ) -> Result<TrialMeasurement, SolverError> {
+        if !norm.is_strictly_positive() {
+            return Err(invalid("trial normalization is not separated from zero"));
+        }
+        let quotient = w.div(energy, norm)?;
+        let midpoint = quotient.midpoint();
+        w.rational(&midpoint)?;
+        let radius = quotient.width() / 2;
+        w.rational(&radius)?;
+        Ok(TrialMeasurement {
+            energy: bounds(energy),
+            squared_norm: bounds(norm),
+            rayleigh_quotient: bounds(&quotient),
+            rayleigh_midpoint: midpoint.to_string(),
+            rayleigh_absolute_error_bound: radius.to_string(),
+        })
+    }
+
+    /// Analyze baseline plus all corrections using one form and one SPD metric.
+    /// Exact point inputs produce zero-width bounds; interval inputs may be
+    /// conservative because their dependencies are not asserted. Failure returns
+    /// no report. This function does not select an eigenstate or predict a root.
+    pub fn analyze_trial_energy(
+        problem: &TrialEnergyProblem,
+        options: &TrialEnergyOptions,
+        token: &CancellationToken,
+    ) -> Result<TrialEnergyReport, SolverError> {
+        let mut w = Work {
+            options,
+            token,
+            operations: 0,
+        };
+        w.cancel()?;
+        validate(problem, options)?;
+        let a = read_form(&problem.operator, &w)?;
+        let g = read_form(&problem.metric, &w)?;
+        let n = problem.operator.dimension;
+        let metric_check = metric_check(&g, n, &mut w)?;
+        let vectors: Vec<_> = std::iter::once(&problem.baseline)
+            .chain(&problem.corrections)
+            .collect();
+        let parts: Vec<Vec<I>> = vectors
+            .iter()
+            .map(|v| v.coefficients.iter().map(|x| w.read(x)).collect())
+            .collect::<Result<_, _>>()?;
+        let mut combined = vec![zero(); n];
+        for part in &parts {
+            for (x, y) in combined.iter_mut().zip(part) {
+                *x = w.add(x, y)?;
+            }
+        }
+        let energy = decompose(&a, &parts, &combined, &mut w)?;
+        let norm = decompose(&g, &parts, &combined, &mut w)?;
+        let baseline = measurement(&energy.baseline, &norm.baseline, &mut w)?;
+        let corrected = measurement(&energy.total, &norm.total, &mut w)?;
+        let before = w.read(&baseline.rayleigh_quotient)?;
+        let after = w.read(&corrected.rayleigh_quotient)?;
+        let rayleigh_change = bounds(&w.sub(&after, &before)?);
+        let mut common_norm_energy_contributions = Vec::new();
+        let mut normalized_sum = zero();
+        for term in &energy.report.contributions {
+            let value = w.read(&term.value)?;
+            let normalized = w.div(&value, &norm.total)?;
+            normalized_sum = w.add(&normalized_sum, &normalized)?;
+            common_norm_energy_contributions.push(FormContribution {
+                left: term.left,
+                right: term.right,
+                value: bounds(&normalized),
+            });
+        }
+        let normalized_closure = w.sub(&normalized_sum, &after)?;
+        if !normalized_closure.contains_zero() {
+            return Err(SolverError::NumericalBreakdown(
+                "normalized trial form expansion does not close".into(),
+            ));
+        }
+        w.cancel()?;
+        Ok(TrialEnergyReport {
+            schema_version: 1,
+            semantics: SEMANTICS.into(),
+            scope: SCOPE.into(),
+            problem_sha256: hash(&(SEMANTICS, problem))?,
+            request_sha256: hash(&(SEMANTICS, problem, options))?,
+            metric_check,
+            part_labels: vectors.iter().map(|v| v.label.clone()).collect(),
+            energy: energy.report,
+            norm: norm.report,
+            baseline,
+            corrected,
+            rayleigh_change,
+            common_norm_energy_contributions,
+            common_norm_expansion_sum: bounds(&normalized_sum),
+            common_norm_closure_residual: bounds(&normalized_closure),
+            interval_operations: w.operations,
+        })
+    }
+
+    /// Streaming contractions of a supplied finite symmetric form. The stream
+    /// is the packed upper triangle in row order; it defines both triangles.
+    #[doc(hidden)]
+    pub mod streaming {
+        use super::*;
+        use rug::{float::Round, Float};
+        use std::io::{BufRead, Read};
+
+        pub const STREAM_SEMANTICS: &str = "packed-upper-trial-contractions-v1";
+        pub const STREAM_SCOPE: &str =
+            "finite_declared_interval_forms_digest_bound_no_assembly_or_continuum_certificate";
+
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct FormMetadata {
+            pub source_id: String,
+            pub basis_id: String,
+            pub normalization_id: String,
+            pub dimension: usize,
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct FormSource {
+            pub metadata: FormMetadata,
+            /// Digest from fingerprint(), retained independently of replay.
+            pub sha256: String,
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct FormBlock {
+            pub start: u64,
+            pub entries: Vec<ExactBounds>,
+        }
+        /// Readers must honor the requested block limit. The consumer checks
+        /// order, coverage, endpoint validity, byte limits and the final digest.
+        /// A reader's own allocation/I/O behavior remains its responsibility.
+        pub trait FormReader {
+            fn next_block(
+                &mut self,
+                maximum_entries: usize,
+                maximum_scalar_bytes: usize,
+            ) -> Result<Option<FormBlock>, SolverError>;
+        }
+
+        /// One ExactBounds JSON object per line, with no header or blank lines.
+        /// A bounded line read prevents an oversized record from growing without
+        /// limit. Digest identity is independent of JSON whitespace and blocks,
+        /// but binds the exact endpoint strings ("1" and "1.0" differ).
+        pub struct JsonLinesReader<R: BufRead> {
+            reader: R,
+            position: u64,
+            pending: Option<ExactBounds>,
+        }
+        impl<R: BufRead> JsonLinesReader<R> {
+            pub fn new(reader: R) -> Self {
+                Self {
+                    reader,
+                    position: 0,
+                    pending: None,
+                }
+            }
+        }
+        impl<R: BufRead> FormReader for JsonLinesReader<R> {
+            fn next_block(
+                &mut self,
+                maximum_entries: usize,
+                maximum_scalar_bytes: usize,
+            ) -> Result<Option<FormBlock>, SolverError> {
+                if maximum_entries == 0
+                    || maximum_entries > 16_384
+                    || maximum_scalar_bytes == 0
+                    || maximum_scalar_bytes > 134_217_728
+                {
+                    return Err(invalid("stream block limit"));
+                }
+                let mut entries = Vec::new();
+                let mut bytes = 0usize;
+                for _ in 0..maximum_entries {
+                    let value = if let Some(value) = self.pending.take() {
+                        value
+                    } else {
+                        let mut line = Vec::new();
+                        const MAX_LINE: u64 = 262_400;
+                        let read = self
+                            .reader
+                            .by_ref()
+                            .take(MAX_LINE + 1)
+                            .read_until(b'\n', &mut line)
+                            .map_err(|_| invalid("stream read failed"))?;
+                        if read == 0 {
+                            break;
+                        }
+                        if read as u64 > MAX_LINE {
+                            return Err(limit("stream JSON record limit"));
+                        }
+                        serde_json::from_slice::<ExactBounds>(&line)
+                            .map_err(|_| invalid("invalid stream JSON record"))?
+                    };
+                    let size = value.lower.len() + value.upper.len();
+                    if size > maximum_scalar_bytes {
+                        return Err(limit("stream record scalar byte limit"));
+                    }
+                    if bytes + size > maximum_scalar_bytes {
+                        self.pending = Some(value);
+                        break;
+                    }
+                    bytes += size;
+                    entries.push(value);
+                }
+                if entries.is_empty() {
+                    return Ok(None);
+                }
+                let start = self.position;
+                self.position = self
+                    .position
+                    .checked_add(entries.len() as u64)
+                    .ok_or_else(|| invalid("stream position overflow"))?;
+                Ok(Some(FormBlock { start, entries }))
+            }
+        }
+
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        pub enum Metric {
+            Identity {
+                metadata: FormMetadata,
+            },
+            Diagonal {
+                metadata: FormMetadata,
+                entries: Vec<ExactBounds>,
+            },
+            Stream {
+                source: FormSource,
+            },
+        }
+        impl Metric {
+            fn metadata(&self) -> &FormMetadata {
+                match self {
+                    Self::Identity { metadata } | Self::Diagonal { metadata, .. } => metadata,
+                    Self::Stream { source } => &source.metadata,
+                }
+            }
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct Problem {
+            pub schema_version: u32,
+            pub operator: FormSource,
+            pub metric: Metric,
+            pub baseline: TrialVector,
+            pub corrections: Vec<TrialVector>,
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct Options {
+            pub maximum_dimension: usize,
+            pub maximum_parts: usize,
+            pub maximum_block_entries: usize,
+            pub maximum_block_scalar_bytes: usize,
+            /// Total packed entries across the operator and streamed metric.
+            pub maximum_stream_entries: u64,
+            /// Endpoint-string bytes across all matrix streams.
+            pub maximum_stream_scalar_bytes: u64,
+            /// Vector and inline-metric endpoint-string bytes.
+            pub maximum_vector_scalar_bytes: usize,
+            pub maximum_interval_operations: u64,
+            pub maximum_rational_bits: u32,
+            /// Directed rounding is used only for reported square roots.
+            pub norm_precision_bits: u32,
+        }
+        impl Default for Options {
+            fn default() -> Self {
+                Self {
+                    maximum_dimension: 16_384,
+                    maximum_parts: 8,
+                    maximum_block_entries: 4096,
+                    maximum_block_scalar_bytes: 16_777_216,
+                    maximum_stream_entries: 67_108_864,
+                    maximum_stream_scalar_bytes: 17_179_869_184,
+                    maximum_vector_scalar_bytes: 67_108_864,
+                    maximum_interval_operations: 1_000_000_000,
+                    maximum_rational_bits: 32_768,
+                    norm_precision_bits: 256,
+                }
+            }
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct StreamRecord {
+            pub metadata: FormMetadata,
+            pub sha256: String,
+            pub entries: u64,
+            pub scalar_bytes: u64,
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum MetricStatus {
+            Identity,
+            PositiveDiagonal,
+            PositiveStrictDiagonalDominance,
+            PositiveOnTrialSpan,
+            Unresolved,
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum MeasurementStatus {
+            CertifiedFinite,
+            MetricUnresolved,
+            NormNotSeparatedFromZero,
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct Measurement {
+            pub energy: ExactBounds,
+            /// A symmetric form value; it is a norm only under metric_status.
+            pub squared_norm: ExactBounds,
+            pub norm: Option<ExactBounds>,
+            pub status: MeasurementStatus,
+            pub normalized: Option<TrialMeasurement>,
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct Stage {
+            /// Baseline followed by this many corrections, in request order.
+            pub corrections_applied: usize,
+            pub measurement: Measurement,
+            pub energy_change_from_previous: Option<ExactBounds>,
+            pub squared_norm_change_from_previous: Option<ExactBounds>,
+            pub rayleigh_change_from_previous: Option<ExactBounds>,
+        }
+        #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct Report {
+            pub semantics: String,
+            pub scope: String,
+            pub problem_sha256: String,
+            pub request_sha256: String,
+            pub operator: StreamRecord,
+            pub metric_stream: Option<StreamRecord>,
+            pub metric_status: MetricStatus,
+            /// Certified global lower bound only for diagonal/dominance checks.
+            pub metric_global_lower_bound: Option<String>,
+            pub part_labels: Vec<String>,
+            pub parts: Vec<Measurement>,
+            pub stages: Vec<Stage>,
+            /// Row-major small matrices of all bilinear pairings, not twice
+            /// their off-diagonal entries. Parts need not be independent.
+            pub energy_pairings: Vec<ExactBounds>,
+            pub metric_pairings: Vec<ExactBounds>,
+            pub energy: FormDecomposition,
+            pub norm: FormDecomposition,
+            /// Original-coordinate absolute term sums for each small pairing.
+            /// The summation is over all ordered matrix coordinates i,j.
+            pub energy_pairing_cancellation: Vec<CancellationMeasure>,
+            pub metric_pairing_cancellation: Vec<CancellationMeasure>,
+            pub common_norm_energy_contributions: Option<Vec<FormContribution>>,
+            pub common_norm_closure_residual: Option<ExactBounds>,
+            pub interval_operations: u64,
+            pub vector_scalar_bytes: usize,
+            pub streamed_entries: u64,
+            pub streamed_scalar_bytes: u64,
+        }
+
+        fn options(o: &Options) -> Result<TrialEnergyOptions, SolverError> {
+            if o.maximum_dimension == 0
+                || o.maximum_dimension > 65_536
+                || o.maximum_parts == 0
+                || o.maximum_parts > 16
+                || o.maximum_block_entries == 0
+                || o.maximum_block_entries > 16_384
+                || o.maximum_block_scalar_bytes == 0
+                || o.maximum_block_scalar_bytes > 134_217_728
+                || o.maximum_stream_entries == 0
+                || o.maximum_stream_entries > 4_295_032_832
+                || o.maximum_stream_scalar_bytes == 0
+                || o.maximum_stream_scalar_bytes > 1_099_511_627_776
+                || o.maximum_vector_scalar_bytes == 0
+                || o.maximum_vector_scalar_bytes > 134_217_728
+                || o.maximum_interval_operations > 10_000_000_000
+                || !(64..=65_536).contains(&o.maximum_rational_bits)
+                || !(64..=16_384).contains(&o.norm_precision_bits)
+            {
+                return Err(invalid("unsupported streaming limits"));
+            }
+            Ok(TrialEnergyOptions {
+                maximum_dimension: o.maximum_dimension,
+                maximum_parts: o.maximum_parts,
+                maximum_input_bytes: o.maximum_vector_scalar_bytes,
+                maximum_interval_operations: o.maximum_interval_operations,
+                maximum_rational_bits: o.maximum_rational_bits,
+            })
+        }
+        fn identity(s: &str) -> Result<(), SolverError> {
+            if s.trim().is_empty() || s.len() > 4096 {
+                Err(invalid("stream source identity"))
+            } else {
+                Ok(())
+            }
+        }
+        fn metadata(m: &FormMetadata, o: &Options) -> Result<u64, SolverError> {
+            identity(&m.source_id)?;
+            identity(&m.basis_id)?;
+            identity(&m.normalization_id)?;
+            if m.dimension == 0 || m.dimension > o.maximum_dimension {
+                return Err(invalid("stream dimension"));
+            }
+            let n = m.dimension as u64;
+            Ok(n * (n + 1) / 2)
+        }
+        fn digest(s: &str) -> Result<(), SolverError> {
+            if s.len() != 64
+                || !s
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                Err(invalid("lowercase SHA256 digest required"))
+            } else {
+                Ok(())
+            }
+        }
+        #[derive(Default)]
+        struct Consumption {
+            entries: u64,
+            bytes: u64,
+        }
+
+        // The digest binds domain+metadata followed by length-prefixed endpoint
+        // strings. The complete upper triangle is mandatory, including zeros.
+        fn consume(
+            m: &FormMetadata,
+            reader: &mut dyn FormReader,
+            o: &Options,
+            used: &mut Consumption,
+            w: &mut Work<'_>,
+            mut entry: impl FnMut(usize, usize, I, &mut Work<'_>) -> Result<(), SolverError>,
+        ) -> Result<StreamRecord, SolverError> {
+            let count = metadata(m, o)?;
+            if count > o.maximum_stream_entries.saturating_sub(used.entries) {
+                return Err(limit("stream entry limit"));
+            }
+            let mut sha = Sha256::new();
+            let head = serde_json::to_vec(&(STREAM_SEMANTICS, m))
+                .map_err(|_| invalid("stream metadata serialization"))?;
+            sha.update((head.len() as u64).to_le_bytes());
+            sha.update(head);
+            let mut record = StreamRecord {
+                metadata: m.clone(),
+                sha256: String::new(),
+                entries: 0,
+                scalar_bytes: 0,
+            };
+            let (mut i, mut j) = (0usize, 0usize);
+            loop {
+                w.cancel()?;
+                let block =
+                    reader.next_block(o.maximum_block_entries, o.maximum_block_scalar_bytes)?;
+                w.cancel()?;
+                let Some(block) = block else {
+                    break;
+                };
+                let block_bytes = block
+                    .entries
+                    .iter()
+                    .try_fold(0usize, |sum, b| {
+                        sum.checked_add(b.lower.len())?.checked_add(b.upper.len())
+                    })
+                    .ok_or_else(|| limit("stream block byte overflow"))?;
+                if block_bytes > o.maximum_block_scalar_bytes {
+                    return Err(limit("stream block scalar byte limit"));
+                }
+                if block.start != record.entries
+                    || block.entries.is_empty()
+                    || block.entries.len() > o.maximum_block_entries
+                    || block.entries.len() as u64 > count - record.entries
+                {
+                    return Err(invalid("stream order, coverage or block shape"));
+                }
+                for b in block.entries {
+                    w.cancel()?;
+                    let bytes = b.lower.len() as u64 + b.upper.len() as u64;
+                    if bytes > o.maximum_stream_scalar_bytes.saturating_sub(used.bytes) {
+                        return Err(limit("stream scalar byte limit"));
+                    }
+                    used.bytes += bytes;
+                    record.scalar_bytes += bytes;
+                    let value = w.read(&b)?;
+                    for s in [&b.lower, &b.upper] {
+                        sha.update((s.len() as u64).to_le_bytes());
+                        sha.update(s.as_bytes());
+                    }
+                    entry(i, j, value, w)?;
+                    used.entries += 1;
+                    record.entries += 1;
+                    j += 1;
+                    if j == m.dimension {
+                        i += 1;
+                        j = i;
+                    }
+                }
+            }
+            if record.entries != count {
+                return Err(invalid("incomplete symmetric form stream"));
+            }
+            record.sha256 = format!("{:x}", sha.finalize());
+            Ok(record)
+        }
+        /// Import-time digest. Keep the result in a source manifest before
+        /// analysis/replay; computing it from the replay input cannot establish
+        /// independent provenance. This scans and validates every endpoint.
+        pub fn fingerprint(
+            m: &FormMetadata,
+            reader: &mut dyn FormReader,
+            o: &Options,
+            token: &CancellationToken,
+        ) -> Result<StreamRecord, SolverError> {
+            let opts = options(o)?;
+            let mut w = Work {
+                options: &opts,
+                token,
+                operations: 0,
+            };
+            w.cancel()?;
+            consume(
+                m,
+                reader,
+                o,
+                &mut Consumption::default(),
+                &mut w,
+                |_, _, _, _| Ok(()),
+            )
+        }
+
+        struct Contracted {
+            pairings: Vec<I>,
+            absolute: Vec<I>,
+            direct: I,
+            direct_absolute: I,
+            global_lower: Option<Rational>,
+        }
+        // Columns include the original parts and their separately assembled sum.
+        // Exact interval matvecs cost O(n^2 p); the final contractions O(n p^2).
+        // Neither the source matrix nor an n-by-n interval copy is retained.
+        struct Accumulator<'a> {
+            columns: &'a [Vec<I>],
+            applied: Vec<Vec<I>>,
+            absolute_applied: Vec<Vec<I>>,
+            diagonal_lower: Vec<Rational>,
+            off_diagonal_upper: Vec<I>,
+            check_metric: bool,
+        }
+        impl<'a> Accumulator<'a> {
+            fn new(columns: &'a [Vec<I>], check_metric: bool) -> Self {
+                let n = columns[0].len();
+                Self {
+                    columns,
+                    applied: vec![vec![zero(); n]; columns.len()],
+                    absolute_applied: vec![vec![zero(); n]; columns.len()],
+                    diagonal_lower: vec![Rational::from(0); n],
+                    off_diagonal_upper: vec![zero(); n],
+                    check_metric,
+                }
+            }
+            fn entry(
+                &mut self,
+                i: usize,
+                j: usize,
+                a: I,
+                w: &mut Work<'_>,
+            ) -> Result<(), SolverError> {
+                if self.check_metric {
+                    if i == j {
+                        self.diagonal_lower[i] = a.lower().clone();
+                    } else {
+                        let upper = I::point(magnitude(&a).upper().clone());
+                        self.off_diagonal_upper[i] = w.add(&self.off_diagonal_upper[i], &upper)?;
+                        self.off_diagonal_upper[j] = w.add(&self.off_diagonal_upper[j], &upper)?;
+                    }
+                }
+                if a == zero() {
+                    return Ok(());
+                }
+                for c in 0..self.columns.len() {
+                    let v = w.mul(&a, &self.columns[c][j])?;
+                    self.applied[c][i] = w.add(&self.applied[c][i], &v)?;
+                    self.absolute_applied[c][i] =
+                        w.add(&self.absolute_applied[c][i], &magnitude(&v))?;
+                    if i != j {
+                        let v = w.mul(&a, &self.columns[c][i])?;
+                        self.applied[c][j] = w.add(&self.applied[c][j], &v)?;
+                        self.absolute_applied[c][j] =
+                            w.add(&self.absolute_applied[c][j], &magnitude(&v))?;
+                    }
+                }
+                Ok(())
+            }
+            fn contract(
+                &self,
+                left: usize,
+                right: usize,
+                w: &mut Work<'_>,
+            ) -> Result<(I, I), SolverError> {
+                let mut value = zero();
+                let mut absolute = zero();
+                for i in 0..self.columns[0].len() {
+                    let term = w.mul(&self.columns[left][i], &self.applied[right][i])?;
+                    value = w.add(&value, &term)?;
+                    let term = w.mul(
+                        &magnitude(&self.columns[left][i]),
+                        &self.absolute_applied[right][i],
+                    )?;
+                    absolute = w.add(&absolute, &term)?;
+                }
+                Ok((value, absolute))
+            }
+            fn finish(self, w: &mut Work<'_>) -> Result<Contracted, SolverError> {
+                let p = self.columns.len() - 1;
+                let mut pairings = vec![zero(); p * p];
+                let mut absolute = pairings.clone();
+                for a in 0..p {
+                    for b in a..p {
+                        let (mut v, mut abs) = self.contract(a, b, w)?;
+                        if a != b {
+                            let (reverse, reverse_abs) = self.contract(b, a, w)?;
+                            v = intersection(&v, &reverse)?;
+                            // Symmetry makes both ordered-coordinate absolute
+                            // sums the same real quantity, also for interval data.
+                            abs = intersection(&abs, &reverse_abs)?;
+                        }
+                        pairings[a * p + b] = v.clone();
+                        pairings[b * p + a] = v;
+                        absolute[a * p + b] = abs.clone();
+                        absolute[b * p + a] = abs;
+                    }
+                }
+                let (direct, direct_absolute) = self.contract(p, p, w)?;
+                let mut lower: Option<Rational> = None;
+                if self.check_metric {
+                    for (d, r) in self.diagonal_lower.iter().zip(&self.off_diagonal_upper) {
+                        let bound = w.sub(&I::point(d.clone()), r)?;
+                        lower = Some(lower.map_or_else(
+                            || bound.lower().clone(),
+                            |v| v.min(bound.lower().clone()),
+                        ));
+                    }
+                }
+                Ok(Contracted {
+                    pairings,
+                    absolute,
+                    direct,
+                    direct_absolute,
+                    global_lower: lower,
+                })
+            }
+        }
+
+        fn validate_problem(p: &Problem, o: &Options) -> Result<usize, SolverError> {
+            let a = &p.operator.metadata;
+            let g = p.metric.metadata();
+            metadata(a, o)?;
+            metadata(g, o)?;
+            digest(&p.operator.sha256)?;
+            if let Metric::Stream { source } = &p.metric {
+                digest(&source.sha256)?;
+            }
+            if p.schema_version != 1
+                || p.corrections.len() >= o.maximum_parts
+                || a.dimension != g.dimension
+                || a.basis_id != g.basis_id
+                || a.normalization_id != g.normalization_id
+            {
+                return Err(invalid("stream schema, coordinates or part limit"));
+            }
+            let mut labels = std::collections::BTreeSet::new();
+            let mut bytes = 0usize;
+            let mut add_bytes = |b: &ExactBounds| -> Result<(), SolverError> {
+                bytes = bytes
+                    .checked_add(b.lower.len())
+                    .and_then(|v| v.checked_add(b.upper.len()))
+                    .ok_or_else(|| limit("vector scalar byte overflow"))?;
+                if bytes > o.maximum_vector_scalar_bytes {
+                    return Err(limit("vector scalar byte limit"));
+                }
+                Ok(())
+            };
+            for v in std::iter::once(&p.baseline).chain(&p.corrections) {
+                identity(&v.label)?;
+                identity(&v.source_id)?;
+                if !labels.insert(&v.label)
+                    || v.coefficients.len() != a.dimension
+                    || v.operator_id != a.source_id
+                    || v.metric_id != g.source_id
+                    || v.basis_id != a.basis_id
+                    || v.normalization_id != a.normalization_id
+                {
+                    return Err(invalid("stream vector identity or shape"));
+                }
+                for b in &v.coefficients {
+                    add_bytes(b)?;
+                }
+            }
+            if let Metric::Diagonal { entries, .. } = &p.metric {
+                if entries.len() != a.dimension {
+                    return Err(invalid("diagonal metric shape"));
+                }
+                for b in entries {
+                    add_bytes(b)?;
+                }
+            }
+            Ok(bytes)
+        }
+        fn metric_status(
+            g: &Contracted,
+            p: usize,
+            metric: &Metric,
+            w: &mut Work<'_>,
+        ) -> Result<MetricStatus, SolverError> {
+            if matches!(metric, Metric::Identity { .. }) {
+                return Ok(MetricStatus::Identity);
+            }
+            if g.global_lower.as_ref().is_some_and(|v| v > &0) {
+                return Ok(if matches!(metric, Metric::Diagonal { .. }) {
+                    MetricStatus::PositiveDiagonal
+                } else {
+                    MetricStatus::PositiveStrictDiagonalDominance
+                });
+            }
+            // An unresolved/negative LDL pivot is evidence of no certificate,
+            // not a proof of indefiniteness. Work/cancellation errors propagate.
+            match super::metric_check(&g.pairings, p, w) {
+                Ok(_) => Ok(MetricStatus::PositiveOnTrialSpan),
+                Err(SolverError::InvalidConfiguration(_)) => Ok(MetricStatus::Unresolved),
+                Err(e) => Err(e),
+            }
+        }
+        fn measured(
+            energy: &I,
+            norm: &I,
+            metric: &MetricStatus,
+            o: &Options,
+            w: &mut Work<'_>,
+        ) -> Result<Measurement, SolverError> {
+            let mut out = Measurement {
+                energy: bounds(energy),
+                squared_norm: bounds(norm),
+                norm: None,
+                status: MeasurementStatus::MetricUnresolved,
+                normalized: None,
+            };
+            if *metric == MetricStatus::Unresolved {
+                return Ok(out);
+            }
+            if norm.upper() < &0 {
+                return Err(SolverError::NumericalBreakdown(
+                    "negative norm with positive metric".into(),
+                ));
+            }
+            let lo = norm.lower().clone().max(Rational::from(0));
+            let mut low = Float::with_val_round(o.norm_precision_bits, &lo, Round::Down).0;
+            let mut high = Float::with_val_round(o.norm_precision_bits, norm.upper(), Round::Up).0;
+            low.sqrt_round(Round::Down);
+            high.sqrt_round(Round::Up);
+            let low = low
+                .to_rational()
+                .ok_or_else(|| limit("norm square-root range"))?;
+            let high = high
+                .to_rational()
+                .ok_or_else(|| limit("norm square-root range"))?;
+            // A rounded nonzero upper endpoint may never silently become zero.
+            if norm.upper() > &0 && high == 0 {
+                return Err(limit("norm square-root underflow"));
+            }
+            let norm_bound = w.checked(I::new(low, high).map_err(|_| invalid("norm bounds"))?)?;
+            out.norm = Some(bounds(&norm_bound));
+            if norm.is_strictly_positive() {
+                out.normalized = Some(super::measurement(energy, norm, w)?);
+                out.status = MeasurementStatus::CertifiedFinite;
+            } else {
+                out.status = MeasurementStatus::NormNotSeparatedFromZero;
+            }
+            Ok(out)
+        }
+        fn prefix(
+            pairings: &[I],
+            p: usize,
+            count: usize,
+            w: &mut Work<'_>,
+        ) -> Result<I, SolverError> {
+            let mut value = zero();
+            for i in 0..count {
+                for j in i..count {
+                    let term = if i == j {
+                        pairings[i * p + j].clone()
+                    } else {
+                        w.mul(&two(), &pairings[i * p + j])?
+                    };
+                    value = w.add(&value, &term)?;
+                }
+            }
+            Ok(value)
+        }
+
+        /// All matrix input is consumed and digest-checked before returning a
+        /// report. No partial report is returned after failure or cancellation.
+        /// Unresolved metric/norm gates retain raw finite diagnostics but never
+        /// a certified normalized measurement. Zero/dependent corrections work.
+        pub fn analyze(
+            problem: &Problem,
+            o: &Options,
+            operator: &mut dyn FormReader,
+            metric_reader: Option<&mut dyn FormReader>,
+            token: &CancellationToken,
+        ) -> Result<Report, SolverError> {
+            let opts = options(o)?;
+            let mut w = Work {
+                options: &opts,
+                token,
+                operations: 0,
+            };
+            w.cancel()?;
+            let vector_scalar_bytes = validate_problem(problem, o)?;
+            if matches!(problem.metric, Metric::Stream { .. }) != metric_reader.is_some() {
+                return Err(invalid("metric reader presence mismatch"));
+            }
+            let n = problem.operator.metadata.dimension;
+            let p = 1 + problem.corrections.len();
+            let vectors: Vec<_> = std::iter::once(&problem.baseline)
+                .chain(&problem.corrections)
+                .collect();
+            let mut columns: Vec<Vec<I>> = vectors
+                .iter()
+                .map(|v| v.coefficients.iter().map(|b| w.read(b)).collect())
+                .collect::<Result<_, _>>()?;
+            let mut sum = vec![zero(); n];
+            for v in &columns {
+                for (s, x) in sum.iter_mut().zip(v) {
+                    *s = w.add(s, x)?;
+                }
+            }
+            columns.push(sum);
+            let mut used = Consumption::default();
+            let mut a = Accumulator::new(&columns, false);
+            let source = consume(
+                &problem.operator.metadata,
+                operator,
+                o,
+                &mut used,
+                &mut w,
+                |i, j, v, w| a.entry(i, j, v, w),
+            )?;
+            if source.sha256 != problem.operator.sha256 {
+                return Err(invalid("operator source digest mismatch"));
+            }
+            let a = a.finish(&mut w)?;
+            let mut g = Accumulator::new(&columns, true);
+            let metric_stream = match (&problem.metric, metric_reader) {
+                (Metric::Identity { .. }, None) => {
+                    for i in 0..n {
+                        w.cancel()?;
+                        g.entry(i, i, I::point(Rational::from(1)), &mut w)?;
+                    }
+                    None
+                }
+                (Metric::Diagonal { entries, .. }, None) => {
+                    for (i, b) in entries.iter().enumerate() {
+                        let v = w.read(b)?;
+                        g.entry(i, i, v, &mut w)?;
+                    }
+                    None
+                }
+                (Metric::Stream { source }, Some(reader)) => {
+                    let record = consume(
+                        &source.metadata,
+                        reader,
+                        o,
+                        &mut used,
+                        &mut w,
+                        |i, j, v, w| g.entry(i, j, v, w),
+                    )?;
+                    if record.sha256 != source.sha256 {
+                        return Err(invalid("metric source digest mismatch"));
+                    }
+                    Some(record)
+                }
+                _ => return Err(invalid("metric stream mismatch")),
+            };
+            let g = g.finish(&mut w)?;
+            let metric_status = metric_status(&g, p, &problem.metric, &mut w)?;
+            let metric_global_lower_bound = g
+                .global_lower
+                .as_ref()
+                .filter(|v| *v > &0)
+                .map(ToString::to_string);
+            let energy = decompose_pairings(
+                &a.pairings,
+                p,
+                a.direct.clone(),
+                a.direct_absolute.clone(),
+                &mut w,
+            )?;
+            let norm = decompose_pairings(
+                &g.pairings,
+                p,
+                g.direct.clone(),
+                g.direct_absolute.clone(),
+                &mut w,
+            )?;
+            let mut parts = Vec::new();
+            let mut stages: Vec<Stage> = Vec::new();
+            for i in 0..p {
+                parts.push(measured(
+                    &a.pairings[i * p + i],
+                    &g.pairings[i * p + i],
+                    &metric_status,
+                    o,
+                    &mut w,
+                )?);
+                let e = if i + 1 == p {
+                    energy.total.clone()
+                } else {
+                    prefix(&a.pairings, p, i + 1, &mut w)?
+                };
+                let s = if i + 1 == p {
+                    norm.total.clone()
+                } else {
+                    prefix(&g.pairings, p, i + 1, &mut w)?
+                };
+                let m = measured(&e, &s, &metric_status, o, &mut w)?;
+                let (mut de, mut ds, mut dr) = (None, None, None);
+                if let Some(last) = stages.last() {
+                    // Use just the new row/column to avoid losing cancellation
+                    // by subtracting two large prefix totals.
+                    let mut ed = a.pairings[i * p + i].clone();
+                    let mut sd = g.pairings[i * p + i].clone();
+                    for j in 0..i {
+                        let v = w.mul(&two(), &a.pairings[j * p + i])?;
+                        ed = w.add(&ed, &v)?;
+                        let v = w.mul(&two(), &g.pairings[j * p + i])?;
+                        sd = w.add(&sd, &v)?;
+                    }
+                    let previous_e = w.read(&last.measurement.energy)?;
+                    let previous_s = w.read(&last.measurement.squared_norm)?;
+                    de = Some(bounds(&intersection(&ed, &w.sub(&e, &previous_e)?)?));
+                    ds = Some(bounds(&intersection(&sd, &w.sub(&s, &previous_s)?)?));
+                    if let (Some(before), Some(after)) =
+                        (&last.measurement.normalized, &m.normalized)
+                    {
+                        let before = w.read(&before.rayleigh_quotient)?;
+                        let after = w.read(&after.rayleigh_quotient)?;
+                        dr = Some(bounds(&w.sub(&after, &before)?));
+                    }
+                }
+                stages.push(Stage {
+                    corrections_applied: i,
+                    measurement: m,
+                    energy_change_from_previous: de,
+                    squared_norm_change_from_previous: ds,
+                    rayleigh_change_from_previous: dr,
+                });
+            }
+            let mut energy_pairing_cancellation = Vec::new();
+            let mut metric_pairing_cancellation = Vec::new();
+            for i in 0..p * p {
+                energy_pairing_cancellation.push(cancellation(
+                    &a.absolute[i],
+                    &a.pairings[i],
+                    &mut w,
+                )?);
+                metric_pairing_cancellation.push(cancellation(
+                    &g.absolute[i],
+                    &g.pairings[i],
+                    &mut w,
+                )?);
+            }
+            let (mut common, mut closure) = (None, None);
+            if let Some(final_value) = &stages[p - 1].measurement.normalized {
+                let mut contributions = Vec::new();
+                let mut total = zero();
+                for term in &energy.report.contributions {
+                    let v = w.read(&term.value)?;
+                    let v = w.div(&v, &norm.total)?;
+                    total = w.add(&total, &v)?;
+                    contributions.push(FormContribution {
+                        left: term.left,
+                        right: term.right,
+                        value: bounds(&v),
+                    });
+                }
+                let quotient = w.read(&final_value.rayleigh_quotient)?;
+                let difference = w.sub(&total, &quotient)?;
+                if !difference.contains_zero() {
+                    return Err(SolverError::NumericalBreakdown(
+                        "stream normalized closure".into(),
+                    ));
+                }
+                common = Some(contributions);
+                closure = Some(bounds(&difference));
+            }
+            w.cancel()?;
+            Ok(Report {
+                semantics: STREAM_SEMANTICS.into(),
+                scope: STREAM_SCOPE.into(),
+                problem_sha256: hash(&(STREAM_SEMANTICS, problem))?,
+                request_sha256: hash(&(STREAM_SEMANTICS, problem, o))?,
+                operator: source,
+                metric_stream,
+                metric_status,
+                metric_global_lower_bound,
+                part_labels: vectors.iter().map(|v| v.label.clone()).collect(),
+                parts,
+                stages,
+                energy_pairings: a.pairings.iter().map(bounds).collect(),
+                metric_pairings: g.pairings.iter().map(bounds).collect(),
+                energy: energy.report,
+                norm: norm.report,
+                energy_pairing_cancellation,
+                metric_pairing_cancellation,
+                common_norm_energy_contributions: common,
+                common_norm_closure_residual: closure,
+                interval_operations: w.operations,
+                vector_scalar_bytes,
+                streamed_entries: used.entries,
+                streamed_scalar_bytes: used.bytes,
+            })
+        }
+        /// Fresh readers must start at entry zero. Source contents, requested
+        /// options, all enclosures, metric gates and diagnostic fields replay.
+        /// Reader chunking is transport metadata and may differ on replay.
+        pub fn verify(
+            problem: &Problem,
+            o: &Options,
+            operator: &mut dyn FormReader,
+            metric: Option<&mut dyn FormReader>,
+            report: &Report,
+            token: &CancellationToken,
+        ) -> Result<(), SolverError> {
+            if analyze(problem, o, operator, metric, token)? != *report {
+                return Err(invalid("streamed trial report replay mismatch"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Replay all identities, metric checks, cross terms, bounds and statuses.
+    /// Source labels and caller-supplied interval premises are not authenticated.
+    pub fn verify_trial_energy(
+        problem: &TrialEnergyProblem,
+        options: &TrialEnergyOptions,
+        report: &TrialEnergyReport,
+        token: &CancellationToken,
+    ) -> Result<(), SolverError> {
+        if analyze_trial_energy(problem, options, token)? != *report {
+            return Err(invalid(
+                "report source, request, bounds or diagnostics mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Bounded reference checks for real finite problems and explicitly supplied
+/// analytic envelopes. Labels bind requests; they do not authenticate sources.
+#[cfg(feature = "hp-reference")]
+#[doc(hidden)]
+pub mod convergence {
+    /// Largest serialized problem `analyze` accepts. Callers bound their own
+    /// workspace below this; the cap only rejects inputs no caller declared.
+    pub const MAXIMUM_INPUT_BYTES: usize = 16 << 30;
+    use super::trial_energy::{bounds, hash, magnitude, read_form, zero, Work as ExactWork};
+    pub use super::trial_energy::{ExactBounds, TrialForm};
+    use super::SolverError;
+    use rug::{float::Round, Float, Rational};
+    use serde::{Deserialize, Serialize};
+    use xc_core::CancellationToken;
+    use xc_numerics::interval::RationalInterval as I;
+    use xc_numerics::mpfr_interval::MpfrInterval as M;
+
+    const SEMANTICS: &str = "finite-convergence-witnesses-v2";
+    fn default_precision() -> u32 {
+        512
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Options {
+        pub maximum_dimension: usize,
+        pub maximum_parts: usize,
+        pub maximum_input_bytes: usize,
+        pub maximum_interval_operations: u64,
+        pub maximum_rational_bits: u32,
+        #[serde(default = "default_precision")]
+        pub working_precision_bits: u32,
+    }
+    impl Default for Options {
+        fn default() -> Self {
+            let o = super::trial_energy::TrialEnergyOptions::default();
+            Self {
+                maximum_dimension: o.maximum_dimension,
+                maximum_parts: o.maximum_parts,
+                maximum_input_bytes: o.maximum_input_bytes,
+                maximum_interval_operations: o.maximum_interval_operations,
+                maximum_rational_bits: o.maximum_rational_bits,
+                working_precision_bits: default_precision(),
+            }
+        }
+    }
+    // This bounded arithmetic is local to convergence checks. Exact trial-energy
+    // and LP contracts retain their independent exact-rational implementation.
+    struct Work<'a> {
+        exact: ExactWork<'a>,
+        precision: u32,
+    }
+    impl<'a> std::ops::Deref for Work<'a> {
+        type Target = ExactWork<'a>;
+        fn deref(&self) -> &Self::Target {
+            &self.exact
+        }
+    }
+    impl std::ops::DerefMut for Work<'_> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.exact
+        }
+    }
+    impl Work<'_> {
+        fn mpfr(&self, x: &I) -> Result<M, SolverError> {
+            M::new(
+                Float::with_val_round(self.precision, x.lower(), Round::Down).0,
+                Float::with_val_round(self.precision, x.upper(), Round::Up).0,
+            )
+            .map_err(|_| invalid("directed conversion range"))
+        }
+        fn rational_interval(&self, x: M) -> Result<I, SolverError> {
+            x.validate()
+                .map_err(|_| invalid("directed arithmetic range"))?;
+            for f in [x.lower(), x.upper()] {
+                // Check before to_rational allocates an exponent-sized integer.
+                let e = i64::from(f.get_exp().unwrap_or(0));
+                let limit = i64::from(self.options.maximum_rational_bits);
+                if e.max(i64::from(f.prec())) > limit || i64::from(f.prec()) - e > limit {
+                    return Err(SolverError::IterationBudgetExhausted(
+                        "convergence: directed endpoint bit limit".into(),
+                    ));
+                }
+            }
+            self.checked(
+                I::new(
+                    x.lower()
+                        .to_rational()
+                        .ok_or_else(|| invalid("directed lower range"))?,
+                    x.upper()
+                        .to_rational()
+                        .ok_or_else(|| invalid("directed upper range"))?,
+                )
+                .unwrap(),
+            )
+        }
+        fn bounded(&self, x: I) -> Result<I, SolverError> {
+            let limit = self
+                .precision
+                .saturating_mul(2)
+                .max(self.options.maximum_rational_bits / 4)
+                .min(self.options.maximum_rational_bits);
+            if [x.lower(), x.upper()].iter().all(|v| {
+                v.numer().significant_bits() <= limit && v.denom().significant_bits() <= limit
+            }) {
+                self.checked(x)
+            } else {
+                self.rational_interval(self.mpfr(&x)?)
+            }
+        }
+        fn add(&mut self, x: &I, y: &I) -> Result<I, SolverError> {
+            self.tick()?;
+            self.bounded(x.add(y))
+        }
+        fn sub(&mut self, x: &I, y: &I) -> Result<I, SolverError> {
+            self.tick()?;
+            self.bounded(x.sub(y))
+        }
+        fn mul(&mut self, x: &I, y: &I) -> Result<I, SolverError> {
+            self.tick()?;
+            self.bounded(x.mul(y))
+        }
+        fn square(&mut self, x: &I) -> Result<I, SolverError> {
+            self.tick()?;
+            self.bounded(x.square())
+        }
+        fn div(&mut self, x: &I, y: &I) -> Result<I, SolverError> {
+            self.tick()?;
+            self.bounded(x.div(y).map_err(|_| invalid("denominator contains zero"))?)
+        }
+    }
+    fn invalid(s: &str) -> SolverError {
+        SolverError::InvalidConfiguration(format!("convergence: {s}"))
+    }
+    fn premise_metric_check(g: &[I], n: usize, w: &mut Work<'_>) -> Result<String, SolverError> {
+        let count = inertia(g, n, w).map_err(|e| match e {
+            SolverError::PremiseNotVerified(reason) => SolverError::PremiseNotVerified(format!(
+                "positive definiteness unresolved: {reason}"
+            )),
+            e => e,
+        })?;
+        if count != 0 {
+            return Err(SolverError::PremiseNotVerified(
+                "finite form is not positive definite".into(),
+            ));
+        }
+        Ok("positive_directed_interval_ldl".into())
+    }
+    fn point(v: i32) -> I {
+        I::point(Rational::from(v))
+    }
+    fn upper(v: &I) -> Rational {
+        magnitude(v).upper().clone()
+    }
+    fn widen(x: &I, e: &Rational) -> I {
+        x.add(&I::new(-e.clone(), e.clone()).unwrap())
+    }
+    fn nonnegative(s: &str, w: &Work<'_>) -> Result<Rational, SolverError> {
+        let v = w.scalar(s)?;
+        if v < 0 {
+            return Err(invalid("negative error bound"));
+        }
+        Ok(v)
+    }
+    fn sqrt_upper(x: &Rational, w: &mut Work<'_>) -> Result<Rational, SolverError> {
+        w.tick()?;
+        if x < &0 {
+            return Err(invalid("negative squared norm"));
+        }
+        let mut f = Float::with_val_round(256, x, Round::Up).0;
+        f.sqrt_round(Round::Up);
+        let r = f
+            .to_rational()
+            .ok_or_else(|| invalid("square-root range"))?;
+        Ok(w.checked(I::point(r))?.upper().clone())
+    }
+    fn vector(v: &[ExactBounds], w: &Work<'_>) -> Result<Vec<I>, SolverError> {
+        if v.is_empty() || v.len() > w.options.maximum_dimension {
+            return Err(invalid("vector dimension limit"));
+        }
+        v.iter().map(|x| w.read(x)).collect()
+    }
+    fn dot(x: &[I], y: &[I], w: &mut Work<'_>) -> Result<I, SolverError> {
+        if x.len() != y.len() {
+            return Err(invalid("dot shape"));
+        }
+        let mut s = zero();
+        for (x, y) in x.iter().zip(y) {
+            let t = w.mul(x, y)?;
+            s = w.add(&s, &t)?;
+        }
+        Ok(s)
+    }
+    fn norm2(x: &[I], w: &mut Work<'_>) -> Result<I, SolverError> {
+        let mut s = zero();
+        for x in x {
+            let t = w.square(x)?;
+            s = w.add(&s, &t)?;
+        }
+        Ok(s)
+    }
+    fn matvec(a: &[I], x: &[I], w: &mut Work<'_>) -> Result<Vec<I>, SolverError> {
+        if a.len() != x.len() * x.len() {
+            return Err(invalid("matrix/vector shape"));
+        }
+        a.chunks_exact(x.len()).map(|row| dot(row, x, w)).collect()
+    }
+    fn form(a: &TrialForm, w: &Work<'_>) -> Result<Vec<I>, SolverError> {
+        if a.dimension == 0
+            || a.dimension > w.options.maximum_dimension
+            || a.entries.len() != a.dimension * a.dimension
+            || [&a.source_id, &a.basis_id, &a.normalization_id]
+                .iter()
+                .any(|s| s.trim().is_empty() || s.len() > 4096)
+        {
+            return Err(invalid("matrix shape, coordinates or identity"));
+        }
+        read_form(a, w)
+    }
+    fn shifted(a: &[I], n: usize, shift: &I, w: &mut Work<'_>) -> Result<Vec<I>, SolverError> {
+        let mut b = a.to_vec();
+        for i in 0..n {
+            b[i * n + i] = w.sub(&b[i * n + i], shift)?;
+        }
+        Ok(b)
+    }
+    // No-pivot interval LDL is a sufficient certificate, not a complete
+    // inertia algorithm. Any pivot containing zero refuses the certificate.
+    fn inertia(a: &[I], n: usize, w: &mut Work<'_>) -> Result<usize, SolverError> {
+        let a: Vec<_> = a.iter().map(|x| w.mpfr(x)).collect::<Result<_, _>>()?;
+        let zero = M::from_i64(0, w.precision);
+        let mut l = vec![zero.clone(); n * n];
+        let mut d = vec![zero; n];
+        let mut negative = 0;
+        for i in 0..n {
+            let mut pivot = a[i * n + i].clone();
+            for k in 0..i {
+                w.tick()?;
+                let q = l[i * n + k].square();
+                w.tick()?;
+                let t = q.mul(&d[k]);
+                w.tick()?;
+                pivot = pivot.sub(&t);
+            }
+            pivot
+                .validate()
+                .map_err(|_| invalid("inertia arithmetic range"))?;
+            if pivot.contains_zero() {
+                return Err(SolverError::PremiseNotVerified(
+                    "shifted inertia pivot unresolved".into(),
+                ));
+            }
+            negative += usize::from(pivot.upper() < &0);
+            d[i] = pivot;
+            for j in i + 1..n {
+                let mut v = a[j * n + i].clone();
+                for k in 0..i {
+                    w.tick()?;
+                    let q = l[j * n + k].mul(&l[i * n + k]);
+                    w.tick()?;
+                    let t = q.mul(&d[k]);
+                    w.tick()?;
+                    v = v.sub(&t);
+                }
+                w.tick()?;
+                l[j * n + i] = v
+                    .div(&d[i])
+                    .map_err(|_| invalid("inertia division range"))?;
+            }
+        }
+        Ok(negative)
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RootProblem {
+        pub source_id: String,
+        pub branch_id: String,
+        /// A caller's label, never a certified global ordinal.
+        pub requested_index: usize,
+        pub weights: Vec<ExactBounds>,
+        pub poles: Vec<ExactBounds>,
+        pub bracket: ExactBounds,
+        pub center: String,
+        /// Uniform C1 perturbation bounds on the complete bracket. Zero gives
+        /// the rational interval family itself. External validity is a premise.
+        pub value_error_upper: String,
+        pub derivative_error_upper: String,
+        pub taylor_order: usize,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum RootStatus {
+        CertifiedLocal,
+        PoleContact,
+        UnresolvedDerivative,
+        NoSignChange,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct RootReport {
+        pub status: RootStatus,
+        pub requested_index: usize,
+        pub source_id: String,
+        pub branch_id: String,
+        pub enclosure: Option<ExactBounds>,
+        pub absolute_error_upper: Option<String>,
+        /// Contributions before intersecting with the isolating bracket.
+        /// Evaluation includes uncertainty already present in weights/poles.
+        pub evaluation_displacement_upper: Option<String>,
+        pub source_displacement_upper: Option<String>,
+        pub derivative: Option<ExactBounds>,
+        pub endpoint_values: Option<[ExactBounds; 2]>,
+        pub global_ordinal_certified: bool,
+    }
+    fn secular(
+        weights: &[I],
+        poles: &[I],
+        x: &I,
+        derivative: bool,
+        w: &mut Work<'_>,
+    ) -> Result<I, SolverError> {
+        let mut s = zero();
+        for (a, p) in weights.iter().zip(poles) {
+            let d = w.sub(x, p)?;
+            let t = if derivative {
+                let q = w.square(&d)?;
+                w.div(a, &q)?.neg()
+            } else {
+                w.div(a, &d)?
+            };
+            s = w.add(&s, &t)?;
+        }
+        Ok(s)
+    }
+    fn root(p: &RootProblem, w: &mut Work<'_>) -> Result<RootReport, SolverError> {
+        if p.source_id.trim().is_empty()
+            || p.branch_id.trim().is_empty()
+            || p.requested_index == 0
+            || !(2..=64).contains(&p.taylor_order)
+        {
+            return Err(invalid("root identity/index/order"));
+        }
+        let a = vector(&p.weights, w)?;
+        let poles = vector(&p.poles, w)?;
+        if a.len() != poles.len() {
+            return Err(invalid("root shape"));
+        }
+        let b = w.read(&p.bracket)?;
+        let c = w.scalar(&p.center)?;
+        if b.lower() >= &c || b.upper() <= &c {
+            return Err(invalid("root center must be interior"));
+        }
+        let e = nonnegative(&p.value_error_upper, w)?;
+        let de = nonnegative(&p.derivative_error_upper, w)?;
+        let mut out = RootReport {
+            status: RootStatus::PoleContact,
+            requested_index: p.requested_index,
+            source_id: p.source_id.clone(),
+            branch_id: p.branch_id.clone(),
+            enclosure: None,
+            absolute_error_upper: None,
+            evaluation_displacement_upper: None,
+            source_displacement_upper: None,
+            derivative: None,
+            endpoint_values: None,
+            global_ordinal_certified: false,
+        };
+        if poles
+            .iter()
+            .any(|p| p.lower() <= b.upper() && p.upper() >= b.lower())
+        {
+            return Ok(out);
+        }
+        let center = I::point(c.clone());
+        let radius = Rational::from(&c - b.lower()).max(Rational::from(b.upper() - &c));
+        let r = I::point(radius);
+        let direct = secular(&a, &poles, &b, true, w)?;
+        // Cancellation-preserving Taylor coefficients and geometric derivative tail.
+        let mut coefficients = vec![zero(); p.taylor_order + 1];
+        let mut tail = zero();
+        let mut taylor_usable = true;
+        for (weight, pole) in a.iter().zip(&poles) {
+            let d = w.sub(&center, pole)?;
+            let distance = magnitude(&d).lower().clone();
+            if r.upper() >= &distance {
+                taylor_usable = false;
+                break;
+            }
+            let mut term = w.div(weight, &d)?;
+            for coefficient in &mut coefficients {
+                *coefficient = w.add(coefficient, &term)?;
+                term = w.div(&term, &d)?.neg();
+            }
+            let q = w.div(&r, &I::point(distance.clone()))?;
+            let mut power = point(1);
+            for _ in 0..p.taylor_order {
+                power = w.mul(&power, &q)?;
+            }
+            let mq = w.mul(&point(p.taylor_order as i32), &q)?;
+            let numerator = w.sub(&point(p.taylor_order as i32 + 1), &mq)?;
+            let t = w.mul(&power, &numerator)?;
+            let one_minus = w.sub(&point(1), &q)?;
+            let square = w.square(&one_minus)?;
+            let t = w.div(&t, &square)?;
+            let distance2 = w.square(&I::point(distance))?;
+            let scale = w.div(&magnitude(weight), &distance2)?;
+            let t = w.mul(&scale, &t)?;
+            tail = w.add(&tail, &t)?;
+        }
+        let mut derivative = direct;
+        if taylor_usable {
+            let mut variation = tail;
+            let mut power = r.clone();
+            for (m, coefficient) in coefficients.iter().enumerate().skip(2) {
+                let t = w.mul(&magnitude(coefficient), &point(m as i32))?;
+                let t = w.mul(&t, &power)?;
+                variation = w.add(&variation, &t)?;
+                power = w.mul(&power, &r)?;
+            }
+            let taylor = widen(&coefficients[1], variation.upper());
+            derivative = I::new(
+                derivative.lower().clone().max(taylor.lower().clone()),
+                derivative.upper().clone().min(taylor.upper().clone()),
+            )
+            .map_err(|_| invalid("inconsistent derivative bounds"))?;
+        }
+        derivative = w.checked(widen(&derivative, &de))?;
+        out.derivative = Some(bounds(&derivative));
+        let left = secular(&a, &poles, &I::point(b.lower().clone()), false, w)?;
+        let left = w.checked(widen(&left, &e))?;
+        let right = secular(&a, &poles, &I::point(b.upper().clone()), false, w)?;
+        let right = w.checked(widen(&right, &e))?;
+        out.endpoint_values = Some([bounds(&left), bounds(&right)]);
+        if derivative.contains_zero() {
+            out.status = RootStatus::UnresolvedDerivative;
+            return Ok(out);
+        }
+        if !((left.is_strictly_negative() && right.is_strictly_positive())
+            || (left.is_strictly_positive() && right.is_strictly_negative()))
+        {
+            out.status = RootStatus::NoSignChange;
+            return Ok(out);
+        }
+        let value = secular(&a, &poles, &center, false, w)?;
+        let floor = I::point(magnitude(&derivative).lower().clone());
+        let evaluation = w.div(&I::point(upper(&value)), &floor)?;
+        let source = w.div(&I::point(e.clone()), &floor)?;
+        out.evaluation_displacement_upper = Some(evaluation.upper().to_string());
+        out.source_displacement_upper = Some(source.upper().to_string());
+        let value = w.checked(widen(&value, &e))?;
+        let err = w.div(
+            &I::point(upper(&value)),
+            &I::point(magnitude(&derivative).lower().clone()),
+        )?;
+        let region = widen(&center, err.upper());
+        let enclosure = I::new(
+            b.lower().clone().max(region.lower().clone()),
+            b.upper().clone().min(region.upper().clone()),
+        )
+        .map_err(|_| invalid("root enclosure intersection"))?;
+        let bound =
+            Rational::from(&c - enclosure.lower()).max(Rational::from(enclosure.upper() - &c));
+        out.status = RootStatus::CertifiedLocal;
+        out.enclosure = Some(bounds(&enclosure));
+        out.absolute_error_upper = Some(bound.to_string());
+        Ok(out)
+    }
+
+    /// B x*=b with symmetric positive definite B. Both residuals are recomputed;
+    /// no claimed solver convergence or supplied residual is trusted.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct DirectionalProblem {
+        pub matrix: TrialForm,
+        pub rhs: Vec<ExactBounds>,
+        pub approximate_solution: Vec<ExactBounds>,
+        pub functional: Vec<ExactBounds>,
+        pub approximate_dual: Vec<ExactBounds>,
+        pub coercivity_lower: String,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct DirectionalReport {
+        pub signed_correction: ExactBounds,
+        pub residual_squared_norm: ExactBounds,
+        pub dual_residual_squared_norm: ExactBounds,
+        pub correction_error_upper: String,
+        pub exact_functional_enclosure: ExactBounds,
+    }
+    fn directional(
+        p: &DirectionalProblem,
+        w: &mut Work<'_>,
+    ) -> Result<DirectionalReport, SolverError> {
+        let a = form(&p.matrix, w)?;
+        let n = p.matrix.dimension;
+        let x = vector(&p.approximate_solution, w)?;
+        let z = vector(&p.approximate_dual, w)?;
+        let b = vector(&p.rhs, w)?;
+        let c = vector(&p.functional, w)?;
+        if [&x, &z, &b, &c].iter().any(|v| v.len() != n) {
+            return Err(invalid("directional shape"));
+        }
+        let g = nonnegative(&p.coercivity_lower, w)?;
+        if g == 0 {
+            return Err(invalid("positive coercivity required"));
+        }
+        let shifted = shifted(&a, n, &I::point(g.clone()), w)?;
+        premise_metric_check(&shifted, n, w)?;
+        let ax = matvec(&a, &x, w)?;
+        let az = matvec(&a, &z, w)?;
+        let r: Vec<_> = b
+            .iter()
+            .zip(&ax)
+            .map(|(b, a)| w.sub(b, a))
+            .collect::<Result<_, _>>()?;
+        let d: Vec<_> = c
+            .iter()
+            .zip(&az)
+            .map(|(c, a)| w.sub(c, a))
+            .collect::<Result<_, _>>()?;
+        let rn = norm2(&r, w)?;
+        let dn = norm2(&d, w)?;
+        let product = w.mul(&rn, &dn)?;
+        let error = sqrt_upper(product.upper(), w)?;
+        let error = w.div(&I::point(error), &I::point(g))?;
+        let signed = dot(&z, &r, w)?;
+        let nominal = dot(&c, &x, w)?;
+        let corrected = w.add(&nominal, &signed)?;
+        let enclosure = w.checked(widen(&corrected, error.upper()))?;
+        Ok(DirectionalReport {
+            signed_correction: bounds(&signed),
+            residual_squared_norm: bounds(&rn),
+            dual_residual_squared_norm: bounds(&dn),
+            correction_error_upper: error.upper().to_string(),
+            exact_functional_enclosure: bounds(&enclosure),
+        })
+    }
+
+    /// Finite omitted block only: verifies A22-shift I > gap I and bounds the
+    /// norm of A12 (A22-shift I)^-1 A21. No unseen infinite block is inferred.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TailBlockProblem {
+        pub matrix: TrialForm,
+        pub retained_dimension: usize,
+        pub shift: ExactBounds,
+        pub gap_lower: String,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TailBlockReport {
+        pub omitted_dimension: usize,
+        pub coupling_squared_upper: String,
+        pub schur_correction_norm_upper: String,
+    }
+    fn tail_block(p: &TailBlockProblem, w: &mut Work<'_>) -> Result<TailBlockReport, SolverError> {
+        let a = form(&p.matrix, w)?;
+        let n = p.matrix.dimension;
+        let k = p.retained_dimension;
+        if k == 0 || k >= n {
+            return Err(invalid("nonempty retained and omitted blocks required"));
+        }
+        let shift = w.read(&p.shift)?;
+        let g = nonnegative(&p.gap_lower, w)?;
+        if g == 0 {
+            return Err(invalid("positive tail gap required"));
+        }
+        let m = n - k;
+        let mut block = vec![zero(); m * m];
+        let mut coupling = zero();
+        for i in k..n {
+            for j in k..n {
+                block[(i - k) * m + j - k] = a[i * n + j].clone();
+            }
+        }
+        let boundary = w.add(&I::point(shift.upper().clone()), &I::point(g.clone()))?;
+        let block = shifted(&block, m, &boundary, w)?;
+        premise_metric_check(&block, m, w)?;
+        for i in 0..k {
+            for j in k..n {
+                let t = w.square(&a[i * n + j])?;
+                coupling = w.add(&coupling, &t)?;
+            }
+        }
+        let error = w.div(&coupling, &I::point(g))?;
+        Ok(TailBlockReport {
+            omitted_dimension: m,
+            coupling_squared_upper: coupling.upper().to_string(),
+            schur_correction_norm_upper: error.upper().to_string(),
+        })
+    }
+
+    /// Caller-supplied analytic hypothesis |term_j|<=scale/(j+offset)^power
+    /// for every j>N. The integral-test calculation is verified; the infinite
+    /// hypothesis and its applicability to a root displacement are external.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct TailMajorant {
+        pub branch_id: String,
+        pub proof_id: String,
+        pub hypotheses: Vec<String>,
+        pub minimum_modes: usize,
+        pub scale: String,
+        pub offset: String,
+        pub power: u32,
+    }
+    fn tail_bound(
+        p: &TailMajorant,
+        n: usize,
+        branch: &str,
+        w: &mut Work<'_>,
+    ) -> Result<Rational, SolverError> {
+        if p.branch_id != branch
+            || p.proof_id.trim().is_empty()
+            || p.hypotheses.is_empty()
+            || p.hypotheses.iter().any(|s| s.trim().is_empty())
+            || n < p.minimum_modes
+            || !(2..=64).contains(&p.power)
+        {
+            return Err(invalid("tail hypothesis, branch or domain"));
+        }
+        let scale = nonnegative(&p.scale, w)?;
+        let offset = w.scalar(&p.offset)?;
+        let base = Rational::from(n) + offset;
+        if base <= 0 {
+            return Err(invalid("positive tail integration endpoint required"));
+        }
+        let base = I::point(base);
+        let mut denominator = point(p.power as i32 - 1);
+        for _ in 0..p.power - 1 {
+            denominator = w.mul(&denominator, &base)?;
+        }
+        Ok(w.div(&I::point(scale), &denominator)?.upper().clone())
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct BudgetCandidate {
+        pub modes: usize,
+        pub precision_bits: u32,
+        pub root: RootProblem,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct DeclaredCutoffBound {
+        pub branch_id: String,
+        pub proof_id: String,
+        pub hypotheses: Vec<String>,
+        pub absolute_error_upper: String,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct BudgetProblem {
+        pub branch_id: String,
+        pub target_absolute_error: String,
+        pub candidates: Vec<BudgetCandidate>,
+        pub truncation: Option<TailMajorant>,
+        pub cutoff: Option<DeclaredCutoffBound>,
+        pub reference_assisted: bool,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum BudgetAction {
+        SufficientUnderDeclaredHypotheses,
+        MissingTruncationBound,
+        MissingCutoffBound,
+        ResolveRoot,
+        RefineFiniteRootOrSource,
+        IncreaseModes,
+        IncreaseCutoff,
+        RefineMultipleComponents,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct CandidateReport {
+        pub modes: usize,
+        pub precision_bits: u32,
+        pub root: RootReport,
+        pub truncation_error_upper: Option<String>,
+        pub cutoff_error_upper: Option<String>,
+        pub total_error_upper: Option<String>,
+        pub action: BudgetAction,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct BudgetReport {
+        pub rows: Vec<CandidateReport>,
+        pub selected_candidate: Option<usize>,
+        pub reference_assisted: bool,
+    }
+    fn budget(p: &BudgetProblem, w: &mut Work<'_>) -> Result<BudgetReport, SolverError> {
+        if p.candidates.is_empty() || p.candidates.len() > 64 {
+            return Err(invalid("candidate count"));
+        }
+        let target = nonnegative(&p.target_absolute_error, w)?;
+        if target == 0 {
+            return Err(invalid("positive target tolerance required"));
+        }
+        let cutoff = if let Some(c) = &p.cutoff {
+            if c.branch_id != p.branch_id
+                || c.proof_id.trim().is_empty()
+                || c.hypotheses.is_empty()
+                || c.hypotheses.iter().any(|x| x.trim().is_empty())
+            {
+                return Err(invalid("cutoff bound provenance"));
+            }
+            Some(nonnegative(&c.absolute_error_upper, w)?)
+        } else {
+            None
+        };
+        let mut rows = Vec::new();
+        let mut selected: Option<usize> = None;
+        let mut settings = std::collections::BTreeSet::new();
+        for c in &p.candidates {
+            if c.modes == 0
+                || !(64..=1_000_000).contains(&c.precision_bits)
+                || c.root.branch_id != p.branch_id
+                || !settings.insert((c.modes, c.precision_bits))
+            {
+                return Err(invalid("candidate configuration or branch"));
+            }
+            let r = root(&c.root, w)?;
+            let tail = p
+                .truncation
+                .as_ref()
+                .map(|t| tail_bound(t, c.modes, &p.branch_id, w))
+                .transpose()?;
+            let arithmetic = r
+                .absolute_error_upper
+                .as_ref()
+                .map(|s| w.scalar(s))
+                .transpose()?;
+            let mut total = None;
+            let action = match (&arithmetic, &tail, &cutoff) {
+                (None, _, _) => BudgetAction::ResolveRoot,
+                (_, None, _) => BudgetAction::MissingTruncationBound,
+                (_, _, None) => BudgetAction::MissingCutoffBound,
+                (Some(a), Some(t), Some(cut)) => {
+                    let sum = w.add(&I::point(a.clone()), &I::point(t.clone()))?;
+                    let sum = w.add(&sum, &I::point(cut.clone()))?;
+                    total = Some(sum.upper().to_string());
+                    if sum.upper() <= &target {
+                        BudgetAction::SufficientUnderDeclaredHypotheses
+                    } else if [a, t, cut].iter().filter(|x| *x >= &&target).count() > 1 {
+                        BudgetAction::RefineMultipleComponents
+                    } else if a >= &target {
+                        BudgetAction::RefineFiniteRootOrSource
+                    } else if t >= &target {
+                        BudgetAction::IncreaseModes
+                    } else if cut >= &target {
+                        BudgetAction::IncreaseCutoff
+                    } else {
+                        BudgetAction::RefineMultipleComponents
+                    }
+                }
+            };
+            if action == BudgetAction::SufficientUnderDeclaredHypotheses
+                && selected.is_none_or(|i| {
+                    (c.modes, c.precision_bits)
+                        < (p.candidates[i].modes, p.candidates[i].precision_bits)
+                })
+            {
+                selected = Some(rows.len());
+            }
+            rows.push(CandidateReport {
+                modes: c.modes,
+                precision_bits: c.precision_bits,
+                root: r,
+                truncation_error_upper: tail.map(|v| v.to_string()),
+                cutoff_error_upper: cutoff.as_ref().map(ToString::to_string),
+                total_error_upper: total,
+                action,
+            });
+        }
+        Ok(BudgetReport {
+            rows,
+            selected_candidate: selected,
+            reference_assisted: p.reference_assisted,
+        })
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct NormalizationProblem {
+        pub source_id: String,
+        pub raw_norm_error_upper: String,
+        pub reference_norm_upper: String,
+        pub source_normalizer: ExactBounds,
+        pub reference_normalizer: ExactBounds,
+        /// Separate trace/evaluation control. A nonzero floor is insufficient.
+        pub normalizer_difference_upper: String,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct NormalizationReport {
+        pub source_floor: String,
+        pub reference_floor: String,
+        pub normalized_norm_error_upper: String,
+    }
+    fn normalize(
+        p: &NormalizationProblem,
+        w: &mut Work<'_>,
+    ) -> Result<NormalizationReport, SolverError> {
+        if p.source_id.trim().is_empty() {
+            return Err(invalid("normalization source identity"));
+        }
+        let a = w.read(&p.source_normalizer)?;
+        let b = w.read(&p.reference_normalizer)?;
+        let af = magnitude(&a).lower().clone();
+        let bf = magnitude(&b).lower().clone();
+        if af == 0 || bf == 0 {
+            return Err(SolverError::PremiseNotVerified(
+                "normalization floor unresolved".into(),
+            ));
+        }
+        let e = nonnegative(&p.raw_norm_error_upper, w)?;
+        let v = nonnegative(&p.reference_norm_upper, w)?;
+        let diff = nonnegative(&p.normalizer_difference_upper, w)?;
+        let actual = w.sub(&a, &b)?;
+        if magnitude(&actual).lower() > &diff {
+            return Err(SolverError::PremiseNotVerified(
+                "inconsistent normalization difference".into(),
+            ));
+        }
+        let diff = diff.min(upper(&actual));
+        let t1 = w.div(&I::point(e), &I::point(af.clone()))?;
+        let t2 = w.mul(&I::point(v), &I::point(diff))?;
+        let denominator = w.mul(&I::point(af.clone()), &I::point(bf.clone()))?;
+        let t2 = w.div(&t2, &denominator)?;
+        let result = w.add(&t1, &t2)?;
+        Ok(NormalizationReport {
+            source_floor: af.to_string(),
+            reference_floor: bf.to_string(),
+            normalized_norm_error_upper: result.upper().to_string(),
+        })
+    }
+    /// Supremum bounds apply over the entire cell, not only sampled nodes.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ProfileCell {
+        pub left: String,
+        pub right: String,
+        pub left_residual: ExactBounds,
+        pub right_residual: ExactBounds,
+        pub weight: ExactBounds,
+        pub second_derivative_upper: String,
+        pub additional_sup_error_upper: String,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ProfileProblem {
+        pub source_id: String,
+        pub validation_grid_id: String,
+        pub training_grid_id: Option<String>,
+        pub cells: Vec<ProfileCell>,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ProfileReport {
+        pub weighted_l1: ExactBounds,
+        pub interpolation_error_upper: String,
+        pub cell_integrals: Vec<ExactBounds>,
+        pub independent_validation_grid: bool,
+    }
+    fn profile(p: &ProfileProblem, w: &mut Work<'_>) -> Result<ProfileReport, SolverError> {
+        if p.source_id.trim().is_empty()
+            || p.validation_grid_id.trim().is_empty()
+            || p.cells.is_empty()
+            || p.cells.len() > 16384
+        {
+            return Err(invalid("profile identity or cell count"));
+        }
+        let mut previous: Option<Rational> = None;
+        let mut total = zero();
+        let mut error_sum = zero();
+        let mut cells = Vec::new();
+        for cell in &p.cells {
+            let l = w.scalar(&cell.left)?;
+            let r = w.scalar(&cell.right)?;
+            if r <= l || previous.as_ref().is_some_and(|x| x != &l) {
+                return Err(invalid(
+                    "profile cells must form an ordered contiguous partition",
+                ));
+            }
+            previous = Some(r.clone());
+            let h = I::point(r - l);
+            let a = w.read(&cell.left_residual)?;
+            let b = w.read(&cell.right_residual)?;
+            let weight = w.read(&cell.weight)?;
+            if weight.lower() < &0 {
+                return Err(invalid("negative weight"));
+            }
+            let midpoint = |x: &I| -> Rational { Rational::from(x.lower() + x.upper()) / 2 };
+            let aa = midpoint(&a);
+            let bb = midpoint(&b);
+            let node_error = Rational::from(a.upper() - &aa).max(Rational::from(b.upper() - &bb));
+            let exact = if aa == 0 && bb == 0 {
+                zero()
+            } else if (aa >= 0 && bb >= 0) || (aa <= 0 && bb <= 0) {
+                let s = w.add(&I::point(aa.clone().abs()), &I::point(bb.clone().abs()))?;
+                let t = w.mul(&h, &s)?;
+                w.div(&t, &point(2))?
+            } else {
+                let x = w.square(&I::point(aa.clone()))?;
+                let y = w.square(&I::point(bb.clone()))?;
+                let s = w.add(&x, &y)?;
+                let s = w.mul(&h, &s)?;
+                let d = w.add(&I::point(aa.abs()), &I::point(bb.abs()))?;
+                let d = w.mul(&point(2), &d)?;
+                w.div(&s, &d)?
+            };
+            let m = nonnegative(&cell.second_derivative_upper, w)?;
+            let extra = nonnegative(&cell.additional_sup_error_upper, w)?;
+            let h2 = w.square(&h)?;
+            let t = w.mul(&I::point(m), &h2)?;
+            let t = w.div(&t, &point(8))?;
+            let t = w.add(&t, &I::point(node_error))?;
+            let t = w.add(&t, &I::point(extra))?;
+            let t = w.mul(&t, &h)?;
+            let err = w.mul(&t, &weight)?;
+            let nominal = w.mul(&exact, &weight)?;
+            let integral = w.checked(
+                I::new(
+                    Rational::from(nominal.lower() - err.upper()).max(Rational::from(0)),
+                    Rational::from(nominal.upper() + err.upper()),
+                )
+                .unwrap(),
+            )?;
+            total = w.add(&total, &integral)?;
+            error_sum = w.add(&error_sum, &err)?;
+            cells.push(bounds(&integral));
+        }
+        Ok(ProfileReport {
+            weighted_l1: bounds(&total),
+            interpolation_error_upper: error_sum.upper().to_string(),
+            cell_integrals: cells,
+            independent_validation_grid: p
+                .training_grid_id
+                .as_ref()
+                .is_some_and(|s| !s.trim().is_empty() && s != &p.validation_grid_id),
+        })
+    }
+
+    /// Columns need not be orthonormal. A verified Gram lower bound controls
+    /// their conditioning. The selected window is in Euclidean coordinates.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ClusterProblem {
+        pub matrix: TrialForm,
+        pub spectral_window: ExactBounds,
+        pub columns: Vec<Vec<ExactBounds>>,
+        pub shifts: Vec<String>,
+        pub gram_lower: String,
+        /// Optional preceding trial subspace in the identical coordinates.
+        /// Tracking is subspace overlap, not an assertion of eigenstate identity.
+        pub previous_columns: Option<Vec<Vec<ExactBounds>>>,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct ClusterReport {
+        pub eigenvalues_below: usize,
+        pub eigenvalues_in_window: usize,
+        pub contains_ground: bool,
+        pub simple_ground: bool,
+        pub projector_frobenius_squared_upper: String,
+        pub residual_squared_norms: Vec<ExactBounds>,
+        pub previous_trial_projector_frobenius_squared_upper: Option<String>,
+    }
+    fn columns(
+        raw: &[Vec<ExactBounds>],
+        n: usize,
+        w: &Work<'_>,
+    ) -> Result<Vec<Vec<I>>, SolverError> {
+        if raw.is_empty() || raw.len() > n {
+            return Err(invalid("cluster rank"));
+        }
+        raw.iter()
+            .map(|v| {
+                let x = vector(v, w)?;
+                if x.len() != n {
+                    return Err(invalid("cluster vector dimension"));
+                }
+                Ok(x)
+            })
+            .collect()
+    }
+    fn gram(q: &[Vec<I>], w: &mut Work<'_>) -> Result<Vec<I>, SolverError> {
+        let k = q.len();
+        let mut g = vec![zero(); k * k];
+        for i in 0..k {
+            for j in 0..=i {
+                let v = if i == j {
+                    norm2(&q[i], w)?
+                } else {
+                    dot(&q[i], &q[j], w)?
+                };
+                g[i * k + j] = v.clone();
+                g[j * k + i] = v;
+            }
+        }
+        Ok(g)
+    }
+    fn row_sum_bound(g: &[I], k: usize, w: &mut Work<'_>) -> Result<Rational, SolverError> {
+        let mut maximum = Rational::from(0);
+        for row in g.chunks_exact(k) {
+            let mut sum = zero();
+            for x in row {
+                sum = w.add(&sum, &magnitude(x))?;
+            }
+            maximum = maximum.max(sum.upper().clone());
+        }
+        Ok(maximum)
+    }
+    fn cluster(p: &ClusterProblem, w: &mut Work<'_>) -> Result<ClusterReport, SolverError> {
+        let a = form(&p.matrix, w)?;
+        let n = p.matrix.dimension;
+        let q = columns(&p.columns, n, w)?;
+        let k = q.len();
+        if p.shifts.len() != k {
+            return Err(invalid("cluster shifts shape"));
+        }
+        let window = w.read(&p.spectral_window)?;
+        if window.lower() >= window.upper() {
+            return Err(invalid("empty spectral window"));
+        }
+        let low = shifted(&a, n, &I::point(window.lower().clone()), w)?;
+        let high = shifted(&a, n, &I::point(window.upper().clone()), w)?;
+        let below = inertia(&low, n, w)?;
+        let above = inertia(&high, n, w)?;
+        if above < below || above - below != k {
+            return Err(SolverError::PremiseNotVerified(
+                "cluster count does not match trial rank".into(),
+            ));
+        }
+        let g = gram(&q, w)?;
+        let beta = nonnegative(&p.gram_lower, w)?;
+        if beta == 0 {
+            return Err(invalid("positive Gram lower bound required"));
+        }
+        let test = shifted(&g, k, &I::point(beta.clone()), w)?;
+        premise_metric_check(&test, k, w)?;
+        let mut error = zero();
+        let mut residuals = Vec::new();
+        for (q, s) in q.iter().zip(&p.shifts) {
+            let s = w.scalar(s)?;
+            let gap = Rational::from(&s - window.lower()).min(Rational::from(window.upper() - &s));
+            if gap <= 0 {
+                return Err(invalid("cluster shift outside window"));
+            }
+            let aq = matvec(&a, q, w)?;
+            let mut residual = Vec::new();
+            for (a, x) in aq.iter().zip(q) {
+                let sx = w.mul(&I::point(s.clone()), x)?;
+                residual.push(w.sub(a, &sx)?);
+            }
+            let nr = norm2(&residual, w)?;
+            let gap2 = w.square(&I::point(gap))?;
+            let term = w.div(&nr, &gap2)?;
+            error = w.add(&error, &term)?;
+            residuals.push(bounds(&nr));
+        }
+        let error = w.div(&error, &I::point(beta))?;
+        let distance = error.upper().clone().min(Rational::from(k));
+        let previous = if let Some(raw) = &p.previous_columns {
+            let v = columns(raw, n, w)?;
+            if v.len() != k {
+                return Err(invalid("tracking ranks differ"));
+            }
+            let vg = gram(&v, w)?;
+            premise_metric_check(&vg, k, w)?;
+            let mut overlap = zero();
+            for x in &q {
+                for y in &v {
+                    let xy = dot(x, y, w)?;
+                    let sq = w.square(&xy)?;
+                    overlap = w.add(&overlap, &sq)?;
+                }
+            }
+            let g_bound = row_sum_bound(&g, k, w)?;
+            let vg_bound = row_sum_bound(&vg, k, w)?;
+            let den = w.mul(&I::point(g_bound), &I::point(vg_bound))?;
+            let lower = w.div(&overlap, &den)?;
+            Some(((Rational::from(k) - lower.lower()).max(Rational::from(0)) * 2i32).to_string())
+        } else {
+            None
+        };
+        Ok(ClusterReport {
+            eigenvalues_below: below,
+            eigenvalues_in_window: k,
+            contains_ground: below == 0,
+            simple_ground: below == 0 && k == 1,
+            projector_frobenius_squared_upper: (distance * 2i32).to_string(),
+            residual_squared_norms: residuals,
+            previous_trial_projector_frobenius_squared_upper: previous,
+        })
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(
+        tag = "kind",
+        content = "input",
+        rename_all = "snake_case",
+        deny_unknown_fields
+    )]
+    pub enum Problem {
+        Root(RootProblem),
+        Directional(DirectionalProblem),
+        TailBlock(TailBlockProblem),
+        Budget(BudgetProblem),
+        Normalization(NormalizationProblem),
+        Profile(ProfileProblem),
+        Cluster(ClusterProblem),
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(
+        tag = "kind",
+        content = "output",
+        rename_all = "snake_case",
+        deny_unknown_fields
+    )]
+    pub enum Output {
+        Root(RootReport),
+        Directional(DirectionalReport),
+        TailBlock(TailBlockReport),
+        Budget(BudgetReport),
+        Normalization(NormalizationReport),
+        Profile(ProfileReport),
+        Cluster(ClusterReport),
+    }
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct Report {
+        pub semantics: String,
+        pub request_sha256: String,
+        pub scope: String,
+        pub output: Output,
+        pub interval_operations: u64,
+    }
+    pub fn analyze(
+        problem: &Problem,
+        options: &Options,
+        token: &CancellationToken,
+    ) -> Result<Report, SolverError> {
+        if options.maximum_dimension == 0
+            || options.maximum_dimension > 512
+            || options.maximum_input_bytes == 0
+            || options.maximum_input_bytes > MAXIMUM_INPUT_BYTES
+            || options.maximum_interval_operations > 1_000_000_000
+            || !(64..=65_536).contains(&options.maximum_rational_bits)
+            || !(64..=32_768).contains(&options.working_precision_bits)
+            || options.working_precision_bits > options.maximum_rational_bits
+        {
+            return Err(invalid("unsupported work limits"));
+        }
+        let limits = super::trial_energy::TrialEnergyOptions {
+            maximum_dimension: options.maximum_dimension,
+            maximum_parts: options.maximum_parts,
+            maximum_input_bytes: options.maximum_input_bytes,
+            maximum_interval_operations: options.maximum_interval_operations,
+            maximum_rational_bits: options.maximum_rational_bits,
+        };
+        let mut w = Work {
+            exact: ExactWork {
+                options: &limits,
+                token,
+                operations: 0,
+            },
+            precision: options.working_precision_bits,
+        };
+        w.cancel()?;
+        // Serialization is also the identity representation; input size bounds
+        // include strings and analytic hypotheses, not merely scalar payloads.
+        let bytes = serde_json::to_vec(problem).map_err(|_| invalid("request serialization"))?;
+        if bytes.len() > options.maximum_input_bytes {
+            return Err(invalid("input byte limit"));
+        }
+        let output = match problem {
+            Problem::Root(p) => Output::Root(root(p, &mut w)?),
+            Problem::Directional(p) => Output::Directional(directional(p, &mut w)?),
+            Problem::TailBlock(p) => Output::TailBlock(tail_block(p, &mut w)?),
+            Problem::Budget(p) => Output::Budget(budget(p, &mut w)?),
+            Problem::Normalization(p) => Output::Normalization(normalize(p, &mut w)?),
+            Problem::Profile(p) => Output::Profile(profile(p, &mut w)?),
+            Problem::Cluster(p) => Output::Cluster(cluster(p, &mut w)?),
+        };
+        w.cancel()?;
+        Ok(Report{semantics:SEMANTICS.into(),request_sha256:hash(&(SEMANTICS,problem,options))?,
+            scope:"finite_interval_arithmetic_conditional_on_declared_input_enclosures_and_explicit_analytic_hypotheses_no_source_authentication".into(),output,interval_operations:w.operations})
+    }
+    pub fn verify(
+        problem: &Problem,
+        options: &Options,
+        report: &Report,
+        token: &CancellationToken,
+    ) -> Result<(), SolverError> {
+        if analyze(problem, options, token)? != *report {
+            return Err(invalid("report replay mismatch"));
+        }
+        Ok(())
     }
 }

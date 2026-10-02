@@ -24,7 +24,9 @@ pub(super) fn validate(a: &[Float], v: &[Float], lambda: &Float, p: u32) -> Resu
         .saturating_mul(4)
         .saturating_add((n as u64).saturating_mul(12))
         .saturating_add(256);
-    if buffers.saturating_mul(u64::from(work).div_ceil(8) + 64) > (8u64 << 30) {
+    if buffers.saturating_mul(u64::from(work).div_ceil(8) + 64) as u128
+        > super::source_working_budget()?
+    {
         bail!("sector eigenvector validation exceeds numerical workspace budget");
     }
     let tolerance = Float::with_val(work, 1) >> (p - 32);

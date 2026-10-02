@@ -1,5 +1,5 @@
-//! Historical audit witnesses retained after the production repair. These
-//! independently demonstrate why staged pi rounding cannot define the source.
+//! Rational witnesses that independently demonstrate why staged pi rounding
+//! cannot define the source.
 //! Production discovery agreement is exercised in complete_discovery's tests.
 #![cfg(feature = "hp")]
 

@@ -594,10 +594,9 @@ fn comparisons(
     use xc_numerics::mpfr_interval::MpfrInterval as I;
     let mut r = report("configuration_comparison", s, o);
     let Some(completion) = completion(i).filter(|c| !c.comparisons.is_empty()) else {
-        return Ok(missing(
-            r,
-            "comparison snapshots or a verified retained-source cohort required",
-        ));
+        r.outcome = "awaiting_cohort".into();
+        r.reason = Some("comparison follows independently acquired compatible configurations; retain this run now and assess the cohort afterward".into());
+        return Ok(r);
     };
     let p = o.working_precision_bits;
     let mut multiplicities = std::collections::BTreeMap::new();
@@ -925,7 +924,7 @@ pub(crate) fn band_single(
             beta = coeffs(&saved.beta, p)?;
             r.rows = saved.rows;
             begin = saved.next;
-            eprintln!("band recurrence resumed at degree {begin}/{d}");
+            xc_core::progress_message!("band recurrence resumed at degree {begin}/{d}");
         } else {
             vectors.clear_memory();
         }
@@ -1030,7 +1029,7 @@ pub(crate) fn band_single(
             .store
             .save("jacobi-roots", &values.iter().map(dec).collect::<Vec<_>>())
         {
-            eprintln!("band checkpoint unavailable: {e}");
+            xc_core::progress_message!("band checkpoint unavailable: {e}");
         }
         values
     };

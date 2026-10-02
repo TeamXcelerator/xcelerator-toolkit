@@ -1,4 +1,587 @@
 #![cfg(feature = "hp")]
+mod energy_extension_tests {
+    use super::*;
+    use rug::Rational;
+    use xc_solver::trial_energy::ExactBounds as B;
+    use xc_spectral::ccm::convergence_capture::finite_capture::energy_extensions::capture_projection;
+    use xc_spectral::ccm::convergence_capture::finite_capture::{self as f, energy_extensions::*};
+    fn bound(s: &str) -> DeclaredBound {
+        DeclaredBound {
+            upper: s.into(),
+            provenance: "synthetic exact model".into(),
+            scope: "declared object only".into(),
+        }
+    }
+    fn projection() -> ProjectionRequest {
+        ProjectionRequest {
+            definition_digest: ContentDigest::sha256(b"generic polynomial"),
+            operator_id: "test form".into(),
+            period: "2".into(),
+            basis_id: "orthonormal_periodic_fourier".into(),
+            domain: "interval_h1".into(),
+            coefficients: complex_vector("polynomial", &["0", "1", "0"], &["0", "0", "0"]),
+            retained_modes: 0,
+            remainder: FourierRemainder::ExactPolynomial,
+            source_l2_error: bound("0"),
+            source_h1_error: bound("0"),
+            continuity: Some(FormContinuity {
+                operator_id: "test form".into(),
+                period: "2".into(),
+                basis_id: "orthonormal_periodic_fourier".into(),
+                domain: "interval_h1".into(),
+                bound: bound("2"),
+            }),
+            trial_absolute_energy: Some(bound("3")),
+            precision_bits: 128,
+        }
+    }
+    fn rat(v: &serde_json::Value) -> Rational {
+        Rational::from_str_radix(v.as_str().unwrap(), 10).unwrap()
+    }
+    fn contains(v: &serde_json::Value, s: &str) -> bool {
+        let x = Rational::from_str_radix(s, 10).unwrap();
+        rat(&v["lower"]) <= x && x <= rat(&v["upper"])
+    }
+    #[test]
+    fn projection_energy_keeps_interval_traces_and_missing_tail_distinct() {
+        let mut p = projection();
+        let r = analyze_projection(&p).unwrap();
+        assert_eq!(r["absolute_rayleigh_upper"], "3");
+        assert_eq!(r["energy_difference_upper"], "0");
+        assert!(rat(&r["endpoint_traces"]["real"]["lower"]) > 0);
+        p.remainder = FourierRemainder::Unknown;
+        let r = analyze_projection(&p).unwrap();
+        assert_eq!(r["status"], "unresolved");
+        assert_eq!(r["observed_tail_l2_squared"]["upper"], "0");
+        assert!(r.get("energy_difference_upper").is_none());
+        p.remainder = FourierRemainder::ExactPolynomial;
+        p.source_l2_error = bound("1");
+        assert_eq!(
+            analyze_projection(&p).unwrap()["quotient_status"],
+            "unresolved_norm_floor"
+        );
+        p.continuity.as_mut().unwrap().period = "3".into();
+        assert!(analyze_projection(&p).is_err());
+    }
+    #[test]
+    fn projection_high_frequency_and_tighter_declared_tails_change_the_bound() {
+        let mut p = projection();
+        p.period = "1/10000".into();
+        p.continuity.as_mut().unwrap().period = p.period.clone();
+        p.coefficients.real[2] = B::point("1/10000");
+        let r = analyze_projection(&p).unwrap();
+        assert!(rat(&r["observed_tail_l2_squared"]["upper"]) < 1);
+        assert!(rat(&r["observed_tail_h1_squared"]["lower"]) > 30);
+        p = projection();
+        p.remainder = FourierRemainder::Declared {
+            l2: bound("1/10"),
+            h1: bound("1/5"),
+        };
+        let loose = analyze_projection(&p).unwrap();
+        p.remainder = FourierRemainder::Declared {
+            l2: bound("1/100"),
+            h1: bound("1/50"),
+        };
+        let tight = analyze_projection(&p).unwrap();
+        assert!(rat(&tight["energy_difference_upper"]) < rat(&loose["energy_difference_upper"]));
+        assert!(rat(&tight["absolute_rayleigh_upper"]) < rat(&loose["absolute_rayleigh_upper"]));
+    }
+    fn component(label: &str, sign: &str, diagonal: &[&str]) -> SignedComponent {
+        SignedComponent::from_data(ComponentData {
+            label: label.into(),
+            signed_weight: sign.into(),
+            diagonal: diagonal.iter().map(|x| B::point(*x)).collect(),
+            upper_triangle: vec![],
+            rank_one: vec![],
+        })
+        .unwrap()
+    }
+    fn component_input(
+        m: &ArtifactManifest,
+        _matrix: &RetainedMatrix<'_>,
+    ) -> ExternalResearchInputs {
+        let mut i = inputs(m);
+        i.finite_diagnostics = Some(f::Inputs {
+            scope: "synthetic signed components".into(),
+            component_energy: Some(ComponentRequest {
+                matrix_digest: m.dependencies[0].content_digest.clone(),
+                basis_id: "centered_full_V_fourier".into(),
+                components: vec![
+                    component("positive", "1", &["10", "3", "10"]),
+                    component("subtracted", "-1", &["6", "0", "6"]),
+                ],
+                assembly_operator_norm_error: None,
+            }),
+            ..Default::default()
+        });
+        i
+    }
+    fn component_run(
+        i: &ExternalResearchInputs,
+        s: &RetainedState,
+        m: &RetainedMatrix<'_>,
+    ) -> serde_json::Value {
+        f::capture(
+            "trial_vector_energy",
+            s,
+            Some(m),
+            None,
+            Some(i),
+            None,
+            &[],
+            &context(),
+        )
+        .unwrap()
+        .value
+        .data
+        .result["component_energy"]
+            .clone()
+    }
+    #[test]
+    fn component_closure_checks_all_vectors_and_authenticates_signs() {
+        let (s, sm, m) = fixture();
+        let mut i = component_input(&sm, &m);
+        let r = component_run(&i, &s, &m);
+        assert_eq!(r["operator_closure"]["status"], "exact_stored_equality");
+        // Components stream concurrently; the result is independent of threads.
+        for threads in [1, 2, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            assert_eq!(pool.install(|| component_run(&i, &s, &m)), r);
+        }
+        let x = i
+            .finite_diagnostics
+            .as_mut()
+            .unwrap()
+            .component_energy
+            .as_mut()
+            .unwrap();
+        x.components.pop();
+        let r = component_run(&i, &s, &m);
+        // The retained center vector still has exactly matching energy.
+        assert_eq!(r["stages"][0]["total_minus_component_sum"]["lower"], "0");
+        assert_eq!(r["operator_closure"]["status"], "refuted");
+        assert_eq!(r["operator_closure"]["spectral_norm_upper"], "6");
+        let x = i
+            .finite_diagnostics
+            .as_mut()
+            .unwrap()
+            .component_energy
+            .as_mut()
+            .unwrap();
+        x.components
+            .push(component("wrong sign", "1", &["6", "0", "6"]));
+        assert_eq!(
+            component_run(&i, &s, &m)["operator_closure"]["spectral_norm_upper"],
+            "12"
+        );
+        i.finite_diagnostics
+            .as_mut()
+            .unwrap()
+            .component_energy
+            .as_mut()
+            .unwrap()
+            .components[0]
+            .data
+            .signed_weight = "-1".into();
+        assert!(f::capture(
+            "trial_vector_energy",
+            &s,
+            Some(&m),
+            None,
+            Some(&i),
+            None,
+            &[],
+            &context()
+        )
+        .is_err());
+    }
+    #[test]
+    fn signed_components_follow_complex_stages_and_pairings() {
+        let (s, sm, m) = fixture();
+        let mut i = component_input(&sm, &m);
+        i.finite_diagnostics.as_mut().unwrap().complex_trials = Some(f::ComplexTrialSeries {
+            basis_id: "centered_full_V_fourier".into(),
+            matrix_digest: sm.dependencies[0].content_digest.clone(),
+            scope: "complex synthetic".into(),
+            baseline: complex_vector("first", &["1", "0", "0"], &["0", "1", "0"]),
+            corrections: vec![complex_vector(
+                "change",
+                &["-1", "1", "0"],
+                &["0", "0", "1"],
+            )],
+            functional: None,
+            provenance: BTreeMap::new(),
+        });
+        let r = component_run(&i, &s, &m);
+        assert_eq!(r["stages"][0]["signed_sum"]["lower"], "7");
+        assert_eq!(r["stages"][1]["signed_sum"]["lower"], "10");
+        assert_eq!(r["stages"][1]["total_minus_component_sum"]["upper"], "0");
+        assert_eq!(
+            r["components"][0]["report"]["energy_pairings"][1]["lower"],
+            "-10"
+        );
+        assert_eq!(
+            r["components"][1]["report"]["energy_pairings"][1]["lower"],
+            "6"
+        );
+    }
+    #[test]
+    fn component_rank_one_and_interval_closure_do_not_overstate_equality() {
+        let (s, sm, m) = fixture();
+        let mut i = component_input(&sm, &m);
+        let remainder = ComponentData {
+            label: "remainder".into(),
+            signed_weight: "1".into(),
+            diagonal: vec![],
+            upper_triangle: ["3", "-1", "0", "2", "0", "4"]
+                .into_iter()
+                .map(B::point)
+                .collect(),
+            rank_one: vec![],
+        };
+        let rank = ComponentData {
+            label: "rank one".into(),
+            signed_weight: "1".into(),
+            diagonal: vec![],
+            upper_triangle: vec![],
+            rank_one: vec![RankOne {
+                weight: B::point("1"),
+                vector: ["1", "1", "0"].into_iter().map(B::point).collect(),
+            }],
+        };
+        i.finite_diagnostics
+            .as_mut()
+            .unwrap()
+            .component_energy
+            .as_mut()
+            .unwrap()
+            .components = vec![
+            SignedComponent::from_data(rank).unwrap(),
+            SignedComponent::from_data(remainder.clone()).unwrap(),
+        ];
+        assert_eq!(
+            component_run(&i, &s, &m)["operator_closure"]["status"],
+            "exact_stored_equality"
+        );
+        let mut uncertain = remainder;
+        uncertain.upper_triangle[1] = B {
+            lower: "-11/10".into(),
+            upper: "-9/10".into(),
+        };
+        i.finite_diagnostics
+            .as_mut()
+            .unwrap()
+            .component_energy
+            .as_mut()
+            .unwrap()
+            .components[1] = SignedComponent::from_data(uncertain).unwrap();
+        let r = component_run(&i, &s, &m);
+        assert_eq!(r["operator_closure"]["status"], "enclosed_not_proved_equal");
+        assert_eq!(r["operator_closure"]["spectral_norm_upper"], "1/10");
+    }
+    fn profile(label: &str, knots: &[(&str, &str)]) -> LogProfile {
+        LogProfile {
+            label: label.into(),
+            knots: knots
+                .iter()
+                .map(|(x, y)| Knot {
+                    coordinate: (*x).into(),
+                    value: (*y).into(),
+                })
+                .collect(),
+        }
+    }
+    fn continuous() -> ContinuousRequest {
+        let k = profile("compact tent", &[("-1/4", "0"), ("0", "1"), ("1/4", "0")]);
+        ContinuousRequest {
+            definition_digest: ContentDigest::sha256(b"synthetic compact functions"),
+            profile_a: k.clone(),
+            profile_b: k.clone(),
+            profile_sum: profile("sum", &[("-1/4", "0"), ("0", "2"), ("1/4", "0")]),
+            scope: ProfileScope::ExactInterpolant,
+            summands: vec![],
+            integration_windows: vec![],
+            unrepresented_sum_l2: None,
+            overlap: None,
+            translation_shifts: vec!["1/8".into(), "3/8".into()],
+            integration_cells: 128,
+            maximum_prime_power: 8,
+            precision_bits: 128,
+        }
+    }
+    #[test]
+    fn continuous_energy_is_independent_and_preserves_correlation_identity() {
+        let mut resolved = continuous();
+        resolved.integration_cells = 2048;
+        let r = analyze_continuous(&resolved).unwrap();
+        // Forms, prime terms and cells are evaluated concurrently and folded
+        // in order; the result is independent of the thread count.
+        for threads in [1, 2, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            assert_eq!(pool.install(|| analyze_continuous(&resolved).unwrap()), r);
+        }
+        assert_eq!(r["profile_a"]["squared_norm"], "1/6");
+        assert_eq!(r["profile_a"]["derivative_squared_norm"], "8");
+        assert_eq!(r["profile_a"]["prime"]["lower"], "0");
+        assert!(contains(&r["difference_energy"], "0"));
+        // Independent closed-form correlation plus high-precision quadrature oracle.
+        assert!(contains(
+            &r["profile_a"]["energy"],
+            "12933191472510148103423655415665/1000000000000000000000000000000000"
+        ));
+        assert_eq!(r["decomposition_l2_squared"], "0");
+        assert_eq!(r["translations"][0]["correlation"], "23/192");
+        assert_eq!(
+            r["translations"][0]["translated_difference_squared_norm"],
+            "3/32"
+        );
+        assert_eq!(r["translations"][1]["shifted_support"][1], "-1/8");
+        assert!(!contains(&r["sum_with_a"], "0"));
+        let mut c = resolved;
+        c.profile_b = profile("zero", &[("-1/4", "0"), ("1/4", "0")]);
+        c.profile_sum = c.profile_a.clone();
+        let r = analyze_continuous(&c).unwrap();
+        assert!(!contains(&r["difference_energy"], "0"));
+        assert_eq!(r["profile_b"]["rayleigh"], serde_json::Value::Null);
+    }
+    #[test]
+    fn continuous_enclosures_refine_but_do_not_invent_source_tails() {
+        let mut c = continuous();
+        c.integration_cells = 32;
+        let a = analyze_continuous(&c).unwrap();
+        c.integration_cells = 256;
+        c.scope = ProfileScope::UnresolvedSource;
+        let b = analyze_continuous(&c).unwrap();
+        assert!(rat(&b["profile_a"]["absolute_width"]) < rat(&a["profile_a"]["absolute_width"]));
+        assert_eq!(b["source_global_status"], "unresolved");
+        c.scope = ProfileScope::DeclaredEnergyErrors {
+            profile_a: Box::new(bound("1/10")),
+            profile_b: Box::new(bound("1/5")),
+            profile_sum: Box::new(bound("1/2")),
+        };
+        let declared = analyze_continuous(&c).unwrap();
+        assert_eq!(
+            declared["source_global_status"],
+            "conditional_on_declared_energy_error_ledgers"
+        );
+        assert_eq!(
+            rat(&b["profile_a"]["energy"]["lower"])
+                - rat(&declared["profile_a"]["conditional_source_energy"]["lower"]),
+            Rational::from((1, 10))
+        );
+        c.profile_a.knots[0].value = "1".into();
+        assert!(analyze_continuous(&c).is_err());
+        c = continuous();
+        c.profile_a.knots[0].coordinate = "-8".into();
+        assert!(analyze_continuous(&c).is_err());
+    }
+    #[test]
+    fn separate_summands_keep_endpoint_atoms_without_spurious_connections() {
+        let mut c = continuous();
+        c.summands = vec![
+            profile("left", &[("0", "1"), ("1", "1")]),
+            profile("right", &[("2", "1"), ("3", "1")]),
+        ];
+        c.integration_windows = vec![IntegrationWindow {
+            label: "edge strip".into(),
+            lower: "3/4".into(),
+            upper: "5/4".into(),
+        }];
+        c.unrepresented_sum_l2 = Some(bound("1/10"));
+        let r = analyze_continuous(&c).unwrap();
+        assert_eq!(r["summands"]["diagonal_sum"], "2");
+        assert_eq!(r["summands"]["sum_norm_squared"], "2");
+        assert_eq!(r["summands"]["aggregate_off_diagonal"], "0");
+        assert_eq!(r["summands"]["endpoint_atom_variations"][0], "2");
+        assert_eq!(
+            r["summands"]["windows"][0]["first_summand_squared_norm"],
+            "1/4"
+        );
+        assert_eq!(r["summands"]["tail_status"], "conditional");
+        c.summands[1] = c.summands[0].clone();
+        let r = analyze_continuous(&c).unwrap();
+        assert_eq!(r["summands"]["sum_norm_squared"], "4");
+        assert_eq!(r["summands"]["aggregate_off_diagonal"], "2");
+    }
+    #[test]
+    fn independent_poisson_route_retains_pole_correction_and_explicit_tail() {
+        let mut o = AdditiveOverlap {
+            source: profile("reflected tent samples", &[("0", "1"), ("1", "0")]),
+            coordinates: vec!["1/2".into(), "2".into()],
+            fourier_terms: 16,
+        };
+        let a = analyze_overlap(&o, 128).unwrap();
+        assert_eq!(a["zero_correction_constraints_hold"], false);
+        for row in a["rows"].as_array().unwrap() {
+            assert_eq!(row["overlap_consistent"], true);
+        }
+        assert!(!contains(&a["rows"][0]["pole_correction"], "0"));
+        o.fourier_terms = 64;
+        let b = analyze_overlap(&o, 192).unwrap();
+        assert!(
+            rat(&b["rows"][0]["omitted_fourier_terms_upper"])
+                < rat(&a["rows"][0]["omitted_fourier_terms_upper"])
+        );
+        o.source = profile(
+            "zero constraints",
+            &[("0", "0"), ("1", "1"), ("2", "-1"), ("3", "0")],
+        );
+        let c = analyze_overlap(&o, 128).unwrap();
+        assert_eq!(c["zero_constraints_hold"], true);
+        for row in c["rows"].as_array().unwrap() {
+            assert_eq!(row["overlap_consistent"], true);
+        }
+    }
+    #[test]
+    fn extension_capture_is_private_replayable_and_joins_existing_groups() {
+        let dir = xc_core::test_support::TestDir::new("energy-extension-replay");
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(ZipJsonFilesystemCacheStore::new(
+                "local",
+                dir.to_path_buf(),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let cache = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            acceptance: Some(&policy),
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            ordered_overlays: vec!["local".into()],
+            ..context()
+        };
+        let p = projection();
+        let c = continuous();
+        let first = capture_projection(&p, &cache).unwrap();
+        let replay = capture_projection(&p, &cache).unwrap();
+        assert!(first.produced_manifest.is_some() && replay.reused_manifest.is_some());
+        assert_eq!(first.value.data, replay.value.data);
+        let first = capture_continuous(&c, &cache).unwrap();
+        let replay = capture_continuous(&c, &cache).unwrap();
+        assert!(first.produced_manifest.is_some() && replay.reused_manifest.is_some());
+        assert_eq!(first.value.data, replay.value.data);
+        let mut public = context();
+        public.write_visibility = CacheVisibility::Public;
+        assert!(capture_projection(&p, &public).is_err());
+        assert!(capture_continuous(&c, &public).is_err());
+        let (s, sm, m) = fixture();
+        let mut i = component_input(&sm, &m);
+        i.finite_diagnostics.as_mut().unwrap().projection_energy = Some(p);
+        i.finite_diagnostics.as_mut().unwrap().continuous_energy = Some(c);
+        for (group, field) in [
+            ("finite_tail_bound", "projection_energy"),
+            ("trial_vector_energy", "continuous_energy"),
+        ] {
+            let a = f::capture(group, &s, Some(&m), None, Some(&i), None, &[], &cache).unwrap();
+            assert!(a.value.data.result[field].is_object());
+            assert!(a.value.data.rows.iter().any(|r| r.label == field));
+            let b = f::capture(group, &s, Some(&m), None, Some(&i), None, &[], &cache).unwrap();
+            assert!(b.reused_manifest.is_some());
+        }
+        let combined = f::capture(
+            "trial_vector_energy",
+            &s,
+            None,
+            None,
+            Some(&i),
+            None,
+            &[],
+            &cache,
+        )
+        .unwrap();
+        assert!(combined
+            .value
+            .data
+            .rows
+            .iter()
+            .any(|r| r.label == "primary_analysis" && r.outcome == "missing_input"));
+        assert!(combined
+            .value
+            .data
+            .rows
+            .iter()
+            .any(|r| r.label == "continuous_energy"));
+
+        i.finite_diagnostics.as_mut().unwrap().energy_distance = Some(f::EnergyDistancePremises {
+            matrix_digest: sm.dependencies[0].content_digest.clone(),
+            basis_id: "centered_full_V_fourier".into(),
+            metric_id: "identity-coefficient-metric-v1".into(),
+            ground_enclosure: B {
+                lower: "100000".into(),
+                upper: "100001".into(),
+            },
+            complementary_eigenvalue_lower: "200000".into(),
+            full_space_simple_ground: true,
+            provenance: "deliberately refuted synthetic premise".into(),
+        });
+        let retained = f::capture(
+            "trial_vector_energy",
+            &s,
+            Some(&m),
+            None,
+            Some(&i),
+            None,
+            &[],
+            &cache,
+        )
+        .unwrap();
+        assert!(retained.value.data.result["report"]["stages"].is_array());
+        assert!(retained
+            .value
+            .data
+            .rows
+            .iter()
+            .any(|r| r.label == "energy_distance" && r.outcome == "premise_not_verified"));
+
+        let mut execution = f::ExecutionContext {
+            certificate_error: Some("attempt at path one".into()),
+            ..Default::default()
+        };
+        let first = f::capture_with_context(
+            "finite_root_budget",
+            &s,
+            Some(&m),
+            None,
+            None,
+            None,
+            &[],
+            &cache,
+            &execution,
+        )
+        .unwrap();
+        execution.certificate_error = Some("attempt at path two".into());
+        let replay = f::capture_with_context(
+            "finite_root_budget",
+            &s,
+            Some(&m),
+            None,
+            None,
+            None,
+            &[],
+            &cache,
+            &execution,
+        )
+        .unwrap();
+        assert!(replay.reused_manifest.is_some());
+        assert_eq!(first.value.data, replay.value.data);
+    }
+}
 use rug::{float::Constant, Float};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -18,8 +601,8 @@ fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
                 size_bytes: bytes.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -1086,6 +1669,10 @@ fn independent_cohort_measures_forcing_and_withholds_unmatched_roots() {
     use xc_spectral::ccm::{convergence_capture::*, research_completion::*};
     let (s, sm, m) = fixture();
     let mut i = inputs(&sm);
+    let deferred = run("configuration_comparison", &s, Some(&m), Some(&i));
+    assert_eq!(deferred.outcome, "awaiting_cohort");
+    assert!(deferred.rows.is_empty());
+    assert!(deferred.reason.unwrap().contains("afterward"));
     i.run_once = Some(RunOnceInputs {
         completion: Some(CompletionInputs {
             comparisons: vec![ComparisonSnapshot {
@@ -1367,14 +1954,8 @@ fn band_scoring_requires_a_complete_ordered_coordinate_match() {
 
 #[test]
 fn capability_dependent_diagnostics_do_not_reuse_other_or_unspecified_backends() {
-    let root = std::env::temp_dir().join(format!(
-        "ccm-feature-identity-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root_dir = xc_core::test_support::TestDir::new("ccm-feature-identity");
+    let root = root_dir.to_path_buf();
     let (state, _, _) = fixture();
     let options = ExtensionOptions::for_source(&state);
     for id in ["transform_enclosure", "band_reconstruction"] {
@@ -1491,4 +2072,1453 @@ fn capability_dependent_diagnostics_do_not_reuse_other_or_unspecified_backends()
     }
     // This is a unique test-owned child of the platform temporary directory.
     std::fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn weighted_tail_reports_origin_mass_and_keeps_nonzero_inverse_moments() {
+    let (s, m, _) = fixture();
+    let mut i = inputs(&m);
+    i.atom_coordinate = Some("test lattice coordinate".into());
+    i.atom_coverage = Some("finite supplied table, no omitted-tail bound".into());
+    i.tail_checkpoints = vec!["0".into(), "1".into(), "4".into()];
+    for (ordinal, x, w, partition) in [
+        (1, "0", "3", "origin;ordinal=mode+1"),
+        (2, "1", "2", "nonzero_modes;ordinal=mode+1"),
+        (3, "4", "1", "nonzero_modes;ordinal=mode+1"),
+    ] {
+        i.atoms.push(WeightedAtom {
+            ordinal,
+            coordinate: x.into(),
+            weight: w.into(),
+            family: "lattice".into(),
+            partition: partition.into(),
+        });
+    }
+    let r = run("weighted_tail", &s, None, Some(&i));
+    let origin = r
+        .rows
+        .iter()
+        .filter(|row| row.label == "lattice/origin;ordinal=mode+1")
+        .collect::<Vec<_>>();
+    let nonzero = r
+        .rows
+        .iter()
+        .filter(|row| row.label == "lattice/nonzero_modes;ordinal=mode+1")
+        .collect::<Vec<_>>();
+    assert!(!origin.is_empty() && !nonzero.is_empty());
+    for row in &origin {
+        assert_eq!(row.outcome, "point_measurement");
+        assert!(row.values.contains_key("included_mass"));
+        assert!(!row.values.contains_key("weighted_inverse_moment_1"));
+        assert!(row
+            .notes
+            .iter()
+            .any(|n| n.contains("do not apply at the origin")));
+    }
+    let last = nonzero.last().unwrap();
+    assert_eq!(last.outcome, "point_measurement");
+    assert!(last.values.contains_key("weighted_inverse_moment_1"));
+}
+#[test]
+fn automatic_finite_recipes_keep_fixed_proposals_and_need_no_future_results() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let (s, sm, matrix) = fixture();
+    let mut input = inputs(&sm);
+    input.target = Some(SampledReference {
+        definition_digest: ContentDigest::sha256(b"constant finite test reference"),
+        evaluation_policy: "constant exact test points".into(),
+        approximation_scope: "finite constant function only".into(),
+        intervals: 8,
+        values: vec!["1".into(); 9],
+        basis_values: vec![],
+        fixed_second_component: None,
+        raw_normalizer: "1".into(),
+        trial_coefficients: Some(vec!["0".into(), "1".into(), "0".into()]),
+    });
+    let analyze = |id, input| {
+        f::capture(id, &s, Some(&matrix), None, input, None, &[], &context())
+            .unwrap()
+            .value
+            .data
+    };
+    let cluster = analyze("spectral_cluster_bound", None);
+    // The fixed window [-3,9] contains both even eigenvalues 3 and 4.
+    // It must not silently shrink until a rank-one certificate succeeds.
+    assert_eq!(cluster.rows[0].outcome, "unresolved");
+    for id in ["finite_tail_bound", "directional_error_bound"] {
+        assert_eq!(
+            analyze(id, None).rows[0].outcome,
+            "certified_finite_enclosure",
+            "{id}"
+        );
+    }
+    let fit = analyze("constrained_l1_fit", Some(&input));
+    assert_eq!(fit.result["fit"]["witness"]["coefficients"][0], "1");
+    assert_eq!(fit.result["basis_dimension"], 1);
+    assert_eq!(fit.result["equality_constraints"], 0);
+    let profile = analyze("continuous_l1_bound", Some(&input));
+    assert_eq!(profile.rows.len(), 2);
+    for row in profile.rows {
+        assert_eq!(row.outcome, "certified_finite_enclosure");
+        assert_eq!(
+            row.result["report"]["output"]["output"]["weighted_l1"]["upper"], "0",
+            "{row:?}"
+        );
+    }
+    assert_eq!(
+        analyze("dimension_precision_budget", Some(&input)).outcome,
+        "awaiting_cohort"
+    );
+    input.source_eigenpair = ContentDigest::sha256(b"another source");
+    assert!(f::capture(
+        "continuous_l1_bound",
+        &s,
+        Some(&matrix),
+        None,
+        Some(&input),
+        None,
+        &[],
+        &context()
+    )
+    .is_err());
+}
+
+#[test]
+fn ultra_finite_interfaces_execute_every_supplied_problem_and_keep_absence_records() {
+    use xc_solver::convergence as c;
+    use xc_spectral::ccm::{
+        capture::{CcmCapturePlan, FINITE_DIAGNOSTICS},
+        convergence_capture::finite_capture as f,
+    };
+    let (s, m, matrix) = fixture();
+    let plan = CcmCapturePlan::ultra(2, 2).unwrap();
+    assert!(FINITE_DIAGNOSTICS.iter().all(|id| plan
+        .receipt()
+        .unwrap()
+        .outcomes()
+        .contains_key(*id)));
+    let missing = capture_and_persist(
+        &plan,
+        FINITE_DIAGNOSTICS.iter().map(|s| s.to_string()).collect(),
+        |id| {
+            CapturedDiagnostic::from_cached(
+                f::capture(id, &s, Some(&matrix), None, None, None, &[], &context()).unwrap(),
+            )
+            .map_err(CaptureFailure::failed)
+        },
+        &context(),
+    )
+    .unwrap()
+    .value;
+    assert_eq!(missing.measurements.len(), FINITE_DIAGNOSTICS.len());
+    assert_eq!(
+        missing.coverage()["constrained_l1_fit"].outcome,
+        "awaiting_source"
+    );
+    assert_eq!(
+        missing.coverage()["trial_vector_energy"].outcome,
+        "certified_finite_enclosure"
+    );
+    assert_ne!(
+        missing.coverage()["indexed_prolate_comparison"].outcome,
+        "certified_finite_enclosure"
+    );
+    let bounds = |s: &str| c::ExactBounds::point(s);
+    let form = |entries: Vec<&str>| c::TrialForm {
+        source_id: "explicit-independent-test-matrix".into(),
+        basis_id: "test".into(),
+        normalization_id: "euclidean".into(),
+        dimension: 2,
+        entries: entries.into_iter().map(bounds).collect(),
+    };
+    let root = c::RootProblem {
+        source_id: "test-rational-function".into(),
+        branch_id: "test".into(),
+        requested_index: 1,
+        weights: vec![bounds("1"), bounds("1")],
+        poles: vec![bounds("-1"), bounds("1")],
+        bracket: c::ExactBounds {
+            lower: "-1/4".into(),
+            upper: "1/4".into(),
+        },
+        center: "0".into(),
+        value_error_upper: "0".into(),
+        derivative_error_upper: "0".into(),
+        taylor_order: 8,
+    };
+    let mut input = inputs(&m);
+    let mut extra = f::Inputs {
+        scope: "synthetic independent supplied premises; no physical operator assertion".into(),
+        ..Default::default()
+    };
+    extra.l1 = Some(xc_solver::weighted_l1::WeightedL1Problem {
+        schema_version: 1,
+        basis_id: "test".into(),
+        target_id: "test-target".into(),
+        normalization_id: "raw".into(),
+        quadrature_id: "finite-grid".into(),
+        basis: vec![vec!["1".into()], vec!["1".into()], vec!["1".into()]],
+        target: vec!["0".into(), "1".into(), "9".into()],
+        weights: vec!["1".into(); 3],
+        constraints: vec![],
+        rhs: vec![],
+    });
+    extra.trials = Some(f::TrialSeries {
+        basis_id: "centered_full_V_fourier".into(),
+        scope: "synthetic full-coordinate trial with two independent corrections".into(),
+        baseline: f::Vector {
+            label: "base".into(),
+            coefficients: vec![bounds("0"), bounds("1"), bounds("0")],
+        },
+        corrections: vec![f::Vector {
+            label: "correction".into(),
+            coefficients: vec![bounds("1"), bounds("0"), bounds("0")],
+        }],
+        provenance: BTreeMap::from([("domain".into(), "finite source window".into())]),
+    });
+    extra.convergence = BTreeMap::from([
+        ("finite_root_budget".into(), c::Problem::Root(root.clone())),
+        (
+            "directional_error_bound".into(),
+            c::Problem::Directional(c::DirectionalProblem {
+                matrix: form(vec!["2", "0", "0", "3"]),
+                rhs: vec![bounds("2"), bounds("3")],
+                approximate_solution: vec![bounds("0"), bounds("0")],
+                functional: vec![bounds("1"), bounds("1")],
+                approximate_dual: vec![bounds("1/2"), bounds("1/3")],
+                coercivity_lower: "1".into(),
+            }),
+        ),
+        (
+            "finite_tail_bound".into(),
+            c::Problem::TailBlock(c::TailBlockProblem {
+                matrix: form(vec!["2", "1", "1", "4"]),
+                retained_dimension: 1,
+                shift: bounds("0"),
+                gap_lower: "3".into(),
+            }),
+        ),
+        (
+            "dimension_precision_budget".into(),
+            c::Problem::Budget(c::BudgetProblem {
+                branch_id: "test".into(),
+                target_absolute_error: "1/100".into(),
+                candidates: vec![c::BudgetCandidate {
+                    modes: 2,
+                    precision_bits: 128,
+                    root,
+                }],
+                truncation: None,
+                cutoff: None,
+                reference_assisted: false,
+            }),
+        ),
+        (
+            "normalization_error_bound".into(),
+            c::Problem::Normalization(c::NormalizationProblem {
+                source_id: "test".into(),
+                raw_norm_error_upper: "1/10".into(),
+                reference_norm_upper: "2".into(),
+                source_normalizer: bounds("2"),
+                reference_normalizer: bounds("3"),
+                normalizer_difference_upper: "1".into(),
+            }),
+        ),
+        (
+            "continuous_l1_bound".into(),
+            c::Problem::Profile(c::ProfileProblem {
+                source_id: "test".into(),
+                validation_grid_id: "validation".into(),
+                training_grid_id: Some("training".into()),
+                cells: vec![c::ProfileCell {
+                    left: "0".into(),
+                    right: "1".into(),
+                    left_residual: bounds("1"),
+                    right_residual: bounds("1"),
+                    weight: bounds("1"),
+                    second_derivative_upper: "0".into(),
+                    additional_sup_error_upper: "0".into(),
+                }],
+            }),
+        ),
+        (
+            "spectral_cluster_bound".into(),
+            c::Problem::Cluster(c::ClusterProblem {
+                matrix: form(vec!["1", "0", "0", "3"]),
+                spectral_window: c::ExactBounds {
+                    lower: "0".into(),
+                    upper: "2".into(),
+                },
+                columns: vec![vec![bounds("1"), bounds("0")]],
+                shifts: vec!["1".into()],
+                gram_lower: "1/2".into(),
+                previous_columns: None,
+            }),
+        ),
+    ]);
+    input.finite_diagnostics = Some(extra);
+    input.validate().unwrap();
+    let all = capture_and_persist(
+        &plan,
+        FINITE_DIAGNOSTICS.iter().map(|s| s.to_string()).collect(),
+        |id| {
+            CapturedDiagnostic::from_cached(
+                f::capture(
+                    id,
+                    &s,
+                    Some(&matrix),
+                    None,
+                    Some(&input),
+                    None,
+                    &[],
+                    &context(),
+                )
+                .unwrap(),
+            )
+            .map_err(CaptureFailure::failed)
+        },
+        &context(),
+    )
+    .unwrap()
+    .value;
+    all.validate().unwrap();
+    assert_eq!(all.measurements.len(), FINITE_DIAGNOSTICS.len());
+    for id in FINITE_DIAGNOSTICS {
+        assert_eq!(
+            all.measurements[*id].value["data"]["outcome"], "computed",
+            "{id}"
+        );
+    }
+    let data = &all.measurements["trial_vector_energy"].value["data"]["result"];
+    assert_eq!(
+        data["report"]["energy"]["total"],
+        json!({"lower":"7","upper":"7"})
+    );
+    assert_eq!(
+        data["report"]["norm"]["total"],
+        json!({"lower":"2","upper":"2"})
+    );
+    assert_eq!(
+        data["report"]["stages"][1]["measurement"]["normalized"]["rayleigh_quotient"],
+        json!({"lower":"7/2","upper":"7/2"})
+    );
+    assert_eq!(data["report"]["stages"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        data["report"]["energy_pairings"].as_array().unwrap().len(),
+        4
+    );
+    assert_eq!(
+        all.measurements["constrained_l1_fit"].value["data"]["result"]["witness"]["coefficients"],
+        json!(["1"])
+    );
+    // Numerical incomplete budgets remain qualified despite successful acquisition.
+    assert_ne!(
+        all.coverage()["dimension_precision_budget"].outcome,
+        "certified_finite_enclosure"
+    );
+    let mut changed = input.clone();
+    let mut auto = input.clone();
+    auto.finite_diagnostics
+        .as_mut()
+        .unwrap()
+        .convergence
+        .remove("normalization_error_bound");
+    auto.target=Some(serde_json::from_value(json!({"definition_digest":ContentDigest::sha256(b"finite projection"),"evaluation_policy":"finite test","approximation_scope":"finite coefficients only","intervals":8,"values":vec!["2";9],"basis_values":[],"fixed_second_component":null,"raw_normalizer":"2","trial_coefficients":["0","2","0"]})).unwrap());
+    let normalized = f::capture(
+        "normalization_error_bound",
+        &s,
+        None,
+        None,
+        Some(&auto),
+        None,
+        &[],
+        &context(),
+    )
+    .unwrap();
+    assert_eq!(normalized.value.data.result["squared_difference"], "0");
+    let extra = auto.finite_diagnostics.as_mut().unwrap();
+    extra.prolate_references.push(f::ProlateReference {
+        full_index: 4,
+        source_id: "synthetic-reference".into(),
+        log_singular_value_deficit: "-10".into(),
+        precision_bits: 128,
+        quadrature_order: 32,
+        scope: "synthetic numerical reference".into(),
+        weil: Some(f::WeilReference {
+            source_id: "synthetic-weil-reference".into(),
+            sector: "even".into(),
+            zero_based_index: 0,
+            sector_dimension: 2,
+            log_absolute_eigenvalue: "-9".into(),
+        }),
+    });
+    let indexed = f::capture(
+        "indexed_prolate_comparison",
+        &s,
+        None,
+        None,
+        Some(&auto),
+        None,
+        &[],
+        &context(),
+    )
+    .unwrap();
+    assert_eq!(indexed.value.data.rows.len(), 4);
+    assert_eq!(
+        Float::with_val(
+            128,
+            Float::parse(
+                indexed.value.data.rows[3].result["log_abs_weil_over_numerical_deficit"]
+                    .as_str()
+                    .unwrap()
+            )
+            .unwrap()
+        ),
+        1
+    );
+    changed
+        .finite_diagnostics
+        .as_mut()
+        .unwrap()
+        .not_applicable
+        .insert("continuous_l1_bound".into(), "finite grid only".into());
+    assert!(changed.validate().is_err());
+    changed
+        .finite_diagnostics
+        .as_mut()
+        .unwrap()
+        .convergence
+        .remove("continuous_l1_bound");
+    let na = f::capture(
+        "continuous_l1_bound",
+        &s,
+        None,
+        None,
+        Some(&changed),
+        None,
+        &[],
+        &context(),
+    )
+    .unwrap();
+    assert_eq!(na.value.data.outcome, "not_applicable");
+    assert_ne!(
+        na.value.request,
+        all.measurements["continuous_l1_bound"].value["request"]
+    );
+    changed.source_eigenpair = ContentDigest::sha256(b"foreign state");
+    assert!(f::capture(
+        "continuous_l1_bound",
+        &s,
+        None,
+        None,
+        Some(&changed),
+        None,
+        &[],
+        &context()
+    )
+    .is_err());
+    let mut public = context();
+    public.write_visibility = CacheVisibility::Public;
+    assert!(f::capture(
+        "trial_vector_energy",
+        &s,
+        Some(&matrix),
+        None,
+        None,
+        None,
+        &[],
+        &public
+    )
+    .is_err());
+}
+
+#[test]
+fn finite_capture_sign_and_reference_joins_are_explicit() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let (s, m, _) = fixture();
+    let mut input = inputs(&m);
+    input.finite_diagnostics = Some(f::Inputs {
+        scope: "synthetic".into(),
+        ..Default::default()
+    });
+    let r = f::ProlateReference {
+        full_index: 4,
+        source_id: "synthetic-deficit".into(),
+        log_singular_value_deficit: "-10".into(),
+        precision_bits: 128,
+        quadrature_order: 32,
+        scope: "synthetic point".into(),
+        weil: Some(f::WeilReference {
+            source_id: "synthetic-spectrum".into(),
+            sector: "even".into(),
+            zero_based_index: 0,
+            sector_dimension: 2,
+            log_absolute_eigenvalue: "-9".into(),
+        }),
+    };
+    input
+        .finite_diagnostics
+        .as_mut()
+        .unwrap()
+        .prolate_references
+        .push(r);
+    let result = f::capture(
+        "indexed_prolate_comparison",
+        &s,
+        None,
+        None,
+        Some(&input),
+        None,
+        &[],
+        &context(),
+    )
+    .unwrap();
+    // Independent elementary expression for full mode 4. D=-log(deficit).
+    assert_eq!(result.value.data.result["convention"], "D=-log(deficit)");
+    assert_eq!(result.value.data.result["logarithm"], "natural");
+    assert_eq!(
+        result.value.request["indexed_prolate_convention"],
+        result.value.data.result
+    );
+    let log_asym = ((16384.0 / 3.0) * 2f64.sqrt() * std::f64::consts::PI.powi(5)).ln()
+        - 36.0 * std::f64::consts::PI
+        + 4.5 * 9f64.ln();
+    let expected = 10.0 - (-log_asym);
+    assert!(expected < 0.0);
+    near(
+        result.value.data.rows[3].result["D_numerical_minus_D_asymptotic"]
+            .as_str()
+            .unwrap(),
+        expected,
+        1e-12,
+    );
+    for (sector, index, dimension, mode) in [
+        ("odd", 0, 2, 4),
+        ("full", 0, 3, 4),
+        ("even", 999, 2, 4),
+        ("even", 0, 0, 4),
+        ("even", 0, 2, 6),
+    ] {
+        let mut bad = input.clone();
+        let r = &mut bad.finite_diagnostics.as_mut().unwrap().prolate_references[0];
+        r.full_index = mode;
+        let w = r.weil.as_mut().unwrap();
+        w.sector = sector.into();
+        w.zero_based_index = index;
+        w.sector_dimension = dimension;
+        assert!(bad.validate().is_err());
+    }
+}
+
+#[test]
+fn finite_capture_final_norm_controls_assurance() {
+    use xc_solver::trial_energy::ExactBounds;
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let (s, m, matrix) = fixture();
+    for bounds in [
+        ExactBounds::point("0"),
+        ExactBounds {
+            lower: "-1".into(),
+            upper: "1".into(),
+        },
+    ] {
+        let mut input = inputs(&m);
+        input.finite_diagnostics = Some(f::Inputs {
+            scope: "synthetic".into(),
+            trials: Some(f::TrialSeries {
+                basis_id: "centered_full_V_fourier".into(),
+                scope: "finite".into(),
+                baseline: f::Vector {
+                    label: "zero-or-uncertain".into(),
+                    coefficients: vec![bounds; 3],
+                },
+                corrections: vec![],
+                provenance: BTreeMap::new(),
+            }),
+            ..Default::default()
+        });
+        for id in ["trial_vector_energy", "trial_vector_parity"] {
+            let r = f::capture(
+                id,
+                &s,
+                Some(&matrix),
+                None,
+                Some(&input),
+                None,
+                &[],
+                &context(),
+            )
+            .unwrap();
+            assert_eq!(r.value.data.rows[0].outcome, "unresolved");
+            let stages = r.value.data.result["report"]["stages"].as_array().unwrap();
+            assert_eq!(
+                stages.last().unwrap()["measurement"]["status"],
+                "norm_not_separated_from_zero"
+            );
+            assert_ne!(
+                NumericalCoverage::from_value(&serde_json::to_value(&r.value).unwrap()).outcome,
+                "certified_finite_enclosure"
+            );
+        }
+    }
+}
+
+#[test]
+fn finite_capture_center_normalization_removes_scale_and_sign_artifacts() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let (s, m, matrix) = fixture();
+    for target in [vec!["0", "-2", "0"], vec!["1", "3", "0"]] {
+        let mut input = inputs(&m);
+        input.target=Some(serde_json::from_value(json!({"definition_digest":ContentDigest::sha256(b"test target"),"evaluation_policy":"finite test","approximation_scope":"finite coefficients only","intervals":8,"values":vec!["2";9],"basis_values":[],"fixed_second_component":null,"raw_normalizer":"2","trial_coefficients":target})).unwrap());
+        let r = f::capture(
+            "normalization_error_bound",
+            &s,
+            None,
+            None,
+            Some(&input),
+            None,
+            &[],
+            &context(),
+        )
+        .unwrap();
+        let e = f::capture(
+            "trial_vector_energy",
+            &s,
+            Some(&matrix),
+            None,
+            Some(&input),
+            None,
+            &[],
+            &context(),
+        )
+        .unwrap();
+        if target[1] == "-2" {
+            assert_eq!(r.value.data.result["squared_difference"], "0");
+            assert_eq!(
+                r.value.data.result["normalized_norm_error"],
+                json!({"lower":"0","upper":"0"})
+            );
+            assert!(
+                e.value.data.result["trial_series"]["corrections"][0]["coefficients"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|b| b["lower"] == "0" && b["upper"] == "0")
+            );
+        } else {
+            // x=(0,1,0), y=(1,3,0); centers 1 and 2. Squared distance=1/2.
+            assert_eq!(r.value.data.result["squared_difference"], "1/2");
+            let norm = &r.value.data.result["normalized_norm_error"];
+            let lo = rug::Rational::from_str_radix(norm["lower"].as_str().unwrap(), 10).unwrap();
+            let hi = rug::Rational::from_str_radix(norm["upper"].as_str().unwrap(), 10).unwrap();
+            assert!(rug::Rational::from(&lo * &lo) <= rug::Rational::from((1, 2)));
+            assert!(rug::Rational::from(&hi * &hi) >= rug::Rational::from((1, 2)));
+            assert!(hi - lo < rug::Rational::from((1, rug::Integer::from(1) << 120)));
+        }
+        assert_eq!(
+            e.value.data.result["trial_series"]["provenance"]["source_center_normalizer"],
+            "1"
+        );
+    }
+}
+
+#[test]
+fn finite_capture_resource_limits_do_not_poison_warm_replay() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let (s, _, matrix) = fixture();
+    let dir = xc_core::test_support::TestDir::new("finite-resource-replay");
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(ZipJsonFilesystemCacheStore::new(
+            "local",
+            dir.to_path_buf(),
+            true,
+            CacheVisibility::Local,
+        )),
+    }]);
+    let policy = CachePolicy {
+        current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        minimum_quality: CacheQuality::Validated,
+        accepted_schema_versions: vec![1],
+        allow_deprecated: false,
+        allow_quarantined: false,
+        allowed_visibilities: vec![CacheVisibility::Local],
+    };
+    let cache = ArtifactCacheContext {
+        resolver: Some(&resolver),
+        acceptance: Some(&policy),
+        mode: ArtifactExecutionCacheMode::PreferReuse,
+        write_on_miss: true,
+        ordered_overlays: vec!["local".into()],
+        ..context()
+    };
+    let run = |execution: &f::ExecutionContext| {
+        f::capture_with_context(
+            "trial_vector_energy",
+            &s,
+            Some(&matrix),
+            None,
+            None,
+            None,
+            &[],
+            &cache,
+            execution,
+        )
+        .unwrap()
+    };
+    let mut limit = f::ExecutionContext::default();
+    limit.policy.maximum_working_bytes = 1000;
+    let blocked = run(&limit);
+    assert_eq!(blocked.value.data.outcome, "blocked");
+    assert!(blocked.produced_manifest.is_none() && blocked.reused_manifest.is_none());
+    limit.policy.maximum_working_bytes = 96 << 30;
+    limit.policy.maximum_output_bytes = 1;
+    let output = run(&limit);
+    assert_eq!(output.value.data.outcome, "blocked");
+    assert!(output.produced_manifest.is_none() && output.reused_manifest.is_none());
+    limit.policy.maximum_output_bytes = 8 << 30;
+    let computed = run(&limit);
+    assert!(computed.produced_manifest.is_some());
+    limit.policy.maximum_working_bytes = 8 << 30;
+    let replay = run(&limit);
+    assert!(replay.reused_manifest.is_some());
+    assert_eq!(
+        serde_json::to_value(&computed.value).unwrap(),
+        serde_json::to_value(&replay.value).unwrap()
+    );
+    assert_eq!(blocked.value.request, computed.value.request);
+    // Even a small execution cap can reuse already-completed content.
+    limit.policy.maximum_working_bytes = 1000;
+    assert!(run(&limit).reused_manifest.is_some());
+    let mut profiles = profile_request();
+    let cold = f::capture_target_profiles(&profiles, &cache).unwrap();
+    let warm = f::capture_target_profiles(&profiles, &cache).unwrap();
+    assert!(cold.produced_manifest.is_some() && warm.reused_manifest.is_some());
+    assert_eq!(cold.value.data, warm.value.data);
+    profiles.profiles[0].real[2] = xc_solver::trial_energy::ExactBounds::point("2");
+    let changed = f::capture_target_profiles(&profiles, &cache).unwrap();
+    assert_ne!(
+        cold.produced_manifest.unwrap().key,
+        changed.produced_manifest.unwrap().key
+    );
+}
+
+#[test]
+fn finite_capture_refuted_premise_is_evidence_but_bad_shape_is_error() {
+    use xc_solver::convergence as c;
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let (s, m, _) = fixture();
+    let mut input = inputs(&m);
+    let b = c::ExactBounds::point;
+    let mut p = c::DirectionalProblem {
+        matrix: c::TrialForm {
+            source_id: "finite".into(),
+            basis_id: "test".into(),
+            normalization_id: "unit".into(),
+            dimension: 1,
+            entries: vec![b("2")],
+        },
+        rhs: vec![b("1")],
+        approximate_solution: vec![b("0")],
+        functional: vec![b("1")],
+        approximate_dual: vec![b("0")],
+        coercivity_lower: "5".into(),
+    };
+    input.finite_diagnostics = Some(f::Inputs {
+        scope: "synthetic".into(),
+        convergence: BTreeMap::from([(
+            "directional_error_bound".into(),
+            c::Problem::Directional(p.clone()),
+        )]),
+        ..Default::default()
+    });
+    let run = |i: &ExternalResearchInputs| {
+        f::capture(
+            "directional_error_bound",
+            &s,
+            None,
+            None,
+            Some(i),
+            None,
+            &[],
+            &context(),
+        )
+    };
+    let r = run(&input).unwrap();
+    assert_eq!(r.value.data.outcome, "computed");
+    assert_eq!(r.value.data.rows[0].outcome, "premise_not_verified");
+    assert!(r
+        .value
+        .data
+        .reason
+        .unwrap()
+        .contains("finite form is not positive definite"));
+    p.rhs.clear();
+    input
+        .finite_diagnostics
+        .as_mut()
+        .unwrap()
+        .convergence
+        .insert("directional_error_bound".into(), c::Problem::Directional(p));
+    assert!(run(&input).is_err());
+}
+
+fn complex_vector(
+    label: &str,
+    real: &[&str],
+    imaginary: &[&str],
+) -> xc_spectral::ccm::convergence_capture::finite_capture::ComplexVector {
+    use xc_solver::trial_energy::ExactBounds as B;
+    xc_spectral::ccm::convergence_capture::finite_capture::ComplexVector {
+        label: label.into(),
+        real: real.iter().map(|v| B::point(*v)).collect(),
+        imaginary: imaginary.iter().map(|v| B::point(*v)).collect(),
+    }
+}
+fn profile_request() -> xc_spectral::ccm::convergence_capture::finite_capture::ProfileRequest {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let target = complex_vector("reference", &["0", "1", "0"], &["0", "0", "0"]);
+    f::ProfileRequest {
+        basis_id: "centered_full_V_fourier".into(),
+        lambda_squared: "4".into(),
+        scope: "synthetic finite functions".into(),
+        definition_digest: ContentDigest::sha256(b"finite synthetic profile"),
+        profiles: vec![
+            complex_vector("candidate", &["0", "1", "1"], &["0", "0", "0"]),
+            target.clone(),
+        ],
+        functional: f::BoundedFunctional {
+            id: "synthetic inner product".into(),
+            reference: target,
+            denominator: f::FunctionalDenominator::ReferenceSquaredNorm,
+        },
+        intervals_per_half: 8,
+        precision_bits: 128,
+    }
+}
+#[test]
+fn functional_normalization_is_not_a_least_squares_fit_and_survives_zero_center() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let request = profile_request();
+    let result = f::analyze_profiles(&request).unwrap();
+    assert_eq!(result["normalizers"][0]["functional"]["real"]["lower"], "1");
+    assert_eq!(result["pairs"][0]["status"], "unresolved"); // center 1-1=0
+    let pair = &result["pairs"][1];
+    let upper = rug::Rational::from_str_radix(
+        result["functional_weighted_l1_dual_bounds"]["full_window_upper"]
+            .as_str()
+            .unwrap(),
+        10,
+    )
+    .unwrap()
+    .to_f64();
+    assert!((upper - 2.0f64.sqrt() / 4.0f64.ln()).abs() < 1e-14);
+    assert_eq!(
+        result["normalizers"][0]["reciprocal_even_point_coefficients"],
+        false
+    );
+    assert_eq!(pair["normalization"], "bounded_functional");
+    assert_eq!(pair["coefficient_l2_difference"]["lower"], "1");
+    assert_eq!(pair["coefficient_l2_difference"]["upper"], "1");
+    // Least-squares rescaling would produce squared error 1/2, not 1.
+    assert_eq!(pair["halves"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        pair["halves"][0]["signed_residual_samples"]
+            .as_array()
+            .unwrap()
+            .len(),
+        9
+    );
+    // The residual is a unit-modulus Fourier mode. Its integral on [1,2]
+    // is exactly 2(sqrt(2)-1); directed cell ranges must enclose it.
+    let bound = &pair["halves"][1]["continuous_weighted_l1_enclosure"];
+    let r = |s: &serde_json::Value| {
+        rug::Rational::from_str_radix(s.as_str().unwrap(), 10)
+            .unwrap()
+            .to_f64()
+    };
+    let exact = 2.0 * (2.0f64.sqrt() - 1.0);
+    assert!(r(&bound["lower"]) <= exact && r(&bound["upper"]) >= exact);
+    let mut rotated = request.clone();
+    rotated.profiles[0] = complex_vector("candidate", &["0", "0", "0"], &["0", "3", "3"]);
+    let rotated = f::analyze_profiles(&rotated).unwrap();
+    assert_eq!(
+        rotated["pairs"][1]["coefficient_l2_difference"],
+        pair["coefficient_l2_difference"]
+    );
+    assert_eq!(rotated["pairs"][1]["halves"], pair["halves"]);
+}
+#[test]
+fn profile_analysis_is_bit_identical_across_thread_counts() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let mut request = profile_request();
+    request.intervals_per_half = 64;
+    // Several pairs per normalization, evaluated concurrently, keep their order.
+    request.profiles.push(complex_vector(
+        "third",
+        &["1/3", "2", "-1"],
+        &["0", "1/5", "0"],
+    ));
+    request.profiles.push(complex_vector(
+        "fourth",
+        &["-1", "1", "1/7"],
+        &["1/2", "0", "-1/9"],
+    ));
+    let run = |threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| f::analyze_profiles(&request).unwrap())
+    };
+    let serial = run(1);
+    for _ in 0..10 {
+        assert_eq!(run(4), serial);
+    }
+}
+#[test]
+fn target_only_capture_replays_without_an_eigenstate_and_blocks_publication() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let mut request = profile_request();
+    let result = f::capture_target_profiles(&request, &context()).unwrap();
+    assert!(result.value.source_dependencies.is_empty());
+    assert_eq!(result.value.data, f::analyze_profiles(&request).unwrap());
+    let mut public = context();
+    public.write_visibility = CacheVisibility::Public;
+    assert!(f::capture_target_profiles(&request, &public).is_err());
+    request.functional.denominator = f::FunctionalDenominator::Declared {
+        value: xc_solver::trial_energy::ExactBounds {
+            lower: "0".into(),
+            upper: "1".into(),
+        },
+        provenance: "synthetic exterior allowance".into(),
+        scope: "declared full-domain denominator".into(),
+    };
+    let unresolved = f::analyze_profiles(&request).unwrap();
+    assert_eq!(unresolved["pairs"][1]["status"], "unresolved");
+    assert!(unresolved["functional_operator_norm_bound"].is_null());
+}
+#[test]
+fn complex_capture_preserves_hermitian_energy_cancellation_and_parity() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let (s, m, matrix) = fixture();
+    let mut input = inputs(&m);
+    // diag(4,3,4): Q(x+iy)=3+8=11; Q(x+y) would add
+    // unrelated bilinear terms on a general matrix.
+    input.finite_diagnostics = Some(f::Inputs {
+        scope: "synthetic complex trial".into(),
+        complex_trials: Some(f::ComplexTrialSeries {
+            basis_id: "centered_full_V_fourier".into(),
+            matrix_digest: m.dependencies[0].content_digest.clone(),
+            scope: "finite coefficients".into(),
+            baseline: complex_vector("baseline", &["0", "1", "0"], &["-1", "0", "1"]),
+            corrections: vec![],
+            functional: Some(profile_request().functional),
+            provenance: BTreeMap::new(),
+        }),
+        ..Default::default()
+    });
+    let capture = |id: &str, i: &ExternalResearchInputs| {
+        f::capture(id, &s, Some(&matrix), None, Some(i), None, &[], &context())
+    };
+    let energy = capture("trial_vector_energy", &input).unwrap().value.data;
+    let report = &energy.result["report"];
+    assert_eq!(report["stages"][0]["measurement"]["energy"]["lower"], "11");
+    assert_eq!(
+        report["stages"][0]["measurement"]["squared_norm"]["lower"],
+        "3"
+    );
+    assert_eq!(
+        energy.result["functional_energy"]["rows"][0]["energy_over_functional_squared"]["lower"],
+        "11"
+    );
+    let parity = capture("trial_vector_parity", &input)
+        .unwrap()
+        .value
+        .data
+        .result;
+    assert_eq!(parity["report"]["parts"][0]["energy"]["lower"], "3");
+    assert_eq!(parity["report"]["parts"][1]["energy"]["lower"], "8");
+    assert_eq!(parity["report"]["energy_pairings"][1]["lower"], "0");
+    assert_eq!(
+        parity["report"]["stages"][1]["measurement"]["energy"]["lower"],
+        "11"
+    );
+    input
+        .finite_diagnostics
+        .as_mut()
+        .unwrap()
+        .complex_trials
+        .as_mut()
+        .unwrap()
+        .corrections
+        .push(complex_vector(
+            "correction",
+            &["0", "1", "0"],
+            &["1", "0", "-1"],
+        ));
+    let corrected = capture("trial_vector_energy", &input)
+        .unwrap()
+        .value
+        .data
+        .result;
+    assert_eq!(corrected["report"]["energy_pairings"][1]["lower"], "-5");
+    assert_eq!(
+        corrected["report"]["stages"][1]["measurement"]["energy"]["lower"],
+        "12"
+    );
+    let trial = input
+        .finite_diagnostics
+        .as_mut()
+        .unwrap()
+        .complex_trials
+        .as_mut()
+        .unwrap();
+    trial.baseline = complex_vector(
+        "overlapping_real_imaginary",
+        &["0", "1", "0"],
+        &["0", "1", "0"],
+    );
+    trial.corrections.clear();
+    let overlap = capture("trial_vector_energy", &input)
+        .unwrap()
+        .value
+        .data
+        .result;
+    assert_eq!(
+        overlap["report"]["stages"][0]["measurement"]["energy"]["lower"],
+        "6"
+    ); // Q(x+y) would incorrectly be 12.
+    input
+        .finite_diagnostics
+        .as_mut()
+        .unwrap()
+        .complex_trials
+        .as_mut()
+        .unwrap()
+        .matrix_digest = ContentDigest::sha256(b"wrong matrix");
+    assert!(capture("trial_vector_energy", &input).is_err());
+}
+#[test]
+fn even_projection_can_reduce_energy_and_increase_rayleigh_quotient() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let (mm, mb) = source(
+        "ccm_tau_matrix",
+        json!({"schema_version":2,"lambda_squared":"9","n_modes":1,"precision_bits":128,
+        "entries":["1.5","0","-0.5","0","10","0","-0.5","0","1.5"]}),
+    );
+    let (mut sm, sb) = source(
+        "ccm_weil_eigenpair",
+        json!({"schema_version":3,"lambda_squared":"9","n_modes":1,"precision_bits":128,"force_even":true,"eigenvalue":"1","eigenvector":["1","0","1"]}),
+    );
+    sm.dependencies.push(DependencyRef {
+        key: mm.key.clone(),
+        content_digest: mm.content_digest.clone(),
+        required_quality: CacheQuality::Validated,
+    });
+    let s =
+        RetainedState::from_payload(&sm, &sb, std::slice::from_ref(&sm.content_digest)).unwrap();
+    let matrix =
+        RetainedMatrix::from_payload(&mm, &mb, std::slice::from_ref(&mm.content_digest)).unwrap();
+    let mut input = inputs(&sm);
+    input.finite_diagnostics = Some(f::Inputs {
+        scope: "ordered finite spectrum 1 < 2 < 10".into(),
+        complex_trials: Some(f::ComplexTrialSeries {
+            basis_id: "centered_full_V_fourier".into(),
+            matrix_digest: mm.content_digest,
+            scope: "finite complex vector".into(),
+            baseline: complex_vector("trial", &["0", "1", "0"], &["-1", "0", "1"]),
+            corrections: vec![],
+            functional: None,
+            provenance: BTreeMap::new(),
+        }),
+        ..Default::default()
+    });
+    let r = f::capture(
+        "trial_vector_parity",
+        &s,
+        Some(&matrix),
+        None,
+        Some(&input),
+        None,
+        &[],
+        &context(),
+    )
+    .unwrap()
+    .value
+    .data
+    .result;
+    assert_eq!(
+        r["report"]["stages"][0]["measurement"]["energy"]["lower"],
+        "10"
+    );
+    assert_eq!(
+        r["report"]["stages"][1]["measurement"]["energy"]["lower"],
+        "14"
+    );
+    assert_eq!(
+        r["report"]["stages"][0]["measurement"]["normalized"]["rayleigh_quotient"]["lower"],
+        "10"
+    );
+    assert_eq!(
+        r["report"]["stages"][1]["measurement"]["normalized"]["rayleigh_quotient"]["lower"],
+        "14/3"
+    );
+}
+
+#[test]
+fn tiny_odd_norm_can_carry_material_energy() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let diagonal = format!("{}.5", 1u128 << 119);
+    let off_diagonal = format!("-{}.5", (1u128 << 119) - 1);
+    let (mm, mb) = source(
+        "ccm_tau_matrix",
+        json!({"schema_version":2,"lambda_squared":"9","n_modes":1,"precision_bits":128,
+        "entries":[diagonal,"0",off_diagonal,"0","1","0",off_diagonal,"0",diagonal]}),
+    );
+    let (mut sm, sb) = source(
+        "ccm_weil_eigenpair",
+        json!({"schema_version":3,"lambda_squared":"9","n_modes":1,"precision_bits":128,"force_even":true,"eigenvalue":"1","eigenvector":["0","1","0"]}),
+    );
+    sm.dependencies.push(DependencyRef {
+        key: mm.key.clone(),
+        content_digest: mm.content_digest.clone(),
+        required_quality: CacheQuality::Validated,
+    });
+    let s =
+        RetainedState::from_payload(&sm, &sb, std::slice::from_ref(&sm.content_digest)).unwrap();
+    let matrix =
+        RetainedMatrix::from_payload(&mm, &mb, std::slice::from_ref(&mm.content_digest)).unwrap();
+    let mut input = inputs(&sm);
+    input.finite_diagnostics = Some(f::Inputs {
+        scope: "synthetic tiny odd component".into(),
+        complex_trials: Some(f::ComplexTrialSeries {
+            basis_id: "centered_full_V_fourier".into(),
+            matrix_digest: mm.content_digest,
+            scope: "finite complex vector".into(),
+            baseline: complex_vector(
+                "trial",
+                &["0", "1", "0"],
+                &["-1/1152921504606846976", "0", "1/1152921504606846976"],
+            ),
+            corrections: vec![],
+            functional: None,
+            provenance: BTreeMap::new(),
+        }),
+        ..Default::default()
+    });
+    let r = f::capture(
+        "trial_vector_parity",
+        &s,
+        Some(&matrix),
+        None,
+        Some(&input),
+        None,
+        &[],
+        &context(),
+    )
+    .unwrap()
+    .value
+    .data
+    .result;
+    assert_eq!(r["report"]["parts"][1]["energy"]["lower"], "2");
+    assert_eq!(
+        r["report"]["parts"][1]["squared_norm"]["lower"],
+        format!("1/{}", 1u128 << 119)
+    );
+    assert_eq!(
+        r["parity_summary"]["odd_signed_energy_fraction"]["lower"],
+        "2/3"
+    );
+}
+
+#[test]
+fn zero_center_withholds_the_correction_but_keeps_raw_and_functional_energy() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let (s, m, matrix) = fixture();
+    let mut input = inputs(&m);
+    input.target = Some(SampledReference {
+        definition_digest: ContentDigest::sha256(b"zero-center synthetic reference"),
+        evaluation_policy: "stored finite projection".into(),
+        approximation_scope: "synthetic".into(),
+        intervals: 8,
+        values: vec!["0".into(); 9],
+        basis_values: vec![],
+        fixed_second_component: None,
+        raw_normalizer: "1".into(),
+        trial_coefficients: Some(vec!["0".into(), "1".into(), "1".into()]),
+    });
+    let r = f::capture(
+        "trial_vector_energy",
+        &s,
+        Some(&matrix),
+        None,
+        Some(&input),
+        None,
+        &[],
+        &context(),
+    )
+    .unwrap()
+    .value
+    .data;
+    assert_eq!(r.rows[0].outcome, "certified_finite_enclosure");
+    assert_eq!(r.result["report"]["stages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        r.result["report"]["stages"][0]["measurement"]["energy"]["lower"],
+        "3"
+    );
+    assert!(
+        r.result["trial_series"]["provenance"]["automatic_target_correction_withheld"].is_string()
+    );
+    assert_eq!(
+        r.result["functional_energy"]["rows"][0]["energy_over_functional_squared"]["lower"],
+        "12"
+    );
+}
+fn refinement_cohort() -> xc_spectral::ccm::convergence_capture::finite_capture::RefinementCohort {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    f::RefinementCohort {
+        axis: f::RefinementAxis::Dimension,
+        scope: "synthetic increasing dimension".into(),
+        relative_tolerance: "0.01".into(),
+        observations: ["100", "100.5", "101"]
+            .iter()
+            .enumerate()
+            .map(|(j, value)| f::RefinementObservation {
+                source: ContentDigest::sha256(format!("source{j}").as_bytes()),
+                matrix: ContentDigest::sha256(format!("matrix{j}").as_bytes()),
+                configuration: f::RefinementConfiguration {
+                    observable: f::RefinementObservable::Eigenvalue,
+                    domain: f::ComparisonDomain::CoefficientSpace,
+                    lambda_squared: "4".into(),
+                    branch: f::SpectralBranch::EvenGround,
+                    external_index: 1,
+                    index_origin: f::IndexOrigin::One,
+                    n_modes: j + 1,
+                    precision_bits: 128,
+                    operator_quadrature_orders: vec![64],
+                    projection_quadrature_order: 64,
+                    representation_order: 32,
+                    guard_bits: 32,
+                    certificate_precision_bits: 256,
+                    basis_id: "centered_full_V_fourier".into(),
+                    metric_id: "identity-coefficient-metric-v1".into(),
+                    operator_recipe: ContentDigest::sha256(b"fixed recipe"),
+                    target_definition: None,
+                    normalizer_id: "unit coefficient norm".into(),
+                    trial_recipe: None,
+                },
+                validity: f::ObservationValidity::Accepted,
+                value: (*value).into(),
+                enclosure: Some(xc_solver::trial_energy::ExactBounds::point(*value)),
+            })
+            .collect(),
+    }
+}
+#[test]
+fn refinement_gates_use_unrounded_adjacent_distinct_steps_and_typed_joins() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let original = refinement_cohort();
+    let result = f::analyze_refinement_cohort(&original).unwrap();
+    assert_eq!(
+        f::capture_refinement_cohort(&original, &context())
+            .unwrap()
+            .value
+            .data,
+        result
+    );
+    assert_eq!(result["operationally_stabilized"], true);
+    assert_eq!(result["enclosed_changes_below_tolerance"], true);
+    assert_eq!(result["distinct_dimension_precision_configurations"], 3);
+    let mut c = original.clone();
+    c.observations.push(c.observations[2].clone());
+    assert_eq!(
+        f::analyze_refinement_cohort(&c).unwrap()["operationally_stabilized"],
+        false
+    );
+    c = original.clone();
+    c.observations[1].validity = f::ObservationValidity::Unresolved;
+    assert_eq!(
+        f::analyze_refinement_cohort(&c).unwrap()["operationally_stabilized"],
+        false
+    );
+    c = original.clone();
+    for (o, value) in c.observations.iter_mut().zip(["98", "99", "100"]) {
+        o.value = value.into();
+        o.enclosure = Some(xc_solver::trial_energy::ExactBounds::point(value));
+    }
+    let equality = f::analyze_refinement_cohort(&c).unwrap();
+    assert_eq!(equality["rows"][2]["relative_change"], "1/100");
+    assert_eq!(equality["operationally_stabilized"], false);
+    c = original.clone();
+    c.observations[2].configuration.branch = f::SpectralBranch::OddGround;
+    assert!(f::analyze_refinement_cohort(&c).is_err());
+    c = original.clone();
+    c.observations[2].configuration.projection_quadrature_order = 128;
+    assert!(f::analyze_refinement_cohort(&c).is_err());
+    c = original.clone();
+    c.observations[2].configuration.observable = f::RefinementObservable::SquaredNorm;
+    assert!(f::analyze_refinement_cohort(&c).is_err());
+    c = original.clone();
+    c.observations[2].enclosure = Some(xc_solver::trial_energy::ExactBounds {
+        lower: "-101".into(),
+        upper: "101".into(),
+    });
+    let interval = f::analyze_refinement_cohort(&c).unwrap();
+    assert_eq!(interval["operationally_stabilized"], true);
+    assert_eq!(interval["enclosed_changes_below_tolerance"], false);
+    assert!(interval["rows"][2]["relative_change_enclosure"].is_null());
+    c = original.clone();
+    c.axis = f::RefinementAxis::OperatorQuadrature;
+    for (j, o) in c.observations.iter_mut().enumerate() {
+        o.configuration.n_modes = 1;
+        o.configuration.operator_quadrature_orders = vec![64 * (j + 1)];
+    }
+    assert_eq!(
+        f::analyze_refinement_cohort(&c).unwrap()["distinct_dimension_precision_configurations"],
+        1
+    );
+}
+#[test]
+fn energy_distance_uses_absolute_complement_floor_and_refuses_inconsistency() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let mut p = f::EnergyDistancePremises {
+        matrix_digest: ContentDigest::sha256(b"finite matrix"),
+        basis_id: "centered_full_V_fourier".into(),
+        metric_id: "identity-coefficient-metric-v1".into(),
+        ground_enclosure: xc_solver::trial_energy::ExactBounds {
+            lower: "1".into(),
+            upper: "2".into(),
+        },
+        complementary_eigenvalue_lower: "5".into(),
+        full_space_simple_ground: true,
+        provenance: "synthetic premises".into(),
+    };
+    assert_eq!(
+        f::energy_distance_bound(&p, "3", 128).unwrap()["squared_sine_upper"],
+        "1/2"
+    );
+    assert_eq!(
+        f::energy_distance_bound(&p, "0", 128).unwrap()["status"],
+        "premise_not_verified"
+    );
+    p.full_space_simple_ground = false;
+    assert_eq!(
+        f::energy_distance_bound(&p, "3", 128).unwrap()["status"],
+        "unresolved"
+    );
+}
+#[test]
+fn matched_spectral_triples_reject_unmatched_matrices_and_index_conventions() {
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    let seed = refinement_cohort().observations[0].clone();
+    let mut triple = [seed.clone(), seed.clone(), seed];
+    for (j, (o, branch)) in triple
+        .iter_mut()
+        .zip([
+            f::SpectralBranch::EvenGround,
+            f::SpectralBranch::OddGround,
+            f::SpectralBranch::EvenFirstExcited,
+        ])
+        .enumerate()
+    {
+        o.configuration.branch = branch;
+        o.configuration.external_index = if j == 2 { 2 } else { 1 };
+        o.value = (j + 1).to_string();
+        o.enclosure = Some(xc_solver::trial_energy::ExactBounds::point(&o.value));
+        o.source = ContentDigest::sha256(format!("branch{j}").as_bytes());
+    }
+    let r = f::analyze_matched_spectral_triple(&triple).unwrap();
+    assert_eq!(r["enclosed_even0_lt_odd0_lt_even1"], true);
+    triple[2].configuration.index_origin = f::IndexOrigin::Zero;
+    assert!(f::analyze_matched_spectral_triple(&triple).is_err());
+    triple[2].configuration.external_index = 1;
+    assert!(f::analyze_matched_spectral_triple(&triple).is_ok());
+    triple[2].matrix = ContentDigest::sha256(b"other dimension");
+    assert!(f::analyze_matched_spectral_triple(&triple).is_err());
+}
+
+#[test]
+fn high_precision_complex_profile_normalization_encloses_exact_midpoints() {
+    use rug::{Integer, Rational as R};
+    use xc_solver::trial_energy::ExactBounds as B;
+    use xc_spectral::ccm::convergence_capture::finite_capture as f;
+    // Exact accumulation before dyadic enclosure exceeds 70,000 denominator bits.
+    let tiny = R::from((Integer::from(1), Integer::from(1) << 7000));
+    let width: R = tiny.clone() / 16i32;
+    let raw = [tiny.clone(), R::from(1), tiny.clone() * 2i32];
+    let imaginary = [tiny.clone(), R::from(0), -tiny.clone()];
+    let center: R = R::from(1) - tiny.clone() * 3i32;
+    let reference: Vec<R> = raw.iter().map(|x| x.clone() / &center).collect();
+    let interval = |x: &R| B {
+        lower: (x.clone() - &width).to_string(),
+        upper: (x.clone() + &width).to_string(),
+    };
+    let mut request = profile_request();
+    request.precision_bits = 7014;
+    request.profiles = vec![
+        f::ComplexVector {
+            label: "interval candidate".into(),
+            real: raw.iter().map(interval).collect(),
+            imaginary: imaginary.iter().map(interval).collect(),
+        },
+        f::ComplexVector {
+            label: "point target".into(),
+            real: raw.iter().map(|x| B::point(x.to_string())).collect(),
+            imaginary: vec![B::point("0"); 3],
+        },
+    ];
+    request.functional.reference = f::ComplexVector {
+        label: "center-one reference".into(),
+        real: reference.iter().map(|x| B::point(x.to_string())).collect(),
+        imaginary: vec![B::point("0"); 3],
+    };
+    let result = f::analyze_profiles(&request).unwrap();
+    let norm2 = |v: &[(R, R)]| {
+        v.iter().fold(R::from(0), |sum, (r, i)| {
+            sum + r.clone() * r + i.clone() * i
+        })
+    };
+    let x: Vec<_> = raw.iter().cloned().zip(imaginary).collect();
+    let y: Vec<_> = raw.iter().cloned().map(|r| (r, R::from(0))).collect();
+    let denominator = reference
+        .iter()
+        .fold(R::from(0), |sum, r| sum + r.clone() * r);
+    let divide = |z: &(R, R), a: &(R, R)| {
+        let d = a.0.clone() * &a.0 + a.1.clone() * &a.1;
+        (
+            (z.0.clone() * &a.0 + z.1.clone() * &a.1) / &d,
+            (z.1.clone() * &a.0 - z.0.clone() * &a.1) / &d,
+        )
+    };
+    for pair in result["pairs"].as_array().unwrap() {
+        assert_eq!(pair["status"], "finite_enclosure");
+        let normalizer = |v: &[(R, R)]| {
+            v.iter()
+                .enumerate()
+                .fold((R::from(0), R::from(0)), |s, (j, z)| {
+                    let weight = if pair["normalization"] == "center" {
+                        R::from(if j == 1 { 1 } else { -1 })
+                    } else {
+                        reference[j].clone() / &denominator
+                    };
+                    (s.0 + z.0.clone() * &weight, s.1 + z.1.clone() * weight)
+                })
+        };
+        let (a, b) = (normalizer(&x), normalizer(&y));
+        let delta: Vec<_> = x
+            .iter()
+            .zip(&y)
+            .map(|(x, y)| {
+                let (x, y) = (divide(x, &a), divide(y, &b));
+                (x.0 - y.0, x.1 - y.1)
+            })
+            .collect();
+        let exact = norm2(&delta);
+        let bound = &pair["coefficient_l2_difference"];
+        let lower = R::from_str_radix(bound["lower"].as_str().unwrap(), 10).unwrap();
+        let upper = R::from_str_radix(bound["upper"].as_str().unwrap(), 10).unwrap();
+        assert!(lower >= 0);
+        assert!(lower.clone() * lower <= exact);
+        assert!(upper.clone() * upper >= exact);
+    }
 }

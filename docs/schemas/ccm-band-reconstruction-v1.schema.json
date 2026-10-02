@@ -217,7 +217,7 @@
           "minimum": 0
         },
         "resource_admission": {
-          "const": "resolved_working_bytes_v1"
+          "const": "budget_limited_results_not_retained_v2"
         },
         "duplicate_coordinate_policy": {
           "const": "all_ambiguous_members_withheld_v2"

@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use rug::{float::Round, Float};
 use xc_numerics::mpfr_interval::MpfrInterval as I;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct ValidationBounds {
     #[cfg(test)]
     pub gram_defect_upper: Float,
@@ -16,6 +16,48 @@ pub(super) struct ValidationBounds {
     #[cfg(test)]
     pub matrix_binary_exponent: i64,
     pub eigenvalue_allowance: Float,
+}
+
+// Successful proofs are pure functions of these exact points and arithmetic
+// environment. Keep only small proof results, never source matrices, and never
+// retain failures. A different byte of the source requires a fresh proof.
+std::thread_local! {
+    static CHECKED_TRANSFORMS: std::cell::RefCell<Vec<(xc_cache::ContentDigest, ValidationBounds)>> = const { std::cell::RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static FULL_TRANSFORM_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
+    pub(super) static SANITY_TRANSFORM_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn source_digest(
+    namespace: &[u8],
+    groups: &[&[Float]],
+    p: u32,
+) -> Result<xc_cache::ContentDigest> {
+    use sha2::{Digest, Sha256};
+    if !(64..=1_000_000).contains(&p) {
+        bail!("invalid validation precision");
+    }
+    let mut hash = Sha256::new();
+    hash.update(namespace.len().to_le_bytes());
+    hash.update(namespace);
+    hash.update(p.to_le_bytes());
+    hash.update(rug::float::exp_min().to_le_bytes());
+    hash.update(rug::float::exp_max().to_le_bytes());
+    hash.update(groups.len().to_le_bytes());
+    for group in groups {
+        hash.update(group.len().to_le_bytes());
+        for x in *group {
+            if !x.is_finite() || x.prec() > p {
+                bail!("nonfinite or overprecision validation source");
+            }
+            hash.update(x.prec().to_le_bytes());
+            let text = x.to_string_radix(16, None);
+            hash.update(text.len().to_le_bytes());
+            hash.update(text.as_bytes());
+        }
+    }
+    Ok(xc_cache::ContentDigest(format!("{:x}", hash.finalize())))
 }
 
 #[cfg(test)]
@@ -38,7 +80,173 @@ pub(super) fn bounds(
     n: usize,
     p: u32,
 ) -> std::result::Result<ValidationBounds, String> {
-    check(matrix, diagonal, off_diagonal, basis, n, p).map_err(|e| format!("{e:#}"))
+    if n == 0
+        || n.checked_mul(n) != Some(matrix.len())
+        || basis.len() != matrix.len()
+        || diagonal.len() != n
+        || off_diagonal.len() != n - 1
+    {
+        return Err("invalid finite sector-transform dimensions".into());
+    }
+    let namespace = format!("full-sector-transform-v1:{n}");
+    let digest = source_digest(
+        namespace.as_bytes(),
+        &[matrix, diagonal, off_diagonal, basis],
+        p,
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    if let Some(checked) = CHECKED_TRANSFORMS.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(key, _)| key == &digest)
+            .map(|(_, value)| value.clone())
+    }) {
+        return Ok(checked);
+    }
+    let checked =
+        check(matrix, diagonal, off_diagonal, basis, n, p).map_err(|e| format!("{e:#}"))?;
+    CHECKED_TRANSFORMS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 8 {
+            cache.remove(0);
+        }
+        cache.push((digest, checked.clone()));
+    });
+    Ok(checked)
+}
+
+/// Ordinary computed-reuse admission of a retained transform whose full proof
+/// recorded `allowance` when it was produced. It checks the shape, finite
+/// points, exact stored symmetry, the unit-column domain and, for three fixed
+/// columns, the complete Gram column and the complete A Q - Q T column at the
+/// same directed tolerances as the full proof. Cost is O(n^2). It detects
+/// storage and association errors; it is not a proof of the allowance, which
+/// explicit verification replays with [`bounds`].
+pub(super) fn sanity(
+    a: &[Float],
+    d: &[Float],
+    e: &[Float],
+    q: &[Float],
+    n: usize,
+    p: u32,
+    allowance: &Float,
+) -> Result<()> {
+    #[cfg(test)]
+    SANITY_TRANSFORM_CHECKS.with(|count| count.set(count.get() + 1));
+    if n == 0
+        || n.checked_mul(n) != Some(a.len())
+        || a.len() != q.len()
+        || d.len() != n
+        || e.len() != n - 1
+        || !(64..=1_000_000).contains(&p)
+        || a.iter()
+            .chain(d)
+            .chain(e)
+            .chain(q)
+            .any(|x| !x.is_finite() || x.prec() > p)
+        || !allowance.is_finite()
+        || allowance.is_sign_negative()
+    {
+        bail!("invalid retained sector-transform dimensions, points, precision or allowance");
+    }
+    for i in 0..n {
+        for j in i + 1..n {
+            if a[i * n + j] != a[j * n + i] {
+                bail!("retained sector transform requires exact stored matrix symmetry");
+            }
+        }
+    }
+    if q.iter().any(|x| x.clone().abs() > 2) {
+        bail!("sector-transform basis exceeds the unit-column domain");
+    }
+    let work = p + 64;
+    let epsilon = Float::with_val(work, 1) >> p.saturating_sub(64).max(1);
+    let mut probes = vec![0, n / 2, n - 1];
+    probes.dedup();
+    let column = |j: usize| -> Result<Vec<I>> {
+        (0..n)
+            .map(|i| Ok(I::from_float(&q[i * n + j], work)?))
+            .collect()
+    };
+    for &j in &probes {
+        let qj = column(j)?;
+        let gram = (0..n)
+            .into_par_iter()
+            .map(|k| -> Result<Float> {
+                let mut dot = I::from_i64(0, work);
+                for (i, value) in qj.iter().enumerate() {
+                    dot = dot.add(&value.mul(&I::from_float(&q[i * n + k], work)?));
+                }
+                Ok(abs(&dot.sub(&I::from_i64(i64::from(j == k), work)))?
+                    .upper()
+                    .clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut bound = Float::with_val(work, 0);
+        for value in gram {
+            bound = Float::with_val_round(work, &bound + &value, Round::Up).0;
+        }
+        if !bound.is_finite() || bound > epsilon {
+            bail!(
+                "retained sector-transform Gram column {j} exceeds requested-precision tolerance"
+            );
+        }
+    }
+    let exponent = a
+        .iter()
+        .chain(d)
+        .chain(e)
+        .filter_map(Float::get_exp)
+        .max()
+        .map_or(0, i64::from);
+    let scaled =
+        |x: &Float| -> Result<I> { Ok(I::from_float(&scale_float(x, -exponent, work)?, work)?) };
+    let mut matrix_norm_lower = Float::with_val(work, 0);
+    for row in a.chunks(n) {
+        let mut sum = Float::with_val(work, 0);
+        for x in row {
+            sum = Float::with_val_round(work, &sum + abs(&scaled(x)?)?.lower(), Round::Down).0;
+        }
+        if sum > matrix_norm_lower {
+            matrix_norm_lower = sum;
+        }
+    }
+    let threshold = Float::with_val_round(work, &epsilon * &matrix_norm_lower, Round::Down).0;
+    for &j in &probes {
+        let qj = column(j)?;
+        let neighbors = [(j > 0).then(|| j - 1), (j + 1 < n).then_some(j + 1)];
+        let dj = scaled(&d[j])?;
+        let left_e = if j > 0 {
+            Some(scaled(&e[j - 1])?)
+        } else {
+            None
+        };
+        let right_e = if j + 1 < n {
+            Some(scaled(&e[j])?)
+        } else {
+            None
+        };
+        (0..n).into_par_iter().try_for_each(|i| -> Result<()> {
+            let mut left = I::from_i64(0, work);
+            for (k, value) in qj.iter().enumerate() {
+                left = left.add(&scaled(&a[i * n + k])?.mul(value));
+            }
+            let mut right = I::from_float(&q[i * n + j], work)?.mul(&dj);
+            if let (Some(k), Some(coupling)) = (neighbors[0], &left_e) {
+                right = right.add(&I::from_float(&q[i * n + k], work)?.mul(coupling));
+            }
+            if let (Some(k), Some(coupling)) = (neighbors[1], &right_e) {
+                right = right.add(&I::from_float(&q[i * n + k], work)?.mul(coupling));
+            }
+            let entry = abs(&left.sub(&right))?;
+            if !entry.upper().is_finite() || entry.upper() > &threshold {
+                bail!("retained A Q = Q T entry ({i}, {j}) exceeds scale-relative requested-precision tolerance");
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 fn check(
@@ -49,6 +257,8 @@ fn check(
     n: usize,
     p: u32,
 ) -> Result<ValidationBounds> {
+    #[cfg(test)]
+    FULL_TRANSFORM_CHECKS.with(|count| count.set(count.get() + 1));
     if n == 0
         || n.checked_mul(n) != Some(a.len())
         || a.len() != q.len()
@@ -79,7 +289,9 @@ fn check(
         .saturating_mul(4)
         .saturating_add((n as u64).saturating_mul(6))
         .saturating_add((rayon::current_num_threads() as u64).saturating_mul(192));
-    if buffers.saturating_mul(u64::from(work).div_ceil(8) + 64) > (8u64 << 30) {
+    if buffers.saturating_mul(u64::from(work).div_ceil(8) + 64) as u128
+        > super::source_working_budget()?
+    {
         bail!("sector-transform validation exceeds numerical workspace budget");
     }
     let epsilon = Float::with_val(work, 1) >> p.saturating_sub(64).max(1);
@@ -203,6 +415,58 @@ fn check(
 mod tests {
     use super::*;
     use rug::Rational;
+    #[test]
+    fn successful_transform_proof_reuses_only_identical_sources() {
+        CHECKED_TRANSFORMS.with(|cache| cache.borrow_mut().clear());
+        FULL_TRANSFORM_CHECKS.with(|count| count.set(0));
+        let (a, d, e, q) = fixture(4, 3, 128);
+        let first = bounds(&a, &d, &e, &q, 4, 128).unwrap();
+        let second = bounds(&a, &d, &e, &q, 4, 128).unwrap();
+        assert_eq!(first.eigenvalue_allowance, second.eigenvalue_allowance);
+        assert_eq!(FULL_TRANSFORM_CHECKS.with(|count| count.get()), 1);
+        assert!(bounds(&a, &d, &e, &q, 3, 128).is_err());
+        let mut wrong = q.clone();
+        wrong[0] = Float::with_val(128, 3);
+        for expected in [2, 3] {
+            assert!(bounds(&a, &d, &e, &wrong, 4, 128).is_err());
+            assert_eq!(FULL_TRANSFORM_CHECKS.with(|count| count.get()), expected);
+        }
+        bounds(&a, &d, &e, &q, 4, 160).unwrap();
+        assert_eq!(FULL_TRANSFORM_CHECKS.with(|count| count.get()), 4);
+    }
+    #[test]
+    fn retained_sanity_probes_columns_without_the_full_proof() {
+        let p = 128;
+        for n in [1, 2, 5, 8] {
+            let (a, d, e, q) = fixture(n, 2, p);
+            let allowance = check(&a, &d, &e, &q, n, p).unwrap().eigenvalue_allowance;
+            FULL_TRANSFORM_CHECKS.with(|count| count.set(0));
+            sanity(&a, &d, &e, &q, n, p, &allowance).unwrap();
+            assert_eq!(FULL_TRANSFORM_CHECKS.with(|count| count.get()), 0);
+            assert!(sanity(&a, &d, &e, &q, n, p, &Float::with_val(p, -1)).is_err());
+            if n > 1 {
+                // A corrupted probed column fails its Gram or similarity row.
+                let mut wrong = q.clone();
+                wrong[n - 1] += Float::with_val(p, 1) >> 20;
+                assert!(sanity(&a, &d, &e, &wrong, n, p, &allowance).is_err());
+                let mut asymmetric = a.clone();
+                asymmetric[1] += 1;
+                assert!(sanity(&asymmetric, &d, &e, &q, n, p, &allowance).is_err());
+            }
+        }
+        // Sanity is not a proof: a column outside the probe set is invisible
+        // to it, while the full replay rejects the same basis.
+        let (n, p) = (8, 128);
+        let (a, d, e, q) = fixture(n, 2, p);
+        let allowance = check(&a, &d, &e, &q, n, p).unwrap().eigenvalue_allowance;
+        let mut unsampled = q.clone();
+        for row in 0..n {
+            unsampled[row * n + 2] *= 2;
+        }
+        assert!(check(&a, &d, &e, &unsampled, n, p).is_err());
+        assert!(sanity(&a, &d, &e, &unsampled, n, p, &allowance).is_ok());
+    }
+
     fn fixture(n: usize, case: usize, p: u32) -> (Vec<Float>, Vec<Float>, Vec<Float>, Vec<Float>) {
         let mut q = (0..n * n)
             .map(|j| Rational::from(i32::from(j / n == j % n)))

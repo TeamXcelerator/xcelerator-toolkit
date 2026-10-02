@@ -1036,8 +1036,8 @@ mod tests {
             payload_digest: payload_digest.clone(),
             transport_digests: vec![transport_digest],
             resolved_mathematical_configuration_digest: ContentDigest::sha256(b"configuration"),
-            producer_toolkit_version: crate::ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: crate::ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: crate::ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: crate::ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             requested_assurance: AssuranceLevel::Computed,
             claim_scope: "fixture".to_owned(),
@@ -1051,8 +1051,8 @@ mod tests {
             actor: "fixture-validator".to_owned(),
             policy_digest: ContentDigest::sha256(b"policy"),
             execution_fingerprint_digest: ContentDigest::sha256(b"fingerprint"),
-            producer_toolkit_version: crate::ToolkitVersion::parse("0.13.0").unwrap(),
-            dependency_versions: BTreeMap::from([("xc-cache".to_owned(), "0.13.0".to_owned())]),
+            producer_toolkit_version: crate::ToolkitVersion::parse("0.16.0").unwrap(),
+            dependency_versions: BTreeMap::from([("xc-cache".to_owned(), "0.16.0".to_owned())]),
             source_revision: "toolkit-revision".to_owned(),
             event_unix_seconds: 1,
             location: None,
@@ -1139,11 +1139,8 @@ mod tests {
         )
     }
 
-    fn temporary_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "xc-cache-publication-staging-{name}-{}",
-            std::process::id()
-        ))
+    fn temporary_root(name: &str) -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new(&format!("pub-staging-{name}"))
     }
 
     fn ledger() -> CapacityLedger {
@@ -1166,7 +1163,6 @@ mod tests {
     fn stages_exact_metadata_index_ledger_and_receipt_documents() {
         let (mut journal, bundle) = fixture(PublicationDestination::Private);
         let root = temporary_root("complete");
-        let _ = fs::remove_dir_all(&root);
         let metadata = stage_immutable_publication_metadata(
             &root,
             &ResourcePolicy::default(),
@@ -1209,8 +1205,8 @@ mod tests {
             manifest_digest: ContentDigest::sha256(b"prior-manifest"),
             achieved_assurance: ArtifactAssuranceState::Computed,
             disposition: ArtifactDisposition::Active,
-            producer_toolkit_version: crate::ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: crate::ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: crate::ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: crate::ToolkitVersion::parse("0.16.0").unwrap(),
             transport_digests: vec![ContentDigest::sha256(b"prior-transport")],
             publication_transaction_id: ContentDigest::sha256(b"prior-transaction").0,
         };
@@ -1331,7 +1327,6 @@ mod tests {
     fn older_toolkit_cannot_publish_after_a_newer_active_artifact() {
         let (mut journal, bundle) = fixture(PublicationDestination::Private);
         let root = temporary_root("producer-downgrade");
-        let _ = fs::remove_dir_all(&root);
         let metadata = stage_immutable_publication_metadata(
             &root,
             &ResourcePolicy::default(),
@@ -1374,8 +1369,8 @@ mod tests {
             manifest_digest: ContentDigest::sha256(b"newer-manifest"),
             achieved_assurance: ArtifactAssuranceState::Computed,
             disposition: ArtifactDisposition::Active,
-            producer_toolkit_version: crate::ToolkitVersion::parse("0.14.0").unwrap(),
-            minimum_reader_version: crate::ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: crate::ToolkitVersion::parse("0.17.0").unwrap(),
+            minimum_reader_version: crate::ToolkitVersion::parse("0.16.0").unwrap(),
             transport_digests: vec![ContentDigest::sha256(b"newer-transport")],
             publication_transaction_id: ContentDigest::sha256(b"newer-transaction").0,
         };
@@ -1421,8 +1416,8 @@ mod tests {
     #[test]
     fn public_staging_fails_closed_without_document_sanitizer() {
         let (mut journal, bundle) = fixture(PublicationDestination::Public);
-        let root = temporary_root("public-sanitizer");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = temporary_root("public-sanitizer");
+        let root = scratch.join("root");
         let error = stage_immutable_publication_metadata(
             &root,
             &ResourcePolicy::default(),
@@ -1441,8 +1436,8 @@ mod tests {
     fn public_staging_rejects_private_only_artifact_kinds_before_serialization() {
         let (mut journal, mut bundle) = fixture(PublicationDestination::Public);
         bundle.manifest.semantic_key.artifact_kind = "ccm_target_distance".to_owned();
-        let root = temporary_root("public-private-only");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = temporary_root("public-private-only");
+        let root = scratch.join("root");
         let error = stage_immutable_publication_metadata(
             &root,
             &ResourcePolicy::default(),

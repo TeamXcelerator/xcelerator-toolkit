@@ -97,6 +97,23 @@ fn retained_eigenstate_replays_parity_and_normalization() {
         .record,
     );
     assert!(decode_weil_eigenpair(&artifact, &params, &cfg, &tau).is_ok());
+    // Ordinary computed reuse keeps every quadratic gate but not the cubic
+    // ground-index proof; fresh output and explicit verification keep it.
+    ground_index::CHECKED_SOURCES.with(|cache| cache.borrow_mut().clear());
+    ground_index::FULL_GROUND_CHECKS.with(|count| count.set(0));
+    assert!(decode_weil_eigenpair_admitted(&artifact, &params, &cfg, &tau, false).is_ok());
+    assert_eq!(
+        ground_index::FULL_GROUND_CHECKS.with(|count| count.get()),
+        0
+    );
+    assert!(decode_weil_eigenpair_admitted(&artifact, &params, &cfg, &tau, true).is_ok());
+    assert_eq!(
+        ground_index::FULL_GROUND_CHECKS.with(|count| count.get()),
+        1
+    );
+    let mut stale = artifact.clone();
+    stale.inverse_iteration.final_relative_residual_norm = "1e-10".into();
+    assert!(decode_weil_eigenpair_admitted(&stale, &params, &cfg, &tau, false).is_err());
 }
 
 #[test]

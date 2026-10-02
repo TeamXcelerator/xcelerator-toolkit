@@ -179,6 +179,12 @@ impl DecimalLiteral {
         Ok(Self(value))
     }
 
+    /// Check a decimal spelling without copying it. Accepts exactly the
+    /// spellings [`DecimalLiteral::new`] accepts.
+    pub fn validate_str(value: &str) -> Result<(), ConfigError> {
+        DecimalParts::parse(value).map(|_| ())
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

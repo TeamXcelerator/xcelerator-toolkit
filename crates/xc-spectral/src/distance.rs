@@ -3,7 +3,7 @@
 
 //! Weighted distances between CCM eigenfunctions and a runtime-supplied target.
 //!
-//! Implements the collaboration's central measurement,
+//! Implements the weighted distance
 //!
 //! ```text
 //!   d(N, λ) = ∫₁^λ |f_{N,λ}(u) − target(u)| u^{−α} du
@@ -11,8 +11,6 @@
 //!
 //! together with the weighted norm `‖g‖_α = ∫₁^λ |g(u)| u^{−α} du` and the
 //! inter-discretization distance `D_α(N, M; λ) = ‖f_{N,λ} − f_{M,λ}‖_α`.
-//! The program objective is `lim_{λ→∞} lim_{N→∞} d(N, λ) = 0`, with the limits
-//! in that order: the eigenfunction must first stabilize in `N` at fixed `λ`.
 //!
 //! `f_{N,λ}` is the canonical even CCM eigenfunction reconstructed from its
 //! zero-shift, smallest-magnitude selected state. Ground-state ordering requires
@@ -25,8 +23,8 @@
 //! ## Conventions travel with results
 //!
 //! At finite resolution the value of every quantity here depends on the
-//! integration rule, the grid variable, the resolution, and `α`. Independent
-//! groups in this collaboration integrate differently, so every result type
+//! integration rule, the grid variable, the resolution, and `α`. Different
+//! implementations integrate differently, so every result type
 //! records the full convention it was computed under. A number separated from
 //! its convention is not comparable and should not be reported.
 //!
@@ -616,6 +614,13 @@ pub mod hp {
 
     /// Guard bits for internal evaluation above the requested precision.
     const GUARD_BITS: u32 = 64;
+
+    mod target_comparison;
+    pub use target_comparison::{
+        capture_target_comparison_via_cache, PortableCriticalLineMaximum, PortableTargetComparison,
+        PortableTargetComparisonLevel, PortableTargetProjection, TARGET_COMPARISON_KIND,
+        TARGET_COMPARISON_SEMANTICS,
+    };
     const RESIDUAL_MASS_CONSISTENCY_POLICY: &str =
         "snap_signed_to_absolute_within_scaled_2^(-(precision_bits-8));otherwise_reject_v1";
 
@@ -698,13 +703,21 @@ pub mod hp {
                     certification_failure_policy: cache.certification_failure_policy,
                     production_sink: cache.production_sink,
                 };
-                let resolved = xc_numerics::quadrature::gauss_legendre_nodes_via_cache(
-                    points, working, request,
+                let resolved = xc_numerics::quadrature::gauss_legendre_nodes_via_cache_scheduled(
+                    points,
+                    working,
+                    request,
+                    root_schedule(points, working),
                 )?;
                 self.0
                     .insert((points, working), (resolved.nodes, resolved.weights));
             }
             Ok(())
+        }
+
+        /// A table that is already built or resolved; never builds one.
+        fn get(&self, points: usize, working: u32) -> Option<&(Vec<Float>, Vec<Float>)> {
+            self.0.get(&(points, working))
         }
 
         fn get_or_build(
@@ -715,10 +728,11 @@ pub mod hp {
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 self.0.entry((points, working))
             {
-                entry.insert(xc_numerics::quadrature::try_gauss_legendre_nodes(
+                entry.insert(xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
                     points,
                     working,
                     xc_numerics::quadrature::CacheMode::Off,
+                    root_schedule(points, working),
                 )?);
             }
             Ok(self
@@ -726,6 +740,13 @@ pub mod hp {
                 .get(&(points, working))
                 .expect("inserted checked table"))
         }
+    }
+
+    /// Root schedule for one Gauss--Legendre table, planned from the calling
+    /// thread's HP runtime policy: root-parallel only when that policy enables
+    /// GL root parallelism, serial on Rayon workers and without a policy.
+    fn root_schedule(points: usize, working: u32) -> xc_numerics::hp_runtime::GlRootSchedule {
+        xc_numerics::hp_runtime::plan_gl_precompute(&[points], working).root_schedule(points)
     }
 
     /// Integrate `g` over `[1, λ]` under `rule` at `prec` bits.
@@ -760,10 +781,11 @@ pub mod hp {
                         (&table.0, &table.1)
                     }
                     None => {
-                        built = xc_numerics::quadrature::try_gauss_legendre_nodes(
+                        built = xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
                             points,
                             working,
                             xc_numerics::quadrature::CacheMode::Off,
+                            root_schedule(points, working),
                         )?;
                         (&built.0, &built.1)
                     }
@@ -1548,9 +1570,9 @@ pub mod hp {
 
     /// Measure `D_α(N, M; λ) = ‖f_{N,λ} − f_{M,λ}‖_α` end to end.
     ///
-    /// This is the quantity the first stage of the program is stated in: the
-    /// eigenfunction is said to stabilize at fixed `λ` when successive
-    /// `D_α(N, M; λ)` shrink. It requires no target function, so it can be
+    /// It measures stabilization in `N` at fixed `λ`: the eigenfunction
+    /// stabilizes when successive `D_α(N, M; λ)` shrink. It requires no target
+    /// function, so it can be
     /// measured before any runtime target enters the comparison.
     ///
     /// Both configurations must share `λ²`; comparing across different `λ`
@@ -1964,6 +1986,92 @@ pub mod hp {
         Ok(())
     }
 
+    fn parse_deviation_sample(text: &str, field: &str, prec: u32) -> Result<Float> {
+        let parsed = Float::parse(text)
+            .map_err(|error| anyhow::anyhow!("invalid retained {field}: {error}"))?;
+        let value = Float::with_val(prec, parsed);
+        if !value.is_finite()
+            || (value.is_zero() && xc_core::DecimalLiteral::new(text)?.canonical()?.as_str() != "0")
+        {
+            anyhow::bail!("retained {field} is outside the finite exponent range");
+        }
+        Ok(value)
+    }
+
+    pub(crate) type DeviationSamples = (Vec<Float>, Vec<Float>, Vec<Float>);
+
+    /// Abscissae, target deviations and auxiliary reference values of a
+    /// retained profile. The auxiliary profile is a pure series evaluation, so
+    /// every point is evaluated in one parallel pass up front. The loop still
+    /// meets each parse, provider and auxiliary result in the original order,
+    /// so values, provider calls and the first reported error are unchanged.
+    pub(crate) fn deviation_samples(
+        profile: &PortableEigenfunctionProfile,
+        prec: u32,
+        target: &crate::target::hp::TargetEvaluator,
+    ) -> Result<DeviationSamples> {
+        let working = prec.saturating_add(64);
+        let parsed_us = profile
+            .u_values
+            .iter()
+            .enumerate()
+            .map(|(index, u_text)| {
+                parse_deviation_sample(u_text, &format!("profile abscissa {index}"), prec)
+            })
+            .collect::<Vec<_>>();
+        let auxiliary_values = {
+            use rayon::prelude::*;
+            let auxiliary = |u: &Result<Float>| u.as_ref().ok().map(|u| target.auxiliary_value(u));
+            if xc_numerics::mpfr_interval::ensure_uniform_exponent_range().is_ok() {
+                parsed_us.par_iter().map(auxiliary).collect::<Vec<_>>()
+            } else {
+                parsed_us.iter().map(auxiliary).collect::<Vec<_>>()
+            }
+        };
+        let mut us = Vec::with_capacity(profile.u_values.len());
+        let mut deviation = Vec::with_capacity(profile.u_values.len());
+        let mut reference = Vec::with_capacity(profile.u_values.len());
+        for (index, ((u, f_text), auxiliary)) in parsed_us
+            .into_iter()
+            .zip(&profile.f_values)
+            .zip(auxiliary_values)
+            .enumerate()
+        {
+            let u = u?;
+            let f = parse_deviation_sample(f_text, &format!("profile value {index}"), prec)?;
+            let mut d = Float::with_val(working, &f);
+            d -= target.try_value(&u)?;
+            reference.push(auxiliary.expect("parsed abscissae have auxiliary values")?);
+            deviation.push(d);
+            us.push(u);
+        }
+        Ok((us, deviation, reference))
+    }
+
+    /// The serial sample loop that [`deviation_samples`] replaced.
+    #[cfg(test)]
+    pub(crate) fn deviation_samples_serial_reference(
+        profile: &PortableEigenfunctionProfile,
+        prec: u32,
+        target: &crate::target::hp::TargetEvaluator,
+    ) -> Result<DeviationSamples> {
+        let working = prec.saturating_add(64);
+        let mut us = Vec::with_capacity(profile.u_values.len());
+        let mut deviation = Vec::with_capacity(profile.u_values.len());
+        let mut reference = Vec::with_capacity(profile.u_values.len());
+        for (index, (u_text, f_text)) in profile.u_values.iter().zip(&profile.f_values).enumerate()
+        {
+            let u = parse_deviation_sample(u_text, &format!("profile abscissa {index}"), prec)?;
+            let f = parse_deviation_sample(f_text, &format!("profile value {index}"), prec)?;
+            let mut d = Float::with_val(working, &f);
+            d -= target.try_value(&u)?;
+            reference.push(target.auxiliary_value(&u)?);
+            deviation.push(d);
+            us.push(u);
+        }
+        Ok((us, deviation, reference))
+    }
+
     pub(crate) fn compute_deviation_decomposition_payload(
         profile: &PortableEigenfunctionProfile,
         prec: u32,
@@ -1985,19 +2093,6 @@ pub mod hp {
             anyhow::bail!("deviation decomposition requires at least two profile samples");
         }
 
-        let parse = |text: &str, field: &str| -> Result<Float> {
-            let parsed = Float::parse(text)
-                .map_err(|error| anyhow::anyhow!("invalid retained {field}: {error}"))?;
-            let value = Float::with_val(prec, parsed);
-            if !value.is_finite()
-                || (value.is_zero()
-                    && xc_core::DecimalLiteral::new(text)?.canonical()?.as_str() != "0")
-            {
-                anyhow::bail!("retained {field} is outside the finite exponent range");
-            }
-            Ok(value)
-        };
-
         let working = prec.saturating_add(64);
         let target = crate::target::hp::TargetEvaluator::from_environment(working)?;
         target.validate_lambda(
@@ -2006,20 +2101,7 @@ pub mod hp {
         let parameter = target
             .auxiliary_parameter()
             .ok_or_else(|| anyhow::anyhow!("target specification has no auxiliary profile"))?;
-
-        let mut us = Vec::with_capacity(profile.u_values.len());
-        let mut deviation = Vec::with_capacity(profile.u_values.len());
-        let mut reference = Vec::with_capacity(profile.u_values.len());
-        for (index, (u_text, f_text)) in profile.u_values.iter().zip(&profile.f_values).enumerate()
-        {
-            let u = parse(u_text, &format!("profile abscissa {index}"))?;
-            let f = parse(f_text, &format!("profile value {index}"))?;
-            let mut d = Float::with_val(working, &f);
-            d -= target.try_value(&u)?;
-            reference.push(target.auxiliary_value(&u)?);
-            deviation.push(d);
-            us.push(u);
-        }
+        let (us, deviation, reference) = deviation_samples(profile, prec, &target)?;
 
         let mut projections = Vec::with_capacity(2);
         for metric in [
@@ -2196,12 +2278,15 @@ pub mod hp {
         variable: GridVariable,
         prec: u32,
     ) -> (Vec<Float>, Vec<Float>) {
-        let mut u_values = Vec::with_capacity(steps + 1);
-        let mut f_values = Vec::with_capacity(steps + 1);
-        for u in profile_abscissae(lambda, steps, variable, prec) {
-            f_values.push(Float::with_val(prec, eigenfunction.eval(&u)));
-            u_values.push(Float::with_val(prec, u));
-        }
+        let abscissae: Vec<Float> = profile_abscissae(lambda, steps, variable, prec).collect();
+        let f_values = evaluate_eigenfunction_points(eigenfunction, &abscissae)
+            .into_iter()
+            .map(|value| Float::with_val(prec, value))
+            .collect();
+        let u_values = abscissae
+            .into_iter()
+            .map(|u| Float::with_val(prec, u))
+            .collect();
         (u_values, f_values)
     }
 
@@ -2553,6 +2638,90 @@ pub mod hp {
         }
     }
 
+    /// The abscissae `integrate_with` visits for a Gauss--Legendre rule with
+    /// these nodes, built with the same arithmetic. They only seed
+    /// exact-value lookups, so a point that differed would cost a direct
+    /// evaluation, never a different value.
+    fn gauss_legendre_rule_abscissae(
+        lambda: &Float,
+        nodes: &[Float],
+        variable: GridVariable,
+        prec: u32,
+    ) -> Vec<Float> {
+        let working = prec.saturating_add(GUARD_BITS);
+        let (lo, hi) = match variable {
+            GridVariable::U => (
+                Float::with_val(working, 1u32),
+                Float::with_val(working, lambda),
+            ),
+            GridVariable::LogU => (
+                Float::with_val(working, 0u32),
+                Float::with_val(working, lambda).ln(),
+            ),
+        };
+        if !(lo.is_finite() && hi.is_finite() && hi > lo) {
+            return Vec::new();
+        }
+        let mut mid = Float::with_val(working, &lo + &hi);
+        mid /= 2u32;
+        let mut half = Float::with_val(working, &hi - &lo);
+        half /= 2u32;
+        nodes
+            .iter()
+            .map(|node| {
+                let mut point = half.clone();
+                point *= node;
+                point += &mid;
+                match variable {
+                    GridVariable::U => point,
+                    GridVariable::LogU => point.exp(),
+                }
+            })
+            .collect()
+    }
+
+    /// The abscissae a weighted integral under `rule` visits. A
+    /// Gauss--Legendre rule contributes only when its table is already in
+    /// `tables`; nothing is built here, so no new failure can arise.
+    fn weighted_rule_abscissae(
+        rule: WeightedIntegrationRule,
+        lambda: &Float,
+        prec: u32,
+        tables: Option<&SharedGlTables>,
+    ) -> Vec<Float> {
+        if rule.validate().is_err() || !lambda.is_finite() || *lambda <= 1u32 {
+            return Vec::new();
+        }
+        match rule {
+            WeightedIntegrationRule::UniformGrid {
+                scheme,
+                variable,
+                steps,
+            } => uniform_rule_abscissae(lambda, scheme, variable, steps, prec),
+            WeightedIntegrationRule::GaussLegendre { points, variable } => tables
+                .and_then(|tables| tables.get(points, prec.saturating_add(GUARD_BITS)))
+                .map_or_else(Vec::new, |(nodes, _)| {
+                    gauss_legendre_rule_abscissae(lambda, nodes, variable, prec)
+                }),
+        }
+    }
+
+    /// Eigenfunction values at `points`, in order. Every value is computed by
+    /// [`WeilEigenfunction::eval`] alone, so the parallel pass returns the
+    /// serial values. It runs only when every worker shares the caller's MPFR
+    /// exponent range.
+    fn evaluate_eigenfunction_points(
+        eigenfunction: &WeilEigenfunction,
+        points: &[Float],
+    ) -> Vec<Float> {
+        use rayon::prelude::*;
+        if xc_numerics::mpfr_interval::ensure_uniform_exponent_range().is_ok() {
+            points.par_iter().map(|u| eigenfunction.eval(u)).collect()
+        } else {
+            points.iter().map(|u| eigenfunction.eval(u)).collect()
+        }
+    }
+
     /// Eigenfunction values for a known set of abscissae, evaluated once.
     ///
     /// Replaces a lazily-populated memoization cache. The abscissae a uniform
@@ -2608,26 +2777,42 @@ pub mod hp {
             lambda: &Float,
             prec: u32,
         ) {
-            use rayon::prelude::*;
             // Deduplicate across every requested rule before evaluating.
+            self.extend_points(rules.iter().copied().flat_map(|(scheme, variable, steps)| {
+                uniform_rule_abscissae(lambda, scheme, variable, steps, prec)
+            }));
+        }
+
+        /// Seed with no points, then evaluate the given abscissae.
+        pub(crate) fn from_points(
+            eigenfunction: &'a WeilEigenfunction,
+            points: impl IntoIterator<Item = Float>,
+        ) -> Self {
+            let mut table = Self {
+                eigenfunction,
+                values: std::collections::HashMap::new(),
+            };
+            table.extend_points(points);
+            table
+        }
+
+        /// Evaluate every previously unseen abscissa in one parallel pass.
+        /// Each value is the eigenfunction's own evaluation at that point.
+        pub(crate) fn extend_points(&mut self, points: impl IntoIterator<Item = Float>) {
             let mut pending: Vec<Float> = Vec::new();
             let mut seen: std::collections::HashSet<(Integer, i32)> =
                 self.values.keys().cloned().collect();
-            for (scheme, variable, steps) in rules.iter().copied() {
-                for u in uniform_rule_abscissae(lambda, scheme, variable, steps, prec) {
-                    let Some(key) = u.to_integer_exp() else {
-                        continue;
-                    };
-                    if seen.insert(key) {
-                        pending.push(u);
-                    }
+            for u in points {
+                let Some(key) = u.to_integer_exp() else {
+                    continue;
+                };
+                if seen.insert(key) {
+                    pending.push(u);
                 }
             }
 
-            let evaluated: Vec<(Float, Float)> = pending
-                .par_iter()
-                .map(|u| (u.clone(), self.eigenfunction.eval(u)))
-                .collect();
+            let values = evaluate_eigenfunction_points(self.eigenfunction, &pending);
+            let evaluated: Vec<(Float, Float)> = pending.into_iter().zip(values).collect();
             self.values.reserve(evaluated.len());
             for (u, value) in evaluated {
                 if let Some(key) = u.to_integer_exp() {
@@ -2742,6 +2927,190 @@ pub mod hp {
             let exact_difference = coarser.to_rational().unwrap() - 1;
             assert!(exact_difference * 100_000_000u32 > 1);
             assert!(!resolution_tolerance_met(&coarser, &finer, p));
+        }
+    }
+
+    #[cfg(test)]
+    mod parallel_evaluation_contract {
+        use super::*;
+
+        fn eigenfunction(lambda: &Float, prec: u32) -> WeilEigenfunction {
+            let n_modes = 7;
+            let mut xi: Vec<Float> = (0..(2 * n_modes + 1))
+                .map(|_| Float::with_val(prec, 0u32))
+                .collect();
+            for k in 0..=n_modes {
+                let mut value = Float::with_val(prec, 3u32);
+                value /= (k * k + 1) as u32;
+                if k % 2 == 1 {
+                    value = -value;
+                }
+                xi[n_modes + k] = value.clone();
+                xi[n_modes - k] = value;
+            }
+            WeilEigenfunction::from_v_basis(&xi, n_modes, lambda, prec).unwrap()
+        }
+
+        fn pools() -> Vec<rayon::ThreadPool> {
+            [1, 2, 5]
+                .into_iter()
+                .map(|threads| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap()
+                })
+                .collect()
+        }
+
+        fn bits(value: &Float) -> (u32, String) {
+            (value.prec(), value.to_string_radix(16, None))
+        }
+
+        /// The profile is the serial per-abscissa evaluation, bit for bit, at
+        /// every worker count.
+        #[test]
+        fn parallel_profile_equals_serial_profile() {
+            let prec = 192;
+            let lambda = Float::with_val(prec + GUARD_BITS, 13u32).sqrt();
+            let f = eigenfunction(&lambda, prec);
+            for variable in [GridVariable::U, GridVariable::LogU] {
+                let mut serial_u = Vec::new();
+                let mut serial_f = Vec::new();
+                for u in profile_abscissae(&lambda, 37, variable, prec) {
+                    serial_f.push(bits(&Float::with_val(prec, f.eval(&u))));
+                    serial_u.push(bits(&Float::with_val(prec, u)));
+                }
+                for pool in pools() {
+                    for _ in 0..3 {
+                        let (u_values, f_values) =
+                            pool.install(|| sample_profile(&f, &lambda, 37, variable, prec));
+                        assert_eq!(u_values.iter().map(bits).collect::<Vec<_>>(), serial_u);
+                        assert_eq!(f_values.iter().map(bits).collect::<Vec<_>>(), serial_f);
+                    }
+                }
+            }
+        }
+
+        /// Every abscissa a weighted integral visits is precomputed, and the
+        /// precomputed integral equals direct evaluation exactly.
+        #[test]
+        fn precomputed_rule_values_cover_every_node_and_keep_results() {
+            let prec = 192;
+            let working = prec + GUARD_BITS;
+            let lambda = Float::with_val(working, 13u32).sqrt();
+            let alpha = Float::with_val(prec, 0.5);
+            let f = eigenfunction(&lambda, prec);
+            let mut rules = Vec::new();
+            for variable in [GridVariable::U, GridVariable::LogU] {
+                for scheme in [
+                    UniformGridScheme::Trapezoid,
+                    UniformGridScheme::Midpoint,
+                    UniformGridScheme::LeftRiemann,
+                    UniformGridScheme::RightRiemann,
+                ] {
+                    rules.push(WeightedIntegrationRule::UniformGrid {
+                        scheme,
+                        variable,
+                        steps: 24,
+                    });
+                }
+                rules.push(WeightedIntegrationRule::GaussLegendre {
+                    points: 21,
+                    variable,
+                });
+            }
+            for rule in rules {
+                let mut tables = SharedGlTables::new();
+                let direct = weighted_alpha_norm_with_tables(
+                    |u: &Float| f.eval(u),
+                    &lambda,
+                    &alpha,
+                    rule,
+                    prec,
+                    Some(&mut tables),
+                )
+                .unwrap();
+                for pool in pools() {
+                    for _ in 0..2 {
+                        let values = pool.install(|| {
+                            PrecomputedEigenfunctionValues::from_points(
+                                &f,
+                                weighted_rule_abscissae(rule, &lambda, prec, Some(&tables)),
+                            )
+                        });
+                        let misses = std::cell::Cell::new(0usize);
+                        let precomputed = weighted_alpha_norm_with_tables(
+                            |u: &Float| {
+                                let known = u
+                                    .to_integer_exp()
+                                    .is_some_and(|key| values.values.contains_key(&key));
+                                misses.set(misses.get() + usize::from(!known));
+                                values.eval(u)
+                            },
+                            &lambda,
+                            &alpha,
+                            rule,
+                            prec,
+                            Some(&mut tables),
+                        )
+                        .unwrap();
+                        assert_eq!(misses.get(), 0, "{rule:?} visited an unlisted abscissa");
+                        assert_eq!(bits(&precomputed.value), bits(&direct.value), "{rule:?}");
+                    }
+                }
+            }
+        }
+
+        /// The parallel auxiliary pass returns the serial samples, and a
+        /// malformed sample still reports the first error of the serial loop.
+        #[test]
+        fn deviation_samples_equal_the_serial_loop() {
+            let prec = 192;
+            let working = prec + 64;
+            let target = crate::target::hp::TargetEvaluator::from_environment(working).unwrap();
+            let mut profile = PortableEigenfunctionProfile {
+                schema_version: 1,
+                lambda_squared: "16".to_owned(),
+                n_modes: 8,
+                precision_bits: prec,
+                grid_variable: "uniform_u".to_owned(),
+                sample_count: 41,
+                normalization: "f(1)=1".to_owned(),
+                u_values: (0..=40)
+                    .map(|k| decimal(&Float::with_val(prec, 1.0 + 0.075 * f64::from(k)), prec))
+                    .collect(),
+                f_values: (0..=40)
+                    .map(|k| decimal(&Float::with_val(prec, 1.0 - 0.01 * f64::from(k)), prec))
+                    .collect(),
+                normalized_coefficients: Vec::new(),
+            };
+            let render = |samples: Result<DeviationSamples>| match samples {
+                Ok((us, deviation, reference)) => [us, deviation, reference]
+                    .iter()
+                    .map(|values| values.iter().map(bits).collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+                    .concat(),
+                Err(error) => vec![(0, format!("error: {error}"))],
+            };
+            for corruption in [None, Some((false, 17)), Some((true, 9))] {
+                if let Some((value, index)) = corruption {
+                    let field = if value {
+                        &mut profile.f_values
+                    } else {
+                        &mut profile.u_values
+                    };
+                    field[index] = "not-a-number".to_owned();
+                }
+                let serial = render(deviation_samples_serial_reference(&profile, prec, &target));
+                for pool in pools() {
+                    for _ in 0..2 {
+                        let parallel =
+                            render(pool.install(|| deviation_samples(&profile, prec, &target)));
+                        assert_eq!(parallel, serial);
+                    }
+                }
+            }
         }
     }
 
@@ -3309,8 +3678,17 @@ pub mod hp {
                 let gl_tables = supplied_gl_tables.unwrap_or(&mut local_gl_tables);
                 let mut values = Vec::with_capacity(source.rules.len());
                 for rule in source.rules {
+                    let rule_values = PrecomputedEigenfunctionValues::from_points(
+                        source.eigenfunction,
+                        weighted_rule_abscissae(
+                            *rule,
+                            source.lambda,
+                            source.precision_bits,
+                            Some(&*gl_tables),
+                        ),
+                    );
                     values.push(signed_residual_to_target_with_tables(
-                        |u: &Float| source.eigenfunction.eval(u),
+                        |u: &Float| rule_values.eval(u),
                         source.lambda,
                         source.alpha,
                         *rule,
@@ -3935,7 +4313,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -4133,10 +4511,16 @@ pub mod hp {
             let mut distances = Vec::with_capacity(rules.len());
             let mut norm_values = Vec::with_capacity(rules.len());
             for rule in rules {
+                // The rule's abscissae are evaluated in one parallel pass;
+                // the quadrature then consumes those exact values in order.
+                let rule_values = PrecomputedEigenfunctionValues::from_points(
+                    &eigenfunction,
+                    weighted_rule_abscissae(*rule, &lambda, prec, Some(&gl_tables)),
+                );
                 let recorded_values = std::cell::RefCell::new(Vec::new());
                 let distance = distance_to_target_with_tables_bound(
                     |u: &Float| {
-                        let value = eigenfunction.eval(u);
+                        let value = rule_values.eval(u);
                         recorded_values.borrow_mut().push(value.clone());
                         value
                     },
@@ -4329,7 +4713,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -4403,7 +4787,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -4488,7 +4872,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -4557,7 +4941,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -4618,7 +5002,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -4752,17 +5136,17 @@ pub mod hp {
             let decomposition_key = bind_key(&decomposition_key, &child_dependencies);
             let evidence_request = ArtifactExecutionCacheRequest {
                 semantic_key: &evidence_key,
-                minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+                minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
                 ..evidence_request
             };
             let residual_request = ArtifactExecutionCacheRequest {
                 semantic_key: &residual_key,
-                minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+                minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
                 ..residual_request
             };
             let decomposition_request = ArtifactExecutionCacheRequest {
                 semantic_key: &decomposition_key,
-                minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+                minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
                 ..decomposition_request
             };
 
@@ -4788,7 +5172,12 @@ pub mod hp {
                     resolution_verdict(&resolved_evidence.value, &resolved_distance.value)?;
                 resolution_ladder_tolerance_met =
                     resolution_ladder_verdict(&resolved_evidence.value);
-                check_measurement_dependencies(&resolved_evidence, &child_dependencies)?;
+                check_measurement_dependencies(
+                    &resolved_evidence,
+                    &evidence_key,
+                    &child_dependencies,
+                    cache,
+                )?;
             }
 
             if derived_capture.deviation_decomposition {
@@ -4818,7 +5207,12 @@ pub mod hp {
                     check,
                 )?;
                 check(&resolved_decomposition.value)?;
-                check_measurement_dependencies(&resolved_decomposition, &child_dependencies)?;
+                check_measurement_dependencies(
+                    &resolved_decomposition,
+                    &decomposition_key,
+                    &child_dependencies,
+                    cache,
+                )?;
             }
 
             if derived_capture.residual_analysis {
@@ -4839,7 +5233,12 @@ pub mod hp {
                     structural_residual_analysis_check,
                 )?;
                 structural_residual_analysis_check(&resolved_residual.value)?;
-                check_measurement_dependencies(&resolved_residual, &child_dependencies)?;
+                check_measurement_dependencies(
+                    &resolved_residual,
+                    &residual_key,
+                    &child_dependencies,
+                    cache,
+                )?;
             }
 
             // Full hit: decode the measurement from the retained artifact.
@@ -4920,17 +5319,17 @@ pub mod hp {
         let decomposition_key = bind_key(&decomposition_key, &child_dependencies);
         let evidence_request = ArtifactExecutionCacheRequest {
             semantic_key: &evidence_key,
-            minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             ..evidence_request
         };
         let residual_request = ArtifactExecutionCacheRequest {
             semantic_key: &residual_key,
-            minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             ..residual_request
         };
         let decomposition_request = ArtifactExecutionCacheRequest {
             semantic_key: &decomposition_key,
-            minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             ..decomposition_request
         };
 
@@ -4955,7 +5354,12 @@ pub mod hp {
             resolution_tolerance_met =
                 resolution_verdict(&resolved_evidence.value, &resolved_distance.value)?;
             resolution_ladder_tolerance_met = resolution_ladder_verdict(&resolved_evidence.value);
-            check_measurement_dependencies(&resolved_evidence, &child_dependencies)?;
+            check_measurement_dependencies(
+                &resolved_evidence,
+                &evidence_key,
+                &child_dependencies,
+                cache,
+            )?;
             if resolved_evidence.value != evidence_payload {
                 anyhow::bail!(
                     "resolved CCM distance resolution evidence disagrees with replayed values"
@@ -4990,6 +5394,12 @@ pub mod hp {
                 check,
             )?;
             check(&resolved_decomposition.value)?;
+            check_measurement_dependencies(
+                &resolved_decomposition,
+                &decomposition_key,
+                &child_dependencies,
+                cache,
+            )?;
         }
 
         if derived_capture.residual_analysis {
@@ -5007,6 +5417,12 @@ pub mod hp {
                     }
                     Ok(())
                 },
+            )?;
+            check_measurement_dependencies(
+                &resolved_residual,
+                &residual_key,
+                &child_dependencies,
+                cache,
             )?;
             if resolved_residual.value != residual_payload {
                 anyhow::bail!(
@@ -5123,15 +5539,24 @@ pub mod hp {
     }
     fn check_measurement_dependencies<T>(
         result: &xc_cache::ArtifactExecutionCacheResult<T>,
+        semantic: &xc_cache::SemanticKeyEnvelope,
         expected: &[xc_cache::DependencyRef],
+        cache: &xc_cache::ArtifactCacheContext<'_>,
     ) -> Result<()> {
-        if result
+        if let Some(manifest) = result
             .produced_manifest
             .as_ref()
             .or(result.reused_manifest.as_ref())
-            .is_some_and(|m| m.dependencies != expected)
         {
-            anyhow::bail!("measurement child dependency closure mismatch");
+            // Published/adopted artifacts retain exact canonical parents in a
+            // bound manifest tag; their local dependency list is empty.
+            xc_cache::validate_artifact_dependency_closure(
+                manifest,
+                semantic,
+                "ccm-distance",
+                expected,
+                cache,
+            )?;
         }
         Ok(())
     }
@@ -5282,24 +5707,24 @@ pub mod hp {
             &higher_canonical.eigenvalue,
             &higher_canonical.eigenvector,
         )?;
-        let mut gl_tables = SharedGlTables::new();
-        let mut distances = Vec::with_capacity(rules.len());
-        for rule in rules {
-            distances.push(weighted_alpha_distance_with_tables(
-                |u: &Float| lower_state.eigenfunction.eval(u),
-                |u: &Float| higher_state.eigenfunction.eval(u),
-                &lower_state.lambda,
-                alpha,
-                *rule,
-                cfg.precision_bits,
-                Some(&mut gl_tables),
-            )?);
-        }
-        let measurement = CcmDiscretizationDistanceHp {
-            lambda_squared: lower.lambda_squared(),
-            n_modes: lower.n_modes,
-            m_modes: higher.n_modes,
-            distances,
+        // The weighted integrals are the expensive part. They run only on a
+        // cache miss or under explicit verification; a hit rebuilds the
+        // runtime values from the exactly round-tripping stored decimals.
+        let compute_distances = || -> Result<Vec<WeightedGridValueHp>> {
+            let mut gl_tables = SharedGlTables::new();
+            let mut distances = Vec::with_capacity(rules.len());
+            for rule in rules {
+                distances.push(weighted_alpha_distance_with_tables(
+                    |u: &Float| lower_state.eigenfunction.eval(u),
+                    |u: &Float| higher_state.eigenfunction.eval(u),
+                    &lower_state.lambda,
+                    alpha,
+                    *rule,
+                    cfg.precision_bits,
+                    Some(&mut gl_tables),
+                )?);
+            }
+            Ok(distances)
         };
         let prec = cfg.precision_bits;
         let lambda_sq_identity = lambda_squared_identity(lower);
@@ -5335,19 +5760,20 @@ pub mod hp {
             dependencies
         };
 
-        let mut measurements = Vec::with_capacity(rules.len());
-        for (rule, distance) in rules.iter().zip(&measurement.distances) {
-            measurements.push(portable_rule_distance(*rule, &distance.value, prec));
-        }
-        let payload = PortableDiscretizationDistance {
+        let payload_of = |distances: &[WeightedGridValueHp]| PortableDiscretizationDistance {
             schema_version: 1,
             lambda_squared: lambda_sq_identity.clone(),
             n_modes: lower.n_modes,
             m_modes: higher.n_modes,
             precision_bits: prec,
             alpha: alpha_identity(alpha, prec),
-            measurements,
+            measurements: rules
+                .iter()
+                .zip(distances)
+                .map(|(rule, distance)| portable_rule_distance(*rule, &distance.value, prec))
+                .collect(),
         };
+        let verify = cache.mode.compares_against_reference();
 
         let semantic_key = SemanticKeyEnvelope {
             schema_version: 1,
@@ -5413,7 +5839,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -5422,23 +5848,84 @@ pub mod hp {
             provenance_digest: None,
             production_sink: cache.production_sink,
         };
+        let produced = std::cell::RefCell::new(None);
         let resolved = resolve_or_compute_json_artifact_with_dependencies(
             &request,
-            || Ok((payload.clone(), eigenpair_dependencies())),
+            || {
+                let distances = compute_distances()
+                    .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                let payload = payload_of(&distances);
+                produced.replace(Some(payload.clone()));
+                Ok((payload, eigenpair_dependencies()))
+            },
             |artifact| {
-                if artifact != &payload {
+                // Identity, rule order and the shape of every stored value.
+                let expected = payload_of(&[]);
+                if artifact.schema_version != expected.schema_version
+                    || artifact.lambda_squared != expected.lambda_squared
+                    || artifact.n_modes != expected.n_modes
+                    || artifact.m_modes != expected.m_modes
+                    || artifact.precision_bits != expected.precision_bits
+                    || artifact.alpha != expected.alpha
+                    || artifact.measurements.len() != rules.len()
+                    || artifact
+                        .measurements
+                        .iter()
+                        .zip(rules)
+                        .any(|(stored, rule)| {
+                            let named =
+                                portable_rule_distance(*rule, &Float::with_val(prec, 0), prec);
+                            stored.rule_family != named.rule_family
+                                || stored.quadrature_rule != named.quadrature_rule
+                                || stored.grid_variable != named.grid_variable
+                                || stored.resolution != named.resolution
+                                || Float::parse(&stored.distance)
+                                    .map(|v| Float::with_val(prec, v))
+                                    .map_or(true, |v| {
+                                        !v.is_finite()
+                                            || v.is_sign_negative()
+                                            || retained_decimal(&v, prec) != stored.distance
+                                    })
+                        })
+                {
                     return Err(CacheError::InvalidManifest(
-                        "CCM discretization distance does not replay under its stated convention"
+                        "CCM discretization distance does not match its stated convention"
                             .to_owned(),
                     ));
+                }
+                // Explicit verification replays the integrals of a reused value.
+                if verify && produced.borrow().is_none() {
+                    let distances = compute_distances()
+                        .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
+                    if artifact != &payload_of(&distances) {
+                        return Err(CacheError::InvalidManifest(
+                            "CCM discretization distance does not replay under its stated convention"
+                                .to_owned(),
+                        ));
+                    }
                 }
                 Ok(())
             },
         )?;
-        if resolved.value != payload {
-            anyhow::bail!("resolved CCM discretization distance disagrees with replayed values");
-        }
-        Ok(measurement)
+        let distances = rules
+            .iter()
+            .zip(&resolved.value.measurements)
+            .map(|(rule, stored)| -> Result<WeightedGridValueHp> {
+                Ok(WeightedGridValueHp {
+                    value: Float::with_val(prec, Float::parse(&stored.distance)?),
+                    lambda: Float::with_val(prec, &lower_state.lambda),
+                    alpha: Float::with_val(prec.saturating_add(GUARD_BITS), alpha),
+                    rule: *rule,
+                    precision_bits: prec,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CcmDiscretizationDistanceHp {
+            lambda_squared: lower.lambda_squared(),
+            n_modes: lower.n_modes,
+            m_modes: higher.n_modes,
+            distances,
+        })
     }
 }
 
@@ -6044,8 +6531,7 @@ mod tests {
             hp::WeilEigenfunction::from_v_basis(&xi, n_modes, lambda, prec).unwrap()
         }
 
-        /// HP self-distance is exactly zero at every precision — mirrors the
-        /// collaboration's own harness invariant at 3535–7189 bits.
+        /// HP self-distance is exactly zero at every precision.
         #[test]
         fn hp_nonfinite_distance_is_an_error() {
             for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -6161,11 +6647,8 @@ mod tests {
                 FilesystemCacheStore, ToolkitVersion,
             };
 
-            let root = std::env::temp_dir().join(format!(
-                "xc-spectral-managed-gl-exact-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&root);
+            let root_dir = xc_core::test_support::TestDir::new("managed-gl-exact");
+            let root = root_dir.to_path_buf();
             let resolver = CacheResolver::new(vec![CacheLayer {
                 precedence: 0,
                 store: Box::new(FilesystemCacheStore::new(
@@ -6954,11 +7437,8 @@ mod tests {
                 FilesystemCacheStore, ToolkitVersion,
             };
 
-            let root = std::env::temp_dir().join(format!(
-                "xc-spectral-distance-analysis-backfill-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&root);
+            let root_dir = xc_core::test_support::TestDir::new("distance-analysis-backfi");
+            let root = root_dir.to_path_buf();
             let resolver = CacheResolver::new(vec![CacheLayer {
                 precedence: 0,
                 store: Box::new(FilesystemCacheStore::new(

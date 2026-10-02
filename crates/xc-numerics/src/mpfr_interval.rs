@@ -21,6 +21,67 @@
 use crate::interval::{IntervalError, RationalInterval};
 use rug::float::{Constant, Round};
 use rug::{Float, Rational};
+use std::cmp::Ordering;
+
+/// Fail before parallel MPFR work unless every worker of the current Rayon
+/// pool shares the caller's exponent range. MPFR exponent bounds are
+/// thread-local, so arithmetic on a worker with other bounds could round or
+/// underflow differently and make results depend on scheduling. The check
+/// visits every worker, so its own outcome does not depend on scheduling.
+pub fn ensure_uniform_exponent_range() -> Result<(), IntervalError> {
+    let caller = (rug::float::exp_min(), rug::float::exp_max());
+    let workers = rayon::broadcast(|_| (rug::float::exp_min(), rug::float::exp_max()));
+    if workers.iter().any(|worker| *worker != caller) {
+        return Err(IntervalError::Inconclusive(
+            "parallel MPFR workers do not share the caller's exponent range".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Downward and upward correctly rounded values of the correctly rounded MPFR
+/// function `f` at one stored point, bitwise equal to two directed calls.
+/// One evaluation suffices when the downward result settles the upward one;
+/// see `upward_from_downward`.
+pub fn directed_point_pair(x: &Float, f: impl Fn(&mut Float, Round) -> Ordering) -> (Float, Float) {
+    let mut lower = x.clone();
+    let ternary = f(&mut lower, Round::Down);
+    let upper = upward_from_downward(x, &lower, ternary, f);
+    (lower, upper)
+}
+
+/// The upward rounding of `f(x)` from its downward rounding `lower` and that
+/// call's ternary. Correct rounding makes an exact result equal in either
+/// direction and an inexact downward result the predecessor of the upward
+/// one. Zeros, results at the exponent extremes and every other case evaluate
+/// the upward rounding directly.
+fn upward_from_downward(
+    x: &Float,
+    lower: &Float,
+    ternary: Ordering,
+    f: impl Fn(&mut Float, Round) -> Ordering,
+) -> Float {
+    if lower.is_normal() {
+        match ternary {
+            Ordering::Equal => return lower.clone(),
+            Ordering::Less
+                if lower
+                    .get_exp()
+                    .is_some_and(|exponent| exponent > rug::float::exp_min()) =>
+            {
+                let mut upper = lower.clone();
+                upper.next_up();
+                if upper.is_finite() {
+                    return upper;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut upper = x.clone();
+    f(&mut upper, Round::Up);
+    upper
+}
 
 #[derive(Clone, Debug)]
 pub struct MpfrInterval {
@@ -270,21 +331,33 @@ impl MpfrInterval {
             return Self::invalid(self.precision());
         }
         let p = self.precision();
-        let pairs = [
-            (&self.lower, &other.lower),
-            (&self.lower, &other.upper),
-            (&self.upper, &other.lower),
-            (&self.upper, &other.upper),
-        ];
-        let mut lower_values = Vec::with_capacity(4);
-        let mut upper_values = Vec::with_capacity(4);
-        for (left, right) in pairs {
-            lower_values.push(Float::with_val_round(p, left * right, Round::Down).0);
-            upper_values.push(Float::with_val_round(p, left * right, Round::Up).0);
+        // A point operand repeats its corner products. Rounded products of
+        // bitwise-equal operands are bitwise equal, so the distinct corners
+        // give the same extrema; signed zeros keep both endpoints.
+        let (left, left_count) = self.corners();
+        let (right, right_count) = other.corners();
+        let mut lower: Option<Float> = None;
+        let mut upper: Option<Float> = None;
+        for &x in &left[..left_count] {
+            for &y in &right[..right_count] {
+                let down = Float::with_val_round(p, x * y, Round::Down).0;
+                let up = Float::with_val_round(p, x * y, Round::Up).0;
+                if lower.as_ref().is_none_or(|v| down.total_cmp(v).is_lt()) {
+                    lower = Some(down);
+                }
+                if upper.as_ref().is_none_or(|v| up.total_cmp(v).is_gt()) {
+                    upper = Some(up);
+                }
+            }
         }
-        let lower = lower_values.into_iter().min_by(Float::total_cmp).unwrap();
-        let upper = upper_values.into_iter().max_by(Float::total_cmp).unwrap();
-        Self::arithmetic_result(lower, upper)
+        Self::arithmetic_result(lower.unwrap(), upper.unwrap())
+    }
+
+    /// The distinct endpoints: one for a bitwise point, including zero sign.
+    fn corners(&self) -> ([&Float; 2], usize) {
+        let point = self.lower == self.upper
+            && self.lower.is_sign_negative() == self.upper.is_sign_negative();
+        ([&self.lower, &self.upper], if point { 1 } else { 2 })
     }
 
     pub fn square(&self) -> Self {
@@ -373,11 +446,10 @@ impl MpfrInterval {
         Self::arithmetic_result(lower, upper)
     }
 
-    fn lipschitz_trig(&self, sine: bool) -> Self {
+    /// Midpoint and radius of the Lipschitz trigonometric enclosure; `None`
+    /// when the radius already covers the full range of sine and cosine.
+    fn trig_center(&self) -> Option<(Float, Float)> {
         let p = self.precision();
-        if self.validate().is_err() {
-            return Self::invalid(p);
-        }
         let midpoint = self.midpoint_point().lower;
         let (left_radius, _) = Float::with_val_round(p, &midpoint - &self.lower, Round::Up);
         let (right_radius, _) = Float::with_val_round(p, &self.upper - &midpoint, Round::Up);
@@ -388,22 +460,15 @@ impl MpfrInterval {
         };
         // A radius of two already covers the full range of either function.
         // Avoid expensive argument reduction when it cannot improve this bound.
-        if radius >= 2 {
-            return Self::arithmetic_result(Float::with_val(p, -1), Float::with_val(p, 1));
-        }
-        let mut lower = midpoint.clone();
-        let mut upper = midpoint;
-        if sine {
-            lower.sin_round(Round::Down);
-            upper.sin_round(Round::Up);
-        } else {
-            lower.cos_round(Round::Down);
-            upper.cos_round(Round::Up);
-        }
+        (radius < 2).then_some((midpoint, radius))
+    }
+
+    fn trig_widened(lower: Float, upper: Float, radius: &Float) -> Self {
+        let p = lower.prec();
         // Borrow both operands: an owned left operand is rounded to nearest in
         // place before the directed conversion can apply.
-        lower = Float::with_val_round(p, &lower - &radius, Round::Down).0;
-        upper = Float::with_val_round(p, &upper + &radius, Round::Up).0;
+        let mut lower = Float::with_val_round(p, &lower - radius, Round::Down).0;
+        let mut upper = Float::with_val_round(p, &upper + radius, Round::Up).0;
         let minus_one = Float::with_val(p, -1);
         let one = Float::with_val(p, 1);
         if lower < minus_one {
@@ -413,6 +478,48 @@ impl MpfrInterval {
             upper = one;
         }
         Self::arithmetic_result(lower, upper)
+    }
+
+    fn lipschitz_trig(&self, sine: bool) -> Self {
+        let p = self.precision();
+        if self.validate().is_err() {
+            return Self::invalid(p);
+        }
+        let Some((midpoint, radius)) = self.trig_center() else {
+            return Self::arithmetic_result(Float::with_val(p, -1), Float::with_val(p, 1));
+        };
+        let (lower, upper) = if sine {
+            directed_point_pair(&midpoint, |x, round| x.sin_round(round))
+        } else {
+            directed_point_pair(&midpoint, |x, round| x.cos_round(round))
+        };
+        Self::trig_widened(lower, upper, &radius)
+    }
+
+    /// `(self.sin(), self.cos())`, sharing one midpoint evaluation.
+    pub fn sin_cos(&self) -> (Self, Self) {
+        let p = self.precision();
+        if self.validate().is_err() {
+            return (Self::invalid(p), Self::invalid(p));
+        }
+        let Some((midpoint, radius)) = self.trig_center() else {
+            let full = Self::arithmetic_result(Float::with_val(p, -1), Float::with_val(p, 1));
+            return (full.clone(), full);
+        };
+        // MPFR rounds each sin_cos output correctly, with its own ternary.
+        let mut sin_lower = midpoint.clone();
+        let mut cos_lower = Float::new(p);
+        let (sin_ternary, cos_ternary) = sin_lower.sin_cos_round(&mut cos_lower, Round::Down);
+        let sin_upper = upward_from_downward(&midpoint, &sin_lower, sin_ternary, |x, round| {
+            x.sin_round(round)
+        });
+        let cos_upper = upward_from_downward(&midpoint, &cos_lower, cos_ternary, |x, round| {
+            x.cos_round(round)
+        });
+        (
+            Self::trig_widened(sin_lower, sin_upper, &radius),
+            Self::trig_widened(cos_lower, cos_upper, &radius),
+        )
     }
 
     pub fn sin(&self) -> Self {
@@ -687,6 +794,258 @@ pub fn evaluate_complex_polynomial_mpfr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayon::prelude::*;
+
+    // Frozen eight-product multiplication preceding the point fast paths.
+    fn reference_mul(a: &MpfrInterval, b: &MpfrInterval) -> MpfrInterval {
+        if a.precision() != b.precision() || a.validate().is_err() || b.validate().is_err() {
+            return MpfrInterval::invalid(a.precision());
+        }
+        let p = a.precision();
+        let pairs = [
+            (&a.lower, &b.lower),
+            (&a.lower, &b.upper),
+            (&a.upper, &b.lower),
+            (&a.upper, &b.upper),
+        ];
+        let mut lower_values = Vec::with_capacity(4);
+        let mut upper_values = Vec::with_capacity(4);
+        for (left, right) in pairs {
+            lower_values.push(Float::with_val_round(p, left * right, Round::Down).0);
+            upper_values.push(Float::with_val_round(p, left * right, Round::Up).0);
+        }
+        let lower = lower_values.into_iter().min_by(Float::total_cmp).unwrap();
+        let upper = upper_values.into_iter().max_by(Float::total_cmp).unwrap();
+        MpfrInterval::arithmetic_result(lower, upper)
+    }
+
+    // Frozen two-evaluation trigonometric enclosure preceding the shared
+    // directed pair.
+    fn reference_trig(x: &MpfrInterval, sine: bool) -> MpfrInterval {
+        let p = x.precision();
+        if x.validate().is_err() {
+            return MpfrInterval::invalid(p);
+        }
+        let midpoint = x.midpoint_point().lower;
+        let (left_radius, _) = Float::with_val_round(p, &midpoint - &x.lower, Round::Up);
+        let (right_radius, _) = Float::with_val_round(p, &x.upper - &midpoint, Round::Up);
+        let radius = if left_radius >= right_radius {
+            left_radius
+        } else {
+            right_radius
+        };
+        if radius >= 2 {
+            return MpfrInterval::arithmetic_result(Float::with_val(p, -1), Float::with_val(p, 1));
+        }
+        let mut lower = midpoint.clone();
+        let mut upper = midpoint;
+        if sine {
+            lower.sin_round(Round::Down);
+            upper.sin_round(Round::Up);
+        } else {
+            lower.cos_round(Round::Down);
+            upper.cos_round(Round::Up);
+        }
+        lower = Float::with_val_round(p, &lower - &radius, Round::Down).0;
+        upper = Float::with_val_round(p, &upper + &radius, Round::Up).0;
+        let minus_one = Float::with_val(p, -1);
+        let one = Float::with_val(p, 1);
+        if lower < minus_one {
+            lower = minus_one;
+        }
+        if upper > one {
+            upper = one;
+        }
+        MpfrInterval::arithmetic_result(lower, upper)
+    }
+
+    // Bitwise: precision, value and the sign of zero (NaN by sign).
+    fn same_float(a: &Float, b: &Float) -> bool {
+        a.prec() == b.prec()
+            && if a.is_nan() || b.is_nan() {
+                a.is_nan() && b.is_nan() && a.is_sign_negative() == b.is_sign_negative()
+            } else {
+                a.total_cmp(b).is_eq()
+            }
+    }
+
+    fn same_interval(a: &MpfrInterval, b: &MpfrInterval) -> bool {
+        same_float(&a.lower, &b.lower) && same_float(&a.upper, &b.upper)
+    }
+
+    // Deterministic finite sample: random significand, sign and exponent,
+    // with a few fixed special values at the start of every stream.
+    fn sample(p: u32, index: u64, exponent_span: i32) -> Float {
+        let mut state = index.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ u64::from(p);
+        let mut next = || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let half_pi = Float::with_val(p, Constant::Pi) >> 1;
+        let minimum = Float::with_val(p, rug::float::Special::Zero).next_up_value();
+        match index {
+            0 => return Float::with_val(p, 0),
+            1 => return -Float::with_val(p, 0),
+            2 => return Float::with_val(p, 1),
+            3 => return half_pi,
+            4 => return -half_pi * 3u32,
+            5 => return minimum,
+            6 => return -minimum,
+            7 => return Float::with_val(p, 1) >> 100_000,
+            8 => return Float::with_val(p, Constant::Pi) * 1_000_000u32,
+            _ => {}
+        }
+        let limbs = (p as usize).div_ceil(64);
+        let digits = (0..limbs).map(|_| next()).collect::<Vec<_>>();
+        let significand = rug::Integer::from_digits(&digits, rug::integer::Order::Lsf);
+        let exponent = (next() % (2 * exponent_span as u64 + 1)) as i32 - exponent_span;
+        let value = (Float::with_val(p, significand) >> (64 * limbs as i32)) << exponent;
+        let value = if next() % 7 == 0 {
+            // Exactly representable small dyadics and near multiples of pi/2.
+            if next() % 2 == 0 {
+                Float::with_val(p, (next() % 64) as i64 - 32) >> (next() % 8) as u32
+            } else {
+                (Float::with_val(p, Constant::Pi) * ((next() % 64) as i64 - 32)) >> 1
+            }
+        } else {
+            value
+        };
+        if next() % 2 == 0 {
+            -value
+        } else {
+            value
+        }
+    }
+
+    trait NextUpValue {
+        fn next_up_value(self) -> Self;
+    }
+    impl NextUpValue for Float {
+        fn next_up_value(mut self) -> Self {
+            self.next_up();
+            self
+        }
+    }
+
+    #[test]
+    fn point_multiplication_matches_all_four_corners_bitwise() {
+        for p in [32, 128, 3386, 9000] {
+            let zero = Float::with_val(p, 0);
+            let minimum = zero.clone().next_up_value();
+            let maximum = Float::with_val(p, 1) << (rug::float::exp_max() - 1);
+            let mut values = vec![
+                zero.clone(),
+                -zero,
+                minimum.clone(),
+                -minimum.clone(),
+                minimum.next_up_value(),
+                maximum.clone(),
+                -maximum.clone(),
+                Float::with_val(p, 1) << (rug::float::exp_max() / 2),
+                Float::with_val(p, 1) >> (-(rug::float::exp_min() / 2)),
+            ];
+            for k in [-3i32, -1, 1, 2, 7] {
+                values.push(Float::with_val(p, k) / 3u32);
+                values.push((Float::with_val(p, k) / 7u32) << 4000);
+                values.push((Float::with_val(p, k) / 11u32) >> 4000);
+            }
+            let mut intervals = Vec::new();
+            for a in &values {
+                for b in &values {
+                    // Ordered pairs only; [+0, -0] is a valid interval.
+                    if a <= b {
+                        intervals.push(MpfrInterval {
+                            lower: a.clone(),
+                            upper: b.clone(),
+                        });
+                    }
+                }
+            }
+            intervals.push(MpfrInterval::from_i64(1, p + 1));
+            intervals.push(MpfrInterval::invalid(p));
+            intervals.par_iter().for_each(|left| {
+                for right in &intervals {
+                    let actual = left.mul(right);
+                    let expected = reference_mul(left, right);
+                    assert!(
+                        same_interval(&actual, &expected),
+                        "{left:?} * {right:?}: {actual:?} != {expected:?}"
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn single_evaluation_directed_functions_match_two_directed_calls() {
+        type Function = fn(&mut Float, Round) -> Ordering;
+        let functions: [(Function, i32); 4] = [
+            (|x, round| x.sin_round(round), 64),
+            (|x, round| x.cos_round(round), 64),
+            (|x, round| x.sinh_round(round), 40),
+            (|x, round| x.exp_m1_round(round), 40),
+        ];
+        for p in [64, 128, 512, 3386, 9000] {
+            let samples: u64 = 100_000;
+            (0..samples).into_par_iter().for_each(|index| {
+                let x = sample(p, index, 64);
+                for (number, (f, span)) in functions.iter().enumerate() {
+                    if number >= 2 && x.get_exp().is_some_and(|e| e > *span) {
+                        continue;
+                    }
+                    let mut lower = x.clone();
+                    f(&mut lower, Round::Down);
+                    let mut upper = x.clone();
+                    f(&mut upper, Round::Up);
+                    let (actual_lower, actual_upper) = directed_point_pair(&x, f);
+                    assert!(
+                        same_float(&actual_lower, &lower) && same_float(&actual_upper, &upper),
+                        "function {number} at {x}"
+                    );
+                }
+                let mut sin = x.clone();
+                let mut cos = Float::new(p);
+                sin.sin_cos_round(&mut cos, Round::Down);
+                let mut sin_lower = x.clone();
+                sin_lower.sin_round(Round::Down);
+                let mut cos_lower = x.clone();
+                cos_lower.cos_round(Round::Down);
+                assert!(same_float(&sin, &sin_lower) && same_float(&cos, &cos_lower));
+                let width = Float::with_val(p, 1) >> ((index % 8) as u32 * (p / 8));
+                for interval in [
+                    MpfrInterval::point(x.clone()),
+                    MpfrInterval {
+                        upper: Float::with_val_round(p, &x + &width, Round::Up).0,
+                        lower: x.clone(),
+                    },
+                ] {
+                    let expected = (
+                        reference_trig(&interval, true),
+                        reference_trig(&interval, false),
+                    );
+                    let (sin, cos) = interval.sin_cos();
+                    assert!(same_interval(&interval.sin(), &expected.0), "sin at {x}");
+                    assert!(same_interval(&interval.cos(), &expected.1), "cos at {x}");
+                    assert!(same_interval(&sin, &expected.0) && same_interval(&cos, &expected.1));
+                }
+            });
+        }
+        let wide = MpfrInterval {
+            lower: Float::with_val(128, -3),
+            upper: Float::with_val(128, 3),
+        };
+        let (sin, cos) = wide.sin_cos();
+        assert!(same_interval(&sin, &reference_trig(&wide, true)));
+        assert!(same_interval(&cos, &reference_trig(&wide, false)));
+        let invalid = MpfrInterval::invalid(128);
+        assert!(same_interval(
+            &invalid.sin_cos().0,
+            &reference_trig(&invalid, true)
+        ));
+    }
 
     #[test]
     fn invalid_complex_components_cannot_establish_zero_exclusion() {
@@ -825,5 +1184,19 @@ mod tests {
         assert!(imaginary_unit.add(&low_precision).is_err());
         assert!(MpfrBallContext::new(31).is_err());
         assert!(evaluate_complex_polynomial_mpfr(&[], &imaginary_unit).is_err());
+    }
+}
+
+#[cfg(test)]
+mod exponent_range_tests {
+    #[test]
+    fn default_pools_share_the_caller_exponent_range() {
+        for threads in [1, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| super::ensure_uniform_exponent_range().unwrap());
+        }
     }
 }

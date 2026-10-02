@@ -550,9 +550,8 @@ mod tests {
             "team/shard",
             RepositoryPermission::Maintain,
         );
-        let root =
-            std::env::temp_dir().join(format!("xc-shard-index-repair-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("shard-index-repair");
+        let root = scratch.join("root");
         let outcome = execute_shard_index_repair(
             &remote,
             &session,

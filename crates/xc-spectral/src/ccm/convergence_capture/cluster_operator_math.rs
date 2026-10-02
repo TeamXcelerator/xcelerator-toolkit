@@ -7,13 +7,14 @@ use crate::ccm::{
         ExtensionOptions, ExternalResearchInputs,
     },
     retained_evidence::{
-        finite_math::{abs, narrow, scale},
+        finite_math::{narrow, scale},
         point, scalar, RetainedMatrix,
     },
     state_geometry::RetainedState,
 };
 use anyhow::{bail, Result};
 use rayon::prelude::*;
+use rug::Assign;
 use rug::Float;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -23,20 +24,10 @@ struct Basis {
     columns: Vec<Vec<I>>,
     selected: Vec<usize>,
 }
-struct Factors {
-    values: Vec<I>,
-    permutation: Vec<usize>,
-}
 #[derive(Serialize, Deserialize)]
-struct SavedFactor {
+struct SavedSolutions {
     precision: u32,
-    values: Vec<[String; 2]>,
-    permutation: Vec<usize>,
-}
-#[derive(Serialize, Deserialize)]
-struct SavedSolve {
-    precision: u32,
-    values: Vec<[String; 2]>,
+    columns: Vec<Vec<[String; 2]>>,
 }
 struct Measurement {
     values: Values,
@@ -102,63 +93,198 @@ fn basis(raw: &[Vec<Float>], requested: u32, p: u32) -> Result<Option<Basis>> {
     }
     Ok(Some(Basis { columns, selected }))
 }
-fn factor(matrix: &[I], n: usize, p: u32) -> Result<Option<Factors>> {
-    let mut a = matrix.to_vec();
-    let mut permutation = (0..n).collect::<Vec<_>>();
+/// Approximate inverse of the midpoint of `h` by Gauss-Jordan elimination with
+/// partial pivoting at `p` bits. It is only a preconditioner: `verified_solve`
+/// proves every enclosure. Rows update in parallel, each in its serial
+/// operation order. `None` when a pivot is exactly zero.
+fn midpoint_inverse(h: &[I], n: usize, p: u32) -> Option<Vec<Vec<Float>>> {
+    let mut rows: Vec<Vec<Float>> = (0..n)
+        .map(|i| {
+            let mut row: Vec<Float> = h[i * n..(i + 1) * n]
+                .iter()
+                .map(|v| v.midpoint_point().lower().clone())
+                .collect();
+            row.extend((0..n).map(|j| Float::with_val(p, u32::from(i == j))));
+            row
+        })
+        .collect();
     for k in 0..n {
-        let mut best = None;
-        let mut magnitude = Float::with_val(p, 0);
-        for i in k..n {
-            let candidate = abs(&a[i * n + k])?;
-            if candidate.lower() > &magnitude {
-                magnitude = candidate.lower().clone();
-                best = Some(i);
-            }
+        let pivot = (k..n).max_by(|&a, &b| {
+            rows[a][k]
+                .cmp_abs(&rows[b][k])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })?;
+        if rows[pivot][k].is_zero() {
+            return None;
         }
-        let Some(pivot) = best else { return Ok(None) };
-        if pivot != k {
-            for j in 0..n {
-                a.swap(k * n + j, pivot * n + j)
-            }
-            permutation.swap(k, pivot);
-        }
-        let divisor = a[k * n + k].clone();
-        for i in k + 1..n {
-            let ratio = a[i * n + k].div(&divisor)?;
-            a[i * n + k] = ratio.clone();
-            for j in k + 1..n {
-                a[i * n + j] = a[i * n + j].sub(&ratio.mul(&a[k * n + j]));
-                a[i * n + j].validate()?;
-            }
-        }
+        rows.swap(k, pivot);
+        let inverse = Float::with_val(p, rows[k][k].recip_ref());
+        let pivot_row: Vec<Float> = rows[k]
+            .iter()
+            .map(|v| Float::with_val(p, v * &inverse))
+            .collect();
+        rows.par_iter_mut()
+            .enumerate()
+            .filter(|(i, _)| *i != k)
+            .for_each(|(_, row)| {
+                if row[k].is_zero() {
+                    return;
+                }
+                let factor = row[k].clone();
+                let mut product = Float::new(p);
+                for (value, pivot) in row.iter_mut().zip(&pivot_row).skip(k) {
+                    product.assign(&factor * pivot);
+                    *value -= &product;
+                }
+            });
+        rows[k] = pivot_row;
     }
-    Ok(Some(Factors {
-        values: a,
-        permutation,
-    }))
+    Some(rows.into_iter().map(|row| row[n..].to_vec()).collect())
 }
-fn solve(f: &Factors, rhs: &[I], p: u32) -> Result<Vec<I>> {
-    let n = rhs.len();
-    let mut x = f
-        .permutation
-        .iter()
-        .map(|i| rhs[*i].clone())
+/// Add the exact range of point `r` times interval `x` to directed sums.
+fn add_product(lower: &mut Float, upper: &mut Float, r: &Float, x: &I, product: &mut Float) {
+    use rug::{
+        float::Round,
+        ops::{AddAssignRound, AssignRound},
+    };
+    let (low, high) = if r.is_sign_negative() {
+        (x.upper(), x.lower())
+    } else {
+        (x.lower(), x.upper())
+    };
+    product.assign_round(r * low, Round::Down);
+    lower.add_assign_round(&*product, Round::Down);
+    product.assign_round(r * high, Round::Up);
+    upper.add_assign_round(&*product, Round::Up);
+}
+fn magnitude(lower: &Float, upper: &Float) -> Float {
+    if lower.cmp_abs(upper) == Some(std::cmp::Ordering::Greater) {
+        lower.clone().abs()
+    } else {
+        upper.clone().abs()
+    }
+}
+/// Verified solves of every interval system `h y = rhs` (Rump's method).
+/// With R ~ mid(h)^-1, C contains I - R h and z contains R(rhs - h x~). If
+/// ||C||_inf < 1, every matrix in `h` is nonsingular, and since
+/// y - x~ = R(rhs - A x~) + (I - R A)(y - x~), each solution lies in
+/// x~ + z + C [-e, e] with e = ||z||_inf / (1 - ||C||_inf). Rows run in
+/// parallel; every directed sum keeps a fixed order. `None` when ||C||_inf is
+/// not proven below one, so an unresolvable system fails without elimination.
+fn verified_solve(h: &[I], rhs: &[Vec<I>], n: usize, p: u32) -> Result<Option<Vec<Vec<I>>>> {
+    use rug::{
+        float::Round,
+        ops::{AddAssignRound, AssignRound, SubAssignRound},
+    };
+    xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
+    let Some(r) = midpoint_inverse(h, n, p) else {
+        return Ok(None);
+    };
+    // Row sums of |I - R h|, rounded up.
+    let row_sums = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut product = Float::new(p);
+            let mut total = Float::new(p);
+            for j in 0..n {
+                let mut lower = Float::new(p);
+                let mut upper = Float::new(p);
+                for k in 0..n {
+                    add_product(
+                        &mut lower,
+                        &mut upper,
+                        &r[i][k],
+                        &h[k * n + j],
+                        &mut product,
+                    );
+                }
+                let delta = Float::with_val(p, u32::from(i == j));
+                let mut c_lower = delta.clone();
+                c_lower.sub_assign_round(&upper, Round::Down);
+                let mut c_upper = delta;
+                c_upper.sub_assign_round(&lower, Round::Up);
+                total.add_assign_round(magnitude(&c_lower, &c_upper), Round::Up);
+            }
+            total
+        })
         .collect::<Vec<_>>();
-    for i in 0..n {
-        for j in 0..i {
-            x[i] = x[i].sub(&f.values[i * n + j].mul(&x[j]));
-        }
+    let norm = row_sums.iter().fold(Float::new(p), |a, b| a.max(b));
+    if !norm.is_finite() || norm >= 1 {
+        return Ok(None);
     }
-    for i in (0..n).rev() {
-        for j in i + 1..n {
-            x[i] = x[i].sub(&f.values[i * n + j].mul(&x[j]));
+    let mut contraction = Float::with_val(p, 1);
+    contraction.sub_assign_round(&norm, Round::Down);
+    let mut solutions = Vec::with_capacity(rhs.len());
+    for b in rhs {
+        let center = b
+            .iter()
+            .map(|v| v.midpoint_point().lower().clone())
+            .collect::<Vec<_>>();
+        let approximate = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut sum = Float::new(p);
+                let mut product = Float::new(p);
+                for (r, c) in r[i].iter().zip(&center) {
+                    product.assign(r * c);
+                    sum += &product;
+                }
+                sum
+            })
+            .collect::<Vec<_>>();
+        // d contains rhs - h x~.
+        let defect = (0..n)
+            .into_par_iter()
+            .map(|i| -> Result<I> {
+                let mut product = Float::new(p);
+                let mut lower = Float::new(p);
+                let mut upper = Float::new(p);
+                for (k, x) in approximate.iter().enumerate() {
+                    add_product(&mut lower, &mut upper, x, &h[i * n + k], &mut product);
+                }
+                let mut d_lower = b[i].lower().clone();
+                d_lower.sub_assign_round(&upper, Round::Down);
+                let mut d_upper = b[i].upper().clone();
+                d_upper.sub_assign_round(&lower, Round::Up);
+                Ok(I::new(d_lower, d_upper)?)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        let z = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let mut product = Float::new(p);
+                let mut lower = Float::new(p);
+                let mut upper = Float::new(p);
+                for (r, d) in r[i].iter().zip(&defect) {
+                    add_product(&mut lower, &mut upper, r, d, &mut product);
+                }
+                (lower, upper)
+            })
+            .collect::<Vec<_>>();
+        let z_norm = z
+            .iter()
+            .fold(Float::new(p), |a, (l, u)| a.max(&magnitude(l, u)));
+        let mut radius = Float::new(p);
+        radius.assign_round(&z_norm / &contraction, Round::Up);
+        let mut y = Vec::with_capacity(n);
+        for (i, (x, (z_lower, z_upper))) in approximate.iter().zip(&z).enumerate() {
+            let mut spread = Float::new(p);
+            spread.assign_round(&radius * &row_sums[i], Round::Up);
+            let mut lower = Float::new(p);
+            lower.assign_round(x + z_lower, Round::Down);
+            lower.sub_assign_round(&spread, Round::Down);
+            let mut upper = Float::new(p);
+            upper.assign_round(x + z_upper, Round::Up);
+            upper.add_assign_round(&spread, Round::Up);
+            let value = I::new(lower, upper)?;
+            value.validate()?;
+            y.push(value);
         }
-        x[i] = x[i].div(&f.values[i * n + i])?;
-        if x[i].precision() != p {
-            bail!("cluster solve interval precision mismatch")
-        }
+        solutions.push(y);
     }
-    Ok(x)
+    Ok(Some(solutions))
 }
 fn encode(values: &[I]) -> Vec<[String; 2]> {
     values
@@ -199,6 +325,76 @@ fn narrow_values(values: &Values, requested: u32) -> Result<bool> {
     }
     Ok(true)
 }
+/// Largest binary exponent of the n x n entries (0 when all are zero). Rows
+/// are scanned on workers; the exact maximum does not depend on order and the
+/// first failure is taken in row-major order.
+fn maximum_exponent(
+    n: usize,
+    shifted: &(impl Fn(usize, usize) -> Result<I> + Sync),
+) -> Result<i64> {
+    let rows = (0..n)
+        .into_par_iter()
+        .map(|i| -> Result<Option<i64>> {
+            let mut exponent = None;
+            for j in 0..n {
+                let entry = shifted(i, j)?;
+                entry.validate()?;
+                for e in [entry.lower(), entry.upper()]
+                    .iter()
+                    .filter_map(|v| v.get_exp())
+                {
+                    exponent =
+                        Some(exponent.map_or(i64::from(e), |old: i64| old.max(i64::from(e))));
+                }
+            }
+            Ok(exponent)
+        })
+        .collect::<Vec<_>>();
+    let mut exponent = None;
+    for row in rows {
+        if let Some(e) = row? {
+            exponent = Some(exponent.map_or(e, |old: i64| old.max(e)));
+        }
+    }
+    Ok(exponent.unwrap_or(0))
+}
+/// `du[column][i] = sum_j entry(i, j) * u[column][j]`, each sum in j order on
+/// one worker per row; the first failure is taken in row-major order.
+fn column_actions(
+    n: usize,
+    u: &[Vec<I>],
+    entry: &(impl Fn(usize, usize) -> Result<I> + Sync),
+    p: u32,
+) -> Result<Vec<Vec<I>>> {
+    let b = u.len();
+    let rows = (0..n)
+        .into_par_iter()
+        .map(|i| -> Result<Vec<I>> {
+            let mut row = vec![I::from_i64(0, p); b];
+            for j in 0..n {
+                let a = entry(i, j)?;
+                for (value, column) in row.iter_mut().zip(u) {
+                    *value = value.add(&a.mul(&column[j]));
+                }
+            }
+            Ok(row)
+        })
+        .collect::<Vec<_>>();
+    let mut du = vec![Vec::with_capacity(n); b];
+    for row in rows {
+        for (column, value) in du.iter_mut().zip(row?) {
+            column.push(value);
+        }
+    }
+    Ok(du)
+}
+/// Row residuals `h[i] . y - rhs[i]`, each dot product serial on one worker.
+fn row_residuals(h: &[I], rhs: &[I], y: &[I], p: u32) -> Vec<I> {
+    h.par_chunks_exact(y.len())
+        .zip(rhs)
+        .map(|(row, rhs)| dot(row, y, p).sub(rhs))
+        .collect()
+}
 #[allow(clippy::too_many_arguments)] // Source identities and precision/resource policy remain explicit.
 fn calculate(
     s: &RetainedState,
@@ -224,30 +420,9 @@ fn calculate(
         let a = I::from_float(&m.entries[i * n + j], p)?;
         Ok(if i == j { a.sub(&eigen) } else { a })
     };
-    let mut exponent = None;
-    for i in 0..n {
-        for j in 0..n {
-            let entry = shifted(i, j)?;
-            entry.validate()?;
-            for e in [entry.lower(), entry.upper()]
-                .iter()
-                .filter_map(|v| v.get_exp())
-            {
-                exponent = Some(exponent.map_or(i64::from(e), |old: i64| old.max(i64::from(e))));
-            }
-        }
-    }
-    let exponent = exponent.unwrap_or(0);
+    let exponent = maximum_exponent(n, &shifted)?;
     let entry = |i: usize, j: usize| -> Result<I> { scale(&shifted(i, j)?, -exponent) };
-    let mut du = vec![vec![I::from_i64(0, p); n]; b];
-    for (i, matrix_row) in m.entries.chunks_exact(n).enumerate() {
-        for (j, _) in matrix_row.iter().enumerate() {
-            let a = entry(i, j)?;
-            for column in 0..b {
-                du[column][i] = du[column][i].add(&a.mul(&u[column][j]));
-            }
-        }
-    }
+    let du = column_actions(n, &u, &entry, p)?;
     let mut small = vec![I::from_i64(0, p); b * b];
     for a in 0..b {
         for c in a..b {
@@ -370,7 +545,7 @@ fn calculate(
             Ok(())
         })?;
     let checkpoints = Checkpoints::new(&(
-        "cluster-directed-shifted-complement-v1",
+        "cluster-directed-shifted-complement-verified-solve-v2",
         &s.manifest.content_digest,
         &m.manifest.content_digest,
         o,
@@ -380,80 +555,48 @@ fn calculate(
         &basis.selected,
     ))?;
     let saved = checkpoints
-        .load::<SavedFactor>("interval-factor")?
-        .filter(|f| {
-            f.precision == p
-                && f.values.len() == n * n
-                && f.permutation.len() == n
-                && f.permutation
-                    .iter()
-                    .copied()
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .eq(0..n)
+        .load::<SavedSolutions>("verified-solutions")?
+        .filter(|v| {
+            v.precision == p && v.columns.len() == b && v.columns.iter().all(|c| c.len() == n)
         });
-    let factors = if let Some(f) = saved {
-        Some(Factors {
-            values: decode(&f.values, p)?,
-            permutation: f.permutation,
-        })
+    let solutions = if let Some(saved) = saved {
+        Some(
+            saved
+                .columns
+                .iter()
+                .map(|c| decode(c, p))
+                .collect::<Result<Vec<_>>>()?,
+        )
     } else {
-        let _stage = Stage::new(format!("bounded complement factorization at {p} bits"));
-        let f = factor(&h, n, p)?;
-        if let Some(f) = &f {
+        let _stage = Stage::new(format!("bounded complement verified solve at {p} bits"));
+        let solutions = verified_solve(&h, &coupling, n, p)?;
+        if let Some(solutions) = &solutions {
             if let Err(error) = checkpoints.save(
-                "interval-factor",
-                &SavedFactor {
+                "verified-solutions",
+                &SavedSolutions {
                     precision: p,
-                    values: encode(&f.values),
-                    permutation: f.permutation.clone(),
+                    columns: solutions.iter().map(|y| encode(y)).collect(),
                 },
             ) {
-                eprintln!("cluster factor checkpoint unavailable: {error}");
+                xc_core::progress_message!("cluster solve checkpoint unavailable: {error}");
             }
         }
-        f
+        solutions
     };
-    let Some(factors) = factors else {
+    let Some(solutions) = solutions else {
         return Ok(Some(partial(rows)));
     };
-    let mut solutions = Vec::with_capacity(b);
     let mut residuals = Vec::with_capacity(b);
-    for (column, rhs) in coupling.iter().enumerate() {
-        let _stage = Stage::new(format!("bounded complement solve {column} at {p} bits"));
-        let key = format!("interval-solve-{column}");
-        let saved = checkpoints
-            .load::<SavedSolve>(&key)?
-            .filter(|v| v.precision == p && v.values.len() == n);
-        let y = if let Some(v) = saved {
-            decode(&v.values, p)?
-        } else {
-            let y = solve(&factors, rhs, p)?;
-            if let Err(error) = checkpoints.save(
-                &key,
-                &SavedSolve {
-                    precision: p,
-                    values: encode(&y),
-                },
-            ) {
-                eprintln!("cluster solve checkpoint unavailable: {error}");
-            }
-            y
-        };
+    for (rhs, y) in coupling.iter().zip(&solutions) {
         // This residual concerns the midpoint vector in the scaled system.
         // Feedback itself uses the verified solution intervals above.
         let midpoint = y.iter().map(I::midpoint_point).collect::<Vec<_>>();
-        let residual = h
-            .chunks_exact(n)
-            .zip(rhs)
-            .map(|(row, rhs)| dot(row, &midpoint, p).sub(rhs))
-            .collect::<Vec<_>>();
+        let residual = row_residuals(&h, rhs, &midpoint, p);
         residuals.push(
             norm2(&residual, p)
                 .sqrt()?
                 .div(&norm2(rhs, p).sqrt()?.add(&I::from_i64(1, p)))?,
         );
-        solutions.push(y);
     }
     let original_rows = rows.clone();
     for a in 0..b {
@@ -501,6 +644,9 @@ pub(super) fn analyze(
     let Some(m) = m else {
         return Ok(missing(out, "retained Tau required"));
     };
+    // Every parallel MPFR stage below (complement assembly, verified solve,
+    // or checkpoint reuse followed by residuals) needs one exponent range.
+    xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
     let requested = o.working_precision_bits;
     let supplied = input
         .and_then(|i| i.run_once.as_ref())
@@ -581,8 +727,164 @@ pub(super) fn analyze(
     }
     if !measured.complete {
         out.outcome = "partial_unresolved".into();
-        out.reason=Some(if measured.budget_limited{"complement interval workspace budget exceeded; enclosed compressed operator and coupling retained"}else{"complement inverse or feedback arithmetic unresolved within guard limit; enclosed compressed operator and coupling retained"}.into());
+        out.reason=Some(if measured.budget_limited{"complement interval workspace budget exceeded; enclosed compressed operator and coupling retained"}else{"verified complement solve (||I - R H|| < 1) or feedback arithmetic unresolved within guard limit; enclosed compressed operator and coupling retained"}.into());
     }
-    out.convention=format!("{}; unit columns selected by a fixed requested-precision residual threshold; interval orthonormal coordinates; original-point A-EI scaled before compression and complement inversion; solve residual uses the scaled system; selected subspace is not a full-declared-span or spectral-selection certificate",if supplied.is_some(){"supplied reference columns"}else{"original center-oriented source and first four even Fourier columns; not a prolate reference"});
+    out.convention=format!("{}; unit columns selected by a fixed requested-precision residual threshold; interval orthonormal coordinates; original-point A-EI scaled before compression and complement inversion; complement solutions enclosed by a midpoint-preconditioned verified solve; solve residual uses the scaled system; selected subspace is not a full-declared-span or spectral-selection certificate",if supplied.is_some(){"supplied reference columns"}else{"original center-oriented source and first four even Fourier columns; not a prolate reference"});
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verified_complement_solve_encloses_exact_solutions_identically_across_threads() {
+        let (n, p) = (24, 256);
+        // Integer system with known integer solutions.
+        let a = |i: usize, j: usize| -> i64 {
+            if i == j {
+                40 + i as i64
+            } else {
+                ((3 * i + 5 * j) % 13) as i64 - 6
+            }
+        };
+        let matrix = (0..n * n)
+            .map(|k| I::from_i64(a(k / n, k % n), p))
+            .collect::<Vec<_>>();
+        let solutions = (0..4)
+            .map(|c| {
+                (0..n)
+                    .map(|i| ((i * (c + 2)) % 9) as i64 - 4)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let rhs = solutions
+            .iter()
+            .map(|x| {
+                (0..n)
+                    .map(|i| I::from_i64((0..n).map(|j| a(i, j) * x[j]).sum(), p))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let run = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| verified_solve(&matrix, &rhs, n, p).unwrap().unwrap())
+        };
+        let endpoints = |y: &[Vec<I>]| {
+            y.iter()
+                .flatten()
+                .map(|v| (v.lower().clone(), v.upper().clone()))
+                .collect::<Vec<_>>()
+        };
+        let serial = run(1);
+        for (y, x) in serial.iter().zip(&solutions) {
+            for (enclosure, exact) in y.iter().zip(x) {
+                assert!(enclosure.lower() <= exact && enclosure.upper() >= exact);
+                let width = Float::with_val(p, enclosure.upper() - enclosure.lower());
+                assert!(width < Float::with_val(p, 1) >> (p - 32));
+            }
+        }
+        for _ in 0..10 {
+            assert_eq!(endpoints(&run(4)), endpoints(&serial));
+        }
+        // A singular midpoint is reported unresolved rather than enclosed.
+        let singular = vec![I::from_i64(1, p); n * n];
+        assert!(verified_solve(&singular, &rhs, n, p).unwrap().is_none());
+    }
+
+    #[test]
+    #[allow(clippy::needless_range_loop)] // The serial reference keeps its original loops.
+    fn parallel_cluster_loops_match_serial_reference_at_any_thread_count() {
+        let (n, b, p) = (17, 3, 320);
+        let value = |seed: usize| {
+            let numerator = ((seed * 7919 + 13) % 1009) as i64 - 504;
+            I::from_float(&(Float::with_val(p, numerator) >> (seed % 37) as u32), p).unwrap()
+        };
+        let u = (0..b)
+            .map(|c| (0..n).map(|j| value(c * n + j + 5)).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let h = (0..n * n).map(value).collect::<Vec<_>>();
+        let y = (0..n)
+            .map(|i| value(i + 3).midpoint_point())
+            .collect::<Vec<_>>();
+        let rhs = (0..n).map(|i| value(i + 11)).collect::<Vec<_>>();
+        let bits = |values: &[I]| {
+            values
+                .iter()
+                .map(|v| (v.lower().clone(), v.upper().clone()))
+                .collect::<Vec<_>>()
+        };
+        for failing in [None, Some((5, 9)), Some((0, 0)), Some((n - 1, n - 1))] {
+            let shifted = |i: usize, j: usize| -> Result<I> {
+                if Some((i, j)) == failing {
+                    bail!("entry {i},{j} fails");
+                }
+                Ok(h[i * n + j].clone())
+            };
+            // Serial loops as they were before row parallelism.
+            let reference = || -> Result<(i64, Vec<Vec<I>>)> {
+                let mut exponent = None;
+                for i in 0..n {
+                    for j in 0..n {
+                        let entry = shifted(i, j)?;
+                        entry.validate()?;
+                        for e in [entry.lower(), entry.upper()]
+                            .iter()
+                            .filter_map(|v| v.get_exp())
+                        {
+                            exponent = Some(
+                                exponent.map_or(i64::from(e), |old: i64| old.max(i64::from(e))),
+                            );
+                        }
+                    }
+                }
+                let exponent = exponent.unwrap_or(0);
+                let mut du = vec![vec![I::from_i64(0, p); n]; b];
+                for i in 0..n {
+                    for j in 0..n {
+                        let a = scale(&shifted(i, j)?, -exponent)?;
+                        for column in 0..b {
+                            du[column][i] = du[column][i].add(&a.mul(&u[column][j]));
+                        }
+                    }
+                }
+                Ok((exponent, du))
+            };
+            let expected = reference();
+            let expected_residual = h
+                .chunks_exact(n)
+                .zip(&rhs)
+                .map(|(row, rhs)| dot(row, &y, p).sub(rhs))
+                .collect::<Vec<_>>();
+            for threads in [1, 2, 4, 8] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                for _ in 0..3 {
+                    let actual = pool.install(|| -> Result<(i64, Vec<Vec<I>>)> {
+                        let exponent = maximum_exponent(n, &shifted)?;
+                        let entry =
+                            |i: usize, j: usize| -> Result<I> { scale(&shifted(i, j)?, -exponent) };
+                        Ok((exponent, column_actions(n, &u, &entry, p)?))
+                    });
+                    match (&actual, &expected) {
+                        (Ok((e1, du1)), Ok((e2, du2))) => {
+                            assert_eq!(e1, e2);
+                            for (left, right) in du1.iter().zip(du2) {
+                                assert_eq!(bits(left), bits(right));
+                            }
+                        }
+                        (Err(left), Err(right)) => assert_eq!(left.to_string(), right.to_string()),
+                        _ => panic!("parallel and serial cluster loops disagree on failure"),
+                    }
+                    let residual = pool.install(|| row_residuals(&h, &rhs, &y, p));
+                    assert_eq!(bits(&residual), bits(&expected_residual));
+                }
+            }
+        }
+    }
 }

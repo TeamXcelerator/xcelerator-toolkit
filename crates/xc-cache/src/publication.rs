@@ -1897,6 +1897,18 @@ pub enum CreateRefResult {
     RefExists { current_head: String },
 }
 
+/// Outcome of deleting a branch only while it still names an expected commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeleteRefResult {
+    Deleted,
+    /// The branch names another commit; it was not deleted.
+    RefConflict {
+        current_head: String,
+    },
+    /// The branch no longer exists.
+    Absent,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AtomicRemoteCommitRequest {
@@ -2001,6 +2013,17 @@ pub trait RemoteGitStore: Send + Sync {
     ) -> Result<AtomicCompareAndSwapResult, CacheError> {
         Err(CacheError::ReadOnlyLayer(
             "remote transport does not support atomic multi-ref commits".to_owned(),
+        ))
+    }
+    /// Delete `branch` only if it still names `expected_head` (compare-and-swap).
+    fn delete_ref_if_head(
+        &self,
+        _repository: &str,
+        _branch: &str,
+        _expected_head: &str,
+    ) -> Result<DeleteRefResult, CacheError> {
+        Err(CacheError::ReadOnlyLayer(
+            "remote transport does not support compare-and-swap ref deletion".to_owned(),
         ))
     }
     fn verify_committed_part(

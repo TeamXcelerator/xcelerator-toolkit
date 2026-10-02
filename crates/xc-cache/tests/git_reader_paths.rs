@@ -1,15 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use xc_cache::{GitCliRemoteStore, RemoteGitStore};
 use xc_core::CancellationToken;
-
-struct Fixture(PathBuf);
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        // Exclusively created test directory, never a caller-owned cache.
-        std::fs::remove_dir_all(&self.0).expect("remove local Git fixture");
-    }
-}
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -28,14 +20,11 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 #[test]
 fn ordinary_canonical_and_owned_reader_paths_recover_exact_committed_bytes() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let fixture =
-        Fixture(std::env::temp_dir().join(format!("xc-r2-git-{}-{nanos}", std::process::id())));
-    std::fs::create_dir(&fixture.0).unwrap();
-    let source = fixture.0.join("source");
+    // Exclusively created test directory, never a caller-owned cache.
+    let scratch = xc_core::test_support::TestDir::new("r2-git");
+    let fixture = scratch.join("fixture");
+    std::fs::create_dir(&fixture).unwrap();
+    let source = fixture.join("source");
     std::fs::create_dir(&source).unwrap();
     git(&source, &["init", "-q"]);
     let payload = b"{\"value\":\"0.25\"}\n\0\xff";
@@ -60,9 +49,9 @@ fn ordinary_canonical_and_owned_reader_paths_recover_exact_committed_bytes() {
         ],
     );
     let revision = git(&source, &["rev-parse", "HEAD"]);
-    let canonical = std::fs::canonicalize(&fixture.0).unwrap();
+    let canonical = std::fs::canonicalize(&fixture).unwrap();
     for (label, parent, owned) in [
-        ("ordinary", &fixture.0, false),
+        ("ordinary", &fixture, false),
         ("canonical", &canonical, false),
         ("Unicode space \u{03b1}", &canonical, false),
         ("owned canonical", &canonical, true),

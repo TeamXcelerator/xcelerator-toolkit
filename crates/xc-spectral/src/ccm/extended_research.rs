@@ -212,6 +212,9 @@ pub struct EnergyAllowance {
 pub struct ExternalResearchInputs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_once: Option<super::convergence_capture::RunOnceInputs>,
+    #[doc(hidden)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finite_diagnostics: Option<super::convergence_capture::finite_capture::Inputs>,
     pub schema_version: u32,
     pub source_eigenpair: ContentDigest,
     pub lambda_squared: String,
@@ -265,8 +268,44 @@ impl ExternalResearchInputs {
         }
     }
 
+    /// Validate every declared value. Each capture admits the same immutable
+    /// input several times; a success is remembered for this thread (up to
+    /// eight inputs), bound to the exact serialized bytes and the MPFR exponent
+    /// range, so byte-identical content is not parsed again on that thread.
     pub fn validate(&self) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        if admitted_digest(self).is_some() {
+            return Ok(());
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"external-research-input-validated-v1\0");
+        hash.update(rug::float::exp_min().to_le_bytes());
+        hash.update(rug::float::exp_max().to_le_bytes());
+        // The same serialization pass also yields the canonical content
+        // digest, so a later admission of these bytes is a memo hit.
+        let mut content = Sha256::new();
+        serde_json::to_writer(
+            HashBoth {
+                keyed: &mut hash,
+                content: &mut content,
+            },
+            self,
+        )?;
+        let key = ContentDigest(format!("{:x}", hash.finalize()));
+        let content = content_validation_key(&ContentDigest(format!("{:x}", content.finalize())));
+        if !VALIDATED_INPUTS.with(|memo| memo.borrow().contains(&key)) {
+            self.validate_values()?;
+            remember_validated(key);
+        }
+        remember_validated(content);
+        Ok(())
+    }
+
+    fn validate_values(&self) -> Result<()> {
         precision(self.precision_bits)?;
+        if let Some(input) = &self.finite_diagnostics {
+            input.validate()?;
+        }
         if self.schema_version != 1
             || self.n_modes > 8192
             || scalar(&self.lambda_squared, self.precision_bits)? <= 1
@@ -493,15 +532,17 @@ impl ExternalResearchInputs {
         Ok(())
     }
     pub fn from_file(path: &std::path::Path) -> Result<Self> {
-        if std::fs::metadata(path)?.len() > 64 * 1024 * 1024 {
-            bail!("external research input exceeds 64 MiB");
+        if std::fs::metadata(path)?.len()
+            > crate::ccm::capture_runtime::RESEARCH_INPUT_MAXIMUM_BYTES
+        {
+            bail!("external research input exceeds the research input byte limit");
         }
         Self::from_bytes(path, &std::fs::read(path)?)
     }
     /// Decode exactly these bytes; path only resolves separately hashed atom chunks.
     pub fn from_bytes(path: &std::path::Path, bytes: &[u8]) -> Result<Self> {
-        if bytes.len() > 64 * 1024 * 1024 {
-            bail!("external research input exceeds 64 MiB");
+        if bytes.len() as u64 > crate::ccm::capture_runtime::RESEARCH_INPUT_MAXIMUM_BYTES {
+            bail!("external research input exceeds the research input byte limit");
         }
         let mut v: Self = serde_json::from_slice(bytes)?;
         super::atom_research::expand_tables(
@@ -512,6 +553,134 @@ impl ExternalResearchInputs {
         )?;
         v.validate()?;
         Ok(v)
+    }
+}
+std::thread_local! {
+    static VALIDATED_INPUTS: std::cell::RefCell<Vec<ContentDigest>> = const { std::cell::RefCell::new(Vec::new()) };
+    static ADMITTED_INPUTS: std::cell::RefCell<Vec<AdmittedEntry>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An input admitted by an enclosing capture on this thread: object address,
+/// canonical content digest, and the exponent range of its validation.
+type AdmittedEntry = (usize, ContentDigest, (i32, i32));
+
+/// Serialization sink feeding two hashers with identical bytes.
+struct HashBoth<'a> {
+    keyed: &'a mut sha2::Sha256,
+    content: &'a mut sha2::Sha256,
+}
+
+impl std::io::Write for HashBoth<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        use sha2::Digest;
+        self.keyed.update(bytes);
+        self.content.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Memo key of a successful validation of the input with this canonical
+/// content digest under the current exponent range.
+fn content_validation_key(digest: &ContentDigest) -> ContentDigest {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"external-research-input-content-validated-v1\0");
+    hash.update(rug::float::exp_min().to_le_bytes());
+    hash.update(rug::float::exp_max().to_le_bytes());
+    hash.update(digest.0.as_bytes());
+    ContentDigest(format!("{:x}", hash.finalize()))
+}
+
+/// Remember a successful validation key (eight inputs, two keys each).
+fn remember_validated(key: ContentDigest) {
+    VALIDATED_INPUTS.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.contains(&key) {
+            return;
+        }
+        if memo.len() == 16 {
+            memo.remove(0);
+        }
+        memo.push(key);
+    });
+}
+
+/// Content digest of `input` when an enclosing [`AdmittedInput`] on this
+/// thread validated this very object under the current exponent range.
+fn admitted_digest(input: &ExternalResearchInputs) -> Option<ContentDigest> {
+    let address = std::ptr::from_ref(input) as usize;
+    let range = (rug::float::exp_min(), rug::float::exp_max());
+    ADMITTED_INPUTS.with(|admitted| {
+        admitted
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(key, _, validated)| *key == address && *validated == range)
+            .map(|(_, digest, _)| digest.clone())
+    })
+}
+
+/// An external input serialized, digested and validated once for one
+/// capture. The guard holds a shared borrow, so the input cannot change while
+/// it lives; validations of this same object during the capture reuse the
+/// result, and its canonical digest replaces repeated serialization.
+pub(crate) struct AdmittedInput<'a> {
+    input: &'a ExternalResearchInputs,
+    digest: ContentDigest,
+}
+
+impl<'a> AdmittedInput<'a> {
+    /// Equivalent to `input.validate()`, retaining the canonical digest.
+    pub(crate) fn new(input: &'a ExternalResearchInputs) -> Result<Self> {
+        let digest = match admitted_digest(input) {
+            Some(digest) => digest,
+            None => {
+                let digest = ContentDigest::sha256(&serde_json::to_vec(input)?);
+                let key = content_validation_key(&digest);
+                if !VALIDATED_INPUTS.with(|memo| memo.borrow().contains(&key)) {
+                    input.validate_values()?;
+                    remember_validated(key);
+                }
+                digest
+            }
+        };
+        ADMITTED_INPUTS.with(|admitted| {
+            admitted.borrow_mut().push((
+                std::ptr::from_ref(input) as usize,
+                digest.clone(),
+                (rug::float::exp_min(), rug::float::exp_max()),
+            ))
+        });
+        Ok(Self { input, digest })
+    }
+
+    /// `ContentDigest::sha256(&serde_json::to_vec(input))`.
+    pub(crate) fn digest(&self) -> &ContentDigest {
+        &self.digest
+    }
+}
+
+impl Drop for AdmittedInput<'_> {
+    fn drop(&mut self) {
+        let address = std::ptr::from_ref(self.input) as usize;
+        ADMITTED_INPUTS.with(|admitted| {
+            let mut admitted = admitted.borrow_mut();
+            if let Some(index) = admitted.iter().rposition(|(key, _, _)| *key == address) {
+                admitted.remove(index);
+            }
+        });
+    }
+}
+
+/// Canonical content digest of `input`, without serializing an admitted one.
+pub(crate) fn input_content_digest(input: &ExternalResearchInputs) -> Result<ContentDigest> {
+    match admitted_digest(input) {
+        Some(digest) => Ok(digest),
+        None => Ok(ContentDigest::sha256(&serde_json::to_vec(input)?)),
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -606,8 +775,18 @@ pub(super) fn row(ordinal: usize, label: impl Into<String>) -> AnalysisRow {
         notes: vec![],
     }
 }
+/// Record a value. An exact integer below 2^64 in magnitude (a count, a byte
+/// size, an availability flag) is written as an integer; every other value as
+/// a lossless decimal.
 pub(super) fn put(m: &mut BTreeMap<String, String>, name: &str, v: &Float) {
-    m.insert(name.into(), dec(v));
+    let small_integer = v.is_integer() && (v.is_zero() || v.get_exp().is_some_and(|e| e <= 64));
+    // Convert only after the magnitude check, so a huge integral value never
+    // allocates its integer expansion.
+    let text = match small_integer.then(|| v.to_integer()).flatten() {
+        Some(integer) => integer.to_string(),
+        None => dec(v),
+    };
+    m.insert(name.into(), text);
 }
 pub(super) fn missing(mut r: ExtendedAnalysis, reason: &str) -> ExtendedAnalysis {
     r.outcome = "missing_input".into();
@@ -1136,15 +1315,21 @@ fn directional(
     }
     let p = o.working_precision_bits;
     if let Some(limit) = o.maximum_working_bytes {
-        let input_bytes = input
-            .map(serde_json::to_vec)
-            .transpose()?
-            .map_or(0, |v| v.len());
-        let cells = (m.entries.len() as u128
-            + input_bytes as u128
-            + 32 * s.coefficients.len() as u128
-            + 256)
-            * 16;
+        // Count only the scalars the directional measurement holds: the
+        // perturbation operators and derivative actions of the input, not
+        // the whole serialized input (atoms, samples and tail forms are unused).
+        let input_scalars = input.map_or(Ok(0), |i| -> Result<u128> {
+            let actions = i
+                .run_once
+                .as_ref()
+                .map(|run| serde_json::to_value(&run.derivative_actions))
+                .transpose()?;
+            Ok(json_scalars(&serde_json::to_value(&i.perturbations)?)
+                + actions.as_ref().map_or(0, json_scalars))
+        })?;
+        let cells =
+            (m.entries.len() as u128 + input_scalars + 32 * s.coefficients.len() as u128 + 256)
+                * 16;
         let estimate = cells * (u128::from(p + 4096).div_ceil(8) + 64);
         if estimate > u128::from(limit) {
             return Ok(unresolved(
@@ -1290,6 +1475,7 @@ pub(crate) fn weighted_tail_base(
             }
         }
         let rows = atom_math::tail(&atoms, &checkpoints, p)?;
+        let origin_only = atoms.iter().all(|atom| atom.coordinate.is_zero());
         for value in rows {
             let mut rr = row(r.rows.len() + 1, format!("{family}/{partition}"));
             put(&mut rr.values, "cutoff", &value.cutoff);
@@ -1318,6 +1504,11 @@ pub(crate) fn weighted_tail_base(
                         value,
                     );
                 }
+            } else if origin_only {
+                rr.notes.push(
+                    "inverse moments do not apply at the origin (z = 0); its mass is reported"
+                        .into(),
+                );
             } else {
                 rr.outcome = "unresolved_denominator".into();
                 r.outcome = "partial_unresolved".into();
@@ -1802,7 +1993,7 @@ pub fn capture_external_source(
 ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ExternalResearchInputs>>> {
     capture_external_source_with_parents(s, i, &[], cache)
 }
-fn capture_external_source_with_parents(
+pub(super) fn capture_external_source_with_parents(
     s: &RetainedState,
     i: &ExternalResearchInputs,
     parents: &[ArtifactManifest],
@@ -1811,19 +2002,36 @@ fn capture_external_source_with_parents(
     i.matches(s)?;
     managed(
         INPUT_KIND,
-        json!({"input_digest":ContentDigest::sha256(&serde_json::to_vec(i)?)}),
+        json!({"input_digest":input_content_digest(i)?}),
         &[std::slice::from_ref(&s.manifest), parents].concat(),
         cache,
         || Ok(i.clone()),
         |r| {
-            r.matches(s)?;
+            // An equal value validates exactly as `i`, which passed above.
             if r != i {
+                r.matches(s)?;
                 bail!("external research source mismatch");
             }
-            Ok(())
+            i.matches(s)
         },
     )
 }
+/// Number of numeric scalars (strings or numbers) in a JSON value.
+fn json_scalars(value: &serde_json::Value) -> u128 {
+    match value {
+        serde_json::Value::String(_) | serde_json::Value::Number(_) => 1,
+        serde_json::Value::Array(items) => items.iter().map(json_scalars).sum(),
+        serde_json::Value::Object(items) => items.values().map(json_scalars).sum(),
+        _ => 0,
+    }
+}
+
+/// True when any part of the diagnostic was left unresolved by the configurable
+/// working-byte budget (`XC_RESEARCH_WORKING_BYTES`).
+fn working_budget_limited(analysis: &ExtendedAnalysis) -> bool {
+    serde_json::to_string(analysis).is_ok_and(|text| text.contains("working-byte budget"))
+}
+
 /// A finite diagnostic computed from immutable admitted primary sources and
 /// explicitly supplied optional reference/operator data. Missing inputs produce
 /// a qualified report; the live outcome adapter maps that report to Missing.
@@ -1838,17 +2046,141 @@ pub fn capture_extended(
     parent_manifests: &[ArtifactManifest],
     cache: &ArtifactCacheContext<'_>,
 ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ExtendedAnalysis>>> {
+    capture_extended_with_certificate(
+        id,
+        s,
+        m,
+        roots,
+        input,
+        None,
+        options,
+        parent_manifests,
+        cache,
+    )
+}
+
+/// [`capture_extended`] with the run's own sector-gap certificate and its
+/// manifest. Capture preflight and the transform enclosure use it when the
+/// external input supplies no certificate. The certificate is bound to their
+/// identity by its manifest and is never copied into the retained external
+/// input artifact.
+#[allow(clippy::too_many_arguments)] // Keep independently admitted sources explicit.
+pub fn capture_extended_with_certificate(
+    id: &str,
+    s: &RetainedState,
+    m: Option<&RetainedMatrix<'_>>,
+    roots: Option<&RetainedRoots>,
+    input: Option<&ExternalResearchInputs>,
+    sector_certificate: Option<(
+        &super::sector_gap_certificate::PortableCcmSectorGapCertificate,
+        &ArtifactManifest,
+    )>,
+    options: &ExtensionOptions,
+    parent_manifests: &[ArtifactManifest],
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ExtendedAnalysis>>> {
+    capture_extended_prepared(
+        id,
+        s,
+        m,
+        roots,
+        input,
+        sector_certificate,
+        options,
+        parent_manifests,
+        cache,
+        None,
+    )
+}
+
+/// Claim of a look-ahead result for the computation step, given the
+/// effective options and whether the computation is plain (no roots,
+/// certificate, directional source or exceeded row budget).
+pub(crate) type ExtendedPrepared<'a> =
+    Box<dyn FnOnce(&ExtensionOptions, bool) -> Option<Result<ExtendedAnalysis>> + 'a>;
+
+/// The options a capture computes with: `options`, with the working-byte
+/// budget of `policy` unless one is given.
+pub(crate) fn effective_options(
+    options: &ExtensionOptions,
+    policy: &super::capture_runtime::CaptureResourcePolicy,
+) -> ExtensionOptions {
+    let mut effective = options.clone();
+    effective.maximum_working_bytes = Some(
+        options
+            .maximum_working_bytes
+            .unwrap_or(policy.maximum_working_bytes),
+    );
+    effective
+}
+
+/// One extended diagnostic computed from exactly its arguments, with no cache
+/// access; see [`capture_extended_with_certificate`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn extended_compute(
+    id: &str,
+    s: &RetainedState,
+    m: Option<&RetainedMatrix<'_>>,
+    roots: Option<&RetainedRoots>,
+    options: &ExtensionOptions,
+    input: Option<&ExternalResearchInputs>,
+    compute_input: Option<&ExternalResearchInputs>,
+    directional_source: Option<&ExtendedAnalysis>,
+    budget_exceeded: bool,
+) -> Result<ExtendedAnalysis> {
+    let _stage = super::capture_runtime::Stage::new(format!("{id} compute"));
+    if budget_exceeded {
+        return Ok(unresolved(
+            report(id, s, options),
+            "row/output resource budget exceeded; retry this diagnostic with explicit limits",
+        ));
+    }
+    match id {
+        "compactness" => compactness(s, options),
+        "weighted_reference_projection" => weighted_projection(s, options, input),
+        "signed_transform" => signed_transforms(s, options, input),
+        "arithmetic_energy" => arithmetic_energy(s, m, options, input),
+        "directional_response" => directional(s, m, roots, options, input),
+        "weighted_tail" => super::atom_research::weighted_report(s, options, input),
+        "spectral_cluster" => cluster(s, options, input),
+        "resolution_budget" => resolution(s, roots, options, input),
+        "energy_allowance" => allowance(s, options, input),
+        _ if super::research_completion::DIAGNOSTICS.contains(&id) => {
+            super::research_completion::analyze(id, s, m, roots, options, compute_input)
+        }
+        _ => {
+            super::convergence_capture::analyze(id, s, m, roots, options, input, directional_source)
+        }
+    }
+}
+
+/// [`capture_extended_with_certificate`] that tries `prepared` for the
+/// computation step. Every cache access, source binding and validation stays
+/// here, in the same order; only the computation's value may come from
+/// `prepared`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn capture_extended_prepared(
+    id: &str,
+    s: &RetainedState,
+    m: Option<&RetainedMatrix<'_>>,
+    roots: Option<&RetainedRoots>,
+    input: Option<&ExternalResearchInputs>,
+    sector_certificate: Option<(
+        &super::sector_gap_certificate::PortableCcmSectorGapCertificate,
+        &ArtifactManifest,
+    )>,
+    options: &ExtensionOptions,
+    parent_manifests: &[ArtifactManifest],
+    cache: &ArtifactCacheContext<'_>,
+    prepared: Option<ExtendedPrepared<'_>>,
+) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ExtendedAnalysis>>> {
     let kind =
         artifact_kind(id).ok_or_else(|| anyhow::anyhow!("unknown extended research diagnostic"))?;
     let resource_policy = super::capture_runtime::CaptureResourcePolicy::from_environment()?;
-    let mut effective_options = options.clone();
-    effective_options.maximum_working_bytes = Some(
-        options
-            .maximum_working_bytes
-            .unwrap_or(resource_policy.maximum_working_bytes),
-    );
+    let effective_options = effective_options(options, &resource_policy);
     let options = &effective_options;
     options.validate(s)?;
+    let admitted = input.map(AdmittedInput::new).transpose()?;
     if let Some(i) = input {
         i.matches(s)?;
         if options.working_precision_bits < i.precision_bits {
@@ -1876,10 +2208,47 @@ pub fn capture_extended(
         if let Some(m) = manifest {
             sources.push(m);
         }
-        Some(ContentDigest::sha256(&serde_json::to_vec(i)?))
+        admitted.as_ref().map(|admitted| admitted.digest().clone())
     } else {
         None
     };
+    let sector_certificate = sector_certificate.filter(|_| {
+        matches!(id, "capture_preflight" | "transform_enclosure")
+            && input.is_some()
+            && super::research_completion::completion(input)
+                .is_none_or(|c| c.sector_certificate.is_none())
+    });
+    let mut admitted_certificate = None;
+    let certified_input = match (sector_certificate, input) {
+        (Some((certificate, manifest)), Some(i)) => {
+            // The manifest decides identity, so the object must be its payload.
+            if manifest.key.kind != "ccm_sector_gap_certificate" {
+                bail!("sector-gap certificate object does not match its manifest");
+            }
+            admitted_certificate =
+                super::sector_gap_certificate::AdmittedCertificate::bind(certificate, manifest)?;
+            if admitted_certificate.is_none() {
+                bail!("sector-gap certificate object does not match its manifest");
+            }
+            sources.push(manifest.clone());
+            let mut augmented = i.clone();
+            augmented
+                .run_once
+                .get_or_insert_with(Default::default)
+                .completion
+                .get_or_insert_with(Default::default)
+                .sector_certificate = Some(certificate.clone());
+            Some(augmented)
+        }
+        _ => None,
+    };
+    // The augmented input carries a clone of the admitted certificate.
+    let _admitted_clone = admitted_certificate.as_ref().and_then(|admitted| {
+        super::research_completion::completion(certified_input.as_ref())
+            .and_then(|completion| completion.sector_certificate.as_ref())
+            .map(|clone| admitted.clone_of(clone))
+    });
+    let compute_input = certified_input.as_ref().or(input);
     let directional_source = if let ("root_transport", Some(_), Some(r)) = (id, m, roots) {
         let mut full = options.clone();
         full.maximum_directional_rows = r.dataset.points.len();
@@ -1977,1150 +2346,1201 @@ pub fn capture_extended(
                     * (u64::from(options.working_precision_bits) / 3 + 32))
             > options.maximum_estimated_output_bytes;
 
-    let result = managed(
-        kind,
-        {
-            let mut request = json!({"semantics":if id == "transform_enclosure" { "extended-retained-diagnostics-v5-minus-fourier-source-error-hull" } else if matches!(id,"band_reconstruction"|"tail_operator"|"weighted_tail") { "extended-retained-diagnostics-v4" } else if id == "resolution_budget" { "extended-retained-diagnostics-v3" } else { "extended-retained-diagnostics-v2" },"expected_rows":if matches!(id,"transform_enclosure"|"operator_cluster"|"finite_section_transfer"|"configuration_comparison"|"weighted_tail"|"band_reconstruction"|"tail_operator") { None } else { Some(estimated_rows) },"diagnostic":id,"options":options,"external_input_digest":input_digest,"state_selection_policy":s.selection_policy,"state_manifest_tags":s.manifest.tags});
-            if id == "configuration_comparison" {
-                request["duplicate_coordinate_policy"] = json!("all_ambiguous_members_withheld_v2");
-            }
-            if matches!(id, "observable_budget" | "tail_operator") {
-                request["declared_error_semantics"] = json!("exact_decimal_upper_bound_v2");
-            }
-            if id == "band_reconstruction" {
-                request["ladder_positivity_policy"] =
-                    json!("all_required_recurrence_steps_including_failed_v2");
-            }
-            request["source_unit_arithmetic"] = json!("binary_scaled_hypot_checked_range_v2");
-            request["resource_admission"] = json!("resolved_working_bytes_v1");
-            if id == "complex_transform" {
-                request["maximum_parallel_rows"] = json!(resource_policy.root_block_rows);
-                request["workspace_admission"] = json!("configured_row_block_bound_v1");
-            }
-            if id == "band_reconstruction" {
-                request["exact_contraction_admission"] = json!("all_block_workspace_bound_v1");
-            }
-            if id == "weighted_reference_projection" {
-                request["weighted_profile_arithmetic"] =
-                    json!("stored_points_combined_difference_interval_gram_unresolved_v2");
-                request["maximum_weighted_profile_guard_bits"] = json!(4096);
-                request["weighted_profile_output"] =
-                    json!("midpoint_with_outward_decimal_enclosures_v1");
-            }
-            if id == "directional_response" {
-                request["directional_arithmetic"] =
-                    json!("stored_points_projected_resolvent_displacement_checked_v2");
-                request["maximum_directional_guard_bits"] = json!(4096);
-                request["directional_output"] =
-                    json!("midpoints_with_outward_decimal_enclosures_v1");
-                request["root_point_precision"] = json!("declared_payload_precision_v1");
-            }
-            if id == "arithmetic_energy" {
-                request["energy_arithmetic"] =
-                    json!("stored_points_scaled_quadratic_intervals_deficit_kind_v2");
-                request["component_selection"] =
-                    json!("explicit_operators_else_compact_actions_v1");
-                request["maximum_energy_guard_bits"] = json!(4096);
-                request["energy_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
-            }
-            if id == "signed_transform" {
-                request["signed_channel_arithmetic"] =
-                    json!("exact_cutoff_center_declared_points_checked_channels_v3");
-            }
-            if id == "spectral_cluster" {
-                request["cluster_arithmetic"] = json!("stored_points_scaled_unit_checked_gram_v3");
-                request["maximum_cluster_guard_bits"] = json!(4096);
-                request["cluster_precision_policy"] = json!("unit_column_pivot_proxy_v1");
-            }
-            if id == "weighted_tail" {
-                request["atom_arithmetic"] = json!("stored_points_exact_mass_directed_moments_v2");
-                request["atom_coordinate_serialization"] = json!("promoted_source_point_v1");
-                request["maximum_atom_guard_bits"] = json!(4096);
-                request["maximum_atom_exponent_span_bits"] = json!(1_000_000);
-            }
-            if id == "compactness" {
-                request["compactness_arithmetic"] =
-                    json!("directed_enclosure_agreed_rounding_or_unresolved_v2");
-                request["maximum_additional_guard_bits"] = json!(4096);
-            }
-            if id == "band_reconstruction" {
-                request["polynomial_band_arithmetic"] =
-                    json!("stored_polynomial_exact_newton_inverse_moments_v1");
-                request["polynomial_root_output"] =
-                    json!("outward_root_bounds_and_safe_midpoints_v1");
-                request["polynomial_root_window"] =
-                    json!("common_binary_scale_exact_rational_cauchy_v2");
-                request["maximum_polynomial_band_exact_bits"] = json!(8_000_000);
-                request["signed_band_arithmetic"] =
-                    json!("declared_points_normalized_recurrence_exact_contractions_v1");
-                request["maximum_signed_band_exact_bits"] = json!(8_000_000);
-                request["signed_band_inverse_arithmetic"] =
-                    json!("relative_zero_guard_scaled_directed_sums_v1");
-                request["maximum_signed_band_inverse_guard_bits"] = json!(4096);
-                request["basis_disk_budget_bytes"] = json!(super::band_runtime::disk_budget()?);
-                request["checkpoint_block_budget_bytes"] = json!(
-                    super::capture_runtime::CaptureResourcePolicy::from_environment()?
-                        .maximum_checkpoint_bytes
-                );
-            }
-            // Feature-dependent absence and polynomial isolation must not share
-            // a cache identity with an Arb-enabled calculation, including legacy
-            // records that did not state the available numerical backend.
-            if matches!(id, "transform_enclosure" | "band_reconstruction") {
-                request["arb_available"] = json!(cfg!(feature = "arb"));
-            }
-            if id == "transform_enclosure" {
-                request["enclosure_fourier_semantics"] =
-                    json!(super::transform_enclosure::FOURIER_SEMANTICS);
-                request["enclosure_algorithm"] =
-                    json!("centered-taylor-48-integral-remainder-minus-fourier-v4-stored-points");
-                request["enclosure_point_precision"] =
-                    json!("declared_payload_and_external_precision_v1");
-                request["enclosure_decimal_output"] = json!("outward_endpoints_v1");
-            }
-            if matches!(id, "tail_operator" | "band_reconstruction") {
-                request["tail_model_checkpoint_arithmetic"] =
-                    json!("finite-tail-model-original-matrix-dense-source-recovery-v8");
-                request["tail_model_householder_arithmetic"] =
-                    json!(xc_numerics::eigen::STABLE_HOUSEHOLDER_SEMANTICS);
-                request["tail_model_qr_arithmetic"] =
-                    json!(xc_numerics::eigen::TRIDIAG_QR_SEMANTICS);
-                request["tail_model_vector_recovery_arithmetic"] =
-                    json!(xc_numerics::eigen::DENSE_EIGENVECTOR_SEMANTICS);
-                request["tail_model_arithmetic"] =
-                    json!("declared_points_exact_dyadic_recipe_forms_v2");
-                request["maximum_tail_form_exact_bits"] = json!(8_000_000);
-            }
-            if id == "root_transport" {
-                request["transport_arithmetic"] =
-                    json!("exact_cutoff_stored_points_directional_intervals_v1");
-                request["transport_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
-                request["maximum_transport_guard_bits"] = json!(4096);
-            }
-            if id == "tail_operator" {
-                request["model_linear_algebra_arithmetic"] =
-                    json!("exact_stored_dot_product_stages_and_tail_bound_v0.15.2-v2");
-                request["l2_normalization_arithmetic"] =
-                    json!(xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2);
-            }
-            if matches!(
-                id,
-                "signed_transform"
-                    | "resolution_budget"
-                    | "observable_budget"
-                    | "configuration_comparison"
-            ) {
-                request["transform_arithmetic"] =
-                    json!("exact_cutoff_stored_points_directed_sinc_v1");
-                request["maximum_transform_guard_bits"] = json!(4096);
-            }
-            if id == "resolution_budget" {
-                request["resolution_arithmetic"] =
-                    json!("exact_decimal_tolerance_original_point_conditional_distance_v2");
-                request["resolution_output"] =
-                    json!("outward_allowance_upper_endpoints_with_expression_enclosures_v1");
-            }
-            if id == "finite_section_transfer" {
-                request["finite_transfer_arithmetic"] =
-                    json!("original_points_scaled_prefix_shifted_residual_v1");
-                request["finite_transfer_output"] =
-                    json!("midpoints_with_outward_decimal_enclosures_v1");
-                request["maximum_finite_transfer_guard_bits"] = json!(4096);
-            }
-            if id == "consistency" {
-                request["consistency_arithmetic"] =
-                    json!("original_points_scaled_action_difference_v1");
-                request["consistency_output"] =
-                    json!("midpoints_with_outward_decimal_enclosures_v1");
-                request["maximum_consistency_guard_bits"] = json!(4096);
-            }
-            if id == "complex_transform" {
-                request["complex_fourier_semantics"] =
-                    json!(super::transform_enclosure::FOURIER_SEMANTICS);
-                request["complex_arithmetic"] =
-                    json!("exact_cutoff_original_points_directed_entire_minus_sinc_v2");
-                request["complex_point_construction"] =
-                    json!("original_probes_exact_affine_contour_minus_fourier_v2");
-                request["complex_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
-                request["maximum_complex_guard_bits"] = json!(4096);
-                request["complex_root_point_precision"] = json!("declared_payload_precision_v1");
-            }
-            if id == "operator_cluster" {
-                request["cluster_operator_arithmetic"] =
-                    json!("original_points_shift_before_interval_projection_lu_v1");
-                request["cluster_operator_output"] =
-                    json!("midpoints_with_outward_decimal_enclosures_v1");
-                request["maximum_cluster_operator_guard_bits"] = json!(4096);
+    // The working-byte budget decides whether a diagnostic can be computed, not
+    // what a completed diagnostic contains, so it is not part of the identity.
+    // Capture preflight reports the budget itself and keeps it. A result
+    // limited by the budget is returned but never retained, so a later run with
+    // a larger budget computes it instead of reusing the limited result.
+    let mut identity_options = options.clone();
+    if id != "capture_preflight" {
+        identity_options.maximum_working_bytes = None;
+    }
+    let request = {
+        let mut request = json!({"semantics":if id == "transform_enclosure" { "extended-retained-diagnostics-v5-minus-fourier-source-error-hull" } else if matches!(id,"band_reconstruction"|"tail_operator"|"weighted_tail") { "extended-retained-diagnostics-v4" } else if id == "resolution_budget" { "extended-retained-diagnostics-v3" } else { "extended-retained-diagnostics-v2" },"expected_rows":if matches!(id,"transform_enclosure"|"operator_cluster"|"finite_section_transfer"|"configuration_comparison"|"weighted_tail"|"band_reconstruction"|"tail_operator") { None } else { Some(estimated_rows) },"diagnostic":id,"options":identity_options,"external_input_digest":input_digest,"state_selection_policy":s.selection_policy,"state_manifest_tags":s.manifest.tags});
+        if id == "configuration_comparison" {
+            request["duplicate_coordinate_policy"] = json!("all_ambiguous_members_withheld_v2");
+        }
+        if matches!(id, "observable_budget" | "tail_operator") {
+            request["declared_error_semantics"] = json!("exact_decimal_upper_bound_v2");
+        }
+        if id == "band_reconstruction" {
+            request["ladder_positivity_policy"] =
+                json!("all_required_recurrence_steps_including_failed_v2");
+        }
+        request["source_unit_arithmetic"] = json!("binary_scaled_hypot_checked_range_v2");
+        request["resource_admission"] = json!("budget_limited_results_not_retained_v2");
+        if id == "operator_cluster" {
+            // Only this group's identity changes with the complement solve.
+            request["complement_solve"] = json!("midpoint_preconditioned_verified_solve_v1");
+        }
+        if id == "complex_transform" {
+            request["maximum_parallel_rows"] = json!(resource_policy.root_block_rows);
+            request["workspace_admission"] = json!("configured_row_block_bound_v1");
+        }
+        if id == "band_reconstruction" {
+            request["exact_contraction_admission"] = json!("all_block_workspace_bound_v1");
+        }
+        if id == "weighted_reference_projection" {
+            request["weighted_profile_arithmetic"] =
+                json!("stored_points_combined_difference_interval_gram_unresolved_v2");
+            request["maximum_weighted_profile_guard_bits"] = json!(4096);
+            request["weighted_profile_output"] =
+                json!("midpoint_with_outward_decimal_enclosures_v1");
+        }
+        if id == "directional_response" {
+            request["directional_arithmetic"] =
+                json!("stored_points_projected_resolvent_displacement_checked_v2");
+            request["maximum_directional_guard_bits"] = json!(4096);
+            request["directional_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
+            request["root_point_precision"] = json!("declared_payload_precision_v1");
+        }
+        if id == "arithmetic_energy" {
+            request["energy_arithmetic"] =
+                json!("stored_points_scaled_quadratic_intervals_deficit_kind_v2");
+            request["component_selection"] = json!("explicit_operators_else_compact_actions_v1");
+            request["maximum_energy_guard_bits"] = json!(4096);
+            request["energy_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
+        }
+        if id == "signed_transform" {
+            request["signed_channel_arithmetic"] =
+                json!("exact_cutoff_center_declared_points_checked_channels_v3");
+        }
+        if id == "spectral_cluster" {
+            request["cluster_arithmetic"] = json!("stored_points_scaled_unit_checked_gram_v3");
+            request["maximum_cluster_guard_bits"] = json!(4096);
+            request["cluster_precision_policy"] = json!("unit_column_pivot_proxy_v1");
+        }
+        if id == "weighted_tail" {
+            request["atom_arithmetic"] = json!("stored_points_exact_mass_directed_moments_v2");
+            request["atom_coordinate_serialization"] = json!("promoted_source_point_v1");
+            request["maximum_atom_guard_bits"] = json!(4096);
+            request["maximum_atom_exponent_span_bits"] = json!(1_000_000);
+        }
+        if id == "compactness" {
+            request["compactness_arithmetic"] =
+                json!("directed_enclosure_agreed_rounding_or_unresolved_v2");
+            request["maximum_additional_guard_bits"] = json!(4096);
+        }
+        if id == "band_reconstruction" {
+            request["polynomial_band_arithmetic"] =
+                json!("stored_polynomial_exact_newton_inverse_moments_v1");
+            request["polynomial_root_output"] = json!("outward_root_bounds_and_safe_midpoints_v1");
+            request["polynomial_root_window"] =
+                json!("common_binary_scale_exact_rational_cauchy_v2");
+            request["maximum_polynomial_band_exact_bits"] = json!(8_000_000);
+            request["signed_band_arithmetic"] =
+                json!("declared_points_normalized_recurrence_exact_contractions_v1");
+            request["maximum_signed_band_exact_bits"] = json!(8_000_000);
+            request["signed_band_inverse_arithmetic"] =
+                json!("relative_zero_guard_scaled_directed_sums_v1");
+            request["maximum_signed_band_inverse_guard_bits"] = json!(4096);
+            request["basis_disk_budget_bytes"] = json!(super::band_runtime::disk_budget()?);
+            request["checkpoint_block_budget_bytes"] = json!(
+                super::capture_runtime::CaptureResourcePolicy::from_environment()?
+                    .maximum_checkpoint_bytes
+            );
+        }
+        // Feature-dependent absence and polynomial isolation must not share
+        // a cache identity with an Arb-enabled calculation, including legacy
+        // records that did not state the available numerical backend.
+        if matches!(id, "transform_enclosure" | "band_reconstruction") {
+            request["arb_available"] = json!(cfg!(feature = "arb"));
+        }
+        if id == "configuration_comparison" {
+            request["cohort_dependency"] = json!("retained_after_acquisition_v1");
+        }
+        if id == "transform_enclosure" {
+            request["enclosure_fourier_semantics"] =
+                json!(super::transform_enclosure::FOURIER_SEMANTICS);
+            request["enclosure_algorithm"] =
+                json!("centered-taylor-48-integral-remainder-minus-fourier-v4-stored-points");
+            request["enclosure_point_precision"] =
+                json!("declared_payload_and_external_precision_v1");
+            request["enclosure_decimal_output"] = json!("outward_endpoints_v1");
+        }
+        if matches!(id, "tail_operator" | "band_reconstruction") {
+            request["tail_model_checkpoint_arithmetic"] =
+                json!("finite-tail-model-original-matrix-dense-source-recovery-v8");
+            request["tail_model_householder_arithmetic"] =
+                json!(xc_numerics::eigen::STABLE_HOUSEHOLDER_SEMANTICS);
+            request["tail_model_qr_arithmetic"] = json!(xc_numerics::eigen::TRIDIAG_QR_SEMANTICS);
+            request["tail_model_vector_recovery_arithmetic"] =
+                json!(xc_numerics::eigen::DENSE_EIGENVECTOR_SEMANTICS);
+            request["tail_model_arithmetic"] =
+                json!("declared_points_exact_dyadic_recipe_forms_v2");
+            request["maximum_tail_form_exact_bits"] = json!(8_000_000);
+        }
+        if id == "root_transport" {
+            request["transport_arithmetic"] =
+                json!("exact_cutoff_stored_points_directional_intervals_v1");
+            request["transport_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
+            request["maximum_transport_guard_bits"] = json!(4096);
+        }
+        if id == "tail_operator" {
+            request["model_linear_algebra_arithmetic"] =
+                json!("exact_stored_dot_product_stages_and_tail_bound_v0.15.2-v2");
+            request["l2_normalization_arithmetic"] =
+                json!(xc_numerics::linalg::L2_NORMALIZATION_ARITHMETIC_V2);
+        }
+        if matches!(
+            id,
+            "signed_transform"
+                | "resolution_budget"
+                | "observable_budget"
+                | "configuration_comparison"
+        ) {
+            request["transform_arithmetic"] = json!("exact_cutoff_stored_points_directed_sinc_v1");
+            request["maximum_transform_guard_bits"] = json!(4096);
+        }
+        if id == "resolution_budget" {
+            request["resolution_arithmetic"] =
+                json!("exact_decimal_tolerance_original_point_conditional_distance_v2");
+            request["resolution_output"] =
+                json!("outward_allowance_upper_endpoints_with_expression_enclosures_v1");
+        }
+        if id == "finite_section_transfer" {
+            request["finite_transfer_arithmetic"] =
+                json!("original_points_scaled_prefix_shifted_residual_v1");
+            request["finite_transfer_output"] =
+                json!("midpoints_with_outward_decimal_enclosures_v1");
+            request["maximum_finite_transfer_guard_bits"] = json!(4096);
+        }
+        if id == "consistency" {
+            request["consistency_arithmetic"] =
+                json!("original_points_scaled_action_difference_v1");
+            request["consistency_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
+            request["maximum_consistency_guard_bits"] = json!(4096);
+        }
+        if id == "complex_transform" {
+            request["complex_fourier_semantics"] =
+                json!(super::transform_enclosure::FOURIER_SEMANTICS);
+            request["complex_arithmetic"] =
+                json!("exact_cutoff_original_points_directed_entire_minus_sinc_v2");
+            request["complex_point_construction"] =
+                json!("original_probes_exact_affine_contour_minus_fourier_v2");
+            request["complex_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
+            request["maximum_complex_guard_bits"] = json!(4096);
+            request["complex_root_point_precision"] = json!("declared_payload_precision_v1");
+        }
+        if id == "operator_cluster" {
+            request["cluster_operator_arithmetic"] =
+                json!("original_points_shift_before_interval_projection_lu_v1");
+            request["cluster_operator_output"] =
+                json!("midpoints_with_outward_decimal_enclosures_v1");
+            request["maximum_cluster_operator_guard_bits"] = json!(4096);
 
-                request["cluster_basis_arithmetic"] =
-                    json!("original_points_unit_columns_before_rank_threshold_v1");
-            }
-            if id == "observable_budget" {
-                request["observation_arithmetic"] =
-                    json!("original_points_directed_l2_transport_v1");
-                request["observation_output"] =
-                    json!("allowance_upper_margin_lower_with_expression_enclosures_v1");
-            }
-            if id == "configuration_comparison" {
-                request["comparison_arithmetic"] =
-                    json!("original_points_scaled_overlap_shifted_residual_v1");
-                request["comparison_output"] =
-                    json!("midpoints_with_outward_decimal_enclosures_v1");
-                request["maximum_comparison_guard_bits"] = json!(4096);
-            }
-            if id == "energy_allowance" {
-                request["allowance_interpretation"] = json!("trial-energy-scale-v1");
-                request["allowance_arithmetic"] =
-                    json!("declared_points_separate_binary_scales_intervals_v1");
-                request["maximum_allowance_guard_bits"] = json!(4096);
-                request["allowance_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
-            }
-            request
-        },
-        &sources,
-        cache,
-        || {
-            let _stage = super::capture_runtime::Stage::new(format!("{id} compute"));
-            if budget_exceeded {
-                return Ok(unresolved(
-                    report(id, s, options),
-                    "row/output resource budget exceeded; retry this diagnostic with explicit limits",
-                ));
-            }
-            match id {
-                "compactness" => compactness(s, options),
-                "weighted_reference_projection" => weighted_projection(s, options, input),
-                "signed_transform" => signed_transforms(s, options, input),
-                "arithmetic_energy" => arithmetic_energy(s, m, options, input),
-                "directional_response" => directional(s, m, roots, options, input),
-                "weighted_tail" => super::atom_research::weighted_report(s, options, input),
-                "spectral_cluster" => cluster(s, options, input),
-                "resolution_budget" => resolution(s, roots, options, input),
-                "energy_allowance" => allowance(s, options, input),
-                _ if super::research_completion::DIAGNOSTICS.contains(&id) => {
-                    super::research_completion::analyze(id, s, m, roots, options, input)
+            request["cluster_basis_arithmetic"] =
+                json!("original_points_unit_columns_before_rank_threshold_v1");
+        }
+        if id == "observable_budget" {
+            request["observation_arithmetic"] = json!("original_points_directed_l2_transport_v1");
+            request["observation_output"] =
+                json!("allowance_upper_margin_lower_with_expression_enclosures_v1");
+        }
+        if id == "configuration_comparison" {
+            request["comparison_arithmetic"] =
+                json!("original_points_scaled_overlap_shifted_residual_v1");
+            request["comparison_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
+            request["maximum_comparison_guard_bits"] = json!(4096);
+        }
+        if id == "energy_allowance" {
+            request["allowance_interpretation"] = json!("trial-energy-scale-v1");
+            request["allowance_arithmetic"] =
+                json!("declared_points_separate_binary_scales_intervals_v1");
+            request["maximum_allowance_guard_bits"] = json!(4096);
+            request["allowance_output"] = json!("midpoints_with_outward_decimal_enclosures_v1");
+        }
+        if let (Some((_, manifest)), Some(_)) = (sector_certificate, &certified_input) {
+            request["run_sector_certificate"] = json!(manifest.content_digest);
+        }
+        request
+    };
+    let budget_limited = std::cell::RefCell::new(None);
+    let compute = || -> Result<ExtendedAnalysis> {
+        // A look-ahead result exists only for the plain case.
+        let plain = !budget_exceeded
+            && roots.is_none()
+            && certified_input.is_none()
+            && directional_source.is_none();
+        if let Some(result) = prepared.and_then(|claim| claim(options, plain)) {
+            return result;
+        }
+        extended_compute(
+            id,
+            s,
+            m,
+            roots,
+            options,
+            input,
+            compute_input,
+            directional_source.as_ref(),
+            budget_exceeded,
+        )
+    };
+    let validate = |r: &ExtendedAnalysis| -> Result<()> {
+        if (r.outcome == "certified_finite_enclosure" && id != "transform_enclosure")
+            || r.diagnostic != id
+            || r.lambda_squared != s.cutoff
+            || r.n_modes != s.modes
+            || r.source_precision_bits != s.precision
+            || r.working_precision_bits != options.working_precision_bits
+            || r.assurance
+                != if id == "transform_enclosure" {
+                    "finite_retained_function_enclosures; source_scope_explicit; no_infinite_limit_claim"
+                } else if id == "directional_response" {
+                    DIRECTIONAL_ASSURANCE
+                } else if id == "root_transport" {
+                    TRANSPORT_ASSURANCE
+                } else if id == "complex_transform" {
+                    COMPLEX_ASSURANCE
+                } else if id == "operator_cluster" {
+                    OPERATOR_CLUSTER_ASSURANCE
+                } else if id == "finite_section_transfer" {
+                    TRANSFER_ASSURANCE
+                } else if id == "consistency" {
+                    CONSISTENCY_ASSURANCE
+                } else if id == "observable_budget" {
+                    OBSERVATION_ASSURANCE
+                } else if id == "configuration_comparison" {
+                    COMPARISON_ASSURANCE
+                } else if id == "resolution_budget" {
+                    RESOLUTION_ASSURANCE
+                } else if id == "energy_allowance" {
+                    ALLOWANCE_ASSURANCE
+                } else if id == "arithmetic_energy" {
+                    ENERGY_ASSURANCE
+                } else if id == "weighted_reference_projection" {
+                    WEIGHTED_PROFILE_ASSURANCE
+                } else {
+                    ASSURANCE
                 }
-                _ => super::convergence_capture::analyze(
-                    id,
-                    s,
-                    m,
-                    roots,
-                    options,
-                    input,
-                    directional_source.as_ref(),
-                ),
-            }
-        },
-        |r| {
-            if (r.outcome == "certified_finite_enclosure" && id != "transform_enclosure")
-                || r.diagnostic != id
-                || r.lambda_squared != s.cutoff
-                || r.n_modes != s.modes
-                || r.source_precision_bits != s.precision
-                || r.working_precision_bits != options.working_precision_bits
-                || r.assurance
-                    != if id == "transform_enclosure" {
-                        "finite_retained_function_enclosures; source_scope_explicit; no_infinite_limit_claim"
-                    } else if id == "directional_response" {
-                        DIRECTIONAL_ASSURANCE
-                    } else if id == "root_transport" {
-                        TRANSPORT_ASSURANCE
-                    } else if id == "complex_transform" {
-                        COMPLEX_ASSURANCE
-                    } else if id == "operator_cluster" {
-                        OPERATOR_CLUSTER_ASSURANCE
-                    } else if id == "finite_section_transfer" {
-                        TRANSFER_ASSURANCE
-                    } else if id == "consistency" {
-                        CONSISTENCY_ASSURANCE
-                    } else if id == "observable_budget" {
-                        OBSERVATION_ASSURANCE
-                    } else if id == "configuration_comparison" {
-                        COMPARISON_ASSURANCE
-                    } else if id == "resolution_budget" {
-                        RESOLUTION_ASSURANCE
-                    } else if id == "energy_allowance" {
-                        ALLOWANCE_ASSURANCE
-                    } else if id == "arithmetic_energy" {
-                        ENERGY_ASSURANCE
-                    } else if id == "weighted_reference_projection" {
-                        WEIGHTED_PROFILE_ASSURANCE
-                    } else {
-                        ASSURANCE
-                    }
-                || r.convention.is_empty()
-                || ![
-                    "point_measurement",
-                    "certified_finite_enclosure",
-                    "partial_unresolved",
-                    "unresolved",
-                    "missing_input",
-                    "rank_or_precision_unresolved",
-                    "conditional_bound_expression",
-                    "sufficient_bound_unavailable",
-                ]
-                .contains(&r.outcome.as_str())
-                || r.rows.len() > options.maximum_rows
-            {
-                bail!("invalid extended research report identity/status");
-            }
-            if [
-                "missing_input",
+            || r.convention.is_empty()
+            || ![
+                "point_measurement",
+                "certified_finite_enclosure",
+                "partial_unresolved",
                 "unresolved",
+                "missing_input",
+                "awaiting_cohort",
                 "rank_or_precision_unresolved",
+                "conditional_bound_expression",
                 "sufficient_bound_unavailable",
             ]
             .contains(&r.outcome.as_str())
-                && r.reason.as_ref().is_none_or(|v| v.is_empty())
+            || r.rows.len() > options.maximum_rows
+        {
+            bail!("invalid extended research report identity/status");
+        }
+        if [
+            "missing_input",
+            "awaiting_cohort",
+            "unresolved",
+            "rank_or_precision_unresolved",
+            "sufficient_bound_unavailable",
+        ]
+        .contains(&r.outcome.as_str())
+            && r.reason.as_ref().is_none_or(|v| v.is_empty())
+        {
+            bail!("qualified absence requires a reason");
+        }
+        if r.outcome == "awaiting_cohort" {
+            if id != "configuration_comparison"
+                || !r.rows.is_empty()
+                || !r.values.is_empty()
+                || input
+                    .and_then(|i| i.run_once.as_ref())
+                    .and_then(|r| r.completion.as_ref())
+                    .is_some_and(|c| !c.comparisons.is_empty())
             {
-                bail!("qualified absence requires a reason");
+                bail!("invalid deferred cohort report");
             }
-            for v in r
-                .values
-                .values()
-                .chain(r.rows.iter().flat_map(|r| r.values.values()))
-            {
-                scalar(v, options.working_precision_bits)?;
-            }
-            if id == "root_transport" {
-                for row in &r.rows {
-                    let fields = [
-                        "component_forcing_sum",
-                        "absolute_component_forcing_sum",
-                        "forcing_closure_defect",
-                        "support_motion",
-                        "operator_motion",
-                        "conditional_total_physical_velocity",
-                        "retained_secular_pole_motion",
-                        "retained_total_velocity",
-                        "retained_transport_additivity_defect",
-                    ];
-                    if fields.iter().any(|name| row.values.contains_key(*name)) {
-                        let work = scalar(
-                            row.values
-                                .get("transport_arithmetic_precision_bits")
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("missing transport arithmetic precision")
-                                })?,
+            xc_core::validate_secret_free(r, "deferred comparison report")?;
+            return Ok(());
+        }
+        for v in r
+            .values
+            .values()
+            .chain(r.rows.iter().flat_map(|r| r.values.values()))
+        {
+            scalar(v, options.working_precision_bits)?;
+        }
+        if id == "root_transport" {
+            for row in &r.rows {
+                let fields = [
+                    "component_forcing_sum",
+                    "absolute_component_forcing_sum",
+                    "forcing_closure_defect",
+                    "support_motion",
+                    "operator_motion",
+                    "conditional_total_physical_velocity",
+                    "retained_secular_pole_motion",
+                    "retained_total_velocity",
+                    "retained_transport_additivity_defect",
+                ];
+                if fields.iter().any(|name| row.values.contains_key(*name)) {
+                    let work = scalar(
+                        row.values
+                            .get("transport_arithmetic_precision_bits")
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("missing transport arithmetic precision")
+                            })?,
+                        options.working_precision_bits,
+                    )?;
+                    if work < options.working_precision_bits + 64
+                        || work > options.working_precision_bits + 4096
+                    {
+                        bail!("invalid transport arithmetic precision");
+                    }
+                }
+                for name in fields {
+                    if let Some(value) = row.values.get(name) {
+                        let lo = scalar(
+                            row.values.get(&format!("{name}_lower")).ok_or_else(|| {
+                                anyhow::anyhow!("missing transport lower endpoint")
+                            })?,
                             options.working_precision_bits,
                         )?;
-                        if work < options.working_precision_bits + 64
-                            || work > options.working_precision_bits + 4096
-                        {
-                            bail!("invalid transport arithmetic precision");
-                        }
-                    }
-                    for name in fields {
-                        if let Some(value) = row.values.get(name) {
-                            let lo = scalar(
-                                row.values.get(&format!("{name}_lower")).ok_or_else(|| {
-                                    anyhow::anyhow!("missing transport lower endpoint")
-                                })?,
-                                options.working_precision_bits,
-                            )?;
-                            let hi = scalar(
-                                row.values.get(&format!("{name}_upper")).ok_or_else(|| {
-                                    anyhow::anyhow!("missing transport upper endpoint")
-                                })?,
-                                options.working_precision_bits,
-                            )?;
-                            let mid = scalar(value, options.working_precision_bits)?;
-                            if lo > mid || mid > hi {
-                                bail!("invalid transport enclosure");
-                            }
-                        }
-                    }
-                }
-            }
-            for row in &r.rows {
-                if (row.outcome == "certified_finite_enclosure" && id != "transform_enclosure")
-                    || row.ordinal == 0
-                    || row.label.is_empty()
-                    || ![
-                        "point_measurement",
-                        "certified_finite_enclosure",
-                        "missing_input",
-                        "budget_limited",
-                        "carrier_or_unresolved",
-                        "unresolved_denominator",
-                        "cancellation_limited",
-                        "unresolved_derivative",
-                        "channels_resolved_budget_unassessed",
-                        "conditional_budget_met",
-                        "conditional_budget_not_met",
-                        "conditional_budget_unresolved",
-                    ]
-                    .contains(&row.outcome.as_str())
-                {
-                    bail!("invalid extended research row");
-                }
-            }
-            if id == "complex_transform"
-                && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
-            {
-                let p = options.working_precision_bits;
-                let check = |values: &BTreeMap<String, String>| -> Result<()> {
-                    let used = scalar(
-                        values.get("arithmetic_precision_bits").ok_or_else(|| {
-                            anyhow::anyhow!("missing complex arithmetic precision")
-                        })?,
-                        p,
-                    )?;
-                    if used < p + 64 || used > p + 4096 || !used.is_integer() {
-                        bail!("invalid complex arithmetic precision");
-                    }
-                    for (name, value) in values {
-                        if name == "arithmetic_precision_bits"
-                            || name.ends_with("_lower")
-                            || name.ends_with("_upper")
-                        {
-                            continue;
-                        }
-                        let lo = values
-                            .get(&format!("{name}_lower"))
-                            .ok_or_else(|| anyhow::anyhow!("missing complex lower bound"))?;
-                        let hi = values
-                            .get(&format!("{name}_upper"))
-                            .ok_or_else(|| anyhow::anyhow!("missing complex upper bound"))?;
-                        let point = scalar(value, p)?;
-                        let low =
-                            Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
-                        let high =
-                            Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
-                        if low > point || high < point {
-                            bail!("complex point outside enclosure");
-                        }
-                    }
-                    Ok(())
-                };
-                check(&r.values)?;
-                if !r.values.contains_key("normalization_anchor") {
-                    bail!("complex normalization anchor missing");
-                }
-                let count = roots.map_or(0, |roots| roots.dataset.points.len());
-                let probes = 5 * (count + 1);
-                if r.rows.len() != probes + 65 {
-                    bail!("complex retained-ordinal or contour row count mismatch");
-                }
-                for (index, row) in r.rows.iter().enumerate() {
-                    check(&row.values)?;
-                    if row.ordinal != index + 1
-                        || row.label
-                            != if index < probes {
-                                "complex_transform_sample"
-                            } else {
-                                "contour_sample"
-                            }
-                    {
-                        bail!("complex row order or label mismatch");
-                    }
-                    let ordinal = if index >= probes || index < 5 {
-                        0
-                    } else {
-                        roots.unwrap().dataset.points[index / 5 - 1].ordinal
-                    };
-                    if scalar(
-                        row.values
-                            .get("input_ordinal")
-                            .ok_or_else(|| anyhow::anyhow!("missing complex input ordinal"))?,
-                        p,
-                    )? != ordinal
-                    {
-                        bail!("complex input ordinal mismatch");
-                    }
-                    if index < probes {
-                        if scalar(
-                            row.values.get("z_im").ok_or_else(|| {
-                                anyhow::anyhow!("missing complex imaginary coordinate")
+                        let hi = scalar(
+                            row.values.get(&format!("{name}_upper")).ok_or_else(|| {
+                                anyhow::anyhow!("missing transport upper endpoint")
                             })?,
-                            p,
-                        )? != Float::with_val(p, [-4, -1, 0, 1, 4][index % 5]) / 4u32
-                        {
-                            bail!("complex sample offset mismatch");
-                        }
-                        let t = if index < 5 {
-                            Some(Float::with_val(p, 0))
-                        } else {
-                            let roots = roots.unwrap();
-                            roots.dataset.points[index / 5 - 1]
-                                .value
-                                .as_ref()
-                                .map(|value| scalar(value, roots.dataset.precision_bits))
-                                .transpose()?
-                        };
-                        if let Some(t) = t {
-                            if scalar(
-                                row.values.get("z_re").ok_or_else(|| {
-                                    anyhow::anyhow!("missing complex real coordinate")
-                                })?,
-                                p,
-                            )? != t
-                            {
-                                bail!("complex original root point mismatch");
-                            }
-                            if row.outcome == "missing_input" {
-                                bail!("complex present ordinate marked missing");
-                            }
-                        } else {
-                            if row.outcome != "missing_input"
-                                || row.values.contains_key("z_re")
-                                || row.values.contains_key("value_re")
-                            {
-                                bail!("complex missing ordinate contract mismatch");
-                            }
-                            continue;
-                        }
-                    }
-                    if row.outcome == "cancellation_limited" {
-                        if row.values.contains_key("value_re") || row.notes.is_empty() {
-                            bail!("complex unresolved arithmetic contract mismatch");
-                        }
-                        continue;
-                    }
-                    for name in [
-                        "z_re",
-                        "z_im",
-                        "value_re",
-                        "value_im",
-                        "derivative_re",
-                        "derivative_im",
-                        "sum_absolute_terms",
-                        "normalization_denominator_resolved",
-                        "log_derivative_denominator_resolved",
-                    ] {
-                        if !row.values.contains_key(name) {
-                            bail!("complex core measurement missing");
-                        }
-                    }
-                    let mut complete = true;
-                    for (flag, name) in [
-                        ("normalization_denominator_resolved", "normalized"),
-                        ("log_derivative_denominator_resolved", "log_derivative"),
-                    ] {
-                        let flag = scalar(&row.values[flag], p)?;
-                        if flag != 0 && flag != 1 {
-                            bail!("invalid complex ratio flag");
-                        }
-                        let present = flag == 1;
-                        complete &= present;
-                        for part in ["re", "im"] {
-                            if row.values.contains_key(&format!("{name}_{part}")) != present {
-                                bail!("complex ratio presence mismatch");
-                            }
-                        }
-                    }
-                    if row.outcome
-                        != if complete {
-                            "point_measurement"
-                        } else {
-                            "unresolved_denominator"
-                        }
-                    {
-                        bail!("complex ratio outcome mismatch");
-                    }
-                }
-                let a = &r.rows[probes].values;
-                let b = &r.rows[probes + 64].values;
-                for name in [
-                    "z_re",
-                    "z_im",
-                    "z_re_lower",
-                    "z_re_upper",
-                    "z_im_lower",
-                    "z_im_upper",
-                ] {
-                    if a.get(name) != b.get(name) {
-                        bail!("complex contour is not closed");
-                    }
-                }
-                let partial = r.rows.iter().any(|row| row.outcome != "point_measurement");
-                if r.outcome
-                    != if partial {
-                        "partial_unresolved"
-                    } else {
-                        "point_measurement"
-                    }
-                    || (partial && r.reason.as_ref().is_none_or(|v| v.is_empty()))
-                {
-                    bail!("complex aggregate completion mismatch");
-                }
-            }
-            if id == "operator_cluster"
-                && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
-            {
-                let p = options.working_precision_bits;
-                let check = |values: &BTreeMap<String, String>| -> Result<()> {
-                    let used = scalar(
-                        values.get("arithmetic_precision_bits").ok_or_else(|| {
-                            anyhow::anyhow!("missing cluster arithmetic precision")
-                        })?,
-                        p,
-                    )?;
-                    if used < p + 64 || used > p + 4096 || !used.is_integer() {
-                        bail!("invalid cluster arithmetic precision");
-                    }
-                    for (name, value) in values {
-                        if name == "arithmetic_precision_bits"
-                            || name.ends_with("_lower")
-                            || name.ends_with("_upper")
-                        {
-                            continue;
-                        }
-                        let lo = values
-                            .get(&format!("{name}_lower"))
-                            .ok_or_else(|| anyhow::anyhow!("missing cluster lower bound"))?;
-                        let hi = values
-                            .get(&format!("{name}_upper"))
-                            .ok_or_else(|| anyhow::anyhow!("missing cluster upper bound"))?;
-                        let point = scalar(value, p)?;
-                        let low =
-                            Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
-                        let high =
-                            Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
-                        if low > point || high < point {
-                            bail!("cluster point outside enclosure");
-                        }
-                    }
-                    Ok(())
-                };
-                check(&r.values)?;
-                for name in [
-                    "subspace_dimension",
-                    "retained_energy_shift",
-                    "source_leakage_squared",
-                    "estimated_factorization_workspace_bytes",
-                    "column_selection_threshold",
-                    "discarded_reference_columns",
-                ] {
-                    if !r.values.contains_key(name) {
-                        bail!("cluster report core field missing");
-                    }
-                }
-                let b = scalar(&r.values["subspace_dimension"], p)?
-                    .to_integer()
-                    .and_then(|v| v.to_usize())
-                    .ok_or_else(|| anyhow::anyhow!("invalid cluster dimension"))?;
-                if b == 0
-                    || b > s.coefficients.len()
-                    || scalar(&r.values["subspace_dimension"], p)? != b
-                    || r.rows.len() != b * b
-                {
-                    bail!("cluster row shape mismatch");
-                }
-                for index in 0..b {
-                    if !r
-                        .values
-                        .contains_key(&format!("selected_input_column_{index}"))
-                    {
-                        bail!("cluster selected-column identity missing");
-                    }
-                }
-                for (k, row) in r.rows.iter().enumerate() {
-                    check(&row.values)?;
-                    for name in ["row", "column", "compressed_operator", "coupling_gram"] {
-                        if !row.values.contains_key(name) {
-                            bail!("cluster row core field missing");
-                        }
-                    }
-                    if row.ordinal != k + 1
-                        || scalar(&row.values["row"], p)? != k / b
-                        || scalar(&row.values["column"], p)? != k % b
-                    {
-                        bail!("cluster row coordinates mismatch");
-                    }
-                    let complete = r.outcome == "point_measurement";
-                    if (complete && row.outcome != "point_measurement")
-                        || (!complete && row.outcome != "unresolved_denominator")
-                    {
-                        bail!("cluster row completion mismatch");
-                    }
-                    for name in [
-                        "signed_complement_feedback",
-                        "effective_operator",
-                        "solve_relative_residual",
-                    ] {
-                        if row.values.contains_key(name) != complete {
-                            bail!("cluster feedback completion mismatch");
+                            options.working_precision_bits,
+                        )?;
+                        let mid = scalar(value, options.working_precision_bits)?;
+                        if lo > mid || mid > hi {
+                            bail!("invalid transport enclosure");
                         }
                     }
                 }
             }
-            if matches!(id, "finite_section_transfer" | "consistency")
-                && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
-            {
-                let p = options.working_precision_bits;
-                let check = |values: &BTreeMap<String, String>| -> Result<()> {
-                    let used = scalar(
-                        values.get("arithmetic_precision_bits").ok_or_else(|| {
-                            anyhow::anyhow!("missing transfer/consistency precision")
-                        })?,
-                        p,
-                    )?;
-                    if used < p + 64 || used > p + 4096 || !used.is_integer() {
-                        bail!("invalid transfer/consistency precision");
-                    }
-                    for (name, value) in values {
-                        if name == "arithmetic_precision_bits"
-                            || name.ends_with("_lower")
-                            || name.ends_with("_upper")
-                        {
-                            continue;
-                        }
-                        let lo = values.get(&format!("{name}_lower")).ok_or_else(|| {
-                            anyhow::anyhow!("missing transfer/consistency lower bound")
-                        })?;
-                        let hi = values.get(&format!("{name}_upper")).ok_or_else(|| {
-                            anyhow::anyhow!("missing transfer/consistency upper bound")
-                        })?;
-                        let point = scalar(value, p)?;
-                        let low =
-                            Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
-                        let high =
-                            Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
-                        if low > point || high < point {
-                            bail!("transfer/consistency point outside enclosure");
-                        }
-                    }
-                    Ok(())
-                };
-                if id == "finite_section_transfer" {
-                    check(&r.values)?;
-                    if r.rows.len() != s.modes + 1 {
-                        bail!("finite-section prefix count mismatch");
-                    }
-                    if let Some(c) = input
-                        .and_then(|i| i.run_once.as_ref())
-                        .and_then(|i| i.comparison.as_ref())
-                    {
-                        for name in [
-                            "comparison_block_frobenius_difference",
-                            "comparison_precision_bits",
-                        ] {
-                            if !r.values.contains_key(name) {
-                                bail!("finite-section comparison measurement missing");
-                            }
-                        }
-                        let mut nonzero = false;
-                        for value in &c.coefficients {
-                            nonzero |= !scalar(value, c.precision_bits)?.is_zero();
-                        }
-                        if nonzero
-                            != r.values
-                                .contains_key("comparison_state_signed_block_defect")
-                        {
-                            bail!("finite-section signed comparison denominator contract mismatch");
-                        }
-                    }
-                }
-                for (k, row) in r.rows.iter().enumerate() {
-                    if row.values.is_empty() {
-                        if id == "finite_section_transfer"
-                            || !["missing_input", "cancellation_limited"]
-                                .contains(&row.outcome.as_str())
-                        {
-                            bail!("transfer/consistency measurements missing");
-                        }
-                        continue;
-                    }
-                    check(&row.values)?;
-                    let core: &[&str] = if id == "finite_section_transfer" {
-                        &[
-                            "n_modes",
-                            "retained_mass",
-                            "omitted_mass",
-                            "low_residual_squared",
-                            "high_forcing_squared",
-                            "truncated_energy",
-                        ]
-                    } else {
-                        &["action_difference_norm", "signed_energy_difference"]
-                    };
-                    for name in core {
-                        if !row.values.contains_key(*name) {
-                            bail!("transfer/consistency core field missing");
-                        }
-                    }
-                    if id == "finite_section_transfer"
-                        && (row.ordinal != k + 1 || scalar(&row.values["n_modes"], p)? != k)
-                    {
-                        bail!("finite-section prefix order mismatch");
-                    }
-                }
-            }
-            if matches!(id, "observable_budget" | "configuration_comparison")
-                && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
-            {
-                let p = options.working_precision_bits;
-                let check = |values: &BTreeMap<String, String>| -> Result<()> {
-                    let used = scalar(
-                        values.get("arithmetic_precision_bits").ok_or_else(|| {
-                            anyhow::anyhow!("missing comparison/observation precision")
-                        })?,
-                        p,
-                    )?;
-                    if used < p + 64 || used > p + 4096 || !used.is_integer() {
-                        bail!("invalid comparison/observation precision");
-                    }
-                    for (name, value) in values {
-                        if name == "arithmetic_precision_bits"
-                            || name.ends_with("_lower")
-                            || name.ends_with("_upper")
-                        {
-                            continue;
-                        }
-                        let lo = values.get(&format!("{name}_lower")).ok_or_else(|| {
-                            anyhow::anyhow!("missing comparison/observation lower bound")
-                        })?;
-                        let hi = values.get(&format!("{name}_upper")).ok_or_else(|| {
-                            anyhow::anyhow!("missing comparison/observation upper bound")
-                        })?;
-                        let point = scalar(value, p)?;
-                        let low =
-                            Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
-                        let high =
-                            Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
-                        if low > point || high < point {
-                            bail!("comparison/observation point outside enclosure");
-                        }
-                        if id == "observable_budget" {
-                            if name.ends_with("_lower_margin") && value != lo {
-                                bail!("observation margin is not an outward lower endpoint");
-                            }
-                            if [
-                                "declared_origin_error",
-                                "conditional_value_error",
-                                "conditional_derivative_error",
-                            ]
-                            .contains(&name.as_str())
-                                && value != hi
-                            {
-                                bail!("observation error is not an outward upper endpoint");
-                            }
-                        }
-                    }
-                    Ok(())
-                };
-                if id == "observable_budget" {
-                    check(&r.values)?;
-                    for name in ["transform_origin", "origin_absolute_terms"] {
-                        if !r.values.contains_key(name) {
-                            bail!("observation origin channel missing");
-                        }
-                    }
-                    if input
-                        .and_then(|i| i.run_once.as_ref())
-                        .and_then(|i| i.uncertainty.as_ref())
-                        .is_some()
-                    {
-                        for name in [
-                            "declared_unit_state_l2_error",
-                            "declared_origin_error",
-                            "conditional_origin_lower_margin",
-                        ] {
-                            if !r.values.contains_key(name) {
-                                bail!("observation source-error channel missing");
-                            }
-                        }
-                    }
-                }
-                for row in &r.rows {
-                    if row.values.is_empty() {
-                        if ![
-                            "missing_input",
-                            "budget_limited",
-                            "cancellation_limited",
-                            "unresolved_denominator",
-                        ]
-                        .contains(&row.outcome.as_str())
-                        {
-                            bail!("comparison/observation row measurements missing");
-                        }
-                        continue;
-                    }
-                    check(&row.values)?;
-                    let core: &[&str] = if id == "observable_budget" {
-                        &[
-                            "t",
-                            "value",
-                            "derivative",
-                            "absolute_value_terms",
-                            "absolute_derivative_terms",
-                        ]
-                    } else {
-                        &[
-                            "comparison_C",
-                            "comparison_N",
-                            "comparison_P",
-                            "signed_energy_difference",
-                        ]
-                    };
-                    for name in core {
-                        if !row.values.contains_key(*name) {
-                            bail!("comparison/observation core field missing");
-                        }
-                    }
-                    if id == "observable_budget"
-                        && input
-                            .and_then(|i| i.run_once.as_ref())
-                            .and_then(|i| i.uncertainty.as_ref())
-                            .is_some()
-                    {
-                        for name in [
-                            "declared_unit_state_l2_error",
-                            "conditional_value_error",
-                            "conditional_derivative_error",
-                            "conditional_slope_lower_margin",
-                        ] {
-                            if !row.values.contains_key(name) {
-                                bail!("observation root error channel missing");
-                            }
-                        }
-                    }
-                }
-            }
-            if id == "resolution_budget"
-                && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
-            {
-                validate_resolution_report(r, options.working_precision_bits)?;
-            }
-            if id == "directional_response" {
-                for row in &r.rows {
-                    if row.values.is_empty() {
-                        if ![
-                            "missing_input",
-                            "budget_limited",
-                            "carrier_or_unresolved",
-                            "cancellation_limited",
-                        ]
-                        .contains(&row.outcome.as_str())
-                        {
-                            bail!("directional measurements missing");
-                        }
-                        continue;
-                    }
-                    let p = options.working_precision_bits;
-                    for name in [
-                        "t",
-                        "tau",
-                        "directional_energy",
-                        "direction_norm_squared",
-                        "orthogonality_defect",
-                        "rational_root_condition",
-                        "root_condition_tolerance",
-                        "arithmetic_precision_bits",
-                    ] {
-                        if !row.values.contains_key(name) {
-                            bail!("missing directional field");
-                        }
-                    }
-                    let used = scalar(&row.values["arithmetic_precision_bits"], p)?;
-                    if used < p + 64 || used > p + 4096 || !used.is_integer() {
-                        bail!("invalid directional arithmetic precision");
-                    }
-                    for (name, value) in &row.values {
-                        if name == "arithmetic_precision_bits"
-                            || name.ends_with("_lower")
-                            || name.ends_with("_upper")
-                        {
-                            continue;
-                        }
-                        let lo = row.values.get(&format!("{name}_lower")).ok_or_else(|| {
-                            anyhow::anyhow!("missing directional lower enclosure")
-                        })?;
-                        let hi = row.values.get(&format!("{name}_upper")).ok_or_else(|| {
-                            anyhow::anyhow!("missing directional upper enclosure")
-                        })?;
-                        let point = scalar(value, p)?;
-                        if scalar(lo, p)? > point || scalar(hi, p)? < point {
-                            bail!("directional point outside enclosure");
-                        }
-                    }
-                }
-            }
-            if id == "energy_allowance"
-                && [
-                    "conditional_bound_expression",
-                    "sufficient_bound_unavailable",
+        }
+        for row in &r.rows {
+            if (row.outcome == "certified_finite_enclosure" && id != "transform_enclosure")
+                || row.ordinal == 0
+                || row.label.is_empty()
+                || ![
+                    "point_measurement",
+                    "certified_finite_enclosure",
+                    "missing_input",
+                    "budget_limited",
+                    "carrier_or_unresolved",
+                    "unresolved_denominator",
+                    "cancellation_limited",
+                    "unresolved_derivative",
+                    "channels_resolved_budget_unassessed",
+                    "conditional_budget_met",
+                    "conditional_budget_not_met",
+                    "conditional_budget_unresolved",
                 ]
-                .contains(&r.outcome.as_str())
+                .contains(&row.outcome.as_str())
             {
-                let p = options.working_precision_bits;
-                let used = r
-                    .values
-                    .get("arithmetic_precision_bits")
-                    .ok_or_else(|| anyhow::anyhow!("missing allowance arithmetic precision"))?;
-                let used = scalar(used, p)?;
+                bail!("invalid extended research row");
+            }
+        }
+        if id == "complex_transform"
+            && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
+        {
+            let p = options.working_precision_bits;
+            let check = |values: &BTreeMap<String, String>| -> Result<()> {
+                let used = scalar(
+                    values
+                        .get("arithmetic_precision_bits")
+                        .ok_or_else(|| anyhow::anyhow!("missing complex arithmetic precision"))?,
+                    p,
+                )?;
                 if used < p + 64 || used > p + 4096 || !used.is_integer() {
-                    bail!("invalid allowance arithmetic precision");
+                    bail!("invalid complex arithmetic precision");
                 }
-                for (name, value) in &r.values {
+                for (name, value) in values {
                     if name == "arithmetic_precision_bits"
                         || name.ends_with("_lower")
                         || name.ends_with("_upper")
                     {
                         continue;
                     }
-                    let lo = r
-                        .values
+                    let lo = values
                         .get(&format!("{name}_lower"))
-                        .ok_or_else(|| anyhow::anyhow!("missing allowance lower enclosure"))?;
-                    let hi = r
-                        .values
+                        .ok_or_else(|| anyhow::anyhow!("missing complex lower bound"))?;
+                    let hi = values
                         .get(&format!("{name}_upper"))
-                        .ok_or_else(|| anyhow::anyhow!("missing allowance upper enclosure"))?;
+                        .ok_or_else(|| anyhow::anyhow!("missing complex upper bound"))?;
                     let point = scalar(value, p)?;
-                    // Directed parsing tests the actual decimal endpoint against
-                    // the report's stored binary point without nearest-rounding slack.
-                    let lo = Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
-                    let hi = Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
-                    if lo > point || hi < point {
-                        bail!("allowance point outside enclosure");
+                    let low = Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
+                    let high =
+                        Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
+                    if low > point || high < point {
+                        bail!("complex point outside enclosure");
+                    }
+                }
+                Ok(())
+            };
+            check(&r.values)?;
+            if !r.values.contains_key("normalization_anchor") {
+                bail!("complex normalization anchor missing");
+            }
+            let count = roots.map_or(0, |roots| roots.dataset.points.len());
+            let probes = 5 * (count + 1);
+            if r.rows.len() != probes + 65 {
+                bail!("complex retained-ordinal or contour row count mismatch");
+            }
+            for (index, row) in r.rows.iter().enumerate() {
+                check(&row.values)?;
+                if row.ordinal != index + 1
+                    || row.label
+                        != if index < probes {
+                            "complex_transform_sample"
+                        } else {
+                            "contour_sample"
+                        }
+                {
+                    bail!("complex row order or label mismatch");
+                }
+                let ordinal = if index >= probes || index < 5 {
+                    0
+                } else {
+                    roots.unwrap().dataset.points[index / 5 - 1].ordinal
+                };
+                if scalar(
+                    row.values
+                        .get("input_ordinal")
+                        .ok_or_else(|| anyhow::anyhow!("missing complex input ordinal"))?,
+                    p,
+                )? != ordinal
+                {
+                    bail!("complex input ordinal mismatch");
+                }
+                if index < probes {
+                    if scalar(
+                        row.values.get("z_im").ok_or_else(|| {
+                            anyhow::anyhow!("missing complex imaginary coordinate")
+                        })?,
+                        p,
+                    )? != Float::with_val(p, [-4, -1, 0, 1, 4][index % 5]) / 4u32
+                    {
+                        bail!("complex sample offset mismatch");
+                    }
+                    let t = if index < 5 {
+                        Some(Float::with_val(p, 0))
+                    } else {
+                        let roots = roots.unwrap();
+                        roots.dataset.points[index / 5 - 1]
+                            .value
+                            .as_ref()
+                            .map(|value| scalar(value, roots.dataset.precision_bits))
+                            .transpose()?
+                    };
+                    if let Some(t) = t {
+                        if scalar(
+                            row.values.get("z_re").ok_or_else(|| {
+                                anyhow::anyhow!("missing complex real coordinate")
+                            })?,
+                            p,
+                        )? != t
+                        {
+                            bail!("complex original root point mismatch");
+                        }
+                        if row.outcome == "missing_input" {
+                            bail!("complex present ordinate marked missing");
+                        }
+                    } else {
+                        if row.outcome != "missing_input"
+                            || row.values.contains_key("z_re")
+                            || row.values.contains_key("value_re")
+                        {
+                            bail!("complex missing ordinate contract mismatch");
+                        }
+                        continue;
+                    }
+                }
+                if row.outcome == "cancellation_limited" {
+                    if row.values.contains_key("value_re") || row.notes.is_empty() {
+                        bail!("complex unresolved arithmetic contract mismatch");
+                    }
+                    continue;
+                }
+                for name in [
+                    "z_re",
+                    "z_im",
+                    "value_re",
+                    "value_im",
+                    "derivative_re",
+                    "derivative_im",
+                    "sum_absolute_terms",
+                    "normalization_denominator_resolved",
+                    "log_derivative_denominator_resolved",
+                ] {
+                    if !row.values.contains_key(name) {
+                        bail!("complex core measurement missing");
+                    }
+                }
+                let mut complete = true;
+                for (flag, name) in [
+                    ("normalization_denominator_resolved", "normalized"),
+                    ("log_derivative_denominator_resolved", "log_derivative"),
+                ] {
+                    let flag = scalar(&row.values[flag], p)?;
+                    if flag != 0 && flag != 1 {
+                        bail!("invalid complex ratio flag");
+                    }
+                    let present = flag == 1;
+                    complete &= present;
+                    for part in ["re", "im"] {
+                        if row.values.contains_key(&format!("{name}_{part}")) != present {
+                            bail!("complex ratio presence mismatch");
+                        }
+                    }
+                }
+                if row.outcome
+                    != if complete {
+                        "point_measurement"
+                    } else {
+                        "unresolved_denominator"
+                    }
+                {
+                    bail!("complex ratio outcome mismatch");
+                }
+            }
+            let a = &r.rows[probes].values;
+            let b = &r.rows[probes + 64].values;
+            for name in [
+                "z_re",
+                "z_im",
+                "z_re_lower",
+                "z_re_upper",
+                "z_im_lower",
+                "z_im_upper",
+            ] {
+                if a.get(name) != b.get(name) {
+                    bail!("complex contour is not closed");
+                }
+            }
+            let partial = r.rows.iter().any(|row| row.outcome != "point_measurement");
+            if r.outcome
+                != if partial {
+                    "partial_unresolved"
+                } else {
+                    "point_measurement"
+                }
+                || (partial && r.reason.as_ref().is_none_or(|v| v.is_empty()))
+            {
+                bail!("complex aggregate completion mismatch");
+            }
+        }
+        if id == "operator_cluster"
+            && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
+        {
+            let p = options.working_precision_bits;
+            let check = |values: &BTreeMap<String, String>| -> Result<()> {
+                let used = scalar(
+                    values
+                        .get("arithmetic_precision_bits")
+                        .ok_or_else(|| anyhow::anyhow!("missing cluster arithmetic precision"))?,
+                    p,
+                )?;
+                if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                    bail!("invalid cluster arithmetic precision");
+                }
+                for (name, value) in values {
+                    if name == "arithmetic_precision_bits"
+                        || name.ends_with("_lower")
+                        || name.ends_with("_upper")
+                    {
+                        continue;
+                    }
+                    let lo = values
+                        .get(&format!("{name}_lower"))
+                        .ok_or_else(|| anyhow::anyhow!("missing cluster lower bound"))?;
+                    let hi = values
+                        .get(&format!("{name}_upper"))
+                        .ok_or_else(|| anyhow::anyhow!("missing cluster upper bound"))?;
+                    let point = scalar(value, p)?;
+                    let low = Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
+                    let high =
+                        Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
+                    if low > point || high < point {
+                        bail!("cluster point outside enclosure");
+                    }
+                }
+                Ok(())
+            };
+            check(&r.values)?;
+            for name in [
+                "subspace_dimension",
+                "retained_energy_shift",
+                "source_leakage_squared",
+                "estimated_factorization_workspace_bytes",
+                "column_selection_threshold",
+                "discarded_reference_columns",
+            ] {
+                if !r.values.contains_key(name) {
+                    bail!("cluster report core field missing");
+                }
+            }
+            let b = scalar(&r.values["subspace_dimension"], p)?
+                .to_integer()
+                .and_then(|v| v.to_usize())
+                .ok_or_else(|| anyhow::anyhow!("invalid cluster dimension"))?;
+            if b == 0
+                || b > s.coefficients.len()
+                || scalar(&r.values["subspace_dimension"], p)? != b
+                || r.rows.len() != b * b
+            {
+                bail!("cluster row shape mismatch");
+            }
+            for index in 0..b {
+                if !r
+                    .values
+                    .contains_key(&format!("selected_input_column_{index}"))
+                {
+                    bail!("cluster selected-column identity missing");
+                }
+            }
+            for (k, row) in r.rows.iter().enumerate() {
+                check(&row.values)?;
+                for name in ["row", "column", "compressed_operator", "coupling_gram"] {
+                    if !row.values.contains_key(name) {
+                        bail!("cluster row core field missing");
+                    }
+                }
+                if row.ordinal != k + 1
+                    || scalar(&row.values["row"], p)? != k / b
+                    || scalar(&row.values["column"], p)? != k % b
+                {
+                    bail!("cluster row coordinates mismatch");
+                }
+                let complete = r.outcome == "point_measurement";
+                if (complete && row.outcome != "point_measurement")
+                    || (!complete && row.outcome != "unresolved_denominator")
+                {
+                    bail!("cluster row completion mismatch");
+                }
+                for name in [
+                    "signed_complement_feedback",
+                    "effective_operator",
+                    "solve_relative_residual",
+                ] {
+                    if row.values.contains_key(name) != complete {
+                        bail!("cluster feedback completion mismatch");
                     }
                 }
             }
-            if r.outcome != "missing_input" && r.outcome != "unresolved" {
-                let expected: Option<Vec<usize>> = match id {
-                    "compactness" => Some((1..=options.exponential_rates.len()).collect()),
-                    "signed_transform" => {
-                        input.map(|i| i.reference_jets.iter().map(|r| r.ordinal).collect())
-                    }
-                    "directional_response" | "root_transport" | "observable_budget" => {
-                        roots.map(|r| r.dataset.points.iter().map(|r| r.ordinal).collect())
-                    }
-                    "resolution_budget" => {
-                        if input.is_some_and(|i| !i.reference_jets.is_empty()) {
-                            input.map(|i| i.reference_jets.iter().map(|r| r.ordinal).collect())
-                        } else {
-                            roots.map(|r| r.dataset.points.iter().map(|r| r.ordinal).collect())
-                        }
-                    }
-                    "arithmetic_energy" => {
-                        input.map(|i| (1..=i.arithmetic_component_count()).collect())
-                    }
-                    "spectral_cluster" => input.map(|i| (1..=i.cluster.len()).collect()),
-                    _ => None,
-                };
-                if expected
-                    .as_ref()
-                    .is_some_and(|e| !r.rows.iter().map(|r| r.ordinal).eq(e.iter().copied()))
-                {
-                    bail!("extended report lost or changed an input ordinal");
+        }
+        if matches!(id, "finite_section_transfer" | "consistency")
+            && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
+        {
+            let p = options.working_precision_bits;
+            let check = |values: &BTreeMap<String, String>| -> Result<()> {
+                let used = scalar(
+                    values
+                        .get("arithmetic_precision_bits")
+                        .ok_or_else(|| anyhow::anyhow!("missing transfer/consistency precision"))?,
+                    p,
+                )?;
+                if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                    bail!("invalid transfer/consistency precision");
                 }
-                let required: &[&str] = match id {
-                    "compactness" => &[
-                        "transform_origin",
-                        "transform_second_derivative",
-                        "transform_fourth_derivative",
-                    ],
-                    "weighted_reference_projection" if r.outcome == "point_measurement" => {
-                        &["weighted_l1", "weighted_l2_squared", "signed_integral"]
-                    }
-                    "signed_transform" => {
-                        &["arithmetic_precision_bits", "normalization_precision_bits"]
-                    }
-                    "arithmetic_energy" => &[
-                        "arithmetic_precision_bits",
-                        "total_tau_energy_lower",
-                        "total_tau_energy_upper",
-                        "energy_closure_defect_lower",
-                        "energy_closure_defect_upper",
-                        "total_tau_energy",
-                        "sum_component_energy",
-                        "sum_absolute_component_energy",
-                        "energy_closure_defect",
-                        "operator_action_closure_norm",
-                    ],
-                    "resolution_budget" => &[
-                        "conditional_contiguous_prefix",
-                        "relative_tolerance",
-                        "finite_curvature_expression",
-                    ],
-                    "energy_allowance" => &[
-                        "upper_trial_energy",
-                        "low_block_lower_bound",
-                        "high_block_lower_bound",
-                        "cross_block_norm_bound",
-                        "denominator",
-                    ],
-                    _ => &[],
-                };
-                if required.iter().any(|k| !r.values.contains_key(*k)) {
-                    bail!("extended report missing required measurements");
-                }
-                if id == "arithmetic_energy" {
-                    let p = options.working_precision_bits;
-                    let used = scalar(&r.values["arithmetic_precision_bits"], p)?;
-                    if used < p + 64 || used > p + 4096 || !used.is_integer() {
-                        bail!("invalid arithmetic energy guard precision");
-                    }
-                    for values in
-                        std::iter::once(&r.values).chain(r.rows.iter().map(|row| &row.values))
+                for (name, value) in values {
+                    if name == "arithmetic_precision_bits"
+                        || name.ends_with("_lower")
+                        || name.ends_with("_upper")
                     {
-                        for (name, value) in values {
-                            if name == "arithmetic_precision_bits"
-                                || name.ends_with("_lower")
-                                || name.ends_with("_upper")
-                            {
-                                continue;
-                            }
-                            let lower = values
-                                .get(&format!("{name}_lower"))
-                                .ok_or_else(|| anyhow::anyhow!("missing energy lower enclosure"))?;
-                            let upper = values
-                                .get(&format!("{name}_upper"))
-                                .ok_or_else(|| anyhow::anyhow!("missing energy upper enclosure"))?;
-                            let point = scalar(value, p)?;
-                            if scalar(lower, p)? > point || scalar(upper, p)? < point {
-                                bail!("energy point lies outside its reported enclosure");
-                            }
-                        }
+                        continue;
+                    }
+                    let lo = values.get(&format!("{name}_lower")).ok_or_else(|| {
+                        anyhow::anyhow!("missing transfer/consistency lower bound")
+                    })?;
+                    let hi = values.get(&format!("{name}_upper")).ok_or_else(|| {
+                        anyhow::anyhow!("missing transfer/consistency upper bound")
+                    })?;
+                    let point = scalar(value, p)?;
+                    let low = Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
+                    let high =
+                        Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
+                    if low > point || high < point {
+                        bail!("transfer/consistency point outside enclosure");
                     }
                 }
-                if id == "signed_transform"
-                    && (scalar(
-                        &r.values["arithmetic_precision_bits"],
-                        options.working_precision_bits,
-                    )? != options.working_precision_bits
-                        || scalar(
-                            &r.values["normalization_precision_bits"],
-                            options.working_precision_bits,
-                        )? != options.working_precision_bits + 64)
-                {
-                    bail!("signed transform arithmetic precision disagrees with input points");
+                Ok(())
+            };
+            if id == "finite_section_transfer" {
+                check(&r.values)?;
+                if r.rows.len() != s.modes + 1 {
+                    bail!("finite-section prefix count mismatch");
                 }
-                if id == "energy_allowance" && r.outcome == "conditional_bound_expression" {
+                if let Some(c) = input
+                    .and_then(|i| i.run_once.as_ref())
+                    .and_then(|i| i.comparison.as_ref())
+                {
                     for name in [
-                        "conditional_energy_allowance",
-                        "conditional_vector_allowance",
-                        "trial_energy_magnitude",
+                        "comparison_block_frobenius_difference",
+                        "comparison_precision_bits",
                     ] {
                         if !r.values.contains_key(name) {
-                            bail!("energy allowance missing scale interpretation");
+                            bail!("finite-section comparison measurement missing");
                         }
                     }
-                    if r.reason.as_ref().is_none_or(|v| v.is_empty()) {
-                        bail!("energy allowance requires scale interpretation reason");
+                    let mut nonzero = false;
+                    for value in &c.coefficients {
+                        nonzero |= !scalar(value, c.precision_bits)?.is_zero();
                     }
-                    let nonzero = scalar(
-                        &r.values["trial_energy_magnitude"],
-                        options.working_precision_bits,
-                    )? > 0;
-                    if [
-                        "allowance_to_trial_energy_magnitude",
-                        "allowance_below_trial_energy_magnitude",
-                        "scale_comparison_resolved",
-                    ]
-                    .iter()
-                    .any(|name| r.values.contains_key(*name) != nonzero)
+                    if nonzero
+                        != r.values
+                            .contains_key("comparison_state_signed_block_defect")
                     {
-                        bail!("energy allowance scale comparison disagrees with zero trial energy");
+                        bail!("finite-section signed comparison denominator contract mismatch");
                     }
                 }
             }
-            xc_core::validate_secret_free(r, "extended research report")?;
-            Ok(())
+            for (k, row) in r.rows.iter().enumerate() {
+                if row.values.is_empty() {
+                    if id == "finite_section_transfer"
+                        || !["missing_input", "cancellation_limited"]
+                            .contains(&row.outcome.as_str())
+                    {
+                        bail!("transfer/consistency measurements missing");
+                    }
+                    continue;
+                }
+                check(&row.values)?;
+                let core: &[&str] = if id == "finite_section_transfer" {
+                    &[
+                        "n_modes",
+                        "retained_mass",
+                        "omitted_mass",
+                        "low_residual_squared",
+                        "high_forcing_squared",
+                        "truncated_energy",
+                    ]
+                } else {
+                    &["action_difference_norm", "signed_energy_difference"]
+                };
+                for name in core {
+                    if !row.values.contains_key(*name) {
+                        bail!("transfer/consistency core field missing");
+                    }
+                }
+                if id == "finite_section_transfer"
+                    && (row.ordinal != k + 1 || scalar(&row.values["n_modes"], p)? != k)
+                {
+                    bail!("finite-section prefix order mismatch");
+                }
+            }
+        }
+        if matches!(id, "observable_budget" | "configuration_comparison")
+            && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
+        {
+            let p = options.working_precision_bits;
+            let check = |values: &BTreeMap<String, String>| -> Result<()> {
+                let used = scalar(
+                    values.get("arithmetic_precision_bits").ok_or_else(|| {
+                        anyhow::anyhow!("missing comparison/observation precision")
+                    })?,
+                    p,
+                )?;
+                if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                    bail!("invalid comparison/observation precision");
+                }
+                for (name, value) in values {
+                    if name == "arithmetic_precision_bits"
+                        || name.ends_with("_lower")
+                        || name.ends_with("_upper")
+                    {
+                        continue;
+                    }
+                    let lo = values.get(&format!("{name}_lower")).ok_or_else(|| {
+                        anyhow::anyhow!("missing comparison/observation lower bound")
+                    })?;
+                    let hi = values.get(&format!("{name}_upper")).ok_or_else(|| {
+                        anyhow::anyhow!("missing comparison/observation upper bound")
+                    })?;
+                    let point = scalar(value, p)?;
+                    let low = Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
+                    let high =
+                        Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
+                    if low > point || high < point {
+                        bail!("comparison/observation point outside enclosure");
+                    }
+                    if id == "observable_budget" {
+                        if name.ends_with("_lower_margin") && value != lo {
+                            bail!("observation margin is not an outward lower endpoint");
+                        }
+                        if [
+                            "declared_origin_error",
+                            "conditional_value_error",
+                            "conditional_derivative_error",
+                        ]
+                        .contains(&name.as_str())
+                            && value != hi
+                        {
+                            bail!("observation error is not an outward upper endpoint");
+                        }
+                    }
+                }
+                Ok(())
+            };
+            if id == "observable_budget" {
+                check(&r.values)?;
+                for name in ["transform_origin", "origin_absolute_terms"] {
+                    if !r.values.contains_key(name) {
+                        bail!("observation origin channel missing");
+                    }
+                }
+                if input
+                    .and_then(|i| i.run_once.as_ref())
+                    .and_then(|i| i.uncertainty.as_ref())
+                    .is_some()
+                {
+                    for name in [
+                        "declared_unit_state_l2_error",
+                        "declared_origin_error",
+                        "conditional_origin_lower_margin",
+                    ] {
+                        if !r.values.contains_key(name) {
+                            bail!("observation source-error channel missing");
+                        }
+                    }
+                }
+            }
+            for row in &r.rows {
+                if row.values.is_empty() {
+                    if ![
+                        "missing_input",
+                        "budget_limited",
+                        "cancellation_limited",
+                        "unresolved_denominator",
+                    ]
+                    .contains(&row.outcome.as_str())
+                    {
+                        bail!("comparison/observation row measurements missing");
+                    }
+                    continue;
+                }
+                check(&row.values)?;
+                let core: &[&str] = if id == "observable_budget" {
+                    &[
+                        "t",
+                        "value",
+                        "derivative",
+                        "absolute_value_terms",
+                        "absolute_derivative_terms",
+                    ]
+                } else {
+                    &[
+                        "comparison_C",
+                        "comparison_N",
+                        "comparison_P",
+                        "signed_energy_difference",
+                    ]
+                };
+                for name in core {
+                    if !row.values.contains_key(*name) {
+                        bail!("comparison/observation core field missing");
+                    }
+                }
+                if id == "observable_budget"
+                    && input
+                        .and_then(|i| i.run_once.as_ref())
+                        .and_then(|i| i.uncertainty.as_ref())
+                        .is_some()
+                {
+                    for name in [
+                        "declared_unit_state_l2_error",
+                        "conditional_value_error",
+                        "conditional_derivative_error",
+                        "conditional_slope_lower_margin",
+                    ] {
+                        if !row.values.contains_key(name) {
+                            bail!("observation root error channel missing");
+                        }
+                    }
+                }
+            }
+        }
+        if id == "resolution_budget"
+            && !["missing_input", "unresolved"].contains(&r.outcome.as_str())
+        {
+            validate_resolution_report(r, options.working_precision_bits)?;
+        }
+        if id == "directional_response" {
+            for row in &r.rows {
+                if row.values.is_empty() {
+                    if ![
+                        "missing_input",
+                        "budget_limited",
+                        "carrier_or_unresolved",
+                        "cancellation_limited",
+                    ]
+                    .contains(&row.outcome.as_str())
+                    {
+                        bail!("directional measurements missing");
+                    }
+                    continue;
+                }
+                let p = options.working_precision_bits;
+                for name in [
+                    "t",
+                    "tau",
+                    "directional_energy",
+                    "direction_norm_squared",
+                    "orthogonality_defect",
+                    "rational_root_condition",
+                    "root_condition_tolerance",
+                    "arithmetic_precision_bits",
+                ] {
+                    if !row.values.contains_key(name) {
+                        bail!("missing directional field");
+                    }
+                }
+                let used = scalar(&row.values["arithmetic_precision_bits"], p)?;
+                if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                    bail!("invalid directional arithmetic precision");
+                }
+                for (name, value) in &row.values {
+                    if name == "arithmetic_precision_bits"
+                        || name.ends_with("_lower")
+                        || name.ends_with("_upper")
+                    {
+                        continue;
+                    }
+                    let lo = row
+                        .values
+                        .get(&format!("{name}_lower"))
+                        .ok_or_else(|| anyhow::anyhow!("missing directional lower enclosure"))?;
+                    let hi = row
+                        .values
+                        .get(&format!("{name}_upper"))
+                        .ok_or_else(|| anyhow::anyhow!("missing directional upper enclosure"))?;
+                    let point = scalar(value, p)?;
+                    if scalar(lo, p)? > point || scalar(hi, p)? < point {
+                        bail!("directional point outside enclosure");
+                    }
+                }
+            }
+        }
+        if id == "energy_allowance"
+            && [
+                "conditional_bound_expression",
+                "sufficient_bound_unavailable",
+            ]
+            .contains(&r.outcome.as_str())
+        {
+            let p = options.working_precision_bits;
+            let used = r
+                .values
+                .get("arithmetic_precision_bits")
+                .ok_or_else(|| anyhow::anyhow!("missing allowance arithmetic precision"))?;
+            let used = scalar(used, p)?;
+            if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                bail!("invalid allowance arithmetic precision");
+            }
+            for (name, value) in &r.values {
+                if name == "arithmetic_precision_bits"
+                    || name.ends_with("_lower")
+                    || name.ends_with("_upper")
+                {
+                    continue;
+                }
+                let lo = r
+                    .values
+                    .get(&format!("{name}_lower"))
+                    .ok_or_else(|| anyhow::anyhow!("missing allowance lower enclosure"))?;
+                let hi = r
+                    .values
+                    .get(&format!("{name}_upper"))
+                    .ok_or_else(|| anyhow::anyhow!("missing allowance upper enclosure"))?;
+                let point = scalar(value, p)?;
+                // Directed parsing tests the actual decimal endpoint against
+                // the report's stored binary point without nearest-rounding slack.
+                let lo = Float::with_val_round(p, Float::parse(lo)?, rug::float::Round::Up).0;
+                let hi = Float::with_val_round(p, Float::parse(hi)?, rug::float::Round::Down).0;
+                if lo > point || hi < point {
+                    bail!("allowance point outside enclosure");
+                }
+            }
+        }
+        if r.outcome != "missing_input" && r.outcome != "unresolved" {
+            let expected: Option<Vec<usize>> = match id {
+                "compactness" => Some((1..=options.exponential_rates.len()).collect()),
+                "signed_transform" => {
+                    input.map(|i| i.reference_jets.iter().map(|r| r.ordinal).collect())
+                }
+                "directional_response" | "root_transport" | "observable_budget" => {
+                    roots.map(|r| r.dataset.points.iter().map(|r| r.ordinal).collect())
+                }
+                "resolution_budget" => {
+                    if input.is_some_and(|i| !i.reference_jets.is_empty()) {
+                        input.map(|i| i.reference_jets.iter().map(|r| r.ordinal).collect())
+                    } else {
+                        roots.map(|r| r.dataset.points.iter().map(|r| r.ordinal).collect())
+                    }
+                }
+                "arithmetic_energy" => {
+                    input.map(|i| (1..=i.arithmetic_component_count()).collect())
+                }
+                "spectral_cluster" => input.map(|i| (1..=i.cluster.len()).collect()),
+                _ => None,
+            };
+            if expected
+                .as_ref()
+                .is_some_and(|e| !r.rows.iter().map(|r| r.ordinal).eq(e.iter().copied()))
+            {
+                bail!("extended report lost or changed an input ordinal");
+            }
+            let required: &[&str] = match id {
+                "compactness" => &[
+                    "transform_origin",
+                    "transform_second_derivative",
+                    "transform_fourth_derivative",
+                ],
+                "weighted_reference_projection" if r.outcome == "point_measurement" => {
+                    &["weighted_l1", "weighted_l2_squared", "signed_integral"]
+                }
+                "signed_transform" => {
+                    &["arithmetic_precision_bits", "normalization_precision_bits"]
+                }
+                "arithmetic_energy" => &[
+                    "arithmetic_precision_bits",
+                    "total_tau_energy_lower",
+                    "total_tau_energy_upper",
+                    "energy_closure_defect_lower",
+                    "energy_closure_defect_upper",
+                    "total_tau_energy",
+                    "sum_component_energy",
+                    "sum_absolute_component_energy",
+                    "energy_closure_defect",
+                    "operator_action_closure_norm",
+                ],
+                "resolution_budget" => &[
+                    "conditional_contiguous_prefix",
+                    "relative_tolerance",
+                    "finite_curvature_expression",
+                ],
+                "energy_allowance" => &[
+                    "upper_trial_energy",
+                    "low_block_lower_bound",
+                    "high_block_lower_bound",
+                    "cross_block_norm_bound",
+                    "denominator",
+                ],
+                _ => &[],
+            };
+            if required.iter().any(|k| !r.values.contains_key(*k)) {
+                bail!("extended report missing required measurements");
+            }
+            if id == "arithmetic_energy" {
+                let p = options.working_precision_bits;
+                let used = scalar(&r.values["arithmetic_precision_bits"], p)?;
+                if used < p + 64 || used > p + 4096 || !used.is_integer() {
+                    bail!("invalid arithmetic energy guard precision");
+                }
+                for values in std::iter::once(&r.values).chain(r.rows.iter().map(|row| &row.values))
+                {
+                    for (name, value) in values {
+                        if name == "arithmetic_precision_bits"
+                            || name.ends_with("_lower")
+                            || name.ends_with("_upper")
+                        {
+                            continue;
+                        }
+                        let lower = values
+                            .get(&format!("{name}_lower"))
+                            .ok_or_else(|| anyhow::anyhow!("missing energy lower enclosure"))?;
+                        let upper = values
+                            .get(&format!("{name}_upper"))
+                            .ok_or_else(|| anyhow::anyhow!("missing energy upper enclosure"))?;
+                        let point = scalar(value, p)?;
+                        if scalar(lower, p)? > point || scalar(upper, p)? < point {
+                            bail!("energy point lies outside its reported enclosure");
+                        }
+                    }
+                }
+            }
+            if id == "signed_transform"
+                && (scalar(
+                    &r.values["arithmetic_precision_bits"],
+                    options.working_precision_bits,
+                )? != options.working_precision_bits
+                    || scalar(
+                        &r.values["normalization_precision_bits"],
+                        options.working_precision_bits,
+                    )? != options.working_precision_bits + 64)
+            {
+                bail!("signed transform arithmetic precision disagrees with input points");
+            }
+            if id == "energy_allowance" && r.outcome == "conditional_bound_expression" {
+                for name in [
+                    "conditional_energy_allowance",
+                    "conditional_vector_allowance",
+                    "trial_energy_magnitude",
+                ] {
+                    if !r.values.contains_key(name) {
+                        bail!("energy allowance missing scale interpretation");
+                    }
+                }
+                if r.reason.as_ref().is_none_or(|v| v.is_empty()) {
+                    bail!("energy allowance requires scale interpretation reason");
+                }
+                let nonzero = scalar(
+                    &r.values["trial_energy_magnitude"],
+                    options.working_precision_bits,
+                )? > 0;
+                if [
+                    "allowance_to_trial_energy_magnitude",
+                    "allowance_below_trial_energy_magnitude",
+                    "scale_comparison_resolved",
+                ]
+                .iter()
+                .any(|name| r.values.contains_key(*name) != nonzero)
+                {
+                    bail!("energy allowance scale comparison disagrees with zero trial energy");
+                }
+            }
+        }
+        xc_core::validate_secret_free(r, "extended research report")?;
+        Ok(())
+    };
+    let retain_limited = cache.mode.compares_against_reference();
+    let first = managed(
+        kind,
+        request.clone(),
+        &sources,
+        cache,
+        || {
+            let data = compute()?;
+            if !retain_limited && working_budget_limited(&data) {
+                *budget_limited.borrow_mut() = Some(data);
+                bail!("diagnostic limited by the working-byte budget; result is not retained");
+            }
+            Ok(data)
         },
-    )?;
+        validate,
+    );
+    let limited = budget_limited.borrow_mut().take();
+    let result = match (first, limited) {
+        (Err(_), Some(data)) => {
+            let unretained = ArtifactCacheContext {
+                resolver: cache.resolver,
+                reference_resolver: cache.reference_resolver,
+                acceptance: cache.acceptance,
+                ordered_overlays: cache.ordered_overlays.clone(),
+                mode: cache.mode,
+                write_on_miss: false,
+                write_visibility: cache.write_visibility,
+                requested_assurance: cache.requested_assurance,
+                certification_failure_policy: cache.certification_failure_policy,
+                production_sink: None,
+            };
+            managed(
+                kind,
+                request,
+                &sources,
+                &unretained,
+                move || Ok(data),
+                validate,
+            )?
+        }
+        (first, _) => first?,
+    };
     super::research_export::emit(
         &result.value,
         result
@@ -3131,6 +3551,25 @@ pub fn capture_extended(
     Ok(result)
 }
 
+#[cfg(test)]
+mod value_format_contract {
+    use super::*;
+    #[test]
+    fn small_integers_are_plain_and_other_values_stay_lossless() {
+        let p = 128;
+        let mut values = BTreeMap::new();
+        put(&mut values, "count", &Float::with_val(p, 25));
+        put(&mut values, "zero", &Float::with_val(p, 0));
+        put(&mut values, "half", &Float::with_val(p, 0.5));
+        let huge = Float::with_val(p, Float::i_exp(1, 100_000_000));
+        put(&mut values, "huge", &huge);
+        assert_eq!(values["count"], "25");
+        assert_eq!(values["zero"], "0");
+        assert_eq!(values["half"], dec(&Float::with_val(p, 0.5)));
+        // A huge integral value keeps its compact lossless decimal form.
+        assert_eq!(values["huge"], dec(&huge));
+    }
+}
 #[cfg(test)]
 mod exhaustive_resumed_contract {
     use super::*;

@@ -17,7 +17,9 @@ fn precision<'a>(values: impl Iterator<Item = &'a Float>, p: u32, count: usize) 
         }
         working = working.max(value.prec());
     }
-    if count as u128 * (u128::from(working + 4096).div_ceil(8) + 96) * 32 > (8u128 << 30) {
+    if count as u128 * (u128::from(working + 4096).div_ceil(8) + 96) * 32
+        > super::source_working_budget()?
+    {
         bail!("response point arithmetic exceeds the workspace budget");
     }
     Ok(working)
@@ -45,9 +47,11 @@ fn dense_workspace(
     working_floats: u128,
 ) -> Result<()> {
     if dense_workspace_bytes(entries, vectors, source_precision, work, working_floats)
-        > (8u128 << 30)
+        > super::source_working_budget()?
     {
-        bail!("response dense point arithmetic exceeds the 8 GiB workspace at {work} working bits");
+        bail!(
+            "response dense point arithmetic exceeds the declared workspace at {work} working bits"
+        );
     }
     Ok(())
 }
@@ -1069,7 +1073,7 @@ mod resource_tests {
     use super::*;
     #[test]
     fn documented_response_shape_uses_actual_dense_buffer_lifetimes() {
-        for (n, p) in [(661usize, 131u32), (801, 6708)] {
+        for (n, p) in [(661usize, 131u32), (801, 6708), (1001, 3386)] {
             for guard in GUARDS {
                 assert!(dense_workspace_bytes(n * n, 3 * n + 3, p, p + guard, 6) < (8u128 << 30));
             }

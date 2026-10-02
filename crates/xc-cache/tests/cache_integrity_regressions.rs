@@ -22,8 +22,8 @@ fn manifest(
             size_bytes: name.len() as u64,
         }],
         created_unix_seconds: 0,
-        producer_toolkit_version: ToolkitVersion::parse("0.15.2").unwrap(),
-        minimum_reader_version: ToolkitVersion::parse("0.15.2").unwrap(),
+        producer_toolkit_version: ToolkitVersion::parse("0.18.2").unwrap(),
+        minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
         maximum_reader_version: None,
         quality,
         visibility: CacheVisibility::Public,
@@ -35,7 +35,7 @@ fn manifest(
 }
 fn policy(minimum_quality: CacheQuality) -> CachePolicy {
     CachePolicy {
-        current_toolkit_version: ToolkitVersion::parse("0.15.2").unwrap(),
+        current_toolkit_version: ToolkitVersion::parse("0.18.2").unwrap(),
         minimum_quality,
         accepted_schema_versions: vec![1],
         allow_deprecated: false,
@@ -185,14 +185,8 @@ fn git_metadata_fetch_must_not_succeed_after_exceeding_its_disk_limit() {
     }
     // This is a new, exclusively owned local fixture. No existing checkout,
     // external remote, credentials, push, or GitHub workflow is used.
-    let root = std::env::temp_dir().join(format!(
-        "xc-fresh-fetch-budget-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("fresh-fetch-budget");
+    let root = scratch.join("root");
     fs::create_dir(&root).unwrap();
     let source = root.join("source");
     fs::create_dir(&source).unwrap();

@@ -111,7 +111,13 @@ arithmetic. The scalar `value` compatibility method returns NaN on failure.
 
 Each evaluator construction starts a provider, verifies its executable before
 and after launch, and initializes its state. Refinement rules may construct
-separate evaluators; no process-global provider cache is used. With diagnostic
+separate evaluators. By default no provider reply is reused. An operator who
+knows the provider is pure (the same target input, precision and point always
+produce the same reply) may set `XC_TARGET_PROVIDER_PURE=1`; replies are then
+shared within the process, keyed by the provider digest, the exact target
+input, the precision and the exact point string, and only successful replies
+are kept. The declaration is the operator's: it does not change any identity,
+and an impure provider must not be declared pure. With diagnostic
 logging enabled, each construction creates a separate file, and a failed launch
 may leave an empty file. Logs are not rotated automatically. Enable the setting
 for a bounded troubleshooting session and manage the private directory afterward.

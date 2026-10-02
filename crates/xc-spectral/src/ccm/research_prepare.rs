@@ -100,7 +100,13 @@ pub fn prepare_arithmetic_inputs(
             coordinate: dec(&arithmetic::round(&arithmetic::lattice(k, n), p)?),
             weight: dec(&mass),
             family: "lattice".into(),
-            partition: "all_modes_including_origin;ordinal=mode+1".into(),
+            // Inverse moments divide by z, so the origin mode (z = 0) is its own
+            // partition and the remaining modes keep finite inverse moments.
+            partition: if k == 0 {
+                "origin;ordinal=mode+1".into()
+            } else {
+                "nonzero_modes;ordinal=mode+1".into()
+            },
         });
     }
     input.atom_coordinate = Some("z=(t/(2*pi*N/log(C)))^2; lattice z=(mode/N)^2".into());
@@ -127,7 +133,7 @@ pub fn prepare_arithmetic_inputs(
         .tail_correction = tail.iter().map(dec).collect();
     input.validate()?;
     if let Err(e) = store.save("arithmetic-inputs", &input) {
-        eprintln!("arithmetic preparation checkpoint unavailable: {e}");
+        xc_core::progress_message!("arithmetic preparation checkpoint unavailable: {e}");
     }
     Ok(input)
 }
@@ -145,9 +151,32 @@ fn bound_decimal(value: &Float, upper: bool) -> String {
     }
     dec(&outward)
 }
+/// `start + term(0) + ... + term(count - 1)`, added serially in index order;
+/// the terms are formed on workers in bounded chunks.
+fn ordered_sum(
+    start: xc_numerics::mpfr_interval::MpfrInterval,
+    count: usize,
+    term: impl Fn(usize) -> xc_numerics::mpfr_interval::MpfrInterval + Sync,
+) -> xc_numerics::mpfr_interval::MpfrInterval {
+    const CHUNK: usize = 4096;
+    let mut sum = start;
+    for first in (0..count).step_by(CHUNK) {
+        let terms = (first..count.min(first + CHUNK))
+            .into_par_iter()
+            .map(&term)
+            .collect::<Vec<_>>();
+        for value in terms {
+            sum = sum.add(&value);
+        }
+    }
+    sum
+}
 fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<EnergyAllowance> {
     use xc_numerics::mpfr_interval::MpfrInterval as I;
     let _stage = super::capture_runtime::Stage::new("finite matrix block bounds");
+    // Interval terms are formed on workers; every sum and elimination keeps
+    // its serial order, so each bound is the serial bound bit for bit.
+    xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
     let n = s.modes;
     let d = 2 * n + 1;
     let split = n / 2;
@@ -164,13 +193,12 @@ fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<
     let mut notes = Vec::new();
     let mut lower = |indices: &[usize]| -> Result<Float> {
         let size = indices.len();
-        let mut block = Vec::with_capacity(size * size);
-        for &i in indices {
-            for &j in indices {
-                block.push(a(i, j));
-            }
-        }
+        let mut block = (0..size * size)
+            .into_par_iter()
+            .map(|t| a(indices[t / size], indices[t % size]))
+            .collect::<Vec<_>>();
         let gersh = (0..size)
+            .into_par_iter()
             .map(|i| {
                 let mut v = block[i * size + i].clone();
                 for j in 0..size {
@@ -185,6 +213,8 @@ fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<
                 }
                 v.lower().clone()
             })
+            .collect::<Vec<_>>()
+            .into_iter()
             .min_by(Float::total_cmp)
             .unwrap();
         let point = block
@@ -217,11 +247,20 @@ fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<
                     minimum = Some(
                         minimum.map_or_else(|| pivot.lower().clone(), |x| x.min(pivot.lower())),
                     );
-                    for i in j + 1..size {
-                        let factor = block[i * size + j].div(&pivot)?;
-                        for k in i..size {
-                            block[k * size + i] =
-                                block[k * size + i].sub(&block[k * size + j].mul(&factor));
+                    // Column i of the Schur update reads only column j, which
+                    // this step leaves unchanged; columns update independently.
+                    let columns = (j + 1..size)
+                        .into_par_iter()
+                        .map(|i| -> Result<Vec<I>> {
+                            let factor = block[i * size + j].div(&pivot)?;
+                            Ok((i..size)
+                                .map(|k| block[k * size + i].sub(&block[k * size + j].mul(&factor)))
+                                .collect())
+                        })
+                        .collect::<Vec<_>>();
+                    for (i, column) in (j + 1..size).zip(columns) {
+                        for (k, value) in (i..size).zip(column?) {
+                            block[k * size + i] = value;
                         }
                     }
                 }
@@ -236,12 +275,9 @@ fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<
     };
     let b = lower(&low)?;
     let mu = lower(&high)?;
-    let mut cross = I::from_i64(0, p);
-    for &i in &low {
-        for &j in &high {
-            cross = cross.add(&a(i, j).square());
-        }
-    }
+    let cross = ordered_sum(I::from_i64(0, p), low.len() * high.len(), |t| {
+        a(low[t / high.len()], high[t % high.len()]).square()
+    });
     // Use the raw dyadic state and divide by its interval norm. No assumption
     // that a rounded normalized vector has exact norm one is necessary.
     let v = s
@@ -252,12 +288,9 @@ fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<
     let norm = v
         .iter()
         .fold(I::from_i64(0, p), |sum, x| sum.add(&x.square()));
-    let mut energy = I::from_i64(0, p);
-    for i in 0..d {
-        for j in 0..d {
-            energy = energy.add(&a(i, j).mul(&v[i]).mul(&v[j]));
-        }
-    }
+    let energy = ordered_sum(I::from_i64(0, p), d * d, |t| {
+        a(t / d, t % d).mul(&v[t / d]).mul(&v[t % d])
+    });
     let trial = energy.div(&norm)?;
     let cross = cross.sqrt()?;
     notes.push(format!("outward MPFR bounds on retained symmetric Fourier form {}; low |k|<={split}, high {split}<|k|<={n}; interval LDL sharpens Gershgorin when verified; cross-block Frobenius upper endpoint; trial Rayleigh upper endpoint; applies to exact stored point matrix only, with no assembly-error or infinite omitted-mode certificate",m.manifest.content_digest.0));
@@ -274,6 +307,200 @@ fn block_allowance(s: &RetainedState, m: &RetainedMatrix<'_>, p: u32) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parallel_block_allowance_is_bit_identical_to_serial_reference_at_any_thread_count() {
+        let p = 256;
+        let mut paths = std::collections::BTreeSet::new();
+        for (n, coupling) in [(4, "0.3"), (6, "0.05"), (5, "1.5")] {
+            let d = 2 * n + 1;
+            let coefficients = (0..d)
+                .map(|k| Float::with_val(p, (k * 37 % 11) as i64 - 5) >> 3)
+                .collect::<Vec<_>>();
+            let s = RetainedState {
+                manifest: manifest("ccm_weil_eigenpair", b"parallel block bound state"),
+                cutoff: "13".into(),
+                modes: n,
+                precision: p,
+                coefficients,
+                eigenvalue: "0.001".into(),
+                selection_policy: None,
+            };
+            let coupling = scalar(coupling, p).unwrap();
+            let a = (0..d * d)
+                .map(|k| {
+                    let (i, j) = (k / d, k % d);
+                    if i == j {
+                        Float::with_val(p, 1 + (i % 3) as i64)
+                    } else {
+                        Float::with_val(p, &coupling / (1 + i.abs_diff(j) + (k % 5)) as u32)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let m = RetainedMatrix::from_admitted_runtime(
+                manifest("ccm_tau_matrix", b"parallel block matrix"),
+                s.cutoff.clone(),
+                n,
+                p,
+                &a,
+            )
+            .unwrap();
+            let expected = reference_block_allowance(&s, &m, p + 128).unwrap();
+            for note in &expected.hypotheses {
+                for path in [
+                    "interval LDL pivots strictly positive",
+                    "outward Gershgorin",
+                ] {
+                    if note.contains(path) {
+                        paths.insert(path);
+                    }
+                }
+            }
+            for threads in [1, 2, 4, 8] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                for _ in 0..2 {
+                    let actual = pool.install(|| block_allowance(&s, &m, p + 128)).unwrap();
+                    assert_eq!(actual, expected, "n={n} at {threads} threads");
+                }
+            }
+        }
+        // Both the interval LDL and the Gershgorin fallback were exercised.
+        assert_eq!(paths.len(), 2);
+    }
+
+    /// Serial `block_allowance` retained verbatim from before parallel terms.
+    fn reference_block_allowance(
+        s: &RetainedState,
+        m: &RetainedMatrix<'_>,
+        p: u32,
+    ) -> Result<EnergyAllowance> {
+        use xc_numerics::mpfr_interval::MpfrInterval as I;
+        let _stage = crate::ccm::capture_runtime::Stage::new("finite matrix block bounds");
+        let n = s.modes;
+        let d = 2 * n + 1;
+        let split = n / 2;
+        let low = (0..d)
+            .filter(|k| k.abs_diff(n) <= split)
+            .collect::<Vec<_>>();
+        let high = (0..d).filter(|k| k.abs_diff(n) > split).collect::<Vec<_>>();
+        let half = I::point(Float::with_val(p, 0.5));
+        let a = |i: usize, j: usize| {
+            I::point(Float::with_val(p, &m.entries[i * d + j]))
+                .add(&I::point(Float::with_val(p, &m.entries[j * d + i])))
+                .mul(&half)
+        };
+        let mut notes = Vec::new();
+        let mut lower = |indices: &[usize]| -> Result<Float> {
+            let size = indices.len();
+            let mut block = Vec::with_capacity(size * size);
+            for &i in indices {
+                for &j in indices {
+                    block.push(a(i, j));
+                }
+            }
+            let gersh = (0..size)
+                .map(|i| {
+                    let mut v = block[i * size + i].clone();
+                    for j in 0..size {
+                        if i != j {
+                            let radius = block[i * size + j]
+                                .lower()
+                                .clone()
+                                .abs()
+                                .max(&block[i * size + j].upper().clone().abs());
+                            v = v.sub(&I::point(radius));
+                        }
+                    }
+                    v.lower().clone()
+                })
+                .min_by(Float::total_cmp)
+                .unwrap();
+            let point = block
+                .iter()
+                .map(|a| a.midpoint_point().lower().clone())
+                .collect::<Vec<_>>();
+            let values = xc_numerics::eigen::dense_symmetric_eigenvalues_hp_stable(&point, size, p);
+            if let Ok(values) = values {
+                let min = values.into_iter().min_by(Float::total_cmp).unwrap();
+                let scale = point
+                    .iter()
+                    .map(|a| a.clone().abs())
+                    .max_by(Float::total_cmp)
+                    .unwrap()
+                    + 1u32;
+                let candidate = Float::with_val(p, &min) - min.abs() / 16u32 - (scale >> 128u32);
+                if candidate > gersh {
+                    let shift = I::point(candidate.clone());
+                    for j in 0..size {
+                        block[j * size + j] = block[j * size + j].sub(&shift);
+                    }
+                    let mut minimum: Option<Float> = None;
+                    let mut positive = true;
+                    for j in 0..size {
+                        let pivot = block[j * size + j].clone();
+                        if !pivot.is_strictly_positive() {
+                            positive = false;
+                            break;
+                        }
+                        minimum = Some(
+                            minimum.map_or_else(|| pivot.lower().clone(), |x| x.min(pivot.lower())),
+                        );
+                        for i in j + 1..size {
+                            let factor = block[i * size + j].div(&pivot)?;
+                            for k in i..size {
+                                block[k * size + i] =
+                                    block[k * size + i].sub(&block[k * size + j].mul(&factor));
+                            }
+                        }
+                    }
+                    if positive {
+                        notes.push(format!("{size}-dimensional shifted block: all interval LDL pivots strictly positive; minimum pivot lower endpoint={}",dec(&minimum.unwrap())));
+                        return Ok(candidate);
+                    }
+                }
+            }
+            notes.push(format!("{size}-dimensional block uses outward Gershgorin lower bound; sharper interval LDL bound unresolved"));
+            Ok(gersh)
+        };
+        let b = lower(&low)?;
+        let mu = lower(&high)?;
+        let mut cross = I::from_i64(0, p);
+        for &i in &low {
+            for &j in &high {
+                cross = cross.add(&a(i, j).square());
+            }
+        }
+        // Use the raw dyadic state and divide by its interval norm. No assumption
+        // that a rounded normalized vector has exact norm one is necessary.
+        let v = s
+            .coefficients
+            .iter()
+            .map(|x| I::point(Float::with_val(p, x)))
+            .collect::<Vec<_>>();
+        let norm = v
+            .iter()
+            .fold(I::from_i64(0, p), |sum, x| sum.add(&x.square()));
+        let mut energy = I::from_i64(0, p);
+        for i in 0..d {
+            for j in 0..d {
+                energy = energy.add(&a(i, j).mul(&v[i]).mul(&v[j]));
+            }
+        }
+        let trial = energy.div(&norm)?;
+        let cross = cross.sqrt()?;
+        notes.push(format!("outward MPFR bounds on retained symmetric Fourier form {}; low |k|<={split}, high {split}<|k|<={n}; interval LDL sharpens Gershgorin when verified; cross-block Frobenius upper endpoint; trial Rayleigh upper endpoint; applies to exact stored point matrix only, with no assembly-error or infinite omitted-mode certificate",m.manifest.content_digest.0));
+        Ok(EnergyAllowance {
+            upper_trial_energy: bound_decimal(trial.upper(), true),
+            low_block_lower_bound: bound_decimal(&b, false),
+            high_block_lower_bound: bound_decimal(&mu, false),
+            cross_block_norm_bound: bound_decimal(cross.upper(), true),
+            hypothesis_record_digest: ContentDigest::sha256(&serde_json::to_vec(&notes)?),
+            hypotheses: notes,
+        })
+    }
+
     use xc_cache::*;
     fn exhaustive_preparation_fixture() -> ExternalResearchInputs {
         let p = 64;
@@ -401,8 +628,8 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "schema_version":1,"key":ArtifactKey::new(kind,"preparation-test",bytes).unwrap(),
             "content_digest":digest,"size_bytes":bytes.len(),"objects":[{"content_digest":digest,"size_bytes":bytes.len()}],
-            "created_unix_seconds":1,"producer_toolkit_version":ToolkitVersion::parse("0.15.1").unwrap(),
-            "minimum_reader_version":ToolkitVersion::parse("0.15.1").unwrap(),"maximum_reader_version":null,
+            "created_unix_seconds":1,"producer_toolkit_version":ToolkitVersion::parse("0.16.0").unwrap(),
+            "minimum_reader_version":ToolkitVersion::parse("0.16.0").unwrap(),"maximum_reader_version":null,
             "quality":"validated","visibility":"private","immutable":true,"dependencies":[],"tags":{},"provenance_digest":null
         })).unwrap()
     }
@@ -462,14 +689,25 @@ mod tests {
         let mut o = ExtensionOptions::for_source(&s);
         o.working_precision_bits = i.precision_bits + 64;
         let result = weighted_tail_base(&s, &o, Some(&i)).unwrap();
+        // The origin mode is its own partition: its mass is reported without
+        // an inverse moment, and the nonzero modes keep finite inverse moments.
         let origin = result
             .rows
             .iter()
-            .find(|r| r.label.starts_with("lattice/"))
+            .find(|r| r.label.starts_with("lattice/origin"))
             .unwrap();
+        assert!(origin.values.contains_key("included_mass"));
         assert!(!origin.values.contains_key("weighted_inverse_moment_1"));
-        assert_eq!(origin.outcome, "unresolved_denominator");
+        assert_eq!(origin.outcome, "point_measurement");
         assert!(origin.notes.iter().any(|s| s.contains("origin")));
+        let nonzero = result
+            .rows
+            .iter()
+            .filter(|r| r.label.starts_with("lattice/nonzero_modes"))
+            .collect::<Vec<_>>();
+        assert!(!nonzero.is_empty());
+        assert!(nonzero.iter().all(|r| r.outcome == "point_measurement"
+            && r.values.contains_key("weighted_inverse_moment_1")));
     }
 
     /// Opt-in local source replay; never runs in normal qualification or downloads data.

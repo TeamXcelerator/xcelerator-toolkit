@@ -6,7 +6,8 @@ use xc_cache::ContentDigest;
 use xc_certify::exact::{
     build_portable_interval_inertia_certificate, build_portable_interval_inertia_certificate_mpfr,
     interval_record, interval_symmetric_ldlt_inertia_mpfr,
-    verify_portable_interval_inertia_certificate, IntervalInertiaResult,
+    interval_symmetric_ldlt_inertia_mpfr_stable, verify_portable_interval_inertia_certificate,
+    IntervalInertiaResult,
 };
 use xc_certify::PortableIntervalInertiaCertificate;
 use xc_numerics::interval::RationalInterval;
@@ -197,5 +198,40 @@ fn directed_inertia_rejects_invalid_dimensions_precision_and_symmetry() {
         (matrix(&[1, 1, 0, 1]), 2),
     ] {
         assert!(interval_symmetric_ldlt_inertia_mpfr(&entries, n, 128).is_err());
+    }
+}
+
+#[test]
+fn stable_pivots_resolve_exact_congruence_without_tiny_first_pivot_growth() {
+    // Congruence eliminating the two unit diagonals leaves t-2 < 0, so
+    // the exact inertia is (2 positive, 1 negative) for every listed t.
+    // Eliminating t first instead creates two huge, almost equal Schur
+    // entries and loses the last sign through interval dependency.
+    for (exponent, precisions) in [
+        (300, vec![64, 128, 256]),
+        (2000, vec![64, 128, 256]),
+        (5000, vec![64, 128, 256]),
+        (6000, vec![3450, 3642, 4410]),
+    ] {
+        let mut entries = matrix(&[0, 1, 1, 1, 1, 0, 1, 0, 1]);
+        entries[0] = RationalInterval::point(Rational::from(1) >> exponent);
+        for p in precisions {
+            assert!(matches!(
+                interval_symmetric_ldlt_inertia_mpfr(&entries, 3, p).unwrap(),
+                IntervalInertiaResult::Inconclusive { .. }
+            ));
+            let result = interval_symmetric_ldlt_inertia_mpfr_stable(&entries, 3, p).unwrap();
+            assert!(
+                matches!(
+                    result,
+                    IntervalInertiaResult::Conclusive {
+                        positive: 2,
+                        negative: 1,
+                        ..
+                    }
+                ),
+                "{result:?}"
+            );
+        }
     }
 }

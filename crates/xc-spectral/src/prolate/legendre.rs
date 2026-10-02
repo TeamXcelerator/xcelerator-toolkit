@@ -293,6 +293,12 @@ pub(super) mod hp {
         (d, b)
     }
 
+    thread_local! {
+        static CHECKED_SPECTRA: std::cell::RefCell<Vec<[u8; 32]>> = const { std::cell::RefCell::new(Vec::new()) };
+        #[cfg(test)]
+        static FULL_SPECTRUM_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     pub(crate) fn validate_spectrum(
         d: &[Float],
         b: &[Float],
@@ -303,6 +309,35 @@ pub(super) mod hp {
             values.len() == d.len() && b.len() + 1 == d.len(),
             "prolate spectrum shape mismatch"
         );
+        // Sources finer than the working precision remain admissible; the
+        // memo key below binds each value's own precision.
+        ensure!(
+            d.iter().chain(b).chain(values).all(Float::is_finite),
+            "prolate spectrum source must be finite"
+        );
+        // Repeated consumers of these exact retained points need not repeat
+        // the ordered-index Sturm sweeps. This is not a certificate upgrade.
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"prolate-full-spectrum-check-v1\0");
+        hash.update(p.to_le_bytes());
+        hash.update(rug::float::exp_min().to_le_bytes());
+        hash.update(rug::float::exp_max().to_le_bytes());
+        for group in [d, b, values] {
+            hash.update((group.len() as u64).to_le_bytes());
+            for value in group {
+                let text = value.to_string_radix(16, None);
+                hash.update(value.prec().to_le_bytes());
+                hash.update((text.len() as u64).to_le_bytes());
+                hash.update(text.as_bytes());
+            }
+        }
+        let digest: [u8; 32] = hash.finalize().into();
+        if CHECKED_SPECTRA.with(|cache| cache.borrow().contains(&digest)) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        FULL_SPECTRUM_CHECKS.with(|count| count.set(count.get() + 1));
         let work = p + 64;
         let norm = (0..d.len())
             .map(|i| {
@@ -335,7 +370,38 @@ pub(super) mod hp {
                 "prolate cached eigenvalue does not enclose its ordered source-matrix index: index={i}, counts=[{below_lower},{below_upper}]"
             );
         }
+        CHECKED_SPECTRA.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() == 8 {
+                cache.remove(0);
+            }
+            cache.push(digest);
+        });
         Ok(())
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn repeated_spectrum_checks_bind_all_source_points_and_never_retain_failure() {
+        CHECKED_SPECTRA.with(|cache| cache.borrow_mut().clear());
+        FULL_SPECTRUM_CHECKS.with(|count| count.set(0));
+        let p = 128;
+        let d: Vec<_> = [1, 2, 3, 4, 5].map(|v| Float::with_val(p, v)).into();
+        let b = vec![Float::with_val(p, 0); 4];
+        for _ in 0..3 {
+            validate_spectrum(&d, &b, &d, p).unwrap();
+        }
+        assert_eq!(FULL_SPECTRUM_CHECKS.with(|count| count.get()), 1);
+        let mut wrong = d.clone();
+        wrong[3] = Float::with_val(p, 100);
+        for expected in [2, 3] {
+            assert!(validate_spectrum(&d, &b, &wrong, p).is_err());
+            assert_eq!(FULL_SPECTRUM_CHECKS.with(|count| count.get()), expected);
+        }
+        let mut other = d.clone();
+        other[0] = Float::with_val(p, 0);
+        assert!(validate_spectrum(&other, &b, &d, p).is_err());
+        assert_eq!(FULL_SPECTRUM_CHECKS.with(|count| count.get()), 4);
     }
 
     fn evaluate(v: &[Float], t: &Float, p: u32) -> Float {

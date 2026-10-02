@@ -308,11 +308,19 @@ mod enabled {
                         .measurements
                         .get(id)
                         .context("capture measurement missing")?;
-                    let replacement_value = replace_embedded_payload(
-                        &measurement.value,
-                        &serde_json::from_slice::<serde_json::Value>(&source.payload)?,
-                        serde_json::from_slice(&bytes)?,
-                    )?;
+                    let original_payload =
+                        serde_json::from_slice::<serde_json::Value>(&source.payload)?;
+                    let repaired_payload = serde_json::from_slice::<serde_json::Value>(&bytes)?;
+                    // 0.16.0 receipts record retained measurements by reference;
+                    // earlier receipts embed them.
+                    let replacement_value = match &measurement.value_reference {
+                        None => replace_embedded_payload(
+                            &measurement.value,
+                            &original_payload,
+                            repaired_payload.clone(),
+                        )?,
+                        Some(_) => serde_json::Value::Null,
+                    };
                     let mut replacement_dependencies = measurement.source_dependencies.clone();
                     let mut matched = 0;
                     for dep in &mut replacement_dependencies {
@@ -336,11 +344,50 @@ mod enabled {
                     if matched != 1 {
                         bail!("capture response dependency not uniquely bound");
                     }
+                    let replacement_reference = match &measurement.value_reference {
+                        None => None,
+                        Some(reference) => {
+                            if reference.artifacts.len() != 1 {
+                                bail!("referenced capture repair supports single-artifact measurements; regenerate the receipt instead");
+                            }
+                            let wrap = |payload: serde_json::Value| {
+                                if reference.array {
+                                    serde_json::Value::Array(vec![payload])
+                                } else {
+                                    payload
+                                }
+                            };
+                            if xc_core::research_digest(&wrap(original_payload.clone()))?.0
+                                != reference.value_digest
+                            {
+                                bail!(
+                                    "capture reference does not bind the original source payload"
+                                );
+                            }
+                            let original_reference = &reference.artifacts[0];
+                            let repaired_reference = replacement_dependencies
+                                .iter()
+                                .find(|dep| {
+                                    dep.key.kind == original_reference.key.kind
+                                        && dep.content_digest == draft.source_content_digest
+                                })
+                                .context("repaired capture reference not bound")?
+                                .clone();
+                            let value = wrap(repaired_payload);
+                            Some(MeasurementValueReference {
+                                artifacts: vec![repaired_reference],
+                                array: reference.array,
+                                value_digest: xc_core::research_digest(&value)?.0,
+                                coverage: NumericalCoverage::from_value(&value),
+                            })
+                        }
+                    };
                     updates.push(CaptureMeasurementRepair {
                         diagnostic: id.into(),
                         original_evidence_digest: xc_core::research_digest(measurement)?.0,
                         replacement: CapturedMeasurement {
                             value: replacement_value,
+                            value_reference: replacement_reference,
                             source_dependencies: replacement_dependencies,
                         },
                     });

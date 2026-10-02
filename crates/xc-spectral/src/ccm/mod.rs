@@ -660,7 +660,6 @@ mod tests {
     fn f64_matrix_matches_independent_high_mode_and_small_length_integrals() {
         // Independently integrated defining Weil distribution at 90 decimal
         // digits with mpmath tanh-sinh, including direct pole integration.
-        // Reproduction: Research 2026-09-23-full-mathematics-revalidation.
         let params = CcmParams::from_lambda_sq_integer(13, 120);
         let matrix = build_tau_f64(&params, params.log_length(), 13).unwrap();
         for (n, m, expected) in [

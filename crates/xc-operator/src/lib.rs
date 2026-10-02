@@ -157,6 +157,13 @@ pub struct SpectralInertia {
 }
 
 pub trait SymmetricOperator<S>: LinearOperator<S> {
+    /// Optional workspace allowance for dense spectral-count fallbacks.
+    /// A declared limit also applies when `spectral_inertia_at` returns None.
+    /// None selects the solver's conservative default allowance.
+    fn spectral_inertia_working_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Return rigorous spectral counts for this exact operator at `shift`.
     /// The implementation must bind its proof to the same source and basis as
     /// `apply`; metadata or counts from a different matrix are not evidence.

@@ -53,14 +53,8 @@ fn record(kind: &str) -> ProducedArtifactRecord {
 
 #[test]
 fn canonical_staging_must_enforce_each_declared_dependency_quality() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-fresh-staging-quality-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("fresh-staging-quality");
+    let root = scratch.join("root");
     let parent = record("ccm_tau_matrix");
     let mut child = record("ccm_factorization");
     child.manifest.dependencies.push(DependencyRef {
@@ -110,14 +104,8 @@ fn canonical_staging_must_enforce_each_declared_dependency_quality() {
 
 #[test]
 fn qualified_dependency_is_selected_and_quality_upgrades_are_retained() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-fresh-staging-quality-selection-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("fresh-staging-quality-se");
+    let root = scratch.join("root");
     let low = record("ccm_tau_matrix");
     let mut high = low.clone();
     high.manifest.quality = CacheQuality::Certified;
@@ -189,14 +177,8 @@ fn qualified_dependency_is_selected_and_quality_upgrades_are_retained() {
 
 #[test]
 fn incomplete_staging_without_commit_marker_can_be_reopened_and_rebuilt() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-fresh-staging-durability-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("fresh-staging-durability");
+    let root = scratch.join("root");
     let record = record("ccm_tau_matrix");
     let sink = CanonicalStagingProductionSink::new(
         root.clone(),
@@ -236,14 +218,8 @@ fn incomplete_staging_without_commit_marker_can_be_reopened_and_rebuilt() {
 
 #[test]
 fn dependency_quality_distinguishes_publication_and_rejected_dispositions() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-fresh-staging-disposition-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("fresh-staging-dispositio");
+    let root = scratch.join("root");
     for (index, (source, required, accepted)) in [
         (CacheQuality::Validated, CacheQuality::Published, false),
         (CacheQuality::Published, CacheQuality::Certified, false),
@@ -283,14 +259,8 @@ fn dependency_quality_distinguishes_publication_and_rejected_dispositions() {
 
 #[test]
 fn typed_execution_records_resolved_dependency_quality_upgrade_in_both_storage_routes() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-fresh-closure-upgrade-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("fresh-closure-upgrade");
+    let root = scratch.join("root");
     for encoded in [false, true] {
         let directory = root.join(if encoded { "encoded" } else { "decoded" });
         let low = record("ccm_tau_matrix");
@@ -397,4 +367,198 @@ fn typed_execution_records_resolved_dependency_quality_upgrade_in_both_storage_r
             .any(|draft| draft.source_artifact_key == child.manifest.key));
     }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn distance_dependency_closure_checks_published_identity_content_and_quality() {
+    let root = xc_core::test_support::TestDir::new("distance-closure-contract");
+    let policy = CachePolicy {
+        current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        minimum_quality: CacheQuality::Validated,
+        accepted_schema_versions: vec![1],
+        allow_deprecated: false,
+        allow_quarantined: false,
+        allowed_visibilities: vec![CacheVisibility::Local],
+    };
+    let parents = [
+        record("ccm_eigenfunction_profile"),
+        record("ccm_target_distance"),
+        record("ccm_factorization"),
+    ];
+    let mut dependencies = parents
+        .iter()
+        .map(|p| DependencyRef {
+            key: p.manifest.key.clone(),
+            content_digest: p.manifest.content_digest.clone(),
+            required_quality: CacheQuality::Validated,
+        })
+        .collect::<Vec<_>>();
+    dependencies.sort_by(|a, b| a.key.kind.cmp(&b.key.kind));
+    let sink = CanonicalStagingProductionSink::new(
+        root.join("staging"),
+        TransportPolicy::default(),
+        ResourcePolicy::default(),
+        CancellationToken::new(),
+    )
+    .unwrap();
+    for p in &parents {
+        sink.record(p.clone()).unwrap();
+    }
+    let store = FilesystemCacheStore::new(
+        "adopted",
+        root.join("adopted"),
+        true,
+        CacheVisibility::Local,
+    );
+    for draft in sink.drafts().unwrap() {
+        let parent = parents
+            .iter()
+            .find(|p| p.manifest.key == draft.source_artifact_key)
+            .unwrap();
+        store
+            .put(
+                &ArtifactDraft {
+                    schema_version: 1,
+                    key: parent.manifest.key.clone(),
+                    producer_toolkit_version: parent.manifest.producer_toolkit_version.clone(),
+                    minimum_reader_version: parent.manifest.minimum_reader_version.clone(),
+                    maximum_reader_version: None,
+                    quality: CacheQuality::Validated,
+                    visibility: CacheVisibility::Local,
+                    immutable: true,
+                    dependencies: vec![],
+                    tags: BTreeMap::from([
+                        (
+                            SEMANTIC_KEY_MANIFEST_TAG.into(),
+                            serde_json::to_string(&draft.manifest.semantic_key).unwrap(),
+                        ),
+                        (
+                            REMOTE_CANONICAL_MANIFEST_TAG.into(),
+                            serde_json::to_string(&draft.manifest).unwrap(),
+                        ),
+                    ]),
+                    provenance_digest: Some(draft.manifest.digest().unwrap()),
+                },
+                &parent.payload,
+            )
+            .unwrap();
+    }
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(store),
+    }]);
+    let context = ArtifactCacheContext {
+        resolver: Some(&resolver),
+        reference_resolver: None,
+        acceptance: Some(&policy),
+        ordered_overlays: vec!["adopted".into()],
+        mode: ArtifactExecutionCacheMode::RequireReuse,
+        write_on_miss: false,
+        write_visibility: CacheVisibility::Local,
+        requested_assurance: xc_core::AssuranceLevel::Computed,
+        certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+        production_sink: None,
+    };
+    for kind in [
+        "ccm_distance_resolution_evidence",
+        "ccm_target_residual_analysis",
+        "ccm_deviation_decomposition",
+    ] {
+        let mut child = record(kind);
+        child.manifest.dependencies = dependencies.clone();
+        sink.record(child.clone()).unwrap();
+        let drafts = sink.drafts().unwrap();
+        let canonical = &drafts
+            .iter()
+            .find(|d| d.source_artifact_key.kind == kind)
+            .unwrap()
+            .manifest;
+        let mut adapter = child.manifest.clone();
+        adapter.dependencies.clear();
+        adapter.tags.insert(
+            SEMANTIC_KEY_MANIFEST_TAG.into(),
+            serde_json::to_string(&child.semantic_key).unwrap(),
+        );
+        adapter.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.into(),
+            serde_json::to_string(canonical).unwrap(),
+        );
+        adapter.provenance_digest = Some(canonical.digest().unwrap());
+        let check = |m: &ArtifactManifest, deps: &[DependencyRef]| {
+            validate_artifact_dependency_closure(
+                m,
+                &child.semantic_key,
+                "ccm-distance",
+                deps,
+                &context,
+            )
+        };
+        assert!(check(&child.manifest, &dependencies).is_ok());
+        assert!(check(&adapter, &dependencies).is_ok());
+        let mut local = child.manifest.clone();
+        local.dependencies.pop();
+        assert!(check(&local, &dependencies).is_err());
+        let mut bad = adapter.clone();
+        bad.tags.remove(REMOTE_CANONICAL_MANIFEST_TAG);
+        assert!(check(&bad, &dependencies).is_err());
+        let mut bad = adapter.clone();
+        bad.provenance_digest = Some(ContentDigest::sha256(b"wrong"));
+        assert!(check(&bad, &dependencies).is_err());
+        let mut bad = adapter.clone();
+        bad.content_digest = ContentDigest::sha256(b"other payload");
+        assert!(check(&bad, &dependencies).is_err());
+        let mut bad = adapter.clone();
+        bad.tags
+            .insert(REMOTE_CANONICAL_MANIFEST_TAG.into(), "{}".into());
+        assert!(check(&bad, &dependencies).is_err());
+        let mut bad = adapter.clone();
+        bad.dependencies = dependencies[..2].to_vec();
+        assert!(check(&bad, &dependencies).is_err());
+        let mut wrong = dependencies.clone();
+        wrong[0].content_digest = ContentDigest::sha256(b"wrong parent");
+        assert!(check(&adapter, &wrong).is_err());
+        let mut wrong = dependencies.clone();
+        wrong[0].key.parameters_digest = ContentDigest::sha256(b"wrong semantic");
+        assert!(check(&adapter, &wrong).is_err());
+        let mut wrong = dependencies.clone();
+        wrong[0].required_quality = CacheQuality::Certified;
+        assert!(check(&adapter, &wrong).is_err());
+        assert!(check(&adapter, &dependencies[..2]).is_err());
+        // Publication may coalesce logical aliases of identical parent content.
+        let mut aliases = dependencies.clone();
+        aliases[0].key.logical_key = "other-local-alias".into();
+        assert!(check(&adapter, &aliases).is_ok());
+        let mut tampered = canonical.clone();
+        tampered.canonical_payload.dependencies.pop();
+        tampered.payload_digest = tampered.canonical_payload.digest().unwrap();
+        let mut bad = adapter.clone();
+        bad.tags.insert(
+            REMOTE_CANONICAL_MANIFEST_TAG.into(),
+            serde_json::to_string(&tampered).unwrap(),
+        );
+        bad.provenance_digest = Some(tampered.digest().unwrap());
+        assert!(check(&bad, &dependencies).is_err());
+        assert!(validate_artifact_dependency_closure(
+            &adapter,
+            &child.semantic_key,
+            "ccm-evidence",
+            &dependencies,
+            &context
+        )
+        .is_err());
+        let empty = CacheResolver::new(vec![]);
+        let unavailable = ArtifactCacheContext {
+            resolver: Some(&empty),
+            ordered_overlays: context.ordered_overlays.clone(),
+            ..context
+        };
+        assert!(validate_artifact_dependency_closure(
+            &adapter,
+            &child.semantic_key,
+            "ccm-distance",
+            &dependencies,
+            &unavailable
+        )
+        .is_err());
+    }
 }

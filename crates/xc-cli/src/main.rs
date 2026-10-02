@@ -2381,6 +2381,7 @@ struct ErrorEnvelope<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xc_core::test_support::TestDir;
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
@@ -2388,18 +2389,10 @@ mod tests {
 
     #[test]
     fn read_transport_cleans_only_its_owned_session() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-cli-reader-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir(&root).unwrap();
+        let root = TestDir::new("cli-reader");
         fs::write(root.join("keep.txt"), b"caller-owned artifact").unwrap();
         let request = GitReadTransportRequest {
-            temporary_root: root.clone(),
+            temporary_root: root.to_path_buf(),
             resources: ResourcePolicy::default(),
         };
         let first = request.open().unwrap();
@@ -2425,7 +2418,6 @@ mod tests {
             fs::read(root.join("keep.txt")).unwrap(),
             b"caller-owned artifact"
         );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2568,10 +2560,8 @@ mod tests {
 
     #[test]
     fn missing_request_reports_stage_artifact_and_retry_context() {
-        let path = std::env::temp_dir().join(format!(
-            "xc-missing-request-{}-diagnostic.json",
-            std::process::id()
-        ));
+        let dir = TestDir::new("missing-request");
+        let path = dir.join("diagnostic.json");
         let error = load_document::<serde_json::Value>(&path).unwrap_err();
         let report = serde_json::to_value(error.report()).unwrap();
         assert_eq!(report["diagnostic"]["stage"], "request_load");

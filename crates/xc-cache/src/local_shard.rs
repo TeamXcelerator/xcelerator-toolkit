@@ -377,6 +377,7 @@ mod tests {
     use serde_json::json;
 
     struct Fixture {
+        _scratch: crate::test_support::TestDir,
         base: PathBuf,
         manifest_path: PathBuf,
         index_path: PathBuf,
@@ -384,29 +385,13 @@ mod tests {
         payload: Vec<u8>,
         options: LocalShardReadOptions,
     }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let temporary = std::env::temp_dir().canonicalize().unwrap();
-            let target = self.base.canonicalize().unwrap();
-            assert!(target.starts_with(&temporary) && target != temporary);
-            assert!(target
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("xc-local-shard-test-"));
-            fs::remove_dir_all(target).unwrap();
-        }
-    }
     fn write_json(path: &Path, value: &impl Serialize) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, crate::protocol::canonical_json_bytes(value).unwrap()).unwrap();
     }
     fn fixture(visibility: CacheVisibility, assurance: ArtifactAssuranceState) -> Fixture {
-        let base = std::env::temp_dir().join(format!(
-            "xc-local-shard-test-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
+        let scratch = crate::test_support::TestDir::new("local-shard-test");
+        let base = scratch.join("base");
         fs::create_dir(&base).unwrap();
         let root = base.join("shard");
         fs::create_dir(&root).unwrap();
@@ -468,7 +453,7 @@ mod tests {
             source_data_identities: BTreeMap::new(),
             algorithm_semantics: None,
         };
-        let version = ToolkitVersion::parse("0.15.0").unwrap();
+        let version = ToolkitVersion::parse("0.18.0").unwrap();
         let canonical = CanonicalArtifactManifest {
             schema_version: 1,
             artifact_family: "ccm-matrices".into(),
@@ -479,7 +464,7 @@ mod tests {
             transport_digests: vec![encoding.digest().unwrap()],
             resolved_mathematical_configuration_digest: ContentDigest::sha256(b"configuration"),
             producer_toolkit_version: version.clone(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             requested_assurance: xc_core::AssuranceLevel::Computed,
             claim_scope: "synthetic finite fixture".into(),
@@ -526,6 +511,7 @@ mod tests {
             &json!({"schema_version":1,"family":"ccm-matrices","visibility":visibility,"immutable_objects":true,"artifact_kinds":["ccm_even_sector_matrix"]}),
         );
         Fixture {
+            _scratch: scratch,
             base: base.clone(),
             manifest_path,
             index_path,

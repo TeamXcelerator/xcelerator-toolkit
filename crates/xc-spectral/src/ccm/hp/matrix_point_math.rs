@@ -28,6 +28,22 @@ fn rational_stage_budget<'a>(
     points: impl Iterator<Item = &'a Float>,
     parallelism: usize,
 ) -> Result<()> {
+    rational_stage_budget_with_budget(
+        dimension,
+        base,
+        points,
+        parallelism,
+        source_working_budget()?,
+    )
+}
+
+fn rational_stage_budget_with_budget<'a>(
+    dimension: usize,
+    base: u32,
+    points: impl Iterator<Item = &'a Float>,
+    parallelism: usize,
+    maximum_bytes: u128,
+) -> Result<()> {
     let matrix_bytes = matrix_workspace_bytes(dimension, base);
     // Dyadic products double the bit span; a row sum uses a common power-of-two
     // denominator and at most log2(dimension) extra numerator bits. The point
@@ -35,9 +51,11 @@ fn rational_stage_budget<'a>(
     // Charge every concurrently active row and the existing matrix workspace.
     let rational_bytes =
         crate::ccm::certified_roots::boundary::rational_point_vector_workspace(points)?;
-    if matrix_bytes + rational_bytes * parallelism.max(1) as u128 > (8u128 << 30) {
-        bail!("matrix point and rational stages exceed the 8 GiB workspace budget");
-    }
+    source_workspace_with_budget(
+        matrix_bytes + rational_bytes * parallelism.max(1) as u128,
+        "matrix point and rational stages",
+        maximum_bytes,
+    )?;
     Ok(())
 }
 fn rounded(value: &I, p: u32) -> Result<Option<Float>> {
@@ -49,21 +67,27 @@ fn rounded(value: &I, p: u32) -> Result<Option<Float>> {
         && (!lo.is_zero() || (value.lower().is_zero() && value.upper().is_zero())))
     .then_some(lo))
 }
-fn sinh(x: &I) -> Result<I> {
+/// Directed endpoint images of a monotone increasing MPFR function. A bitwise
+/// point (including the sign of zero) shares one evaluation of both roundings.
+fn monotone(x: &I, f: impl Fn(&mut Float, Round) -> std::cmp::Ordering) -> Result<I> {
     x.validate()?;
-    let mut lo = x.lower().clone();
-    let mut hi = x.upper().clone();
-    lo.sinh_round(Round::Down);
-    hi.sinh_round(Round::Up);
+    let (lo, hi) =
+        if x.lower() == x.upper() && x.lower().is_sign_negative() == x.upper().is_sign_negative() {
+            xc_numerics::mpfr_interval::directed_point_pair(x.lower(), f)
+        } else {
+            let mut lo = x.lower().clone();
+            let mut hi = x.upper().clone();
+            f(&mut lo, Round::Down);
+            f(&mut hi, Round::Up);
+            (lo, hi)
+        };
     Ok(I::new(lo, hi)?)
 }
+fn sinh(x: &I) -> Result<I> {
+    monotone(x, |v, round| v.sinh_round(round))
+}
 fn exp_m1(x: &I) -> Result<I> {
-    x.validate()?;
-    let mut lo = x.lower().clone();
-    let mut hi = x.upper().clone();
-    lo.exp_m1_round(Round::Down);
-    hi.exp_m1_round(Round::Up);
-    Ok(I::new(lo, hi)?)
+    monotone(x, |v, round| v.exp_m1_round(round))
 }
 fn sum(x: &[I], p: u32) -> Result<I> {
     for v in x {
@@ -75,6 +99,15 @@ fn sum(x: &[I], p: u32) -> Result<I> {
     )?)
 }
 fn dimensions(n: usize, l: &Float, p: u32) -> Result<(usize, u32)> {
+    dimensions_with_budget(n, l, p, source_working_budget()?)
+}
+
+fn dimensions_with_budget(
+    n: usize,
+    l: &Float,
+    p: u32,
+    maximum_bytes: u128,
+) -> Result<(usize, u32)> {
     if !(64..=1_000_000).contains(&p)
         || n > 4096
         || !l.is_finite()
@@ -85,9 +118,11 @@ fn dimensions(n: usize, l: &Float, p: u32) -> Result<(usize, u32)> {
     }
     let d = 2 * n + 1;
     let base = p.max(l.prec());
-    if matrix_workspace_bytes(d, base) > 8u128 << 30 {
-        bail!("matrix point stage exceeds the 8 GiB workspace budget");
-    }
+    source_workspace_with_budget(
+        matrix_workspace_bytes(d, base),
+        "matrix point stage",
+        maximum_bytes,
+    )?;
     Ok((d, base))
 }
 fn rational_round(x: Rational, p: u32) -> Result<Float> {
@@ -118,14 +153,38 @@ fn kappa(l: &I, p: u32) -> Result<I> {
         .add(&e)
         .div(&I::from_i64(2, p))?)
 }
-pub(super) fn integrals(
-    n: i64,
-    l: &Float,
-    p: u32,
-    nodes: &[Float],
-    weights: &[Float],
-) -> Result<(Float, Float, Float)> {
-    let (_, mut base) = dimensions(n.unsigned_abs() as usize, l, p)?;
+/// Guard schedule shared by every archimedean integral evaluation.
+const INTEGRAL_GUARDS: [u32; 7] = [64, 128, 256, 512, 1024, 2048, 4096];
+
+/// Mode-independent terms of one quadrature rule at one working precision.
+/// Modes that share a rule share these terms; each is formed by exactly the
+/// interval operations a single-mode evaluation performs, so a shared table
+/// yields bit-identical enclosures and correctly rounded results.
+pub(super) struct IntegralNodeTable {
+    guard: u32,
+    work: u32,
+    length: I,
+    two: I,
+    half: I,
+    pi: I,
+    kappa: I,
+    terms: Vec<IntegralNodeTerm>,
+}
+
+struct IntegralNodeTerm {
+    /// Exact node plus one; the phase turn is `(node + 1) * 2n`.
+    shifted: Rational,
+    h: I,
+    /// Weight times the archimedean density rho(x).
+    weighted_rho: I,
+    /// `weighted_rho * x`.
+    weighted_rho_x: I,
+    /// `expm1(-x/2)`.
+    decay: I,
+}
+
+fn validate_integral_rule(l: &Float, p: u32, nodes: &[Float], weights: &[Float]) -> Result<u32> {
+    let (_, mut base) = dimensions(0, l, p)?;
     if nodes.is_empty()
         || nodes.len() != weights.len()
         || nodes.len() > 1_000_000
@@ -142,71 +201,170 @@ pub(super) fn integrals(
     let floating_bytes = nodes.len() as u128 * (u128::from(2 * base + 4096).div_ceil(8) + 96) * 16;
     let rational_bytes =
         crate::ccm::certified_roots::boundary::rational_point_vector_workspace(nodes.iter())?;
-    if floating_bytes + rational_bytes > 8u128 << 30 {
-        bail!("matrix quadrature exceeds workspace budget");
-    }
+    source_workspace(floating_bytes + rational_bytes, "matrix quadrature")?;
     crate::ccm::certified_roots::boundary::rational_point_vector_budget(nodes.iter())?;
-    let exact_nodes = nodes
+    Ok(base)
+}
+
+/// Parallel MPFR stages require every Rayon worker to share the caller's
+/// thread-local exponent range.
+fn uniform_exponent_range() -> Result<()> {
+    xc_numerics::mpfr_interval::ensure_uniform_exponent_range()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+/// Results computed in parallel, returned in order with the first error in
+/// that order, exactly as a serial loop with `?` would report it.
+fn ordered<T>(results: Vec<Result<T>>) -> Result<Vec<T>> {
+    results.into_iter().collect()
+}
+
+/// Prepare the mode-independent terms of a quadrature rule at one guard.
+pub(super) fn integral_node_table(
+    l: &Float,
+    p: u32,
+    nodes: &[Float],
+    weights: &[Float],
+    guard: u32,
+) -> Result<IntegralNodeTable> {
+    let base = validate_integral_rule(l, p, nodes, weights)?;
+    let work = base * 2 + guard;
+    let length = I::from_float(l, work)?;
+    let one = I::from_i64(1, work);
+    let two = I::from_i64(2, work);
+    let half = I::point(Float::with_val(work, 0.5));
+    let pi = I::pi(work);
+    let kappa = kappa(&length, work)?;
+    // Nodes are independent; each term keeps its exact operation sequence and
+    // the first failure is reported in node order, as in a serial loop.
+    let terms = ordered(
+        nodes
+            .par_iter()
+            .zip(weights.par_iter())
+            .map(|(node, weight)| -> Result<IntegralNodeTerm> {
+                let h = I::from_float(node, work)?.add(&one).mul(&half);
+                let x = length.mul(&h);
+                let minus_half = x.mul(&half).neg();
+                let rho = minus_half.exp().div(&exp_m1(&x.mul(&two).neg())?.neg())?;
+                let weighted_rho = I::from_float(weight, work)?.mul(&rho);
+                Ok(IntegralNodeTerm {
+                    shifted: node.to_rational().unwrap() + 1i32,
+                    weighted_rho_x: weighted_rho.mul(&x),
+                    decay: exp_m1(&minus_half)?,
+                    weighted_rho,
+                    h,
+                })
+            })
+            .collect(),
+    )?;
+    Ok(IntegralNodeTable {
+        guard,
+        work,
+        length,
+        two,
+        half,
+        pi,
+        kappa,
+        terms,
+    })
+}
+
+/// One guard attempt for mode `n`; `None` when the rounding is unresolved.
+fn mode_integrals(
+    n: i64,
+    p: u32,
+    table: &IntegralNodeTable,
+) -> Result<Option<(Float, Float, Float)>> {
+    let work = table.work;
+    let one = I::from_i64(1, work);
+    let (two, half, pi) = (&table.two, &table.half, &table.pi);
+    let mut aa = Vec::with_capacity(table.terms.len());
+    let mut bb = Vec::with_capacity(table.terms.len());
+    let mut gg = Vec::with_capacity(table.terms.len());
+    for term in &table.terms {
+        let phase = pi.mul(&I::from_i64(2 * n, work)).mul(&term.h);
+        let turn: Rational = term.shifted.clone() * (2 * n);
+        let quadrant = if turn.denom() == &1 {
+            let q = turn.numer().to_i64().expect("bounded node and mode");
+            Some(q.rem_euclid(4) as usize)
+        } else {
+            None
+        };
+        let (sin, cos, cm1) = if let Some(q) = quadrant {
+            let cos = I::from_i64([1, 0, -1, 0][q], work);
+            (
+                I::from_i64([0, 1, 0, -1][q], work),
+                cos.clone(),
+                cos.sub(&one),
+            )
+        } else {
+            let (sin, cos) = phase.sin_cos();
+            (sin, cos, phase.mul(half).sin().square().mul(two).neg())
+        };
+        aa.push(term.weighted_rho.mul(&sin));
+        bb.push(term.weighted_rho_x.mul(&cos));
+        gg.push(term.weighted_rho.mul(&cm1.sub(&term.decay)));
+    }
+    let a = sum(&aa, work)?.mul(&table.length).div(&two.mul(pi))?;
+    let b = sum(&bb, work)?.mul(half);
+    let g = sum(&gg, work)?
+        .mul(&table.length)
+        .mul(half)
+        .add(&table.kappa);
+    Ok([a, b, g]
         .iter()
-        .map(|v| v.to_rational().unwrap())
-        .collect::<Vec<_>>();
-    for guard in [64, 128, 256, 512, 1024, 2048, 4096] {
-        let work = base * 2 + guard;
-        let length = I::from_float(l, work)?;
-        let one = I::from_i64(1, work);
-        let two = I::from_i64(2, work);
-        let half = I::point(Float::with_val(work, 0.5));
-        let pi = I::pi(work);
-        let mut aa = Vec::with_capacity(nodes.len());
-        let mut bb = Vec::with_capacity(nodes.len());
-        let mut gg = Vec::with_capacity(nodes.len());
-        for ((node, exact), weight) in nodes.iter().zip(&exact_nodes).zip(weights) {
-            let h = I::from_float(node, work)?.add(&one).mul(&half);
-            let x = length.mul(&h);
-            let minus_half = x.mul(&half).neg();
-            let rho = minus_half.exp().div(&exp_m1(&x.mul(&two).neg())?.neg())?;
-            let phase = pi.mul(&I::from_i64(2 * n, work)).mul(&h);
-            let turn: Rational = (exact.clone() + 1i32) * (2 * n);
-            let quadrant = if turn.denom() == &1 {
-                let q = turn.numer().to_i64().expect("bounded node and mode");
-                Some(q.rem_euclid(4) as usize)
-            } else {
-                None
-            };
-            let (sin, cos, cm1) = if let Some(q) = quadrant {
-                let cos = I::from_i64([1, 0, -1, 0][q], work);
-                (
-                    I::from_i64([0, 1, 0, -1][q], work),
-                    cos.clone(),
-                    cos.sub(&one),
-                )
-            } else {
-                (
-                    phase.sin(),
-                    phase.cos(),
-                    phase.mul(&half).sin().square().mul(&two).neg(),
-                )
-            };
-            let wr = I::from_float(weight, work)?.mul(&rho);
-            aa.push(wr.mul(&sin));
-            bb.push(wr.mul(&x).mul(&cos));
-            gg.push(wr.mul(&cm1.sub(&exp_m1(&minus_half)?)));
-        }
-        let a = sum(&aa, work)?.mul(&length).div(&two.mul(&pi))?;
-        let b = sum(&bb, work)?.mul(&half);
-        let g = sum(&gg, work)?
-            .mul(&length)
-            .mul(&half)
-            .add(&kappa(&length, work)?);
-        if let Some(v) = [a, b, g]
-            .iter()
-            .map(|v| rounded(v, p))
-            .collect::<Result<Option<Vec<_>>>>()?
-        {
-            return Ok((v[0].clone(), v[1].clone(), v[2].clone()));
+        .map(|v| rounded(v, p))
+        .collect::<Result<Option<Vec<_>>>>()?
+        .map(|v| (v[0].clone(), v[1].clone(), v[2].clone())))
+}
+
+pub(super) fn integrals(
+    n: i64,
+    l: &Float,
+    p: u32,
+    nodes: &[Float],
+    weights: &[Float],
+) -> Result<(Float, Float, Float)> {
+    dimensions(n.unsigned_abs() as usize, l, p)?;
+    integrals_from_guards(n, l, p, nodes, weights, &INTEGRAL_GUARDS)
+}
+
+fn integrals_from_guards(
+    n: i64,
+    l: &Float,
+    p: u32,
+    nodes: &[Float],
+    weights: &[Float],
+    guards: &[u32],
+) -> Result<(Float, Float, Float)> {
+    for &guard in guards {
+        let table = integral_node_table(l, p, nodes, weights, guard)?;
+        if let Some(values) = mode_integrals(n, p, &table)? {
+            return Ok(values);
         }
     }
     bail!("matrix integral rounding unresolved within the guard budget")
+}
+
+/// Evaluate mode `n` with a first-guard table shared across modes, escalating
+/// through the ordinary guard schedule only when that guard is unresolved.
+pub(super) fn integrals_with_table(
+    n: i64,
+    l: &Float,
+    p: u32,
+    nodes: &[Float],
+    weights: &[Float],
+    first: &IntegralNodeTable,
+) -> Result<(Float, Float, Float)> {
+    dimensions(n.unsigned_abs() as usize, l, p)?;
+    if first.guard == INTEGRAL_GUARDS[0] && first.terms.len() == nodes.len() {
+        if let Some(values) = mode_integrals(n, p, first)? {
+            return Ok(values);
+        }
+        // The first guard is deterministic and already unresolved.
+        return integrals_from_guards(n, l, p, nodes, weights, &INTEGRAL_GUARDS[1..]);
+    }
+    integrals(n, l, p, nodes, weights)
 }
 pub(super) fn pole_arch(
     n: usize,
@@ -214,6 +372,7 @@ pub(super) fn pole_arch(
     p: u32,
     t: &ComputedArchimedeanIntegrals,
 ) -> Result<(Vec<Float>, Vec<Float>)> {
+    uniform_exponent_range()?;
     let (d, base) = dimensions(n, l, p)?;
     if [&t.alpha, &t.beta, &t.gamma]
         .iter()
@@ -245,17 +404,31 @@ pub(super) fn pole_arch(
             x
         }
     };
+    // Exact rational entries, each rounded once; rows are independent and are
+    // written back in row-major order, so the first error is the serial one.
+    let arch_rows = (0..d)
+        .into_par_iter()
+        .map(|row| {
+            let a = row as i64 - n as i64;
+            (row..d)
+                .map(|col| {
+                    let b = col as i64 - n as i64;
+                    let v = if a == b {
+                        (gamma[a.unsigned_abs() as usize].clone()
+                            - &beta[a.unsigned_abs() as usize])
+                            * 2
+                    } else {
+                        (signed(b) - signed(a)) / (a - b)
+                    };
+                    rational_round(v, p)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let mut arch = vec![Float::with_val(p, 0); d * d];
-    for row in 0..d {
-        let a = row as i64 - n as i64;
-        for col in row..d {
-            let b = col as i64 - n as i64;
-            let v = if a == b {
-                (gamma[a.unsigned_abs() as usize].clone() - &beta[a.unsigned_abs() as usize]) * 2
-            } else {
-                (signed(b) - signed(a)) / (a - b)
-            };
-            let v = rational_round(v, p)?;
+    for (row, values) in arch_rows.into_iter().enumerate() {
+        for (col, v) in (row..d).zip(values) {
+            let v = v?;
             arch[row * d + col] = v.clone();
             arch[col * d + row] = v;
         }
@@ -296,6 +469,7 @@ pub(super) fn pole_arch(
     bail!("matrix pole rounding unresolved within the guard budget")
 }
 pub(super) fn prime_matrix(n: usize, cutoff: u64, l: &Float, p: u32) -> Result<Vec<Float>> {
+    uniform_exponent_range()?;
     let (d, base) = dimensions(n, l, p)?;
     if cutoff > 10_000_000 {
         bail!("prime matrix exceeds the supported sieve budget");
@@ -307,24 +481,33 @@ pub(super) fn prime_matrix(n: usize, cutoff: u64, l: &Float, p: u32) -> Result<V
         let pi = I::pi(work);
         let one = I::from_i64(1, work);
         let two = I::from_i64(2, work);
-        let mut sines = vec![I::from_i64(0, work); n + 1];
-        let mut diag = sines.clone();
+        let mut factors = Vec::with_capacity(events.len());
         for &(power, prime, _) in &events {
             let r = one.sub(&I::from_u64(power, work).ln()?.div(&length)?);
             let weight = I::from_u64(prime, work)
                 .ln()?
                 .div(&I::from_u64(power, work).sqrt()?)?;
-            for k in 0..=n {
-                let phase = pi.mul(&I::from_u64((2 * k) as u64, work)).mul(&r);
-                let sine = if k == 0 {
-                    I::from_i64(0, work)
-                } else {
-                    phase.sin()
-                };
-                sines[k] = sines[k].add(&weight.mul(&sine));
-                diag[k] = diag[k].add(&two.mul(&r).mul(&weight).mul(&phase.cos()));
-            }
+            factors.push((r, weight));
         }
+        // Each mode sums the prime powers in their original order.
+        let (sines, diag): (Vec<I>, Vec<I>) = (0..=n)
+            .into_par_iter()
+            .map(|k| {
+                let mut sine_sum = I::from_i64(0, work);
+                let mut diag_sum = sine_sum.clone();
+                for (r, weight) in &factors {
+                    let phase = pi.mul(&I::from_u64((2 * k) as u64, work)).mul(r);
+                    let sine = if k == 0 {
+                        I::from_i64(0, work)
+                    } else {
+                        phase.sin()
+                    };
+                    sine_sum = sine_sum.add(&weight.mul(&sine));
+                    diag_sum = diag_sum.add(&two.mul(r).mul(weight).mul(&phase.cos()));
+                }
+                (sine_sum, diag_sum)
+            })
+            .unzip();
         let signed = |m: i64| {
             let v = sines[m.unsigned_abs() as usize].clone();
             if m < 0 {
@@ -333,20 +516,32 @@ pub(super) fn prime_matrix(n: usize, cutoff: u64, l: &Float, p: u32) -> Result<V
                 v
             }
         };
+        let cells = (0..d)
+            .into_par_iter()
+            .map(|row| {
+                let a = row as i64 - n as i64;
+                (row..d)
+                    .map(|col| {
+                        let b = col as i64 - n as i64;
+                        let v = if a == b {
+                            diag[a.unsigned_abs() as usize].clone()
+                        } else {
+                            signed(a)
+                                .sub(&signed(b))
+                                .div(&pi.mul(&I::from_i64(a - b, work)))?
+                        };
+                        rounded(&v, p)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        // Scan in row-major order: the first error or unresolved rounding is
+        // exactly the one the serial loop would have stopped at.
         let mut out = vec![Float::with_val(p, 0); d * d];
         let mut resolved = true;
-        'rows: for row in 0..d {
-            let a = row as i64 - n as i64;
-            for col in row..d {
-                let b = col as i64 - n as i64;
-                let v = if a == b {
-                    diag[a.unsigned_abs() as usize].clone()
-                } else {
-                    signed(a)
-                        .sub(&signed(b))
-                        .div(&pi.mul(&I::from_i64(a - b, work)))?
-                };
-                let Some(v) = rounded(&v, p)? else {
+        'rows: for (row, values) in cells.into_iter().enumerate() {
+            for (col, v) in (row..d).zip(values) {
+                let Some(v) = v? else {
                     resolved = false;
                     break 'rows;
                 };
@@ -361,6 +556,7 @@ pub(super) fn prime_matrix(n: usize, cutoff: u64, l: &Float, p: u32) -> Result<V
     bail!("prime matrix rounding unresolved within the guard budget")
 }
 pub(super) fn total(c: &ComputedCcmMatrixComponents, p: u32) -> Result<Vec<Float>> {
+    uniform_exponent_range()?;
     if !(64..=1_000_000).contains(&p)
         || c.pole.is_empty()
         || c.pole.len() != c.archimedean.len()
@@ -372,10 +568,11 @@ pub(super) fn total(c: &ComputedCcmMatrixComponents, p: u32) -> Result<Vec<Float
     if d % 2 != 1 || d.checked_mul(d) != Some(c.pole.len()) || d > 8193 {
         bail!("components must have the same square odd shape");
     }
-    c.pole
-        .iter()
-        .zip(&c.archimedean)
-        .zip(&c.prime)
+    let entries = c
+        .pole
+        .par_iter()
+        .zip(c.archimedean.par_iter())
+        .zip(c.prime.par_iter())
         .map(|((a, b), c)| {
             if [a, b, c]
                 .iter()
@@ -404,7 +601,8 @@ pub(super) fn total(c: &ComputedCcmMatrixComponents, p: u32) -> Result<Vec<Float
             }
             Ok(value)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    ordered(entries)
 }
 
 /// Exact actions of the stored component matrices; reconstructed prime includes

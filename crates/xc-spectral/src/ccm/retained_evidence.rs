@@ -68,10 +68,12 @@ pub(super) fn scalar(s: &str, p: u32) -> Result<Float> {
     if s.len() > 1_048_576 {
         bail!("research scalar exceeds the one MiB input budget");
     }
-    let decimal = xc_core::DecimalLiteral::new(s)?;
+    // Validate in place: a matrix decode parses millions of these, and the
+    // canonical spelling is needed only to tell a true zero from underflow.
+    xc_core::DecimalLiteral::validate_str(s)?;
     let v = Float::with_val(p, Float::parse(s)?);
     if !v.is_finite()
-        || (v.is_zero() && decimal.canonical()?.as_str() != "0")
+        || (v.is_zero() && xc_core::DecimalLiteral::new(s)?.canonical()?.as_str() != "0")
         // MPFR's smallest exponent has no subnormal significands. A nonzero
         // nearest result can conceal severe relative loss below that floor.
         || (v.get_exp() == Some(rug::float::exp_min())
@@ -142,7 +144,9 @@ where
             bail!("inadmissible research parent quality");
         }
     }
-    let scope = if kind == "ccm_transform_enclosure" {
+    let scope = if kind == "ccm_finite_diagnostic_analysis" {
+        "finite_supplied_enclosures; explicit_source_scope; no_continuum_claim"
+    } else if kind == "ccm_transform_enclosure" {
         "finite_retained_function_enclosures; source_scope_explicit; no_infinite_limit_claim"
     } else {
         SCOPE
@@ -197,7 +201,7 @@ where
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.1")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([("assurance".into(), "computed_not_certified".into())]),
         provenance_digest: None,
@@ -563,7 +567,10 @@ impl RetainedRoots {
             || ((r["schema_version"].as_u64() == Some(6)
                 || r.get("secular_source_content_digest").is_some())
                 && r["secular_source_content_digest"].as_str() != Some(&secular.content_digest.0))
-            || sec["schema_version"].as_u64() != Some(1)
+            || !matches!(sec["schema_version"].as_u64(), Some(1 | 2))
+            || (sec["schema_version"].as_u64() == Some(2)
+                && sec["eigenpair_semantic_digest"].as_str()
+                    != Some(&state.manifest.key.parameters_digest.0))
             || sec["normalization"].as_str() != Some("sum_xi_equals_sqrt_log_lambda_squared")
             || r["force_even"] != sec["force_even"]
             || r["parity_policy"] != sec["parity_policy"]
@@ -1130,6 +1137,17 @@ impl<'a> RetainedMatrix<'a> {
             precision,
             entries: std::borrow::Cow::Borrowed(entries),
         })
+    }
+    /// The same matrix holding its own copy of the entries, for work that
+    /// outlives the borrowed source.
+    pub(crate) fn to_owned_entries(&self) -> RetainedMatrix<'static> {
+        RetainedMatrix {
+            manifest: self.manifest.clone(),
+            cutoff: self.cutoff.clone(),
+            modes: self.modes,
+            precision: self.precision,
+            entries: std::borrow::Cow::Owned(self.entries.to_vec()),
+        }
     }
     pub(crate) fn match_state(&self, s: &RetainedState) -> Result<()> {
         if !equal_cutoff(&self.cutoff, &s.cutoff)?
@@ -1712,8 +1730,8 @@ mod exhaustive_resumed_validation_contract {
                 size_bytes: bytes.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.14.3").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -1934,7 +1952,7 @@ mod exhaustive_runtime_matrix {
     fn manifest() -> ArtifactManifest {
         let bytes = b"admitted runtime matrix boundary";
         let digest = ContentDigest::sha256(bytes);
-        serde_json::from_value(json!({"schema_version":1,"key":ArtifactKey::new("ccm_tau_matrix","runtime-boundary",bytes).unwrap(),"content_digest":digest,"size_bytes":bytes.len(),"objects":[{"content_digest":digest,"size_bytes":bytes.len()}],"created_unix_seconds":1,"producer_toolkit_version":ToolkitVersion::parse("0.15.2").unwrap(),"minimum_reader_version":ToolkitVersion::parse("0.15.2").unwrap(),"maximum_reader_version":null,"quality":"validated","visibility":"private","immutable":true,"dependencies":[],"tags":{},"provenance_digest":null})).unwrap()
+        serde_json::from_value(json!({"schema_version":1,"key":ArtifactKey::new("ccm_tau_matrix","runtime-boundary",bytes).unwrap(),"content_digest":digest,"size_bytes":bytes.len(),"objects":[{"content_digest":digest,"size_bytes":bytes.len()}],"created_unix_seconds":1,"producer_toolkit_version":ToolkitVersion::parse("0.16.0").unwrap(),"minimum_reader_version":ToolkitVersion::parse("0.16.0").unwrap(),"maximum_reader_version":null,"quality":"validated","visibility":"private","immutable":true,"dependencies":[],"tags":{},"provenance_digest":null})).unwrap()
     }
     #[test]
     fn exhaustive_runtime_matrix_shape_overflow_returns_error() {

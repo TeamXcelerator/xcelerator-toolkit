@@ -30,6 +30,11 @@ pub use xc_core::PrefixDiagnosticPolicy;
 pub const PREFIX_ARTIFACT_KIND: &str = "ccm_prefix_analysis";
 pub const RETAINED_REDUCTION_SEMANTICS: &str = "ccm-retained-reduction-v0.15.1-v3";
 const REDUCTION_ASSURANCE: &str = "computed stored-matrix checks; no construction, branch, positivity or continuum certificate; Q computed but not retained in this report";
+#[cfg(test)]
+thread_local! {
+    static PREFIX_CALCULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REDUCTION_CALCULATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 pub const EVEN_BASIS: &str = "orthonormal_reflection_even_basis_zero_then_positive_modes";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -106,7 +111,11 @@ fn validate_cutoff(text: &str) -> Result<()> {
 fn decode_budget(count: usize, p: u32, encoded_bytes: usize) -> Result<()> {
     precision(p)?;
     let bytes = count as u128 * (u128::from(p).div_ceil(8) + 96) * 2 + encoded_bytes as u128 * 3;
-    if bytes > (8u128 << 30) {
+    let budget = u128::from(
+        crate::ccm::capture_runtime::CaptureResourcePolicy::from_environment()?
+            .maximum_working_bytes,
+    );
+    if bytes > budget {
         bail!("retained prefix decoding exceeds the combined workspace budget");
     }
     Ok(())
@@ -407,6 +416,8 @@ pub fn analyze_retained_prefixes(
     options: &PrefixAnalysisOptions,
     eigenpairs: &[RetainedEvenEigenpair],
 ) -> Result<CcmPrefixAnalysis> {
+    #[cfg(test)]
+    PREFIX_CALCULATIONS.with(|count| count.set(count.get() + 1));
     let p = options.working_precision_bits;
     precision(p)?;
     if p < matrix.precision {
@@ -614,8 +625,8 @@ fn dependency(manifest: &ArtifactManifest) -> DependencyRef {
 /// their existing dependency closure without changing its identities.
 /// Source-only diagnostics may be public only when all supplied parents are
 /// public. Registry registration is separate from numerical execution.
-/// Warm reuse replays every numerical field from the supplied retained points
-/// in O(D^3) arithmetic; it does not reconstruct Tau matrices or eigenstates.
+/// Ordinary reuse checks source bindings, shape, finite values and export
+/// consistency. Explicit verification replays the O(D^3) numerical analysis.
 pub fn analyze_retained_prefixes_via_cache(
     matrix: &RetainedEvenMatrix,
     options: &PrefixAnalysisOptions,
@@ -692,7 +703,7 @@ pub fn analyze_retained_prefixes_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.1")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".into(), "ccm".into()),
@@ -701,8 +712,8 @@ pub fn analyze_retained_prefixes_via_cache(
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
-    // A fresh payload can use its exact process-local seal. Cache reuse has
-    // no such seal and must replay every field against the retained inputs.
+    // A fresh payload can use its exact process-local seal. Ordinary reuse is
+    // admission of computed evidence, not an independent numerical replay.
     let fresh = std::cell::RefCell::new(None);
     let result = resolve_or_compute_json_artifact_with_dependencies(
         &request,
@@ -721,6 +732,10 @@ pub fn analyze_retained_prefixes_via_cache(
                 .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
             if fresh.borrow().as_ref() == Some(&ContentDigest::sha256(&bytes)) {
                 return Ok(());
+            }
+            if !cache.mode.compares_against_reference() {
+                return sanity_prefix(report, matrix, options, eigenpairs)
+                    .map_err(|e| CacheError::InvalidManifest(e.to_string()));
             }
             let expected = analyze_retained_prefixes(matrix, options, eigenpairs)
                 .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
@@ -1012,8 +1027,8 @@ pub struct RetainedReductionCheck {
     pub assurance: String,
 }
 /// Persist a source-bound stable-reduction diagnostic without rebuilding a source.
-/// A warm hit replays the complete computed report from the supplied retained
-/// matrix in O(d^3) arithmetic. This does not rebuild Tau or change assurance.
+/// Ordinary reuse checks the retained report without repeating decomposition.
+/// Explicit verification replays the O(d^3) calculation; assurance is unchanged.
 pub fn check_retained_reduction_via_cache(
     matrix: &RetainedEvenMatrix,
     working_precision_bits: u32,
@@ -1083,7 +1098,7 @@ pub fn check_retained_reduction_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.1")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([("assurance".into(), "computed_not_certified".into())]),
         provenance_digest: None,
@@ -1112,6 +1127,16 @@ pub fn check_retained_reduction_via_cache(
                 .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
             if fresh.borrow().as_ref() == Some(&ContentDigest::sha256(&bytes)) {
                 return Ok(());
+            }
+            if !cache.mode.compares_against_reference() {
+                return sanity_reduction(
+                    report,
+                    matrix,
+                    working_precision_bits,
+                    maximum_dimension,
+                    relative_tolerance,
+                )
+                .map_err(|e| CacheError::InvalidManifest(e.to_string()));
             }
             let expected = check_retained_reduction(
                 matrix,
@@ -1151,6 +1176,8 @@ pub fn check_retained_reduction(
     maximum_dimension: usize,
     relative_tolerance: &str,
 ) -> Result<RetainedReductionCheck> {
+    #[cfg(test)]
+    REDUCTION_CALCULATIONS.with(|count| count.set(count.get() + 1));
     use xc_numerics::eigen::{
         assess_symmetric_reduction_hp, householder_tridiag_hp_stable, tridiag_eigenvalues_hp,
         STABLE_HOUSEHOLDER_SEMANTICS,
@@ -1230,6 +1257,479 @@ fn acceptance_tolerance(text: &str, p: u32) -> Result<Float> {
     Ok(Float::with_val_round(p, Float::parse(text)?, rug::float::Round::Down).0)
 }
 
+// These records contain computed observations, not certificates. Transport
+// digests and dependency bindings authenticate retained bytes. Sanity admission
+// does not establish every numerical field against a freshly recomputed result.
+fn numeric_record(value: &serde_json::Value, p: u32) -> Result<()> {
+    match value {
+        serde_json::Value::String(s) => {
+            scalar(s, p)?;
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                numeric_record(value, p)?;
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                // Only the typed TwoModeMomentStatus enum is textual in rows.
+                if key != "status" {
+                    numeric_record(value, p)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn sanity_prefix(
+    report: &CcmPrefixAnalysis,
+    matrix: &RetainedEvenMatrix,
+    options: &PrefixAnalysisOptions,
+    eigenpairs: &[RetainedEvenEigenpair],
+) -> Result<()> {
+    let p = options.working_precision_bits;
+    precision(p)?;
+    let d = matrix.dimension();
+    let ladder = &report.ladder;
+    if p < matrix.precision
+        || options
+            .checkpoint_dimensions
+            .iter()
+            .any(|&k| k == 0 || k > d)
+        || options
+            .checkpoint_dimensions
+            .windows(2)
+            .any(|w| w[0] >= w[1])
+    {
+        bail!("invalid prefix analysis schedule or precision");
+    }
+    let mut supplied_dimensions = std::collections::BTreeSet::new();
+    for pair in eigenpairs {
+        if xc_core::DecimalLiteral::new(&pair.cutoff)?
+            .cmp_numeric(&xc_core::DecimalLiteral::new(&matrix.cutoff)?)?
+            != std::cmp::Ordering::Equal
+            || pair.precision > p
+            || !options.checkpoint_dimensions.contains(&(pair.modes + 1))
+            || !supplied_dimensions.insert(pair.modes + 1)
+        {
+            bail!("mismatched, duplicate, or unrequested checkpoint eigenstate");
+        }
+    }
+    checked_decimal_export(
+        &[Float::with_val(p, 1)],
+        &options.export_significant_digits,
+        |_| Ok(true),
+    )?;
+    let mut source_bits: Vec<_> = matrix.entries.iter().map(Float::prec).collect();
+    source_bits.sort_unstable();
+    source_bits.dedup();
+    if report.schema_version != 1
+        || report.semantics != prefix_semantics(options)
+        || report.basis != EVEN_BASIS
+        || report.parent_matrix_source != matrix.manifest.content_digest
+        || report.parent_n_modes != matrix.modes
+        || report.cutoff != matrix.cutoff
+        || report.source_precision_bits != matrix.precision
+        || report.options != *options
+        || !report.prefixes_are_parent_derived
+        || !report.nesting_checks.is_empty()
+        || report.assurance != "computed_point_diagnostics_and_export_checks_not_certified"
+        || ladder.semantics
+            != if options.diagnostics.is_legacy_default() {
+                "prefix-spd-unpivoted-ldlt-innovation-gram-v2"
+            } else {
+                "prefix-spd-unpivoted-ldlt-innovation-gram-v3"
+            }
+        || ladder.assurance != "computed_point_diagnostic_not_a_certificate"
+        || ladder.precision_bits != p
+        || ladder.pivot_margin_bits != options.pivot_margin_bits
+        || ladder.diagnostic_policy != options.diagnostics
+        || ladder.source_precision_bits != source_bits
+        || ladder.requested_dimension != d
+        || ladder.rows.len() > d
+        || report.checkpoints.len() != options.checkpoint_dimensions.len()
+    {
+        bail!("cached prefix metadata or source binding mismatch");
+    }
+    match &ladder.stopped {
+        None if ladder.rows.len() != d => bail!("incomplete prefix without a stop"),
+        Some(stop) => {
+            if stop.attempted_dimension != ladder.rows.len() + 1 || stop.attempted_dimension > d {
+                bail!("invalid prefix stop dimension");
+            }
+            scalar(&stop.pivot, p)?;
+            if scalar(&stop.scale, p)? < 0 {
+                bail!("negative prefix stop scale");
+            }
+        }
+        _ => {}
+    }
+    for (i, row) in ladder.rows.iter().enumerate() {
+        if row.dimension != i + 1
+            || scalar(&row.sigma, p)? <= 0
+            || row.third_inverse_moment.is_some() != options.diagnostics.third_inverse_moment
+            || row.innovation_cancellation.is_some() != options.diagnostics.innovation_cancellation
+        {
+            bail!("invalid prefix row shape or pivot");
+        }
+        numeric_record(&serde_json::to_value(row)?, p)?;
+        for value in [
+            &row.innovation_mass,
+            &row.inverse_trace_increment,
+            &row.inverse_trace,
+            &row.inverse_square_trace,
+            &row.pivot_cancellation_scale,
+            &row.effective_inverse_rank,
+            &row.newest_inverse_trace_fraction,
+            &row.smallest_eigenvalue_lower_estimate,
+            &row.smallest_eigenvalue_upper_estimate,
+        ] {
+            if scalar(value, p)? <= 0 {
+                bail!("nonpositive prefix diagnostic");
+            }
+        }
+    }
+    let expected_keys: Vec<_> = options
+        .checkpoint_dimensions
+        .iter()
+        .copied()
+        .filter(|&k| k <= ladder.rows.len())
+        .collect();
+    if ladder
+        .checkpoint_innovations
+        .keys()
+        .copied()
+        .collect::<Vec<_>>()
+        != expected_keys
+    {
+        bail!("prefix checkpoint inventory mismatch");
+    }
+    let tolerance = acceptance_tolerance(&options.export_relative_tolerance, p)?;
+    if tolerance <= 0 || tolerance >= 1 {
+        bail!("invalid prefix acceptance tolerance");
+    }
+    for (&k, packet) in options
+        .checkpoint_dimensions
+        .iter()
+        .zip(&report.checkpoints)
+    {
+        let pair = eigenpairs.iter().find(|pair| pair.modes + 1 == k);
+        if packet.dimension != k || packet.n_modes.checked_add(1) != Some(k)
+            || packet.eigenpair_source != pair.map(|v| v.manifest.content_digest.clone())
+            || packet.eigenpair_precision_bits != pair.map(|v| v.precision)
+            || packet.eigenpair_residual_matrix != "actual_largest_parent_prefix_not_asserted_canonical_checkpoint_matrix"
+            || packet.sign_convention != "innovation_last_coefficient_positive_one; eigenstate_largest_absolute_even_coefficient_positive_first_index_tie"
+        { bail!("prefix export source binding mismatch"); }
+        if let Some(raw) = ladder.checkpoint_innovations.get(&k) {
+            if raw.len() != k || scalar(&raw[k - 1], p)? != 1 {
+                bail!("invalid retained innovation shape");
+            }
+            numeric_record(&serde_json::to_value(raw)?, p)?;
+        }
+        let passed = matches!(
+            packet.status.as_str(),
+            "export_checks_passed" | "innovation_export_passed_eigenpair_not_supplied"
+        );
+        if !passed {
+            if packet.status
+                != if k > ladder.rows.len() {
+                    "unresolved_prefix"
+                } else {
+                    "export_checks_unresolved"
+                }
+                || packet.accepted_significant_digits.is_some()
+                || !packet.raw_innovation.is_empty()
+                || !packet.unit_innovation.is_empty()
+                || !packet.unit_retained_eigenvector.is_empty()
+                || packet.signed_overlap.is_some()
+                || packet.squared_overlap.is_some()
+                || packet.decoded_innovation_backward_error.is_some()
+                || packet.decoded_eigenpair_backward_error.is_some()
+            {
+                bail!("invalid unresolved export");
+            }
+            continue;
+        }
+        if k > ladder.rows.len()
+            || packet.diagnostic.is_some()
+            || packet.status
+                != if pair.is_some() {
+                    "export_checks_passed"
+                } else {
+                    "innovation_export_passed_eigenpair_not_supplied"
+                }
+            || !packet
+                .accepted_significant_digits
+                .is_some_and(|digits| options.export_significant_digits.contains(&digits))
+            || packet.raw_innovation.len() != k
+            || packet.unit_innovation.len() != k
+            || packet.unit_retained_eigenvector.len() != if pair.is_some() { k } else { 0 }
+            || scalar(&packet.raw_innovation[k - 1], p)? != 1
+        {
+            bail!("invalid checked export shape or status");
+        }
+        numeric_record(&serde_json::to_value(&packet.raw_innovation)?, p)?;
+        for (vector, error) in [
+            (
+                &packet.unit_innovation,
+                &packet.decoded_innovation_backward_error,
+            ),
+            (
+                &packet.unit_retained_eigenvector,
+                &packet.decoded_eigenpair_backward_error,
+            ),
+        ] {
+            if vector.is_empty() {
+                if error.is_some() {
+                    bail!("error without exported vector");
+                }
+                continue;
+            }
+            let values = vector
+                .iter()
+                .map(|v| scalar(v, p))
+                .collect::<Result<Vec<_>>>()?;
+            let error = scalar(
+                error
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("missing export error"))?,
+                p,
+            )?;
+            if error < 0
+                || error > tolerance
+                || numerical_checks::unit_deviation_upper(&values, p)? > tolerance
+            {
+                bail!("export norm or recorded backward error fails acceptance");
+            }
+        }
+        // Bind the exported points to the retained matrix: the recorded
+        // backward errors must replay exactly from the exported innovation,
+        // its Schur pivot and the exported eigenvector. Cost O(k^2).
+        let innovation = packet
+            .raw_innovation
+            .iter()
+            .map(|v| scalar(v, p))
+            .collect::<Result<Vec<_>>>()?;
+        let mut rhs = vec![Float::with_val(p, 0); k];
+        rhs[k - 1] = scalar(&ladder.rows[k - 1].sigma, p)?;
+        if packet.decoded_innovation_backward_error.as_deref()
+            != Some(upper_decimal(&residual(&matrix.entries, d, &innovation, &rhs, p)).as_str())
+        {
+            bail!("recorded innovation backward error does not replay from the retained matrix");
+        }
+        if let Some(pair) = pair {
+            let vector = packet
+                .unit_retained_eigenvector
+                .iter()
+                .map(|v| scalar(v, p))
+                .collect::<Result<Vec<_>>>()?;
+            if packet.decoded_eigenpair_backward_error.as_deref()
+                != Some(
+                    upper_decimal(&eigenpair_residual(
+                        &matrix.entries,
+                        d,
+                        &vector,
+                        &pair.eigenvalue,
+                        p,
+                    ))
+                    .as_str(),
+                )
+            {
+                bail!("recorded eigenpair backward error does not replay from the retained matrix");
+            }
+        }
+        for value in [&packet.signed_overlap, &packet.squared_overlap]
+            .into_iter()
+            .flatten()
+        {
+            scalar(value, p)?;
+        }
+        if packet.signed_overlap.is_some() != pair.is_some()
+            || packet.squared_overlap.is_some() != pair.is_some()
+            || packet
+                .squared_overlap
+                .as_ref()
+                .is_some_and(|v| scalar(v, p).map_or(true, |v| v < 0))
+        {
+            bail!("invalid export overlap");
+        }
+    }
+    Ok(())
+}
+
+fn sanity_reduction(
+    report: &RetainedReductionCheck,
+    matrix: &RetainedEvenMatrix,
+    p: u32,
+    maximum_dimension: usize,
+    relative_tolerance: &str,
+) -> Result<()> {
+    let d = matrix.dimension();
+    let bytes = 2 * d as u128 * d as u128 * (u128::from(p).div_ceil(8) + 96);
+    if report.schema_version != 1
+        || report.algorithm_semantics != xc_numerics::eigen::STABLE_HOUSEHOLDER_SEMANTICS
+        || report.matrix_source != matrix.manifest.content_digest
+        || report.cutoff != matrix.cutoff
+        || report.n_modes != matrix.modes
+        || report.dimension != d
+        || report.source_precision_bits != matrix.precision
+        || report.working_precision_bits != p
+        || report.authorized_maximum_dimension != maximum_dimension
+        || u128::from(report.estimated_matrix_working_bytes) != bytes
+        || report.acceptance_tolerance != relative_tolerance
+        || report.assurance != REDUCTION_ASSURANCE
+        || report.diagonal.len() != d
+        || report.off_diagonal.len() != d.saturating_sub(1)
+        || report.computed_eigenvalues.len() != d
+    {
+        bail!("cached reduction metadata, shape or source binding mismatch");
+    }
+    for values in [
+        &report.diagonal,
+        &report.off_diagonal,
+        &report.computed_eigenvalues,
+    ] {
+        numeric_record(&serde_json::to_value(values)?, p)?;
+    }
+    let values = report
+        .computed_eigenvalues
+        .iter()
+        .map(|v| scalar(v, p))
+        .collect::<Result<Vec<_>>>()?;
+    if values.windows(2).any(|w| w[0] > w[1]) {
+        bail!("unordered cached spectrum");
+    }
+    for value in serde_json::to_value(&report.diagnostics)?
+        .as_object()
+        .unwrap()
+        .values()
+    {
+        if scalar(value.as_str().unwrap(), p)? < 0 {
+            bail!("negative reduction diagnostic");
+        }
+    }
+    let tolerance = acceptance_tolerance(relative_tolerance, p)?;
+    let passed = scalar(&report.diagnostics.relative_similarity_residual, p)? <= tolerance
+        && scalar(&report.diagnostics.relative_orthogonality_residual, p)? <= tolerance;
+    if report.checks_passed != passed {
+        bail!("inconsistent reduction acceptance status");
+    }
+    reduction_invariants(report, matrix, p, &values)
+}
+
+// O(d^2) invariants that bind a retained reduction report to its matrix
+// without repeating the decomposition. With A Q = Q T + R and E = Q^T Q - I,
+// T = Q^T A Q - E T - Q^T R gives |tr A - tr T| <= |E|(|A| + |T|) + |Q||R|
+// and ||T| - |A|| <= |E|(|A| + |T|) + (1 + |E|)|R| in Frobenius norms. The
+// spectrum must reproduce tr T and |T|^2. Tolerances include a generous
+// half-precision allowance for point arithmetic; gross fabrication fails.
+fn reduction_invariants(
+    report: &RetainedReductionCheck,
+    matrix: &RetainedEvenMatrix,
+    p: u32,
+    eigenvalues: &[Float],
+) -> Result<()> {
+    let work = p + 64;
+    let d = matrix.dimension();
+    let n = Float::with_val(work, d);
+    let slack = Float::with_val(work, 1) >> (p / 2);
+    let square_sum = |values: &mut dyn Iterator<Item = (Float, u32)>| -> Float {
+        let mut sum = Float::with_val(work, 0);
+        for (value, weight) in values {
+            sum += Float::with_val(work, value.square_ref()) * weight;
+        }
+        sum
+    };
+    let close = |recorded: &Float, replayed: &Float, scale: &Float| -> bool {
+        let difference = Float::with_val(work, recorded - replayed).abs();
+        difference <= Float::with_val(work, scale * &slack)
+    };
+    let diag = report
+        .diagonal
+        .iter()
+        .map(|v| scalar(v, p))
+        .collect::<Result<Vec<_>>>()?;
+    let off = report
+        .off_diagonal
+        .iter()
+        .map(|v| scalar(v, p))
+        .collect::<Result<Vec<_>>>()?;
+    let diagnostic = |v: &str| scalar(v, p);
+    let source = diagnostic(&report.diagnostics.source_frobenius_norm)?;
+    let tridiagonal = diagnostic(&report.diagnostics.tridiagonal_frobenius_norm)?;
+    let basis = diagnostic(&report.diagnostics.basis_frobenius_norm)?;
+    let residual = diagnostic(&report.diagnostics.absolute_similarity_residual)?;
+    let orthogonality = diagnostic(&report.diagnostics.absolute_orthogonality_residual)?;
+    let source_replay = square_sum(&mut matrix.entries.iter().map(|x| (x.clone(), 1))).sqrt();
+    let tridiagonal_replay = square_sum(
+        &mut diag
+            .iter()
+            .map(|x| (x.clone(), 1))
+            .chain(off.iter().map(|x| (x.clone(), 2))),
+    )
+    .sqrt();
+    let one = Float::with_val(work, 1);
+    if !close(&source, &source_replay, &source_replay.clone().max(&one))
+        || !close(
+            &tridiagonal,
+            &tridiagonal_replay,
+            &tridiagonal_replay.clone().max(&one),
+        )
+    {
+        bail!("cached reduction norms do not replay from the retained matrix and tridiagonal");
+    }
+    // |Q|_F^2 = n + tr E, and |tr E| <= sqrt(n) |E|_F.
+    let basis_defect = Float::with_val(work, basis.square_ref()) - &n;
+    let root_n = Float::with_val(work, n.sqrt_ref());
+    if basis_defect.abs() > Float::with_val(work, &root_n * &orthogonality) * 2 + &n * &slack {
+        bail!("cached reduction basis norm is inconsistent with its orthogonality residual");
+    }
+    let scale = Float::with_val(work, &source_replay + &tridiagonal_replay).max(&one);
+    let coupling = Float::with_val(work, &orthogonality * &scale);
+    let trace_a = matrix
+        .entries
+        .iter()
+        .step_by(d + 1)
+        .fold(Float::with_val(work, 0), |sum, x| sum + x);
+    let trace_t = diag.iter().fold(Float::with_val(work, 0), |sum, x| sum + x);
+    let trace_bound = Float::with_val(work, &coupling + Float::with_val(work, &basis * &residual))
+        * 2
+        + Float::with_val(work, &scale * &n) * &slack;
+    if Float::with_val(work, &trace_a - &trace_t).abs() > trace_bound {
+        bail!("cached reduction tridiagonal trace does not match the retained matrix");
+    }
+    let norm_bound = Float::with_val(
+        work,
+        &coupling
+            + Float::with_val(
+                work,
+                Float::with_val(work, &one + &orthogonality) * &residual,
+            ),
+    ) * 2
+        + Float::with_val(work, &scale * &n) * &slack;
+    if Float::with_val(work, &source_replay - &tridiagonal_replay).abs() > norm_bound {
+        bail!("cached reduction tridiagonal norm does not match the retained matrix");
+    }
+    let spectrum_trace = eigenvalues
+        .iter()
+        .fold(Float::with_val(work, 0), |sum, x| sum + x);
+    let spectrum_square = square_sum(&mut eigenvalues.iter().map(|x| (x.clone(), 1)));
+    let t_square = Float::with_val(work, tridiagonal_replay.square_ref());
+    let spectrum_scale = Float::with_val(work, &n * &n) * tridiagonal_replay.clone().max(&one);
+    if !close(&spectrum_trace, &trace_t, &spectrum_scale)
+        || !close(
+            &spectrum_square,
+            &t_square,
+            &Float::with_val(work, &spectrum_scale * tridiagonal_replay.clone().max(&one)),
+        )
+    {
+        bail!("cached reduction spectrum does not reproduce its tridiagonal invariants");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod renewed_boundary_contract {
     use super::*;
@@ -1245,6 +1745,192 @@ mod exhaustive_retained_prefix {
     use super::*;
     use serde_json::json;
     use xc_cache::{ArtifactKey, CacheObjectRef};
+    #[test]
+    fn prefix_sanity_rejects_duplicate_checkpoint_sources_despite_dependency_deduplication() {
+        let (manifest, bytes) = matrix("13");
+        let matrix = RetainedEvenMatrix::from_payload(
+            &manifest,
+            &bytes,
+            std::slice::from_ref(&manifest.content_digest),
+        )
+        .unwrap();
+        let (manifest, bytes) = source(
+            "ccm_weil_eigenpair",
+            json!({
+                "schema_version":2,"lambda_squared":"13","n_modes":1,"precision_bits":128,
+                "eigenvalue":"2","eigenvector":["0","1","0"],"force_even":true,"parity_policy":"even_sector"
+            }),
+        );
+        let pair = RetainedEvenEigenpair::from_payload(
+            &manifest,
+            &bytes,
+            std::slice::from_ref(&manifest.content_digest),
+        )
+        .unwrap();
+        let options = options();
+        let report =
+            analyze_retained_prefixes(&matrix, &options, std::slice::from_ref(&pair)).unwrap();
+        sanity_prefix(&report, &matrix, &options, std::slice::from_ref(&pair)).unwrap();
+        assert!(sanity_prefix(&report, &matrix, &options, &[pair.clone(), pair]).is_err());
+    }
+    #[test]
+    fn ordinary_prefix_and_reduction_hits_do_not_repeat_dense_calculations() {
+        use xc_cache::*;
+        let directory = xc_core::test_support::TestDir::new("retained-warm-sanity");
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "local",
+                directory.join("producer"),
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let mut cache = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["local".into()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let (manifest, bytes) = matrix("13");
+        let matrix = RetainedEvenMatrix::from_payload(
+            &manifest,
+            &bytes,
+            std::slice::from_ref(&manifest.content_digest),
+        )
+        .unwrap();
+        let options = options();
+        PREFIX_CALCULATIONS.with(|count| count.set(0));
+        REDUCTION_CALCULATIONS.with(|count| count.set(0));
+        let prefix = analyze_retained_prefixes_via_cache(&matrix, &options, &[], &cache).unwrap();
+        let reduction =
+            check_retained_reduction_via_cache(&matrix, 128, 2, "1e-25", &cache).unwrap();
+        cache.mode = ArtifactExecutionCacheMode::RequireReuse;
+        cache.write_on_miss = false;
+        assert_eq!(
+            analyze_retained_prefixes_via_cache(&matrix, &options, &[], &cache)
+                .unwrap()
+                .value,
+            prefix.value
+        );
+        assert_eq!(
+            check_retained_reduction_via_cache(&matrix, 128, 2, "1e-25", &cache)
+                .unwrap()
+                .value,
+            reduction.value
+        );
+        assert_eq!(PREFIX_CALCULATIONS.with(|count| count.get()), 1);
+        assert_eq!(REDUCTION_CALCULATIONS.with(|count| count.get()), 1);
+        let mut bad = prefix.value.clone();
+        bad.ladder.rows[0].sigma = "NaN".into();
+        assert!(sanity_prefix(&bad, &matrix, &options, &[]).is_err());
+        bad = prefix.value.clone();
+        bad.checkpoints[0].unit_innovation.clear();
+        assert!(sanity_prefix(&bad, &matrix, &options, &[]).is_err());
+        // Exported points are bound to the matrix by exact error replay.
+        let passed = prefix
+            .value
+            .checkpoints
+            .iter()
+            .position(|packet| !packet.raw_innovation.is_empty())
+            .expect("fixture exports at least one checkpoint");
+        bad = prefix.value.clone();
+        let k = bad.checkpoints[passed].dimension;
+        if k > 1 {
+            bad.checkpoints[passed].raw_innovation[0] = "0.5".into();
+            assert!(sanity_prefix(&bad, &matrix, &options, &[]).is_err());
+        }
+        bad = prefix.value.clone();
+        bad.ladder.rows[k - 1].sigma = "1000".into();
+        assert!(sanity_prefix(&bad, &matrix, &options, &[]).is_err());
+        assert!(sanity_reduction(&reduction.value, &matrix, 128, 2, "1e-25").is_ok());
+        // The 0.15.1 counterexample and smaller fabrications must not pass
+        // ordinary reuse: O(d^2) invariants tie the report to its matrix.
+        let mutations: [&[(&str, &str)]; 5] = [
+            &[
+                ("/computed_eigenvalues/0", "-999"),
+                ("/computed_eigenvalues/1", "-998"),
+                ("/diagnostics/source_frobenius_norm", "0"),
+            ],
+            &[("/computed_eigenvalues/1", "30")],
+            &[("/diagonal/0", "999")],
+            &[("/diagnostics/source_frobenius_norm", "0")],
+            &[("/diagnostics/basis_frobenius_norm", "7")],
+        ];
+        for edits in mutations {
+            let mut value = serde_json::to_value(&reduction.value).unwrap();
+            for (pointer, text) in edits {
+                *value.pointer_mut(pointer).unwrap() = serde_json::json!(text);
+            }
+            let fabricated: RetainedReductionCheck = serde_json::from_value(value).unwrap();
+            assert!(
+                sanity_reduction(&fabricated, &matrix, 128, 2, "1e-25").is_err(),
+                "ordinary reuse accepted {edits:?}"
+            );
+        }
+        let mut bad = reduction.value;
+        bad.checks_passed = !bad.checks_passed;
+        assert!(sanity_reduction(&bad, &matrix, 128, 2, "1e-25").is_err());
+        let validation_root = directory.join("verify");
+        let workflow = ManagedArtifactCacheSession::with_layers_for_test(
+            ManagedArtifactCacheConfig {
+                profile: ManagedRunProfile::Normal,
+                requested_assurance: xc_core::AssuranceLevel::Computed,
+                certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+                cache_root: directory.join("producer"),
+                staging_root: None,
+                publication_target: xc_core::PublicationTarget::None,
+                repository_owner: "local-fixture".into(),
+                remote_cache_mode: ManagedRemoteCacheMode::None,
+                cache_mode: ArtifactExecutionCacheMode::VerifyAgainstReference,
+                replace_existing_publication: false,
+                execute_remote_mutations: false,
+                output_validation: Some(OutputValidationConfig {
+                    validation_root: validation_root.clone(),
+                    report_root: validation_root.join("reports"),
+                    reference_mode: ManagedRemoteCacheMode::Public,
+                }),
+            },
+            vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(FilesystemCacheStore::new(
+                    "validation",
+                    validation_root,
+                    true,
+                    CacheVisibility::Local,
+                )),
+            }],
+            vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(FilesystemCacheStore::new(
+                    "reference",
+                    directory.join("producer"),
+                    false,
+                    CacheVisibility::Local,
+                )),
+            }],
+        )
+        .unwrap();
+        analyze_retained_prefixes_via_cache(&matrix, &options, &[], &workflow.context()).unwrap();
+        check_retained_reduction_via_cache(&matrix, 128, 2, "1e-25", &workflow.context()).unwrap();
+        workflow.finalize_publication_inventory().unwrap();
+        assert!(PREFIX_CALCULATIONS.with(|count| count.get()) > 1);
+        assert!(REDUCTION_CALCULATIONS.with(|count| count.get()) > 1);
+    }
     fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
         let bytes = serde_json::to_vec(&value).unwrap();
         let digest = ContentDigest::sha256(&bytes);
@@ -1260,7 +1946,7 @@ mod exhaustive_retained_prefix {
                 }],
                 created_unix_seconds: 1,
                 producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
-                minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
                 maximum_reader_version: None,
                 quality: CacheQuality::Validated,
                 visibility: CacheVisibility::Local,

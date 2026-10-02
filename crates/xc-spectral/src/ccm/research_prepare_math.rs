@@ -2,6 +2,7 @@
 //! Each transcendental output requires directed bounds to agree after rounding.
 //! Exact dyadic form splitting is separate from continuum/source accuracy.
 use anyhow::{bail, ensure, Result};
+use rayon::prelude::*;
 use rug::{float::Round, ops::Pow, Float, Integer, Rational};
 use xc_numerics::mpfr_interval::MpfrInterval as I;
 const BIT_BUDGET: u64 = 67_108_864;
@@ -153,25 +154,44 @@ pub(super) fn forms(
                 + u128::from(i64::from(x.get_exp().unwrap_or(0)).unsigned_abs())
                 + 2)
         })?;
+    // The estimate counts bits; the declared working budget counts bytes.
+    let budget_bits = u128::from(
+        super::capture_runtime::CaptureResourcePolicy::from_environment()?.maximum_working_bytes,
+    ) * 8;
     ensure!(
-        estimate * (d as u128 + 4) <= 8u128 << 33,
-        "preparation exact form exceeds 8 GiB workspace budget"
+        estimate * (d as u128 + 4) <= budget_bits,
+        "preparation exact form exceeds the declared workspace budget"
     );
     let v = v.iter().map(source).collect::<Result<Vec<_>>>()?;
-    let mut av = vec![Rational::new(); dim * d];
-    for r in 0..dim {
-        for k in 0..dim {
-            let a: Rational = (source(&matrix[r * dim + k])? + source(&matrix[k * dim + r])?) / 2;
-            for j in 0..d {
-                av[r * d + j] += a.clone() * &v[k * d + j];
-                check(&av[r * d + j])?;
+    // Rows of A*V and the (i, j) pairs are independent exact sums. Each keeps
+    // the serial summation order and budget checks; the first failure in the
+    // serial loop order is reported.
+    xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
+    let mut av = Vec::with_capacity(dim * d);
+    for row in (0..dim)
+        .into_par_iter()
+        .map(|r| -> Result<Vec<Rational>> {
+            let mut row = vec![Rational::new(); d];
+            for k in 0..dim {
+                let a: Rational =
+                    (source(&matrix[r * dim + k])? + source(&matrix[k * dim + r])?) / 2;
+                for j in 0..d {
+                    row[j] += a.clone() * &v[k * d + j];
+                    check(&row[j])?;
+                }
             }
-        }
+            Ok(row)
+        })
+        .collect::<Vec<_>>()
+    {
+        av.extend(row?);
     }
-    let mut gram = vec![Float::with_val(p, 0); d * d];
-    let mut actual = gram.clone();
-    for i in 0..d {
-        for j in 0..=i {
+    let pairs = (0..d)
+        .flat_map(|i| (0..=i).map(move |j| (i, j)))
+        .collect::<Vec<_>>();
+    let values = pairs
+        .par_iter()
+        .map(|&(i, j)| -> Result<(Float, Float)> {
             let mut g = Rational::new();
             let mut a = Rational::new();
             for k in 0..dim {
@@ -180,13 +200,17 @@ pub(super) fn forms(
                 check(&g)?;
                 check(&a)?;
             }
-            let g = round(&g, p)?;
-            let a = round(&(a / 2), p)?;
-            gram[i * d + j] = g.clone();
-            gram[j * d + i] = g;
-            actual[i * d + j] = a.clone();
-            actual[j * d + i] = a;
-        }
+            Ok((round(&g, p)?, round(&(a / 2), p)?))
+        })
+        .collect::<Vec<_>>();
+    let mut gram = vec![Float::with_val(p, 0); d * d];
+    let mut actual = gram.clone();
+    for (&(i, j), value) in pairs.iter().zip(values) {
+        let (g, a) = value?;
+        gram[i * d + j] = g.clone();
+        gram[j * d + i] = g;
+        actual[i * d + j] = a.clone();
+        actual[j * d + i] = a;
     }
     Ok((gram, actual))
 }
@@ -215,38 +239,52 @@ pub(super) fn head(
     // Stream exact coefficients: their aggregate size can exceed the budget
     // even though a single coefficient and the moment accumulators fit. Keep
     // the same exact factors and directed summation order at each guard tier.
+    // Each ordinate's weight is formed on a worker, in bounded blocks; the
+    // moments are accumulated serially in ordinate order, and the first
+    // failure in that order is reported.
+    xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
     for guard in [64, 128, 256, 512, 1024, 2048, 4096] {
         let w = p + guard;
         let mut moments = vec![I::from_i64(0, w); 2 * d - 1];
-        for (j, t) in t.iter().enumerate().skip(prefix) {
-            let theta = source(t)? * &l / 2;
-            let mut factor = Rational::from(1);
-            for r in &z[..prefix] {
-                factor *= z[j].clone() - r;
-                check(&factor)?;
-            }
-            for k in 1..=n {
-                let denominator = z[j].clone() - lattice(k, n);
-                ensure!(
-                    denominator != 0,
-                    "stored preparation coordinate is a rational pole"
-                );
-                factor /= denominator;
-                check(&factor)?;
-            }
-            let factor = factor.square();
-            check(&factor)?;
-            let theta_i = I::from_rational(&theta, w);
-            let sinc = if theta == 0 {
-                I::from_i64(1, w)
-            } else {
-                theta_i.sin().div(&theta_i)?
-            };
-            let mut weight = sinc.square().mul(&I::from_rational(&factor, w));
-            let z = I::from_rational(&z[j], w);
-            for m in &mut moments {
-                *m = m.add(&weight);
-                weight = weight.mul(&z);
+        for first in (prefix..t.len()).step_by(4096) {
+            let weights = (first..t.len().min(first + 4096))
+                .into_par_iter()
+                .map(|j| -> Result<(I, I)> {
+                    let theta = source(&t[j])? * &l / 2;
+                    let mut factor = Rational::from(1);
+                    for r in &z[..prefix] {
+                        factor *= z[j].clone() - r;
+                        check(&factor)?;
+                    }
+                    for k in 1..=n {
+                        let denominator = z[j].clone() - lattice(k, n);
+                        ensure!(
+                            denominator != 0,
+                            "stored preparation coordinate is a rational pole"
+                        );
+                        factor /= denominator;
+                        check(&factor)?;
+                    }
+                    let factor = factor.square();
+                    check(&factor)?;
+                    let theta_i = I::from_rational(&theta, w);
+                    let sinc = if theta == 0 {
+                        I::from_i64(1, w)
+                    } else {
+                        theta_i.sin().div(&theta_i)?
+                    };
+                    Ok((
+                        sinc.square().mul(&I::from_rational(&factor, w)),
+                        I::from_rational(&z[j], w),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            for value in weights {
+                let (mut weight, z) = value?;
+                for m in &mut moments {
+                    *m = m.add(&weight);
+                    weight = weight.mul(&z);
+                }
             }
         }
         let values = moments
@@ -297,6 +335,214 @@ pub(super) fn split(actual: &[Float], head: &[Float], p: u32) -> Result<(u32, Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parallel_head_is_bit_identical_to_serial_reference_at_any_thread_count() {
+        for (n, d, count, p) in [(6, 4, 40, 192), (3, 4, 9, 128), (5, 2, 23, 256)] {
+            let l = Float::with_val(p, 3) + Float::with_val(p, 1) / 7u32;
+            let t = (0..count)
+                .map(|j| Float::with_val(p, 1 + 3 * j as u32) / 5u32)
+                .collect::<Vec<_>>();
+            // Coordinates avoid the lattice points (k/n)^2, except one pole case.
+            let mut z = (0..count)
+                .map(|j| Float::with_val(p, 2 * j as u32 + 1) / (3 * count as u32))
+                .collect::<Vec<_>>();
+            if count == 9 {
+                z[7] = Float::with_val(p, Rational::from((4, 9)));
+            }
+            let expected = reference_head(&t, &z, &l, n, d, p);
+            for threads in [1, 2, 4, 8] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                for _ in 0..2 {
+                    let actual = pool.install(|| head(&t, &z, &l, n, d, p));
+                    match (&actual, &expected) {
+                        (Ok(a), Ok(b)) => {
+                            assert_eq!(a.len(), b.len());
+                            for (x, y) in a.iter().zip(b) {
+                                assert!(x.prec() == y.prec() && x.as_ord() == y.as_ord());
+                            }
+                        }
+                        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string()),
+                        _ => panic!("parallel and serial heads disagree on failure"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Serial `head` retained verbatim from before ordinate parallelism.
+    fn reference_head(
+        t: &[Float],
+        z: &[Float],
+        l: &Float,
+        n: usize,
+        d: usize,
+        p: u32,
+    ) -> Result<Vec<Float>> {
+        shape(n, p)?;
+        ensure!(
+            d > 0
+                && d <= 65
+                && d <= n + 1
+                && t.len() == z.len()
+                && t.len() >= n + 1 - d
+                && t.len() <= 1_000_000,
+            "invalid preparation head shape"
+        );
+        let prefix = n + 1 - d;
+        let l = source(l)?;
+        crate::ccm::certified_roots::boundary::rational_budget(z.iter(), 1)?;
+        let z = z.iter().map(source).collect::<Result<Vec<_>>>()?;
+        // Stream exact coefficients: their aggregate size can exceed the budget
+        // even though a single coefficient and the moment accumulators fit. Keep
+        // the same exact factors and directed summation order at each guard tier.
+        for guard in [64, 128, 256, 512, 1024, 2048, 4096] {
+            let w = p + guard;
+            let mut moments = vec![I::from_i64(0, w); 2 * d - 1];
+            for (j, t) in t.iter().enumerate().skip(prefix) {
+                let theta = source(t)? * &l / 2;
+                let mut factor = Rational::from(1);
+                for r in &z[..prefix] {
+                    factor *= z[j].clone() - r;
+                    check(&factor)?;
+                }
+                for k in 1..=n {
+                    let denominator = z[j].clone() - lattice(k, n);
+                    ensure!(
+                        denominator != 0,
+                        "stored preparation coordinate is a rational pole"
+                    );
+                    factor /= denominator;
+                    check(&factor)?;
+                }
+                let factor = factor.square();
+                check(&factor)?;
+                let theta_i = I::from_rational(&theta, w);
+                let sinc = if theta == 0 {
+                    I::from_i64(1, w)
+                } else {
+                    theta_i.sin().div(&theta_i)?
+                };
+                let mut weight = sinc.square().mul(&I::from_rational(&factor, w));
+                let z = I::from_rational(&z[j], w);
+                for m in &mut moments {
+                    *m = m.add(&weight);
+                    weight = weight.mul(&z);
+                }
+            }
+            let values = moments
+                .iter()
+                .map(|x| rounded(x, p))
+                .collect::<Result<Option<Vec<_>>>>()?;
+            if let Some(values) = values {
+                return Ok((0..d * d).map(|k| values[k / d + k % d].clone()).collect());
+            }
+        }
+        bail!("preparation head rounding unresolved within guard budget")
+    }
+
+    #[test]
+    fn parallel_forms_are_bit_identical_to_serial_reference_at_any_thread_count() {
+        for (dim, d, p) in [(9, 5, 256), (13, 7, 512), (3, 1, 64)] {
+            let value = |seed: usize, scale: u32| {
+                let numerator = (seed * 7919 + 104_729) % 65_521;
+                let sign = if seed.is_multiple_of(3) { -1 } else { 1 };
+                Float::with_val(p, sign * numerator as i64) >> (scale + (seed % 23) as u32)
+            };
+            let matrix = (0..dim * dim).map(|k| value(k, 8)).collect::<Vec<_>>();
+            let v = (0..dim * d).map(|k| value(k + 7, 4)).collect::<Vec<_>>();
+            let expected = reference_forms(&matrix, &v, dim, d, p).unwrap();
+            for threads in [1, 2, 4, 8] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                for _ in 0..2 {
+                    let actual = pool.install(|| forms(&matrix, &v, dim, d, p)).unwrap();
+                    for (left, right) in [(&actual.0, &expected.0), (&actual.1, &expected.1)] {
+                        assert_eq!(left.len(), right.len());
+                        for (a, b) in left.iter().zip(right) {
+                            assert!(a.prec() == b.prec() && a.as_ord() == b.as_ord());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Serial `forms` retained verbatim from before row parallelism.
+    fn reference_forms(
+        matrix: &[Float],
+        v: &[Float],
+        dim: usize,
+        d: usize,
+        p: u32,
+    ) -> Result<(Vec<Float>, Vec<Float>)> {
+        ensure!(
+            dim <= 1025
+                && dim > 0
+                && d > 0
+                && d <= 65
+                && matrix.len() == dim * dim
+                && v.len() == dim * d,
+            "preparation form shape mismatch"
+        );
+        let estimate = matrix
+            .iter()
+            .chain(v)
+            .try_fold(0u128, |sum, x| -> Result<_> {
+                ensure!(x.is_finite(), "nonfinite preparation form source");
+                Ok(sum
+                    + u128::from(x.prec())
+                    + u128::from(i64::from(x.get_exp().unwrap_or(0)).unsigned_abs())
+                    + 2)
+            })?;
+        // The estimate counts bits; the declared working budget counts bytes.
+        let budget_bits = u128::from(
+            crate::ccm::capture_runtime::CaptureResourcePolicy::from_environment()?
+                .maximum_working_bytes,
+        ) * 8;
+        ensure!(
+            estimate * (d as u128 + 4) <= budget_bits,
+            "preparation exact form exceeds the declared workspace budget"
+        );
+        let v = v.iter().map(source).collect::<Result<Vec<_>>>()?;
+        let mut av = vec![Rational::new(); dim * d];
+        for r in 0..dim {
+            for k in 0..dim {
+                let a: Rational =
+                    (source(&matrix[r * dim + k])? + source(&matrix[k * dim + r])?) / 2;
+                for j in 0..d {
+                    av[r * d + j] += a.clone() * &v[k * d + j];
+                    check(&av[r * d + j])?;
+                }
+            }
+        }
+        let mut gram = vec![Float::with_val(p, 0); d * d];
+        let mut actual = gram.clone();
+        for i in 0..d {
+            for j in 0..=i {
+                let mut g = Rational::new();
+                let mut a = Rational::new();
+                for k in 0..dim {
+                    g += v[k * d + i].clone() * &v[k * d + j];
+                    a += v[k * d + i].clone() * &av[k * d + j];
+                    check(&g)?;
+                    check(&a)?;
+                }
+                let g = round(&g, p)?;
+                let a = round(&(a / 2), p)?;
+                gram[i * d + j] = g.clone();
+                gram[j * d + i] = g;
+                actual[i * d + j] = a.clone();
+                actual[j * d + i] = a;
+            }
+        }
+        Ok((gram, actual))
+    }
+
     #[test]
     fn preparation_basis_matches_closed_rational_coefficients() {
         for p in [64, 128, 256] {

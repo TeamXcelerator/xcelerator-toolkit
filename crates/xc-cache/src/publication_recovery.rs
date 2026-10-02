@@ -532,8 +532,7 @@ mod tests {
     #[test]
     fn abandon_is_append_only_and_retains_remote_object_accounting() {
         let root = crate::test_support::temporary_root("abandon");
-        let _ = std::fs::remove_dir_all(&root);
-        let store = PublicationJournalStore::new(&root);
+        let store = PublicationJournalStore::new(root.path());
         let mut journal = journal();
         store.save(&journal).unwrap();
         {
@@ -574,8 +573,7 @@ mod tests {
     #[test]
     fn abandon_refuses_a_receipt_that_may_already_be_discoverable() {
         let root = crate::test_support::temporary_root("abandon-receipt");
-        let _ = std::fs::remove_dir_all(&root);
-        let store = PublicationJournalStore::new(&root);
+        let store = PublicationJournalStore::new(root.path());
         let mut journal = journal();
         let error = abandon_publication_target(
             &ReceiptRemote {

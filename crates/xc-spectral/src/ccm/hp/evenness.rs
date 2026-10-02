@@ -45,9 +45,11 @@ fn evenness_must_qualify_algebraic_ground_state() {
     cfg.inverse_iter_steps = 256;
     match measure_evenness_from_tau(&params, &cfg, matrix) {
         Ok(result) => {
-            eprintln!(
+            xc_core::progress_message!(
                 "manufactured source: reported natural={}, forced={}, deviation={}",
-                result.natural_eigenvalue, result.forced_eigenvalue, result.evenness_deviation
+                result.natural_eigenvalue,
+                result.forced_eigenvalue,
+                result.evenness_deviation
             );
             assert!(result.natural_eigenvalue < 0,
                 "near-zero inverse iteration must not claim the positive eigenvalue is the algebraic ground state");

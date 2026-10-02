@@ -266,8 +266,10 @@ do not silently acquire third-moment work: resolve a fresh Ultra plan or set
 the policy explicitly.
 
 Fresh Ultra requests reuse compatible matrix/eigenstate parents and compute
-new v9 children when computation is allowed. `RequireReuse` remains strict and
-replays all numerical fields from the supplied points in O(D^3) arithmetic.
+new v9 children when computation is allowed. `RequireReuse` never computes;
+ordinary reuse admits a retained report with O(D^2) binding checks, and explicit
+verification replays all numerical fields from the supplied points in O(D^3)
+arithmetic.
 Source and root identities are unchanged. The separate retained-reduction
 replay repair advances its child identity to `ccm-retained-reduction-v0.15.1-v3`.
 Both public and private shards use their existing generic artifact envelopes;

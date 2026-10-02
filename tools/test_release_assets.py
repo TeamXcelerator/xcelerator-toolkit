@@ -99,10 +99,10 @@ class ReleaseAssets(unittest.TestCase):
    def git(*args):
     return subprocess.check_output(['git','-C',d,'-c','core.autocrlf=false','-c','user.name=Test','-c','user.email=test@example.invalid',*args],stderr=subprocess.PIPE)
    (root/'.gitattributes').write_bytes(b'*.log binary\n*.py binary\n')
-   raw=b'raw Windows evidence\r\n';(root/'audit.log').write_bytes(raw)
+   raw=b'raw captured bytes\r\n';(root/'capture.log').write_bytes(raw)
    git('init');git('add','.');git('commit','-m','raw log fixture')
    self.assertTrue(assets.repository_bytes(root)['index_text_is_canonical'])
-   self.assertEqual(git('show','HEAD:audit.log'),raw)
+   self.assertEqual(git('show','HEAD:capture.log'),raw)
    (root/'bad.py').write_bytes(b'#!/usr/bin/env python3\r\n')
    git('add','.');git('commit','-m','invalid script fixture')
    with self.assertRaisesRegex(ValueError,'script contains CR'):assets.repository_bytes(root)

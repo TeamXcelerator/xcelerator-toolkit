@@ -21,6 +21,13 @@ pub use external::ExternalProfileSpec;
 /// Environment variable naming the private target-profile specification.
 pub const TARGET_SPEC_FILE_ENV: &str = "XC_TARGET_SPEC_FILE";
 
+/// Whether a runtime target specification is available to this process.
+/// Target-derived measurements that a capture level requests automatically
+/// are recorded as missing, not failed, when it is not.
+pub fn runtime_target_configured() -> bool {
+    cfg!(test) || std::env::var_os(TARGET_SPEC_FILE_ENV).is_some_and(|path| !path.is_empty())
+}
+
 // Decimal coefficients can become significant after normalization or polynomial
 // evaluation. Do not interpret a nonzero input outside binary64 range as zero.
 fn checked_decimal_f64(text: &str) -> Result<f64> {
@@ -162,7 +169,7 @@ impl GaussianPolynomialSeriesSpec {
 #[serde(deny_unknown_fields)]
 pub struct TargetProfileSpec {
     pub schema_version: u32,
-    /// Opaque, non-descriptive identifier chosen by the private research run.
+    /// Opaque, non-descriptive identifier chosen by the caller.
     pub profile_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_series: Option<GaussianPolynomialSeriesSpec>,
@@ -1094,6 +1101,11 @@ pub mod hp {
                 "target evaluation produced a nonfinite value"
             );
             checked_round(&value, self.requested_precision, "target value")
+        }
+
+        /// The unnormalized target at `u = 1`, which every value is divided by.
+        pub fn normalization(&self) -> Float {
+            Float::with_val(self.requested_precision, &self.base_at_one)
         }
 
         /// Scalar callback compatibility; use [`Self::try_value`] to retain errors.

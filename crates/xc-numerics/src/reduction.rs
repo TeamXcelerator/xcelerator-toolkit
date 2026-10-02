@@ -467,8 +467,8 @@ mod tests {
     /// Unique decimal recovery of a P-bit float needs ceil(P*log10(2)) + 1
     /// digits; this helper carries one more as margin. Binary64 is the
     /// canonical reference point: 17 digits required, so the helper must
-    /// return at least 18 for 53 bits, and at least 1022 for the paper's
-    /// 3386-bit tier where the one-short width corrupted persisted roots.
+    /// return at least 18 for 53 bits, and at least 1022 for the 3386-bit
+    /// HP-1000 tier where the one-short width corrupted persisted roots.
     #[test]
     fn roundtrip_digit_width_exceeds_unique_recovery_minimum() {
         assert_eq!(roundtrip_decimal_digits(53), 18);

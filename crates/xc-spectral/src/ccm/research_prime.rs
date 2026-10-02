@@ -64,8 +64,12 @@ pub(super) fn evaluate(
     // Include output, directed generators, prime data and the sieve before allocation.
     let memory = (d as u128 * d as u128 + 8 * u128::from(c.prime_cutoff()) + 32 * d as u128)
         * (u128::from(work_max).div_ceil(8) + 64);
-    if memory > 8u128 << 30 {
-        bail!("aggregate prime assembly exceeds the 8 GiB workspace budget");
+    let budget = u128::from(
+        crate::ccm::capture_runtime::CaptureResourcePolicy::from_environment()?
+            .maximum_working_bytes,
+    );
+    if memory > budget {
+        bail!("aggregate prime assembly exceeds the declared workspace budget");
     }
     let events = super::super::try_prime_powers_up_to(c.prime_cutoff())?;
     for guard in [64, 128, 256, 512, 1024, 2048, 4096] {

@@ -12,6 +12,7 @@ mod analytic_context;
 mod archive;
 mod artifact_plan;
 mod assurance;
+mod cache_location;
 mod capability;
 mod config;
 mod config_resolution;
@@ -31,11 +32,14 @@ mod secret;
 mod status;
 mod subspace;
 mod target;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 pub use analytic_context::*;
 pub use archive::*;
 pub use artifact_plan::*;
 pub use assurance::*;
+pub use cache_location::*;
 pub use capability::*;
 pub use config::*;
 pub use config_resolution::*;

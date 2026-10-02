@@ -8,22 +8,8 @@ fn managed_auto_polishes_krylov_and_replays_the_retained_route() {
     };
     // An explicitly created private directory avoids environment-dependent
     // standalone routing and any remote/publication side effects.
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "xc-confirmed-krylov-{}-{nonce}",
-        std::process::id()
-    ));
-    std::fs::create_dir(&root).unwrap();
-    struct OwnedDirectory(std::path::PathBuf);
-    impl Drop for OwnedDirectory {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let _owned = OwnedDirectory(root.clone());
+    let root_dir = xc_core::test_support::TestDir::new("confirmed-krylov");
+    let root = root_dir.to_path_buf();
     let resolver = CacheResolver::new(vec![CacheLayer {
         precedence: 0,
         store: Box::new(FilesystemCacheStore::new(
@@ -75,7 +61,7 @@ fn managed_auto_polishes_krylov_and_replays_the_retained_route() {
     let diagnostics = payload.shift_invert_krylov.as_ref().unwrap();
     assert_eq!(
         diagnostics.algorithm_semantics,
-        "ccm_even_zero_shift_krylov_guarded_lu_polish_resolution_v6"
+        "ccm_even_zero_shift_krylov_budgeted_count_polish_resolution_v7"
     );
     assert!(diagnostics.polishing_candidate_adopted);
     assert_eq!(
@@ -115,6 +101,27 @@ fn documented_ground_index_budget_has_consistent_byte_admission() {
     assert_eq!(p, 1725);
     ground_index::preflight(301, p, CcmParityPolicy::EvenSector).unwrap();
     assert!(ground_index::preflight(8193, 1_000_000, CcmParityPolicy::EvenSector).is_err());
+}
+
+#[test]
+fn primary_source_admission_uses_campaign_configuration_without_matrix_allocation() {
+    let cfg = HighPrecConfig::for_decimal_digits(1000).with_adaptive_root_precision();
+    assert_eq!(cfg.precision_bits, 3386);
+    cfg.validate_source_admission(&CcmParams::from_lambda_sq_integer(13, 120))
+        .unwrap();
+    let budget = super::super::capture_runtime::CaptureResourcePolicy::from_environment()
+        .unwrap()
+        .maximum_working_bytes;
+    assert_eq!(
+        cfg.validate_source_admission(&CcmParams::from_lambda_sq_integer(100, 500))
+            .is_ok(),
+        budget >= 20_203_846_408
+    );
+    let mut invalid = cfg.clone();
+    invalid.quad_points = 0;
+    assert!(invalid
+        .validate_source_admission(&CcmParams::from_lambda_sq_integer(13, 120))
+        .is_err());
 }
 
 #[test]
@@ -300,4 +307,46 @@ fn source_intervals_control_categories_and_the_gap_representative() {
     assert!(result.gap_log <= result.gap_log_upper);
     let expected = (Float::with_val(3 * p, 2049) / 2048u32).log10();
     assert!(result.gap_log_lower <= expected && expected <= result.gap_log_upper);
+}
+
+#[test]
+fn source_workspace_obeys_declared_budget_without_changing_domain_limits() {
+    let budget = u128::from(
+        super::super::capture_runtime::CaptureResourcePolicy::from_environment()
+            .unwrap()
+            .maximum_working_bytes,
+    );
+    source_workspace(budget, "boundary").unwrap();
+    assert!(source_workspace(budget + 1, "boundary").is_err());
+    // HP-2000/N=970 requires 14,090,378,940 bytes for these four source buffers.
+    assert_eq!(
+        validate_source_shape(970, 6708, 4000).is_ok(),
+        budget >= 14_090_378_940
+    );
+    assert!(validate_source_shape(4097, 64, 1).is_err());
+    assert!(validate_source_shape(1, 64, 1_000_001).is_err());
+    assert!(validate_source_shape(1, 63, 1).is_err());
+}
+
+#[test]
+fn quadrature_admission_charges_concurrent_work_and_rejects_invalid_orders() {
+    let budget = u128::from(
+        super::super::capture_runtime::CaptureResourcePolicy::from_environment()
+            .unwrap()
+            .maximum_working_bytes,
+    );
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    pool.install(|| {
+        // One retained table plus two simultaneous guarded mode workspaces.
+        let expected = 300_000u128 * 2 * (424 + 96) + 300_000u128 * 2 * (1359 + 96) * 16;
+        assert_eq!(
+            quadrature_workspace(1, 3386, &[300_000, 300_000]).is_ok(),
+            expected <= budget
+        );
+        assert!(quadrature_workspace(1, 3386, &[300_000]).is_err());
+        assert!(quadrature_workspace(1, 3386, &[300_000, 0]).is_err());
+    });
 }

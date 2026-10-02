@@ -45,8 +45,6 @@ events and roots in parallel with bounded temporary storage. Fresh responses
 reuse their production checks through an exact process-local payload seal;
 cached responses retain numerical replay. Both paths report event progress.
 See [response performance and validation](CCM_RESPONSE_PERFORMANCE.md).
-See the release validation for measured evaluation counts, test coverage and
-the limits of these performance claims.
 
 Both public and private evidence catalogs register `ccm_prefix_analysis` and
 `ccm_retained_reduction_check`. Public retained diagnostics require authenticated
@@ -55,7 +53,6 @@ public parents; target-derived evidence keeps its private publication policy.
 - [Release notes and migration](RELEASE_NOTES.md)
 - [Numerical compatibility and existing artifacts](NUMERICAL_COMPATIBILITY.md)
 - [Complete positive movable-root discovery](CCM_COMPLETE_ROOT_DISCOVERY.md)
-- [Release validation](VALIDATION.md)
 - [Prefix formulas, precision, and capture](CCM_PREFIX_ANALYSIS.md)
 - [Prefix convergence models and local shard inputs](PREFIX_CONVERGENCE.md)
 - [Frozen research evidence workflow](RESEARCH_EVIDENCE.md)

@@ -1,5 +1,9 @@
 use super::{GeneralizedExtremeConfigHp, HpCrossCheckTolerance, SolverError};
-use rug::{ops::NegAssign, Float};
+use rug::{
+    float::Round,
+    ops::{AddAssignRound, MulAssignRound, NegAssign},
+    Float,
+};
 use xc_core::{AssuranceLevel, EigenTarget, ResultStatus, SolverProvenance, TerminationReason};
 use xc_operator::GeneralizedEigenProblem;
 
@@ -263,7 +267,10 @@ fn canonicalize(vector: &mut [Float]) {
 
 /// Independent dense MPFR reference for one algebraic generalized extreme.
 /// The route uses Cholesky whitening followed by the ordinary dense
-/// Householder/QR eigensolver and verifies the result in the original pair.
+/// Householder/QR eigensolver and verifies the result in the original pair:
+/// residuals are evaluated at the stored inputs' own precision (plus a guard),
+/// so inputs finer than the working precision are never silently rounded away
+/// before acceptance.
 pub fn solve_dense_generalized_whitening_hp(
     problem: &DenseGeneralizedProblemHp<'_>,
     config: &GeneralizedExtremeConfigHp,
@@ -335,40 +342,140 @@ pub fn solve_dense_generalized_whitening_hp(
         *value /= &metric_norm;
     }
     canonicalize(&mut eigenvector);
-    applied_metric = matvec(
-        problem.metric,
-        &eigenvector,
-        problem.dimension,
-        config.precision_bits,
-    );
-    let applied_operator = matvec(
-        problem.operator,
-        &eigenvector,
-        problem.dimension,
-        config.precision_bits,
-    );
-    let residual: Vec<Float> = applied_operator
+    // Verify in the original pair. Every product of stored inputs, the computed
+    // vector and eigenvalue is formed exactly, and each residual component,
+    // image component and the metric normalization is rounded once (MPFR
+    // correctly rounded sum). Inputs finer than the working precision, and
+    // small terms beside large ones, therefore survive cancellation.
+    let verification_bits = problem
+        .operator
         .iter()
-        .zip(&applied_metric)
-        .map(|(operator, metric)| {
-            let mut value = metric.clone();
-            value *= &eigenvalue;
-            value = -value;
-            value += operator;
-            value
-        })
-        .collect();
-    let (residual_norm, relative_residual) = super::hp_residual_measures(
-        &residual,
-        &applied_operator,
-        &applied_metric,
-        &eigenvalue,
-        config.precision_bits,
-    )?;
+        .chain(problem.metric)
+        .map(Float::prec)
+        .max()
+        .unwrap_or(config.precision_bits)
+        .max(config.precision_bits)
+        .saturating_add(64);
+    let dimension = problem.dimension;
+    let negative_eigenvalue = Float::with_val(eigenvalue.prec(), -&eigenvalue);
+    let mut applied_operator = Vec::with_capacity(dimension);
+    let mut residual_upper = Vec::with_capacity(dimension);
+    let mut operator_lower = Vec::with_capacity(dimension);
+    let mut metric_lower = Vec::with_capacity(dimension);
+    let mut metric_bounds = Vec::with_capacity(dimension);
+    applied_metric = Vec::with_capacity(dimension);
+    for row in 0..dimension {
+        let operator_terms = (0..dimension)
+            .map(|column| {
+                super::exact_product(&[
+                    &problem.operator[row * dimension + column],
+                    &eigenvector[column],
+                ])
+            })
+            .collect::<Result<Vec<Float>, _>>()?;
+        let metric_terms = (0..dimension)
+            .map(|column| {
+                super::exact_product(&[
+                    &problem.metric[row * dimension + column],
+                    &eigenvector[column],
+                ])
+            })
+            .collect::<Result<Vec<Float>, _>>()?;
+        let shifted_terms = (0..dimension)
+            .map(|column| {
+                super::exact_product(&[
+                    &negative_eigenvalue,
+                    &problem.metric[row * dimension + column],
+                    &eigenvector[column],
+                ])
+            })
+            .collect::<Result<Vec<Float>, _>>()?;
+        let residual_terms = || operator_terms.iter().chain(&shifted_terms);
+        residual_upper.push(super::magnitude_bounds(residual_terms, verification_bits).1);
+        operator_lower.push(super::magnitude_bounds(|| operator_terms.iter(), verification_bits).0);
+        metric_lower.push(super::magnitude_bounds(|| metric_terms.iter(), verification_bits).0);
+        metric_bounds.push(super::signed_bounds(
+            || metric_terms.iter(),
+            verification_bits,
+        ));
+        applied_operator.push(super::rounded_once_sum(
+            operator_terms.iter(),
+            verification_bits,
+        ));
+        applied_metric.push(super::rounded_once_sum(
+            metric_terms.iter(),
+            verification_bits,
+        ));
+    }
+    // Acceptance uses an upper bound of the residual norm and a lower bound of
+    // its scale: components are enclosed by directed rounding of their exact
+    // sums, and norms scale every component before squaring, so neither an
+    // underflowing square nor a nearest rounding at a threshold can accept.
+    let breakdown = || {
+        SolverError::NumericalBreakdown(
+            "dense HP generalized residual bounds are outside the representable range".into(),
+        )
+    };
+    let residual_norm = super::hp_directed_norm(&residual_upper, verification_bits, Round::Up);
+    let mut scale = super::hp_directed_norm(&metric_lower, verification_bits, Round::Down);
+    scale.mul_assign_round(
+        Float::with_val(verification_bits, eigenvalue.abs_ref()),
+        Round::Down,
+    );
+    scale.add_assign_round(
+        super::hp_directed_norm(&operator_lower, verification_bits, Round::Down),
+        Round::Down,
+    );
+    if !residual_norm.is_finite() || !scale.is_finite() {
+        return Err(breakdown());
+    }
+    let relative_residual = if residual_norm.is_zero() {
+        Float::with_val(verification_bits, 0)
+    } else if scale.is_zero() {
+        return Err(breakdown());
+    } else {
+        Float::with_val_round(verification_bits, &residual_norm / &scale, Round::Up).0
+    };
+    // Metric normalization diagnostic in O(n) memory: an upper bound of
+    // |v^T B v - 1| from the directed enclosures of each (Bv)_i, multiplied
+    // exactly by v_i and summed with -1 in each direction.
+    let minus_one = Float::with_val(2, -1);
+    let mut lower_terms = Vec::with_capacity(dimension);
+    let mut upper_terms = Vec::with_capacity(dimension);
+    for (component, (down, up)) in eigenvector.iter().zip(&metric_bounds) {
+        let first = super::exact_product(&[component, down])?;
+        let second = super::exact_product(&[component, up])?;
+        if first <= second {
+            lower_terms.push(first);
+            upper_terms.push(second);
+        } else {
+            lower_terms.push(second);
+            upper_terms.push(first);
+        }
+    }
+    let lower = Float::with_val_round(
+        verification_bits,
+        Float::sum(lower_terms.iter().chain(std::iter::once(&minus_one))),
+        Round::Down,
+    )
+    .0;
+    let upper = Float::with_val_round(
+        verification_bits,
+        Float::sum(upper_terms.iter().chain(std::iter::once(&minus_one))),
+        Round::Up,
+    )
+    .0;
+    let metric_normalization_error = Float::with_val(verification_bits, lower.abs_ref())
+        .max(&Float::with_val(verification_bits, upper.abs_ref()));
+    // Report the original-pair diagnostics at the working precision, rounded
+    // up, and decide acceptance from those reported values: rounding can only
+    // make acceptance stricter.
+    let report_up =
+        |value: &Float| Float::with_val_round(config.precision_bits, value, Round::Up).0;
+    let residual_norm = report_up(&residual_norm);
+    let relative_residual = report_up(&relative_residual);
+    let metric_normalization_error = report_up(&metric_normalization_error);
     let scaled_backward_error = relative_residual.clone();
-    let mut metric_normalization_error = dot(&eigenvector, &applied_metric, config.precision_bits);
-    metric_normalization_error -= 1u32;
-    metric_normalization_error.abs_mut();
     let (status, termination) = if scaled_backward_error <= backward_tolerance {
         (
             ResultStatus::Converged,
@@ -501,6 +608,200 @@ mod tests {
             ritz_value_stability_tolerance: DecimalLiteral::new("1e-40").unwrap(),
             maximum_iterations: 200,
             minimum_iterations: 2,
+        }
+    }
+
+    #[test]
+    fn residual_is_verified_against_inputs_finer_than_the_working_precision() {
+        // A = [1 + 2^-100] stored at 256 bits, B = [1], solved at 64 bits: the
+        // working solve sees A = [1], but the original-pair residual is 2^-100.
+        let mut entry = Float::with_val(256, 1);
+        entry += Float::with_val(256, Float::i_exp(1, -100));
+        let operator = vec![entry];
+        let metric = values(256, &[1]);
+        let problem = DenseGeneralizedProblemHp::new(&operator, &metric, 1).unwrap();
+        let mut config = config(EigenTarget::AlgebraicSmallest);
+        config.precision_bits = 64;
+        let report = solve_dense_generalized_whitening_hp(&problem, &config).unwrap();
+        assert_eq!(
+            report.residual_norm,
+            Float::with_val(256, Float::i_exp(1, -100))
+        );
+        assert_eq!(report.status, ResultStatus::Approximate);
+        assert!(!report.stopping_evidence.absolute_residual_passed);
+        assert!(!report.stopping_evidence.scaled_backward_error_passed);
+    }
+
+    /// A = [[3,-1,x,-1],[-1,3,-1,y],[x,-1,3,-1],[-1,y,-1,3]], B = I. The solver
+    /// returns lambda = 1, v = (1,1,1,1)/2, with exact residual (x,y,x,y)/2.
+    fn boundary_problem(precision: u32, x: Float, y: Float) -> (Vec<Float>, Vec<Float>) {
+        let mut operator = values(
+            precision,
+            &[3, -1, 0, -1, -1, 3, -1, 0, 0, -1, 3, -1, -1, 0, -1, 3],
+        );
+        operator[2] = x.clone();
+        operator[8] = x;
+        operator[7] = y.clone();
+        operator[13] = y;
+        let metric = values(precision, &[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+        (operator, metric)
+    }
+
+    #[test]
+    fn residual_norm_is_not_understated_by_an_underflowing_square() {
+        // s^2 is the least positive MPFR value and (5s/8)^2 underflows: the
+        // true norm sqrt(89/32)*s exceeds a tolerance between it and sqrt(2)*s.
+        let s = Float::with_val(64, Float::i_exp(1, -536_870_912));
+        let x = Float::with_val(64, &s * 2u32);
+        let y = Float::with_val(64, &s * 5u32) / 4u32;
+        let (operator, metric) = boundary_problem(64, x, y);
+        let problem = DenseGeneralizedProblemHp::new(&operator, &metric, 4).unwrap();
+        let mut config = config(EigenTarget::AlgebraicSmallest);
+        config.precision_bits = 64;
+        config.absolute_residual_tolerance =
+            DecimalLiteral::new("7.52166448181552759435e-161614249").unwrap();
+        config.scaled_backward_error_tolerance = DecimalLiteral::new("1e-200000000").unwrap();
+        let report = solve_dense_generalized_whitening_hp(&problem, &config).unwrap();
+        assert_ne!(report.status, ResultStatus::Converged);
+    }
+
+    #[test]
+    fn residual_norm_is_not_rounded_down_onto_an_exact_tolerance() {
+        // ||r|| = sqrt(d^2 + delta^2) > d with d = 2^-100, delta = 2^-200.
+        let d = Float::with_val(128, Float::i_exp(1, -100));
+        let delta = Float::with_val(128, Float::i_exp(1, -200));
+        let x = Float::with_val(128, &d + &delta);
+        let y = Float::with_val(128, &d - &delta);
+        let (operator, metric) = boundary_problem(128, x, y);
+        let problem = DenseGeneralizedProblemHp::new(&operator, &metric, 4).unwrap();
+        let mut config = config(EigenTarget::AlgebraicSmallest);
+        config.precision_bits = 64;
+        config.absolute_residual_tolerance =
+            DecimalLiteral::new("7.8886090522101180541172856528278622967529296875e-31").unwrap();
+        config.scaled_backward_error_tolerance = DecimalLiteral::new("1e-300").unwrap();
+        let report = solve_dense_generalized_whitening_hp(&problem, &config).unwrap();
+        assert!(report.residual_norm > d);
+        assert_ne!(report.status, ResultStatus::Converged);
+    }
+
+    fn cycle(precision: u32) -> Vec<Float> {
+        values(
+            precision,
+            &[3, -1, 0, -1, -1, 3, -1, 0, 0, -1, 3, -1, -1, 0, -1, 3],
+        )
+    }
+
+    #[test]
+    fn residual_products_do_not_lose_an_underflowing_partial_product() {
+        // A = a*M, B = b*I + a*E (E_02 = E_20 = 1) with a = 2^-900000000 and
+        // b = 2^-600000000. lambda*B_02 underflows, although the residual term
+        // lambda*B_02*v_2 is representable; the residual must not vanish.
+        let a = Float::with_val(64, Float::i_exp(1, -900_000_000));
+        let b = Float::with_val(64, Float::i_exp(1, -600_000_000));
+        let operator: Vec<Float> = cycle(64)
+            .into_iter()
+            .map(|entry| Float::with_val(64, entry * &a))
+            .collect();
+        let mut metric = values(64, &[0; 16]);
+        for index in [0, 5, 10, 15] {
+            metric[index] = b.clone();
+        }
+        metric[2] = a.clone();
+        metric[8] = a.clone();
+        let problem = DenseGeneralizedProblemHp::new(&operator, &metric, 4).unwrap();
+        let mut config = config(EigenTarget::AlgebraicSmallest);
+        config.precision_bits = 64;
+        config.absolute_residual_tolerance = DecimalLiteral::new("1e-300000000").unwrap();
+        config.scaled_backward_error_tolerance = DecimalLiteral::new("1e-100000000").unwrap();
+        // Every exact residual product is representable, so the residual is
+        // bounded rather than refused.
+        let report = solve_dense_generalized_whitening_hp(&problem, &config).unwrap();
+        assert!(!report.residual_norm.is_zero());
+        assert_ne!(report.status, ResultStatus::Converged);
+    }
+
+    #[test]
+    fn metric_normalization_bound_keeps_a_small_exact_error() {
+        // A = M, B = I + 2^-200 E: v = (1,1,1,1)/2 gives v^T B v - 1 = 2^-201.
+        let operator = cycle(64);
+        let mut metric = values(64, &[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+        metric[2] = Float::with_val(64, Float::i_exp(1, -200));
+        metric[8] = metric[2].clone();
+        let problem = DenseGeneralizedProblemHp::new(&operator, &metric, 4).unwrap();
+        let mut config = config(EigenTarget::AlgebraicSmallest);
+        config.precision_bits = 64;
+        let report = solve_dense_generalized_whitening_hp(&problem, &config).unwrap();
+        assert!(report.metric_normalization_error >= Float::with_val(64, Float::i_exp(1, -201)));
+    }
+
+    #[test]
+    fn shared_residual_norm_keeps_an_underflowing_component() {
+        // Matrix-free route, initial candidate lambda = 0, v = e_0: the exact
+        // residual (0, s, 5s/8) has norm sqrt(89)*s/8 > 9s/8 although s^2 is
+        // the least positive value and (5s/8)^2 underflows.
+        let p = 64;
+        let s = Float::with_val(p, Float::i_exp(1, -536_870_912));
+        let t = Float::with_val(p, &s * 5u32) / 8u32;
+        let zero = Float::with_val(p, 0);
+        let data = vec![
+            zero.clone(),
+            s.clone(),
+            t.clone(),
+            s.clone(),
+            Float::with_val(p, &s * 2u32),
+            zero.clone(),
+            t,
+            zero.clone(),
+            Float::with_val(p, &s * 3u32),
+        ];
+        let operator = DenseSymmetricHp::new("shared norm", 3, data, p, &zero).unwrap();
+        let metric = DenseMetricHp(
+            DenseSymmetricHp::new(
+                "identity",
+                3,
+                values(p, &[1, 0, 0, 0, 1, 0, 0, 0, 1]),
+                p,
+                &zero,
+            )
+            .unwrap(),
+        );
+        let problem = GeneralizedEigenProblem::new(&operator, &metric).unwrap();
+        let mut config = config(EigenTarget::AlgebraicSmallest);
+        config.precision_bits = p;
+        config.maximum_iterations = 1;
+        config.minimum_iterations = 1;
+        let threshold = Float::with_val(512, &s) * 9u32 / 8u32;
+        config.absolute_residual_tolerance =
+            DecimalLiteral::new(threshold.to_string_radix(10, Some(170))).unwrap();
+        config.scaled_backward_error_tolerance = DecimalLiteral::new("1e-200000000").unwrap();
+        let seed = vec![Float::with_val(p, 1), zero.clone(), zero];
+        let report = super::super::MatrixFreeGeneralizedRayleighRitzHp
+            .solve_with_initial_vector(&problem, &config, &seed)
+            .unwrap();
+        assert!(!report.stopping_evidence.absolute_residual_passed);
+        assert_ne!(report.status, ResultStatus::Converged);
+    }
+
+    #[test]
+    fn residual_keeps_small_terms_beside_large_ones() {
+        // Exact 64-bit inputs, B = I, tolerances 1e-200. The computed pair
+        // lambda = 1, v = (1,1,1,1)/2 leaves the exact residual (d/2, 0, d/2, 0),
+        // whose norm d/sqrt(2) is far above the tolerance.
+        for exponent in [-200, -300, -600] {
+            let d = Float::with_val(64, Float::i_exp(1, exponent));
+            let entries = [3, -1, 0, -1, -1, 3, -1, 0, 0, -1, 3, -1, -1, 0, -1, 3];
+            let mut operator = values(64, &entries);
+            operator[2] = d.clone();
+            operator[8] = d.clone();
+            let metric = values(64, &[1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+            let problem = DenseGeneralizedProblemHp::new(&operator, &metric, 4).unwrap();
+            let mut config = config(EigenTarget::AlgebraicSmallest);
+            config.precision_bits = 64;
+            config.absolute_residual_tolerance = DecimalLiteral::new("1e-200").unwrap();
+            config.scaled_backward_error_tolerance = DecimalLiteral::new("1e-200").unwrap();
+            let report = solve_dense_generalized_whitening_hp(&problem, &config).unwrap();
+            assert!(!report.residual_norm.is_zero(), "d = 2^{exponent}");
+            assert_ne!(report.status, ResultStatus::Converged, "d = 2^{exponent}");
         }
     }
 
