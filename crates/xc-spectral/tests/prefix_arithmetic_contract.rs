@@ -20,8 +20,8 @@ fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
             size_bytes: bytes.len() as u64,
         }],
         created_unix_seconds: 1,
-        producer_toolkit_version: ToolkitVersion::parse("0.14.3").unwrap(),
-        minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+        producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
         maximum_reader_version: None,
         quality: CacheQuality::Validated,
         visibility: CacheVisibility::Local,
@@ -128,14 +128,8 @@ fn retained_prefix_export_rejects_scale_hidden_residuals_and_normalizes_extreme_
 #[test]
 fn prefix_cache_replays_every_numerical_row_and_export_field() {
     use xc_cache::*;
-    let root = std::env::temp_dir().join(format!(
-        "xc-prefix-numerical-replay-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root_dir = xc_core::test_support::TestDir::new("prefix-numerical-replay");
+    let root = root_dir.join(format!("xc-prefix-numerical-replay-{}", std::process::id()));
     assert!(!root.exists());
     let resolver = CacheResolver::new(vec![CacheLayer {
         precedence: 0,
@@ -176,7 +170,7 @@ fn prefix_cache_replays_every_numerical_row_and_export_field() {
     assert_eq!(semantic.mathematical_semantics_version, PREFIX_SEMANTICS);
     assert_eq!(
         manifest.minimum_reader_version,
-        ToolkitVersion::parse("0.15.1").unwrap()
+        ToolkitVersion::parse(xc_cache::CLEAN_SLATE).unwrap()
     );
     context.mode = ArtifactExecutionCacheMode::RequireReuse;
     context.write_on_miss = false;
@@ -276,13 +270,10 @@ fn prefix_cache_replays_every_numerical_row_and_export_field() {
 #[test]
 fn retained_reduction_cache_replays_spectrum_norms_and_residuals() {
     use xc_cache::*;
-    let root = std::env::temp_dir().join(format!(
-        "xc-reduction-numerical-replay-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+    let root_dir = xc_core::test_support::TestDir::new("reduction-numerical-repl");
+    let root = root_dir.join(format!(
+        "xc-reduction-numerical-replay-{}",
+        std::process::id()
     ));
     assert!(!root.exists());
     let resolver = CacheResolver::new(vec![CacheLayer {
@@ -326,7 +317,7 @@ fn retained_reduction_cache_replays_spectrum_norms_and_residuals() {
     );
     assert_eq!(
         manifest.minimum_reader_version,
-        ToolkitVersion::parse("0.15.1").unwrap()
+        ToolkitVersion::parse(xc_cache::CLEAN_SLATE).unwrap()
     );
     context.mode = ArtifactExecutionCacheMode::RequireReuse;
     context.write_on_miss = false;

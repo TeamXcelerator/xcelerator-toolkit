@@ -118,14 +118,38 @@ fn kappa(l: &I, p: u32) -> Result<I> {
         .add(&e)
         .div(&I::from_i64(2, p))?)
 }
-pub(super) fn integrals(
-    n: i64,
-    l: &Float,
-    p: u32,
-    nodes: &[Float],
-    weights: &[Float],
-) -> Result<(Float, Float, Float)> {
-    let (_, mut base) = dimensions(n.unsigned_abs() as usize, l, p)?;
+/// Guard schedule shared by every archimedean integral evaluation.
+const INTEGRAL_GUARDS: [u32; 7] = [64, 128, 256, 512, 1024, 2048, 4096];
+
+/// Mode-independent terms of one quadrature rule at one working precision.
+/// Modes that share a rule share these terms; each is formed by exactly the
+/// interval operations a single-mode evaluation performs, so a shared table
+/// yields bit-identical enclosures and correctly rounded results.
+pub(super) struct IntegralNodeTable {
+    guard: u32,
+    work: u32,
+    length: I,
+    two: I,
+    half: I,
+    pi: I,
+    kappa: I,
+    terms: Vec<IntegralNodeTerm>,
+}
+
+struct IntegralNodeTerm {
+    /// Exact node plus one; the phase turn is `(node + 1) * 2n`.
+    shifted: Rational,
+    h: I,
+    /// Weight times the archimedean density rho(x).
+    weighted_rho: I,
+    /// `weighted_rho * x`.
+    weighted_rho_x: I,
+    /// `expm1(-x/2)`.
+    decay: I,
+}
+
+fn validate_integral_rule(l: &Float, p: u32, nodes: &[Float], weights: &[Float]) -> Result<u32> {
+    let (_, mut base) = dimensions(0, l, p)?;
     if nodes.is_empty()
         || nodes.len() != weights.len()
         || nodes.len() > 1_000_000
@@ -146,67 +170,151 @@ pub(super) fn integrals(
         bail!("matrix quadrature exceeds workspace budget");
     }
     crate::ccm::certified_roots::boundary::rational_point_vector_budget(nodes.iter())?;
-    let exact_nodes = nodes
+    Ok(base)
+}
+
+/// Prepare the mode-independent terms of a quadrature rule at one guard.
+pub(super) fn integral_node_table(
+    l: &Float,
+    p: u32,
+    nodes: &[Float],
+    weights: &[Float],
+    guard: u32,
+) -> Result<IntegralNodeTable> {
+    let base = validate_integral_rule(l, p, nodes, weights)?;
+    let work = base * 2 + guard;
+    let length = I::from_float(l, work)?;
+    let one = I::from_i64(1, work);
+    let two = I::from_i64(2, work);
+    let half = I::point(Float::with_val(work, 0.5));
+    let pi = I::pi(work);
+    let kappa = kappa(&length, work)?;
+    let mut terms = Vec::with_capacity(nodes.len());
+    for (node, weight) in nodes.iter().zip(weights) {
+        let h = I::from_float(node, work)?.add(&one).mul(&half);
+        let x = length.mul(&h);
+        let minus_half = x.mul(&half).neg();
+        let rho = minus_half.exp().div(&exp_m1(&x.mul(&two).neg())?.neg())?;
+        let weighted_rho = I::from_float(weight, work)?.mul(&rho);
+        terms.push(IntegralNodeTerm {
+            shifted: node.to_rational().unwrap() + 1i32,
+            weighted_rho_x: weighted_rho.mul(&x),
+            decay: exp_m1(&minus_half)?,
+            weighted_rho,
+            h,
+        });
+    }
+    Ok(IntegralNodeTable {
+        guard,
+        work,
+        length,
+        two,
+        half,
+        pi,
+        kappa,
+        terms,
+    })
+}
+
+/// One guard attempt for mode `n`; `None` when the rounding is unresolved.
+fn mode_integrals(
+    n: i64,
+    p: u32,
+    table: &IntegralNodeTable,
+) -> Result<Option<(Float, Float, Float)>> {
+    let work = table.work;
+    let one = I::from_i64(1, work);
+    let (two, half, pi) = (&table.two, &table.half, &table.pi);
+    let mut aa = Vec::with_capacity(table.terms.len());
+    let mut bb = Vec::with_capacity(table.terms.len());
+    let mut gg = Vec::with_capacity(table.terms.len());
+    for term in &table.terms {
+        let phase = pi.mul(&I::from_i64(2 * n, work)).mul(&term.h);
+        let turn: Rational = term.shifted.clone() * (2 * n);
+        let quadrant = if turn.denom() == &1 {
+            let q = turn.numer().to_i64().expect("bounded node and mode");
+            Some(q.rem_euclid(4) as usize)
+        } else {
+            None
+        };
+        let (sin, cos, cm1) = if let Some(q) = quadrant {
+            let cos = I::from_i64([1, 0, -1, 0][q], work);
+            (
+                I::from_i64([0, 1, 0, -1][q], work),
+                cos.clone(),
+                cos.sub(&one),
+            )
+        } else {
+            (
+                phase.sin(),
+                phase.cos(),
+                phase.mul(half).sin().square().mul(two).neg(),
+            )
+        };
+        aa.push(term.weighted_rho.mul(&sin));
+        bb.push(term.weighted_rho_x.mul(&cos));
+        gg.push(term.weighted_rho.mul(&cm1.sub(&term.decay)));
+    }
+    let a = sum(&aa, work)?.mul(&table.length).div(&two.mul(pi))?;
+    let b = sum(&bb, work)?.mul(half);
+    let g = sum(&gg, work)?
+        .mul(&table.length)
+        .mul(half)
+        .add(&table.kappa);
+    Ok([a, b, g]
         .iter()
-        .map(|v| v.to_rational().unwrap())
-        .collect::<Vec<_>>();
-    for guard in [64, 128, 256, 512, 1024, 2048, 4096] {
-        let work = base * 2 + guard;
-        let length = I::from_float(l, work)?;
-        let one = I::from_i64(1, work);
-        let two = I::from_i64(2, work);
-        let half = I::point(Float::with_val(work, 0.5));
-        let pi = I::pi(work);
-        let mut aa = Vec::with_capacity(nodes.len());
-        let mut bb = Vec::with_capacity(nodes.len());
-        let mut gg = Vec::with_capacity(nodes.len());
-        for ((node, exact), weight) in nodes.iter().zip(&exact_nodes).zip(weights) {
-            let h = I::from_float(node, work)?.add(&one).mul(&half);
-            let x = length.mul(&h);
-            let minus_half = x.mul(&half).neg();
-            let rho = minus_half.exp().div(&exp_m1(&x.mul(&two).neg())?.neg())?;
-            let phase = pi.mul(&I::from_i64(2 * n, work)).mul(&h);
-            let turn: Rational = (exact.clone() + 1i32) * (2 * n);
-            let quadrant = if turn.denom() == &1 {
-                let q = turn.numer().to_i64().expect("bounded node and mode");
-                Some(q.rem_euclid(4) as usize)
-            } else {
-                None
-            };
-            let (sin, cos, cm1) = if let Some(q) = quadrant {
-                let cos = I::from_i64([1, 0, -1, 0][q], work);
-                (
-                    I::from_i64([0, 1, 0, -1][q], work),
-                    cos.clone(),
-                    cos.sub(&one),
-                )
-            } else {
-                (
-                    phase.sin(),
-                    phase.cos(),
-                    phase.mul(&half).sin().square().mul(&two).neg(),
-                )
-            };
-            let wr = I::from_float(weight, work)?.mul(&rho);
-            aa.push(wr.mul(&sin));
-            bb.push(wr.mul(&x).mul(&cos));
-            gg.push(wr.mul(&cm1.sub(&exp_m1(&minus_half)?)));
-        }
-        let a = sum(&aa, work)?.mul(&length).div(&two.mul(&pi))?;
-        let b = sum(&bb, work)?.mul(&half);
-        let g = sum(&gg, work)?
-            .mul(&length)
-            .mul(&half)
-            .add(&kappa(&length, work)?);
-        if let Some(v) = [a, b, g]
-            .iter()
-            .map(|v| rounded(v, p))
-            .collect::<Result<Option<Vec<_>>>>()?
-        {
-            return Ok((v[0].clone(), v[1].clone(), v[2].clone()));
+        .map(|v| rounded(v, p))
+        .collect::<Result<Option<Vec<_>>>>()?
+        .map(|v| (v[0].clone(), v[1].clone(), v[2].clone())))
+}
+
+pub(super) fn integrals(
+    n: i64,
+    l: &Float,
+    p: u32,
+    nodes: &[Float],
+    weights: &[Float],
+) -> Result<(Float, Float, Float)> {
+    dimensions(n.unsigned_abs() as usize, l, p)?;
+    integrals_from_guards(n, l, p, nodes, weights, &INTEGRAL_GUARDS)
+}
+
+fn integrals_from_guards(
+    n: i64,
+    l: &Float,
+    p: u32,
+    nodes: &[Float],
+    weights: &[Float],
+    guards: &[u32],
+) -> Result<(Float, Float, Float)> {
+    for &guard in guards {
+        let table = integral_node_table(l, p, nodes, weights, guard)?;
+        if let Some(values) = mode_integrals(n, p, &table)? {
+            return Ok(values);
         }
     }
     bail!("matrix integral rounding unresolved within the guard budget")
+}
+
+/// Evaluate mode `n` with a first-guard table shared across modes, escalating
+/// through the ordinary guard schedule only when that guard is unresolved.
+pub(super) fn integrals_with_table(
+    n: i64,
+    l: &Float,
+    p: u32,
+    nodes: &[Float],
+    weights: &[Float],
+    first: &IntegralNodeTable,
+) -> Result<(Float, Float, Float)> {
+    dimensions(n.unsigned_abs() as usize, l, p)?;
+    if first.guard == INTEGRAL_GUARDS[0] && first.terms.len() == nodes.len() {
+        if let Some(values) = mode_integrals(n, p, first)? {
+            return Ok(values);
+        }
+        // The first guard is deterministic and already unresolved.
+        return integrals_from_guards(n, l, p, nodes, weights, &INTEGRAL_GUARDS[1..]);
+    }
+    integrals(n, l, p, nodes, weights)
 }
 pub(super) fn pole_arch(
     n: usize,

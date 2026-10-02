@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::time::Instant;
-#[cfg(feature = "arb")]
+#[cfg(all(test, feature = "arb"))]
 use xc_cache::resolve_or_compute_json_artifact_with_assessment;
 use xc_cache::{
     resolve_or_compute_json_artifact_with_dependencies, ArtifactAssuranceAttestation,
@@ -54,6 +54,8 @@ pub use stored_resolution::{CcmStoredStateResolution, StoredEigenvalueResolution
 mod ccm_regression_tests;
 mod ground_index;
 pub use eigenstate_accuracy::CcmStoredEigenvalueAccuracy;
+#[cfg(feature = "arb")]
+mod assembly_error;
 #[cfg(test)]
 #[path = "hp/evenness.rs"]
 mod evenness;
@@ -64,6 +66,22 @@ mod response_performance;
 #[cfg(test)]
 mod response_performance_reference;
 mod response_point_math;
+#[cfg(feature = "arb")]
+pub use assembly_error::{
+    CcmAssemblyErrorAnalysis, CcmComponentErrors, CcmErrorNorms, CcmExactFormBound,
+    CcmExactFormRoot, CcmExactFormRoots, ASSEMBLY_ERROR_SEMANTICS,
+};
+mod checkpoint_spectra;
+pub use checkpoint_spectra::{
+    checkpoint_low_spectra, checkpoint_low_spectra_via_cache, CcmCheckpointEigenvalue,
+    CcmCheckpointSpectra, CcmCheckpointSpectrumRow, CHECKPOINT_SPECTRA_SEMANTICS,
+};
+mod root_certification_report;
+use root_certification_report::resolve_root_certification_report_via_cache;
+pub use root_certification_report::{
+    CcmRootCertificationReport, CcmRootCertificationRequest, CcmRootCertificationRow,
+    ROOT_CERTIFICATION_REPORT_SEMANTICS,
+};
 mod root_conditioning_math;
 mod root_response_math;
 pub(in crate::ccm) mod sector_gap_math;
@@ -1325,8 +1343,10 @@ pub struct HighPrecConfig {
     /// computation of α_L, β_L, γ_L. The constructor clamps its default to
     /// `[MIN_QUAD_POINTS, MAX_QUAD_POINTS]`. Explicit positive overrides are
     /// honored as a floor. Each mode also requires `3*mode` plus a length-aware
-    /// nearest-pole geometric order with 64 guard bits. This order policy is
-    /// heuristic and does not certify the finite-form assembly error.
+    /// nearest-pole geometric order with 64 guard bits, and at least the
+    /// Bernstein-ellipse order that absorbs the mode's oscillation growth
+    /// (binding for small cutoffs). This order policy is heuristic and does
+    /// not certify the finite-form assembly error.
     pub quad_points: usize,
     /// Number of positive CCM secular roots to discover independently and
     /// refine. Zero requests an explicit source-only run.
@@ -2433,9 +2453,17 @@ pub struct CcmResearchCaptureResult {
     /// certification opt-in succeeds.
     pub sector_gap_certificate:
         Option<super::sector_gap_certificate::PortableCcmSectorGapCertificate>,
+    /// Why requested sector-gap certification produced no certificate. The
+    /// computed sector gap and every other measurement are still returned.
+    pub sector_gap_certification_limitation: Option<String>,
     /// Separate, source-bound certificate artifact when root-only
     /// certification was requested.
+    /// Present only when every requested root certified in one certificate;
+    /// see `root_certification_report` for per-root outcomes.
     pub root_certificate: Option<super::certified_roots::ProductionIndependentCcmRootCertificate>,
+    /// Per-root certification outcomes when certification was requested:
+    /// certified enclosures and computed-but-not-certified roots with reasons.
+    pub root_certification_report: Option<CcmRootCertificationReport>,
     /// Target-distance measurement, present only when distance capture was
     /// requested. The retained `ccm-distance` artifacts carry the quadrature
     /// convention that produced it.
@@ -3102,7 +3130,7 @@ fn resolve_archimedean_integrals_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -3198,7 +3226,7 @@ fn resolve_prime_component_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -3305,7 +3333,7 @@ fn build_tau_hp_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -3408,7 +3436,7 @@ fn build_tau_hp_via_cache(
                 if cache.certification_failure_policy
                     == xc_cache::CertificationFailurePolicy::RetainComputedSkipPublication =>
             {
-                eprintln!(
+                xc_core::progress_message!(
                     "[HP] certification failed; retained computed tau and disabled its publication: {error}"
                 );
             }
@@ -3753,7 +3781,7 @@ fn resolve_even_sector_matrix_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -3860,7 +3888,7 @@ fn resolve_odd_sector_matrix_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -4074,7 +4102,7 @@ fn resolve_sector_tridiagonal_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -4140,7 +4168,7 @@ fn resolve_sector_tridiagonal_via_cache(
     let tridiagonal = validated.into_inner().ok_or_else(|| {
         anyhow::anyhow!("sector-tridiagonal execution retained no validated runtime value")
     })?;
-    eprintln!(
+    xc_core::progress_message!(
         "[HP] {parity:?} sector tridiagonal: {} in {:.3}s",
         if was_produced { "computed" } else { "reused" },
         started.elapsed().as_secs_f64()
@@ -4220,7 +4248,7 @@ fn resolve_sector_transform_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -4308,7 +4336,7 @@ fn resolve_sector_transform_via_cache(
     let (transform, allowance) = validated.into_inner().ok_or_else(|| {
         anyhow::anyhow!("sector-transform execution retained no validated runtime value")
     })?;
-    eprintln!(
+    xc_core::progress_message!(
         "[HP] {parity:?} sector transform: {} in {:.3}s",
         if was_produced { "computed" } else { "reused" },
         started.elapsed().as_secs_f64()
@@ -4938,7 +4966,7 @@ fn resolve_sector_eigenvalues_with_policy_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -5002,7 +5030,7 @@ fn resolve_sector_eigenvalues_with_policy_via_cache(
     let values = validated.into_inner().ok_or_else(|| {
         anyhow::anyhow!("sector-eigenvalue execution retained no validated runtime value")
     })?;
-    eprintln!(
+    xc_core::progress_message!(
         "[HP] {parity:?} sector eigenvalues ({}): {} {} values in {:.3}s",
         route.as_str(),
         if was_produced { "computed" } else { "reused" },
@@ -5163,7 +5191,7 @@ fn compute_sector_spectrum(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    eprintln!(
+    xc_core::progress_message!(
         "[HP] {parity:?} sector spectrum: {requested_eigenpairs} retained eigenvectors via banded tridiagonal solve={:.3}s",
         eigenvector_start.elapsed().as_secs_f64(),
     );
@@ -5417,7 +5445,7 @@ fn resolve_sector_spectrum_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -5662,7 +5690,7 @@ fn resolve_sector_gap_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -5835,7 +5863,11 @@ fn certify_sector_gap_from_resolution(
     options: super::sector_gap_certificate::CcmSectorGapCertificationOptions,
     resolution: &CcmSectorGapResolution,
     cache: Option<&ArtifactCacheContext<'_>>,
-) -> Result<super::sector_gap_certificate::PortableCcmSectorGapCertificate> {
+) -> Result<
+    xc_cache::ArtifactExecutionCacheResult<
+        super::sector_gap_certificate::PortableCcmSectorGapCertificate,
+    >,
+> {
     let cache = cache.ok_or_else(|| {
         anyhow::anyhow!("CCM sector-gap certification requires a managed cache context")
     })?;
@@ -5871,7 +5903,11 @@ fn certify_sector_gap_from_resolution(
     _options: super::sector_gap_certificate::CcmSectorGapCertificationOptions,
     _resolution: &CcmSectorGapResolution,
     _cache: Option<&ArtifactCacheContext<'_>>,
-) -> Result<super::sector_gap_certificate::PortableCcmSectorGapCertificate> {
+) -> Result<
+    xc_cache::ArtifactExecutionCacheResult<
+        super::sector_gap_certificate::PortableCcmSectorGapCertificate,
+    >,
+> {
     bail!("CCM sector-gap certification requires an xc-spectral build with the arb feature")
 }
 
@@ -6194,7 +6230,7 @@ fn resolve_factorization_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -6277,7 +6313,7 @@ fn resolve_factorization_via_cache(
     let factors = validated_factors.into_inner().ok_or_else(|| {
         anyhow::anyhow!("factorization execution did not retain its validated runtime factors")
     })?;
-    eprintln!(
+    xc_core::progress_message!(
         "[HP] {subspace} LU factorization: {} in {:.3}s",
         if was_produced { "computed" } else { "reused" },
         resolution_start.elapsed().as_secs_f64(),
@@ -6757,7 +6793,7 @@ fn weil_eigenpair_via_cache_with_seed(
     // content-addressing rule that keeps warm-started adaptive root
     // refinement out of the unseeded root identity.
     if continuation_seed.is_some() || continuation_manifest.is_some() {
-        eprintln!(
+        xc_core::progress_message!(
             "[HP] continuation seed ignored: persistent eigenpair artifacts are computed from the canonical start"
         );
     }
@@ -6836,7 +6872,7 @@ fn weil_eigenpair_via_cache_with_seed(
         return match krylov {
             Ok(result) => Ok(result),
             Err(error) if is_retryable_auto_krylov_failure(&error) => {
-                eprintln!(
+                xc_core::progress_message!(
                     "[HP] Auto eigenstate solver: shift-invert Krylov did not converge unambiguously; falling back to legacy inverse iteration"
                 );
                 selected.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
@@ -6893,7 +6929,7 @@ fn weil_eigenpair_via_cache_with_seed(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags,
         provenance_digest: None,
@@ -7219,7 +7255,7 @@ fn resolve_secular_source_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -7277,7 +7313,7 @@ fn resolve_secular_source_via_cache(
         .ok_or_else(|| anyhow::anyhow!("secular-source execution returned no manifest"))
 }
 
-#[cfg(feature = "arb")]
+#[cfg(all(test, feature = "arb"))]
 fn certify_roots_from_retained_source(
     params: &CcmParams,
     cfg: &HighPrecConfig,
@@ -7365,7 +7401,7 @@ fn certify_roots_from_retained_source(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Certified,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -7444,6 +7480,7 @@ fn stored_root_in_decimal_interval(
     Ok(value >= &lower && value <= &upper)
 }
 
+#[cfg(all(test, feature = "arb"))]
 fn reconcile_computed_roots_with_certificate(
     result: &HighPrecResult,
     certificate: &super::certified_roots::ProductionIndependentCcmRootCertificate,
@@ -7483,18 +7520,6 @@ fn reconcile_computed_roots_with_certificate(
         }
     }
     Ok(())
-}
-
-#[cfg(not(feature = "arb"))]
-fn certify_roots_from_retained_source(
-    _params: &CcmParams,
-    _cfg: &HighPrecConfig,
-    _weights: &[Float],
-    _secular_manifest: Option<&ArtifactManifest>,
-    _options: &CcmRootCertificationOptions,
-    _cache: Option<&ArtifactCacheContext<'_>>,
-) -> Result<super::certified_roots::ProductionIndependentCcmRootCertificate> {
-    bail!("root-only CCM certification requires the xc-spectral arb feature")
 }
 
 #[derive(Debug, Clone)]
@@ -7949,7 +7974,7 @@ fn report_precision_limited_category(label: &str, roots: &[(usize, &RootRefineme
         }
         maximum_iterations = maximum_iterations.max(root.diagnostics.iterations);
     }
-    eprintln!(
+    xc_core::progress_message!(
         "[HP] {label} roots retained as computed approximations: indices={}; achieved_digits={}..{}; maximum_iterations={}; full per-root diagnostics are stored in the artifact",
         format_index_ranges(&indices),
         xc_numerics::fmt::display_hp(&minimum_digits, 8),
@@ -7975,7 +8000,7 @@ fn report_root_status_summary(outcomes: &[EigenvalueResult], first_root_index: u
             EigenvalueResult::Failed { .. } => failed += 1,
         }
     }
-    eprintln!(
+    xc_core::progress_message!(
         "[HP] root status summary: {} total; {} converged, {} stagnated, {} approximate, {} failed",
         outcomes.len(),
         converged,
@@ -8699,7 +8724,7 @@ fn resolve_root_range_via_cache(
                     canonical != &Float::with_val(cfg.precision_bits, supplied)
                 })
             {
-                eprintln!(
+                xc_core::progress_message!(
                     "[CCM cache] larger seeded-window reuse declined: supplied values differ from bundled reference seeds at working precision"
                 );
                 // Every candidate uses the same bundled values on this window.
@@ -8736,7 +8761,7 @@ fn resolve_root_range_via_cache(
                 write_visibility: cache.write_visibility,
                 produced_quality: CacheQuality::Validated,
                 producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-                minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+                minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
                 maximum_reader_version: None,
                 tags: BTreeMap::new(),
                 provenance_digest: None,
@@ -8790,7 +8815,7 @@ fn resolve_root_range_via_cache(
             if require_converged && projected.iter().any(|root| !root.is_converged()) {
                 continue;
             }
-            eprintln!(
+            xc_core::progress_message!(
                 "  cache root window: reused indices 1..={candidate_count} for contained request {first_root_index}..={last_root_index}"
             );
             return Ok((projected, manifest, true));
@@ -8830,7 +8855,7 @@ fn resolve_root_range_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -9463,7 +9488,7 @@ fn resolve_root_conditioning_analysis_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -10695,7 +10720,7 @@ fn resolve_prime_power_response_analysis_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -10749,7 +10774,7 @@ fn resolve_prime_power_response_analysis_via_cache(
         },
         |artifact| {
             if fresh.verify_fresh(artifact)? {
-                eprintln!(
+                xc_core::progress_message!(
                     "[HP] response validation: exact fresh payload seal verified; production numerical gates already passed"
                 );
                 return Ok(());
@@ -11422,7 +11447,7 @@ fn resolve_u_flow_response_analysis_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.2")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -11474,7 +11499,7 @@ fn resolve_u_flow_response_analysis_via_cache(
         },
         |artifact| {
             if fresh.verify_fresh(artifact)? {
-                eprintln!(
+                xc_core::progress_message!(
                     "[HP] response validation: exact fresh payload seal verified; production numerical gates already passed"
                 );
                 return Ok(());
@@ -11625,13 +11650,7 @@ fn record_run_evidence_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(if semantics.is_complete_positive() {
-            "0.15.0"
-        } else if semantics.is_advanced() {
-            "0.13.3"
-        } else {
-            "0.13.0"
-        })?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -11945,7 +11964,7 @@ fn run_with_research_capture(
                 secular_manifest,
                 cache,
             )?;
-            eprintln!(
+            xc_core::progress_message!(
                 "[HP] prime-power response capture: {} events, {} roots, {:.3}s",
                 analysis.events.len(),
                 analysis.roots.len(),
@@ -11994,7 +12013,7 @@ fn run_with_research_capture(
                 secular_manifest,
                 cache,
             )?;
-            eprintln!(
+            xc_core::progress_message!(
                 "[HP] u-flow response capture: {} channels, {} roots, {:.3}s",
                 analysis.channels.len(),
                 analysis.roots.len(),
@@ -12030,32 +12049,42 @@ fn run_with_research_capture(
                 secular_manifest,
                 cache,
             )?;
-            eprintln!(
+            xc_core::progress_message!(
                 "[HP] root-conditioning capture: {} outcomes, {:.3}s",
                 primary.eigenvalues_pos.len(),
                 conditioning_started.elapsed().as_secs_f64()
             );
         }
-        let root_certificate = if let Some(certification) = &options.root_certification {
+        // Certify what is certifiable; every other requested root keeps its
+        // computed value and status. Numerical limits never abort the run.
+        let root_certification_report = if let Some(certification) = &options.root_certification {
             let certification_started = Instant::now();
-            let certificate = certify_roots_from_retained_source(
+            let (report, _) = resolve_root_certification_report_via_cache(
                 params,
                 cfg,
+                &primary,
                 &primary.xi,
+                retained_source.root_manifest.as_ref(),
                 retained_source.secular_manifest.as_ref(),
                 certification,
                 cache,
             )?;
-            reconcile_computed_roots_with_certificate(&primary, &certificate)?;
-            eprintln!(
-                "[HP] root-only certification: {} roots, exact stored point source, computed ordinals reconciled, {:.3}s",
-                certificate.selected_root_count,
+            xc_core::progress_message!(
+                "[HP] root certification: {} of {} requested roots certified, {} computed but not certified, {} with neither, {} computed values outside their certified interval, {:.3}s",
+                report.certified_rows,
+                report.rows.len(),
+                report.computed_not_certified_rows,
+                report.unresolved_rows,
+                report.computed_outside_certified_rows,
                 certification_started.elapsed().as_secs_f64()
             );
-            Some(certificate)
+            Some(report)
         } else {
             None
         };
+        let root_certificate = root_certification_report
+            .as_ref()
+            .and_then(|report| report.complete_certificate().cloned());
         let supplemental_started = Instant::now();
         // A parity-sector decomposition is a stronger and substantially less
         // expensive natural-state calculation than repeating full dense
@@ -12079,38 +12108,53 @@ fn run_with_research_capture(
                 None => (None, Some(retained_source), None),
             };
         if let Some(limitation) = &sector_resolution_limit {
-            eprintln!(
+            xc_core::progress_message!(
                 "[HP] sector research capture is precision-limited and was retained without individual eigenpairs or GapLog: {limitation}"
             );
         };
-        if options.sector_gap_certification.is_some() && sector_resolution_limit.is_some() {
-            bail!(
-                "CCM sector-gap certification cannot proceed because the numerical guide spectra are precision-limited"
-            );
-        }
-        let sector_gap_certificate = match (
+        // Certification is additive: a certification that cannot complete is
+        // recorded with its reason and never discards the computed capture.
+        let (sector_gap_certificate, sector_gap_certification_limitation) = match (
             options.sector_gap_certification,
             sector_resolution.as_ref(),
         ) {
             (Some(certification), Some(resolution)) => {
                 let certification_started = Instant::now();
-                let certificate = certify_sector_gap_from_resolution(
+                match certify_sector_gap_from_resolution(
                     params,
                     cfg,
                     certification,
                     resolution,
                     cache,
-                )?;
-                eprintln!(
-                    "[HP] finite sector-gap certification: exact cutoff-free parity, ordering, and simplicity replay, {:.3}s",
-                    certification_started.elapsed().as_secs_f64()
-                );
-                Some(certificate)
+                )
+                .map(|resolved| resolved.value)
+                {
+                    Ok(certificate) => {
+                        xc_core::progress_message!(
+                            "[HP] finite sector-gap certification: exact cutoff-free parity, ordering, and simplicity replay, {:.3}s",
+                            certification_started.elapsed().as_secs_f64()
+                        );
+                        (Some(certificate), None)
+                    }
+                    Err(error) => {
+                        let reason =
+                            format!("sector-gap certification did not complete: {error:#}");
+                        xc_core::progress_message!(
+                            "[HP] {reason}; the computed capture is retained"
+                        );
+                        (None, Some(reason))
+                    }
+                }
             }
             (Some(_), None) => {
-                bail!("CCM sector-gap certification did not receive resolved guide spectra")
+                let reason = match &sector_resolution_limit {
+                    Some(_) => "sector-gap certification needs resolved guide spectra, which are precision-limited at this configuration".to_owned(),
+                    None => "sector-gap certification needs resolved guide spectra; request sector analysis".to_owned(),
+                };
+                xc_core::progress_message!("[HP] {reason}; the computed capture is retained");
+                (None, Some(reason))
             }
-            (None, _) => None,
+            (None, _) => (None, None),
         };
         let evenness = if options.capture_evenness {
             if let Some(resolution) = &sector_resolution {
@@ -12120,7 +12164,7 @@ fn run_with_research_capture(
                     &resolution.gap,
                 )?)
             } else if sector_resolution_limit.is_some() {
-                eprintln!(
+                xc_core::progress_message!(
                     "[HP] natural-evenness evidence was not derived from an unresolved sector cluster"
                 );
                 None
@@ -12187,7 +12231,7 @@ fn run_with_research_capture(
             }
             (None, _) => None,
         };
-        eprintln!(
+        xc_core::progress_message!(
             "[HP] supplemental research capture completed in {:.3}s",
             supplemental_started.elapsed().as_secs_f64()
         );
@@ -12197,7 +12241,9 @@ fn run_with_research_capture(
             evenness,
             sector_gap,
             sector_gap_certificate,
+            sector_gap_certification_limitation,
             root_certificate,
+            root_certification_report,
             target_distance,
         })
     };
@@ -12842,7 +12888,7 @@ fn run_inner_retaining_source(
             (tau, Some(manifest))
         }
     };
-    eprintln!(
+    xc_core::progress_message!(
         "[HP] phase timing: tau construction/reuse={:.3}s",
         tau_started.elapsed().as_secs_f64()
     );
@@ -12920,7 +12966,7 @@ fn run_inner_retaining_source(
                     && weil_eigvec_cache::residual_ok(&tau, dim, &c.xi, &c.eps_n, prec)
                     && ground_index::validate(&tau, &c.xi, &c.eps_n, prec, parity_policy).is_ok()
                 {
-                    eprintln!(
+                    xc_core::progress_message!(
                         "[HP] loaded cached Weil eigenvector for λ²={}, N={}, prec={} bits (τ-residual validated)",
                         lambda_sq.value_f64, n_modes_key, prec
                     );
@@ -12964,9 +13010,10 @@ fn run_inner_retaining_source(
                         let sector =
                             build_even_sector_matrix(&tau, params.n_modes, cfg.precision_bits)?;
                         let sector_dimension = params.n_modes + 1;
-                        eprintln!(
+                        xc_core::progress_message!(
                             "[HP] LU factoring {}×{} even-sector matrix (one-time cost)...",
-                            sector_dimension, sector_dimension
+                            sector_dimension,
+                            sector_dimension
                         );
                         let output = xc_numerics::linalg::inverse_iteration_detailed(
                             &sector,
@@ -12981,9 +13028,10 @@ fn run_inner_retaining_source(
                             output.diagnostics,
                         )
                     } else {
-                        eprintln!(
+                        xc_core::progress_message!(
                             "[HP] LU factoring {}×{} full matrix (one-time cost)...",
-                            dim, dim
+                            dim,
+                            dim
                         );
                         let project_adaptively = parity_policy == CcmParityPolicy::AdaptiveEven;
                         let output = if let Some(warm) = warm_xi {
@@ -13022,7 +13070,7 @@ fn run_inner_retaining_source(
                                 )
                             })?;
                     ground_index::validate(&tau, &xi, &eps_n, prec, parity_policy)?;
-                    eprintln!("[HP] Eigenvector computed. Solving spectrum...");
+                    xc_core::progress_message!("[HP] Eigenvector computed. Solving spectrum...");
                     weil_eigvec_cache::save(
                         lambda_sq,
                         n_modes_key,
@@ -13045,7 +13093,7 @@ fn run_inner_retaining_source(
                 CcmEigenstateSolver::LegacyInverseIteration,
             )
         };
-    eprintln!(
+    xc_core::progress_message!(
         "[HP] phase timing: Weil eigenstate construction/reuse={:.3}s",
         eigenstate_started.elapsed().as_secs_f64()
     );
@@ -13068,7 +13116,7 @@ fn run_inner_retaining_source(
         } else {
             "unshifted limit reached"
         };
-        eprintln!(
+        xc_core::progress_message!(
             "[HP] eigenstate provenance: {} ({}/{} steps), shifted refinement={:?}, final relative Tau residual={}",
             termination,
             inverse_iteration_diagnostics.unshifted_steps,
@@ -13232,7 +13280,7 @@ fn run_inner_retaining_source(
         })
         .collect::<Result<Vec<_>>>()?;
     report_root_status_summary(&eigenvalues_pos, first_root_index);
-    eprintln!(
+    xc_core::progress_message!(
         "[HP] phase timing: root discovery/refinement={:.3}s",
         roots_started.elapsed().as_secs_f64()
     );
@@ -13470,7 +13518,7 @@ fn measure_evenness_from_retained_source_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -13652,7 +13700,7 @@ fn build_tau_hp(params: &CcmParams, l: &Float, cfg: &HighPrecConfig) -> Result<V
 
     if let Some(cached) = tau_cache::load(lambda_sq, n_modes, prec, cfg.quad_points, cfg.cache_mode)
     {
-        eprintln!(
+        xc_core::progress_message!(
             "[HP] loaded cached τ-matrix for λ²={}, N={}, prec={} bits ({}×{} = {} entries)",
             lambda_sq.value_f64,
             n_modes,
@@ -14021,8 +14069,12 @@ fn band_concentration_matrix_hp_inner(
     if omega.is_zero() {
         return Ok(vec![Float::with_val(prec, 0); dim * dim]);
     }
-    let (nodes, weights) =
-        xc_numerics::quadrature::try_gauss_legendre_nodes(npts, prec, cfg.cache_mode)?;
+    let (nodes, weights) = xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
+        npts,
+        prec,
+        cfg.cache_mode,
+        xc_numerics::hp_runtime::plan_gl_precompute(&[npts], prec).root_schedule(npts),
+    )?;
 
     // ω_n = 2π n / L, indexed by position params.idx(n) = n + N.
     let omega_n: Vec<Float> = (-n_max..=n_max)
@@ -14197,7 +14249,9 @@ fn report_quadrature_precompute_summary(
     accesses: &[xc_core::CacheAccessProvenance],
 ) -> String {
     if accesses.is_empty() {
-        eprintln!("[HP] GL tables ready: {total} total (standalone cache/computation)");
+        xc_core::progress_message!(
+            "[HP] GL tables ready: {total} total (standalone cache/computation)"
+        );
         return "standalone".to_owned();
     }
     let mut counts = BTreeMap::<String, usize>::new();
@@ -14218,7 +14272,7 @@ fn report_quadrature_precompute_summary(
         .map(|(label, count)| format!("{count} {label}"))
         .collect::<Vec<_>>()
         .join(", ");
-    eprintln!("[HP] GL tables ready: {total} total ({detail})");
+    xc_core::progress_message!("[HP] GL tables ready: {total} total ({detail})");
     detail
 }
 
@@ -14259,7 +14313,7 @@ fn compute_archimedean_integrals_tracked_with_bucket(
         values.dedup();
         values
     };
-    eprintln!(
+    xc_core::progress_message!(
         "[HP] Precomputing {} unique GL node tables (npts up to {}, prec={} bits)...",
         unique_pts.len(),
         unique_pts.last().copied().unwrap_or(0),
@@ -14354,18 +14408,39 @@ fn compute_archimedean_integrals_tracked_with_bucket(
     let disposition = report_quadrature_precompute_summary(unique_pts.len(), &quadrature_accesses);
     performance_gl.set_cache_disposition(disposition);
     drop(performance_gl);
-    eprintln!("[HP] Computing alpha_L, beta_L, gamma_L integrals...");
+    xc_core::progress_message!("[HP] Computing alpha_L, beta_L, gamma_L integrals...");
 
     let performance_integrals =
         xc_core::performance_stage_with("ccm.tau.archimedean_integrals", || {
             ccm_performance_metadata("ccm.tau.archimedean_integrals", n_modes + 1, prec)
         });
+    // Node-only terms (density, decay, weight products) are prepared once per
+    // quadrature order and shared by every mode using that order; results are
+    // bit-identical to independent per-mode evaluation.
+    let mut orders: Vec<usize> = pts_for_n[..=n_modes].to_vec();
+    orders.sort_unstable();
+    orders.dedup();
+    let node_tables: HashMap<usize, matrix_point_math::IntegralNodeTable> = orders
+        .par_iter()
+        .map(|&npts| {
+            let (nodes, weights) = gl_cache.get(&npts).unwrap();
+            matrix_point_math::integral_node_table(l, prec, nodes, weights, 64)
+                .map(|table| (npts, table))
+        })
+        .collect::<Result<_>>()?;
     let indices: Vec<usize> = (0..=n_modes).collect();
     let fused: Vec<(Float, Float, Float)> = indices
         .par_iter()
         .map(|&n| {
             let (nodes, weights) = gl_cache.get(&pts_for_n[n]).unwrap();
-            compute_archimedean_integrals_l(n as i64, l, prec, nodes, weights)
+            matrix_point_math::integrals_with_table(
+                n as i64,
+                l,
+                prec,
+                nodes,
+                weights,
+                &node_tables[&pts_for_n[n]],
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     let mut alpha = Vec::with_capacity(fused.len());
@@ -14665,6 +14740,7 @@ fn validate_eigenstate_contract(
 /// Evaluate alpha, beta, and gamma in one ordered quadrature pass. Each
 /// accumulator follows the same operation order as the standalone test
 /// evaluator. Gamma uses a cancellation-free trigonometric/expm1 difference.
+#[cfg(test)]
 fn compute_archimedean_integrals_l(
     n: i64,
     l: &Float,
@@ -15524,8 +15600,7 @@ mod tau_cache {
     }
 
     fn cache_dir() -> Option<std::path::PathBuf> {
-        let cwd = std::env::current_dir().ok()?;
-        let dir = cwd.join("data").join("tau_cache");
+        let dir = crate::standalone_cache_root().join("tau_cache");
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
     }
@@ -15989,7 +16064,7 @@ mod tau_cache {
         let entry_name = cache_filename(lambda_sq, n_modes, prec);
         let zip_bytes = compress_to_zip(&json_bytes, &entry_name);
         if zip_bytes.is_empty() {
-            eprintln!(
+            xc_core::progress_message!(
                 "[tau_cache] WARNING: zip compression failed for λ²={}, N={}, prec={} \
                  ({} bytes uncompressed) — this config will NOT be cached and will \
                  recompute from scratch on every run",
@@ -16382,7 +16457,8 @@ mod weil_eigvec_cache {
     //! operator *and* quantity) and the τ-matrix cache (`tau_cache`,
     //! different quantity).
     //!
-    //! Cache layout under `<cwd>/data/weil_eigvec_cache/`:
+    //! Cache layout under `weil_eigvec_cache/` in the standalone cache root
+    //! (`$XC_CACHE_ROOT`, else the per-user cache root):
     //!   - `weil_eigvec_lambda_sq{L}_nmodes{N}_prec{P}.json` (uncompressed,
     //!     fast path)
     //!   - `weil_eigvec_lambda_sq{L}_nmodes{N}_prec{P}.json.zip`
@@ -16478,12 +16554,13 @@ mod weil_eigvec_cache {
 
     fn cache_dir() -> Option<std::path::PathBuf> {
         #[cfg(test)]
-        let cwd = TEST_CACHE_ROOT
+        let root = TEST_CACHE_ROOT
             .with(|slot| slot.borrow().clone())
-            .or_else(|| std::env::current_dir().ok())?;
+            .map(|dir| dir.join("data"))
+            .unwrap_or_else(crate::standalone_cache_root);
         #[cfg(not(test))]
-        let cwd = std::env::current_dir().ok()?;
-        let dir = cwd.join("data").join("weil_eigvec_cache");
+        let root = crate::standalone_cache_root();
+        let dir = root.join("weil_eigvec_cache");
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
     }
@@ -16982,7 +17059,7 @@ mod weil_eigvec_cache {
         let entry_name = cache_filename(lambda_sq, n_modes, prec, parity_policy);
         let zip_bytes = compress_to_zip(&json_bytes, &entry_name);
         if zip_bytes.is_empty() {
-            eprintln!(
+            xc_core::progress_message!(
                 "[weil_eigvec_cache] WARNING: zip compression failed for λ²={}, N={}, \
                  prec={} ({} bytes uncompressed) — this config will NOT be cached and \
                  will recompute from scratch on every run",
@@ -17294,8 +17371,8 @@ mod tests {
                 size_bytes: 1,
             }],
             created_unix_seconds: 0,
-            producer_toolkit_version: ToolkitVersion::parse("0.14.1").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: xc_cache::CacheVisibility::Local,
@@ -17897,11 +17974,10 @@ mod tests {
             FilesystemCacheStore,
         };
 
-        let base =
-            std::env::temp_dir().join(format!("xc-hp-eigenpair-identity-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let base_dir = xc_core::test_support::TestDir::new("hp-eigenpair-identity");
+        let base = base_dir.to_path_buf();
         let policy = CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -19049,15 +19125,8 @@ mod tests {
             ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
             FilesystemCacheStore,
         };
-        let root = std::env::temp_dir().join(format!(
-            "xc-complete-roots-{}-{}-{}",
-            std::process::id(),
-            params.n_modes,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root_dir = xc_core::test_support::TestDir::new("complete-roots");
+        let root = root_dir.to_path_buf();
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -19257,11 +19326,8 @@ mod tests {
             FilesystemCacheStore,
         };
 
-        let cache_root = std::env::temp_dir().join(format!(
-            "xc-spectral-adaptive-root-cache-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&cache_root);
+        let cache_root_dir = xc_core::test_support::TestDir::new("adaptive-root-cache");
+        let cache_root = cache_root_dir.to_path_buf();
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -19687,9 +19753,8 @@ mod tests {
             FilesystemCacheStore,
         };
 
-        let root =
-            std::env::temp_dir().join(format!("xc-spectral-ccm-tau-fabric-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root_dir = xc_core::test_support::TestDir::new("ccm-tau-fabric");
+        let root = root_dir.to_path_buf();
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -20393,11 +20458,8 @@ mod tests {
         };
         use xc_core::{CancellationToken, ResourcePolicy};
 
-        let root = std::env::temp_dir().join(format!(
-            "xc-spectral-ccm-certified-retained-tau-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root_dir = xc_core::test_support::TestDir::new("ccm-certified-retained-t");
+        let root = root_dir.to_path_buf();
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -21538,11 +21600,8 @@ mod tests {
             FilesystemCacheStore,
         };
 
-        let cache_root = std::env::temp_dir().join(format!(
-            "xc-spectral-ccm-response-v2-cache-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&cache_root);
+        let cache_root_dir = xc_core::test_support::TestDir::new("ccm-response-v2-cache");
+        let cache_root = cache_root_dir.to_path_buf();
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -21695,7 +21754,7 @@ mod tests {
         );
         assert_eq!(
             manifests[0].minimum_reader_version,
-            ToolkitVersion::parse("0.15.2").unwrap()
+            ToolkitVersion::parse(xc_cache::CLEAN_SLATE).unwrap()
         );
         let mut legacy = semantic.clone();
         legacy.mathematical_semantics_version = "ccm-u-flow-response-v0.15.0-v3".into();
@@ -21850,11 +21909,8 @@ mod tests {
             FilesystemCacheStore,
         };
 
-        let cache_root = std::env::temp_dir().join(format!(
-            "xc-spectral-ccm-root-conditioning-cache-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&cache_root);
+        let cache_root_dir = xc_core::test_support::TestDir::new("ccm-root-conditioning-ca");
+        let cache_root = cache_root_dir.to_path_buf();
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -21963,11 +22019,8 @@ mod tests {
             CacheResolver, CacheVisibility, FilesystemCacheStore,
         };
 
-        let root = std::env::temp_dir().join(format!(
-            "xc-spectral-ccm-root-certificate-cache-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root_dir = xc_core::test_support::TestDir::new("ccm-root-certificate-cac");
+        let root = root_dir.to_path_buf();
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -22014,8 +22067,8 @@ mod tests {
                 size_bytes: 1,
             }],
             created_unix_seconds: 0,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -22586,6 +22639,7 @@ mod tests {
     /// lifetime to serialize cwd mutation.
     struct CwdGuard {
         original: std::path::PathBuf,
+        _cache_root: crate::TestCacheRoot,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
     impl CwdGuard {
@@ -22599,6 +22653,7 @@ mod tests {
             std::env::set_current_dir(temp).expect("set_current_dir to temp");
             CwdGuard {
                 original,
+                _cache_root: crate::TestCacheRoot::enter(temp),
                 _lock: lock,
             }
         }
@@ -23349,7 +23404,8 @@ mod tests {
     /// an empty report.
     #[test]
     fn tau_cache_verify_missing_dir() {
-        let nonexistent = crate::test_tmp_root().join(format!(
+        let scratch = crate::fresh_test_dir("tau-cache-missing");
+        let nonexistent = scratch.join(format!(
             "xc_spectral_tau_cache_test_missing_{}",
             std::process::id()
         ));
@@ -23722,12 +23778,12 @@ mod tests {
         invalid_cache_replacement_xi(2);
     }
 
-    /// A fresh temp dir + cwd guard so cache reads/writes land in a
-    /// throwaway location and never touch the real `data/` tree.
-    /// Scratch lives under `target/test-tmp/` (removed by `cargo clean`),
-    /// not the OS temp dir.
-    fn weil_temp_cwd(tag: &str) -> std::path::PathBuf {
-        crate::fresh_test_dir(&format!("weil_eigvec_{}", tag))
+    /// A fresh temp dir so cache reads/writes land in a throwaway location
+    /// and never touch the real `data/` tree. The returned guard removes the
+    /// directory on drop; declare it before the `CwdGuard` so the cwd is
+    /// restored first.
+    fn weil_temp_cwd(tag: &str) -> xc_core::test_support::TestDir {
+        crate::fresh_test_dir(&format!("weil-eigvec-{}", tag))
     }
 
     #[test]
@@ -26923,15 +26979,8 @@ mod exhaustive_managed_source_identity {
     use xc_cache::{ArtifactExecutionCacheMode, CacheVisibility, CertificationFailurePolicy};
     fn with_context<T>(f: impl FnOnce(&ArtifactCacheContext<'_>) -> T) -> T {
         use xc_cache::{CacheLayer, CachePolicy, CacheResolver, FilesystemCacheStore};
-        let base = std::env::temp_dir().join(format!(
-            "xc-audit-managed-source-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&base).unwrap();
+        let base_dir = xc_core::test_support::TestDir::new("audit-managed-source");
+        let base = base_dir.to_path_buf();
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -26942,7 +26991,7 @@ mod exhaustive_managed_source_identity {
             )),
         }]);
         let policy = CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -27003,8 +27052,8 @@ mod exhaustive_managed_source_identity {
                 size_bytes: bytes.len() as u64,
             }],
             created_unix_seconds: 0,
-            producer_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -28551,6 +28600,38 @@ mod exhaustive_matrix_point {
             let want = (Float::with_val(2048, &l) / 4u32).sinh().square() * 32u32
                 / Float::with_val(2048, &l);
             assert_eq!(got.0[0], Float::with_val(p, want));
+        }
+    }
+    #[test]
+    fn shared_node_tables_are_bit_identical_to_independent_mode_evaluation() {
+        for (p, lambda_squared, order) in [(128u32, 13u32, 24usize), (192, 2, 40), (256, 50, 33)] {
+            let l = Float::with_val(p, lambda_squared).ln();
+            let (nodes, weights) = xc_numerics::quadrature::try_gauss_legendre_nodes(
+                order,
+                p,
+                xc_numerics::quadrature::CacheMode::Off,
+            )
+            .unwrap();
+            let table =
+                matrix_point_math::integral_node_table(&l, p, &nodes, &weights, 64).unwrap();
+            for n in [0i64, 1, 2, 3, 7, 12, 25, 40] {
+                let shared =
+                    matrix_point_math::integrals_with_table(n, &l, p, &nodes, &weights, &table)
+                        .unwrap();
+                let independent =
+                    compute_archimedean_integrals_l(n, &l, p, &nodes, &weights).unwrap();
+                for (left, right) in [
+                    (&shared.0, &independent.0),
+                    (&shared.1, &independent.1),
+                    (&shared.2, &independent.2),
+                ] {
+                    assert_eq!(left.prec(), right.prec());
+                    assert_eq!(
+                        left.to_string_radix(16, None),
+                        right.to_string_radix(16, None)
+                    );
+                }
+            }
         }
     }
     #[test]

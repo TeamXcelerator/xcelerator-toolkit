@@ -88,9 +88,7 @@ class ExhaustiveTools(unittest.TestCase):
    self.assertEqual(result['phases']['phase']['byte_counters'],{})
    self.assertEqual(len(result['malformed']),1)
 
-import contextlib
 import hashlib
-import io
 import json
 import os
 from pathlib import Path
@@ -99,81 +97,6 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
-import benchmark_publication_import as benchmark
-
-class PublicationImportIdentity(unittest.TestCase):
-    def invoke(self, source, digest, output):
-        with patch.object(sys,"argv",["benchmark_publication_import.py","--part",str(source),"--sha256",digest,"--output",str(output)]), contextlib.redirect_stdout(io.StringIO()):
-            benchmark.main()
-
-    def mutation_check(self, replacement):
-        with tempfile.TemporaryDirectory() as temp:
-            root=Path(temp);source=root/"input.bin";source.write_bytes(b"original retained evidence")
-            digest=hashlib.sha256(source.read_bytes()).hexdigest();output=root/"audit"
-            actual_run=subprocess.run;mutated=False
-            def mutate_after_verification(command,*args,**kwargs):
-                nonlocal mutated
-                if command[:2]==["git","init"] and not mutated:
-                    source.write_bytes(replacement);mutated=True
-                return actual_run(command,*args,**kwargs)
-            with patch.object(benchmark.subprocess,"run",side_effect=mutate_after_verification):
-                with self.assertRaisesRegex(SystemExit,"Imported.*digest|Imported.*size"):
-                    self.invoke(source,digest,output)
-            self.assertTrue(mutated)
-            self.assertFalse((output/"results.json").exists())
-
-    def test_same_length_source_replacement_is_not_reported_as_verified(self):
-        self.mutation_check(b"modified retained evidence")
-
-    def test_size_change_is_not_reported_with_stale_input_digest(self):
-        self.mutation_check(b"different source bytes with a changed length")
-
-    def test_four_policies_retain_verified_content_and_completion(self):
-        for payload in [b"", b"retained evidence\0" * 1000]:
-            with self.subTest(size=len(payload)), tempfile.TemporaryDirectory() as temp:
-                root=Path(temp);source=root/"input.bin";source.write_bytes(payload)
-                digest=hashlib.sha256(payload).hexdigest();output=root/"audit"
-                self.invoke(source,digest,output)
-                report=json.loads((output/"results.json").read_text())
-                self.assertTrue(report["complete"])
-                self.assertEqual(report["input_bytes"],len(payload))
-                self.assertEqual(report["input_sha256"],digest)
-                self.assertEqual(len(report["rows"]),4)
-                for index,row in enumerate(report["rows"]):
-                    imported=subprocess.check_output(["git","-C",str(output/("repo-"+str(index))),"cat-file","blob",row["oid"]])
-                    self.assertEqual(imported,payload)
-
-    def test_invalid_or_wrong_digest_creates_no_output(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root=Path(temp);source=root/"input.bin";source.write_bytes(b"evidence")
-            for digest in ["", "A"*64, "a"*63, "a"*64+"\n", "a"*64]:
-                output=root/"audit"
-                with self.assertRaises(SystemExit): self.invoke(source,digest,output)
-                self.assertFalse(output.exists())
-
-    def test_later_replacement_keeps_only_incomplete_verified_rows(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root=Path(temp);source=root/"input.bin";payload=b"original";source.write_bytes(payload)
-            digest=hashlib.sha256(payload).hexdigest();output=root/"audit"
-            actual_run=subprocess.run
-            def mutate(command,*args,**kwargs):
-                if command[:2]==["git","init"] and str(command[-1]).endswith("repo-2"):
-                    source.write_bytes(b"modified")
-                return actual_run(command,*args,**kwargs)
-            with patch.object(benchmark.subprocess,"run",side_effect=mutate):
-                with self.assertRaises(SystemExit):self.invoke(source,digest,output)
-            report=json.loads((output/"results.json").read_text())
-            self.assertFalse(report["complete"])
-            self.assertEqual(len(report["rows"]),2)
-            self.assertEqual(report["input_sha256"],digest)
-
-    def test_fingerprint_counts_bytes_and_enforces_limit(self):
-        data=b"a"*((1<<20)+1)
-        digest,size=benchmark.fingerprint(io.BytesIO(data),len(data))
-        self.assertEqual(digest,hashlib.sha256(data).hexdigest())
-        self.assertEqual(size,len(data))
-        with self.assertRaises(SystemExit):benchmark.fingerprint(io.BytesIO(data),len(data)-1)
-
 
 class OperationalQualificationGuards(unittest.TestCase):
     def test_band_recovery_rejects_optimized_python_before_writes(self):

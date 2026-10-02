@@ -177,7 +177,8 @@ fn validate_reply(
 ) -> Result<()> {
     anyhow::ensure!(
         reply["protocol_version"].as_u64() == Some(2),
-        "target provider protocol version mismatch"
+        "target provider protocol version mismatch: the Toolkit speaks protocol 2 (with request_nonce), the provider replied with {}",
+        reply.get("protocol_version").map_or_else(|| "no protocol_version".to_owned(), |v| v.to_string())
     );
     anyhow::ensure!(
         reply["request_nonce"].as_str() == Some(nonce),

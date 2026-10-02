@@ -415,24 +415,7 @@ impl ManagedArtifactCacheConfig {
 }
 
 fn default_managed_cache_root() -> std::ffi::OsString {
-    if let Some(root) = std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(root).join("xcelerator").into_os_string();
-    }
-    if cfg!(windows) {
-        if let Some(root) = std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty()) {
-            return PathBuf::from(root)
-                .join("Xcelerator")
-                .join("cache")
-                .into_os_string();
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        return PathBuf::from(home)
-            .join(".cache")
-            .join("xcelerator")
-            .into_os_string();
-    }
-    PathBuf::from(".xcelerator-cache").into_os_string()
+    xc_core::default_cache_root().into_os_string()
 }
 
 fn default_validation_cache_root(cache_root: &Path) -> PathBuf {
@@ -1216,7 +1199,7 @@ impl ManagedArtifactCacheSession {
                 )));
             }
             self.mark_staged_drafts_completed(&pending_drafts)?;
-            eprintln!(
+            xc_core::progress_message!(
                 "{}",
                 format_publication_completion(
                     self.requested_assurance,
@@ -2944,11 +2927,21 @@ where
             String::from_utf8(crate::protocol::canonical_json_bytes(request.semantic_key)?)
                 .map_err(|error| CacheError::Serialization(error.to_string()))?,
         );
+        // A managed kind is never written below its policy reader floor, so
+        // readers released before a format change refuse the artifact.
+        let mut minimum_reader_version = request.minimum_reader_version.clone();
+        if let Some(family) =
+            crate::production_staging::family_for_artifact_kind(&request.semantic_key.artifact_kind)
+        {
+            let policy =
+                crate::artifact_compatibility_policy(family, &request.semantic_key.artifact_kind)?;
+            minimum_reader_version = minimum_reader_version.max(policy.minimum_reader_version);
+        }
         let draft = ArtifactDraft {
             schema_version: request.semantic_key.schema_version,
             key,
             producer_toolkit_version: request.producer_toolkit_version.clone(),
-            minimum_reader_version: request.minimum_reader_version.clone(),
+            minimum_reader_version,
             maximum_reader_version: request.maximum_reader_version.clone(),
             quality: request.produced_quality,
             visibility: request.write_visibility,
@@ -3152,7 +3145,7 @@ fn report_managed_cache_decision(
         .iter()
         .any(|overlay| overlay.starts_with("github-"))
     {
-        eprintln!(
+        xc_core::progress_message!(
             "  cache artifact: {} ({outcome}, source={source})",
             request.semantic_key.artifact_kind
         );
@@ -3262,7 +3255,8 @@ mod tests {
 
     #[test]
     fn validation_cache_root_cannot_overlap_the_production_cache() {
-        let production = root("production-cache-root");
+        let scratch = crate::test_support::TestDir::new("production-cache-root");
+        let production = scratch.join("production");
         assert!(validate_separate_cache_roots(&production, &production).is_err());
         assert!(
             validate_separate_cache_roots(&production, &production.join("validation")).is_err()
@@ -3283,8 +3277,8 @@ mod tests {
     fn validation_cache_root_rejects_a_symlink_alias_of_production() {
         use std::os::unix::fs::symlink;
 
-        let root = root("validation-cache-symlink-alias");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("validation-cache-symlink");
+        let root = scratch.join("root");
         let production = root.join("production");
         let alias = root.join("validation-alias");
         fs::create_dir_all(&production).unwrap();
@@ -3349,8 +3343,8 @@ mod tests {
             }
         }
 
-        let root = root("cumulative-publication-report");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("cumulative-publication-r");
+        let root = scratch.join("root");
         let first = phase(&["transaction-a", "transaction-b"], 2);
         let second = phase(&["transaction-c"], 3);
 
@@ -3420,10 +3414,6 @@ mod tests {
         }
     }
 
-    fn root(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
-    }
-
     fn semantic_key() -> SemanticKeyEnvelope {
         SemanticKeyEnvelope {
             schema_version: 1,
@@ -3440,7 +3430,7 @@ mod tests {
 
     fn policy() -> CachePolicy {
         CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -3467,8 +3457,8 @@ mod tests {
             write_on_miss: mode.writes_computed_artifacts(),
             write_visibility: CacheVisibility::Local,
             produced_quality: CacheQuality::Validated,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             tags: BTreeMap::new(),
             provenance_digest: None,
@@ -3500,7 +3490,8 @@ mod tests {
 
     #[test]
     fn read_only_session_policies_and_no_persistent_side_effects() {
-        let root = root("r2-read-only-policy").join("never-created");
+        let scratch = crate::test_support::TestDir::new("r2-read-only-policy");
+        let root = scratch.join("root").join("never-created");
         assert!(!root.exists());
         for mode in [
             ArtifactExecutionCacheMode::Disabled,
@@ -3583,7 +3574,7 @@ mod tests {
             write_visibility: context.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: crate::current_toolkit_version().unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             tags: BTreeMap::new(),
             provenance_digest: None,
@@ -3631,8 +3622,8 @@ mod tests {
 
     #[test]
     fn one_contract_computes_writes_reuses_and_records_provenance() {
-        let root = root("execution-cache-roundtrip");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-roundtrip");
+        let root = scratch.join("root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -3702,8 +3693,8 @@ mod tests {
 
     #[test]
     fn refresh_bypasses_an_existing_hit_and_publishes_the_fresh_value_locally() {
-        let root = root("execution-cache-refresh");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-refresh");
+        let root = scratch.join("root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -3750,8 +3741,8 @@ mod tests {
 
     #[test]
     fn require_reuse_miss_never_computes() {
-        let root = root("execution-cache-required-miss");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-required-miss");
+        let root = scratch.join("root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -3779,8 +3770,8 @@ mod tests {
 
     #[test]
     fn produced_dependencies_are_committed_and_reused_exactly() {
-        let root = root("execution-cache-dependencies");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-dependencies");
+        let root = scratch.join("root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -3913,8 +3904,8 @@ mod tests {
 
     #[test]
     fn closure_dependencies_from_a_zip_store_are_staged_without_reading_payloads() {
-        let root = root("execution-cache-metadata-only-closure");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-metadata-only");
+        let root = scratch.join("root");
         let policy = policy();
         let payload_reads = std::sync::Arc::new(AtomicUsize::new(0));
         let counting = PayloadReadCountingStore {
@@ -4069,6 +4060,7 @@ mod tests {
     /// adapter does -- empty key-based dependency lists, canonical manifest
     /// and semantic key retained as tags.
     struct AdoptedPairFixture {
+        _scratch: crate::test_support::TestDir,
         root: std::path::PathBuf,
         consumer_resolver: CacheResolver,
         parent: ArtifactManifest,
@@ -4086,8 +4078,8 @@ mod tests {
         parent_kind: &str,
         grandparent_kind: &str,
     ) -> AdoptedPairFixture {
-        let root = root(name);
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new(name);
+        let root = scratch.join("root");
         let policy = policy();
 
         let author_resolver = CacheResolver::new(vec![CacheLayer {
@@ -4228,6 +4220,7 @@ mod tests {
         let adopted_parent = adopt(&parent_canonical, &parent, &parent_payload);
 
         AdoptedPairFixture {
+            _scratch: scratch,
             root,
             consumer_resolver: CacheResolver::new(vec![CacheLayer {
                 precedence: 0,
@@ -4691,8 +4684,8 @@ mod tests {
 
     #[test]
     fn fresh_publication_staging_reconstructs_cached_dependency_closure() {
-        let root = root("execution-cache-fresh-staging-closure");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-fresh-staging");
+        let root = scratch.join("root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -4802,8 +4795,8 @@ mod tests {
 
     #[test]
     fn production_sink_records_fresh_and_reused_artifacts() {
-        let root = root("execution-cache-production-sink");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-production-si");
+        let root = scratch.join("root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -4874,8 +4867,8 @@ mod tests {
 
     #[test]
     fn certified_assessment_is_bound_before_packaging() {
-        let first_root = root("execution-cache-certified-assessment");
-        let _ = fs::remove_dir_all(&first_root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-certified-ass");
+        let first_root = scratch.join("first-root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -4919,8 +4912,8 @@ mod tests {
         assert_eq!(records[0].assurance_evidence_digests, vec![certificate]);
         drop(records);
 
-        let missing_root = root("execution-cache-certified-missing-evidence");
-        let _ = fs::remove_dir_all(&missing_root);
+        let missing_scratch = crate::test_support::TestDir::new("exec-cache-certified-mis");
+        let missing_root = missing_scratch.join("missing-root");
         let missing_resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -4960,8 +4953,8 @@ mod tests {
 
     #[test]
     fn directory_production_sink_queues_identity_bound_payload_once() {
-        let root = root("execution-cache-directory-sink");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-directory-sin");
+        let root = scratch.join("root");
         let sink = DirectoryArtifactProductionSink::new(&root).unwrap();
         let semantic_key = semantic_key();
         let payload = serde_json::to_vec(&vec!["node-a", "node-b"]).unwrap();
@@ -4985,8 +4978,8 @@ mod tests {
                     size_bytes: payload.len() as u64,
                 }],
                 created_unix_seconds: 1,
-                producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-                minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+                minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
                 maximum_reader_version: None,
                 quality: CacheQuality::Validated,
                 visibility: CacheVisibility::Local,
@@ -5022,8 +5015,8 @@ mod tests {
 
     #[test]
     fn successful_same_process_publication_filter_retains_restart_staging() {
-        let root = root("managed-completed-publication-filter");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-completed-public");
+        let root = scratch.join("root");
         let session = ManagedArtifactCacheSession::new(ManagedArtifactCacheConfig {
             profile: ManagedRunProfile::Author,
             requested_assurance: xc_core::AssuranceLevel::Computed,
@@ -5053,8 +5046,8 @@ mod tests {
             write_on_miss: cache.write_on_miss,
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             tags: BTreeMap::new(),
             provenance_digest: None,
@@ -5084,8 +5077,8 @@ mod tests {
 
     #[test]
     fn executed_publication_rejects_vacuous_success_without_observed_artifacts() {
-        let root = root("managed-publication-vacuous-success");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-publication-vacu");
+        let root = scratch.join("root");
         let session = ManagedArtifactCacheSession::new(ManagedArtifactCacheConfig {
             profile: ManagedRunProfile::Author,
             requested_assurance: xc_core::AssuranceLevel::Computed,
@@ -5110,8 +5103,8 @@ mod tests {
 
     #[test]
     fn managed_require_reuse_stages_workstation_hit_for_publication() {
-        let root = root("managed-require-reuse-publication");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-require-reuse-pu");
+        let root = scratch.join("root");
         let config = |cache_mode, staging: &str| ManagedArtifactCacheConfig {
             profile: ManagedRunProfile::Author,
             requested_assurance: xc_core::AssuranceLevel::Computed,
@@ -5218,8 +5211,8 @@ mod tests {
                 write_on_miss: cache.write_on_miss,
                 write_visibility: cache.write_visibility,
                 produced_quality: CacheQuality::Validated,
-                producer_toolkit_version: ToolkitVersion::parse("0.13.0")?,
-                minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+                producer_toolkit_version: ToolkitVersion::parse("0.16.0")?,
+                minimum_reader_version: ToolkitVersion::parse("0.16.0")?,
                 maximum_reader_version: None,
                 tags: BTreeMap::new(),
                 provenance_digest: None,
@@ -5243,13 +5236,13 @@ mod tests {
                 false,
             ),
         ] {
-            let root = root(match policy {
+            let scratch = crate::test_support::TestDir::new(match policy {
                 CertificationFailurePolicy::RetainComputedFailRun => "managed-fail-run",
                 CertificationFailurePolicy::RetainComputedSkipPublication => {
                     "managed-skip-publication"
                 }
             });
-            let _ = fs::remove_dir_all(&root);
+            let root = scratch.join("root");
             let staging_root = root.join("staging");
             let session = ManagedArtifactCacheSession::new(ManagedArtifactCacheConfig {
                 profile: ManagedRunProfile::Author,
@@ -5296,7 +5289,8 @@ mod tests {
 
     #[test]
     fn managed_layer_plans_isolate_validation_from_production_cache() {
-        let root = root("managed-layer-plan-isolation");
+        let scratch = crate::test_support::TestDir::new("managed-layer-plan-isola");
+        let root = scratch.join("root");
         let validation = OutputValidationConfig {
             validation_root: root.join("validation"),
             report_root: root.join("reports"),
@@ -5352,8 +5346,8 @@ mod tests {
     #[ignore = "credentialed read-only GitHub validation-layer preflight"]
     fn managed_verify_production_constructor_preflights_private_reference_layers() {
         let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
-        let root = root("managed-verify-live-private-preflight");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-verify-live-priv");
+        let root = scratch.join("root");
         let mut config = managed_verify_config(&root, "validation");
         config.repository_owner = "TeamXcelerator".to_owned();
         config.output_validation.as_mut().unwrap().reference_mode = ManagedRemoteCacheMode::Private;
@@ -5371,8 +5365,8 @@ mod tests {
     #[test]
     fn managed_verify_session_isolates_layers_and_classifies_fixed_key_cascade() {
         let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
-        let root = root("managed-verify-fixed-key-cascade");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-verify-fixed-key");
+        let root = scratch.join("root");
         let reference_root = root.join("reference");
         let computed_root = root.join("computed");
         let reference_writer = CacheResolver::new(vec![CacheLayer {
@@ -5550,8 +5544,8 @@ mod tests {
     #[test]
     fn reference_absent_rekeyed_parent_is_classified_as_inherited() {
         let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
-        let root = root("managed-verify-rekey-cascade");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-verify-rekey-cas");
+        let root = scratch.join("root");
         let reference_root = root.join("reference");
         let computed_root = root.join("computed");
         let reference_writer = CacheResolver::new(vec![CacheLayer {
@@ -5680,8 +5674,8 @@ mod tests {
     #[test]
     fn verify_mode_writes_real_artifacts_compares_and_rejects_empty_runs() {
         let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
-        let root = root("execution-cache-output-validation");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-output-valida");
+        let root = scratch.join("root");
         let reference_root = root.join("reference");
         let reference_writer = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
@@ -5715,7 +5709,7 @@ mod tests {
             crate::begin_output_validation_run(crate::OutputValidationRunConfig {
                 validation_root: validation_root.clone(),
                 report_root: report_root.clone(),
-                toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
                 reference_mode: "local_fixture".to_owned(),
                 ordered_reference_overlays: vec!["reference".to_owned()],
                 production_cache_installed: false,
@@ -5753,8 +5747,8 @@ mod tests {
                 write_on_miss: true,
                 write_visibility: CacheVisibility::Local,
                 produced_quality: CacheQuality::Validated,
-                producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-                minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+                producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+                minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
                 maximum_reader_version: None,
                 tags: BTreeMap::new(),
                 provenance_digest: None,
@@ -5821,7 +5815,7 @@ mod tests {
         crate::begin_output_validation_run(crate::OutputValidationRunConfig {
             validation_root: empty_root.clone(),
             report_root: empty_root.join("reports"),
-            toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             reference_mode: "local_fixture".to_owned(),
             ordered_reference_overlays: vec!["reference".to_owned()],
             production_cache_installed: false,
@@ -5840,12 +5834,12 @@ mod tests {
     #[test]
     fn verify_mode_never_reports_operational_reference_errors_as_absence() {
         let _validation_guard = crate::output_validation_test_lock().lock().unwrap();
-        let root = root("execution-cache-output-validation-operational-error");
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("exec-cache-output-valida");
+        let root = scratch.join("root");
         crate::begin_output_validation_run(crate::OutputValidationRunConfig {
             validation_root: root.clone(),
             report_root: root.join("reports"),
-            toolkit_version: ToolkitVersion::parse("0.13.3").unwrap(),
+            toolkit_version: ToolkitVersion::parse("0.16.3").unwrap(),
             reference_mode: "faulting_fixture".to_owned(),
             ordered_reference_overlays: vec!["faulting-reference".to_owned()],
             production_cache_installed: false,
@@ -5882,8 +5876,8 @@ mod tests {
             write_on_miss: true,
             write_visibility: CacheVisibility::Local,
             produced_quality: CacheQuality::Validated,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.3").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.3").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             tags: BTreeMap::new(),
             provenance_digest: None,
@@ -5938,8 +5932,8 @@ mod exhaustive_resumed_queue_contract {
                 size_bytes: payload.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.18.1").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -5959,9 +5953,8 @@ mod exhaustive_resumed_queue_contract {
         }
     }
 
-    fn queued_fixture(label: &str) -> (PathBuf, QueuedProducedArtifactRecord) {
+    fn queued_fixture(label: &str) -> (crate::test_support::TestDir, QueuedProducedArtifactRecord) {
         let root = crate::test_support::temporary_root(label);
-        fs::create_dir_all(&root).unwrap();
         let record = record();
         fs::write(
             root.join("payload.json.zip"),

@@ -122,7 +122,7 @@ impl ResponseProgress {
     pub(super) fn new(phase: &'static str, total: usize, roots: usize) -> Self {
         let started = Instant::now();
         if total >= 64 {
-            eprintln!(
+            xc_core::progress_message!(
                 "[HP] prime-power response {phase}: 0/{total} events; {roots} roots/event; {} workers",
                 rayon::current_num_threads()
             );
@@ -138,7 +138,7 @@ impl ResponseProgress {
         let mut state = self.state.lock().expect("response progress mutex poisoned");
         state.1 += 1;
         if self.total >= 64 && (state.1 == self.total || state.0.elapsed().as_secs() >= 30) {
-            eprintln!(
+            xc_core::progress_message!(
                 "[HP] prime-power response {}: {}/{} events; elapsed {:.1}s",
                 self.phase,
                 state.1,

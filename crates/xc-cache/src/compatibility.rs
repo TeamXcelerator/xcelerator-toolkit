@@ -16,6 +16,12 @@ pub struct ArtifactFamilyCompatibilityPolicy {
 
 const SCHEMA_V1: &[u32] = &[1];
 
+/// Producer and reader floor for every managed family and kind. Toolkit 0.16.0
+/// started the artifact repositories from a clean slate: artifacts produced by
+/// earlier releases are misses and are recomputed, and earlier readers refuse
+/// 0.16.0 artifacts instead of misreading their changed formats.
+pub const CLEAN_SLATE: &str = "0.16.0";
+
 pub fn current_toolkit_version() -> Result<ToolkitVersion, CacheError> {
     ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))
 }
@@ -31,24 +37,23 @@ pub fn artifact_family_compatibility_policy(
     // Keep every family in its own arm even while floors coincide. A defect in
     // one family can then raise only that producer floor in a patch release.
     let (minimum_producer, minimum_reader, maximum_reader, schemas) = match family {
-        "quadrature" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
-        "ccm-components" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
-        "ccm-matrices" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
-        "weil-states" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
-        "prolate" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
+        "quadrature" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
+        "ccm-components" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
+        "ccm-matrices" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
+        "weil-states" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
+        "prolate" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
         // Reserved schema support; numerical producers remain separately opt-in.
-        "maynard-tao" => ("0.15.2", "0.15.2", None, SCHEMA_V1),
-        "ccm-roots" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
-        "ccm-evidence" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
-        // Eigenfunction profiles and target-distance measurements. Introduced
-        // in 0.14.0, so its producer floor starts there rather than at 0.13.0.
-        "ccm-distance" => ("0.14.0", "0.13.0", None, SCHEMA_V1),
+        "maynard-tao" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
+        "ccm-roots" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
+        "ccm-evidence" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
+        // Eigenfunction profiles and target-distance measurements.
+        "ccm-distance" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
         // Canonical protocol fixtures exercise backend-neutral mechanics with
         // synthetic families. They remain explicit rather than receiving a
         // permissive unknown-family fallback.
-        "ccm" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
-        "fixture" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
-        "research_evidence" => ("0.13.0", "0.13.0", None, SCHEMA_V1),
+        "ccm" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
+        "fixture" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
+        "research_evidence" => (CLEAN_SLATE, CLEAN_SLATE, None, SCHEMA_V1),
         _ => {
             return Err(CacheError::InvalidManifest(format!(
                 "artifact family {family:?} has no explicit compatibility policy"
@@ -72,64 +77,68 @@ pub fn artifact_compatibility_policy(
     artifact_kind: &str,
 ) -> Result<ArtifactFamilyCompatibilityPolicy, CacheError> {
     let minimum_producer = match artifact_kind {
-        "maynard_basis" | "maynard_moment_table" | "maynard_operator" | "maynard_candidate" | "maynard_bound" | "maynard_certificate" => "0.15.2",
-        "gauss_legendre_rule" => "0.13.0",
-        "quadrature_rule" => "0.13.0",
-        "quadrature_reference_table" => "0.13.0",
-        "quadrature_validation" => "0.13.0",
-        "ccm_prime_enumeration" => "0.13.0",
-        "ccm_archimedean_integrals" => "0.13.0",
-        "ccm_archimedean_component" => "0.13.0",
-        "ccm_prime_component" => "0.13.0",
-        "ccm_pole_component" => "0.13.0",
-        "ccm_tau_matrix" => "0.13.0",
-        "ccm_even_sector_matrix" => "0.13.0",
-        "ccm_odd_sector_matrix" => "0.13.0",
-        "ccm_sector_tridiagonal" => "0.13.0",
-        "ccm_sector_transform" => "0.13.0",
-        "ccm_reduced_operator" => "0.13.0",
-        "ccm_factorization" => "0.13.0",
-        "ccm_sector_eigenvalues" => "0.13.0",
-        "ccm_sector_spectrum" => "0.13.0",
-        "ccm_sector_gap" => "0.13.0",
-        // ccm-distance family, introduced in 0.14.0.
-        "ccm_discretization_distance" => "0.14.0",
-        "ccm_distance_resolution_evidence" => "0.14.1",
-        "ccm_eigenfunction_profile" => "0.14.0",
-        "ccm_target_distance" => "0.14.0",
-        "ccm_target_residual_analysis" => "0.14.1",
-        "ccm_weil_eigenpair" => "0.13.0",
-        "ccm_weil_plunge_state" => "0.13.0",
-        "ccm_weil_sonin_state" => "0.13.0",
-        "ccm_source_eigenbasis" => "0.13.0",
-        "prolate_eigenvalue_spectrum" => "0.13.0",
-        "ccm_prolate_spectrum" => "0.13.0",
-        "ccm_prolate_basis" => "0.13.0",
-        "ccm_prolate_candidate" => "0.13.0",
-        "ccm_band_concentration" => "0.13.0",
-        "ccm_secular_source" => "0.13.0",
-        "ccm_root_count_window" => "0.13.0",
-        "ccm_root_discovery_window" => "0.13.0",
-        "ccm_root_refinement" => "0.13.0",
-        "ccm_spectral_window" => "0.13.0",
-        "ccm_post_discovery_comparison" => "0.13.0",
-        "ccm_convergence_diagnostics" => "0.13.0",
-        "ccm_prefix_analysis" => "0.15.0",
-        "ccm_retained_reduction_check" => "0.15.0",
+        "maynard_basis" | "maynard_moment_table" | "maynard_operator" | "maynard_candidate" | "maynard_bound" | "maynard_certificate" => CLEAN_SLATE,
+        "gauss_legendre_rule" => CLEAN_SLATE,
+        "quadrature_rule" => CLEAN_SLATE,
+        "quadrature_reference_table" => CLEAN_SLATE,
+        "quadrature_validation" => CLEAN_SLATE,
+        "ccm_prime_enumeration" => CLEAN_SLATE,
+        "ccm_archimedean_integrals" => CLEAN_SLATE,
+        "ccm_archimedean_component" => CLEAN_SLATE,
+        "ccm_prime_component" => CLEAN_SLATE,
+        "ccm_pole_component" => CLEAN_SLATE,
+        "ccm_tau_matrix" => CLEAN_SLATE,
+        "ccm_even_sector_matrix" => CLEAN_SLATE,
+        "ccm_odd_sector_matrix" => CLEAN_SLATE,
+        "ccm_sector_tridiagonal" => CLEAN_SLATE,
+        "ccm_sector_transform" => CLEAN_SLATE,
+        "ccm_reduced_operator" => CLEAN_SLATE,
+        "ccm_factorization" => CLEAN_SLATE,
+        "ccm_sector_eigenvalues" => CLEAN_SLATE,
+        "ccm_sector_spectrum" => CLEAN_SLATE,
+        "ccm_sector_gap" => CLEAN_SLATE,
+        // ccm-distance family.
+        "ccm_discretization_distance" => CLEAN_SLATE,
+        "ccm_distance_resolution_evidence" => CLEAN_SLATE,
+        "ccm_eigenfunction_profile" => CLEAN_SLATE,
+        "ccm_target_distance" => CLEAN_SLATE,
+        "ccm_target_residual_analysis" => CLEAN_SLATE,
+        "ccm_target_comparison_analysis" => CLEAN_SLATE,
+        "ccm_weil_eigenpair" => CLEAN_SLATE,
+        "ccm_weil_plunge_state" => CLEAN_SLATE,
+        "ccm_weil_sonin_state" => CLEAN_SLATE,
+        "ccm_source_eigenbasis" => CLEAN_SLATE,
+        "prolate_eigenvalue_spectrum" => CLEAN_SLATE,
+        "ccm_prolate_spectrum" => CLEAN_SLATE,
+        "ccm_prolate_basis" => CLEAN_SLATE,
+        "ccm_prolate_candidate" => CLEAN_SLATE,
+        "ccm_band_concentration" => CLEAN_SLATE,
+        "ccm_secular_source" => CLEAN_SLATE,
+        "ccm_root_count_window" => CLEAN_SLATE,
+        "ccm_root_discovery_window" => CLEAN_SLATE,
+        "ccm_root_refinement" => CLEAN_SLATE,
+        "ccm_spectral_window" => CLEAN_SLATE,
+        "ccm_post_discovery_comparison" => CLEAN_SLATE,
+        "ccm_convergence_diagnostics" => CLEAN_SLATE,
+        "ccm_prefix_analysis" => CLEAN_SLATE,
+        "ccm_retained_reduction_check" => CLEAN_SLATE,
         "ccm_state_geometry_analysis" | "research_observation_packet" | "research_reference_dataset"
         | "ccm_reference_source" | "ccm_reference_projection_analysis" | "ccm_indexed_transform_analysis"
-        | "ccm_operator_energy_analysis" | "ccm_root_band_analysis" | "ccm_stabilization_analysis" => "0.15.1",
-        "ccm_compactness_analysis" | "ccm_arithmetic_energy_analysis" | "ccm_directional_response_analysis" | "ccm_weighted_tail_analysis" | "ccm_spectral_cluster_analysis" | "ccm_resolution_budget_analysis" | "ccm_energy_allowance_analysis" | "ccm_weighted_reference_projection" | "ccm_signed_transform_analysis" | "ccm_external_research_source" | "ccm_complex_transform_analysis" | "ccm_root_transport_analysis" | "ccm_operator_cluster_analysis" | "ccm_finite_section_transfer" | "ccm_tail_operator_analysis" | "ccm_observable_budget_analysis" | "ccm_capture_preflight" | "ccm_consistency_analysis" | "ccm_configuration_comparison" | "ccm_band_reconstruction" | "ccm_transform_enclosure" => "0.15.1",
-        "research_capture_receipt" | "research_hypothesis_evaluation" => "0.15.0",
-        "ccm_root_conditioning_analysis" => "0.14.1",
-        "ccm_deviation_decomposition" => "0.14.1",
-        "ccm_prime_power_response_analysis" => "0.14.1",
-        "ccm_u_flow_response_analysis" => "0.14.1",
-        "ccm_sector_gap_certificate" => "0.15.0",
-        "ccm_cross_check_record" => "0.13.0",
-        "ccm_validation_record" => "0.13.0",
-        "ccm_certificate_bundle" => "0.13.0",
-        _ if matches!(family, "ccm" | "fixture" | "research_evidence") => "0.13.0",
+        | "ccm_operator_energy_analysis" | "ccm_root_band_analysis" | "ccm_stabilization_analysis" => CLEAN_SLATE,
+        "ccm_compactness_analysis" | "ccm_arithmetic_energy_analysis" | "ccm_directional_response_analysis" | "ccm_weighted_tail_analysis" | "ccm_spectral_cluster_analysis" | "ccm_resolution_budget_analysis" | "ccm_energy_allowance_analysis" | "ccm_weighted_reference_projection" | "ccm_signed_transform_analysis" | "ccm_external_research_source" | "ccm_complex_transform_analysis" | "ccm_root_transport_analysis" | "ccm_operator_cluster_analysis" | "ccm_finite_section_transfer" | "ccm_tail_operator_analysis" | "ccm_observable_budget_analysis" | "ccm_capture_preflight" | "ccm_consistency_analysis" | "ccm_configuration_comparison" | "ccm_band_reconstruction" | "ccm_transform_enclosure" => CLEAN_SLATE,
+        "research_capture_receipt" | "research_hypothesis_evaluation" => CLEAN_SLATE,
+        "ccm_root_conditioning_analysis" => CLEAN_SLATE,
+        "ccm_deviation_decomposition" => CLEAN_SLATE,
+        "ccm_prime_power_response_analysis" => CLEAN_SLATE,
+        "ccm_u_flow_response_analysis" => CLEAN_SLATE,
+        "ccm_sector_gap_certificate" => CLEAN_SLATE,
+        "ccm_cross_check_record" => CLEAN_SLATE,
+        "ccm_validation_record" => CLEAN_SLATE,
+        "ccm_certificate_bundle" => CLEAN_SLATE,
+        "ccm_root_certification_report" => CLEAN_SLATE,
+        "ccm_assembly_error_analysis" => CLEAN_SLATE,
+        "ccm_checkpoint_spectra" => CLEAN_SLATE,
+        _ if matches!(family, "ccm" | "fixture" | "research_evidence") => CLEAN_SLATE,
         _ => {
             return Err(CacheError::InvalidManifest(format!(
                 "artifact kind {artifact_kind:?} has no explicit compatibility policy in family {family:?}"
@@ -139,68 +148,6 @@ pub fn artifact_compatibility_policy(
     let mut policy = artifact_family_compatibility_policy(family)?;
     policy.artifact_kind = Some(artifact_kind.to_owned());
     policy.minimum_producer_version = ToolkitVersion::parse(minimum_producer)?;
-    if matches!(
-        artifact_kind,
-        "ccm_distance_resolution_evidence"
-            | "ccm_target_residual_analysis"
-            | "ccm_root_conditioning_analysis"
-            | "ccm_deviation_decomposition"
-            | "ccm_prime_power_response_analysis"
-            | "ccm_u_flow_response_analysis"
-            | "ccm_sector_gap_certificate"
-    ) {
-        policy.minimum_reader_version = ToolkitVersion::parse("0.14.1")?;
-    }
-    if matches!(
-        artifact_kind,
-        "ccm_prefix_analysis" | "ccm_sector_gap_certificate"
-    ) {
-        policy.minimum_reader_version = ToolkitVersion::parse("0.15.0")?;
-    }
-    if matches!(artifact_kind, "ccm_retained_reduction_check") {
-        policy.minimum_reader_version = ToolkitVersion::parse("0.15.0")?;
-    }
-    if matches!(
-        artifact_kind,
-        "research_capture_receipt" | "research_hypothesis_evaluation"
-    ) {
-        policy.minimum_reader_version = ToolkitVersion::parse("0.15.0")?;
-    }
-    if matches!(
-        artifact_kind,
-        "ccm_compactness_analysis"
-            | "ccm_arithmetic_energy_analysis"
-            | "ccm_directional_response_analysis"
-            | "ccm_weighted_tail_analysis"
-            | "ccm_spectral_cluster_analysis"
-            | "ccm_resolution_budget_analysis"
-            | "ccm_energy_allowance_analysis"
-            | "ccm_complex_transform_analysis"
-            | "ccm_root_transport_analysis"
-            | "ccm_operator_cluster_analysis"
-            | "ccm_finite_section_transfer"
-            | "ccm_tail_operator_analysis"
-            | "ccm_observable_budget_analysis"
-            | "ccm_capture_preflight"
-            | "ccm_consistency_analysis"
-            | "ccm_configuration_comparison"
-            | "ccm_band_reconstruction"
-            | "ccm_transform_enclosure"
-            | "ccm_weighted_reference_projection"
-            | "ccm_signed_transform_analysis"
-            | "ccm_external_research_source"
-            | "ccm_state_geometry_analysis"
-            | "research_observation_packet"
-            | "research_reference_dataset"
-            | "ccm_reference_source"
-            | "ccm_reference_projection_analysis"
-            | "ccm_indexed_transform_analysis"
-            | "ccm_operator_energy_analysis"
-            | "ccm_root_band_analysis"
-            | "ccm_stabilization_analysis"
-    ) {
-        policy.minimum_reader_version = ToolkitVersion::parse("0.15.1")?;
-    }
     Ok(policy)
 }
 
@@ -270,187 +217,59 @@ impl ArtifactFamilyCompatibilityPolicy {
 mod tests {
     use super::*;
 
+    const MANAGED_FAMILIES: [&str; 9] = [
+        "quadrature",
+        "ccm-components",
+        "ccm-matrices",
+        "weil-states",
+        "prolate",
+        "maynard-tao",
+        "ccm-roots",
+        "ccm-evidence",
+        "ccm-distance",
+    ];
+
+    fn version(text: &str) -> ToolkitVersion {
+        ToolkitVersion::parse(text).unwrap()
+    }
+
     #[test]
     fn every_managed_family_has_an_explicit_policy() {
-        for family in [
-            "quadrature",
-            "ccm-components",
-            "ccm-matrices",
-            "weil-states",
-            "prolate",
-            "ccm-roots",
-            "ccm-evidence",
-            "ccm-distance",
-        ] {
+        for family in MANAGED_FAMILIES {
             assert_eq!(
                 artifact_family_compatibility_policy(family).unwrap().family,
                 family
             );
         }
         assert!(artifact_family_compatibility_policy("unregistered").is_err());
+        assert!(artifact_compatibility_policy("ccm-evidence", "unregistered_kind").is_err());
     }
 
-    /// The `ccm-distance` family is new in 0.14.0, so its producer floor
-    /// starts there: a 0.13.x toolkit never produced these kinds, and an
-    /// artifact claiming otherwise is not admissible. Its reader floor stays
-    /// at 0.13.0 so the family carries no reader restriction of its own.
+    /// Toolkit 0.16.0 started the artifact repositories from a clean slate:
+    /// every registered kind rejects earlier producers and earlier reader
+    /// floors, and accepts its own release.
     #[test]
-    fn ccm_distance_family_floors_start_at_its_introducing_release() {
-        let policy = artifact_family_compatibility_policy("ccm-distance").unwrap();
-        assert_eq!(
-            policy.minimum_producer_version,
-            ToolkitVersion::parse("0.14.0").unwrap()
-        );
-        assert_eq!(
-            policy.minimum_reader_version,
-            ToolkitVersion::parse("0.13.0").unwrap()
-        );
-        for kind in [
-            "ccm_discretization_distance",
-            "ccm_eigenfunction_profile",
-            "ccm_target_distance",
-        ] {
-            let kind_policy = artifact_compatibility_policy("ccm-distance", kind).unwrap();
-            assert_eq!(
-                kind_policy.minimum_producer_version,
-                ToolkitVersion::parse("0.14.0").unwrap()
-            );
-            assert!(kind_policy
-                .validate_manifest_versions(
-                    1,
-                    &ToolkitVersion::parse("0.13.5").unwrap(),
-                    &ToolkitVersion::parse("0.13.0").unwrap(),
-                    None,
-                )
-                .is_err());
+    fn every_registered_kind_rejects_artifacts_before_the_clean_slate() {
+        let floor = version(CLEAN_SLATE);
+        assert!(floor <= current_toolkit_version().unwrap());
+        for family in MANAGED_FAMILIES {
+            let kinds = crate::artifact_kinds_for_family(family).unwrap();
+            assert!(!kinds.is_empty(), "{family}");
+            for kind in kinds {
+                let policy = artifact_compatibility_policy(family, kind).unwrap();
+                assert_eq!(policy.minimum_producer_version, floor, "{family}/{kind}");
+                assert_eq!(policy.minimum_reader_version, floor, "{family}/{kind}");
+                assert!(policy
+                    .validate_manifest_versions(1, &floor, &floor, None)
+                    .is_ok());
+                let earlier_producer = policy
+                    .validate_manifest_versions(1, &version("0.15.2"), &floor, None)
+                    .unwrap_err();
+                assert!(earlier_producer.to_string().contains("precedes"));
+                assert!(policy
+                    .validate_manifest_versions(1, &floor, &version("0.15.2"), None)
+                    .is_err());
+            }
         }
-        let evidence =
-            artifact_compatibility_policy("ccm-distance", "ccm_distance_resolution_evidence")
-                .unwrap();
-        assert_eq!(
-            evidence.minimum_producer_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
-        );
-        assert_eq!(
-            evidence.minimum_reader_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
-        );
-        assert!(evidence
-            .validate_manifest_versions(
-                1,
-                &ToolkitVersion::parse("0.14.0").unwrap(),
-                &ToolkitVersion::parse("0.14.1").unwrap(),
-                None,
-            )
-            .is_err());
-        let residual =
-            artifact_compatibility_policy("ccm-distance", "ccm_target_residual_analysis").unwrap();
-        assert_eq!(
-            residual.minimum_producer_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
-        );
-        assert_eq!(
-            residual.minimum_reader_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
-        );
-        let root_conditioning =
-            artifact_compatibility_policy("ccm-evidence", "ccm_root_conditioning_analysis")
-                .unwrap();
-        assert_eq!(
-            root_conditioning.minimum_producer_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
-        );
-        assert_eq!(
-            root_conditioning.minimum_reader_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
-        );
-        let prime_response =
-            artifact_compatibility_policy("ccm-evidence", "ccm_prime_power_response_analysis")
-                .unwrap();
-        assert_eq!(
-            prime_response.minimum_producer_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
-        );
-        assert_eq!(
-            prime_response.minimum_reader_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
-        );
-        let u_flow_response =
-            artifact_compatibility_policy("ccm-evidence", "ccm_u_flow_response_analysis").unwrap();
-        assert_eq!(
-            u_flow_response.minimum_producer_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
-        );
-        assert_eq!(
-            u_flow_response.minimum_reader_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
-        );
-        let sector_gap_certificate =
-            artifact_compatibility_policy("ccm-evidence", "ccm_sector_gap_certificate").unwrap();
-        assert_eq!(
-            sector_gap_certificate.minimum_producer_version,
-            ToolkitVersion::parse("0.15.0").unwrap()
-        );
-        assert_eq!(
-            sector_gap_certificate.minimum_reader_version,
-            ToolkitVersion::parse("0.15.0").unwrap()
-        );
-    }
-
-    #[test]
-    fn producer_below_family_floor_is_rejected_for_recomputation() {
-        let policy = artifact_family_compatibility_policy("ccm-matrices").unwrap();
-        let error = policy
-            .validate_manifest_versions(
-                1,
-                &ToolkitVersion::parse("0.12.99").unwrap(),
-                &ToolkitVersion::parse("0.13.0").unwrap(),
-                None,
-            )
-            .unwrap_err();
-        assert!(error.to_string().contains("precedes"));
-    }
-
-    #[test]
-    fn current_ccm_artifact_floors_match_the_release() {
-        let discovery =
-            artifact_compatibility_policy("ccm-roots", "ccm_root_discovery_window").unwrap();
-        let refinement = artifact_compatibility_policy("ccm-roots", "ccm_root_refinement").unwrap();
-        let tau = artifact_compatibility_policy("ccm-matrices", "ccm_tau_matrix").unwrap();
-        let tridiagonal =
-            artifact_compatibility_policy("ccm-matrices", "ccm_sector_tridiagonal").unwrap();
-        let transform =
-            artifact_compatibility_policy("ccm-matrices", "ccm_sector_transform").unwrap();
-        let sector_eigenvalues =
-            artifact_compatibility_policy("weil-states", "ccm_sector_eigenvalues").unwrap();
-        let eigenpair = artifact_compatibility_policy("weil-states", "ccm_weil_eigenpair").unwrap();
-        assert_eq!(
-            discovery.minimum_producer_version,
-            ToolkitVersion::parse("0.13.0").unwrap()
-        );
-        assert_eq!(
-            refinement.minimum_producer_version,
-            ToolkitVersion::parse("0.13.0").unwrap()
-        );
-        assert_eq!(
-            eigenpair.minimum_producer_version,
-            ToolkitVersion::parse("0.13.0").unwrap()
-        );
-        assert_eq!(
-            tau.minimum_producer_version,
-            ToolkitVersion::parse("0.13.0").unwrap()
-        );
-        assert_eq!(
-            tridiagonal.minimum_producer_version,
-            ToolkitVersion::parse("0.13.0").unwrap()
-        );
-        assert_eq!(
-            transform.minimum_producer_version,
-            ToolkitVersion::parse("0.13.0").unwrap()
-        );
-        assert_eq!(
-            sector_eigenvalues.minimum_producer_version,
-            ToolkitVersion::parse("0.13.0").unwrap()
-        );
     }
 }

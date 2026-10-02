@@ -100,7 +100,13 @@ pub fn prepare_arithmetic_inputs(
             coordinate: dec(&arithmetic::round(&arithmetic::lattice(k, n), p)?),
             weight: dec(&mass),
             family: "lattice".into(),
-            partition: "all_modes_including_origin;ordinal=mode+1".into(),
+            // Inverse moments divide by z, so the origin mode (z = 0) is its own
+            // partition and the remaining modes keep finite inverse moments.
+            partition: if k == 0 {
+                "origin;ordinal=mode+1".into()
+            } else {
+                "nonzero_modes;ordinal=mode+1".into()
+            },
         });
     }
     input.atom_coordinate = Some("z=(t/(2*pi*N/log(C)))^2; lattice z=(mode/N)^2".into());
@@ -127,7 +133,7 @@ pub fn prepare_arithmetic_inputs(
         .tail_correction = tail.iter().map(dec).collect();
     input.validate()?;
     if let Err(e) = store.save("arithmetic-inputs", &input) {
-        eprintln!("arithmetic preparation checkpoint unavailable: {e}");
+        xc_core::progress_message!("arithmetic preparation checkpoint unavailable: {e}");
     }
     Ok(input)
 }
@@ -401,8 +407,8 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "schema_version":1,"key":ArtifactKey::new(kind,"preparation-test",bytes).unwrap(),
             "content_digest":digest,"size_bytes":bytes.len(),"objects":[{"content_digest":digest,"size_bytes":bytes.len()}],
-            "created_unix_seconds":1,"producer_toolkit_version":ToolkitVersion::parse("0.15.1").unwrap(),
-            "minimum_reader_version":ToolkitVersion::parse("0.15.1").unwrap(),"maximum_reader_version":null,
+            "created_unix_seconds":1,"producer_toolkit_version":ToolkitVersion::parse("0.16.0").unwrap(),
+            "minimum_reader_version":ToolkitVersion::parse("0.16.0").unwrap(),"maximum_reader_version":null,
             "quality":"validated","visibility":"private","immutable":true,"dependencies":[],"tags":{},"provenance_digest":null
         })).unwrap()
     }
@@ -462,14 +468,25 @@ mod tests {
         let mut o = ExtensionOptions::for_source(&s);
         o.working_precision_bits = i.precision_bits + 64;
         let result = weighted_tail_base(&s, &o, Some(&i)).unwrap();
+        // The origin mode is its own partition: its mass is reported without
+        // an inverse moment, and the nonzero modes keep finite inverse moments.
         let origin = result
             .rows
             .iter()
-            .find(|r| r.label.starts_with("lattice/"))
+            .find(|r| r.label.starts_with("lattice/origin"))
             .unwrap();
+        assert!(origin.values.contains_key("included_mass"));
         assert!(!origin.values.contains_key("weighted_inverse_moment_1"));
-        assert_eq!(origin.outcome, "unresolved_denominator");
+        assert_eq!(origin.outcome, "point_measurement");
         assert!(origin.notes.iter().any(|s| s.contains("origin")));
+        let nonzero = result
+            .rows
+            .iter()
+            .filter(|r| r.label.starts_with("lattice/nonzero_modes"))
+            .collect::<Vec<_>>();
+        assert!(!nonzero.is_empty());
+        assert!(nonzero.iter().all(|r| r.outcome == "point_measurement"
+            && r.values.contains_key("weighted_inverse_moment_1")));
     }
 
     /// Opt-in local source replay; never runs in normal qualification or downloads data.

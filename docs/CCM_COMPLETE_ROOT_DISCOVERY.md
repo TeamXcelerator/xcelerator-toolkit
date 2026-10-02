@@ -68,8 +68,7 @@ family. Existing pole-span and fixed-guard root artifacts remain preserved.
 Compatible matrices, eigenstates and secular sources remain reusable;
 root-dependent diagnostics bind to the new root parent.
 
-Applications must select the complete policy explicitly. Paper 2's ordinary
-independent spectral scripts select it and build with Arb automatically.
+Applications must select the complete policy explicitly.
 A prior incomplete run is retained as historical evidence; a new invocation
 can reuse its source and add the newly acquired root window and diagnostics.
 Do not clear a cache to extend a discovery window.

@@ -3,44 +3,29 @@ target/
 *.exe
 *.pdb
 
-# IDE
+# Editors and operating systems
 .vscode/
 .idea/
-.kiro/
-/.agents/
-/.github/
-/scripts/
-
-# OS
+*.swp
+*~
 .DS_Store
 Thumbs.db
 
-# Local WSL validation environment (large, machine-specific).
-.wsl-bootstrap/
-.wsl-dist/
-
-# Per-working-directory datasets and regeneratable disk caches.
+# Local datasets and caches written by toolkit runs
 /data/
 **/data/*_cache/
+.xcelerator-cache/
 
-# Local cache-output validation artifacts and comparison reports.
+# Local cache-output validation artifacts and comparison reports
 cache-validation/
 xcelerator-validation/
 .xcelerator-cache-validation/
 .xcelerator-validation/
 
-# Local process performance reports.
+# Local performance reports
 performance-reports/
 *.performance.json
-
-# Editor swap
-*.swp
-*~
 
 # Python tooling
 __pycache__/
 *.py[cod]
-
-# Generated deep replay evidence is retained in portable hashed archives.
-
-# September 28 generated evidence is retained in its verified portable archive.

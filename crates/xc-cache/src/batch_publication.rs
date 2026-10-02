@@ -129,7 +129,7 @@ impl RemotePublicationEvidence {
                         .cloned()
                         .unwrap_or_default(),
                     achieved_assurance: ArtifactAssuranceState::Computed,
-                    producer_toolkit_version: ToolkitVersion::parse("0.13.0")
+                    producer_toolkit_version: crate::current_toolkit_version()
                         .expect("current toolkit version is valid"),
                     provenance_evidence_digests: Vec::new(),
                 })
@@ -290,7 +290,7 @@ mod tests {
             transport_digest: ContentDigest::sha256(b"transport"),
             manifest_path: "manifests/aa/manifest.json".to_owned(),
             achieved_assurance: ArtifactAssuranceState::Computed,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             provenance_evidence_digests: Vec::new(),
         };
         let first = RepositoryPublicationBatch::new(
@@ -329,7 +329,7 @@ mod tests {
             transport_digest: ContentDigest::sha256(b"transport"),
             manifest_path: "manifests/aa/manifest.json".to_owned(),
             achieved_assurance: ArtifactAssuranceState::Computed,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             provenance_evidence_digests: Vec::new(),
         };
         let batch = RepositoryPublicationBatch::new(
@@ -365,7 +365,7 @@ mod tests {
             transport_digest: ContentDigest::sha256(b"transport"),
             manifest_path: "manifests/aa/manifest.json".to_owned(),
             achieved_assurance: ArtifactAssuranceState::Computed,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             provenance_evidence_digests: Vec::new(),
         };
         for generation in [None, Some(0)] {
@@ -393,7 +393,7 @@ mod tests {
             transport_digest: ContentDigest::sha256(b"transport"),
             manifest_path: "manifests/aa/manifest.json".to_owned(),
             achieved_assurance: ArtifactAssuranceState::Computed,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             provenance_evidence_digests: Vec::new(),
         };
         let current = RepositoryPublicationBatch::new(

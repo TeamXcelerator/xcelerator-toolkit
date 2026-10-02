@@ -46,11 +46,15 @@ pub fn hp_debug_enabled() -> bool {
     HP_DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Lets exported macros reach `xc-core` without a caller dependency on it.
+#[doc(hidden)]
+pub use xc_core as __xc_core;
+
 #[macro_export]
 macro_rules! hp_debug {
     ($($arg:tt)*) => {
         if $crate::hp_debug_enabled() {
-            eprintln!($($arg)*);
+            $crate::__xc_core::progress_message!($($arg)*);
         }
     };
 }

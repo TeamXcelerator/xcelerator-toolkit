@@ -197,7 +197,7 @@ where
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.1")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([("assurance".into(), "computed_not_certified".into())]),
         provenance_digest: None,
@@ -1712,8 +1712,8 @@ mod exhaustive_resumed_validation_contract {
                 size_bytes: bytes.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.14.3").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -1934,7 +1934,7 @@ mod exhaustive_runtime_matrix {
     fn manifest() -> ArtifactManifest {
         let bytes = b"admitted runtime matrix boundary";
         let digest = ContentDigest::sha256(bytes);
-        serde_json::from_value(json!({"schema_version":1,"key":ArtifactKey::new("ccm_tau_matrix","runtime-boundary",bytes).unwrap(),"content_digest":digest,"size_bytes":bytes.len(),"objects":[{"content_digest":digest,"size_bytes":bytes.len()}],"created_unix_seconds":1,"producer_toolkit_version":ToolkitVersion::parse("0.15.2").unwrap(),"minimum_reader_version":ToolkitVersion::parse("0.15.2").unwrap(),"maximum_reader_version":null,"quality":"validated","visibility":"private","immutable":true,"dependencies":[],"tags":{},"provenance_digest":null})).unwrap()
+        serde_json::from_value(json!({"schema_version":1,"key":ArtifactKey::new("ccm_tau_matrix","runtime-boundary",bytes).unwrap(),"content_digest":digest,"size_bytes":bytes.len(),"objects":[{"content_digest":digest,"size_bytes":bytes.len()}],"created_unix_seconds":1,"producer_toolkit_version":ToolkitVersion::parse("0.16.0").unwrap(),"minimum_reader_version":ToolkitVersion::parse("0.16.0").unwrap(),"maximum_reader_version":null,"quality":"validated","visibility":"private","immutable":true,"dependencies":[],"tags":{},"provenance_digest":null})).unwrap()
     }
     #[test]
     fn exhaustive_runtime_matrix_shape_overflow_returns_error() {

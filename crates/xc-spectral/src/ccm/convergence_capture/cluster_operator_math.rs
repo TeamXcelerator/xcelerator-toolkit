@@ -409,7 +409,7 @@ fn calculate(
                     permutation: f.permutation.clone(),
                 },
             ) {
-                eprintln!("cluster factor checkpoint unavailable: {error}");
+                xc_core::progress_message!("cluster factor checkpoint unavailable: {error}");
             }
         }
         f
@@ -436,7 +436,7 @@ fn calculate(
                     values: encode(&y),
                 },
             ) {
-                eprintln!("cluster solve checkpoint unavailable: {error}");
+                xc_core::progress_message!("cluster solve checkpoint unavailable: {error}");
             }
             y
         };

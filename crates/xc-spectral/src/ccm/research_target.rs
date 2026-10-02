@@ -121,7 +121,7 @@ pub(super) fn prepare(
     });
     input.validate()?;
     if let Err(e) = store.save("reference", &(&reference, &input)) {
-        eprintln!("target research checkpoint unavailable: {e}");
+        xc_core::progress_message!("target research checkpoint unavailable: {e}");
     }
     Ok((reference, input))
 }
@@ -152,8 +152,8 @@ mod tests {
             "schema_version":1,"key":xc_cache::ArtifactKey::new("ccm_weil_eigenpair","test",b"test").unwrap(),
             "content_digest":digest,"size_bytes":12,
             "objects":[{"content_digest":digest,"size_bytes":12}],"created_unix_seconds":1,
-            "producer_toolkit_version":xc_cache::ToolkitVersion::parse("0.15.1").unwrap(),
-            "minimum_reader_version":xc_cache::ToolkitVersion::parse("0.15.1").unwrap(),
+            "producer_toolkit_version":xc_cache::ToolkitVersion::parse("0.16.0").unwrap(),
+            "minimum_reader_version":xc_cache::ToolkitVersion::parse("0.16.0").unwrap(),
             "maximum_reader_version":null,"quality":"validated","visibility":"private",
             "immutable":true,"dependencies":[],"tags":{},"provenance_digest":null
         })).unwrap();

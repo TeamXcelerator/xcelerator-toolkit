@@ -579,8 +579,7 @@ mod tests {
     #[test]
     fn append_only_checkpoint_store_loads_latest_verified_snapshot() {
         let root = temporary_root("publication-journal");
-        let _ = fs::remove_dir_all(&root);
-        let store = PublicationJournalStore::new(&root);
+        let store = PublicationJournalStore::new(root.path());
         let mut journal = journal();
         assert_eq!(store.load_if_exists(&journal.transaction_id).unwrap(), None);
         store.save(&journal).unwrap();
@@ -748,8 +747,7 @@ mod tests {
         let remote = FakeRemote::new();
         let mut journal = journal();
         let root = temporary_root("publication-executor");
-        let _ = fs::remove_dir_all(&root);
-        let checkpoints = PublicationJournalStore::new(&root);
+        let checkpoints = PublicationJournalStore::new(root.path());
         let staging = root.join("staging");
         let resources = ResourcePolicy::default();
         let first = execute_next_payload_batch(
@@ -845,8 +843,7 @@ mod tests {
         let remote = FakeRemote::new();
         let mut journal = journal();
         let root = temporary_root("publication-executor-cancel");
-        let _ = fs::remove_dir_all(&root);
-        let checkpoints = PublicationJournalStore::new(&root);
+        let checkpoints = PublicationJournalStore::new(root.path());
         let staging = root.join("staging");
         let resources = ResourcePolicy::default();
         let cancellation = CancellationToken::new();
@@ -872,8 +869,7 @@ mod tests {
         let remote = FakeRemote::new();
         let mut journal = journal();
         let root = temporary_root("publication-executor-deadline");
-        let _ = fs::remove_dir_all(&root);
-        let checkpoints = PublicationJournalStore::new(&root);
+        let checkpoints = PublicationJournalStore::new(root.path());
         let staging = root.join("staging");
         let resources = ResourcePolicy {
             maximum_wall_seconds: Some(0),
@@ -907,8 +903,7 @@ mod tests {
         let remote = FakeRemote::new();
         let mut journal = journal();
         let root = temporary_root("publication-executor-permission");
-        let _ = fs::remove_dir_all(&root);
-        let checkpoints = PublicationJournalStore::new(&root);
+        let checkpoints = PublicationJournalStore::new(root.path());
         let staging = root.join("staging");
         let resources = ResourcePolicy::default();
         let read_only = AuthenticatedGitHubSession::verified_for_test(
@@ -947,7 +942,7 @@ mod tests {
         target.batches[0].plan.payload_bytes += alias.size_bytes;
         target.batches[0].plan.parts.push(alias);
         let root = temporary_root("audit-publisher-blob-alias");
-        let checkpoints = PublicationJournalStore::new(&root);
+        let checkpoints = PublicationJournalStore::new(root.path());
         let result = execute_next_payload_batch(
             &remote,
             &checkpoints,
@@ -971,7 +966,7 @@ mod tests {
     #[test]
     fn audit_concurrent_journal_saves_have_distinct_sequences() {
         let root = temporary_root("audit-journal-concurrent");
-        let store = PublicationJournalStore::new(&root);
+        let store = PublicationJournalStore::new(root.path());
         let journal = journal();
         store.save(&journal).unwrap();
         let barrier = std::sync::Barrier::new(16);

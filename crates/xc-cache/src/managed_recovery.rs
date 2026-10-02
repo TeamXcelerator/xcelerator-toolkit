@@ -74,7 +74,7 @@ impl ManagedArtifactCacheSession {
                 "publication recovery requires staging and a reuse-capable cache mode".to_owned(),
             )
         })?;
-        eprintln!(
+        xc_core::progress_message!(
             "publication recovery: verifying retained encoded object for {}",
             artifact.key.kind
         );
@@ -83,7 +83,7 @@ impl ManagedArtifactCacheSession {
         )?.ok_or_else(|| CacheError::NotFound(
             "exact recovery artifact has no supported verified encoded representation; no computation attempted".to_owned()))?;
         manifest_semantic_key(&resolved.manifest)?;
-        eprintln!(
+        xc_core::progress_message!(
             "publication recovery: verified {} encoded bytes; staging exact dependencies",
             resolved.encoded.size_bytes
         );
@@ -102,7 +102,7 @@ impl ManagedArtifactCacheSession {
             &resolved.manifest,
             &mut visiting,
         )?;
-        eprintln!(
+        xc_core::progress_message!(
             "publication recovery: staging retained payload and verifying its logical digest"
         );
         record_encoded_dependency(sink, "cache.publication.recover", resolved)?;
@@ -120,20 +120,8 @@ mod tests {
     use crate::{CacheStore, DependencyRef, ZipJsonFilesystemCacheStore};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn temp() -> PathBuf {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let unique = NEXT.fetch_add(1, Ordering::SeqCst);
-        let p = std::env::temp_dir().join(format!(
-            "xc-recovery-{}-{}-{}",
-            unique,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&p).unwrap();
-        p
+    fn temp() -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new("recovery")
     }
     fn config(root: &Path) -> ManagedArtifactCacheConfig {
         ManagedArtifactCacheConfig {
@@ -184,7 +172,7 @@ mod tests {
                 schema_version: 1,
                 key: artifact_key(kind, &key),
                 producer_toolkit_version: crate::current_toolkit_version().unwrap(),
-                minimum_reader_version: ToolkitVersion::parse("0.15.0").unwrap(),
+                minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
                 maximum_reader_version: None,
                 quality: CacheQuality::Validated,
                 visibility: CacheVisibility::Local,
@@ -233,7 +221,7 @@ mod tests {
             write_visibility: CacheVisibility::Local,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: crate::current_toolkit_version().unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.15.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             tags: BTreeMap::new(),
             provenance_digest: None,

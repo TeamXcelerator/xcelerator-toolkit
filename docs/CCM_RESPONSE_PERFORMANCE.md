@@ -54,7 +54,7 @@ Regressions compare complete response JSON with the frozen prior scalar
 implementation, check root responses at 128 through 6708 bits and across worker
 counts, exercise the denominator-budget fallback, and reject changed payloads,
 wrong sources, poles and zero derivatives. Existing cold/reuse/refresh and repair
-regressions remain part of qualification.
+regressions remain in the test suite.
 
 The explicitly invoked `response_root_kernel_benchmark` checks the root-response
 kernel at dimension 801, 400 roots and 6708 bits, including preparation time.
@@ -65,25 +65,9 @@ end-to-end claim runtime forecast. Use release builds with the same source,
 precision, worker count and cache policy when comparing runs; see
 [performance reporting](PERFORMANCE_REPORTING.md).
 
-Three sequential release-build samples on the qualification workstation gave
-these medians (four workers; seconds):
-
-| Measurement | Prior scalar path | Updated path |
-|---|---:|---:|
-| Root kernel: 801 components, 400 roots, 6708 bits, three tangents | 6.818 | 0.894 |
-| Same root kernel including fixed-geometry preparation | 6.818 | 1.374 |
-| Complete synthetic response: 49 components, 24 root points, 193 events, 1024 bits | 0.454 | 0.149 |
-| Fresh exact-payload seal, record and verify combined | n/a | 0.00933 |
-| Updated full numerical replay of that response | n/a | 0.137 |
-
-The root kernel speedup is about 7.6x excluding preparation, or 5.0x including
-preparation over these three tangents. The complete synthetic computation is
-about 3.1x faster. Fresh sealing is about 14.7x cheaper than the updated full
-replay on that fixture. The fixtures are deterministic software controls; their
-root points are not claimed to be physical CCM roots. Payloads match the prior
-implementation byte for byte. Raw samples and output hashes are in the
-[validation record](validation/v0.15.0.json). These measurements do not predict
-an entire claim's runtime or scaling to hundreds of workers.
+The fixtures are deterministic software controls; their root points are not
+claimed to be physical CCM roots. Payloads match the prior implementation byte
+for byte.
 
 Complete positive-root discovery currently performs its numerator isolation
 before looking up the refined root window. This change does not eliminate that

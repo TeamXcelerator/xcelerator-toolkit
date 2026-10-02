@@ -960,7 +960,7 @@ impl<'a> RemoteSessionCleanup<'a> {
             (Ok(_), Err(error)) => Err(error),
             (Err(error), Ok(())) => Err(error),
             (Err(error), Err(cleanup_error)) => {
-                eprintln!(
+                xc_core::progress_message!(
                     "family publication failed and its Git transport cleanup also failed: \
                      {cleanup_error}"
                 );
@@ -974,7 +974,7 @@ impl Drop for RemoteSessionCleanup<'_> {
     fn drop(&mut self) {
         if !self.finished {
             if let Err(error) = self.remote.cleanup_session(self.repository) {
-                eprintln!(
+                xc_core::progress_message!(
                     "family publication Git transport cleanup failed for {}: {error}",
                     self.repository
                 );
@@ -1088,7 +1088,7 @@ fn execute_family_batch_publication(
             &cancellation,
         )?;
         if selection.already_present > 0 {
-            eprintln!(
+            xc_core::progress_message!(
                 "publication destination {} family {}: {} already present, {} pending",
                 visibility_name(destination),
                 first.family,
@@ -1170,7 +1170,7 @@ fn execute_family_batch_publication(
     )?;
     let prepared_files = prepared_candidate_files(&prepared_candidates);
     remote.prepare_staged_parts(&repository_url, &prepared_files)?;
-    eprintln!(
+    xc_core::progress_message!(
         "publication family {}: prepared {} candidate(s) and {} immutable file(s) before lock in {:.3}s",
         first.family,
         prepared_candidates.len(),
@@ -1220,7 +1220,7 @@ fn execute_family_batch_publication(
         // sidecars before planning the first repository batch; subsequent runs
         // simply reuse the verified sidecars.
         let locked_preparation_started = std::time::Instant::now();
-        eprintln!(
+        xc_core::progress_message!(
             "publication family {}: checking destination metadata",
             first.family
         );
@@ -1251,7 +1251,7 @@ fn execute_family_batch_publication(
                 &cancellation,
             )?;
             if selection.already_present > 0 {
-                eprintln!(
+                xc_core::progress_message!(
                     "publication destination {} family {}: {} became present before mutation, {} pending",
                     visibility_name(destination),
                     first.family,
@@ -1588,7 +1588,7 @@ fn execute_family_batch_publication(
             .saturating_sub(1024 * 1024);
         let batches = crate::plan_publication_batches(&ordered_parts, &batch_policy)?;
         let total_batches = batches.len();
-        eprintln!(
+        xc_core::progress_message!(
             "publication family {}: metadata ready in {:.3}s; {} batch(es), {} staged bytes",
             first.family,
             locked_preparation_started.elapsed().as_secs_f64(),
@@ -1605,7 +1605,7 @@ fn execute_family_batch_publication(
             let batch_started = std::time::Instant::now();
             let batch_number = batch_plan.sequence + 1;
             let mut reused_bytes = 0u64;
-            eprintln!(
+            xc_core::progress_message!(
                 "publication family {}: batch {}/{} checking {} file(s)",
                 first.family,
                 batch_number,
@@ -1635,7 +1635,7 @@ fn execute_family_batch_publication(
                 }
                 commit_parts.push(part);
             }
-            eprintln!(
+            xc_core::progress_message!(
                 "publication family {}: batch {}/{} checked in {:.3}s; {} existing bytes reused, {} new or updated bytes",
                 first.family,
                 batch_number,
@@ -1709,7 +1709,7 @@ fn execute_family_batch_publication(
                 }
             }
             remote.publication_event("batch_committed",batch_started.elapsed(),serde_json::json!({"batch":batch_number,"remaining_batches":total_batches-batch_number as usize}));
-            eprintln!(
+            xc_core::progress_message!(
                 "publication family {}: batch {}/{} committed in {:.3}s",
                 first.family,
                 batch_number,
@@ -1733,7 +1733,7 @@ fn execute_family_batch_publication(
         (Ok(_), Some(Err(error))) => Err(error),
         (Err(error), None | Some(Ok(()))) => Err(error),
         (Err(error), Some(Err(release_error))) => {
-            eprintln!(
+            xc_core::progress_message!(
                 "private publication failed and its lease release also failed: {release_error}"
             );
             Err(error)
@@ -1898,7 +1898,10 @@ fn ensure_managed_shard_sidecars(
             repository: repository.to_owned(),
             branch: branch.to_owned(),
             expected_head: head.clone(),
-            message: "initialize Xcelerator v0.13.0 shard capacity ledger".to_owned(),
+            message: format!(
+                "initialize Xcelerator shard capacity ledger (Toolkit {})",
+                env!("CARGO_PKG_VERSION")
+            ),
             parts,
             delete_paths: Vec::new(),
         };
@@ -3324,7 +3327,7 @@ fn execute_managed_family_drafts_on_github(
                         }
                         sessions.insert(destination, refreshed);
                     }
-                    eprintln!(
+                    xc_core::progress_message!(
                         "publication authorization refreshed for family {} after a long-running artifact step",
                         draft.family
                     );
@@ -3338,7 +3341,7 @@ fn execute_managed_family_drafts_on_github(
         }
     }
     if remotely_completed > 0 {
-        eprintln!(
+        xc_core::progress_message!(
             "publication family {}: reused {remotely_completed} completed remote transaction(s)",
             first_draft.family
         );
@@ -3423,7 +3426,7 @@ impl ManagedTransportWorkspace {
         if root.exists() {
             let stale_bytes = transport_tree_size_bytes(&root)?;
             fs::remove_dir_all(&root)?;
-            eprintln!(
+            xc_core::progress_message!(
                 "publication transport recovery: removed {stale_bytes} stale temporary bytes"
             );
         }
@@ -3442,7 +3445,9 @@ impl ManagedTransportWorkspace {
         self.finished = true;
         FileExt::unlock(&self.lock)?;
         if bytes > 0 {
-            eprintln!("publication transport cleanup: removed {bytes} temporary bytes");
+            xc_core::progress_message!(
+                "publication transport cleanup: removed {bytes} temporary bytes"
+            );
         }
         Ok(())
     }
@@ -3453,7 +3458,7 @@ impl Drop for ManagedTransportWorkspace {
         if !self.finished {
             if let Err(error) = fs::remove_dir_all(&self.root) {
                 if self.root.exists() {
-                    eprintln!(
+                    xc_core::progress_message!(
                         "publication transport emergency cleanup failed for {}: {error}",
                         self.root.display()
                     );
@@ -3511,7 +3516,7 @@ pub fn execute_managed_drafts_on_github(
         (Ok(_), Err(error)) => Err(error),
         (Err(error), Ok(())) => Err(error),
         (Err(error), Err(cleanup_error)) => {
-            eprintln!(
+            xc_core::progress_message!(
                 "publication failed and final Git transport cleanup also failed: {cleanup_error}"
             );
             Err(error)
@@ -3629,7 +3634,7 @@ fn execute_managed_drafts_on_github_inner(
             (Ok(_), Err(error)) => return Err(error),
             (Err(error), Ok(())) => return Err(error),
             (Err(error), Err(cleanup_error)) => {
-                eprintln!(
+                xc_core::progress_message!(
                     "dependency preflight failed and its Git transport cleanup also failed: {cleanup_error}"
                 );
                 return Err(error);
@@ -3721,7 +3726,7 @@ fn execute_managed_drafts_on_github_inner(
                 &targets,
                 required_dependencies,
             )?;
-            eprintln!(
+            xc_core::progress_message!(
                 "publication family {family}: evaluated {} staged candidate(s) in {:.3}s",
                 family_drafts.len(),
                 family_started.elapsed().as_secs_f64()
@@ -3737,7 +3742,7 @@ fn execute_managed_drafts_on_github_inner(
     let current_tree_paths_removed = reports.iter().fold(0usize, |total, report| {
         total.saturating_add(report.current_tree_paths_removed)
     });
-    eprintln!(
+    xc_core::progress_message!(
         "publication execution: evaluated {} destination candidate(s), created {} transaction(s) across {} destination shard groups in {:.3}s",
         drafts.len().saturating_mul(requested_destinations.len()),
         transactions.len(),
@@ -3802,11 +3807,8 @@ mod tests {
 
     #[test]
     fn managed_transport_workspace_removes_stale_and_completed_sessions() {
-        let root = std::env::temp_dir().join(format!(
-            "xcelerator-managed-transport-cleanup-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-transport-cleanu");
+        let root = scratch.join("root");
         let transport_root = root.join("git-transport");
         fs::create_dir_all(&transport_root).unwrap();
         fs::write(transport_root.join("stale.pack"), b"interrupted transport").unwrap();
@@ -3829,11 +3831,8 @@ mod tests {
 
     #[test]
     fn managed_transport_workspace_rejects_overlapping_local_publishers() {
-        let root = std::env::temp_dir().join(format!(
-            "xcelerator-managed-transport-lock-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-transport-lock");
+        let root = scratch.join("root");
 
         let first = ManagedTransportWorkspace::acquire(&root).unwrap();
         let error = match ManagedTransportWorkspace::acquire(&root) {
@@ -3885,11 +3884,8 @@ mod tests {
 
     #[test]
     fn family_candidate_preflight_uses_the_refreshed_active_session() {
-        let root = std::env::temp_dir().join(format!(
-            "xcelerator-managed-active-session-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-active-session");
+        let root = scratch.join("root");
         let source = root.join("source");
         let prepared = root.join("prepared");
         let draft = fixture_draft(&source);
@@ -4130,11 +4126,8 @@ mod tests {
 
     #[test]
     fn bootstrap_topology_routes_writes_to_successor_and_keeps_predecessor_readable() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-bootstrap-rollover-routing-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("bootstrap-rollover-routi");
+        let root = scratch.join("root");
         let remote = FilesystemMemoryRemote::new(root.clone());
         let registry_repository =
             "https://github.com/example-org/xcelerator-cache-private-registry.git";
@@ -4312,8 +4305,8 @@ mod tests {
             payload_digest,
             transport_digests: vec![encoding.digest().unwrap()],
             resolved_mathematical_configuration_digest: ContentDigest::sha256(b"config"),
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             requested_assurance: AssuranceLevel::Certified,
             claim_scope: "managed integration fixture".to_owned(),
@@ -4340,16 +4333,13 @@ mod tests {
 
     #[test]
     fn family_batch_leaves_active_replacement_last_for_shared_semantic_identity() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-managed-publication-order-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-publication-orde");
+        let root = scratch.join("root");
         let mut historical = fixture_draft(&root.join("historical"));
         historical.source_operation = "cache.dependency.closure".to_owned();
         let mut active = historical.clone();
         active.source_operation = "ccm.tau.resolve_or_compute".to_owned();
-        active.manifest.producer_toolkit_version = ToolkitVersion::parse("0.14.1").unwrap();
+        active.manifest.producer_toolkit_version = ToolkitVersion::parse("0.17.1").unwrap();
         active
             .manifest
             .canonical_payload
@@ -4368,18 +4358,15 @@ mod tests {
         assert_eq!(drafts[1].source_operation, "ccm.tau.resolve_or_compute");
         assert_eq!(
             drafts[1].manifest.producer_toolkit_version,
-            ToolkitVersion::parse("0.14.1").unwrap()
+            ToolkitVersion::parse("0.17.1").unwrap()
         );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn historical_closure_member_does_not_downgrade_live_index() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-managed-publication-live-index-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
+        let scratch = crate::test_support::TestDir::new("managed-publication-live");
+        let root = scratch.join("root");
         let mut historical = fixture_draft(&root);
         historical.source_operation = "cache.dependency.closure".to_owned();
         let manifest = historical.manifest.clone();
@@ -4389,8 +4376,8 @@ mod tests {
             manifest_digest: ContentDigest::sha256(b"live-manifest"),
             achieved_assurance: ArtifactAssuranceState::Certified,
             disposition: ArtifactDisposition::Active,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.4").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.4").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             transport_digests: vec![ContentDigest::sha256(b"live-transport")],
             publication_transaction_id: ContentDigest::sha256(b"live-batch").0,
         };
@@ -4428,14 +4415,13 @@ mod tests {
     #[test]
     fn destination_selection_accepts_historical_closure_beside_newer_live_entry() {
         let root = crate::test_support::temporary_root("managed-historical-beside-live");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let mut historical = fixture_draft(&staging);
         historical.source_operation = "cache.dependency.closure".to_owned();
         let mut live = historical.clone();
         live.source_operation = "ccm.tau.resolve_or_compute".to_owned();
-        live.manifest.producer_toolkit_version = ToolkitVersion::parse("0.13.4").unwrap();
+        live.manifest.producer_toolkit_version = ToolkitVersion::parse("0.16.4").unwrap();
         live.manifest
             .canonical_payload
             .dependencies
@@ -4518,8 +4504,6 @@ mod tests {
     #[test]
     fn destination_remapping_rewrites_the_complete_dependency_closure() {
         let root = crate::test_support::temporary_root("managed-destination-dependency-remap");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
 
         let mut leaf = fixture_draft_family(fixture_draft_with_n(&root, 2), "ccm-components");
         leaf.manifest
@@ -4598,8 +4582,6 @@ mod tests {
     #[test]
     fn destination_remapping_rejects_an_incomplete_dependency_closure() {
         let root = crate::test_support::temporary_root("managed-destination-incomplete-closure");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let dependency = fixture_draft_with_n(&root, 2);
         let root_draft = fixture_draft_with_dependency(fixture_draft_with_n(&root, 3), &dependency);
 
@@ -4614,8 +4596,6 @@ mod tests {
     #[test]
     fn destination_remapping_accepts_an_exact_indexed_destination_dependency() {
         let root = crate::test_support::temporary_root("managed-destination-external-dependency");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let dependency = fixture_draft_family(fixture_draft_with_n(&root, 2), "weil-states");
         let root_draft = fixture_draft_family(
             fixture_draft_with_dependency(fixture_draft_with_n(&root, 3), &dependency),
@@ -4649,8 +4629,6 @@ mod tests {
     #[test]
     fn destination_remapping_resolves_a_neutral_alias_to_its_staged_private_manifest() {
         let root = crate::test_support::temporary_root("managed-destination-neutral-alias");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let mut dependency = fixture_draft_family(fixture_draft_with_n(&root, 2), "weil-states");
         dependency
             .manifest
@@ -4702,7 +4680,6 @@ mod tests {
     #[test]
     fn exact_destination_dependency_requires_canonical_manifest_and_active_index() {
         let root = crate::test_support::temporary_root("managed-exact-destination-dependency");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let draft = fixture_draft_with_n(&staging, 2);
@@ -4778,7 +4755,6 @@ mod tests {
     #[test]
     fn exact_destination_dependency_accepts_superseded_manifest_with_batch_proof() {
         let root = crate::test_support::temporary_root("managed-historical-destination-dependency");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
 
@@ -4793,7 +4769,7 @@ mod tests {
         };
 
         let mut live = historical.clone();
-        live.manifest.producer_toolkit_version = ToolkitVersion::parse("0.13.4").unwrap();
+        live.manifest.producer_toolkit_version = ToolkitVersion::parse("0.16.4").unwrap();
         let live_manifest = target_manifest(&live, PublicationDestination::Private).unwrap();
         assert_eq!(live_manifest.semantic_digest, dependency.semantic_digest);
         assert_eq!(live_manifest.payload_digest, dependency.payload_digest);
@@ -5034,7 +5010,6 @@ mod tests {
     #[test]
     fn destination_selection_excludes_exact_active_index_entries() {
         let root = crate::test_support::temporary_root("managed-destination-filter");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let existing = fixture_draft_with_n(&staging, 2);
@@ -5072,8 +5047,6 @@ mod tests {
         closure_alias: bool,
     ) {
         let root = crate::test_support::temporary_root("managed-observed-parent");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let parent = fixture_draft_with_n(&root, 2);
         assert_ne!(parent.source_operation, "cache.dependency.closure");
         let child = fixture_draft_family(
@@ -5084,7 +5057,7 @@ mod tests {
         let mut existing_parent = fixture_draft_with_dependency(parent.clone(), &extra);
         if newer_live_parent {
             existing_parent.manifest.producer_toolkit_version =
-                ToolkitVersion::parse("0.13.4").unwrap();
+                ToolkitVersion::parse("0.16.4").unwrap();
         }
         let existing = remap_destination_drafts(&[extra, existing_parent], destination).unwrap();
         let mut drafts = vec![parent.clone(), child];
@@ -5111,7 +5084,7 @@ mod tests {
         let repository = "https://github.com/example-org/test-ccm-matrices-0001.git";
         let head = "before-publication";
         let tree = published_destination_tree(&existing.iter().collect::<Vec<_>>(), destination);
-        let remote = FilesystemMemoryRemote::new(root.clone());
+        let remote = FilesystemMemoryRemote::new(root.to_path_buf());
         remote.insert_repository(repository.to_owned(), head.to_owned(), tree.clone());
         let selection = select_missing_destination_drafts(
             &remote,
@@ -5202,8 +5175,6 @@ mod tests {
     #[test]
     fn destination_manifest_with_stronger_dependencies_dominates_a_stripped_wrapper() {
         let root = crate::test_support::temporary_root("managed-destination-dependency-dominance");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let draft = fixture_draft_with_n(&root, 2);
         let staged = target_manifest(&draft, PublicationDestination::Private).unwrap();
         let mut existing = staged.clone();
@@ -5225,7 +5196,6 @@ mod tests {
     #[test]
     fn destination_selection_republishes_an_unproven_index_entry() {
         let root = crate::test_support::temporary_root("managed-destination-unproven");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let draft = fixture_draft_with_n(&staging, 2);
@@ -5277,7 +5247,6 @@ mod tests {
     #[test]
     fn destination_selection_makes_an_all_existing_family_a_no_op() {
         let root = crate::test_support::temporary_root("managed-destination-noop");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let first = fixture_draft_with_n(&staging, 2);
@@ -5415,7 +5384,6 @@ mod tests {
     #[test]
     fn missing_live_sidecars_are_initialized_without_replacing_bootstrap_content() {
         let root = crate::test_support::temporary_root("managed-bootstrap");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let remote = FilesystemMemoryRemote::new(staging.clone());
@@ -5485,7 +5453,6 @@ mod tests {
     #[test]
     fn managed_adapter_completes_dual_target_resumable_publication() {
         let root = crate::test_support::temporary_root("managed-publication");
-        let _ = fs::remove_dir_all(&root);
         let staging = root.join("staging");
         fs::create_dir_all(&staging).unwrap();
         let draft = fixture_draft(&staging);
@@ -5705,8 +5672,6 @@ mod tests {
     #[ignore = "explicit read-only live GitHub acceptance preflight"]
     fn live_managed_routes_and_owner_permissions_are_read_only() {
         let root = crate::test_support::temporary_root("managed-live-preflight");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let probe = crate::GitHubCredentialApiProbe::default();
         let cancellation = CancellationToken::new();
         let mut principals = BTreeSet::new();

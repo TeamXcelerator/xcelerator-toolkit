@@ -121,7 +121,7 @@ impl Drop for GitCliRemoteStore {
     fn drop(&mut self) {
         if self.read_session_parent.is_some() {
             if let Err(error) = self.cleanup_read_session() {
-                eprintln!("Git read-session cleanup failed: {error}");
+                xc_core::progress_message!("Git read-session cleanup failed: {error}");
             }
         }
     }
@@ -278,7 +278,7 @@ impl GitCliRemoteStore {
 
     pub(crate) fn enable_publication_metrics(&self, directory: &Path) {
         if self.metrics.enable(directory).is_err() {
-            eprintln!("publication telemetry could not be initialized");
+            xc_core::progress_message!("publication telemetry could not be initialized");
         }
     }
     pub(crate) fn publication_event(
@@ -2434,7 +2434,7 @@ impl GitCommandHeartbeat {
                 Err(mpsc::RecvTimeoutError::Timeout)
             ) {
                 let phase = phase.lock().unwrap_or_else(|error| error.into_inner());
-                eprintln!(
+                xc_core::progress_message!(
                     "publication Git {operation}: running {:.1}s; {}",
                     started.elapsed().as_secs_f64(),
                     phase
@@ -2471,7 +2471,7 @@ fn run_observed_git_command(
     let phase = Arc::new(Mutex::new("waiting for Git progress".to_owned()));
     let heartbeat = GitCommandHeartbeat::start(operation, Arc::clone(&phase), started);
     if operation == "push" {
-        eprintln!(
+        xc_core::progress_message!(
             "publication Git push: started (compressed-artifact packing; delta search disabled)"
         );
     }
@@ -2517,7 +2517,7 @@ fn run_observed_git_command(
     let mut output = output?;
     output.stderr = stderr?;
     if operation == "push" || started.elapsed() >= Duration::from_secs(30) {
-        eprintln!(
+        xc_core::progress_message!(
             "publication Git {operation}: finished in {:.3}s; success={}",
             started.elapsed().as_secs_f64(),
             output.status.success()
@@ -2974,8 +2974,6 @@ mod tests {
             return;
         }
         let root = temporary_root("git-batch-check-pipes");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         assert!(test_git(None, &["init", "--bare", root.to_str().unwrap()]));
         let written = run_git_with_input(
             OsStr::new("git"),
@@ -3024,7 +3022,6 @@ mod tests {
     #[test]
     fn multiple_staging_roots_select_the_identity_matching_file() {
         let root = temporary_root("git-cli-multiple-staging-roots");
-        let _ = fs::remove_dir_all(&root);
         let first = root.join("first");
         let second = root.join("second");
         let relative = Path::new("indexes/family/partition.json");
@@ -3060,7 +3057,6 @@ mod tests {
             return;
         }
         let root = temporary_root("git-cli-transport");
-        let _ = fs::remove_dir_all(&root);
         let remote = root.join("remote.git");
         let seed = root.join("seed");
         let temporary = root.join("transport");
@@ -3181,7 +3177,6 @@ mod tests {
             return;
         }
         let root = temporary_root("git-cli-no-historical-hydration");
-        let _ = fs::remove_dir_all(&root);
         let remote = root.join("remote.git");
         let seed = root.join("seed");
         let temporary = root.join("transport");
@@ -3310,7 +3305,6 @@ mod tests {
             return;
         }
         let root = temporary_root("git-cli-batched-prefetch");
-        let _ = fs::remove_dir_all(&root);
         let remote = root.join("remote.git");
         let seed = root.join("seed");
         let temporary = root.join("transport");
@@ -3459,7 +3453,6 @@ mod tests {
     #[test]
     fn disk_reservations_are_shared_by_overlapping_operations_and_released_on_unwind() {
         let root = temporary_root("git-cli-disk-reservation");
-        let _ = fs::remove_dir_all(&root);
         let transport = root.join("transport");
         let store = GitCliRemoteStore::new(
             &transport,
@@ -3538,8 +3531,6 @@ mod tests {
             return;
         }
         let root = temporary_root("git-cli-exact-digest-reservation");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let payload = b"small capacity ledger";
         let (repository, revision, path) = seeded_remote(&root, "digest-size", payload);
         let transport = root.join("transport");
@@ -3597,8 +3588,6 @@ mod tests {
             return;
         }
         let root = temporary_root("git-cli-concurrent-prefetch-budget");
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let (repository_a, revision_a, part_a) = seeded_remote(&root, "alpha", b"alpha payload");
         let (repository_b, revision_b, part_b) = seeded_remote(&root, "beta", b"beta payload");
         let prefetch_a = vec![crate::RemotePathPrefetch {
@@ -3734,7 +3723,6 @@ mod tests {
             return;
         }
         let root = temporary_root("git-cli-prepared-blobs");
-        let _ = fs::remove_dir_all(&root);
         let remote = root.join("remote.git");
         let seed = root.join("seed");
         let temporary = root.join("transport");
@@ -3908,7 +3896,6 @@ mod tests {
             return;
         }
         let root = temporary_root("git-cli-atomic-private-publication");
-        let _ = fs::remove_dir_all(&root);
         let remote = root.join("remote.git");
         let seed = root.join("seed");
         let staging = root.join("staging");
@@ -4190,7 +4177,6 @@ mod tests {
     #[test]
     fn exhaustive_git_prefetch_rejects_oversized_unknown_blob() {
         let root = temporary_root("git-prefetch-oversize");
-        fs::create_dir_all(&root).unwrap();
         let (repository, revision, path) =
             seeded_remote(&root, "oversize", b"twenty bytes payload");
         let store = GitCliRemoteStore::new(
@@ -4236,8 +4222,6 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         assert!(test_git(None, &["--version"]));
         let root = temporary_root("git-expected-revision-race");
-        fs::create_dir_all(root.parent().unwrap()).unwrap();
-        fs::create_dir(&root).unwrap();
         let remote = root.join("remote.git");
         let seed = root.join("seed");
         let staging = root.join("staging");
@@ -4362,8 +4346,6 @@ mod tests {
     fn exhaustive_git_blob_identity_import_race(changed_size: bool) {
         use std::os::unix::fs::PermissionsExt;
         let root = temporary_root("git-import-source-identity");
-        fs::create_dir_all(root.parent().unwrap()).unwrap();
-        fs::create_dir(&root).unwrap();
         let remote = root.join("remote.git");
         assert!(test_git(
             None,
@@ -4421,8 +4403,6 @@ mod tests {
     #[test]
     fn exhaustive_git_blob_identity_verification_binds_declared_size() {
         let root = temporary_root("git-verified-part-size");
-        fs::create_dir_all(root.parent().unwrap()).unwrap();
-        fs::create_dir(&root).unwrap();
         let remote = root.join("remote.git");
         let seed = root.join("seed");
         let staging = root.join("staging");
@@ -4479,8 +4459,6 @@ mod tests {
     #[test]
     fn git_blob_identity_stream_uses_exact_object_and_bounded_size() {
         let root = temporary_root("git-exact-blob-stream");
-        fs::create_dir_all(root.parent().unwrap()).unwrap();
-        fs::create_dir(&root).unwrap();
         let staging = root.join("staging");
         fs::create_dir(&staging).unwrap();
         let store = GitCliRemoteStore::new(
@@ -4535,8 +4513,6 @@ mod tests {
     #[test]
     fn git_blob_identity_import_preserves_crlf_under_git_conversion_settings() {
         let root = temporary_root("git-exact-blob-line-endings");
-        fs::create_dir_all(root.parent().unwrap()).unwrap();
-        fs::create_dir(&root).unwrap();
         let staging = root.join("staging");
         fs::create_dir(&staging).unwrap();
         let bytes = b"first\r\nsecond\r\n";
@@ -4589,11 +4565,10 @@ mod tests {
     #[test]
     fn owned_read_session_supports_git_and_removes_only_its_child() {
         let root = temporary_root("owned-reader-git-path");
-        fs::create_dir_all(&root).unwrap();
         let sibling = root.join("keep.txt");
         fs::write(&sibling, b"preserve").unwrap();
         let store = GitCliRemoteStore::new_read_session(
-            &root,
+            root.path(),
             root.join("parts"),
             "test",
             "test@example.invalid",

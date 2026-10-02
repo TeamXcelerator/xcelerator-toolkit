@@ -524,19 +524,7 @@ pub fn dot_stored_f64(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temporary_path(label: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "xc_operator_{label}_{}_{}.bin",
-            std::process::id(),
-            nonce
-        ))
-    }
+    use xc_core::test_support::TestDir;
 
     #[test]
     fn segmented_vector_reads_and_writes_across_noncontiguous_boundaries() {
@@ -555,8 +543,9 @@ mod tests {
 
     #[test]
     fn file_backed_operator_and_reduction_never_materialize_full_vectors() {
-        let input_path = temporary_path("input");
-        let output_path = temporary_path("output");
+        let dir = TestDir::new("file-backed-vector");
+        let input_path = dir.join("input.bin");
+        let output_path = dir.join("output.bin");
         let input = FileBackedVectorF64::create(&input_path, 7, 2).unwrap();
         let output = FileBackedVectorF64::create(&output_path, 7, 3).unwrap();
         input
@@ -573,11 +562,6 @@ mod tests {
         let mut tail = [0.0; 2];
         reopened.read_chunk(5, &mut tail).unwrap();
         assert_eq!(tail, [12.0, 14.0]);
-        drop(reopened);
-        drop(output);
-        drop(input);
-        std::fs::remove_file(input_path).unwrap();
-        std::fs::remove_file(output_path).unwrap();
     }
 
     #[test]

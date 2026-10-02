@@ -11,14 +11,8 @@ use xc_spectral::ccm::{
 
 #[test]
 fn changing_sector_capture_request_must_not_silently_reuse_the_old_request() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-fresh-capture-options-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root_dir = xc_core::test_support::TestDir::new("fresh-capture-options");
+    let root = root_dir.to_path_buf();
     let resolver = CacheResolver::new(vec![CacheLayer {
         precedence: 0,
         store: Box::new(ZipJsonFilesystemCacheStore::new(

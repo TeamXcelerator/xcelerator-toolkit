@@ -42,7 +42,7 @@ The example constructs a finite-dimensional positive-definiteness certificate, r
 
 ## Exact Maynard–Tao lower bound
 
-This route needs the `hp` feature and therefore a supported GNU/Linux toolchain with GMP/MPFR, such as the project's existing HP WSL environment:
+This route needs the `hp` feature and therefore a supported GNU/Linux toolchain with GMP/MPFR, such as Ubuntu or WSL2 Ubuntu:
 
 ```bash
 cargo run -p xc-variational --example mk_constant --features hp --locked
@@ -58,14 +58,12 @@ The exploratory eigensolver in `mk_symmetric` proposes coefficients, but the rep
 
 ## Target-distance measurement
 
-The CCM target-distance program measures
+The CCM target distance is
 `d(N, lambda) = integral_1^lambda |f(u) - target(u)| u^(-alpha) du`, where `f` is
 the even CCM ground-state eigenfunction normalized to `f(1) = 1` and the
 normalized target profile is supplied privately at runtime. Set
 `XC_TARGET_SPEC_FILE` to the JSON specification path before target-dependent
-work. The public toolkit retains only the specification's SHA-256 digest. The program's objective
-takes the limits in a fixed order: stabilize in `N` at fixed `lambda` first,
-then study the stabilized distance as `lambda` grows.
+work. The public toolkit retains only the specification's SHA-256 digest.
 
 `xc_spectral::distance::hp::ccm_distance_to_target_hp` performs one such
 measurement end to end. The eigenvector resolves through the ordinary
@@ -85,20 +83,6 @@ not interchangeable with a separately approximated sector-spectrum midpoint:
 near the precision floor that midpoint can have the wrong sign while still
 lying inside its absolute Sturm tolerance. Legacy unbound distance identities
 are therefore not reused by the corrected route.
-
-The measurement path is validated against an independent implementation. At
-`N = 150`, 500 decimal digits, matrix quadrature `Q = 600`, Gauss-Legendre
-`Q = 600`, and `alpha = 1/2`, `ccm_distance_to_target_hp` reproduces every
-digit of the values reported independently for `c = 5, 13, 17`:
-
-```text
-c = 5    0.0269735313324961574...
-c = 13   0.00988258128277552575...
-c = 17   0.00750657880432477674...
-```
-
-Only the eigenfunction is an approximation here; the agreement is to the full
-precision the comparison values were quoted at.
 
 Report every distance together with its recorded convention: integration
 rule, grid variable, resolution, `alpha`, and precision. Both the uniform-grid
@@ -290,7 +274,7 @@ either `u` or `log(u)`; midpoint grids are evaluated independently.
 
 ## Library-level normal use
 
-Every production workspace crate has a compiled normal-use target recorded in `EXAMPLE_INVENTORY.json`. The smaller library examples can be run independently:
+Every production workspace crate has a compiled normal-use example. The smaller library examples can be run independently:
 
 ```powershell
 cargo run -p xc-numerics --example quadrature --locked

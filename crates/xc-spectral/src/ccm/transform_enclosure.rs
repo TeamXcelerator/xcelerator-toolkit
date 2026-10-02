@@ -387,7 +387,7 @@ mod certified {
                     angle = angle.add(&turn);
                     rr.notes.push("Arb encloses the entire segment image in a convex rectangle excluding zero; endpoint argument increment is unambiguous".into());
                     if let Err(e) = store.save(&key, &rr) {
-                        eprintln!("contour checkpoint unavailable: {e}");
+                        xc_core::progress_message!("contour checkpoint unavailable: {e}");
                     }
                 }
                 _ => {

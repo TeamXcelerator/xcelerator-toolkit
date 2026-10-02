@@ -389,8 +389,8 @@ fn fixture_source(
         resolved_mathematical_configuration_digest: ContentDigest(
             xc_core::research_digest(&serde_json::json!({})).unwrap().0,
         ),
-        producer_toolkit_version: ToolkitVersion::parse("0.15.0").unwrap(),
-        minimum_reader_version: ToolkitVersion::parse("0.14.1").unwrap(),
+        producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
         maximum_reader_version: None,
         requested_assurance: xc_core::AssuranceLevel::Computed,
         claim_scope: "test fixture".into(),

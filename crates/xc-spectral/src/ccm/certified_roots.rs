@@ -28,10 +28,33 @@ use xc_root::{
     RealIntervalFunctionHp, RootError,
 };
 
+fn root_stage_metadata(
+    operation: &str,
+    source: &CertifiedSecularFunction,
+) -> xc_core::PerformanceStageMetadata {
+    let mut metadata = xc_core::PerformanceStageMetadata::matrix(
+        source.poles.len(),
+        source.precision_bits(),
+        rayon::current_num_threads(),
+    );
+    metadata.operation = Some(operation.to_owned());
+    metadata
+}
+
+type ExactNumerator = (Vec<Rational>, Vec<Rational>);
+
 #[derive(Clone, Debug)]
 pub struct CertifiedSecularFunction {
     poles: Vec<MpfrInterval>,
     weights: Vec<MpfrInterval>,
+    /// Exact poles and numerator coefficients, derived once from the
+    /// immutable stored poles and residues and shared by every count.
+    exact_numerator: std::sync::OnceLock<ExactNumerator>,
+    /// Exact endpoints of every real-root ball strictly inside the stored
+    /// pole span, from one FLINT/Arb isolation. `None` records an isolation
+    /// that could not classify the span; window counts then use FLINT directly.
+    #[cfg(feature = "arb")]
+    span_real_roots: std::sync::OnceLock<Option<Vec<(Rational, Rational)>>>,
 }
 
 impl CertifiedSecularFunction {
@@ -47,17 +70,36 @@ impl CertifiedSecularFunction {
         precision_bits: u32,
     ) -> Result<Self> {
         boundary::shape(modes, weights.len(), precision_bits)?;
-        if integer_cutoff_c <= 1
-            || modes.checked_mul(2).and_then(|n| n.checked_add(1)) != Some(weights.len())
+        if integer_cutoff_c <= 1 {
+            bail!("CCM secular source requires c > 1 and exactly 2N+1 weights");
+        }
+        Self::from_ccm_cutoff_state(
+            &integer_cutoff_c.to_string(),
+            modes,
+            weights,
+            precision_bits,
+        )
+    }
+
+    /// Same shared point stages for an exact decimal cutoff, which may be
+    /// fractional: L=RN(p)(ln(cutoff)) is the logarithm used by CCM assembly
+    /// and refinement for that declared decimal.
+    pub fn from_ccm_cutoff_state(
+        cutoff: &str,
+        modes: usize,
+        weights: &[Float],
+        precision_bits: u32,
+    ) -> Result<Self> {
+        boundary::shape(modes, weights.len(), precision_bits)?;
+        cutoff_floor(cutoff)?;
+        if modes.checked_mul(2).and_then(|n| n.checked_add(1)) != Some(weights.len())
             || i64::try_from(modes).is_err()
             || !(32..=1_000_000).contains(&precision_bits)
         {
             bail!("CCM secular source requires c > 1 and exactly 2N+1 weights");
         }
-        let log_c = super::retained_evidence::finite_math::rounded_log_cutoff(
-            &integer_cutoff_c.to_string(),
-            precision_bits,
-        )?;
+        let log_c =
+            super::retained_evidence::finite_math::rounded_log_cutoff(cutoff, precision_bits)?;
         let spacing = boundary::rounded_spacing(&log_c, precision_bits)?;
         let poles = (-(modes as i64)..=(modes as i64))
             .map(|index| {
@@ -89,6 +131,43 @@ impl CertifiedSecularFunction {
         Self::from_intervals(poles, weights)
     }
 
+    /// Interval data for perturbation enclosures: residue intervals may
+    /// contain zero. Such a source supports evaluation and interval Newton but
+    /// must not be used for residue-sign root counting.
+    #[cfg(feature = "arb")]
+    pub(crate) fn from_interval_data(
+        poles: Vec<MpfrInterval>,
+        weights: Vec<MpfrInterval>,
+    ) -> Result<Self> {
+        if poles.is_empty() || poles.len() != weights.len() {
+            bail!("finite secular source needs equal nonempty pole and weight arrays");
+        }
+        for value in poles.iter().chain(&weights) {
+            value.validate()?;
+        }
+        let precision = poles[0].precision();
+        boundary::source_budget(poles.len(), precision)?;
+        if poles
+            .iter()
+            .chain(&weights)
+            .any(|value| value.precision() != precision)
+            || poles
+                .windows(2)
+                .any(|pair| pair[0].upper() >= pair[1].lower())
+        {
+            bail!(
+                "finite secular interval data must share precision and have ordered disjoint poles"
+            );
+        }
+        Ok(Self {
+            poles,
+            weights,
+            exact_numerator: std::sync::OnceLock::new(),
+            #[cfg(feature = "arb")]
+            span_real_roots: std::sync::OnceLock::new(),
+        })
+    }
+
     pub fn from_intervals(poles: Vec<MpfrInterval>, weights: Vec<MpfrInterval>) -> Result<Self> {
         if poles.is_empty() || poles.len() != weights.len() {
             bail!("finite secular source needs equal nonempty pole and weight arrays");
@@ -113,7 +192,13 @@ impl CertifiedSecularFunction {
         if weights.iter().any(MpfrInterval::contains_zero) {
             bail!("finite secular residue intervals must exclude zero");
         }
-        Ok(Self { poles, weights })
+        Ok(Self {
+            poles,
+            weights,
+            exact_numerator: std::sync::OnceLock::new(),
+            #[cfg(feature = "arb")]
+            span_real_roots: std::sync::OnceLock::new(),
+        })
     }
 
     pub fn poles(&self) -> &[MpfrInterval] {
@@ -305,7 +390,18 @@ impl CertifiedSecularFunction {
         })
     }
 
-    fn exact_numerator_data(&self) -> Result<(Vec<Rational>, Vec<Rational>)> {
+    fn exact_numerator_data(&self) -> Result<&ExactNumerator> {
+        if let Some(data) = self.exact_numerator.get() {
+            return Ok(data);
+        }
+        let data = self.compute_exact_numerator_data()?;
+        Ok(self.exact_numerator.get_or_init(|| data))
+    }
+
+    fn compute_exact_numerator_data(&self) -> Result<ExactNumerator> {
+        let _stage = xc_core::performance_stage_with("ccm.roots.exact_numerator", || {
+            root_stage_metadata("ccm.roots.exact_numerator", self)
+        });
         boundary::rational_budget(
             self.poles
                 .iter()
@@ -372,7 +468,7 @@ impl CertifiedSecularFunction {
     /// and residues.
     pub fn normalized_finite_entire_function(&self) -> Result<FiniteEntireFunction> {
         let (_, numerator) = self.exact_numerator_data()?;
-        FiniteEntireFunction::from_real_coefficients_monic(numerator)
+        FiniteEntireFunction::from_real_coefficients_monic(numerator.clone())
     }
 
     pub fn exact_numerator_count_between_poles(
@@ -385,7 +481,7 @@ impl CertifiedSecularFunction {
         }
         let (poles, numerator) = self.exact_numerator_data()?;
         let count = exact_sturm_root_count(
-            &numerator,
+            numerator,
             poles[first_pole].clone(),
             poles[last_pole].clone(),
         )?;
@@ -419,7 +515,7 @@ impl CertifiedSecularFunction {
         let denominator = Integer::from(1) << isolation_bits;
         let target_width = Rational::from((Integer::from(1), denominator));
         let candidates = exact_sturm_isolate_roots(
-            &numerator,
+            numerator,
             poles[first_pole].clone(),
             poles[last_pole].clone(),
             target_width,
@@ -485,8 +581,15 @@ impl CertifiedSecularFunction {
             bail!("FLINT numerator count requires lower < upper");
         }
         let (_, numerator) = self.exact_numerator_data()?;
-        let (count, square_free) =
-            crate::ccm::arb_bridge::rational_polynomial_root_count(&numerator, lower, upper)?;
+        let (count, square_free) = match self.span_window_count(lower, upper)? {
+            Some(count) => (count, true),
+            None => {
+                let _stage = xc_core::performance_stage_with("ccm.roots.flint_count", || {
+                    root_stage_metadata("ccm.roots.flint_count", self)
+                });
+                crate::ccm::arb_bridge::rational_polynomial_root_count(numerator, lower, upper)?
+            }
+        };
         Ok(SecularCountCertificate {
             pole_count: self
                 .poles
@@ -504,6 +607,53 @@ impl CertifiedSecularFunction {
                 .to_owned(),
             square_free,
         })
+    }
+
+    /// Count a window from the shared span isolation. Each retained ball holds
+    /// exactly one real root of the square-free numerator, and the isolation
+    /// already proved every other root nonreal or outside the span. A window
+    /// inside the span therefore contains exactly the balls strictly inside
+    /// it. A ball touching a window boundary, or a window outside the span,
+    /// returns `None` so the caller runs the direct FLINT window count.
+    #[cfg(feature = "arb")]
+    fn span_window_count(&self, lower: &Rational, upper: &Rational) -> Result<Option<usize>> {
+        let (poles, numerator) = self.exact_numerator_data()?;
+        let (Some(first), Some(last)) = (poles.first(), poles.last()) else {
+            return Ok(None);
+        };
+        if lower < first || upper > last || first >= last {
+            return Ok(None);
+        }
+        let roots = self.span_real_roots.get_or_init(|| {
+            let _stage = xc_core::performance_stage_with("ccm.roots.flint_span_isolation", || {
+                root_stage_metadata("ccm.roots.flint_span_isolation", self)
+            });
+            let (balls, square_free) =
+                crate::ccm::arb_bridge::rational_polynomial_real_roots(numerator, first, last, 128)
+                    .ok()?;
+            if !square_free {
+                return None;
+            }
+            balls
+                .iter()
+                .map(|ball| Some((ball.lower().to_rational()?, ball.upper().to_rational()?)))
+                .collect()
+        });
+        let Some(roots) = roots else {
+            return Ok(None);
+        };
+        let mut count = 0;
+        for (ball_lower, ball_upper) in roots {
+            if ball_upper < lower || ball_lower > upper {
+                continue;
+            }
+            if ball_lower > lower && ball_upper < upper {
+                count += 1;
+                continue;
+            }
+            return Ok(None);
+        }
+        Ok(Some(count))
     }
 
     /// Reference-free production isolation through exact FLINT/Arb root balls.
@@ -562,12 +712,17 @@ impl CertifiedSecularFunction {
         if lower_bound >= upper_bound {
             bail!("FLINT numerator window requires lower < upper");
         }
-        let (mut candidates, square_free) = crate::ccm::arb_bridge::rational_polynomial_real_roots(
-            &numerator,
-            lower_bound,
-            upper_bound,
-            self.precision_bits(),
-        )?;
+        let (mut candidates, square_free) = {
+            let _stage = xc_core::performance_stage_with("ccm.roots.flint_isolation", || {
+                root_stage_metadata("ccm.roots.flint_isolation", self)
+            });
+            crate::ccm::arb_bridge::rational_polynomial_real_roots(
+                numerator,
+                lower_bound,
+                upper_bound,
+                self.precision_bits(),
+            )?
+        };
         if !square_free {
             bail!("FLINT numerator isolation requires a square-free polynomial");
         }
@@ -587,6 +742,9 @@ impl CertifiedSecularFunction {
         if count.certified_root_count != candidates.len() || count.square_free != square_free {
             bail!("FLINT root isolation disagrees with a repeated exact count from the same FLINT/Arb engine");
         }
+        let newton_stage = xc_core::performance_stage_with("ccm.roots.interval_newton", || {
+            root_stage_metadata("ccm.roots.interval_newton", self)
+        });
         let roots = candidates.into_iter().map(|candidate| {
             let mut failure = String::new();
             let mut previous_precision = 0;
@@ -617,6 +775,7 @@ impl CertifiedSecularFunction {
             }
             bail!("finite secular window boundary remains unresolved within the proof precision budget: {failure}")
         }).collect::<Result<Vec<_>>>()?;
+        drop(newton_stage);
         let reconciliation = reconcile_complete_window(&roots, &count)?;
         if !reconciliation.complete {
             bail!(
@@ -905,6 +1064,11 @@ pub enum FiniteSourceCertificationScope {
 pub struct ProductionIndependentCcmRootCertificate {
     pub schema_version: u32,
     pub integer_cutoff_c: u64,
+    /// Exact declared decimal lambda-squared when it is not an integer; the
+    /// integer field then holds its floor, the prime cutoff. Absent for
+    /// integer cutoffs, whose certificates are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lambda_squared_decimal: Option<String>,
     pub modes: usize,
     pub precision_bits: u32,
     pub isolation_bits: u32,
@@ -931,6 +1095,13 @@ pub struct ProductionIndependentCcmRootCertificate {
 }
 
 impl ProductionIndependentCcmRootCertificate {
+    /// Exact cutoff text that determines the certified pole geometry.
+    pub fn cutoff_text(&self) -> String {
+        self.lambda_squared_decimal
+            .clone()
+            .unwrap_or_else(|| self.integer_cutoff_c.to_string())
+    }
+
     /// Return the selected range without panicking on malformed public fields.
     /// This checks slice bounds; use the certificate validators for source truth.
     pub fn try_selected_roots(&self) -> Result<&[IntervalRootCertificate]> {
@@ -990,8 +1161,12 @@ pub fn validate_production_independent_ccm_root_certificate_structure(
         certificate.source_weights.len(),
         certificate.precision_bits,
     )?;
+    let cutoff_valid = match &certificate.lambda_squared_decimal {
+        Some(decimal) => cutoff_floor(decimal).ok() == Some(certificate.integer_cutoff_c),
+        None => certificate.integer_cutoff_c > 1,
+    };
     if certificate.schema_version != 2
-        || certificate.integer_cutoff_c <= 1
+        || !cutoff_valid
         || certificate.modes == 0
         || certificate.precision_bits <= 64
         || certificate.isolation_bits < 16
@@ -1102,8 +1277,8 @@ pub fn validate_production_independent_ccm_root_certificate_structure(
         .iter()
         .map(|x| parse_endpoint(x, certificate.precision_bits))
         .collect::<Result<Vec<_>>>()?;
-    let source = CertifiedSecularFunction::from_integer_ccm_state(
-        certificate.integer_cutoff_c,
+    let source = CertifiedSecularFunction::from_ccm_cutoff_state(
+        &certificate.cutoff_text(),
         certificate.modes,
         &weights,
         certificate.precision_bits,
@@ -1424,6 +1599,13 @@ pub fn certify_production_first_positive_ccm_roots(
     {
         bail!("production first-positive CCM request is invalid");
     }
+    let _stage =
+        xc_core::performance_top_level_stage_with("ccm.roots.production_certificate", || {
+            let mut metadata =
+                xc_core::PerformanceStageMetadata::matrix(weights.len(), precision_bits, 1);
+            metadata.operation = Some("ccm.roots.production_certificate".to_owned());
+            metadata
+        });
     let source = CertifiedSecularFunction::from_integer_ccm_state(
         integer_cutoff_c,
         modes,
@@ -1432,10 +1614,16 @@ pub fn certify_production_first_positive_ccm_roots(
     )?;
     let first_pole = modes;
     let maximum_pole = 2 * modes;
+    xc_core::progress_message!(
+        "[HP] root certification: locating the first {requested_roots} positive roots among {modes} positive poles"
+    );
+    let search_started = std::time::Instant::now();
+    let mut exact_counts = 0usize;
     let mut low = first_pole;
     let mut high = (first_pole + requested_roots).min(maximum_pole);
     let step = (requested_roots / 5).max(4);
     loop {
+        exact_counts += 1;
         let count = source.exact_flint_numerator_count_between_poles(first_pole, high)?;
         if count.certified_root_count >= requested_roots {
             break;
@@ -1448,6 +1636,7 @@ pub fn certify_production_first_positive_ccm_roots(
     }
     while high - low > 1 {
         let middle = low + (high - low) / 2;
+        exact_counts += 1;
         let count = source.exact_flint_numerator_count_between_poles(first_pole, middle)?;
         if count.certified_root_count >= requested_roots {
             high = middle;
@@ -1456,6 +1645,11 @@ pub fn certify_production_first_positive_ccm_roots(
         }
     }
     let last_pole = high;
+    xc_core::progress_message!(
+        "[HP] phase timing: root count search={:.3}s ({exact_counts} exact counts; boundary pole {last_pole})",
+        search_started.elapsed().as_secs_f64()
+    );
+    let window_started = std::time::Instant::now();
     let preceding_window_count = if last_pole == first_pole + 1 {
         SecularCountCertificate {
             pole_count: 1,
@@ -1493,6 +1687,11 @@ pub fn certify_production_first_positive_ccm_roots(
     {
         bail!("production CCM isolated window disagrees with its exact prefix count");
     }
+    xc_core::progress_message!(
+        "[HP] phase timing: root window certification={:.3}s ({} interval-Newton proofs)",
+        window_started.elapsed().as_secs_f64(),
+        window.roots.len()
+    );
     let source_weights = weights
         .iter()
         .map(|weight| serialize_float(&Float::with_val(precision_bits, weight), precision_bits))
@@ -1651,6 +1850,208 @@ pub fn certify_production_independent_ccm_roots(
         weights,
         precision_bits,
     )?;
+    certify_independent_with_source(
+        &source,
+        weights,
+        &integer_cutoff_c.to_string(),
+        modes,
+        target,
+        precision_bits,
+        isolation_bits,
+        interval_newton,
+    )
+}
+
+/// Certify an independently indexed root target for an exact decimal cutoff,
+/// which may be fractional. The pole geometry is the one CCM refinement uses
+/// for that declared decimal; integer text gives the integer certificate.
+#[cfg(feature = "arb")]
+#[allow(clippy::too_many_arguments)]
+pub fn certify_production_independent_ccm_roots_at_cutoff(
+    weights: &[Float],
+    cutoff: &str,
+    modes: usize,
+    target: &IndependentCcmRootTarget,
+    precision_bits: u32,
+    isolation_bits: u32,
+    interval_newton: &IntervalNewtonOptions,
+) -> Result<ProductionIndependentCcmRootCertificate> {
+    let source = independent_source(weights, cutoff, modes, precision_bits, isolation_bits)?;
+    certify_independent_with_source(
+        &source,
+        weights,
+        cutoff,
+        modes,
+        target,
+        precision_bits,
+        isolation_bits,
+        interval_newton,
+    )
+}
+
+/// Integer floor of an exact decimal cutoff greater than one: the prime cutoff.
+fn cutoff_floor(cutoff: &str) -> Result<u64> {
+    let value = boundary::decimal(cutoff)?;
+    if value <= 1 {
+        bail!("CCM cutoff must be an exact decimal greater than one");
+    }
+    rug::Integer::from(value.floor_ref())
+        .to_u64()
+        .context("CCM cutoff floor exceeds the supported range")
+}
+
+/// Root-by-root outcome of certifying an ordinal range: certified pieces plus
+/// the reason each remaining ordinal could not be certified. Numerical
+/// limitations never discard the pieces that did certify.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialIndependentCcmRootCertification {
+    pub first_index: usize,
+    pub last_index: usize,
+    /// Exact count of positive roots inside the positive pole range, when
+    /// that count resolved. Ordinals beyond it are outside certification reach.
+    pub available_positive_roots: Option<usize>,
+    /// Whole-source limitation that prevented any certification, if any.
+    pub source_limitation: Option<String>,
+    /// Disjoint independently replayable certificates, ordered by ordinal.
+    pub certificates: Vec<ProductionIndependentCcmRootCertificate>,
+    /// Ordinal -> reason for every requested ordinal without a certificate.
+    pub uncertified: std::collections::BTreeMap<usize, String>,
+}
+
+/// Certify every certifiable ordinal in `first..=last`. The whole range is
+/// tried first, so a fully certifiable request yields the same single
+/// certificate as `certify_production_independent_ccm_roots_at_cutoff`.
+/// On failure the range is bisected; an ordinal that fails alone, or lies
+/// beyond the exact positive root count, is recorded with its reason.
+#[cfg(feature = "arb")]
+#[allow(clippy::too_many_arguments)]
+pub fn certify_production_independent_ccm_roots_partially(
+    weights: &[Float],
+    cutoff: &str,
+    modes: usize,
+    first: usize,
+    last: usize,
+    whole_range_target: &IndependentCcmRootTarget,
+    precision_bits: u32,
+    isolation_bits: u32,
+    interval_newton: &IntervalNewtonOptions,
+) -> Result<PartialIndependentCcmRootCertification> {
+    if first == 0 || first > last {
+        bail!("partial CCM certification requires 1 <= first <= last");
+    }
+    let mut result = PartialIndependentCcmRootCertification {
+        first_index: first,
+        last_index: last,
+        available_positive_roots: None,
+        source_limitation: None,
+        certificates: Vec::new(),
+        uncertified: std::collections::BTreeMap::new(),
+    };
+    let limited = |result: &mut PartialIndependentCcmRootCertification, reason: String| {
+        for ordinal in first..=last {
+            result.uncertified.insert(ordinal, reason.clone());
+        }
+        result.source_limitation = Some(reason);
+    };
+    let source = match independent_source(weights, cutoff, modes, precision_bits, isolation_bits) {
+        Ok(source) => source,
+        Err(error) => {
+            limited(&mut result, format!("finite secular source: {error:#}"));
+            return Ok(result);
+        }
+    };
+    let available = match cumulative_positive_count(&source, modes, 2 * modes) {
+        Ok(count) => count,
+        Err(error) => {
+            limited(&mut result, format!("exact positive root count: {error:#}"));
+            return Ok(result);
+        }
+    };
+    result.available_positive_roots = Some(available);
+    for ordinal in first.max(available + 1)..=last {
+        result.uncertified.insert(
+            ordinal,
+            format!("ordinal beyond the {available} positive roots inside the positive pole range"),
+        );
+    }
+    if first > available {
+        return Ok(result);
+    }
+    let reachable_last = last.min(available);
+    let whole = (reachable_last == last).then_some(whole_range_target);
+    let attempt = |low: usize, high: usize, target: Option<&IndependentCcmRootTarget>| {
+        let range = IndependentCcmRootTarget::IndexRange {
+            first: low,
+            last: high,
+        };
+        certify_independent_with_source(
+            &source,
+            weights,
+            cutoff,
+            modes,
+            target.unwrap_or(&range),
+            precision_bits,
+            isolation_bits,
+            interval_newton,
+        )
+    };
+    // Full bisection: a failure is isolated down to single ordinals, so every
+    // certifiable ordinal is certified even when a neighbor is not. A
+    // systematic failure therefore costs about 2n attempts; that is the price
+    // of never discarding a certifiable root.
+    let mut pending = vec![(first, reachable_last, whole)];
+    while let Some((low, high, target)) = pending.pop() {
+        match attempt(low, high, target) {
+            Ok(certificate) => result.certificates.push(certificate),
+            Err(error) if low == high => {
+                result.uncertified.insert(low, format!("{error:#}"));
+            }
+            Err(_) => {
+                let middle = low + (high - low) / 2;
+                pending.push((middle + 1, high, None));
+                pending.push((low, middle, None));
+            }
+        }
+    }
+    result
+        .certificates
+        .sort_by_key(|certificate| certificate.first_selected_positive_index);
+    Ok(result)
+}
+
+#[cfg(feature = "arb")]
+fn independent_source(
+    weights: &[Float],
+    cutoff: &str,
+    modes: usize,
+    precision_bits: u32,
+    isolation_bits: u32,
+) -> Result<CertifiedSecularFunction> {
+    boundary::shape(modes, weights.len(), precision_bits)?;
+    if modes == 0
+        || weights.len() != 2 * modes + 1
+        || precision_bits <= 64
+        || isolation_bits < 16
+        || isolation_bits >= precision_bits
+    {
+        bail!("production independent CCM request is invalid");
+    }
+    CertifiedSecularFunction::from_ccm_cutoff_state(cutoff, modes, weights, precision_bits)
+}
+
+#[cfg(feature = "arb")]
+#[allow(clippy::too_many_arguments)]
+fn certify_independent_with_source(
+    source: &CertifiedSecularFunction,
+    weights: &[Float],
+    cutoff: &str,
+    modes: usize,
+    target: &IndependentCcmRootTarget,
+    precision_bits: u32,
+    isolation_bits: u32,
+    interval_newton: &IntervalNewtonOptions,
+) -> Result<ProductionIndependentCcmRootCertificate> {
     let (poles, _) = source.exact_numerator_data()?;
     let zero_pole = modes;
     let maximum_pole = 2 * modes;
@@ -1665,9 +2066,10 @@ pub fn certify_production_independent_ccm_roots(
                     first: 1,
                     last: *count,
                 };
-                let certificate = certify_production_independent_ccm_roots(
+                let certificate = certify_independent_with_source(
+                    source,
                     weights,
-                    integer_cutoff_c,
+                    cutoff,
                     modes,
                     &requested,
                     precision_bits,
@@ -1683,7 +2085,7 @@ pub fn certify_production_independent_ccm_roots(
                 if *first == 0 || first > last {
                     bail!("independent CCM positive indices require 1 <= first <= last");
                 }
-                let available = cumulative_positive_count(&source, zero_pole, maximum_pole)?;
+                let available = cumulative_positive_count(source, zero_pole, maximum_pole)?;
                 if *last > available {
                     bail!(
                         "finite CCM source has only {available} positive roots inside its positive pole range; requested index {last}"
@@ -1695,21 +2097,21 @@ pub fn certify_production_independent_ccm_roots(
                 let mut high = maximum_pole;
                 while high - low > 1 {
                     let middle = low + (high - low) / 2;
-                    if cumulative_positive_count(&source, zero_pole, middle)? < *first {
+                    if cumulative_positive_count(source, zero_pole, middle)? < *first {
                         low = middle;
                     } else {
                         high = middle;
                     }
                 }
                 let first_boundary = low;
-                let before = cumulative_positive_count(&source, zero_pole, first_boundary)?;
+                let before = cumulative_positive_count(source, zero_pole, first_boundary)?;
 
                 // Smallest pole boundary whose cumulative count reaches `last`.
                 let mut low = first_boundary;
                 let mut high = maximum_pole;
                 while high - low > 1 {
                     let middle = low + (high - low) / 2;
-                    if cumulative_positive_count(&source, zero_pole, middle)? >= *last {
+                    if cumulative_positive_count(source, zero_pole, middle)? >= *last {
                         high = middle;
                     } else {
                         low = middle;
@@ -1763,9 +2165,13 @@ pub fn certify_production_independent_ccm_roots(
         .iter()
         .map(|weight| serialize_float(&Float::with_val(precision_bits, weight), precision_bits))
         .collect::<Vec<_>>();
+    let integer_cutoff_c = cutoff_floor(cutoff)?;
+    let lambda_squared_decimal =
+        (cutoff != integer_cutoff_c.to_string()).then(|| cutoff.to_owned());
     Ok(ProductionIndependentCcmRootCertificate {
         schema_version: 2,
         integer_cutoff_c,
+        lambda_squared_decimal,
         modes,
         precision_bits,
         isolation_bits,
@@ -1824,9 +2230,9 @@ pub fn verify_production_independent_ccm_root_certificate(
         .iter()
         .map(|weight| parse_endpoint(weight, certificate.precision_bits))
         .collect::<Result<Vec<_>>>()?;
-    let mut replay = certify_production_independent_ccm_roots(
+    let mut replay = certify_production_independent_ccm_roots_at_cutoff(
         &weights,
-        certificate.integer_cutoff_c,
+        &certificate.cutoff_text(),
         certificate.modes,
         &certificate.target,
         certificate.precision_bits,
@@ -3156,5 +3562,59 @@ mod exhaustive_certificate_pole_stage {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "arb"))]
+mod span_count_equivalence_tests {
+    use super::*;
+
+    #[test]
+    fn span_window_counts_equal_direct_flint_window_counts() {
+        let precision = 192;
+        let modes = 12;
+        // Mixed-sign residues place zero, one, or several roots between poles.
+        let weights = (0..2 * modes + 1)
+            .map(|j| {
+                let value = ((j * 7 + 3) % 11) as i32 - 5;
+                Float::with_val(precision, if value == 0 { 3 } else { value }) / 7u32
+            })
+            .collect::<Vec<_>>();
+        let source =
+            CertifiedSecularFunction::from_integer_ccm_state(13, modes, &weights, precision)
+                .unwrap();
+        let (poles, numerator) = source.exact_numerator_data().unwrap();
+        let mut compared = 0;
+        for first in 0..poles.len() {
+            for last in first + 1..poles.len() {
+                let direct = crate::ccm::arb_bridge::rational_polynomial_root_count(
+                    numerator,
+                    &poles[first],
+                    &poles[last],
+                )
+                .unwrap();
+                let shared = source
+                    .exact_flint_numerator_count_between_poles(first, last)
+                    .unwrap();
+                assert_eq!(shared.certified_root_count, direct.0, "{first}..{last}");
+                assert_eq!(shared.square_free, direct.1);
+                compared += 1;
+            }
+        }
+        // Windows strictly between poles exercise the arbitrary-window entry.
+        let midpoint = |k: usize| (poles[k].clone() + &poles[k + 1]) / 2u32;
+        for first in 0..poles.len() - 2 {
+            let (lower, upper) = (midpoint(first), midpoint(first + 1));
+            let direct =
+                crate::ccm::arb_bridge::rational_polynomial_root_count(numerator, &lower, &upper)
+                    .unwrap();
+            let shared = source
+                .exact_flint_numerator_count_in_window(&lower, &upper)
+                .unwrap();
+            assert_eq!(shared.certified_root_count, direct.0);
+            compared += 1;
+        }
+        assert!(source.span_real_roots.get().is_some_and(Option::is_some));
+        assert_eq!(compared, 300 + 23);
     }
 }

@@ -9,7 +9,6 @@
 //! need not reproduce the rounding of the canonical cell-by-cell route.
 
 use anyhow::{anyhow, bail, Result};
-#[cfg(test)]
 use rug::float::Constant;
 use rug::{ops::Pow, Float, Integer, Rational};
 use serde::{Deserialize, Serialize};
@@ -305,12 +304,14 @@ pub fn quadrature_orders_for_length(
     if !floor.is_finite() || !(1.0..=1_000_000.0).contains(&floor) {
         bail!("length-aware archimedean order exceeds the quadrature budget");
     }
+    let oscillation = oscillation_order_table(precision_bits, length)?;
     (0..=n_modes)
         .map(|n| {
             let order = n
                 .checked_mul(3)
                 .and_then(|v| v.checked_add(floor as usize))
                 .ok_or_else(|| anyhow!("quadrature order overflow"))?
+                .max(oscillation.order(n)?)
                 .max(base);
             let order = order
                 .div_ceil(bucket)
@@ -322,6 +323,73 @@ pub fn quadrature_orders_for_length(
             Ok(order)
         })
         .collect()
+}
+
+/// Oscillation-aware order requirement for one length and precision.
+///
+/// On the Bernstein ellipse with parameter `exp(s)`, mode `n` contributes the
+/// carrier growth `cosh(pi*n*sinh(s)) <= exp(pi*n*sinh(s))`, so `m` nodes give
+/// about `exp(pi*n*sinh(s) - 2*m*s)`. Any admissible `s <= s_pole` yields a
+/// requirement; the smallest sampled one is used. The fixed `3n` allowance
+/// covers this only when the pole ellipse is thin (larger cutoffs). Ellipse
+/// geometry and `sinh` use correctly rounded MPFR, rounded once to binary64,
+/// so the order is identical on every platform.
+struct OscillationOrders {
+    need: f64,
+    samples: Vec<(f64, f64)>,
+}
+
+const OSCILLATION_SAMPLES: u32 = 400;
+
+impl OscillationOrders {
+    fn order(&self, n: usize) -> Result<usize> {
+        if n == 0 {
+            return Ok(0);
+        }
+        let pi_n = std::f64::consts::PI * n as f64;
+        let required = self
+            .samples
+            .iter()
+            .map(|(s, sinh)| (self.need + pi_n * sinh) / (2.0 * s))
+            .fold(f64::INFINITY, f64::min)
+            .ceil();
+        if !required.is_finite() || required > 1_000_000.0 {
+            bail!("length-aware archimedean order exceeds the quadrature budget");
+        }
+        Ok(required as usize)
+    }
+}
+
+fn oscillation_order_table(precision_bits: u32, length: &Float) -> Result<OscillationOrders> {
+    const BITS: u32 = 128;
+    let two_pi = Float::with_val(BITS, Constant::Pi) * 2u32;
+    let y = two_pi / Float::with_val(BITS, length);
+    // a - 1 = (y + y^2/(sqrt(4+y^2)+2))/2 for the ellipse through -1+iy.
+    let y_squared = Float::with_val(BITS, &y * &y);
+    let root = Float::with_val(BITS, &y_squared + 4u32).sqrt() + 2u32;
+    let a_minus_one = (y_squared / root + &y) / 2u32;
+    let s_pole = (a_minus_one / 2u32).sqrt().asinh() * 2u32;
+    let need = Float::with_val(BITS, Constant::Log2) * (precision_bits + 64);
+    if !s_pole.is_finite() || s_pole <= 0 || !need.is_finite() {
+        bail!("length-aware archimedean order requires a finite positive ellipse");
+    }
+    // Very wide ellipses (cutoffs near one) can overflow sinh in binary64;
+    // such samples are never the minimum, so they are omitted.
+    let samples = (1..=OSCILLATION_SAMPLES)
+        .map(|k| {
+            let s = Float::with_val(BITS, &s_pole * k) / OSCILLATION_SAMPLES;
+            let sinh = Float::with_val(BITS, s.sinh_ref());
+            (s.to_f64(), sinh.to_f64())
+        })
+        .filter(|(s, sinh)| s.is_finite() && *s > 0.0 && sinh.is_finite())
+        .collect::<Vec<_>>();
+    if samples.is_empty() {
+        bail!("length-aware archimedean order ellipse is not representable");
+    }
+    Ok(OscillationOrders {
+        need: need.to_f64(),
+        samples,
+    })
 }
 
 /// O(K*d+d^2) arithmetic and O(d) generator storage, plus the output matrix.

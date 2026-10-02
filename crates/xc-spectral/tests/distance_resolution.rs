@@ -23,15 +23,8 @@ impl Drop for LocalFixture {
 #[test]
 #[ignore = "explicit HP capture qualification: Q=12000 and Q=30000 refinements"]
 fn returned_grid_verdict_and_ladder_verdict_are_distinct_through_cache() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-confirmed-distance-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&root).unwrap();
+    let root_dir = xc_core::test_support::TestDir::new("confirmed-distance");
+    let root = root_dir.to_path_buf();
     let fixture = LocalFixture(root);
     let spec = fixture.0.join("target.json");
     std::fs::write(&spec, serde_json::to_vec(&serde_json::json!({

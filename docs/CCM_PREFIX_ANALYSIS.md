@@ -162,7 +162,7 @@ Canonical shard sources use the alternative `shard_manifest` form with explicit
 local read limits. Optional `nesting_matrices` add source-bound exact block
 comparisons to the report. See the [local shard guide](PREFIX_CONVERGENCE.md#read-a-canonical-local-shard-without-rebuilding-its-matrix).
 
-## Qualification and provenance
+## Testing and provenance
 
 The recurrences are derived from the block inverse identity. Implementation
 and tests use AI assistance and the existing exact-rational and MPFR toolkit
@@ -172,8 +172,7 @@ incorporated. Fixtures use synthetic matrices and public configurations.
 Tests compare against independently implemented exact rational Gauss-Jordan
 inversion, include Hilbert and near-degenerate fixtures, malformed input,
 unresolved pivots, serialization cancellation, retained-source tampering,
-missing sources, private routing, and derived-only cache reuse. See the release
-[validation guide](VALIDATION.md) for commands, outcomes and coverage limits.
+missing sources, private routing, and derived-only cache reuse.
 Synthetic tests do not establish accuracy for an application's complete dataset.
 
 The extended policy also computes `tr(A^-3)` through a retained normalized Gram

@@ -335,14 +335,10 @@ fn explicit_krylov_admits_resolved_original_n20_and_n10_control() {
             }
         }
     }
-    let dir = Owned(std::env::temp_dir().join(format!(
-            "xc-r2-krylov-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )));
+    // `Owned` checks that the fixture created and can remove its cache; the
+    // enclosing scratch guard, declared first, is removed after it.
+    let scratch = xc_core::test_support::TestDir::new("r2-krylov");
+    let dir = Owned(scratch.join("cache"));
     let resolver = CacheResolver::new(vec![CacheLayer {
         precedence: 0,
         store: Box::new(FilesystemCacheStore::new(
@@ -404,14 +400,8 @@ fn explicit_krylov_admits_resolved_original_n20_and_n10_control() {
 
 #[test]
 fn read_only_source_preserves_explicit_solver_routes_without_creating_cache() {
-    let root = std::env::temp_dir().join(format!(
-        "r2-read-only-ccm-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("r2-read-only-ccm");
+    let root = scratch.join("cache");
     assert!(!root.exists());
     for solver in [
         CcmEigenstateSolver::LegacyInverseIteration,

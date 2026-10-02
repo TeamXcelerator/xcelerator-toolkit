@@ -7,21 +7,11 @@ destination checks and atomic publication remain in place. This setting is
 passed only to the publication Git command; it does not change a user's Git
 configuration or recompress existing artifact archives.
 
-## Measured scope
+## Scope
 
-A local Windows test with Git 2.50.1 packed eight retained 90 MiB archive parts
-(720 MiB total). Two trials reversed the order of the baseline and changed
-policy:
-
-| Git packing policy | First trial | Second trial | Pack bytes |
-|---|---:|---:|---:|
-| Default delta search | 109.567 s | 100.892 s | 755,205,160 |
-| Delta search disabled | 13.341 s | 13.455 s | 755,205,160 |
-
-The four packs have the same SHA-256. These measurements establish a 7.5-8.2x
-reduction in local packing time for this retained sample. They do not measure
-GitHub upload time, network throughput, receiver processing, or complete claim
-runtime. Other data and machines can behave differently.
+Delta search is disabled only for compressed, verified artifact archives. The
+setting reduces local packing work; it makes no claim about upload time, network
+throughput, receiver processing, or complete run time.
 
 Git documents the [delta-search window and packing options](https://git-scm.com/docs/git-config#Documentation/git-config.txt-packwindow).
 This release leaves the Git compression level unchanged.
@@ -64,10 +54,8 @@ v0.15.1 imports verified canonical `objects/sha256/*.part` archive pieces with
 command-local `core.looseCompression=0`. Metadata retains ordinary compression.
 This changes Git's local storage work, not blob identity or archive bytes. It is
 separate from the existing no-delta push policy; global Git settings are untouched.
-A synthetic 32 MiB compressed archive imported in 0.70-0.72 seconds with the
-default policy and 0.25 seconds without loose-object compression in two reversed
-Windows trials. All Git object IDs matched. This measures local import only,
-not live GitHub throughput or complete campaign runtime.
+Git object IDs are unchanged. The change affects local import only, not network
+throughput or complete campaign runtime.
 
 Verified loose blobs have a bounded process-local SHA-256 cache keyed by exact
 session, Git object ID and size. Unchanged file size and modification time are
@@ -90,24 +78,6 @@ packing and remote acknowledgment; it is not a separate bandwidth measurement.
 A missing final-success event means completion must be checked against the
 canonical publication report. Operational logging failure does not bypass any
 publication check or turn an unsuccessful transaction into success.
-
-## Retained archive measurement
-
-A verified 90 MiB artifact part was imported into fresh local Git repositories
-and then packed with the existing no-delta policy. Two trials reversed the order:
-
-| Trial | Default import + pack | No loose compression + pack | Improvement |
-|---|---:|---:|---:|
-| First | 6.121 s | 2.967 s | 2.06x |
-| Reversed | 3.911 s | 2.779 s | 1.41x |
-
-All four resulting packs have identical bytes and SHA-256. Warm filesystem state
-and concurrent local work can affect timings. This measurement includes import
-and local packing, not network transfer, remote processing or complete claims.
-The [raw record](validation/v0.15.1-publication-import.json) retains individual
-phase times, byte counts and hashes. `tools/benchmark_publication_import.py`
-replays this comparison on a caller-selected verified part without a remote.
-
 
 Verified loose-blob digest reuse requires a platform change stamp. On Unix this
 binds device, inode, length, modification time and nanosecond change time; replacing

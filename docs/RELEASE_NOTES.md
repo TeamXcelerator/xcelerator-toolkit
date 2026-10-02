@@ -1,9 +1,65 @@
 # Release notes
 
-## Unreleased: full-toolkit integrity repairs
+## 0.16.0 (2026-10-02)
 
-The full-toolkit review identified additional formula, rounding, validation and
-API-contract defects. These repairs align CCM discovery pole spacing with
+This release starts a clean artifact fabric: identities, receipts and capture
+plans change, and artifacts from earlier releases are not reused. Every managed
+family and kind has producer and reader floor 0.16.0, so earlier artifacts are
+cache misses and are recomputed, and earlier readers refuse 0.16.0 artifacts.
+The CCM evidence family registers `ccm_root_certification_report`,
+`ccm_assembly_error_analysis` and `ccm_checkpoint_spectra`.
+
+Ultra (capture-plan v7) adds two measurements that give CCM datapoints
+trustworthy digits. `assembly_error` bounds the stored Tau matrix against the
+exact finite Weil form at the declared cutoff, integer or fractional, using the
+cutoff-free FLINT/Arb closed form, and converts every retained stored eigenvalue
+enclosure into an exact-form enclosure, including exact-form root enclosures
+through a Davis-Kahan state bound and interval Newton. `checkpoint_spectra` encloses the lowest
+eigenvalues, gap and gap ratio of leading even-sector blocks along a dimension
+ladder. See [capture levels](CAPTURE_LEVELS.md#exact-form-error-bars-and-checkpoint-spectra-v7).
+
+Root certification in a retained run now certifies what is certifiable and
+retains everything else: every requested ordinal is either certified, computed
+but not certified (with its reason), or neither. Stagnated roots receive a
+certified enclosure when one exists, and disagreements are flagged instead of
+failing the measurement. Fractional cutoffs are certified and replay.
+Sector-gap certification in the maximum-capture path is additive too: a
+certification that cannot complete records its reason instead of ending the
+capture.
+
+Capture receipts record measurements that are retained artifacts by reference
+instead of embedding a second copy; `measurement_value` reconstructs and
+verifies them.
+
+Archimedean quadrature orders now also meet a per-mode Bernstein-ellipse
+requirement that accounts for oscillation growth. With an explicit low
+`quad_points` floor, small cutoffs (lambda squared below about 11) previously
+under-resolved middle modes: about 2^-244 instead of the intended 2^-320 at
+lambda squared 2 and 256 bits. Default floors at lambda squared 2 and above
+select the same orders as before, so those artifact identities are unchanged.
+
+Production root certification derives the exact secular numerator once and
+counts pole windows from one shared FLINT/Arb isolation of the pole span. A
+root ball touching a window boundary falls back to the direct window count, so
+certificates are unchanged; the first-fifty example now certifies and verifies
+about ten times faster. Certification phases report `ccm.roots.*` timings and
+print progress (see [performance reporting](PERFORMANCE_REPORTING.md)).
+
+Archimedean integrals prepare their node-only terms (density, decay and
+weight products) once per quadrature order and share them across every mode
+using that order. Each mode's interval enclosure is formed by the same
+operations as before, so the correctly rounded integrals and every Tau,
+eigenstate and root artifact are byte-identical while the stage does less
+repeated work.
+
+Library progress messages go through one facility,
+`xc_core::set_message_sink`. Without a sink they print to stderr exactly as
+before; applications can silence, capture or forward them.
+
+### Integrity repairs
+
+This release repairs additional formula, rounding, validation and API-contract
+defects. These repairs align CCM discovery pole spacing with
 refinement, apply the CCM basis phase before Sonin compression, make mixed energy
 component selection explicit, and decide resolution acceptance from losslessly
 retained measurements with conservative arithmetic. Changed discovery, resolution
@@ -25,10 +81,62 @@ writes and staging metadata use atomic replacement and bounded decoding.
 Assurance requires explicit accepted comparison evidence for CrossChecked.
 Quadrature callers handle an optional persisted manifest. Archive receipts use
 valid calendar timestamps, exact fractional ordering and artifact-bound
-provenance digests. Independent PARI/GP eigenvalue fixtures are restored.
+provenance digests. Independent PARI/GP eigenvalue fixtures are included.
 
 Historical research outputs require replay where affected; this repair does not certify
 all past results or establish universal numerical correctness.
+
+The standalone Gauss-Legendre, tau, Weil-eigenvector and prolate caches now
+live under `$XC_CACHE_ROOT`, or the per-user cache root shared with the managed
+cache when that variable is unset. They previously defaulted to `data/` under
+the working directory, so runs started inside a checkout wrote cache files
+into it. Existing files there are not migrated; they are recomputed on first
+use. Tests create their scratch directories outside the checkout and remove
+them when they finish.
+
+The research working-memory cap (`XC_RESEARCH_WORKING_BYTES`) is not part of
+artifact identity. A diagnostic that the cap leaves unresolved is returned in
+the capture but not retained, so a later run with a larger cap computes it, and
+a complete result is reused whatever cap produced it.
+
+Every Ultra measurement reports numerical coverage rather than unassessed:
+distance profiles, rules, refinements, verdicts and projections; evenness;
+sector gap and spectra; prefix ladder and checkpoints; retained reduction; root
+band and conditioning; prime-power and u-flow responses; operator energy; state
+geometry; assembly error; reference projections; the sector-gap certificate;
+and target comparison. Each row is counted as resolved, qualified or
+unresolved, and a result reported without countable rows is unassessed. A
+managed Gauss--Legendre rule is fully validated once per process for each exact
+payload instead of on every lookup, and rule construction and the distance
+captures report progress. A runtime-target provider that answers with another
+protocol version is named in the error.
+
+Prepared arithmetic inputs place the lattice origin mode (z = 0) in its own
+partition: the origin's mass is reported without an inverse moment, and the
+nonzero modes keep finite inverse moments instead of being left unresolved. The
+directional-response memory estimate counts the perturbation and derivative
+scalars it holds rather than every byte of the serialized research input. New
+shard ledgers name the producing Toolkit version in their initialization commit. Gauss--Legendre
+rules built by the distance captures and the concentration matrix use the same
+planned root schedule as the operator precompute, so they compute roots in
+parallel when GL root parallelism is enabled instead of always serially.
+
+A requested sector-gap certificate is resolved once per run and supplies the
+source assembly certificate to capture preflight and the transform enclosure
+(bound to their identity by its manifest, never copied into the external input
+artifact). The capture receipt records the certificate by reference, like the
+root certificate, instead of embedding a second copy. Research reports write
+exact integers (counts, byte sizes, availability flags) as integers.
+Exact-form eigenvalue and gap bounds in `ccm_assembly_error_analysis` are
+exported with the precision of their internal enclosure (outward rounding), and
+resolved digits are computed from the exported bounds with directed logarithm
+rounding; previously the endpoints kept 20 significant digits while the digits
+were reported from the narrower internal enclosure. The dense HP generalized
+solver evaluates its original-pair residual at the stored inputs' precision, so
+inputs finer than the working precision are no longer rounded away before
+acceptance. The regularized Yakaboylu matrix element keeps a representable real
+component when the squared offset underflows (binary64 and MPFR) instead of
+returning it as zero.
 
 ## 0.15.2 (2026-09-28)
 
@@ -39,9 +147,8 @@ correction diagnostics being accepted. Automatic polynomial preparation streams
 exact head coefficients, preserving its rounding checks while avoiding excessive
 aggregate coefficient storage.
 
-Release source digests now include Cargo configuration and toolchain files.
-Development/test builds disable incremental compilation and debug information
-by default, retaining their assertions and overflow checks.
+Release source digests now include Cargo configuration, when present, and
+toolchain files.
 
 The consolidated release also includes the following repairs. Native symmetric eigensystems pair eigenvalues with their own columns
 and verify residuals and orthogonality. HP inverse iteration checks the requested
@@ -99,13 +206,7 @@ resource exhaustion return errors. These point guarantees do not certify
 quadrature truncation or total operator source error.
 
 This release collects mathematics, precision, validation, and cache-integrity
-repairs. Local optimized HP/Arb and native Windows qualification included 20
-isolated numerical tests and the 401-by-401, 9,000-bit cutoff-free certificate,
-covering 103 repaired reproduced failure cases and 3,901 exact-rational or
-directed-reference cases.
-The recovered original fixtures were subsequently replayed, and the live
-historical-fixture check verifies rejection of an actively revoked manifest.
-Native Windows HP/FLINT and 32-bit execution remain unqualified.
+repairs. Native Windows HP/FLINT and 32-bit execution are not validated.
 Successful finite checks do not establish a universal defect-free guarantee.
 
 Repairs include exact-source boundary handling, robust eigenvalue and root
@@ -174,7 +275,7 @@ projection and its finite transform jets from their configured runtime evaluator
 Weighted atoms, a polynomial arithmetic-tail form, model energy/band, and Fourier
 block allowances are derived from the current retained state and matrix plus the
 bundled ordinate table. Finite scope and unresolved bound conditions remain
-explicit; no previous run's result or chat attachment is required. Finite contour
+explicit; no previously computed result is required. Finite contour
 enclosures use centered Taylor coefficients with an integral remainder to reduce
 interval dependency loss; acceptance still requires every boundary segment.
 
@@ -273,7 +374,7 @@ query tools preserve exact values and source identities. See [usage](ATOM_RESEAR
 - New kinds require v0.15.1 readers/producers. Existing numerical identities,
   old capture plans and source artifacts remain compatible. Both registry
   lanes receive matching schemas and their appropriate kind registrations.
-- See [release validation](VALIDATION.md). These are finite observations and
+- These are finite observations and
   software checks, not a proof of CCM convergence or RH. The remaining
   proof-dependent proposals are listed in the coverage guide.
 
@@ -281,8 +382,8 @@ query tools preserve exact values and source identities. See [usage](ATOM_RESEAR
 
 - Artifact publication avoids Git delta searches on compressed archives and
   reports batch sizes, reused bytes, push timings and 30-second Git progress
-  heartbeats. Retained local packing tests improved by 7.5-8.2x with identical
-  pack bytes; network speed is outside that measurement. Existing numerical
+  heartbeats. Local packing work is reduced with identical pack bytes;
+  network transfer is outside its scope. Existing numerical
   artifacts and publication recovery remain compatible. See
   [publication performance](PUBLICATION_PERFORMANCE.md).
 
@@ -422,15 +523,15 @@ current evidence. The schema-3 verifier reconstructs the interval operator and
 replays its interval certificates; midpoint discovery guides are checked for
 valid structure and retained as provenance, without replaying the discovery
 eigensolve. New assembly and certificate semantics and prefix/certificate
-reader floors use 0.15.0. Corrected development drafts carrying 0.14.4 remain
-distinct historical identities and are recognized by the impact inventory.
+reader floors use 0.15.0. Pre-release artifacts carrying 0.14.4 remain
+distinct historical identities.
 
 Upgrading an existing campaign requests new sector and distance chains; old
-objects remain available for deliberate historical replay. The impact tool
-now counts directly changed identities and their descendants separately from
-the known certificate defect, and reports missing rollover repositories.
-Use its per-kind counts with measured dimension/precision costs before sizing
-a campaign; root/Tau/eigenstate kind identities are not broadly invalidated.
+objects remain available for deliberate historical replay. Directly changed
+identities and their descendants are distinct from artifacts affected by the
+known certificate defect. Size a campaign from per-kind counts and measured
+dimension/precision costs; root/Tau/eigenstate kind identities are not broadly
+invalidated.
 Extended prefix policies use v3 identities so old reports cannot silently omit
 new measurements. Fresh Ultra plans request the full policy; old serialized
 plans preserve their requests. Two-moment/cancellation-enabled v2 children
@@ -438,8 +539,8 @@ remain byte-reusable. Computation must be allowed to backfill new children.
 Existing v1 scalar observations remain readable. No new artifact kind or
 public/private shard schema is needed for this extension.
 
-See [numerical compatibility](NUMERICAL_COMPATIBILITY.md),
-[capture integration](CAPTURE_LEVELS.md) and [release validation](VALIDATION.md).
+See [numerical compatibility](NUMERICAL_COMPATIBILITY.md)
+and [capture integration](CAPTURE_LEVELS.md).
 Applications adopt `execute_with_receipt` to run primary and retained phases
 with automatic managed outcome recording. Reduction and full quadrature checks
 remain explicitly budgeted requests.
@@ -550,7 +651,7 @@ locally or enters Git.
   each workstation object and must match before staging adopts its encoded
   bytes. Legacy unprofiled objects remain valid logical cache hits but are
   decoded and re-encoded as V1 for publication. A retained single-entry object
-  from the superseded interim V2 build is relabeled V1 only when doing so
+  from the superseded pre-release V2 profile is relabeled V1 only when doing so
   exactly reproduces a transport digest authorized by the retained V1 manifest.
 - Publication closure traversal can continue from the validated canonical
   manifest of an already staged draft without resolving and decoding that
@@ -630,7 +731,7 @@ publication.
   reporting a missing dependency after computation. Historical inventories
   are read once per shard revision and remain bounded. Regression tests cover
   both the reused-parent/unstaged-grandparent shape and the superseded-index
-  dependency that interrupted an HP-1000 sweep.
+  dependency case.
 - Reopened publication staging is completed rather than trusted: closure
   walks traverse the dependencies of already-staged artifacts and suppress
   only their re-recording, so a staging directory left by an interrupted or
@@ -686,10 +787,9 @@ publication.
   content digest is part of each affected semantic identity, and retained
   target-distance eigenvalues must exactly equal the canonical eigenvalue.
   Previously these paths independently requested the midpoint of a selected-
-  sector Sturm enclosure whose absolute tolerance was too coarse near the
-  HP-200 floor; at `(lambda^2, N) = (100, 120)` it retained a negative
-  `-3.38270e-211` distance eigenvalue while the residual-validated canonical
-  state was `+3.48676e-215`. The numerical claim path was unaffected. All
+  sector Sturm enclosure whose absolute tolerance was too coarse; near the
+  HP-200 floor the midpoint could have the wrong sign. The numerical claim path
+  was unaffected. All
   affected artifact semantic versions are advanced, so no legacy profile or
   distance payload can be reused under the corrected identities.
 - A target-distance capture resolves one managed `gauss_legendre_rule` artifact for each
@@ -809,10 +909,8 @@ publication.
   from `XC_TARGET_SPEC_FILE`; only its SHA-256 digest is retained.
   `crate::deviation` adds the projection those artifacts use.
 - Target-derived distance, resolution, and residual artifacts use
-  schema/semantics v2; the deviation decomposition uses schema/semantics v3
-  because an interim pre-release build of this branch serialized a draft
-  projection field name under v2, and the final schema refuses interim
-  payloads rather than colliding with them. All four bind the opaque
+  schema/semantics v2; the deviation decomposition uses schema/semantics v3,
+  which supersedes a pre-release v2 layout. All four bind the opaque
   target-specification digest. Managed publication withholds these kinds from
   every public leg (see the mixed-visibility routing entry below), and public
   bootstrap layers ignore them. Eigenfunction profiles and inter-discretization
@@ -896,11 +994,10 @@ the amended private runtime-target interface in 0.14.1.
 - `xc_spectral::ccm::hp` exports the even and odd parity-sector eigenvector
   expansions with their normalization documented and tested as an isometry.
   `xc_spectral::prolate` gains an eigenvector `xi_l2` norm, making the
-  scale-free relative distance recoverable, and an end-to-end educated-guess
+  scale-free relative distance recoverable, and an end-to-end prolate
   comparison `ccm_prolate_distance_hp`.
 - `ccm_discretization_distance_hp` measures `D_alpha(N, M; lambda)` end to
-  end for two discretizations of one `lambda^2`. This is the quantity the
-  first stage of the program is stated in, and it needs no target function.
+  end for two discretizations of one `lambda^2`. It needs no target function.
   `WeilEigenfunction::from_normalized_coefficients` rebuilds an eigenfunction
   from the coefficients a retained profile carries, so a published artifact is
   usable without repeating the eigensolve. `target_crossings_f64` reports where

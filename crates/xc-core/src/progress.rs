@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "event")]
@@ -80,6 +80,46 @@ pub trait ProgressSink: Send + Sync {
     fn emit(&self, event: ProgressEvent);
 }
 
+/// Process-wide destination for the toolkit's human-readable progress and
+/// diagnostic messages. With no sink installed (the default), each message is
+/// written to stderr as one line, exactly as the libraries always have.
+static MESSAGE_SINK: RwLock<Option<Arc<dyn ProgressSink>>> = RwLock::new(None);
+
+/// Install (or with `None`, remove) the process-wide message sink and return
+/// the previous one. An application can silence library messages with
+/// [`NoopProgress`], capture them with [`CollectingProgress`], or forward them
+/// to its own logger. Each message arrives as [`ProgressEvent::Message`] with
+/// level `"info"`.
+pub fn set_message_sink(sink: Option<Arc<dyn ProgressSink>>) -> Option<Arc<dyn ProgressSink>> {
+    let mut slot = MESSAGE_SINK
+        .write()
+        .unwrap_or_else(|poison| poison.into_inner());
+    std::mem::replace(&mut *slot, sink)
+}
+
+/// Deliver one library message; see [`set_message_sink`].
+pub fn emit_message(text: String) {
+    let sink = MESSAGE_SINK
+        .read()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    match sink {
+        Some(sink) => sink.emit(ProgressEvent::Message {
+            level: "info".to_owned(),
+            text,
+        }),
+        None => eprintln!("{text}"),
+    }
+}
+
+/// Format and deliver a library message through [`emit_message`].
+#[macro_export]
+macro_rules! progress_message {
+    ($($arg:tt)*) => {
+        $crate::emit_message(::std::format!($($arg)*))
+    };
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoopProgress;
 
@@ -120,6 +160,19 @@ impl ProgressSink for CollectingProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_message_sink_receives_library_messages() {
+        let sink = CollectingProgress::default();
+        let previous = set_message_sink(Some(Arc::new(sink.clone())));
+        crate::progress_message!("[HP] stage {} took {:.1}s", "tau", 1.25);
+        set_message_sink(previous);
+        assert!(sink.events().iter().any(|event| matches!(
+            event,
+            ProgressEvent::Message { level, text }
+                if level == "info" && text == "[HP] stage tau took 1.2s"
+        )));
+    }
 
     #[test]
     fn collecting_sink_preserves_event_order() {

@@ -3,7 +3,7 @@
 
 //! Weighted distances between CCM eigenfunctions and a runtime-supplied target.
 //!
-//! Implements the collaboration's central measurement,
+//! Implements the weighted distance
 //!
 //! ```text
 //!   d(N, λ) = ∫₁^λ |f_{N,λ}(u) − target(u)| u^{−α} du
@@ -11,8 +11,6 @@
 //!
 //! together with the weighted norm `‖g‖_α = ∫₁^λ |g(u)| u^{−α} du` and the
 //! inter-discretization distance `D_α(N, M; λ) = ‖f_{N,λ} − f_{M,λ}‖_α`.
-//! The program objective is `lim_{λ→∞} lim_{N→∞} d(N, λ) = 0`, with the limits
-//! in that order: the eigenfunction must first stabilize in `N` at fixed `λ`.
 //!
 //! `f_{N,λ}` is the canonical even CCM eigenfunction reconstructed from its
 //! zero-shift, smallest-magnitude selected state. Ground-state ordering requires
@@ -25,8 +23,8 @@
 //! ## Conventions travel with results
 //!
 //! At finite resolution the value of every quantity here depends on the
-//! integration rule, the grid variable, the resolution, and `α`. Independent
-//! groups in this collaboration integrate differently, so every result type
+//! integration rule, the grid variable, the resolution, and `α`. Different
+//! implementations integrate differently, so every result type
 //! records the full convention it was computed under. A number separated from
 //! its convention is not comparable and should not be reported.
 //!
@@ -616,6 +614,13 @@ pub mod hp {
 
     /// Guard bits for internal evaluation above the requested precision.
     const GUARD_BITS: u32 = 64;
+
+    mod target_comparison;
+    pub use target_comparison::{
+        capture_target_comparison_via_cache, PortableCriticalLineMaximum, PortableTargetComparison,
+        PortableTargetComparisonLevel, PortableTargetProjection, TARGET_COMPARISON_KIND,
+        TARGET_COMPARISON_SEMANTICS,
+    };
     const RESIDUAL_MASS_CONSISTENCY_POLICY: &str =
         "snap_signed_to_absolute_within_scaled_2^(-(precision_bits-8));otherwise_reject_v1";
 
@@ -698,8 +703,11 @@ pub mod hp {
                     certification_failure_policy: cache.certification_failure_policy,
                     production_sink: cache.production_sink,
                 };
-                let resolved = xc_numerics::quadrature::gauss_legendre_nodes_via_cache(
-                    points, working, request,
+                let resolved = xc_numerics::quadrature::gauss_legendre_nodes_via_cache_scheduled(
+                    points,
+                    working,
+                    request,
+                    root_schedule(points, working),
                 )?;
                 self.0
                     .insert((points, working), (resolved.nodes, resolved.weights));
@@ -715,10 +723,11 @@ pub mod hp {
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 self.0.entry((points, working))
             {
-                entry.insert(xc_numerics::quadrature::try_gauss_legendre_nodes(
+                entry.insert(xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
                     points,
                     working,
                     xc_numerics::quadrature::CacheMode::Off,
+                    root_schedule(points, working),
                 )?);
             }
             Ok(self
@@ -726,6 +735,13 @@ pub mod hp {
                 .get(&(points, working))
                 .expect("inserted checked table"))
         }
+    }
+
+    /// Root schedule for one Gauss--Legendre table, planned from the calling
+    /// thread's HP runtime policy: root-parallel only when that policy enables
+    /// GL root parallelism, serial on Rayon workers and without a policy.
+    fn root_schedule(points: usize, working: u32) -> xc_numerics::hp_runtime::GlRootSchedule {
+        xc_numerics::hp_runtime::plan_gl_precompute(&[points], working).root_schedule(points)
     }
 
     /// Integrate `g` over `[1, λ]` under `rule` at `prec` bits.
@@ -760,10 +776,11 @@ pub mod hp {
                         (&table.0, &table.1)
                     }
                     None => {
-                        built = xc_numerics::quadrature::try_gauss_legendre_nodes(
+                        built = xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
                             points,
                             working,
                             xc_numerics::quadrature::CacheMode::Off,
+                            root_schedule(points, working),
                         )?;
                         (&built.0, &built.1)
                     }
@@ -1548,9 +1565,9 @@ pub mod hp {
 
     /// Measure `D_α(N, M; λ) = ‖f_{N,λ} − f_{M,λ}‖_α` end to end.
     ///
-    /// This is the quantity the first stage of the program is stated in: the
-    /// eigenfunction is said to stabilize at fixed `λ` when successive
-    /// `D_α(N, M; λ)` shrink. It requires no target function, so it can be
+    /// It measures stabilization in `N` at fixed `λ`: the eigenfunction
+    /// stabilizes when successive `D_α(N, M; λ)` shrink. It requires no target
+    /// function, so it can be
     /// measured before any runtime target enters the comparison.
     ///
     /// Both configurations must share `λ²`; comparing across different `λ`
@@ -3935,7 +3952,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -4329,7 +4346,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -4403,7 +4420,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -4488,7 +4505,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -4557,7 +4574,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -4618,7 +4635,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -4752,17 +4769,17 @@ pub mod hp {
             let decomposition_key = bind_key(&decomposition_key, &child_dependencies);
             let evidence_request = ArtifactExecutionCacheRequest {
                 semantic_key: &evidence_key,
-                minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+                minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
                 ..evidence_request
             };
             let residual_request = ArtifactExecutionCacheRequest {
                 semantic_key: &residual_key,
-                minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+                minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
                 ..residual_request
             };
             let decomposition_request = ArtifactExecutionCacheRequest {
                 semantic_key: &decomposition_key,
-                minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+                minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
                 ..decomposition_request
             };
 
@@ -4920,17 +4937,17 @@ pub mod hp {
         let decomposition_key = bind_key(&decomposition_key, &child_dependencies);
         let evidence_request = ArtifactExecutionCacheRequest {
             semantic_key: &evidence_key,
-            minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             ..evidence_request
         };
         let residual_request = ArtifactExecutionCacheRequest {
             semantic_key: &residual_key,
-            minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             ..residual_request
         };
         let decomposition_request = ArtifactExecutionCacheRequest {
             semantic_key: &decomposition_key,
-            minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             ..decomposition_request
         };
 
@@ -5413,7 +5430,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.14.1")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "ccm".to_owned()),
@@ -6044,8 +6061,7 @@ mod tests {
             hp::WeilEigenfunction::from_v_basis(&xi, n_modes, lambda, prec).unwrap()
         }
 
-        /// HP self-distance is exactly zero at every precision — mirrors the
-        /// collaboration's own harness invariant at 3535–7189 bits.
+        /// HP self-distance is exactly zero at every precision.
         #[test]
         fn hp_nonfinite_distance_is_an_error() {
             for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -6161,11 +6177,8 @@ mod tests {
                 FilesystemCacheStore, ToolkitVersion,
             };
 
-            let root = std::env::temp_dir().join(format!(
-                "xc-spectral-managed-gl-exact-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&root);
+            let root_dir = xc_core::test_support::TestDir::new("managed-gl-exact");
+            let root = root_dir.to_path_buf();
             let resolver = CacheResolver::new(vec![CacheLayer {
                 precedence: 0,
                 store: Box::new(FilesystemCacheStore::new(
@@ -6954,11 +6967,8 @@ mod tests {
                 FilesystemCacheStore, ToolkitVersion,
             };
 
-            let root = std::env::temp_dir().join(format!(
-                "xc-spectral-distance-analysis-backfill-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&root);
+            let root_dir = xc_core::test_support::TestDir::new("distance-analysis-backfi");
+            let root = root_dir.to_path_buf();
             let resolver = CacheResolver::new(vec![CacheLayer {
                 precedence: 0,
                 store: Box::new(FilesystemCacheStore::new(

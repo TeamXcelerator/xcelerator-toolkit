@@ -59,11 +59,15 @@ pub fn hp_debug_enabled() -> bool {
     HP_DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Lets exported macros reach `xc-core` without a caller dependency on it.
+#[doc(hidden)]
+pub use xc_core as __xc_core;
+
 #[macro_export]
 macro_rules! hp_debug {
     ($($arg:tt)*) => {
         if $crate::hp_debug_enabled() {
-            eprintln!($($arg)*);
+            $crate::__xc_core::progress_message!($($arg)*);
         }
     };
 }
@@ -73,7 +77,7 @@ macro_rules! hp_debug {
 /// Cargo runs tests in parallel within a single test binary, and the
 /// current working directory is process-global (not per-thread). The
 /// `ccm::hp` and `prolate::hp` cache tests both `set_current_dir` into
-/// a throwaway temp dir to isolate their `<cwd>/data/*_cache/` writes;
+/// a throwaway temp dir and redirect the standalone cache root there;
 /// if they used separate mutexes they would race each other (one test
 /// deleting the temp dir another captured as its "original"). A single
 /// crate-level lock guarantees mutual exclusion across both modules.
@@ -83,35 +87,61 @@ macro_rules! hp_debug {
 #[cfg(all(test, feature = "hp"))]
 pub(crate) static TEST_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Root for throwaway test directories, under the workspace `target/`
-/// dir (not the OS temp dir). Keeping test scratch inside `target/`
-/// means it is contained in the repo's build area and removed by
-/// `cargo clean`, rather than scattering directories in `/tmp` or
-/// `%TEMP%`. Resolved from `CARGO_MANIFEST_DIR` at compile time, so it
-/// is correct regardless of the process's runtime cwd.
-///
-/// Gated on the `hp` feature: only the HP-gated cache tests use it.
+/// Test-only override of [`standalone_cache_root`], set by the cache-test
+/// guards while they hold [`TEST_CWD_LOCK`].
 #[cfg(all(test, feature = "hp"))]
-pub(crate) fn test_tmp_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("target")
-        .join("test-tmp")
+pub(crate) static TEST_CACHE_ROOT: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Root of the standalone HP caches (`tau_cache`, `weil_eigvec_cache`,
+/// `prolate_eigvals_cache`): `$XC_CACHE_ROOT` when set, else the per-user
+/// cache root shared with the managed cache. The working directory is never
+/// used, so runs started inside a checkout do not write into it.
+#[cfg(feature = "hp")]
+pub(crate) fn standalone_cache_root() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(root) = TEST_CACHE_ROOT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return root;
+    }
+    xc_core::configured_cache_root()
 }
 
-/// Make a fresh, unique throwaway directory under [`test_tmp_root`].
-/// The `tag` plus a process-id + nanosecond suffix avoids clashes when
-/// tests run in parallel or are re-run rapidly.
+/// Points [`standalone_cache_root`] at `<dir>/data` for a cache test and
+/// restores the previous value on drop.
+#[cfg(all(test, feature = "hp"))]
+pub(crate) struct TestCacheRoot(Option<std::path::PathBuf>);
+
+#[cfg(all(test, feature = "hp"))]
+impl TestCacheRoot {
+    pub(crate) fn enter(dir: &std::path::Path) -> Self {
+        let mut slot = TEST_CACHE_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self(slot.replace(dir.join("data")))
+    }
+}
+
+#[cfg(all(test, feature = "hp"))]
+impl Drop for TestCacheRoot {
+    fn drop(&mut self) {
+        *TEST_CACHE_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.0.take();
+    }
+}
+
+/// Make a fresh, unique throwaway directory for a test.
+///
+/// The directory lives under `<OS temp>/xc-test/`, never inside the
+/// checkout, and is removed when the returned guard is dropped (including
+/// when the test panics). Keep the guard alive for the whole test.
 ///
 /// Gated on the `hp` feature: only the HP-gated cache tests use it.
 #[cfg(all(test, feature = "hp"))]
-pub(crate) fn fresh_test_dir(tag: &str) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = test_tmp_root().join(format!("{}_{}_{}", tag, std::process::id(), nanos));
-    std::fs::create_dir_all(&dir).expect("create test tmp dir");
-    dir
+pub(crate) fn fresh_test_dir(tag: &str) -> xc_core::test_support::TestDir {
+    xc_core::test_support::TestDir::new(tag)
 }

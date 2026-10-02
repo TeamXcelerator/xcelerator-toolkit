@@ -4,8 +4,8 @@
 //! Gauss-Legendre quadrature at f64 and high precision.
 //!
 //! The HP nodes/weights are computed via Newton iteration on Legendre
-//! polynomials and cached to disk under `$XC_CACHE_ROOT/gl_cache/`, or
-//! `<cwd>/data/gl_cache/` when that variable is unset, so they're reused
+//! polynomials and cached to disk under `$XC_CACHE_ROOT/gl_cache/`, or under
+//! the per-user cache root when that variable is unset, so they're reused
 //! across runs at the same `(n_pts, precision_bits)`.
 //!
 //! The standalone HP API reads a local deterministic `.json.zip`, directly
@@ -22,7 +22,8 @@
 //! explicitly; pass `CacheMode::default()` for standard local behavior.
 //!
 //! New computes write only the compressed representation. Every reused HP rule
-//! passes the full O(n^2) Legendre/node/weight check. Legacy standalone files
+//! passes the full O(n^2) Legendre/node/weight check, once per process for each
+//! exact managed-cache payload. Legacy standalone files
 //! establish numerical compatibility, not bit-for-bit producer authenticity:
 //! accepted values may differ from a fresh rule within the explicit validation
 //! tolerances. Managed identities bind generation semantics, but are not by
@@ -287,6 +288,14 @@ mod hp {
         }
     }
 
+    /// Rules that already passed the full O(n^2) check in this process, keyed by
+    /// their exact payload. The check is a pure function of these bytes, so a
+    /// later lookup of the same rule returns the checked values instead of
+    /// repeating it. Bounded to a few rules.
+    static VALIDATED_TABLES: std::sync::Mutex<Vec<(PortableGlTable, GlTable)>> =
+        std::sync::Mutex::new(Vec::new());
+    const VALIDATED_TABLE_LIMIT: usize = 8;
+
     fn decode_portable_table(
         table: &PortableGlTable,
         n: usize,
@@ -303,6 +312,14 @@ mod hp {
                 "quadrature payload identity or dimensions do not match its semantic key"
                     .to_owned(),
             ));
+        }
+        if let Some((_, checked)) = VALIDATED_TABLES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|(validated, _)| validated == table)
+        {
+            return Ok(checked.clone());
         }
         let parse = |value: &str| {
             Float::parse(value)
@@ -328,6 +345,13 @@ mod hp {
                 "quadrature payload failed structural validation: {reason}"
             )));
         }
+        let mut validated = VALIDATED_TABLES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if validated.len() >= VALIDATED_TABLE_LIMIT {
+            validated.remove(0);
+        }
+        validated.push((table.clone(), (nodes.clone(), weights.clone())));
         Ok((nodes, weights))
     }
 
@@ -433,7 +457,7 @@ mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.13.0")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "quadrature".to_owned()),
@@ -449,7 +473,20 @@ mod hp {
                     xc_core::performance_stage_with("quadrature.gl.construct", || {
                         gl_performance_metadata_scheduled(n, precision_bits, root_schedule)
                     });
+                let started = std::time::Instant::now();
+                xc_core::progress_message!(
+                    "[HP] Gauss-Legendre rule n={n}, {precision_bits} bits: computing {} roots",
+                    if root_schedule.parallel_min_task_len().is_some() {
+                        "parallel"
+                    } else {
+                        "serial"
+                    }
+                );
                 let table = gauss_legendre_compute_scheduled(n, precision_bits, root_schedule)?;
+                xc_core::progress_message!(
+                    "[HP] Gauss-Legendre rule n={n}, {precision_bits} bits: computed in {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
                 drop(performance_construct);
                 let performance_encode =
                     xc_core::performance_stage_with("quadrature.gl.portable_encode", || {
@@ -825,13 +862,10 @@ mod hp {
     }
 
     /// Cache directory: `$XC_CACHE_ROOT/gl_cache` when that is set, else
-    /// `<cwd>/data/gl_cache`. Created on demand so fresh checkouts work
-    /// without manual setup.
-    ///
-    /// Honouring `XC_CACHE_ROOT` matters because the fallback is relative to
-    /// the *working directory*: a run started from inside a checkout drops
-    /// binary cache files into that checkout, where they are neither the
-    /// operator's chosen cache volume nor necessarily ignored by git.
+    /// `gl_cache` under the per-user cache root shared with the managed
+    /// cache ([`xc_core::default_cache_root`]). Created on demand. The
+    /// working directory is never used, so runs started inside a checkout
+    /// do not write into it.
     fn gl_cache_dir() -> Option<std::path::PathBuf> {
         #[cfg(test)]
         if let Some(root) = TEST_CACHE_ROOT.with(|current| current.borrow().clone()) {
@@ -839,11 +873,7 @@ mod hp {
             std::fs::create_dir_all(&dir).ok()?;
             return Some(dir);
         }
-        let root = match std::env::var_os("XC_CACHE_ROOT") {
-            Some(root) if !root.is_empty() => std::path::PathBuf::from(root),
-            _ => std::env::current_dir().ok()?.join("data"),
-        };
-        let dir = root.join("gl_cache");
+        let dir = xc_core::configured_cache_root().join("gl_cache");
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
     }
@@ -927,7 +957,7 @@ mod hp {
     /// so reviewers can identify and remediate corrupt fixtures
     /// without silently triggering a multi-minute Newton recompute.
     fn warn_cache_skip(path: &std::path::Path, reason: &str) {
-        eprintln!(
+        xc_core::progress_message!(
             "[gl_cache] WARNING: skipping {} ({}); recomputing",
             path.display(),
             reason
@@ -1133,7 +1163,7 @@ mod hp {
                 }
             }
             if let Err(error) = xc_cache::atomic_replace_cache_file(&zip_path, &buf) {
-                eprintln!("quadrature cache write failed: {error}");
+                xc_core::progress_message!("quadrature cache write failed: {error}");
             }
         }
     }
@@ -1237,6 +1267,32 @@ mod hp {
         let mut weight = Float::with_val(prec, 2);
         weight /= &denominator;
         (x, weight)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn validated_rules_are_remembered_and_altered_rules_still_rejected() {
+        let (n, prec) = (12, 192);
+        let rule = portable_table(
+            n,
+            prec,
+            gauss_legendre_compute_scheduled(n, prec, crate::hp_runtime::GlRootSchedule::serial())
+                .unwrap(),
+        );
+        let first = decode_portable_table(&rule, n, prec).unwrap();
+        assert!(VALIDATED_TABLES
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(table, _)| table == &rule));
+        let second = decode_portable_table(&rule, n, prec).unwrap();
+        assert_eq!(first, second);
+        let mut altered = rule.clone();
+        altered.nodes.swap(0, 1);
+        assert!(decode_portable_table(&altered, n, prec).is_err());
+        let mut altered = rule;
+        altered.weights[0] = "0".into();
+        assert!(decode_portable_table(&altered, n, prec).is_err());
     }
 
     #[cfg(test)]
@@ -1674,11 +1730,7 @@ mod tests {
         };
         use xc_core::{CacheLookupOutcome, CacheReuseDisposition};
 
-        let root = std::env::temp_dir().join(format!(
-            "xc-numerics-quadrature-fabric-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = xc_core::test_support::TestDir::new("quad-fabric");
         let reference_root = root.join("reference");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
@@ -1690,7 +1742,7 @@ mod tests {
             )),
         }]);
         let policy = CachePolicy {
-            current_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            current_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
             minimum_quality: CacheQuality::Validated,
             accepted_schema_versions: vec![1],
             allow_deprecated: false,
@@ -1771,7 +1823,6 @@ mod tests {
         .unwrap();
         assert!(report.output_preserving);
         assert_eq!(report.totals.matched, 1);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1978,32 +2029,12 @@ mod hp_cache_tests {
         }
     }
 
-    /// Make a fresh, unique throwaway directory under the workspace
-    /// `target/test-tmp/` dir (not the OS temp dir). Keeping test scratch
-    /// inside `target/` means it is contained in the repo's build area
-    /// and removed by `cargo clean`, rather than scattering directories
-    /// in `/tmp` or `%TEMP%`. The path is resolved from
-    /// `CARGO_MANIFEST_DIR` at compile time, so it is correct regardless
-    /// of the process's runtime cwd. A tag plus a process-id +
-    /// nanosecond suffix avoids clashes when tests run in parallel or
-    /// are re-run rapidly.
-    fn fresh_temp_dir(tag: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let pid = std::process::id();
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("target")
-            .join("test-tmp")
-            .join(format!(
-                "xc_numerics_gl_cache_test_{}_{}_{}",
-                tag, pid, nanos
-            ));
-        std::fs::create_dir_all(&dir).expect("create test tmp dir");
-        dir
+    /// Make a fresh, unique throwaway directory outside the checkout. The
+    /// returned guard deletes the directory when dropped, including on
+    /// panic, so callers must keep it alive for the whole test and declare
+    /// it before any `CacheRootGuard` that points into it.
+    fn fresh_temp_dir(tag: &str) -> xc_core::test_support::TestDir {
+        xc_core::test_support::TestDir::new(tag)
     }
 
     #[test]
@@ -2245,7 +2276,7 @@ mod hp_cache_tests {
         // Zip-only: fresh compute writes the .json.zip, never the .json.
         assert!(
             zip_path.exists(),
-            "fresh compute should write the .json.zip to <cwd>/data/gl_cache/..."
+            "fresh compute should write the .json.zip to gl_cache/ under the redirected cache root"
         );
         assert!(
             !json_path.exists(),
@@ -2437,8 +2468,8 @@ mod hp_cache_tests {
 
     /// Sanity check that the legitimate computed GL nodes integrate a
     /// known polynomial correctly. This is a sanity wrapper around
-    /// `gauss_legendre_compute` (no cache involved if the test runs
-    /// in a fresh temp cwd).
+    /// `gauss_legendre_compute` (no cache involved because the cache
+    /// root is redirected to a fresh scratch directory).
     #[test]
     fn fresh_compute_integrates_x_squared() {
         let temp = fresh_temp_dir("integrate_x2");

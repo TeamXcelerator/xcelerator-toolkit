@@ -33,7 +33,8 @@ fn alias_dependencies(
 
 #[test]
 fn destination_aliases_publish_once_with_closed_dependencies_in_both_lanes() {
-    let root = std::env::temp_dir().join(format!("xc-publication-aliases-{}", std::process::id()));
+    let scratch = crate::test_support::TestDir::new("publication-aliases");
+    let root = scratch.join("root");
     let neutral = fixture_draft_with_n(&root, 2);
     let mut private = neutral.clone();
     private.manifest = target_manifest(&private, PublicationDestination::Private).unwrap();
@@ -129,10 +130,8 @@ fn destination_aliases_publish_once_with_closed_dependencies_in_both_lanes() {
 
 #[test]
 fn destination_aliases_preserve_assurance_requirements_and_evidence() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-publication-alias-assurance-{}",
-        std::process::id()
-    ));
+    let scratch = crate::test_support::TestDir::new("publication-alias-assura");
+    let root = scratch.join("root");
     let strong = fixture_draft(&root);
     let mut weak = strong.clone();
     weak.achieved_assurance = ArtifactAssuranceState::Computed;
@@ -169,10 +168,8 @@ fn destination_aliases_preserve_assurance_requirements_and_evidence() {
 
 #[test]
 fn destination_aliases_do_not_hide_unbound_transport() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-publication-alias-forged-{}",
-        std::process::id()
-    ));
+    let scratch = crate::test_support::TestDir::new("publication-alias-forged");
+    let root = scratch.join("root");
     let valid = fixture_draft(&root);
     let mut forged = valid.clone();
     forged.encoding.canonical_payload_digest = ContentDigest::sha256(b"other-payload");
@@ -185,10 +182,8 @@ fn destination_aliases_do_not_hide_unbound_transport() {
 
 #[test]
 fn destination_aliases_preserve_distinct_historical_closures() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-publication-alias-history-{}",
-        std::process::id()
-    ));
+    let scratch = crate::test_support::TestDir::new("publication-alias-histor");
+    let root = scratch.join("root");
     let first = fixture_draft_with_n(&root, 2);
     let second = fixture_draft_with_n(&root, 3);
     let child = alias_dependencies(fixture_draft_with_n(&root, 4), &[&first]);
@@ -225,10 +220,8 @@ fn destination_aliases_preserve_distinct_historical_closures() {
 #[test]
 fn destination_aliases_from_reopened_production_staging_remap_successfully() {
     use crate::ArtifactProductionSink;
-    let root = std::env::temp_dir().join(format!(
-        "xc-publication-alias-staging-{}",
-        std::process::id()
-    ));
+    let scratch = crate::test_support::TestDir::new("publication-alias-stagin");
+    let root = scratch.join("root");
     let fixture = fixture_draft(&root.join("fixture"));
     let payload = b"{\"entries\":[\"1\",\"0\",\"0\",\"1\"]}".to_vec();
     let semantic_key = fixture.manifest.semantic_key.clone();
@@ -251,8 +244,8 @@ fn destination_aliases_from_reopened_production_staging_remap_successfully() {
                 size_bytes: payload.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.15.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.18.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: crate::CacheQuality::Validated,
             visibility: CacheVisibility::Local,

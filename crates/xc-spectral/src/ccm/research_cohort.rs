@@ -340,8 +340,8 @@ mod tests {
             "schema_version":1,"key":ArtifactKey::new(kind,kind,kind.as_bytes()).unwrap(),
             "content_digest":ContentDigest::sha256(kind.as_bytes()),"size_bytes":kind.len(),
             "objects":[{"content_digest":ContentDigest::sha256(kind.as_bytes()),"size_bytes":kind.len()}],"created_unix_seconds":1,
-            "producer_toolkit_version":ToolkitVersion::parse("0.15.1").unwrap(),
-            "minimum_reader_version":ToolkitVersion::parse("0.15.1").unwrap(),
+            "producer_toolkit_version":ToolkitVersion::parse("0.16.0").unwrap(),
+            "minimum_reader_version":ToolkitVersion::parse("0.16.0").unwrap(),
             "maximum_reader_version":null,"quality":"validated","visibility":"private",
             "immutable":true,"dependencies":[],"tags":{},"provenance_digest":null
         })).unwrap()

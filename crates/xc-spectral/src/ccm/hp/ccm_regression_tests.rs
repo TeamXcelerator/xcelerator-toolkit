@@ -94,7 +94,7 @@ fn with_remaining_cache(test: impl FnOnce(&ArtifactCacheContext<'_>)) {
         precedence: 0,
         store: Box::new(FilesystemCacheStore::new(
             "remaining-local",
-            &root,
+            &*root,
             true,
             CacheVisibility::Local,
         )),
@@ -271,4 +271,42 @@ fn wide_cached_window_admits_only_the_requested_converged_prefix() {
             Ok(())
         }).unwrap();
     });
+}
+#[test]
+fn small_cutoff_archimedean_order_meets_its_precision_target() {
+    // At lambda^2 = 2 the pole ellipse is wide and the fixed 3n allowance
+    // under-resolved middle modes (about 2^-244 at p = 256 for n = 10).
+    // An explicit low quad_points floor exposes the per-mode order itself.
+    let p = 256;
+    let length = Float::with_val(p, 2).ln();
+    let orders =
+        super::super::research::quadrature_orders_for_length(10, 1, p, 1, &length).unwrap();
+    for n in [5usize, 10] {
+        let order = orders[n];
+        let coarse = xc_numerics::quadrature::try_gauss_legendre_nodes(
+            order,
+            p,
+            xc_numerics::quadrature::CacheMode::Off,
+        )
+        .unwrap();
+        let fine = xc_numerics::quadrature::try_gauss_legendre_nodes(
+            4 * order,
+            p,
+            xc_numerics::quadrature::CacheMode::Off,
+        )
+        .unwrap();
+        let a =
+            compute_archimedean_integrals_l(n as i64, &length, p, &coarse.0, &coarse.1).unwrap();
+        let b = compute_archimedean_integrals_l(n as i64, &length, p, &fine.0, &fine.1).unwrap();
+        // Both rules store p-bit nodes and weights, so correctly rounded
+        // results can differ by a few ulps; the former order missed by 2^-244.
+        let tolerance = Float::with_val(p, 1) >> (p - 8);
+        for (left, right) in [(&a.0, &b.0), (&a.1, &b.1), (&a.2, &b.2)] {
+            let difference = Float::with_val(p, left - right).abs();
+            assert!(
+                difference <= tolerance,
+                "n={n} order={order}: integral changed by {difference}"
+            );
+        }
+    }
 }

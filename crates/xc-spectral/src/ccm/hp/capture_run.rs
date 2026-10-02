@@ -28,6 +28,12 @@ pub struct RetainedCcmRun {
     sector_record: Option<CapturedDiagnostic>,
     sector_error: Option<String>,
     sector_options: Option<CcmSectorAnalysisOptions>,
+    sector_certificate: Option<
+        xc_cache::ArtifactExecutionCacheResult<
+            crate::ccm::sector_gap_certificate::PortableCcmSectorGapCertificate,
+        >,
+    >,
+    sector_certificate_error: Option<String>,
 }
 
 // Observe only the requested logical payloads. Keep the configured publication
@@ -240,9 +246,14 @@ fn recorded(mut records: Vec<ProducedArtifactRecord>) -> Result<CapturedDiagnost
         .iter()
         .map(|r| serde_json::from_slice::<serde_json::Value>(&r.payload))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(CapturedDiagnostic::new(
+    // The measurement is exactly these retained payloads, so the receipt
+    // references them instead of embedding a second copy.
+    let manifests = records.into_iter().map(|r| r.manifest).collect::<Vec<_>>();
+    Ok(CapturedDiagnostic::by_reference(
         &values,
-        records.into_iter().map(|r| r.manifest).collect(),
+        manifests.clone(),
+        true,
+        manifests,
     )?)
 }
 
@@ -338,7 +349,7 @@ impl RetainedCcmRun {
                 ),
             };
             if let Err(e) = crate::ccm::research_cohort::register(&registration) {
-                eprintln!("research cohort registration unavailable: {e}");
+                xc_core::progress_message!("research cohort registration unavailable: {e}");
             }
         }
         Ok(Self {
@@ -362,6 +373,8 @@ impl RetainedCcmRun {
             sector_record: None,
             sector_error: None,
             sector_options: None,
+            sector_certificate: None,
+            sector_certificate_error: None,
         })
     }
     /// Explicit additional references; the legacy runtime target file is never imported.
@@ -424,6 +437,11 @@ impl RetainedCcmRun {
         options: &CcmResearchCaptureOptions,
         cache: &ArtifactCacheContext<'_>,
     ) -> std::result::Result<CapturedDiagnostic, xc_cache::CaptureFailure> {
+        if id == "target_comparison" && !crate::target::runtime_target_configured() {
+            return Err(xc_cache::CaptureFailure::Missing {
+                reason: "no runtime target is configured".into(),
+            });
+        }
         let result = self
             .capture_diagnostic(id, options, cache)
             .map_err(xc_cache::CaptureFailure::failed)?;
@@ -932,6 +950,44 @@ impl RetainedCcmRun {
         }
     }
 
+    /// Resolve the run's sector-gap certificate once. The certificate capture
+    /// and the research diagnostics that replay it share this single result.
+    fn ensure_sector_certificate(
+        &mut self,
+        options: &CcmResearchCaptureOptions,
+        cache: &ArtifactCacheContext<'_>,
+    ) -> Result<()> {
+        if self.sector_certificate.is_some() {
+            return Ok(());
+        }
+        if let Some(error) = &self.sector_certificate_error {
+            bail!("sector-gap certificate unavailable: {error}");
+        }
+        let certification = options
+            .sector_gap_certification
+            .ok_or_else(|| anyhow::anyhow!("sector certification not requested"))?;
+        let resolved = self.sectors(options, cache).and_then(|()| {
+            let sectors = self.sectors.as_ref().expect("resolved sectors");
+            certify_sector_gap_from_resolution(
+                &self.params,
+                &self.cfg,
+                certification,
+                sectors,
+                Some(cache),
+            )
+        });
+        match resolved {
+            Ok(resolved) => {
+                self.sector_certificate = Some(resolved);
+                Ok(())
+            }
+            Err(error) => {
+                self.sector_certificate_error = Some(format!("{error:#}"));
+                Err(error)
+            }
+        }
+    }
+
     /// Attempt one primary diagnostic. Callers convert errors to explicit
     /// receipt outcomes and continue other independent requests. Measurements
     /// include exact authenticated artifact manifests, on fresh and warm runs.
@@ -954,10 +1010,7 @@ impl RetainedCcmRun {
     ) -> Result<CapturedDiagnostic> {
         if id == "u_flow_response" {
             if let Some(saved) = &self.uflow_capture {
-                return Ok(CapturedDiagnostic::new(
-                    &saved.value,
-                    saved.sources.clone(),
-                )?);
+                return Ok(saved.clone());
             }
         }
         let complete = id.ends_with("_full")
@@ -971,6 +1024,17 @@ impl RetainedCcmRun {
             use crate::ccm::extended_research::*;
             use crate::ccm::retained_evidence::{RetainedMatrix, RetainedRoots};
             use crate::ccm::state_geometry::RetainedState;
+            // The run's own certificate, when requested, supplies the source
+            // assembly certificate these two diagnostics replay.
+            if matches!(id, "capture_preflight" | "transform_enclosure")
+                && options.sector_gap_certification.is_some()
+            {
+                if let Err(error) = self.ensure_sector_certificate(options, cache) {
+                    xc_core::progress_message!(
+                        "  sector-gap certificate unavailable to {id}: {error:#}"
+                    );
+                }
+            }
             if !self.extended_inputs_loaded {
                 self.extended_inputs_loaded = true;
                 if let Some(path) = std::env::var_os("XC_RESEARCH_INPUTS_FILE") {
@@ -1227,16 +1291,30 @@ impl RetainedCcmRun {
             } else {
                 self.extended_inputs.as_ref()
             };
-            return Ok(CapturedDiagnostic::from_cached(capture_extended(
-                id,
-                &state,
-                matrix.as_ref(),
-                roots.as_ref(),
-                input,
-                &options,
-                &self.run_once_sources,
-                cache,
-            )?)?);
+            let certificate = self
+                .sector_certificate
+                .as_ref()
+                .filter(|_| matches!(id, "capture_preflight" | "transform_enclosure"))
+                .and_then(|resolved| {
+                    resolved
+                        .produced_manifest
+                        .as_ref()
+                        .or(resolved.reused_manifest.as_ref())
+                        .map(|manifest| (&resolved.value, manifest))
+                });
+            return Ok(CapturedDiagnostic::from_cached(
+                capture_extended_with_certificate(
+                    id,
+                    &state,
+                    matrix.as_ref(),
+                    roots.as_ref(),
+                    input,
+                    certificate,
+                    &options,
+                    &self.run_once_sources,
+                    cache,
+                )?,
+            )?);
         }
         if matches!(
             id,
@@ -1339,6 +1417,57 @@ impl RetainedCcmRun {
                 )?,
             )?);
         }
+        if id == "checkpoint_spectra" {
+            let (matrix, _) = self.retained_even_sources(cache)?;
+            let ladder = crate::ccm::capture::checkpoint_spectrum_ladder(matrix.dimension());
+            let result = super::checkpoint_low_spectra_via_cache(&matrix, &ladder, 3, cache)?;
+            return Ok(CapturedDiagnostic::from_cached(result)?);
+        }
+        if id == "target_comparison" {
+            // Hard private-only: derived from the private runtime target.
+            let _stage = crate::ccm::capture_runtime::Stage::new(format!("{id} compute"));
+            let (matrix, _) = self.retained_even_sources(cache)?;
+            return Ok(CapturedDiagnostic::from_cached(
+                crate::distance::hp::capture_target_comparison_via_cache(
+                    &self.params,
+                    &self.cfg,
+                    &matrix,
+                    cache,
+                )?,
+            )?);
+        }
+        if id == "assembly_error" {
+            #[cfg(not(feature = "arb"))]
+            bail!("assembly error analysis requires the xc-spectral arb feature");
+            #[cfg(feature = "arb")]
+            {
+                // Sector enclosures add exact-form eigenvalue bounds; a sector
+                // limitation only omits those bounds from this measurement.
+                if options.sector_analysis.is_some() {
+                    let _ = self.sectors(options, cache);
+                }
+                let tau_manifest = self.source.tau_manifest.clone().ok_or_else(|| {
+                    anyhow::anyhow!("retained Tau manifest unavailable for assembly error analysis")
+                })?;
+                let eigenpair = self.source.eigenpair_manifest.clone();
+                let sectors = self.sectors.as_ref().and_then(|resolution| {
+                    resolution
+                        .gap_manifest
+                        .as_ref()
+                        .map(|manifest| (&resolution.gap, manifest))
+                });
+                let result = super::assembly_error::resolve_assembly_error_via_cache(
+                    &self.params,
+                    &self.cfg,
+                    &self.source.tau,
+                    &tau_manifest,
+                    eigenpair.as_ref().map(|manifest| (&self.primary, manifest)),
+                    sectors,
+                    cache,
+                )?;
+                return Ok(CapturedDiagnostic::from_cached(result)?);
+            }
+        }
         if id == "state_geometry" {
             use crate::ccm::state_geometry::{
                 analyze_state_geometry_via_cache, GeometryOptions, RetainedState,
@@ -1358,10 +1487,37 @@ impl RetainedCcmRun {
             )?;
             return Ok(CapturedDiagnostic::from_cached(result)?);
         }
-        if matches!(
-            id,
-            "evenness" | "sector_analysis" | "sector_gap_certificate"
-        ) {
+        if id == "sector_gap_certificate" {
+            // Recorded by reference to the certificate artifact, like the root
+            // certificate, so the receipt does not carry a second copy.
+            self.ensure_sector_certificate(options, cache)?;
+            let resolved = self
+                .sector_certificate
+                .as_ref()
+                .expect("resolved certificate");
+            return Ok(
+                match resolved
+                    .produced_manifest
+                    .as_ref()
+                    .or(resolved.reused_manifest.as_ref())
+                {
+                    Some(manifest) => CapturedDiagnostic::by_reference(
+                        &resolved.value,
+                        vec![manifest.clone()],
+                        false,
+                        vec![manifest.clone()],
+                    )?,
+                    None => CapturedDiagnostic::new(
+                        &resolved.value,
+                        self.sector_record
+                            .as_ref()
+                            .map(|record| record.sources.clone())
+                            .unwrap_or_default(),
+                    )?,
+                },
+            );
+        }
+        if matches!(id, "evenness" | "sector_analysis") {
             self.sectors(options, cache)?;
             let sectors = self.sectors.as_ref().expect("resolved sectors");
             let record = self.sector_record.as_ref().expect("recorded sectors");
@@ -1370,22 +1526,6 @@ impl RetainedCcmRun {
                     evenness_from_sector_gap(&self.params, self.cfg.precision_bits, &sectors.gap)?;
                 return Ok(CapturedDiagnostic::new(
                     &serde_json::json!({"method":"resolved_stored_parity_sector_lift_v2", "claim_scope":value.claim_scope, "assembly_error_bound":null, "evenness_deviation":value.evenness_deviation.to_string(), "natural_eigenvalue":value.natural_eigenvalue.to_string(), "forced_eigenvalue":value.forced_eigenvalue.to_string()}),
-                    record.sources.clone(),
-                )?);
-            }
-            if id == "sector_gap_certificate" {
-                let certification = options
-                    .sector_gap_certification
-                    .ok_or_else(|| anyhow::anyhow!("sector certification not requested"))?;
-                let certificate = certify_sector_gap_from_resolution(
-                    &self.params,
-                    &self.cfg,
-                    certification,
-                    sectors,
-                    Some(cache),
-                )?;
-                return Ok(CapturedDiagnostic::new(
-                    &certificate,
                     record.sources.clone(),
                 )?);
             }
@@ -1403,7 +1543,7 @@ impl RetainedCcmRun {
             "distance_resolution" => "ccm_distance_resolution_evidence",
             "target_residual_analysis" => "ccm_target_residual_analysis",
             "deviation_decomposition" => "ccm_deviation_decomposition",
-            "root_certificate" => "ccm_root_certificate",
+            "root_certificate" => "ccm_root_certification_report",
             _ => bail!("unknown retained-run diagnostic {id:?}"),
         };
         let sink = RecordingSink::new(cache, std::slice::from_ref(&kind));
@@ -1478,19 +1618,29 @@ impl RetainedCcmRun {
                 .root_certification
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("root certification not requested"))?;
-            let certificate = certify_roots_from_retained_source(
+            // Every requested root receives a row: certified enclosures where
+            // certifiable, computed values with reasons everywhere else.
+            let (report, manifest) = super::resolve_root_certification_report_via_cache(
                 p,
                 cfg,
+                primary,
                 &primary.xi,
-                source.secular_manifest.as_ref(),
+                Some(&required(&source.root_manifest)?),
+                Some(&required(&source.secular_manifest)?),
                 certification,
                 Some(&observed),
             )?;
-            reconcile_computed_roots_with_certificate(primary, &certificate)?;
-            return Ok(CapturedDiagnostic::new(
-                &certificate,
-                vec![required(&source.secular_manifest)?],
-            )?);
+            let mut sources = vec![
+                required(&source.root_manifest)?,
+                required(&source.secular_manifest)?,
+            ];
+            return Ok(match manifest {
+                Some(manifest) => {
+                    sources.push(manifest.clone());
+                    CapturedDiagnostic::by_reference(&report, vec![manifest], false, sources)?
+                }
+                None => CapturedDiagnostic::new(&report, sources)?,
+            });
         } else if id == "distance_profile" {
             let distance = options
                 .distance_capture
@@ -1500,6 +1650,7 @@ impl RetainedCcmRun {
                 .rules
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("profile capture requires a grid convention"))?;
+            let _stage = crate::ccm::capture_runtime::Stage::new(format!("{id} compute"));
             crate::distance::hp::capture_ccm_profile_via_cache(
                 p,
                 cfg,
@@ -1513,6 +1664,7 @@ impl RetainedCcmRun {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("distance capture not requested"))?;
             let alpha = Float::with_val(cfg.precision_bits, Float::parse(&distance.alpha)?);
+            let _stage = crate::ccm::capture_runtime::Stage::new(format!("{id} compute"));
             let captured = crate::distance::hp::capture_ccm_distance_with_derived_via_cache(
                 p,
                 cfg,
@@ -1545,10 +1697,7 @@ impl RetainedCcmRun {
             )?;
         }
         if id == "u_flow_response" {
-            self.uflow_capture = Some(CapturedDiagnostic::new(
-                &result.value,
-                result.sources.clone(),
-            )?);
+            self.uflow_capture = Some(result.clone());
         }
         Ok(result)
     }
@@ -1577,14 +1726,8 @@ mod tests {
             ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
             ZipJsonFilesystemCacheStore as FilesystemCacheStore,
         };
-        let root = std::env::temp_dir().join(format!(
-            "ccm-retained-run-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root_dir = xc_core::test_support::TestDir::new("ccm-retained-run");
+        let root = root_dir.to_path_buf();
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -1699,6 +1842,70 @@ mod tests {
         if with_staging {
             // Fresh state/matrix notifications must survive encoded production too.
             assert_eq!(run.retained_even_sources(&cache).unwrap().1.len(), 1);
+            options.root_certification = Some(
+                CcmRootCertificationOptions::for_decimal_digits(
+                    crate::ccm::certified_roots::IndependentCcmRootTarget::Prefix { count: 3 },
+                    20,
+                )
+                .unwrap(),
+            );
+            let mut ids = vec![
+                "checkpoint_spectra",
+                "root_certificate",
+                "target_comparison",
+            ];
+            if cfg!(feature = "arb") {
+                ids.push("assembly_error");
+            }
+            for id in ids {
+                let cold = run
+                    .capture_diagnostic(id, &options, &cache)
+                    .unwrap_or_else(|error| panic!("cold {id}: {error:#}"));
+                let warm = run
+                    .capture_diagnostic(id, &options, &cache)
+                    .unwrap_or_else(|error| panic!("warm {id}: {error:#}"));
+                assert_eq!(cold.value, warm.value, "{id}");
+                assert!(
+                    cold.value_reference.is_some() || id == "root_certificate",
+                    "{id}"
+                );
+                match id {
+                    "root_certificate" => {
+                        let rows = cold.value["rows"].as_array().unwrap();
+                        assert_eq!(rows.len(), 3);
+                        assert_eq!(rows[0]["computed_status"], "converged");
+                        assert!(rows
+                            .iter()
+                            .all(|row| row["outcome"] != "not_computed_not_certified"
+                                || row["reason"].is_string()));
+                    }
+                    "target_comparison" => {
+                        assert_eq!(cold.value["outcome"], "computed", "{}", cold.value);
+                        assert_eq!(cold.value["levels"].as_array().unwrap().len(), 2);
+                        let residual: f64 = cold.value["basis_consistency_residual"]
+                            .as_str()
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        assert!(residual < 1e-30, "{residual}");
+                        assert!(
+                            cold.value["levels"][1]["projection"]["rayleigh_quotient"].is_string()
+                        );
+                        assert!(!xc_cache::artifact_kind_admitted_to_destination(
+                            crate::distance::hp::TARGET_COMPARISON_KIND,
+                            xc_cache::PublicationDestination::Public
+                        ));
+                    }
+                    "assembly_error" => {
+                        assert_eq!(cold.value["outcome"], "certified_finite_enclosure");
+                        assert!(!cold.value["exact_form_bounds"]
+                            .as_array()
+                            .unwrap()
+                            .is_empty());
+                    }
+                    _ => assert!(!cold.value["rows"].as_array().unwrap().is_empty()),
+                }
+            }
             for id in [
                 "capture_preflight",
                 "consistency",

@@ -685,17 +685,8 @@ pub(crate) fn tail_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn temp() -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "xc-atom-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&p).unwrap();
-        p
+    fn temp() -> xc_core::test_support::TestDir {
+        xc_core::test_support::TestDir::new("atom-test")
     }
     #[test]
     fn cutoff_row_rejects_invalid_scalar_without_panicking() {

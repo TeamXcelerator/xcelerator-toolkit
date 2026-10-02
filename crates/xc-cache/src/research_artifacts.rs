@@ -85,12 +85,49 @@ impl NumericalCoverage {
                     "point_measurement" | "certified_finite_enclosure" => result.resolved_rows += 1,
                     "conditional_budget_met"
                     | "conditional_budget_not_met"
-                    | "channels_resolved_budget_unassessed" => result.qualified_rows += 1,
+                    | "channels_resolved_budget_unassessed"
+                    | "computed_not_certified" => result.qualified_rows += 1,
                     _ => result.unresolved_rows += 1,
                 }
             }
         }
-        let outcome = data["outcome"].as_str().unwrap_or("unassessed");
+        let mut default_outcome =
+            if result.retained_rows > 0 && result.resolved_rows == result.retained_rows {
+                "point_measurement"
+            } else {
+                "unassessed"
+            };
+        let labelled = matches!(
+            data["outcome"].as_str(),
+            Some("computed" | "computed_with_limitation")
+        );
+        let mut outcome_override = None;
+        if data["rows"].as_array().is_none_or(|rows| rows.is_empty()) {
+            if let Some(shape) = shape_rows(data) {
+                result.retained_rows = shape.retained;
+                result.resolved_rows = shape.resolved;
+                result.qualified_rows = shape.qualified;
+                result.unresolved_rows = shape.retained - shape.resolved - shape.qualified;
+                for (label, count) in [
+                    (shape.outcome, shape.resolved),
+                    ("qualified", shape.qualified),
+                    ("unresolved", result.unresolved_rows),
+                ] {
+                    if count > 0 {
+                        result.row_outcomes.insert(label.into(), count);
+                    }
+                }
+                if shape.retained > 0 {
+                    default_outcome = shape.outcome;
+                }
+                if labelled || data["outcome"].is_null() {
+                    outcome_override = Some(default_outcome);
+                }
+            }
+        }
+        let outcome = outcome_override
+            .or(data["outcome"].as_str())
+            .unwrap_or(default_outcome);
         result.outcome = if result.unresolved_rows > 0
             || result
                 .expected_rows
@@ -103,6 +140,15 @@ impl NumericalCoverage {
             outcome
         }
         .into();
+        if result.retained_rows == 0
+            && matches!(
+                result.outcome.as_str(),
+                "point_measurement" | "certified_finite_enclosure"
+            )
+        {
+            result.outcome = "unassessed".into();
+            result.reason = Some("a result was reported without any countable rows".into());
+        }
         if !matches!(
             result.outcome.as_str(),
             "point_measurement" | "certified_finite_enclosure"
@@ -113,12 +159,336 @@ impl NumericalCoverage {
     }
 }
 
+/// Coverage rows of a measurement payload that carries no generic
+/// `outcome`/`rows` fields, recognized by its documented shape.
+struct ShapeRows {
+    retained: usize,
+    resolved: usize,
+    qualified: usize,
+    /// Outcome of a resolved row.
+    outcome: &'static str,
+}
+
+fn shape(
+    retained: usize,
+    resolved: usize,
+    qualified: usize,
+    outcome: &'static str,
+) -> Option<ShapeRows> {
+    Some(ShapeRows {
+        retained,
+        resolved,
+        qualified,
+        outcome,
+    })
+}
+
+fn strings(data: &serde_json::Value, keys: &[&str]) -> bool {
+    keys.iter().all(|key| data[*key].is_string())
+}
+
+fn count(items: &[serde_json::Value], resolved: impl Fn(&serde_json::Value) -> bool) -> usize {
+    items.iter().filter(|item| resolved(item)).count()
+}
+
+/// Rows per payload shape:
+/// - eigenfunction profile: samples; target distance and residual analysis:
+///   quadrature rules; resolution evidence: refinements plus its reported and
+///   ladder verdicts; deviation decomposition: metric projections;
+/// - evenness, operator energy, state geometry, retained reduction and a
+///   prefix checkpoint: one row; sector gap analysis: one row; sector
+///   spectrum: one row per retained eigenpair;
+/// - prefix ladder: checkpoints plus the ladder's completion;
+/// - root band: retained roots plus missing roots; root conditioning: roots;
+///   prime-power and u-flow responses: roots plus events or channels;
+/// - sector-gap certificate: one certified row when it certifies a simple
+///   finite ground state and a positive definite finite matrix;
+/// - target comparison: grid levels, qualified when a limitation is recorded.
+///
+/// A prefix checkpoint that exports only the innovation (the predeclared
+/// eigenstate exclusion) is qualified. `None` for other shapes.
+fn shape_rows(data: &serde_json::Value) -> Option<ShapeRows> {
+    const CONVERGED: &str = "converged";
+    const EXPORTED: &str = "export_checks_passed";
+    const INNOVATION_ONLY: &str = "innovation_export_passed_eigenpair_not_supplied";
+    let status = |row: &serde_json::Value, value: &str| row["status"].as_str() == Some(value);
+    if let Some(items) = data.as_array() {
+        let mut total = ShapeRows {
+            retained: 0,
+            resolved: 0,
+            qualified: 0,
+            outcome: "point_measurement",
+        };
+        for (index, item) in items.iter().enumerate() {
+            let rows = shape_rows(item)?;
+            if index == 0 {
+                total.outcome = rows.outcome;
+            } else if total.outcome != rows.outcome {
+                return None;
+            }
+            total.retained += rows.retained;
+            total.resolved += rows.resolved;
+            total.qualified += rows.qualified;
+        }
+        return Some(total);
+    }
+    if let (Some(bounds), true) = (
+        data["exact_form_bounds"].as_array(),
+        data.get("full").is_some(),
+    ) {
+        let sectors = ["full", "even_sector", "odd_sector"];
+        let resolved = count(bounds, |row| {
+            strings(row, &["exact_form_lower", "exact_form_upper"])
+        }) + sectors
+            .iter()
+            .filter(|key| data[**key]["spectral_upper"].is_string())
+            .count();
+        return shape(
+            bounds.len() + sectors.len(),
+            resolved,
+            0,
+            "certified_finite_enclosure",
+        );
+    }
+    if data.get("signed_unit_overlap").is_some() {
+        // The overlap with the reference, plus one row per fit coefficient
+        // when a fit basis was supplied; a requested fit that did not solve is
+        // unresolved.
+        let basis = data["rhs"].as_array().map_or(0, Vec::len);
+        let overlap = usize::from(strings(
+            data,
+            &["signed_unit_overlap", "difference_norm_squared"],
+        ));
+        let fitted = data["coefficients"]
+            .as_array()
+            .map_or(0, |values| count(values, |value| value.is_string()));
+        return shape(1 + basis, overlap + fitted, 0, "point_measurement");
+    }
+    if let Some(evidence) = data.get("retained_evidence") {
+        let rows = shape_rows(evidence)?;
+        let verdicts = [
+            "reported_resolution_tolerance_met",
+            "refinement_ladder_tolerance_met",
+        ];
+        let met = verdicts
+            .iter()
+            .filter(|key| data[**key].as_bool() == Some(true))
+            .count();
+        return shape(
+            rows.retained + verdicts.len(),
+            rows.resolved + met,
+            rows.qualified,
+            rows.outcome,
+        );
+    }
+    if let Some(rows) = data["refinements"].as_array() {
+        let resolved = count(rows, |row| row["tolerance_met"].as_bool() == Some(true));
+        return shape(rows.len(), resolved, 0, "point_measurement");
+    }
+    if let Some(rows) = data["projections"].as_array() {
+        let resolved = count(rows, |row| {
+            strings(row, &["amplitude", "relative_residual"])
+        });
+        return shape(rows.len(), resolved, 0, "point_measurement");
+    }
+    if let Some(levels) = data["levels"].as_array() {
+        return match data["outcome"].as_str() {
+            Some("computed") => shape(levels.len(), levels.len(), 0, "point_measurement"),
+            Some("computed_with_limitation") => {
+                shape(levels.len(), 0, levels.len(), "point_measurement")
+            }
+            _ => None,
+        };
+    }
+    if let Some(rows) = data["measurements"].as_array() {
+        let keys = ["distance_to_target", "absolute_residual_mass"];
+        if !rows
+            .iter()
+            .all(|row| keys.iter().any(|key| row.get(*key).is_some()))
+        {
+            return None;
+        }
+        let resolved = count(rows, |row| keys.iter().any(|key| row[*key].is_string()));
+        return shape(rows.len(), resolved, 0, "point_measurement");
+    }
+    if let (Some(u), Some(f)) = (data["u_values"].as_array(), data["f_values"].as_array()) {
+        let resolved = if u.len() == f.len() {
+            count(f, |value| value.is_string())
+        } else {
+            0
+        };
+        return shape(f.len(), resolved, 0, "point_measurement");
+    }
+    if data.get("evenness_deviation").is_some() {
+        let ok = strings(
+            data,
+            &[
+                "evenness_deviation",
+                "natural_eigenvalue",
+                "forced_eigenvalue",
+            ],
+        );
+        return shape(1, usize::from(ok), 0, "point_measurement");
+    }
+    if data.get("gap_log").is_some() && data.get("even_simple").is_some() {
+        let ok = strings(data, &["gap_log", "lambda_even", "lambda_odd"])
+            && data["even_simple"].is_boolean();
+        return shape(1, usize::from(ok), 0, "point_measurement");
+    }
+    if let (Some(rows), Some(ladder)) = (data["checkpoints"].as_array(), data.get("ladder")) {
+        let complete = usize::from(ladder.get("stopped").is_some_and(|v| v.is_null()));
+        return shape(
+            rows.len() + 1,
+            count(rows, |row| status(row, EXPORTED)) + complete,
+            count(rows, |row| status(row, INNOVATION_ONLY)),
+            "point_measurement",
+        );
+    }
+    if data.get("squared_overlap").is_some()
+        && data.get("dimension").is_some()
+        && data.get("status").is_some()
+    {
+        return shape(
+            1,
+            usize::from(status(data, EXPORTED)),
+            usize::from(status(data, INNOVATION_ONLY)),
+            "point_measurement",
+        );
+    }
+    if let (Some(passed), true) = (
+        data["checks_passed"].as_bool(),
+        data.get("computed_eigenvalues").is_some(),
+    ) {
+        return shape(1, usize::from(passed), 0, "point_measurement");
+    }
+    if let (Some(points), Some(missing)) =
+        (data["points"].as_array(), data["missing_count"].as_u64())
+    {
+        let missing = usize::try_from(missing).ok()?;
+        let resolved = count(points, |row| {
+            row["source_status"].as_str() == Some(CONVERGED)
+        });
+        return shape(points.len() + missing, resolved, 0, "point_measurement");
+    }
+    if let (Some(rows), true) = (
+        data["outcomes"].as_array(),
+        data.get("root_count").is_some(),
+    ) {
+        return shape(
+            rows.len(),
+            count(rows, |row| status(row, CONVERGED)),
+            0,
+            "point_measurement",
+        );
+    }
+    if let Some(roots) = data["roots"].as_array() {
+        if let Some(extra) = data["events"].as_array().or(data["channels"].as_array()) {
+            let resolved = count(roots, |row| status(row, CONVERGED))
+                + count(extra, |row| row["eigenvalue_velocity_response"].is_string());
+            return shape(roots.len() + extra.len(), resolved, 0, "point_measurement");
+        }
+    }
+    if let (Some(norms), Some(vectors), true) = (
+        data["residual_norms"].as_array(),
+        data["eigenvectors"].as_array(),
+        data.get("parity").is_some(),
+    ) {
+        let resolved = if vectors.len() == norms.len() {
+            count(norms, |norm| norm.is_string())
+        } else {
+            0
+        };
+        return shape(norms.len(), resolved, 0, "point_measurement");
+    }
+    if data.get("rayleigh_quotient").is_some() {
+        let ok = strings(
+            data,
+            &[
+                "rayleigh_quotient",
+                "relative_residual",
+                "eigenvalue_defect",
+            ],
+        );
+        return shape(1, usize::from(ok), 0, "point_measurement");
+    }
+    if data.get("unit_l2_center").is_some() {
+        let ok = strings(
+            data,
+            &[
+                "unit_l2_center",
+                "coefficient_evenness_defect",
+                "coefficient_norm",
+            ],
+        );
+        return shape(1, usize::from(ok), 0, "point_measurement");
+    }
+    if let Some(values) = data["values"].as_object() {
+        // Analyses that report scalar values instead of rows: each enclosed
+        // value (with lower and upper bounds) is a row, else each value.
+        let enclosed = values
+            .keys()
+            .filter(|key| {
+                values.contains_key(&format!("{key}_lower"))
+                    && values.contains_key(&format!("{key}_upper"))
+            })
+            .collect::<Vec<_>>();
+        if !enclosed.is_empty() {
+            let resolved = enclosed
+                .iter()
+                .filter(|key| {
+                    [String::new(), "_lower".into(), "_upper".into()]
+                        .iter()
+                        .all(|suffix| values[&format!("{key}{suffix}")].is_string())
+                })
+                .count();
+            return shape(enclosed.len(), resolved, 0, "point_measurement");
+        }
+        if !values.is_empty() {
+            let resolved = values.values().filter(|value| value.is_string()).count();
+            return shape(values.len(), resolved, 0, "point_measurement");
+        }
+    }
+    if data.get("certifies_finite_ground_state_simple").is_some() {
+        let certified = data["certifies_finite_ground_state_simple"].as_bool() == Some(true)
+            && data["certifies_finite_matrix_positive_definite"].as_bool() == Some(true);
+        return shape(1, usize::from(certified), 0, "certified_finite_enclosure");
+    }
+    None
+}
+
+#[derive(Clone)]
 pub struct CapturedDiagnostic {
     pub value: serde_json::Value,
     /// Exact manifests supplied by the diagnostic's authenticated cache route.
     pub sources: Vec<ArtifactManifest>,
+    /// When set, `value` is exactly the decoded payload of these artifacts
+    /// (one artifact, or an ordered array when the flag is true). The receipt
+    /// then records the references instead of a second copy of the data.
+    pub value_reference: Option<(Vec<ArtifactManifest>, bool)>,
 }
 impl CapturedDiagnostic {
+    /// A measurement whose value is exactly the decoded payload of the given
+    /// artifacts: one artifact, or an ordered array of payloads.
+    pub fn by_reference<T: Serialize>(
+        value: &T,
+        artifacts: Vec<ArtifactManifest>,
+        array: bool,
+        mut sources: Vec<ArtifactManifest>,
+    ) -> Result<Self, CacheError> {
+        if artifacts.is_empty() || (!array && artifacts.len() != 1) {
+            return Err(invalid(
+                "measurement reference requires its value artifacts",
+            ));
+        }
+        for artifact in &artifacts {
+            if !sources.contains(artifact) {
+                sources.push(artifact.clone());
+            }
+        }
+        let mut diagnostic = Self::new(value, sources)?;
+        diagnostic.value_reference = Some((artifacts, array));
+        Ok(diagnostic)
+    }
     /// A retained qualified-absence record must not become a completed measurement.
     pub fn qualified(self) -> Result<Self, CaptureFailure> {
         if matches!(
@@ -164,25 +534,82 @@ impl CapturedDiagnostic {
         let value = xc_core::finite_json::to_value(value).map_err(|e| invalid(e.to_string()))?;
         xc_core::validate_secret_free(&value, "capture measurement")
             .map_err(|e| invalid(e.to_string()))?;
-        Ok(Self { value, sources })
+        Ok(Self {
+            value,
+            sources,
+            value_reference: None,
+        })
     }
+    /// The measurement is the retained artifact itself; receipts reference it.
     pub fn from_cached<T: Serialize>(
         result: ArtifactExecutionCacheResult<T>,
     ) -> Result<Self, CacheError> {
-        let sources = result
-            .produced_manifest
-            .or(result.reused_manifest)
-            .into_iter()
-            .collect();
-        Self::new(&result.value, sources)
+        match result.produced_manifest.or(result.reused_manifest) {
+            Some(manifest) => {
+                Self::by_reference(&result.value, vec![manifest.clone()], false, vec![manifest])
+            }
+            None => Self::new(&result.value, Vec::new()),
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapturedMeasurement {
+    /// Embedded value; null when the value is recorded by reference.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub value: serde_json::Value,
+    /// Artifacts whose decoded payload is the value (see `measurement_value`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_reference: Option<MeasurementValueReference>,
     pub source_dependencies: Vec<DependencyRef>,
+}
+
+/// A measurement value stored once in the artifact fabric rather than copied
+/// into the receipt. The digest binds the exact referenced value, and the
+/// coverage summary is computed from it at capture time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeasurementValueReference {
+    pub artifacts: Vec<DependencyRef>,
+    /// True when the value is the ordered array of the artifacts' payloads.
+    pub array: bool,
+    pub value_digest: String,
+    pub coverage: NumericalCoverage,
+}
+
+/// Recover a measurement value, reading referenced artifacts through
+/// `resolver` and checking the bound digest.
+pub fn measurement_value(
+    measurement: &CapturedMeasurement,
+    resolver: &CacheResolver,
+    policy: &CachePolicy,
+) -> Result<serde_json::Value, CacheError> {
+    let Some(reference) = &measurement.value_reference else {
+        return Ok(measurement.value.clone());
+    };
+    let mut values = Vec::with_capacity(reference.artifacts.len());
+    for artifact in &reference.artifacts {
+        let bytes = resolver.read_exact_payload(&artifact.key, &artifact.content_digest, policy)?;
+        values.push(serde_json::from_slice::<serde_json::Value>(&bytes)?);
+    }
+    let value = if reference.array {
+        serde_json::Value::Array(values)
+    } else {
+        values
+            .pop()
+            .ok_or_else(|| invalid("measurement reference has no artifact"))?
+    };
+    if xc_core::research_digest(&value)
+        .map_err(|e| invalid(e.to_string()))?
+        .0
+        != reference.value_digest
+    {
+        return Err(invalid(
+            "referenced measurement value does not match its digest",
+        ));
+    }
+    Ok(value)
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -241,6 +668,23 @@ pub fn research_source_dependencies(
     }
     canonical_dependencies(dependencies)
 }
+/// Value-reference artifacts in their value order: an array value is the
+/// ordered list of these payloads, so they are never canonically re-sorted.
+fn ordered_value_references(
+    manifests: &[ArtifactManifest],
+) -> Result<Vec<DependencyRef>, CacheError> {
+    let mut references = Vec::with_capacity(manifests.len());
+    for m in manifests {
+        let reference = research_source_dependencies(std::slice::from_ref(m))?
+            .pop()
+            .ok_or_else(|| invalid("measurement reference has no artifact"))?;
+        if references.contains(&reference) {
+            return Err(invalid("measurement reference repeats an artifact"));
+        }
+        references.push(reference);
+    }
+    Ok(references)
+}
 fn measurement_evidence(
     id: &str,
     measurement: &CapturedMeasurement,
@@ -263,7 +707,10 @@ impl CaptureArtifact {
     pub fn coverage(&self) -> BTreeMap<String, NumericalCoverage> {
         self.receipt.outcomes().iter().map(|(id, outcome)| {
             let summary = if let Some(m) = self.measurements.get(id) {
-                NumericalCoverage::from_value(&m.value)
+                m.value_reference.as_ref().map_or_else(
+                    || NumericalCoverage::from_value(&m.value),
+                    |reference| reference.coverage.clone(),
+                )
             } else {
                 let (status, reason) = match outcome {
                     DiagnosticOutcome::Missing { reason } => ("missing_input", reason.clone()),
@@ -305,6 +752,18 @@ impl CaptureArtifact {
                         != m.source_dependencies
                     {
                         return Err(invalid("noncanonical measurement dependencies"));
+                    }
+                    if let Some(reference) = &m.value_reference {
+                        if !m.value.is_null()
+                            || reference.artifacts.is_empty()
+                            || (!reference.array && reference.artifacts.len() != 1)
+                            || reference
+                                .artifacts
+                                .iter()
+                                .any(|artifact| !m.source_dependencies.contains(artifact))
+                        {
+                            return Err(invalid("invalid referenced measurement value"));
+                        }
                     }
                     completed.insert(id);
                 }
@@ -429,9 +888,25 @@ where
                 let measurement = (|| {
                     xc_core::validate_secret_free(&diagnostic.value, "capture measurement")
                         .map_err(|e| invalid(e.to_string()))?;
-                    let m = CapturedMeasurement {
-                        value: diagnostic.value,
-                        source_dependencies: research_source_dependencies(&diagnostic.sources)?,
+                    let source_dependencies = research_source_dependencies(&diagnostic.sources)?;
+                    let m = match &diagnostic.value_reference {
+                        None => CapturedMeasurement {
+                            value: diagnostic.value,
+                            value_reference: None,
+                            source_dependencies,
+                        },
+                        Some((artifacts, array)) => CapturedMeasurement {
+                            value_reference: Some(MeasurementValueReference {
+                                artifacts: ordered_value_references(artifacts)?,
+                                array: *array,
+                                value_digest: xc_core::research_digest(&diagnostic.value)
+                                    .map_err(|e| invalid(e.to_string()))?
+                                    .0,
+                                coverage: NumericalCoverage::from_value(&diagnostic.value),
+                            }),
+                            value: serde_json::Value::Null,
+                            source_dependencies,
+                        },
                     };
                     let evidence = vec![measurement_evidence(id, &m)?];
                     Ok::<_, CacheError>((m, evidence))
@@ -552,18 +1027,7 @@ where
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Validated,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse(
-            if kind == CAPTURE_RECEIPT_KIND
-                && serde_json::to_value(record)
-                    .map_err(|e| invalid(e.to_string()))?
-                    .get("numerical_coverage")
-                    .is_some()
-            {
-                "0.15.1"
-            } else {
-                "0.15.0"
-            },
-        )?,
+        minimum_reader_version: ToolkitVersion::parse(crate::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags,
         provenance_digest: None,
@@ -735,8 +1199,8 @@ mod tests {
                 size_bytes: bytes.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.15.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.18.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -833,6 +1297,7 @@ mod tests {
         let old = original.measurements["a"].clone();
         let replacement = CapturedMeasurement {
             value: json!({"corrected": 17}),
+            value_reference: None,
             source_dependencies: vec![],
         };
         let repair = || CaptureMeasurementRepair {
@@ -950,20 +1415,110 @@ mod tests {
             let policy = artifact_compatibility_policy("ccm-evidence", kind).unwrap();
             assert_eq!(
                 policy.minimum_reader_version,
-                ToolkitVersion::parse("0.15.0").unwrap()
+                ToolkitVersion::parse(crate::CLEAN_SLATE).unwrap()
             );
         }
     }
     #[test]
-    fn managed_receipts_reuse_exact_attempts_and_preserve_changed_outcomes() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-research-record-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+    fn referenced_measurements_are_not_copied_and_reconstruct_exactly() {
+        let root = crate::test_support::temporary_root("referenced-measurements");
+        let store = FilesystemCacheStore::new("record", root.path(), true, CacheVisibility::Local);
+        let put = |name: &str, value: &serde_json::Value| {
+            let draft = ArtifactDraft {
+                schema_version: 1,
+                key: ArtifactKey::new("synthetic", name, name.as_bytes()).unwrap(),
+                producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
+                maximum_reader_version: None,
+                quality: CacheQuality::Validated,
+                visibility: CacheVisibility::Local,
+                immutable: true,
+                dependencies: Vec::new(),
+                tags: BTreeMap::new(),
+                provenance_digest: None,
+            };
+            store
+                .put(&draft, &serde_json::to_vec(value).unwrap())
                 .unwrap()
-                .as_nanos()
-        ));
+        };
+        let single = json!({"rows":[{"outcome":"point_measurement"},{"outcome":"unresolved"}]});
+        let first = json!({"value": 1});
+        let second = json!({"value": [2, 3]});
+        let single_manifest = put("single", &single);
+        let first_manifest = put("first", &first);
+        let second_manifest = put("second", &second);
+        let record = collect_capture(
+            &json!({}),
+            vec!["array".into(), "reversed".into(), "single".into()],
+            |id| {
+                if id == "reversed" {
+                    // Value order differs from canonical dependency order.
+                    CapturedDiagnostic::by_reference(
+                        &json!([second.clone(), first.clone()]),
+                        vec![second_manifest.clone(), first_manifest.clone()],
+                        true,
+                        vec![],
+                    )
+                } else if id == "single" {
+                    CapturedDiagnostic::by_reference(
+                        &single,
+                        vec![single_manifest.clone()],
+                        false,
+                        vec![],
+                    )
+                } else {
+                    CapturedDiagnostic::by_reference(
+                        &json!([first.clone(), second.clone()]),
+                        vec![first_manifest.clone(), second_manifest.clone()],
+                        true,
+                        vec![],
+                    )
+                }
+                .map_err(CaptureFailure::failed)
+            },
+        )
+        .unwrap();
+        record.validate().unwrap();
+        assert!(record.receipt.is_complete());
+        assert!(record.measurements.values().all(|m| m.value.is_null()));
+        assert_eq!(record.numerical_coverage["single"].resolved_rows, 1);
+        assert_eq!(record.numerical_coverage["single"].unresolved_rows, 1);
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(store),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        assert_eq!(
+            measurement_value(&record.measurements["single"], &resolver, &policy).unwrap(),
+            single
+        );
+        assert_eq!(
+            measurement_value(&record.measurements["array"], &resolver, &policy).unwrap(),
+            json!([first, second])
+        );
+        assert_eq!(
+            measurement_value(&record.measurements["reversed"], &resolver, &policy).unwrap(),
+            json!([second, first])
+        );
+        let mut tampered = record.measurements["single"].clone();
+        tampered.value_reference.as_mut().unwrap().value_digest = "0".repeat(64);
+        assert!(measurement_value(&tampered, &resolver, &policy).is_err());
+        let mut embedded = record.clone();
+        embedded.measurements.get_mut("single").unwrap().value = json!(1);
+        assert!(embedded.validate().is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn managed_receipts_reuse_exact_attempts_and_preserve_changed_outcomes() {
+        let scratch = crate::test_support::TestDir::new("research-record");
+        let root = scratch.join("root");
         let resolver = CacheResolver::new(vec![CacheLayer {
             precedence: 0,
             store: Box::new(FilesystemCacheStore::new(
@@ -1057,6 +1612,160 @@ mod coverage_tests {
         let legacy = NumericalCoverage::from_value(&serde_json::json!({"value":"3"}));
         assert_eq!(legacy.outcome, "unassessed");
         assert_eq!(legacy.expected_rows, None);
+    }
+
+    #[test]
+    fn capture_payload_shapes_have_numerical_coverage() {
+        use serde_json::json;
+        let cov = |v: serde_json::Value| {
+            let c = NumericalCoverage::from_value(&v);
+            (
+                c.outcome,
+                c.retained_rows,
+                c.resolved_rows,
+                c.qualified_rows,
+                c.unresolved_rows,
+            )
+        };
+        let o = |s: &str| s.to_owned();
+        assert_eq!(
+            cov(
+                json!({"evenness_deviation":"1e-9","natural_eigenvalue":"3","forced_eigenvalue":"3"})
+            ),
+            (o("point_measurement"), 1, 1, 0, 0)
+        );
+        let spectrum = json!({"parity":"even","eigenvectors":[[],[]],"residual_norms":["1e-90","1e-80"],"eigenvalues":["1","2"]});
+        let gap = json!({"gap_log":"5","even_simple":true,"lambda_even":"1","lambda_odd":"2"});
+        assert_eq!(
+            cov(json!([gap, spectrum])),
+            (o("point_measurement"), 3, 3, 0, 0)
+        );
+        let checkpoint =
+            |status: &str| json!({"dimension":121,"squared_overlap":"1","status":status});
+        assert_eq!(
+            cov(checkpoint("export_checks_passed")),
+            (o("point_measurement"), 1, 1, 0, 0)
+        );
+        assert_eq!(
+            cov(checkpoint(
+                "innovation_export_passed_eigenpair_not_supplied"
+            ))
+            .3,
+            1
+        );
+        assert_eq!(
+            cov(checkpoint("eigenpair_mismatch")),
+            (o("partial_unresolved"), 1, 0, 0, 1)
+        );
+        let ladder =
+            json!({"ladder":{"stopped":null},"checkpoints":[checkpoint("export_checks_passed")]});
+        assert_eq!(cov(ladder), (o("point_measurement"), 2, 2, 0, 0));
+        let stopped = json!({"ladder":{"stopped":"precision"},"checkpoints":[checkpoint("export_checks_passed")]});
+        assert_eq!(cov(stopped).4, 1);
+        assert_eq!(
+            cov(json!({"checks_passed":false,"computed_eigenvalues":[]})).4,
+            1
+        );
+        let band = json!({"data":{"points":[{"source_status":"converged"}],"missing_count":1}});
+        assert_eq!(cov(band), (o("partial_unresolved"), 2, 1, 0, 1));
+        let conditioning =
+            json!([{"root_count":2,"outcomes":[{"status":"converged"},{"status":"stagnated"}]}]);
+        assert_eq!(cov(conditioning).4, 1);
+        let response = json!([{"roots":[{"status":"converged"}],"events":[{"eigenvalue_velocity_response":"2"}]}]);
+        assert_eq!(cov(response), (o("point_measurement"), 2, 2, 0, 0));
+        let flow = json!([{"roots":[{"status":"converged"}],"channels":[{"eigenvalue_velocity_response":"2"},{}]}]);
+        assert_eq!(cov(flow).4, 1);
+        assert_eq!(cov(json!({"data":{"rayleigh_quotient":"3","relative_residual":"1e-90","eigenvalue_defect":"0"}})).0, "point_measurement");
+        assert_eq!(cov(json!({"unit_l2_center":"1","coefficient_evenness_defect":"0","coefficient_norm":"1"})).0, "point_measurement");
+        let certificate = |simple: bool| json!({"certifies_finite_ground_state_simple":simple,"certifies_finite_matrix_positive_definite":true});
+        assert_eq!(
+            cov(certificate(true)),
+            (o("certified_finite_enclosure"), 1, 1, 0, 0)
+        );
+        assert_eq!(cov(certificate(false)).4, 1);
+        assert_eq!(
+            cov(json!({"levels":[{},{}],"outcome":"computed"})),
+            (o("point_measurement"), 2, 2, 0, 0)
+        );
+        assert_eq!(
+            cov(json!({"levels":[{}],"outcome":"computed_with_limitation"})),
+            (o("qualified"), 1, 0, 1, 0)
+        );
+        let assembly = json!({"full":{"spectral_upper":"1e-981"},"even_sector":{"spectral_upper":"1e-981"},
+            "odd_sector":{},"exact_form_bounds":[{"exact_form_lower":"1","exact_form_upper":"2"}]});
+        assert_eq!(cov(assembly), (o("partial_unresolved"), 4, 3, 0, 1));
+        let overlap = json!({"outcome":"point_measurement","signed_unit_overlap":"0.9","difference_norm_squared":"0.1","rhs":[],"coefficients":[]});
+        assert_eq!(cov(overlap), (o("point_measurement"), 1, 1, 0, 0));
+        let unsolved = json!({"outcome":"rank_or_precision_unresolved","signed_unit_overlap":"0.9","difference_norm_squared":"0.1","rhs":["1","2"],"coefficients":null});
+        assert_eq!(cov(unsolved), (o("partial_unresolved"), 3, 1, 0, 2));
+        let enclosed = json!({"outcome":"point_measurement","rows":[],"values":{"w":"1","w_lower":"0.9","w_upper":"1.1","bits":"64"}});
+        assert_eq!(cov(enclosed), (o("point_measurement"), 1, 1, 0, 0));
+        let empty =
+            NumericalCoverage::from_value(&json!({"outcome":"point_measurement","rows":[]}));
+        assert_eq!(
+            (empty.outcome.as_str(), empty.retained_rows),
+            ("unassessed", 0)
+        );
+        let rows = json!({"data":{"rows":[{"outcome":"point_measurement"}]}});
+        assert_eq!(cov(rows), (o("point_measurement"), 1, 1, 0, 0));
+    }
+
+    #[test]
+    fn distance_payloads_have_numerical_coverage() {
+        use serde_json::json;
+        let profile = NumericalCoverage::from_value(
+            &json!({"u_values":["1","2"],"f_values":["1","0.5"],"sample_count":2}),
+        );
+        assert_eq!(
+            (
+                profile.outcome.as_str(),
+                profile.retained_rows,
+                profile.resolved_rows
+            ),
+            ("point_measurement", 2, 2)
+        );
+        let distance = NumericalCoverage::from_value(&json!({"measurements":[
+            {"distance_to_target":"0.1","eigenfunction_norm":"1"},{"distance_to_target":"0.2","eigenfunction_norm":"1"}]}));
+        assert_eq!(
+            (distance.outcome.as_str(), distance.resolved_rows),
+            ("point_measurement", 2)
+        );
+        let residual = NumericalCoverage::from_value(
+            &json!({"measurements":[{"absolute_residual_mass":"3"}]}),
+        );
+        assert_eq!(residual.outcome, "point_measurement");
+        let deviation = NumericalCoverage::from_value(&json!({"projections":[
+            {"amplitude":"1","relative_residual":"0.1"},{"amplitude":"2","relative_residual":"0.2"}]}));
+        assert_eq!(
+            (deviation.outcome.as_str(), deviation.resolved_rows),
+            ("point_measurement", 2)
+        );
+        let evidence = |row_met: bool, ladder: bool| {
+            json!({
+            "reported_resolution_tolerance_met": true, "refinement_ladder_tolerance_met": ladder,
+            "retained_evidence": [{"refinements":[{"tolerance_met":true},{"tolerance_met":row_met}]}]})
+        };
+        let met = NumericalCoverage::from_value(&evidence(true, true));
+        assert_eq!(
+            (met.outcome.as_str(), met.retained_rows, met.resolved_rows),
+            ("point_measurement", 4, 4)
+        );
+        let row_failed = NumericalCoverage::from_value(&evidence(false, true));
+        assert_eq!(
+            (row_failed.outcome.as_str(), row_failed.unresolved_rows),
+            ("partial_unresolved", 1)
+        );
+        let ladder_failed = NumericalCoverage::from_value(&evidence(true, false));
+        assert_eq!(
+            (
+                ladder_failed.outcome.as_str(),
+                ladder_failed.unresolved_rows
+            ),
+            ("partial_unresolved", 1)
+        );
+        // Other shapes are unchanged.
+        let other = NumericalCoverage::from_value(&json!({"measurements":[{"value":"1"}]}));
+        assert_eq!(other.outcome, "unassessed");
     }
     #[test]
     fn summaries_are_validated_and_historical_receipts_remain_readable() {

@@ -8,22 +8,8 @@ fn managed_auto_polishes_krylov_and_replays_the_retained_route() {
     };
     // An explicitly created private directory avoids environment-dependent
     // standalone routing and any remote/publication side effects.
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "xc-confirmed-krylov-{}-{nonce}",
-        std::process::id()
-    ));
-    std::fs::create_dir(&root).unwrap();
-    struct OwnedDirectory(std::path::PathBuf);
-    impl Drop for OwnedDirectory {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let _owned = OwnedDirectory(root.clone());
+    let root_dir = xc_core::test_support::TestDir::new("confirmed-krylov");
+    let root = root_dir.to_path_buf();
     let resolver = CacheResolver::new(vec![CacheLayer {
         precedence: 0,
         store: Box::new(FilesystemCacheStore::new(

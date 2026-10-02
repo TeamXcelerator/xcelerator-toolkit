@@ -23,5 +23,8 @@ fs2 = { workspace = true }
 getrandom = { workspace = true }
 xc-core = { workspace = true }
 
+[dev-dependencies]
+xc-core = { workspace = true, features = ["test-support"] }
+
 [build-dependencies]
 sha2 = { workspace = true }

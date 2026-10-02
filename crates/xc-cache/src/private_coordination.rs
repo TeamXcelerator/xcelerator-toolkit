@@ -382,7 +382,7 @@ pub fn acquire_private_publication_lease(
                     parts,
                 })? {
                     CreateRefResult::Created { commit_id } => {
-                        eprintln!(
+                        xc_core::progress_message!(
                             "private publication lock acquired: generation=1 repository={repository}"
                         );
                         return Ok(PrivatePublicationLease {
@@ -458,7 +458,7 @@ pub fn acquire_private_publication_lease(
                     };
                     match remote.compare_and_swap_commit(&request)? {
                         CompareAndSwapResult::Committed { commit_id } => {
-                            eprintln!(
+                            xc_core::progress_message!(
                                 "private publication lock acquired: generation={} repository={repository}",
                                 state.fencing_generation
                             );
@@ -482,7 +482,7 @@ pub fn acquire_private_publication_lease(
                 }
                 if now.saturating_sub(last_status) >= 60 {
                     let existing = existing.expect("unavailable lock exists");
-                    eprintln!(
+                    xc_core::progress_message!(
                         "private publication lock held: principal={} run={} generation={} lease_remaining={}s; waiting",
                         existing.github_principal,
                         existing.owner_run_id.chars().take(12).collect::<String>(),
@@ -662,9 +662,10 @@ pub fn release_private_publication_lease(
     };
     match remote.compare_and_swap_commit(&request)? {
         CompareAndSwapResult::Committed { .. } => {
-            eprintln!(
+            xc_core::progress_message!(
                 "private publication lock released: generation={} repository={}",
-                lease.lock.fencing_generation, lease.repository
+                lease.lock.fencing_generation,
+                lease.repository
             );
             Ok(())
         }
@@ -700,7 +701,7 @@ mod tests {
             owner_run_id: "run".to_owned(),
             publication_transaction_id: "transaction".to_owned(),
             github_principal: "principal".to_owned(),
-            toolkit_version: "0.13.0".to_owned(),
+            toolkit_version: "0.16.0".to_owned(),
             instance_fingerprint: ContentDigest::sha256(b"instance"),
             process_id: 1,
             fencing_generation: 3,
@@ -721,7 +722,7 @@ mod tests {
             owner_run_id: "run".into(),
             publication_transaction_id: "transaction".into(),
             github_principal: "principal".into(),
-            toolkit_version: "0.15.1".into(),
+            toolkit_version: "0.18.1".into(),
             instance_fingerprint: ContentDigest::sha256(b"instance"),
             process_id: 1,
             fencing_generation: 3,
@@ -777,7 +778,6 @@ mod tests {
             return;
         }
         let root = temporary_root("private-publication-lease-lifecycle");
-        let _ = fs::remove_dir_all(&root);
         let remote_path = root.join("remote.git");
         let seed = root.join("seed");
         let staging = root.join("staging");
@@ -899,7 +899,7 @@ mod tests {
             owner_run_id: "run".into(),
             publication_transaction_id: "transaction".into(),
             github_principal: "principal".into(),
-            toolkit_version: "0.15.1".into(),
+            toolkit_version: "0.18.1".into(),
             instance_fingerprint: ContentDigest::sha256(b"instance"),
             process_id: 1,
             fencing_generation: 1,

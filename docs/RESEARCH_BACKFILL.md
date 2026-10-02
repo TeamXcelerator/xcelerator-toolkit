@@ -90,7 +90,7 @@ Changing the batch requires a new output directory; the same child cache can
 be shared. Sources stay immutable. No source deletion or numerical recomputation
 is required solely to add these children. Publication is a separate managed
 operation with exact dependency closure and the normal destination policy.
-Historical campaign discovery, publication and paper upgrades are separate
+Historical campaign discovery, publication and application upgrades are separate
 steps; this release does not claim that any existing campaign was backfilled.
 
 ## Local acceptance test

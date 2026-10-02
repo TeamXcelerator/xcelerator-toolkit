@@ -818,7 +818,7 @@ pub(crate) fn resolve_sector_gap_certificate_via_cache(
     gap_manifest: &xc_cache::ArtifactManifest,
     options: CcmSectorGapCertificationOptions,
     cache: &xc_cache::ArtifactCacheContext<'_>,
-) -> Result<PortableCcmSectorGapCertificate> {
+) -> Result<xc_cache::ArtifactExecutionCacheResult<PortableCcmSectorGapCertificate>> {
     use std::collections::BTreeMap;
     use xc_cache::{
         resolve_or_compute_json_artifact_with_assessment, ArtifactAssuranceState,
@@ -914,7 +914,7 @@ pub(crate) fn resolve_sector_gap_certificate_via_cache(
         write_visibility: cache.write_visibility,
         produced_quality: CacheQuality::Certified,
         producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-        minimum_reader_version: ToolkitVersion::parse("0.15.1")?,
+        minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
         maximum_reader_version: None,
         tags: BTreeMap::from([
             ("domain".to_owned(), "ccm".to_owned()),
@@ -1048,7 +1048,7 @@ pub(crate) fn resolve_sector_gap_certificate_via_cache(
             Ok(())
         },
     )?;
-    Ok(resolved.value)
+    Ok(resolved)
 }
 
 #[cfg(test)]

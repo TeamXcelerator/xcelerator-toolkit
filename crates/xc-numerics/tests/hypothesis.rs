@@ -576,8 +576,8 @@ fn managed_evaluation_requires_exact_sources_and_roundtrips_with_required_reuse(
             size_bytes: 1,
         }],
         created_unix_seconds: 1,
-        producer_toolkit_version: ToolkitVersion::parse("0.15.0").unwrap(),
-        minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+        producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
         maximum_reader_version: None,
         quality: CacheQuality::Validated,
         visibility: CacheVisibility::Local,
@@ -586,19 +586,12 @@ fn managed_evaluation_requires_exact_sources_and_roundtrips_with_required_reuse(
         tags: Default::default(),
         provenance_digest: None,
     };
-    let root = std::env::temp_dir().join(format!(
-        "xc-evaluation-record-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = xc_core::test_support::TestDir::new("evaluation-record");
     let resolver = CacheResolver::new(vec![CacheLayer {
         precedence: 0,
         store: Box::new(FilesystemCacheStore::new(
             "evaluation",
-            root.clone(),
+            root.to_path_buf(),
             true,
             CacheVisibility::Local,
         )),
@@ -653,5 +646,4 @@ fn managed_evaluation_requires_exact_sources_and_roundtrips_with_required_reuse(
     wrong.content_digest = ContentDigest("f".repeat(64));
     assert!(persist_hypothesis_evaluation(&packet, &[wrong], false, &cold_context).is_err());
     drop(resolver);
-    std::fs::remove_dir_all(root).unwrap();
 }

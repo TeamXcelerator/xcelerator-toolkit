@@ -148,7 +148,7 @@ The live extended producers accept these explicit environment policies:
 
 | Variable | Default | Meaning |
 |---|---:|---|
-| `XC_RESEARCH_WORKING_BYTES` | 8589934592 | Estimated working memory cap |
+| `XC_RESEARCH_WORKING_BYTES` | 8589934592 | Estimated working memory cap. Not part of artifact identity: a diagnostic limited by it is returned but not retained, so a later run with a larger cap computes it; complete results are reused whatever cap produced them. |
 | `XC_RESEARCH_OUTPUT_BYTES` | 8589934592 | Estimated output cap |
 | `XC_RESEARCH_CHECKPOINT_BYTES` | 8589934592 | Per-checkpoint serialized byte cap |
 | `XC_RESEARCH_ROOT_BLOCK_ROWS` | 128 | Root rows per checkpoint, 1 through 4096 |

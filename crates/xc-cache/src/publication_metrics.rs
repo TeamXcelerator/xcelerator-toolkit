@@ -39,7 +39,7 @@ impl PublicationMetrics {
             writer.flush()
         })();
         if result.is_err() {
-            eprintln!(
+            xc_core::progress_message!(
                 "publication telemetry unavailable; numerical and publication checks continue"
             );
             *file = None;
@@ -62,14 +62,8 @@ mod tests {
     use super::*;
     #[test]
     fn telemetry_retains_attempts_and_failed_stages_without_identity_data() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-telemetry-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let scratch = crate::test_support::TestDir::new("telemetry");
+        let root = scratch.join("root");
         let m = PublicationMetrics::default();
         m.enable(&root).unwrap();
         m.record(

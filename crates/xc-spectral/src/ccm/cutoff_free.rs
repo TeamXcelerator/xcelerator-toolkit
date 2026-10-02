@@ -365,17 +365,77 @@ fn signed_s(values: &[SpecialValues], n: i64) -> MpfrInterval {
     }
 }
 
-pub fn assemble(config: &CutoffFreeConfig) -> Result<CutoffFreeMatrix> {
-    config.validate()?;
-    let p = config.precision_bits;
-    let c = MpfrInterval::from_u64(config.integer_cutoff_c, p);
+/// Interval components of the cutoff-free finite Weil form, in centered
+/// row-major order, with `tau = w02 - wr - wp` enclosed entrywise.
+#[derive(Clone, Debug)]
+pub struct CutoffFreeComponents {
+    pub w02: Vec<RationalInterval>,
+    pub wr: Vec<RationalInterval>,
+    pub wp: Vec<RationalInterval>,
+    pub tau: Vec<RationalInterval>,
+}
+
+/// Assemble every component for a cutoff enclosed by `c` (precision taken
+/// from `c`). The closed forms depend on the cutoff only through
+/// L = ln(c), sqrt(c), (c-1)/(c+1) and the prime powers up to `prime_cutoff`
+/// = floor(c), so a fractional cutoff is admissible.
+fn assemble_components(
+    c: &MpfrInterval,
+    prime_cutoff: u64,
+    modes: usize,
+    geometric_terms: usize,
+) -> Result<CutoffFreeComponents> {
+    let dimension = 2 * modes + 1;
+    let zero = MpfrInterval::from_i64(0, c.precision()).to_rational_interval();
+    let mut w02 = vec![zero; dimension * dimension];
+    let mut wr = w02.clone();
+    let mut wp = w02.clone();
+    let mut tau = w02.clone();
+    visit_cells(
+        c,
+        prime_cutoff,
+        modes,
+        geometric_terms,
+        |row, column, w02_cell, wr_cell, wp_cell, tau_cell| {
+            for index in [row * dimension + column, column * dimension + row] {
+                w02[index] = w02_cell.to_rational_interval();
+                wr[index] = wr_cell.to_rational_interval();
+                wp[index] = wp_cell.to_rational_interval();
+                tau[index] = tau_cell.to_rational_interval();
+            }
+            Ok(())
+        },
+    )?;
+    Ok(CutoffFreeComponents { w02, wr, wp, tau })
+}
+
+/// Visit every upper-triangle cell (row <= column) with its W02, WR, Wp and
+/// Tau enclosures, without retaining the dense matrices.
+pub(crate) fn visit_cells<F>(
+    c: &MpfrInterval,
+    prime_cutoff: u64,
+    modes: usize,
+    geometric_terms: usize,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(
+        usize,
+        usize,
+        &MpfrInterval,
+        &MpfrInterval,
+        &MpfrInterval,
+        &MpfrInterval,
+    ) -> Result<()>,
+{
+    let p = c.precision();
     let l = c.ln()?;
     let pi = MpfrInterval::pi(p);
     let zero = MpfrInterval::from_i64(0, p);
     let quarter = q(1, 4, p);
     let (psi_quarter, _) = complex_digamma(&quarter, &zero)?;
-    let special: Vec<SpecialValues> = (0..=config.modes)
-        .map(|n| special_values(n, &l, &pi, &psi_quarter, config.geometric_terms))
+    let special: Vec<SpecialValues> = (0..=modes)
+        .map(|n| special_values(n, &l, &pi, &psi_quarter, geometric_terms))
         .collect::<Result<_>>()?;
 
     let u = c.sqrt()?;
@@ -399,7 +459,7 @@ pub fn assemble(config: &CutoffFreeConfig) -> Result<CutoffFreeMatrix> {
         .add(&MpfrInterval::euler_gamma(p));
 
     let prime_data: Vec<(MpfrInterval, MpfrInterval, MpfrInterval)> =
-        try_prime_powers_up_to(config.integer_cutoff_c)?
+        try_prime_powers_up_to(prime_cutoff)?
             .into_iter()
             .map(|(power, prime, _)| {
                 let power_value = MpfrInterval::from_u64(power, p);
@@ -414,9 +474,9 @@ pub fn assemble(config: &CutoffFreeConfig) -> Result<CutoffFreeMatrix> {
     // Sum the prime-power generators once per mode. Off-diagonal entries
     // are divided differences of these generators. Outward rounding remains
     // in force, and the changed enclosure arithmetic has a NEW identity.
-    let mut sine_moments = Vec::with_capacity(config.modes + 1);
-    let mut diagonal_moments = Vec::with_capacity(config.modes + 1);
-    for n in 0..=config.modes {
+    let mut sine_moments = Vec::with_capacity(modes + 1);
+    let mut diagonal_moments = Vec::with_capacity(modes + 1);
+    for n in 0..=modes {
         let nf = MpfrInterval::from_u64(n as u64, p);
         let mut sine = zero.clone();
         let mut diagonal = zero.clone();
@@ -445,20 +505,15 @@ pub fn assemble(config: &CutoffFreeConfig) -> Result<CutoffFreeMatrix> {
         }
     };
 
-    let dimension = config.dimension();
-    let count = dimension * dimension;
-    let mut w02 = vec![zero.to_rational_interval(); count];
-    let mut wr = w02.clone();
-    let mut wp = w02.clone();
-    let mut tau = w02.clone();
+    let dimension = 2 * modes + 1;
     let l_squared = l.square();
     let sixteen_pi_squared = pi.square().mul(&MpfrInterval::from_i64(16, p));
     let sinh_squared = sinh(&l.div(&four)?)?.square();
 
     for row in 0..dimension {
-        let n = row as i64 - config.modes as i64;
+        let n = row as i64 - modes as i64;
         for column in row..dimension {
-            let m = column as i64 - config.modes as i64;
+            let m = column as i64 - modes as i64;
             let nf = MpfrInterval::from_i64(n, p);
             let mf = MpfrInterval::from_i64(m, p);
             let numerator = l_squared.sub(&sixteen_pi_squared.mul(&mf).mul(&nf));
@@ -490,16 +545,94 @@ pub fn assemble(config: &CutoffFreeConfig) -> Result<CutoffFreeMatrix> {
                     .div(&pi.mul(&MpfrInterval::from_i64(n - m, p)))?
             };
             let tau_cell = w02_cell.sub(&wr_cell).sub(&wp_cell);
-            let indices = [row * dimension + column, column * dimension + row];
-            for index in indices {
-                w02[index] = w02_cell.to_rational_interval();
-                wr[index] = wr_cell.to_rational_interval();
-                wp[index] = wp_cell.to_rational_interval();
-                tau[index] = tau_cell.to_rational_interval();
-            }
+            visit(row, column, &w02_cell, &wr_cell, &wp_cell, &tau_cell)?;
         }
     }
+    Ok(())
+}
 
+/// Number of geometric correction terms for an arbitrary cutoff c > 1. The
+/// analytic tail after M terms is at most 4*exp(-(4M+1)L/2)/(1-exp(-2L)); this
+/// chooses M so it is below 2^-(p + 2*dimension_bits + 16). Integer cutoffs
+/// keep `recommended_geometric_terms`. The tail is always enclosed, so this
+/// only controls enclosure width, never validity.
+pub fn geometric_terms_for_length(log_cutoff: f64, modes: usize, precision_bits: u32) -> usize {
+    let d = modes.saturating_mul(2).saturating_add(1);
+    let dimension_bits = f64::from(usize::BITS - d.leading_zeros());
+    let required = f64::from(precision_bits) + 2.0 * dimension_bits + 16.0;
+    let terms = (required * std::f64::consts::LN_2 / (2.0 * log_cutoff)).ceil();
+    if terms.is_finite() && terms >= 1.0 {
+        (terms as usize).min(10_000_000)
+    } else {
+        1
+    }
+}
+
+/// Resolve an exact decimal cutoff, which may be fractional.
+pub(crate) fn resolve_cutoff(
+    cutoff: &str,
+    modes: usize,
+    precision_bits: u32,
+) -> Result<ResolvedCutoff> {
+    let exact = super::research::ExactCutoff::parse(cutoff)?;
+    let value = exact.value().clone();
+    if value <= 1 {
+        bail!("cutoff-free CCM requires a cutoff greater than one");
+    }
+    let prime_cutoff = exact.prime_cutoff();
+    let integer = (value.denom() == &1).then_some(prime_cutoff);
+    let geometric_terms = match integer {
+        Some(c) => recommended_geometric_terms(c, modes, precision_bits),
+        None => geometric_terms_for_length(value.to_f64().ln(), modes, precision_bits),
+    };
+    let config = CutoffFreeConfig {
+        integer_cutoff_c: prime_cutoff.max(2),
+        modes,
+        precision_bits,
+        geometric_terms,
+    };
+    config.validate()?;
+    let c = MpfrInterval::from_rational(&value, precision_bits);
+    Ok(ResolvedCutoff {
+        c,
+        prime_cutoff,
+        geometric_terms,
+    })
+}
+
+/// Exact cutoff enclosure, prime cutoff and analytic term count.
+pub(crate) struct ResolvedCutoff {
+    pub c: MpfrInterval,
+    pub prime_cutoff: u64,
+    pub geometric_terms: usize,
+}
+
+/// Assemble the cutoff-free components for an exact decimal cutoff, which may
+/// be fractional, at `precision_bits`. Integer text reproduces `assemble`.
+pub fn assemble_components_at_cutoff(
+    cutoff: &str,
+    modes: usize,
+    precision_bits: u32,
+) -> Result<CutoffFreeComponents> {
+    let resolved = resolve_cutoff(cutoff, modes, precision_bits)?;
+    assemble_components(
+        &resolved.c,
+        resolved.prime_cutoff,
+        modes,
+        resolved.geometric_terms,
+    )
+}
+
+pub fn assemble(config: &CutoffFreeConfig) -> Result<CutoffFreeMatrix> {
+    config.validate()?;
+    let p = config.precision_bits;
+    let c = MpfrInterval::from_u64(config.integer_cutoff_c, p);
+    let CutoffFreeComponents { w02, wr, wp, tau } = assemble_components(
+        &c,
+        config.integer_cutoff_c,
+        config.modes,
+        config.geometric_terms,
+    )?;
     let mut matrix = CutoffFreeMatrix {
         config: config.clone(),
         scalar_backend: format!("system-flint-arb-{}", backend_version()),

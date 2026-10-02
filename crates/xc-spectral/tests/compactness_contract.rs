@@ -18,8 +18,8 @@ fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
                 size_bytes: bytes.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -251,4 +251,73 @@ fn shared_source_normalization_preserves_complete_component_energy_at_extreme_sc
             );
         }
     }
+}
+#[test]
+fn working_budget_is_not_identity_and_budget_limited_results_are_not_retained() {
+    let root = xc_core::test_support::TestDir::new("budget-identity");
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(ZipJsonFilesystemCacheStore::new(
+            "local",
+            &*root,
+            true,
+            CacheVisibility::Local,
+        )),
+    }]);
+    let policy = CachePolicy {
+        current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        minimum_quality: CacheQuality::Validated,
+        accepted_schema_versions: vec![1],
+        allow_deprecated: false,
+        allow_quarantined: false,
+        allowed_visibilities: vec![CacheVisibility::Local],
+    };
+    let cache = ArtifactCacheContext {
+        resolver: Some(&resolver),
+        reference_resolver: None,
+        acceptance: Some(&policy),
+        ordered_overlays: vec!["local".into()],
+        mode: ArtifactExecutionCacheMode::PreferReuse,
+        write_on_miss: true,
+        write_visibility: CacheVisibility::Local,
+        requested_assurance: xc_core::AssuranceLevel::Computed,
+        certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+        production_sink: None,
+    };
+    let (s, m) = state("9", vec!["0".into(), "1".into(), "0".into()], 128);
+    let sources = [m];
+    let mut o = ExtensionOptions::for_source(&s);
+    o.exponential_rates = vec!["0".into()];
+    let capture = |o: &ExtensionOptions| {
+        capture_extended("compactness", &s, None, None, None, o, &sources, &cache).unwrap()
+    };
+
+    // A budget-limited result is returned but not retained.
+    o.maximum_working_bytes = Some(1);
+    let limited = capture(&o);
+    assert!(limited
+        .value
+        .data
+        .reason
+        .as_deref()
+        .unwrap()
+        .contains("working-byte budget"));
+    assert!(limited.produced_manifest.is_none() && limited.reused_manifest.is_none());
+
+    // A larger budget computes and retains the complete result.
+    o.maximum_working_bytes = Some(1 << 40);
+    let complete = capture(&o);
+    assert!(!complete.value.data.rows.is_empty());
+    let produced = complete
+        .produced_manifest
+        .expect("complete result is retained");
+
+    // A different budget reuses the same complete result.
+    o.maximum_working_bytes = Some(1 << 41);
+    let reused = capture(&o);
+    assert_eq!(
+        reused.reused_manifest.expect("reused").content_digest,
+        produced.content_digest
+    );
+    assert_eq!(reused.value.data.rows.len(), complete.value.data.rows.len());
 }

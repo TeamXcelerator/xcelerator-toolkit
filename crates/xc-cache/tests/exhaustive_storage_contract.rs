@@ -5,7 +5,7 @@ use std::{
 };
 use xc_cache::*;
 fn draft(kind: &str, name: &str) -> ArtifactDraft {
-    let v = ToolkitVersion::parse("0.15.1").unwrap();
+    let v = ToolkitVersion::parse("0.18.1").unwrap();
     ArtifactDraft {
         schema_version: 1,
         key: ArtifactKey::new(kind, name, b"same").unwrap(),
@@ -73,7 +73,7 @@ impl CacheStore for MemoryStore {
 }
 fn policy() -> CachePolicy {
     CachePolicy {
-        current_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
+        current_toolkit_version: ToolkitVersion::parse("0.18.1").unwrap(),
         minimum_quality: CacheQuality::Validated,
         allowed_visibilities: [CacheVisibility::Local].into_iter().collect(),
         accepted_schema_versions: [1].into_iter().collect(),
@@ -220,30 +220,13 @@ fn corrupted_payload_cannot_write_beyond_its_declared_size() {
     assert!(output.len() <= 1);
 }
 
-struct Temp(std::path::PathBuf);
+struct Temp(xc_core::test_support::TestDir);
 impl Temp {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        loop {
-            let path = std::env::temp_dir().join(format!(
-                "xc-storage-audit-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            match std::fs::create_dir(&path) {
-                Ok(()) => return Self(path),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => panic!("{e}"),
-            }
-        }
+        Self(xc_core::test_support::TestDir::new("storage-audit"))
     }
     fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        self.0.path()
     }
 }
 

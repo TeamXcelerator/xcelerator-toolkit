@@ -68,7 +68,7 @@ pub(crate) struct Stage {
 impl Stage {
     pub(crate) fn new(label: impl Into<String>) -> Self {
         let label = label.into();
-        eprintln!("research stage {label}: started");
+        xc_core::progress_message!("research stage {label}: started");
         let (stop, rx) = mpsc::channel();
         let name = label.clone();
         let thread = std::thread::spawn(move || {
@@ -77,7 +77,7 @@ impl Stage {
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .is_err_and(|e| e == mpsc::RecvTimeoutError::Timeout)
             {
-                eprintln!(
+                xc_core::progress_message!(
                     "research stage {name}: active, {:.1}s elapsed",
                     start.elapsed().as_secs_f64()
                 );
@@ -97,7 +97,7 @@ impl Drop for Stage {
         if let Some(h) = self.thread.take() {
             let _ = h.join();
         }
-        eprintln!(
+        xc_core::progress_message!(
             "research stage {}: ended after {:.3}s",
             self.label,
             self.start.elapsed().as_secs_f64()
@@ -239,12 +239,12 @@ impl Checkpoints {
         match result {
             Ok(value) => {
                 if self.verbose {
-                    eprintln!("research checkpoint {display_label}: reused");
+                    xc_core::progress_message!("research checkpoint {display_label}: reused");
                 }
                 Ok(Some(value))
             }
             Err(e) => {
-                eprintln!(
+                xc_core::progress_message!(
                     "research checkpoint {display_label}: rejected ({e}); recomputing diagnostic stage"
                 );
                 Ok(None)
@@ -373,7 +373,9 @@ where
                 .map(&compute)
                 .collect::<Result<Vec<_>>>()?;
             if let Err(e) = store.save(&key, &rows) {
-                eprintln!("research checkpoint unavailable: {e}; numerical result retained");
+                xc_core::progress_message!(
+                    "research checkpoint unavailable: {e}; numerical result retained"
+                );
             }
             rows
         };
@@ -387,7 +389,8 @@ mod tests {
     use super::*;
     #[test]
     fn checkpoints_reject_legacy_content_only_identity() {
-        let root = std::env::temp_dir().join(format!("xc-build-bound-{}", std::process::id()));
+        let root_dir = xc_core::test_support::TestDir::new("build-bound");
+        let root = root_dir.to_path_buf();
         let key = ("legacy", "same inputs");
         let legacy = Checkpoints {
             directory: Some(root.clone()),
@@ -404,14 +407,8 @@ mod tests {
     }
     #[test]
     fn checkpoint_reuse_binds_sources_and_rejects_corruption_and_resource_excess() {
-        let root = std::env::temp_dir().join(format!(
-            "xc-checkpoint-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root_dir = xc_core::test_support::TestDir::new("checkpoint-test");
+        let root = root_dir.to_path_buf();
         let store = Checkpoints {
             directory: Some(root.clone()),
             identity: ContentDigest::sha256(b"source A and policy"),

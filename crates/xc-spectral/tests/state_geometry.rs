@@ -19,8 +19,8 @@ fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
             size_bytes: bytes.len() as u64,
         }],
         created_unix_seconds: 1,
-        producer_toolkit_version: ToolkitVersion::parse("0.14.3").unwrap(),
-        minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+        producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+        minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
         maximum_reader_version: None,
         quality: CacheQuality::Validated,
         visibility: CacheVisibility::Local,
@@ -134,14 +134,8 @@ fn geometry_managed_reuse_is_source_bound_and_publication_fails_closed() {
         ArtifactCacheContext, ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver,
         FilesystemCacheStore,
     };
-    let root = std::env::temp_dir().join(format!(
-        "ccm-geometry-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root_dir = xc_core::test_support::TestDir::new("ccm-geometry-test");
+    let root = root_dir.to_path_buf();
     let resolver = CacheResolver::new(vec![CacheLayer {
         precedence: 0,
         store: Box::new(FilesystemCacheStore::new(

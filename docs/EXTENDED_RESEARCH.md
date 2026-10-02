@@ -260,7 +260,7 @@ is unresolved. A prefix requires all consecutive ordinals starting at 1.
 The target error, curvature and isolation assumptions remain external; the
 finite-state curvature formula does not certify them for a different target.
 The report makes no zeta identification, infinite-tail or source-error claim.
-Point-transform callers still require their own interpretation review. Older
+Point-transform callers are outside the scope of these guarantees. Older
 cached revisions do not acquire the new arithmetic guarantees.
 
 
@@ -284,8 +284,8 @@ Joined-root fields participate in output estimates. All physical measurements
 have outward enclosures and record the guard precision, capped at 4096 extra bits.
 
 These calculations do not validate external source selection, source accuracy,
-root identification, historical results or convergence. Remaining callers of
-shared dot/norm/matrix helpers require their own review. Archived report revisions
+root identification, historical results or convergence. Other callers of shared
+dot/norm/matrix helpers are outside their scope. Archived report revisions
 retain their original guarantees.
 
 

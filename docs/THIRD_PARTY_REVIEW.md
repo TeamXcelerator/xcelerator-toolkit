@@ -14,7 +14,7 @@
 - Integration decision: accepted as an optional user-installed shared-library dependency behind the `xc-spectral/arb` feature. The toolkit dynamically links `libflint`; it does not vendor FLINT source or statically incorporate `libflint.a`.
 - Boundary: the project-owned C shim exposes only complex digamma and trigamma interval evaluation through MPFR endpoints. Rust owns input validation, endpoint storage, error propagation, and all remaining CCM formula operations.
 - Distribution control: a toolkit binary built with `xc-spectral/arb` has a runtime dependency on the separately replaceable system shared library. Release packaging must preserve this notice, disclose the runtime dependency, and must not bundle FLINT without a fresh package-content and license review.
-- Validation environment: Ubuntu 24.04 WSL with system FLINT 3.0.1, MPFR/GMP, `pkg-config`, and Rust 1.98.1 for v0.15.0 qualification.
+- Tested with system FLINT 3.0.1 on Ubuntu 24.04.
 
 ## Contribution and distribution review
 
@@ -34,8 +34,7 @@ is incorporated in this extension.
 The exact-rational Gauss-Jordan oracle is implemented separately from the
 prefix recurrence. Tests use synthetic positive-definite matrices and small
 public CCM configurations; this algorithmic comparison does not imply an
-independent human review or replication of a research dataset. See
-[release validation](VALIDATION.md) for the executed checks and scope.
+independent human review or replication of a research dataset.
 
 This extension adds no dependency requirement or locked external package.
 It reuses Rug, MPFR/GMP, Rayon, serde and the optional dynamically linked FLINT

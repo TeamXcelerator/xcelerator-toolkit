@@ -256,6 +256,45 @@ pub fn try_v_r_matrix_element_hp(
 mod tests {
     use super::*;
 
+    /// Near the pole e^2 = (a + ib)^2 with a = e = 1 and tiny b, the exact
+    /// value is Re M = 1/(4 + b^2), Im M = (2/b)/(4 + b^2). Both components are
+    /// representable although b^2 underflows; neither may be lost.
+    #[test]
+    fn near_pole_keeps_the_real_component_when_the_offset_square_underflows() {
+        for exponent in [-600, -800, -1000] {
+            let b = 2f64.powi(exponent);
+            let (real, imaginary) = try_v_r_matrix_element_f64(1.0, 0.0, 1.0, b, 1.0).unwrap();
+            assert_eq!(real, 0.25, "b = 2^{exponent}");
+            assert_eq!(imaginary, 2f64.powi(-exponent - 1), "b = 2^{exponent}");
+        }
+        // A moderate offset still agrees with the analytic formula.
+        let b = 2f64.powi(-20);
+        let (real, imaginary) = try_v_r_matrix_element_f64(1.0, 0.0, 1.0, b, 1.0).unwrap();
+        assert!((real - 1.0 / (4.0 + b * b)).abs() <= 4.0 * f64::EPSILON * real);
+        let expected = (2.0 / b) / (4.0 + b * b);
+        assert!((imaginary - expected).abs() <= 4.0 * f64::EPSILON * expected);
+    }
+
+    #[cfg(feature = "hp")]
+    #[test]
+    fn hp_near_pole_keeps_the_real_component_at_the_exponent_floor() {
+        use rug::Float;
+        let p = 128;
+        for exponent in [-600, -536_871_011] {
+            let one = Float::with_val(p, 1);
+            let zero = Float::with_val(p, 0);
+            let b = Float::with_val(p, Float::i_exp(1, exponent));
+            let (real, imaginary) =
+                try_v_r_matrix_element_hp(&one, &zero, &one, &b, &one, p).unwrap();
+            assert_eq!(real, Float::with_val(p, 0.25), "b = 2^{exponent}");
+            assert_eq!(
+                imaginary,
+                Float::with_val(p, Float::i_exp(1, -exponent - 1)),
+                "b = 2^{exponent}"
+            );
+        }
+    }
+
     /// Diagonal element on critical line: should be exactly 1.
     #[test]
     fn diagonal_on_critical_line_is_one() {

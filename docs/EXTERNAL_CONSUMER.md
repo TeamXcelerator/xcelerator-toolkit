@@ -28,6 +28,4 @@ cargo clippy --manifest-path tests/external-consumer/Cargo.toml --all-targets --
 cargo clippy --manifest-path tests/external-consumer/Cargo.toml --all-targets --features hp --locked -- -D warnings
 ```
 
-The [manual qualification workflow](../.github/workflows/ccm-qualification.yml)
-includes the HP consumer test. The [release validation summary](VALIDATION.md)
-records the native and HP consumer results.
+Release checks include the native and HP consumer tests.

@@ -248,7 +248,7 @@ pub fn tridiag_eigenvalues_hp_with_options(
             if iter_count == TRIDIAG_QR_SLOW_SWEEP_WARNING + 1
                 && max_iter > TRIDIAG_QR_SLOW_SWEEP_WARNING
             {
-                eprintln!(
+                xc_core::progress_message!(
                     "[HP] tridiagonal QR slow convergence at eigenvalue l={l}: continuing beyond {TRIDIAG_QR_SLOW_SWEEP_WARNING} sweeps (hard limit={max_iter})"
                 );
             }

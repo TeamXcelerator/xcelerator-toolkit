@@ -362,7 +362,6 @@ pub fn safe_mode() -> bool {
 mod tests {
     use super::*;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn explicit_safe_policy_changes_scheduling_not_mathematics() {
@@ -488,14 +487,8 @@ mod tests {
 
     #[test]
     fn process_performance_report_includes_safe_thread_and_rayon_workers() {
-        let report_path = std::env::temp_dir().join(format!(
-            "xc-safe-performance-{}-{}.performance.json",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = xc_core::test_support::TestDir::new("safe-performance");
+        let report_path = dir.join("safe.performance.json");
         let policy =
             HpRuntimePolicy::safe_capped(2, 8 * 1024 * 1024, "test-platform-hp-instability")
                 .unwrap();
@@ -537,7 +530,5 @@ mod tests {
                 "missing {expected} from process report"
             );
         }
-
-        let _ = fs::remove_file(report_path);
     }
 }

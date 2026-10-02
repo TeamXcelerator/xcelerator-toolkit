@@ -53,14 +53,8 @@ fn record(kind: &str) -> ProducedArtifactRecord {
 
 #[test]
 fn canonical_staging_must_enforce_each_declared_dependency_quality() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-fresh-staging-quality-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("fresh-staging-quality");
+    let root = scratch.join("root");
     let parent = record("ccm_tau_matrix");
     let mut child = record("ccm_factorization");
     child.manifest.dependencies.push(DependencyRef {
@@ -110,14 +104,8 @@ fn canonical_staging_must_enforce_each_declared_dependency_quality() {
 
 #[test]
 fn qualified_dependency_is_selected_and_quality_upgrades_are_retained() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-fresh-staging-quality-selection-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("fresh-staging-quality-se");
+    let root = scratch.join("root");
     let low = record("ccm_tau_matrix");
     let mut high = low.clone();
     high.manifest.quality = CacheQuality::Certified;
@@ -189,14 +177,8 @@ fn qualified_dependency_is_selected_and_quality_upgrades_are_retained() {
 
 #[test]
 fn incomplete_staging_without_commit_marker_can_be_reopened_and_rebuilt() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-fresh-staging-durability-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("fresh-staging-durability");
+    let root = scratch.join("root");
     let record = record("ccm_tau_matrix");
     let sink = CanonicalStagingProductionSink::new(
         root.clone(),
@@ -236,14 +218,8 @@ fn incomplete_staging_without_commit_marker_can_be_reopened_and_rebuilt() {
 
 #[test]
 fn dependency_quality_distinguishes_publication_and_rejected_dispositions() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-fresh-staging-disposition-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("fresh-staging-dispositio");
+    let root = scratch.join("root");
     for (index, (source, required, accepted)) in [
         (CacheQuality::Validated, CacheQuality::Published, false),
         (CacheQuality::Published, CacheQuality::Certified, false),
@@ -283,14 +259,8 @@ fn dependency_quality_distinguishes_publication_and_rejected_dispositions() {
 
 #[test]
 fn typed_execution_records_resolved_dependency_quality_upgrade_in_both_storage_routes() {
-    let root = std::env::temp_dir().join(format!(
-        "xc-fresh-closure-upgrade-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let scratch = xc_core::test_support::TestDir::new("fresh-closure-upgrade");
+    let root = scratch.join("root");
     for encoded in [false, true] {
         let directory = root.join(if encoded { "encoded" } else { "decoded" });
         let low = record("ccm_tau_matrix");

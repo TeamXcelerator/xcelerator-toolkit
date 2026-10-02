@@ -1,4 +1,4 @@
-//! Fresh audit oracles. Expectations are algebraic identities, not replayed toolkit algorithms.
+//! Independent algebraic oracles. Expectations are algebraic identities, not replayed toolkit algorithms.
 #![cfg(feature = "hp")]
 
 use rug::{ops::Pow, Float, Rational};

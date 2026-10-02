@@ -925,7 +925,7 @@ pub(crate) fn band_single(
             beta = coeffs(&saved.beta, p)?;
             r.rows = saved.rows;
             begin = saved.next;
-            eprintln!("band recurrence resumed at degree {begin}/{d}");
+            xc_core::progress_message!("band recurrence resumed at degree {begin}/{d}");
         } else {
             vectors.clear_memory();
         }
@@ -1030,7 +1030,7 @@ pub(crate) fn band_single(
             .store
             .save("jacobi-roots", &values.iter().map(dec).collect::<Vec<_>>())
         {
-            eprintln!("band checkpoint unavailable: {e}");
+            xc_core::progress_message!("band checkpoint unavailable: {e}");
         }
         values
     };

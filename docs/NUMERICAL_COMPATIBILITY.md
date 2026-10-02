@@ -5,6 +5,15 @@ versioned semantic identities. An upgrade does not rewrite stored artifacts or
 establish the accuracy of an earlier experiment. The changes below apply to
 the library; applications must update their dependencies and rebuild to use them.
 
+## v0.16.0 clean slate
+
+Toolkit 0.16.0 does not reuse any artifact produced by an earlier release.
+Every managed family and kind has producer and reader floor 0.16.0: earlier
+entries in local caches or shards are inadmissible hits and are recomputed.
+The artifact repositories were restarted for this release. Results reported
+from earlier releases are assessed by recomputing them with 0.16.0; the
+guidance below for comparing earlier results remains applicable.
+
 ## Changes after v0.15.2
 
 Adaptive root results must replay their directed local root witness at the
@@ -101,7 +110,7 @@ The tail comparison is computed floating-point arithmetic, not a directed
 interval certificate for the complete evaluator. Cancellation and source
 accuracy remain separate concerns. Independent Arb checks verify selected
 values, parameters and unequal scales using incomplete-gamma integral tail
-bounds; full historical distance and conclusion revalidation remains open.
+bounds. Historical distance results are not revalidated by this change.
 
 ### Stable cutoff-flow derivative identity
 
@@ -187,27 +196,14 @@ use the [prefix precision guidance](PREFIX_CONVERGENCE.md#precision-planning-and
 to plan those studies. Effective inverse rank and cancellation are diagnostics,
 not automatic proofs of sufficient precision.
 
-The read-only metadata inventory can identify the known cutoff-free
-zero-mode certificate semantics and their recorded descendants, and count
-artifacts requiring new identities under the v0.15.0 sector/distance routes:
+Artifacts carrying the known cutoff-free zero-mode certificate semantics, their
+recorded descendants, and artifacts whose identities change under the v0.15.0
+sector/distance routes require new calculation. Include every relevant
+dependency shard, including rollover shards and public parents of private
+children, when determining that closure; missing dependency manifests can
+undercount descendants. Absence from that closure does not make an artifact a
+validated numerical result.
 
-```sh
-python tools/ccm_artifact_impact.py /local/shard-a /local/shard-b \
-  --registry /local/registry --verify-manifest-bytes \
-  --output /local/reports/upgrade-impact.json
-```
-
-Supply every relevant dependency shard, including rollover shards and public
-parents of private children. Exit status 1 means changed active identities,
-affected or unrecognized active certificate semantics, or incomplete metadata coverage;
-status 2 means the inventory could not run. The optional byte check hashes
-manifest files only. This tool does not check package bytes, recompute numerical
-results, or establish which old numerics were inaccurate. An unflagged artifact is not
-a validated numerical result.
-
-`active_recompute_count` and `active_recompute_by_kind` describe upgrade work;
-`active_affected_count` describes the known certificate defect. These are
-different questions. Missing dependency manifests can undercount descendants.
 There is no universal per-artifact cost: a sector reduction is cubic in its
 dimension, while a cached scalar child can be cheap. Use representative
 dimension/precision measurements and the full dependency closure rather than
@@ -296,9 +292,8 @@ repeating the expensive bordered solves. Missing or incompatible retained
 inputs are explicit errors, never a reason to silently replace a source.
 The correction does not change captured eigenvalues, roots, eigenvector
 tangents, prefix moments or matrix assembly. It requires no new shard layout
-or artifact kind. The impact inventory counts older response identities and
-their descendants under `active_recompute_count`; its separate
-`active_affected_count` remains specific to the certificate defect rule.
+or artifact kind. Older response identities and their descendants require
+recomputation.
 
 ### Published research record reuse
 
@@ -349,16 +344,15 @@ for publication and dependency validation.
 
 Ordinary Gauss--Legendre reads use O(n) structural and selected-moment screens.
 `check_gauss_legendre_rule_hp` explicitly checks all Legendre residuals and
-derivative-weight identities in O(nÃ‚Â²), under an order budget. LU validation
-uses three deterministic solve probes in O(dÃ‚Â²); it is not a full PA=LU residual
+derivative-weight identities in O(n²), under an order budget. LU validation
+uses three deterministic solve probes in O(d²); it is not a full PA=LU residual
 or a condition-number bound.
 
 Managed retained-reduction reports validate identity, exact dependencies,
 finite values, shape and verdict consistency on a warm hit. Refresh/Verify
 performs numerical replay. The initial check is cubic and requires an explicit
 dimension and working-precision budget. See [research evidence](RESEARCH_EVIDENCE.md)
-for its residual definitions and [release validation](VALIDATION.md) for the
-tested scope.
+for its residual definitions.
 
 ### Extended prefix policies
 
@@ -367,9 +361,9 @@ the two-moment policy uses v8. The optional cancellation flag
 remains part of the explicit diagnostic policy. Earlier phase scheduling kept
 v2/v3 arithmetic unchanged; the present export repair requires new child
 identities. Neither policy changes source, root, eigenstate or retained-reduction
-identities. Old serialized plans keep their requested diagnostics. The impact
-inventory identifies older prefix children for fresh calculation; it does not
-establish which historical payloads exhibit the defects described below.
+identities. Old serialized plans keep their requested diagnostics. Older prefix
+children require fresh calculation; this does not establish which historical
+payloads exhibit the defects described below.
 
 ### Capability-dependent retained diagnostics
 
@@ -494,8 +488,6 @@ The screw kernel semantics are `suzuki-sqrt-prime-cusp-v2`: Suzuki's prime weigh
 is Lambda(n)/sqrt(n), not the old Lambda(n)/n. Old screw reference values above
 the first prime threshold are wrong. Checked construction/evaluation validates
 support and convergence, and a local expansion handles the cusp near zero.
-The same wrong transcription was found in the Research source note and marked
-with a dated erratum. Downstream historical impact remains unverified.
 
 The Mellin semantics are `eta-stable-real-crossings-v2`. Stable eta evaluation
 uses exp(-abs(t)) without a fixed HP asymptotic cutoff. Checked crossing APIs
@@ -918,8 +910,8 @@ before rounding, and decode eigenvalues at their declared source precision befor
 promotion. Required physical outputs outside MPFR range cause explicit errors.
 Default transform precision stays within the public cap; guard bits are internal.
 These are finite point diagnostics, without a source or continuum error enclosure.
-Projection, root statistics, stabilization and extended formulas retain separate
-review obligations. Their shared v2 keys are not a blanket correctness certificate.
+Other formulas are outside the scope of this change; shared v2 keys are not a
+blanket correctness certificate.
 
 
 Energy accumulation retains only row scratch space and exact signed/absolute
@@ -1011,8 +1003,8 @@ enclosures. Explicit byte limits estimate additional scratch at the maximum guar
 An atom coordinate-echo follow-up promotes the declared source point to report
 precision before decimal serialization. The atom calculation itself is unchanged.
 Its request and local kernel checkpoint identities advance to prevent reuse of
-the earlier echo. Other fixed-guard projection callers and remaining numerical
-formulas need independent conditioning review. Historical artifacts are not cleared.
+the earlier echo. Other fixed-guard projection callers and formulas are outside
+the scope of this change. Historical artifacts are not cleared.
 
 
 ## Finite weighted-profile arithmetic
@@ -1214,8 +1206,9 @@ the certificates themselves. Decimal ordering and duplicate comparisons retain
 all supplied digits. Declared root indices are preserved, missing indices stay
 unknown, and zero/overflowing indices fail. Discovery remains unverified.
 
-Independent fixtures cover 677 exact secular evaluations, 104 reach calculations,
-55 digit-to-bit ceilings, and public overflow/assurance/enclosure regressions.
+Independent fixtures cover these boundaries, including exact secular evaluations,
+reach calculations, digit-to-bit ceilings, and public overflow/assurance/enclosure
+regressions.
 Historical effects remain unvalidated.
 
 
@@ -1245,9 +1238,8 @@ Downstream QR can explicitly reject extreme exponents even when reduction is
 representable. This repair does not promise all-scale QR success or relative
 accuracy/sign assurance for eigenvalues tiny compared with the matrix norm.
 
-Four regressions cover tiny-column underflow, analytic globally scaled spectra,
-explicit working precision and invalid domains. The independent scratch corpus
-also compares216 finite matrix configurations and1944 ordered eigenvalues.
+Regressions cover tiny-column underflow, analytic globally scaled spectra,
+explicit working precision and invalid domains.
 Historical incidence remains unvalidated.
 
 
@@ -1290,9 +1282,9 @@ definition identity advances to gaussian-series-log-range-checked-v3, including
 Gaussian auxiliary series on external targets. External-only protocol identities
 are unchanged. No historical payload is relabeled or numerically cleared.
 
-Seven public-API regressions cover the repaired boundaries and cache identities.
-Independent 640-bit mpmath calculations check 648 HP and 216 binary64 evaluations;
-18 additional log-domain reference cases span the MPFR underflow boundary.
+Public-API regressions cover the repaired boundaries and cache identities.
+Independent fixtures cover these boundaries in HP and binary64, including
+log-domain reference cases across the MPFR underflow boundary.
 These are computed point values and tail estimates, not full interval
 certificates or uniform accuracy guarantees for arbitrary cancellation.
 Historical impact remains unvalidated.
@@ -1347,9 +1339,9 @@ exact-rational inertia, selected-index decisions and portable proof bytes are
 unchanged; existing valid cache and certificate identities remain applicable.
 
 Independent rational orthogonal spectral fixtures cover threshold contacts,
-interval perturbations, selected indices and clusters: 1494 conclusive counts,
-1008 unresolved boundaries and 396 portable selected proofs. All 2898 valid
-results match the prior implementation, including pivot records. Invalid
+interval perturbations, selected indices and clusters, including conclusive
+counts, unresolved boundaries and portable selected proofs. Valid results match
+the prior implementation, including pivot records. Invalid
 domains, selection controls and proof mutations also reject. This does not
 remove the exact-rational path's scaling limitation or establish historical
 correctness outside the tested and derived scope.
@@ -1378,11 +1370,9 @@ Filesystem atomic writes and replacements reserve private sibling files with
 exclusive creation and a checked process-local counter. Existing names are
 skipped, with a bounded 128-collision retry; writing/sync failures clean up only
 the owned staging name. Equal timestamps can no longer make two writers share
-a staging handle and change an already published file. The controlled before
-case reproduced that race; its repaired counterpart preserves both writers
-and a preexisting sentinel. Logical payload bytes and cache identities do not
-change. Destination replacement/index merging and historical incidence remain
-separate obligations.
+a staging handle and change an already published file. Logical payload bytes
+and cache identities do not change. Destination replacement/index merging is
+outside the scope of this change.
 
 The same ownership rule now covers encoded-object adoption and corrupt-part
 quarantine. Adoption keeps exclusive hard-link staging and uses exclusive
@@ -1427,8 +1417,8 @@ bound the displayed finite-data diagnostic, not source assembly error, continuum
 error, or forward error of the response solve.
 
 Response arithmetic identities have changed; prior response payloads require
-recomputation under the new semantics. Current identities are defined in `hp.rs`
-and mirrored by `tools/ccm_artifact_impact.py`. Root-only retained repair does not
+recomputation under the new semantics. Current identities are defined in `hp.rs`.
+Root-only retained repair does not
 upgrade old actions, tangents, or residual evidence to the current arithmetic.
 
 The response forcing projection `action_i - unit_i * eigenvalue_response` also

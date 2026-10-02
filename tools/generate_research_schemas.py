@@ -223,7 +223,7 @@ def revision_contract(schema,kind):
   schema.setdefault('allOf',[]).append({'if':{'properties':{'request':{'required':['residual_semantics']}}},'then':{'properties':{'data':{'required':['residual_normalization']}}}})
  diagnostic=next((diagnostic for diagnostic,k,_,_ in EXTENDED if k==kind),None)
  if diagnostic is None:return
- request['properties']['resource_admission']={'const':'resolved_working_bytes_v1'}
+ request['properties']['resource_admission']={'const':'budget_limited_results_not_retained_v2'}
  request['properties']['duplicate_coordinate_policy']={'const':'all_ambiguous_members_withheld_v2'}
  request['properties']['ladder_positivity_policy']={'const':'all_required_recurrence_steps_including_failed_v2'}
  if diagnostic in ('observable_budget','tail_operator'):

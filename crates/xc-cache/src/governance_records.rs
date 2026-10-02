@@ -876,8 +876,8 @@ mod tests {
         )
         .unwrap();
         assert!(plan.changes_remote_state);
-        let staging =
-            std::env::temp_dir().join(format!("xc-revocation-{}", plan.replacement_digest.0));
+        let scratch = crate::test_support::TestDir::new("revocation");
+        let staging = scratch.join("staging");
         let session = AuthenticatedGitHubSession::verified_for_test(
             "owner",
             "owner/repo",
@@ -950,8 +950,8 @@ mod tests {
         )
         .unwrap();
         assert!(plan.changes_remote_state);
-        let staging =
-            std::env::temp_dir().join(format!("xc-supersession-{}", plan.replacement_digest.0));
+        let scratch = crate::test_support::TestDir::new("supersession");
+        let staging = scratch.join("staging");
         let session = AuthenticatedGitHubSession::verified_for_test(
             "owner",
             "owner/repo",

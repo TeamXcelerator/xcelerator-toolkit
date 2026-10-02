@@ -411,7 +411,7 @@ fn materialize_resolved_remote_artifact_inner(
                 if quarantined.is_empty() {
                     return Err(CacheError::DigestMismatch { expected, actual });
                 }
-                eprintln!(
+                xc_core::progress_message!(
                     "  cache transport: {} reused part(s) failed verification and were quarantined; fetching them again",
                     quarantined.len()
                 );
@@ -638,15 +638,13 @@ mod tests {
         }
     }
 
-    fn temporary_root() -> PathBuf {
-        std::env::temp_dir().join(format!("xc-cache-materialization-{}", std::process::id()))
+    fn temporary_root() -> crate::test_support::TestDir {
+        crate::test_support::TestDir::new("materialization")
     }
 
     #[test]
     fn selective_materialization_reuses_parts_and_verified_package() {
         let root = temporary_root();
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
         let source_path = root.join("source.bin");
         let logical_bytes = b"canonical decoded payload";
         fs::write(&source_path, logical_bytes).unwrap();
@@ -720,8 +718,8 @@ mod tests {
             payload_digest: payload_digest.clone(),
             transport_digests: vec![transport_digest.clone()],
             resolved_mathematical_configuration_digest: ContentDigest::sha256(b"config"),
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             requested_assurance: AssuranceLevel::Computed,
             claim_scope: "materialization fixture".to_owned(),
@@ -735,8 +733,8 @@ mod tests {
             manifest_digest: manifest_digest.clone(),
             achieved_assurance: ArtifactAssuranceState::Computed,
             disposition: ArtifactDisposition::Active,
-            producer_toolkit_version: ToolkitVersion::parse("0.13.0").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.13.0").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             transport_digests: vec![transport_digest.clone()],
             publication_transaction_id: transaction_id.clone(),
         };
@@ -1110,7 +1108,8 @@ mod tests {
     }
     #[test]
     fn audit_projection_counts_repeated_physical_parts_once() {
-        let root = std::env::temp_dir().join(format!("xc-audit-projection-{}", std::process::id()));
+        let scratch = crate::test_support::TestDir::new("audit-projection");
+        let root = scratch.join("root");
         let part = crate::TransportPart {
             sequence: 0,
             repository_path: "objects/repeated".into(),

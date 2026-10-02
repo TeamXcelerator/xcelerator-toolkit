@@ -18,8 +18,8 @@ fn source(kind: &str, value: serde_json::Value) -> (ArtifactManifest, Vec<u8>) {
                 size_bytes: bytes.len() as u64,
             }],
             created_unix_seconds: 1,
-            producer_toolkit_version: ToolkitVersion::parse("0.15.1").unwrap(),
-            minimum_reader_version: ToolkitVersion::parse("0.15.1").unwrap(),
+            producer_toolkit_version: ToolkitVersion::parse("0.16.0").unwrap(),
+            minimum_reader_version: ToolkitVersion::parse("0.16.0").unwrap(),
             maximum_reader_version: None,
             quality: CacheQuality::Validated,
             visibility: CacheVisibility::Local,
@@ -1367,14 +1367,8 @@ fn band_scoring_requires_a_complete_ordered_coordinate_match() {
 
 #[test]
 fn capability_dependent_diagnostics_do_not_reuse_other_or_unspecified_backends() {
-    let root = std::env::temp_dir().join(format!(
-        "ccm-feature-identity-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root_dir = xc_core::test_support::TestDir::new("ccm-feature-identity");
+    let root = root_dir.to_path_buf();
     let (state, _, _) = fixture();
     let options = ExtensionOptions::for_source(&state);
     for id in ["transform_enclosure", "band_reconstruction"] {
@@ -1491,4 +1485,49 @@ fn capability_dependent_diagnostics_do_not_reuse_other_or_unspecified_backends()
     }
     // This is a unique test-owned child of the platform temporary directory.
     std::fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn weighted_tail_reports_origin_mass_and_keeps_nonzero_inverse_moments() {
+    let (s, m, _) = fixture();
+    let mut i = inputs(&m);
+    i.atom_coordinate = Some("test lattice coordinate".into());
+    i.atom_coverage = Some("finite supplied table, no omitted-tail bound".into());
+    i.tail_checkpoints = vec!["0".into(), "1".into(), "4".into()];
+    for (ordinal, x, w, partition) in [
+        (1, "0", "3", "origin;ordinal=mode+1"),
+        (2, "1", "2", "nonzero_modes;ordinal=mode+1"),
+        (3, "4", "1", "nonzero_modes;ordinal=mode+1"),
+    ] {
+        i.atoms.push(WeightedAtom {
+            ordinal,
+            coordinate: x.into(),
+            weight: w.into(),
+            family: "lattice".into(),
+            partition: partition.into(),
+        });
+    }
+    let r = run("weighted_tail", &s, None, Some(&i));
+    let origin = r
+        .rows
+        .iter()
+        .filter(|row| row.label == "lattice/origin;ordinal=mode+1")
+        .collect::<Vec<_>>();
+    let nonzero = r
+        .rows
+        .iter()
+        .filter(|row| row.label == "lattice/nonzero_modes;ordinal=mode+1")
+        .collect::<Vec<_>>();
+    assert!(!origin.is_empty() && !nonzero.is_empty());
+    for row in &origin {
+        assert_eq!(row.outcome, "point_measurement");
+        assert!(row.values.contains_key("included_mass"));
+        assert!(!row.values.contains_key("weighted_inverse_moment_1"));
+        assert!(row
+            .notes
+            .iter()
+            .any(|n| n.contains("do not apply at the origin")));
+    }
+    let last = nonzero.last().unwrap();
+    assert_eq!(last.outcome, "point_measurement");
+    assert!(last.values.contains_key("weighted_inverse_moment_1"));
 }

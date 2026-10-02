@@ -951,7 +951,7 @@ pub mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse("0.15.0")?,
+            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
             maximum_reader_version: None,
             tags: BTreeMap::from([("domain".to_owned(), "prolate".to_owned())]),
             provenance_digest: None,
@@ -1576,7 +1576,7 @@ pub mod hp {
     // and reusable across runs at the same configuration.
     //
     // Cache layout (mirrors xc-numerics::quadrature::hp gl_cache):
-    //   <cwd>/data/prolate_eigvals_cache/lambda_sq{LSQ}_ngrid{N}_prec{P}.json[.zip]
+    //   <cache root>/prolate_eigvals_cache/lambda_sq{LSQ}_ngrid{N}_prec{P}.json[.zip]
     //
     // The standalone API reads a local `.json.zip` in memory and computes a
     // fresh spectrum on a miss. Managed remote resolution uses
@@ -1660,8 +1660,7 @@ pub mod hp {
     }
 
     fn prolate_cache_dir() -> Option<std::path::PathBuf> {
-        let cwd = std::env::current_dir().ok()?;
-        let dir = cwd.join("data").join("prolate_eigvals_cache");
+        let dir = crate::standalone_cache_root().join("prolate_eigvals_cache");
         std::fs::create_dir_all(&dir).ok()?;
         Some(dir)
     }
@@ -1765,7 +1764,7 @@ pub mod hp {
     }
 
     fn warn_prolate_cache_skip(path: &std::path::Path, reason: &str) {
-        eprintln!(
+        xc_core::progress_message!(
             "[prolate_cache] WARNING: skipping {} ({}); recomputing",
             path.display(),
             reason
@@ -1812,15 +1811,8 @@ pub mod hp {
         #[test]
         fn bounded_zip_read_accepts_generated_shape_and_rejects_oversized_decoded_json() {
             use std::io::Write;
-            let root = std::env::temp_dir().join(format!(
-                "xc-prolate-size-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
+            let root_dir = xc_core::test_support::TestDir::new("prolate-size");
+            let root = root_dir.to_path_buf();
             let lambda = LambdaSq::integer(1);
             let name = "spectrum.json";
             let json = serde_json::json!({ "schema_version":1, "toolkit_version":PROLATE_TOOLKIT_VERSION,
@@ -1984,7 +1976,7 @@ pub mod hp {
             }
         }
         if let Err(e) = xc_cache::atomic_replace_cache_file(&zip_path, &buf) {
-            eprintln!(
+            xc_core::progress_message!(
                 "[prolate_cache] WARNING: could not write {}: {}",
                 zip_path.display(),
                 e
@@ -2434,7 +2426,7 @@ pub mod hp {
             .ok_or_else(|| anyhow::anyhow!("prolate finite-sum work budget exceeded"))?;
         super::legendre::resource_budget(n, n_sample, terms, prec, false)?;
 
-        eprintln!(
+        xc_core::progress_message!(
             "[HP prolate] computing k_λ at λ²={}, N={}, n_sample={}, prec={} bits",
             {
                 let mut sq = lambda.clone();
@@ -2447,10 +2439,10 @@ pub mod hp {
         );
 
         // Build the tridiagonal in HP.
-        eprintln!("[HP prolate] building tridiagonal PW_λ on N={} grid...", n);
+        xc_core::progress_message!("[HP prolate] building tridiagonal PW_λ on N={} grid...", n);
         let pw_start = std::time::Instant::now();
         let (diag, off_diag) = try_build_pw_matrix(lambda, n, prec)?;
-        eprintln!(
+        xc_core::progress_message!(
             "[HP prolate] PW_λ built in {:.1}s",
             pw_start.elapsed().as_secs_f64()
         );
@@ -2490,7 +2482,7 @@ pub mod hp {
                         validate_fd_selected_spectrum(&diag, &off_diag, values, prec).is_ok()
                     })
                 {
-                    eprintln!(
+                    xc_core::progress_message!(
                         "[HP prolate] loaded {} cached eigenvalues for λ²={}, N={}, prec={} bits",
                         cached.len(),
                         lambda_sq_int.value_f64,
@@ -2499,13 +2491,13 @@ pub mod hp {
                     );
                     cached
                 } else {
-                    eprintln!(
+                    xc_core::progress_message!(
                         "[HP prolate] computing all {} eigenvalues of PW_λ via tridiag QR...",
                         n
                     );
                     let eig_start = std::time::Instant::now();
                     let evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec)?;
-                    eprintln!(
+                    xc_core::progress_message!(
                         "[HP prolate] {} eigenvalues computed in {:.1}s",
                         evals.len(),
                         eig_start.elapsed().as_secs_f64()
@@ -2546,7 +2538,7 @@ pub mod hp {
         // Search the lowest-lying eigenfunctions for h_0 and h_4.
         // Limit search depth: prolate h_4 is the third even eigenfunction.
         let n_try = super::PROLATE_SEARCH_DEPTH.min(n);
-        eprintln!("[HP prolate] searching for h_0 (even, 0 nodes) and h_4 (even, 4 nodes) in first {} eigenvectors...", n_try);
+        xc_core::progress_message!("[HP prolate] searching for h_0 (even, 0 nodes) and h_4 (even, 4 nodes) in first {} eigenvectors...", n_try);
         let search_start = std::time::Instant::now();
         let mut h0_idx: Option<usize> = None;
         let mut h4_idx: Option<usize> = None;
@@ -2556,7 +2548,7 @@ pub mod hp {
         let mut h4_value = None;
 
         for (k, lambda_k) in eigenvalues.iter().enumerate().take(n_try) {
-            eprintln!(
+            xc_core::progress_message!(
                 "[HP prolate] eigenvector {}/{} (eigenvalue {})...",
                 k + 1,
                 n_try,
@@ -2602,13 +2594,13 @@ pub mod hp {
             let nodes = try_count_nodes(&v, prec)?;
             match nodes {
                 0 if h0_idx.is_none() => {
-                    eprintln!("[HP prolate] found h_0 at index {}", k);
+                    xc_core::progress_message!("[HP prolate] found h_0 at index {}", k);
                     h0_idx = Some(k);
                     h0_vec = Some(v);
                     h0_value = Some(recovery.eigenvalue);
                 }
                 4 if h4_idx.is_none() => {
-                    eprintln!("[HP prolate] found h_4 at index {}", k);
+                    xc_core::progress_message!("[HP prolate] found h_4 at index {}", k);
                     h4_idx = Some(k);
                     h4_vec = Some(v);
                     h4_value = Some(recovery.eigenvalue);
@@ -2619,7 +2611,7 @@ pub mod hp {
                 break;
             }
         }
-        eprintln!(
+        xc_core::progress_message!(
             "[HP prolate] eigenvector search done in {:.1}s",
             search_start.elapsed().as_secs_f64()
         );
@@ -2733,7 +2725,7 @@ pub mod hp {
 
         // Evaluate k_λ(u) = √u · Σ_{n=1}^{⌊λ/u⌋} h_λ(n·u).
         // Each grid point u is independent → parallelize via par_iter.
-        eprintln!(
+        xc_core::progress_message!(
             "[HP prolate] sampling k_λ on {} log-spaced grid points...",
             n_sample
         );
@@ -2769,7 +2761,7 @@ pub mod hp {
                 Ok(result)
             })
             .collect::<Result<_>>()?;
-        eprintln!(
+        xc_core::progress_message!(
             "[HP prolate] k_λ sampling done in {:.1}s; total compute_k_lambda elapsed {:.1}s",
             sample_start.elapsed().as_secs_f64(),
             start.elapsed().as_secs_f64()
@@ -2962,15 +2954,8 @@ pub mod hp {
 
         #[test]
         fn fd_cache_recomputes_sorted_wrong_spectrum() {
-            let root = std::env::temp_dir().join(format!(
-                "xc-remaining-fd-cache-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
+            let root_dir = xc_core::test_support::TestDir::new("remaining-fd-cache");
+            let root = root_dir.to_path_buf();
             let p = 128;
             let n = 25;
             let lambda = Float::with_val(p, 2).sqrt();
@@ -3018,15 +3003,8 @@ pub mod hp {
 
         #[test]
         fn legendre_cache_rejects_sorted_wrong_spectrum() {
-            let root = std::env::temp_dir().join(format!(
-                "xc-confirmed-legendre-cache-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
+            let root_dir = xc_core::test_support::TestDir::new("confirmed-legendre-cache");
+            let root = root_dir.to_path_buf();
             let p = 128;
             let n = 24;
             let lambda = Float::with_val(p, 2).sqrt();
@@ -3097,15 +3075,8 @@ pub mod hp {
 
         #[test]
         fn exact_standalone_cache_reuses_noninteger_sources_and_never_aliases_nearby_cutoffs() {
-            let root = std::env::temp_dir().join(format!(
-                "xc-exact-prolate-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            std::fs::create_dir_all(&root).unwrap();
+            let root_dir = xc_core::test_support::TestDir::new("exact-prolate");
+            let root = root_dir.to_path_buf();
             let p = 128;
             let lambda = Float::with_val(p, Float::parse("3.123456789").unwrap());
             let n = 17;
@@ -3145,9 +3116,8 @@ pub mod hp {
                 ManagedRunProfile, OutputPreservationValidationReport, OutputValidationConfig,
             };
 
-            let root = std::env::temp_dir()
-                .join(format!("xc-spectral-prolate-fabric-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
+            let root_dir = xc_core::test_support::TestDir::new("prolate-fabric");
+            let root = root_dir.to_path_buf();
             let reference_root = root.join("reference");
             let resolver = CacheResolver::new(vec![CacheLayer {
                 precedence: 0,
@@ -3769,10 +3739,7 @@ pub mod hp {
         /// returns an empty report, not an error.
         #[test]
         fn verify_dir_handles_missing_directory() {
-            let temp_root = crate::test_tmp_root().join(format!(
-                "xc_spectral_prolate_cache_test_missing_{}",
-                std::process::id()
-            ));
+            let temp_root = crate::fresh_test_dir("prolate-cache-missing");
             let nonexistent = temp_root.join("does_not_exist");
             let report = verify_prolate_eigvals_cache_dir(&nonexistent).unwrap();
             assert_eq!(report.statuses.len(), 0);
@@ -3794,8 +3761,8 @@ pub mod hp {
             let (diag, off_diag) = build_pw_matrix(&lambda, n_grid, prec);
             let real_evals = tridiag_eigenvalues_hp(&diag, &off_diag, prec).unwrap();
 
-            // Build an isolated temp dir under target/test-tmp.
-            let temp_dir = crate::fresh_test_dir("prolate_cache_classify");
+            // Build an isolated, self-removing temp dir.
+            let temp_dir = crate::fresh_test_dir("prolate-cache-classify");
 
             // 1. Valid file: serialize the real spectrum as envelope.
             let valid_name = prolate_cache_filename(lambda_sq, n_grid, prec);
@@ -3917,6 +3884,7 @@ pub mod hp {
 
         struct ProlateCwdGuard {
             original: std::path::PathBuf,
+            _cache_root: crate::TestCacheRoot,
             _lock: std::sync::MutexGuard<'static, ()>,
         }
 
@@ -3929,6 +3897,7 @@ pub mod hp {
                 std::env::set_current_dir(temp).expect("enter prolate test directory");
                 Self {
                     original,
+                    _cache_root: crate::TestCacheRoot::enter(temp),
                     _lock: lock,
                 }
             }
@@ -3940,23 +3909,11 @@ pub mod hp {
             }
         }
 
-        fn prolate_temp_cwd(tag: &str) -> std::path::PathBuf {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0);
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("..")
-                .join("target")
-                .join("test-tmp")
-                .join(format!(
-                    "xc_spectral_prolate_cache_{tag}_{}_{}",
-                    std::process::id(),
-                    nanos
-                ));
-            std::fs::create_dir_all(&path).expect("create prolate test directory");
-            path
+        /// A fresh, self-removing temp dir for cwd-relative cache tests.
+        /// Declare it before the `ProlateCwdGuard` so the cwd is restored
+        /// before the directory is removed.
+        fn prolate_temp_cwd(tag: &str) -> xc_core::test_support::TestDir {
+            crate::fresh_test_dir(&format!("prolate-cache-{tag}"))
         }
 
         /// `save` then `load` round-trips eigenvalues at every CacheMode

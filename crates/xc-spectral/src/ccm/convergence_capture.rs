@@ -306,7 +306,7 @@ pub(crate) fn tail_operator(
     let result = tail_operator_uncached(s, o, i, source_precision)?;
     if result.outcome == "point_measurement" {
         if let Err(e) = store.save("model-solve", &result) {
-            eprintln!("tail model checkpoint unavailable: {e}");
+            xc_core::progress_message!("tail model checkpoint unavailable: {e}");
         }
     }
     Ok(result)

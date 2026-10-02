@@ -263,7 +263,10 @@ fn canonicalize(vector: &mut [Float]) {
 
 /// Independent dense MPFR reference for one algebraic generalized extreme.
 /// The route uses Cholesky whitening followed by the ordinary dense
-/// Householder/QR eigensolver and verifies the result in the original pair.
+/// Householder/QR eigensolver and verifies the result in the original pair:
+/// residuals are evaluated at the stored inputs' own precision (plus a guard),
+/// so inputs finer than the working precision are never silently rounded away
+/// before acceptance.
 pub fn solve_dense_generalized_whitening_hp(
     problem: &DenseGeneralizedProblemHp<'_>,
     config: &GeneralizedExtremeConfigHp,
@@ -335,17 +338,28 @@ pub fn solve_dense_generalized_whitening_hp(
         *value /= &metric_norm;
     }
     canonicalize(&mut eigenvector);
+    // Verify in the original pair: residual arithmetic keeps every stored input
+    // entry exactly, even when the solve itself ran at a lower working precision.
+    let verification_bits = problem
+        .operator
+        .iter()
+        .chain(problem.metric)
+        .map(Float::prec)
+        .max()
+        .unwrap_or(config.precision_bits)
+        .max(config.precision_bits)
+        .saturating_add(64);
     applied_metric = matvec(
         problem.metric,
         &eigenvector,
         problem.dimension,
-        config.precision_bits,
+        verification_bits,
     );
     let applied_operator = matvec(
         problem.operator,
         &eigenvector,
         problem.dimension,
-        config.precision_bits,
+        verification_bits,
     );
     let residual: Vec<Float> = applied_operator
         .iter()
@@ -363,12 +377,21 @@ pub fn solve_dense_generalized_whitening_hp(
         &applied_operator,
         &applied_metric,
         &eigenvalue,
-        config.precision_bits,
+        verification_bits,
     )?;
-    let scaled_backward_error = relative_residual.clone();
-    let mut metric_normalization_error = dot(&eigenvector, &applied_metric, config.precision_bits);
+    let mut metric_normalization_error = dot(&eigenvector, &applied_metric, verification_bits);
     metric_normalization_error -= 1u32;
     metric_normalization_error.abs_mut();
+    // Report the original-pair diagnostics at the working precision, rounded
+    // up, and decide acceptance from those reported values: rounding can only
+    // make acceptance stricter.
+    let report_up = |value: &Float| {
+        Float::with_val_round(config.precision_bits, value, rug::float::Round::Up).0
+    };
+    let residual_norm = report_up(&residual_norm);
+    let relative_residual = report_up(&relative_residual);
+    let metric_normalization_error = report_up(&metric_normalization_error);
+    let scaled_backward_error = relative_residual.clone();
     let (status, termination) = if scaled_backward_error <= backward_tolerance {
         (
             ResultStatus::Converged,
@@ -502,6 +525,27 @@ mod tests {
             maximum_iterations: 200,
             minimum_iterations: 2,
         }
+    }
+
+    #[test]
+    fn residual_is_verified_against_inputs_finer_than_the_working_precision() {
+        // A = [1 + 2^-100] stored at 256 bits, B = [1], solved at 64 bits: the
+        // working solve sees A = [1], but the original-pair residual is 2^-100.
+        let mut entry = Float::with_val(256, 1);
+        entry += Float::with_val(256, Float::i_exp(1, -100));
+        let operator = vec![entry];
+        let metric = values(256, &[1]);
+        let problem = DenseGeneralizedProblemHp::new(&operator, &metric, 1).unwrap();
+        let mut config = config(EigenTarget::AlgebraicSmallest);
+        config.precision_bits = 64;
+        let report = solve_dense_generalized_whitening_hp(&problem, &config).unwrap();
+        assert_eq!(
+            report.residual_norm,
+            Float::with_val(256, Float::i_exp(1, -100))
+        );
+        assert_eq!(report.status, ResultStatus::Approximate);
+        assert!(!report.stopping_evidence.absolute_residual_passed);
+        assert!(!report.stopping_evidence.scaled_backward_error_passed);
     }
 
     #[test]
