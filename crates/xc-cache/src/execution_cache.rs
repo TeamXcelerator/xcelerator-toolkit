@@ -5178,7 +5178,7 @@ mod tests {
         }
     }
 
-    /// Regression (Claim 4b): a second managed publication in one process must
+    /// Regression: a second managed publication in one process must
     /// keep the already-published parents of its new drafts in the closure.
     #[test]
     fn later_publication_in_one_process_keeps_completed_parents_in_its_closure() {

@@ -3452,9 +3452,9 @@ mod tests {
                 .chain(crate::ccm::convergence_capture::lookahead::EXTENDED)
                 .map(|id| id.to_string()),
         );
-        // Explicit inputs stand in for run-once preparation: its cohort
-        // discovery reads registrations that concurrently running tests add
-        // to the shared cache root, which would make two runs differ.
+        // Explicit synthetic inputs stand in for run-once preparation, so the
+        // fixture skips that work and the failing variant can inject a bad
+        // trial vector.
         use crate::ccm::convergence_capture::finite_capture as f;
         let record = run.eigenpair.as_ref().unwrap();
         let state = crate::ccm::state_geometry::RetainedState::from_payload(

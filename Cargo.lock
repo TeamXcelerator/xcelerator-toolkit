@@ -646,7 +646,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xc-cache"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "fs2",
  "getrandom",
@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "xc-certify"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "rug",
  "serde",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "xc-cli"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "xc-core"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "xc-numerics"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "anyhow",
  "rayon",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "xc-operator"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "rayon",
  "rug",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "xc-root"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "num-bigint",
  "rayon",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "xc-solver"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "nalgebra",
  "num-bigint",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "xc-spectral"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "anyhow",
  "cc",
@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "xc-variational"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "rug",
  "serde",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "xc-zeta"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "anyhow",
  "rug",

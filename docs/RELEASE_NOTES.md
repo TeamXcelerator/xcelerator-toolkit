@@ -1,5 +1,22 @@
 # Release notes
 
+## 0.16.1 (2026-10-16)
+
+Version 0.16.1 is the 0.16.0 release as amended through 2026-10-15, published
+under its own version. The `v0.16.0` tag moved as those amendments were
+published; pinning `v0.16.1` identifies this code exactly. The amendments are
+described under 0.16.0 below, including the removal of in-capture comparison
+cohorts, blocked reporting for declared arithmetic limits, and the publication
+and preparation speedups.
+
+No computation, artifact format, semantic identity or cache rule changes.
+0.16.1 reads and reuses 0.16.0 artifacts unchanged, and the producer and
+reader floor stays 0.16.0. Artifacts it publishes record producer 0.16.1.
+Publication is producer-version monotonic per semantic identity, so once a
+shard holds an active 0.16.1 entry for an identity, 0.16.0 can no longer
+publish that identity there; applications sharing artifact repositories should
+move to 0.16.1 together.
+
 ## 0.16.0 (2026-10-02)
 
 This release starts a clean artifact fabric: identities, receipts and capture

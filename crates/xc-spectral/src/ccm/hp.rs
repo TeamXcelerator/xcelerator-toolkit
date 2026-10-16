@@ -19859,8 +19859,8 @@ mod tests {
         // At 22 digits two even-sector eigenvalues of lambda^2=13, N=40 lie
         // within a quarter of the stored rounding scale of zero, so the source
         // count precludes Krylov acceptance before any restart, whatever the
-        // restart budget. As in Claim 1c, the legacy state is then retained
-        // without an established ground index.
+        // restart budget. The legacy state is then retained without an
+        // established ground index.
         let params = CcmParams::from_lambda_sq_integer(13, 40);
         let solve = |solver: CcmEigenstateSolver, name: &str| {
             let base_dir = xc_core::test_support::TestDir::new(name);
@@ -21246,7 +21246,7 @@ mod tests {
     #[test]
     #[cfg(feature = "arb")]
     #[ignore = "requires an explicit retained eigenpair JSON fixture; no network or matrix assembly"]
-    fn complete_root_retained_claim2a_replay() {
+    fn complete_root_retained_lambda_sq_2500_n50_replay() {
         let path = std::env::var("CCM_COMPLETE_EIGENPAIR_FIXTURE")
             .expect("set retained eigenpair fixture path");
         let raw = std::fs::read(path).unwrap();

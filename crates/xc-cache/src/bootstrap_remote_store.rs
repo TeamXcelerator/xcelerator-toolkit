@@ -2769,7 +2769,7 @@ mod tests {
             PublicationDestination::Private,
             "ccm-matrices",
             "fixture-author",
-            "TeamXcelerator/xcelerator-cache-private-ccm-matrices-0001",
+            "example-org/xcelerator-cache-private-ccm-matrices-0001",
             "main",
             ContentDigest::sha256(b"bootstrap-policy"),
             Some(1),
@@ -2821,7 +2821,7 @@ mod tests {
             &fixture.source,
             PublicationDestination::Private,
             "ccm-matrices",
-            "TeamXcelerator/xcelerator-cache-private-ccm-matrices-0001",
+            "example-org/xcelerator-cache-private-ccm-matrices-0001",
             &fixture.semantic_digest,
             &fixture.entry,
             &fixture.manifest_path,
@@ -2839,7 +2839,7 @@ mod tests {
             &fixture.source,
             PublicationDestination::Private,
             "ccm-matrices",
-            "TeamXcelerator/xcelerator-cache-private-ccm-matrices-0001",
+            "example-org/xcelerator-cache-private-ccm-matrices-0001",
             &fixture.semantic_digest,
             &fixture.entry,
             &fixture.manifest_path,
@@ -2865,7 +2865,7 @@ mod tests {
             &batches,
             PublicationDestination::Private,
             "ccm-matrices",
-            "TeamXcelerator/xcelerator-cache-private-ccm-matrices-0001",
+            "example-org/xcelerator-cache-private-ccm-matrices-0001",
             &identity,
             &fixture.manifest_path,
         )
@@ -2880,7 +2880,7 @@ mod tests {
             &batches,
             PublicationDestination::Private,
             "ccm-matrices",
-            "TeamXcelerator/xcelerator-cache-private-ccm-matrices-0001",
+            "example-org/xcelerator-cache-private-ccm-matrices-0001",
             &wrong_identity,
             &fixture.manifest_path,
         )
@@ -2889,32 +2889,32 @@ mod tests {
 
     #[test]
     #[ignore = "read-only live GitHub consumer acceptance"]
-    fn claim_1a_artifacts_resolve_from_the_public_bootstrap_fabric() {
+    fn reference_artifacts_resolve_from_the_public_bootstrap_fabric() {
         let scratch = crate::test_support::TestDir::new("public-consumer-acceptan");
         let root = scratch.join("root");
         let store = GitHubBootstrapCacheStore::public("TeamXcelerator", root).unwrap();
-        assert_claim_1a_resolves(&store, CacheVisibility::Public);
+        assert_reference_artifacts_resolve(&store, CacheVisibility::Public);
     }
 
     #[test]
     #[ignore = "authenticated read-only live GitHub acceptance"]
-    fn claim_1a_artifacts_resolve_from_the_private_bootstrap_fabric() {
+    fn reference_artifacts_resolve_from_the_private_bootstrap_fabric() {
         let scratch = crate::test_support::TestDir::new("private-consumer-accepta");
         let root = scratch.join("root");
         let store = GitHubBootstrapCacheStore::private("TeamXcelerator", root).unwrap();
-        assert_claim_1a_resolves(&store, CacheVisibility::Private);
+        assert_reference_artifacts_resolve(&store, CacheVisibility::Private);
     }
 
     #[test]
     #[ignore = "authenticated V1-corpus staging acceptance against the private shard"]
-    fn claim_1a_v1_artifact_stages_for_republication() {
+    fn v1_artifact_stages_for_republication() {
         let scratch = crate::test_support::TestDir::new("private-v1-republication");
         let root = scratch.join("root");
         let store =
             GitHubBootstrapCacheStore::private("TeamXcelerator", root.join("remote")).unwrap();
         let key = ArtifactKey {
             kind: "gauss_legendre_rule".to_owned(),
-            logical_key: "live-claim-1a".to_owned(),
+            logical_key: "live-acceptance".to_owned(),
             parameters_digest: ContentDigest(
                 "a23310358f5f5e1f83db0cef44bd27d2a26ff1bdbffd94f02292bdba64f8b3fa".to_owned(),
             ),
@@ -2971,10 +2971,11 @@ mod tests {
 
     #[test]
     #[ignore = "authenticated revoked historical-identity rejection against the private shard"]
-    fn revoked_claim_1a_matrix_is_rejected_by_exact_historical_identity() {
+    fn revoked_matrix_is_rejected_by_exact_historical_identity() {
         let scratch = crate::test_support::TestDir::new("private-historical-ident");
         let root = scratch.join("root");
-        let store = GitHubBootstrapCacheStore::private("TeamXcelerator", root).unwrap();
+        let owner = "TeamXcelerator";
+        let store = GitHubBootstrapCacheStore::private(owner, root).unwrap();
         let identity = PayloadDependencyIdentity {
             artifact_family: "ccm-matrices".to_owned(),
             semantic_digest: ContentDigest(
@@ -2990,12 +2991,14 @@ mod tests {
         // This exact historical manifest was revoked for incomplete source
         // dependencies. Prove that the revocation exists before checking that
         // resolution refuses it, so a missing repository cannot pass this test.
-        let repository =
-            "https://github.com/TeamXcelerator/xcelerator-cache-private-ccm-matrices-0001.git";
-        let revision = store.shard_revision(repository).unwrap();
+        let repository = format!(
+            "https://github.com/{owner}/xcelerator-cache-private-{}-0001.git",
+            identity.artifact_family
+        );
+        let revision = store.shard_revision(&repository).unwrap();
         assert!(store
             .has_active_revocation(
-                repository,
+                &repository,
                 &revision,
                 RevocationScope::Manifest,
                 &identity.manifest_digest,
@@ -3005,7 +3008,7 @@ mod tests {
         assert!(store.identity_candidates(&identity).unwrap().is_empty());
     }
 
-    fn assert_claim_1a_resolves(
+    fn assert_reference_artifacts_resolve(
         store: &GitHubBootstrapCacheStore,
         expected_visibility: CacheVisibility,
     ) {
@@ -3025,7 +3028,7 @@ mod tests {
         ] {
             let key = ArtifactKey {
                 kind: kind.to_owned(),
-                logical_key: "live-claim-1a".to_owned(),
+                logical_key: "live-acceptance".to_owned(),
                 parameters_digest: ContentDigest(digest.to_owned()),
             };
             let resolved = store.resolve(&key).unwrap().expect("published artifact");

@@ -7,13 +7,15 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-## Retained research with v0.16.0
+## Retained research with v0.16.1
 
 Xcelerator Toolkit supplies high-precision numerical libraries and reusable,
 source-bound research data. Applications can retain a primary calculation once
 and use Ultra capture to preserve every applicable implemented diagnostic.
 Version 0.16.0 starts a clean artifact fabric: artifacts produced by earlier
-releases are recomputed, never reused. Ultra adds rigorous error bars against
+releases are recomputed, never reused. Version 0.16.1 is the amended 0.16.0
+release under its own version number, and it reads and reuses 0.16.0
+artifacts unchanged. Ultra adds rigorous error bars against
 the exact finite CCM form for eigenvalues, gaps and roots, rigorous low-spectrum
 enclosures along the mode ladder, and root certification that certifies every
 certifiable root while keeping every computed one. Capture receipts reference
@@ -212,7 +214,7 @@ If you use Xcelerator Toolkit in research, please cite the exact version or Git 
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.16.0},
+  version = {0.16.1},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }

@@ -1165,7 +1165,7 @@ pub mod finite_capture {
             run(3386, Some(64), pivot),
             ("certified_finite_enclosure".into(), vec![64])
         );
-        // An unresolved pivot retries (Claim 1b needed 256 in the primary proof).
+        // An unresolved pivot retries at the next guard width.
         assert_eq!(
             run(3386, Some(256), pivot),
             ("certified_finite_enclosure".into(), vec![64, 256])
