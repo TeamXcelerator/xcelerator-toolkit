@@ -33,6 +33,10 @@ pub mod quadrature;
 pub mod root_finding;
 pub mod symmetric_f64;
 
+/// Explicit exact integer products with a bounded modular reconstruction.
+#[cfg(feature = "modular-product")]
+pub mod modular_product;
+
 /// Debug logging macro controlled by [`set_hp_debug_logging`].
 static HP_DEBUG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -67,6 +71,10 @@ pub mod fmt;
 
 #[cfg(feature = "hp")]
 pub mod eigen;
+
+/// Opt-in exact stored-dyadic matrix products and explicit final rounding.
+#[cfg(feature = "hp")]
+pub mod exact_product;
 
 #[cfg(feature = "hp")]
 pub mod interval;

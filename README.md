@@ -7,7 +7,11 @@
 - **ORCID:** [0009-0003-9724-3104](https://orcid.org/0009-0003-9724-3104)
 - **Contact:** randrewsmath@gmail.com
 
-## Retained research with v0.16.1
+## Retained research with v0.17.0
+
+Version 0.17.0 improves large-run execution and retained-artifact reuse.
+See the [release notes](docs/RELEASE_NOTES.md)
+for compatibility details and public API changes.
 
 Xcelerator Toolkit supplies high-precision numerical libraries and reusable,
 source-bound research data. Applications can retain a primary calculation once
@@ -68,6 +72,15 @@ cargo build --workspace --release --features hp --locked
 
 FLINT/Arb is used by routes that need ball arithmetic or rigorous interval certification. Ordinary high-precision computation uses the appropriate MPFR-based implementation. Explicit `f64` routes remain available for lower-precision work and are never silently substituted for an HP request.
 
+HP CCM primary, evenness, and bordered response LU use exact blocked Schur
+updates for every nontrivial matrix, including small claims. They automatically
+use admitted CUDA devices when the runtime is available, with the same
+arithmetic on CPU or multiple GPUs. CUDA
+headers and libraries are not required to build; GPU execution needs compatible
+CUDA 12/13 runtime and cuBLAS shared libraries. LU/eigenpair and bordered-response
+identities change deliberately, while unchanged source matrices remain reusable. See
+[execution controls and numerical scope](docs/HIGH_PRECISION_PRODUCTS.md).
+
 ## Capture and interpret research data
 
 Applications integrate `RetainedCcmRun` with the shared `CcmCapturePlan::ultra`.
@@ -125,7 +138,7 @@ A numerical claim does not need to be rerun just because publication stopped.
 - **High-precision numerics** — GMP/MPFR-based arithmetic, deterministic reductions, structured linear algebra, root finding, and eigensolvers.
 - **Research mathematics** — CCM finite Weil forms, the CCM target function and weighted eigenfunction distances, prolate and Mellin methods, Suzuki screw functions, Yakaboylu operators, Dirichlet character data (generalized L-function CCM assembly is planned), zeta utilities, and Maynard–Tao variational calculations.
 - **Reusable artifacts** — versioned, content-addressed local and remote caching with validation before reuse.
-- **Output-preserving optimization** — cache verification compares recomputed payload bytes with current references, while deterministic HP parallelism and retained validated values reduce avoidable work without changing artifact identities.
+- **Explicit numerical compatibility** — cache verification compares payload bytes with current references. Arithmetic changes receive distinct identities; compatible parallel and retained-value optimizations preserve their existing contracts.
 - **Optional stronger assurance** — independent cross-checks and replayable finite certificates are available for claims that need them.
 
 Finite computations are always reported with their finite scope. They are not presented as proofs of infinite-dimensional conjectures.
@@ -209,12 +222,15 @@ Please report proposed changes upstream so they can be reviewed and incorporated
 
 If you use Xcelerator Toolkit in research, please cite the exact version or Git commit. Citation metadata is also provided in [CITATION.cff](CITATION.cff).
 
+The citation metadata and example below describe v0.17.0. For a development
+snapshot or an amended release, also cite its exact Git commit.
+
 ```bibtex
 @software{AndrewsXceleratorToolkit2026,
   author  = {Andrews, Ronnie, Jr.},
   title   = {Xcelerator Toolkit: High-Precision Numerical Libraries for
              Analytic Number Theory and Spectral Methods},
-  version = {0.16.1},
+  version = {0.17.0},
   year    = {2026},
   url     = {https://github.com/TeamXcelerator/xcelerator-toolkit}
 }

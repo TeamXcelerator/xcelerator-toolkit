@@ -8,6 +8,54 @@ use crate::ccm::state_geometry::RetainedState;
 use anyhow::{bail, Result};
 use rug::{float::Round, Float};
 use xc_numerics::mpfr_interval::MpfrInterval as I;
+pub(in crate::ccm) const LEGACY_MAXIMUM_GUARD_BITS: u32 = 4096;
+const MAXIMUM_CONFIGURED_GUARD_BITS: u32 = 1_048_576;
+
+pub(in crate::ccm) fn parse_maximum_guard_bits(text: &str) -> Result<u32> {
+    let value = text.parse::<u32>().ok().filter(|value| {
+        value.to_string() == text
+            && value.is_power_of_two()
+            && (LEGACY_MAXIMUM_GUARD_BITS..=MAXIMUM_CONFIGURED_GUARD_BITS).contains(value)
+    });
+    value.ok_or_else(|| {
+        anyhow::anyhow!(
+            "XC_TRANSFORM_MAX_GUARD_BITS must be a decimal power of two from 4096 through 1048576"
+        )
+    })
+}
+
+pub(in crate::ccm) fn configured_maximum_guard_bits(requested: u32) -> Result<u32> {
+    precision(requested)?;
+    match std::env::var("XC_TRANSFORM_MAX_GUARD_BITS") {
+        Ok(text) => parse_maximum_guard_bits(&text),
+        Err(std::env::VarError::NotPresent) => Ok((requested + 64)
+            .next_power_of_two()
+            .max(LEGACY_MAXIMUM_GUARD_BITS)),
+        Err(_) => bail!("XC_TRANSFORM_MAX_GUARD_BITS is not valid Unicode"),
+    }
+}
+
+fn guards(maximum: u32) -> Result<impl Iterator<Item = u32>> {
+    if !maximum.is_power_of_two()
+        || !(LEGACY_MAXIMUM_GUARD_BITS..=MAXIMUM_CONFIGURED_GUARD_BITS).contains(&maximum)
+    {
+        bail!("invalid finite transform maximum guard bits");
+    }
+    Ok((6..=maximum.ilog2()).map(|power| 1u32 << power))
+}
+
+fn reserve_attempt(bytes: u128) -> Result<Option<xc_core::MemoryReservation>> {
+    let bytes = u64::try_from(bytes)
+        .map_err(|_| anyhow::anyhow!("run memory budget exceeded: transform workspace overflow"))?;
+    // A Rayon child may run while its parent owns the enclosing preparation
+    // workspace. Waiting here could deadlock that parent's join. Admission is
+    // therefore immediate; a budget refusal must not advance the guard ladder.
+    xc_core::RunResources::current()
+        .map(|resources| resources.try_reserve_working(bytes))
+        .transpose()
+        .map_err(Into::into)
+}
+
 pub(in crate::ccm) struct Measurement {
     pub value: I,
     pub derivative: I,
@@ -15,6 +63,7 @@ pub(in crate::ccm) struct Measurement {
     pub absolute_derivative_terms: I,
     pub curvature: I,
     pub precision: u32,
+    _reservation: Option<xc_core::MemoryReservation>,
 }
 fn widen(value: &I, error: &I) -> Result<I> {
     Ok(value.add(&I::new(-error.upper().clone(), error.upper().clone())?))
@@ -101,8 +150,16 @@ fn curvature_from_log(l: &I) -> Result<I> {
     Ok(value)
 }
 pub(in crate::ccm) fn curvature(cutoff: &str, requested: u32) -> Result<Option<I>> {
+    curvature_with_guard_limit(cutoff, requested, LEGACY_MAXIMUM_GUARD_BITS)
+}
+pub(in crate::ccm) fn curvature_with_guard_limit(
+    cutoff: &str,
+    requested: u32,
+    maximum: u32,
+) -> Result<Option<I>> {
     precision(requested)?;
-    for guard in [64, 128, 256, 512, 1024, 2048, 4096] {
+    for guard in guards(maximum)? {
+        let _reservation = reserve_attempt(256 * (u128::from(requested + guard).div_ceil(8) + 64))?;
         let l = decimal(cutoff, requested + guard)?.ln()?;
         if !l.is_strictly_positive() {
             continue;
@@ -120,6 +177,11 @@ fn calculate(
     requested: u32,
     p: u32,
 ) -> Result<Option<Measurement>> {
+    // Include the coefficient intervals and scalar/Taylor temporaries before
+    // any promoted coefficient allocation. Keep admission through point use.
+    let reservation = reserve_attempt(
+        (8 * state.coefficients.len() as u128 + 256) * (u128::from(p).div_ceil(8) + 64),
+    )?;
     let l = decimal(&state.cutoff, p)?.ln()?;
     if !l.is_strictly_positive() {
         return Ok(None);
@@ -209,6 +271,7 @@ fn calculate(
         absolute_derivative_terms: absolute_derivative,
         curvature,
         precision: p,
+        _reservation: reservation,
     }))
 }
 // Coordinated callers use the same bounded guard for both transforms and
@@ -233,12 +296,30 @@ pub(in crate::ccm) fn measure(
     t: &Float,
     requested: u32,
 ) -> Result<Option<Measurement>> {
+    measure_with_guard_limit(state, t, requested, LEGACY_MAXIMUM_GUARD_BITS, false)
+}
+
+pub(in crate::ccm) fn measure_with_guard_limit(
+    state: &RetainedState,
+    t: &Float,
+    requested: u32,
+    maximum: u32,
+    root_convention: bool,
+) -> Result<Option<Measurement>> {
     precision(requested)?;
     if requested < state.precision.max(t.prec()) || !t.is_finite() {
         bail!("finite transform requires finite stored points without precision reduction");
     }
-    for guard in [64, 128, 256, 512, 1024, 2048, 4096] {
-        if let Some(value) = measure_at(state, t, requested, guard)? {
+    for guard in guards(maximum)? {
+        let ordinate = if root_convention {
+            -t.clone()
+        } else {
+            t.clone()
+        };
+        if let Some(mut value) = calculate(state, &ordinate, requested, requested + guard)? {
+            if root_convention {
+                value.derivative = value.derivative.neg();
+            }
             return Ok(Some(value));
         }
     }

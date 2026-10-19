@@ -1,8 +1,8 @@
 //! Additional source-bound point diagnostics. External reference values are data,
 //! never executable target definitions. No new primary eigensolve is available.
 use super::retained_evidence::{
-    managed, matrix_ancestry, point, precision, scalar, solve_gram_checked, transform_terms,
-    ResearchRecord, RetainedMatrix, RetainedRoots,
+    managed, matrix_ancestry, point, precision, scalar, solve_gram_checked, transform,
+    transform_math, ResearchRecord, RetainedMatrix, RetainedRoots,
 };
 use super::state_geometry::RetainedState;
 use anyhow::{bail, Result};
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use xc_cache::*;
+use xc_numerics::fmt::decimal_string_round;
 use xc_numerics::prefix::lossless_decimal as dec;
 
 #[path = "extended_research/allowance_math.rs"]
@@ -195,6 +196,54 @@ pub struct ClusterVector {
     pub coefficients: Vec<String>,
     pub assembly_policy: String,
 }
+/// Provenance for a cluster acquisition that did not retain individual sector
+/// eigenvectors. This records an attempted calculation or a declared earlier
+/// acquisition policy; its reason is not a spectral theorem or a replayed proof.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterPreparationAssessment {
+    pub source_eigenpair: ContentDigest,
+    pub source_matrix: ContentDigest,
+    pub source_precision_bits: u32,
+    pub requested_eigenpairs_per_sector: usize,
+    pub eigenvalue_route: String,
+    pub origin: String,
+    pub evidence_digest: ContentDigest,
+    pub reason: String,
+}
+impl ClusterPreparationAssessment {
+    fn validate(&self) -> Result<()> {
+        precision(self.source_precision_bits)?;
+        if !self.source_eigenpair.validate()
+            || !self.source_matrix.validate()
+            || !self.evidence_digest.validate()
+            || !(1..=16).contains(&self.requested_eigenpairs_per_sector)
+            || !["selected", "complete_qr", "cross_checked"]
+                .contains(&self.eigenvalue_route.as_str())
+            || !["automatic_sector_attempt", "declared_prior_capture_policy"]
+                .contains(&self.origin.as_str())
+            || self.reason.trim().is_empty()
+            || self.reason.len() > 16384
+            || (self.origin == "automatic_sector_attempt"
+                && !self.reason.contains("CCM sector resolution limit:"))
+        {
+            bail!("invalid cluster preparation assessment");
+        }
+        Ok(())
+    }
+
+    fn matches(&self, s: &RetainedState, m: &RetainedMatrix<'_>) -> Result<()> {
+        self.validate()?;
+        if self.source_eigenpair != s.manifest.content_digest
+            || self.source_matrix != m.manifest.content_digest
+            || self.source_precision_bits != s.precision
+            || self.source_precision_bits != m.precision
+        {
+            bail!("cluster preparation assessment belongs to another retained source");
+        }
+        m.match_state(s)
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EnergyAllowance {
@@ -254,6 +303,8 @@ pub struct ExternalResearchInputs {
     pub previous_cluster: Vec<ClusterVector>,
     #[serde(default)]
     pub cluster_boundary_eigenvalues: Option<[String; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_preparation_assessment: Option<ClusterPreparationAssessment>,
     #[serde(default)]
     pub energy_allowance: Option<EnergyAllowance>,
 }
@@ -330,6 +381,14 @@ impl ExternalResearchInputs {
         let n = 2 * self.n_modes + 1;
         if let Some(inputs) = &self.run_once {
             inputs.validate(n, p)?;
+        }
+        if let Some(assessment) = &self.cluster_preparation_assessment {
+            assessment.validate()?;
+            if assessment.source_eigenpair != self.source_eigenpair
+                || assessment.source_precision_bits > self.precision_bits
+            {
+                bail!("cluster preparation assessment does not match its external source");
+            }
         }
         let mut count = 0usize;
         let mut check = |v: &str| -> Result<()> {
@@ -628,9 +687,69 @@ fn admitted_digest(input: &ExternalResearchInputs) -> Option<ContentDigest> {
 /// capture. The guard holds a shared borrow, so the input cannot change while
 /// it lives; validations of this same object during the capture reuse the
 /// result, and its canonical digest replaces repeated serialization.
+/// Mutable preparation followed by repeated immutable admissions. Any mutable
+/// access invalidates the cached digest before the caller can change a field.
+/// Admission guards still borrow the input, and are scoped to the current
+/// thread and exponent range. No pointer-only validation survives mutation.
+pub(crate) struct RunInput {
+    input: ExternalResearchInputs,
+    admission: std::sync::Mutex<Option<((i32, i32), ContentDigest)>>,
+}
+impl Clone for RunInput {
+    fn clone(&self) -> Self {
+        Self::from(self.input.clone())
+    }
+}
+impl From<ExternalResearchInputs> for RunInput {
+    fn from(input: ExternalResearchInputs) -> Self {
+        Self {
+            input,
+            admission: std::sync::Mutex::new(None),
+        }
+    }
+}
+impl std::ops::Deref for RunInput {
+    type Target = ExternalResearchInputs;
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
+}
+impl std::ops::DerefMut for RunInput {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        *self
+            .admission
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        &mut self.input
+    }
+}
+impl RunInput {
+    pub(crate) fn admit(&self) -> Result<AdmittedInput<'_>> {
+        let range = (rug::float::exp_min(), rug::float::exp_max());
+        if let Some((previous, digest)) = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            if *previous == range {
+                return Ok(AdmittedInput::with_digest(&self.input, digest.clone()));
+            }
+        }
+        let admitted = AdmittedInput::new(&self.input)?;
+        *self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((range, admitted.digest().clone()));
+        Ok(admitted)
+    }
+}
+
 pub(crate) struct AdmittedInput<'a> {
     input: &'a ExternalResearchInputs,
     digest: ContentDigest,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl<'a> AdmittedInput<'a> {
@@ -648,6 +767,10 @@ impl<'a> AdmittedInput<'a> {
                 digest
             }
         };
+        Ok(Self::with_digest(input, digest))
+    }
+
+    fn with_digest(input: &'a ExternalResearchInputs, digest: ContentDigest) -> Self {
         ADMITTED_INPUTS.with(|admitted| {
             admitted.borrow_mut().push((
                 std::ptr::from_ref(input) as usize,
@@ -655,7 +778,11 @@ impl<'a> AdmittedInput<'a> {
                 (rug::float::exp_min(), rug::float::exp_max()),
             ))
         });
-        Ok(Self { input, digest })
+        Self {
+            input,
+            digest,
+            _thread: std::marker::PhantomData,
+        }
     }
 
     /// `ContentDigest::sha256(&serde_json::to_vec(input))`.
@@ -775,6 +902,81 @@ pub(super) fn row(ordinal: usize, label: impl Into<String>) -> AnalysisRow {
         notes: vec![],
     }
 }
+// The new acquisition assessment has an explicitly unresolved scientific row.
+// Admit that shape only after the report's source-bound assessment validation;
+// all other diagnostics keep their existing row-status contract.
+fn unresolved_cluster_assessment_row(
+    id: &str,
+    report_outcome: &str,
+    row: &AnalysisRow,
+    source_bound_assessment: bool,
+) -> bool {
+    source_bound_assessment
+        && id == "spectral_cluster"
+        && report_outcome == "partial_unresolved"
+        && row.ordinal == 1
+        && row.label == "retained_source_cluster_assessment"
+        && row.outcome == "unresolved"
+}
+
+#[cfg(test)]
+mod cluster_assessment_row_contract {
+    use super::*;
+
+    #[test]
+    fn unresolved_rows_require_the_validated_cluster_assessment_shape() {
+        let mut assessment = row(1, "retained_source_cluster_assessment");
+        assessment.outcome = "unresolved".into();
+        assert!(unresolved_cluster_assessment_row(
+            "spectral_cluster",
+            "partial_unresolved",
+            &assessment,
+            true
+        ));
+        assert!(!unresolved_cluster_assessment_row(
+            "spectral_cluster",
+            "partial_unresolved",
+            &assessment,
+            false
+        ));
+        assert!(!unresolved_cluster_assessment_row(
+            "compactness",
+            "partial_unresolved",
+            &assessment,
+            true
+        ));
+        assert!(!unresolved_cluster_assessment_row(
+            "spectral_cluster",
+            "point_measurement",
+            &assessment,
+            true
+        ));
+        let mut arbitrary = assessment.clone();
+        arbitrary.label = "current_cluster_vector".into();
+        assert!(!unresolved_cluster_assessment_row(
+            "spectral_cluster",
+            "partial_unresolved",
+            &arbitrary,
+            true
+        ));
+        arbitrary = assessment.clone();
+        arbitrary.ordinal = 2;
+        assert!(!unresolved_cluster_assessment_row(
+            "spectral_cluster",
+            "partial_unresolved",
+            &arbitrary,
+            true
+        ));
+        arbitrary = assessment;
+        arbitrary.outcome = "certified_finite_enclosure".into();
+        assert!(!unresolved_cluster_assessment_row(
+            "spectral_cluster",
+            "partial_unresolved",
+            &arbitrary,
+            true
+        ));
+    }
+}
 /// Record a value. An exact integer below 2^64 in magnitude (a count, a byte
 /// size, an availability flag) is written as an integer; every other value as
 /// a lossless decimal.
@@ -835,6 +1037,7 @@ fn compactness(s: &RetainedState, o: &ExtensionOptions) -> Result<ExtendedAnalys
             "compactness arithmetic scratch estimate exceeds explicit working-byte budget",
         ));
     }
+    let _workspace = super::capture_runtime::reserve_working(u128::from(scratch))?;
     let measured =
         match compactness_math::measure(&s.coefficients, &s.cutoff, &o.exponential_rates, p) {
             Ok(measured) => measured,
@@ -842,7 +1045,7 @@ fn compactness(s: &RetainedState, o: &ExtensionOptions) -> Result<ExtendedAnalys
                 return Ok(unresolved(
                     r,
                     &format!("finite moment arithmetic unresolved: {error}; no zero inferred"),
-                ))
+                ));
             }
         };
     put(&mut r.values, "transform_origin", &measured.origin);
@@ -914,6 +1117,7 @@ fn weighted_projection(
             "weighted profile scratch estimate exceeds explicit working-byte budget",
         ));
     }
+    let _workspace = super::capture_runtime::reserve_working(u128::from(scratch))?;
     // These decimals denote stored source points, not exact real parameters.
     let target = coeffs(&t.values, input.precision_bits)?;
     let basis = t
@@ -945,7 +1149,7 @@ fn weighted_projection(
             return Ok(unresolved(
                 r,
                 &format!("weighted profile unresolved: {error}"),
-            ))
+            ));
         }
     };
     for (name, bound) in measured.values {
@@ -966,11 +1170,11 @@ fn weighted_projection(
         let digits = Some((u64::from(p) * 30103 / 100000 + 10) as usize);
         r.values.insert(
             format!("{name}_lower"),
-            lo.to_string_radix_round(10, digits, Round::Down),
+            decimal_string_round(&lo, digits, Round::Down),
         );
         r.values.insert(
             format!("{name}_upper"),
-            hi.to_string_radix_round(10, digits, Round::Up),
+            decimal_string_round(&hi, digits, Round::Up),
         );
     }
     put(
@@ -1013,6 +1217,7 @@ fn signed_transforms(
     s: &RetainedState,
     o: &ExtensionOptions,
     input: Option<&ExternalResearchInputs>,
+    maximum_guard: u32,
 ) -> Result<ExtendedAnalysis> {
     let mut r = report("signed_transform", s, o);
     let Some(i) = input.filter(|i| !i.reference_jets.is_empty()) else {
@@ -1050,12 +1255,14 @@ fn signed_transforms(
         "normalization_precision_bits",
         &Float::with_val(p, normalization_precision),
     );
+    let resources = xc_core::RunResources::current();
     r.rows = i
         .reference_jets
         .par_iter()
         .map(|a| -> Result<_> {
+            let _scope = resources.as_ref().map(xc_core::RunResources::enter);
             let t = input_point(&a.t)?;
-            let (v, d, abs, absd) = transform_terms(s, &t, p)?;
+            let (v, d, abs, absd) = transform::terms_with_guard_limit(s, &t, p, maximum_guard, false)?;
             let mut rr = row(a.ordinal, "reference_ordinate");
             put(&mut rr.values, "t", &t);
             for (name, value, absolute, w, f, tail, end, fit) in [
@@ -1177,11 +1384,11 @@ pub(super) fn save_arithmetic_enclosure(
     let digits = Some((u64::from(p) * 30103 / 100000 + 10) as usize);
     map.insert(
         format!("{name}_lower"),
-        lo.to_string_radix_round(10, digits, Round::Down),
+        decimal_string_round(&lo, digits, Round::Down),
     );
     map.insert(
         format!("{name}_upper"),
-        hi.to_string_radix_round(10, digits, Round::Up),
+        decimal_string_round(&hi, digits, Round::Up),
     );
     Ok(())
 }
@@ -1191,6 +1398,17 @@ fn arithmetic_energy(
     m: Option<&RetainedMatrix<'_>>,
     o: &ExtensionOptions,
     input: Option<&ExternalResearchInputs>,
+) -> Result<ExtendedAnalysis> {
+    arithmetic_energy_reserved(s, m, o, input, 0, &mut None)
+}
+
+fn arithmetic_energy_reserved(
+    s: &RetainedState,
+    m: Option<&RetainedMatrix<'_>>,
+    o: &ExtensionOptions,
+    input: Option<&ExternalResearchInputs>,
+    metadata_bytes: u64,
+    reservation: &mut Option<xc_core::MemoryReservation>,
 ) -> Result<ExtendedAnalysis> {
     let mut r = report("arithmetic_energy", s, o);
     let Some(i) = input.filter(|i| {
@@ -1208,20 +1426,8 @@ fn arithmetic_energy(
         return Ok(missing(r, "retained Tau required for component closure"));
     };
     let p = o.working_precision_bits;
-    let count = m.entries.len() as u64
-        + s.coefficients.len() as u64 * 256
-        + i.components
-            .iter()
-            .map(|c| {
-                (c.diagonal.len()
-                    + c.dense.len()
-                    + c.rank_one.iter().map(|r| r.vector.len() + 1).sum::<usize>())
-                    as u64
-            })
-            .sum::<u64>();
-    let scratch = count
-        .checked_mul(64)
-        .and_then(|n| n.checked_mul((u64::from(p) + 4096).div_ceil(8) + 128))
+    let scratch = energy_math::workspace_bytes(s, i, p)?
+        .checked_add(metadata_bytes)
         .ok_or_else(|| anyhow::anyhow!("arithmetic energy scratch estimate overflow"))?;
     if o.maximum_working_bytes.is_some_and(|limit| scratch > limit) {
         return Ok(unresolved(
@@ -1229,6 +1435,9 @@ fn arithmetic_energy(
             "arithmetic energy scratch estimate exceeds explicit working-byte budget",
         ));
     }
+    // Tau is borrowed; charge the arrays this evaluator actually owns. The
+    // capture caller keeps this guard through managed serialization/export.
+    *reservation = super::capture_runtime::reserve_working(u128::from(scratch))?;
     let Some(measured) = energy_math::measure(s, m, i, p)? else {
         return Ok(unresolved(
             r,
@@ -1523,12 +1732,131 @@ pub(crate) fn weighted_tail_base(
     Ok(r)
 }
 
+fn cluster_preparation_report(
+    s: &RetainedState,
+    m: &RetainedMatrix<'_>,
+    o: &ExtensionOptions,
+    assessment: &ClusterPreparationAssessment,
+) -> Result<ExtendedAnalysis> {
+    assessment.matches(s, m)?;
+    let mut r = report("spectral_cluster", s, o);
+    let p = o.working_precision_bits;
+    let n = s.coefficients.len();
+    // Borrow the authenticated matrix. Only one matrix row's exact products,
+    // three vectors, and the point report are additional live allocations.
+    let scratch = (8 * n as u64 + 1024) * (u64::from(p).div_ceil(4) + 128);
+    if o.maximum_working_bytes.is_some_and(|limit| scratch > limit) {
+        return Ok(unresolved(
+            r,
+            "retained cluster assessment exceeds explicit working-byte budget",
+        ));
+    }
+    let _workspace = super::capture_runtime::reserve_working(u128::from(scratch))?;
+    let v = source_unit(s, p)?;
+    let norm_squared = point::dot(&v, &v, p)?;
+    let action = m
+        .entries
+        .chunks(n)
+        .map(|row| point::dot(row, &v, p))
+        .collect::<Result<Vec<_>>>()?;
+    let rayleigh = point::quotient(&point::dot(&v, &action, p)?, &norm_squared, p)?;
+    let eigenvalue = scalar(&s.eigenvalue, s.precision)?;
+    let residual = action
+        .iter()
+        .zip(&v)
+        .map(|(a, x)| point::sum(&[a.clone(), -point::product(&[&eigenvalue, x], p)?], p))
+        .collect::<Result<Vec<_>>>()?;
+    let residual_norm = point::dot(&residual, &residual, p)?.sqrt();
+    put(
+        &mut r.values,
+        "arithmetic_precision_bits",
+        &Float::with_val(p, p),
+    );
+    put(
+        &mut r.values,
+        "retained_cluster_vector_count",
+        &Float::with_val(p, 0),
+    );
+    put(
+        &mut r.values,
+        "requested_eigenpairs_per_sector",
+        &Float::with_val(p, assessment.requested_eigenpairs_per_sector),
+    );
+    put(
+        &mut r.values,
+        "sector_attempted",
+        &Float::with_val(
+            p,
+            u32::from(assessment.origin == "automatic_sector_attempt"),
+        ),
+    );
+    put(
+        &mut r.values,
+        "cluster_projection_available",
+        &Float::with_val(p, 0),
+    );
+    put(
+        &mut r.values,
+        "certifies_spectral_cluster",
+        &Float::with_val(p, 0),
+    );
+    put(&mut r.values, "retained_source_norm_squared", &norm_squared);
+    put(
+        &mut r.values,
+        "retained_source_rayleigh_quotient",
+        &rayleigh,
+    );
+    put(&mut r.values, "retained_source_eigenvalue", &eigenvalue);
+    put(
+        &mut r.values,
+        "retained_source_residual_norm",
+        &residual_norm,
+    );
+    r.outcome = "partial_unresolved".into();
+    r.reason = Some(format!(
+        "retained source assessed, but individual sector eigenvectors are unavailable; {}: {}",
+        if assessment.origin == "automatic_sector_attempt" {
+            "recorded sector resolution limit"
+        } else {
+            "declared prior acquisition policy (not a replayed sector calculation)"
+        },
+        assessment.reason,
+    ));
+    let mut rr = row(1, "retained_source_cluster_assessment");
+    rr.outcome = "unresolved".into();
+    rr.notes.push(format!(
+        "sector eigenvalue route: {}; requested vectors per sector: {}",
+        assessment.eigenvalue_route, assessment.requested_eigenpairs_per_sector
+    ));
+    rr.notes.push(format!(
+        "recorded provenance: {}; evidence digest: {}",
+        assessment.origin, assessment.evidence_digest.0
+    ));
+    rr.notes.push("the retained source norm, Rayleigh quotient, and residual are point measurements; no cluster vectors, projection, individual isolation, gap, rank, or branch identity are inferred".into());
+    r.rows.push(rr);
+    r.convention = "same authenticated retained state and Tau; unit coefficient norm; bounded finite matrix action; acquisition reason is provenance, not a spectral certificate".into();
+    Ok(r)
+}
+
 fn cluster(
     s: &RetainedState,
+    m: Option<&RetainedMatrix<'_>>,
     o: &ExtensionOptions,
     input: Option<&ExternalResearchInputs>,
 ) -> Result<ExtendedAnalysis> {
     let mut r = report("spectral_cluster", s, o);
+    if let Some(assessment) = input
+        .filter(|i| i.cluster.is_empty())
+        .and_then(|i| i.cluster_preparation_assessment.as_ref())
+    {
+        let Some(m) = m else {
+            return Ok(missing(
+                r,
+                "the authenticated retained matrix is required to assess the unavailable cluster",
+            ));
+        };
+        return cluster_preparation_report(s, m, o, assessment);
+    }
     let Some(i) = input.filter(|i| !i.cluster.is_empty()) else {
         return Ok(missing(
             r,
@@ -1553,6 +1881,7 @@ fn cluster(
             "finite cluster scratch estimate exceeds explicit working-byte budget",
         ));
     }
+    let _workspace = super::capture_runtime::reserve_working(u128::from(scratch))?;
     let current = i
         .cluster
         .iter()
@@ -1661,6 +1990,7 @@ fn resolution(
             "resolution maximum-guard scratch exceeds explicit working-byte budget",
         ));
     }
+    let _workspace = super::capture_runtime::reserve_working(u128::from(scratch))?;
     let Some(curvature) = transform_math::curvature(&s.cutoff, p)? else {
         return Ok(unresolved(
             r,
@@ -2016,6 +2346,49 @@ pub(super) fn capture_external_source_with_parents(
         },
     )
 }
+/// The capture adapter needs the source manifest, not another owned input.
+/// All validation operands are named in the memo context; the semantic request
+/// and produced payload are identical to capture_external_source_with_parents.
+pub(super) fn admit_external_source_with_parents(
+    s: &RetainedState,
+    i: &ExternalResearchInputs,
+    parents: &[ArtifactManifest],
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<ArtifactExecutionCacheResult<xc_cache::SharedValidated<()>>> {
+    let _stage =
+        xc_core::performance_stage("ccm.capture.external_input_admission", Default::default());
+    i.matches(s)?;
+    let digest = input_content_digest(i)?;
+    let context = xc_cache::ValidatedValueMemoContext::exact(
+        ContentDigest::sha256_json(&(
+            "external-input-complete-admission-v1",
+            &digest,
+            &s.manifest,
+            &s.cutoff,
+            s.modes,
+            s.precision,
+            rug::float::exp_min(),
+            rug::float::exp_max(),
+        ))?
+        .0,
+    );
+    super::retained_evidence::managed_admission(
+        INPUT_KIND,
+        json!({"input_digest":digest}),
+        &[std::slice::from_ref(&s.manifest), parents].concat(),
+        cache,
+        &context,
+        || Ok(i.clone()),
+        |r| {
+            if r != i {
+                r.matches(s)?;
+                bail!("external research source mismatch");
+            }
+            i.matches(s)
+        },
+    )
+}
+
 /// Number of numeric scalars (strings or numbers) in a JSON value.
 fn json_scalars(value: &serde_json::Value) -> u128 {
     match value {
@@ -2138,11 +2511,13 @@ pub(crate) fn extended_compute(
     match id {
         "compactness" => compactness(s, options),
         "weighted_reference_projection" => weighted_projection(s, options, input),
-        "signed_transform" => signed_transforms(s, options, input),
+        "signed_transform" => {
+            signed_transforms(s, options, input, transform_math::LEGACY_MAXIMUM_GUARD_BITS)
+        }
         "arithmetic_energy" => arithmetic_energy(s, m, options, input),
         "directional_response" => directional(s, m, roots, options, input),
         "weighted_tail" => super::atom_research::weighted_report(s, options, input),
-        "spectral_cluster" => cluster(s, options, input),
+        "spectral_cluster" => cluster(s, m, options, input),
         "resolution_budget" => resolution(s, roots, options, input),
         "energy_allowance" => allowance(s, options, input),
         _ if super::research_completion::DIAGNOSTICS.contains(&id) => {
@@ -2183,6 +2558,66 @@ pub(crate) fn capture_extended_prepared(
     cache: &ArtifactCacheContext<'_>,
     prepared: Option<ExtendedPrepared<'_>>,
 ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ExtendedAnalysis>>> {
+    let maximum = if id == "signed_transform" {
+        transform_math::configured_maximum_guard_bits(options.working_precision_bits)?
+    } else {
+        transform_math::LEGACY_MAXIMUM_GUARD_BITS
+    };
+    let exhausted = std::cell::Cell::new(false);
+    let first = capture_extended_prepared_with_transform_guard(
+        id,
+        s,
+        m,
+        roots,
+        input,
+        sector_certificate,
+        options,
+        parent_manifests,
+        cache,
+        prepared,
+        transform_math::LEGACY_MAXIMUM_GUARD_BITS,
+        &exhausted,
+    );
+    if maximum > transform_math::LEGACY_MAXIMUM_GUARD_BITS
+        && transform::retry_extended(&first, exhausted.get(), cache.mode)
+    {
+        capture_extended_prepared_with_transform_guard(
+            id,
+            s,
+            m,
+            roots,
+            input,
+            sector_certificate,
+            options,
+            parent_manifests,
+            cache,
+            None,
+            maximum,
+            &exhausted,
+        )
+    } else {
+        first
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_extended_prepared_with_transform_guard(
+    id: &str,
+    s: &RetainedState,
+    m: Option<&RetainedMatrix<'_>>,
+    roots: Option<&RetainedRoots>,
+    input: Option<&ExternalResearchInputs>,
+    sector_certificate: Option<(
+        &super::sector_gap_certificate::PortableCcmSectorGapCertificate,
+        &ArtifactManifest,
+    )>,
+    options: &ExtensionOptions,
+    parent_manifests: &[ArtifactManifest],
+    cache: &ArtifactCacheContext<'_>,
+    prepared: Option<ExtendedPrepared<'_>>,
+    maximum_transform_guard: u32,
+    exhausted: &std::cell::Cell<bool>,
+) -> Result<ArtifactExecutionCacheResult<ResearchRecord<ExtendedAnalysis>>> {
     let kind =
         artifact_kind(id).ok_or_else(|| anyhow::anyhow!("unknown extended research diagnostic"))?;
     let resource_policy = super::capture_runtime::CaptureResourcePolicy::from_environment()?;
@@ -2212,7 +2647,7 @@ pub(crate) fn capture_extended_prepared(
         sources.extend([r.manifest.clone(), r.secular_manifest.clone()]);
     }
     let input_digest = if let Some(i) = input {
-        let result = capture_external_source_with_parents(s, i, parent_manifests, cache)?;
+        let result = admit_external_source_with_parents(s, i, parent_manifests, cache)?;
         let manifest = result.produced_manifest.or(result.reused_manifest);
         if let Some(m) = manifest {
             sources.push(m);
@@ -2294,7 +2729,11 @@ pub(crate) fn capture_extended_prepared(
         "arithmetic_energy" => input.map_or(0, ExternalResearchInputs::arithmetic_component_count),
         "directional_response" => roots.map_or(0, |r| r.dataset.points.len()),
         "weighted_tail" => tail_rows,
-        "spectral_cluster" => input.map_or(0, |i| i.cluster.len()),
+        "spectral_cluster" => input.map_or(0, |i| {
+            i.cluster
+                .len()
+                .max(usize::from(i.cluster_preparation_assessment.is_some()))
+        }),
         "resolution_budget" => input.filter(|i| !i.reference_jets.is_empty()).map_or_else(
             || roots.map_or(0, |r| r.dataset.points.len()),
             |i| i.reference_jets.len(),
@@ -2412,6 +2851,12 @@ pub(crate) fn capture_extended_prepared(
             request["cluster_arithmetic"] = json!("stored_points_scaled_unit_checked_gram_v3");
             request["maximum_cluster_guard_bits"] = json!(4096);
             request["cluster_precision_policy"] = json!("unit_column_pivot_proxy_v1");
+            if input
+                .is_some_and(|i| i.cluster.is_empty() && i.cluster_preparation_assessment.is_some())
+            {
+                request["unavailable_cluster_assessment"] =
+                    json!("source_bound_matrix_action_declared_acquisition_provenance_v1");
+            }
         }
         if id == "weighted_tail" {
             request["atom_arithmetic"] = json!("stored_points_exact_mass_directed_moments_v2");
@@ -2493,7 +2938,7 @@ pub(crate) fn capture_extended_prepared(
                 | "configuration_comparison"
         ) {
             request["transform_arithmetic"] = json!("exact_cutoff_stored_points_directed_sinc_v1");
-            request["maximum_transform_guard_bits"] = json!(4096);
+            request["maximum_transform_guard_bits"] = json!(maximum_transform_guard);
         }
         if id == "resolution_budget" {
             request["resolution_arithmetic"] =
@@ -2560,6 +3005,11 @@ pub(crate) fn capture_extended_prepared(
         request
     };
     let budget_limited = std::cell::RefCell::new(None);
+    // A computed arithmetic-energy report and the serialization buffers are
+    // still live after its arithmetic returns. Keep its one reservation here
+    // until managed validation/persistence and research export finish. A warm
+    // cache hit never executes this branch and acquires no compute workspace.
+    let arithmetic_workspace = std::cell::RefCell::new(None);
     let compute = || -> Result<ExtendedAnalysis> {
         // A look-ahead result exists only for the plain case.
         let plain = !budget_exceeded
@@ -2568,6 +3018,23 @@ pub(crate) fn capture_extended_prepared(
             && directional_source.is_none();
         if let Some(result) = prepared.and_then(|claim| claim(options, plain)) {
             return result;
+        }
+        if id == "arithmetic_energy" && !budget_exceeded {
+            let _stage = super::capture_runtime::Stage::new("arithmetic_energy compute");
+            let metadata_bytes =
+                super::capture_runtime::retained_json_bytes(&(&request, &sources))?;
+            return arithmetic_energy_reserved(
+                s,
+                m,
+                options,
+                input,
+                metadata_bytes,
+                &mut arithmetic_workspace.borrow_mut(),
+            );
+        }
+        if id == "signed_transform" && !budget_exceeded {
+            let _stage = super::capture_runtime::Stage::new("signed_transform compute");
+            return signed_transforms(s, options, input, maximum_transform_guard);
         }
         extended_compute(
             id,
@@ -2668,6 +3135,52 @@ pub(crate) fn capture_extended_prepared(
         {
             scalar(v, options.working_precision_bits)?;
         }
+        if id == "spectral_cluster" && r.outcome == "partial_unresolved" {
+            if let Some(assessment) = input
+                .filter(|i| i.cluster.is_empty())
+                .and_then(|i| i.cluster_preparation_assessment.as_ref())
+            {
+                let matrix = m.ok_or_else(|| {
+                    anyhow::anyhow!("cluster assessment lost its retained matrix")
+                })?;
+                assessment.matches(s, matrix)?;
+                let p = options.working_precision_bits;
+                let value_at = |name: &str, precision: u32| -> Result<Float> {
+                    scalar(
+                        r.values.get(name).ok_or_else(|| {
+                            anyhow::anyhow!("cluster assessment measurement missing")
+                        })?,
+                        precision,
+                    )
+                };
+                let value = |name: &str| value_at(name, p);
+                if r.rows.len() != 1
+                    || r.rows[0].ordinal != 1
+                    || r.rows[0].label != "retained_source_cluster_assessment"
+                    || r.rows[0].outcome != "unresolved"
+                    || r.reason
+                        .as_ref()
+                        .is_none_or(|reason| !reason.contains(&assessment.reason))
+                    || value("arithmetic_precision_bits")? != p
+                    || value("retained_cluster_vector_count")? != 0
+                    || value("requested_eigenpairs_per_sector")?
+                        != assessment.requested_eigenpairs_per_sector
+                    || value("sector_attempted")?
+                        != u32::from(assessment.origin == "automatic_sector_attempt")
+                    || value("cluster_projection_available")? != 0
+                    || value("certifies_spectral_cluster")? != 0
+                    || value("retained_source_norm_squared")? <= 0
+                    || value("retained_source_residual_norm")? < 0
+                    // This retained value's decimal export round-trips at source
+                    // precision, not necessarily at the higher working precision.
+                    || value_at("retained_source_eigenvalue", s.precision)?
+                        != scalar(&s.eigenvalue, s.precision)?
+                {
+                    bail!("invalid unresolved cluster assessment");
+                }
+                value("retained_source_rayleigh_quotient")?;
+            }
+        }
         if id == "root_transport" {
             for row in &r.rows {
                 let fields = [
@@ -2722,7 +3235,7 @@ pub(crate) fn capture_extended_prepared(
             if (row.outcome == "certified_finite_enclosure" && id != "transform_enclosure")
                 || row.ordinal == 0
                 || row.label.is_empty()
-                || ![
+                || (![
                     "point_measurement",
                     "certified_finite_enclosure",
                     "missing_input",
@@ -2737,6 +3250,14 @@ pub(crate) fn capture_extended_prepared(
                     "conditional_budget_unresolved",
                 ]
                 .contains(&row.outcome.as_str())
+                    && !unresolved_cluster_assessment_row(
+                        id,
+                        &r.outcome,
+                        row,
+                        input.is_some_and(|i| {
+                            i.cluster.is_empty() && i.cluster_preparation_assessment.is_some()
+                        }),
+                    ))
             {
                 bail!("invalid extended research row");
             }
@@ -3381,7 +3902,13 @@ pub(crate) fn capture_extended_prepared(
                 "arithmetic_energy" => {
                     input.map(|i| (1..=i.arithmetic_component_count()).collect())
                 }
-                "spectral_cluster" => input.map(|i| (1..=i.cluster.len()).collect()),
+                "spectral_cluster" => input.map(|i| {
+                    (1..=i
+                        .cluster
+                        .len()
+                        .max(usize::from(i.cluster_preparation_assessment.is_some())))
+                        .collect()
+                }),
                 _ => None,
             };
             if expected
@@ -3510,7 +4037,11 @@ pub(crate) fn capture_extended_prepared(
         &sources,
         cache,
         || {
-            let data = compute()?;
+            let data = compute().inspect_err(|error| {
+                if error.is::<transform::GuardExhausted>() {
+                    exhausted.set(true);
+                }
+            })?;
             if !retain_limited && working_budget_limited(&data) {
                 *budget_limited.borrow_mut() = Some(data);
                 bail!("diagnostic limited by the working-byte budget; result is not retained");
@@ -3729,6 +4260,54 @@ mod exhaustive_resumed_resolution_validation_contract {
         assert!(
             matches!(result, Ok(Err(_))),
             "missing prefix must fail without panicking"
+        );
+    }
+}
+
+#[cfg(test)]
+mod run_input_admission_tests {
+    use super::*;
+    fn fixture() -> ExternalResearchInputs {
+        serde_json::from_value(json!({
+            "schema_version":1,"source_eigenpair":ContentDigest::sha256(b"state"),
+            "lambda_squared":"9","n_modes":0,"precision_bits":128,
+            "convention_id":"fixture","definition_digest":ContentDigest::sha256(b"definition"),
+            "approximation_scope":"finite fixture"
+        }))
+        .unwrap()
+    }
+    #[test]
+    fn run_input_admission_reuses_digest_and_invalidates_before_mutation() {
+        let mut input = RunInput::from(fixture());
+        let digest = input.admit().unwrap().digest().clone();
+        assert_eq!(input.admit().unwrap().digest(), &digest);
+        assert_eq!(input_content_digest(&input).unwrap(), digest);
+        input.convention_id = "changed".into();
+        assert!(input.admission.lock().unwrap().is_none());
+        let changed = input.admit().unwrap().digest().clone();
+        assert_ne!(digest, changed);
+        input.precision_bits = 1;
+        assert!(
+            input.admit().is_err(),
+            "old successful admission cannot hide invalid mutation"
+        );
+        assert!(input.admission.lock().unwrap().is_none());
+    }
+    #[test]
+    fn run_input_admission_scope_never_leaks_after_guard() {
+        let input = RunInput::from(fixture());
+        assert!(admitted_digest(&input).is_none());
+        {
+            let admitted = input.admit().unwrap();
+            assert_eq!(admitted_digest(&input), Some(admitted.digest().clone()));
+            let nested = AdmittedInput::new(&input).unwrap();
+            assert_eq!(nested.digest(), admitted.digest());
+        }
+        assert!(admitted_digest(&input).is_none());
+        let clone = input.clone();
+        assert_eq!(
+            clone.admit().unwrap().digest(),
+            input.admit().unwrap().digest()
         );
     }
 }

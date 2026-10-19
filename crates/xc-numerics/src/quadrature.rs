@@ -33,6 +33,12 @@
 //! odd central node need not be exactly zero. Orders unresolved at the selected
 //! precision fail validation rather than imply a certified rule.
 
+#[cfg(feature = "hp")]
+#[path = "quadrature_arb.rs"]
+mod arb;
+#[cfg(feature = "hp")]
+pub use arb::GaussLegendreGenerator;
+
 /// Machine-readable quadrature artifact decomposition. Nodes and weights are
 /// independent of downstream integrands and can be reused wherever order,
 /// backend, precision, and generation semantics match.
@@ -219,6 +225,7 @@ fn legendre_p_deriv_f64(n: usize, x: f64) -> (f64, f64) {
 
 #[cfg(feature = "hp")]
 mod hp {
+    use super::GaussLegendreGenerator;
     use rug::{ops::Pow, Assign, Float};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
@@ -240,6 +247,8 @@ mod hp {
         precision_bits: u32,
         nodes: Vec<String>,
         weights: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arb_certificate: Option<super::arb::Certificate>,
     }
 
     /// Cache-fabric controls for one HP Gauss--Legendre rule resolution.
@@ -262,10 +271,11 @@ mod hp {
             precision_bits: prec,
             nodes: table.0.iter().map(Float::to_string).collect(),
             weights: table.1.iter().map(Float::to_string).collect(),
+            arb_certificate: None,
         }
     }
 
-    fn validate_gl_domain(n: usize, prec: u32) -> Result<(), CacheError> {
+    pub(super) fn validate_gl_domain(n: usize, prec: u32) -> Result<(), CacheError> {
         if n == 0
             || !(16..=1_000_000).contains(&prec)
             || n.checked_mul(4)
@@ -347,7 +357,8 @@ mod hp {
         prec: u32,
     ) -> Result<GlTable, CacheError> {
         validate_gl_domain(n, prec)?;
-        if table.schema_version != 1
+        if table.arb_certificate.is_some()
+            || table.schema_version != 1
             || table.order != n
             || table.precision_bits != prec
             || table.nodes.len() != n
@@ -440,6 +451,7 @@ mod hp {
             cache,
             crate::hp_runtime::GlRootSchedule::serial(),
             true,
+            GaussLegendreGenerator::LegacyNewton,
         )
     }
 
@@ -453,27 +465,22 @@ mod hp {
         cache: QuadratureCacheRequest<'_>,
         root_schedule: crate::hp_runtime::GlRootSchedule,
     ) -> Result<CachedQuadratureRule, CacheError> {
-        gauss_legendre_nodes_via_cache_impl(n, precision_bits, cache, root_schedule, false)
+        gauss_legendre_nodes_via_cache_impl(
+            n,
+            precision_bits,
+            cache,
+            root_schedule,
+            false,
+            GaussLegendreGenerator::LegacyNewton,
+        )
     }
 
-    fn gauss_legendre_nodes_via_cache_impl(
+    fn gl_semantic_key(
         n: usize,
         precision_bits: u32,
-        cache: QuadratureCacheRequest<'_>,
-        root_schedule: crate::hp_runtime::GlRootSchedule,
-        top_level: bool,
-    ) -> Result<CachedQuadratureRule, CacheError> {
-        let mut performance_resolve = if top_level {
-            xc_core::performance_top_level_stage_with("quadrature.gl.resolve", || {
-                gl_performance_metadata_scheduled(n, precision_bits, root_schedule)
-            })
-        } else {
-            xc_core::performance_stage_with("quadrature.gl.resolve", || {
-                gl_performance_metadata_scheduled(n, precision_bits, root_schedule)
-            })
-        };
-        validate_gl_domain(n, precision_bits)?;
-        let semantic_key = SemanticKeyEnvelope {
+        generator: GaussLegendreGenerator,
+    ) -> SemanticKeyEnvelope {
+        let mut key = SemanticKeyEnvelope {
             schema_version: 1,
             artifact_kind: "gauss_legendre_rule".to_owned(),
             mathematical_semantics_version: "gauss-legendre-v0.13.0-v1".to_owned(),
@@ -489,7 +496,42 @@ mod hp {
             source_data_identities: BTreeMap::new(),
             algorithm_semantics: None,
         };
-        let logical_key = format!("gauss-legendre/{n}/{precision_bits}");
+        if !generator.is_default() {
+            key.mathematical_semantics_version = "gauss-legendre-arb-certified-v1".to_owned();
+            key.resolved_mathematical_parameters["generation_semantics"] =
+                serde_json::json!(generator.semantic_id());
+        }
+        key
+    }
+
+    fn gauss_legendre_nodes_via_cache_impl(
+        n: usize,
+        precision_bits: u32,
+        cache: QuadratureCacheRequest<'_>,
+        root_schedule: crate::hp_runtime::GlRootSchedule,
+        top_level: bool,
+        generator: GaussLegendreGenerator,
+    ) -> Result<CachedQuadratureRule, CacheError> {
+        generator.ensure_available()?;
+        if !generator.is_default() {
+            super::arb::domain(n, precision_bits)?;
+        }
+        let mut performance_resolve = if top_level {
+            xc_core::performance_top_level_stage_with("quadrature.gl.resolve", || {
+                gl_performance_metadata_scheduled(n, precision_bits, root_schedule)
+            })
+        } else {
+            xc_core::performance_stage_with("quadrature.gl.resolve", || {
+                gl_performance_metadata_scheduled(n, precision_bits, root_schedule)
+            })
+        };
+        validate_gl_domain(n, precision_bits)?;
+        let semantic_key = gl_semantic_key(n, precision_bits, generator);
+        let logical_key = if generator.is_default() {
+            format!("gauss-legendre/{n}/{precision_bits}")
+        } else {
+            format!("gauss-legendre/arb-certified-v1/{n}/{precision_bits}")
+        };
         let execution_request = ArtifactExecutionCacheRequest {
             operation: "quadrature.gauss_legendre.resolve_or_compute",
             semantic_key: &semantic_key,
@@ -503,7 +545,11 @@ mod hp {
             write_visibility: cache.write_visibility,
             produced_quality: CacheQuality::Validated,
             producer_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION"))?,
-            minimum_reader_version: ToolkitVersion::parse(xc_cache::CLEAN_SLATE)?,
+            minimum_reader_version: ToolkitVersion::parse(if generator.is_default() {
+                xc_cache::CLEAN_SLATE
+            } else {
+                "0.17.0"
+            })?,
             maximum_reader_version: None,
             tags: BTreeMap::from([
                 ("domain".to_owned(), "quadrature".to_owned()),
@@ -512,6 +558,11 @@ mod hp {
             provenance_digest: None,
             production_sink: cache.production_sink,
         };
+        // Scoped to this exact resolution and exponent context. An immutable
+        // payload accepted by the validator need not run another native replay
+        // merely to return its already validated decoded points.
+        type ValidatedArb = (PortableGlTable, GlTable, (i32, i32));
+        let validated_arb = std::cell::RefCell::new(None::<ValidatedArb>);
         let resolved = resolve_or_compute_json_artifact(
             &execution_request,
             || {
@@ -528,7 +579,8 @@ mod hp {
                         "serial"
                     }
                 );
-                let table = gauss_legendre_compute_scheduled(n, precision_bits, root_schedule)?;
+                let (table, proof) =
+                    compute_generated_table(n, precision_bits, root_schedule, generator)?;
                 xc_core::progress_message!(
                     "[HP] Gauss-Legendre rule n={n}, {precision_bits} bits: computed in {:.1}s",
                     started.elapsed().as_secs_f64()
@@ -538,7 +590,8 @@ mod hp {
                     xc_core::performance_stage_with("quadrature.gl.portable_encode", || {
                         gl_performance_metadata(n, precision_bits)
                     });
-                let portable = portable_table(n, precision_bits, table);
+                let mut portable = portable_table(n, precision_bits, table);
+                portable.arb_certificate = proof;
                 drop(performance_encode);
                 Ok(portable)
             },
@@ -547,7 +600,20 @@ mod hp {
                     xc_core::performance_stage_with("quadrature.gl.validation_decode", || {
                         gl_performance_metadata(n, precision_bits)
                     });
-                decode_portable_table(table, n, precision_bits).map(|_| ())
+                if generator.is_default() {
+                    return decode_portable_table(table, n, precision_bits).map(|_| ());
+                }
+                let context = (rug::float::exp_min(), rug::float::exp_max());
+                if validated_arb
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(saved, _, range)| saved == table && *range == context)
+                {
+                    return Ok(());
+                }
+                let points = decode_for_generator(table, n, precision_bits, generator)?;
+                *validated_arb.borrow_mut() = Some((table.clone(), points, context));
+                Ok(())
             },
         )?;
         performance_resolve.set_cache_disposition(match resolved.access.reuse_disposition {
@@ -559,7 +625,19 @@ mod hp {
             xc_core::performance_stage_with("quadrature.gl.return_decode", || {
                 gl_performance_metadata(n, precision_bits)
             });
-        let (nodes, weights) = decode_portable_table(&resolved.value, n, precision_bits)?;
+        let (nodes, weights) = if generator.is_default() {
+            decode_portable_table(&resolved.value, n, precision_bits)?
+        } else {
+            match validated_arb.into_inner() {
+                Some((saved, points, range))
+                    if saved == resolved.value
+                        && range == (rug::float::exp_min(), rug::float::exp_max()) =>
+                {
+                    points
+                }
+                _ => decode_for_generator(&resolved.value, n, precision_bits, generator)?,
+            }
+        };
         drop(performance_decode);
         let artifact_manifest = resolved.produced_manifest.or(resolved.reused_manifest);
         Ok(CachedQuadratureRule {
@@ -568,6 +646,632 @@ mod hp {
             cache_access: resolved.access,
             artifact_manifest,
         })
+    }
+
+    /// Explicit generator selection with managed identities separated before lookup.
+    /// Arb selection requires feature `arb`, fresh proof replay, and the full existing
+    /// point validator on reuse. No-feature builds refuse even RequireReuse.
+    pub fn gauss_legendre_nodes_via_cache_with_generator(
+        n: usize,
+        precision_bits: u32,
+        cache: QuadratureCacheRequest<'_>,
+        generator: GaussLegendreGenerator,
+    ) -> Result<CachedQuadratureRule, CacheError> {
+        gauss_legendre_nodes_via_cache_impl(
+            n,
+            precision_bits,
+            cache,
+            crate::hp_runtime::GlRootSchedule::serial(),
+            true,
+            generator,
+        )
+    }
+
+    /// Generator-aware entry point for the owning batch planner. The Arb
+    /// construction itself is serial; the existing validator honors the schedule.
+    #[doc(hidden)]
+    pub fn gauss_legendre_nodes_via_cache_scheduled_with_generator(
+        n: usize,
+        precision_bits: u32,
+        cache: QuadratureCacheRequest<'_>,
+        root_schedule: crate::hp_runtime::GlRootSchedule,
+        generator: GaussLegendreGenerator,
+    ) -> Result<CachedQuadratureRule, CacheError> {
+        gauss_legendre_nodes_via_cache_impl(
+            n,
+            precision_bits,
+            cache,
+            root_schedule,
+            false,
+            generator,
+        )
+    }
+
+    #[cfg(all(test, feature = "arb"))]
+    fn compute_portable(
+        n: usize,
+        p: u32,
+        schedule: crate::hp_runtime::GlRootSchedule,
+        generator: GaussLegendreGenerator,
+    ) -> Result<PortableGlTable, CacheError> {
+        let (points, proof) = compute_generated_table(n, p, schedule, generator)?;
+        let mut table = portable_table(n, p, points);
+        table.arb_certificate = proof;
+        Ok(table)
+    }
+
+    fn compute_generated_table(
+        n: usize,
+        p: u32,
+        schedule: crate::hp_runtime::GlRootSchedule,
+        generator: GaussLegendreGenerator,
+    ) -> Result<(GlTable, Option<super::arb::Certificate>), CacheError> {
+        if generator.is_default() {
+            return gauss_legendre_compute_scheduled(n, p, schedule).map(|t| (t, None));
+        }
+        if schedule.parallel_min_task_len().is_some() {
+            crate::mpfr_interval::ensure_uniform_exponent_range()
+                .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+        }
+        let (points, proof) = super::arb::evaluate(n, p, None)?;
+        if let Some(reason) = full_cache_check_scheduled(&points.0, &points.1, p, schedule) {
+            return Err(CacheError::InvalidManifest(format!(
+                "certified GL points failed Toolkit validation: {reason}"
+            )));
+        }
+        Ok((points, Some(proof)))
+    }
+
+    fn decode_for_generator(
+        table: &PortableGlTable,
+        n: usize,
+        p: u32,
+        generator: GaussLegendreGenerator,
+    ) -> Result<GlTable, CacheError> {
+        generator.ensure_available()?;
+        if generator.is_default() {
+            return decode_portable_table(table, n, p);
+        }
+        super::arb::domain(n, p)?;
+        if table.schema_version != 1
+            || table.order != n
+            || table.precision_bits != p
+            || table.nodes.len() != n
+            || table.weights.len() != n
+        {
+            return Err(CacheError::InvalidManifest(
+                "certified quadrature payload shape/identity mismatch".into(),
+            ));
+        }
+        let proof = table.arb_certificate.as_ref().ok_or_else(|| {
+            CacheError::InvalidManifest(
+                "certified quadrature requires certification semantics".into(),
+            )
+        })?;
+        let (canonical, _) = super::arb::evaluate(n, p, Some(proof))?;
+        for (texts, values) in [(&table.nodes, &canonical.0), (&table.weights, &canonical.1)] {
+            for (text, value) in texts.iter().zip(values) {
+                if text.len() > p as usize + 128 {
+                    return Err(CacheError::InvalidManifest(
+                        "certified quadrature point text exceeds bound".into(),
+                    ));
+                }
+                let parsed =
+                    Float::parse(text).map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+                let parsed = Float::with_val(p, parsed);
+                if parsed != *value || parsed.is_sign_negative() != value.is_sign_negative() {
+                    return Err(CacheError::InvalidManifest(
+                        "quadrature point differs from certified nearest rounding".into(),
+                    ));
+                }
+            }
+        }
+        if let Some(reason) = full_cache_check(&canonical.0, &canonical.1, p) {
+            return Err(CacheError::InvalidManifest(format!(
+                "certified GL reuse failed Toolkit validation: {reason}"
+            )));
+        }
+        Ok(canonical)
+    }
+
+    /// Checked standalone generator selection. Legacy selection delegates to
+    /// the released path. Arb ZIPs live only in `gl_cache/arb-certified-v1/`.
+    pub fn try_gauss_legendre_nodes_with_generator(
+        n: usize,
+        p: u32,
+        mode: CacheMode,
+        generator: GaussLegendreGenerator,
+    ) -> Result<GlTable, CacheError> {
+        if generator.is_default() {
+            return try_gauss_legendre_nodes(n, p, mode);
+        }
+        try_gauss_legendre_nodes_scheduled_with_generator(
+            n,
+            p,
+            mode,
+            crate::hp_runtime::GlRootSchedule::serial(),
+            generator,
+        )
+    }
+
+    /// Generator-aware checked standalone entry point for the owning planner.
+    #[doc(hidden)]
+    pub fn try_gauss_legendre_nodes_scheduled_with_generator(
+        n: usize,
+        p: u32,
+        mode: CacheMode,
+        schedule: crate::hp_runtime::GlRootSchedule,
+        generator: GaussLegendreGenerator,
+    ) -> Result<GlTable, CacheError> {
+        generator.ensure_available()?;
+        if generator.is_default() {
+            return try_gauss_legendre_nodes_scheduled(n, p, mode, schedule);
+        }
+        super::arb::domain(n, p)?;
+        let path = if mode == CacheMode::JsonZip {
+            gl_cache_dir().map(|root| {
+                root.join("arb-certified-v1")
+                    .join(format!("prec{p}_npts{n}.json.zip"))
+            })
+        } else {
+            None
+        };
+        if let Some(path) = path.as_ref().filter(|path| path.exists()) {
+            return load_arb_compatibility(path, n, p);
+        }
+        let (points, proof) = compute_generated_table(n, p, schedule, generator)?;
+        if let Some(path) = path {
+            let mut table = portable_table(n, p, points.clone());
+            table.arb_certificate = proof;
+            save_arb_compatibility(&path, table)?;
+        }
+        Ok(points)
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ArbCompatibilityEnvelope {
+        schema_version: u32,
+        toolkit_version: String,
+        generator: GaussLegendreGenerator,
+        table: PortableGlTable,
+    }
+
+    fn load_arb_compatibility(
+        path: &std::path::Path,
+        n: usize,
+        p: u32,
+    ) -> Result<GlTable, CacheError> {
+        use std::io::Read;
+        // Bounded decompression before JSON/native proof decoding.
+        let limit = (n as u64) * (u64::from(p) + 512) * 16 + 4096;
+        let file = std::fs::File::open(path)?;
+        if file.metadata()?.len() > limit + 65536 {
+            return Err(CacheError::InvalidManifest(
+                "certified quadrature ZIP exceeds bound".into(),
+            ));
+        }
+        let mut zip =
+            zip::ZipArchive::new(file).map_err(|e| CacheError::Serialization(e.to_string()))?;
+        if zip.len() != 1 {
+            return Err(CacheError::InvalidManifest(
+                "certified quadrature ZIP member count".into(),
+            ));
+        }
+        let mut entry = zip
+            .by_name("arb-certified-v1.json")
+            .map_err(|e| CacheError::Serialization(e.to_string()))?;
+        if entry.size() > limit {
+            return Err(CacheError::InvalidManifest(
+                "certified quadrature decoded size exceeds bound".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        entry.by_ref().take(limit + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(CacheError::InvalidManifest(
+                "certified quadrature expanded size exceeds bound".into(),
+            ));
+        }
+        let envelope: ArbCompatibilityEnvelope = serde_json::from_slice(&bytes)?;
+        if envelope.schema_version != 1
+            || envelope.generator != GaussLegendreGenerator::ArbCertified
+            || version_is_older(&envelope.toolkit_version, &effective_min_version())
+        {
+            return Err(CacheError::InvalidManifest(
+                "certified quadrature compatibility identity/version mismatch".into(),
+            ));
+        }
+        decode_for_generator(&envelope.table, n, p, GaussLegendreGenerator::ArbCertified)
+    }
+
+    fn save_arb_compatibility(
+        path: &std::path::Path,
+        table: PortableGlTable,
+    ) -> Result<(), CacheError> {
+        use std::io::Write;
+        let envelope = ArbCompatibilityEnvelope {
+            schema_version: 1,
+            toolkit_version: TOOLKIT_VERSION.to_owned(),
+            generator: GaussLegendreGenerator::ArbCertified,
+            table,
+        };
+        let bytes = serde_json::to_vec(&envelope)?;
+        let mut output = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut output));
+            zip.start_file(
+                "arb-certified-v1.json",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated)
+                    .large_file(true),
+            )
+            .map_err(|e| CacheError::Serialization(e.to_string()))?;
+            zip.write_all(&bytes)?;
+            zip.finish()
+                .map_err(|e| CacheError::Serialization(e.to_string()))?;
+        }
+        std::fs::create_dir_all(
+            path.parent()
+                .ok_or_else(|| CacheError::Io("missing quadrature cache parent".into()))?,
+        )?;
+        xc_cache::atomic_replace_cache_file(path, &output)
+    }
+
+    #[cfg(test)]
+    mod arb_generator_tests {
+        use super::*;
+
+        #[test]
+        fn arb_generator_default_key_and_payload_remain_released() {
+            assert_eq!(
+                GaussLegendreGenerator::default(),
+                GaussLegendreGenerator::LegacyNewton
+            );
+            let key = gl_semantic_key(3000, 3386, GaussLegendreGenerator::default());
+            assert_eq!(
+                key.digest().unwrap().0,
+                "a23310358f5f5e1f83db0cef44bd27d2a26ff1bdbffd94f02292bdba64f8b3fa"
+            );
+            assert_ne!(
+                key.digest().unwrap(),
+                gl_semantic_key(3000, 3386, GaussLegendreGenerator::ArbCertified)
+                    .digest()
+                    .unwrap()
+            );
+            // Frozen pre-generator record shape; exact serializer comparison.
+            #[derive(Serialize)]
+            struct ReleasedTable {
+                schema_version: u32,
+                order: usize,
+                precision_bits: u32,
+                nodes: Vec<String>,
+                weights: Vec<String>,
+            }
+            let points = gauss_legendre_compute_scheduled(
+                3,
+                128,
+                crate::hp_runtime::GlRootSchedule::serial(),
+            )
+            .unwrap();
+            let released = ReleasedTable {
+                schema_version: 1,
+                order: 3,
+                precision_bits: 128,
+                nodes: points.0.iter().map(Float::to_string).collect(),
+                weights: points.1.iter().map(Float::to_string).collect(),
+            };
+            assert_eq!(
+                serde_json::to_vec(&released).unwrap(),
+                serde_json::to_vec(&portable_table(3, 128, points)).unwrap()
+            );
+            assert_eq!(
+                try_gauss_legendre_nodes(3, 128, CacheMode::Off).unwrap(),
+                try_gauss_legendre_nodes_with_generator(
+                    3,
+                    128,
+                    CacheMode::Off,
+                    GaussLegendreGenerator::default()
+                )
+                .unwrap()
+            );
+        }
+
+        #[cfg(not(feature = "arb"))]
+        #[test]
+        fn arb_generator_without_feature_refuses_before_cache_access() {
+            let error = try_gauss_legendre_nodes_with_generator(
+                3,
+                128,
+                CacheMode::JsonZip,
+                GaussLegendreGenerator::ArbCertified,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("requires feature arb"));
+            assert!(GaussLegendreGenerator::ArbCertified
+                .ensure_available()
+                .is_err());
+        }
+
+        #[cfg(feature = "arb")]
+        #[test]
+        fn arb_generator_odd_even_proof_replay_and_full_validator() {
+            let expected: Vec<_> = [1, 2, 3, 8, 9]
+                .into_iter()
+                .map(|n| {
+                    serde_json::to_vec(
+                        &compute_portable(
+                            n,
+                            128,
+                            crate::hp_runtime::GlRootSchedule::serial(),
+                            GaussLegendreGenerator::ArbCertified,
+                        )
+                        .unwrap_or_else(|error| panic!("certified n={n}, p=128: {error}")),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            for threads in [1, 8, 16] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                pool.install(|| {
+                    for (slot, n) in [1, 2, 3, 8, 9].into_iter().enumerate() {
+                        let table = compute_portable(
+                            n,
+                            128,
+                            crate::hp_runtime::GlRootSchedule::serial(),
+                            GaussLegendreGenerator::ArbCertified,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("certified n={n}, p=128, threads={threads}: {error}")
+                        });
+                        assert_eq!(serde_json::to_vec(&table).unwrap(), expected[slot]);
+                        let points = decode_for_generator(
+                            &table,
+                            n,
+                            128,
+                            GaussLegendreGenerator::ArbCertified,
+                        )
+                        .unwrap();
+                        assert!(
+                            check_gauss_legendre_rule_hp(&points.0, &points.1, 128, n)
+                                .unwrap()
+                                .checks_passed
+                        );
+                        if n % 2 == 1 {
+                            assert!(points.0[n / 2].is_zero());
+                            assert!(!points.0[n / 2].is_sign_negative());
+                        }
+                        let again = compute_portable(
+                            n,
+                            128,
+                            crate::hp_runtime::GlRootSchedule::serial(),
+                            GaussLegendreGenerator::ArbCertified,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            serde_json::to_vec(&table).unwrap(),
+                            serde_json::to_vec(&again).unwrap()
+                        );
+                        assert!(decode_portable_table(&table, n, 128).is_err());
+                    }
+                });
+            }
+        }
+
+        #[cfg(all(feature = "arb", unix))]
+        #[test]
+        fn arb_generator_rejects_restricted_mpfr_range_without_changing_it() {
+            std::thread::spawn(|| {
+                unsafe extern "C" {
+                    fn mpfr_set_emin(value: std::os::raw::c_long) -> i32;
+                    fn mpfr_get_emin() -> std::os::raw::c_long;
+                }
+                struct Restore(std::os::raw::c_long);
+                impl Drop for Restore {
+                    fn drop(&mut self) {
+                        assert_eq!(unsafe { mpfr_set_emin(self.0) }, 0);
+                    }
+                }
+                let before = unsafe { mpfr_get_emin() };
+                let _restore = Restore(before);
+                assert_eq!(unsafe { mpfr_set_emin(-10) }, 0);
+                let rust_range_after_setting = rug::float::exp_min();
+                let error = super::super::arb::evaluate(3, 128, None).unwrap_err();
+                assert!(error.to_string().contains("MPFR ABI/range"));
+                assert_eq!(unsafe { mpfr_get_emin() }, -10);
+                assert_eq!(rug::float::exp_min(), rust_range_after_setting);
+            })
+            .join()
+            .unwrap();
+        }
+
+        #[cfg(feature = "arb")]
+        #[test]
+        fn arb_generator_exact_two_node_weights_have_unique_nearest_values() {
+            // For P_2=(3x^2-1)/2, both quadrature weights are exactly one.
+            // A nonzero-radius enclosure of one need not determine MPFR's
+            // ternary result, but it can determine the unique rounded value.
+            for p in [64, 128, 3386] {
+                let table = compute_portable(
+                    2,
+                    p,
+                    crate::hp_runtime::GlRootSchedule::serial(),
+                    GaussLegendreGenerator::ArbCertified,
+                )
+                .unwrap_or_else(|error| panic!("certified n=2, p={p}: {error}"));
+                let (nodes, weights) =
+                    decode_for_generator(&table, 2, p, GaussLegendreGenerator::ArbCertified)
+                        .unwrap_or_else(|error| panic!("certified replay n=2, p={p}: {error}"));
+                for weight in &weights {
+                    assert_eq!(weight.prec(), p);
+                    assert_eq!(weight, &Float::with_val(p, 1));
+                }
+                assert!(nodes[0] < 0 && nodes[1] > 0);
+                assert_eq!(nodes[0], -nodes[1].clone());
+                assert!(
+                    check_gauss_legendre_rule_hp(&nodes, &weights, p, 2)
+                        .unwrap()
+                        .checks_passed
+                );
+            }
+        }
+
+        #[cfg(feature = "arb")]
+        #[test]
+        fn arb_generator_refuses_corruption_and_resource_failure_is_not_cached() {
+            let table = compute_portable(
+                3,
+                128,
+                crate::hp_runtime::GlRootSchedule::serial(),
+                GaussLegendreGenerator::ArbCertified,
+            )
+            .unwrap();
+            for alteration in 0..4 {
+                let mut bad = table.clone();
+                match alteration {
+                    0 => bad.arb_certificate = None,
+                    1 => bad.arb_certificate.as_mut().unwrap().semantics = "unproved".into(),
+                    2 => bad.nodes[1] = "-0".into(),
+                    _ => bad.weights[0] = "1".into(),
+                }
+                assert!(
+                    decode_for_generator(&bad, 3, 128, GaussLegendreGenerator::ArbCertified)
+                        .is_err()
+                );
+            }
+            assert!(super::super::arb::domain(0, 128).is_err());
+            assert!(super::super::arb::domain(3, 63).is_err());
+            assert!(super::super::arb::domain(16385, 128).is_err());
+            assert!(GaussLegendreGenerator::ArbCertified
+                .validate_rule(16384, 64)
+                .is_ok());
+            let resources = xc_core::RunResources::new(1).unwrap();
+            {
+                let _scope = resources.enter();
+                assert!(
+                    decode_for_generator(&table, 3, 128, GaussLegendreGenerator::ArbCertified)
+                        .is_err()
+                );
+                assert_eq!(resources.usage().working_bytes, 0);
+            }
+            assert!(
+                decode_for_generator(&table, 3, 128, GaussLegendreGenerator::ArbCertified).is_ok()
+            );
+        }
+
+        #[cfg(feature = "arb")]
+        #[test]
+        fn arb_generator_compatibility_files_are_disjoint_and_replay_exactly() {
+            let root = xc_core::test_support::TestDir::new("arb-gl-disjoint");
+            struct Restore(Option<std::path::PathBuf>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    replace_test_cache_root(self.0.take());
+                }
+            }
+            let _restore = Restore(replace_test_cache_root(Some(root.path().to_owned())));
+            let old = try_gauss_legendre_nodes(3, 128, CacheMode::JsonZip).unwrap();
+            let old_path = root.join("gl_cache/prec128_npts3.json.zip");
+            let old_bytes = std::fs::read(&old_path).unwrap();
+            let new = try_gauss_legendre_nodes_with_generator(
+                3,
+                128,
+                CacheMode::JsonZip,
+                GaussLegendreGenerator::ArbCertified,
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(old_path).unwrap(), old_bytes);
+            assert!(root
+                .join("gl_cache/arb-certified-v1/prec128_npts3.json.zip")
+                .is_file());
+            assert_eq!(
+                new,
+                try_gauss_legendre_nodes_with_generator(
+                    3,
+                    128,
+                    CacheMode::JsonZip,
+                    GaussLegendreGenerator::ArbCertified
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                old,
+                try_gauss_legendre_nodes(3, 128, CacheMode::JsonZip).unwrap()
+            );
+        }
+
+        #[cfg(feature = "arb")]
+        #[test]
+        fn arb_generator_managed_require_reuse_never_accepts_legacy_key() {
+            use xc_cache::{
+                ArtifactExecutionCacheMode as Mode, CacheLayer, CachePolicy, CacheResolver,
+                CacheVisibility, FilesystemCacheStore,
+            };
+            let root = xc_core::test_support::TestDir::new("arb-gl-managed");
+            let resolver = CacheResolver::new(vec![CacheLayer {
+                precedence: 0,
+                store: Box::new(FilesystemCacheStore::new(
+                    "local",
+                    root.path(),
+                    true,
+                    CacheVisibility::Local,
+                )),
+            }]);
+            let policy = CachePolicy {
+                current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                minimum_quality: CacheQuality::Validated,
+                accepted_schema_versions: vec![1],
+                allow_deprecated: false,
+                allow_quarantined: false,
+                allowed_visibilities: vec![CacheVisibility::Local],
+            };
+            let request = |mode| QuadratureCacheRequest {
+                resolver: Some(&resolver),
+                reference_resolver: None,
+                acceptance: Some(&policy),
+                ordered_overlays: vec!["local".into()],
+                mode,
+                write_on_miss: mode != Mode::RequireReuse,
+                write_visibility: CacheVisibility::Local,
+                requested_assurance: xc_core::AssuranceLevel::Computed,
+                certification_failure_policy:
+                    xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+                production_sink: None,
+            };
+            let old = gauss_legendre_nodes_via_cache(3, 128, request(Mode::PreferReuse)).unwrap();
+            assert!(matches!(
+                gauss_legendre_nodes_via_cache_with_generator(
+                    3,
+                    128,
+                    request(Mode::RequireReuse),
+                    GaussLegendreGenerator::ArbCertified
+                ),
+                Err(CacheError::NotFound(_))
+            ));
+            let new = gauss_legendre_nodes_via_cache_with_generator(
+                3,
+                128,
+                request(Mode::PreferReuse),
+                GaussLegendreGenerator::ArbCertified,
+            )
+            .unwrap();
+            let warm = gauss_legendre_nodes_via_cache_with_generator(
+                3,
+                128,
+                request(Mode::RequireReuse),
+                GaussLegendreGenerator::ArbCertified,
+            )
+            .unwrap();
+            assert_eq!(new.nodes, warm.nodes);
+            assert_eq!(new.weights, warm.weights);
+            assert_ne!(
+                old.artifact_manifest.unwrap().key,
+                new.artifact_manifest.unwrap().key
+            );
+        }
     }
 
     /// Controls how `gauss_legendre_nodes` resolves a `(n, prec)` table.
@@ -1231,6 +1935,10 @@ mod hp {
         root_schedule: crate::hp_runtime::GlRootSchedule,
     ) -> Result<GlTable, CacheError> {
         validate_gl_domain(n, prec)?;
+        if root_schedule.parallel_min_task_len().is_some() {
+            crate::mpfr_interval::ensure_uniform_exponent_range()
+                .map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+        }
         let pi_v = pi(prec);
         let one = Float::with_val(prec, 1);
         let four_n_plus_two = fl_i(prec, (4 * n + 2) as i64);
@@ -1944,9 +2652,12 @@ mod hp {
 pub use hp::{
     check_gauss_legendre_rule_hp, gauss_legendre_nodes, gauss_legendre_nodes_scheduled,
     gauss_legendre_nodes_via_cache, gauss_legendre_nodes_via_cache_scheduled,
-    try_gauss_legendre_nodes, try_gauss_legendre_nodes_scheduled, verify_gl_cache_dir,
-    CacheFileStatus, CacheMode, CacheVerifyReport, CachedQuadratureRule, GaussLegendreRuleCheckHp,
-    QuadratureCacheRequest, GL_CACHE_ADMISSION_SEMANTICS,
+    gauss_legendre_nodes_via_cache_scheduled_with_generator,
+    gauss_legendre_nodes_via_cache_with_generator, try_gauss_legendre_nodes,
+    try_gauss_legendre_nodes_scheduled, try_gauss_legendre_nodes_scheduled_with_generator,
+    try_gauss_legendre_nodes_with_generator, verify_gl_cache_dir, CacheFileStatus, CacheMode,
+    CacheVerifyReport, CachedQuadratureRule, GaussLegendreRuleCheckHp, QuadratureCacheRequest,
+    GL_CACHE_ADMISSION_SEMANTICS,
 };
 
 #[cfg(test)]

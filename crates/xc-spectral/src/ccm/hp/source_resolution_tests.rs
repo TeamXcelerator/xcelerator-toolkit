@@ -115,7 +115,7 @@ fn primary_source_admission_uses_campaign_configuration_without_matrix_allocatio
     assert_eq!(
         cfg.validate_source_admission(&CcmParams::from_lambda_sq_integer(100, 500))
             .is_ok(),
-        budget >= 20_203_846_408
+        budget >= 5_259_675_544
     );
     let mut invalid = cfg.clone();
     invalid.quad_points = 0;
@@ -231,9 +231,12 @@ fn response_isolates_simple_ground_state_with_a_repeated_neighbor_cluster() {
             .is_err());
         }
         let prep = ResponseSpectralPreparation {
-            even_sector_matrix: (0..9)
-                .map(|k| Float::with_val(p, if k / 3 == k % 3 { [1, 2, 2][k / 3] } else { 0 }))
-                .collect(),
+            even_sector_matrix: shared_float_vector(
+                (0..9)
+                    .map(|k| Float::with_val(p, if k / 3 == k % 3 { [1, 2, 2][k / 3] } else { 0 }))
+                    .collect(),
+            )
+            .unwrap(),
             source_matrix_eigenvalue_allowance: Float::with_val(p, 0),
             selected_enclosures: decoded.selected_enclosures,
         };
@@ -607,4 +610,29 @@ fn resolved_sector_gap_payload_keeps_its_fields_and_bytes() {
     assert!(object.values().all(|field| !field.is_null()));
     assert_eq!(object["ordering"], serde_json::json!(1));
     assert_eq!(object["schema_version"], serde_json::json!(2));
+}
+
+#[test]
+fn shared_symmetry_preserves_owned_precision_and_signed_zero() {
+    for (a, b) in [
+        (Float::with_val(64, 1), Float::with_val(128, 1)),
+        (Float::with_val(128, 0.0), Float::with_val(128, -0.0)),
+        (Float::with_val(128, -0.0), Float::with_val(128, 0.0)),
+    ] {
+        let values = vec![Float::with_val(128, 2), a, b, Float::with_val(128, 3)];
+        let mut expected = values.clone();
+        force_symmetric(&mut expected, 2).unwrap();
+        let mut shared = shared_float_vector(values).unwrap();
+        let original = shared.clone();
+        force_shared_symmetric(&mut shared, 2).unwrap();
+        assert!(!shared.ptr_eq(&original));
+        for (actual, expected) in shared.iter().zip(&expected) {
+            assert_eq!(actual, expected);
+            assert_eq!(actual.prec(), expected.prec());
+            assert_eq!(actual.is_sign_negative(), expected.is_sign_negative());
+        }
+        let normalized = shared.clone();
+        force_shared_symmetric(&mut shared, 2).unwrap();
+        assert!(shared.ptr_eq(&normalized));
+    }
 }

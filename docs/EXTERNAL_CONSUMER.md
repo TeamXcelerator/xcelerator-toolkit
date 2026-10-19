@@ -1,6 +1,6 @@
 # Standalone public-API consumer
 
-Version target: `0.16.1`
+Version target: `0.17.0`.
 
 `tests/external-consumer` is intentionally excluded from the toolkit workspace and has its own manifest and dependency lock. It models an adjacent mathematical application rather than a toolkit crate. Its direct toolkit dependencies include `xc-core`, `xc-operator`, `xc-solver`, `xc-certify`, `xc-cache`, optional HP `xc-numerics`, and `xc-spectral`. The solver example is domain independent; a separate public CCM capture-plan check verifies the current Ultra contract. It imports public CCM types without implementing CCM internals.
 

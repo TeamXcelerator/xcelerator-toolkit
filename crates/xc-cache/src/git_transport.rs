@@ -48,15 +48,20 @@ type VerifiedDigestCache = BTreeMap<(PathBuf, String, u64), (ContentDigest, Loos
 pub struct GitCliRemoteStore {
     git_executable: OsString,
     temporary_root: PathBuf,
+    disk_accounting_root: PathBuf,
     read_session_parent: Option<PathBuf>,
     staged_parts_roots: Vec<PathBuf>,
+    exact_staged_part_sources: Option<BTreeMap<String, (ContentDigest, u64, PathBuf)>>,
     author_name: String,
     author_email: String,
     resources: ResourcePolicy,
     session_gate: RwLock<()>,
     repository_operation_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    /// A failed promisor-config cleanup makes further use unsafe. Refuse the
+    /// session until explicit cleanup instead of probing Git on every cache hit.
+    unusable_sessions: Mutex<BTreeSet<PathBuf>>,
     prepared_blob_oids: Mutex<BTreeMap<(PathBuf, ContentDigest, u64), String>>,
-    resolved_blob_oids: Mutex<BTreeMap<(String, String, String), ResolvedBlobObject>>,
+    resolved_blob_oids: Mutex<BTreeMap<(String, String, String), Option<ResolvedBlobObject>>>,
     /// Bytes reserved against the temporary-disk budget by operations that
     /// are still in flight. Shared by every repository session of this
     /// transport so concurrent preparations cannot each see enough room and
@@ -125,6 +130,18 @@ impl Drop for GitCliRemoteStore {
             }
         }
     }
+}
+
+fn staged_metadata_is_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Refuse junctions and other reparse points as well as symlinks.
+        if metadata.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+    metadata.file_type().is_symlink()
 }
 
 fn git_compatible_path(path: &Path) -> PathBuf {
@@ -228,16 +245,20 @@ impl GitCliRemoteStore {
         author_name: impl Into<String>,
         author_email: impl Into<String>,
     ) -> Result<Self, CacheError> {
+        let temporary_root = git_compatible_path(&temporary_root.into());
         let store = Self {
             git_executable: OsString::from("git"),
-            temporary_root: git_compatible_path(&temporary_root.into()),
+            disk_accounting_root: temporary_root.clone(),
+            temporary_root,
             read_session_parent: None,
             staged_parts_roots: vec![staged_parts_root.into()],
+            exact_staged_part_sources: None,
             author_name: author_name.into(),
             author_email: author_email.into(),
             resources: ResourcePolicy::default(),
             session_gate: RwLock::new(()),
             repository_operation_locks: Mutex::new(BTreeMap::new()),
+            unusable_sessions: Mutex::new(BTreeSet::new()),
             prepared_blob_oids: Mutex::new(BTreeMap::new()),
             resolved_blob_oids: Mutex::new(BTreeMap::new()),
             disk_reservations: Arc::new(Mutex::new(DiskReservationState::default())),
@@ -276,6 +297,39 @@ impl GitCliRemoteStore {
         self
     }
 
+    /// Managed families know each archive's original root. Generated documents
+    /// belong to the primary root. This is routing only: the selected path is
+    /// still fully checked and hashed before import, and Git's blob afterward.
+    pub(crate) fn with_exact_staged_part_sources(
+        mut self,
+        sources: impl IntoIterator<Item = (PathBuf, TransportPart)>,
+    ) -> Result<Self, CacheError> {
+        let mut exact = BTreeMap::new();
+        for (root, part) in sources {
+            validate_relative_git_path(&part.repository_path)?;
+            if !self.staged_parts_roots.contains(&root) {
+                return Err(CacheError::InvalidManifest(
+                    "exact staged part source is not a configured root".to_owned(),
+                ));
+            }
+            if let Some((digest, size, _)) = exact.get(&part.repository_path) {
+                if digest != &part.content_digest || size != &part.size_bytes {
+                    return Err(CacheError::InvalidManifest(
+                        "duplicate staged part path declares differing content".to_owned(),
+                    ));
+                }
+            }
+            // Identical declarations are interchangeable. The chosen copy
+            // must still pass the complete byte and path checks at import.
+            exact.insert(
+                part.repository_path,
+                (part.content_digest, part.size_bytes, root),
+            );
+        }
+        self.exact_staged_part_sources = Some(exact);
+        Ok(self)
+    }
+
     pub(crate) fn enable_publication_metrics(&self, directory: &Path) {
         if self.metrics.enable(directory).is_err() {
             xc_core::progress_message!("publication telemetry could not be initialized");
@@ -288,6 +342,9 @@ impl GitCliRemoteStore {
         details: serde_json::Value,
     ) {
         self.metrics.record(phase, elapsed, details);
+    }
+    pub(crate) fn close_publication_metrics(&self) {
+        self.metrics.close();
     }
     fn observed_push(
         &self,
@@ -306,6 +363,35 @@ impl GitCliRemoteStore {
     pub fn with_resource_policy(mut self, resources: ResourcePolicy) -> Self {
         self.resources = resources;
         self
+    }
+
+    /// Sibling publication stores retain independent immutable-object caches
+    /// but charge concurrent reservations against their common temporary root.
+    pub(crate) fn with_publication_disk_budget(
+        mut self,
+        accounting_root: &Path,
+        other: Option<&Self>,
+    ) -> Result<Self, CacheError> {
+        let root = fs::canonicalize(accounting_root)?;
+        if !fs::canonicalize(&self.temporary_root)?.starts_with(&root) {
+            return Err(CacheError::InvalidTransition(
+                "publication transport must remain inside its accounting root".to_owned(),
+            ));
+        }
+        if let Some(other) = other {
+            if root != other.disk_accounting_root
+                || self.resources.maximum_temporary_disk_bytes
+                    != other.resources.maximum_temporary_disk_bytes
+            {
+                return Err(CacheError::InvalidTransition(
+                    "shared Git transport reservations require the same root and disk limit"
+                        .to_owned(),
+                ));
+            }
+            self.disk_reservations = Arc::clone(&other.disk_reservations);
+        }
+        self.disk_accounting_root = root;
+        Ok(self)
     }
 
     pub(crate) fn set_resource_policy(&mut self, resources: ResourcePolicy) {
@@ -328,6 +414,10 @@ impl GitCliRemoteStore {
         if session.exists() {
             fs::remove_dir_all(&session)?;
         }
+        self.unusable_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&session);
         self.verified_blob_digests
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -355,6 +445,10 @@ impl GitCliRemoteStore {
         if self.temporary_root.exists() {
             fs::remove_dir_all(&self.temporary_root)?;
         }
+        self.unusable_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.prepared_blob_oids
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -393,13 +487,6 @@ impl GitCliRemoteStore {
         parts: &[TransportPart],
     ) -> Result<(), CacheError> {
         validate_repository(repository)?;
-        let additional_bytes = parts.iter().try_fold(0u64, |total, part| {
-            total.checked_add(part.size_bytes).ok_or_else(|| {
-                CacheError::ResourceLimit(
-                    "prepared Git transport parts exceed the u64 byte range".to_owned(),
-                )
-            })
-        })?;
         let _gate = self
             .session_gate
             .read()
@@ -408,6 +495,33 @@ impl GitCliRemoteStore {
         let _guard = operation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Retained, authenticated Git objects are already charged as resident
+        // disk bytes. Reserve only distinct objects absent from this session.
+        let session_path = self.session_path(repository);
+        let additional_bytes = {
+            let prepared = self
+                .prepared_blob_oids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut missing = BTreeSet::new();
+            let mut bytes = 0u64;
+            for part in parts {
+                validate_relative_git_path(&part.repository_path)?;
+                let key = (
+                    session_path.clone(),
+                    part.content_digest.clone(),
+                    part.size_bytes,
+                );
+                if !prepared.contains_key(&key) && missing.insert(key) {
+                    bytes = bytes.checked_add(part.size_bytes).ok_or_else(|| {
+                        CacheError::ResourceLimit(
+                            "prepared Git transport parts exceed the u64 byte range".to_owned(),
+                        )
+                    })?;
+                }
+            }
+            bytes
+        };
         let _disk_reservation = self.enforce_transport_disk_budget(additional_bytes)?;
         let session = self.ensure_session(repository)?;
         self.hash_staged_blobs(&session, parts)?;
@@ -423,6 +537,7 @@ impl GitCliRemoteStore {
     fn ensure_session(&self, repository: &str) -> Result<PathBuf, CacheError> {
         validate_repository(repository)?;
         let session = self.session_path(repository);
+        self.require_usable_session(&session)?;
         if !session.join("HEAD").exists() {
             if let Some(parent) = session.parent() {
                 fs::create_dir_all(parent)?;
@@ -452,6 +567,20 @@ impl GitCliRemoteStore {
         Ok(session)
     }
 
+    fn require_usable_session(&self, session: &Path) -> Result<(), CacheError> {
+        if self
+            .unusable_sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(session)
+        {
+            return Err(CacheError::Io(
+                "Git session refused after implicit-lazy-fetch cleanup failure; explicit session cleanup is required".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Reserve `additional_bytes` against the temporary-disk budget for as
     /// long as the returned guard lives. Accounting runs under one lock and
     /// counts every other in-flight reservation, so concurrent repository
@@ -462,12 +591,12 @@ impl GitCliRemoteStore {
         &self,
         additional_bytes: u64,
     ) -> Result<DiskReservation, CacheError> {
-        fs::create_dir_all(&self.temporary_root)?;
+        fs::create_dir_all(&self.disk_accounting_root)?;
         let mut reserved = self
             .disk_reservations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let measured_bytes = directory_size_bytes(&self.temporary_root)?;
+        let measured_bytes = directory_size_bytes(&self.disk_accounting_root)?;
         if reserved.in_flight_bytes == 0 {
             reserved.baseline_bytes = measured_bytes;
             reserved.released_reservation_bytes = 0;
@@ -499,8 +628,8 @@ impl GitCliRemoteStore {
                  concurrent operations + {additional_bytes} pending), exceeding the configured limit"
             )));
         }
-        let available = available_space(&self.temporary_root)?;
-        let total = total_space(&self.temporary_root)?;
+        let available = available_space(&self.disk_accounting_root)?;
+        let total = total_space(&self.disk_accounting_root)?;
         let reserve = (total / 20).clamp(2 * 1024 * 1024 * 1024, 20 * 1024 * 1024 * 1024);
         let required_free = remaining_in_flight
             .checked_add(additional_bytes)
@@ -558,7 +687,7 @@ impl GitCliRemoteStore {
                 maximum.min(GIT_REVISION_METADATA_RESERVATION_BYTES)
             });
         let _disk_reservation = self.enforce_transport_disk_budget(metadata_reservation)?;
-        run_git_network(
+        let fetched = run_git_network(
             &self.git_executable,
             Some(&session),
             [
@@ -569,8 +698,27 @@ impl GitCliRemoteStore {
                 OsString::from(revision),
             ],
             &[],
-        )?;
-        self.disable_implicit_lazy_fetch(&session)?;
+        );
+        // Git may configure the promisor remote and write objects before a
+        // later connectivity/transport failure. Cleanup is required on both
+        // outcomes, including when a prefetch caller elects to continue.
+        let disabled = self.disable_implicit_lazy_fetch(&session);
+        if disabled.is_err() {
+            self.unusable_sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(session.clone());
+        }
+        if let Err(fetch_error) = fetched {
+            return match disabled {
+                Ok(()) => Err(fetch_error),
+                Err(cleanup_error) => Err(CacheError::Io(format!(
+                    "Git revision metadata fetch failed: {fetch_error}; \
+                     disabling implicit lazy fetch also failed: {cleanup_error}"
+                ))),
+            };
+        }
+        disabled?;
         drop(_disk_reservation);
         self.enforce_transport_disk_budget(0)?;
         Ok(session)
@@ -654,12 +802,22 @@ impl GitCliRemoteStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let session = self.fetch_revision(repository, revision)?;
         let mut objects = BTreeMap::<String, u64>::new();
+        let mut absent = BTreeSet::<String>::new();
         let mut unresolved = Vec::new();
         for (repository_path, maximum_bytes) in &requested_paths {
             cancellation
                 .check()
                 .map_err(|error| CacheError::Cancelled(error.to_string()))?;
-            if let Some(object) = self.cached_blob_object(repository, revision, repository_path) {
+            if self.cached_path_is_absent(repository, revision, repository_path) {
+                if !allow_missing {
+                    return Err(CacheError::NotFound(format!(
+                        "remote path {repository_path:?} at {revision}"
+                    )));
+                }
+                absent.insert(repository_path.clone());
+            } else if let Some(object) =
+                self.cached_blob_object(repository, revision, repository_path)
+            {
                 if object.size_bytes.is_some_and(|size| size > *maximum_bytes) {
                     return Err(CacheError::ResourceLimit(format!(
                         "remote path {repository_path:?} exceeds the {maximum_bytes}-byte limit"
@@ -674,10 +832,26 @@ impl GitCliRemoteStore {
                 unresolved.push((repository_path, maximum_bytes));
             }
         }
-        let mut absent = BTreeSet::<String>::new();
         if !unresolved.is_empty() {
             let mut listed = BTreeMap::new();
-            for path_batch in unresolved.chunks(32) {
+            let mut start = 0;
+            while start < unresolved.len() {
+                let mut end = start;
+                let mut argument_bytes = 0usize;
+                while end < unresolved.len() && end - start < 32 {
+                    let length = unresolved[end].0.len();
+                    if length > 24 * 1024 {
+                        return Err(CacheError::ResourceLimit(
+                            "prefetched Git path exceeds the command argument budget".to_owned(),
+                        ));
+                    }
+                    if end > start && argument_bytes + length > 24 * 1024 {
+                        break;
+                    }
+                    argument_bytes += length;
+                    end += 1;
+                }
+                let path_batch = &unresolved[start..end];
                 let mut arguments = vec![
                     OsString::from("ls-tree"),
                     OsString::from("-l"),
@@ -694,6 +868,7 @@ impl GitCliRemoteStore {
                         )));
                     }
                 }
+                start = end;
             }
             for (path, maximum_bytes) in unresolved {
                 let Some(object) = listed.remove(path) else {
@@ -721,6 +896,9 @@ impl GitCliRemoteStore {
                 return Err(CacheError::InvalidManifest(
                     "git ls-tree returned an unrequested path during batched prefetch".to_owned(),
                 ));
+            }
+            for path in &absent {
+                self.remember_blob_absence(repository, revision, path);
             }
         }
 
@@ -810,6 +988,7 @@ impl GitCliRemoteStore {
         reservation_bytes: u64,
     ) -> Result<(), CacheError> {
         validate_revision(object_id)?;
+        self.require_usable_session(session)?;
         // A batch prefetch makes this the normal path. Immutable object reads
         // must not queue behind unrelated Git session mutations.
         let local = run_git_allow_failure(
@@ -831,6 +1010,7 @@ impl GitCliRemoteStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Another reader may have hydrated this object while the current
         // reader waited for the mutation lock.
+        self.require_usable_session(session)?;
         let local = run_git_allow_failure(
             &self.git_executable,
             Some(session),
@@ -964,6 +1144,31 @@ impl GitCliRemoteStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&(repository.to_owned(), revision.to_owned(), path.to_owned()))
             .cloned()
+            .flatten()
+    }
+
+    fn cached_path_is_absent(&self, repository: &str, revision: &str, path: &str) -> bool {
+        matches!(
+            self.resolved_blob_oids
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&(repository.to_owned(), revision.to_owned(), path.to_owned())),
+            Some(None)
+        )
+    }
+
+    fn remember_blob_absence(&self, repository: &str, revision: &str, path: &str) {
+        const MAXIMUM_CACHED_PATHS_FOR_ABSENCE: usize = 16_384;
+        let mut cache = self
+            .resolved_blob_oids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if cache.len() < MAXIMUM_CACHED_PATHS_FOR_ABSENCE {
+            cache.insert(
+                (repository.to_owned(), revision.to_owned(), path.to_owned()),
+                None,
+            );
+        }
     }
 
     fn remember_blob_object(
@@ -978,7 +1183,7 @@ impl GitCliRemoteStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(
                 (repository.to_owned(), revision.to_owned(), path.to_owned()),
-                object,
+                Some(object),
             );
     }
 
@@ -989,6 +1194,10 @@ impl GitCliRemoteStore {
         path: &str,
     ) -> Result<Option<(PathBuf, ResolvedBlobObject)>, CacheError> {
         validate_relative_git_path(path)?;
+        self.require_usable_session(&self.session_path(repository))?;
+        if self.cached_path_is_absent(repository, revision, path) {
+            return Ok(None);
+        }
         // Callers hold the session read gate, while cleanup takes its write
         // gate. A cached immutable tree answer is therefore safe to use
         // without queueing behind unrelated repository mutation work.
@@ -999,6 +1208,10 @@ impl GitCliRemoteStore {
         let _guard = operation_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.require_usable_session(&self.session_path(repository))?;
+        if self.cached_path_is_absent(repository, revision, path) {
+            return Ok(None);
+        }
         if let Some(object) = self.cached_blob_object(repository, revision, path) {
             return Ok(Some((self.session_path(repository), object)));
         }
@@ -1016,6 +1229,7 @@ impl GitCliRemoteStore {
             &[],
         )?;
         if listing.stdout.is_empty() {
+            self.remember_blob_absence(repository, revision, path);
             return Ok(None);
         }
         let object = parse_ls_tree_blob_object(&listing.stdout, path)?;
@@ -1034,11 +1248,59 @@ impl GitCliRemoteStore {
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let roots = if let Some(sources) = &self.exact_staged_part_sources {
+            match sources.get(&part.repository_path) {
+                Some((digest, size, root)) => {
+                    if digest != &part.content_digest || size != &part.size_bytes {
+                        return Err(CacheError::InvalidManifest(
+                            "staged part differs from its exact source declaration".to_owned(),
+                        ));
+                    }
+                    std::slice::from_ref(root)
+                }
+                None => &self.staged_parts_roots[..1],
+            }
+        } else {
+            &self.staged_parts_roots
+        };
         let mut observed = None;
-        for root in self.staged_parts_roots.iter().rev() {
+        for root in roots.iter().rev() {
+            let root_metadata = fs::symlink_metadata(root)?;
+            if staged_metadata_is_link(&root_metadata) || !root_metadata.is_dir() {
+                return Err(CacheError::InvalidManifest(
+                    "staged transport root must be an ordinary directory".to_owned(),
+                ));
+            }
             let mut path = root.clone();
-            path.extend(&components);
-            if path.is_file() {
+            let mut missing = false;
+            for (index, component) in components.iter().enumerate() {
+                path.push(component);
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) => {
+                        if staged_metadata_is_link(&metadata)
+                            || (index + 1 < components.len() && !metadata.is_dir())
+                            || (index + 1 == components.len() && !metadata.is_file())
+                        {
+                            return Err(CacheError::InvalidManifest(
+                                "staged transport path contains a link or invalid file type"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        missing = true;
+                        break;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if !missing {
+                let canonical_root = fs::canonicalize(root)?;
+                if !fs::canonicalize(&path)?.starts_with(&canonical_root) {
+                    return Err(CacheError::InvalidManifest(
+                        "staged transport path escaped its source root".to_owned(),
+                    ));
+                }
                 let (digest, size) = digest_file(&path)?;
                 if digest == part.content_digest && size == part.size_bytes {
                     return Ok(path);
@@ -1057,6 +1319,62 @@ impl GitCliRemoteStore {
             part.repository_path,
             self.staged_parts_roots.len()
         )))
+    }
+
+    fn read_refs(
+        &self,
+        repository: &str,
+        branches: &[&str],
+    ) -> Result<BTreeMap<String, String>, CacheError> {
+        validate_repository(repository)?;
+        let mut requested = BTreeMap::new();
+        for branch in branches {
+            validate_branch(branch)?;
+            requested.insert(format!("refs/heads/{branch}"), *branch);
+        }
+        if requested.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut arguments = vec![
+            OsString::from("ls-remote"),
+            OsString::from("--heads"),
+            OsString::from(repository),
+        ];
+        arguments.extend(requested.keys().map(OsString::from));
+        let output = run_git_network(&self.git_executable, None, arguments, &[])?;
+        let text = std::str::from_utf8(&output.stdout)
+            .map_err(|_| CacheError::Io("git ls-remote returned non-UTF8".to_owned()))?;
+        let mut revisions = BTreeMap::new();
+        for line in text.lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(revision), Some(reference), None) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                return Err(CacheError::InvalidManifest(
+                    "git ls-remote returned an invalid ref row".to_owned(),
+                ));
+            };
+            validate_revision(revision)?;
+            let branch = requested.get(reference).ok_or_else(|| {
+                CacheError::InvalidManifest("git ls-remote returned an unrequested ref".to_owned())
+            })?;
+            if revisions
+                .insert((*branch).to_owned(), revision.to_owned())
+                .is_some()
+            {
+                return Err(CacheError::InvalidManifest(
+                    "git ls-remote returned a duplicate ref".to_owned(),
+                ));
+            }
+        }
+        for branch in requested.values() {
+            if !revisions.contains_key(*branch) {
+                return Err(CacheError::NotFound(format!(
+                    "branch {branch:?} in repository {repository:?}"
+                )));
+            }
+        }
+        Ok(revisions)
     }
 
     fn hash_staged_blobs(
@@ -1721,26 +2039,10 @@ impl GitCliRemoteStore {
 
 impl RemoteGitStore for GitCliRemoteStore {
     fn read_ref(&self, repository: &str, branch: &str) -> Result<String, CacheError> {
-        validate_repository(repository)?;
-        validate_branch(branch)?;
-        let output = run_git_network(
-            &self.git_executable,
-            None,
-            [
-                OsString::from("ls-remote"),
-                OsString::from("--heads"),
-                OsString::from(repository),
-                OsString::from(format!("refs/heads/{branch}")),
-            ],
-            &[],
-        )?;
-        let line = String::from_utf8(output.stdout)
-            .map_err(|error| CacheError::Io(format!("git ls-remote returned non-UTF8: {error}")))?;
-        let revision = line.split_whitespace().next().ok_or_else(|| {
-            CacheError::NotFound(format!("branch {branch:?} in repository {repository:?}"))
-        })?;
-        validate_revision(revision)?;
-        Ok(revision.to_owned())
+        Ok(self
+            .read_refs(repository, &[branch])?
+            .remove(branch)
+            .expect("requested ref was checked"))
     }
 
     fn immutable_path_digest(
@@ -2252,11 +2554,12 @@ impl RemoteGitStore for GitCliRemoteStore {
                 validate_relative_git_path(path)?;
             }
         }
-        let mut current_heads = BTreeMap::new();
-        for commit in &request.commits {
-            let current = self.read_ref(&request.repository, &commit.branch)?;
-            current_heads.insert(commit.branch.clone(), current);
-        }
+        let branches = request
+            .commits
+            .iter()
+            .map(|commit| commit.branch.as_str())
+            .collect::<Vec<_>>();
+        let current_heads = self.read_refs(&request.repository, &branches)?;
         if request.commits.iter().any(|commit| {
             current_heads
                 .get(&commit.branch)
@@ -2289,13 +2592,7 @@ impl RemoteGitStore for GitCliRemoteStore {
         if push.status.success() {
             return Ok(AtomicCompareAndSwapResult::Committed { commit_ids });
         }
-        let mut observed = BTreeMap::new();
-        for commit in &request.commits {
-            observed.insert(
-                commit.branch.clone(),
-                self.read_ref(&request.repository, &commit.branch)?,
-            );
-        }
+        let observed = self.read_refs(&request.repository, &branches)?;
         if request.commits.iter().any(|commit| {
             observed
                 .get(&commit.branch)
@@ -3138,6 +3435,426 @@ mod tests {
     }
 
     #[test]
+    fn exact_staged_sources_route_metadata_and_reject_conflicting_declarations() {
+        let root = temporary_root("git-exact-staged-sources");
+        let metadata = root.join("metadata");
+        let archive = root.join("archive");
+        let make = || {
+            GitCliRemoteStore::new(
+                root.join("transport"),
+                &metadata,
+                "Test Publisher",
+                "test@example.invalid",
+            )
+            .unwrap()
+            .with_additional_staged_parts_roots([archive.clone()])
+            .unwrap()
+        };
+        let part = TransportPart {
+            sequence: 0,
+            repository_path: "objects/item.part".into(),
+            size_bytes: 7,
+            content_digest: ContentDigest::sha256(b"payload"),
+        };
+        let mut sidecar = part.clone();
+        sidecar.repository_path = "manifests/item.json".into();
+        for (base, relative) in [
+            (&archive, &part.repository_path),
+            (&metadata, &sidecar.repository_path),
+        ] {
+            let path = base.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"payload").unwrap();
+        }
+        let store = make()
+            .with_exact_staged_part_sources([
+                (archive.clone(), part.clone()),
+                (archive.clone(), part.clone()),
+            ])
+            .unwrap();
+        assert_eq!(
+            store.staged_part_path(&part).unwrap(),
+            archive.join(&part.repository_path)
+        );
+        assert_eq!(
+            store.staged_part_path(&sidecar).unwrap(),
+            metadata.join(&sidecar.repository_path)
+        );
+        fs::write(archive.join(&part.repository_path), b"changed").unwrap();
+        assert!(store.staged_part_path(&part).is_err());
+        let mut conflict = part.clone();
+        conflict.content_digest = ContentDigest::sha256(b"changed");
+        assert!(make()
+            .with_exact_staged_part_sources([
+                (archive.clone(), part.clone()),
+                (archive.clone(), conflict),
+            ])
+            .is_err());
+        assert!(make()
+            .with_exact_staged_part_sources([(root.join("outside"), part)])
+            .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batched_absence_is_commit_bound_and_cleared_with_session() {
+        if !test_git(None, &["--version"]) {
+            return;
+        }
+        let root = temporary_root("git-commit-bound-absence");
+        let staging = root.join("staging");
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            &staging,
+            "Test Publisher",
+            "test@example.invalid",
+        )
+        .unwrap();
+        let repository = root.join("unused.git").to_string_lossy().into_owned();
+        let session = store.ensure_session(&repository).unwrap();
+        let tree = store
+            .write_tree_batch(&session, &[BTreeMap::new()])
+            .unwrap()
+            .remove(0);
+        let seed = run_git(
+            &store.git_executable,
+            Some(&session),
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit-tree",
+                &tree,
+                "-m",
+                "seed",
+            ]
+            .map(OsString::from),
+            &[],
+        )
+        .unwrap();
+        let old = parse_single_line(&seed.stdout, "seed").unwrap();
+        assert!(test_git(
+            Some(&session),
+            &["update-ref", "refs/heads/main", &old]
+        ));
+        let part = TransportPart {
+            sequence: 0,
+            repository_path: "new.json".into(),
+            size_bytes: 7,
+            content_digest: ContentDigest::sha256(b"payload"),
+        };
+        store
+            .prefetch_present_committed_paths(
+                &repository,
+                &old,
+                &[crate::RemotePathPrefetch {
+                    repository_path: part.repository_path.clone(),
+                    maximum_bytes: 1024,
+                }],
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(store.cached_path_is_absent(&repository, &old, &part.repository_path));
+        assert_eq!(
+            store
+                .immutable_path_digest(&repository, &old, &part.repository_path)
+                .unwrap(),
+            None
+        );
+        assert!(store
+            .prefetch_committed_paths(
+                &repository,
+                &old,
+                &[crate::RemotePathPrefetch {
+                    repository_path: part.repository_path.clone(),
+                    maximum_bytes: 1024,
+                }],
+                &CancellationToken::new()
+            )
+            .is_err());
+        fs::write(staging.join(&part.repository_path), b"payload").unwrap();
+        store
+            .prepare_staged_parts(&repository, std::slice::from_ref(&part))
+            .unwrap();
+        let new = store
+            .commit_tree(
+                &session,
+                &RemoteCommitRequest {
+                    repository: repository.clone(),
+                    branch: "main".into(),
+                    expected_head: old.clone(),
+                    message: "new immutable revision".into(),
+                    parts: vec![part.clone()],
+                    delete_paths: vec![],
+                },
+            )
+            .unwrap();
+        assert_ne!(old, new);
+        assert!(test_git(
+            Some(&session),
+            &["update-ref", "refs/heads/main", &new]
+        ));
+        let current = test_git_stdout(Some(&session), &["rev-parse", "refs/heads/main"]);
+        assert_eq!(current, new);
+        assert_eq!(
+            store
+                .immutable_path_digest(&repository, &current, &part.repository_path)
+                .unwrap(),
+            Some(part.content_digest)
+        );
+        assert_eq!(
+            store
+                .immutable_path_digest(&repository, &old, &part.repository_path)
+                .unwrap(),
+            None
+        );
+        store.cleanup_session(&repository).unwrap();
+        assert!(store.resolved_blob_oids.lock().unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn immutable_absence_cache_has_a_fixed_entry_bound() {
+        let root = temporary_root("git-bounded-absence");
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            root.join("staging"),
+            "Test Publisher",
+            "test@example.invalid",
+        )
+        .unwrap();
+        for index in 0..16_400 {
+            store.remember_blob_absence("repository", "revision", &format!("path/{index}"));
+        }
+        assert_eq!(store.resolved_blob_oids.lock().unwrap().len(), 16_384);
+        store.cleanup_all_sessions().unwrap();
+        assert!(store.resolved_blob_oids.lock().unwrap().is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Offline retained-byte harness: no ref mutation, push, credentials or
+    /// remote access. Run explicitly with its study-owned fixture configuration.
+    #[test]
+    #[ignore]
+    fn retained_local_publication_benchmark() {
+        let config_path =
+            PathBuf::from(std::env::var_os("XC_PUBLICATION_BENCHMARK_CONFIG").unwrap());
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        let base = config_path.parent().unwrap();
+        let metadata = base.join(config["metadata_root"].as_str().unwrap());
+        let sources = config["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| {
+                (
+                    base.join(source["root"].as_str().unwrap()),
+                    serde_json::from_value::<TransportPart>(source["part"].clone()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let parts = config["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|part| serde_json::from_value::<TransportPart>(part.clone()).unwrap())
+            .collect::<Vec<_>>();
+        let work = PathBuf::from(std::env::var_os("XC_PUBLICATION_BENCHMARK_WORK").unwrap());
+        assert!(!work.exists());
+        let optimized = std::env::var("XC_PUBLICATION_BENCHMARK_OPTIMIZED").unwrap() == "1";
+        let wall = Instant::now();
+        let mut store =
+            GitCliRemoteStore::new(&work, &metadata, "Test Publisher", "test@example.invalid")
+                .unwrap()
+                .with_additional_staged_parts_roots(sources.iter().map(|(root, _)| root.clone()))
+                .unwrap();
+        if let Some(git) = std::env::var_os("XC_PUBLICATION_BENCHMARK_GIT") {
+            store = store.with_git_executable(git);
+        }
+        if optimized {
+            store = store.with_exact_staged_part_sources(sources).unwrap();
+        }
+        let repository = work.join("unused.git").to_string_lossy().into_owned();
+        let session = store.ensure_session(&repository).unwrap();
+        let tree = store
+            .write_tree_batch(&session, &[BTreeMap::new()])
+            .unwrap()
+            .remove(0);
+        let seed = run_git(
+            &store.git_executable,
+            Some(&session),
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit-tree",
+                &tree,
+                "-m",
+                "seed",
+            ]
+            .map(OsString::from),
+            &[],
+        )
+        .unwrap();
+        let head = parse_single_line(&seed.stdout, "seed").unwrap();
+        let checked = Instant::now();
+        if optimized {
+            let paths = parts
+                .iter()
+                .map(|part| crate::RemotePathPrefetch {
+                    repository_path: part.repository_path.clone(),
+                    maximum_bytes: crate::GITHUB_HARD_FILE_BOUNDARY_BYTES - 1,
+                })
+                .collect::<Vec<_>>();
+            for batch in paths.chunks(256) {
+                store
+                    .prefetch_present_committed_paths(
+                        &repository,
+                        &head,
+                        batch,
+                        &CancellationToken::new(),
+                    )
+                    .unwrap();
+            }
+        }
+        for part in &parts {
+            assert_eq!(
+                store
+                    .immutable_path_digest(&repository, &head, &part.repository_path)
+                    .unwrap(),
+                None
+            );
+        }
+        let check_seconds = checked.elapsed().as_secs_f64();
+        let imported = Instant::now();
+        store.prepare_staged_parts(&repository, &parts).unwrap();
+        let import_seconds = imported.elapsed().as_secs_f64();
+        let committed = Instant::now();
+        let revision = store
+            .commit_tree(
+                &session,
+                &RemoteCommitRequest {
+                    repository: repository.clone(),
+                    branch: "main".into(),
+                    expected_head: head,
+                    message: "retained local benchmark".into(),
+                    parts: parts.clone(),
+                    delete_paths: vec![],
+                },
+            )
+            .unwrap();
+        let commit_seconds = committed.elapsed().as_secs_f64();
+        let verified = Instant::now();
+        for part in &parts {
+            store
+                .verify_committed_part(&repository, &revision, part)
+                .unwrap();
+        }
+        let verify_seconds = verified.elapsed().as_secs_f64();
+        println!(
+            "PUBLICATION_BENCHMARK {}",
+            serde_json::json!({
+                "optimized":optimized,"parts":parts.len(),"bytes":parts.iter().map(|p|p.size_bytes).sum::<u64>(),
+                "file_check_seconds":check_seconds,"import_seconds":import_seconds,
+                "commit_seconds":commit_seconds,"destination_verify_seconds":verify_seconds,
+                "wall_seconds":wall.elapsed().as_secs_f64(),"pushes":0,
+            })
+        );
+        store.cleanup_all_sessions().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn original_staging_roots_reject_linked_paths_even_with_matching_bytes() {
+        use std::os::unix::fs::symlink;
+        let root = temporary_root("git-original-root-links");
+        let source = root.join("source");
+        let outside = root.join("outside");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("payload.part"), b"exact bytes").unwrap();
+        let part = TransportPart {
+            sequence: 0,
+            repository_path: "linked/payload.part".to_owned(),
+            size_bytes: 11,
+            content_digest: ContentDigest::sha256(b"exact bytes"),
+        };
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            root.join("metadata"),
+            "Test Publisher",
+            "test@example.invalid",
+        )
+        .unwrap()
+        .with_additional_staged_parts_roots([source.clone()])
+        .unwrap()
+        .with_exact_staged_part_sources([(source.clone(), part.clone())])
+        .unwrap();
+        symlink(&outside, source.join("linked")).unwrap();
+        assert!(store.staged_part_path(&part).is_err());
+        fs::remove_file(source.join("linked")).unwrap();
+        fs::create_dir(source.join("linked")).unwrap();
+        symlink(
+            outside.join("payload.part"),
+            source.join("linked/payload.part"),
+        )
+        .unwrap();
+        assert!(store.staged_part_path(&part).is_err());
+        let mut traversal = part;
+        traversal.repository_path = "../outside/payload.part".to_owned();
+        assert!(store.staged_part_path(&traversal).is_err());
+    }
+
+    #[test]
+    fn retained_sibling_transports_share_quota_without_sharing_object_databases() {
+        let root = temporary_root("git-publication-shared-quota");
+        let common = root.join("transport");
+        let resources = ResourcePolicy {
+            maximum_temporary_disk_bytes: Some(100),
+            ..ResourcePolicy::default()
+        };
+        let first = GitCliRemoteStore::new(
+            common.join("first"),
+            root.join("first-staging"),
+            "Test Publisher",
+            "test@example.invalid",
+        )
+        .unwrap()
+        .with_resource_policy(resources.clone())
+        .with_publication_disk_budget(&common, None)
+        .unwrap();
+        let second = GitCliRemoteStore::new(
+            common.join("second"),
+            root.join("second-staging"),
+            "Test Publisher",
+            "test@example.invalid",
+        )
+        .unwrap()
+        .with_resource_policy(resources)
+        .with_publication_disk_budget(&common, Some(&first))
+        .unwrap();
+        assert_ne!(first.session_path("repo"), second.session_path("repo"));
+        let held = first.enforce_transport_disk_budget(60).unwrap();
+        assert!(matches!(
+            second.enforce_transport_disk_budget(60),
+            Err(CacheError::ResourceLimit(_))
+        ));
+        drop(second.enforce_transport_disk_budget(40).unwrap());
+        drop(held);
+        fs::write(common.join("second/retained"), [0u8; 20]).unwrap();
+        first.cleanup_all_sessions().unwrap();
+        assert!(common.join("second/retained").exists());
+        assert!(matches!(
+            second.enforce_transport_disk_budget(81),
+            Err(CacheError::ResourceLimit(_))
+        ));
+        drop(second.enforce_transport_disk_budget(80).unwrap());
+    }
+
+    #[test]
     fn direct_git_transport_commits_without_a_checkout_of_the_remote() {
         if !test_git(None, &["--version"]) {
             return;
@@ -3497,6 +4214,173 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    fn check_failed_metadata_fetch_cleanup(cleanup_fails: bool) {
+        if !test_git(None, &["--version"]) {
+            return;
+        }
+        let root = temporary_root("git-failed-metadata-fetch-cleanup");
+        let remote = root.join("remote.git");
+        let seed = root.join("seed");
+        assert!(test_git(
+            None,
+            &["init", "--bare", remote.to_str().unwrap()]
+        ));
+        assert!(test_git(
+            Some(&remote),
+            &["config", "uploadpack.allowFilter", "true"]
+        ));
+        assert!(test_git(None, &["init", seed.to_str().unwrap()]));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.name", "Local Fixture"]
+        ));
+        assert!(test_git(
+            Some(&seed),
+            &["config", "user.email", "fixture@example.invalid"]
+        ));
+        fs::write(seed.join("unrequested.txt"), b"unrequested blob").unwrap();
+        assert!(test_git(Some(&seed), &["add", "."]));
+        assert!(test_git(Some(&seed), &["commit", "-m", "seed"]));
+        assert!(test_git(
+            Some(&seed),
+            &["push", remote.to_str().unwrap(), "HEAD:refs/heads/main"]
+        ));
+        let revision = test_git_stdout(Some(&seed), &["rev-parse", "HEAD"]);
+        let blob = test_git_stdout(Some(&seed), &["rev-parse", "HEAD:unrequested.txt"]);
+        let marker = root.join("fetch-count");
+        let quoted_marker = format!("'{}'", marker.to_str().unwrap().replace('\'', "'\\''"));
+        let commands = root.join("commands");
+        let quoted_commands = format!("'{}'", commands.to_str().unwrap().replace('\'', "'\\''"));
+        let fail_cleanup = root.join("fail-cleanup");
+        let quoted_fail_cleanup = format!(
+            "'{}'",
+            fail_cleanup.to_str().unwrap().replace('\'', "'\\''")
+        );
+        if cleanup_fails {
+            fs::write(&fail_cleanup, b"fail").unwrap();
+        }
+        let wrapper = root.join("post-fetch-failure.sh");
+        install_script(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\nset -e\nprintf '%s\\n' \"$*\" >> {quoted_commands}\nfor arg in \"$@\"; do\n \
+                 if [ \"$arg\" = config ] && [ -e {quoted_fail_cleanup} ]; then\n \
+                  echo 'simulated config cleanup failure' >&2\n  exit 48\n fi\n \
+                 if [ \"$arg\" = fetch ]; then\n  git \"$@\"\n  \
+                 printf 'fetch\\n' >> {quoted_marker}\n  \
+                 echo 'simulated post-metadata-fetch failure' >&2\n  exit 47\n fi\ndone\nexec git \"$@\"\n"
+            ),
+        );
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            root.join("staging"),
+            "Local Fixture",
+            "fixture@example.invalid",
+        )
+        .unwrap()
+        .with_git_executable(wrapper.into_os_string());
+        let repository = local_file_url(&remote);
+        let error = store.fetch_revision(&repository, &revision).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("simulated post-metadata-fetch failure"));
+        let session = store.session_path(&repository);
+        assert!(test_git(
+            Some(&session),
+            &["cat-file", "-e", &format!("{revision}^{{commit}}")]
+        ));
+        if cleanup_fails {
+            assert!(error
+                .to_string()
+                .contains("simulated config cleanup failure"));
+            assert!(test_git(
+                Some(&session),
+                &["config", "--get", "remote.origin.promisor"]
+            ));
+            fs::remove_file(&fail_cleanup).unwrap();
+            let before = fs::read(&commands).unwrap();
+            let refused = store.fetch_revision(&repository, &revision).unwrap_err();
+            assert!(refused
+                .to_string()
+                .contains("explicit session cleanup is required"));
+            store.remember_blob_object(
+                &repository,
+                &revision,
+                "unrequested.txt",
+                ResolvedBlobObject {
+                    object_id: blob.clone(),
+                    size_bytes: Some(16),
+                },
+            );
+            let refused = store
+                .resolve_blob_object(&repository, &revision, "unrequested.txt")
+                .unwrap_err();
+            assert!(refused
+                .to_string()
+                .contains("explicit session cleanup is required"));
+            assert_eq!(
+                fs::read(&commands).unwrap(),
+                before,
+                "refused session invoked Git"
+            );
+            store.cleanup_session(&repository).unwrap();
+            // Explicit cleanup permits a fresh session; the injected fetch
+            // error remains visible, but its now-successful cleanup runs.
+            let error = store.fetch_revision(&repository, &revision).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("simulated post-metadata-fetch failure"));
+            assert!(!test_git(
+                Some(&session),
+                &["config", "--get", "remote.origin.promisor"]
+            ));
+            store.cleanup_all_sessions().unwrap();
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+        for key in ["remote.origin.promisor", "remote.origin.partialclonefilter"] {
+            assert!(
+                !test_git(Some(&session), &["config", "--get", key]),
+                "failed metadata fetch retained {key}"
+            );
+        }
+        let before = fs::read_to_string(&commands).unwrap().lines().count();
+        assert_eq!(
+            store.fetch_revision(&repository, &revision).unwrap(),
+            session
+        );
+        assert_eq!(
+            fs::read_to_string(&commands).unwrap().lines().count(),
+            before + 1,
+            "local commit fast path must only check the commit, without config subprocesses"
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "fetch\n");
+        for key in ["remote.origin.promisor", "remote.origin.partialclonefilter"] {
+            assert!(!test_git(Some(&session), &["config", "--get", key]));
+        }
+        // No GIT_NO_LAZY_FETCH assumption: absent config must keep an ordinary
+        // blob lookup from silently hydrating the filtered-out input.
+        assert!(!test_git(
+            Some(&session),
+            &["cat-file", "-e", &format!("{blob}^{{blob}}")]
+        ));
+        store.cleanup_all_sessions().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_metadata_fetch_clears_promisor_state_and_local_commit_fast_path() {
+        check_failed_metadata_fetch_cleanup(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_metadata_fetch_cleanup_refuses_session_until_explicit_cleanup() {
+        check_failed_metadata_fetch_cleanup(true);
+    }
+
     #[test]
     fn present_path_prefetch_skips_absent_paths_and_hydrates_the_rest_in_one_fetch() {
         if !test_git(None, &["--version"]) {
@@ -3659,6 +4543,90 @@ mod tests {
         ));
         let revision = test_git_stdout(Some(&seed), &["rev-parse", "HEAD"]);
         (local_file_url(&remote), revision, part_path)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn batched_refs_use_one_negotiation_and_observe_new_heads() {
+        if !test_git(None, &["--version"]) {
+            return;
+        }
+        let root = temporary_root("git-batched-refs");
+        let (repository, head, _) = seeded_remote(&root, "refs", b"payload");
+        let bare = root.join("refs.git");
+        assert!(test_git(
+            Some(&bare),
+            &["update-ref", "refs/heads/coordination", &head]
+        ));
+        let log = root.join("ref-calls");
+        let wrapper = root.join("count-refs.sh");
+        let quoted = format!("'{}'", log.to_str().unwrap().replace('\'', "'\\''"));
+        install_script(&wrapper, &format!(
+            "#!/bin/sh\nset -e\nif [ \"$1\" = ls-remote ]; then printf 'call\\n' >> {quoted}; fi\nexec git \"$@\"\n"
+        ));
+        let store = GitCliRemoteStore::new(
+            root.join("transport"),
+            root.join("staging"),
+            "Test Publisher",
+            "test@example.invalid",
+        )
+        .unwrap()
+        .with_git_executable(wrapper.into_os_string());
+        let refs = store
+            .read_refs(&repository, &["main", "coordination"])
+            .unwrap();
+        assert_eq!(refs["main"], head);
+        assert_eq!(refs["coordination"], head);
+        assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+        let seed = root.join("refs-seed");
+        assert!(test_git(
+            Some(&seed),
+            &["commit", "--allow-empty", "-m", "advance"]
+        ));
+        let advanced = test_git_stdout(Some(&seed), &["rev-parse", "HEAD"]);
+        assert!(test_git(
+            Some(&seed),
+            &["push", "origin", "HEAD:refs/heads/coordination"]
+        ));
+        let refs = store
+            .read_refs(&repository, &["main", "coordination"])
+            .unwrap();
+        assert_eq!(refs["main"], head);
+        assert_eq!(refs["coordination"], advanced);
+        assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 2);
+        assert!(matches!(
+            store.read_refs(&repository, &["main", "missing"]),
+            Err(CacheError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn batched_refs_reject_unrequested_duplicate_and_malformed_rows() {
+        let root = temporary_root("git-batched-refs-invalid");
+        let head = "0123456789abcdef0123456789abcdef01234567";
+        for (index, rows) in [
+            format!("{head}\\trefs/heads/unrequested\\n"),
+            format!("{head}\\trefs/heads/main\\n{head}\\trefs/heads/main\\n"),
+            format!("{head}\\trefs/heads/main extra\\n"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let wrapper = root.join(format!("invalid-{index}.sh"));
+            install_script(&wrapper, &format!("#!/bin/sh\nprintf '{rows}'\n"));
+            let store = GitCliRemoteStore::new(
+                root.join(format!("transport-{index}")),
+                root.join("staging"),
+                "Test Publisher",
+                "test@example.invalid",
+            )
+            .unwrap()
+            .with_git_executable(wrapper.into_os_string());
+            assert!(store
+                .read_refs(root.join("remote.git").to_str().unwrap(), &["main"])
+                .is_err());
+        }
     }
 
     #[test]
@@ -4586,10 +5554,12 @@ mod tests {
         install_script(&wrapper,&format!("#!/bin/sh\nset -e\nfor arg in \"$@\"; do\n  if [ \"$arg\" = push ]; then\n    git -C {quoted_remote} {mutation}\n    break\n  fi\ndone\nexec git \"$@\"\n"));
         let store = GitCliRemoteStore::new(
             root.join("transport"),
-            &staging,
+            root.join("metadata"),
             "Local Audit",
             "audit@example.invalid",
         )
+        .unwrap()
+        .with_additional_staged_parts_roots([staging.clone()])
         .unwrap()
         .with_git_executable(wrapper.into_os_string());
         let repository = remote.to_str().unwrap().to_owned();
@@ -4675,10 +5645,12 @@ mod tests {
         install_script(&wrapper,&format!("#!/bin/sh\nset -e\nfor arg in \"$@\"; do\n if [ \"$arg\" = hash-object ]; then\n  printf '%s' '{replacement}' > {quoted}\n  break\n fi\ndone\nexec git \"$@\"\n"));
         let store = GitCliRemoteStore::new(
             root.join("transport"),
-            &staging,
+            root.join("metadata"),
             "Local Audit",
             "audit@example.invalid",
         )
+        .unwrap()
+        .with_additional_staged_parts_roots([staging.clone()])
         .unwrap()
         .with_git_executable(wrapper.into_os_string());
         let part = TransportPart {

@@ -2228,7 +2228,11 @@ pub mod hp {
     }
 
     fn retained_decimal(value: &Float, prec: u32) -> String {
-        Float::with_val(prec, value).to_string()
+        xc_numerics::fmt::decimal_string_round(
+            &Float::with_val(prec, value),
+            None,
+            rug::float::Round::Nearest,
+        )
     }
 
     pub(crate) fn decimal(value: &Float, prec: u32) -> String {
@@ -2881,14 +2885,8 @@ pub mod hp {
                 discarded_one_sided_l1: decimal(&one_sided_l1, precision_bits),
                 // Both accumulation and serialization round outward. Ordinary
                 // decimal formatting can make an upper bound too small.
-                discarded_cosine_pointwise_bound: Float::with_val_round(
-                    precision_bits,
-                    &pointwise_bound,
-                    Round::Up,
-                )
-                .0
-                .to_string_radix_round(
-                    10,
+                discarded_cosine_pointwise_bound: xc_numerics::fmt::decimal_string_round(
+                    &Float::with_val_round(precision_bits, &pointwise_bound, Round::Up).0,
                     Some(
                         2 + (f64::from(precision_bits) * std::f64::consts::LOG10_2).ceil() as usize,
                     ),

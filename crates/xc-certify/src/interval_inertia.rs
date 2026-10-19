@@ -56,9 +56,9 @@ fn inertia_route(
             .collect()
     };
     let result = if stable {
-        symmetric_inertia::inertia_stable(&matrix, n, p)?
+        symmetric_inertia::inertia_stable_owned(matrix, n, p)?
     } else {
-        symmetric_inertia::inertia(&matrix, n, p)?
+        symmetric_inertia::inertia_owned(matrix, n, p)?
     };
     Ok(match result {
         MpfrInertiaResult::Conclusive {

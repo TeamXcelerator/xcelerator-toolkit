@@ -61,7 +61,7 @@ fn exact_quadrant(node: &Float, n: usize) -> Result<Option<usize>> {
         None
     })
 }
-fn integral(n: usize, l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Result<[I; 3]> {
+fn validate_table(nodes: &[Float], weights: &[Float]) -> Result<()> {
     if nodes.len() != weights.len()
         || nodes.is_empty()
         || nodes.len() > 1_000_000
@@ -70,6 +70,10 @@ fn integral(n: usize, l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Resu
     {
         bail!("invalid stored u-flow quadrature rule");
     }
+    Ok(())
+}
+fn integral(n: usize, l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Result<[I; 3]> {
+    validate_table(nodes, weights)?;
     let one = I::from_i64(1, p);
     let two = I::from_i64(2, p);
     let half = I::point(Float::with_val(p, 0.5));
@@ -118,6 +122,100 @@ fn integral(n: usize, l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Resu
             .add(&one.div(&two.mul(&sinh(l)?))?),
     ])
 }
+struct IntegrandFactors {
+    h: I,
+    weight: I,
+    combined: I,
+    decay_difference: I,
+    gamma_offset: I,
+}
+struct SharedRule {
+    factors: Vec<IntegrandFactors>,
+    one: I,
+    two: I,
+    half: I,
+    pi: I,
+    gamma_tail: I,
+    _reservation: xc_core::MemoryReservation,
+}
+fn shared_rule_bytes(points: usize, p: u32) -> u128 {
+    // Five intervals per node, four scalar intervals and the final tail.
+    (points as u128 * 10 + 16) * (u128::from(p).div_ceil(8) + 96)
+}
+fn prepare_shared_rule(l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Result<SharedRule> {
+    validate_table(nodes, weights)?;
+    let reservation = prime_response_kernel::reserve_optional(shared_rule_bytes(nodes.len(), p))
+        .ok_or_else(|| anyhow::anyhow!("optional u-flow rule sharing unavailable"))?;
+    let one = I::from_i64(1, p);
+    let two = I::from_i64(2, p);
+    let half = I::point(Float::with_val(p, 0.5));
+    let pi = I::pi(p);
+    let factors = nodes
+        .iter()
+        .zip(weights)
+        .map(|(node, weight)| -> Result<_> {
+            let h = I::from_float(node, p)?.add(&one).mul(&half);
+            let x = l.mul(&h);
+            let e = x.mul(&half).neg().exp();
+            let rho = e.div(&exp_m1(&x.mul(&two).neg())?.neg())?;
+            let coth = one.add(&two.div(&exp_m1(&x.mul(&two))?)?);
+            let combined = rho.mul(&one.add(&x.mul(&half.sub(&coth))));
+            Ok(IntegrandFactors {
+                h,
+                weight: I::from_float(weight, p)?,
+                combined,
+                decay_difference: exp_m1(&x.mul(&half).neg())?,
+                gamma_offset: x.mul(&e).mul(&rho).mul(&half),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let gamma_tail = one.div(&two.mul(&sinh(l)?))?;
+    Ok(SharedRule {
+        factors,
+        one,
+        two,
+        half,
+        pi,
+        gamma_tail,
+        _reservation: reservation,
+    })
+}
+fn integral_shared(n: usize, nodes: &[Float], rule: &SharedRule, p: u32) -> Result<[I; 3]> {
+    let SharedRule {
+        one, two, half, pi, ..
+    } = rule;
+    let mut alpha = Vec::with_capacity(nodes.len());
+    let mut beta = Vec::with_capacity(nodes.len());
+    let mut gamma = Vec::with_capacity(nodes.len());
+    for (node, factor) in nodes.iter().zip(&rule.factors) {
+        let phase = pi.mul(&I::from_u64((2 * n) as u64, p)).mul(&factor.h);
+        let quadrant = exact_quadrant(node, n)?;
+        let (sin, cos, difference_cos) = if let Some(q) = quadrant {
+            let cos = I::from_i64([1, 0, -1, 0][q], p);
+            (I::from_i64([0, 1, 0, -1][q], p), cos.clone(), cos.sub(one))
+        } else {
+            (
+                phase.sin(),
+                phase.cos(),
+                phase.mul(half).sin().square().mul(two).neg(),
+            )
+        };
+        alpha.push(factor.weight.mul(&sin).mul(&factor.combined));
+        beta.push(factor.weight.mul(&factor.h).mul(&cos).mul(&factor.combined));
+        let difference = difference_cos.sub(&factor.decay_difference);
+        gamma.push(
+            factor
+                .weight
+                .mul(&difference.mul(&factor.combined).add(&factor.gamma_offset)),
+        );
+    }
+    Ok([
+        sum(&alpha, p)?.div(&two.mul(pi))?,
+        sum(&beta, p)?.mul(half),
+        sum(&gamma, p)?.mul(half).add(&rule.gamma_tail),
+    ])
+}
+#[cfg(test)]
 fn arch_coefficients(v: &[Rational], n: usize, row: usize) -> (Vec<Rational>, Rational) {
     let a = row as i64 - n as i64;
     let mut alpha = vec![Rational::from(0); n + 1];
@@ -207,6 +305,15 @@ pub(super) fn evaluate(
     l: &Float,
     vector: &[Float],
 ) -> Result<UFlowVelocityActions> {
+    evaluate_with_reuse(params, cfg, l, vector, true)
+}
+fn evaluate_with_reuse(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    vector: &[Float],
+    reuse: bool,
+) -> Result<UFlowVelocityActions> {
     let p = cfg.precision_bits;
     let n = params.n_modes;
     if !(64..=995_904).contains(&p)
@@ -242,7 +349,8 @@ pub(super) fn evaluate(
         * rayon::current_num_threads().min(n + 1) as u128
         * (u128::from(base + 4096).div_ceil(8) + 96)
         * 16;
-    if bytes + scratch > super::source_working_budget()? {
+    let budget = super::source_working_budget()?;
+    if bytes + scratch > budget {
         bail!("u-flow exceeds the declared workspace budget");
     }
     let plan = xc_numerics::hp_runtime::plan_gl_precompute(&unique, p);
@@ -267,27 +375,66 @@ pub(super) fn evaluate(
         .iter()
         .map(|v| scale_float(v, -exponent, base))
         .collect::<Result<Vec<_>>>()?;
-    crate::ccm::certified_roots::boundary::rational_budget(normalized.iter(), normalized.len())?;
-    let exact = normalized
-        .iter()
-        .map(|v| v.to_rational().expect("finite validated source"))
-        .collect::<Vec<_>>();
+    let exact = crate::ccm::certified_roots::boundary::response_points(
+        &normalized,
+        n,
+        rayon::current_num_threads(),
+        bytes + scratch,
+        budget,
+    )?;
     let events = super::super::try_prime_powers_up_to(params.lambda_sq_int())?;
+    // Exact preparation is independent of the guard precision and prime event.
+    // Keep the previous path if the extra preparation cannot be admitted.
+    let prime_scratch = prime_response_kernel::workspace_bytes(vector.len(), base + 4096, true);
+    let coefficient_source = prime_response_kernel::CoefficientSource::new(
+        &exact.values,
+        n,
+        if reuse {
+            budget.saturating_sub(bytes + scratch + prime_scratch + exact.workspace_bytes)
+        } else {
+            0
+        },
+    );
+    // The order formula has one repeated prefix, then strictly increasing
+    // orders. Sharing only that prefix bounds storage to one rule per guard.
+    let shared_order = orders
+        .first()
+        .copied()
+        .filter(|order| reuse && orders.iter().filter(|v| *v == order).count() > 1);
     for guard in [64, 128, 256, 512, 1024, 2048, 4096] {
         let work = base + guard;
         let length = I::from_float(l, work)?;
+        let shared = shared_order.and_then(|order| {
+            let required = shared_rule_bytes(order, work);
+            if required > (64u128 << 20)
+                || required
+                    > budget.saturating_sub(bytes + scratch + coefficient_source.storage_bytes())
+            {
+                return None;
+            }
+            let (nodes, weights) = &tables[&order];
+            // A preparation error follows the original mode/node path so its
+            // existing failure order is preserved rather than reordered.
+            prepare_shared_rule(&length, nodes, weights, work).ok()
+        });
         let integrals = (0..=n)
             .into_par_iter()
             .map(|mode| {
                 let (nodes, weights) = &tables[&orders[mode]];
+                if shared_order == Some(orders[mode]) {
+                    if let Some(rule) = &shared {
+                        return integral_shared(mode, nodes, rule, work);
+                    }
+                }
                 integral(mode, &length, nodes, weights, work)
             })
             .collect::<Result<Vec<_>>>()?;
-        let poles = pole(&exact, n, &length, work)?;
+        drop(shared);
+        let poles = pole(&exact.values, n, &length, work)?;
         let arches = (0..vector.len())
             .into_par_iter()
             .map(|row| -> Result<I> {
-                let (coeff, diag) = arch_coefficients(&exact, n, row);
+                let (coeff, diag) = coefficient_source.arch_coefficients(row);
                 let mut terms = coeff
                     .iter()
                     .zip(&integrals)
@@ -301,8 +448,16 @@ pub(super) fn evaluate(
             .collect::<Result<Vec<_>>>()?;
         let mut primes = vec![I::from_i64(0, work); vector.len()];
         for &(power, prime, _) in &events {
-            let action =
-                prime_response_kernel::evaluate(n, power, prime, l, &normalized, work, true)?;
+            let action = prime_response_kernel::evaluate_prepared(
+                n,
+                power,
+                prime,
+                l,
+                &normalized,
+                work,
+                true,
+                &coefficient_source,
+            )?;
             for (value, term) in primes.iter_mut().zip(action.action) {
                 *value = value.add(&rounding_enclosure(term)?);
             }
@@ -345,6 +500,190 @@ pub(super) fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "supervised shared-integrand measurement; not claim-scale qualification"]
+    fn measure_uflow_shared_rule_kernel() {
+        use std::{hint::black_box, time::Instant};
+        let resources = xc_core::RunResources::new(1 << 28).unwrap();
+        let _scope = resources.enter();
+        let (modes, points, p) = (16, 65, 512);
+        let (nodes, weights) = xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
+            points,
+            p,
+            xc_numerics::quadrature::CacheMode::Off,
+            xc_numerics::hp_runtime::plan_gl_precompute(&[points], p).root_schedule(points),
+        )
+        .unwrap();
+        let l = I::from_i64(3, p);
+        let scalar_bits = |values: &[I; 3]| {
+            values
+                .iter()
+                .flat_map(|v| [v.lower(), v.upper()])
+                .map(|v| {
+                    (
+                        xc_numerics::prefix::lossless_decimal(v),
+                        v.prec(),
+                        v.is_sign_negative(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let shared = prepare_shared_rule(&l, &nodes, &weights, p).unwrap();
+        for mode in 0..=modes {
+            assert_eq!(
+                scalar_bits(&integral(mode, &l, &nodes, &weights, p).unwrap()),
+                scalar_bits(&integral_shared(mode, &nodes, &shared, p).unwrap())
+            );
+        }
+        drop(shared);
+        let mut times = [Vec::new(), Vec::new()];
+        for repetition in 0..5 {
+            for route in if repetition % 2 == 0 { [0, 1] } else { [1, 0] } {
+                let started = Instant::now();
+                let shared =
+                    (route == 1).then(|| prepare_shared_rule(&l, &nodes, &weights, p).unwrap());
+                for mode in 0..=modes {
+                    black_box(
+                        if let Some(shared) = &shared {
+                            integral_shared(mode, &nodes, shared, p)
+                        } else {
+                            integral(mode, &l, &nodes, &weights, p)
+                        }
+                        .unwrap(),
+                    );
+                }
+                times[route].push(started.elapsed().as_secs_f64());
+            }
+        }
+        for values in &mut times {
+            values.sort_by(f64::total_cmp);
+        }
+        println!("Directed integral kernel only: modes={modes}, points={points}, p={p}, trials=5; original/current median {:.6}/{:.6}s; shared preparation included, table generation excluded; exact endpoint equality checked; not a claim-scale speed estimate", times[0][2], times[1][2]);
+    }
+    fn channel_bits(action: &UFlowVelocityActions) -> Vec<(String, u32, bool)> {
+        [
+            &action.tau_pole,
+            &action.tau_archimedean,
+            &action.tau_prime,
+            &action.tau_total,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|v| {
+            (
+                xc_numerics::prefix::lossless_decimal(v),
+                v.prec(),
+                v.is_sign_negative(),
+            )
+        })
+        .collect()
+    }
+    #[test]
+    fn capacity_uflow_full_actions_match_original_with_admitted_exact_source() {
+        let resources = xc_core::RunResources::new(1 << 30).unwrap();
+        let _scope = resources.enter();
+        for p in [64, 128] {
+            let mut cfg = HighPrecConfig::for_decimal_digits(20);
+            cfg.precision_bits = p;
+            cfg.quad_points = 96;
+            cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+            let params = CcmParams::from_lambda_sq_integer(3, 1);
+            let l = Float::with_val(p, 3);
+            for values in [[2, -3, 1], [1, 0, -1], [0, 0, 0]] {
+                let vector = values.map(|v| Float::with_val(p, v));
+                let original = evaluate_with_reuse(&params, &cfg, &l, &vector, false).unwrap();
+                let reused = evaluate(&params, &cfg, &l, &vector).unwrap();
+                assert_eq!(channel_bits(&reused), channel_bits(&original));
+                assert_eq!(resources.usage().retained_bytes, 0);
+                assert_eq!(resources.usage().working_bytes, 0);
+                assert!(resources.usage().peak_bytes > 0);
+                let occupied = resources.try_reserve_retained((1 << 30) - 1).unwrap();
+                let before = resources.usage();
+                let error = evaluate(&params, &cfg, &l, &vector).err().unwrap();
+                assert!(format!("{error:#}").contains("run memory budget exceeded"));
+                assert_eq!(resources.usage(), before);
+                drop(occupied);
+            }
+        }
+    }
+    #[test]
+    fn uflow_shared_rule_reservation_denial_releases_all_optional_storage() {
+        let resources = xc_core::RunResources::new(1 << 20).unwrap();
+        let _scope = resources.enter();
+        let p = 128;
+        let l = I::from_i64(3, p);
+        let nodes = [-0.5, 0.0, 0.5].map(|v| Float::with_val(p, v));
+        let weights = [1, 2, 1].map(|v| Float::with_val(p, v));
+        {
+            let _rule = prepare_shared_rule(&l, &nodes, &weights, p).unwrap();
+            assert_eq!(
+                u128::from(resources.usage().retained_bytes),
+                shared_rule_bytes(nodes.len(), p)
+            );
+        }
+        assert_eq!(resources.usage().retained_bytes, 0);
+        let _occupied = resources.try_reserve_retained((1 << 20) - 1).unwrap();
+        assert!(prepare_shared_rule(&l, &nodes, &weights, p).is_err());
+        assert_eq!(resources.usage().retained_bytes, (1 << 20) - 1);
+    }
+    #[test]
+    fn uflow_shared_rule_matches_original_interval_endpoints_across_guards() {
+        let resources = xc_core::RunResources::new(1 << 30).unwrap();
+        let _scope = resources.enter();
+        for source_precision in [64, 128] {
+            let mut nodes = [-0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75]
+                .map(|x| Float::with_val(source_precision, x))
+                .to_vec();
+            nodes.push(Float::with_val(source_precision, 1) >> 400u32);
+            nodes.push(-Float::with_val(source_precision, 1) >> 400u32);
+            let weights = (0..nodes.len())
+                .map(|i| Float::with_val(source_precision, i + 1) / 16u32)
+                .collect::<Vec<_>>();
+            for guard in [64, 128, 256] {
+                let work = source_precision + guard;
+                for length in [1, 3] {
+                    let l = I::from_i64(length, work);
+                    let shared = prepare_shared_rule(&l, &nodes, &weights, work).unwrap();
+                    for mode in 0..=4 {
+                        let expected = integral(mode, &l, &nodes, &weights, work).unwrap();
+                        let actual = integral_shared(mode, &nodes, &shared, work).unwrap();
+                        for (actual, expected) in actual.iter().zip(&expected) {
+                            for (a, b) in [
+                                (actual.lower(), expected.lower()),
+                                (actual.upper(), expected.upper()),
+                            ] {
+                                assert_eq!(a, b, "p={source_precision},guard={guard},mode={mode}");
+                                assert_eq!(a.prec(), b.prec());
+                                assert_eq!(a.is_sign_negative(), b.is_sign_negative());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uflow_compact_arch_coefficients_match_original_exact_rows() {
+        let resources = xc_core::RunResources::new(1 << 30).unwrap();
+        let _scope = resources.enter();
+        for modes in 0..=8 {
+            let exact = (0..2 * modes + 1)
+                .map(|k| Rational::from(((k as i32 - 5) * (k as i32 + 1), 1u32 << k)))
+                .collect::<Vec<_>>();
+            let prepared =
+                prime_response_kernel::CoefficientSource::new(&exact, modes, 1u128 << 30);
+            let fallback = prime_response_kernel::CoefficientSource::new(&exact, modes, 0);
+            assert!(prepared.storage_bytes() > 0);
+            assert_eq!(fallback.storage_bytes(), 0);
+            for row in 0..exact.len() {
+                let expected = arch_coefficients(&exact, modes, row);
+                assert_eq!(prepared.arch_coefficients(row), expected);
+                assert_eq!(fallback.arch_coefficients(row), expected);
+            }
+        }
+    }
+
     #[test]
     fn uflow_directed_quadrature_matches_independent_derivative_rule() {
         for p in [64, 128, 256] {

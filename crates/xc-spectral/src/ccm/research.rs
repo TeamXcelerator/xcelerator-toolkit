@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use xc_cache::ContentDigest;
 use xc_numerics::mpfr_interval::MpfrInterval;
 
+fn report_decimal(value: &Float) -> String {
+    xc_numerics::fmt::decimal_string_round(value, None, rug::float::Round::Nearest)
+}
+
 #[cfg(test)]
 use super::prime_powers_up_to;
 #[path = "research_exact.rs"]
@@ -223,6 +227,11 @@ pub struct ResearchAssemblyIdentity {
     pub quadrature_orders: Vec<usize>,
     #[serde(default)]
     pub quadrature_policy: QuadraturePolicy,
+    #[serde(
+        default,
+        skip_serializing_if = "xc_numerics::quadrature::GaussLegendreGenerator::is_legacy"
+    )]
+    pub quadrature_generator: xc_numerics::quadrature::GaussLegendreGenerator,
     pub assurance: String,
 }
 
@@ -236,11 +245,7 @@ impl ResearchMatrixHp {
     /// Bind a locally retained experiment to both its route and actual values.
     /// This digest is deliberately not a legacy managed Tau semantic key.
     pub fn content_digest(&self) -> Result<ContentDigest> {
-        let values = self
-            .entries
-            .iter()
-            .map(|v| v.to_string_radix(10, None))
-            .collect::<Vec<_>>();
+        let values = self.entries.iter().map(report_decimal).collect::<Vec<_>>();
         Ok(ContentDigest::sha256(&serde_json::to_vec(&(
             &self.identity,
             values,
@@ -453,10 +458,7 @@ fn validate_symmetric_matrix(
 }
 
 fn matrix_digest(matrix: &[Float], dimension: usize, p: u32) -> Result<ContentDigest> {
-    let values = matrix
-        .iter()
-        .map(|v| v.to_string_radix(10, None))
-        .collect::<Vec<_>>();
+    let values = matrix.iter().map(report_decimal).collect::<Vec<_>>();
     Ok(ContentDigest::sha256(&serde_json::to_vec(&(
         dimension, p, values,
     ))?))
@@ -541,11 +543,11 @@ fn schur_report(
         smaller_matrix_digest: small_digest,
         larger_matrix_digest: large_digest,
         prefix_within_tolerance: values.defect <= tolerance_q,
-        prefix_maximum_absolute_defect: exact::output(&values.defect, p)?.to_string_radix(10, None),
-        requested_prefix_tolerance: tolerance.to_string_radix(10, None),
-        shift: shift.to_string_radix(10, None),
-        border_norm: exact::sqrt(&values.border_squared, p)?.to_string_radix(10, None),
-        schur_complement: exact::output(&values.value, p)?.to_string_radix(10, None),
+        prefix_maximum_absolute_defect: report_decimal(&exact::output(&values.defect, p)?),
+        requested_prefix_tolerance: report_decimal(tolerance),
+        shift: report_decimal(shift),
+        border_norm: report_decimal(&exact::sqrt(&values.border_squared, p)?),
+        schur_complement: report_decimal(&exact::output(&values.value, p)?),
         solve_relative_residual: "0".into(),
         schur_uses_actual_larger_prefix: true,
         assurance: "exact_stored_point_schur_correctly_rounded_not_a_positivity_certificate".into(),
@@ -626,8 +628,8 @@ pub fn analyze_nested_gram_schur_hp(
     let tolerance = exact::point(prefix_tolerance, p)?;
     report.prefix_within_tolerance = defects.iter().all(|d| d <= &tolerance);
     report.generalized_prefix_defects = Some([
-        exact::output(&defects[0], p)?.to_string_radix(10, None),
-        exact::output(&defects[1], p)?.to_string_radix(10, None),
+        report_decimal(&exact::output(&defects[0], p)?),
+        report_decimal(&exact::output(&defects[1], p)?),
     ]);
     report.generalized_input_digests = Some([
         matrix_digest(small_a, smaller_dimension, p)?,
@@ -695,20 +697,16 @@ pub fn analyze_root_transfer_hp(
         } else {
             at_target.value.abs() / at_target.absolute_sum
         };
-        target_residual = Some(exact::output(&residual, p)?.to_string_radix(10, None));
+        target_residual = Some(report_decimal(&exact::output(&residual, p)?));
         let displacement = target - &old;
-        observed = Some(exact::output(&displacement, p)?.to_string_radix(10, None));
-        prediction_error =
-            Some(exact::output(&(displacement - &prediction), p)?.to_string_radix(10, None));
+        observed = Some(report_decimal(&exact::output(&displacement, p)?));
+        prediction_error = Some(report_decimal(&exact::output(
+            &(displacement - &prediction),
+            p,
+        )?));
     }
-    let encoded_weights = new_weights
-        .iter()
-        .map(|v| v.to_string_radix(10, None))
-        .collect::<Vec<_>>();
-    let encoded_poles = poles
-        .iter()
-        .map(|v| v.to_string_radix(10, None))
-        .collect::<Vec<_>>();
+    let encoded_weights = new_weights.iter().map(report_decimal).collect::<Vec<_>>();
+    let encoded_poles = poles.iter().map(report_decimal).collect::<Vec<_>>();
     Ok(RootTransferReport {
         schema_version: 2,
         arithmetic: FINITE_DIAGNOSTIC_ARITHMETIC.into(),
@@ -718,11 +716,11 @@ pub fn analyze_root_transfer_hp(
             encoded_weights,
             encoded_poles,
         ))?),
-        expansion_point: old_root.to_string_radix(10, None),
-        function_value: exact::output(&source.value, p)?.to_string_radix(10, None),
-        derivative: exact::output(&source.derivative, p)?.to_string_radix(10, None),
-        nearest_pole_distance: exact::output(&source.nearest, p)?.to_string_radix(10, None),
-        predicted_displacement: exact::output(&prediction, p)?.to_string_radix(10, None),
+        expansion_point: report_decimal(old_root),
+        function_value: report_decimal(&exact::output(&source.value, p)?),
+        derivative: report_decimal(&exact::output(&source.derivative, p)?),
+        nearest_pole_distance: report_decimal(&exact::output(&source.nearest, p)?),
+        predicted_displacement: report_decimal(&exact::output(&prediction, p)?),
         predicted_step_crosses_pole: crosses,
         observed_displacement: observed,
         displacement_prediction_error: prediction_error,

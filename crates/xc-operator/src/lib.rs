@@ -83,9 +83,11 @@ impl Display for OperatorError {
 impl Error for OperatorError {}
 
 /// Absolute error contract for one operator application.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ApplicationErrorBound<S> {
     /// No approximation bound has been established by this implementation.
+    #[default]
     Unknown,
     /// The action is exact up to arithmetic in its declared scalar backend.
     Exact,

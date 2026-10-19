@@ -1298,13 +1298,11 @@ fn polynomial_root_row(
     let digits = Some((u64::from(root.precision()) * 30103 / 100000 + 10) as usize);
     r.values.insert(
         "rounded_polynomial_root_lower".into(),
-        root.lower()
-            .to_string_radix_round(10, digits, rug::float::Round::Down),
+        xc_numerics::fmt::decimal_string_round(root.lower(), digits, rug::float::Round::Down),
     );
     r.values.insert(
         "rounded_polynomial_root_upper".into(),
-        root.upper()
-            .to_string_radix_round(10, digits, rug::float::Round::Up),
+        xc_numerics::fmt::decimal_string_round(root.upper(), digits, rug::float::Round::Up),
     );
     Ok(r)
 }

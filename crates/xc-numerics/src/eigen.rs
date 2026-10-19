@@ -1337,6 +1337,7 @@ pub fn assess_symmetric_reduction_hp(
     q: &[Float],
     prec: u32,
 ) -> Result<xc_core::SymmetricReductionDiagnostics<Float>> {
+    crate::mpfr_interval::ensure_uniform_exponent_range()?;
     let n = diag.len();
     validate_stable_symmetric_input(a, n, prec)?;
     if off_diag.len() != n - 1
@@ -1494,6 +1495,7 @@ fn householder_tridiag_hp_route(
     prec: u32,
     accumulate_q: bool,
 ) -> Result<(Vec<Float>, Vec<Float>, Vec<Float>)> {
+    crate::mpfr_interval::ensure_uniform_exponent_range()?;
     if n == 0 || n.checked_mul(n) != Some(a.len()) {
         return Err(anyhow!("invalid Householder matrix dimension or length"));
     }

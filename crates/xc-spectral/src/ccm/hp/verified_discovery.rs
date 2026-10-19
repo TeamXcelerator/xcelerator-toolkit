@@ -85,6 +85,11 @@ fn exact_isolation(
     if coefficients.len() > 129 || work > 16_384 {
         bail!("large exact discovery requires the Arb feature");
     }
+    let count =
+        xc_numerics::interval::exact_sturm_root_count(coefficients, lower.clone(), upper.clone())?;
+    if !count.square_free {
+        bail!("exact discovery has unresolved repeated roots");
+    }
     let width = (upper.clone() - lower) / Rational::from(Integer::from(1) << work);
     xc_numerics::interval::exact_sturm_isolate_roots(
         coefficients,
@@ -359,6 +364,23 @@ pub(super) fn height_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn portable_sturm_fallback_rejects_repeated_roots() {
+        // The exact polynomial is (x - 65/128)^2.
+        let error = exact_isolation(
+            &[
+                Rational::from((4225, 16384)),
+                Rational::from((-65, 64)),
+                Rational::from(1),
+            ],
+            &Rational::from(0),
+            &Rational::from(1),
+            96,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unresolved repeated roots"));
+    }
+
     #[test]
     fn portable_sturm_fallback_agrees_with_independent_factored_roots() {
         let roots = exact_isolation(

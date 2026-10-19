@@ -33,8 +33,9 @@ finite Fourier projection with zero exterior, and never discard an infinite
 target tail. Explicit research-input files take precedence. Prepared samples
 are integrity-checked local checkpoints; target-dependent records stay private.
 
-For sections with 1 through 512 modes, the same option prepares the remaining
-finite arithmetic inputs directly from the authenticated run. The bundled
+The same option prepares the remaining finite arithmetic inputs directly from
+the authenticated run, subject to explicit shared resource admission. There is
+no fixed 512-mode preparation ceiling. The bundled
 1,000-ordinate table supplies identified comparison geometry. State transform
 squares supply zero weights; coefficient squares supply the full lattice measure,
 including its origin mass. Inverse moments involving nonzero origin mass remain
@@ -47,6 +48,31 @@ This includes every contribution in the retained arithmetic matrix without
 assuming RH or treating a finite critical-line sum as complete. The model solves
 for its own energy and polynomial, then isolates that polynomial's roots.
 Its constrained finite minimum does not certify the full ground or continuum.
+The prefix must fit the complete identified ordinate table. With the bundled
+1,000-ordinate table, the construction supports at most 1,064 modes; a larger
+section requires explicitly supplied inputs with sufficient source data.
+This is a mathematical input requirement, not a memory setting. No prefix root,
+zero atom, or lattice mode is silently omitted to fit a budget.
+
+Arithmetic preparation reserves its workspace against the active run's
+remaining memory, including retained parents and concurrent work already
+charged to that run. Estimates cover interval block assembly and elimination,
+simultaneously active guarded transforms, basis storage, exact-rational
+coefficient scratch, and output promotion/validation. Exact form assembly
+reserves its additional exponent-span-dependent workspace separately. Overflow,
+insufficient memory, or missing ordinate data produces an explicit refusal.
+The arithmetic order, guard ladder, polynomial definition, and existing
+resolved artifact identities are unchanged.
+
+Standalone preparation uses `XC_RESEARCH_WORKING_BYTES` (8 GiB by default) and
+includes existing matrix/state residency in admission. Applications with an
+already-admitted retained matrix can call
+`prepare_arithmetic_inputs_with_resources` with its shared `RunResources`.
+The returned input's continued retention belongs to the caller's accounting.
+These cooperative estimates are not an operating-system memory quota.
+Arithmetic checkpoints retain their identities; a payload larger than the
+currently reserved read allowance is rejected before deserialization and
+recomputed with dynamically admitted output precision.
 
 Energy allowances use the current full Fourier matrix split at `|mode|=N/2`:
 Outward Gershgorin bounds sharpened by verified interval LDL, the Frobenius cross-block bound, and a trial Rayleigh

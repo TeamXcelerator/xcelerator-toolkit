@@ -406,7 +406,7 @@ fn eigenpair_residual(a: &[Float], stride: usize, v: &[Float], lambda: &Float, p
     .unwrap_or_else(|_| Float::with_val(p, rug::float::Special::Infinity))
 }
 fn upper_decimal(value: &Float) -> String {
-    value.to_string_radix_round(10, None, rug::float::Round::Up)
+    xc_numerics::fmt::decimal_string_round(value, None, rug::float::Round::Up)
 }
 
 /// O(D^3) prefix analysis; only explicitly supplied retained eigenstates are

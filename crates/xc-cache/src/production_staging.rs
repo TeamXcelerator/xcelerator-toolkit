@@ -46,6 +46,24 @@ pub struct CanonicalProductionDraft {
     pub assurance_evidence_digests: Vec<ContentDigest>,
 }
 
+#[derive(Clone)]
+pub(crate) struct AuthenticatedDraftFacts {
+    pub manifest_digest: ContentDigest,
+    pub transport_digest: ContentDigest,
+}
+
+/// Validate and hash one descriptor for its current inventory pass. There is
+/// deliberately no retained trust state: every call validates the full manifest
+/// and transport record. Staged bytes remain checked before and after import.
+pub(crate) fn authenticated_draft_facts(
+    draft: &CanonicalProductionDraft,
+) -> Result<AuthenticatedDraftFacts, CacheError> {
+    Ok(AuthenticatedDraftFacts {
+        manifest_digest: draft.manifest.digest()?,
+        transport_digest: draft.encoding.digest()?,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedPublicationInventoryEntry {
@@ -131,8 +149,7 @@ pub fn build_managed_publication_inventory(
     }
     let mut entries = Vec::new();
     for draft in drafts {
-        draft.manifest.validate()?;
-        draft.encoding.validate()?;
+        let facts = authenticated_draft_facts(draft)?;
         for destination in &destinations {
             if !artifact_semantics_admitted_to_destination(
                 &draft.manifest.semantic_key,
@@ -153,9 +170,9 @@ pub fn build_managed_publication_inventory(
                 ),
                 branch: "main".to_owned(),
                 semantic_digest: draft.manifest.semantic_digest.clone(),
-                manifest_digest: draft.manifest.digest()?,
+                manifest_digest: facts.manifest_digest.clone(),
                 payload_digest: draft.manifest.payload_digest.clone(),
-                transport_digest: draft.encoding.digest()?,
+                transport_digest: facts.transport_digest.clone(),
                 package_size_bytes: draft.encoding.package_size_bytes,
                 ordered_part_count: draft.encoding.ordered_parts.len(),
                 achieved_assurance: draft.achieved_assurance,
