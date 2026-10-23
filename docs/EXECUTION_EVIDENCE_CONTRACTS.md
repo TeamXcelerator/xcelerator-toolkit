@@ -56,6 +56,20 @@ context; sharing does not bypass validation.
 
 ## Run resources and retention
 
+Supplemental retained-source recovery can evaluate indexed transforms and
+prime-power or u-flow responses without reacquiring the primary matrix,
+eigenpair, or secular roots. The original portable primary result supplies
+the response root selection and must match authenticated retained payloads,
+including failed-root details. The original quadrature base and parity policy
+are required for response replay; missing or inconsistent source declarations
+are refused. Secondary spectral preparation and tangent solves may still run.
+Recovery uses the live producers and preserves their artifact identities and
+numerical qualifications. Completing acquisition does not certify every bound.
+U-flow source admission precedes quadrature setup. Paired MPFR sine/cosine
+evaluation preserves directed interval endpoints, accumulation order, and
+successful artifact identities. Separate phase timings identify table setup,
+integrals, pole/archimedean actions, and prime-event work.
+
 Signed and indexed finite transforms first use the legacy 4096-bit guard
 policy and its existing artifact identity. If that arithmetic exhausts its
 precision ladder, an extended attempt uses a distinct identity containing its

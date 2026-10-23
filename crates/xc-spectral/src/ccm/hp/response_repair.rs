@@ -1,8 +1,228 @@
-//! Offline repair of the normalization cancellation in schema-2 responses.
-//! Only root-velocity fields change. No matrix assembly, eigenstate solve, or
-//! bordered tangent solve is performed, and source assurance is not upgraded.
+//! Secondary response recovery from authenticated retained primary sources,
+//! and offline normalization repair of existing schema-2 response artifacts.
+//! Neither route reacquires a primary eigenstate or root window.
 use super::*;
 use xc_cache::{LocalShardJson, REMOTE_CANONICAL_MANIFEST_TAG};
+
+/// Frozen recorded-run inputs needed to reproduce secondary response identities.
+/// This adapter admits the integer-cutoff, even-sector route.
+#[derive(Clone, Debug)]
+pub struct RetainedResponseOptions {
+    pub primary: PortableHighPrecResult,
+    pub lambda_squared: u64,
+    pub n_modes: usize,
+    pub precision_bits: u32,
+    pub quadrature_base_points: usize,
+    pub parity_policy: CcmParityPolicy,
+}
+
+pub(crate) struct RetainedResponseSources<'a> {
+    pub state: &'a crate::ccm::state_geometry::RetainedState,
+    pub matrix: &'a crate::ccm::retained_evidence::RetainedMatrix<'a>,
+    pub roots: &'a crate::ccm::retained_evidence::RetainedRoots,
+    pub state_payload: &'a [u8],
+    pub root_payload: &'a [u8],
+    pub secular_payload: &'a [u8],
+}
+
+struct ValidatedResponse {
+    params: CcmParams,
+    cfg: HighPrecConfig,
+    roots: Vec<EigenvalueResult>,
+    first_positive_root_index: usize,
+}
+
+fn validate_response_sources(
+    source: &RetainedResponseSources<'_>,
+    options: &RetainedResponseOptions,
+) -> Result<ValidatedResponse> {
+    let state = source.state;
+    if options.lambda_squared <= 1
+        || options.lambda_squared.to_string() != state.cutoff
+        || options.n_modes != state.modes
+        || options.precision_bits != state.precision
+        || options.primary.precision_bits != state.precision
+        || options.parity_policy != CcmParityPolicy::EvenSector
+        // Same supported quadrature domain as validate_source_shape.
+        || !(1..=1_000_000).contains(&options.quadrature_base_points)
+    {
+        bail!("retained response configuration differs from its authenticated source");
+    }
+    source.matrix.match_state(state)?;
+    for (manifest, bytes) in [
+        (&state.manifest, source.state_payload),
+        (&source.roots.manifest, source.root_payload),
+        (&source.roots.secular_manifest, source.secular_payload),
+    ] {
+        if manifest.size_bytes != bytes.len() as u64
+            || ContentDigest::sha256(bytes) != manifest.content_digest
+        {
+            bail!("retained response source bytes differ from their immutable manifests");
+        }
+    }
+    // RetainedRoots replays the secular->state and root->secular closure; retain
+    // the complete outcome payload as well because its failed rows carry exact
+    // reasons and iteration counts used by the response selection identity.
+    crate::ccm::retained_evidence::RetainedRoots::from_payload(
+        &source.roots.manifest,
+        source.root_payload,
+        &source.roots.secular_manifest,
+        source.secular_payload,
+        state,
+        &[
+            source.roots.manifest.content_digest.clone(),
+            source.roots.secular_manifest.content_digest.clone(),
+        ],
+    )?;
+    #[derive(Deserialize)]
+    struct StateParity {
+        force_even: bool,
+        #[serde(default)]
+        parity_policy: Option<CcmParityPolicy>,
+    }
+    let parity: StateParity = serde_json::from_slice(source.state_payload)?;
+    let secular: PortableSecularSource = serde_json::from_slice(source.secular_payload)?;
+    let range: PortableRootRange = serde_json::from_slice(source.root_payload)?;
+    if !payload_parity_matches(
+        parity.force_even,
+        parity.parity_policy,
+        options.parity_policy,
+    ) || !payload_parity_matches(
+        secular.force_even,
+        secular.parity_policy,
+        options.parity_policy,
+    ) || !payload_parity_matches(range.force_even, range.parity_policy, options.parity_policy)
+        || secular.precision_bits != state.precision
+        || range.precision_bits != state.precision
+        || range.root_domain != IndependentRootDomain::Positive
+        || range.outcomes.is_empty()
+        || range.first_root_index == 0
+    {
+        bail!("retained response requires the original positive even-sector root window");
+    }
+    let primary = options.primary.to_runtime()?;
+    let eigenvalue = parse_hp_scalar(&state.eigenvalue, state.precision)?;
+    if primary.weil_min_eigenvalue.prec() != state.precision
+        || primary.weil_min_eigenvalue != eigenvalue
+        || primary.xi != state.coefficients
+        || primary.xi.iter().any(|x| x.prec() != state.precision)
+        || primary.eigenvalues_pos.is_empty()
+    {
+        bail!("retained response primary differs from its authenticated eigenpair");
+    }
+    let roots = authenticated_response_root_selection(
+        &range.outcomes,
+        range.first_root_index,
+        primary.first_positive_root_index,
+        &primary.eigenvalues_pos,
+        state.precision,
+    )?;
+    let params = CcmParams::from_lambda_sq_integer(options.lambda_squared, state.modes);
+    let mut cfg = HighPrecConfig::for_decimal_digits(1);
+    cfg.precision_bits = state.precision;
+    cfg.quad_points = options.quadrature_base_points;
+    cfg.set_parity_policy(options.parity_policy);
+    Ok(ValidatedResponse {
+        params,
+        cfg,
+        roots,
+        first_positive_root_index: primary.first_positive_root_index,
+    })
+}
+
+fn authenticated_response_root_selection(
+    outcomes: &[PortableRootOutcome],
+    first_stored_index: usize,
+    first_selected_index: usize,
+    selected_primary: &[EigenvalueResult],
+    precision: u32,
+) -> Result<Vec<EigenvalueResult>> {
+    let offset = first_selected_index
+        .checked_sub(first_stored_index)
+        .ok_or_else(|| {
+            anyhow::anyhow!("retained response selection starts outside its root window")
+        })?;
+    let end = offset
+        .checked_add(selected_primary.len())
+        .ok_or_else(|| anyhow::anyhow!("retained response root selection overflow"))?;
+    let selected = outcomes
+        .get(offset..end)
+        .ok_or_else(|| anyhow::anyhow!("retained response selection exceeds its root window"))?;
+    let roots = selected
+        .iter()
+        .map(|r| decode_root_outcome(r, precision))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if root_selection_digest(&roots)? != root_selection_digest(selected_primary)? {
+        bail!("retained response primary root selection differs from its authenticated window");
+    }
+    Ok(roots)
+}
+
+pub(crate) fn retained_capture_failure(error: anyhow::Error) -> xc_cache::CaptureFailure {
+    super::capture_run::capture_failure(error)
+}
+
+/// Cheap authentication only: never constructs secondary spectra or responses.
+pub(crate) fn validate_retained_response(
+    source: &RetainedResponseSources<'_>,
+    options: &RetainedResponseOptions,
+) -> Result<()> {
+    validate_response_sources(source, options).map(|_| ())
+}
+
+/// Compute secondary response artifacts through the live producer using only
+/// authenticated stored sources. No primary or root acquisition is available.
+pub(crate) fn capture_retained_response(
+    id: &str,
+    source: &RetainedResponseSources<'_>,
+    options: &RetainedResponseOptions,
+    cache: &ArtifactCacheContext<'_>,
+) -> Result<xc_cache::CapturedDiagnostic> {
+    let admitted = validate_response_sources(source, options)?;
+    let kind = match id {
+        "prime_power_response" => "ccm_prime_power_response_analysis",
+        "u_flow_response" => "ccm_u_flow_response_analysis",
+        _ => bail!("unsupported retained response diagnostic"),
+    };
+    let l = log_lambda_sq_hp(&admitted.params, admitted.cfg.precision_bits)?;
+    let eigenvalue = parse_hp_scalar(&source.state.eigenvalue, source.state.precision)?;
+    super::capture_run::record_retained_response(cache, kind, |observed| {
+        if id == "prime_power_response" {
+            resolve_prime_power_response_analysis_via_cache(
+                &admitted.params,
+                &admitted.cfg,
+                &l,
+                &source.matrix.entries,
+                &eigenvalue,
+                &source.state.coefficients,
+                &admitted.roots,
+                admitted.first_positive_root_index,
+                &source.matrix.manifest,
+                &source.state.manifest,
+                &source.roots.manifest,
+                &source.roots.secular_manifest,
+                observed,
+            )?;
+        } else {
+            resolve_u_flow_response_analysis_via_cache(
+                &admitted.params,
+                &admitted.cfg,
+                &l,
+                &source.matrix.entries,
+                &eigenvalue,
+                &source.state.coefficients,
+                &admitted.roots,
+                admitted.first_positive_root_index,
+                &source.matrix.manifest,
+                &source.state.manifest,
+                &source.roots.manifest,
+                &source.roots.secular_manifest,
+                observed,
+            )?;
+        }
+        Ok(())
+    })
+}
 
 /// Corrected root-response bytes and their retained arithmetic semantic key. The caller must
 /// retain the old artifact and publish the result additively, at the same
@@ -643,6 +863,49 @@ pub(super) fn check_fresh_response_repair(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_recovery_root_selection_preserves_failed_metadata() {
+        let outcomes = vec![
+            PortableRootOutcome::Failed {
+                iterations: 4,
+                reason: "first original reason".into(),
+            },
+            PortableRootOutcome::Failed {
+                iterations: 19,
+                reason: "second original reason".into(),
+            },
+        ];
+        let selected = vec![EigenvalueResult::Failed {
+            iterations: 19,
+            reason: "second original reason".into(),
+        }];
+        let replay =
+            authenticated_response_root_selection(&outcomes, 8, 9, &selected, 192).unwrap();
+        assert_eq!(
+            root_selection_digest(&replay).unwrap(),
+            root_selection_digest(&selected).unwrap()
+        );
+        assert!(
+            matches!(&replay[0], EigenvalueResult::Failed {iterations: 19, reason} if reason == "second original reason")
+        );
+        for changed in [
+            EigenvalueResult::Failed {
+                iterations: 18,
+                reason: "second original reason".into(),
+            },
+            EigenvalueResult::Failed {
+                iterations: 19,
+                reason: "changed reason".into(),
+            },
+        ] {
+            assert!(
+                authenticated_response_root_selection(&outcomes, 8, 9, &[changed], 192).is_err()
+            );
+        }
+        assert!(authenticated_response_root_selection(&outcomes, 8, 7, &selected, 192).is_err());
+        assert!(authenticated_response_root_selection(&outcomes, 8, 10, &selected, 192).is_err());
+    }
 
     #[test]
     fn nontrivial_producer_response_roundtrips() {

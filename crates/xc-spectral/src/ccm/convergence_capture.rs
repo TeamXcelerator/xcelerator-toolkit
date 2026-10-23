@@ -5709,6 +5709,9 @@ pub mod finite_capture {
         state: RetainedState,
         matrix: Option<RetainedMatrix<'static>>,
         roots: Option<RetainedRoots>,
+        state_payload: Vec<u8>,
+        root_payload: Option<Vec<u8>>,
+        secular_payload: Option<Vec<u8>>,
         resources: xc_core::RunResources,
         _source_reservations: Vec<xc_core::MemoryReservation>,
     }
@@ -5812,6 +5815,22 @@ pub mod finite_capture {
             }
         }
         options
+    }
+
+    /// Diagnostics with an immutable-source supplemental execution route.
+    pub fn supports_recovery_diagnostic(id: &str) -> bool {
+        if super::super::capture::FINITE_DIAGNOSTICS.contains(&id)
+            || matches!(
+                id,
+                "indexed_transform" | "prime_power_response" | "u_flow_response"
+            )
+        {
+            return true;
+        }
+        let normalized = id.strip_suffix("_full").unwrap_or(id);
+        super::super::extended_research::DIAGNOSTICS.contains(&normalized)
+            || super::DIAGNOSTICS.contains(&normalized)
+            || super::super::research_completion::DIAGNOSTICS.contains(&normalized)
     }
 
     impl RetainedFiniteSources {
@@ -5923,7 +5942,7 @@ pub mod finite_capture {
             let em = find(&["ccm_weil_eigenpair"])?
                 .ok_or_else(|| anyhow::anyhow!("retained eigenpair manifest missing"))?;
             let mut source_reservations = Vec::new();
-            let state = {
+            let (state, state_payload) = {
                 let (bytes, _buffer) = read(em)?;
                 #[derive(serde::Deserialize)]
                 struct Shape {
@@ -5939,7 +5958,12 @@ pub mod finite_capture {
                 // Includes parse strings, scalar scratch and retained metadata.
                 let estimate = numeric + 8 * u128::from(em.size_bytes);
                 source_reservations.push(resources.try_reserve_retained(u64::try_from(estimate)?)?);
-                RetainedState::from_payload(em, &bytes, std::slice::from_ref(&em.content_digest))?
+                let state = RetainedState::from_payload(
+                    em,
+                    &bytes,
+                    std::slice::from_ref(&em.content_digest),
+                )?;
+                (state, bytes)
             };
             let matrix = if include_matrix {
                 find(&["ccm_tau_matrix"])?
@@ -5970,7 +5994,7 @@ pub mod finite_capture {
             } else {
                 None
             };
-            let roots = find(&["ccm_root_refinement", "ccm_root_discovery_window"])?
+            let root_sources = find(&["ccm_root_refinement", "ccm_root_discovery_window"])?
                 .map(|m| -> Result<_> {
                     let secular = find(&["ccm_secular_source"])?.ok_or_else(|| {
                         anyhow::anyhow!("retained secular source manifest missing")
@@ -5982,20 +6006,28 @@ pub mod finite_capture {
                         + u128::from(state.precision).div_ceil(8) * 16;
                     source_reservations
                         .push(resources.try_reserve_retained(u64::try_from(estimated)?)?);
-                    RetainedRoots::from_payload(
+                    let roots = RetainedRoots::from_payload(
                         m,
                         &root_bytes,
                         secular,
                         &secular_bytes,
                         &state,
                         &[m.content_digest.clone(), secular.content_digest.clone()],
-                    )
+                    )?;
+                    Ok((roots, root_bytes, secular_bytes))
                 })
                 .transpose()?;
+            let (roots, root_payload, secular_payload) = match root_sources {
+                Some((roots, root, secular)) => (Some(roots), Some(root), Some(secular)),
+                None => (None, None, None),
+            };
             Ok(Self {
                 state,
                 matrix,
                 roots,
+                state_payload,
+                root_payload,
+                secular_payload,
                 resources: resources.clone(),
                 _source_reservations: source_reservations,
             })
@@ -6067,6 +6099,42 @@ pub mod finite_capture {
             Ok(input)
         }
 
+        fn response_sources(
+            &self,
+        ) -> Result<super::super::hp::response_repair::RetainedResponseSources<'_>> {
+            Ok(super::super::hp::response_repair::RetainedResponseSources {
+                state: &self.state,
+                matrix: self.matrix.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("retained response requires its authenticated Tau matrix")
+                })?,
+                roots: self.roots.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("retained response requires its authenticated root window")
+                })?,
+                state_payload: &self.state_payload,
+                root_payload: self
+                    .root_payload
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("retained response root payload missing"))?,
+                secular_payload: self
+                    .secular_payload
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("retained response secular payload missing"))?,
+            })
+        }
+
+        /// Authenticate the original response configuration and root selection
+        /// before preparing expensive supplemental inputs or secondary spectra.
+        pub fn validate_recovery_response_options(
+            &self,
+            options: &super::super::hp::response_repair::RetainedResponseOptions,
+        ) -> Result<()> {
+            let _scope = self.resources.enter();
+            super::super::hp::response_repair::validate_retained_response(
+                &self.response_sources()?,
+                options,
+            )
+        }
+
         /// Extended supplemental capture with the live producer's default
         /// standalone/full options and receipt qualification, without a live run.
         pub fn capture_recovery_outcome(
@@ -6076,9 +6144,54 @@ pub mod finite_capture {
             research_sources: &[ArtifactManifest],
             cache: &ArtifactCacheContext<'_>,
         ) -> std::result::Result<xc_cache::CapturedDiagnostic, xc_cache::CaptureFailure> {
+            self.capture_recovery_outcome_with_response_options(
+                id,
+                input,
+                research_sources,
+                cache,
+                None,
+            )
+        }
+
+        /// Recover a selected diagnostic from immutable primary sources. Response
+        /// routes additionally require the frozen original request and primary.
+        pub fn capture_recovery_outcome_with_response_options(
+            &self,
+            id: &str,
+            input: &ExternalResearchInputs,
+            research_sources: &[ArtifactManifest],
+            cache: &ArtifactCacheContext<'_>,
+            response_options: Option<&super::super::hp::response_repair::RetainedResponseOptions>,
+        ) -> std::result::Result<xc_cache::CapturedDiagnostic, xc_cache::CaptureFailure> {
             let attempt = || -> Result<xc_cache::CapturedDiagnostic> {
                 let _scope = self.resources.enter();
                 self.validate_recovery_input(input)?;
+                if id == "indexed_transform" {
+                    let roots = self.roots.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("indexed transform requires its authenticated root window")
+                    })?;
+                    let options = super::super::retained_evidence::TransformOptions::for_roots(
+                        &self.state,
+                        roots,
+                    );
+                    return Ok(xc_cache::CapturedDiagnostic::from_cached(
+                        super::super::retained_evidence::capture_transforms_at_roots(
+                            &self.state,
+                            roots,
+                            &options,
+                            cache,
+                        )?,
+                    )?);
+                }
+                if matches!(id, "prime_power_response" | "u_flow_response") {
+                    let options = response_options.ok_or_else(|| anyhow::anyhow!("retained response requires its frozen original configuration and primary"))?;
+                    return super::super::hp::response_repair::capture_retained_response(
+                        id,
+                        &self.response_sources()?,
+                        options,
+                        cache,
+                    );
+                }
                 if super::super::capture::FINITE_DIAGNOSTICS.contains(&id) {
                     return Ok(xc_cache::CapturedDiagnostic::from_cached(self.capture(
                         id,
@@ -6144,7 +6257,8 @@ pub mod finite_capture {
                 )?;
                 Ok(xc_cache::CapturedDiagnostic::from_cached(result)?)
             };
-            let result = attempt().map_err(xc_cache::CaptureFailure::failed)?;
+            let result =
+                attempt().map_err(super::super::hp::response_repair::retained_capture_failure)?;
             // Match RetainedCcmRun's outcome adapter. Qualified numerical
             // limitations remain measurements; missing prerequisites do not.
             if result.value["data"]["outcome"] == "missing_input" {

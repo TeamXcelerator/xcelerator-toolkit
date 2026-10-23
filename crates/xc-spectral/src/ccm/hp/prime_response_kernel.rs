@@ -384,8 +384,8 @@ fn evaluate_impl(
         let phases = (0..=n_modes)
             .map(|n| phase_scale.mul(&I::from_u64(n as u64, work)))
             .collect::<Vec<_>>();
-        let cosines = phases.iter().map(I::cos).collect::<Vec<_>>();
-        let sines = phases.iter().map(I::sin).collect::<Vec<_>>();
+        // Paired MPFR evaluation preserves the separate directed endpoints.
+        let (sines, cosines): (Vec<_>, Vec<_>) = phases.iter().map(I::sin_cos).unzip();
         let row = |index: usize| -> Result<Option<Float>> {
             let (cosine, sine) = source.prime_coefficients(index)?;
             let mut terms = Vec::with_capacity(cosine.len() + 1);

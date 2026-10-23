@@ -253,7 +253,7 @@ impl ArtifactProductionSink for RecordingSink<'_> {
 /// can resolve within its declared resources; that is not an error in its
 /// inputs, and it is reported as a coverage limit, as larger configurations on
 /// smaller machines meet it routinely. Every other error remains a failure.
-fn capture_failure(error: anyhow::Error) -> xc_cache::CaptureFailure {
+pub(super) fn capture_failure(error: anyhow::Error) -> xc_cache::CaptureFailure {
     let limited = error.chain().any(|cause| {
         let text = cause.to_string();
         (text.contains("unresolved within") && text.contains("guard bits"))
@@ -345,6 +345,20 @@ fn recorded(mut records: Vec<ProducedArtifactRecord>) -> Result<CapturedDiagnost
         true,
         manifests,
     )?)
+}
+
+/// Reuse the live response observer, including encoded publication forwarding.
+/// The closure may produce secondary artifacts only; its caller owns the exact
+/// authenticated primary inputs.
+pub(super) fn record_retained_response(
+    cache: &ArtifactCacheContext<'_>,
+    kind: &str,
+    produce: impl FnOnce(&ArtifactCacheContext<'_>) -> Result<()>,
+) -> Result<CapturedDiagnostic> {
+    let kinds = [kind];
+    let sink = RecordingSink::new(cache, &kinds);
+    produce(&observing(cache, &sink))?;
+    recorded(sink.finish()?)
 }
 
 impl RetainedCcmRun {
@@ -2399,6 +2413,223 @@ impl RetainedCcmRun {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_recovery_routes_match_live_artifacts_and_refuse_foreign_sources() {
+        use crate::ccm::convergence_capture::finite_capture as f;
+        use crate::ccm::hp::response_repair::RetainedResponseOptions;
+        use xc_cache::{
+            ArtifactExecutionCacheMode, CacheLayer, CachePolicy, CacheResolver, CacheVisibility,
+            ZipJsonFilesystemCacheStore as FilesystemCacheStore,
+        };
+        let directory = xc_core::test_support::TestDir::new("retained-recovery-routes");
+        let resolver = CacheResolver::new(vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(FilesystemCacheStore::new(
+                "local",
+                &*directory,
+                true,
+                CacheVisibility::Local,
+            )),
+        }]);
+        let policy = CachePolicy {
+            current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let cache = ArtifactCacheContext {
+            resolver: Some(&resolver),
+            reference_resolver: None,
+            acceptance: Some(&policy),
+            ordered_overlays: vec!["local".into()],
+            mode: ArtifactExecutionCacheMode::PreferReuse,
+            write_on_miss: true,
+            write_visibility: CacheVisibility::Local,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy:
+                xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+            production_sink: None,
+        };
+        let params = CcmParams::from_lambda_sq_integer(13, 16);
+        let mut cfg = HighPrecConfig::for_decimal_digits(40);
+        cfg.n_eigenvalues = 2;
+        cfg.quad_points = 32;
+        let dataset = xc_zeta::zeros::bundled_dataset_identity().unwrap();
+        let seeds = xc_zeta::zeros::bundled_first_n_strings(2)
+            .unwrap()
+            .iter()
+            .map(|s| Float::with_val(cfg.precision_bits, Float::parse(s).unwrap()))
+            .collect::<Vec<_>>();
+        let mut run = RetainedCcmRun::seeded(&params, &cfg, 1, &seeds, &dataset, &cache).unwrap();
+        // Response selection is narrower than the immutable two-row root source.
+        // Indexed transforms must still use the complete retained root window.
+        run.primary.eigenvalues_pos.truncate(1);
+        let input: crate::ccm::extended_research::ExternalResearchInputs =
+            serde_json::from_value(serde_json::json!({"schema_version":1,
+                "source_eigenpair":run.source.eigenpair_manifest.as_ref().unwrap().content_digest,
+                "lambda_squared":"13", "n_modes":16, "precision_bits":cfg.precision_bits,
+                "convention_id":"retained recovery fixture",
+                "definition_digest":ContentDigest::sha256(b"retained recovery fixture"),
+                "approximation_scope":"finite stored source",
+                "reference_jets":[{"ordinal":1,"t":"1",
+                    "reference_window":{"value":"1","derivative":"0"},
+                    "reference_full":{"value":"1","derivative":"0"},
+                    "exterior_tail":{"value":"0","derivative":"0"},
+                    "endpoint_tail_part":null,"fitted_interior_parts":[],
+                    "source_value_error":null,"tail_value_error":null,
+                    "source_derivative_error":null,"root_separation_radius":null}]}))
+            .unwrap();
+        run.set_extended_research_inputs(input.clone()).unwrap();
+        let options = super::super::super::capture::CcmCapturePlan::ultra(2, 17)
+            .unwrap()
+            .primary_options()
+            .unwrap();
+        let response_options = RetainedResponseOptions {
+            primary: PortableHighPrecResult::from_runtime(run.primary()).unwrap(),
+            lambda_squared: 13,
+            n_modes: 16,
+            precision_bits: cfg.precision_bits,
+            quadrature_base_points: cfg.quad_points,
+            parity_policy: cfg.effective_parity_policy(),
+        };
+        let manifests = run.primary_sources();
+        let retained = f::RetainedFiniteSources::from_manifests(&manifests, true, &cache).unwrap();
+        retained
+            .validate_recovery_response_options(&response_options)
+            .unwrap();
+        // Refresh forces actual recomputation instead of comparing two cache hits.
+        let fresh = ArtifactCacheContext {
+            resolver: cache.resolver,
+            reference_resolver: None,
+            acceptance: cache.acceptance,
+            ordered_overlays: cache.ordered_overlays.clone(),
+            mode: ArtifactExecutionCacheMode::Refresh,
+            write_on_miss: true,
+            write_visibility: cache.write_visibility,
+            requested_assurance: cache.requested_assurance,
+            certification_failure_policy: cache.certification_failure_policy,
+            production_sink: None,
+        };
+        for id in [
+            "indexed_transform",
+            "signed_transform",
+            "prime_power_response",
+            "u_flow_response",
+        ] {
+            assert!(f::supports_recovery_diagnostic(id));
+            let live = run.capture_diagnostic(id, &options, &cache).unwrap();
+            let recovered = retained
+                .capture_recovery_outcome_with_response_options(
+                    id,
+                    &input,
+                    &[],
+                    &fresh,
+                    Some(&response_options),
+                )
+                .unwrap();
+            assert_eq!(live.value, recovered.value, "{id}");
+            assert_eq!(
+                live.sources
+                    .iter()
+                    .map(|m| (&m.key, &m.content_digest))
+                    .collect::<Vec<_>>(),
+                recovered
+                    .sources
+                    .iter()
+                    .map(|m| (&m.key, &m.content_digest))
+                    .collect::<Vec<_>>(),
+                "{id}"
+            );
+            if id == "indexed_transform" {
+                assert_eq!(recovered.value["data"]["rows"].as_array().unwrap().len(), 2);
+            }
+        }
+        for id in [
+            "primary",
+            "root_refinement",
+            "indexed_transform_full",
+            "prime_power_response_full",
+            "u_flow_response_full",
+        ] {
+            assert!(!f::supports_recovery_diagnostic(id), "{id}");
+        }
+        let before = cache_snapshot(&directory);
+        assert!(retained
+            .capture_recovery_outcome("prime_power_response", &input, &[], &cache)
+            .is_err());
+        let mut changed = response_options.clone();
+        changed.primary.xi[0] =
+            xc_numerics::fmt::PortableHpFloat::from_float(&Float::with_val(cfg.precision_bits, 99))
+                .unwrap();
+        assert!(retained
+            .validate_recovery_response_options(&changed)
+            .is_err());
+        changed = response_options.clone();
+        changed.primary.first_positive_root_index = 3;
+        assert!(retained
+            .validate_recovery_response_options(&changed)
+            .is_err());
+        changed = response_options.clone();
+        changed.primary.eigenvalues_pos[0] = PortableEigenvalueResult::Failed {
+            iterations: 9,
+            reason: "changed failure".into(),
+        };
+        assert!(retained
+            .validate_recovery_response_options(&changed)
+            .is_err());
+        changed = response_options.clone();
+        changed.lambda_squared = 17;
+        assert!(retained
+            .validate_recovery_response_options(&changed)
+            .is_err());
+        changed = response_options.clone();
+        changed.quadrature_base_points = 0;
+        assert!(retained
+            .validate_recovery_response_options(&changed)
+            .is_err());
+        let no_matrix =
+            f::RetainedFiniteSources::from_manifests(&manifests, false, &cache).unwrap();
+        assert!(no_matrix
+            .validate_recovery_response_options(&response_options)
+            .is_err());
+        let no_roots = manifests
+            .iter()
+            .filter(|m| {
+                !matches!(
+                    m.key.kind.as_str(),
+                    "ccm_root_refinement" | "ccm_root_discovery_window" | "ccm_secular_source"
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let no_roots = f::RetainedFiniteSources::from_manifests(&no_roots, true, &cache).unwrap();
+        assert!(no_roots
+            .validate_recovery_response_options(&response_options)
+            .is_err());
+        assert!(no_roots
+            .capture_recovery_outcome("indexed_transform", &input, &[], &cache)
+            .is_err());
+        let mut changed_manifest = manifests.clone();
+        changed_manifest
+            .iter_mut()
+            .find(|m| {
+                matches!(
+                    m.key.kind.as_str(),
+                    "ccm_root_refinement" | "ccm_root_discovery_window"
+                )
+            })
+            .unwrap()
+            .content_digest = ContentDigest::sha256(b"changed root payload");
+        assert!(f::RetainedFiniteSources::from_manifests(&changed_manifest, true, &cache).is_err());
+        assert_eq!(
+            cache_snapshot(&directory),
+            before,
+            "refused sources must not acquire replacements"
+        );
+    }
+
     #[test]
     fn retained_run_survives_diagnostic_failure_and_authenticates_warm_sources() {
         retained_run_round_trip(false, false);

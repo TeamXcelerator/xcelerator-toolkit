@@ -96,11 +96,8 @@ fn integral(n: usize, l: &I, nodes: &[Float], weights: &[Float], p: u32) -> Resu
             let cos = I::from_i64([1, 0, -1, 0][q], p);
             (I::from_i64([0, 1, 0, -1][q], p), cos.clone(), cos.sub(&one))
         } else {
-            (
-                phase.sin(),
-                phase.cos(),
-                phase.mul(&half).sin().square().mul(&two).neg(),
-            )
+            let (sin, cos) = phase.sin_cos();
+            (sin, cos, phase.mul(&half).sin().square().mul(&two).neg())
         };
         let weight = I::from_float(weight, p)?;
         alpha.push(weight.mul(&sin).mul(&combined));
@@ -194,11 +191,8 @@ fn integral_shared(n: usize, nodes: &[Float], rule: &SharedRule, p: u32) -> Resu
             let cos = I::from_i64([1, 0, -1, 0][q], p);
             (I::from_i64([0, 1, 0, -1][q], p), cos.clone(), cos.sub(one))
         } else {
-            (
-                phase.sin(),
-                phase.cos(),
-                phase.mul(half).sin().square().mul(two).neg(),
-            )
+            let (sin, cos) = phase.sin_cos();
+            (sin, cos, phase.mul(half).sin().square().mul(two).neg())
         };
         alpha.push(factor.weight.mul(&sin).mul(&factor.combined));
         beta.push(factor.weight.mul(&factor.h).mul(&cos).mul(&factor.combined));
@@ -307,6 +301,10 @@ pub(super) fn evaluate(
 ) -> Result<UFlowVelocityActions> {
     evaluate_with_reuse(params, cfg, l, vector, true)
 }
+#[cfg(test)]
+thread_local! {
+    static GL_PRECOMPUTE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 fn evaluate_with_reuse(
     params: &CcmParams,
     cfg: &HighPrecConfig,
@@ -353,19 +351,8 @@ fn evaluate_with_reuse(
     if bytes + scratch > budget {
         bail!("u-flow exceeds the declared workspace budget");
     }
-    let plan = xc_numerics::hp_runtime::plan_gl_precompute(&unique, p);
-    let tables =
-        xc_numerics::hp_runtime::map_gl_precompute_planned(&unique, plan, |points, schedule| {
-            xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
-                points,
-                p,
-                cfg.cache_mode,
-                schedule,
-            )
-            .map(|table| (points, table))
-        })
-        .into_iter()
-        .collect::<std::result::Result<std::collections::HashMap<usize, Table>, _>>()?;
+    // Refuse an inadmissible exact source before resolving potentially expensive
+    // quadrature tables. Successful inputs retain the same source arithmetic.
     let exponent = vector
         .iter()
         .filter_map(Float::get_exp)
@@ -382,6 +369,29 @@ fn evaluate_with_reuse(
         bytes + scratch,
         budget,
     )?;
+    #[cfg(test)]
+    GL_PRECOMPUTE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let tables = {
+        let plan = xc_numerics::hp_runtime::plan_gl_precompute(&unique, p);
+        let _stage = crate::ccm::capture_runtime::Stage::new(format!(
+            "u-flow quadrature tables ({} unique, {}..{} points, {p} bits, {})",
+            unique.len(),
+            unique.first().copied().unwrap_or(0),
+            unique.last().copied().unwrap_or(0),
+            plan.label(),
+        ));
+        xc_numerics::hp_runtime::map_gl_precompute_planned(&unique, plan, |points, schedule| {
+            xc_numerics::quadrature::try_gauss_legendre_nodes_scheduled(
+                points,
+                p,
+                cfg.cache_mode,
+                schedule,
+            )
+            .map(|table| (points, table))
+        })
+        .into_iter()
+        .collect::<std::result::Result<std::collections::HashMap<usize, Table>, _>>()?
+    };
     let events = super::super::try_prime_powers_up_to(params.lambda_sq_int())?;
     // Exact preparation is independent of the guard precision and prime event.
     // Keep the previous path if the extra preparation cannot be admitted.
@@ -404,6 +414,10 @@ fn evaluate_with_reuse(
     for guard in [64, 128, 256, 512, 1024, 2048, 4096] {
         let work = base + guard;
         let length = I::from_float(l, work)?;
+        let integral_stage = crate::ccm::capture_runtime::Stage::new(format!(
+            "u-flow integrals (guard={guard}, work={work} bits, {} modes)",
+            n + 1,
+        ));
         let shared = shared_order.and_then(|order| {
             let required = shared_rule_bytes(order, work);
             if required > (64u128 << 20)
@@ -430,6 +444,10 @@ fn evaluate_with_reuse(
             })
             .collect::<Result<Vec<_>>>()?;
         drop(shared);
+        drop(integral_stage);
+        let assembly_stage = crate::ccm::capture_runtime::Stage::new(format!(
+            "u-flow pole and archimedean actions (guard={guard}, work={work} bits)"
+        ));
         let poles = pole(&exact.values, n, &length, work)?;
         let arches = (0..vector.len())
             .into_par_iter()
@@ -446,6 +464,11 @@ fn evaluate_with_reuse(
                 sum(&terms, work)
             })
             .collect::<Result<Vec<_>>>()?;
+        drop(assembly_stage);
+        let prime_stage = crate::ccm::capture_runtime::Stage::new(format!(
+            "u-flow prime actions (guard={guard}, work={work} bits, {} events)",
+            events.len(),
+        ));
         let mut primes = vec![I::from_i64(0, work); vector.len()];
         for &(power, prime, _) in &events {
             let action = prime_response_kernel::evaluate_prepared(
@@ -462,6 +485,7 @@ fn evaluate_with_reuse(
                 *value = value.add(&rounding_enclosure(term)?);
             }
         }
+        drop(prime_stage);
         let mut pole_out = Vec::with_capacity(vector.len());
         let mut arch_out = pole_out.clone();
         let mut prime_out = pole_out.clone();
@@ -500,6 +524,65 @@ fn evaluate_with_reuse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capacity_uflow_denied_exact_source_skips_quadrature() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let resources = xc_core::RunResources::with_worker_limit(4 << 20, 2).unwrap();
+            let _scope = resources.enter();
+            let mut cfg = HighPrecConfig::for_decimal_digits(20);
+            cfg.precision_bits = 128;
+            cfg.quad_points = 17;
+            cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+            let params = CcmParams::from_lambda_sq_integer(3, 1);
+            let vector = [
+                Float::with_val(128, 1),
+                Float::with_val(128, 0),
+                Float::with_val(128, 1) >> 1_000_000u32,
+            ];
+            let before = GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get);
+            let error = evaluate(&params, &cfg, &Float::with_val(128, 3), &vector)
+                .err()
+                .expect("the compact Float source exceeds exact rational workspace");
+            assert!(error
+                .to_string()
+                .contains("exact response point conversion exceeds the rational workspace budget"));
+            assert_eq!(GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get), before);
+            assert_eq!(resources.usage().working_bytes, 0);
+            assert_eq!(resources.usage().retained_bytes, 0);
+        });
+    }
+
+    #[test]
+    fn uflow_paired_trigonometry_matches_separate_directed_endpoints() {
+        for p in [64, 128, 6772, 13608] {
+            let pi = I::pi(p);
+            let phases = [
+                I::from_i64(0, p),
+                I::point(-Float::with_val(p, 0)),
+                I::point(Float::with_val(p, 1) >> 400u32),
+                pi.mul(&I::from_i64(800, p)),
+                pi.div(&I::from_i64(7, p)).unwrap(),
+                I::new(Float::with_val(p, -100), Float::with_val(p, 100)).unwrap(),
+            ];
+            for phase in phases {
+                let (sin, cos) = phase.sin_cos();
+                for (actual, expected) in [(sin, phase.sin()), (cos, phase.cos())] {
+                    for (a, b) in [
+                        (actual.lower(), expected.lower()),
+                        (actual.upper(), expected.upper()),
+                    ] {
+                        assert_eq!(a, b);
+                        assert_eq!(a.prec(), b.prec());
+                        assert_eq!(a.is_sign_negative(), b.is_sign_negative());
+                    }
+                }
+            }
+        }
+    }
     #[test]
     #[ignore = "supervised shared-integrand measurement; not claim-scale qualification"]
     fn measure_uflow_shared_rule_kernel() {
