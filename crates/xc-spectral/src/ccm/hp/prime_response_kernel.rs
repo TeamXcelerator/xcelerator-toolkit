@@ -318,6 +318,7 @@ fn validate_batch_event(power: u64, prime: u64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn prepare_batch_event(
     modes: usize,
     power: u64,
@@ -325,6 +326,21 @@ fn prepare_batch_event(
     l: &Float,
     p: u32,
     work: u32,
+    parallel: bool,
+) -> Result<Option<BatchEventGuard>> {
+    prepare_batch_event_in_context(modes, power, prime, l, p, work, parallel, &mut false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_batch_event_in_context(
+    modes: usize,
+    power: u64,
+    prime: u64,
+    l: &Float,
+    p: u32,
+    work: u32,
+    parallel: bool,
+    exponent_range_checked: &mut bool,
 ) -> Result<Option<BatchEventGuard>> {
     let one = I::from_i64(1, work);
     let two = I::from_i64(2, work);
@@ -347,11 +363,45 @@ fn prepare_batch_event(
     let Some(metadata) = metadata else {
         return Ok(None);
     };
+    let resources = xc_core::RunResources::current();
+    let workers = if parallel {
+        rayon::current_num_threads()
+            .min(
+                resources
+                    .as_ref()
+                    .map_or(usize::MAX, |run| run.worker_limit()),
+            )
+            .min(modes + 1)
+    } else {
+        1
+    };
+    // MPFR exponent limits are thread-local. Check once, lazily, for this
+    // guard's ordered event loop, after preserving metadata error selection.
+    if workers > 1 && !*exponent_range_checked {
+        xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
+        *exponent_range_checked = true;
+    }
     let phase_scale = pi.mul(&two).mul(&reduced);
     let phases = (0..=modes)
         .map(|n| phase_scale.mul(&I::from_u64(n as u64, work)))
         .collect::<Vec<_>>();
-    let (sines, cosines) = phases.iter().map(I::sin_cos).unzip();
+    let (sines, cosines) = if workers > 1 {
+        // Indexed chunks preserve phase order and bound simultaneous native
+        // calls even when the surrounding Rayon pool exceeds the run limit.
+        // Reenter the run owner because Rayon does not inherit its TLS scope.
+        phases
+            .par_chunks(phases.len().div_ceil(workers))
+            .map(|chunk| {
+                let _scope = resources.as_ref().map(xc_core::RunResources::enter);
+                chunk.iter().map(I::sin_cos).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .unzip()
+    } else {
+        phases.iter().map(I::sin_cos).unzip()
+    };
     Ok(Some(BatchEventGuard {
         metadata,
         pi,
@@ -568,6 +618,7 @@ pub(super) fn evaluate_prepared_batch(
     for guard in [64, 128, 256, 512, 1024, 2048, 4096] {
         let work = base * 2 + guard;
         let mut active = Vec::new();
+        let mut exponent_range_checked = false;
         for (index, &(power, prime)) in events.iter().enumerate() {
             if outcomes[index].is_some() {
                 continue;
@@ -578,7 +629,16 @@ pub(super) fn evaluate_prepared_batch(
             {
                 continue;
             }
-            match prepare_batch_event(n_modes, power, prime, l, p, work) {
+            match prepare_batch_event_in_context(
+                n_modes,
+                power,
+                prime,
+                l,
+                p,
+                work,
+                parallel,
+                &mut exponent_range_checked,
+            ) {
                 Ok(Some(event)) => active.push((index, event)),
                 Ok(None) => {}
                 Err(error) => outcomes[index] = Some(Err(error)),
@@ -899,6 +959,94 @@ mod tests {
     }
 
     #[test]
+    fn batch_phase_parallel_endpoints_and_metadata_errors_match_serial() {
+        let bits = |event: &BatchEventGuard| {
+            event
+                .metadata
+                .iter()
+                .chain(
+                    [&event.pi, &event.reduced, &event.coefficient]
+                        .into_iter()
+                        .chain(event.sines.iter())
+                        .chain(event.cosines.iter())
+                        .flat_map(|value| [value.lower(), value.upper()]),
+                )
+                .map(|value| {
+                    (
+                        xc_numerics::prefix::lossless_decimal(value),
+                        value.prec(),
+                        value.is_sign_negative(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for workers in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                // Exercise a run smaller than the surrounding pool as well.
+                for limit in [1, workers] {
+                    let resources =
+                        xc_core::RunResources::with_worker_limit(1 << 28, limit).unwrap();
+                    let _scope = resources.enter();
+                    for p in [64, 128, 3386] {
+                        let length = Float::with_val(p, 3);
+                        let mut checked = false;
+                        for (power, prime) in [(2, 2), (9, 3)] {
+                            let serial = prepare_batch_event(
+                                12,
+                                power,
+                                prime,
+                                &length,
+                                p,
+                                p * 2 + 64,
+                                false,
+                            )
+                            .unwrap()
+                            .unwrap();
+                            let parallel = prepare_batch_event_in_context(
+                                12,
+                                power,
+                                prime,
+                                &length,
+                                p,
+                                p * 2 + 64,
+                                true,
+                                &mut checked,
+                            )
+                            .unwrap()
+                            .unwrap();
+                            assert_eq!(bits(&serial), bits(&parallel));
+                        }
+                        assert_eq!(checked, workers > 1 && limit > 1);
+                    }
+                    let zero = Float::with_val(64, 0);
+                    let serial = prepare_batch_event(12, 2, 2, &zero, 64, 192, false)
+                        .err()
+                        .unwrap();
+                    let mut checked = false;
+                    let parallel = prepare_batch_event_in_context(
+                        12,
+                        2,
+                        2,
+                        &zero,
+                        64,
+                        192,
+                        true,
+                        &mut checked,
+                    )
+                    .err()
+                    .unwrap();
+                    assert_eq!(format!("{serial:#}"), format!("{parallel:#}"));
+                    assert!(!checked, "metadata errors must precede parallel preflight");
+                }
+            });
+        }
+    }
+
+    #[test]
     fn batch_prime_actions_match_reference_bits_precision_and_signed_zero() {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
@@ -988,31 +1136,49 @@ mod tests {
 
     #[test]
     fn batch_prime_errors_follow_original_event_and_row_selection() {
-        let resources = xc_core::RunResources::new(1 << 28).unwrap();
-        let _scope = resources.enter();
-        let p = 64;
-        let vector = [Float::with_val(p, 1)];
-        let exact = batch_exact_source(&vector, p);
-        let source = CoefficientSource::new(&exact, 0, 0);
-        let l = Float::with_val(p, 3);
-        for events in [
-            vec![(8, 3), (1, 2)],
-            vec![(2, 2), (8, 3), (1, 2)],
-            vec![(2, 2), (1, 2), (8, 3)],
-        ] {
-            let expected = events
-                .iter()
-                .map(|&(power, prime)| {
-                    evaluate_prepared(0, power, prime, &l, &vector, p, false, &source)
-                })
-                .collect::<Result<Vec<_>>>()
-                .err()
+        for workers in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
                 .unwrap();
-            let actual =
-                evaluate_prepared_batch(0, &events, &l, &vector, p, false, &source, u128::MAX)
-                    .err()
-                    .unwrap();
-            assert_eq!(actual.to_string(), expected.to_string());
+            pool.install(|| {
+                let resources = xc_core::RunResources::with_worker_limit(1 << 28, workers).unwrap();
+                let _scope = resources.enter();
+                let p = 64;
+                let vector = [1, 2, 1].map(|value| Float::with_val(p, value));
+                let exact = batch_exact_source(&vector, p);
+                let source = CoefficientSource::new(&exact, 1, 0);
+                let l = Float::with_val(p, 3);
+                for events in [
+                    vec![(8, 3), (1, 2)],
+                    vec![(2, 2), (8, 3), (1, 2)],
+                    vec![(2, 2), (1, 2), (8, 3)],
+                ] {
+                    let expected = events
+                        .iter()
+                        .map(|&(power, prime)| {
+                            evaluate_prepared(1, power, prime, &l, &vector, p, false, &source)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                        .err()
+                        .unwrap();
+                    for parallel in [false, true] {
+                        let actual = evaluate_prepared_batch(
+                            1,
+                            &events,
+                            &l,
+                            &vector,
+                            p,
+                            parallel,
+                            &source,
+                            u128::MAX,
+                        )
+                        .err()
+                        .unwrap();
+                        assert_eq!(format!("{actual:#}"), format!("{expected:#}"));
+                    }
+                }
+            });
         }
         let unresolved =
             ordered_batch_rows(vec![Ok(None), Err(anyhow::anyhow!("later row error"))]).unwrap();

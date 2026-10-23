@@ -44,6 +44,11 @@ batch storage remains reserved until its consumer finishes. The stored GL-node
 quadrant test rejects impossible dyadic denominators without allocating a
 rational; possible exact quadrants still use the original exact calculation.
 
+Independent sine/cosine phase evaluations use bounded chunks on the existing
+Rayon pool. Their interval operations and output order are unchanged. Workers
+inherit the run resource scope, and a guard checks matching native exponent
+ranges once before dispatching its first resolved event.
+
 These changes preserve stored quadrature tables and successful response values.
 They do not remove cold quadrature generation, transcendental evaluation,
 bordered solves, or private input preparation. Measure those stages separately

@@ -5,6 +5,8 @@
 U-flow prime actions reuse exact coefficient rows across bounded event batches,
 with optional storage admitted by the shared memory budget. Exact quadrant
 rejection avoids rational allocation for ordinary stored quadrature nodes.
+Independent phase evaluations run in bounded parallel chunks with the same
+interval operations, native exponent range, and ordered outputs.
 Successful values, signed zeros, ordered failures, and artifact identities are
 preserved. An explicit CUDA route contracts common-denominator coefficients
 using exact integer products and rigorous interval radii, retaining the original

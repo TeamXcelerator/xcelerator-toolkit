@@ -523,7 +523,7 @@ mod tests {
                 .map(|(index, &(power, prime))| {
                     (
                         index,
-                        prepare_batch_event(modes, power, prime, &length, p, work)
+                        prepare_batch_event(modes, power, prime, &length, p, work, false)
                             .unwrap()
                             .unwrap(),
                     )
@@ -624,7 +624,7 @@ mod tests {
                     let prepared = CoefficientSource::new(&exact, modes, 1 << 30);
                     let work = p * 2 + 64;
                     let active = events.iter().enumerate().map(|(index, &(power, prime))| {
-                        (index, prepare_batch_event(modes, power, prime, &length, p, work)
+                        (index, prepare_batch_event(modes, power, prime, &length, p, work, true)
                             .unwrap().expect("benchmark metadata must resolve at first guard"))
                     }).collect::<Vec<_>>();
                     let rows = if gpu {
@@ -664,6 +664,8 @@ mod tests {
     #[ignore = "isolated supervised CUDA batch/tile screening; run exact test with --test-threads=1"]
     fn measure_prime_actions_cuda_batch_tile_sweep() {
         use std::time::Instant;
+        const RUN_BYTES: u64 = 2 << 30;
+        const GPU_BYTES: u128 = 1536 << 20;
         struct RestoreEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
         impl Drop for RestoreEnvironment {
             fn drop(&mut self) {
@@ -686,8 +688,9 @@ mod tests {
         );
         std::env::set_var("XC_PRIME_RESPONSE_GPU_HOST_WORKERS", "4");
         let all_events = crate::ccm::try_prime_powers_up_to(1000).unwrap();
-        // The full-row241 case is screened at32 events. At64 events its
-        // admitted storage can exceed this deliberately bounded768MiB cap.
+        // The full 241-row case is screened at 32 events. Its previous 768 MiB
+        // allowance correctly refused; these planned larger cases receive an
+        // explicit 1.5 GiB helper allowance within a 2 GiB run ledger.
         // Two alternating trials are screening evidence, not an auto policy.
         for (event_count, tile_rows) in [(32, 64), (32, 128), (32, 241), (64, 64), (64, 128)] {
             std::env::set_var("XC_PRIME_RESPONSE_GPU_TILE_ROWS", tile_rows.to_string());
@@ -696,7 +699,7 @@ mod tests {
                 .build()
                 .unwrap();
             pool.install(|| {
-                let resources = xc_core::RunResources::with_worker_limit(1 << 30, 4).unwrap();
+                let resources = xc_core::RunResources::with_worker_limit(RUN_BYTES, 4).unwrap();
                 let _scope = resources.enter();
                 let (modes, p) = (120usize, 3386u32);
                 let events = all_events[..event_count].iter()
@@ -711,15 +714,15 @@ mod tests {
                     let exact = vector.iter().map(|value| {
                         scale_float(value, -exponent, p).unwrap().to_rational().unwrap()
                     }).collect::<Vec<_>>();
-                    let prepared = CoefficientSource::new(&exact, modes, 1 << 30);
+                    let prepared = CoefficientSource::new(&exact, modes, u128::from(RUN_BYTES));
                     let work = p * 2 + 64;
                     let active = events.iter().enumerate().map(|(index, &(power, prime))| {
-                        (index, prepare_batch_event(modes, power, prime, &length, p, work)
+                        (index, prepare_batch_event(modes, power, prime, &length, p, work, true)
                             .unwrap().expect("screening metadata must resolve at first guard"))
                     }).collect::<Vec<_>>();
                     let rows = if gpu {
                         apply_rows_with_backend(&prepared, &active, modes, exponent, p, work,
-                            true, 768 << 20, ProductBackend::Cuda).unwrap()
+                            true, GPU_BYTES, ProductBackend::Cuda).unwrap()
                     } else {
                         (0..vector.len()).into_par_iter().map(|row| {
                             let (cosine, sine) = prepared.prime_coefficients(row).unwrap();
@@ -750,11 +753,11 @@ mod tests {
                         assert_eq!(cpu.prec(), gpu.prec());
                         assert_eq!(cpu.is_sign_negative(), gpu.is_sign_negative());
                     }
-                    println!("prime_action_sweep modes=120 p=3386 events={event_count} event_first={} event_last={} tile_rows={tile_rows} host_workers=4 trial={trial} preparation=included metadata_and_action_identity=passed cpu_seconds={:.6} cuda_seconds={:.6} ratio={:.4} ledger_peak={} screening_only=true",
+                    println!("prime_action_sweep modes=120 p=3386 events={event_count} event_first={} event_last={} tile_rows={tile_rows} host_workers=4 trial={trial} preparation=included metadata_and_action_identity=passed cpu_seconds={:.6} cuda_seconds={:.6} ratio={:.4} ledger_peak={} run_max_bytes={RUN_BYTES} helper_max_bytes={GPU_BYTES} screening_only=true",
                         events[0].0, events.last().unwrap().0, cpu.1, gpu.1, cpu.1/gpu.1,
                         resources.usage().peak_bytes);
                 }
-                assert!(resources.usage().peak_bytes <= 1 << 30);
+                assert!(resources.usage().peak_bytes <= RUN_BYTES);
             });
             drop(pool);
         }
