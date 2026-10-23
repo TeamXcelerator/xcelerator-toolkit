@@ -76,6 +76,10 @@ pub mod eigen;
 #[cfg(feature = "hp")]
 pub mod exact_product;
 
+/// Bounded exact rational matrix contractions against interval columns.
+#[cfg(feature = "hp")]
+pub mod rational_interval_product;
+
 #[cfg(feature = "hp")]
 pub mod interval;
 

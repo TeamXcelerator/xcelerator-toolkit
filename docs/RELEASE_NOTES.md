@@ -2,6 +2,16 @@
 
 ## 0.17.0 (2026-10-19)
 
+U-flow prime actions reuse exact coefficient rows across bounded event batches,
+with optional storage admitted by the shared memory budget. Exact quadrant
+rejection avoids rational allocation for ordinary stored quadrature nodes.
+Successful values, signed zeros, ordered failures, and artifact identities are
+preserved. An explicit CUDA route contracts common-denominator coefficients
+using exact integer products and rigorous interval radii, retaining the original
+unique-rounding requirement. Workspace, tile rows, host workers, and event batch
+size are configurable; CPU batching remains the default. See
+[response performance](CCM_RESPONSE_PERFORMANCE.md) for scope and controls.
+
 Finite signed and indexed transforms can retry cancellation-limited inputs
 with additional directed-arithmetic precision. The legacy precision policy
 and cache identity are tried first; only exhaustion of that policy selects a

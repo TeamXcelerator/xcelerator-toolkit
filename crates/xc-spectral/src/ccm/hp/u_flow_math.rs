@@ -50,6 +50,24 @@ fn exact_quadrant(node: &Float, n: usize) -> Result<Option<usize>> {
     let twice_mode = n
         .checked_mul(2)
         .ok_or_else(|| anyhow::anyhow!("u-flow mode overflow"))?;
+    // For a nonzero dyadic M*2^(e-b), cancel M's trailing zero bits.
+    // Its reduced denominator is 2^(b-e-v2(M)). Adding one preserves that
+    // denominator, so multiplication by 2n cannot be integral when the
+    // denominator needs more powers of two than 2n supplies. Borrowing the
+    // significand allocates nothing; the original rational route handles all
+    // divisible cases, zeros, and integers (including its i64 admission).
+    if twice_mode != 0 {
+        if let (Some(significand), Some(exponent)) = (node.get_significand(), node.get_exp()) {
+            if let Some(trailing) = significand.find_one(0) {
+                let denominator_bits = i64::from(significand.significant_bits())
+                    - i64::from(exponent)
+                    - i64::from(trailing);
+                if denominator_bits > i64::from(twice_mode.trailing_zeros()) {
+                    return Ok(None);
+                }
+            }
+        }
+    }
     let exact_turn: Rational =
         (node.to_rational().expect("validated finite node") + 1i32) * twice_mode;
     Ok(if exact_turn.denom() == &1 {
@@ -312,6 +330,16 @@ fn evaluate_with_reuse(
     vector: &[Float],
     reuse: bool,
 ) -> Result<UFlowVelocityActions> {
+    let event_batch = if reuse {
+        prime_response_kernel::validate_batch_configuration()?;
+        match std::env::var("XC_RESPONSE_EVENT_BATCH") {
+            Ok(value) => event_batch_size(Some(&value))?,
+            Err(std::env::VarError::NotPresent) => event_batch_size(None)?,
+            Err(_) => bail!("XC_RESPONSE_EVENT_BATCH must be valid text"),
+        }
+    } else {
+        1
+    };
     let p = cfg.precision_bits;
     let n = params.n_modes;
     if !(64..=995_904).contains(&p)
@@ -470,19 +498,57 @@ fn evaluate_with_reuse(
             events.len(),
         ));
         let mut primes = vec![I::from_i64(0, work); vector.len()];
-        for &(power, prime, _) in &events {
-            let action = prime_response_kernel::evaluate_prepared(
-                n,
-                power,
-                prime,
-                l,
-                &normalized,
-                work,
-                true,
-                &coefficient_source,
-            )?;
-            for (value, term) in primes.iter_mut().zip(action.action) {
-                *value = value.add(&rounding_enclosure(term)?);
+        for batch in events.chunks(event_batch) {
+            let actions = if reuse {
+                let pairs = batch
+                    .iter()
+                    .map(|&(power, prime, _)| (power, prime))
+                    .collect::<Vec<_>>();
+                prime_response_kernel::evaluate_prepared_batch(
+                    n,
+                    &pairs,
+                    l,
+                    &normalized,
+                    work,
+                    true,
+                    &coefficient_source,
+                    budget.saturating_sub(
+                        bytes
+                            + scratch
+                            + prime_scratch
+                            + exact.workspace_bytes
+                            + coefficient_source.storage_bytes(),
+                    ),
+                )?
+            } else {
+                None
+            };
+            // Retain the batch owner (and its memory reservation) until every
+            // independently rounded event has been accumulated in canonical order.
+            if let Some(actions) = actions {
+                for action in &actions.actions {
+                    for (value, term) in primes.iter_mut().zip(&action.action) {
+                        *value = value.add(&rounding_enclosure(term.clone())?);
+                    }
+                }
+            } else {
+                // Optional batching must never add a source-admission failure.
+                // A denied batch uses the original single-event storage lifetime.
+                for &(power, prime, _) in batch {
+                    let action = prime_response_kernel::evaluate_prepared(
+                        n,
+                        power,
+                        prime,
+                        l,
+                        &normalized,
+                        work,
+                        true,
+                        &coefficient_source,
+                    )?;
+                    for (value, term) in primes.iter_mut().zip(action.action) {
+                        *value = value.add(&rounding_enclosure(term)?);
+                    }
+                }
             }
         }
         drop(prime_stage);
@@ -521,9 +587,35 @@ fn evaluate_with_reuse(
     bail!("u-flow action rounding unresolved within 4096 guard bits")
 }
 
+fn event_batch_size(value: Option<&str>) -> Result<usize> {
+    match value {
+        None => Ok(8),
+        Some(value) => {
+            anyhow::ensure!(
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+                "XC_RESPONSE_EVENT_BATCH must be a positive ASCII integer"
+            );
+            let size: usize = value.parse().map_err(|_| {
+                anyhow::anyhow!("XC_RESPONSE_EVENT_BATCH must be a positive integer")
+            })?;
+            anyhow::ensure!(size > 0, "XC_RESPONSE_EVENT_BATCH must be positive");
+            Ok(size)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn response_event_batch_configuration_is_positive_and_not_a_source_cap() {
+        assert_eq!(event_batch_size(None).unwrap(), 8);
+        assert_eq!(event_batch_size(Some("1")).unwrap(), 1);
+        assert_eq!(event_batch_size(Some("256")).unwrap(), 256);
+        for value in ["0", "-1", "+1", " 1", "１", "", "many"] {
+            assert!(event_batch_size(Some(value)).is_err());
+        }
+    }
     #[test]
     fn capacity_uflow_denied_exact_source_skips_quadrature() {
         let pool = rayon::ThreadPoolBuilder::new()
@@ -688,6 +780,27 @@ mod tests {
                 drop(occupied);
             }
         }
+    }
+
+    #[test]
+    fn batched_uflow_preserves_all_channels_across_multiple_prime_events() {
+        let resources = xc_core::RunResources::new(1 << 30).unwrap();
+        let _scope = resources.enter();
+        let p = 128;
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = p;
+        cfg.quad_points = 96;
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let params = CcmParams::from_lambda_sq_integer(13, 3);
+        let l = Float::with_val(p, 13).ln();
+        let vector = (0..7)
+            .map(|k| Float::with_val(p, k - 2) / (k + 3))
+            .collect::<Vec<_>>();
+        let original = evaluate_with_reuse(&params, &cfg, &l, &vector, false).unwrap();
+        let batched = evaluate_with_reuse(&params, &cfg, &l, &vector, true).unwrap();
+        assert_eq!(channel_bits(&original), channel_bits(&batched));
+        assert_eq!(resources.usage().working_bytes, 0);
+        assert_eq!(resources.usage().retained_bytes, 0);
     }
     #[test]
     fn uflow_shared_rule_reservation_denial_releases_all_optional_storage() {
@@ -883,5 +996,130 @@ mod tests {
                 assert_eq!(channel[0], -channel[2].clone());
             }
         }
+    }
+
+    fn exact_quadrant_rational_reference(node: &Float, n: usize) -> Result<Option<usize>> {
+        crate::ccm::certified_roots::boundary::rational_budget(std::iter::once(node), 1)?;
+        let twice_mode = n
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("u-flow mode overflow"))?;
+        let exact_turn: Rational =
+            (node.to_rational().expect("validated finite node") + 1i32) * twice_mode;
+        Ok(if exact_turn.denom() == &1 {
+            exact_turn
+                .numer()
+                .to_i64()
+                .map(|q| q.rem_euclid(4) as usize)
+        } else {
+            None
+        })
+    }
+
+    fn compare_quadrant_routes(node: &Float, mode: usize) {
+        let render = |value: Result<Option<usize>>| value.map_err(|error| format!("{error:#}"));
+        assert_eq!(
+            render(exact_quadrant(node, mode)),
+            render(exact_quadrant_rational_reference(node, mode)),
+            "precision={}, exponent={:?}, negative={}, mode={mode}",
+            node.prec(),
+            node.get_exp(),
+            node.is_sign_negative()
+        );
+    }
+
+    #[test]
+    fn uflow_quadrant_fast_rejection_matches_exact_dyadics() {
+        let modes = [0, 1, 2, 3, 4, 7, 8, 15, 16, 63, 64, 255, 256, 800, 4096];
+        for precision in [16, 64, 128, 6772] {
+            for numerator in -17..=17 {
+                for shift in -12..=2 {
+                    let node = Float::with_val(precision, numerator) << shift;
+                    for mode in modes {
+                        compare_quadrant_routes(&node, mode);
+                    }
+                }
+            }
+            // Full-precision dyadics obtained from non-dyadic divisions,
+            // with deterministic varied signs and exponents.
+            let mut state = 0x79a5_d13c_e012_638fu64;
+            for index in 0..64 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let mut node =
+                    Float::with_val(precision, state) / Float::with_val(precision, u64::MAX - 58);
+                node <<= [-400, -64, 0, 5, 32][index % 5];
+                if index % 2 == 0 {
+                    node = -node;
+                }
+                for mode in modes {
+                    compare_quadrant_routes(&node, mode);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uflow_quadrant_fast_rejection_preserves_edge_cases_and_errors() {
+        let precision = 128;
+        let tiny = Float::with_val(precision, 1) >> 4096u32;
+        for node in [
+            Float::with_val(precision, 0),
+            -Float::with_val(precision, 0),
+            Float::with_val(precision, -1),
+            Float::with_val(precision, 1),
+            Float::with_val(precision, -0.5),
+            Float::with_val(precision, 0.5),
+            tiny.clone(),
+            -tiny,
+        ] {
+            for mode in [0, 1, 2, 4096, usize::MAX / 2, usize::MAX] {
+                compare_quadrant_routes(&node, mode);
+            }
+        }
+        // The original rational resource check still wins before mode overflow,
+        // and before the new rejection can bypass an expensive conversion.
+        let denied = Float::with_val(precision, 1) >> 70_000_000u32;
+        for mode in [0, 1, usize::MAX] {
+            compare_quadrant_routes(&denied, mode);
+            assert!(format!("{:#}", exact_quadrant(&denied, mode).unwrap_err())
+                .contains("rational workspace budget"));
+        }
+        for special in [rug::float::Special::Nan, rug::float::Special::Infinity] {
+            compare_quadrant_routes(&Float::with_val(precision, special), usize::MAX);
+        }
+    }
+
+    #[test]
+    #[ignore = "bounded kernel benchmark; no quadrature generation or cache access"]
+    fn uflow_quadrant_fast_rejection_benchmark() {
+        let nodes = (-64..=64)
+            .filter(|value| *value != 0)
+            .map(|value| Float::with_val(6772, value) / 257u32)
+            .collect::<Vec<_>>();
+        for node in &nodes {
+            for mode in 0..=32 {
+                compare_quadrant_routes(node, mode);
+            }
+        }
+        let mut timings = [Vec::new(), Vec::new()];
+        for _ in 0..5 {
+            for (route, times) in timings.iter_mut().enumerate() {
+                let started = std::time::Instant::now();
+                for mode in 1..=32 {
+                    for node in &nodes {
+                        let value = if route == 0 {
+                            exact_quadrant_rational_reference(node, mode)
+                        } else {
+                            exact_quadrant(node, mode)
+                        };
+                        std::hint::black_box(value.unwrap());
+                    }
+                }
+                times.push(started.elapsed().as_secs_f64());
+            }
+        }
+        for times in &mut timings {
+            times.sort_by(f64::total_cmp);
+        }
+        println!("Exact quadrant kernel: p=6772, 128 stored GL-like dyadics, 32 modes, 5 trials; rational/borrowed-rejection median {:.6}/{:.6}s; source construction excluded; exact Options/errors compared; not a full u-flow speed estimate", timings[0][2], timings[1][2]);
     }
 }
