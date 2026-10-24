@@ -164,7 +164,7 @@ pub(in crate::ccm) fn response_points(
     let limit = maximum_bytes.min(
         resources
             .as_ref()
-            .map_or(8u128 << 30, |r| u128::from(r.maximum_bytes())),
+            .map_or(maximum_bytes, |r| u128::from(r.maximum_bytes())),
     );
     if workspace_bytes
         .checked_add(other_workspace_bytes)
@@ -255,6 +255,42 @@ pub(in crate::ccm) fn rounded_spacing(length: &Float, p: u32) -> Result<Float> {
 #[cfg(test)]
 mod capacity_tests {
     use super::*;
+
+    #[test]
+    fn capacity_response_points_honor_explicit_standalone_budget() {
+        // An independent thread has no inherited run owner. The large value
+        // represents other admitted workspace, not an allocation in this test.
+        std::thread::spawn(|| {
+            assert!(xc_core::RunResources::current().is_none());
+            let values = [1, -2, 3].map(|n| Float::with_val(128, n));
+            let other = (8u128 << 30) + 1;
+            let points = response_point_workspace(&values, 1, 2).unwrap();
+            let admitted = response_points(&values, 1, 2, other, other + points).unwrap();
+            assert_eq!(
+                admitted.values,
+                vec![Rational::from(1), Rational::from(-2), Rational::from(3)]
+            );
+            assert!(response_points(&values, 1, 2, other, other + points - 1).is_err());
+            assert!(response_points(&values, 1, 2, 0, points - 1).is_err());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn capacity_response_points_cannot_override_run_owner_budget() {
+        let values = [1, -2, 3].map(|n| Float::with_val(128, n));
+        let points = response_point_workspace(&values, 1, 2).unwrap();
+        let resources = xc_core::RunResources::new(points as u64).unwrap();
+        let _scope = resources.enter();
+        let error = response_points(&values, 1, 2, 1, 16u128 << 30)
+            .err()
+            .expect("the explicit stage limit cannot enlarge its enclosing run");
+        assert!(error
+            .to_string()
+            .contains(&format!("maximum_working_bytes={points}")));
+        assert_eq!(resources.usage().peak_bytes, 0);
+    }
 
     #[test]
     fn capacity_response_vector_does_not_charge_a_nonexistent_polynomial() {

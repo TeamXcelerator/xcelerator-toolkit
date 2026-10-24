@@ -14,12 +14,23 @@ estimated table budget. Above the budget it regenerates denominators while still
 reusing the derivatives. This keeps the optional table from growing without a
 bound as dimension, precision or root count increases.
 
-Independent prime-power events run in at most sixteen concurrent chunks. Matrix
-rows, phase evaluations and root batches use the existing Rayon pool. Each root
+Prime-power events run sequentially so multiple events cannot each reserve
+workspace for the whole Rayon pool. Matrix rows, phase evaluations and root
+batches still use that pool, within the shared run worker policy. Each root
 batch reuses MPFR reduction storage. The original scalar rounding operations,
 root/event order and adjacent-pair summation tree are preserved. Division remains
 division; reciprocal multiplication and reassociated sums are not substituted.
 Event errors are reported in canonical event order.
+
+Implicit root responses keep the original guard attempts of 64 through 4096
+extra bits. At higher source precision, the default extends through the next
+power of two at or above `precision_bits + 64`. Set
+`XC_ROOT_RESPONSE_MAX_GUARD_BITS` to a canonical decimal power of two from
+4096 through 1048576 to choose an explicit ceiling. Each reached attempt must
+fit the run's remaining admitted workspace. The limit is operational: it never
+relaxes the nonzero-derivative or identical-rounded-endpoints checks. Extra
+guard bits can resolve cancellation but do not guarantee a result. Guard
+exhaustion and budget refusal do not create reusable response artifacts.
 
 Generation and numerical replay print progress at event boundaries, approximately
 every thirty seconds for larger jobs, and at completion. The line distinguishes
@@ -104,7 +115,7 @@ residual acceptance and the source-bound spectral isolation, without replaying
 each event's bordered solve; u-flow derivative actions are computed only on a
 miss. Explicit cache verification/comparison modes and requests above computed
 assurance retain full numerical replay, which for prime-power responses uses the
-prepared root quantities and bounded parallel event path. No assurance level is
+prepared root quantities and bounded parallel row/root paths. No assurance level is
 upgraded by a fresh-data seal, and it is not a mathematical certificate.
 
 Existing response artifact types, semantic keys, dependency bindings and payload

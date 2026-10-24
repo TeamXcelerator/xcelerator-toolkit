@@ -22,6 +22,17 @@ Exact interval contractions classify native-range, midpoint/radius, and first
 product-preparation refusals as admission failures before any backend executes.
 Failures after backend entry remain execution failures.
 
+Prime-response event evaluation and verifying replay now retain the shared run
+resource owner. Outer events execute sequentially while rows and root batches
+remain parallel, avoiding simultaneous reservations for the whole worker pool.
+Standalone exact point conversion respects the caller's explicit budget.
+Implicit root responses support a configurable extra-precision guard ceiling
+with admission for each actual attempt and unchanged correct-rounding checks.
+Retained-source recovery can reconstruct explicitly finite runtime-reference
+jets from authenticated projection coefficients, without evaluating a provider
+or inferring an infinite tail. Previously successful artifact values and keys
+are unchanged.
+
 ## 0.17.0 (2026-10-19)
 
 Finite signed and indexed transforms can retry cancellation-limited inputs

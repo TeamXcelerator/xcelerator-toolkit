@@ -12161,6 +12161,25 @@ fn bordered_response_relative_residual(
     .map_err(|error| CacheError::InvalidManifest(error.to_string()))
 }
 
+// Every event's matrix rows already use the Rayon pool. Keep event workspaces
+// sequential so several events cannot each reserve scratch for the entire pool.
+// Both production and verifying replay retain canonical event/error ordering.
+fn map_prime_response_chunks<T, R>(
+    events: &[T],
+    mut evaluate: impl FnMut(usize, &[T]) -> R,
+) -> Vec<R> {
+    let resources = xc_core::RunResources::current();
+    let chunk_size = response_performance::event_chunk_size(events.len());
+    events
+        .chunks(chunk_size)
+        .enumerate()
+        .map(|(index, chunk)| {
+            let _scope = resources.as_ref().map(xc_core::RunResources::enter);
+            evaluate(index * chunk_size, chunk)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn compute_prime_power_response_analysis(
@@ -12252,10 +12271,9 @@ fn compute_prime_power_response_analysis_with_memo(
     let prepared_roots = PreparedRootResponses::new(&unit_state, &poles, roots, precision_bits)?;
     let progress = ResponseProgress::new("compute", prime_content.len(), roots.len());
 
-    let chunk_size = response_performance::event_chunk_size(prime_content.len());
-    let chunks = prime_content
-        .par_chunks(chunk_size)
-        .map(|chunk| -> Result<Vec<PortablePrimePowerResponseEvent>> {
+    let chunks = map_prime_response_chunks(
+        &prime_content,
+        |_, chunk| -> Result<Vec<PortablePrimePowerResponseEvent>> {
             let mut events = Vec::with_capacity(chunk.len());
             for &(power, prime, exponent) in chunk {
                 let velocity = apply_prime_power_velocity(
@@ -12268,12 +12286,26 @@ fn compute_prime_power_response_analysis_with_memo(
                 )?;
                 let eigenvalue_response =
                     deterministic_dot_hp(&unit_state, &velocity.action, precision_bits)?;
-                let projected_forcing = projected_response_forcing(&velocity.action, &unit_state, &eigenvalue_response, precision_bits)?;
-                let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
+                let projected_forcing = projected_response_forcing(
+                    &velocity.action,
+                    &unit_state,
+                    &eigenvalue_response,
+                    precision_bits,
+                )?;
+                let projected_forcing_norm =
+                    deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
                 let (eigenvector_response, lagrange_multiplier) =
                     solve_even_sector_bordered_response(&bordered_solver, &projected_forcing)?;
-                let response_norm = deterministic_l2_norm_hp(&eigenvector_response, precision_bits)?;
-                let ccm_scale_response = response_normalization_tangent(&unit_state, &eigenvector_response, &Float::with_val(precision_bits, 0), &ccm_scale, &unit_state_sum, precision_bits)?;
+                let response_norm =
+                    deterministic_l2_norm_hp(&eigenvector_response, precision_bits)?;
+                let ccm_scale_response = response_normalization_tangent(
+                    &unit_state,
+                    &eigenvector_response,
+                    &Float::with_val(precision_bits, 0),
+                    &ccm_scale,
+                    &unit_state_sum,
+                    precision_bits,
+                )?;
                 let root_velocity_responses = prepared_roots.values(&eigenvector_response)?;
                 let relative_residual = bordered_response_relative_residual(
                     tau,
@@ -12285,36 +12317,41 @@ fn compute_prime_power_response_analysis_with_memo(
                     &shifted_frobenius_norm,
                     precision_bits,
                 )?;
-                if !weil_eigvec_cache::residual_within_precision_floor(&relative_residual, precision_bits) {
+                if !weil_eigvec_cache::residual_within_precision_floor(
+                    &relative_residual,
+                    precision_bits,
+                ) {
                     bail!(
                         "prime-power response bordered solve for {power} failed its precision-scaled residual gate"
                     );
-            }
+                }
 
-            events.push(PortablePrimePowerResponseEvent {
-                power,
-                prime,
-                exponent,
-                log_power: lossless_hp_decimal(&velocity.log_power),
-                von_mangoldt_weight: lossless_hp_decimal(&velocity.von_mangoldt_weight),
-                reduced_position: lossless_hp_decimal(&velocity.reduced_position),
-                velocity_coefficient: lossless_hp_decimal(&velocity.velocity_coefficient),
-                edge_jump_coefficient: lossless_hp_decimal(&velocity.edge_jump_coefficient),
-                observation_is_event_edge: cutoff_equals_event_power(&lambda_identity, power)?,
-                eigenvalue_velocity_response: lossless_hp_decimal(&eigenvalue_response),
-                projected_forcing_norm: lossless_hp_decimal(&projected_forcing_norm),
-                l2_eigenvector_velocity_response_norm: lossless_hp_decimal(&response_norm),
-                l2_eigenvector_velocity_response: encode_hp_vector(&eigenvector_response),
-                ccm_normalization_scale_velocity_response: lossless_hp_decimal(&ccm_scale_response),
-                bordered_lagrange_multiplier: lossless_hp_decimal(&lagrange_multiplier),
-                bordered_solve_relative_residual: lossless_hp_decimal(&relative_residual),
-                root_velocity_responses,
-            });
+                events.push(PortablePrimePowerResponseEvent {
+                    power,
+                    prime,
+                    exponent,
+                    log_power: lossless_hp_decimal(&velocity.log_power),
+                    von_mangoldt_weight: lossless_hp_decimal(&velocity.von_mangoldt_weight),
+                    reduced_position: lossless_hp_decimal(&velocity.reduced_position),
+                    velocity_coefficient: lossless_hp_decimal(&velocity.velocity_coefficient),
+                    edge_jump_coefficient: lossless_hp_decimal(&velocity.edge_jump_coefficient),
+                    observation_is_event_edge: cutoff_equals_event_power(&lambda_identity, power)?,
+                    eigenvalue_velocity_response: lossless_hp_decimal(&eigenvalue_response),
+                    projected_forcing_norm: lossless_hp_decimal(&projected_forcing_norm),
+                    l2_eigenvector_velocity_response_norm: lossless_hp_decimal(&response_norm),
+                    l2_eigenvector_velocity_response: encode_hp_vector(&eigenvector_response),
+                    ccm_normalization_scale_velocity_response: lossless_hp_decimal(
+                        &ccm_scale_response,
+                    ),
+                    bordered_lagrange_multiplier: lossless_hp_decimal(&lagrange_multiplier),
+                    bordered_solve_relative_residual: lossless_hp_decimal(&relative_residual),
+                    root_velocity_responses,
+                });
                 progress.completed();
             }
             Ok(events)
-        })
-        .collect::<Vec<_>>();
+        },
+    );
     let events = chunks
         .into_iter()
         .collect::<Result<Vec<_>>>()?
@@ -12428,120 +12465,114 @@ fn validate_prime_power_response_analysis(
     let prepared_roots = PreparedRootResponses::new(&unit_state, &poles, roots, precision_bits)
         .map_err(|error| invalid(error.to_string()))?;
     let progress = ResponseProgress::new("validate", expected_content.len(), roots.len());
-    let chunk_size = response_performance::event_chunk_size(artifact.events.len());
-    let chunks = artifact
-        .events
-        .par_chunks(chunk_size)
-        .enumerate()
-        .map(
-            |(chunk_index, events)| -> std::result::Result<(), CacheError> {
-                for (event, (power, prime, exponent)) in events
-                    .iter()
-                    .zip(expected_content[chunk_index * chunk_size..].iter().copied())
+    let chunks = map_prime_response_chunks(
+        &artifact.events,
+        |offset, events| -> std::result::Result<(), CacheError> {
+            for (event, (power, prime, exponent)) in events
+                .iter()
+                .zip(expected_content[offset..].iter().copied())
+            {
+                if event.power != power
+                    || event.prime != prime
+                    || event.exponent != exponent
+                    || event.observation_is_event_edge
+                        != cutoff_equals_event_power(&lambda_identity, power)
+                            .map_err(|e| invalid(e.to_string()))?
+                    || event.l2_eigenvector_velocity_response.len() != dimension
+                    || event.root_velocity_responses.len() != roots.len()
                 {
-                    if event.power != power
-                        || event.prime != prime
-                        || event.exponent != exponent
-                        || event.observation_is_event_edge
-                            != cutoff_equals_event_power(&lambda_identity, power)
-                                .map_err(|e| invalid(e.to_string()))?
-                        || event.l2_eigenvector_velocity_response.len() != dimension
-                        || event.root_velocity_responses.len() != roots.len()
-                    {
-                        return Err(invalid(format!(
-                "CCM prime-power response event {power} has incompatible shape or identity"
-            )));
-                    }
-                    let velocity = apply_prime_power_velocity(
-                        params.n_modes,
-                        power,
-                        prime,
-                        l,
-                        &unit_state,
+                    return Err(invalid(format!(
+                        "CCM prime-power response event {power} has incompatible shape or identity"
+                    )));
+                }
+                let velocity = apply_prime_power_velocity(
+                    params.n_modes,
+                    power,
+                    prime,
+                    l,
+                    &unit_state,
+                    precision_bits,
+                )
+                .map_err(|error| invalid(error.to_string()))?;
+                let eigenvalue_response =
+                    deterministic_dot_hp(&unit_state, &velocity.action, precision_bits)?;
+                let projected_forcing = projected_response_forcing(
+                    &velocity.action,
+                    &unit_state,
+                    &eigenvalue_response,
+                    precision_bits,
+                )?;
+                let projected_forcing_norm =
+                    deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
+                let response =
+                    parse_hp_vector(&event.l2_eigenvector_velocity_response, precision_bits)?;
+                if response.iter().any(|value| !value.is_finite()) {
+                    return Err(invalid(format!(
+                        "CCM prime-power response event {power} contains a nonfinite vector value"
+                    )));
+                }
+                let response_norm = deterministic_l2_norm_hp(&response, precision_bits)?;
+                let ccm_scale_response = response_normalization_tangent(
+                    &unit_state,
+                    &response,
+                    &Float::with_val(precision_bits, 0),
+                    &ccm_scale,
+                    &unit_state_sum,
+                    precision_bits,
+                )?;
+                let lagrange_multiplier =
+                    parse_hp_scalar(&event.bordered_lagrange_multiplier, precision_bits)?;
+                let relative_residual = bordered_response_relative_residual(
+                    tau,
+                    state_eigenvalue,
+                    &unit_state,
+                    &projected_forcing,
+                    &response,
+                    &lagrange_multiplier,
+                    &shifted_frobenius_norm,
+                    precision_bits,
+                )?;
+
+                if event.log_power != lossless_hp_decimal(&velocity.log_power)
+                    || event.von_mangoldt_weight
+                        != lossless_hp_decimal(&velocity.von_mangoldt_weight)
+                    || event.reduced_position != lossless_hp_decimal(&velocity.reduced_position)
+                    || event.velocity_coefficient
+                        != lossless_hp_decimal(&velocity.velocity_coefficient)
+                    || event.edge_jump_coefficient
+                        != lossless_hp_decimal(&velocity.edge_jump_coefficient)
+                    || event.eigenvalue_velocity_response
+                        != lossless_hp_decimal(&eigenvalue_response)
+                    || event.projected_forcing_norm != lossless_hp_decimal(&projected_forcing_norm)
+                    || event.l2_eigenvector_velocity_response_norm
+                        != lossless_hp_decimal(&response_norm)
+                    || event.ccm_normalization_scale_velocity_response
+                        != lossless_hp_decimal(&ccm_scale_response)
+                    || event.bordered_solve_relative_residual
+                        != lossless_hp_decimal(&relative_residual)
+                    || !weil_eigvec_cache::residual_within_precision_floor(
+                        &relative_residual,
                         precision_bits,
                     )
-                    .map_err(|error| invalid(error.to_string()))?;
-                    let eigenvalue_response =
-                        deterministic_dot_hp(&unit_state, &velocity.action, precision_bits)?;
-                    let projected_forcing = projected_response_forcing(
-                        &velocity.action,
-                        &unit_state,
-                        &eigenvalue_response,
-                        precision_bits,
-                    )?;
-                    let projected_forcing_norm =
-                        deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
-                    let response =
-                        parse_hp_vector(&event.l2_eigenvector_velocity_response, precision_bits)?;
-                    if response.iter().any(|value| !value.is_finite()) {
-                        return Err(invalid(format!(
-                "CCM prime-power response event {power} contains a nonfinite vector value"
-            )));
-                    }
-                    let response_norm = deterministic_l2_norm_hp(&response, precision_bits)?;
-                    let ccm_scale_response = response_normalization_tangent(
-                        &unit_state,
-                        &response,
-                        &Float::with_val(precision_bits, 0),
-                        &ccm_scale,
-                        &unit_state_sum,
-                        precision_bits,
-                    )?;
-                    let lagrange_multiplier =
-                        parse_hp_scalar(&event.bordered_lagrange_multiplier, precision_bits)?;
-                    let relative_residual = bordered_response_relative_residual(
-                        tau,
-                        state_eigenvalue,
-                        &unit_state,
-                        &projected_forcing,
-                        &response,
-                        &lagrange_multiplier,
-                        &shifted_frobenius_norm,
-                        precision_bits,
-                    )?;
-
-                    if event.log_power != lossless_hp_decimal(&velocity.log_power)
-                        || event.von_mangoldt_weight
-                            != lossless_hp_decimal(&velocity.von_mangoldt_weight)
-                        || event.reduced_position != lossless_hp_decimal(&velocity.reduced_position)
-                        || event.velocity_coefficient
-                            != lossless_hp_decimal(&velocity.velocity_coefficient)
-                        || event.edge_jump_coefficient
-                            != lossless_hp_decimal(&velocity.edge_jump_coefficient)
-                        || event.eigenvalue_velocity_response
-                            != lossless_hp_decimal(&eigenvalue_response)
-                        || event.projected_forcing_norm
-                            != lossless_hp_decimal(&projected_forcing_norm)
-                        || event.l2_eigenvector_velocity_response_norm
-                            != lossless_hp_decimal(&response_norm)
-                        || event.ccm_normalization_scale_velocity_response
-                            != lossless_hp_decimal(&ccm_scale_response)
-                        || event.bordered_solve_relative_residual
-                            != lossless_hp_decimal(&relative_residual)
-                        || !weil_eigvec_cache::residual_within_precision_floor(
-                            &relative_residual,
-                            precision_bits,
-                        )
-                    {
-                        return Err(invalid(format!(
-                            "CCM prime-power response event {power} failed its numerical replay"
-                        )));
-                    }
-
-                    let expected = prepared_roots
-                        .values(&response)
-                        .map_err(|error| invalid(error.to_string()))?;
-                    if event.root_velocity_responses != expected {
-                        return Err(invalid(format!(
-                            "CCM prime-power response event {power} has an invalid root response"
-                        )));
-                    }
-                    progress.completed();
+                {
+                    return Err(invalid(format!(
+                        "CCM prime-power response event {power} failed its numerical replay"
+                    )));
                 }
-                Ok(())
-            },
-        )
-        .collect::<Vec<_>>();
+
+                let expected = prepared_roots
+                    .values(&response)
+                    .map_err(|error| invalid(error.to_string()))?;
+                if event.root_velocity_responses != expected {
+                    return Err(invalid(format!(
+                        "CCM prime-power response event {power} has an invalid root response"
+                    )));
+                }
+                progress.completed();
+            }
+            Ok(())
+        },
+    );
     for chunk in chunks {
         chunk?;
     }
@@ -23825,7 +23856,55 @@ mod tests {
     }
 
     #[test]
+    fn prime_response_event_schedule_preserves_owner_budget_and_order() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let resources = xc_core::RunResources::with_worker_limit(1024, 4).unwrap();
+            let _scope = resources.enter();
+            let parent = resources.try_reserve_retained(128).unwrap();
+            let events = (0..16).collect::<Vec<_>>();
+            let mut visited = Vec::new();
+            let chunks = map_prime_response_chunks(&events, |offset, chunk| {
+                let owner = xc_core::RunResources::current().expect("event lost its run owner");
+                assert_eq!(owner.maximum_bytes(), 1024);
+                assert_eq!(owner.usage().retained_bytes, 128);
+                // Two simultaneous event workspaces would exceed this budget.
+                let _workspace = owner.try_reserve_working(768).unwrap();
+                visited.extend_from_slice(chunk);
+                assert_eq!(chunk, &events[offset..offset + chunk.len()]);
+                chunk.iter().map(|n| n * n).collect::<Vec<_>>()
+            });
+            assert_eq!(visited, events);
+            assert_eq!(
+                chunks.into_iter().flatten().collect::<Vec<_>>(),
+                events.iter().map(|n| n * n).collect::<Vec<_>>()
+            );
+            assert_eq!(resources.usage().working_bytes, 0);
+            assert_eq!(resources.usage().peak_bytes, 896);
+            // Ordered result collection retains the first canonical failure.
+            let failures = map_prime_response_chunks(&events, |offset, _| Err::<(), _>(offset));
+            assert_eq!(failures.into_iter().collect::<Result<Vec<_>, _>>(), Err(0));
+            let occupied = resources.try_reserve_retained(129).unwrap();
+            let denied = map_prime_response_chunks(&events, |_, _| {
+                xc_core::RunResources::current()
+                    .unwrap()
+                    .try_reserve_working(768)
+                    .is_err()
+            });
+            assert!(denied.into_iter().all(|denied| denied));
+            drop(occupied);
+            drop(parent);
+            assert_eq!(resources.usage().retained_bytes, 0);
+        });
+    }
+
+    #[test]
     fn prime_power_response_records_and_replays_full_state_and_root_transport() {
+        let resources = xc_core::RunResources::new(32 << 20).unwrap();
+        let _scope = resources.enter();
         let precision_bits = 192;
         let params = CcmParams::from_lambda_sq_integer(13, 1);
         let mut cfg = HighPrecConfig::for_decimal_digits(40);
@@ -23886,6 +23965,8 @@ mod tests {
             &spectral_preparation,
         )
         .unwrap();
+        assert!(resources.usage().peak_bytes > 0);
+        assert_eq!(resources.usage().working_bytes, 0);
         assert_eq!(artifact.events.len(), 9);
         assert_eq!(artifact.roots.len(), 1);
         assert!(artifact.events.last().unwrap().observation_is_event_edge);
@@ -23917,6 +23998,7 @@ mod tests {
             &spectral_preparation,
         )
         .unwrap();
+        assert_eq!(resources.usage().working_bytes, 0);
 
         let mut tampered = artifact;
         tampered.events[0].root_velocity_responses[0] =
@@ -23939,6 +24021,7 @@ mod tests {
             &spectral_preparation,
         )
         .is_err());
+        assert_eq!(resources.usage().working_bytes, 0);
     }
 
     #[test]

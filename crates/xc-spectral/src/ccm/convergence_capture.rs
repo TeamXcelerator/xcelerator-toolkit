@@ -6054,6 +6054,85 @@ pub mod finite_capture {
             input.matches(&self.state)
         }
 
+        /// Restore the live route's explicitly finite reference jets from the
+        /// original authenticated runtime projection, after private preparation.
+        /// Later prepared target coefficients are never reference authority.
+        /// Existing explicit jets prevail. No provider or primary/root solver
+        /// is available through this route.
+        pub fn restore_recovery_reference_jets(
+            &self,
+            original: &ExternalResearchInputs,
+            expected_target_definition: &ContentDigest,
+            input: &mut ExternalResearchInputs,
+        ) -> std::result::Result<bool, xc_cache::CaptureFailure> {
+            self.restore_recovery_reference_jets_checked(
+                original,
+                expected_target_definition,
+                input,
+            )
+            .map_err(super::super::hp::response_repair::retained_capture_failure)
+        }
+
+        fn restore_recovery_reference_jets_checked(
+            &self,
+            original: &ExternalResearchInputs,
+            expected_target_definition: &ContentDigest,
+            input: &mut ExternalResearchInputs,
+        ) -> Result<bool> {
+            let _scope = self.resources.enter();
+            self.validate_recovery_input(input)?;
+            if !input.reference_jets.is_empty() {
+                return Ok(false);
+            }
+            let Some(reference) = super::super::research_completion::ReferencePreparation::from_retained_runtime_projection(
+                original, &self.state, expected_target_definition,
+            )? else {
+                return Ok(false);
+            };
+            let roots = self.roots.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("retained finite reference jets require authenticated roots")
+            })?;
+            let mut prepared = reference.prepare(&self.state, Some(roots))?;
+            if input.precision_bits >= prepared.precision_bits {
+                super::super::research_completion::promote_input_precision(
+                    &mut prepared,
+                    input.precision_bits,
+                )?;
+                // The usual recovery already has higher-precision inputs. Only
+                // jets change, so a failed combined budget/shape check can roll
+                // back without cloning a potentially large supplemental bundle.
+                let previous =
+                    std::mem::replace(&mut input.reference_jets, prepared.reference_jets);
+                if let Err(error) = input.validate() {
+                    input.reference_jets = previous;
+                    return Err(error);
+                }
+            } else {
+                // Match the live merge for lower-precision inputs. Admit its
+                // transactional copy and possible decimal growth before cloning.
+                let bytes = super::super::capture_runtime::retained_json_bytes(input)?
+                    .checked_mul(
+                        u64::from(prepared.precision_bits)
+                            .div_ceil(u64::from(input.precision_bits)),
+                    )
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "run memory budget exceeded: finite reference merge overflow"
+                        )
+                    })?;
+                let _reservation = self.resources.try_reserve_working(bytes)?;
+                let mut merged = input.clone();
+                super::super::research_completion::align_input_precisions(
+                    &mut merged,
+                    &mut prepared,
+                )?;
+                merged.reference_jets = prepared.reference_jets;
+                merged.validate()?;
+                *input = merged;
+            }
+            Ok(true)
+        }
+
         /// Prepare finite arithmetic children under the same ledger that admitted
         /// the retained matrix. The original state and matrix remain immutable.
         pub fn prepare_recovery_arithmetic_inputs(&self) -> Result<ExternalResearchInputs> {
@@ -6810,6 +6889,310 @@ pub mod finite_capture {
     #[cfg(test)]
     mod recovery_options_contract {
         use super::*;
+
+        fn finite_reference_fixture() -> (
+            RetainedFiniteSources,
+            ExternalResearchInputs,
+            super::super::super::research_completion::ReferencePreparation,
+        ) {
+            use super::super::super::retained_evidence::{
+                DatasetSpec, EvaluationPoint, ProjectionOptions, ReferenceSpec, ResearchInputs,
+            };
+            let manifest = |kind: &str| -> ArtifactManifest {
+                let digest = ContentDigest::sha256(kind.as_bytes());
+                serde_json::from_value(serde_json::json!({
+                    "schema_version":1,"key":xc_cache::ArtifactKey::new(kind,"finite-reference-fixture",kind.as_bytes()).unwrap(),
+                    "content_digest":digest,"size_bytes":1,"objects":[{"content_digest":digest,"size_bytes":1}],
+                    "created_unix_seconds":1,"producer_toolkit_version":xc_cache::ToolkitVersion::parse("0.16.0").unwrap(),"minimum_reader_version":xc_cache::ToolkitVersion::parse("0.16.0").unwrap(),
+                    "maximum_reader_version":null,"quality":"validated","visibility":"local","immutable":true,
+                    "dependencies":[],"tags":{},"provenance_digest":null
+                })).unwrap()
+            };
+            let state = super::super::super::state_geometry::RetainedState {
+                manifest: manifest("ccm_weil_eigenpair"),
+                cutoff: "9".into(),
+                modes: 1,
+                precision: 128,
+                coefficients: [0, 1, 0].map(|v| Float::with_val(128, v)).to_vec(),
+                eigenvalue: "1".into(),
+                selection_policy: None,
+            };
+            let mut secular = manifest("ccm_secular_source");
+            secular.dependencies.push(xc_cache::DependencyRef {
+                key: state.manifest.key.clone(),
+                content_digest: state.manifest.content_digest.clone(),
+                required_quality: xc_cache::CacheQuality::Validated,
+            });
+            let mut root_manifest = manifest("ccm_root_refinement");
+            root_manifest.dependencies.push(xc_cache::DependencyRef {
+                key: secular.key.clone(),
+                content_digest: secular.content_digest.clone(),
+                required_quality: xc_cache::CacheQuality::Validated,
+            });
+            let roots = super::super::super::retained_evidence::RetainedRoots {
+                manifest: root_manifest,
+                secular_manifest: secular,
+                dataset: DatasetSpec {
+                    schema_version: 1,
+                    role: "retained_ccm_roots".into(),
+                    attribution: "stored finite fixture; no provider or solver available".into(),
+                    coordinate: "mellin_t".into(),
+                    precision_bits: 128,
+                    points: vec![
+                        EvaluationPoint {
+                            ordinal: 1,
+                            value: Some("1".into()),
+                            source_status: "converged".into(),
+                        },
+                        EvaluationPoint {
+                            ordinal: 2,
+                            value: None,
+                            source_status: "failed".into(),
+                        },
+                        EvaluationPoint {
+                            ordinal: 3,
+                            value: Some("2".into()),
+                            source_status: "converged".into(),
+                        },
+                    ],
+                },
+                completeness: "partial".into(),
+                acquisition: serde_json::Value::Null,
+                cutoff: "9".into(),
+                modes: 1,
+            };
+            let definition = ContentDigest::sha256(b"offline original runtime target");
+            let scope = "supplied runtime target sampled on 256 uniform log-coordinate intervals; finite even Fourier projection through mode 1; composite trapezoid; maximum coefficient change on half grid=0; this measured refinement is not a quadrature, source-error, or infinite-tail certificate";
+            let original: ExternalResearchInputs = serde_json::from_value(serde_json::json!({
+                "schema_version":1,"source_eigenpair":state.manifest.content_digest,"lambda_squared":"9","n_modes":1,
+                "precision_bits":192,"convention_id":"runtime-target-samples-and-fourier-v1","definition_digest":definition,"approximation_scope":scope,
+                "target":{"definition_digest":definition,"evaluation_policy":"configured target evaluator; uniform x=log(u) nodes; normalized at u=1",
+                    "approximation_scope":scope,"intervals":256,"values":vec!["1";257],"basis_values":[],"fixed_second_component":null,
+                    "raw_normalizer":"1","trial_coefficients":["0.25","1","0.25"]}
+            })).unwrap();
+            original.validate().unwrap();
+            // The live constructor's retained values, independently assembled
+            // from the original finite reference, without evaluating a provider.
+            let live = super::super::super::research_completion::ReferencePreparation {
+                schema_version:1,
+                finite_reference:Some(ResearchInputs {schema_version:1,
+                    reference:ReferenceSpec {schema_version:1,definition:format!("finite Fourier projection of runtime target {}",definition.0),
+                        lambda_squared:"9".into(),precision_bits:192,coefficients:vec!["0.25".into(),"1".into(),"0.25".into()],approximation_scope:scope.into()},
+                    basis:vec![],projection:ProjectionOptions {working_precision_bits:256,normalization:"center_one".into(),fixed_second_component:None}}),
+                sampled_reference:original.target.clone(),lambda_squared:"9".into(),precision_bits:192,definition_digest:definition,
+                approximation_scope:format!("{scope}; signed jets refer to this explicitly finite Fourier projection, extended by zero outside the run window"),
+                weighted_atoms:vec![],atom_coordinate:None,atom_coverage:None,tail_form:None,tail_recipe:None,completion:None,
+            };
+            (
+                RetainedFiniteSources {
+                    state,
+                    matrix: None,
+                    roots: Some(roots),
+                    state_payload: vec![],
+                    root_payload: None,
+                    secular_payload: None,
+                    resources: xc_core::RunResources::with_worker_limit(256 << 20, 2).unwrap(),
+                    _source_reservations: vec![],
+                },
+                original,
+                live,
+            )
+        }
+
+        #[test]
+        fn retained_finite_reference_matches_live_without_provider_and_preserves_explicit_jets() {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let (mut sources, original, live) = finite_reference_fixture();
+                sources.resources = xc_core::RunResources::with_worker_limit(256 << 20, 1).unwrap();
+                let _scope = sources.resources.enter();
+                let mut later = original.clone();
+                // Later smooth-trial coefficients are explicitly not authority.
+                later.target.as_mut().unwrap().trial_coefficients =
+                    Some(vec!["1".into(), "3".into(), "1".into()]);
+                later.precision_bits = 384;
+                let mut expected = later.clone();
+                let mut live_prepared = live
+                    .prepare(&sources.state, sources.roots.as_ref())
+                    .unwrap();
+                super::super::super::research_completion::align_input_precisions(
+                    &mut expected,
+                    &mut live_prepared,
+                )
+                .unwrap();
+                expected.reference_jets = live_prepared.reference_jets;
+                assert!(sources
+                    .restore_recovery_reference_jets(
+                        &original,
+                        &original.definition_digest,
+                        &mut later
+                    )
+                    .unwrap());
+                assert_eq!(later, expected);
+                let mut lower = original.clone();
+                let mut lower_expected = original.clone();
+                let mut live_lower = live
+                    .prepare(&sources.state, sources.roots.as_ref())
+                    .unwrap();
+                super::super::super::research_completion::align_input_precisions(
+                    &mut lower_expected,
+                    &mut live_lower,
+                )
+                .unwrap();
+                lower_expected.reference_jets = live_lower.reference_jets;
+                assert!(sources
+                    .restore_recovery_reference_jets(
+                        &original,
+                        &original.definition_digest,
+                        &mut lower
+                    )
+                    .unwrap());
+                assert_eq!(
+                    lower, lower_expected,
+                    "admitted lower-precision merge must match live promotion"
+                );
+                assert_eq!(
+                    later
+                        .reference_jets
+                        .iter()
+                        .map(|j| j.ordinal)
+                        .collect::<Vec<_>>(),
+                    vec![1, 3]
+                );
+                assert!(later
+                    .reference_jets
+                    .iter()
+                    .all(|j| j.exterior_tail.value == "0" && j.exterior_tail.derivative == "0"));
+                let cache = ArtifactCacheContext {
+                    resolver: None,
+                    reference_resolver: None,
+                    acceptance: None,
+                    ordered_overlays: vec!["disabled".into()],
+                    mode: xc_cache::ArtifactExecutionCacheMode::Disabled,
+                    write_on_miss: false,
+                    write_visibility: xc_cache::CacheVisibility::Local,
+                    requested_assurance: xc_core::AssuranceLevel::Computed,
+                    certification_failure_policy:
+                        xc_cache::CertificationFailurePolicy::RetainComputedFailRun,
+                    production_sink: None,
+                };
+                let mut options = ExtensionOptions::for_source(&sources.state);
+                options.working_precision_bits = later.precision_bits;
+                let capture = |input| {
+                    super::super::super::extended_research::capture_extended(
+                        "signed_transform",
+                        &sources.state,
+                        None,
+                        sources.roots.as_ref(),
+                        Some(input),
+                        &options,
+                        &[],
+                        &cache,
+                    )
+                    .unwrap()
+                    .value
+                };
+                assert_eq!(
+                    serde_json::to_value(capture(&later)).unwrap(),
+                    serde_json::to_value(capture(&expected)).unwrap()
+                );
+                let before = later.clone();
+                assert!(!sources
+                    .restore_recovery_reference_jets(
+                        &original,
+                        &ContentDigest::sha256(b"different target"),
+                        &mut later
+                    )
+                    .unwrap());
+                assert_eq!(later, before, "explicit jets must prevail unchanged");
+            });
+        }
+
+        #[test]
+        fn retained_finite_reference_rejects_wrong_authority_and_missing_roots() {
+            let (mut sources, original, _) = finite_reference_fixture();
+            for case in 0..8 {
+                let mut changed = original.clone();
+                match case {
+                    0 => changed.source_eigenpair = ContentDigest::sha256(b"other state"),
+                    1 => changed.precision_bits += 64,
+                    2 => changed.definition_digest = ContentDigest::sha256(b"other target"),
+                    3 => {
+                        changed.target.as_mut().unwrap().definition_digest =
+                            ContentDigest::sha256(b"other sample")
+                    }
+                    4 => changed.target.as_mut().unwrap().trial_coefficients = None,
+                    5 => {
+                        changed.target.as_mut().unwrap().approximation_scope = "other scope".into()
+                    }
+                    6 => changed.target.as_mut().unwrap().fixed_second_component = Some("1".into()),
+                    _ => changed.n_modes = 2,
+                }
+                assert!(
+                    matches!(
+                        sources.restore_recovery_reference_jets(
+                            &changed,
+                            &original.definition_digest,
+                            &mut original.clone()
+                        ),
+                        Err(xc_cache::CaptureFailure::Failed { .. })
+                    ),
+                    "case {case}"
+                );
+            }
+            let mut unsupported = original.clone();
+            unsupported.convention_id = "arbitrary smooth reference".into();
+            assert!(!sources
+                .restore_recovery_reference_jets(
+                    &unsupported,
+                    &original.definition_digest,
+                    &mut original.clone()
+                )
+                .unwrap());
+            sources.roots = None;
+            assert!(sources
+                .restore_recovery_reference_jets(
+                    &original,
+                    &original.definition_digest,
+                    &mut original.clone()
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn finite_reference_workers_use_the_run_memory_owner() {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let (mut sources, original, live) = finite_reference_fixture();
+                let resources = xc_core::RunResources::with_worker_limit(1, 2).unwrap();
+                let _scope = resources.enter();
+                let error = live
+                    .prepare(&sources.state, sources.roots.as_ref())
+                    .unwrap_err();
+                assert!(format!("{error:#}").contains("budget"), "{error:#}");
+                assert_eq!(resources.usage().working_bytes, 0);
+                sources.resources = resources.clone();
+                let mut input = original.clone();
+                assert!(matches!(
+                    sources.restore_recovery_reference_jets(
+                        &original,
+                        &original.definition_digest,
+                        &mut input
+                    ),
+                    Err(xc_cache::CaptureFailure::Blocked { .. })
+                ));
+                assert_eq!(
+                    input, original,
+                    "refused restoration must leave every input field unchanged"
+                );
+            });
+        }
 
         fn defaults() -> ExtensionOptions {
             ExtensionOptions {
