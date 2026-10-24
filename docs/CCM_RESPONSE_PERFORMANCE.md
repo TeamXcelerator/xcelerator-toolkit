@@ -64,6 +64,9 @@ arithmetic remains directed. Only a uniquely rounded nonzero action is accepted.
 Zero or unresolved actions use the original row calculation at the same guard,
 and mathematical row errors replay the original ordering before selection.
 CUDA execution failures propagate. They do not silently switch to a CPU backend.
+The tighter CUDA enclosure may resolve an action at an earlier kernel guard,
+or succeed where the CPU guard ladder remains unresolved; values and artifact
+identities agree whenever both routes resolve.
 
 `cpu` is the default. `auto` currently uses the CPU route until complete stage
 measurements establish a winning GPU range. This setting does not change dense

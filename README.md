@@ -13,6 +13,10 @@ Version 0.17.0 improves large-run execution and retained-artifact reuse.
 See the [release notes](docs/RELEASE_NOTES.md)
 for compatibility details and public API changes.
 
+Main also contains unreleased updates after the existing `v0.17.0` tag. The
+package version remains 0.17.0; record the exact Git revision when identifying
+a build. The tag retains its published source snapshot.
+
 Xcelerator Toolkit supplies high-precision numerical libraries and reusable,
 source-bound research data. Applications can retain a primary calculation once
 and use Ultra capture to preserve every applicable implemented diagnostic.

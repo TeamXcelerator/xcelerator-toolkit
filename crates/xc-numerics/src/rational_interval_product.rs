@@ -145,7 +145,7 @@ pub fn contract(
     precision: u32,
     options: ContractionOptions,
 ) -> Result<Contraction> {
-    ensure_uniform_exponent_range()?;
+    ensure_uniform_exponent_range().context(ContractionAdmission)?;
     ensure!(
         shape.rows > 0 && shape.inner > 0 && shape.cols > 0,
         "positive contraction shape required"
@@ -237,7 +237,9 @@ pub fn contract(
     )?;
     let resources = xc_core::RunResources::current();
     if let Some(resources) = &resources {
-        resources.check_workers(options.workers)?;
+        resources
+            .check_workers(options.workers)
+            .context(ContractionAdmission)?;
     }
     let reservation = resources
         .as_ref()
@@ -260,29 +262,23 @@ pub fn contract(
     for interval in columns {
         let mut center = Float::with_val(precision, interval.lower() + interval.upper());
         center >>= 1;
-        ensure!(
+        admitted(
             center.is_finite(),
-            "contraction midpoint outside supported finite range"
-        );
+            "contraction midpoint outside supported finite range",
+        )?;
         let below = Float::with_val_round(precision, &center - interval.lower(), Round::Up).0;
         let above = Float::with_val_round(precision, interval.upper() - &center, Round::Up).0;
         let radius = if below > above { below } else { above };
-        ensure!(
+        admitted(
             radius.is_finite() && radius >= 0,
-            "contraction radius outside supported finite range"
-        );
+            "contraction radius outside supported finite range",
+        )?;
         centers.push(center);
         radii.push(radius);
     }
     let prepared = exact_product::prepare(&left, &centers, shape, precision, exact_limits)
         .and_then(|p| p.with_exact_output(u128::from(product_budget)))
-        .map_err(|e| {
-            if e.is::<exact_product::WorkspaceLimit>() {
-                e.context(ContractionAdmission)
-            } else {
-                e
-            }
-        })?;
+        .context(ContractionAdmission)?;
     let center_product = product(&prepared, Round::Nearest, options, product_budget)?;
     drop(prepared);
     for value in &mut left {
@@ -451,6 +447,27 @@ mod tests {
             .unwrap_err()
             .is::<ContractionAdmission>());
         assert!(contract(&a, &Integer::from(1), &x, shape, 96, options()).is_err());
+    }
+
+    #[test]
+    fn exponent_span_refusal_is_admission_and_releases_workspace() {
+        let resources = xc_core::RunResources::with_worker_limit(128 << 20, 1).unwrap();
+        let _scope = resources.enter();
+        let a = [Integer::from(1), Integer::from(1)];
+        let x = [bounds(1, 1, 64), bounds(1 << 20, 1 << 20, 64)];
+        let shape = ProductShape {
+            rows: 1,
+            inner: 2,
+            cols: 1,
+        };
+        let limits = ContractionOptions {
+            max_exponent_span: 1,
+            ..options()
+        };
+        let error = contract(&a, &Integer::from(1), &x, shape, 64, limits).unwrap_err();
+        assert!(error.is::<ContractionAdmission>(), "{error:#}");
+        assert!(!error.is::<ContractionExecution>());
+        assert_eq!(resources.usage().working_bytes, 0);
     }
 
     #[test]

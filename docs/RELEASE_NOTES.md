@@ -1,6 +1,10 @@
 # Release notes
 
-## 0.17.0 (2026-10-19)
+## Unreleased changes after v0.17.0
+
+Main includes the following updates after the existing v0.17.0 tag. The package
+version remains 0.17.0; use the exact Git revision to identify these builds.
+The published tag continues to identify its original source snapshot.
 
 U-flow prime actions reuse exact coefficient rows across bounded event batches,
 with optional storage admitted by the shared memory budget. Exact quadrant
@@ -13,6 +17,12 @@ using exact integer products and rigorous interval radii, retaining the original
 unique-rounding requirement. Workspace, tile rows, host workers, and event batch
 size are configurable; CPU batching remains the default. See
 [response performance](CCM_RESPONSE_PERFORMANCE.md) for scope and controls.
+
+Exact interval contractions classify native-range, midpoint/radius, and first
+product-preparation refusals as admission failures before any backend executes.
+Failures after backend entry remain execution failures.
+
+## 0.17.0 (2026-10-19)
 
 Finite signed and indexed transforms can retry cancellation-limited inputs
 with additional directed-arithmetic precision. The legacy precision policy
