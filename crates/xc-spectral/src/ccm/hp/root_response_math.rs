@@ -1,6 +1,6 @@
 //! Correctly rounded implicit root motion of exact stored point data.
 //! Directed, reversibly scaled arithmetic excludes source/assembly error.
-//! Guard limits are operational: the legacy attempt prefix is unchanged, and
+//! Root and stored-point response guard limits are operational: the legacy attempt prefix is unchanged, and
 //! only uniquely rounded results (or an exact interval zero) are accepted.
 use crate::ccm::retained_evidence::finite_math::{scale, scale_float};
 use anyhow::{bail, Result};
@@ -39,8 +39,11 @@ impl GuardPolicy {
         };
         Self::new(precision_bits, maximum)
     }
-    fn guards(self) -> impl Iterator<Item = u32> {
+    pub(super) fn guards(self) -> impl Iterator<Item = u32> {
         (6..=self.maximum_guard_bits.ilog2()).map(|power| 1u32 << power)
+    }
+    pub(super) fn maximum_guard_bits(self) -> u32 {
+        self.maximum_guard_bits
     }
 }
 fn default_maximum_guard_bits(p: u32) -> Result<u32> {

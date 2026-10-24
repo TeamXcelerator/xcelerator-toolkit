@@ -9,7 +9,7 @@
 //! - Solve the spectrum equation with Halley's method by default, with
 //!   explicit Newton selection available for controlled comparisons.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
 use rug::{ops::Pow, Float};
 use serde::{Deserialize, Serialize};
@@ -11918,6 +11918,8 @@ struct UFlowVelocityActions {
     tau_archimedean: Vec<Float>,
     tau_prime: Vec<Float>,
     tau_total: Vec<Float>,
+    // A decoded private checkpoint owns its admitted storage until consumed.
+    _checkpoint_reservation: Option<xc_core::MemoryReservation>,
 }
 
 #[cfg(test)]
@@ -12046,6 +12048,20 @@ fn compute_u_flow_velocity_actions(
     #[cfg(test)]
     U_FLOW_ACTION_CALLS.with(|count| count.set(count.get() + 1));
     u_flow_math::evaluate(params, cfg, l, unit_state)
+}
+
+fn compute_u_flow_velocity_actions_checkpointed(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    unit_state: &[Float],
+    semantic: &SemanticKeyEnvelope,
+    mode: xc_cache::ArtifactExecutionCacheMode,
+    assurance: xc_core::AssuranceLevel,
+) -> Result<UFlowVelocityActions> {
+    #[cfg(test)]
+    U_FLOW_ACTION_CALLS.with(|count| count.set(count.get() + 1));
+    u_flow_math::evaluate_checkpointed(params, cfg, l, unit_state, semantic, mode, assurance)
 }
 
 /// Apply one active prime power's additive contribution to `dQ/du` to a
@@ -12863,7 +12879,8 @@ fn compute_u_flow_response_channel(
     if action.len() != dimension {
         bail!("CCM u-flow channel {channel} has an incompatible action dimension");
     }
-    let eigenvalue_response = deterministic_dot_hp(unit_state, action, precision_bits)?;
+    let eigenvalue_response = deterministic_dot_hp(unit_state, action, precision_bits)
+        .context("eigenvalue-response dot product")?;
     let projected_forcing =
         projected_response_forcing(action, unit_state, &eigenvalue_response, precision_bits)?;
     let projected_forcing_norm = deterministic_l2_norm_hp(&projected_forcing, precision_bits)?;
@@ -13048,7 +13065,8 @@ fn compute_u_flow_response_analysis_with_memo(
             &bordered_solver,
             &shifted_frobenius_norm,
             precision_bits,
-        )?;
+        )
+        .with_context(|| format!("u-flow response channel {channel}"))?;
         if index + 1 == U_FLOW_CHANNELS.len() {
             total_l2_vector_response = Some(l2_vector_response);
         }
@@ -13568,8 +13586,16 @@ fn resolve_u_flow_response_analysis_via_cache_with_memo(
             let unit_state = response_unit_state(xi, precision_bits)?;
             let velocity_actions = {
                 let _stage = crate::ccm::capture_runtime::Stage::new("u-flow velocity actions");
-                compute_u_flow_velocity_actions(params, cfg, l, &unit_state)
-                    .map_err(|e| CacheError::InvalidManifest(e.to_string()))?
+                compute_u_flow_velocity_actions_checkpointed(
+                    params,
+                    cfg,
+                    l,
+                    &unit_state,
+                    &semantic_key,
+                    cache.mode,
+                    cache.requested_assurance,
+                )
+                .map_err(|e| CacheError::InvalidManifest(format!("{e:#}")))?
             };
             let _stage = crate::ccm::capture_runtime::Stage::new("u-flow response solves");
             let artifact = compute_u_flow_response_analysis_with_memo(

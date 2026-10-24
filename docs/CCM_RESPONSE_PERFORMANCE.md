@@ -22,7 +22,8 @@ root/event order and adjacent-pair summation tree are preserved. Division remain
 division; reciprocal multiplication and reassociated sums are not substituted.
 Event errors are reported in canonical event order.
 
-Implicit root responses keep the original guard attempts of 64 through 4096
+Implicit root responses and stored-point response helpers keep the original
+guard attempts of 64 through 4096
 extra bits. At higher source precision, the default extends through the next
 power of two at or above `precision_bits + 64`. Set
 `XC_ROOT_RESPONSE_MAX_GUARD_BITS` to a canonical decimal power of two from
@@ -32,6 +33,14 @@ relaxes the nonzero-derivative or identical-rounded-endpoints checks. Extra
 guard bits can resolve cancellation but do not guarantee a result. Guard
 exhaustion and budget refusal do not create reusable response artifacts.
 
+Stored-point dot products have an additional exact fallback after their original
+interval attempts. Each finite binary product is formed exactly, checked for
+range loss, and the complete sum is rounded once. Workspace admission includes
+product storage and exponent spread. This resolves cancellation that exceeds
+the old dot guard without weakening the required rounding or changing previous
+successful results. Other helpers still require their directed intervals to
+resolve; extending their guard ceiling is not a proof of eventual success.
+
 Generation and numerical replay print progress at event boundaries, approximately
 every thirty seconds for larger jobs, and at completion. The line distinguishes
 `compute` from `validate`, and includes completed/total events and elapsed time.
@@ -39,6 +48,15 @@ An individual event can exceed the reporting interval; the line is not an ETA.
 Operational progress does not enter artifact payloads or cache identities.
 
 ## U-flow event preparation
+
+Completed derivative action vectors can be retained in local research
+checkpoints before subsequent channel solves. Reuse validates the source,
+precision, numerical policy, native exponent context, and checkpoint payload.
+These checkpoints are build-bound, never published as research artifacts, and
+are used only for computed-assurance reuse. Forced recomputation, numerical
+verification, and higher assurance bypass them. They preserve
+work across a later failure under the same build; they cannot recover vectors
+lost by an older process or promise reuse after a code update.
 
 U-flow reuses exact coefficient rows and their directed interval conversions
 across bounded prime-power event batches. `XC_RESPONSE_EVENT_BATCH` is a positive

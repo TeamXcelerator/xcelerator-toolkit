@@ -319,6 +319,226 @@ pub(super) fn evaluate(
 ) -> Result<UFlowVelocityActions> {
     evaluate_with_reuse(params, cfg, l, vector, true)
 }
+
+fn action_checkpoint_identity(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    vector: &[Float],
+    semantic: &SemanticKeyEnvelope,
+) -> serde_json::Value {
+    serde_json::json!({
+        "semantics": "ccm-private-u-flow-actions-v2",
+        "request": semantic,
+        "lambda_squared": lambda_squared_cache_identity(params),
+        "modes": params.n_modes,
+        "precision_bits": cfg.precision_bits,
+        "quad_points": cfg.quad_points,
+        "quadrature_generator": cfg.archimedean_gl_generator,
+        "source": hp_values_memo_identity(vector),
+        "length": hp_values_memo_identity(std::slice::from_ref(l)),
+        "mpfr_range": [rug::float::exp_min(), rug::float::exp_max()],
+    })
+}
+
+fn action_checkpoint_allowed(
+    mode: xc_cache::ArtifactExecutionCacheMode,
+    assurance: xc_core::AssuranceLevel,
+) -> bool {
+    mode == xc_cache::ArtifactExecutionCacheMode::PreferReuse
+        && assurance == xc_core::AssuranceLevel::Computed
+}
+
+pub(super) fn evaluate_checkpointed(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    vector: &[Float],
+    semantic: &SemanticKeyEnvelope,
+    mode: xc_cache::ArtifactExecutionCacheMode,
+    assurance: xc_core::AssuranceLevel,
+) -> Result<UFlowVelocityActions> {
+    // Higher assurance, refresh, disabled, and independent verification never
+    // consume or write execution checkpoints. They exercise the original path.
+    let store = if action_checkpoint_allowed(mode, assurance) {
+        match crate::ccm::capture_runtime::Checkpoints::new(&action_checkpoint_identity(
+            params, cfg, l, vector, semantic,
+        )) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                xc_core::progress_message!("u-flow action checkpoint unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    evaluate_with_checkpoint(params, cfg, l, vector, true, store.as_ref())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionCheckpoint {
+    schema_version: u32,
+    precision_bits: u32,
+    // Fixed-count JSON strings avoid Vec<String> allocation amplification from
+    // a malformed sealed file containing many tiny scalar elements. Tokens are
+    // counted and length-checked before allocating any decoded Float vector.
+    channels: [String; 4],
+}
+
+impl ActionCheckpoint {
+    fn encode(actions: &UFlowVelocityActions, p: u32) -> Self {
+        let encode = |values: &[Float]| {
+            let mut text = String::new();
+            for value in values {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&lossless_hp_decimal(value));
+            }
+            text
+        };
+        Self {
+            schema_version: 2,
+            precision_bits: p,
+            channels: [
+                encode(&actions.tau_pole),
+                encode(&actions.tau_archimedean),
+                encode(&actions.tau_prime),
+                encode(&actions.tau_total),
+            ],
+        }
+    }
+
+    fn decode(self, count: usize, p: u32) -> Result<UFlowVelocityActions> {
+        anyhow::ensure!(
+            self.schema_version == 2
+                && self.precision_bits == p
+                && self.channels.iter().all(|row| {
+                    row.split('\n').count() == count
+                        && row
+                            .split('\n')
+                            .all(|text| !text.is_empty() && text.len() <= p as usize + 128)
+                }),
+            "u-flow action checkpoint shape or precision mismatch"
+        );
+        let decode = |values: String| -> Result<Vec<Float>> {
+            values
+                .split('\n')
+                .map(|text| {
+                    let value = parse_hp_scalar(text, p)?;
+                    anyhow::ensure!(
+                        value.is_finite() && lossless_hp_decimal(&value) == text,
+                        "u-flow action checkpoint is not canonical finite point data"
+                    );
+                    Ok(value)
+                })
+                .collect()
+        };
+        let [pole, archimedean, prime, total] = self.channels;
+        Ok(UFlowVelocityActions {
+            tau_pole: decode(pole)?,
+            tau_archimedean: decode(archimedean)?,
+            tau_prime: decode(prime)?,
+            tau_total: decode(total)?,
+            _checkpoint_reservation: None,
+        })
+    }
+}
+
+// One ASCII character per precision bit is a conservative bound for the
+// lossless decimal mantissa; the remainder admits exponents and JSON framing.
+fn action_checkpoint_bytes(count: usize, p: u32) -> u64 {
+    1024 + 4 * count as u64 * (u64::from(p) + 128)
+}
+
+fn action_checkpoint_workspace(cap: u64) -> u64 {
+    // Checkpoints uses a 1 MiB BufReader. The remaining allowance covers JSON
+    // string growth, parsed Floats, and canonical scalar formatting scratch.
+    (1 << 20) + cap.saturating_mul(4)
+}
+
+fn load_action_checkpoint(
+    store: &crate::ccm::capture_runtime::Checkpoints,
+    count: usize,
+    p: u32,
+    budget: u128,
+) -> Option<UFlowVelocityActions> {
+    if !store.enabled() {
+        return None;
+    }
+    // A checkpoint must not bypass the native exponent-range compatibility
+    // required by the subsequent numerical worker route.
+    xc_numerics::mpfr_interval::ensure_uniform_exponent_range().ok()?;
+    let cap = action_checkpoint_bytes(count, p);
+    let bytes = action_checkpoint_workspace(cap);
+    if u128::from(bytes) > budget {
+        return None;
+    }
+    // Admit JSON text, decoded points, and temporary validation storage before
+    // deserialization. A denied optional reuse takes the original cold path.
+    let reservation = match xc_core::RunResources::current() {
+        Some(resources) => Some(resources.try_reserve_working(bytes).ok()?),
+        None => None,
+    };
+    match store
+        .limited_bytes(cap)
+        .load::<ActionCheckpoint>("u-flow-velocity-actions")
+    {
+        Ok(Some(saved)) => match saved.decode(count, p) {
+            Ok(mut actions) => {
+                actions._checkpoint_reservation = reservation;
+                xc_core::progress_message!(
+                    "[HP] u-flow velocity actions: reused private completion"
+                );
+                Some(actions)
+            }
+            Err(error) => {
+                xc_core::progress_message!(
+                    "u-flow action checkpoint rejected ({error}); recomputing"
+                );
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            xc_core::progress_message!(
+                "u-flow action checkpoint unavailable ({error}); recomputing"
+            );
+            None
+        }
+    }
+}
+
+fn save_action_checkpoint(
+    store: &crate::ccm::capture_runtime::Checkpoints,
+    actions: &UFlowVelocityActions,
+    p: u32,
+    budget: u128,
+) {
+    if !store.enabled() {
+        return;
+    }
+    let cap = action_checkpoint_bytes(actions.tau_total.len(), p);
+    let bytes = action_checkpoint_workspace(cap);
+    if u128::from(bytes) > budget {
+        return;
+    }
+    let _reservation = match xc_core::RunResources::current() {
+        Some(resources) => match resources.try_reserve_working(bytes) {
+            Ok(reservation) => Some(reservation),
+            Err(_) => return,
+        },
+        None => None,
+    };
+    if let Err(error) = store.limited_bytes(cap).save(
+        "u-flow-velocity-actions",
+        &ActionCheckpoint::encode(actions, p),
+    ) {
+        xc_core::progress_message!("u-flow action checkpoint not saved ({error})");
+    }
+}
 #[cfg(test)]
 thread_local! {
     static GL_PRECOMPUTE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -329,6 +549,17 @@ fn evaluate_with_reuse(
     l: &Float,
     vector: &[Float],
     reuse: bool,
+) -> Result<UFlowVelocityActions> {
+    evaluate_with_checkpoint(params, cfg, l, vector, reuse, None)
+}
+
+fn evaluate_with_checkpoint(
+    params: &CcmParams,
+    cfg: &HighPrecConfig,
+    l: &Float,
+    vector: &[Float],
+    reuse: bool,
+    checkpoint: Option<&crate::ccm::capture_runtime::Checkpoints>,
 ) -> Result<UFlowVelocityActions> {
     let event_batch = if reuse {
         prime_response_kernel::validate_batch_configuration()?;
@@ -397,6 +628,14 @@ fn evaluate_with_reuse(
         bytes + scratch,
         budget,
     )?;
+    // Preserve source, execution-policy, and workspace admission before any
+    // reuse. The checkpoint contains only fully resolved action vectors, never
+    // a failed/partial action or the subsequent channel-solve result.
+    if let Some(checkpoint) = checkpoint {
+        if let Some(actions) = load_action_checkpoint(checkpoint, vector.len(), p, budget) {
+            return Ok(actions);
+        }
+    }
     #[cfg(test)]
     GL_PRECOMPUTE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let tables = {
@@ -576,12 +815,17 @@ fn evaluate_with_reuse(
             total_out.push(values[3].clone());
         }
         if resolved {
-            return Ok(UFlowVelocityActions {
+            let actions = UFlowVelocityActions {
                 tau_pole: pole_out,
                 tau_archimedean: arch_out,
                 tau_prime: prime_out,
                 tau_total: total_out,
-            });
+                _checkpoint_reservation: None,
+            };
+            if let Some(checkpoint) = checkpoint {
+                save_action_checkpoint(checkpoint, &actions, p, budget);
+            }
+            return Ok(actions);
         }
     }
     bail!("u-flow action rounding unresolved within 4096 guard bits")
@@ -607,6 +851,199 @@ fn event_batch_size(value: Option<&str>) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn checkpoint_fixture() -> (
+        CcmParams,
+        HighPrecConfig,
+        Float,
+        Vec<Float>,
+        SemanticKeyEnvelope,
+    ) {
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = 128;
+        cfg.quad_points = 96;
+        cfg.cache_mode = xc_numerics::quadrature::CacheMode::Off;
+        let params = CcmParams::from_lambda_sq_integer(3, 1);
+        let l = Float::with_val(128, 3);
+        let vector = [1, -2, 3].map(|v| Float::with_val(128, v) / 7).to_vec();
+        let semantic = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "ccm_u_flow_response_analysis".into(),
+            mathematical_semantics_version: "test".into(),
+            resolved_mathematical_parameters: serde_json::json!({"source": "test"}),
+            normalization: None,
+            target: None,
+            subspace: None,
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: None,
+        };
+        (params, cfg, l, vector, semantic)
+    }
+
+    #[test]
+    fn uflow_action_checkpoint_survives_later_failure_and_rejects_tampering() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let resources = xc_core::RunResources::new(1 << 30).unwrap();
+            let _scope = resources.enter();
+            let (params, cfg, l, vector, semantic) = checkpoint_fixture();
+            let directory = xc_core::test_support::TestDir::new("u-flow-progress");
+            let identity = action_checkpoint_identity(&params, &cfg, &l, &vector, &semantic);
+            let store =
+                crate::ccm::capture_runtime::Checkpoints::local(&identity, directory.to_path_buf())
+                    .unwrap();
+            let before = GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get);
+            let cold =
+                evaluate_with_checkpoint(&params, &cfg, &l, &vector, true, Some(&store)).unwrap();
+            let expected = channel_bits(&cold);
+            assert_eq!(GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get), before + 1);
+            drop(cold);
+            // A later response-channel failure does not undo successful action work.
+            let later: Result<()> = (|| {
+                let warm =
+                    evaluate_with_checkpoint(&params, &cfg, &l, &vector, true, Some(&store))?;
+                assert_eq!(channel_bits(&warm), expected);
+                assert!(resources.usage().working_bytes > 0);
+                bail!("injected later channel refusal")
+            })();
+            assert!(later
+                .unwrap_err()
+                .to_string()
+                .contains("later channel refusal"));
+            assert_eq!(GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get), before + 1);
+            assert_eq!(resources.usage().working_bytes, 0);
+            let warm =
+                evaluate_with_checkpoint(&params, &cfg, &l, &vector, true, Some(&store)).unwrap();
+            assert_eq!(channel_bits(&warm), expected);
+            drop(warm);
+            // The existing checkpoint reader authenticates the sealed payload.
+            let key_dir = std::fs::read_dir(&directory)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let payload = std::fs::read_dir(key_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_none())
+                .unwrap();
+            let mut bytes = std::fs::read(&payload).unwrap();
+            bytes[0] = b'!';
+            std::fs::write(&payload, bytes).unwrap();
+            let repaired =
+                evaluate_with_checkpoint(&params, &cfg, &l, &vector, true, Some(&store)).unwrap();
+            assert_eq!(channel_bits(&repaired), expected);
+            assert_eq!(GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get), before + 2);
+            drop(repaired);
+            // Reuse still runs admission before touching the stored vectors.
+            let occupied = resources.try_reserve_retained((1 << 30) - 1).unwrap();
+            assert!(
+                evaluate_with_checkpoint(&params, &cfg, &l, &vector, true, Some(&store)).is_err()
+            );
+            assert_eq!(GL_PRECOMPUTE_CALLS.with(std::cell::Cell::get), before + 2);
+            drop(occupied);
+            assert_eq!(resources.usage().working_bytes, 0);
+        });
+    }
+
+    #[test]
+    fn uflow_action_checkpoint_validates_points_and_binds_context() {
+        let (params, cfg, l, vector, semantic) = checkpoint_fixture();
+        let identity = action_checkpoint_identity(&params, &cfg, &l, &vector, &semantic);
+        let mut changed = vector.clone();
+        changed[0] += 1;
+        assert_ne!(
+            identity,
+            action_checkpoint_identity(&params, &cfg, &l, &changed, &semantic)
+        );
+        changed = vector.clone();
+        changed[0].set_prec(129);
+        assert_ne!(
+            identity,
+            action_checkpoint_identity(&params, &cfg, &l, &changed, &semantic)
+        );
+        let mut other_cfg = cfg.clone();
+        other_cfg.quad_points += 1;
+        assert_ne!(
+            identity,
+            action_checkpoint_identity(&params, &other_cfg, &l, &vector, &semantic)
+        );
+        let mut other = semantic.clone();
+        other.resolved_mathematical_parameters = serde_json::json!({"source": "different"});
+        assert_ne!(
+            identity,
+            action_checkpoint_identity(&params, &cfg, &l, &vector, &other)
+        );
+        let values = vec![Float::with_val(128, -0.0), Float::with_val(128, 1) / 7];
+        let actions = UFlowVelocityActions {
+            tau_pole: values.clone(),
+            tau_archimedean: values.clone(),
+            tau_prime: values.clone(),
+            tau_total: values,
+            _checkpoint_reservation: None,
+        };
+        let decoded = ActionCheckpoint::encode(&actions, 128)
+            .decode(2, 128)
+            .unwrap();
+        assert_eq!(channel_bits(&decoded), channel_bits(&actions));
+        assert!(ActionCheckpoint::encode(&actions, 128)
+            .decode(2, 127)
+            .is_err());
+        assert!(ActionCheckpoint::encode(&actions, 128)
+            .decode(1, 128)
+            .is_err());
+        let mut invalid = ActionCheckpoint::encode(&actions, 128);
+        invalid.channels[0] = "NaN\n1".into();
+        assert!(invalid.decode(2, 128).is_err());
+        let mut invalid = ActionCheckpoint::encode(&actions, 128);
+        invalid.channels[0] = "0.0\n1".into();
+        assert!(invalid.decode(2, 128).is_err());
+        for malformed in [
+            "0\n".to_owned(),
+            "\n0".to_owned(),
+            "0\n0\n0".to_owned(),
+            "0".repeat(257),
+        ] {
+            let mut invalid = ActionCheckpoint::encode(&actions, 128);
+            invalid.channels[0] = malformed;
+            assert!(invalid.decode(2, 128).is_err());
+        }
+        // Tiny-element JSON arrays are rejected by the wire type itself;
+        // deserialization cannot grow an arbitrary Vec<String> first.
+        let malformed = serde_json::json!({
+            "schema_version": 2, "precision_bits": 128,
+            "channels": [["", "", ""], [], [], []],
+        });
+        assert!(serde_json::from_value::<ActionCheckpoint>(malformed).is_err());
+        use xc_cache::ArtifactExecutionCacheMode as Mode;
+        use xc_core::AssuranceLevel as Assurance;
+        assert!(action_checkpoint_allowed(
+            Mode::PreferReuse,
+            Assurance::Computed
+        ));
+        for assurance in [Assurance::CrossChecked, Assurance::Certified] {
+            assert!(!action_checkpoint_allowed(Mode::PreferReuse, assurance));
+        }
+        for mode in [
+            Mode::RequireReuse,
+            Mode::Refresh,
+            Mode::VerifyAgainstReference,
+            Mode::Disabled,
+        ] {
+            for assurance in [
+                Assurance::Computed,
+                Assurance::CrossChecked,
+                Assurance::Certified,
+            ] {
+                assert!(!action_checkpoint_allowed(mode, assurance));
+            }
+        }
+    }
+
     #[test]
     fn response_event_batch_configuration_is_positive_and_not_a_source_cap() {
         assert_eq!(event_batch_size(None).unwrap(), 8);

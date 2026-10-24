@@ -33,6 +33,14 @@ jets from authenticated projection coefficients, without evaluating a provider
 or inferring an infinite tail. Previously successful artifact values and keys
 are unchanged.
 
+Stored-point response dot products retain their previous interval attempts and
+then use an admitted exact-product sum when cancellation prevents resolution.
+The shared response guard setting also applies to downstream stored-point
+helpers, with workspace admission for extended attempts. Completed u-flow
+derivative actions have validated local, build-bound checkpoints before channel
+solves. Earlier successful artifact bytes and identities remain unchanged;
+resource refusals and unresolved mathematical quantities remain explicit.
+
 ## 0.17.0 (2026-10-19)
 
 Finite signed and indexed transforms can retry cancellation-limited inputs
