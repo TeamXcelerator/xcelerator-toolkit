@@ -23,6 +23,44 @@ Dependency or source-code additions follow the review requirements in
 static linking or redistributing native libraries requires a review of the
 new incorporation and distribution scope.
 
+## Exact products and optional CUDA integration
+
+The stored-dyadic conversion, exact integer CPU oracle, modular residue/product
+tree and CRT code, binary HP adapter, and typed two-pass Tau decoder are original
+implementations developed with AI assistance. The integer/CRT identities and
+binary scaling are implemented by project-owned Rust code; no third-party matrix
+kernel source, research dataset, or external solver implementation is copied.
+The HP path reuses Rug and its existing GMP/MPFR dependencies.
+
+`xc-numerics/modular-product` adds optional direct dependencies pinned to
+`num-bigint` 0.4.8, `num-integer` 0.1.46, and `num-traits` 0.2.19. These package
+versions already occur in the workspace lockfile. All three declare
+`MIT OR Apache-2.0`; their original notices and distribution terms apply.
+They supply integer and numeric traits, while the toolkit owns residue selection,
+product bounds, reconstruction, resource checks, and backend selection.
+
+`xc-numerics/cuda-product`, also enabled by `hp`, uses separately installed NVIDIA CUDA runtime and
+cuBLAS shared libraries. Its original, narrow Rust FFI follows the documented
+ABI for allocation/copy/free, cuBLAS handle lifetime, and `cublasGemmEx` integer
+products. Sources reviewed are NVIDIA's [cuBLAS API](https://docs.nvidia.com/cuda/cublas/index.html)
+and [CUDA runtime memory API](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda_runtime_api/group__CUDART__MEMORY.html).
+No NVIDIA implementation, header, SDK package, or binary is vendored or bundled;
+no CUDA source is compiled by this feature. The original runtime-loader code
+resolves CUDA 12/13 and cuBLAS shared-library entry points from the user's
+installation; neither library is a build/link dependency. Device selection,
+per-device handles and buffers, and the prime-task scheduler are project-owned
+implementations. CPU execution remains available without a CUDA installation.
+
+NVIDIA software remains subject to its separate
+[CUDA license terms](https://docs.nvidia.com/cuda/eula/index.html). This integration
+does not grant redistribution rights or authorize bundling vendor libraries.
+Binary distribution must disclose the optional runtime dependency and undergo
+a fresh package-content/license review before any vendor component is included.
+The toolkit's source-available license and contribution authorization requirements
+remain unchanged. ABI and integer-GEMM behavior require qualification against the
+actual installed driver, libraries, and hardware; numerical tests alone do not
+establish compatibility across every CUDA version or device.
+
 ## Retained-source diagnostics in v0.15.0
 
 Prefix LDLT, block-inverse trace recurrences, normalized checkpoint exports
@@ -94,9 +132,18 @@ dependency notices and distribution terms continue to apply.
 
 ### Native library linkage
 
-The Linux `arb` bridge dynamically links system FLINT while `rug` uses its
-bundled GMP/MPFR build. Native ABI compatibility is therefore a build
-requirement, not a fact certified by numerical tests. Symbol interposition
-between the bundled and system libraries has been observed without numerical
-failure in the tested build; a coherent native-library toolchain remains a
-packaging limitation to qualify on library upgrades.
+The optional `arb` feature uses shared system FLINT, GMP, and MPFR throughout
+the dependency graph, including Rug. The direct optional `gmp-mpfr-sys` 1.7
+dependency enables its `use-system-libs` feature; this is the same resolved
+package already supplied through Rug, with unchanged distribution terms.
+Builds without Arb retain Rug's bundled GMP 6.3.0 and MPFR 4.2.2.
+The qualified Arb system stack uses FLINT 3.0.1, GMP 6.3.0, and MPFR 4.2.1.
+
+The Arb build requires matching development headers and runtime libraries and
+executes a probe requiring thread-safe MPFR. The bridge requires TLS-enabled
+FLINT headers at compile time. It checks versions, ABI,
+exponent context, and serial FLINT settings before generation and proof replay.
+Deployment must preserve one shared GMP/MPFR pair, without bundled native symbol
+definitions or allocator/interposition overrides. Numerical tests alone do not
+establish this packaging contract. See the
+[native build and linkage policy](../crates/xc-numerics/ARBITRARY_PRECISION_QUADRATURE.md).

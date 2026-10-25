@@ -281,6 +281,7 @@ pub(super) fn analyze(
             "finite-section maximum-guard scratch exceeds explicit working-byte budget",
         ));
     }
+    let _workspace = crate::ccm::capture_runtime::reserve_working(u128::from(scratch))?;
     for guard in [64, 128, 256, 512, 1024, 2048, 4096] {
         let Some(measured) = calculate(s, m, c, requested, requested + guard)? else {
             continue;

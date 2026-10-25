@@ -1,6 +1,185 @@
 use super::*;
 use rug::{Integer, Rational};
 
+// Frozen stored-resolution contracts, with the new default dense-LU arithmetic
+// isolated explicitly from the released solver identity. Literal old arithmetic
+// names and the record shape deliberately do not use current version constants.
+#[test]
+fn default_dense_lu_isolates_released_eigenpair_identity_for_both_solvers() {
+    let tau =
+        super::tests::conditioning_test_manifest("ccm_tau_matrix", "released-eigenpair-source");
+    let params = CcmParams::from_lambda_sq_integer(13, 1);
+    let mut cfg = HighPrecConfig::for_decimal_digits(20);
+    cfg.precision_bits = 128;
+    cfg.inverse_iter_steps = 2;
+    let common = serde_json::json!({
+        "lambda_squared": "13", "n_modes": 1, "precision_bits": 128,
+        "scalar_backend": "rug_mpfr", "force_even": true,
+        "normalization": "sum_xi_equals_sqrt_log_lambda_squared",
+        "source_identity_arithmetic": "validated_tau_dependency_and_exact_log_source_v2",
+        "tau_source_identity": DependencyRef { key: tau.key.clone(), content_digest: tau.content_digest.clone(), required_quality: CacheQuality::Validated },
+        "l2_normalization_arithmetic": "power_two_scaled_max_precision_l2_v2",
+        "parity_basis_arithmetic": "directed_stored_point_orthonormal_parity_v2",
+        "state_normalization_arithmetic": "directed_scaled_exact_sum_sqrt_l_state_v2",
+        "tau_residual_arithmetic": "directed_scaled_stored_infinity_norm_v2",
+        "ground_index_validation": "directed_stored_source_stable_ground_index_and_rounding_scale_gap_v3",
+        "inverse_iteration_semantics": "dense-inverse-iteration-mixed-parity-residual-checked-wrapper-v3"
+    });
+    for solver in [
+        CcmEigenstateSolver::LegacyInverseIteration,
+        CcmEigenstateSolver::ShiftInvertKrylov,
+    ] {
+        cfg.eigenstate_solver = solver;
+        cfg.ground_index_policy = CcmGroundIndexPolicy::Require;
+        let mut parameters = common.clone();
+        let (version, algorithm, suffix) = match solver {
+            CcmEigenstateSolver::LegacyInverseIteration => {
+                parameters["inverse_iteration_step_limit"] = serde_json::json!(2);
+                ("ccm-smallest-weil-eigenpair-stored-resolution-v4",
+                 "dense_inverse_iteration_with_half_precision_basin_shifted_rescue_and_full_tau_residual_gate_v1", "")
+            }
+            CcmEigenstateSolver::ShiftInvertKrylov => {
+                for (key, value) in serde_json::json!({
+                    "eigenstate_route": "shift_invert_krylov",
+                    "krylov_subspace_dimension": 32, "krylov_maximum_restarts": 64,
+                    "krylov_guard_eigenpairs": 2, "polishing_inverse_iteration_step_limit": 2,
+                    "polishing_residual_policy": "directed_nonworsening_16_dim_ulp_matrix_floor_budgeted_phases_v2",
+                    "krylov_working_precision_bits": 320,
+                    "krylov_precision_policy": "same_stored_sector_double_source_plus_64_capped_one_million_v1",
+                    "ccm_source_boundary_count": "budgeted_stable_outward_stored_source_inertia_v1",
+                    "source_boundary_count_semantics": "hp_krylov_source_bound_budgeted_boundary_inertia_v5",
+                    "boundary_cluster_resolution_policy": "stored_state_residual_and_one_norm_scale_gap_v1",
+                    "borrowed_dense_action": "exact_products_guarded_sum_v2"
+                }).as_object().unwrap() {
+                    parameters[key] = value.clone();
+                }
+                (
+                    "ccm-smallest-weil-eigenpair-shift-invert-krylov-budgeted-count-resolution-v7",
+                    "ccm_even_zero_shift_krylov_budgeted_count_polish_resolution_v7",
+                    "/shift_invert_krylov",
+                )
+            }
+            CcmEigenstateSolver::Auto => unreachable!(),
+        };
+        let released = SemanticKeyEnvelope {
+            schema_version: 1,
+            artifact_kind: "ccm_weil_eigenpair".into(),
+            mathematical_semantics_version: version.into(),
+            resolved_mathematical_parameters: parameters,
+            normalization: Some("sum_xi_equals_sqrt_log_lambda_squared".into()),
+            target: Some("smallest_weil_form_eigenpair".into()),
+            subspace: Some("even".into()),
+            source_data_identities: BTreeMap::new(),
+            algorithm_semantics: Some(algorithm.into()),
+        };
+        let (required, logical) = weil_eigenpair_cache_identity(&params, &cfg, &tau).unwrap();
+        assert_eq!(logical, format!("ccm/weil-eigenpair/13/1/128/even{suffix}"));
+        let mut without_dense_lu = required.clone();
+        let dense_lu = without_dense_lu
+            .resolved_mathematical_parameters
+            .as_object_mut()
+            .unwrap()
+            .remove("dense_lu_arithmetic")
+            .unwrap();
+        assert_eq!(
+            dense_lu,
+            serde_json::json!("dense_lu_partial_pivot_dimension_panel512_exact_schur_v1")
+        );
+        assert_eq!(
+            serde_json::to_vec(&without_dense_lu).unwrap(),
+            serde_json::to_vec(&released).unwrap()
+        );
+        assert_ne!(required.digest().unwrap(), released.digest().unwrap());
+
+        cfg.ground_index_policy = CcmGroundIndexPolicy::RecordOutcome;
+        let (recorded, recorded_logical) =
+            weil_eigenpair_cache_identity(&params, &cfg, &tau).unwrap();
+        let mut old_recorded = released.clone();
+        old_recorded.resolved_mathematical_parameters["ground_index_admission"] =
+            serde_json::json!("record_outcome_v1");
+        let mut corrected_recorded = old_recorded.clone();
+        corrected_recorded.resolved_mathematical_parameters["stored_resolution_arithmetic"] =
+            serde_json::json!("stored_state_residual_and_admitted_gap_v2");
+        corrected_recorded.resolved_mathematical_parameters["dense_lu_arithmetic"] = dense_lu;
+        assert_eq!(recorded, corrected_recorded);
+        assert_ne!(recorded.digest().unwrap(), old_recorded.digest().unwrap());
+        assert_ne!(recorded.digest().unwrap(), required.digest().unwrap());
+        assert_eq!(recorded_logical, logical);
+    }
+}
+
+#[test]
+fn released_required_resolution_preserves_serialized_record_bytes() {
+    #[derive(Serialize)]
+    struct ReleasedResolution {
+        arithmetic: &'static str,
+        eigenvalue_resolution: &'static str,
+        eigenvalue_lower: String,
+        eigenvalue_upper: String,
+        residual_upper: String,
+        matrix_rounding_scale_upper: String,
+        coefficient_sum_condition_upper: Option<String>,
+        selected_gap_lower: Option<String>,
+        residual_angle_upper: String,
+        assembly_error_bound: Option<String>,
+    }
+    for p in [64, 128, 256] {
+        for dimension in [1, 3] {
+            let mut tau = vec![Float::with_val(p, 0); dimension * dimension];
+            let mut xi = vec![Float::with_val(p, 0); dimension];
+            for i in 0..dimension {
+                tau[i * dimension + i] = Float::with_val(p, 2);
+            }
+            tau[(dimension / 2) * dimension + dimension / 2] = Float::with_val(p, 1);
+            xi[dimension / 2] = Float::with_val(p, 1);
+            let lambda = Float::with_val(p, 1);
+            let parity = CcmParityPolicy::EvenSector;
+            let outcome =
+                ground_index::outcome_with_residual(&tau, &xi, &lambda, p, parity, None).unwrap();
+            assert_eq!(outcome, ground_index::Outcome::Proven);
+            let record = stored_resolution::bounds(&tau, &xi, &lambda, p, parity)
+                .unwrap()
+                .admit(&outcome, CcmGroundIndexPolicy::Require);
+            let work = p + 64;
+            let up = |x: &Float| x.to_string_radix_round(10, None, rug::float::Round::Up);
+            let down = |x: &Float| x.to_string_radix_round(10, None, rug::float::Round::Down);
+            let one = Float::with_val(work, 1);
+            let zero = Float::with_val(work, 0);
+            // Exact diagonal oracle: residual zero, floor n*max|A|*2^-p,
+            // and neighbor gap floor + 2^-(p+8), with no eigensolver.
+            let floor = Float::with_val(work, if dimension == 1 { 1 } else { 6 }) >> p;
+            let gap = Float::with_val(work, Rational::from((1537, 256))) >> p;
+            let released = ReleasedResolution {
+                arithmetic: "stored_state_residual_and_one_norm_scale_gap_v1",
+                eigenvalue_resolution: "resolved",
+                eigenvalue_lower: down(&one),
+                eigenvalue_upper: up(&one),
+                residual_upper: up(&zero),
+                matrix_rounding_scale_upper: up(&floor),
+                coefficient_sum_condition_upper: Some(up(&one)),
+                selected_gap_lower: (dimension != 1).then(|| down(&gap)),
+                residual_angle_upper: up(&zero),
+                assembly_error_bound: None,
+            };
+            let frozen_bytes = serde_json::to_vec(&released).unwrap();
+            assert_eq!(serde_json::to_vec(&record).unwrap(), frozen_bytes);
+            let decoded: CcmStoredStateResolution = serde_json::from_slice(&frozen_bytes).unwrap();
+            assert_eq!(decoded, record);
+
+            let recorded = stored_resolution::bounds(&tau, &xi, &lambda, p, parity)
+                .unwrap()
+                .admit(&outcome, CcmGroundIndexPolicy::RecordOutcome);
+            assert_eq!(
+                recorded.arithmetic,
+                "stored_state_residual_and_admitted_gap_v2"
+            );
+            assert_eq!(recorded.selected_gap_lower, record.selected_gap_lower);
+            assert_eq!(recorded.residual_angle_upper, record.residual_angle_upper);
+            assert!(recorded.separation_unresolved_reason.is_none());
+        }
+    }
+}
+
 #[test]
 fn exact_dyadic_gap_floor_threshold_and_scaling() {
     for p in [64u32, 128, 256] {
@@ -28,9 +207,8 @@ fn exact_dyadic_gap_floor_threshold_and_scaling() {
                 // The manufactured even pencil is diagonal with eigenvalues
                 // exactly 0, gap, scale: this oracle uses no eigensolver.
                 let record =
-                    stored_resolution::bounds(&a, &v, &zero, p, CcmParityPolicy::EvenSector)
-                        .unwrap()
-                        .record;
+                    stored_resolution::resolved(&a, &v, &zero, p, CcmParityPolicy::EvenSector)
+                        .unwrap();
                 let bound = Float::with_val(
                     p + 64,
                     Float::parse(&record.matrix_rounding_scale_upper).unwrap(),
@@ -59,9 +237,8 @@ fn eigenvalue_sign_floor_is_distinct_from_eigenvector_resolution() {
             Float::with_val(p, 0),
         ];
         ground_index::validate(&a, &v, &a[4], p, CcmParityPolicy::EvenSector).unwrap();
-        let record = stored_resolution::bounds(&a, &v, &a[4], p, CcmParityPolicy::EvenSector)
-            .unwrap()
-            .record;
+        let record =
+            stored_resolution::resolved(&a, &v, &a[4], p, CcmParityPolicy::EvenSector).unwrap();
         assert_eq!(record.eigenvalue_resolution, expected);
         assert_eq!(record.assembly_error_bound, None);
     }
@@ -850,4 +1027,125 @@ fn secular_source_rebinds_validation_identity_with_unchanged_state_bytes() {
         ..warm
     };
     assert!(resolve_secular_source_via_cache(&params, &cfg, &current, &corrupt_cache).is_err());
+}
+
+#[cfg(test)]
+mod unresolved_separation_regression {
+    use super::*;
+    #[test]
+    fn repeated_eigenvalue_never_retains_unproved_separation() {
+        let p = 128;
+        let tau = vec![Float::with_val(p, 0); 9];
+        let xi = vec![
+            Float::with_val(p, 0),
+            Float::with_val(p, 1),
+            Float::with_val(p, 0),
+        ];
+        let lambda = Float::with_val(p, 0);
+        let bounds =
+            stored_resolution::bounds(&tau, &xi, &lambda, p, CcmParityPolicy::EvenSector).unwrap();
+        let outcome = ground_index::outcome_with_residual(
+            &tau,
+            &xi,
+            &lambda,
+            p,
+            CcmParityPolicy::EvenSector,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(outcome, ground_index::Outcome::NotEstablished(_)));
+        let record = bounds.admit(&outcome, CcmGroundIndexPolicy::RecordOutcome);
+        assert!(record.selected_gap_lower.is_none());
+        assert!(record.residual_angle_upper.is_none());
+        assert!(record.separation_unresolved_reason.is_some());
+
+        let params = CcmParams::from_lambda_sq_integer(13, 1);
+        let mut cfg = HighPrecConfig::for_decimal_digits(20);
+        cfg.precision_bits = p;
+        cfg.eigenstate_solver = CcmEigenstateSolver::LegacyInverseIteration;
+        cfg.ground_index_policy = CcmGroundIndexPolicy::RecordOutcome;
+        let middle = log_lambda_sq_hp(&params, p).unwrap().sqrt();
+        let normalized = vec![Float::with_val(p, 0), middle.clone(), Float::with_val(p, 0)];
+        let mut artifact = PortableWeilEigenpair {
+            stored_state_resolution: Some(
+                stored_resolution::resolved(
+                    &tau,
+                    &normalized,
+                    &lambda,
+                    p,
+                    cfg.effective_parity_policy(),
+                )
+                .unwrap(),
+            ),
+            schema_version: 4,
+            lambda_squared: "13".into(),
+            n_modes: 1,
+            precision_bits: p,
+            force_even: true,
+            parity_policy: None,
+            eigenstate_route: legacy_eigenstate_route_name(),
+            eigenvalue: "0".into(),
+            eigenvector: vec!["0".into(), middle.to_string(), "0".into()],
+            inverse_iteration: PortableInverseIterationDiagnostics {
+                configured_step_limit: cfg.inverse_iter_steps,
+                unshifted_steps: 2,
+                unshifted_converged: true,
+                final_relative_rayleigh_change: Some("0".into()),
+                shifted_refinement: "accepted".into(),
+                final_relative_residual_norm: "0".into(),
+            },
+            shift_invert_krylov: None,
+            ground_index: Some(CcmGroundIndexAdmission::from_outcome(
+                ground_index::outcome_with_residual(
+                    &tau,
+                    &normalized,
+                    &lambda,
+                    p,
+                    cfg.effective_parity_policy(),
+                    None,
+                )
+                .unwrap(),
+            )),
+        };
+        assert!(
+            decode_weil_eigenpair(&artifact, &params, &cfg, &tau).is_ok(),
+            "record-outcome decoder rejects fixture"
+        );
+        assert!(decode_weil_eigenpair_admitted(&artifact, &params, &cfg, &tau, false).is_ok());
+        let original = artifact.stored_state_resolution.clone();
+        // The previous outcome route published candidate separation despite
+        // the failed proof. Its v1 bytes must not enter the corrected identity,
+        // on either mathematical replay or previously admitted warm decoding.
+        let old = artifact.stored_state_resolution.as_mut().unwrap();
+        old.arithmetic = "stored_state_residual_and_one_norm_scale_gap_v1".into();
+        old.selected_gap_lower = Some("1e-41".into());
+        old.residual_angle_upper = Some("0".into());
+        old.separation_unresolved_reason = None;
+        for prove in [false, true] {
+            let error =
+                decode_weil_eigenpair_admitted(&artifact, &params, &cfg, &tau, prove).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("stored-state resolution failed source replay"),
+                "{error}"
+            );
+        }
+        artifact.stored_state_resolution = original.clone();
+        artifact
+            .stored_state_resolution
+            .as_mut()
+            .unwrap()
+            .selected_gap_lower = Some("1e-41".into());
+        for prove in [false, true] {
+            assert!(decode_weil_eigenpair_admitted(&artifact, &params, &cfg, &tau, prove).is_err());
+        }
+        artifact.stored_state_resolution = original;
+        let value = serde_json::to_value(&artifact.stored_state_resolution).unwrap();
+        assert!(value["selected_gap_lower"].is_null());
+        assert!(value["residual_angle_upper"].is_null());
+        cfg.ground_index_policy = CcmGroundIndexPolicy::Require;
+        artifact.ground_index = None;
+        assert!(decode_weil_eigenpair(&artifact, &params, &cfg, &tau).is_err());
+    }
 }

@@ -803,6 +803,7 @@ pub mod hp {
         Ok(values)
     }
 
+    #[cfg(test)]
     fn prolate_spectrum_via_cache(
         lambda: &Float,
         n_grid: usize,
@@ -893,16 +894,96 @@ pub mod hp {
             let started = std::time::Instant::now();
             let error = compute_k_lambda_finite_dirichlet(&lambda, 100001, 2, p, CacheMode::Off)
                 .unwrap_err();
-            assert!(error.to_string().contains("work budget"), "{error}");
+            assert!(error.to_string().contains("workspace budget"), "{error}");
             assert!(started.elapsed() < std::time::Duration::from_secs(2));
             // This documented setting is admissible under both memory and work policy.
             super::super::legendre::resource_budget(512, 64, 13, 3386, false).unwrap();
             assert!(super::super::legendre::resource_budget(100001, 2, 4, 3386, false).is_err());
         }
+
+        #[test]
+        fn finite_dirichlet_plans_real_grids_without_polynomial_work_charge() {
+            for (cutoff, n, p) in [
+                (13, 4001, 3386),
+                (100, 4001, 3386),
+                (100, 8001, 3386),
+                (1000, 8001, 6708),
+            ] {
+                let lambda = Float::with_val(p, cutoff).sqrt();
+                let plan = plan_finite_dirichlet(&lambda, n, 1024, p, 32 << 30).unwrap();
+                assert_eq!(plan.grid_points, n);
+                assert!(plan.estimated_peak_bytes < 2 << 30);
+                assert!(plan.maximum_interpolations <= 1024 * (cutoff as u128 + 1));
+                assert!(super::super::legendre::resource_budget(
+                    n,
+                    1024,
+                    cutoff as usize,
+                    p,
+                    false
+                )
+                .is_err());
+                assert!(
+                    plan_finite_dirichlet(&lambda, n, 1024, p, plan.estimated_peak_bytes - 1)
+                        .is_err()
+                );
+            }
+        }
+
+        #[test]
+        fn finite_dirichlet_plan_bounds_actual_rounded_grid_and_cache_text() {
+            for p in [33, 128, 3386] {
+                let lambda = Float::with_val(p, 13).sqrt();
+                let plan = plan_finite_dirichlet(&lambda, 32, 19, p, 1 << 30).unwrap();
+                assert_eq!(plan.grid_points, 33);
+                for i in 0..19u32 {
+                    let mut x = Float::with_val(p, i);
+                    x /= 18u32;
+                    x *= 2u32;
+                    x -= 1u32;
+                    x *= lambda.clone().ln();
+                    let terms = Float::with_val(p, &lambda / x.exp())
+                        .floor()
+                        .to_integer()
+                        .unwrap()
+                        .to_u64()
+                        .unwrap();
+                    assert!(u128::from(terms) * 19 <= plan.maximum_interpolations);
+                }
+            }
+            let lambda = Float::with_val(3386, 13).sqrt();
+            assert!(plan_finite_dirichlet(&lambda, 33, 100_000, 3386, 1 << 30).is_err());
+            assert!(plan_finite_dirichlet(&lambda, usize::MAX, 2, 3386, u64::MAX).is_err());
+            assert!(plan_finite_dirichlet(&lambda, 33, usize::MAX, 3386, u64::MAX).is_err());
+            assert!(plan_finite_dirichlet(&lambda, 33, 2, u32::MAX, u64::MAX).is_err());
+        }
+
+        #[test]
+        fn finite_dirichlet_run_budget_refuses_before_cache_and_releases_lease() {
+            let run = xc_core::RunResources::new(1).unwrap();
+            let _scope = run.enter();
+            let error = compute_k_lambda_finite_dirichlet(
+                &Float::with_val(128, 2),
+                33,
+                9,
+                128,
+                CacheMode::Off,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("workspace budget"));
+            assert_eq!(run.usage().working_bytes, 0);
+            assert_eq!(run.usage().peak_bytes, 0);
+            drop(_scope);
+            let run = xc_core::RunResources::new(1 << 30).unwrap();
+            let _scope = run.enter();
+            compute_k_lambda_finite_dirichlet(&Float::with_val(128, 2), 33, 9, 128, CacheMode::Off)
+                .unwrap();
+            assert_eq!(run.usage().working_bytes, 0);
+            assert!(run.usage().peak_bytes > 0);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn prolate_spectrum_via_cache_model(
+    fn prolate_spectrum_artifact_via_cache_model(
         lambda: &Float,
         n_grid: usize,
         prec: u32,
@@ -910,7 +991,10 @@ pub mod hp {
         off_diag: &[Float],
         cache: &ArtifactCacheContext<'_>,
         legendre: bool,
-    ) -> std::result::Result<Vec<Float>, CacheError> {
+    ) -> std::result::Result<
+        xc_cache::ArtifactExecutionCacheResult<PortableProlateSpectrum>,
+        CacheError,
+    > {
         let model = if legendre {
             "prolate-bounded-legendre-even-spectrum-v1"
         } else {
@@ -987,7 +1071,27 @@ pub mod hp {
                 Ok(())
             },
         )?;
-        decode_prolate_spectrum(&resolved.value, lambda, n_grid, prec)
+        Ok(resolved)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prolate_spectrum_via_cache_model(
+        lambda: &Float,
+        n_grid: usize,
+        prec: u32,
+        diag: &[Float],
+        off_diag: &[Float],
+        cache: &ArtifactCacheContext<'_>,
+        legendre: bool,
+    ) -> std::result::Result<Vec<Float>, CacheError> {
+        let source = prolate_spectrum_artifact_via_cache_model(
+            lambda, n_grid, prec, diag, off_diag, cache, legendre,
+        )?;
+        decode_prolate_spectrum(&source.value, lambda, n_grid, prec)
+    }
+
+    mod finite_dirichlet_cache {
+        include!("prolate_fd_cache.rs");
     }
 
     // The standalone noninteger route uses the same exact-source payload as
@@ -1632,10 +1736,16 @@ pub mod hp {
         {
             return Some("invalid finite prolate source dimensions or cutoff".into());
         }
-        if let Err(error) = super::legendre::resource_budget(n_expected, 2, 0, prec, false) {
+        let lambda = Float::with_val(prec, lambda_sq.value_f64).sqrt();
+        if let Err(error) = plan_finite_dirichlet(
+            &lambda,
+            n_expected,
+            2,
+            prec,
+            xc_core::RunResources::current().map_or(1 << 30, |r| r.maximum_bytes()),
+        ) {
             return Some(error.to_string());
         }
-        let lambda = Float::with_val(prec, lambda_sq.value_f64).sqrt();
         let (d, b) = match try_build_pw_matrix(&lambda, n_expected, prec) {
             Ok(matrix) => matrix,
             Err(error) => return Some(error.to_string()),
@@ -2322,6 +2432,11 @@ pub mod hp {
     }
 
     /// Managed-cache counterpart of the explicit finite-Dirichlet route.
+    /// Retains the complete historical spectrum, selected recovered modes, and
+    /// sampled profile as separate source-bound artifacts. Sample-count changes
+    /// reuse the modes. Mode reuse rechecks the directed recovery gate without
+    /// inverse iteration; profile reuse retains computed assurance. Refresh and
+    /// reference verification recompute every layer under the common policy.
     pub fn compute_k_lambda_finite_dirichlet_via_cache(
         lambda: &Float,
         n_grid: usize,
@@ -2391,16 +2506,92 @@ pub mod hp {
     ) -> Result<HpProlateResult> {
         let start = std::time::Instant::now();
 
+        let resources = xc_core::RunResources::current();
+        if let Some(r) = &resources {
+            r.check_cancelled()?;
+            r.check_workers(rayon::current_num_threads())?;
+        }
+        let plan = plan_finite_dirichlet(
+            lambda,
+            n_grid,
+            n_sample,
+            prec,
+            resources.as_ref().map_or(1 << 30, |r| r.maximum_bytes()),
+        )?;
+        // Keep the reservation across spectrum, mode recovery, cache decoding,
+        // and sampling. It includes worker scratch and the returned profile.
+        let _workspace = resources
+            .as_ref()
+            .map(|r| r.reserve_working(plan.estimated_peak_bytes))
+            .transpose()?;
+
+        let source_lambda = lambda;
+        let working_lambda = Float::with_val(prec, lambda);
+        let lambda = &working_lambda;
+        let n = plan.grid_points;
+
+        xc_core::progress_message!(
+            "[HP prolate] finite-Dirichlet admission: estimated workspace={} bytes; at most {} interpolations; QR work indicator={} (not an elapsed-time estimate)",
+            plan.estimated_peak_bytes,
+            plan.maximum_interpolations,
+            plan.eigen_work_indicator
+        );
+
+        let fresh = matches!(&cache_route, ProlateCacheRoute::Fabric(cache)
+            if !cache.mode.consults_cache_for_result_reuse())
+            || matches!(&cache_route, ProlateCacheRoute::Standalone(CacheMode::Off));
+        let compute = || {
+            compute_k_lambda_admitted(
+                source_lambda,
+                lambda,
+                n_grid,
+                n,
+                n_sample,
+                prec,
+                cache_route,
+                start,
+            )
+        };
+        if fresh {
+            xc_numerics::eigen::without_qr_checkpoints(compute)
+        } else {
+            compute()
+        }
+    }
+
+    /// Allocation and work estimates for the HP finite-Dirichlet route.
+    /// Work indicators describe the algorithm; they are not memory or time caps.
+    #[derive(Clone, Debug)]
+    pub struct FiniteDirichletPlan {
+        pub grid_points: usize,
+        pub estimated_peak_bytes: u64,
+        pub maximum_interpolations: u128,
+        pub eigen_work_indicator: u128,
+    }
+
+    /// Validate and plan the historical finite-difference route without solving
+    /// a spectrum, consulting a cache, or allocating grid-sized arrays.
+    /// Sampling uses two neighboring grid values, not Legendre polynomials.
+    /// The caller supplies a memory budget; computation uses the active run's
+    /// shared reservation ledger (or a 1 GiB estimate limit without a run).
+    /// This is an allocation estimate, not an RSS guarantee or a runtime bound.
+    #[allow(unknown_lints, clippy::manual_is_multiple_of)]
+    pub fn plan_finite_dirichlet(
+        lambda: &Float,
+        n_grid: usize,
+        n_sample: usize,
+        prec: u32,
+        maximum_working_bytes: u64,
+    ) -> Result<FiniteDirichletPlan> {
         if !lambda.is_finite()
             || lambda <= &1
-            || !(32..=1_000_000).contains(&prec)
+            || !(33..=1_000_000).contains(&prec)
             || n_grid >= u32::MAX as usize
             || n_sample < 2
             || n_sample > u32::MAX as usize
         {
             anyhow::bail!("prolate requires finite positive lambda, valid precision, grid < u32::MAX, and at least two samples");
         }
-        let source_lambda = lambda;
         let working_lambda = Float::with_val(prec, lambda);
         let lambda = &working_lambda;
         anyhow::ensure!(
@@ -2418,14 +2609,54 @@ pub mod hp {
             anyhow::bail!("n_grid too small (got {}); need at least 16 to find h_4", n);
         }
 
-        let terms = cutoff
-            .clone()
-            .ceil()
+        // Use exactly the sampler's rounded lower endpoint. Rounding exp/log
+        // means ceil(lambda^2) alone need not bound its integer loop count.
+        // Every later grid point is at least this endpoint by monotonicity.
+        let lower = (-lambda.clone().ln()).exp();
+        let ratio = Float::with_val(prec, lambda / &lower);
+        let terms = ratio
+            .floor()
             .to_integer()
-            .and_then(|x| x.to_usize())
-            .ok_or_else(|| anyhow::anyhow!("prolate finite-sum work budget exceeded"))?;
-        super::legendre::resource_budget(n, n_sample, terms, prec, false)?;
+            .and_then(|x| x.to_u64())
+            .ok_or_else(|| anyhow::anyhow!("sampled finite-sum cutoff exceeds u64 range"))?;
+        let work_precision = (prec * 2 + 64).min(1_000_000);
+        let work_scalar = 96 + u128::from(work_precision).div_ceil(64) * 8;
+        let stored_scalar = 96 + u128::from(prec).div_ceil(64) * 8;
+        // Recovery itself permits 64*n scalars at 2*p+64. Allow another 32*n
+        // for retained source/mode vectors and portable cache text. Profile
+        // serialization needs both Float values and their decimal strings.
+        let workers = rayon::current_num_threads().min(n_sample) as u128;
+        let bytes = 96 * n as u128 * work_scalar
+            + n_sample as u128 * (8 * (u128::from(prec) + 128) + 4 * stored_scalar)
+            + 64 * workers * work_scalar;
+        anyhow::ensure!(
+            bytes <= u128::from(maximum_working_bytes),
+            "finite-Dirichlet workspace budget exceeded: estimated_bytes={bytes}, maximum_working_bytes={maximum_working_bytes}"
+        );
+        // Mirror the downstream banded recovery admission before any QR work.
+        anyhow::ensure!(
+            64 * n as u128 * (64 + u128::from(work_precision).div_ceil(8)) <= 8u128 << 30,
+            "finite-Dirichlet eigenvector recovery exceeds its 8 GiB workspace bound"
+        );
+        Ok(FiniteDirichletPlan {
+            grid_points: n,
+            estimated_peak_bytes: u64::try_from(bytes)?,
+            maximum_interpolations: n_sample as u128 * u128::from(terms),
+            eigen_work_indicator: n as u128 * n as u128 * u128::from(work_precision).div_ceil(64),
+        })
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn compute_k_lambda_admitted(
+        source_lambda: &Float,
+        lambda: &Float,
+        n_grid: usize,
+        n: usize,
+        n_sample: usize,
+        prec: u32,
+        cache_route: ProlateCacheRoute<'_>,
+        start: std::time::Instant,
+    ) -> Result<HpProlateResult> {
         xc_core::progress_message!(
             "[HP prolate] computing k_λ at λ²={}, N={}, n_sample={}, prec={} bits",
             {
@@ -2471,10 +2702,21 @@ pub mod hp {
             None
         };
 
-        let eigenvalues: Vec<Float> = if let ProlateCacheRoute::Fabric(cache) = &cache_route {
-            // Exact source keys support every finite cutoff and enforce RequireReuse
-            // even when lambda squared is not an integer.
-            prolate_spectrum_via_cache(source_lambda, n, prec, &diag, &off_diag, cache)?
+        let spectrum_source = if let ProlateCacheRoute::Fabric(cache) = &cache_route {
+            Some(prolate_spectrum_artifact_via_cache_model(
+                source_lambda,
+                n,
+                prec,
+                &diag,
+                &off_diag,
+                cache,
+                false,
+            )?)
+        } else {
+            None
+        };
+        let eigenvalues: Vec<Float> = if let Some(source) = &spectrum_source {
+            decode_prolate_spectrum(&source.value, source_lambda, n, prec)?
         } else if let Some(lambda_sq_int) = cache_key {
             if let ProlateCacheRoute::Standalone(mode) = cache_route {
                 if let Some(cached) = load_prolate_eigvals_cache(lambda_sq_int, n, prec, mode)
@@ -2535,106 +2777,33 @@ pub mod hp {
         }
         validate_fd_selected_spectrum(&diag, &off_diag, &eigenvalues, prec)?;
 
-        // Search the lowest-lying eigenfunctions for h_0 and h_4.
-        // Limit search depth: prolate h_4 is the third even eigenfunction.
-        let n_try = super::PROLATE_SEARCH_DEPTH.min(n);
-        xc_core::progress_message!("[HP prolate] searching for h_0 (even, 0 nodes) and h_4 (even, 4 nodes) in first {} eigenvectors...", n_try);
-        let search_start = std::time::Instant::now();
-        let mut h0_idx: Option<usize> = None;
-        let mut h4_idx: Option<usize> = None;
-        let mut h0_vec: Option<Vec<Float>> = None;
-        let mut h4_vec: Option<Vec<Float>> = None;
-        let mut h0_value = None;
-        let mut h4_value = None;
-
-        for (k, lambda_k) in eigenvalues.iter().enumerate().take(n_try) {
-            xc_core::progress_message!(
-                "[HP prolate] eigenvector {}/{} (eigenvalue {})...",
-                k + 1,
-                n_try,
-                xc_numerics::fmt::display_hp(lambda_k, 8)
-            );
-            // Opt into the production defaults: banded LU (O(n) factor
-            // and O(n) per-step solve via tridiag_lu_factor_hp + Thomas
-            // forward/back substitution), early termination on the
-            // |⟨v_k, v_{k-1}⟩| convergence proxy, 200-step ceiling.
-            //
-            // Prolate eigenvectors are well-conditioned (the spectrum
-            // is widely-spaced and non-degenerate at small k) so the
-            // iteration typically converges in 20-50 steps. Capping at
-            // 200 with no convergence check was wasting hours per run
-            // at HP-1000.
-            //
-            // Banded LU drops the per-eigenvector wall-time from hours
-            // to seconds at HP-1000 with N=8001, and the memory
-            // footprint from ~26 GB to a few KB, vs the dense LU
-            // alternative.
-            let recovery = match xc_numerics::eigen::tridiag_eigenvector_for_value_detailed_hp(
+        let modes = if let ProlateCacheRoute::Fabric(cache) = &cache_route {
+            finite_dirichlet_cache::modes_via_cache(
+                source_lambda,
+                n,
+                prec,
                 &diag,
                 &off_diag,
-                lambda_k,
+                &eigenvalues,
+                spectrum_source.as_ref().expect("managed spectrum source"),
+                cache,
+            )?
+        } else {
+            (
+                recover_finite_dirichlet_modes(&diag, &off_diag, &eigenvalues, prec)?,
                 None,
-                prec,
-                TridiagEigvecOptions {
-                    solver: xc_numerics::eigen::TridiagSolver::BandedInterleaved,
-                    ..TridiagEigvecOptions::default()
-                },
-            ) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let v = recovery.eigenvector;
-            // Check parity.
-            let parity = parity_of(&v, prec);
-            let is_even = matches!(parity, HpParity::Even);
-            if !is_even {
-                continue;
-            }
-            // Count nodes.
-            let nodes = try_count_nodes(&v, prec)?;
-            match nodes {
-                0 if h0_idx.is_none() => {
-                    xc_core::progress_message!("[HP prolate] found h_0 at index {}", k);
-                    h0_idx = Some(k);
-                    h0_vec = Some(v);
-                    h0_value = Some(recovery.eigenvalue);
-                }
-                4 if h4_idx.is_none() => {
-                    xc_core::progress_message!("[HP prolate] found h_4 at index {}", k);
-                    h4_idx = Some(k);
-                    h4_vec = Some(v);
-                    h4_value = Some(recovery.eigenvalue);
-                }
-                _ => {}
-            }
-            if h0_idx.is_some() && h4_idx.is_some() {
-                break;
-            }
-        }
-        xc_core::progress_message!(
-            "[HP prolate] eigenvector search done in {:.1}s",
-            search_start.elapsed().as_secs_f64()
-        );
-        let h0_idx = h0_idx.ok_or_else(|| {
-            anyhow::anyhow!(
-                "could not find h_{{0,λ}} (even, 0 nodes) in first {} eigenfunctions",
-                n_try
+                None,
             )
-        })?;
-        let h4_idx = h4_idx.ok_or_else(|| {
-            anyhow::anyhow!(
-                "could not find h_{{4,λ}} (even, 4 nodes) in first {} eigenfunctions",
-                n_try
-            )
-        })?;
-        anyhow::ensure!(
-            h0_idx == 0 && h4_idx == 4,
-            "prolate parity/node classification disagrees with ordered modes 0 and 4"
-        );
-        let mut h0_vec = h0_vec.unwrap();
-        let mut h4_vec = h4_vec.unwrap();
-        let eigenvalue_0 = h0_value.expect("selected ground Rayleigh value");
-        let eigenvalue_4 = h4_value.expect("selected fourth Rayleigh value");
+        };
+        let mode_manifest = modes.1;
+        let mode_payload_digest = modes.2;
+        let finite_dirichlet_cache::Modes {
+            mut h0_vec,
+            mut h4_vec,
+            eigenvalue_0,
+            eigenvalue_4,
+            ..
+        } = modes.0;
 
         // Inverse iteration normalizes to unit ℓ² norm. To get unit
         // continuous-L² norm, scale by 1/√h.
@@ -2704,6 +2873,175 @@ pub mod hp {
 
         super::grid_contract::validate_grid(&h_lambda, lambda, &h, prec)?;
 
+        let (u_grid, k_values) = if let ProlateCacheRoute::Fabric(cache) = &cache_route {
+            finite_dirichlet_cache::profile_via_cache(
+                source_lambda,
+                n,
+                n_sample,
+                prec,
+                &h_lambda,
+                mode_payload_digest.as_ref().expect("managed mode payload"),
+                mode_manifest.as_ref(),
+                cache,
+            )?
+        } else {
+            sample_finite_dirichlet_profile(lambda, &h_lambda, n_sample, prec)?
+        };
+
+        Ok(HpProlateResult {
+            discretization: "prolate-finite-dirichlet-recovered-rayleigh-v3".to_owned(),
+            resolution_budget: n_grid,
+            basis_dimension: n,
+            relative_operator_residual: None,
+            k_values,
+            u_grid,
+            eigenvalue_0,
+            eigenvalue_4,
+            c_4,
+            c_0,
+            elapsed_seconds: start.elapsed().as_secs_f64(),
+            precision_bits: prec,
+        })
+    }
+
+    fn recover_finite_dirichlet_modes(
+        diag: &[Float],
+        off_diag: &[Float],
+        eigenvalues: &[Float],
+        prec: u32,
+    ) -> Result<finite_dirichlet_cache::Modes> {
+        #[cfg(test)]
+        finite_dirichlet_cache::mode_computed();
+        let mut context = xc_numerics::eigen::TridiagonalEigenvectorRecoveryHp::new(
+            diag,
+            off_diag,
+            prec,
+            TridiagEigvecOptions {
+                solver: xc_numerics::eigen::TridiagSolver::BandedInterleaved,
+                ..TridiagEigvecOptions::default()
+            },
+        );
+        recover_finite_dirichlet_modes_with(diag.len(), eigenvalues, prec, |value| {
+            match &mut context {
+                Ok(context) => context.recover_for_value(value, None),
+                Err(error) => Err(anyhow::anyhow!("{error}")),
+            }
+        })
+    }
+
+    fn recover_finite_dirichlet_modes_with(
+        n: usize,
+        eigenvalues: &[Float],
+        prec: u32,
+        mut recover: impl FnMut(&Float) -> Result<xc_numerics::eigen::HpEigenvectorRecovery>,
+    ) -> Result<finite_dirichlet_cache::Modes> {
+        // Search the lowest-lying eigenfunctions for h_0 and h_4.
+        // Limit search depth: prolate h_4 is the third even eigenfunction.
+        let n_try = super::PROLATE_SEARCH_DEPTH.min(n);
+        xc_core::progress_message!("[HP prolate] searching for h_0 (even, 0 nodes) and h_4 (even, 4 nodes) in first {} eigenvectors...", n_try);
+        let search_start = std::time::Instant::now();
+        let mut h0_idx: Option<usize> = None;
+        let mut h4_idx: Option<usize> = None;
+        let mut h0_vec: Option<Vec<Float>> = None;
+        let mut h4_vec: Option<Vec<Float>> = None;
+        let mut h0_value = None;
+        let mut h4_value = None;
+        let mut h0_window = None;
+        let mut h4_window = None;
+
+        for (k, lambda_k) in eigenvalues.iter().enumerate().take(n_try) {
+            if let Some(r) = xc_core::RunResources::current() {
+                r.check_cancelled()?;
+            }
+            xc_core::progress_message!(
+                "[HP prolate] eigenvector {}/{} (eigenvalue {})...",
+                k + 1,
+                n_try,
+                xc_numerics::fmt::display_hp(lambda_k, 8)
+            );
+            // Reuse the identical working-precision guide; each vector still
+            // passes directed index counts, banded inverse iteration, and the
+            // residual/separation gate before parity and node classification.
+            let recovery_start = std::time::Instant::now();
+            let recovery = match recover(lambda_k) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            xc_core::progress_message!("[HP prolate] eigenvector {} recovered in {:.3}s (includes guide preparation on the first valid request)", k + 1, recovery_start.elapsed().as_secs_f64());
+            let v = recovery.eigenvector;
+            // Check parity.
+            let parity = parity_of(&v, prec);
+            let is_even = matches!(parity, HpParity::Even);
+            if !is_even {
+                continue;
+            }
+            // Count nodes.
+            let nodes = try_count_nodes(&v, prec)?;
+            match nodes {
+                0 if h0_idx.is_none() => {
+                    xc_core::progress_message!("[HP prolate] found h_0 at index {}", k);
+                    h0_idx = Some(k);
+                    h0_vec = Some(v);
+                    h0_value = Some(recovery.eigenvalue);
+                    h0_window = Some((recovery.enclosure.lower, recovery.enclosure.upper));
+                }
+                4 if h4_idx.is_none() => {
+                    xc_core::progress_message!("[HP prolate] found h_4 at index {}", k);
+                    h4_idx = Some(k);
+                    h4_vec = Some(v);
+                    h4_value = Some(recovery.eigenvalue);
+                    h4_window = Some((recovery.enclosure.lower, recovery.enclosure.upper));
+                }
+                _ => {}
+            }
+            if h0_idx.is_some() && h4_idx.is_some() {
+                break;
+            }
+        }
+        xc_core::progress_message!(
+            "[HP prolate] eigenvector search done in {:.1}s",
+            search_start.elapsed().as_secs_f64()
+        );
+        let h0_idx = h0_idx.ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not find h_{{0,λ}} (even, 0 nodes) in first {} eigenfunctions",
+                n_try
+            )
+        })?;
+        let h4_idx = h4_idx.ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not find h_{{4,λ}} (even, 4 nodes) in first {} eigenfunctions",
+                n_try
+            )
+        })?;
+        anyhow::ensure!(
+            h0_idx == 0 && h4_idx == 4,
+            "prolate parity/node classification disagrees with ordered modes 0 and 4"
+        );
+        let h0_vec = h0_vec.unwrap();
+        let h4_vec = h4_vec.unwrap();
+        let eigenvalue_0 = h0_value.expect("selected ground Rayleigh value");
+        let eigenvalue_4 = h4_value.expect("selected fourth Rayleigh value");
+
+        Ok(finite_dirichlet_cache::Modes {
+            h0_vec,
+            h4_vec,
+            eigenvalue_0,
+            eigenvalue_4,
+            h0_window: h0_window.expect("selected ground window"),
+            h4_window: h4_window.expect("selected fourth window"),
+        })
+    }
+
+    fn sample_finite_dirichlet_profile(
+        lambda: &Float,
+        h_lambda: &[Float],
+        n_sample: usize,
+        prec: u32,
+    ) -> Result<(Vec<Float>, Vec<Float>)> {
+        #[cfg(test)]
+        finite_dirichlet_cache::profile_computed();
+        let resources = xc_core::RunResources::current();
         // Build logarithmic u-grid in [λ⁻¹, λ].
         let n_sample = n_sample.max(2);
         let log_lambda = lambda.clone().ln();
@@ -2725,14 +3063,12 @@ pub mod hp {
 
         // Evaluate k_λ(u) = √u · Σ_{n=1}^{⌊λ/u⌋} h_λ(n·u).
         // Each grid point u is independent → parallelize via par_iter.
-        xc_core::progress_message!(
-            "[HP prolate] sampling k_λ on {} log-spaced grid points...",
-            n_sample
-        );
-        let sample_start = std::time::Instant::now();
         let k_values: Vec<Float> = u_grid
             .par_iter()
             .map(|u| {
+                if let Some(r) = &resources {
+                    r.check_cancelled()?;
+                }
                 let mut ratio = lambda.clone();
                 ratio /= u;
                 let ratio_floor = ratio.floor();
@@ -2751,7 +3087,7 @@ pub mod hp {
                     if x >= *lambda {
                         break;
                     }
-                    s += super::grid_contract::interpolate(&h_lambda, lambda, &x, prec);
+                    s += super::grid_contract::interpolate(h_lambda, lambda, &x, prec);
                 }
                 // u^(1/2)
                 let sqrt_u = u.clone().sqrt();
@@ -2761,26 +3097,7 @@ pub mod hp {
                 Ok(result)
             })
             .collect::<Result<_>>()?;
-        xc_core::progress_message!(
-            "[HP prolate] k_λ sampling done in {:.1}s; total compute_k_lambda elapsed {:.1}s",
-            sample_start.elapsed().as_secs_f64(),
-            start.elapsed().as_secs_f64()
-        );
-
-        Ok(HpProlateResult {
-            discretization: "prolate-finite-dirichlet-recovered-rayleigh-v3".to_owned(),
-            resolution_budget: n_grid,
-            basis_dimension: n,
-            relative_operator_residual: None,
-            k_values,
-            u_grid,
-            eigenvalue_0,
-            eigenvalue_4,
-            c_4,
-            c_0,
-            elapsed_seconds: start.elapsed().as_secs_f64(),
-            precision_bits: prec,
-        })
+        Ok((u_grid, k_values))
     }
 
     /// HP comparison result. All fields HP except `linf_index` (a usize).

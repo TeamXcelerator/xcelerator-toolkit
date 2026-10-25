@@ -441,6 +441,7 @@ pub struct ShiftInvertBoundaryClusterHp {
 /// Convergence concerns retained Ritz residuals and stability. The projected
 /// boundary cannot exclude an unvisited eigenspace or establish multiplicity.
 pub struct BlockShiftInvertReportHp {
+    pub operator_error: super::OperatorErrorEvidenceHp,
     /// True only after a full-space projection; false means global target
     /// selection and completeness remain unverified, even when Converged.
     pub global_target_ordering_established: bool,
@@ -1072,7 +1073,7 @@ impl BlockShiftInvertSolverHp {
                 });
                 let (orthogonality_errors, maximum_orthogonality_error) =
                     orthogonality_errors(&states, config.precision_bits);
-                let retained_eigenpairs = states
+                let retained_eigenpairs: Vec<ShiftInvertEigenpairHp> = states
                     .iter()
                     .enumerate()
                     .filter(|(position, _)| {
@@ -1152,6 +1153,14 @@ impl BlockShiftInvertSolverHp {
                 let mut provenance = SolverProvenance::current_package("rug_mpfr");
                 provenance.precision_bits = Some(config.precision_bits);
                 return Ok(BlockShiftInvertReportHp {
+                    operator_error: super::OperatorErrorEvidenceHp::for_residuals(
+                        operator,
+                        None,
+                        retained_eigenpairs
+                            .iter()
+                            .map(|p: &ShiftInvertEigenpairHp| (&p.eigenvalue, &p.residual_norm)),
+                        config.precision_bits,
+                    )?,
                     global_target_ordering_established: maximum_trial_dimension == dimension
                         || interval_count_evidence
                             .as_ref()

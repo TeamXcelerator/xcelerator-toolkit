@@ -14,11 +14,13 @@ integrate capture into applications, and interpret retained numerical evidence.
 
 - [Release notes](RELEASE_NOTES.md)
 - [Numerical compatibility and existing artifacts](NUMERICAL_COMPATIBILITY.md)
+- [Execution, evidence, and API migration contracts](EXECUTION_EVIDENCE_CONTRACTS.md)
 - [Capture levels and application integration](CAPTURE_LEVELS.md)
 - [Frozen research evidence](RESEARCH_EVIDENCE.md)
 - [Retained prefix diagnostics](CCM_PREFIX_ANALYSIS.md)
 - [Prefix convergence, spectral estimates and precision planning](PREFIX_CONVERGENCE.md)
 - [Prolate numerical model](PROLATE_NUMERICAL_MODEL.md)
+- [Default HP CCM LU, multi-GPU execution, exact products, and quadrature](HIGH_PRECISION_PRODUCTS.md)
 - [Research workflows](RESEARCH_WORKFLOWS.md)
 - [CLI reference](CLI.md)
 - [External consumer guide](EXTERNAL_CONSUMER.md)

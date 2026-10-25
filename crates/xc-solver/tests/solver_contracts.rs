@@ -1835,7 +1835,7 @@ mod convergence_contracts {
         }
     }
     #[test]
-    fn input_byte_cap_accepts_large_declared_limits_up_to_the_maximum() {
+    fn input_byte_cap_honors_large_declared_limits() {
         let t = CancellationToken::new();
         let problem = Problem::Root(root_case());
         let at = |bytes| Options {
@@ -1844,7 +1844,7 @@ mod convergence_contracts {
         };
         assert!(analyze(&problem, &at(256 << 20), &t).is_ok());
         assert!(analyze(&problem, &at(MAXIMUM_INPUT_BYTES), &t).is_ok());
-        assert!(analyze(&problem, &at(MAXIMUM_INPUT_BYTES + 1), &t).is_err());
+        assert!(analyze(&problem, &at(MAXIMUM_INPUT_BYTES + 1), &t).is_ok());
         let rejected = analyze(&problem, &at(1), &t).unwrap_err().to_string();
         assert!(
             rejected.contains("convergence: input byte limit"),

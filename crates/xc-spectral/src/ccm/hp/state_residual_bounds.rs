@@ -12,6 +12,21 @@ pub(super) struct ResidualBounds {
     pub vector_scaled_residual_upper: Float,
 }
 
+/// Owned scratch only: the source matrix/vector remain borrowed. The bound
+/// covers normalized vector/result collections and constant-sized arithmetic
+/// scratch for at most one task per row, independently of the Rayon pool size.
+pub(super) fn workspace_bytes(n: usize, p: u32) -> Result<u128> {
+    if n == 0 || !(64..=1_000_000).contains(&p) {
+        bail!("invalid source residual workspace dimensions or precision");
+    }
+    let scalar = u128::from(p + 64).div_ceil(64) * 8 + 160;
+    (n as u128)
+        .checked_mul(64)
+        .and_then(|count| count.checked_add(512))
+        .and_then(|count| count.checked_mul(scalar))
+        .ok_or_else(|| anyhow::anyhow!("source residual workspace estimate overflow"))
+}
+
 /// One evaluation shared by the consumers of a single (A, v, lambda, p): the
 /// value `weil_eigvec_cache::relative_residual_norm` returns, with the bounds
 /// it was derived from. `None` exactly when that function returns `None`.
@@ -53,13 +68,13 @@ pub(super) fn evaluate(a: &[Float], v: &[Float], lambda: &Float, p: u32) -> Resu
         }
     }
     let work = p + 64;
-    let buffers = (a.len() as u64)
-        .saturating_mul(2)
-        .saturating_add((n as u64).saturating_mul(8))
-        .saturating_add(192);
-    if buffers.saturating_mul(u64::from(work).div_ceil(8) + 64) > (8u64 << 30) {
-        bail!("source residual exceeds numerical workspace budget");
+    let scratch_bytes = workspace_bytes(n, p)?;
+    let maximum_bytes = super::super::capture_runtime::CaptureResourcePolicy::from_environment()?
+        .maximum_working_bytes;
+    if scratch_bytes > u128::from(maximum_bytes) {
+        bail!("source residual exceeds numerical workspace budget: estimated_bytes={scratch_bytes}, maximum_working_bytes={maximum_bytes}");
     }
+    let _scratch_reservation = super::super::capture_runtime::reserve_working(scratch_bytes)?;
     let ae = a
         .iter()
         .chain(std::iter::once(lambda))
@@ -71,6 +86,22 @@ pub(super) fn evaluate(a: &[Float], v: &[Float], lambda: &Float, p: u32) -> Resu
     // results are consumed in index order, so values and the first error are
     // those of the serial evaluation at every thread count.
     xc_numerics::mpfr_interval::ensure_uniform_exponent_range()?;
+    // Preserve the allocating route's error order: every matrix normalization
+    // is checked before normalizing the vector or evaluating a row. Retaining
+    // only one result per row avoids an O(n^2) intermediate collection. The
+    // same exact scaling is repeated below, without a dense interval image.
+    let matrix_checks = a
+        .par_chunks(n)
+        .map(|row| -> Result<()> {
+            for entry in row {
+                I::from_float(&scale_float(entry, -ae, work)?, work)?;
+            }
+            Ok(())
+        })
+        .collect::<Vec<_>>();
+    for result in matrix_checks {
+        result?;
+    }
     let normalized = |xs: &[Float], exponent: i64| -> Result<Vec<I>> {
         xs.par_iter()
             .map(|x| Ok(I::from_float(&scale_float(x, -exponent, work)?, work)?))
@@ -78,15 +109,15 @@ pub(super) fn evaluate(a: &[Float], v: &[Float], lambda: &Float, p: u32) -> Resu
             .into_iter()
             .collect()
     };
-    let a = normalized(a, ae)?;
     let v = normalized(v, ve)?;
     let lambda = I::from_float(&scale_float(lambda, -ae, work)?, work)?;
     let rows = a
         .par_chunks(n)
         .enumerate()
-        .map(|(i, row)| {
+        .map(|(i, row)| -> Result<I> {
             let mut value = I::from_i64(0, work);
             for (entry, x) in row.iter().zip(&v) {
+                let entry = I::from_float(&scale_float(entry, -ae, work)?, work)?;
                 value = value.add(&entry.mul(x));
             }
             abs(&value.sub(&lambda.mul(&v[i])))
@@ -133,6 +164,69 @@ pub(super) fn evaluate(a: &[Float], v: &[Float], lambda: &Float, p: u32) -> Resu
 mod tests {
     use super::*;
     use rug::Rational;
+
+    /// Explicit shape qualification only. A structured zero-heavy source has
+    /// different arithmetic and RSS behavior from an arbitrary dense matrix.
+    #[test]
+    #[ignore = "explicit real-shape residual qualification; allocates a large source"]
+    fn claim12_real_shape_structured_residual() {
+        let modes: usize = std::env::var("XC_RESIDUAL_REAL_N")
+            .expect("set XC_RESIDUAL_REAL_N to 2400 or 2800")
+            .parse()
+            .unwrap();
+        assert!([2400, 2800].contains(&modes));
+        let p = 4217u32;
+        let n = 2 * modes + 1;
+        let source_bytes = u64::try_from(
+            ((n as u128) * (n as u128) + n as u128 + 1) * (u128::from(p).div_ceil(64) * 8 + 160),
+        )
+        .unwrap();
+        let scratch_bytes = u64::try_from(workspace_bytes(n, p).unwrap()).unwrap();
+        let budget = source_bytes + scratch_bytes + 65536;
+        assert!(budget <= 84u64 << 30);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let resources = xc_core::RunResources::with_worker_limit(budget, 4).unwrap();
+            let _scope = resources.enter();
+            let source_reservation = resources.try_reserve_retained(source_bytes).unwrap();
+            let started = std::time::Instant::now();
+            eprintln!("[real-shape residual] allocating N={modes}, D={n}, p={p}; admitted source={source_bytes}, scratch={scratch_bytes} bytes");
+            let mut matrix = vec![Float::with_val(p, 0); n * n];
+            for i in 0..n {
+                matrix[i * n + i] = Float::with_val(p, i + 1);
+            }
+            let mut vector = vec![Float::with_val(p, 0); n];
+            vector[0] = Float::with_val(p, 1);
+            let lambda = Float::with_val(p, 1);
+            eprintln!("[real-shape residual] source ready after {:.3}s; evaluating unchanged production residual", started.elapsed().as_secs_f64());
+            let result = evaluate(&matrix, &vector, &lambda, p).unwrap();
+            assert_eq!(result.eigenvalue_error_upper, 0);
+            assert_eq!(result.vector_scaled_residual_upper, 0);
+            assert_eq!(result.eigenvalue_error_upper.prec(), p + 64);
+            assert_eq!(result.vector_scaled_residual_upper.prec(), p + 64);
+            assert_eq!(resources.usage().working_bytes, 0);
+            assert_eq!(resources.usage().retained_bytes, source_bytes);
+            assert_eq!(resources.usage().peak_bytes, source_bytes + scratch_bytes);
+            eprintln!("{}", serde_json::json!({
+                "schema_version": 1, "passed": true, "n_modes": modes, "full_dimension": n,
+                "precision_bits": p, "workers": 4, "elapsed_seconds": started.elapsed().as_secs_f64(),
+                "admitted_source_bytes": source_bytes, "admitted_scratch_bytes": scratch_bytes,
+                "reservation_peak_bytes_not_rss": resources.usage().peak_bytes,
+                "eigenvalue_error_upper": "0", "vector_scaled_residual_upper": "0",
+                "fixture": "exact diagonal A[i,i]=i+1, one-hot v[0]=1, lambda=1",
+                "scope": "Real production residual shape with an exact closed-form oracle; structured diagonal/one-hot fixture RSS and timing are not representative of a dense arbitrary production matrix. No claim, ground proof, Krylov solve, cache, or publication."
+            }));
+            drop(matrix);
+            drop(vector);
+            drop(lambda);
+            drop(source_reservation);
+            assert_eq!(resources.usage().retained_bytes, 0);
+        });
+    }
+
     // Frozen serial evaluation preceding parallel rows.
     fn reference_evaluate(
         a: &[Float],
@@ -283,6 +377,13 @@ mod tests {
             }
         }
         cases.push((residual_fixture(1001, 64, 0), 64, 1));
+        // The actual Claim 12 source precision and the larger production
+        // precision use the same arithmetic despite the different storage.
+        for p in [4217, 6708] {
+            for n in [3, 17, 65] {
+                cases.push((residual_fixture(n, p, 3), p, 2));
+            }
+        }
         // Error paths: the first failing entry, in index order, is reported.
         let p = 128;
         let huge = Float::with_val(p, 1) << (rug::float::exp_max() - 2);
@@ -307,6 +408,45 @@ mod tests {
         assert!(cases
             .iter()
             .any(|((a, v, l), p, _)| evaluate(a, v, l, *p).is_err()));
+    }
+
+    #[test]
+    fn streaming_residual_admission_tracks_owned_linear_scratch() {
+        for (n, bytes) in [(4801, 214_212_096u128), (5601, 249_847_296)] {
+            assert_eq!(workspace_bytes(n, 4217).unwrap(), bytes);
+            // This is an allocation-free admission calculation, not execution
+            // of a Claim 12 matrix or a measurement of peak process memory.
+            assert!(bytes < 256 << 20);
+        }
+        let n = 17;
+        let p = 231;
+        let (a, v, lambda) = residual_fixture(n, p, 3);
+        let bytes = u64::try_from(workspace_bytes(n, p).unwrap()).unwrap();
+        let expected = reference_evaluate(&a, &v, &lambda, p);
+        let resources = xc_core::RunResources::new(bytes).unwrap();
+        {
+            let _scope = resources.enter();
+            assert!(same_bounds(&evaluate(&a, &v, &lambda, p), &expected));
+            assert_eq!(resources.usage().working_bytes, 0);
+            assert_eq!(resources.usage().peak_bytes, bytes);
+        }
+        let resources = xc_core::RunResources::new(bytes - 1).unwrap();
+        {
+            let _scope = resources.enter();
+            let error = evaluate(&a, &v, &lambda, p).err().unwrap();
+            assert!(error
+                .to_string()
+                .contains("source residual exceeds numerical workspace budget"));
+            assert_eq!(resources.usage().peak_bytes, 0);
+        }
+        let resources = xc_core::RunResources::new(bytes).unwrap();
+        let _scope = resources.enter();
+        let _other = resources.try_reserve_retained(1).unwrap();
+        assert!(evaluate(&a, &v, &lambda, p).is_err());
+        assert_eq!(resources.usage().working_bytes, 0);
+        assert!(workspace_bytes(0, p).is_err());
+        assert!(workspace_bytes(n, 63).is_err());
+        assert!(workspace_bytes(n, 1_000_001).is_err());
     }
 
     #[test]

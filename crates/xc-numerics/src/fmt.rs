@@ -26,6 +26,43 @@ use std::fmt::{Display, Formatter};
 /// Number of significant decimal digits used by `display_hp_short`.
 pub const DISPLAY_HP_DEFAULT_DIGITS: usize = 6;
 
+/// Decimal text identical to `Float::to_string_radix_round(10, digits, round)`
+/// with allocation proportional to the significant digits and exponent text.
+///
+/// Rug's combined formatter can reserve space proportional to the magnitude
+/// of the decimal exponent even when it emits compact scientific notation.
+/// Converting the significand and exponent separately avoids that reservation
+/// while preserving MPFR rounding, trailing zeros, and notation choices.
+/// Uses Rug's split-conversion domain of signed 32-bit decimal exponents.
+pub fn decimal_string_round(value: &Float, digits: Option<usize>, round: Round) -> String {
+    // The combined formatter's special-value paths have constant-size output.
+    // Keep its spelling and sign behavior, including signed zero and NaN.
+    if !value.is_normal() {
+        return value.to_string_radix_round(10, digits, round);
+    }
+    let (negative, significand, exponent) = value.to_sign_string_exp_round(10, digits, round);
+    let exponent = exponent.expect("normal MPFR value has a decimal exponent");
+    let plain_position = usize::try_from(exponent)
+        .ok()
+        .filter(|position| *position > 0 && *position <= significand.len());
+    let split = plain_position.unwrap_or(1);
+    // One sign, one decimal point, 'e', and a signed i32 exponent fit in 16.
+    let mut output = String::with_capacity(significand.len().saturating_add(16));
+    if negative {
+        output.push('-');
+    }
+    output.push_str(&significand[..split]);
+    if split < significand.len() {
+        output.push('.');
+        output.push_str(&significand[split..]);
+    }
+    if plain_position.is_none() {
+        use std::fmt::Write;
+        write!(output, "e{}", i64::from(exponent) - 1).expect("writing decimal exponent to String");
+    }
+    output
+}
+
 /// Exact, portable representation of one finite MPFR value.
 ///
 /// `significand_hex * 2^binary_exponent` is the exact value. Retaining the
@@ -545,6 +582,108 @@ mod tests {
 
     fn fl(prec: u32, s: &str) -> Float {
         Float::with_val(prec, Float::parse(s).unwrap())
+    }
+
+    #[test]
+    fn compact_decimal_matches_rug_rounding_signs_and_notation_boundaries() {
+        let rounds = [
+            Round::Nearest,
+            Round::Down,
+            Round::Up,
+            Round::Zero,
+            Round::AwayZero,
+        ];
+        let widths = [None, Some(0), Some(1), Some(2), Some(3), Some(17), Some(80)];
+        // Decimal carries can move the point across either notation boundary.
+        for precision in [2, 53, 192] {
+            for literal in [
+                "0.001", "0.0625", "0.0995", "0.5", "0.995", "0.9995", "1", "1.25", "9.95",
+                "9.995", "9.9995", "10", "23.3", "99.5", "99.995", "100", "999.5", "1024",
+                "1e-1000", "1e1000",
+            ] {
+                let value = fl(precision, literal);
+                let mut below = value.clone();
+                below.next_down();
+                let mut above = value.clone();
+                above.next_up();
+                for value in [below, value, above] {
+                    for value in [value.clone(), -value] {
+                        assert_eq!(
+                            decimal_string_round(&value, None, Round::Nearest),
+                            value.to_string()
+                        );
+                        for digits in widths {
+                            for round in rounds {
+                                assert_eq!(
+                                    decimal_string_round(&value, digits, round),
+                                    value.to_string_radix_round(10, digits, round),
+                                    "precision={precision}, literal={literal}, digits={digits:?}, round={round:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for special in [
+            Special::Zero,
+            Special::NegZero,
+            Special::Infinity,
+            Special::NegInfinity,
+            Special::Nan,
+        ] {
+            let value = Float::with_val(128, special);
+            for value in [value.clone(), -value] {
+                assert_eq!(
+                    decimal_string_round(&value, None, Round::Nearest),
+                    value.to_string()
+                );
+                for digits in widths {
+                    for round in rounds {
+                        assert_eq!(
+                            decimal_string_round(&value, digits, round),
+                            value.to_string_radix_round(10, digits, round)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_decimal_extreme_exponents_bound_capacity_and_preserve_roundtrip() {
+        let precision = 192;
+        let digits = crate::reduction::roundtrip_decimal_digits(precision);
+        for exponent in [-1_000_000_000i32, 1_000_000_000] {
+            let value = Float::with_val(precision, 3) << exponent;
+            assert!(value.is_normal());
+            for value in [value.clone(), -value] {
+                for width in [None, Some(0), Some(digits)] {
+                    let encoded = decimal_string_round(&value, width, Round::Nearest);
+                    assert!(encoded.len() < 100);
+                    assert!(encoded.capacity() <= digits + 32);
+                    let decoded = Float::with_val(precision, Float::parse(&encoded).unwrap());
+                    assert!(decoded == value, "extreme decimal failed round trip");
+                    assert_eq!(decoded.is_sign_negative(), value.is_sign_negative());
+                    // Parsing toward the opposite infinity at source precision
+                    // cannot cross this representable source point.
+                    let lower = decimal_string_round(&value, width, Round::Down);
+                    let upper = decimal_string_round(&value, width, Round::Up);
+                    assert!(lower.capacity() <= digits + 32);
+                    assert!(upper.capacity() <= digits + 32);
+                    let lower =
+                        Float::with_val_round(precision, Float::parse(&lower).unwrap(), Round::Up)
+                            .0;
+                    let upper = Float::with_val_round(
+                        precision,
+                        Float::parse(&upper).unwrap(),
+                        Round::Down,
+                    )
+                    .0;
+                    assert!(lower <= value && value <= upper);
+                }
+            }
+        }
     }
 
     #[test]

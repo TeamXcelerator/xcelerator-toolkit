@@ -8,6 +8,7 @@
 //! separate from checking the payload's exact byte digest here.
 
 mod numerical_checks;
+mod shared_source;
 
 use anyhow::{bail, Result};
 use rug::Float;
@@ -69,15 +70,32 @@ pub struct RetainedEvenMatrix {
     cutoff: String,
     modes: usize,
     precision: u32,
-    entries: Vec<Float>,
+    entries: MatrixEntries,
 }
+
+#[derive(Clone, Debug)]
+enum MatrixEntries {
+    Owned(Vec<Float>),
+    Shared(xc_cache::SharedValidated<Vec<Float>>),
+}
+impl std::ops::Deref for MatrixEntries {
+    type Target = [Float];
+    fn deref(&self) -> &[Float] {
+        match self {
+            Self::Owned(entries) => entries,
+            Self::Shared(entries) => entries,
+        }
+    }
+}
+
+pub(in crate::ccm) const LEGACY_MAXIMUM_ENCODED_BYTES: u64 = 2 << 30;
 
 fn authenticate(
     manifest: &ArtifactManifest,
     bytes: &[u8],
     allowed: &[ContentDigest],
 ) -> Result<()> {
-    if bytes.len() as u128 > (2u128 << 30) {
+    if bytes.len() as u128 > u128::from(LEGACY_MAXIMUM_ENCODED_BYTES) {
         bail!("retained prefix payload exceeds the encoded byte budget");
     }
     manifest.validate()?;
@@ -180,7 +198,7 @@ impl RetainedEvenMatrix {
             cutoff: payload.lambda_squared,
             modes: payload.n_modes,
             precision: payload.precision_bits,
-            entries,
+            entries: MatrixEntries::Owned(entries),
         })
     }
     pub fn dimension(&self) -> usize {
@@ -406,7 +424,7 @@ fn eigenpair_residual(a: &[Float], stride: usize, v: &[Float], lambda: &Float, p
     .unwrap_or_else(|_| Float::with_val(p, rug::float::Special::Infinity))
 }
 fn upper_decimal(value: &Float) -> String {
-    value.to_string_radix_round(10, None, rug::float::Round::Up)
+    xc_numerics::fmt::decimal_string_round(value, None, rug::float::Round::Up)
 }
 
 /// O(D^3) prefix analysis; only explicitly supplied retained eigenstates are

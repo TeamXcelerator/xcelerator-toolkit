@@ -861,6 +861,163 @@ fn allocate_byte_buffer(size: u64) -> Result<Vec<u8>, CacheError> {
     Ok(bytes)
 }
 
+/// A verified logical payload in a private, seekable scratch file.
+///
+/// Construction verifies the manifest's exact decoded size and SHA-256 before
+/// returning. The reader starts at offset zero, exposes no write access, and
+/// removes its scratch file on drop (including when construction fails).
+/// Scratch storage is separate from immutable cache objects. Its explicit byte
+/// bound is a disk allowance, not a limit on the caller's numerical workspace.
+#[derive(Debug)]
+pub struct VerifiedPayloadReader {
+    file: Option<fs::File>,
+    path: PathBuf,
+    size_bytes: u64,
+}
+
+impl VerifiedPayloadReader {
+    pub fn len(&self) -> u64 {
+        self.size_bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size_bytes == 0
+    }
+
+    fn from_stream(
+        manifest: &ArtifactManifest,
+        scratch_directory: &Path,
+        maximum_decoded_bytes: u64,
+        read: impl FnOnce(&mut dyn Write) -> Result<(), CacheError>,
+    ) -> Result<Self, CacheError> {
+        manifest.validate()?;
+        if manifest.size_bytes > maximum_decoded_bytes {
+            return Err(CacheError::ResourceLimit(format!(
+                "payload declares {} bytes, exceeding the {maximum_decoded_bytes}-byte scratch allowance",
+                manifest.size_bytes
+            )));
+        }
+        fs::create_dir_all(scratch_directory)?;
+        let mut spool = None;
+        for _ in 0..128 {
+            let path = private_sibling_candidate(scratch_directory, "xc-payload")?;
+            let mut options = fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => {
+                    spool = Some(Self {
+                        file: Some(file),
+                        path,
+                        size_bytes: manifest.size_bytes,
+                    });
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let mut spool = spool.ok_or_else(|| {
+            CacheError::Io("could not reserve a private payload file after 128 collisions".into())
+        })?;
+        let (size, actual) = {
+            let file = spool.file.as_mut().expect("live payload file");
+            let mut writer = BoundedPayloadWriter {
+                output: std::io::BufWriter::with_capacity(1024 * 1024, file),
+                hasher: Sha256::new(),
+                written: 0,
+                maximum: manifest.size_bytes,
+                exceeded: false,
+            };
+            let result = read(&mut writer);
+            if writer.exceeded {
+                return Err(CacheError::ResourceLimit(format!(
+                    "decoded payload exceeds its declared {}-byte size",
+                    manifest.size_bytes
+                )));
+            }
+            result?;
+            writer.flush()?;
+            let size = writer.written;
+            let actual = ContentDigest(hex_digest(writer.hasher.finalize().as_slice()));
+            drop(writer.output);
+            (size, actual)
+        };
+        if size != manifest.size_bytes {
+            return Err(CacheError::InvalidManifest(format!(
+                "payload has size {size}, expected {}",
+                manifest.size_bytes
+            )));
+        }
+        if actual != manifest.content_digest {
+            return Err(CacheError::DigestMismatch {
+                expected: manifest.content_digest.to_string(),
+                actual: actual.to_string(),
+            });
+        }
+        spool.rewind()?;
+        Ok(spool)
+    }
+}
+
+impl Read for VerifiedPayloadReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.file.as_mut().expect("live payload file").read(buffer)
+    }
+}
+
+impl Seek for VerifiedPayloadReader {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file
+            .as_mut()
+            .expect("live payload file")
+            .seek(position)
+    }
+}
+
+impl Drop for VerifiedPayloadReader {
+    fn drop(&mut self) {
+        // Close first so cleanup also works on Windows.
+        drop(self.file.take());
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct BoundedPayloadWriter<W> {
+    output: W,
+    hasher: Sha256,
+    written: u64,
+    maximum: u64,
+    exceeded: bool,
+}
+
+impl<W: Write> Write for BoundedPayloadWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if u64::try_from(bytes.len())
+            .ok()
+            .and_then(|size| self.written.checked_add(size))
+            .is_none_or(|size| size > self.maximum)
+        {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "decoded payload exceeds its declared size",
+            ));
+        }
+        let count = self.output.write(bytes)?;
+        self.hasher.update(&bytes[..count]);
+        self.written += count as u64;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+}
+
 pub trait CacheStore: Send + Sync {
     fn name(&self) -> &str;
     fn writable(&self) -> bool;
@@ -917,6 +1074,26 @@ pub trait CacheStore: Send + Sync {
         manifest: &ArtifactManifest,
         writer: &mut dyn Write,
     ) -> Result<(), CacheError>;
+
+    /// Stream and authenticate a logical payload into a seekable private file.
+    /// The caller supplies an existing or creatable scratch directory and an
+    /// explicit decoded-byte allowance; there is no process-memory-sized cap.
+    /// Implementations retain their transport authentication and read policy.
+    /// The default uses `read_payload_to`; stores with optional buffered read
+    /// strategies should override this method to force their streaming route.
+    fn open_payload(
+        &self,
+        manifest: &ArtifactManifest,
+        scratch_directory: &Path,
+        maximum_decoded_bytes: u64,
+    ) -> Result<VerifiedPayloadReader, CacheError> {
+        VerifiedPayloadReader::from_stream(
+            manifest,
+            scratch_directory,
+            maximum_decoded_bytes,
+            |writer| self.read_payload_to(manifest, writer),
+        )
+    }
 
     /// Return an already verified encoded representation of the logical
     /// payload, when the store retains one. This lets a writable cache adopt a
@@ -2147,6 +2324,25 @@ pub struct ZipJsonFilesystemCacheStore {
     single_pass_object_limit: u64,
 }
 
+// Bound the additional compressed buffer for ordinary writes. Larger logical
+// payloads use a seekable file with the exact same encoder and ZIP profile.
+// This is a route selection threshold, not a bound on the caller-owned payload
+// or an aggregate process-memory policy.
+const ZIP_IN_MEMORY_WRITE_LIMIT: usize = 16 * 1024 * 1024;
+const ZIP_FILE_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
+
+fn zip_write_stage(
+    stage: &'static str,
+    draft: &ArtifactDraft,
+    route: &'static str,
+) -> xc_core::PerformanceStageGuard {
+    xc_core::performance_stage_with(stage, || xc_core::PerformanceStageMetadata {
+        operation: Some(draft.key.kind.clone()),
+        scheduling: Some(route.to_owned()),
+        ..xc_core::PerformanceStageMetadata::default()
+    })
+}
+
 impl ZipJsonFilesystemCacheStore {
     pub fn new(
         name: impl Into<String>,
@@ -2189,6 +2385,153 @@ impl ZipJsonFilesystemCacheStore {
         .into_inner())
     }
 
+    /// Only accepts a writer for a newly and exclusively created private file.
+    /// Unlike an externally offered encoded descriptor, no alleged digest is
+    /// trusted: hash the completed, synced file before exposing its name.
+    fn store_file_encoded(
+        &self,
+        draft: &ArtifactDraft,
+        write: impl FnOnce(&mut fs::File) -> Result<(), CacheError>,
+    ) -> Result<CacheObjectRef, CacheError> {
+        let parent = self.root().join("objects").join("sha256");
+        fs::create_dir_all(&parent)?;
+        let (temporary, mut output) = create_private_sibling_file(&parent, "xc-zip")?;
+        let result = (|| {
+            {
+                let _stage = zip_write_stage("cache.zip.encode", draft, "file");
+                write(&mut output)?;
+            }
+            {
+                let _stage = zip_write_stage("cache.zip.file_sync", draft, "file");
+                output.sync_all()?;
+            }
+            drop(output);
+            // ZIP finalization seeks back to rewrite headers, so a digest of
+            // the write calls would not describe the resulting object bytes.
+            let (content_digest, size_bytes) = {
+                let _stage = zip_write_stage("cache.zip.file_hash", draft, "file");
+                digest_file(&temporary)?
+            };
+            let object = CacheObjectRef {
+                content_digest,
+                size_bytes,
+            };
+            let _stage = zip_write_stage("cache.zip.object_publish", draft, "file");
+            self.publish_file_encoded(draft, &temporary, &object, |from, to| {
+                fs::hard_link(from, to)
+            })?;
+            Ok(object)
+        })();
+        // The owned handle has closed on every path, including writer errors,
+        // before Windows cleanup. A successful link owns the same bytes and
+        // does not require a second compressed copy or compression pass.
+        let _ = fs::remove_file(&temporary);
+        result
+    }
+
+    fn publish_file_encoded(
+        &self,
+        draft: &ArtifactDraft,
+        temporary: &Path,
+        object: &CacheObjectRef,
+        link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    ) -> Result<(), CacheError> {
+        let path = self.inner.object_path(&object.content_digest);
+        fs::create_dir_all(path.parent().expect("object path has a parent"))?;
+        // On the bounded-memory route, never replace an existing canonical
+        // object. Concurrent writers verify the winner, including corruption.
+        match link(temporary, &path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.inner.verify_object(object)
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::CrossesDevices
+                ) =>
+            {
+                // Preserve the old filesystem support when links are not
+                // available. This exceptional route retains a compressed Vec
+                // and uses the original object publication/collision checks;
+                // it does not compress again or use an unchecked rename.
+                let _stage = zip_write_stage("cache.zip.memory_fallback", draft, "memory_fallback");
+                if path.exists() {
+                    return self.inner.verify_object(object);
+                }
+                let encoded = fs::read(temporary)?;
+                let digest = ContentDigest::sha256(&encoded);
+                if digest != object.content_digest || encoded.len() as u64 != object.size_bytes {
+                    return Err(CacheError::DigestMismatch {
+                        expected: format!(
+                            "{} ({} bytes)",
+                            object.content_digest, object.size_bytes
+                        ),
+                        actual: format!("{digest} ({} bytes)", encoded.len()),
+                    });
+                }
+                self.inner.ensure_object(&encoded)?;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn put_with_encoded_memory_limit(
+        &self,
+        draft: &ArtifactDraft,
+        payload: &[u8],
+        memory_limit: usize,
+    ) -> Result<ArtifactManifest, CacheError> {
+        if !self.inner.writable {
+            return Err(CacheError::ReadOnlyLayer(self.inner.name.clone()));
+        }
+        let route = if payload.len() <= memory_limit {
+            "memory"
+        } else {
+            "file"
+        };
+        let object = if payload.len() <= memory_limit {
+            let encoded = {
+                let _stage = zip_write_stage("cache.zip.encode", draft, route);
+                Self::encode(payload)?
+            };
+            let _stage = zip_write_stage("cache.zip.object_publish", draft, route);
+            self.inner.ensure_object(&encoded)?
+        } else {
+            self.store_file_encoded(draft, |output| {
+                let buffered =
+                    std::io::BufWriter::with_capacity(ZIP_FILE_WRITE_BUFFER_BYTES, output);
+                let mut buffered =
+                    write_deterministic_zip_entry(buffered, "payload.json", payload)?;
+                buffered.flush()?;
+                Ok(())
+            })?
+        };
+        let content_digest = {
+            let _stage = zip_write_stage("cache.zip.logical_hash", draft, route);
+            ContentDigest::sha256(payload)
+        };
+        let mut encoded_draft = draft.clone();
+        encoded_draft.tags.insert(
+            "xc_storage_encoding".to_owned(),
+            "zip-json-entry-v1".to_owned(),
+        );
+        encoded_draft.tags.insert(
+            STORAGE_ENCODER_PROFILE_TAG.to_owned(),
+            CURRENT_DETERMINISTIC_ZIP64_PROFILE.to_owned(),
+        );
+        let _stage = zip_write_stage("cache.zip.manifest_publish", draft, route);
+        self.inner.publish_manifest(
+            &encoded_draft,
+            vec![object],
+            content_digest,
+            payload.len() as u64,
+        )
+    }
+
     /// Verify and decode one ZIP JSON object, reporting which read strategy
     /// was used. A single pass is taken only when the object fits the
     /// per-object limit and a reservation against the aggregate in-memory
@@ -2197,6 +2540,15 @@ impl ZipJsonFilesystemCacheStore {
         &self,
         manifest: &ArtifactManifest,
         writer: &mut dyn Write,
+    ) -> Result<ZipReadStrategy, CacheError> {
+        self.read_zip_object_with_memory(manifest, writer, true)
+    }
+
+    fn read_zip_object_with_memory(
+        &self,
+        manifest: &ArtifactManifest,
+        writer: &mut dyn Write,
+        allow_memory: bool,
     ) -> Result<ZipReadStrategy, CacheError> {
         manifest.validate()?;
         if manifest
@@ -2211,7 +2563,7 @@ impl ZipJsonFilesystemCacheStore {
         }
         let object = &manifest.objects[0];
         let object_path = self.inner.object_path(&object.content_digest);
-        if object.size_bytes <= self.single_pass_object_limit {
+        if allow_memory && object.size_bytes <= self.single_pass_object_limit {
             if let Some(_reservation) = self.in_memory_zip_budget.try_reserve(object.size_bytes) {
                 let metadata = match fs::symlink_metadata(&object_path) {
                     Ok(metadata) => metadata,
@@ -2258,8 +2610,15 @@ impl ZipJsonFilesystemCacheStore {
                 return Ok(ZipReadStrategy::SinglePass);
             }
         }
-        self.inner.verify_object(object)?;
-        let file = fs::File::open(&object_path)?;
+        let file = if allow_memory {
+            self.inner.verify_object(object)?;
+            fs::File::open(&object_path)?
+        } else {
+            // The seekable API never allocates a compressed object buffer.
+            // Verify and rewind the same handle that the ZIP decoder uses,
+            // avoiding a path reopen between authentication and decoding.
+            open_verified_zip_object(&object_path, object)?
+        };
         let archive = zip::ZipArchive::new(file)
             .map_err(|error| CacheError::InvalidManifest(error.to_string()))?;
         Self::decode_zip_json_entry(archive, manifest, writer)?;
@@ -2451,26 +2810,7 @@ impl CacheStore for ZipJsonFilesystemCacheStore {
     }
 
     fn put(&self, draft: &ArtifactDraft, payload: &[u8]) -> Result<ArtifactManifest, CacheError> {
-        if !self.inner.writable {
-            return Err(CacheError::ReadOnlyLayer(self.inner.name.clone()));
-        }
-        let encoded = Self::encode(payload)?;
-        let object = self.inner.ensure_object(&encoded)?;
-        let mut encoded_draft = draft.clone();
-        encoded_draft.tags.insert(
-            "xc_storage_encoding".to_owned(),
-            "zip-json-entry-v1".to_owned(),
-        );
-        encoded_draft.tags.insert(
-            STORAGE_ENCODER_PROFILE_TAG.to_owned(),
-            CURRENT_DETERMINISTIC_ZIP64_PROFILE.to_owned(),
-        );
-        self.inner.publish_manifest(
-            &encoded_draft,
-            vec![object],
-            ContentDigest::sha256(payload),
-            payload.len() as u64,
-        )
+        self.put_with_encoded_memory_limit(draft, payload, ZIP_IN_MEMORY_WRITE_LIMIT)
     }
 
     fn candidates(&self, key: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
@@ -2509,6 +2849,23 @@ impl CacheStore for ZipJsonFilesystemCacheStore {
         writer: &mut dyn Write,
     ) -> Result<(), CacheError> {
         self.read_zip_object(manifest, writer).map(|_| ())
+    }
+
+    fn open_payload(
+        &self,
+        manifest: &ArtifactManifest,
+        scratch_directory: &Path,
+        maximum_decoded_bytes: u64,
+    ) -> Result<VerifiedPayloadReader, CacheError> {
+        VerifiedPayloadReader::from_stream(
+            manifest,
+            scratch_directory,
+            maximum_decoded_bytes,
+            |writer| {
+                self.read_zip_object_with_memory(manifest, writer, false)
+                    .map(|_| ())
+            },
+        )
     }
 
     fn read_payload_and_encoded(
@@ -2619,6 +2976,15 @@ pub struct ResolvedArtifact {
     pub manifest: ArtifactManifest,
     pub payload: Vec<u8>,
     pub encoded_payload: Option<VerifiedEncodedPayload>,
+}
+
+/// An exact artifact whose authenticated logical bytes are held in a private
+/// seekable file rather than a complete in-memory payload buffer.
+#[derive(Debug)]
+pub struct ResolvedPayloadReader {
+    pub layer_name: String,
+    pub manifest: ArtifactManifest,
+    pub payload: VerifiedPayloadReader,
 }
 
 /// An exact artifact resolved as metadata plus its verified encoded
@@ -2951,6 +3317,47 @@ impl CacheResolver {
                     manifest,
                     payload,
                     encoded_payload,
+                });
+            }
+        }
+        Err(CacheError::NotFound(format!(
+            "{} / {} with digest {}",
+            key.kind, key.logical_key, content_digest
+        )))
+    }
+
+    /// Open the same exact candidate as `resolve_exact`, streaming its verified
+    /// logical bytes into caller-selected scratch storage. A missing or corrupt
+    /// object in the selected layer fails instead of falling through to a lower
+    /// layer. No artifact, encoding, or numerical identity is changed.
+    pub fn open_exact_payload(
+        &self,
+        key: &ArtifactKey,
+        content_digest: &ContentDigest,
+        required_quality: CacheQuality,
+        policy: &CachePolicy,
+        scratch_directory: &Path,
+        maximum_decoded_bytes: u64,
+    ) -> Result<ResolvedPayloadReader, CacheError> {
+        for layer in &self.layers {
+            for manifest in layer.store.candidates(key)? {
+                if !Self::exact_candidate_accepted(
+                    &manifest,
+                    content_digest,
+                    required_quality,
+                    policy,
+                ) {
+                    continue;
+                }
+                let payload = layer.store.open_payload(
+                    &manifest,
+                    scratch_directory,
+                    maximum_decoded_bytes,
+                )?;
+                return Ok(ResolvedPayloadReader {
+                    layer_name: layer.store.name().to_owned(),
+                    manifest,
+                    payload,
                 });
             }
         }
@@ -3317,6 +3724,61 @@ fn digest_file(path: &Path) -> Result<(ContentDigest, u64), CacheError> {
         ContentDigest(hex_digest(hasher.finalize().as_slice())),
         size,
     ))
+}
+
+fn open_verified_zip_object(path: &Path, object: &CacheObjectRef) -> Result<fs::File, CacheError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CacheError::NotFound(path.display().to_string()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() != object.size_bytes
+    {
+        return Err(CacheError::InvalidManifest(format!(
+            "object {} has invalid type or size at {}",
+            object.content_digest,
+            path.display()
+        )));
+    }
+    let mut input = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(count as u64)
+            .ok_or_else(|| CacheError::ResourceLimit("encoded ZIP object exceeds u64".into()))?;
+        if size > object.size_bytes {
+            return Err(CacheError::ResourceLimit(format!(
+                "object {} exceeds its declared {}-byte size",
+                object.content_digest, object.size_bytes
+            )));
+        }
+        hasher.update(&buffer[..count]);
+    }
+    if size != object.size_bytes {
+        return Err(CacheError::InvalidManifest(format!(
+            "object {} has size {size}, expected {}",
+            object.content_digest, object.size_bytes
+        )));
+    }
+    let actual = ContentDigest(hex_digest(hasher.finalize().as_slice()));
+    if actual != object.content_digest {
+        return Err(CacheError::DigestMismatch {
+            expected: object.content_digest.to_string(),
+            actual: actual.to_string(),
+        });
+    }
+    input.rewind()?;
+    Ok(input)
 }
 
 // A clock reading is not a unique file name. Reserve each staging file with
@@ -3859,6 +4321,366 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    fn assert_no_zip_write_temporary(store: &ZipJsonFilesystemCacheStore) {
+        let parent = store.root().join("objects").join("sha256");
+        if parent.exists() {
+            for entry in fs::read_dir(parent).unwrap() {
+                assert!(
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".xc-zip-"),
+                    "an owned ZIP staging file survived the operation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_backed_zip_matches_memory_bytes_metadata_and_warm_reuse() {
+        let root = temporary_root("xc-cache-file-zip-equivalence");
+        let memory = ZipJsonFilesystemCacheStore::new(
+            "memory",
+            root.join("memory"),
+            true,
+            CacheVisibility::Local,
+        );
+        let file = ZipJsonFilesystemCacheStore::new(
+            "file",
+            root.join("file"),
+            true,
+            CacheVisibility::Local,
+        );
+        // Include exact JSON scalar spelling, empty input, compressible data,
+        // and changing bytes that cross both the encoder and file buffers.
+        let mut changing = Vec::with_capacity(ZIP_FILE_WRITE_BUFFER_BYTES + 4096);
+        let mut state = 0x1234_5678u32;
+        for _ in 0..changing.capacity() {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            changing.push(state as u8);
+        }
+        let payloads = [
+            Vec::new(),
+            br#"{"zero":-0.0,"entries":["-0","1.0000e+12"],"escaped":"\u0041"}"#.to_vec(),
+            vec![b'0'; ZIP_FILE_WRITE_BUFFER_BYTES + 4096],
+            changing,
+        ];
+        for (index, payload) in payloads.iter().enumerate() {
+            let key = ArtifactKey::new("matrix", format!("file-{index}"), b"zip").unwrap();
+            let mut request = draft(key.clone(), CacheQuality::Certified, CacheVisibility::Local);
+            request
+                .tags
+                .insert("retained-note".to_owned(), "exact".to_owned());
+            request.provenance_digest = Some(ContentDigest::sha256(b"provenance"));
+            request.dependencies.push(DependencyRef {
+                key: ArtifactKey::new("source", "parent", b"source").unwrap(),
+                content_digest: ContentDigest::sha256(b"source payload"),
+                required_quality: CacheQuality::Validated,
+            });
+            let in_memory = memory
+                .put_with_encoded_memory_limit(&request, payload, usize::MAX)
+                .unwrap();
+            // Empty payloads also exercise file finalization directly because
+            // the public route deliberately keeps zero-byte inputs in memory.
+            let object = file
+                .store_file_encoded(&request, |output| {
+                    let buffered =
+                        std::io::BufWriter::with_capacity(ZIP_FILE_WRITE_BUFFER_BYTES, output);
+                    let mut buffered =
+                        write_deterministic_zip_entry(buffered, "payload.json", payload)?;
+                    buffered.flush()?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(object, in_memory.objects[0]);
+            let mut on_file = file
+                .put_with_encoded_memory_limit(&request, payload, 0)
+                .unwrap();
+            assert_eq!(file.read_payload(&on_file).unwrap(), *payload);
+            let memory_bytes = fs::read(
+                memory
+                    .inner
+                    .object_path(&in_memory.objects[0].content_digest),
+            )
+            .unwrap();
+            let file_bytes =
+                fs::read(file.inner.object_path(&on_file.objects[0].content_digest)).unwrap();
+            assert_eq!(file_bytes, memory_bytes);
+            // Creation time is sampled independently on each put; no other
+            // manifest field or serialized byte is excluded from comparison.
+            on_file.created_unix_seconds = in_memory.created_unix_seconds;
+            assert_eq!(
+                serde_json::to_vec(&on_file).unwrap(),
+                serde_json::to_vec(&in_memory).unwrap()
+            );
+            assert_no_zip_write_temporary(&file);
+
+            let reopened = ZipJsonFilesystemCacheStore::new(
+                "warm",
+                file.root(),
+                false,
+                CacheVisibility::Local,
+            );
+            let candidates = reopened.candidates(&key).unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(reopened.read_payload(&candidates[0]).unwrap(), *payload);
+            let encoded = reopened
+                .verified_encoded_payload(&candidates[0])
+                .unwrap()
+                .unwrap();
+            assert_eq!(encoded.content_digest, object.content_digest);
+            assert_eq!(
+                encoded.encoder_profile.as_deref(),
+                Some(CURRENT_DETERMINISTIC_ZIP64_PROFILE)
+            );
+        }
+    }
+
+    #[test]
+    fn file_backed_zip_public_put_above_threshold_matches_reference() {
+        let root = temporary_root("xc-cache-file-zip-public-threshold");
+        let store =
+            ZipJsonFilesystemCacheStore::new("file", root.path(), true, CacheVisibility::Local);
+        let mut payload = vec![b'0'; ZIP_IN_MEMORY_WRITE_LIMIT + 1];
+        payload[0] = b'1';
+        payload[ZIP_IN_MEMORY_WRITE_LIMIT] = b'2';
+        let key = ArtifactKey::new("matrix", "above-threshold", b"{}").unwrap();
+        let manifest = store
+            .put(
+                &draft(key, CacheQuality::Validated, CacheVisibility::Local),
+                &payload,
+            )
+            .unwrap();
+        let expected = ZipJsonFilesystemCacheStore::encode(&payload).unwrap();
+        assert_eq!(
+            fs::read(store.inner.object_path(&manifest.objects[0].content_digest)).unwrap(),
+            expected
+        );
+        assert_eq!(manifest.content_digest, ContentDigest::sha256(&payload));
+        assert_eq!(store.read_payload(&manifest).unwrap(), payload);
+        assert_no_zip_write_temporary(&store);
+    }
+
+    #[test]
+    fn file_backed_zip_cleans_partial_write_and_preserves_other_staging() {
+        let root = temporary_root("xc-cache-file-zip-write-error");
+        let store =
+            ZipJsonFilesystemCacheStore::new("file", root.path(), true, CacheVisibility::Local);
+        let parent = root.join("objects").join("sha256");
+        fs::create_dir_all(&parent).unwrap();
+        let sentinel = parent.join("other-writer");
+        fs::write(&sentinel, b"other writer's bytes").unwrap();
+        let key = ArtifactKey::new("matrix", "write-error", b"{}").unwrap();
+        let request = draft(key.clone(), CacheQuality::Validated, CacheVisibility::Local);
+        let result = store.store_file_encoded(&request, |output| {
+            output.write_all(b"partial ZIP before write/finalization failure")?;
+            Err(CacheError::Io("injected writer failure".to_owned()))
+        });
+        assert_eq!(
+            result,
+            Err(CacheError::Io("injected writer failure".to_owned()))
+        );
+        assert_no_zip_write_temporary(&store);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"other writer's bytes");
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+        assert!(store.candidates(&key).unwrap().is_empty());
+    }
+
+    #[test]
+    fn file_backed_zip_rejects_corrupt_existing_object_without_replacement() {
+        let root = temporary_root("xc-cache-file-zip-corruption");
+        let store =
+            ZipJsonFilesystemCacheStore::new("file", root.path(), true, CacheVisibility::Local);
+        let key = ArtifactKey::new("matrix", "corruption", b"{}").unwrap();
+        let payload = br#"{"retain":"same object digest"}"#;
+        let encoded = ZipJsonFilesystemCacheStore::encode(payload).unwrap();
+        let path = store.inner.object_path(&ContentDigest::sha256(&encoded));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut corrupt = encoded;
+        corrupt[0] ^= 1;
+        fs::write(&path, &corrupt).unwrap();
+        let result = store.put_with_encoded_memory_limit(
+            &draft(key.clone(), CacheQuality::Validated, CacheVisibility::Local),
+            payload,
+            0,
+        );
+        assert!(matches!(result, Err(CacheError::DigestMismatch { .. })));
+        assert_eq!(fs::read(path).unwrap(), corrupt);
+        assert_no_zip_write_temporary(&store);
+        assert!(store.candidates(&key).unwrap().is_empty());
+    }
+
+    #[test]
+    fn file_backed_zip_cleans_after_object_or_manifest_publication_failure() {
+        let root = temporary_root("xc-cache-file-zip-publish-error");
+        let store =
+            ZipJsonFilesystemCacheStore::new("file", root.path(), true, CacheVisibility::Local);
+        let key = ArtifactKey::new("matrix", "publication-error", b"{}").unwrap();
+        let payload = br#"{"publication":"fails"}"#;
+        let digest = ContentDigest::sha256(&ZipJsonFilesystemCacheStore::encode(payload).unwrap());
+        let object_path = store.inner.object_path(&digest);
+        let blocked_parent = object_path.parent().unwrap();
+        fs::create_dir_all(blocked_parent.parent().unwrap()).unwrap();
+        fs::write(blocked_parent, b"not a directory").unwrap();
+        let request = draft(key.clone(), CacheQuality::Validated, CacheVisibility::Local);
+        assert!(store
+            .put_with_encoded_memory_limit(&request, payload, 0)
+            .is_err());
+        assert_eq!(fs::read(blocked_parent).unwrap(), b"not a directory");
+        assert_no_zip_write_temporary(&store);
+        assert!(store.candidates(&key).unwrap().is_empty());
+        fs::remove_file(blocked_parent).unwrap();
+
+        let mut invalid = request;
+        invalid.schema_version = 2;
+        assert!(matches!(
+            store.put_with_encoded_memory_limit(&invalid, payload, 0),
+            Err(CacheError::InvalidManifest(_))
+        ));
+        assert_no_zip_write_temporary(&store);
+        assert!(store.candidates(&key).unwrap().is_empty());
+        // As on the old route, an already durable valid object may remain
+        // after manifest rejection and is safely reused by a corrected draft.
+        let manifest = store
+            .put_with_encoded_memory_limit(
+                &draft(key, CacheQuality::Validated, CacheVisibility::Local),
+                payload,
+                0,
+            )
+            .unwrap();
+        assert_eq!(store.read_payload(&manifest).unwrap(), payload);
+    }
+
+    #[test]
+    fn file_backed_zip_concurrent_same_object_publication_is_exact() {
+        let root = temporary_root("xc-cache-file-zip-concurrent");
+        let store =
+            ZipJsonFilesystemCacheStore::new("file", root.path(), true, CacheVisibility::Local);
+        let barrier = std::sync::Barrier::new(4);
+        let payload = vec![b'x'; 128 * 1024];
+        let manifests = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|index| {
+                    let store = &store;
+                    let barrier = &barrier;
+                    let payload = &payload;
+                    scope.spawn(move || {
+                        let key =
+                            ArtifactKey::new("matrix", format!("writer-{index}"), b"{}").unwrap();
+                        let request = draft(key, CacheQuality::Validated, CacheVisibility::Local);
+                        barrier.wait();
+                        store
+                            .put_with_encoded_memory_limit(&request, payload, 0)
+                            .unwrap()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for manifest in &manifests {
+            assert_eq!(manifest.objects, manifests[0].objects);
+            assert_eq!(store.read_payload(manifest).unwrap(), payload);
+        }
+        let path = store
+            .inner
+            .object_path(&manifests[0].objects[0].content_digest);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            ZipJsonFilesystemCacheStore::encode(&payload).unwrap()
+        );
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        assert_no_zip_write_temporary(&store);
+    }
+
+    #[test]
+    fn file_backed_zip_unsupported_links_use_verified_original_publication() {
+        let root = temporary_root("xc-cache-file-zip-link-fallback");
+        let payload = br#"{"fallback":"unchanged compressed bytes"}"#;
+        let encoded = ZipJsonFilesystemCacheStore::encode(payload).unwrap();
+        let object = CacheObjectRef {
+            content_digest: ContentDigest::sha256(&encoded),
+            size_bytes: encoded.len() as u64,
+        };
+        for (index, kind) in [
+            std::io::ErrorKind::Unsupported,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::CrossesDevices,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let store = ZipJsonFilesystemCacheStore::new(
+                "file",
+                root.join(index.to_string()),
+                true,
+                CacheVisibility::Local,
+            );
+            fs::create_dir_all(store.root()).unwrap();
+            let temporary = store.root().join("owned.zip");
+            fs::write(&temporary, &encoded).unwrap();
+            let key = ArtifactKey::new("matrix", "fallback", b"{}").unwrap();
+            let request = draft(key.clone(), CacheQuality::Validated, CacheVisibility::Local);
+            store
+                .publish_file_encoded(&request, &temporary, &object, |_, _| {
+                    Err(std::io::Error::from(kind))
+                })
+                .unwrap();
+            let path = store.inner.object_path(&object.content_digest);
+            assert_eq!(fs::read(&path).unwrap(), encoded);
+            // A subsequent normal write reuses exactly this object and all
+            // public read/manifest checks still apply.
+            let manifest = store
+                .put_with_encoded_memory_limit(&request, payload, 0)
+                .unwrap();
+            assert_eq!(manifest.objects, vec![object.clone()]);
+            assert_eq!(store.read_payload(&manifest).unwrap(), payload);
+            let mut corrupt = encoded.clone();
+            corrupt[0] ^= 1;
+            fs::write(&path, &corrupt).unwrap();
+            assert!(matches!(
+                store.publish_file_encoded(&request, &temporary, &object, |_, _| {
+                    Err(std::io::Error::from(kind))
+                }),
+                Err(CacheError::DigestMismatch { .. })
+            ));
+            assert_eq!(fs::read(&path).unwrap(), corrupt);
+            // Reject a changed staging file before any canonical publication.
+            fs::remove_file(&path).unwrap();
+            fs::write(&temporary, &corrupt).unwrap();
+            assert!(matches!(
+                store.publish_file_encoded(&request, &temporary, &object, |_, _| {
+                    Err(std::io::Error::from(kind))
+                }),
+                Err(CacheError::DigestMismatch { .. })
+            ));
+            assert!(!path.exists());
+            assert_no_zip_write_temporary(&store);
+        }
+    }
+
+    #[test]
+    fn file_backed_zip_read_only_refusal_does_not_create_staging() {
+        let root = temporary_root("xc-cache-file-zip-read-only");
+        let store =
+            ZipJsonFilesystemCacheStore::new("file", root.path(), false, CacheVisibility::Local);
+        let key = ArtifactKey::new("matrix", "read-only", b"{}").unwrap();
+        assert!(matches!(
+            store.put_with_encoded_memory_limit(
+                &draft(key, CacheQuality::Validated, CacheVisibility::Local),
+                b"{}",
+                0,
+            ),
+            Err(CacheError::ReadOnlyLayer(_))
+        ));
+        assert!(!root.join("objects").exists());
+    }
+
     #[test]
     fn zip_store_persists_encoder_provenance_and_legacy_objects_are_decode_only() {
         let root = temporary_root("xc-cache-encoder-provenance");
@@ -4243,6 +5065,338 @@ mod tests {
             )
             .unwrap();
         (store, manifest, root)
+    }
+
+    #[test]
+    fn seekable_payload_plain_chunks_preserve_bytes_and_cleanup_after_rewinds() {
+        let root = temporary_root("xc-cache-seekable-plain");
+        let scratch = root.join("scratch");
+        let store = FilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
+        let key = ArtifactKey::new("fixture", "seekable", b"{}").unwrap();
+        let chunks: [&[u8]; 3] = [br#"{"entries":["-0","1\u002e5"],"#, br#""late":true"#, b"}"];
+        let manifest = store
+            .put_chunks(
+                &draft(key, CacheQuality::Validated, CacheVisibility::Local),
+                chunks,
+            )
+            .unwrap();
+        let expected = chunks.concat();
+        let reader_store =
+            FilesystemCacheStore::new("read-only", root.path(), false, CacheVisibility::Local);
+        let mut reader = reader_store
+            .open_payload(&manifest, &scratch, expected.len() as u64)
+            .unwrap();
+        assert_eq!(reader.len(), manifest.size_bytes);
+        assert!(!reader.is_empty());
+        let private_path = reader.path.clone();
+        assert!(private_path.is_file());
+        for _ in 0..2 {
+            reader.rewind().unwrap();
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+        reader.seek(std::io::SeekFrom::End(-1)).unwrap();
+        let mut last = [0u8; 1];
+        reader.read_exact(&mut last).unwrap();
+        assert_eq!(&last, b"}");
+        drop(reader);
+        assert!(!private_path.exists());
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        assert_eq!(reader_store.read_payload(&manifest).unwrap(), expected);
+    }
+
+    #[test]
+    fn seekable_payload_zip_forces_streaming_and_preserves_legacy_encoding() {
+        let budget = Arc::new(InMemoryZipBudget::new(1024 * 1024));
+        let (store, mut manifest, root) =
+            zip_store_with_object("xc-cache-seekable-zip", budget.clone(), 1024 * 1024);
+        // Historical objects need no asserted encoder-profile tag to decode.
+        manifest.tags.remove(STORAGE_ENCODER_PROFILE_TAG);
+        let expected = store.read_payload(&manifest).unwrap();
+        struct ObserveBudget<'a> {
+            bytes: Vec<u8>,
+            budget: &'a InMemoryZipBudget,
+        }
+        impl Write for ObserveBudget<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert_eq!(self.budget.in_use(), 0, "no compressed buffer reservation");
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut observed = ObserveBudget {
+            bytes: Vec::new(),
+            budget: &budget,
+        };
+        assert_eq!(
+            store
+                .read_zip_object_with_memory(&manifest, &mut observed, false)
+                .unwrap(),
+            ZipReadStrategy::Streamed
+        );
+        assert_eq!(observed.bytes, expected);
+        let scratch = root.join("scratch");
+        let mut reader = store.open_payload(&manifest, &scratch, u64::MAX).unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(budget.in_use(), 0);
+        drop(reader);
+        assert_eq!(fs::read_dir(scratch).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn seekable_payload_rejects_limit_before_io_without_a_fixed_large_size_cap() {
+        let (store, mut manifest, root) = zip_store_with_object(
+            "xc-cache-seekable-limit",
+            Arc::new(InMemoryZipBudget::new(0)),
+            0,
+        );
+        let scratch = root.join("not-created");
+        assert!(matches!(
+            store.open_payload(&manifest, &scratch, manifest.size_bytes - 1),
+            Err(CacheError::ResourceLimit(_))
+        ));
+        assert!(!scratch.exists());
+        // Exercise admission above former RAM-sized ceilings without allocating
+        // or writing that amount. The caller, not a built-in cap, admits it.
+        manifest.size_bytes = 129u64 << 30;
+        let invoked = std::cell::Cell::new(false);
+        let result =
+            VerifiedPayloadReader::from_stream(&manifest, &scratch, manifest.size_bytes, |_| {
+                invoked.set(true);
+                Err(CacheError::NotFound(
+                    "synthetic missing large source".into(),
+                ))
+            });
+        assert!(invoked.get());
+        assert!(matches!(result, Err(CacheError::NotFound(_))));
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn seekable_payload_rechecks_logical_bytes_and_cleans_failed_spools() {
+        let (store, manifest, root) = zip_store_with_object(
+            "xc-cache-seekable-errors",
+            Arc::new(InMemoryZipBudget::new(0)),
+            0,
+        );
+        let bytes = store.read_payload(&manifest).unwrap();
+        let scratch = root.join("scratch");
+        for failure in ["short", "digest", "oversize", "io"] {
+            let result =
+                VerifiedPayloadReader::from_stream(&manifest, &scratch, u64::MAX, |writer| {
+                    match failure {
+                        "short" => writer.write_all(&bytes[..bytes.len() - 1])?,
+                        "digest" => writer.write_all(&vec![b'x'; bytes.len()])?,
+                        "oversize" => {
+                            writer.write_all(&bytes)?;
+                            // A store cannot hide a refused overrun by swallowing it.
+                            let _ = writer.write_all(b"!");
+                        }
+                        "io" => {
+                            writer.write_all(&bytes[..3])?;
+                            return Err(CacheError::Io("injected read failure".into()));
+                        }
+                        _ => unreachable!(),
+                    }
+                    Ok(())
+                });
+            match (failure, result) {
+                ("short", Err(CacheError::InvalidManifest(_)))
+                | ("digest", Err(CacheError::DigestMismatch { .. }))
+                | ("oversize", Err(CacheError::ResourceLimit(_)))
+                | ("io", Err(CacheError::Io(_))) => {}
+                (case, outcome) => panic!("unexpected {case} result: {outcome:?}"),
+            }
+            assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        }
+        let sentinel = root.join("ordinary-file");
+        fs::write(&sentinel, b"preserve").unwrap();
+        assert!(store.open_payload(&manifest, &sentinel, u64::MAX).is_err());
+        assert_eq!(fs::read(sentinel).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn seekable_payload_zip_refuses_corrupt_transport_logical_mismatch_and_missing_object() {
+        let (store, manifest, root) = zip_store_with_object(
+            "xc-cache-seekable-corruption",
+            Arc::new(InMemoryZipBudget::new(0)),
+            0,
+        );
+        let scratch = root.join("scratch");
+        let mut wrong_logical = manifest.clone();
+        wrong_logical.content_digest = ContentDigest::sha256(b"not the payload");
+        assert!(matches!(
+            store.open_payload(&wrong_logical, &scratch, u64::MAX),
+            Err(CacheError::DigestMismatch { .. })
+        ));
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        let mut wrong_size = manifest.clone();
+        wrong_size.size_bytes += 1;
+        assert!(matches!(
+            store.open_payload(&wrong_size, &scratch, u64::MAX),
+            Err(CacheError::InvalidManifest(_))
+        ));
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        let object = store.inner.object_path(&manifest.objects[0].content_digest);
+        let mut encoded = fs::read(&object).unwrap();
+        encoded.push(0);
+        fs::write(&object, &encoded).unwrap();
+        assert!(matches!(
+            store.open_payload(&manifest, &scratch, u64::MAX),
+            Err(CacheError::InvalidManifest(_))
+        ));
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        encoded.pop();
+        encoded[0] ^= 1;
+        fs::write(&object, &encoded).unwrap();
+        assert!(matches!(
+            store.open_payload(&manifest, &scratch, u64::MAX),
+            Err(CacheError::DigestMismatch { .. })
+        ));
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+        fs::remove_file(object).unwrap();
+        assert!(matches!(
+            store.open_payload(&manifest, &scratch, u64::MAX),
+            Err(CacheError::NotFound(_))
+        ));
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn seekable_payload_empty_round_trip_and_concurrent_reader_lifetimes() {
+        let root = temporary_root("xc-cache-seekable-lifetimes");
+        let store = FilesystemCacheStore::new("local", root.path(), true, CacheVisibility::Local);
+        let manifest = store
+            .put(
+                &draft(
+                    ArtifactKey::new("fixture", "empty", b"{}").unwrap(),
+                    CacheQuality::Validated,
+                    CacheVisibility::Local,
+                ),
+                b"",
+            )
+            .unwrap();
+        let scratch = root.join("scratch");
+        let first = store.open_payload(&manifest, &scratch, 0).unwrap();
+        let mut second = store.open_payload(&manifest, &scratch, 0).unwrap();
+        assert!(first.is_empty());
+        assert_ne!(first.path, second.path);
+        let second_path = second.path.clone();
+        drop(first);
+        assert!(second_path.exists());
+        assert_eq!(second.read(&mut [0u8; 1]).unwrap(), 0);
+        drop(second);
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn seekable_payload_exact_resolver_preserves_quality_and_corrupt_first_refusal() {
+        let root = temporary_root("xc-cache-seekable-resolver");
+        let first =
+            FilesystemCacheStore::new("first", root.join("first"), true, CacheVisibility::Local);
+        let second =
+            FilesystemCacheStore::new("second", root.join("second"), true, CacheVisibility::Local);
+        let key = ArtifactKey::new("fixture", "exact", b"{}").unwrap();
+        let weak = first
+            .put(
+                &draft(key.clone(), CacheQuality::Validated, CacheVisibility::Local),
+                b"same",
+            )
+            .unwrap();
+        let strong = second
+            .put(
+                &draft(key.clone(), CacheQuality::Certified, CacheVisibility::Local),
+                b"same",
+            )
+            .unwrap();
+        let first_object = first.object_path(&weak.objects[0].content_digest);
+        let resolver = CacheResolver::new(vec![
+            CacheLayer {
+                precedence: 0,
+                store: Box::new(first),
+            },
+            CacheLayer {
+                precedence: 1,
+                store: Box::new(second),
+            },
+        ]);
+        let policy = CachePolicy {
+            current_toolkit_version: version("0.18.2"),
+            minimum_quality: CacheQuality::Validated,
+            accepted_schema_versions: vec![1],
+            allow_deprecated: false,
+            allow_quarantined: false,
+            allowed_visibilities: vec![CacheVisibility::Local],
+        };
+        let scratch = root.join("scratch");
+        let resolved = resolver
+            .open_exact_payload(
+                &key,
+                &strong.content_digest,
+                CacheQuality::Certified,
+                &policy,
+                &scratch,
+                4,
+            )
+            .unwrap();
+        assert_eq!(resolved.layer_name, "second");
+        assert_eq!(resolved.manifest, strong);
+        drop(resolved);
+        let resolved = resolver
+            .open_exact_payload(
+                &key,
+                &weak.content_digest,
+                CacheQuality::Validated,
+                &policy,
+                &scratch,
+                4,
+            )
+            .unwrap();
+        assert_eq!(resolved.layer_name, "first");
+        assert_eq!(resolved.manifest, weak);
+        drop(resolved);
+        fs::write(&first_object, b"evil").unwrap();
+        assert!(matches!(
+            resolver.open_exact_payload(
+                &key,
+                &weak.content_digest,
+                CacheQuality::Validated,
+                &policy,
+                &scratch,
+                4
+            ),
+            Err(CacheError::DigestMismatch { .. })
+        ));
+        fs::remove_file(first_object).unwrap();
+        assert!(matches!(
+            resolver.open_exact_payload(
+                &key,
+                &weak.content_digest,
+                CacheQuality::Validated,
+                &policy,
+                &scratch,
+                4
+            ),
+            Err(CacheError::NotFound(_))
+        ));
+        assert!(matches!(
+            resolver.open_exact_payload(
+                &key,
+                &ContentDigest::sha256(b"other"),
+                CacheQuality::Validated,
+                &policy,
+                &scratch,
+                4
+            ),
+            Err(CacheError::NotFound(_))
+        ));
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
     }
 
     #[test]

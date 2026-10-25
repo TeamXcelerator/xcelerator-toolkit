@@ -14,6 +14,8 @@ use xc_numerics::prefix::lossless_decimal as dec;
 mod energy;
 #[path = "retained_evidence/finite_math.rs"]
 pub(super) mod finite_math;
+#[path = "retained_evidence/matrix_decode.rs"]
+mod matrix_decode;
 #[path = "retained_evidence/point.rs"]
 pub(super) mod point;
 #[path = "retained_evidence/projection.rs"]
@@ -21,7 +23,7 @@ mod projection;
 #[path = "retained_evidence/projection_math.rs"]
 mod projection_math;
 #[path = "retained_evidence/transform.rs"]
-mod transform;
+pub(super) mod transform;
 #[path = "retained_evidence/transform_math.rs"]
 pub(super) mod transform_math;
 pub const SEMANTICS: &str = "ccm-retained-research-observations-v22";
@@ -153,6 +155,60 @@ where
     F: FnOnce() -> Result<T>,
     V: Fn(&T) -> Result<()>,
 {
+    with_managed_request(
+        kind,
+        &request,
+        sources,
+        cache,
+        |req, scope, dependencies, identities| {
+            Ok(resolve_or_compute_json_artifact_with_dependencies(
+                req,
+                || {
+                    let data = compute().map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+                    Ok((
+                        ResearchRecord {
+                            schema_version: 1,
+                            semantics: SEMANTICS.into(),
+                            kind: kind.into(),
+                            scope: scope.into(),
+                            source_dependencies: identities.clone(),
+                            request: request.clone(),
+                            data,
+                        },
+                        dependencies.clone(),
+                    ))
+                },
+                |r| {
+                    if r.schema_version != 1
+                        || r.semantics != SEMANTICS
+                        || r.kind != kind
+                        || r.scope != scope
+                        || r.source_dependencies != identities
+                        || r.request != request
+                    {
+                        return Err(CacheError::InvalidManifest(
+                            "retained research identity mismatch".into(),
+                        ));
+                    }
+                    validate(&r.data).map_err(|e| CacheError::InvalidManifest(e.to_string()))
+                },
+            )?)
+        },
+    )
+}
+
+fn with_managed_request<R>(
+    kind: &str,
+    request: &Value,
+    sources: &[ArtifactManifest],
+    cache: &ArtifactCacheContext<'_>,
+    resolve: impl FnOnce(
+        &ArtifactExecutionCacheRequest<'_>,
+        &str,
+        Vec<DependencyRef>,
+        Vec<DependencyRef>,
+    ) -> Result<R>,
+) -> Result<R> {
     if cache.requested_assurance != xc_core::AssuranceLevel::Computed {
         bail!("research observations are computed, not certificates");
     }
@@ -214,39 +270,70 @@ where
         provenance_digest: None,
         production_sink: cache.production_sink,
     };
-    Ok(resolve_or_compute_json_artifact_with_dependencies(
-        &req,
-        || {
-            let data = compute().map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
-            Ok((
-                ResearchRecord {
-                    schema_version: 1,
-                    semantics: SEMANTICS.into(),
-                    kind: kind.into(),
-                    scope: scope.into(),
-                    source_dependencies: identities.clone(),
-                    request: request.clone(),
-                    data,
-                },
-                dependencies.clone(),
-            ))
-        },
-        |r| {
-            if r.schema_version != 1
-                || r.semantics != SEMANTICS
-                || r.kind != kind
-                || r.scope != scope
-                || r.source_dependencies != identities
-                || r.request != request
-            {
-                return Err(CacheError::InvalidManifest(
-                    "retained research identity mismatch".into(),
-                ));
-            }
-            validate(&r.data).map_err(|e| CacheError::InvalidManifest(e.to_string()))
-        },
-    )?)
+    resolve(&req, scope, dependencies, identities)
 }
+
+/// Retain only the fact of complete typed admission, not a second large input.
+/// The execution core still authenticates payload bytes, manifests, policy and
+/// ancestry on every access; a run memo avoids repeating the stable codec and
+/// domain validation for an identical payload and validation context.
+pub(super) fn managed_admission<T, F, V>(
+    kind: &str,
+    request: Value,
+    sources: &[ArtifactManifest],
+    cache: &ArtifactCacheContext<'_>,
+    context: &xc_cache::ValidatedValueMemoContext,
+    compute: F,
+    validate: V,
+) -> Result<ArtifactExecutionCacheResult<xc_cache::SharedValidated<()>>>
+where
+    T: Serialize + DeserializeOwned + 'static,
+    F: FnOnce() -> Result<T>,
+    V: Fn(&T) -> Result<()>,
+{
+    with_managed_request(
+        kind,
+        &request,
+        sources,
+        cache,
+        |req, scope, dependencies, identities| {
+            Ok(xc_cache::resolve_or_compute_json_artifact_admission(
+                req,
+                context,
+                || {
+                    let data = compute().map_err(|e| CacheError::InvalidManifest(e.to_string()))?;
+                    Ok((
+                        ResearchRecord {
+                            schema_version: 1,
+                            semantics: SEMANTICS.into(),
+                            kind: kind.into(),
+                            scope: scope.into(),
+                            source_dependencies: identities.clone(),
+                            request: request.clone(),
+                            data,
+                        },
+                        dependencies.clone(),
+                    ))
+                },
+                |r| {
+                    if r.schema_version != 1
+                        || r.semantics != SEMANTICS
+                        || r.kind != kind
+                        || r.scope != scope
+                        || r.source_dependencies != identities
+                        || r.request != request
+                    {
+                        return Err(CacheError::InvalidManifest(
+                            "retained research identity mismatch".into(),
+                        ));
+                    }
+                    validate(&r.data).map_err(|e| CacheError::InvalidManifest(e.to_string()))
+                },
+            )?)
+        },
+    )
+}
+
 /// Explicit finite Fourier reference. This is not an automatically certified
 /// prolate function or a reader of the legacy private target specification.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -841,13 +928,6 @@ pub(super) fn transform_terms(
 ) -> Result<(Float, Float, Float, Float)> {
     transform::terms(state, t, p)
 }
-pub(super) fn transform_terms_at_root(
-    state: &RetainedState,
-    t: &Float,
-    p: u32,
-) -> Result<(Float, Float, Float, Float)> {
-    transform::terms_at_root(state, t, p)
-}
 fn transforms(
     state: &RetainedState,
     dataset: &DatasetSpec,
@@ -855,6 +935,46 @@ fn transforms(
     extra: &[ArtifactManifest],
     root_convention: bool,
     cache: &ArtifactCacheContext<'_>,
+) -> Result<ArtifactExecutionCacheResult<ResearchRecord<TransformData>>> {
+    let maximum = transform_math::configured_maximum_guard_bits(o.working_precision_bits)?;
+    let exhausted = std::cell::Cell::new(false);
+    let first = transforms_with_guard_limit(
+        state,
+        dataset,
+        o,
+        extra,
+        root_convention,
+        cache,
+        transform_math::LEGACY_MAXIMUM_GUARD_BITS,
+        &exhausted,
+    );
+    if maximum > transform_math::LEGACY_MAXIMUM_GUARD_BITS
+        && transform::retry_extended(&first, exhausted.get(), cache.mode)
+    {
+        transforms_with_guard_limit(
+            state,
+            dataset,
+            o,
+            extra,
+            root_convention,
+            cache,
+            maximum,
+            &exhausted,
+        )
+    } else {
+        first
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn transforms_with_guard_limit(
+    state: &RetainedState,
+    dataset: &DatasetSpec,
+    o: &TransformOptions,
+    extra: &[ArtifactManifest],
+    root_convention: bool,
+    cache: &ArtifactCacheContext<'_>,
+    maximum_guard: u32,
+    exhausted: &std::cell::Cell<bool>,
 ) -> Result<ArtifactExecutionCacheResult<ResearchRecord<TransformData>>> {
     dataset.validate()?;
     precision(o.working_precision_bits)?;
@@ -890,79 +1010,99 @@ fn transforms(
     sources.extend_from_slice(extra);
     managed(
         "ccm_indexed_transform_analysis",
-        json!({"options":o,"dataset":dataset,"formula":formula,"transform_arithmetic":arithmetic,"maximum_transform_guard_bits":4096,"curvature_output":"outward_upper_endpoint_v1"}),
+        json!({"options":o,"dataset":dataset,"formula":formula,"transform_arithmetic":arithmetic,"maximum_transform_guard_bits":maximum_guard,"curvature_output":"outward_upper_endpoint_v1"}),
         &sources,
         cache,
         || {
-            let p = o.working_precision_bits;
-            let curvature = transform_math::curvature(&state.cutoff, p)?
-                .ok_or_else(|| anyhow::anyhow!("curvature unresolved within 4096 guard bits"))?;
-            let curvature = Float::with_val_round(p, curvature.upper(), rug::float::Round::Up).0;
-            let rows = dataset
-                .points
-                .par_iter()
-                .map(|r| -> Result<_> {
-                    let mut row = TransformRow {
-                        ordinal: r.ordinal,
-                        source_status: r.source_status.clone(),
-                        t: r.value.clone(),
-                        outcome: "missing_input".into(),
-                        value: None,
-                        derivative: None,
-                        sum_absolute_terms: None,
-                        sum_absolute_derivative_terms: None,
-                        cancellation_digits: None,
-                        newton_correction: None,
-                        newton_remainder:
-                            "not_bounded; local_Newton_diagnostic_not_a_zero_error_certificate"
-                                .into(),
-                    };
-                    if let Some(t) = &r.value {
-                        let t = scalar(t, dataset.precision_bits)?;
-                        let (v, d, a, ad) = if root_convention {
-                            transform_terms_at_root(state, &t, p)?
-                        } else {
-                            transform_terms(state, &t, p)?
+            let computation = (|| {
+                let p = o.working_precision_bits;
+                let curvature =
+                    transform_math::curvature_with_guard_limit(&state.cutoff, p, maximum_guard)?
+                        .ok_or(transform::GuardExhausted {
+                            maximum: maximum_guard,
+                            requested: p,
+                        })?;
+                let curvature =
+                    Float::with_val_round(p, curvature.upper(), rug::float::Round::Up).0;
+                let resources = xc_core::RunResources::current();
+                let rows = dataset
+                    .points
+                    .par_iter()
+                    .map(|r| -> Result<_> {
+                        let _scope = resources.as_ref().map(xc_core::RunResources::enter);
+                        let mut row = TransformRow {
+                            ordinal: r.ordinal,
+                            source_status: r.source_status.clone(),
+                            t: r.value.clone(),
+                            outcome: "missing_input".into(),
+                            value: None,
+                            derivative: None,
+                            sum_absolute_terms: None,
+                            sum_absolute_derivative_terms: None,
+                            cancellation_digits: None,
+                            newton_correction: None,
+                            newton_remainder:
+                                "not_bounded; local_Newton_diagnostic_not_a_zero_error_certificate"
+                                    .into(),
                         };
-                        let scale = (Float::with_val(p, &ad) + 1) >> (p - 32);
-                        let floor = (Float::with_val(p, &a) + 1) >> (p - 32);
-                        row.outcome = if d.clone().abs() <= scale {
-                            "unresolved_derivative"
-                        } else if v.clone().abs() <= floor {
-                            "cancellation_limited"
-                        } else {
-                            "point_measurement"
+                        if let Some(t) = &r.value {
+                            let t = scalar(t, dataset.precision_bits)?;
+                            let (v, d, a, ad) = transform::terms_with_guard_limit(
+                                state,
+                                &t,
+                                p,
+                                maximum_guard,
+                                root_convention,
+                            )?;
+                            let scale = (Float::with_val(p, &ad) + 1) >> (p - 32);
+                            let floor = (Float::with_val(p, &a) + 1) >> (p - 32);
+                            row.outcome = if d.clone().abs() <= scale {
+                                "unresolved_derivative"
+                            } else if v.clone().abs() <= floor {
+                                "cancellation_limited"
+                            } else {
+                                "point_measurement"
+                            }
+                            .into();
+                            if row.outcome == "point_measurement" {
+                                row.newton_correction = Some(dec(&(-point::quotient(&v, &d, p)?)));
+                            }
+                            if v != 0 && a > 0 {
+                                let c = a.clone().log10() - v.clone().abs().log10();
+                                row.cancellation_digits = Some(dec(&c.max(&Float::with_val(p, 0))));
+                            }
+                            row.value = Some(dec(&v));
+                            row.derivative = Some(dec(&d));
+                            row.sum_absolute_terms = Some(dec(&a));
+                            row.sum_absolute_derivative_terms = Some(dec(&ad));
                         }
-                        .into();
-                        if row.outcome == "point_measurement" {
-                            row.newton_correction = Some(dec(&(-point::quotient(&v, &d, p)?)));
-                        }
-                        if v != 0 && a > 0 {
-                            let c = a.clone().log10() - v.clone().abs().log10();
-                            row.cancellation_digits = Some(dec(&c.max(&Float::with_val(p, 0))));
-                        }
-                        row.value = Some(dec(&v));
-                        row.derivative = Some(dec(&d));
-                        row.sum_absolute_terms = Some(dec(&a));
-                        row.sum_absolute_derivative_terms = Some(dec(&ad));
-                    }
-                    Ok(row)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(TransformData {
-                coordinate: coordinate.into(),
-                normalization: "unit_L2_dx; center_positive_else_largest_coefficient_positive"
-                    .into(),
-                input_role: dataset.role.clone(),
-                source_precision_bits: state.precision,
-                working_precision_bits: p,
-                finite_support: "[-log(C)/2,log(C)/2]; zero_extended_finite_Fourier_state".into(),
-                physical_tail:
-                    "not_available; zero_extension_is_not_an_infinite_ground_state_tail_bound"
+                        Ok(row)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(TransformData {
+                    coordinate: coordinate.into(),
+                    normalization: "unit_L2_dx; center_positive_else_largest_coefficient_positive"
                         .into(),
-                second_derivative_cauchy_schwarz_expression: dec(&curvature),
-                rows,
-            })
+                    input_role: dataset.role.clone(),
+                    source_precision_bits: state.precision,
+                    working_precision_bits: p,
+                    finite_support: "[-log(C)/2,log(C)/2]; zero_extended_finite_Fourier_state"
+                        .into(),
+                    physical_tail:
+                        "not_available; zero_extension_is_not_an_infinite_ground_state_tail_bound"
+                            .into(),
+                    second_derivative_cauchy_schwarz_expression: dec(&curvature),
+                    rows,
+                })
+            })();
+            if computation
+                .as_ref()
+                .err()
+                .is_some_and(|error: &anyhow::Error| error.is::<transform::GuardExhausted>())
+            {
+                exhausted.set(true);
+            }
+            computation
         },
         |r| {
             if r.rows.len() != dataset.points.len()
@@ -1055,13 +1195,43 @@ pub fn capture_transforms_at_dataset(
     transforms(s, &d.spec, o, std::slice::from_ref(&d.manifest), false, c)
 }
 
+/// Immutable matrix entries. Owned clones share both data and its reservation.
+#[derive(Clone, Debug)]
+pub(crate) enum RetainedMatrixEntries<'a> {
+    Borrowed(&'a [Float]),
+    Owned(std::sync::Arc<OwnedRetainedMatrix>),
+}
+#[derive(Debug)]
+pub(crate) struct OwnedRetainedMatrix {
+    entries: Vec<Float>,
+    _reservation: xc_core::MemoryReservation,
+}
+impl<'a> RetainedMatrixEntries<'a> {
+    pub(crate) fn borrowed(entries: &'a [Float]) -> Self {
+        Self::Borrowed(entries)
+    }
+}
+impl std::ops::Deref for RetainedMatrixEntries<'_> {
+    type Target = [Float];
+    fn deref(&self) -> &[Float] {
+        match self {
+            Self::Borrowed(entries) => entries,
+            Self::Owned(owner) => &owner.entries,
+        }
+    }
+}
+impl AsRef<[Float]> for RetainedMatrixEntries<'_> {
+    fn as_ref(&self) -> &[Float] {
+        self
+    }
+}
 #[derive(Clone, Debug)]
 pub struct RetainedMatrix<'a> {
     pub(crate) manifest: ArtifactManifest,
     pub(crate) cutoff: String,
     pub(crate) modes: usize,
     pub(crate) precision: u32,
-    pub(crate) entries: std::borrow::Cow<'a, [Float]>,
+    pub(crate) entries: RetainedMatrixEntries<'a>,
 }
 fn retained_matrix_shape(modes: usize, p: u32, entries: usize) -> Result<usize> {
     precision(p)?;
@@ -1069,55 +1239,87 @@ fn retained_matrix_shape(modes: usize, p: u32, entries: usize) -> Result<usize> 
         .checked_mul(2)
         .and_then(|n| n.checked_add(1))
         .ok_or_else(|| anyhow::anyhow!("retained matrix dimension overflow"))?;
-    if modes > 8192
-        || dim.checked_mul(dim) != Some(entries)
-        || entries as u128 * (u128::from(p).div_ceil(8) + 96) > (8u128 << 30)
-    {
+    if modes > 8192 || dim.checked_mul(dim) != Some(entries) {
         bail!("retained matrix shape or workspace exceeds its supported domain");
     }
     Ok(dim)
 }
+fn retained_matrix_bytes(p: u32, entries: usize) -> Result<u64> {
+    precision(p)?;
+    let scalar = u128::from(p).div_ceil(64) * 8 + 96;
+    u64::try_from(
+        (entries as u128)
+            .checked_mul(scalar)
+            .and_then(|v| v.checked_add(4096))
+            .ok_or_else(|| anyhow::anyhow!("retained matrix allocation size overflow"))?,
+    )
+    .map_err(Into::into)
+}
+fn retained_matrix_resources() -> Result<xc_core::RunResources> {
+    match xc_core::RunResources::current() {
+        Some(resources) => Ok(resources),
+        None => Ok(xc_core::RunResources::new(
+            super::capture_runtime::CaptureResourcePolicy::from_environment()?
+                .maximum_working_bytes,
+        )?),
+    }
+}
 impl<'a> RetainedMatrix<'a> {
     pub fn from_payload(m: &ArtifactManifest, b: &[u8], allowed: &[ContentDigest]) -> Result<Self> {
+        // Preserve byte-slice authentication before inspecting payload syntax.
         admits(m, b, allowed, "ccm_tau_matrix")?;
-        #[derive(Deserialize)]
-        struct Payload {
-            schema_version: u32,
-            lambda_squared: String,
-            n_modes: usize,
-            precision_bits: u32,
-            entries: Vec<String>,
+        Self::from_reader(m, &mut std::io::Cursor::new(b), allowed)
+    }
+    /// Decode an authenticated logical JSON stream without retaining its bytes.
+    /// Uses the active shared run budget, or the configured research working
+    /// budget when called alone. The default is a policy, not a matrix-size cap.
+    /// Both passes verify the exact logical length and digest. Reader-owned
+    /// buffers and caller-owned input bytes are not charged by this adapter.
+    pub fn from_reader<R: std::io::Read + std::io::Seek>(
+        m: &ArtifactManifest,
+        reader: &mut R,
+        allowed: &[ContentDigest],
+    ) -> Result<Self> {
+        let resources = retained_matrix_resources()?;
+        Self::from_reader_with_resources(m, reader, allowed, &resources)
+    }
+    /// Explicit-budget variant. The returned owned allocation keeps its shared
+    /// reservation until its last clone is dropped, even after the run scope ends.
+    pub fn from_reader_with_resources<R: std::io::Read + std::io::Seek>(
+        m: &ArtifactManifest,
+        reader: &mut R,
+        allowed: &[ContentDigest],
+        resources: &xc_core::RunResources,
+    ) -> Result<Self> {
+        m.validate()?;
+        if m.key.kind != "ccm_tau_matrix"
+            || !m.immutable
+            || m.quality.admissible_rank() < CacheQuality::Validated.admissible_rank()
+            || !allowed.contains(&m.content_digest)
+        {
+            bail!("unapproved or invalid retained research source");
         }
-        let r: Payload = serde_json::from_slice(b)?;
-        let n = retained_matrix_shape(r.n_modes, r.precision_bits, r.entries.len())?;
-        super::research::ExactCutoff::parse(&r.lambda_squared)?;
-        if r.schema_version != 2 {
-            bail!("invalid retained matrix shape");
-        }
-        let entries = r
-            .entries
-            .iter()
-            .map(|v| scalar(v, r.precision_bits))
-            .collect::<Result<Vec<_>>>()?;
-        for i in 0..n {
+        let r = matrix_decode::decode_reader(reader, m.size_bytes, &m.content_digest, resources)?;
+        for i in 0..r.dimension {
             for j in 0..i {
-                if entries[i * n + j] != entries[j * n + i] {
+                if r.entries[i * r.dimension + j] != r.entries[j * r.dimension + i] {
                     bail!("retained matrix is not exactly symmetric");
                 }
             }
         }
         Ok(Self {
             manifest: m.clone(),
-            cutoff: r.lambda_squared,
-            modes: r.n_modes,
-            precision: r.precision_bits,
-            entries: std::borrow::Cow::Owned(entries),
+            cutoff: r.cutoff,
+            modes: r.modes,
+            precision: r.precision,
+            entries: RetainedMatrixEntries::Owned(std::sync::Arc::new(OwnedRetainedMatrix {
+                entries: r.entries,
+                _reservation: r.reservation,
+            })),
         })
     }
-    // The private live adapter borrows immutable, reader-authenticated bytes
-    // already decoded by the owning run. Recheck numeric/metadata domains here.
-    // Preserve its exact stored entries, including historical tiny asymmetry;
-    // quadratic-form diagnostics explicitly use the symmetric part.
+    // The private live adapter borrows already-charged immutable entries.
+    // Preserve historical tiny asymmetry; quadratic forms use the symmetric part.
     pub(crate) fn from_admitted_runtime(
         m: ArtifactManifest,
         cutoff: String,
@@ -1142,19 +1344,33 @@ impl<'a> RetainedMatrix<'a> {
             cutoff,
             modes,
             precision,
-            entries: std::borrow::Cow::Borrowed(entries),
+            entries: RetainedMatrixEntries::borrowed(entries),
         })
     }
-    /// The same matrix holding its own copy of the entries, for work that
-    /// outlives the borrowed source.
-    pub(crate) fn to_owned_entries(&self) -> RetainedMatrix<'static> {
-        RetainedMatrix {
+    /// Share owned entries, or reserve before copying an existing borrowed view.
+    pub(crate) fn to_owned_entries(&self) -> Result<RetainedMatrix<'static>> {
+        let entries = match &self.entries {
+            RetainedMatrixEntries::Owned(owner) => RetainedMatrixEntries::Owned(owner.clone()),
+            RetainedMatrixEntries::Borrowed(source) => {
+                let resources = retained_matrix_resources()?;
+                let reservation = resources
+                    .try_reserve_retained(retained_matrix_bytes(self.precision, source.len())?)?;
+                let mut entries = Vec::new();
+                entries.try_reserve_exact(source.len())?;
+                entries.extend(source.iter().cloned());
+                RetainedMatrixEntries::Owned(std::sync::Arc::new(OwnedRetainedMatrix {
+                    entries,
+                    _reservation: reservation,
+                }))
+            }
+        };
+        Ok(RetainedMatrix {
             manifest: self.manifest.clone(),
             cutoff: self.cutoff.clone(),
             modes: self.modes,
             precision: self.precision,
-            entries: std::borrow::Cow::Owned(self.entries.to_vec()),
-        }
+            entries,
+        })
     }
     pub(crate) fn match_state(&self, s: &RetainedState) -> Result<()> {
         if !equal_cutoff(&self.cutoff, &s.cutoff)?

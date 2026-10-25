@@ -368,3 +368,165 @@ fn arithmetic_energy_limits_zero_trials_and_compact_actions_are_explicit() {
         0.0
     );
 }
+
+#[test]
+fn arithmetic_energy_workspace_budget_is_not_identity_or_a_cached_failure() {
+    let root = xc_core::test_support::TestDir::new("energy-workspace-budget");
+    let resolver = CacheResolver::new(vec![CacheLayer {
+        precedence: 0,
+        store: Box::new(ZipJsonFilesystemCacheStore::new(
+            "local",
+            &*root,
+            true,
+            CacheVisibility::Local,
+        )),
+    }]);
+    let policy = CachePolicy {
+        current_toolkit_version: ToolkitVersion::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+        minimum_quality: CacheQuality::Validated,
+        accepted_schema_versions: vec![1],
+        allow_deprecated: false,
+        allow_quarantined: false,
+        allowed_visibilities: vec![CacheVisibility::Local],
+    };
+    let cache = ArtifactCacheContext {
+        resolver: Some(&resolver),
+        reference_resolver: None,
+        acceptance: Some(&policy),
+        ordered_overlays: vec!["local".into()],
+        mode: ArtifactExecutionCacheMode::PreferReuse,
+        write_on_miss: true,
+        write_visibility: CacheVisibility::Local,
+        requested_assurance: xc_core::AssuranceLevel::Computed,
+        certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+        production_sink: None,
+    };
+    let (state, manifest, matrix) = fixture();
+    let mut input = inputs(&manifest);
+    input.components.push(OperatorComponent {
+        label: "tau".into(),
+        source_digest: ContentDigest::sha256(b"tau"),
+        diagonal: vec!["4".into(), "3".into(), "4".into()],
+        dense: vec![],
+        rank_one: vec![],
+    });
+    input.components_are_complete = true;
+    let sources = [manifest];
+    let capture = |options: &ExtensionOptions, context: &ArtifactCacheContext<'_>| {
+        capture_extended(
+            "arithmetic_energy",
+            &state,
+            Some(&matrix),
+            None,
+            Some(&input),
+            options,
+            &sources,
+            context,
+        )
+        .unwrap()
+    };
+    let mut options = ExtensionOptions::for_source(&state);
+    options.maximum_working_bytes = Some(1);
+    let limited = capture(&options, &cache);
+    assert_eq!(limited.value.data.outcome, "unresolved");
+    assert!(limited
+        .value
+        .data
+        .reason
+        .as_deref()
+        .unwrap()
+        .contains("working-byte budget"));
+    assert!(limited.produced_manifest.is_none() && limited.reused_manifest.is_none());
+
+    // The former borrowed-Tau estimate was 33,146,880 bytes for this fixture;
+    // this cap distinguishes the owned-workspace planner from that estimate.
+    options.maximum_working_bytes = Some(8 << 20);
+    let resources = xc_core::RunResources::new(8 << 20).unwrap();
+    let complete = {
+        let _scope = resources.enter();
+        capture(&options, &cache)
+    };
+    assert_eq!(complete.value.data.outcome, "point_measurement");
+    assert_eq!(number(&complete.value.data.values["total_tau_energy"]), 3.0);
+    assert!(resources.usage().peak_bytes > 0);
+    assert_eq!(resources.usage().working_bytes, 0);
+    let produced = complete
+        .produced_manifest
+        .as_ref()
+        .expect("complete result retained");
+    let expected = serde_json::to_value(&complete.value).unwrap();
+
+    // The budget is neither a key field nor a prerequisite for a warm hit.
+    options.maximum_working_bytes = Some(1);
+    let warm_resources = xc_core::RunResources::new(1).unwrap();
+    let reused = {
+        let _scope = warm_resources.enter();
+        capture(&options, &cache)
+    };
+    assert_eq!(
+        reused.reused_manifest.unwrap().content_digest,
+        produced.content_digest
+    );
+    assert_eq!(serde_json::to_value(&reused.value).unwrap(), expected);
+    assert_eq!(warm_resources.usage().working_bytes, 0);
+
+    // Independent recomputation uses one reservation and preserves every payload field.
+    let verification_root = xc_core::test_support::TestDir::new("energy-workspace-verify");
+    let verification = ManagedArtifactCacheSession::with_layers_for_test(
+        ManagedArtifactCacheConfig {
+            profile: ManagedRunProfile::Normal,
+            requested_assurance: xc_core::AssuranceLevel::Computed,
+            certification_failure_policy: CertificationFailurePolicy::RetainComputedFailRun,
+            cache_root: root.to_path_buf(),
+            staging_root: None,
+            publication_target: xc_core::PublicationTarget::None,
+            repository_owner: "local-energy-fixture".into(),
+            remote_cache_mode: ManagedRemoteCacheMode::None,
+            cache_mode: ArtifactExecutionCacheMode::VerifyAgainstReference,
+            replace_existing_publication: false,
+            execute_remote_mutations: false,
+            output_validation: Some(OutputValidationConfig {
+                validation_root: verification_root.to_path_buf(),
+                report_root: verification_root.join("reports"),
+                reference_mode: ManagedRemoteCacheMode::Public,
+            }),
+        },
+        vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(ZipJsonFilesystemCacheStore::new(
+                "validation",
+                &*verification_root,
+                true,
+                CacheVisibility::Local,
+            )),
+        }],
+        vec![CacheLayer {
+            precedence: 0,
+            store: Box::new(ZipJsonFilesystemCacheStore::new(
+                "reference",
+                &*root,
+                false,
+                CacheVisibility::Local,
+            )),
+        }],
+    )
+    .unwrap();
+    options.maximum_working_bytes = Some(16 << 20);
+    let verification_resources = xc_core::RunResources::new(16 << 20).unwrap();
+    let verified = {
+        let _scope = verification_resources.enter();
+        capture(&options, &verification.context())
+    };
+    assert_eq!(
+        verified.access.validation_outcome,
+        xc_core::CacheValidationOutcome::Passed
+    );
+    assert_eq!(serde_json::to_value(&verified.value).unwrap(), expected);
+    assert_eq!(
+        verified.produced_manifest.unwrap().content_digest,
+        produced.content_digest
+    );
+    assert!(verification_resources.usage().peak_bytes > 0);
+    assert_eq!(verification_resources.usage().working_bytes, 0);
+    verification.finalize_publication_inventory().unwrap();
+}

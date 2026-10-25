@@ -50,7 +50,11 @@ fn dot(a: &[Float], b: &[Float], p: u32) -> Float {
 }
 
 pub fn lossless_decimal(v: &Float) -> String {
-    v.to_string_radix(10, Some(roundtrip_decimal_digits(v.prec())))
+    crate::fmt::decimal_string_round(
+        v,
+        Some(roundtrip_decimal_digits(v.prec())),
+        rug::float::Round::Nearest,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +274,7 @@ fn analyze_prefixes_impl(
     policy: &PrefixDiagnosticPolicy,
     column_factor: bool,
 ) -> Result<PrefixAnalysisReport> {
+    crate::mpfr_interval::ensure_uniform_exponent_range()?;
     if d == 0
         || d.checked_mul(d) != Some(matrix.len())
         || d > 8193
@@ -529,7 +534,7 @@ where
     for &digits in digits_schedule {
         let encoded: Vec<String> = values
             .iter()
-            .map(|v| v.to_string_radix(10, Some(digits)))
+            .map(|v| crate::fmt::decimal_string_round(v, Some(digits), rug::float::Round::Nearest))
             .collect();
         let decoded: Vec<Float> = values
             .iter()

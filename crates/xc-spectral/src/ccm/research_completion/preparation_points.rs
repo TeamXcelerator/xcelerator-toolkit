@@ -23,9 +23,11 @@ impl Promotion {
     }
     fn upper(&self, value: &mut String) -> Result<()> {
         let bound = crate::ccm::retained_evidence::finite_math::decimal_upper(value, self.source)?;
-        *value = Float::with_val_round(self.target, bound, rug::float::Round::Up)
-            .0
-            .to_string_radix_round(10, None, rug::float::Round::Up);
+        *value = xc_numerics::fmt::decimal_string_round(
+            &Float::with_val_round(self.target, bound, rug::float::Round::Up).0,
+            None,
+            rug::float::Round::Up,
+        );
         Ok(())
     }
     fn values(&self, values: &mut [String]) -> Result<()> {
@@ -302,6 +304,7 @@ impl Promotion {
             cluster: _,
             previous_cluster: _,
             cluster_boundary_eigenvalues,
+            cluster_preparation_assessment: _,
             energy_allowance,
         } = input;
         // Cluster vectors own separate precisions. The cutoff is an exact decimal

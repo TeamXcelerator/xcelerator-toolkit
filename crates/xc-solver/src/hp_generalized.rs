@@ -34,6 +34,7 @@ pub struct GeneralizedExtremeConfigHp {
 /// invariant search plateau can hide a better target despite convergence.
 #[derive(Clone, Debug)]
 pub struct MatrixFreeGeneralizedEigenpairReportHp {
+    pub operator_error: super::OperatorErrorEvidenceHp,
     pub target: EigenTarget,
     pub eigenvalue: Float,
     pub eigenvector: Vec<Float>,
@@ -436,6 +437,7 @@ impl MatrixFreeGeneralizedRayleighRitzHp {
                     config.precision_bits,
                 );
                 return Ok(MatrixFreeGeneralizedEigenpairReportHp {
+                    operator_error: super::OperatorErrorEvidenceHp::for_residuals(problem.operator, Some(problem.metric), std::iter::once((&eigenvalue, &residual_norm)), config.precision_bits)?,
                     target: config.target.clone(),
                     eigenvalue,
                     eigenvector: current.vector,

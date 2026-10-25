@@ -64,24 +64,117 @@ fn validate_exact_input(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Own cleanup from the moment of spawn, including failures during setup.
+#[derive(Debug)]
+struct ProviderChild(Child);
+
+impl Drop for ProviderChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[derive(Debug)]
 struct Connection {
-    child: Child,
+    child: ProviderChild,
     requests: mpsc::Sender<Vec<u8>>,
     writes: mpsc::Receiver<std::io::Result<()>>,
     replies: mpsc::Receiver<std::result::Result<serde_json::Value, String>>,
-    timeout: Duration,
+    timeout: Option<Duration>,
     failed: bool,
     next_request_id: u64,
     precision_bits: u32,
     _executable_file: File,
 }
-impl Drop for Connection {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+
+struct RequestFrame {
+    bytes: Vec<u8>,
+    maximum: usize,
+}
+
+fn request_timeout(value: Option<&str>) -> Result<Option<Duration>> {
+    let seconds = value.unwrap_or("300").parse::<u64>()?;
+    Ok((seconds != 0).then(|| Duration::from_secs(seconds)))
+}
+
+// A zero policy removes only the elapsed deadline. EOF, protocol errors and
+// failed writes still terminate the connection, and its owner still reaps it.
+fn receive<T>(rx: &mpsc::Receiver<T>, timeout: Option<Duration>, started: Instant) -> Result<T> {
+    match timeout {
+        Some(limit) => rx
+            .recv_timeout(
+                limit
+                    .checked_sub(started.elapsed())
+                    .context("external target provider timed out")?,
+            )
+            .context("external target provider timed out or disconnected"),
+        None => rx.recv().context("external target provider disconnected"),
     }
 }
+
+struct InputSize {
+    bytes: u64,
+    maximum: u64,
+}
+
+impl Write for InputSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len() as u64)
+            .filter(|length| *length <= self.maximum)
+            .ok_or_else(|| {
+                std::io::Error::other("target input exceeds its configured byte limit")
+            })?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn admit_input(input: &serde_json::Value, maximum: u64) -> Result<()> {
+    // Count without constructing a second large buffer or starting a provider.
+    serde_json::to_writer(&mut InputSize { bytes: 0, maximum }, input)?;
+    Ok(())
+}
+
+impl Write for RequestFrame {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let length = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("target request length overflows"))?;
+        if length > self.maximum {
+            return Err(std::io::Error::other(
+                "target request exceeds its configured byte limit",
+            ));
+        }
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(|_| std::io::Error::other("cannot reserve target request memory"))?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn request_frame(request: &serde_json::Value, maximum: u64) -> Result<Vec<u8>> {
+    let mut frame = RequestFrame {
+        bytes: Vec::new(),
+        maximum: usize::try_from(maximum).context("target request exceeds address space")?,
+    };
+    serde_json::to_writer(&mut frame, request)?;
+    frame.write_all(b"\n")?;
+    Ok(frame.bytes)
+}
+
 impl Connection {
     fn exchange(&mut self, message: &serde_json::Value) -> Result<serde_json::Value> {
         anyhow::ensure!(
@@ -108,28 +201,15 @@ impl Connection {
             fields.insert("protocol_version".into(), 2.into());
             fields.insert("request_nonce".into(), nonce.clone().into());
             fields.insert("precision_bits".into(), self.precision_bits.into());
-            let mut frame = serde_json::to_vec(&request)?;
-            frame.push(b'\n');
-            let remaining = || {
-                self.timeout
-                    .checked_sub(started.elapsed())
-                    .context("external target provider timed out")
-            };
-            remaining()?;
+            let frame = request_frame(&request, super::input::target_request_maximum_bytes()?)?;
             self.requests
                 .send(frame)
                 .context("external target writer disconnected")?;
-            self.writes
-                .recv_timeout(remaining()?)
-                .context("external target request timed out or disconnected")?
+            receive(&self.writes, self.timeout, started)?
                 .context("cannot write external target request")?;
-            let reply = self
-                .replies
-                .recv_timeout(remaining()?)
-                .map_err(|_| anyhow::anyhow!("external target provider timed out or disconnected"))?
-                .map_err(|_| {
-                    anyhow::anyhow!("external target provider returned an invalid response")
-                })?;
+            let reply = receive(&self.replies, self.timeout, started)?.map_err(|_| {
+                anyhow::anyhow!("external target provider returned an invalid response")
+            })?;
             validate_reply(
                 &reply,
                 id,
@@ -143,7 +223,7 @@ impl Connection {
         })();
         if result.is_err() {
             self.failed = true;
-            let _ = self.child.kill();
+            let _ = self.child.0.kill();
         }
         result
     }
@@ -177,8 +257,7 @@ fn validate_reply(
 ) -> Result<()> {
     anyhow::ensure!(
         reply["protocol_version"].as_u64() == Some(2),
-        "target provider protocol version mismatch: the Toolkit speaks protocol 2 (with request_nonce), the provider replied with {}",
-        reply.get("protocol_version").map_or_else(|| "no protocol_version".to_owned(), |v| v.to_string())
+        "target provider protocol version mismatch: expected protocol 2 (with request_nonce)"
     );
     anyhow::ensure!(
         reply["request_nonce"].as_str() == Some(nonce),
@@ -353,25 +432,25 @@ struct Provider {
 impl Provider {
     fn start(spec: &ExternalProfileSpec, bits: u32) -> Result<Self> {
         spec.validate()?;
+        admit_input(&spec.input, super::input::target_maximum_bytes()?)?;
         anyhow::ensure!(
             bits <= spec.evaluation_precision_bits,
             "external target requires regeneration at the requested precision"
         );
+        let pure_identity = provider_declared_pure()?
+            .then(|| pure_reply_identity(spec, bits))
+            .transpose()?;
         let path = std::env::var_os("XC_TARGET_PROVIDER_EXECUTABLE").context(
             "external target requires explicit XC_TARGET_PROVIDER_EXECUTABLE authorization",
         )?;
         anyhow::ensure!(!path.is_empty(), "empty target provider path");
         let path = std::path::Path::new(&path);
         let executable_file = verified_executable(path, &spec.provider_sha256)?;
-        let timeout = std::env::var("XC_TARGET_PROVIDER_TIMEOUT_SECONDS")
-            .ok()
-            .map(|s| s.parse::<u64>())
-            .transpose()?
-            .unwrap_or(300);
-        anyhow::ensure!(
-            (1..=3600).contains(&timeout),
-            "invalid target provider timeout"
-        );
+        let timeout = request_timeout(
+            std::env::var("XC_TARGET_PROVIDER_TIMEOUT_SECONDS")
+                .ok()
+                .as_deref(),
+        )?;
         let mut command = Command::new(path);
         command
             .arg("--stdio")
@@ -383,24 +462,24 @@ impl Provider {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
-        let mut child = command
-            .spawn()
-            .context("cannot start authorized target provider")?;
+        let mut child = ProviderChild(
+            command
+                .spawn()
+                .context("cannot start authorized target provider")?,
+        );
         // Detect ordinary replacement across spawn. This is not an atomic
         // execution guarantee against a hostile local writer on every platform.
-        if let Err(error) = verified_executable(path, &spec.provider_sha256) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
+        verified_executable(path, &spec.provider_sha256)?;
         let input = BufWriter::new(
             child
+                .0
                 .stdin
                 .take()
                 .context("target provider stdin unavailable")?,
         );
         let (requests, writes) = request_writer(input);
         let output = child
+            .0
             .stdout
             .take()
             .context("target provider stdout unavailable")?;
@@ -425,16 +504,13 @@ impl Provider {
                 }
             }
         });
-        let pure_identity = provider_declared_pure()?
-            .then(|| pure_reply_identity(spec, bits))
-            .transpose()?;
         let provider = Self {
             connection: Arc::new(Mutex::new(Connection {
                 child,
                 requests,
                 writes,
                 replies,
-                timeout: Duration::from_secs(timeout),
+                timeout,
                 failed: false,
                 next_request_id: 1,
                 precision_bits: bits,
@@ -449,7 +525,7 @@ impl Provider {
             .exchange(&serde_json::json!({"operation":"initialize","input":spec.input}))?;
         Ok(provider)
     }
-    fn value(&self, u: &str) -> Result<String> {
+    fn value<T>(&self, u: &str, parse: impl FnOnce(&str) -> Result<T>) -> Result<T> {
         let key = self
             .pure_identity
             .as_ref()
@@ -459,7 +535,7 @@ impl Provider {
                 .get()
                 .and_then(|memo| memo.lock().ok()?.values.get(key).cloned())
             {
-                return Ok(value);
+                return parse(&value);
             }
         }
         let reply = self
@@ -472,14 +548,16 @@ impl Provider {
             .and_then(|v| v.as_str())
             .map(str::to_owned)
             .context("external target provider omitted its value")?;
-        // Only successful replies are remembered; a failing point is asked again.
+        // A string-shaped reply can still be invalid for the scalar backend.
+        // Only validated replies are remembered; a failing point is asked again.
+        let parsed = parse(&value)?;
         if let Some(key) = key {
             let memo = PURE_REPLIES.get_or_init(|| Mutex::new(PureReplies::default()));
             if let Ok(mut memo) = memo.lock() {
                 memo.remember(key, &value, PURE_REPLY_MEMO_ENTRIES, PURE_REPLY_MEMO_BYTES);
             }
         }
-        Ok(value)
+        Ok(parsed)
     }
 }
 fn parse_scalar_f64(text: &str) -> Result<f64> {
@@ -526,7 +604,7 @@ impl CompiledF64 {
     }
     pub(super) fn raw(&self, u: f64) -> Result<f64> {
         anyhow::ensure!(u.is_finite() && u > 0.0, "target requires finite u > 0");
-        parse_scalar_f64(&self.provider.value(&u.to_string())?)
+        self.provider.value(&u.to_string(), parse_scalar_f64)
     }
 }
 #[cfg(feature = "hp")]
@@ -591,8 +669,25 @@ pub(super) mod hp {
         pub(crate) fn raw(&self, u: &Float) -> Result<Float> {
             anyhow::ensure!(u.is_finite() && u > &0, "target requires finite u > 0");
             let provider_u = Float::with_val(self.bits.max(u.prec()), u);
-            let text = self.provider.value(&provider_u.to_string_radix(10, None))?;
-            parse_scalar(&text, self.bits)
+            self.provider
+                .value(&provider_u.to_string_radix(10, None), |text| {
+                    parse_scalar(text, self.bits)
+                })
+        }
+        /// Scheduling hint only. The ordinary value route still validates and
+        /// consumes the memo reply, or evaluates it if another caller evicts it.
+        pub(crate) fn has_memoized_value(&self, u: &Float) -> bool {
+            let Some(identity) = &self.provider.pure_identity else {
+                return false;
+            };
+            if !u.is_finite() || u <= &0 {
+                return false;
+            }
+            let provider_u = Float::with_val(self.bits.max(u.prec()), u);
+            let key = format!("{identity}{}", provider_u.to_string_radix(10, None));
+            PURE_REPLIES
+                .get()
+                .is_some_and(|memo| memo.lock().is_ok_and(|memo| memo.values.contains_key(&key)))
         }
     }
 }
@@ -601,6 +696,22 @@ mod tests {
     use super::*;
     fn reply(id: u64) -> serde_json::Value {
         serde_json::json!({"protocol_version":2,"request_nonce":"test-nonce","request_id":id,"operation":"evaluate","precision_bits":256,"value":"0.5"})
+    }
+    #[test]
+    fn request_frames_keep_exact_json_and_enforce_the_complete_frame_budget() {
+        let request = serde_json::json!({"operation":"initialize","input":["0.125","1e-2000"]});
+        let mut expected = serde_json::to_vec(&request).unwrap();
+        expected.push(b'\n');
+        assert_eq!(
+            request_frame(&request, expected.len() as u64).unwrap(),
+            expected
+        );
+        assert!(request_frame(&request, expected.len() as u64 - 1).is_err());
+        assert!(request_frame(&request, 0).is_err());
+        let input = &request["input"];
+        let length = serde_json::to_vec(input).unwrap().len() as u64;
+        admit_input(input, length).unwrap();
+        assert!(admit_input(input, length - 1).is_err());
     }
     #[test]
     fn pure_reply_keys_carry_a_digest_not_the_target_input() {
@@ -700,6 +811,29 @@ mod tests {
             let error = validate_reply(&wrong, 1, 256, "test-nonce", "evaluate").unwrap_err();
             assert!(!error.to_string().contains("private detail"));
         }
+    }
+    #[test]
+    fn protocol_version_errors_never_render_response_values() {
+        for version in [
+            serde_json::json!("private-version-marker"),
+            serde_json::json!({"private-version-marker": "private-response-marker"}),
+            serde_json::json!(["private-response-marker"]),
+            serde_json::Value::Null,
+            serde_json::json!(3),
+        ] {
+            let mut wrong = reply(1);
+            wrong["protocol_version"] = version;
+            let error = validate_reply(&wrong, 1, 256, "test-nonce", "evaluate")
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "target provider protocol version mismatch: expected protocol 2 (with request_nonce)"
+            );
+        }
+        let mut missing = reply(1);
+        missing.as_object_mut().unwrap().remove("protocol_version");
+        assert!(validate_reply(&missing, 1, 256, "test-nonce", "evaluate").is_err());
     }
     #[test]
     fn external_policy_rejects_invalid_cutoff_precision_and_digest() {

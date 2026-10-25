@@ -17,6 +17,11 @@ use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use rug::{ops::Pow, Assign, Float};
 
+mod blocked;
+pub use blocked::{
+    dense_lu_arithmetic, lu_factor_auto, lu_factor_blocked, DenseLuExecutionFailure, DenseLuOptions,
+};
+
 /// Build an HP zero at the given precision. Uses an integer literal so
 /// no f64 round-trip occurs.
 #[inline]
@@ -72,6 +77,7 @@ pub struct LuFactors {
 /// callers (`inverse_iteration`) the LU factor is computed once and
 /// reused per step.
 pub fn lu_factor(a: &[Float], dim: usize) -> Result<LuFactors> {
+    crate::mpfr_interval::ensure_uniform_exponent_range()?;
     if dim == 0
         || dim.checked_mul(dim) != Some(a.len())
         || a.iter().any(|x| !x.is_finite())
@@ -218,6 +224,12 @@ pub fn try_lu_solve_with(
     prec: u32,
     parallel: bool,
 ) -> Result<Vec<Float>> {
+    // No row reaches the parallel threshold when dim <= PAR_SOLVE_MIN_ROW.
+    // In that case all arithmetic uses the caller's MPFR range, so there is
+    // no worker state to admit and no reason to broadcast to unused workers.
+    if parallel && dim > PAR_SOLVE_MIN_ROW {
+        crate::mpfr_interval::ensure_uniform_exponent_range()?;
+    }
     if !(32..=1_000_000).contains(&prec)
         || dim.checked_mul(dim) != Some(factors.lu.len())
         || b.len() != dim
@@ -687,6 +699,7 @@ pub const L2_NORMALIZATION_ARITHMETIC_V2: &str = "power_two_scaled_max_precision
 /// unchanged; empty input is a no-op. This is a computed point normalization,
 /// not an interval norm certificate or an all-domain forward-error bound.
 pub fn try_normalize_l2(v: &mut [Float]) -> Result<()> {
+    crate::mpfr_interval::ensure_uniform_exponent_range()?;
     if v.is_empty() {
         return Ok(());
     }
@@ -759,20 +772,24 @@ pub fn try_normalize_l2(v: &mut [Float]) -> Result<()> {
 /// and change the iteration count. A deterministic μ keeps xi
 /// reproducible.
 pub fn rayleigh_quotient(a: &[Float], dim: usize, xi: &[Float], prec: u32) -> Float {
-    let contribs: Vec<Float> = (0..dim)
-        .into_par_iter()
-        .map(|i| {
-            let mut row_sum = hp_zero(prec);
-            for j in 0..dim {
-                let mut t = Float::with_val(prec, &a[i * dim + j]);
-                t *= &xi[j];
-                row_sum += &t;
-            }
-            let mut contrib = row_sum;
-            contrib *= &xi[i];
-            contrib
-        })
-        .collect();
+    let row = |i: usize| {
+        let mut row_sum = hp_zero(prec);
+        for j in 0..dim {
+            let mut t = Float::with_val(prec, &a[i * dim + j]);
+            t *= &xi[j];
+            row_sum += &t;
+        }
+        let mut contrib = row_sum;
+        contrib *= &xi[i];
+        contrib
+    };
+    // The infallible compatibility API uses the caller's arithmetic serially
+    // when an embedding application configured different worker ranges.
+    let contribs: Vec<Float> = if crate::mpfr_interval::ensure_uniform_exponent_range().is_ok() {
+        (0..dim).into_par_iter().map(row).collect()
+    } else {
+        (0..dim).map(row).collect()
+    };
     crate::reduction::deterministic_pairwise_sum_hp_owned(contribs, prec)
 }
 
@@ -890,6 +907,7 @@ fn try_residual_verified_shifted_refinement(
     force_even: bool,
     eigenvalue: &Float,
     eigenvector: &[Float],
+    accelerated: bool,
 ) -> Result<Option<(Float, Vec<Float>, Float)>> {
     let shifted = (0..dimension * dimension)
         .into_par_iter()
@@ -903,8 +921,10 @@ fn try_residual_verified_shifted_refinement(
             value
         })
         .collect::<Vec<_>>();
-    let Ok(factors) = lu_factor(&shifted, dimension) else {
-        return Ok(None);
+    let factors = match iteration_factor(&shifted, dimension, accelerated) {
+        Ok(factors) => factors,
+        Err(error) if recoverable_factor_error(dimension, accelerated, &error) => return Ok(None),
+        Err(error) => return Err(error),
     };
     let Ok(mut refined) = try_lu_solve(&factors, eigenvector, dimension, precision_bits) else {
         return Ok(None);
@@ -1038,7 +1058,7 @@ pub fn inverse_iteration_from_detailed(
     force_even: bool,
     start: Option<Vec<Float>>,
 ) -> Result<InverseIterationOutput> {
-    inverse_iteration_from_optional_factors(a, dim, prec, max_steps, force_even, start, None)
+    inverse_iteration_from_optional_factors(a, dim, prec, max_steps, force_even, start, None, false)
 }
 
 /// Inverse iteration using a previously validated LU factorization of `a`.
@@ -1085,10 +1105,15 @@ pub fn inverse_iteration_from_factors_detailed(
         force_even,
         start,
         Some(factors),
+        false,
     )
 }
 
-fn inverse_iteration_from_optional_factors(
+/// Primary iteration with the dimension-bound accelerated LU contract, including
+/// both shifted-refinement factorizations. Retained factors must have this same
+/// arithmetic identity; original-matrix acceptance remains the caller's duty.
+#[allow(clippy::too_many_arguments)]
+pub fn inverse_iteration_auto_detailed(
     a: &[Float],
     dim: usize,
     prec: u32,
@@ -1097,6 +1122,41 @@ fn inverse_iteration_from_optional_factors(
     start: Option<Vec<Float>>,
     retained_factors: Option<&LuFactors>,
 ) -> Result<InverseIterationOutput> {
+    inverse_iteration_from_optional_factors(
+        a,
+        dim,
+        prec,
+        max_steps,
+        force_even,
+        start,
+        retained_factors,
+        true,
+    )
+}
+
+fn iteration_factor(a: &[Float], dim: usize, accelerated: bool) -> Result<LuFactors> {
+    if accelerated {
+        lu_factor_auto(a, dim)
+    } else {
+        lu_factor(a, dim)
+    }
+}
+fn recoverable_factor_error(dim: usize, accelerated: bool, error: &anyhow::Error) -> bool {
+    !accelerated || dense_lu_arithmetic(dim).is_none() || error.is::<blocked::SingularPivot>()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inverse_iteration_from_optional_factors(
+    a: &[Float],
+    dim: usize,
+    prec: u32,
+    max_steps: usize,
+    force_even: bool,
+    start: Option<Vec<Float>>,
+    retained_factors: Option<&LuFactors>,
+    accelerated: bool,
+) -> Result<InverseIterationOutput> {
+    crate::mpfr_interval::ensure_uniform_exponent_range()?;
     if !(33..=rug::float::prec_max().min(i32::MAX as u32)).contains(&prec)
         || dim == 0
         || dim.checked_mul(dim) != Some(a.len())
@@ -1152,7 +1212,7 @@ fn inverse_iteration_from_optional_factors(
         }
         factors
     } else {
-        computed_factors = lu_factor(a, dim)?;
+        computed_factors = iteration_factor(a, dim, accelerated)?;
         &computed_factors
     };
 
@@ -1274,7 +1334,15 @@ fn inverse_iteration_from_optional_factors(
                     max_steps
                 );
                 if let Some((refined_eigenvalue, refined_eigenvector, relative_residual)) =
-                    try_residual_verified_shifted_refinement(a, dim, prec, force_even, &mu, &xi)?
+                    try_residual_verified_shifted_refinement(
+                        a,
+                        dim,
+                        prec,
+                        force_even,
+                        &mu,
+                        &xi,
+                        accelerated,
+                    )?
                 {
                     crate::hp_debug!(
                         "[HP invit] early shifted rescue accepted with full residual verification"
@@ -1339,7 +1407,7 @@ fn inverse_iteration_from_optional_factors(
         })
         .collect();
 
-    let shifted_refinement = match lu_factor(&shifted_a, dim) {
+    let shifted_refinement = match iteration_factor(&shifted_a, dim, accelerated) {
         Ok(shifted_lu) => {
             let mut xi_refined = try_lu_solve(&shifted_lu, &xi, dim, prec)?;
             try_normalize_l2(&mut xi_refined)?;
@@ -1385,6 +1453,7 @@ fn inverse_iteration_from_optional_factors(
                 ShiftedRefinementOutcome::RejectedEigenvalueJump
             }
         }
+        Err(error) if !recoverable_factor_error(dim, accelerated, &error) => return Err(error),
         Err(_) => {
             // A computed factorization failed. This is not proof that the
             // exact shifted matrix is singular; keep the previous candidate.
@@ -3213,5 +3282,98 @@ mod tests {
         let tol = hp(prec, "1e-15");
         assert!(d0 < tol, "I·x = e_0: x[0] should be 1 (got diff {})", d0);
         assert!(d1 < tol, "I·x = e_0: x[1] should be 0 (got diff {})", d1);
+    }
+}
+
+#[cfg(test)]
+mod worker_range_regression {
+    use super::*;
+    unsafe extern "C" {
+        fn mpfr_set_emin(value: std::os::raw::c_long) -> i32;
+    }
+
+    #[test]
+    fn serial_small_lu_solve_does_not_admit_unused_workers() {
+        let precision = 128;
+        let normal = rug::float::exp_min();
+        let cases = [1, PAR_SOLVE_MIN_ROW, PAR_SOLVE_MIN_ROW + 1].map(|dimension| {
+            let mut lu = vec![Float::with_val(precision, 0); dimension * dimension];
+            for i in 0..dimension {
+                lu[i * dimension + i] = Float::with_val(precision, 1);
+            }
+            let factors = LuFactors {
+                lu,
+                perm: (0..dimension).collect(),
+            };
+            let mut rhs = vec![Float::with_val(precision, Float::i_exp(1, -100)); dimension];
+            rhs[0] = -Float::with_val(precision, 0);
+            let expected = try_lu_solve_with(&factors, &rhs, dimension, precision, false).unwrap();
+            (dimension, factors, rhs, expected)
+        });
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .start_handler(|index| {
+                if index != 0 {
+                    assert_eq!(unsafe { mpfr_set_emin(-10) }, 0);
+                }
+            })
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let previous = rug::float::exp_min();
+            assert_eq!(unsafe { mpfr_set_emin(normal as _) }, 0);
+            assert!(crate::mpfr_interval::ensure_uniform_exponent_range().is_err());
+            for (dimension, factors, rhs, expected) in &cases {
+                let result = try_lu_solve_with(factors, rhs, *dimension, precision, true);
+                if *dimension > PAR_SOLVE_MIN_ROW {
+                    assert!(result.unwrap_err().to_string().contains("exponent range"));
+                } else {
+                    let actual = result.unwrap();
+                    assert_eq!(&actual, expected);
+                    for (left, right) in actual.iter().zip(expected) {
+                        assert_eq!(left.prec(), right.prec());
+                        assert_eq!(left.is_sign_negative(), right.is_sign_negative());
+                    }
+                }
+            }
+            assert_eq!(unsafe { mpfr_set_emin(previous as _) }, 0);
+        });
+    }
+    #[test]
+    fn mixed_worker_ranges_use_serial_form_and_reject_mutating_kernels() {
+        let p = 128;
+        let n = 128;
+        let normal = rug::float::exp_min();
+        let tiny = Float::with_val(p, Float::i_exp(1, -100));
+        let mut a = vec![Float::with_val(p, 0); n * n];
+        for i in 0..n {
+            a[i * n + i] = tiny.clone();
+        }
+        let x = vec![Float::with_val(p, 1); n];
+        let expected = Float::with_val(p, &tiny * n);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .start_handler(|i| {
+                if i != 0 {
+                    assert_eq!(unsafe { mpfr_set_emin(-10) }, 0);
+                }
+            })
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let previous = rug::float::exp_min();
+            assert_eq!(unsafe { mpfr_set_emin(normal as _) }, 0);
+            assert!(crate::mpfr_interval::ensure_uniform_exponent_range().is_err());
+            for _ in 0..12 {
+                assert_eq!(rayleigh_quotient(&a, n, &x, p), expected);
+            }
+            let mut normalized = x.clone();
+            assert!(try_normalize_l2(&mut normalized).is_err());
+            assert_eq!(normalized, x);
+            assert!(lu_factor(&a, n).is_err());
+            assert!(crate::eigen::householder_tridiag_hp(&a, n, p).is_err());
+            assert!(crate::prefix::analyze_prefixes(&a, n, p, 16, &[n]).is_err());
+            assert_eq!(unsafe { mpfr_set_emin(previous as _) }, 0);
+        });
     }
 }

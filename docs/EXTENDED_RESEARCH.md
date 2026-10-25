@@ -102,6 +102,19 @@ cross-N overlap matrices with a common-cutoff Fourier embedding and match
 margins. Input vector identities and assembly policies remain explicit.
 Overlap matching does not certify branch continuity or select a ground state.
 
+When individual sector eigenvectors were not retained, an explicit acquisition
+assessment can bind the earlier attempt or acquisition policy to the exact
+retained state, matrix, precision, requested vector count, and eigenvalue route.
+An automatic attempt retains its actual precision refusal. An earlier policy
+is recorded as declared provenance, with its evidence digest; recording it does
+not claim that a sector calculation was replayed or that isolation is impossible.
+The assessment measures the retained source's coefficient norm, Rayleigh
+quotient, and residual against the authenticated matrix. Its cluster row remains
+unresolved. It supplies no substitute eigenvectors, cluster projection, gap,
+rank, or branch identity. An absent vector list without this explicit assessment
+continues to report missing input. Successful vector-based measurements retain
+their existing arithmetic and identity.
+
 **Resolution:** retain actual transform channels, numerical resolution, point
 Newton corrections and unassessed outcomes when source error or isolation is
 unavailable. Source value/derivative allowances require error_normalization=unit_l2_dx

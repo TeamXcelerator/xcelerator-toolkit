@@ -333,18 +333,35 @@ impl ArtifactProductionSink for EphemeralCacheStore {
     }
 }
 
-/// A nonwriting persistent overlay that rejects oversized logical/encoded
-/// reads before the inner store reserves payload or archive buffers.
+/// A nonwriting persistent overlay with separate buffered-memory and streamed
+/// scratch limits. Transport spooling does not move numerical allocations out
+/// of RAM and does not enable an out-of-core numerical algorithm.
 pub(crate) struct ReadOnlyBudgetedStore {
     inner: Box<dyn CacheStore>,
     maximum_read_bytes: u64,
+    maximum_scratch_bytes: Option<u64>,
 }
+// The seekable ZIP route owns a 1 MiB spool writer and a 1 MiB verification or
+// decode buffer. This admission floor covers those buffers, not allocator,
+// ZIP metadata, or every process allocation; it is not an RSS guarantee.
+const SEEKABLE_READ_BUFFER_BYTES: u64 = 2 << 20;
 impl ReadOnlyBudgetedStore {
     pub(crate) fn new(inner: Box<dyn CacheStore>, maximum_read_bytes: u64) -> Self {
         Self {
             inner,
             maximum_read_bytes,
+            // Callers without a distinct disk policy keep a conservative cap.
+            maximum_scratch_bytes: Some(maximum_read_bytes),
         }
+    }
+    pub(crate) fn with_streaming_limits(
+        inner: Box<dyn CacheStore>,
+        maximum_read_bytes: u64,
+        maximum_scratch_bytes: Option<u64>,
+    ) -> Self {
+        let mut store = Self::new(inner, maximum_read_bytes);
+        store.maximum_scratch_bytes = maximum_scratch_bytes;
+        store
     }
     fn check_read(&self, manifest: &ArtifactManifest) -> Result<(), CacheError> {
         manifest.validate()?;
@@ -363,6 +380,30 @@ impl ReadOnlyBudgetedStore {
             ));
         }
         Ok(())
+    }
+    fn check_streaming_read(
+        &self,
+        manifest: &ArtifactManifest,
+        maximum_decoded_bytes: u64,
+    ) -> Result<u64, CacheError> {
+        manifest.validate()?;
+        if self.maximum_read_bytes < SEEKABLE_READ_BUFFER_BYTES {
+            return Err(CacheError::ResourceLimit(
+                "read-only streaming buffers exceed the session memory budget".to_owned(),
+            ));
+        }
+        let scratch_limit = self
+            .maximum_scratch_bytes
+            .map_or(maximum_decoded_bytes, |limit| {
+                limit.min(maximum_decoded_bytes)
+            });
+        if manifest.size_bytes > scratch_limit {
+            return Err(CacheError::ResourceLimit(
+                "read-only decoded payload exceeds the caller or temporary-disk scratch allowance"
+                    .to_owned(),
+            ));
+        }
+        Ok(scratch_limit)
     }
 }
 impl CacheStore for ReadOnlyBudgetedStore {
@@ -413,6 +454,16 @@ impl CacheStore for ReadOnlyBudgetedStore {
     ) -> Result<(), CacheError> {
         self.check_read(manifest)?;
         self.inner.read_payload_to(manifest, writer)
+    }
+    fn open_payload(
+        &self,
+        manifest: &ArtifactManifest,
+        scratch_directory: &std::path::Path,
+        maximum_decoded_bytes: u64,
+    ) -> Result<crate::VerifiedPayloadReader, CacheError> {
+        let maximum_decoded_bytes = self.check_streaming_read(manifest, maximum_decoded_bytes)?;
+        self.inner
+            .open_payload(manifest, scratch_directory, maximum_decoded_bytes)
     }
     fn verified_encoded_payload(
         &self,
@@ -532,6 +583,110 @@ mod tests {
             Err(CacheError::ReadOnlyLayer(_))
         ));
     }
+    #[test]
+    fn read_only_seekable_payload_checks_budget_and_forwards_streaming_route() {
+        struct StreamingOnly;
+        impl CacheStore for StreamingOnly {
+            fn name(&self) -> &str {
+                "streaming-only"
+            }
+            fn writable(&self) -> bool {
+                false
+            }
+            fn visibility(&self) -> CacheVisibility {
+                CacheVisibility::Local
+            }
+            fn put(&self, _: &ArtifactDraft, _: &[u8]) -> Result<ArtifactManifest, CacheError> {
+                panic!("read-only probe cannot write")
+            }
+            fn candidates(&self, _: &ArtifactKey) -> Result<Vec<ArtifactManifest>, CacheError> {
+                Ok(Vec::new())
+            }
+            fn read_payload_to(
+                &self,
+                _: &ArtifactManifest,
+                _: &mut dyn Write,
+            ) -> Result<(), CacheError> {
+                panic!("seekable wrapper used the potentially buffered fallback")
+            }
+            fn open_payload(
+                &self,
+                manifest: &ArtifactManifest,
+                scratch: &std::path::Path,
+                maximum: u64,
+            ) -> Result<crate::VerifiedPayloadReader, CacheError> {
+                assert_eq!(manifest.size_bytes, 20u64 << 30);
+                assert_eq!(scratch, std::path::Path::new("unused-scratch"));
+                assert_eq!(maximum, 21u64 << 30);
+                Err(CacheError::NotFound("forwarded streaming route".into()))
+            }
+        }
+        let memory = EphemeralCacheStore::new(16_384).unwrap();
+        let mut manifest = memory.put(&draft(), b"fixture").unwrap();
+        manifest.size_bytes = 20u64 << 30;
+        manifest.objects[0].size_bytes = 20u64 << 30;
+        let path = std::path::Path::new("unused-scratch");
+        let small = ReadOnlyBudgetedStore::new(Box::new(StreamingOnly), 8u64 << 30);
+        assert!(matches!(
+            small.open_payload(&manifest, path, 21u64 << 30),
+            Err(CacheError::ResourceLimit(_))
+        ));
+        let large = ReadOnlyBudgetedStore::with_streaming_limits(
+            Box::new(StreamingOnly),
+            8u64 << 30,
+            Some(100u64 << 30),
+        );
+        assert!(
+            matches!(large.open_payload(&manifest, path, 21u64 << 30), Err(CacheError::NotFound(message)) if message == "forwarded streaming route")
+        );
+        // Buffered and encoded APIs retain the old logical-plus-encoded gate.
+        assert!(matches!(
+            large.read_payload(&manifest),
+            Err(CacheError::ResourceLimit(_))
+        ));
+        assert!(matches!(
+            large.read_payload_to(&manifest, &mut Vec::new()),
+            Err(CacheError::ResourceLimit(_))
+        ));
+        assert!(matches!(
+            large.verified_encoded_payload(&manifest),
+            Err(CacheError::ResourceLimit(_))
+        ));
+        assert!(matches!(
+            large.verified_transport_parts(&manifest),
+            Err(CacheError::ResourceLimit(_))
+        ));
+        for (memory, disk, caller) in [
+            (
+                SEEKABLE_READ_BUFFER_BYTES - 1,
+                Some(100u64 << 30),
+                21u64 << 30,
+            ),
+            (8u64 << 30, Some(1u64 << 30), 21u64 << 30),
+            (8u64 << 30, Some(100u64 << 30), 19u64 << 30),
+        ] {
+            let limited =
+                ReadOnlyBudgetedStore::with_streaming_limits(Box::new(StreamingOnly), memory, disk);
+            assert!(matches!(
+                limited.open_payload(&manifest, path, caller),
+                Err(CacheError::ResourceLimit(_))
+            ));
+        }
+        // A missing policy ceiling leaves the caller's explicit bound active.
+        let caller_only = ReadOnlyBudgetedStore::with_streaming_limits(
+            Box::new(StreamingOnly),
+            SEEKABLE_READ_BUFFER_BYTES,
+            None,
+        );
+        assert!(
+            matches!(caller_only.open_payload(&manifest, path, 21u64 << 30), Err(CacheError::NotFound(message)) if message == "forwarded streaming route")
+        );
+        assert!(matches!(
+            caller_only.open_payload(&manifest, path, 19u64 << 30),
+            Err(CacheError::ResourceLimit(_))
+        ));
+    }
+
     #[test]
     fn ephemeral_assurance_requires_actual_retained_evidence() {
         let store = EphemeralCacheStore::new(65_536).unwrap();

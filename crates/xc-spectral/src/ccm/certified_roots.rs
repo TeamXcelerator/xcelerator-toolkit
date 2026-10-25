@@ -735,7 +735,7 @@ impl CertifiedSecularFunction {
                     let requested = options.validate(work)?;
                     if fine_width < requested {
                         refined_options.width_tolerance = xc_core::DecimalLiteral::new(
-                            fine_width.to_string_radix_round(10, None, Round::Down))?;
+                            xc_numerics::fmt::decimal_string_round(&fine_width, None, Round::Down))?;
                     }
                 }
                 let root = promoted.isolate(&MpfrInterval::new(lower, upper)?, &refined_options)?;
@@ -1187,7 +1187,7 @@ impl CertifiedSecularFunction {
                 // or a value within arithmetic error of zero near this point.
                 return Ok(GapSubdivision::Stalled(format!(
                     "G stays within arithmetic error of zero near {}",
-                    lower.to_string_radix(10, Some(24))
+                    xc_numerics::fmt::decimal_string_round(&lower, Some(24), Round::Nearest)
                 )));
             };
             pending.push((middle.clone(), upper));
@@ -2053,7 +2053,7 @@ fn serialize_float(value: &Float, precision_bits: u32) -> String {
         .ceil()
         .max(32.0) as usize
         + 2;
-    value.to_string_radix(10, Some(digits))
+    xc_numerics::fmt::decimal_string_round(value, Some(digits), Round::Nearest)
 }
 
 fn parse_source_weights(certificate: &FirstPositiveCcmRootCertificate) -> Result<Vec<Float>> {
